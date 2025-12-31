@@ -1,0 +1,20 @@
+[package]
+name = "vortex-rdf-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[dependencies]
+vortex-rdf-core.workspace = true
+clap.workspace = true
+oxrdf.workspace = true
+oxrdfio.workspace = true
+anyhow.workspace = true
+vortex-array.workspace = true
+vortex-ipc.workspace = true
+vortex-session.workspace = true
+vortex.workspace = true
+mimalloc.workspace = true

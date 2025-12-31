@@ -1,0 +1,31 @@
+{
+    "name": "vortex-rdf",
+    "version": "0.1.0",
+    "description": "High-performance, columnar RDF serialization format",
+    "main": "pkg/vortex_rdf.js",
+    "types": "pkg/vortex_rdf.d.ts",
+    "files": [
+        "pkg/vortex_rdf_bg.wasm",
+        "pkg/vortex_rdf.js",
+        "pkg/vortex_rdf.d.ts"
+    ],
+    "scripts": {
+        "build": "wasm-pack build --target nodejs --out-dir pkg",
+        "build:web": "wasm-pack build --target web --out-dir pkg",
+        "test": "echo \"Error: no test specified\" && exit 1"
+    },
+    "keywords": [
+        "rdf",
+        "vortex",
+        "columnar",
+        "semantic-web",
+        "wasm",
+        "zero-copy"
+    ],
+    "author": "Julián Rojas",
+    "license": "MIT",
+    "devDependencies": {
+        "wasm-pack": "^0.13.1",
+        "@rdfjs/types": "^1.1.0"
+    }
+}
