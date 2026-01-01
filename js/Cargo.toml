@@ -13,13 +13,16 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 vortex-rdf-core.workspace = true
 wasm-bindgen.workspace = true
+wasm-bindgen-futures = "0.4"
 js-sys.workspace = true
+futures.workspace = true
 console_error_panic_hook.workspace = true
 getrandom = { workspace = true, features = ["js"] }
 oxrdf.workspace = true
 oxrdfio.workspace = true
 vortex-array.workspace = true
 vortex-dtype.workspace = true
+vortex.workspace = true
 
 [dependencies.web-sys]
 version = "0.3"

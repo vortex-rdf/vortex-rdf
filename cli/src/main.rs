@@ -1,13 +1,17 @@
 use anyhow::{anyhow, Context, Result};
 use mimalloc::MiMalloc;
+use futures::StreamExt;
 
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
 use clap::{Parser, ValueEnum};
 use oxrdfio::RdfFormat;
 use std::fs::File;
 use std::io::{stdin, stdout, Read, Write};
 use std::path::PathBuf;
+use vortex_rdf_core::io::ser::write_array_to_ipc;
+use vortex_rdf_core::{deserialize, serialize, VortexRdfStore};
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser)]
 #[command(
@@ -24,7 +28,7 @@ struct Cli {
     #[arg(short, long)]
     input: Option<PathBuf>,
 
-    /// Output file path (defaults to stdout)
+    /// Output file path (required for serialize action, defaults to stdout for others)
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -106,7 +110,8 @@ fn detect_format(path: &Option<PathBuf>) -> Option<RdfFormat> {
     RdfFormat::from_extension(ext)
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.action {
@@ -119,17 +124,15 @@ fn main() -> Result<()> {
                     anyhow!("Could not detect RDF format. Please specify it with --format")
                 })?;
 
-            let mut reader: Box<dyn Read> = match &cli.input {
+            let reader: Box<dyn Read + Send> = match &cli.input {
                 Some(p) => Box::new(File::open(p).context("Failed to open input file")?),
                 None => Box::new(stdin()),
             };
 
-            let writer: Box<dyn Write> = match &cli.output {
-                Some(p) => Box::new(File::create(p).context("Failed to create output file")?),
-                None => Box::new(stdout()),
-            };
-
-            vortex_rdf_core::serialize(&mut reader, writer, format)
+            let output_path = cli.output.as_ref().ok_or_else(|| anyhow!("Output file is required for serialize action"))?;
+            let writer = tokio::fs::File::create(output_path).await.context("Failed to create output file")?;
+            serialize(reader, writer, format)
+                .await
                 .context("Failed to serialize to Vortex")?;
         }
         Action::Deserialize => {
@@ -144,13 +147,23 @@ fn main() -> Result<()> {
                 None => Box::new(stdout()),
             };
 
-            let reader: Box<dyn Read> = match &cli.input {
-                Some(p) => Box::new(File::open(p).context("Failed to open input file")?),
-                None => Box::new(stdin()),
-            };
-
-            vortex_rdf_core::deserialize(reader, writer, format)
-                .context("Failed to deserialize from Vortex")?;
+            match &cli.input {
+                Some(p) => {
+                     // From file path
+                     deserialize(p.clone(), writer, format)
+                        .await
+                        .context("Failed to deserialize from Vortex")?;
+                }
+                None => {
+                    // From stdin (read to buffer first)
+                    let mut buffer = Vec::new();
+                    stdin().read_to_end(&mut buffer).context("Failed to read from stdin")?;
+                    let buffer = vortex::buffer::Buffer::from(buffer);
+                    deserialize(buffer, writer, format)
+                        .await
+                        .context("Failed to deserialize from Vortex")?;
+                }
+            }
         }
         Action::Match => {
             let input_path = cli
@@ -158,7 +171,8 @@ fn main() -> Result<()> {
                 .as_ref()
                 .ok_or_else(|| anyhow!("Input file is required for match action"))?;
 
-            let store = vortex_rdf_core::VortexRdfStore::from_file(input_path)
+            let store = VortexRdfStore::from_file(input_path)
+                .await
                 .context("Failed to load Vortex store via mmap")?;
 
             let mut subject = None;
@@ -188,6 +202,7 @@ fn main() -> Result<()> {
                     object.as_ref(),
                     graph.as_ref(),
                 )
+                .await
                 .context("Failed to apply match pattern")?;
 
             let format = cli
@@ -204,7 +219,7 @@ fn main() -> Result<()> {
             // If output is .vortex, we should serialize as Vortex
             if let Some(p) = &cli.output {
                 if p.extension().map(|e| e == "vortex").unwrap_or(false) {
-                    vortex_rdf_core::ser::write_array_to_ipc(filtered.root, writer)
+                    write_array_to_ipc(filtered.root, writer)
                         .context("Failed to write Vortex output")?;
                     return Ok(());
                 }
@@ -212,7 +227,8 @@ fn main() -> Result<()> {
 
             // Otherwise default to RDF
             let mut serializer = oxrdfio::RdfSerializer::from_format(format).for_writer(writer);
-            for quad_res in filtered.quads()? {
+            let mut quads_stream = filtered.quads()?;
+            while let Some(quad_res) = quads_stream.next().await {
                 let quad = quad_res?;
                 serializer
                     .serialize_quad(&quad)
@@ -266,4 +282,3 @@ fn parse_graph_name(s: &str) -> Result<oxrdf::GraphName> {
         Ok(oxrdf::GraphName::NamedNode(parse_named_node(s)?))
     }
 }
-

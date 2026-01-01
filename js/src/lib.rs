@@ -3,6 +3,7 @@ use std::io::Cursor;
 use vortex_rdf_core::{deserialize, serialize, RdfFormat};
 use wasm_bindgen::prelude::*;
 use js_sys::{Object, Reflect};
+use futures::StreamExt;
 
 #[wasm_bindgen(typescript_custom_section)]
 const TS_APPEND_CONTENT: &'static str = r#"
@@ -12,8 +13,14 @@ export interface VortexRdfStore {
     addQuad(quad: Quad): void;
     deleteQuad(quad: Quad): void;
     has(quad: Quad): boolean;
-    match(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): VortexRdfStore;
-    values(): IterableIterator<Quad>;
+    match(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): Promise<VortexRdfStore>;
+    values(): Promise<IterableIterator<Quad>>;
+}
+
+export namespace VortexRdfStore {
+    export function empty(): VortexRdfStore;
+    export function fromBytes(bytes: Uint8Array): VortexRdfStore;
+    export function fromString(input: string, format: string): VortexRdfStore;
 }
 "#;
 
@@ -31,14 +38,21 @@ pub struct VortexRdfStore {
 #[wasm_bindgen]
 impl VortexRdfStore {
     #[wasm_bindgen(js_name = fromBytes)]
-    pub fn from_bytes(bytes: &[u8]) -> Result<VortexRdfStore, JsValue> {
+    pub async fn from_bytes(bytes: &[u8]) -> Result<VortexRdfStore, JsValue> {
         let inner = vortex_rdf_core::VortexRdfStore::from_bytes(bytes)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(VortexRdfStore { inner })
+    }
+
+    pub fn empty() -> Result<VortexRdfStore, JsValue> {
+        let inner = vortex_rdf_core::VortexRdfStore::empty()
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(VortexRdfStore { inner })
     }
 
     #[wasm_bindgen(js_name = fromString)]
-    pub fn from_string(input: &str, format_name: &str) -> Result<VortexRdfStore, JsValue> {
+    pub async fn from_string(input: String, format_name: &str) -> Result<VortexRdfStore, JsValue> {
         let format = match format_name.to_lowercase().as_str() {
             "nt" | "ntriples" => RdfFormat::NTriples,
             "nq" | "nquads" => RdfFormat::NQuads,
@@ -51,17 +65,19 @@ impl VortexRdfStore {
         };
 
         let mut bytes = Vec::new();
+        // Vec<u8> implements VortexWrite
         serialize(Cursor::new(input), &mut bytes, format)
+            .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-        Self::from_bytes(&bytes)
+        Self::from_bytes(&bytes).await
     }
 
     pub fn size(&self) -> usize {
         self.inner.size()
     }
 
-    pub fn has(&self, quad_js: JsValue) -> bool {
+    pub async fn has(&self, quad_js: JsValue) -> bool {
         if let Some(quad) = js_to_quad(quad_js) {
             self.inner
                 .match_pattern(
@@ -70,6 +86,7 @@ impl VortexRdfStore {
                     Some(&quad.object),
                     Some(&quad.graph_name),
                 )
+                .await
                 .map(|ds| ds.size() > 0)
                 .unwrap_or(false)
         } else {
@@ -78,9 +95,10 @@ impl VortexRdfStore {
     }
 
     #[wasm_bindgen(js_name = addQuad)]
-    pub fn add_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
+    pub async fn add_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
         if let Some(quad) = js_to_quad(quad_js) {
             self.inner = self.inner.add_quad(quad)
+                .await
                 .map_err(|e| JsValue::from_str(&e.to_string()))?;
             Ok(())
         } else {
@@ -89,9 +107,10 @@ impl VortexRdfStore {
     }
 
     #[wasm_bindgen(js_name = deleteQuad)]
-    pub fn delete_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
+    pub async fn delete_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
         if let Some(quad) = js_to_quad(quad_js) {
             self.inner = self.inner.delete_quad(&quad)
+                .await
                 .map_err(|e| JsValue::from_str(&e.to_string()))?;
             Ok(())
         } else {
@@ -100,7 +119,7 @@ impl VortexRdfStore {
     }
 
     #[wasm_bindgen(js_name = match)]
-    pub fn match_pattern(
+    pub async fn match_pattern(
         &self,
         subject: JsValue,
         predicate: JsValue,
@@ -115,20 +134,21 @@ impl VortexRdfStore {
         let filtered = self
             .inner
             .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+            .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         Ok(VortexRdfStore { inner: filtered })
     }
 
-    pub fn values(&self) -> js_sys::Iterator {
-        let quads_iter = self.inner.quads().unwrap();
+    pub async fn values(&self) -> Result<js_sys::Iterator, JsValue> {
+        let mut quads_stream = self.inner.quads().map_err(|e| JsValue::from_str(&e.to_string()))?;
         let js_array = js_sys::Array::new();
-        for q_res in quads_iter {
+        while let Some(q_res) = quads_stream.next().await {
             if let Ok(q) = q_res {
                 js_array.push(&quad_to_js(&q));
             }
         }
-        js_array.values()
+        Ok(js_array.values())
     }
 }
 
@@ -291,17 +311,19 @@ fn js_to_quad(val: JsValue) -> Option<Quad> {
 }
 
 #[wasm_bindgen]
-pub fn nquads_to_vortex(nquads: &str) -> Result<Vec<u8>, JsValue> {
+pub async fn nquads_to_vortex(nquads: String) -> Result<Vec<u8>, JsValue> {
     let mut buffer = Vec::new();
     serialize(Cursor::new(nquads), &mut buffer, RdfFormat::NQuads)
+        .await
         .map_err(|e| JsValue::from_str(&format!("Vortex error: {}", e)))?;
     Ok(buffer)
 }
 
 #[wasm_bindgen]
-pub fn vortex_to_nquads(vortex_bytes: &[u8]) -> Result<String, JsValue> {
+pub async fn vortex_to_nquads(vortex_bytes: &[u8]) -> Result<String, JsValue> {
     let mut buffer = Vec::new();
-    deserialize(Cursor::new(vortex_bytes), &mut buffer, RdfFormat::NQuads)
+    deserialize(vortex::buffer::Buffer::from(vortex_bytes.to_vec()), &mut buffer, RdfFormat::NQuads)
+        .await
         .map_err(|e| JsValue::from_str(&format!("Vortex error: {}", e)))?;
 
     String::from_utf8(buffer).map_err(|e| JsValue::from_str(&format!("UTF-8 error: {}", e)))

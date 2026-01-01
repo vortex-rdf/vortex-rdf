@@ -18,3 +18,5 @@ vortex-ipc.workspace = true
 vortex-session.workspace = true
 vortex.workspace = true
 mimalloc.workspace = true
+tokio.workspace = true
+futures.workspace = true

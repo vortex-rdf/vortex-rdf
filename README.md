@@ -1,35 +1,32 @@
 # Vortex-RDF
 
-Vortex-RDF is a high-performance, columnar RDF serialization format built on top of [Vortex](https://vortex.dev). It combines the flexible graph model of RDF with the efficiency of modern analytical data formats.
+Vortex-RDF is modern and high-performance columnar RDF serialization built on top of the [Vortex](https://vortex.dev) data format. It combines the flexible graph-based model of RDF with the efficiency of modern analytical data formats.
+
+This library provides both serialization and deserialization capabilities for converting RDF files to Vortex-RDF and vice versa. It also provides an implementation of a RDF store according to the [RDF-JS specification](https://rdf.js.org/dataset-spec/#datasetcore-interface). 
 
 ## Key Features
 
-- **Advanced Columnar Storage**: Leverages Vortex's zero-copy, compressed array formats.
-- **FSST String Compression**: Uses Fast Static Symbol Table (FSST) compression [1] for the dictionary/resource table, specifically optimized for repetitive short strings like IRIs.
-- **Physical Optimization**: Intelligently narrows Predicate indices to `u16` when unique predicates are few, saving 50% RAM for the most repetitive column.
-- **Quads Support**: Full support for Named Graphs (S, P, O, G).
-- **Universal Interop**: Native Rust library, WebAssembly (WASM) bindings for browsers/Node.js, and a powerful CLI.
+- 📊 **Advanced Columnar Storage**: Leverages Vortex's zero-copy, compressed array formats.
+- 📦 **FSST String Compression**: Uses [Fast Static Symbol Table (FSST)](https://doi.org/10.14778/3407790.3407851) compression [1] for the dictionary/resource table, specifically optimized for repetitive short strings like IRIs.
+- 🧠 **Memory Optimization**: Automatically narrows Predicate indices to `u16` when unique predicates are few (< 65,536), saving up to 50% RAM for the most repetitive column.
+- 🧊 **Quads Support**: Full support for named Graphs (S, P, O, G) and in general for [RDF 1.1](https://www.w3.org/TR/rdf11-concepts/).
+- 🌍 **Cross-Platform**: Native Rust library with a CLI + WebAssembly (WASM) bindings for browsers/Node.js. Python binding comming soon.
 
-## The Power of Zero-Copy
+### The Power of Zero-Copy
 
-Vortex-RDF is built on a "Zero-Copy" philosophy. This means that after the data is serialized into the Vortex format, it can be read, filtered, and queried without ever moving or copying the bytes in memory.
+Vortex-RDF is built on a ["Zero-Copy" philosophy](https://en.wikipedia.org/wiki/Zero-copy). This means that after the RDF data is serialized into the Vortex format, it can be read, filtered, and queried without ever moving or copying the bytes in memory.
 
-### How it works:
-1. **Memory Mapping**: Using `mmap`, the library maps large RDF files directly into the process memory. The operating system handles loading only the parts of the file that your query actually touches.
-2. **Buffer Views**: When you extract a specific column (e.g., just the Predicates) or a specific row range, Vortex creates an "Array View." This view is just a pointer and a length—it doesn't duplicate the data.
+#### How it works:
+1. **Memory Mapping**: Using `mmap` (via the [`memmap2`](https://docs.rs/memmap2/latest/memmap2/) crate), the library maps large RDF files directly into the process memory. The operating system handles loading only the parts of the file that your query actually touches.
+2. **Buffer Views**: When you extract a specific column (e.g., just the Predicates) or a specific row range, Vortex creates a [_Layout_](https://docs.vortex.dev/concepts/layouts). This view is just a pointer and some metadata—it doesn't duplicate the data.
 3. **Lazy Decompression**: Even with FSST compression, Vortex is designed to decompress data "just-in-time" at the CPU register level, avoiding the creation of temporary intermediate strings.
 
-### Advantages:
-- **Instantaneous Loading**: Open massive (GBs/TBs) stores in microseconds.
-- **Memory Efficiency**: The application's RAM usage is decoupled from the file size.
-- **Performance**: Eliminates the 30-50% CPU overhead usually spent on deserialization (JSON parsing, N-Triples parsing, etc.).
+### Vortex IPC & File Format
 
-## Vortex IPC & File Format
+Vortex-RDF is serialized using the [_Vortex IPC (Inter-Process Communication)_ protocol](https://docs.rs/vortex-ipc/0.56.0/vortex_ipc/). This is a streaming, self-describing binary format that shares its design philosophy with the Apache Arrow IPC protocol but is specifically optimized for Vortex's advanced encodings.
 
-Vortex-RDF is serialized using the **Vortex IPC (Inter-Process Communication)** protocol. This is a streaming, self-describing binary format that shares its design philosophy with the Apache Arrow IPC protocol but is specifically optimized for Vortex's advanced encodings.
-
-### How IPC is Used:
-1. **Self-Describing Stream**: Every `.vortex` file begins with a **Schema Message** (using FlatBuffers) that describes the `DType` (data types) of the columns. The consumer doesn't need a sidecar file to know it is looking at an S, P, O, G struct.
+#### How IPC is Used:
+1. **Self-Describing Stream**: Every `.vortex` file begins with a **Schema Message** (using FlatBuffers) that describes the `DType` (data types) of the columns. The consumer doesn't need a sidecar file to know it is looking at an (S, P, O, G) struct.
 2. **Message-Based Serialization**: The data is written as a sequence of messages. In Vortex-RDF, the entire store is typically bundled into a single high-level `StructArray` message, though it could be chunked into multiple messages for massive streaming stores.
 3. **Flat Memory Layout**: IPC messages are designed to be **8-byte aligned**. When mapped into memory, the columnar data (like the Subject `u32` IDs) can be read directly by the CPU as a native array without any "shuffling" or "parsing."
 4. **Encodings in the Stream**: The IPC stream encodes not just the values, but the **Encoding IDs** (e.g., `vortex.fsst`, `vortex.dict`). When a reader encounters these IDs, it uses the Vortex Registry to instantiate the correct decompressors.
@@ -201,6 +198,7 @@ await init();
 // Create store from Vortex bytes or RDF string
 const store = VortexRdfStore.fromBytes(vortexBytes);
 // const store = VortexRdfStore.fromString(turtleString, "turtle");
+// const store = VortexRdfStore.empty();
 
 console.log(`Loaded ${store.size} quads`);
 

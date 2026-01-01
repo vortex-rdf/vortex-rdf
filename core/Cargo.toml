@@ -19,6 +19,9 @@ vortex-session.workspace = true
 vortex-fsst.workspace = true
 vortex-mask.workspace = true
 vortex-scalar.workspace = true
+vortex-file.workspace = true
+vortex-scan.workspace = true
+tokio.workspace = true
 
 # RDF handling
 oxrdf.workspace = true
@@ -28,3 +31,4 @@ oxrdfio.workspace = true
 itertools.workspace = true
 thiserror.workspace = true
 memmap2.workspace = true
+futures.workspace = true

@@ -27,6 +27,9 @@ const store = VortexRdfStore.fromBytes(vortexBytes);
 
 // Or from a Turtle/N-Quads string
 const store = VortexRdfStore.fromString(ttlData, "turtle");
+
+// Or create a new empty store
+const store = VortexRdfStore.empty();
 ```
 
 ### Querying
