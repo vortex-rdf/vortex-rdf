@@ -233,6 +233,9 @@ cat test/test.vortex | vortex-rdf-cli deserialize --format jsonld
 vortex-rdf-cli match --input test/test.vortex --predicate "http://example.org/p1"
 # Save filtered results back to Vortex
 vortex-rdf-cli match --input test/test.vortex --subject "http://example.org/s1" --output filtered.vortex
+
+# Enable debug logging (shows timing metrics)
+RUST_LOG=debug vortex-rdf-cli serialize --input data.ttl --output data.vortex
 ```
 
 ---
