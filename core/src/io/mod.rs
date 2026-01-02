@@ -18,6 +18,7 @@ pub async fn serialize<R: Read + Send + 'static, W: VortexWrite + Unpin + Send>(
     writer: W,
     format: RdfFormat,
 ) -> error::Result<()> {
+    let start = std::time::Instant::now();
     let parser = RdfParser::from_format(format);
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
 
@@ -37,6 +38,7 @@ pub async fn serialize<R: Read + Send + 'static, W: VortexWrite + Unpin + Send>(
     let mut o_ids = Vec::new();
     let mut g_ids = Vec::new();
 
+    let convert_start = std::time::Instant::now();
     while let Some(quad_res) = rx.recv().await {
         let quad = quad_res.map_err(|e| error::VortexRdfError::Serialization(e.to_string()))?;
         s_ids.push(dict.get_or_insert(&quad.subject.to_string()));
@@ -44,10 +46,18 @@ pub async fn serialize<R: Read + Send + 'static, W: VortexWrite + Unpin + Send>(
         o_ids.push(dict.get_or_insert(&quad.object.to_string()));
         g_ids.push(dict.get_or_insert(&quad.graph_name.to_string()));
     }
+    log::debug!("[serialize] RDF to Oxigraph Quads Conversion took {:?}", convert_start.elapsed());
 
+    let bundle_start = std::time::Instant::now();
     let root = ser::bundle_as_struct(dict, s_ids, p_ids, o_ids, g_ids)?;
+    log::debug!("[serialize] Vortex Struct Array Bundling took {:?}", bundle_start.elapsed());
 
-    ser::write_array_to_vortex(root, writer).await
+    let writing_start = std::time::Instant::now();
+    let converted = ser::write_array_to_vortex(root, writer).await;
+    log::debug!("[serialize] Vortex Array Writing took {:?}", writing_start.elapsed());
+    log::debug!("[serialize] Full serialization took {:?}", start.elapsed());
+
+    converted
 }
 
 /// High-level function to deserialize Vortex-RDF data from a reader directly to an RDF writer.

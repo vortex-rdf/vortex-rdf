@@ -21,30 +21,35 @@ pub fn bundle_as_struct(
     g_ids: Vec<u32>,
 ) -> Result<ArrayRef> {
     // Compress the dictionary using FSST
+    let dict_start = std::time::Instant::now();
     let dict_arr = encode_dictionary(&dict)?;
+    log::debug!("[ser::bundle_as_struct] Dictionary FSST encoding took {:?}", dict_start.elapsed());
     // Build an initial StructArray with all the (SPOG) columns
+    let quads_start = std::time::Instant::now();
     let quads_struct = encode_quad_ids(s_ids, p_ids, o_ids, g_ids)?;
+    log::debug!("[ser::bundle_as_struct] Quad IDs struct encoding took {:?}", quads_start.elapsed());
     
     /*
-     * Bundle everything into an overarching root StructArray using the ListArray trick for differing lengths.
-     * We create a StructArray with two fields: "dictionary" and "quads" that looks like this:
-     * { 
-     *    "dictionary": [
-     *        dict_arr: VarBinViewArray (FSST compressed)
-     *    ]: ListArray, 
-     *    "quads": [
-     *        quads_struct: {
-     *            s: PrimitiveArray,
-     *            p: PrimitiveArray,
-     *            o: PrimitiveArray,
-     *            g: PrimitiveArray
-     *        }: StructArray
-     *    ]: ListArray 
-     * }
-     * 
-     * The ListArray trick is used to homogenize the array lengths, where both the "dictionary" and "quads"
-     * become ListArrays of length 1, where the offsets define the boundaries of the single element containing the entire original array.
+      Bundle everything into an overarching root StructArray using the ListArray trick for differing lengths.
+      We create a StructArray with two fields: "dictionary" and "quads" that looks like this:
+      { 
+         "dictionary": [
+             dict_arr: VarBinViewArray (FSST compressed)
+         ]: ListArray, 
+         "quads": [
+             quads_struct: {
+                 s: PrimitiveArray,
+                 p: PrimitiveArray,
+                 o: PrimitiveArray,
+                 g: PrimitiveArray
+             }: StructArray
+         ]: ListArray 
+      }
+      
+      The ListArray trick is used to homogenize the array lengths, where both the "dictionary" and "quads"
+      become ListArrays of length 1, where the offsets define the boundaries of the single element containing the entire original array.
      */
+    let bundle_start = std::time::Instant::now();
     let dict_offsets = PrimitiveArray::from_iter(vec![0i32, dict_arr.len() as i32]).into_array();
     let dict_list = ListArray::try_new(dict_arr, dict_offsets, Validity::NonNullable)?.into_array();
     let quads_offsets =
@@ -53,7 +58,7 @@ pub fn bundle_as_struct(
         ListArray::try_new(quads_struct, quads_offsets, Validity::NonNullable)?.into_array();
     let root =
         StructArray::from_fields(&[("dictionary", dict_list), ("quads", quads_list)])?.into_array();
-
+    log::debug!("[ser::bundle_as_struct] Root struct encoding took {:?}", bundle_start.elapsed());
     Ok(root)
 }
 
@@ -120,6 +125,7 @@ pub async fn write_array_to_vortex<W: VortexWrite + Unpin + Send>(
     array: ArrayRef,
     mut writer: W,
 ) -> Result<()> {
+    let session_start = std::time::Instant::now();
     let session = VortexSession::default();
 
     let write_opts = session.write_options().with_strategy(
@@ -127,12 +133,18 @@ pub async fn write_array_to_vortex<W: VortexWrite + Unpin + Send>(
             .with_compressor(CompactCompressor::default())
             .build(),
     );
+    log::debug!("[ser::write_array_to_vortex] Vortex writer options setup took {:?}", session_start.elapsed());
 
+    let stream_start = std::time::Instant::now();
     let stream = array.to_array_stream();
+    log::debug!("[ser::write_array_to_vortex] Array stream creation took {:?}", stream_start.elapsed());
+
+    let write_start = std::time::Instant::now();
     let _summary = write_opts
         .write(&mut writer, stream)
         .await
         .map_err(|e: vortex_error::VortexError| crate::error::VortexRdfError::from(e))?;
+    log::debug!("[ser::write_array_to_vortex] Vortex writing took {:?}", write_start.elapsed());
 
     Ok(())
 }
