@@ -60,9 +60,15 @@ where
     S: IntoReadSource,
     W: Write,
 {
+    let start = std::time::Instant::now();
     let array = de::read_array_from_vortex(source).await?;
-    let mut quads_stream = de::decode_quads_stream(array)?;
+    log::debug!("[deserialize] Reading vortex array took {:?}", start.elapsed());
 
+    let decode_start = std::time::Instant::now();
+    let mut quads_stream = de::decode_quads_stream(array)?;
+    log::debug!("[deserialize] Stream setup took {:?}", decode_start.elapsed());
+
+    let write_start = std::time::Instant::now();
     let mut serializer = RdfSerializer::from_format(format).for_writer(writer);
     while let Some(quad_res) = quads_stream.next().await {
         let quad = quad_res?;
@@ -73,6 +79,10 @@ where
     serializer
         .finish()
         .map_err(|e| error::VortexRdfError::Deserialization(e.to_string()))?;
+    
+    log::debug!("[deserialize] Serialization/write loop took {:?}", write_start.elapsed());
+    log::debug!("[deserialize] Total deserialization took {:?}", start.elapsed());
+    
     Ok(())
 }
 

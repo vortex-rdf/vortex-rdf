@@ -3,7 +3,14 @@ pub mod io;
 pub mod store;
 
 pub use error::VortexRdfError;
-pub use io::{deserialize, quads_to_vortex, quads_to_vortex_writer, serialize, vortex_to_quads, RdfFormat};
+pub use io::{
+    deserialize,
+    quads_to_vortex,
+    quads_to_vortex_writer,
+    serialize,
+    vortex_to_quads,
+    RdfFormat,
+};
 pub use store::dictionary::Dictionary;
 pub use store::VortexRdfStore;
 

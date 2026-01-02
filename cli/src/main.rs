@@ -10,6 +10,10 @@ use std::path::PathBuf;
 use vortex_rdf_core::io::ser::write_array_to_ipc;
 use vortex_rdf_core::{deserialize, serialize, VortexRdfStore};
 
+/*
+ As indicated by vortex docs:
+ https://docs.rs/vortex/latest/vortex/index.html#performance-optimization
+*/
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
@@ -112,6 +116,7 @@ fn detect_format(path: &Option<PathBuf>) -> Option<RdfFormat> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    env_logger::init();
     let cli = Cli::parse();
 
     match cli.action {

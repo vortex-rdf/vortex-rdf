@@ -32,3 +32,4 @@ itertools.workspace = true
 thiserror.workspace = true
 memmap2.workspace = true
 futures.workspace = true
+log = "0.4"

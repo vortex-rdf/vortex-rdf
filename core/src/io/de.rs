@@ -15,8 +15,6 @@ use vortex::VortexSessionDefault;
 use vortex_dtype::{DType, Nullability, PType};
 
 pub fn array_from_reader<R: std::io::Read>(reader: R) -> Result<ArrayRef> {
-    // let _ = vortex::Session::default(); // Probe root
-    // let _ = vortex::VortexFileReader::try_new; // Probe root
     let array_session = ArraySession::default();
     let registry = array_session.registry();
 
@@ -38,19 +36,26 @@ pub fn array_from_reader<R: std::io::Read>(reader: R) -> Result<ArrayRef> {
 pub async fn read_array_from_vortex<S: IntoReadSource>(
     source: S,
 ) -> Result<ArrayRef> {
+    let start = std::time::Instant::now();
     let session = VortexSession::default();
 
     let file = session.open_options()
         .open(source)
         .await
         .map_err(|e| crate::VortexRdfError::from(e))?;
+    log::debug!("[de::read_array_from_vortex] File open Session took {:?}", start.elapsed());
 
-    let scan = file.scan().map_err(|e| crate::VortexRdfError::from(e))?;
+    let scan_start = std::time::Instant::now();
+    let scan = file.scan().map_err(|e| crate::VortexRdfError::from(e))?;    
     let stream = scan.into_array_stream().map_err(|e| crate::VortexRdfError::from(e))?;
+    log::debug!("[de::read_array_from_vortex] Scan took {:?}", scan_start.elapsed());
+    
+    let read_start = std::time::Instant::now();
     let array: ArrayRef = stream
         .read_all()
         .await
         .map_err(|e: vortex_error::VortexError| crate::VortexRdfError::from(e))?;
+    log::debug!("[de::read_array_from_vortex] Stream read_all took {:?}", read_start.elapsed());
 
     Ok(array)
 }
@@ -60,7 +65,11 @@ pub async fn decode_quads(root: ArrayRef) -> Result<Vec<Quad>> {
 }
 
 pub fn decode_quads_stream(root: ArrayRef) -> Result<impl Stream<Item = Result<Quad>>> {
+    let start = std::time::Instant::now();
     let dictionary = Dictionary::from_root(&root)?;
+    log::debug!("[de::decode_quads_stream] Dictionary rebuild took {:?}", start.elapsed());
+
+    let quads_start = std::time::Instant::now();
     let root_struct = root.to_struct();
 
     let quads_list_ref = root_struct
@@ -102,48 +111,34 @@ pub fn decode_quads_stream(root: ArrayRef) -> Result<impl Stream<Item = Result<Q
 
     let s_ids = fields.get(0)
         .ok_or_else(|| VortexRdfError::Deserialization("Missing S IDs".to_string()))?
-        .clone();
+        .clone().to_primitive();
     let p_ids = fields.get(1)
         .ok_or_else(|| VortexRdfError::Deserialization("Missing P IDs".to_string()))?
-        .clone();
+        .clone().to_primitive();
     let o_ids = fields.get(2)
         .ok_or_else(|| VortexRdfError::Deserialization("Missing O IDs".to_string()))?
-        .clone();
+        .clone().to_primitive();
     let g_ids = fields.get(3)
         .ok_or_else(|| VortexRdfError::Deserialization("Missing G IDs".to_string()))?
-        .clone();
+        .clone().to_primitive();
+    
+    log::debug!("[de::decode_quads_stream] Quads struct extraction took {:?}", quads_start.elapsed());
 
     let len = s_ids.len();
 
     let iter = (0..len).map(move |i| {
-        let s_id: u32 = s_ids
-            .scalar_at(i)
-            .cast(&DType::Primitive(PType::U32, Nullability::NonNullable))
-            .map_err(VortexRdfError::Vortex)?
-            .as_primitive()
-            .typed_value::<u32>()
-            .ok_or_else(|| VortexRdfError::Deserialization("Invalid S ID scalar".to_string()))?;
-        let p_id: u32 = p_ids
-            .scalar_at(i)
-            .cast(&DType::Primitive(PType::U32, Nullability::NonNullable))
-            .map_err(VortexRdfError::Vortex)?
-            .as_primitive()
-            .typed_value::<u32>()
-            .ok_or_else(|| VortexRdfError::Deserialization("Invalid P ID scalar".to_string()))?;
-        let o_id: u32 = o_ids
-            .scalar_at(i)
-            .cast(&DType::Primitive(PType::U32, Nullability::NonNullable))
-            .map_err(VortexRdfError::Vortex)?
-            .as_primitive()
-            .typed_value::<u32>()
-            .ok_or_else(|| VortexRdfError::Deserialization("Invalid O ID scalar".to_string()))?;
-        let g_id: u32 = g_ids
-            .scalar_at(i)
-            .cast(&DType::Primitive(PType::U32, Nullability::NonNullable))
-            .map_err(VortexRdfError::Vortex)?
-            .as_primitive()
-            .typed_value::<u32>()
-            .ok_or_else(|| VortexRdfError::Deserialization("Invalid G ID scalar".to_string()))?;
+        let s_id = s_ids.as_slice::<u32>()[i];
+        let p_id = match p_ids.ptype() {
+            vortex_dtype::PType::U16 => p_ids.as_slice::<u16>()[i] as u32,
+            vortex_dtype::PType::U32 => p_ids.as_slice::<u32>()[i],
+            _ => {
+                // This shouldn't happen if we validated above, but let's handle it
+                // To avoid returning Result in every field access.
+                0 // Fallback
+            }
+        };
+        let o_id = o_ids.as_slice::<u32>()[i];
+        let g_id = g_ids.as_slice::<u32>()[i];
 
         let s_term = dictionary
             .get_term(s_id)

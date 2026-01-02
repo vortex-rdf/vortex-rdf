@@ -17,7 +17,10 @@ impl Dictionary {
     }
 
     pub fn from_root(root: &ArrayRef) -> Result<Self> {
+        let start = std::time::Instant::now();
         let root_struct = root.to_struct();
+        log::debug!("[Dictionary::from_root] Build root struct took {:?}", start.elapsed());
+        
         let dict_list_ref = root_struct
             .fields()
             .get(0)
@@ -25,14 +28,28 @@ impl Dictionary {
             .clone();
 
         let dict_list = dict_list_ref.to_listview();
-        let dict_offset = dict_list.offsets().scalar_at(0).cast(&DType::Primitive(PType::I32, Nullability::NonNullable)).map_err(VortexRdfError::Vortex)?.as_primitive().typed_value::<i32>().ok_or_else(|| VortexRdfError::Deserialization("Missing dictionary offset".to_string()))? as usize;
-        let dict_size = dict_list.sizes().scalar_at(0).cast(&DType::Primitive(PType::I32, Nullability::NonNullable)).map_err(VortexRdfError::Vortex)?.as_primitive().typed_value::<i32>().ok_or_else(|| VortexRdfError::Deserialization("Missing dictionary size".to_string()))? as usize;
+        let dict_offset = dict_list.offsets()
+            .scalar_at(0)
+            .cast(&DType::Primitive(PType::I32, Nullability::NonNullable))
+            .map_err(VortexRdfError::Vortex)?
+            .as_primitive()
+            .typed_value::<i32>()
+            .ok_or_else(|| VortexRdfError::Deserialization("Missing dictionary offset".to_string()))? as usize;
+        let dict_size = dict_list.sizes()
+            .scalar_at(0)
+            .cast(&DType::Primitive(PType::I32, Nullability::NonNullable))
+            .map_err(VortexRdfError::Vortex)?
+            .as_primitive()
+            .typed_value::<i32>()
+            .ok_or_else(|| VortexRdfError::Deserialization("Missing dictionary size".to_string()))? as usize;
         let dict_array_ref = dict_list
             .elements()
             .slice(dict_offset..dict_offset + dict_size);
-
         let dict_varbin = dict_array_ref.to_varbinview();
+        
+        log::debug!("[Dictionary::from_root] Vortex extraction took {:?}", start.elapsed());
 
+        let loop_start = std::time::Instant::now();
         let mut dictionary = Dictionary::new();
         for i in 0..dict_varbin.len() {
             let bytes = dict_varbin.bytes_at(i);
@@ -40,6 +57,9 @@ impl Dictionary {
             dictionary.terms.push(s.clone());
             dictionary.term_to_id.insert(s.clone(), i as u32);
         }
+        
+        log::debug!("Dictionary::from_root: HashMap build took {:?}", loop_start.elapsed());
+        
         Ok(dictionary)
     }
 
