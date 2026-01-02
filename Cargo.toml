@@ -5,7 +5,7 @@ members = ["core", "js", "cli"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-authors = ["Julián Rojas"]
+authors = ["Julián Rojas <julianandres.rojasmelendez@ugent.be>"]
 license = "MIT"
 repository = "https://github.com/julianrojas87/vortex-rdf"
 description = "Modern and high-performance columnar RDF serialization format"
