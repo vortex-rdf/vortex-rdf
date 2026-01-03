@@ -8,11 +8,11 @@ use futures::{Stream, TryStreamExt};
 use vortex_array::session::ArraySession;
 use vortex_session::VortexSession;
 use vortex_file::OpenOptionsSessionExt;
-use vortex_scalar::Scalar;
 use vortex_io::file::IntoReadSource;
 use vortex_array::stream::ArrayStreamExt;
 use vortex::VortexSessionDefault;
-use vortex_dtype::{DType, Nullability, PType};
+use std::time::Instant;
+use crate::utils;
 
 pub fn array_from_reader<R: std::io::Read>(reader: R) -> Result<ArrayRef> {
     let array_session = ArraySession::default();
@@ -36,7 +36,7 @@ pub fn array_from_reader<R: std::io::Read>(reader: R) -> Result<ArrayRef> {
 pub async fn read_array_from_vortex<S: IntoReadSource>(
     source: S,
 ) -> Result<ArrayRef> {
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let session = VortexSession::default();
 
     let file = session.open_options()
@@ -45,82 +45,51 @@ pub async fn read_array_from_vortex<S: IntoReadSource>(
         .map_err(|e| crate::VortexRdfError::from(e))?;
     log::debug!("[de::read_array_from_vortex] File open Session took {:?}", start.elapsed());
 
-    let scan_start = std::time::Instant::now();
+    let scan_start = Instant::now();
     let scan = file.scan().map_err(|e| crate::VortexRdfError::from(e))?;    
     let stream = scan.into_array_stream().map_err(|e| crate::VortexRdfError::from(e))?;
     log::debug!("[de::read_array_from_vortex] Scan took {:?}", scan_start.elapsed());
     
-    let read_start = std::time::Instant::now();
-    let array: ArrayRef = stream
+    let read_start = Instant::now();
+    let vortex_array: ArrayRef = stream
         .read_all()
         .await
         .map_err(|e: vortex_error::VortexError| crate::VortexRdfError::from(e))?;
     log::debug!("[de::read_array_from_vortex] Stream read_all took {:?}", read_start.elapsed());
 
-    Ok(array)
+    Ok(vortex_array)
 }
 
-pub async fn decode_quads(root: ArrayRef) -> Result<Vec<Quad>> {
-    decode_quads_stream(root)?.try_collect().await
+pub async fn decode_quads(vortex_array: ArrayRef) -> Result<Vec<Quad>> {
+    decode_quads_stream(vortex_array)?.try_collect().await
 }
 
-pub fn decode_quads_stream(root: ArrayRef) -> Result<impl Stream<Item = Result<Quad>>> {
-    let start = std::time::Instant::now();
-    let dictionary = Dictionary::from_root(&root)?;
+pub fn decode_quads_stream(vortex_array: ArrayRef) -> Result<impl Stream<Item = Result<Quad>>> {
+    let start = Instant::now();
+    let dictionary = Dictionary::from_vortex_array(&vortex_array)?;
     log::debug!("[de::decode_quads_stream] Dictionary rebuild took {:?}", start.elapsed());
 
-    let quads_start = std::time::Instant::now();
-    let root_struct = root.to_struct();
-
-    let quads_list_ref = root_struct
-        .fields()
-        .get(1)
-        .ok_or_else(|| VortexRdfError::Deserialization("Missing quads field".to_string()))?
-        .clone();
-
-    let quads_list = quads_list_ref.to_listview();
-    let offsets_scalar = quads_list.offsets().scalar_at(0);
-    let sizes_scalar = quads_list.sizes().scalar_at(0);
-    
-    let quads_offset: usize = offsets_scalar
-        .cast(&DType::Primitive(PType::I32, Nullability::NonNullable))
-        .map_err(VortexRdfError::Vortex)
-        .and_then(
-            |scalar: Scalar| scalar
-                .as_primitive()
-                .typed_value::<i32>()
-                .ok_or_else(|| VortexRdfError::Deserialization("Missing quads offset".to_string()))
-        )
-        .map(|offset| offset as usize)?;
-    let quads_size: usize = sizes_scalar
-        .cast(&DType::Primitive(PType::I32, Nullability::NonNullable))
-        .map_err(VortexRdfError::Vortex)
-        .and_then(
-            |scalar: Scalar| scalar
-                .as_primitive()
-                .typed_value::<i32>()
-                .ok_or_else(|| VortexRdfError::Deserialization("Missing quads size".to_string()))
-        )
-        .map(|size| size as usize)?;
-    let quads_array_ref = quads_list
-        .elements()
-        .slice(quads_offset..quads_offset + quads_size);
-
-    let quads_struct = quads_array_ref.to_struct();
+    let quads_start = Instant::now();
+    let quads_array = utils::quads_array_from_vortex_array(vortex_array)?;
+    let quads_struct = quads_array.to_struct();
     let fields = quads_struct.fields();
 
     let s_ids = fields.get(0)
         .ok_or_else(|| VortexRdfError::Deserialization("Missing S IDs".to_string()))?
-        .clone().to_primitive();
+        .clone()
+        .to_primitive();
     let p_ids = fields.get(1)
         .ok_or_else(|| VortexRdfError::Deserialization("Missing P IDs".to_string()))?
-        .clone().to_primitive();
+        .clone()
+        .to_primitive();
     let o_ids = fields.get(2)
         .ok_or_else(|| VortexRdfError::Deserialization("Missing O IDs".to_string()))?
-        .clone().to_primitive();
+        .clone()
+        .to_primitive();
     let g_ids = fields.get(3)
         .ok_or_else(|| VortexRdfError::Deserialization("Missing G IDs".to_string()))?
-        .clone().to_primitive();
+        .clone()
+        .to_primitive();
     
     log::debug!("[de::decode_quads_stream] Quads struct extraction took {:?}", quads_start.elapsed());
 

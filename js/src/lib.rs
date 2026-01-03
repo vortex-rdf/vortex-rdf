@@ -18,7 +18,7 @@ export interface VortexRdfStore {
 }
 
 export namespace VortexRdfStore {
-    export function empty(): VortexRdfStore;
+    export function empty(): Promise<VortexRdfStore>;
     export function fromBytes(bytes: Uint8Array): VortexRdfStore;
     export function fromString(input: string, format: string): VortexRdfStore;
 }
@@ -45,8 +45,9 @@ impl VortexRdfStore {
         Ok(VortexRdfStore { inner })
     }
 
-    pub fn empty() -> Result<VortexRdfStore, JsValue> {
+    pub async fn empty() -> Result<VortexRdfStore, JsValue> {
         let inner = vortex_rdf_core::VortexRdfStore::empty()
+            .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(VortexRdfStore { inner })
     }

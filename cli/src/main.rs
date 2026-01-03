@@ -1,14 +1,18 @@
 use anyhow::{anyhow, Context, Result};
 use mimalloc::MiMalloc;
 use futures::StreamExt;
+use log::{debug, info};
 
 use clap::{Parser, ValueEnum};
 use oxrdfio::RdfFormat;
 use std::fs::File;
 use std::io::{stdin, stdout, Read, Write};
 use std::path::PathBuf;
-use vortex_rdf_core::io::ser::write_array_to_ipc;
+use std::time::Instant;
+
 use vortex_rdf_core::{deserialize, serialize, VortexRdfStore};
+use vortex_rdf_core::utils::*;
+use vortex_rdf_core::io::*;
 
 /*
  As indicated by vortex docs:
@@ -67,53 +71,6 @@ enum Action {
     Match,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-enum Format {
-    /// N-Triples (.nt)
-    #[value(name = "nt")]
-    NTriples,
-    /// N-Quads (.nq)
-    #[value(name = "nq")]
-    NQuads,
-    /// Turtle (.ttl)
-    #[value(name = "ttl")]
-    Turtle,
-    /// TriG (.trig)
-    #[value(name = "trig")]
-    TriG,
-    /// RDF/XML (.rdf, .xml)
-    #[value(name = "rdf")]
-    RdfXml,
-    /// JSON-LD (.jsonld, .json)
-    #[value(name = "jsonld")]
-    JsonLd,
-    /// N3 (.n3)
-    #[value(name = "n3")]
-    N3,
-}
-
-impl From<Format> for RdfFormat {
-    fn from(f: Format) -> Self {
-        match f {
-            Format::NTriples => RdfFormat::NTriples,
-            Format::NQuads => RdfFormat::NQuads,
-            Format::Turtle => RdfFormat::Turtle,
-            Format::TriG => RdfFormat::TriG,
-            Format::RdfXml => RdfFormat::RdfXml,
-            Format::JsonLd => RdfFormat::JsonLd {
-                profile: Default::default(),
-            },
-            Format::N3 => RdfFormat::N3,
-        }
-    }
-}
-
-fn detect_format(path: &Option<PathBuf>) -> Option<RdfFormat> {
-    let path = path.as_ref()?;
-    let ext = path.extension()?.to_str()?;
-    RdfFormat::from_extension(ext)
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
@@ -121,6 +78,7 @@ async fn main() -> Result<()> {
 
     match cli.action {
         Action::Serialize => {
+            let start = Instant::now();
             let format = cli
                 .format
                 .map(RdfFormat::from)
@@ -134,13 +92,18 @@ async fn main() -> Result<()> {
                 None => Box::new(stdin()),
             };
 
-            let output_path = cli.output.as_ref().ok_or_else(|| anyhow!("Output file is required for serialize action"))?;
-            let writer = tokio::fs::File::create(output_path).await.context("Failed to create output file")?;
+            let output_path = cli.output.as_ref()
+                .ok_or_else(|| anyhow!("Output file is required for serialize action"))?;
+            let writer = tokio::fs::File::create(output_path)
+                .await
+                .context("Failed to create output file")?;
             serialize(reader, writer, format)
                 .await
                 .context("Failed to serialize to Vortex")?;
+            info!("Serialization took {:?}", start.elapsed());
         }
         Action::Deserialize => {
+            let start = Instant::now();
             let format = cli
                 .format
                 .map(RdfFormat::from)
@@ -169,16 +132,20 @@ async fn main() -> Result<()> {
                         .context("Failed to deserialize from Vortex")?;
                 }
             }
+            info!("Deserialization took {:?}", start.elapsed());
         }
         Action::Match => {
+            let start = Instant::now();
             let input_path = cli
                 .input
                 .as_ref()
                 .ok_or_else(|| anyhow!("Input file is required for match action"))?;
 
+            let load_start = Instant::now();
             let store = VortexRdfStore::from_file(input_path)
                 .await
-                .context("Failed to load Vortex store via mmap")?;
+                .context("Failed to load Vortex-RDF store from file")?;
+            debug!("Loading vortex file to store took {:?}", load_start.elapsed());
 
             let mut subject = None;
             if let Some(s) = &cli.subject {
@@ -200,6 +167,7 @@ async fn main() -> Result<()> {
                 graph = Some(parse_graph_name(g)?);
             }
 
+            let match_start = Instant::now();
             let filtered = store
                 .match_pattern(
                     subject.as_ref(),
@@ -209,6 +177,7 @@ async fn main() -> Result<()> {
                 )
                 .await
                 .context("Failed to apply match pattern")?;
+            debug!("Applying match pattern took {:?}", match_start.elapsed());
 
             let format = cli
                 .format
@@ -224,8 +193,24 @@ async fn main() -> Result<()> {
             // If output is .vortex, we should serialize as Vortex
             if let Some(p) = &cli.output {
                 if p.extension().map(|e| e == "vortex").unwrap_or(false) {
-                    write_array_to_ipc(filtered.root, writer)
+                    let writer = tokio::fs::File::create(p)
+                        .await
+                        .context("Failed to create output file for Vortex")?;
+                    
+                    // Re-serialize the quads to rebuild the dictionary.
+                    // The filtered store currently shares the original (likely large) dictionary.
+                    // By decoding and re-encoding, we create a fresh, minimal dictionary containing
+                    // only the terms actually used in the filtered results.
+                    // For some reason directly re-writing to a file is much slower.
+                    let start_re_ser = std::time::Instant::now();
+                    
+                    let new_array = ser::encode_quads(filtered.quads()?).await?;
+                    debug!("Re-serialization took {:?}", start_re_ser.elapsed());
+
+                    ser::write_array_to_vortex(new_array, writer)
+                        .await
                         .context("Failed to write Vortex output")?;
+                    info!("Matching took {:?}", start.elapsed());
                     return Ok(());
                 }
             }
@@ -242,48 +227,9 @@ async fn main() -> Result<()> {
             serializer
                 .finish()
                 .map_err(|e| anyhow!("Serialization finish error: {}", e))?;
+            info!("Matching took {:?}", start.elapsed());
         }
     }
 
     Ok(())
-}
-
-fn parse_named_node(s: &str) -> Result<oxrdf::NamedNode> {
-    let s = s.trim_matches(|c| c == '<' || c == '>');
-    oxrdf::NamedNode::new(s).map_err(|e| anyhow!("Invalid NamedNode '{}': {}", s, e))
-}
-
-fn parse_blank_node(s: &str) -> Result<oxrdf::BlankNode> {
-    let s = s.trim_start_matches("_:");
-    oxrdf::BlankNode::new(s).map_err(|e| anyhow!("Invalid BlankNode '{}': {}", s, e))
-}
-
-fn parse_subject(s: &str) -> Result<oxrdf::Subject> {
-    if s.starts_with("_:") {
-        Ok(oxrdf::Subject::BlankNode(parse_blank_node(s)?))
-    } else {
-        Ok(oxrdf::Subject::NamedNode(parse_named_node(s)?))
-    }
-}
-
-fn parse_term(s: &str) -> Result<oxrdf::Term> {
-    if s.starts_with('_') {
-        Ok(oxrdf::Term::BlankNode(parse_blank_node(s)?))
-    } else if s.starts_with('"') {
-        // Simple literal parsing for now
-        let val = s.trim_matches('"');
-        Ok(oxrdf::Term::Literal(oxrdf::Literal::new_simple_literal(val)))
-    } else {
-        Ok(oxrdf::Term::NamedNode(parse_named_node(s)?))
-    }
-}
-
-fn parse_graph_name(s: &str) -> Result<oxrdf::GraphName> {
-    if s.is_empty() || s == "default" {
-        Ok(oxrdf::GraphName::DefaultGraph)
-    } else if s.starts_with("_:") {
-        Ok(oxrdf::GraphName::BlankNode(parse_blank_node(s)?))
-    } else {
-        Ok(oxrdf::GraphName::NamedNode(parse_named_node(s)?))
-    }
 }

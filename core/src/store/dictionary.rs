@@ -4,6 +4,7 @@ use vortex_array::ToCanonical;
 use vortex_array::ArrayRef;
 use vortex_dtype::{DType, Nullability, PType};
 use crate::error::{Result, VortexRdfError};
+use std::time::Instant;
 
 #[derive(Debug, Clone, Default)]
 pub struct Dictionary {
@@ -16,12 +17,12 @@ impl Dictionary {
         Self::default()
     }
 
-    pub fn from_root(root: &ArrayRef) -> Result<Self> {
-        let start = std::time::Instant::now();
-        let root_struct = root.to_struct();
-        log::debug!("[Dictionary::from_root] Build root struct took {:?}", start.elapsed());
+    pub fn from_vortex_array(vortex_array: &ArrayRef) -> Result<Self> {
+        let start = Instant::now();
+        let vortex_struct = vortex_array.to_struct();
+        log::debug!("[Dictionary::from_vortex_array] Build vortex struct took {:?}", start.elapsed());
         
-        let dict_list_ref = root_struct
+        let dict_list_ref = vortex_struct
             .fields()
             .get(0)
             .ok_or_else(|| VortexRdfError::Deserialization("Missing dictionary field".to_string()))?
@@ -47,9 +48,9 @@ impl Dictionary {
             .slice(dict_offset..dict_offset + dict_size);
         let dict_varbin = dict_array_ref.to_varbinview();
         
-        log::debug!("[Dictionary::from_root] Vortex extraction took {:?}", start.elapsed());
+        log::debug!("[Dictionary::from_vortex_array] Vortex extraction took {:?}", start.elapsed());
 
-        let loop_start = std::time::Instant::now();
+        let loop_start = Instant::now();
         let mut dictionary = Dictionary::new();
         for i in 0..dict_varbin.len() {
             let bytes = dict_varbin.bytes_at(i);
@@ -58,7 +59,7 @@ impl Dictionary {
             dictionary.term_to_id.insert(s.clone(), i as u32);
         }
         
-        log::debug!("Dictionary::from_root: HashMap build took {:?}", loop_start.elapsed());
+        log::debug!("[Dictionary::from_vortex_array] HashMap build took {:?}", loop_start.elapsed());
         
         Ok(dictionary)
     }

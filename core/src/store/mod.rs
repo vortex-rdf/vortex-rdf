@@ -9,60 +9,46 @@ use vortex_array::arrays::{ChunkedArray, ConstantArray, ListArray, PrimitiveArra
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, Canonical, IntoArray, ToCanonical};
 use vortex_mask::Mask;
+use std::time::Instant;
 use vortex::buffer::Buffer;
-use vortex_dtype::{DType, Nullability, PType};
+use crate::utils;
 
 use futures::Stream;
 
-#[allow(dead_code)]
 pub struct VortexRdfStore {
-    pub root: ArrayRef,
+    pub vortex_array: ArrayRef,
     pub dictionary: Dictionary,
-    #[allow(dead_code)]
-    mmap: Option<memmap2::Mmap>,
 }
 
 impl VortexRdfStore {
-    pub fn new(root: ArrayRef) -> Result<Self> {
-        let dictionary = Dictionary::from_root(&root)?;
+    pub fn new(vortex_array: ArrayRef) -> Result<Self> {
+        let dictionary = Dictionary::from_vortex_array(&vortex_array)?;
         Ok(Self {
-            root,
+            vortex_array,
             dictionary,
-            mmap: None,
         })
     }
 
-    pub fn empty() -> Result<Self> {
-        let array = ser::encode_quads(std::iter::empty())?;
+    pub async fn empty() -> Result<Self> {
+        let array = ser::encode_quads(futures::stream::empty()).await?;
         Self::new(array)
     }
 
     pub async fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
         // VortexFile::open handles opening the file from path
-        let array = de::read_array_from_vortex(path.as_ref().to_path_buf()).await?;
-        Self::new(array)
+        let vortex_array = de::read_array_from_vortex(path.as_ref().to_path_buf()).await?;
+        Self::new(vortex_array)
     }
 
     pub async fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let buffer = Buffer::from(bytes.to_vec());
-        let array = de::read_array_from_vortex(buffer).await?;
-        Self::new(array)
+        let vortex_array = de::read_array_from_vortex(buffer).await?;
+        Self::new(vortex_array)
     }
 
     pub fn get_quads_array(&self) -> Result<ArrayRef> {
-        let root_struct = self.root.to_struct();
-        let quads_list_ref = root_struct
-            .fields()
-            .get(1)
-            .ok_or_else(|| VortexRdfError::Deserialization("Missing quads field".to_string()))?
-            .clone();
-
-        let quads_list = quads_list_ref.to_listview();
-        let quads_offset = quads_list.offsets().scalar_at(0).cast(&DType::Primitive(PType::I32, Nullability::NonNullable)).map_err(VortexRdfError::Vortex)?.as_primitive().typed_value::<i32>().ok_or_else(|| VortexRdfError::Deserialization("Missing quads offset".to_string()))? as usize;
-        let quads_size = quads_list.sizes().scalar_at(0).cast(&DType::Primitive(PType::I32, Nullability::NonNullable)).map_err(VortexRdfError::Vortex)?.as_primitive().typed_value::<i32>().ok_or_else(|| VortexRdfError::Deserialization("Missing quads size".to_string()))? as usize;
-        Ok(quads_list
-            .elements()
-            .slice(quads_offset..quads_offset + quads_size))
+        let quads_array = utils::quads_array_from_vortex_array(self.vortex_array.clone())?;
+        Ok(quads_array)
     }
 
     pub fn size(&self) -> usize {
@@ -70,7 +56,7 @@ impl VortexRdfStore {
     }
 
     pub fn quads(&self) -> Result<impl Stream<Item = Result<Quad>>> {
-        de::decode_quads_stream(self.root.clone())
+        de::decode_quads_stream(self.vortex_array.clone())
     }
 
     /// Internal helper to find row indices matching a pattern
@@ -97,6 +83,7 @@ impl VortexRdfStore {
         };
 
         if let Some(s) = subject {
+            let start_subject = Instant::now();
             let id = self.dictionary.get_id(&s.to_string());
             if let Some(sid) = id {
                 let col = fields.get(0).unwrap();
@@ -109,6 +96,7 @@ impl VortexRdfStore {
                     Operator::Eq,
                 )
                 .map_err(VortexRdfError::Vortex)?;
+                log::debug!("[VortexStore::find_mask] Subject comparison took {:?}", start_subject.elapsed());
                 combine_mask(col_mask)?;
             } else {
                 // If term not in dict, mask is all false
@@ -120,6 +108,7 @@ impl VortexRdfStore {
         }
 
         if let Some(p) = predicate {
+            let start_predicate = Instant::now();
             let id = self.dictionary.get_id(&p.to_string());
             if let Some(pid) = id {
                 let col = fields.get(1).unwrap();
@@ -132,6 +121,7 @@ impl VortexRdfStore {
                     Operator::Eq,
                 )
                 .map_err(VortexRdfError::Vortex)?;
+                log::debug!("[VortexStore::find_mask] Predicate comparison took {:?}", start_predicate.elapsed());
                 combine_mask(col_mask)?;
             } else {
                 let col = fields.get(1).unwrap();
@@ -142,6 +132,7 @@ impl VortexRdfStore {
         }
 
         if let Some(o) = object {
+            let start_object = Instant::now();
             let id = self.dictionary.get_id(&o.to_string());
             if let Some(oid) = id {
                 let col = fields.get(2).unwrap();
@@ -154,6 +145,7 @@ impl VortexRdfStore {
                     Operator::Eq,
                 )
                 .map_err(VortexRdfError::Vortex)?;
+                log::debug!("[VortexStore::find_mask] Object comparison took {:?}", start_object.elapsed());
                 combine_mask(col_mask)?;
             } else {
                 let col = fields.get(2).unwrap();
@@ -164,6 +156,7 @@ impl VortexRdfStore {
         }
 
         if let Some(g) = graph {
+            let start_graph = Instant::now();
             let id = self.dictionary.get_id(&g.to_string());
             if let Some(gid) = id {
                 let col = fields.get(3).unwrap();
@@ -176,6 +169,7 @@ impl VortexRdfStore {
                     Operator::Eq,
                 )
                 .map_err(VortexRdfError::Vortex)?;
+                log::debug!("[VortexStore::find_mask] Graph comparison took {:?}", start_graph.elapsed());
                 combine_mask(col_mask)?;
             } else {
                 let col = fields.get(3).unwrap();
@@ -195,11 +189,12 @@ impl VortexRdfStore {
         object: Option<&Term>,
         graph: Option<&GraphName>,
     ) -> Result<Self> {
-        // For now, we still use the mask-based approach but we can eventually refactor
-        // to use vortex-scan and vortex-expr for better performance on large datasets.
+        let start = Instant::now();
+        // TODO: check if can use vortex-scan for better performance on large datasets.
         let mask = self.find_mask(subject, predicate, object, graph)?;
 
         if let Some(m) = mask {
+            let mask_start = Instant::now();
             let quads_array_ref = self.get_quads_array()?;
             let canonical = m.to_canonical();
             let canonical_mask = match canonical {
@@ -210,14 +205,18 @@ impl VortexRdfStore {
                     ))
                 }
             };
-            let filtered_quads =
-                filter(&quads_array_ref, &canonical_mask).map_err(VortexRdfError::Vortex)?;
-            self.with_quads(filtered_quads)
+            log::debug!("[VortexStore::match_pattern] Mask creation took {:?}", mask_start.elapsed());
+            let filter_start = Instant::now();
+            let filtered_quads = filter(&quads_array_ref, &canonical_mask)
+                .map_err(VortexRdfError::Vortex)?;
+            log::debug!("[VortexStore::match_pattern] Filtering compute operation took {:?}", filter_start.elapsed());
+            let _self = self.with_quads(filtered_quads);
+            log::debug!("[VortexStore::match_pattern] Pattern matching took overall {:?}", start.elapsed());
+            _self
         } else {
             Ok(Self {
-                root: self.root.clone(),
+                vortex_array: self.vortex_array.clone(),
                 dictionary: self.dictionary.clone(),
-                mmap: None,
             })
         }
     }
@@ -244,9 +243,8 @@ impl VortexRdfStore {
         let dict_arr = ser::encode_dictionary(&new_dict)?;
 
         Ok(Self {
-            root: self.with_dict_and_quads(dict_arr, combined_quads)?,
+            vortex_array: self.with_dict_and_quads(dict_arr, combined_quads)?,
             dictionary: new_dict,
-            mmap: None,
         })
     }
 
@@ -278,53 +276,62 @@ impl VortexRdfStore {
             };
 
             let quads_array_ref = self.get_quads_array()?;
-            let filtered_quads =
-                filter(&quads_array_ref, &canonical_mask).map_err(VortexRdfError::Vortex)?;
+            let filtered_quads = filter(&quads_array_ref, &canonical_mask)
+            .map_err(VortexRdfError::Vortex)?;
             self.with_quads(filtered_quads)
         } else {
             Ok(Self {
-                root: self.root.clone(),
+                vortex_array: self.vortex_array.clone(),
                 dictionary: self.dictionary.clone(),
-                mmap: None,
             })
         }
     }
 
     fn with_quads(&self, quads: ArrayRef) -> Result<Self> {
         Ok(Self {
-            root: self.with_quads_root(quads)?,
+            vortex_array: self.with_quads_array(quads)?,
             dictionary: self.dictionary.clone(),
-            mmap: None,
         })
     }
 
-    fn with_quads_root(&self, quads: ArrayRef) -> Result<ArrayRef> {
-        let root_struct = self.root.to_struct();
-        let dict_list = root_struct.fields().get(0).unwrap().clone();
-        self.with_dict_and_quads_root(dict_list, quads)
+    fn with_quads_array(&self, quads: ArrayRef) -> Result<ArrayRef> {
+        let vortex_struct = self.vortex_array.to_struct();
+        let dict_list = vortex_struct.fields().get(0).unwrap().clone();
+        self.with_dict_and_quads_array(dict_list, quads)
     }
 
     fn with_dict_and_quads(&self, dict: ArrayRef, quads: ArrayRef) -> Result<ArrayRef> {
         let dict_offsets =
             PrimitiveArray::from_iter(vec![0i32, dict.len() as i32])
                 .into_array();
-        let dict_list = ListArray::try_new(dict, dict_offsets, Validity::NonNullable)?.into_array();
+        let dict_list = ListArray::try_new(
+            dict,
+            dict_offsets,
+            Validity::NonNullable,
+        )
+        .map_err(VortexRdfError::Vortex)?
+        .into_array();
 
-        self.with_dict_and_quads_root(dict_list, quads)
+        self.with_dict_and_quads_array(dict_list, quads)
     }
 
-    fn with_dict_and_quads_root(&self, dict_list: ArrayRef, quads: ArrayRef) -> Result<ArrayRef> {
-        let quads_offsets =
-            PrimitiveArray::from_iter(vec![0i32, quads.len() as i32])
-                .into_array();
-        let quads_list =
-            ListArray::try_new(quads, quads_offsets, Validity::NonNullable)?.into_array();
+    fn with_dict_and_quads_array(&self, dict_list: ArrayRef, quads: ArrayRef) -> Result<ArrayRef> {
+        let quads_offsets = PrimitiveArray::from_iter(vec![0i32, quads.len() as i32])
+            .into_array();
+        let quads_list = ListArray::try_new(
+                quads,
+                quads_offsets,
+                Validity::NonNullable,
+            )
+            .map_err(VortexRdfError::Vortex)?
+            .into_array();
 
-        let new_root = StructArray::from_fields(&[
+        let new_dict_struct = StructArray::from_fields(&[
             ("dictionary", dict_list),
             ("quads", quads_list),
-        ])?
+        ])
+        .map_err(VortexRdfError::Vortex)?
         .into_array();
-        Ok(new_root)
+        Ok(new_dict_struct)
     }
 }

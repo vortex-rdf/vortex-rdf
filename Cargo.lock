@@ -1380,15 +1380,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 
 [[package]]
-name = "memmap2"
-version = "0.9.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "744133e4a0e0a658e1374cf3bf8e415c4052a15a111acd372764c55b4177d490"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "mimalloc"
 version = "0.1.48"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2947,6 +2938,7 @@ dependencies = [
  "clap",
  "env_logger",
  "futures",
+ "log",
  "mimalloc",
  "oxrdf",
  "oxrdfio",
@@ -2962,10 +2954,10 @@ dependencies = [
 name = "vortex-rdf-core"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "futures",
  "itertools 0.12.1",
  "log",
- "memmap2",
  "oxrdf",
  "oxrdfio",
  "thiserror 1.0.69",

@@ -1,12 +1,13 @@
 pub mod error;
 pub mod io;
 pub mod store;
+pub mod utils;
 
 pub use error::VortexRdfError;
 pub use io::{
     deserialize,
-    quads_to_vortex,
-    quads_to_vortex_writer,
+    quads_stream_to_vortex,
+    quads_stream_to_vortex_writer,
     serialize,
     vortex_to_quads,
     RdfFormat,
@@ -29,7 +30,9 @@ mod tests {
         let quad = Quad::new(s, p, o, g);
         let quads = vec![quad.clone()];
 
-        let vortex_bytes = quads_to_vortex(quads).await.expect("Serialization failed");
+        let vortex_bytes = quads_stream_to_vortex(futures::stream::iter(quads.into_iter().map(Ok)))
+            .await
+            .expect("Serialization failed");
         let decoded_quads = vortex_to_quads(&vortex_bytes).await.expect("Deserialization failed");
 
         assert_eq!(1, decoded_quads.len());
@@ -55,7 +58,9 @@ mod tests {
         let q2 = Quad::new(s2.clone(), p2.clone(), o2.clone(), g2.clone());
 
         let quads = vec![q1.clone(), q2.clone()];
-        let vortex_bytes = quads_to_vortex(quads).await.unwrap();
+        let vortex_bytes = quads_stream_to_vortex(futures::stream::iter(quads.into_iter().map(Ok)))
+            .await
+            .unwrap();
         let store = VortexRdfStore::from_bytes(&vortex_bytes).await.unwrap();
 
         // Match ?s <p1> ?o ?g
@@ -80,7 +85,7 @@ mod tests {
         let g1 = GraphName::DefaultGraph;
         let q1 = Quad::new(s1.clone(), p1.clone(), o1.clone(), g1.clone());
 
-        let store = VortexRdfStore::empty().unwrap();
+        let store = VortexRdfStore::empty().await.unwrap();
         assert_eq!(store.size(), 0);
 
         // Add quad

@@ -1,8 +1,9 @@
 use crate::store::dictionary::Dictionary;
-use crate::error::Result;
+use futures::StreamExt;
+use crate::error::{Result, VortexRdfError};
 use oxrdf::Quad;
 use vortex_array::arrays::{ListArray, PrimitiveArray, StructArray, VarBinViewArray};
-use vortex_array::validity::Validity;
+use vortex_array::validity::Validity::NonNullable;
 use vortex_array::{ArrayRef, IntoArray};
 use vortex_dtype::{DType, Nullability};
 use vortex_fsst::{fsst_compress, fsst_train_compressor};
@@ -12,6 +13,8 @@ use vortex_session::VortexSession;
 use vortex_file::WriteOptionsSessionExt;
 use vortex_io::VortexWrite;
 use vortex::VortexSessionDefault;
+use std::time::Instant;
+use futures::Stream;
 
 pub fn bundle_as_struct(
     dict: Dictionary,
@@ -21,16 +24,16 @@ pub fn bundle_as_struct(
     g_ids: Vec<u32>,
 ) -> Result<ArrayRef> {
     // Compress the dictionary using FSST
-    let dict_start = std::time::Instant::now();
+    let dict_start = Instant::now();
     let dict_arr = encode_dictionary(&dict)?;
     log::debug!("[ser::bundle_as_struct] Dictionary FSST encoding took {:?}", dict_start.elapsed());
     // Build an initial StructArray with all the (SPOG) columns
-    let quads_start = std::time::Instant::now();
+    let quads_start = Instant::now();
     let quads_struct = encode_quad_ids(s_ids, p_ids, o_ids, g_ids)?;
     log::debug!("[ser::bundle_as_struct] Quad IDs struct encoding took {:?}", quads_start.elapsed());
     
     /*
-      Bundle everything into an overarching root StructArray using the ListArray trick for differing lengths.
+      Bundle everything into an overarching StructArray using the ListArray trick for differing lengths.
       We create a StructArray with two fields: "dictionary" and "quads" that looks like this:
       { 
          "dictionary": [
@@ -49,22 +52,28 @@ pub fn bundle_as_struct(
       The ListArray trick is used to homogenize the array lengths, where both the "dictionary" and "quads"
       become ListArrays of length 1, where the offsets define the boundaries of the single element containing the entire original array.
      */
-    let bundle_start = std::time::Instant::now();
-    let dict_offsets = PrimitiveArray::from_iter(vec![0i32, dict_arr.len() as i32]).into_array();
-    let dict_list = ListArray::try_new(dict_arr, dict_offsets, Validity::NonNullable)?.into_array();
-    let quads_offsets =
-        PrimitiveArray::from_iter(vec![0i32, quads_struct.len() as i32]).into_array();
-    let quads_list =
-        ListArray::try_new(quads_struct, quads_offsets, Validity::NonNullable)?.into_array();
-    let root =
-        StructArray::from_fields(&[("dictionary", dict_list), ("quads", quads_list)])?.into_array();
-    log::debug!("[ser::bundle_as_struct] Root struct encoding took {:?}", bundle_start.elapsed());
-    Ok(root)
+    let bundle_start = Instant::now();
+    let dict_offsets = PrimitiveArray::from_iter(vec![0i32, dict_arr.len() as i32])
+        .into_array();
+    let dict_list = ListArray::try_new(dict_arr, dict_offsets, NonNullable)?
+        .into_array();
+    let quads_offsets = PrimitiveArray::from_iter(vec![0i32, quads_struct.len() as i32])
+        .into_array();
+    let quads_list = ListArray::try_new(quads_struct, quads_offsets, NonNullable)?
+        .into_array();
+    let vortex_array = StructArray::from_fields(&[
+        ("dictionary", dict_list),
+        ("quads", quads_list),
+    ])
+    .map_err(VortexRdfError::Vortex)?
+    .into_array();
+    log::debug!("[ser::bundle_as_struct] Vortex array encoding took {:?}", bundle_start.elapsed());
+    Ok(vortex_array)
 }
 
-pub fn encode_quads<I>(quads: I) -> Result<ArrayRef>
+pub async fn encode_quads<S>(mut quads: S) -> Result<ArrayRef>
 where
-    I: IntoIterator<Item = Quad>,
+    S: Stream<Item = Result<Quad>> + Unpin,
 {
     let mut dict = Dictionary::new();
     let mut s_ids = Vec::new();
@@ -72,7 +81,8 @@ where
     let mut o_ids = Vec::new();
     let mut g_ids = Vec::new();
 
-    for quad in quads {
+    while let Some(quad_res) = quads.next().await {
+        let quad = quad_res?;
         s_ids.push(dict.get_or_insert(&quad.subject.to_string()));
         p_ids.push(dict.get_or_insert(&quad.predicate.to_string()));
         o_ids.push(dict.get_or_insert(&quad.object.to_string()));
@@ -122,24 +132,23 @@ pub fn encode_quad_ids(
 }
 
 pub async fn write_array_to_vortex<W: VortexWrite + Unpin + Send>(
-    array: ArrayRef,
+    vortex_array: ArrayRef,
     mut writer: W,
 ) -> Result<()> {
-    let session_start = std::time::Instant::now();
+    let session_start = Instant::now();
     let session = VortexSession::default();
 
-    let write_opts = session.write_options().with_strategy(
-        WriteStrategyBuilder::new()
-            .with_compressor(CompactCompressor::default())
-            .build(),
-    );
+    let mut strategy = WriteStrategyBuilder::new();
+    strategy = strategy.with_compressor(CompactCompressor::default());
+
+    let write_opts = session.write_options().with_strategy(strategy.build());
     log::debug!("[ser::write_array_to_vortex] Vortex writer options setup took {:?}", session_start.elapsed());
 
-    let stream_start = std::time::Instant::now();
-    let stream = array.to_array_stream();
+    let stream_start = Instant::now();
+    let stream = vortex_array.to_array_stream();
     log::debug!("[ser::write_array_to_vortex] Array stream creation took {:?}", stream_start.elapsed());
 
-    let write_start = std::time::Instant::now();
+    let write_start = Instant::now();
     let _summary = write_opts
         .write(&mut writer, stream)
         .await
@@ -149,9 +158,9 @@ pub async fn write_array_to_vortex<W: VortexWrite + Unpin + Send>(
     Ok(())
 }
 
-pub fn write_array_to_ipc<W: std::io::Write>(array: ArrayRef, mut writer: W) -> Result<()> {
+pub fn write_array_to_ipc<W: std::io::Write>(vortex_array: ArrayRef, mut writer: W) -> Result<()> {
     use vortex_ipc::iterator::ArrayIteratorIPC;
-    let ipc_iter = array.to_array_iterator().into_ipc();
+    let ipc_iter = vortex_array.to_array_iterator().into_ipc();
 
     for msg_res in ipc_iter {
         let msg = msg_res.map_err(crate::error::VortexRdfError::Vortex)?;
