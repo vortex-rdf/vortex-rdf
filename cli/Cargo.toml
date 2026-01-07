@@ -18,7 +18,7 @@ vortex-ipc.workspace = true
 vortex-session.workspace = true
 vortex.workspace = true
 mimalloc.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["full"] }
 futures.workspace = true
 env_logger = "0.11"
 log = "0.4"

@@ -20,16 +20,16 @@ npm install vortex-rdf
 ### Loading Data
 
 ```javascript
-import { VortexRdfStore } from 'vortex-rdf';
+import { DictionaryStore, ChainedHashStore } from 'vortex-rdf';
 
-// From a Vortex binary file
-const store = VortexRdfStore.fromBytes(vortexBytes);
+// From a Vortex binary file (DictionaryStore)
+const store = await DictionaryStore.fromBytes(vortexBytes);
 
 // Or from a Turtle/N-Quads string
-const store = VortexRdfStore.fromString(ttlData, "turtle");
+const store = await DictionaryStore.fromString(ttlData, "turtle");
 
 // Or create a new empty store
-const store = VortexRdfStore.empty();
+const store = DictionaryStore.empty();
 ```
 
 ### Querying
@@ -37,11 +37,13 @@ const store = VortexRdfStore.empty();
 ```javascript
 // Perform a match (subject, predicate, object, graph)
 // Patterns can be Iris, Literals, or null/undefined for variables
-const matches = store.match(null, "http://schema.org/name", null, null);
+const matches = await store.match(null, "http://schema.org/name", null, null);
 
-console.log(`Found ${matches.size} results`);
+console.log(`Found ${matches.size()} results`);
 
-for (const quad of matches.values()) {
+// .values() is async and returns an iterator
+const iterator = await matches.values();
+for (const quad of iterator) {
   console.log(`${quad.subject.value} -> ${quad.object.value}`);
 }
 ```
@@ -49,19 +51,19 @@ for (const quad of matches.values()) {
 ### Manipulation
 
 ```javascript
-store.addQuad(myQuad);
-store.deleteQuad(existingQuad);
+await store.addQuad(myQuad);
+await store.deleteQuad(existingQuad);
 ```
 
 ### TypeScript Support
 
-`VortexRdfStore` provides built-in TypeScript definitions that are fully compatible with `@rdfjs/types`.
+Both `DictionaryStore` and `ChainedHashStore` implement the `VortexStore` interface.
 
 ```typescript
-import { VortexRdfStore } from 'vortex-rdf';
+import { DictionaryStore, VortexStore } from 'vortex-rdf';
 import { Quad, NamedNode, Term } from '@rdfjs/types';
 
-async function queryExample(store: VortexRdfStore) {
+async function queryExample(store: VortexStore) {
   // Methods are strictly typed to RDF-JS types
   const predicate: NamedNode = {
     termType: 'NamedNode',
@@ -69,12 +71,12 @@ async function queryExample(store: VortexRdfStore) {
     equals: (other: Term) => other.termType === 'NamedNode' && other.value === 'http://schema.org/name'
   };
 
-  const matches: VortexRdfStore = store.match(null, predicate, null, null);
+  // Note: match returns the concrete store type (DictionaryStore or ChainedHashStore)
+  const matches = await store.match(null, predicate, null, null);
   
-  console.log(`Matched ${matches.size} quads`);
-
-  // results from .values() are typed as Quad[]
-  for (const quad of matches.values()) {
+  // We can iterate values
+  const iterator = await matches.values();
+  for (const quad of iterator) {
     const s: Quad['subject'] = quad.subject;
     console.log(`Subject: ${s.value}`);
   }

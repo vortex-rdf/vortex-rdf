@@ -1,137 +1,23 @@
-use crate::store::dictionary::Dictionary;
-use futures::StreamExt;
 use crate::error::{Result, VortexRdfError};
+use crate::store::dictionary_store::DictionaryStore;
+use crate::store::VortexRdfStore;
+use crate::error;
+
+use std::time::Instant;
 use oxrdf::Quad;
-use vortex_array::arrays::{ListArray, PrimitiveArray, StructArray, VarBinViewArray};
-use vortex_array::validity::Validity::NonNullable;
-use vortex_array::{ArrayRef, IntoArray};
-use vortex_dtype::{DType, Nullability};
-use vortex_fsst::{fsst_compress, fsst_train_compressor};
-use vortex::compressor::CompactCompressor;
-use vortex::file::WriteStrategyBuilder;
+
+use vortex_array::ArrayRef;
+use vortex_array::stream::ArrayStreamAdapter;
+use futures::stream;
+use vortex_file::{WriteStrategyBuilder, WriteOptionsSessionExt};
 use vortex_session::VortexSession;
-use vortex_file::WriteOptionsSessionExt;
 use vortex_io::VortexWrite;
 use vortex::VortexSessionDefault;
-use std::time::Instant;
-use futures::Stream;
+#[cfg(feature = "file-io")]
+use vortex::compressor::CompactCompressor;
 
-pub fn bundle_as_struct(
-    dict: Dictionary,
-    s_ids: Vec<u32>,
-    p_ids: Vec<u32>,
-    o_ids: Vec<u32>,
-    g_ids: Vec<u32>,
-) -> Result<ArrayRef> {
-    // Compress the dictionary using FSST
-    let dict_start = Instant::now();
-    let dict_arr = encode_dictionary(&dict)?;
-    log::debug!("[ser::bundle_as_struct] Dictionary FSST encoding took {:?}", dict_start.elapsed());
-    // Build an initial StructArray with all the (SPOG) columns
-    let quads_start = Instant::now();
-    let quads_struct = encode_quad_ids(s_ids, p_ids, o_ids, g_ids)?;
-    log::debug!("[ser::bundle_as_struct] Quad IDs struct encoding took {:?}", quads_start.elapsed());
-    
-    /*
-      Bundle everything into an overarching StructArray using the ListArray trick for differing lengths.
-      We create a StructArray with two fields: "dictionary" and "quads" that looks like this:
-      { 
-         "dictionary": [
-             dict_arr: VarBinViewArray (FSST compressed)
-         ]: ListArray, 
-         "quads": [
-             quads_struct: {
-                 s: PrimitiveArray,
-                 p: PrimitiveArray,
-                 o: PrimitiveArray,
-                 g: PrimitiveArray
-             }: StructArray
-         ]: ListArray 
-      }
-      
-      The ListArray trick is used to homogenize the array lengths, where both the "dictionary" and "quads"
-      become ListArrays of length 1, where the offsets define the boundaries of the single element containing the entire original array.
-     */
-    let bundle_start = Instant::now();
-    let dict_offsets = PrimitiveArray::from_iter(vec![0i32, dict_arr.len() as i32])
-        .into_array();
-    let dict_list = ListArray::try_new(dict_arr, dict_offsets, NonNullable)?
-        .into_array();
-    let quads_offsets = PrimitiveArray::from_iter(vec![0i32, quads_struct.len() as i32])
-        .into_array();
-    let quads_list = ListArray::try_new(quads_struct, quads_offsets, NonNullable)?
-        .into_array();
-    let vortex_array = StructArray::from_fields(&[
-        ("dictionary", dict_list),
-        ("quads", quads_list),
-    ])
-    .map_err(VortexRdfError::Vortex)?
-    .into_array();
-    log::debug!("[ser::bundle_as_struct] Vortex array encoding took {:?}", bundle_start.elapsed());
-    Ok(vortex_array)
-}
-
-pub async fn encode_quads<S>(mut quads: S) -> Result<ArrayRef>
-where
-    S: Stream<Item = Result<Quad>> + Unpin,
-{
-    let mut dict = Dictionary::new();
-    let mut s_ids = Vec::new();
-    let mut p_ids = Vec::new();
-    let mut o_ids = Vec::new();
-    let mut g_ids = Vec::new();
-
-    while let Some(quad_res) = quads.next().await {
-        let quad = quad_res?;
-        s_ids.push(dict.get_or_insert(&quad.subject.to_string()));
-        p_ids.push(dict.get_or_insert(&quad.predicate.to_string()));
-        o_ids.push(dict.get_or_insert(&quad.object.to_string()));
-        g_ids.push(dict.get_or_insert(&quad.graph_name.to_string()));
-    }
-
-    bundle_as_struct(dict, s_ids, p_ids, o_ids, g_ids)
-}
-
-pub fn encode_dictionary(dict: &Dictionary) -> Result<ArrayRef> {
-    let dict_raw = VarBinViewArray::from_iter(
-        dict.terms.iter().map(|s: &String| Some(s.as_str())),
-        DType::Utf8(Nullability::NonNullable),
-    );
-
-    // Apply FSST compression to the dictionary table
-    if dict_raw.len() > 0 {
-        let compressor = fsst_train_compressor(&dict_raw);
-        Ok(fsst_compress(dict_raw, &compressor).into_array())
-    } else {
-        Ok(dict_raw.into_array())
-    }
-}
-
-pub fn encode_quad_ids(
-    s_ids: Vec<u32>,
-    p_ids: Vec<u32>,
-    o_ids: Vec<u32>,
-    g_ids: Vec<u32>,
-) -> Result<ArrayRef> {
-    let s_arr = PrimitiveArray::from_iter(s_ids).into_array();
-
-    // Check if predicates fit in u16
-    let p_arr = if p_ids.iter().all(|&id| id <= u16::MAX as u32) {
-        PrimitiveArray::from_iter(p_ids.into_iter().map(|id| id as u16)).into_array()
-    } else {
-        PrimitiveArray::from_iter(p_ids).into_array()
-    };
-
-    let o_arr = PrimitiveArray::from_iter(o_ids).into_array();
-    let g_arr = PrimitiveArray::from_iter(g_ids).into_array();
-
-    Ok(
-        StructArray::from_fields(&[("s", s_arr), ("p", p_arr), ("o", o_arr), ("g", g_arr)])?
-            .into_array(),
-    )
-}
-
-pub async fn write_array_to_vortex<W: VortexWrite + Unpin + Send>(
+/// High-level function to serialize RDF from a reader directly to a Vortex-RDF writer.
+pub async fn serialize<W: VortexWrite + Unpin + Send>(
     vortex_array: ArrayRef,
     mut writer: W,
 ) -> Result<()> {
@@ -139,22 +25,27 @@ pub async fn write_array_to_vortex<W: VortexWrite + Unpin + Send>(
     let session = VortexSession::default();
 
     let mut strategy = WriteStrategyBuilder::new();
-    strategy = strategy.with_compressor(CompactCompressor::default());
+    
+    #[cfg(feature = "file-io")]
+    {
+        strategy = strategy.with_compressor(CompactCompressor::default());
+    }
 
     let write_opts = session.write_options().with_strategy(strategy.build());
-    log::debug!("[ser::write_array_to_vortex] Vortex writer options setup took {:?}", session_start.elapsed());
-
-    let stream_start = Instant::now();
-    let stream = vortex_array.to_array_stream();
-    log::debug!("[ser::write_array_to_vortex] Array stream creation took {:?}", stream_start.elapsed());
+    let dtype = vortex_array.dtype().clone();
+    let vortex_stream = ArrayStreamAdapter::new(
+        dtype,
+        Box::pin(stream::once(async move { Ok(vortex_array) }))
+    );
+    log::debug!("[ser::write_stream_to_vortex] Vortex writer options setup took {:?}", session_start.elapsed());
 
     let write_start = Instant::now();
     let _summary = write_opts
-        .write(&mut writer, stream)
+        .write(&mut writer, vortex_stream)
         .await
-        .map_err(|e: vortex_error::VortexError| crate::error::VortexRdfError::from(e))?;
-    log::debug!("[ser::write_array_to_vortex] Vortex writing took {:?}", write_start.elapsed());
-
+        .map_err(|e: vortex_error::VortexError| VortexRdfError::from(e))?;
+    log::debug!("[ser::write_stream_to_vortex] Vortex writing took {:?}", write_start.elapsed());
+    
     Ok(())
 }
 
@@ -163,11 +54,32 @@ pub fn write_array_to_ipc<W: std::io::Write>(vortex_array: ArrayRef, mut writer:
     let ipc_iter = vortex_array.to_array_iterator().into_ipc();
 
     for msg_res in ipc_iter {
-        let msg = msg_res.map_err(crate::error::VortexRdfError::Vortex)?;
+        let msg = msg_res.map_err(VortexRdfError::Vortex)?;
         writer
             .write_all(&msg)
-            .map_err(|e| crate::error::VortexRdfError::Serialization(e.to_string()))?;
+            .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
     }
 
     Ok(())
+}
+
+/// High-level function to serialize a stream of quads to a Vortex-RDF writer.
+pub async fn quads_stream_to_vortex_writer<S, W>(quads: S, writer: W) -> error::Result<()>
+where
+    S: futures::Stream<Item = error::Result<Quad>> + Unpin + Send + 'static,
+    W: VortexWrite + Unpin + Send,
+{
+    let stream = DictionaryStore::build_vortex_index(quads).await?;
+    serialize(stream, writer).await?;
+    Ok(())
+}
+
+/// High-level function to serialize a stream of quads directly to a byte buffer.
+pub async fn quads_stream_to_vortex<S>(quads: S) -> error::Result<Vec<u8>>
+where
+    S: futures::Stream<Item = error::Result<Quad>> + Unpin + Send + 'static,
+{
+    let mut buffer = Vec::new();
+    quads_stream_to_vortex_writer(quads, &mut buffer).await?;
+    Ok(buffer)
 }

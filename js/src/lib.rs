@@ -1,26 +1,57 @@
 use oxrdf::{GraphName, NamedNode, Quad, Subject, Term};
+use oxrdfio::RdfFormat;
 use std::io::Cursor;
-use vortex_rdf_core::{deserialize, serialize, RdfFormat};
+use vortex_rdf_core::io::{
+    deserialize,
+    quads_stream_to_vortex,
+    array_from_reader,
+};
+use vortex_rdf_core::{
+    DictionaryStore as CoreDictionaryStore, 
+    ChainedHashStore as CoreChainedHashStore, 
+    VortexRdfStore as VortexRdfStoreTrait,
+};
+use vortex_rdf_core::common::indexes::{IndexType, detect_index_type};
+use vortex_rdf_core::common::utils::parse_quads_from_reader;
 use wasm_bindgen::prelude::*;
 use js_sys::{Object, Reflect};
 use futures::StreamExt;
+
+
 
 #[wasm_bindgen(typescript_custom_section)]
 const TS_APPEND_CONTENT: &'static str = r#"
 import { Quad, Term, NamedNode, BlankNode, Literal, Quad_Subject, Quad_Predicate, Quad_Object, Quad_Graph } from '@rdfjs/types';
 
-export interface VortexRdfStore {
-    addQuad(quad: Quad): void;
-    deleteQuad(quad: Quad): void;
-    has(quad: Quad): boolean;
-    match(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): Promise<VortexRdfStore>;
+export interface VortexStore {
+    addQuad(quad: Quad): Promise<void>;
+    deleteQuad(quad: Quad): Promise<void>;
+    has(quad: Quad): Promise<boolean>;
     values(): Promise<IterableIterator<Quad>>;
 }
 
-export namespace VortexRdfStore {
-    export function empty(): Promise<VortexRdfStore>;
-    export function fromBytes(bytes: Uint8Array): VortexRdfStore;
-    export function fromString(input: string, format: string): VortexRdfStore;
+export class DictionaryStore implements VortexStore {
+    static empty(): DictionaryStore;
+    static fromBytes(bytes: Uint8Array): Promise<DictionaryStore>;
+    static fromString(input: string, format: string): Promise<DictionaryStore>;
+    
+    addQuad(quad: Quad): Promise<void>;
+    deleteQuad(quad: Quad): Promise<void>;
+    has(quad: Quad): Promise<boolean>;
+    match(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): Promise<DictionaryStore>;
+    values(): Promise<IterableIterator<Quad>>;
+}
+
+export class ChainedHashStore implements VortexStore {
+    static empty(): ChainedHashStore;
+    static fromBytes(bytes: Uint8Array): Promise<ChainedHashStore>;
+    static fromString(input: string, format: string): Promise<ChainedHashStore>;
+
+    addQuad(quad: Quad): Promise<void>;
+    deleteQuad(quad: Quad): Promise<void>;
+    has(quad: Quad): Promise<boolean>;
+    match(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): Promise<ChainedHashStore>;
+    values(): Promise<IterableIterator<Quad>>;
 }
 "#;
 
@@ -29,49 +60,55 @@ pub fn init_panic_hook() {
     console_error_panic_hook::set_once();
 }
 
+// -------------------------
+// Dictionary Store Bindings
+// -------------------------
+
 #[wasm_bindgen]
-pub struct VortexRdfStore {
+pub struct DictionaryStore {
     #[wasm_bindgen(skip)]
-    pub(crate) inner: vortex_rdf_core::VortexRdfStore,
+    pub inner: CoreDictionaryStore,
 }
 
 #[wasm_bindgen]
-impl VortexRdfStore {
+impl DictionaryStore {
     #[wasm_bindgen(js_name = fromBytes)]
-    pub async fn from_bytes(bytes: &[u8]) -> Result<VortexRdfStore, JsValue> {
-        let inner = vortex_rdf_core::VortexRdfStore::from_bytes(bytes)
-            .await
+    pub async fn from_bytes(bytes: &[u8]) -> Result<DictionaryStore, JsValue> {
+        let cursor = Cursor::new(bytes);
+        let array = array_from_reader(cursor)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(VortexRdfStore { inner })
+
+        // Verify index type
+        match detect_index_type(&array) {
+            IndexType::Dictionary => {},
+            _ => return Err(JsValue::from_str("Provided bytes are not a DictionaryStore")),
+        }
+
+        let inner = CoreDictionaryStore::new(array)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(DictionaryStore { inner })
     }
 
-    pub async fn empty() -> Result<VortexRdfStore, JsValue> {
-        let inner = vortex_rdf_core::VortexRdfStore::empty()
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(VortexRdfStore { inner })
+    pub fn empty() -> DictionaryStore {
+        let inner = CoreDictionaryStore::empty();
+        DictionaryStore { inner }
     }
 
     #[wasm_bindgen(js_name = fromString)]
-    pub async fn from_string(input: String, format_name: &str) -> Result<VortexRdfStore, JsValue> {
-        let format = match format_name.to_lowercase().as_str() {
-            "nt" | "ntriples" => RdfFormat::NTriples,
-            "nq" | "nquads" => RdfFormat::NQuads,
-            "ttl" | "turtle" => RdfFormat::Turtle,
-            "trig" => RdfFormat::TriG,
-            "jsonld" => RdfFormat::JsonLd {
-                profile: Default::default(),
-            },
-            _ => return Err(JsValue::from_str("Unsupported format")),
-        };
-
-        let mut bytes = Vec::new();
-        // Vec<u8> implements VortexWrite
-        serialize(Cursor::new(input), &mut bytes, format)
+    pub async fn from_string(input: String, format_name: &str) -> Result<DictionaryStore, JsValue> {
+        let format = parse_format(format_name)?;
+        let cursor = Cursor::new(input);
+        let quads_stream = parse_quads_from_reader(cursor, format);
+        
+        // Build DictionaryStore
+        let vortex_array = CoreDictionaryStore::build_vortex_index(quads_stream)
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        
+        let inner = CoreDictionaryStore::new(vortex_array)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-        Self::from_bytes(&bytes).await
+        Ok(DictionaryStore { inner })
     }
 
     pub fn size(&self) -> usize {
@@ -80,16 +117,15 @@ impl VortexRdfStore {
 
     pub async fn has(&self, quad_js: JsValue) -> bool {
         if let Some(quad) = js_to_quad(quad_js) {
-            self.inner
-                .match_pattern(
-                    Some(&quad.subject),
-                    Some(&quad.predicate),
-                    Some(&quad.object),
-                    Some(&quad.graph_name),
-                )
-                .await
-                .map(|ds| ds.size() > 0)
-                .unwrap_or(false)
+            self.inner.match_pattern(
+                Some(&quad.subject),
+                Some(&quad.predicate),
+                Some(&quad.object),
+                Some(&quad.graph_name),
+            )
+            .await
+            .map(|ds| ds.size() > 0)
+            .unwrap_or(false)
         } else {
             false
         }
@@ -98,9 +134,7 @@ impl VortexRdfStore {
     #[wasm_bindgen(js_name = addQuad)]
     pub async fn add_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
         if let Some(quad) = js_to_quad(quad_js) {
-            self.inner = self.inner.add_quad(quad)
-                .await
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            self.inner = self.inner.add_quad(quad).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
             Ok(())
         } else {
             Err(JsValue::from_str("Invalid quad object"))
@@ -110,9 +144,7 @@ impl VortexRdfStore {
     #[wasm_bindgen(js_name = deleteQuad)]
     pub async fn delete_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
         if let Some(quad) = js_to_quad(quad_js) {
-            self.inner = self.inner.delete_quad(&quad)
-                .await
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            self.inner = self.inner.delete_quad(&quad).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
             Ok(())
         } else {
             Err(JsValue::from_str("Invalid quad object"))
@@ -126,23 +158,22 @@ impl VortexRdfStore {
         predicate: JsValue,
         object: JsValue,
         graph: JsValue,
-    ) -> Result<VortexRdfStore, JsValue> {
+    ) -> Result<DictionaryStore, JsValue> {
         let s = js_to_subject(subject);
         let p = js_to_named_node(predicate);
         let o = js_to_term(object);
         let g = js_to_graph(graph);
 
-        let filtered = self
-            .inner
-            .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+        let res = self.inner.match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-        Ok(VortexRdfStore { inner: filtered })
+        Ok(DictionaryStore { inner: res })
     }
 
     pub async fn values(&self) -> Result<js_sys::Iterator, JsValue> {
         let mut quads_stream = self.inner.quads().map_err(|e| JsValue::from_str(&e.to_string()))?;
+
         let js_array = js_sys::Array::new();
         while let Some(q_res) = quads_stream.next().await {
             if let Ok(q) = q_res {
@@ -152,6 +183,147 @@ impl VortexRdfStore {
         Ok(js_array.values())
     }
 }
+
+// -------------------------
+// Chained Hash Store Bindings
+// -------------------------
+
+#[wasm_bindgen]
+pub struct ChainedHashStore {
+    #[wasm_bindgen(skip)]
+    pub inner: CoreChainedHashStore,
+}
+
+#[wasm_bindgen]
+impl ChainedHashStore {
+    #[wasm_bindgen(js_name = fromBytes)]
+    pub async fn from_bytes(bytes: &[u8]) -> Result<ChainedHashStore, JsValue> {
+        let cursor = Cursor::new(bytes);
+        let array = array_from_reader(cursor)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        // Verify index type
+        match detect_index_type(&array) {
+            IndexType::ChainedHash => {},
+            _ => return Err(JsValue::from_str("Provided bytes are not a ChainedHashStore")),
+        }
+
+        let inner = CoreChainedHashStore::new(array)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(ChainedHashStore { inner })
+    }
+
+    pub fn empty() -> ChainedHashStore {
+        let inner = CoreChainedHashStore::empty();
+        ChainedHashStore { inner }
+    }
+
+    #[wasm_bindgen(js_name = fromString)]
+    pub async fn from_string(input: String, format_name: &str) -> Result<ChainedHashStore, JsValue> {
+        let format = parse_format(format_name)?;
+        let cursor = Cursor::new(input);
+        let quads_stream = parse_quads_from_reader(cursor, format);
+        
+        // Build ChainedHashStore
+        let vortex_array = CoreChainedHashStore::build_vortex_index(quads_stream)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        
+        let inner = CoreChainedHashStore::new(vortex_array)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        Ok(ChainedHashStore { inner })
+    }
+
+    pub fn size(&self) -> usize {
+        self.inner.size()
+    }
+
+    pub async fn has(&self, quad_js: JsValue) -> bool {
+        if let Some(quad) = js_to_quad(quad_js) {
+            self.inner.match_pattern(
+                Some(&quad.subject),
+                Some(&quad.predicate),
+                Some(&quad.object),
+                Some(&quad.graph_name),
+            )
+            .await
+            .map(|ds| ds.size() > 0)
+            .unwrap_or(false)
+        } else {
+            false
+        }
+    }
+
+    #[wasm_bindgen(js_name = addQuad)]
+    pub async fn add_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
+        if let Some(quad) = js_to_quad(quad_js) {
+            self.inner = self.inner.add_quad(quad).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
+            Ok(())
+        } else {
+            Err(JsValue::from_str("Invalid quad object"))
+        }
+    }
+
+    #[wasm_bindgen(js_name = deleteQuad)]
+    pub async fn delete_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
+        if let Some(quad) = js_to_quad(quad_js) {
+            self.inner = self.inner.delete_quad(&quad).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
+            Ok(())
+        } else {
+            Err(JsValue::from_str("Invalid quad object"))
+        }
+    }
+
+    #[wasm_bindgen(js_name = match)]
+    pub async fn match_pattern(
+        &self,
+        subject: JsValue,
+        predicate: JsValue,
+        object: JsValue,
+        graph: JsValue,
+    ) -> Result<ChainedHashStore, JsValue> {
+        let s = js_to_subject(subject);
+        let p = js_to_named_node(predicate);
+        let o = js_to_term(object);
+        let g = js_to_graph(graph);
+
+        let res = self.inner.match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        Ok(ChainedHashStore { inner: res })
+    }
+
+    pub async fn values(&self) -> Result<js_sys::Iterator, JsValue> {
+        let mut quads_stream = self.inner.quads().map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        let js_array = js_sys::Array::new();
+        while let Some(q_res) = quads_stream.next().await {
+            if let Ok(q) = q_res {
+                js_array.push(&quad_to_js(&q));
+            }
+        }
+        Ok(js_array.values())
+    }
+}
+
+// Helpers
+
+fn parse_format(format_name: &str) -> Result<RdfFormat, JsValue> {
+    match format_name.to_lowercase().as_str() {
+        "nt" | "ntriples" => Ok(RdfFormat::NTriples),
+        "nq" | "nquads" => Ok(RdfFormat::NQuads),
+        "ttl" | "turtle" => Ok(RdfFormat::Turtle),
+        "trig" => Ok(RdfFormat::TriG),
+        "jsonld" => Ok(RdfFormat::JsonLd {
+            profile: Default::default(),
+        }),
+        _ => Err(JsValue::from_str("Unsupported format")),
+    }
+}
+
+// ... Term conversions ...
 
 fn term_to_js(term: &Term) -> JsValue {
     let obj = Object::new();
@@ -313,8 +485,8 @@ fn js_to_quad(val: JsValue) -> Option<Quad> {
 
 #[wasm_bindgen]
 pub async fn nquads_to_vortex(nquads: String) -> Result<Vec<u8>, JsValue> {
-    let mut buffer = Vec::new();
-    serialize(Cursor::new(nquads), &mut buffer, RdfFormat::NQuads)
+    let quads_stream = parse_quads_from_reader(Cursor::new(nquads), RdfFormat::NQuads);
+    let buffer = quads_stream_to_vortex(quads_stream)
         .await
         .map_err(|e| JsValue::from_str(&format!("Vortex error: {}", e)))?;
     Ok(buffer)
@@ -322,10 +494,29 @@ pub async fn nquads_to_vortex(nquads: String) -> Result<Vec<u8>, JsValue> {
 
 #[wasm_bindgen]
 pub async fn vortex_to_nquads(vortex_bytes: &[u8]) -> Result<String, JsValue> {
-    let mut buffer = Vec::new();
-    deserialize(vortex::buffer::Buffer::from(vortex_bytes.to_vec()), &mut buffer, RdfFormat::NQuads)
-        .await
-        .map_err(|e| JsValue::from_str(&format!("Vortex error: {}", e)))?;
+    let cursor = Cursor::new(vortex_bytes);
+    let vortex_array = array_from_reader(cursor)
+        .map_err(|e| JsValue::from_str(&format!("Vortex read error: {}", e)))?;
 
-    String::from_utf8(buffer).map_err(|e| JsValue::from_str(&format!("UTF-8 error: {}", e)))
+    let mut output_buffer = Vec::new();
+    
+    // Detect and deserialize
+    match detect_index_type(&vortex_array) {
+        IndexType::Dictionary => {
+            let store = CoreDictionaryStore::new(vortex_array)
+                .map_err(|e| JsValue::from_str(&format!("Store init error: {}", e)))?;
+            deserialize(store, &mut output_buffer, RdfFormat::NQuads)
+                .await
+                .map_err(|e| JsValue::from_str(&format!("Deserialize error: {}", e)))?;
+        },
+        IndexType::ChainedHash => {
+             let store = CoreChainedHashStore::new(vortex_array)
+                .map_err(|e| JsValue::from_str(&format!("Store init error: {}", e)))?;
+            deserialize(store, &mut output_buffer, RdfFormat::NQuads)
+                .await
+                .map_err(|e| JsValue::from_str(&format!("Deserialize error: {}", e)))?;
+        }
+    }
+
+    String::from_utf8(output_buffer).map_err(|e| JsValue::from_str(&format!("UTF-8 error: {}", e)))
 }

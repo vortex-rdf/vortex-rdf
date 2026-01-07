@@ -1,16 +1,17 @@
 # Vortex-RDF
 
-Vortex-RDF is modern and high-performance columnar RDF serialization built on top of the [Vortex](https://vortex.dev) data format. It combines the flexible graph-based model of RDF with the efficiency of modern analytical data formats.
+Vortex-RDF is a columnar RDF serialization built on top of the [Vortex](https://docs.vortex.dev) data format. It combines the flexible graph-based model of RDF with the efficiency of modern analytical data formats. Its main goal is to **provide a compact, zero-copy and high-performance serialization format for exchanging and querying RDF data**.
 
-This library provides both serialization and deserialization capabilities for converting RDF files to Vortex-RDF and vice versa. It also provides an implementation of a RDF store according to the [RDF-JS specification](https://rdf.js.org/dataset-spec/#datasetcore-interface). 
+This library provides both serialization and deserialization capabilities for converting traditional RDF formats (everything supported by [`oxrdfio`](https://docs.rs/oxrdfio/latest/oxrdfio/)) to Vortex-RDF and vice-versa. It also provides implementations of RDF stores, based on the [RDF-JS specification](https://rdf.js.org/dataset-spec/#datasetcore-interface). 
 
 ## Key Features
 
 - 📊 **Advanced Columnar Storage**: Leverages Vortex's zero-copy, compressed array formats.
 - 📦 **FSST String Compression**: Uses [Fast Static Symbol Table (FSST)](https://doi.org/10.14778/3407790.3407851) compression [1] for the dictionary/resource table, specifically optimized for repetitive short strings like IRIs.
+- 🔗 **Chained Hash Index**: Optional zero-copy index structure that allows strictly zero-copy lookups without materializing a hash map in memory.
 - 🧠 **Memory Optimization**: Automatically narrows Predicate indices to `u16` when unique predicates are few (< 65,536), saving up to 50% RAM for the most repetitive column.
 - 🧊 **Quads Support**: Full support for named Graphs (S, P, O, G) and in general for [RDF 1.1](https://www.w3.org/TR/rdf11-concepts/).
-- 🌍 **Cross-Platform**: Native Rust library with a CLI + WebAssembly (WASM) bindings for browsers/Node.js. Python binding comming soon.
+- 🌍 **Cross-Platform**: Native Rust library with a CLI + WebAssembly (WASM) bindings for browsers/Node.js. Python binding coming soon.
 
 ### The Power of Zero-Copy
 
@@ -47,7 +48,22 @@ The graph structure is stored as an optimized `StructArray` of indices:
 - **Object**: `u32` indices.
 - **Graph**: `u32` indices.
 
-This layout allows for extremely fast analytical queries and filtering on specific columns without reading the entire store.
+### 3. Indexing Strategies
+Vortex-RDF supports two distinct indexing strategies depending on your workload:
+
+#### A. Dictionary Index (Default)
+Optimized for **storage size and analytical scans**.
+- **Structure**: Only stores the compressed Resource Table and the Quad indices.
+- **Lookups**: To perform term lookups (e.g., finding the ID for `"http://example.org/alice"`), the library builds a transient `HashMap` in memory when opening the file.
+- **Use Case**: Archival, bulk analytics, and scenarios where startup time is less critical than file size.
+
+#### B. Chained Hash Index
+Optimized for **random access and zero-copy queries**.
+- **Structure**: Persists a hash map directly in the file using two additional arrays:
+    - `buckets`: A hash table pointing to the first entry in a chain.
+    - `next`: A "linked list" array for collision resolution.
+- **Lookups**: `O(1)` lookups are performed **directly on the memory-mapped file**. No in-memory `HashMap` is built, meaning instant startup and strictly zero-copy random access.
+- **Use Case**: Read-heavy workloads, random pattern matching, and applications requiring instant access to large datasets.
 
 ## Data Representation Example
 
@@ -89,6 +105,48 @@ The quads are stored as an optimized table of indices.
 - The **G column** is Run-Length Encoded (RLE) by Vortex because all values are the same (Default Graph), effectively reducing its size to near-zero.
 - The **S, P, O columns** are bitpacked to the minimum number of bits needed to represent the max ID.
 
+### 3. Chained Hash Index (Physical View)
+*Only present when using Chained Hash Index.*
+
+To enable O(1) lookups to find the ID of a term (e.g., getting `0` for `<http://example.org/alice>`) without checking every string, two additional integer arrays are stored.
+
+Assuming a **Bucket Size of 5** (simplified for this example):
+
+**Buckets Array** (Hash Table Entry Points):
+| Bucket ID | Head Row ID |
+|---|---|
+| 0 | 5 |
+| 1 | -1 |
+| 2 | 0 |
+| 3 | 6 |
+| 4 | 4 |
+
+**Next Array** (Collision Chain):
+| Row ID | Next Row ID | Value (for context) |
+|---|---|---|
+| 0 | -1 | `<http://example.org/alice>` |
+| ... | ... | ... |
+| 4 | -1 | `"Alice"` |
+| 5 | 2 | `<http://example.org/bob>` |
+| 6 | -1 | `<http://xmlns.com/foaf/0.1/knows>` |
+
+**How a lookup works:**
+1. You want to find `<http://example.org/bob>`.
+2. Compute `hash("<http://example.org/bob>") % 5`. Let's say it equals `0`.
+3. Check `Buckets[0]`. It points to Row `5`.
+4. Check Resource Table at Row `5`. Is it `<http://example.org/bob>`? **Yes**.
+   - **Result**: ID is `5`.
+
+**Collision Example:**
+1. You want to find `<http://xmlns.com/foaf/0.1/Person>`.
+2. Compute hash. Let's say it also equals `0`.
+3. Check `Buckets[0]`. It points to Row `5` (`.../bob`). **No match**.
+4. Check `Next[5]`. It points to Row `2`.
+5. Check Resource Table at Row `2`. Is it `.../Person`? **Yes**.
+   - **Result**: ID is `2`.
+
+This allows the library to traverse chains **entirely using bit-wise integer reads** without ever decoding strings that don't match.
+
 ## How Datatypes are Handled
 
 Vortex-RDF ensures 100% fidelity for all [XSD datatypes](https://www.w3.org/TR/xmlschema-2/) (numeric, boolean, datetime, etc.) by leveraging **N-Triples Canonicalization** combined with **Symbolic Compression**.
@@ -128,7 +186,7 @@ cargo build --release -p vortex-rdf-cli
 ### WebAssembly (WASM)
 Build for JS environments using `wasm-pack`:
 ```bash
-cd wasm
+cd js
 wasm-pack build --target web
 ```
 
@@ -138,25 +196,31 @@ wasm-pack build --target web
 
 ### Rust API
 ```rust
-use vortex_rdf_core::{serialize, deserialize, RdfFormat};
+use vortex_rdf_core::{serialize, deserialize};
+use vortex_rdf_core::common::formats::Format;
 use std::fs::File;
 
 // High-level Streaming API (Recommended)
 let input_file = File::open("data.ttl")?;
-let vortex_bytes = serialize(input_file, RdfFormat::Turtle)?;
+let vortex_bytes = serialize(input_file, Format::Turtle)?;
 
 let output_file = File::create("output.nq")?;
-deserialize(&vortex_bytes, output_file, RdfFormat::NQuads)?;
+deserialize(&vortex_bytes, output_file, Format::NQuads)?;
 
 // Low-level Quad API
 use vortex_rdf_core::{quads_to_vortex, vortex_to_quads};
 let quads = vortex_to_quads(&vortex_bytes)?;
 
-// Pattern Matching (Zero-Copy)
-use vortex_rdf_core::{VortexRdfStore, Subject, NamedNode};
-let store = VortexRdfStore::from_file("data.vortex")?;
+// Pattern Matching
+use vortex_rdf_core::{DictionaryStore, VortexRdfStore};
+use oxrdf::{NamedNode, Subject};
+
+// Load Store (Dictionary or ChainedHash)
+// ChainedHashStore::from_file(...) is also available and allows zero-copy lookups
+let store = DictionaryStore::from_file("data.vortex").await?;
+
 let predicate = NamedNode::new("http://xmlns.com/foaf/0.1/knows")?;
-let filtered = store.match_pattern(None, Some(&predicate), None, None)?;
+let filtered = store.match_pattern(None, Some(&predicate), None, None).await?;
 println!("Found {} matches", filtered.size());
 
 // --- Data Modification ---
@@ -165,12 +229,12 @@ println!("Found {} matches", filtered.size());
 // Uses Vortex's ChunkedArray to virtually append a new row without copying 
 // the existing store in memory.
 let new_quad = Quad::new(s, p, o, g);
-let mutated = store.add_quad(new_quad)?;
+let mutated = store.add_quad(new_quad).await?;
 
 // 2. Delete Quad (Inverse Columnar Filter)
 // Uses columnar pattern matching to find the quad and applies an inverse 
 // vectorized filter to exclude it.
-let cleaned = mutated.delete_quad(&new_quad)?;
+let cleaned = mutated.delete_quad(&new_quad).await?;
 ```
 
 ### JavaScript / WASM
@@ -220,8 +284,11 @@ store.delete(otherQuad);
 
 ### Command Line Interface
 ```bash
-# Convert Turtle to Vortex
+# Convert Turtle to Vortex (Dictionary Index by default)
 vortex-rdf-cli serialize --input test/test.ttl --output test/test.vortex
+
+# Convert using Chained Hash Index (Faster lookups, slightly larger file)
+vortex-rdf-cli serialize --index-type chained-hash --input test/test.ttl --output test/test-ch.vortex
 
 # Convert Vortex to N-Quads (defaults to stdout)
 vortex-rdf-cli deserialize --input test/test.vortex
@@ -243,7 +310,7 @@ RUST_LOG=debug vortex-rdf-cli serialize --input data.ttl --output data.vortex
 ## Project Structure
 
 - `core/`: The core Rust implementation of the serialization logic.
-- `wasm/`: WebAssembly bindings for the core library.
+- `js/`: WebAssembly bindings for the core library.
 - `cli/`: Command-line tool for file conversion.
 
 ## References
