@@ -19,6 +19,11 @@ vortex-session.workspace = true
 vortex-fsst.workspace = true
 vortex-mask.workspace = true
 vortex-scalar.workspace = true
+vortex-file = { version = "0.57.2", default-features = false }
+vortex-scan = { version = "0.57.2", default-features = false }
+
+
+tokio.workspace = true
 
 # RDF handling
 oxrdf.workspace = true
@@ -27,4 +32,11 @@ oxrdfio.workspace = true
 # Utilities
 itertools.workspace = true
 thiserror.workspace = true
-memmap2.workspace = true
+
+futures.workspace = true
+log = "0.4"
+clap = { version = "4.5", features = ["derive"] }
+
+[features]
+default = ["file-io"]
+file-io = ["vortex-io/tokio", "vortex/zstd", "vortex/files"]
