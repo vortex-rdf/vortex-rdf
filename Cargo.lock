@@ -2975,6 +2975,7 @@ dependencies = [
  "futures",
  "itertools 0.12.1",
  "log",
+ "mimalloc",
  "oxrdf",
  "oxrdfio",
  "thiserror 1.0.69",

@@ -1,8 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use mimalloc::MiMalloc;
-
 use log::{debug, info};
-
 use clap::{Parser, Subcommand};
 use oxrdfio::RdfFormat;
 use std::fs::File;
@@ -28,13 +25,6 @@ use vortex_rdf_core::common::utils::{
     parse_graph_name,
     parse_quads_from_reader
 };
-
-/*
- As indicated by vortex docs:
- https://docs.rs/vortex/latest/vortex/index.html#performance-optimization
-*/
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser)]
 #[command(
@@ -269,10 +259,9 @@ async fn main() -> Result<()> {
             let match_start = Instant::now();
             match resolved_index_type {
                 IndexType::Dictionary => {
-                    let dict_start = Instant::now();
                     let store = DictionaryStore::new(vortex_array)
                         .map_err(|e| anyhow::anyhow!(e))?;
-                    debug!("DictionaryStore instance created in {:?}", dict_start.elapsed());
+                    debug!("DictionaryStore instance created in {:?}", start.elapsed());
                     
                     let filtered = store.match_pattern(
                         subject_node.as_ref(),
@@ -287,10 +276,9 @@ async fn main() -> Result<()> {
                         .context("Failed to deserialize filtered results")?;
                 },
                 IndexType::ChainedHash => {
-                    let chained_start = Instant::now();
                     let store = ChainedHashStore::new(vortex_array)
                          .map_err(|e| anyhow::anyhow!(e))?;
-                    debug!("ChainedHashStore instance created in {:?}", chained_start.elapsed());
+                    debug!("ChainedHashStore instance created in {:?}", start.elapsed());
                     
                     let filtered = store.match_pattern(
                         subject_node.as_ref(),

@@ -4,10 +4,11 @@ use crate::io::de;
 use crate::common::utils;
 
 use oxrdf::{GraphName, NamedNode, Quad, Subject, Term};
+use std::path::Path;
 use std::time::Instant;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, stream};
 
 use vortex::compute::{and, compare, filter, Operator};
 use vortex_array::arrays::{ChunkedArray, ConstantArray, ListArray, PrimitiveArray, StructArray, VarBinViewArray};
@@ -19,36 +20,32 @@ use vortex_scalar::Scalar;
 
 #[derive(Clone)]
 pub struct ChainedHashStore {
-    pub vortex_array: ArrayRef,
-
-    // Chained Hash Index
+    // Chained Hash Index for RDF Terms
     pub buckets: ArrayRef, // PrimitiveArray<i32>
     pub next: ArrayRef,    // PrimitiveArray<i32>
+    pub values: ArrayRef,  // VarBinViewArray
 
     // Data
-    pub values: ArrayRef, // VarBinViewArray
     pub quads: ArrayRef,  // StructArray {s, p, o, g}
 }
 
 impl ChainedHashStore {
     const BUCKET_SIZE: usize = 1_000_003; // Prime number
 
-    pub fn new(
-        vortex_index: ArrayRef,
-    ) -> Result<Self> {
+    pub fn new(vortex_index: ArrayRef) -> Result<Self> {
         let start = Instant::now();
         let vortex_struct = vortex_index.to_struct();
 
-        let values = utils::extract_vortex_struct_field(&vortex_struct, 0, "dictionary")?;
-        let quads = utils::extract_vortex_struct_field(&vortex_struct, 1, "quads")?;
-        let buckets_arr = utils::extract_vortex_struct_field(&vortex_struct, 2, "buckets")?;
-        let next = utils::extract_vortex_struct_field(&vortex_struct, 3, "next")?;
+        // Field 0 is the store_type
+        let values = utils::extract_vortex_struct_field(&vortex_struct, 1, "dictionary")?;
+        let quads = utils::extract_vortex_struct_field(&vortex_struct, 2, "quads")?;
+        let buckets_arr = utils::extract_vortex_struct_field(&vortex_struct, 3, "buckets")?;
+        let next = utils::extract_vortex_struct_field(&vortex_struct, 4, "next")?;
 
         let buckets = buckets_arr;
         log::debug!("[chained_hash_store::new] Vortex index destructuring took {:?}", start.elapsed());
         
         Ok(Self {
-            vortex_array: vortex_index,
             buckets,
             next,
             values,
@@ -72,11 +69,11 @@ impl ChainedHashStore {
         let store_type = ConstantArray::new("chained-hash", 1).into_array();
 
         let vortex_array = StructArray::from_fields(&[
+            ("store_type", store_type),
             ("dictionary", values_list),
             ("quads", quads_list),
             ("buckets", buckets_list),
             ("next", next_list),
-            ("store_type", store_type),
         ])
         .map_err(VortexRdfError::Vortex)?
         .into_array();
@@ -113,15 +110,7 @@ impl ChainedHashStore {
         .unwrap()
         .into_array();
 
-        let vortex_array = Self::build_joint_array(
-            values.clone(),
-            quads.clone(),
-            buckets.clone(),
-            next.clone()
-        ).unwrap();
-
         Self {
-            vortex_array,
             buckets,
             next,
             values,
@@ -130,7 +119,7 @@ impl ChainedHashStore {
     }
 
     #[cfg(feature = "file-io")]
-    pub async fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+    pub async fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         // VortexFile::open handles opening the file from path
         let vortex_array = de::load_vortex_file_ref(path.as_ref().to_path_buf()).await?;
         Self::new(vortex_array)
@@ -352,11 +341,7 @@ impl VortexRdfStore for ChainedHashStore {
 
         // Vortex arrays for quads
         let s_arr = PrimitiveArray::from_iter(s_ids).into_array();
-        let p_arr = if p_ids.iter().all(|&id| id <= u16::MAX as u32) {
-            PrimitiveArray::from_iter(p_ids.iter().map(|&id| id as u16)).into_array()
-        } else {
-            PrimitiveArray::from_iter(p_ids).into_array()
-        };
+        let p_arr = PrimitiveArray::from_iter(p_ids).into_array();
         let o_arr = PrimitiveArray::from_iter(o_ids).into_array();
         let g_arr = PrimitiveArray::from_iter(g_ids).into_array();
         let quads_array = StructArray::from_fields(&[
@@ -456,15 +441,7 @@ impl VortexRdfStore for ChainedHashStore {
 
         let buckets_arr = PrimitiveArray::from_iter(buckets).into_array();
 
-        let new_vortex_index = Self::build_joint_array(
-            combined_values.clone(),
-            combined_quads.clone(),
-            buckets_arr.clone(),
-            combined_next.clone()
-        )?;
-
         Ok(Self {
-            vortex_array: new_vortex_index,
             buckets: buckets_arr,
             next: combined_next,
             values: combined_values,
@@ -497,15 +474,7 @@ impl VortexRdfStore for ChainedHashStore {
             let filtered_quads = filter(&self.quads, &canonical_mask)
                 .map_err(VortexRdfError::Vortex)?;
 
-            let vortex_array = Self::build_joint_array(
-                self.values.clone(),
-                filtered_quads.clone(),
-                self.buckets.clone(),
-                self.next.clone(),
-            )?;
-
             Ok(Self {
-                vortex_array,
                 buckets: self.buckets.clone(),
                 next: self.next.clone(),
                 values: self.values.clone(),
@@ -535,15 +504,7 @@ impl VortexRdfStore for ChainedHashStore {
             let filtered_quads = filter(&self.quads, &canonical_mask)
                 .map_err(VortexRdfError::Vortex)?;
             
-            let vortex_array = Self::build_joint_array(
-                self.values.clone(),
-                filtered_quads.clone(),
-                self.buckets.clone(),
-                self.next.clone(),
-            )?;
-
             Ok(Self {
-                vortex_array,
                 buckets: self.buckets.clone(),
                 next: self.next.clone(),
                 values: self.values.clone(),
@@ -584,15 +545,7 @@ impl VortexRdfStore for ChainedHashStore {
 
         let iter = (0..len).map(move |i| {
             let s_id = s_ids.as_slice::<u32>()[i];
-            let p_id = match p_ids.ptype() {
-                vortex_dtype::PType::U16 => p_ids.as_slice::<u16>()[i] as u32,
-                vortex_dtype::PType::U32 => p_ids.as_slice::<u32>()[i],
-                _ => {
-                    // This shouldn't happen if we validated above, but let's handle it
-                    // To avoid returning Result in every field access.
-                    0 // Fallback
-                }
-            };
+            let p_id = p_ids.as_slice::<u32>()[i];
             let o_id = o_ids.as_slice::<u32>()[i];
             let g_id = g_ids.as_slice::<u32>()[i];
 
@@ -600,7 +553,8 @@ impl VortexRdfStore for ChainedHashStore {
             let get_term_from_view = |id: u32| -> Result<Term> {
                 let bytes = values_varbin.bytes_at(id as usize);
                 let s = String::from_utf8_lossy(bytes.as_ref()).to_string();
-                utils::get_as_term(&s).ok_or_else(|| VortexRdfError::Deserialization(format!("ID {} invalid term", id)))
+                utils::get_as_term(&s)
+                    .ok_or_else(|| VortexRdfError::Deserialization(format!("ID {} invalid term", id)))
             };
 
             let get_graph_name_from_view = |id: u32| -> Result<GraphName> {
@@ -636,7 +590,7 @@ impl VortexRdfStore for ChainedHashStore {
             Ok(Quad::new(subject, predicate, o_term, g_name))
         });
 
-        Ok(Box::new(futures::stream::iter(iter)))
+        Ok(Box::new(stream::iter(iter)))
     }
 }
 
