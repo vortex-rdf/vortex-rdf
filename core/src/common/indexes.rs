@@ -18,11 +18,9 @@ pub fn detect_index_type(array: &ArrayRef) -> IndexType {
                 array.clone()
             };
             
-            let struct_arr = slice.to_struct(); // Returns StructArray
+            let struct_arr = slice.to_struct();
             if let Some(idx) = struct_arr.names().iter().position(|n| n.as_ref() == "store_type") {
-                 // fields() returns &Arc<[ArrayRef]>
                  if let Some(col) = struct_arr.fields().get(idx) {
-                     // scalar_at apparently returns Scalar in this version
                      let scalar = col.scalar_at(0);
                      let val = format!("{}", scalar); 
                      if val.contains("chained-hash") { return IndexType::ChainedHash; }
@@ -30,11 +28,7 @@ pub fn detect_index_type(array: &ArrayRef) -> IndexType {
                  }
             }
         }
-
-        // Fallback: Check for "buckets"
-        if fields.names().iter().any(|n| n.as_ref() == "buckets") {
-            return IndexType::ChainedHash;
-        }
     }
-    IndexType::Dictionary
+    // Fallback to ChainedHash
+    IndexType::ChainedHash
 }

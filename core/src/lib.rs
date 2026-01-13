@@ -20,6 +20,15 @@ pub use store::{
     chained_hash_store::ChainedHashStore,
 };
 
+use mimalloc::MiMalloc;
+/*
+ As indicated by vortex docs:
+ https://docs.rs/vortex/latest/vortex/index.html#performance-optimization
+*/
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
