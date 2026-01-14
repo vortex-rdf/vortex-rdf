@@ -4,8 +4,17 @@ use vortex_dtype::DType;
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
 pub enum IndexType {
-    Dictionary,
+    SimpleDictionary,
     ChainedHash,
+}
+
+impl IndexType {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            IndexType::SimpleDictionary => "simple-dictionary",
+            IndexType::ChainedHash => "chained-hash",
+        }
+    }
 }
 
 pub fn detect_index_type(array: &ArrayRef) -> IndexType {
@@ -24,7 +33,7 @@ pub fn detect_index_type(array: &ArrayRef) -> IndexType {
                      let scalar = col.scalar_at(0);
                      let val = format!("{}", scalar); 
                      if val.contains("chained-hash") { return IndexType::ChainedHash; }
-                     if val.contains("dictionary") { return IndexType::Dictionary; }
+                     if val.contains("simple-dictionary") { return IndexType::SimpleDictionary; }
                  }
             }
         }

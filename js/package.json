@@ -10,7 +10,7 @@
         "pkg/vortex_rdf.d.ts"
     ],
     "scripts": {
-        "build": "wasm-pack build --target nodejs --out-dir pkg",
+        "build:node": "wasm-pack build --target nodejs --out-dir pkg",
         "build:web": "wasm-pack build --target web --out-dir pkg",
         "test": "echo \"Error: no test specified\" && exit 1"
     },

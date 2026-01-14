@@ -12,7 +12,7 @@ use vortex::buffer::Buffer;
 
 use vortex_rdf_core::{
     io::{serialize, deserialize, load_vortex_file_ref},
-    DictionaryStore,
+    SimpleDictionaryStore,
     ChainedHashStore,
     VortexRdfStore,
 };
@@ -132,8 +132,8 @@ async fn main() -> Result<()> {
             let quads_stream = parse_quads_from_reader(reader, format);
             
             let vortex_array = match index_type {
-                IndexType::Dictionary 
-                    => DictionaryStore::build_vortex_index(quads_stream).await?,
+                IndexType::SimpleDictionary 
+                    => SimpleDictionaryStore::build_vortex_index(quads_stream).await?,
                 IndexType::ChainedHash 
                     => ChainedHashStore::build_vortex_index(quads_stream).await?,
             };
@@ -170,9 +170,9 @@ async fn main() -> Result<()> {
             
             let detect_start = Instant::now();
             match detect_index_type(&vortex_index) {
-                IndexType::Dictionary => {
+                IndexType::SimpleDictionary => {
                     log::debug!("[cli::deserialize] Dictionary index detected in {:?}", detect_start.elapsed());
-                    let store = DictionaryStore::new(vortex_index)
+                    let store = SimpleDictionaryStore::new(vortex_index)
                         .map_err(|e| anyhow::anyhow!(e))?;
                     deserialize(store, writer, format)
                         .await
@@ -232,10 +232,10 @@ async fn main() -> Result<()> {
                 let reader = Box::new(File::open(&input).context("Failed to open input file")?);
                 let quads_stream = parse_quads_from_reader(reader, input_format);
 
-                let t = index_type.unwrap_or(IndexType::Dictionary);
+                let t = index_type.unwrap_or(IndexType::SimpleDictionary);
                 
                 let arr = match t {
-                    IndexType::Dictionary => DictionaryStore::build_vortex_index(quads_stream).await?,
+                    IndexType::SimpleDictionary => SimpleDictionaryStore::build_vortex_index(quads_stream).await?,
                     IndexType::ChainedHash => ChainedHashStore::build_vortex_index(quads_stream).await?,
                 };
                 debug!("Vortex index created in {:?}", load_start.elapsed());
@@ -258,8 +258,8 @@ async fn main() -> Result<()> {
             
             let match_start = Instant::now();
             match resolved_index_type {
-                IndexType::Dictionary => {
-                    let store = DictionaryStore::new(vortex_array)
+                IndexType::SimpleDictionary => {
+                    let store = SimpleDictionaryStore::new(vortex_array)
                         .map_err(|e| anyhow::anyhow!(e))?;
                     debug!("DictionaryStore instance created in {:?}", start.elapsed());
                     

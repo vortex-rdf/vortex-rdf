@@ -2,6 +2,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::store::VortexRdfStore;
 use crate::io::de;
 use crate::common::utils;
+use crate::common::indexes::IndexType;
 
 use oxrdf::{GraphName, NamedNode, Quad, Subject, Term};
 use std::path::Path;
@@ -30,6 +31,7 @@ pub struct ChainedHashStore {
 }
 
 impl ChainedHashStore {
+    const STORE_TYPE: &str = IndexType::ChainedHash.as_str();
     const BUCKET_SIZE: usize = 1_000_003; // Prime number
 
     pub fn new(vortex_index: ArrayRef) -> Result<Self> {
@@ -66,7 +68,7 @@ impl ChainedHashStore {
         let buckets_list = Self::wrap_in_list(buckets_arr)?;
         let next_list = Self::wrap_in_list(next)?;
 
-        let store_type = ConstantArray::new("chained-hash", 1).into_array();
+        let store_type = ConstantArray::new(Self::STORE_TYPE, 1).into_array();
 
         let vortex_array = StructArray::from_fields(&[
             ("store_type", store_type),
@@ -280,6 +282,7 @@ impl ChainedHashStore {
 }
 
 impl VortexRdfStore for ChainedHashStore {
+    
     async fn build_vortex_index(
         mut quad_stream: impl Stream<Item = Result<Quad>> + Unpin + Send + 'static
     ) -> Result<ArrayRef> {

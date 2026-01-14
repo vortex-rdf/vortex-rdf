@@ -16,7 +16,7 @@ pub use io::load_vortex_file_ref;
 
 pub use store::{
     VortexRdfStore,
-    dictionary_store::DictionaryStore,
+    simple_dictionary_store::SimpleDictionaryStore,
     chained_hash_store::ChainedHashStore,
 };
 
@@ -45,10 +45,10 @@ mod tests {
         let quad = Quad::new(s, p, o, g);
         let quads = vec![quad.clone()];
 
-        let dict_index = DictionaryStore::build_vortex_index(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
+        let dict_index = SimpleDictionaryStore::build_vortex_index(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
             .await
             .expect("Serialization failed");
-        let dict_store = DictionaryStore::new(dict_index).unwrap();
+        let dict_store = SimpleDictionaryStore::new(dict_index).unwrap();
         
         let decoded_quads: Vec<Quad> = dict_store.quads()
             .unwrap()
@@ -131,10 +131,10 @@ mod tests {
 
         let quads = vec![q1.clone(), q2.clone()];
 
-        let dict_index = DictionaryStore::build_vortex_index(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
+        let dict_index = SimpleDictionaryStore::build_vortex_index(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
             .await
             .expect("Serialization failed");
-        let dict_store = DictionaryStore::new(dict_index).unwrap();
+        let dict_store = SimpleDictionaryStore::new(dict_index).unwrap();
 
         // Match ?s <p1> ?o ?g
         let filtered = dict_store.match_pattern(None, Some(&p1), None, None).await.unwrap();
@@ -210,7 +210,7 @@ mod tests {
         let g1 = GraphName::DefaultGraph;
         let q1 = Quad::new(s1.clone(), p1.clone(), o1.clone(), g1.clone());
 
-        let store = DictionaryStore::empty();
+        let store = SimpleDictionaryStore::empty();
         assert_eq!(store.size(), 0);
 
         // Add quad
@@ -244,9 +244,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_append_dict_index() {
-        use crate::store::dictionary_store::DictionaryStore;
+        use crate::store::simple_dictionary_store::SimpleDictionaryStore;
         
-        let mut store = DictionaryStore::empty();
+        let mut store = SimpleDictionaryStore::empty();
         
         for i in 0..10 {
             let s = Subject::NamedNode(NamedNode::new(format!("http://example.org/s{}", i)).unwrap());

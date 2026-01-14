@@ -1,5 +1,5 @@
 pub mod chained_hash_store;
-pub mod dictionary_store;
+pub mod simple_dictionary_store;
 
 use crate::error::Result;
 use futures::Stream;

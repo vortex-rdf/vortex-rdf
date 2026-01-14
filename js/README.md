@@ -20,16 +20,16 @@ npm install vortex-rdf
 ### Loading Data
 
 ```javascript
-import { DictionaryStore, ChainedHashStore } from 'vortex-rdf';
+import { SimpleDictionaryStore, ChainedHashStore } from 'vortex-rdf';
 
-// From a Vortex binary file (DictionaryStore)
-const store = await DictionaryStore.fromBytes(vortexBytes);
+// From a Vortex binary file (SimpleDictionaryStore)
+const store = await SimpleDictionaryStore.fromBytes(vortexBytes);
 
 // Or from a Turtle/N-Quads string
-const store = await DictionaryStore.fromString(ttlData, "turtle");
+const store = await SimpleDictionaryStore.fromString(ttlData, "turtle");
 
 // Or create a new empty store
-const store = DictionaryStore.empty();
+const store = SimpleDictionaryStore.empty();
 ```
 
 ### Querying
@@ -57,10 +57,10 @@ await store.deleteQuad(existingQuad);
 
 ### TypeScript Support
 
-Both `DictionaryStore` and `ChainedHashStore` implement the `VortexStore` interface.
+Both `SimpleDictionaryStore` and `ChainedHashStore` implement the `VortexStore` interface.
 
 ```typescript
-import { DictionaryStore, VortexStore } from 'vortex-rdf';
+import { SimpleDictionaryStore, VortexStore } from 'vortex-rdf';
 import { Quad, NamedNode, Term } from '@rdfjs/types';
 
 async function queryExample(store: VortexStore) {
@@ -71,7 +71,7 @@ async function queryExample(store: VortexStore) {
     equals: (other: Term) => other.termType === 'NamedNode' && other.value === 'http://schema.org/name'
   };
 
-  // Note: match returns the concrete store type (DictionaryStore or ChainedHashStore)
+  // Note: match returns the concrete store type (SimpleDictionaryStore or ChainedHashStore)
   const matches = await store.match(null, predicate, null, null);
   
   // We can iterate values

@@ -2,6 +2,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::io::de;
 use crate::store::VortexRdfStore;
 use crate::common::utils;
+use crate::common::indexes::IndexType;
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -10,6 +11,7 @@ use std::time::Instant;
 use futures::{Stream, StreamExt, stream};
 use oxrdf::{GraphName, NamedNode, Quad, Subject, Term};
 
+use vortex_scalar::Scalar;
 use vortex::compute::{and, compare, filter, Operator};
 use vortex_array::arrays::{
     ChunkedArray, 
@@ -26,12 +28,15 @@ use vortex_mask::Mask;
 use vortex_fsst::{fsst_compress, fsst_train_compressor};
 
 
-pub struct DictionaryStore {
+
+pub struct SimpleDictionaryStore {
     pub dictionary: Dictionary,
     pub quads: ArrayRef,
 }
 
-impl DictionaryStore {
+impl SimpleDictionaryStore {
+    const STORE_TYPE: &str = IndexType::SimpleDictionary.as_str();
+    
     pub fn new(vortex_array: ArrayRef) -> Result<Self> {
         let dictionary = Dictionary::from_vortex_array(&vortex_array)?;
         let quads = utils::extract_vortex_struct_field(
@@ -113,7 +118,7 @@ impl DictionaryStore {
                 let start = Instant::now();
                 if let Some(id) = self.dictionary.get_id(&term_str) {
                     let col = fields.get(col_idx).unwrap();
-                    let scalar = vortex_scalar::Scalar::from(id)
+                    let scalar = Scalar::from(id)
                         .cast(col.dtype())
                         .map_err(VortexRdfError::Vortex)?;
 
@@ -131,7 +136,7 @@ impl DictionaryStore {
         Ok(mask)
     }
 
-    fn compare_with_pruning(&self, col: &ArrayRef, scalar: &vortex_scalar::Scalar) -> Result<ArrayRef> {
+    fn compare_with_pruning(&self, col: &ArrayRef, scalar: &Scalar) -> Result<ArrayRef> {
         compare(
             col,
             &ConstantArray::new(scalar.clone(), col.len()).into_array(),
@@ -148,7 +153,7 @@ impl DictionaryStore {
     }
 }
 
-impl VortexRdfStore for DictionaryStore {
+impl VortexRdfStore for SimpleDictionaryStore {
     async fn build_vortex_index(
         mut quad_stream: impl Stream<Item = Result<Quad>> + Unpin + Send + 'static
     ) -> Result<ArrayRef> {
@@ -212,7 +217,7 @@ impl VortexRdfStore for DictionaryStore {
         .into_array();
 
         // Add store type metadata field
-        let store_type = ConstantArray::new("dictionary", 1).into_array();
+        let store_type = ConstantArray::new(Self::STORE_TYPE, 1).into_array();
 
         let vortex_array = StructArray::try_new(
             ["store_type", "dictionary", "quads"].into(),
@@ -229,7 +234,9 @@ impl VortexRdfStore for DictionaryStore {
 
 
     fn size(&self) -> usize {
-        self.get_quads_array().map(|a| a.len()).unwrap_or(0)
+        self.get_quads_array()
+            .map(|a: ArrayRef| a.len())
+            .unwrap_or(0)
     }
 
     fn quads(&self) -> Result<Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + '_>> {
@@ -303,7 +310,7 @@ impl VortexRdfStore for DictionaryStore {
         if let Some(m) = mask {
             let mask_start = Instant::now();
             let quads_array_ref = self.get_quads_array()?;
-            let canonical = m.to_canonical();
+            let canonical: Canonical = (&*m).to_canonical();
             let canonical_mask = match canonical {
                 Canonical::Bool(b) => Mask::from(b.bit_buffer().clone()),
                 _ => {
@@ -378,7 +385,7 @@ impl VortexRdfStore for DictionaryStore {
             // We want rows where mask is FALSE
             let inverse_mask_array = compare(
                 &m,
-                &ConstantArray::new(true, m.len()).into_array(),
+                &IntoArray::into_array(ConstantArray::new(Scalar::from(true), m.len())),
                 Operator::NotEq,
             )
             .map_err(VortexRdfError::Vortex)?;

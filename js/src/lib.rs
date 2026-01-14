@@ -7,7 +7,7 @@ use vortex_rdf_core::io::{
     array_from_reader,
 };
 use vortex_rdf_core::{
-    DictionaryStore as CoreDictionaryStore, 
+    SimpleDictionaryStore as CoreSimpleDictionaryStore, 
     ChainedHashStore as CoreChainedHashStore, 
     VortexRdfStore as VortexRdfStoreTrait,
 };
@@ -30,15 +30,15 @@ export interface VortexStore {
     values(): Promise<IterableIterator<Quad>>;
 }
 
-export class DictionaryStore implements VortexStore {
-    static empty(): DictionaryStore;
-    static fromBytes(bytes: Uint8Array): Promise<DictionaryStore>;
-    static fromString(input: string, format: string): Promise<DictionaryStore>;
+export class SimpleDictionaryStore implements VortexStore {
+    static empty(): SimpleDictionaryStore;
+    static fromBytes(bytes: Uint8Array): Promise<SimpleDictionaryStore>;
+    static fromString(input: string, format: string): Promise<SimpleDictionaryStore>;
     
     addQuad(quad: Quad): Promise<void>;
     deleteQuad(quad: Quad): Promise<void>;
     has(quad: Quad): Promise<boolean>;
-    match(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): Promise<DictionaryStore>;
+    match(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): Promise<SimpleDictionaryStore>;
     values(): Promise<IterableIterator<Quad>>;
 }
 
@@ -65,50 +65,50 @@ pub fn init_panic_hook() {
 // -------------------------
 
 #[wasm_bindgen]
-pub struct DictionaryStore {
+pub struct SimpleDictionaryStore {
     #[wasm_bindgen(skip)]
-    pub inner: CoreDictionaryStore,
+    pub inner: CoreSimpleDictionaryStore,
 }
 
 #[wasm_bindgen]
-impl DictionaryStore {
+impl SimpleDictionaryStore {
     #[wasm_bindgen(js_name = fromBytes)]
-    pub async fn from_bytes(bytes: &[u8]) -> Result<DictionaryStore, JsValue> {
+    pub async fn from_bytes(bytes: &[u8]) -> Result<SimpleDictionaryStore, JsValue> {
         let cursor = Cursor::new(bytes);
         let array = array_from_reader(cursor)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         // Verify index type
         match detect_index_type(&array) {
-            IndexType::Dictionary => {},
-            _ => return Err(JsValue::from_str("Provided bytes are not a DictionaryStore")),
+            IndexType::SimpleDictionary => {},
+            _ => return Err(JsValue::from_str("Provided bytes are not a SimpleDictionaryStore")),
         }
 
-        let inner = CoreDictionaryStore::new(array)
+        let inner = CoreSimpleDictionaryStore::new(array)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(DictionaryStore { inner })
+        Ok(SimpleDictionaryStore { inner })
     }
 
-    pub fn empty() -> DictionaryStore {
-        let inner = CoreDictionaryStore::empty();
-        DictionaryStore { inner }
+    pub fn empty() -> SimpleDictionaryStore {
+        let inner = CoreSimpleDictionaryStore::empty();
+        SimpleDictionaryStore { inner }
     }
 
     #[wasm_bindgen(js_name = fromString)]
-    pub async fn from_string(input: String, format_name: &str) -> Result<DictionaryStore, JsValue> {
+    pub async fn from_string(input: String, format_name: &str) -> Result<SimpleDictionaryStore, JsValue> {
         let format = parse_format(format_name)?;
         let cursor = Cursor::new(input);
         let quads_stream = parse_quads_from_reader(cursor, format);
         
-        // Build DictionaryStore
-        let vortex_array = CoreDictionaryStore::build_vortex_index(quads_stream)
+        // Build SimpleDictionaryStore
+        let vortex_array = CoreSimpleDictionaryStore::build_vortex_index(quads_stream)
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         
-        let inner = CoreDictionaryStore::new(vortex_array)
+        let inner = CoreSimpleDictionaryStore::new(vortex_array)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-        Ok(DictionaryStore { inner })
+        Ok(SimpleDictionaryStore { inner })
     }
 
     pub fn size(&self) -> usize {
@@ -158,7 +158,7 @@ impl DictionaryStore {
         predicate: JsValue,
         object: JsValue,
         graph: JsValue,
-    ) -> Result<DictionaryStore, JsValue> {
+    ) -> Result<SimpleDictionaryStore, JsValue> {
         let s = js_to_subject(subject);
         let p = js_to_named_node(predicate);
         let o = js_to_term(object);
@@ -168,7 +168,7 @@ impl DictionaryStore {
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-        Ok(DictionaryStore { inner: res })
+        Ok(SimpleDictionaryStore { inner: res })
     }
 
     pub async fn values(&self) -> Result<js_sys::Iterator, JsValue> {
@@ -502,8 +502,8 @@ pub async fn vortex_to_nquads(vortex_bytes: &[u8]) -> Result<String, JsValue> {
     
     // Detect and deserialize
     match detect_index_type(&vortex_array) {
-        IndexType::Dictionary => {
-            let store = CoreDictionaryStore::new(vortex_array)
+        IndexType::SimpleDictionary => {
+            let store = CoreSimpleDictionaryStore::new(vortex_array)
                 .map_err(|e| JsValue::from_str(&format!("Store init error: {}", e)))?;
             deserialize(store, &mut output_buffer, RdfFormat::NQuads)
                 .await

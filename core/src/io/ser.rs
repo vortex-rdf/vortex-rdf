@@ -1,5 +1,5 @@
 use crate::error::{Result, VortexRdfError};
-use crate::store::dictionary_store::DictionaryStore;
+use crate::store::simple_dictionary_store::SimpleDictionaryStore;
 use crate::store::VortexRdfStore;
 use crate::error;
 
@@ -69,7 +69,8 @@ where
     S: futures::Stream<Item = error::Result<Quad>> + Unpin + Send + 'static,
     W: VortexWrite + Unpin + Send,
 {
-    let stream = DictionaryStore::build_vortex_index(quads).await?;
+    // TODO: allow for index type selection
+    let stream = SimpleDictionaryStore::build_vortex_index(quads).await?;
     serialize(stream, writer).await?;
     Ok(())
 }
