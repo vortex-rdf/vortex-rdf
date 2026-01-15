@@ -234,9 +234,7 @@ impl VortexRdfStore for SimpleDictionaryStore {
 
 
     fn size(&self) -> usize {
-        self.get_quads_array()
-            .map(|a: ArrayRef| a.len())
-            .unwrap_or(0)
+        self.quads.len()
     }
 
     fn quads(&self) -> Result<Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + '_>> {

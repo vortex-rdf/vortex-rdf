@@ -40,3 +40,15 @@ mimalloc.workspace = true
 [features]
 default = ["file-io"]
 file-io = ["vortex-io/tokio", "vortex/zstd", "vortex/files"]
+
+[dev-dependencies]
+divan = { version = "*", package = "codspeed-divan-compat" }
+tokio = { workspace = true, features = ["time", "rt-multi-thread"] }
+
+[[bench]]
+name = "simple_dict_bench"
+harness = false
+
+[[bench]]
+name = "chained_hash_bench"
+harness = false

@@ -144,3 +144,27 @@ pub fn extract_vortex_struct_field(
     log::debug!("[utils::extract_vortex_struct_field] Extracting Vortex struct field '{}' took {:?}", _name, start.elapsed());
     Ok(list.elements().slice(offset..offset + size))
 }
+
+/*
+* Test functions for benchmarks
+*/
+
+// Generate a stream of RDF quads for benchmarking
+pub fn generate_rdf_data_stream(size: usize) -> impl Stream<Item = Result<Quad>> {
+    const EX: &str = "http://example.org/";
+    
+    stream::iter((0..size).map(|i| {
+        let subject = Subject::NamedNode(
+            NamedNode::new_unchecked(format!("{}subject/{}", EX, i))
+        );
+        let predicate = NamedNode::new_unchecked(format!("{}predicate/{}", EX, i % 100));
+        let object = Term::NamedNode(
+            NamedNode::new_unchecked(format!("{}object/{}", EX, i % 50))
+        );
+        let graph = GraphName::NamedNode(
+            NamedNode::new_unchecked(format!("{}graph", EX))
+        );
+        
+        Ok(Quad::new(subject, predicate, object, graph))
+    }))
+}
