@@ -1,6 +1,8 @@
 
 use divan::Bencher;
 use tokio::runtime::Runtime;
+use oxrdf::{Subject, NamedNode};
+
 use vortex_rdf_core::common::utils::generate_rdf_data_stream;
 use vortex_rdf_core::store::{
     chained_hash_store::ChainedHashStore, 
@@ -59,4 +61,44 @@ fn instantiate_store<const SIZE: usize>(bencher: Bencher) {
             ChainedHashStore::new(vortex_array)
                 .expect("Failed to create ChainedHashStore")
         });
+}
+
+/// Benchmark ChainedHashStore::match()
+#[divan::bench(
+    consts = [10_000, 100_000, 1_000_000],
+    sample_count = 10
+)]
+fn match_pattern<const SIZE: usize>(bencher: Bencher) {
+    let rt = Runtime::new().unwrap();
+    
+    bencher
+        .with_inputs(|| {
+            // Pre-generate the ArrayRef - this time is NOT counted in the benchmark
+            let quad_stream = generate_rdf_data_stream(SIZE);
+            rt.block_on(async {
+                let varray = ChainedHashStore::build_vortex_index(quad_stream)
+                    .await
+                    .expect("Failed to build vortex index");
+                ChainedHashStore::new(varray)
+                    .expect("Failed to create ChainedHashStore")
+            })
+        })
+        .bench_values(|store| {
+            // Only this block is timed - measuring SimpleDictionaryStore::match()
+            let subject = Some(&Subject::NamedNode(
+                NamedNode::new_unchecked("http://example.org/subject/0")
+            ));
+            let predicate = Some(&NamedNode::new_unchecked("http://example.org/predicate/0"));
+            
+            rt.block_on(async {
+                store.match_pattern(
+                    subject,
+                    predicate,
+                    None,
+                    None
+                )
+                .await
+                .expect("Failed to match pattern")
+            })
+    });
 }
