@@ -15,7 +15,7 @@ fn main() {
 
 /// Benchmark SimpleDictionaryStore::build_vortex_index with different dataset sizes
 #[divan::bench(
-    consts = [10_000, 100_000, 1_000_000, 10_000_000],
+    consts = [10_000, 100_000, 1_000_000],
     sample_count = 10
 )]
 fn build_vortex_index<const SIZE: usize>(bencher: Bencher) {
@@ -38,7 +38,7 @@ fn build_vortex_index<const SIZE: usize>(bencher: Bencher) {
 
 /// Benchmark SimpleDictionaryStore::new() with pre-built vortex arrays
 #[divan::bench(
-    consts = [10_000, 100_000, 1_000_000, 10_000_000],
+    consts = [10_000, 100_000, 1_000_000],
     sample_count = 10
 )]
 fn instantiate_store<const SIZE: usize>(bencher: Bencher) {
