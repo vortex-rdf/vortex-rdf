@@ -4,10 +4,7 @@ use tokio::runtime::Runtime;
 use oxrdf::{Subject, NamedNode};
 
 use vortex_rdf_core::common::utils::generate_rdf_data_stream;
-use vortex_rdf_core::store::{
-    chained_hash_store::ChainedHashStore, 
-    VortexRdfStore
-};
+use vortex_rdf_core::store::ChainedHashStore;
 
 
 fn main() {

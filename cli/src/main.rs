@@ -14,7 +14,6 @@ use vortex_rdf_core::{
     io::{serialize, deserialize, load_vortex_file_ref},
     SimpleDictionaryStore,
     ChainedHashStore,
-    VortexRdfStore,
 };
 use vortex_rdf_core::common::formats::{Format, detect_format};
 use vortex_rdf_core::common::indexes::{IndexType, detect_index_type};

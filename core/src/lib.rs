@@ -2,6 +2,7 @@ pub mod error;
 pub mod io;
 pub mod store;
 pub mod common;
+pub mod index;
 
 pub use error::VortexRdfError;
 pub use io::{
@@ -16,8 +17,14 @@ pub use io::load_vortex_file_ref;
 
 pub use store::{
     VortexRdfStore,
-    simple_dictionary_store::SimpleDictionaryStore,
-    chained_hash_store::ChainedHashStore,
+    SimpleDictionaryStore,
+    ChainedHashStore,
+};
+
+pub use index::{
+    RdfDictionary,
+    SimpleDictionary,
+    ChainedHash,
 };
 
 use mimalloc::MiMalloc;
@@ -244,8 +251,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_append_dict_index() {
-        use crate::store::simple_dictionary_store::SimpleDictionaryStore;
-        
         let mut store = SimpleDictionaryStore::empty();
         
         for i in 0..10 {
@@ -272,8 +277,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_append_chained_hash_index() {
-        use crate::store::chained_hash_store::ChainedHashStore;
-        
         let mut store = ChainedHashStore::empty();
         
         for i in 0..10 {

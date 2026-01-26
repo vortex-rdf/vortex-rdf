@@ -9,7 +9,6 @@ use vortex_rdf_core::io::{
 use vortex_rdf_core::{
     SimpleDictionaryStore as CoreSimpleDictionaryStore, 
     ChainedHashStore as CoreChainedHashStore, 
-    VortexRdfStore as VortexRdfStoreTrait,
 };
 use vortex_rdf_core::common::indexes::{IndexType, detect_index_type};
 use vortex_rdf_core::common::utils::parse_quads_from_reader;

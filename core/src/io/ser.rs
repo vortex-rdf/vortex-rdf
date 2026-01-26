@@ -1,6 +1,5 @@
 use crate::error::{Result, VortexRdfError};
-use crate::store::simple_dictionary_store::SimpleDictionaryStore;
-use crate::store::VortexRdfStore;
+use crate::store::SimpleDictionaryStore;
 use crate::error;
 
 use std::time::Instant;
