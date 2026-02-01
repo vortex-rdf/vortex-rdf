@@ -6,10 +6,8 @@ use vortex_rdf_core::io::{
     quads_stream_to_vortex,
     array_from_reader,
 };
-use vortex_rdf_core::{
-    SimpleDictionaryStore as CoreSimpleDictionaryStore, 
-    ChainedHashStore as CoreChainedHashStore, 
-};
+use vortex_rdf_core::VortexRdfStore;
+use vortex_rdf_core::index::{SimpleDictionary, ChainedHash};
 use vortex_rdf_core::common::indexes::{IndexType, detect_index_type};
 use vortex_rdf_core::common::utils::parse_quads_from_reader;
 use wasm_bindgen::prelude::*;
@@ -66,7 +64,7 @@ pub fn init_panic_hook() {
 #[wasm_bindgen]
 pub struct SimpleDictionaryStore {
     #[wasm_bindgen(skip)]
-    pub inner: CoreSimpleDictionaryStore,
+    pub inner: VortexRdfStore<SimpleDictionary>,
 }
 
 #[wasm_bindgen]
@@ -83,13 +81,13 @@ impl SimpleDictionaryStore {
             _ => return Err(JsValue::from_str("Provided bytes are not a SimpleDictionaryStore")),
         }
 
-        let inner = CoreSimpleDictionaryStore::new(array)
+        let inner = VortexRdfStore::<SimpleDictionary>::new(array)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(SimpleDictionaryStore { inner })
     }
 
     pub fn empty() -> SimpleDictionaryStore {
-        let inner = CoreSimpleDictionaryStore::empty();
+        let inner = VortexRdfStore::<SimpleDictionary>::empty();
         SimpleDictionaryStore { inner }
     }
 
@@ -100,11 +98,11 @@ impl SimpleDictionaryStore {
         let quads_stream = parse_quads_from_reader(cursor, format);
         
         // Build SimpleDictionaryStore
-        let vortex_array = CoreSimpleDictionaryStore::build_vortex_index(quads_stream)
+        let vortex_array = VortexRdfStore::<SimpleDictionary>::build_vortex_index(quads_stream)
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         
-        let inner = CoreSimpleDictionaryStore::new(vortex_array)
+        let inner = VortexRdfStore::<SimpleDictionary>::new(vortex_array)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         Ok(SimpleDictionaryStore { inner })
@@ -190,7 +188,7 @@ impl SimpleDictionaryStore {
 #[wasm_bindgen]
 pub struct ChainedHashStore {
     #[wasm_bindgen(skip)]
-    pub inner: CoreChainedHashStore,
+    pub inner: VortexRdfStore<ChainedHash>,
 }
 
 #[wasm_bindgen]
@@ -207,13 +205,13 @@ impl ChainedHashStore {
             _ => return Err(JsValue::from_str("Provided bytes are not a ChainedHashStore")),
         }
 
-        let inner = CoreChainedHashStore::new(array)
+        let inner = VortexRdfStore::<ChainedHash>::new(array)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(ChainedHashStore { inner })
     }
 
     pub fn empty() -> ChainedHashStore {
-        let inner = CoreChainedHashStore::empty();
+        let inner = VortexRdfStore::<ChainedHash>::empty();
         ChainedHashStore { inner }
     }
 
@@ -224,11 +222,11 @@ impl ChainedHashStore {
         let quads_stream = parse_quads_from_reader(cursor, format);
         
         // Build ChainedHashStore
-        let vortex_array = CoreChainedHashStore::build_vortex_index(quads_stream)
+        let vortex_array = VortexRdfStore::<ChainedHash>::build_vortex_index(quads_stream)
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         
-        let inner = CoreChainedHashStore::new(vortex_array)
+        let inner = VortexRdfStore::<ChainedHash>::new(vortex_array)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         Ok(ChainedHashStore { inner })
@@ -502,14 +500,14 @@ pub async fn vortex_to_nquads(vortex_bytes: &[u8]) -> Result<String, JsValue> {
     // Detect and deserialize
     match detect_index_type(&vortex_array) {
         IndexType::SimpleDictionary => {
-            let store = CoreSimpleDictionaryStore::new(vortex_array)
+            let store = VortexRdfStore::<SimpleDictionary>::new(vortex_array)
                 .map_err(|e| JsValue::from_str(&format!("Store init error: {}", e)))?;
             deserialize(store, &mut output_buffer, RdfFormat::NQuads)
                 .await
                 .map_err(|e| JsValue::from_str(&format!("Deserialize error: {}", e)))?;
         },
         IndexType::ChainedHash => {
-             let store = CoreChainedHashStore::new(vortex_array)
+             let store = VortexRdfStore::<ChainedHash>::new(vortex_array)
                 .map_err(|e| JsValue::from_str(&format!("Store init error: {}", e)))?;
             deserialize(store, &mut output_buffer, RdfFormat::NQuads)
                 .await

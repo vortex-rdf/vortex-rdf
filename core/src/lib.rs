@@ -15,11 +15,7 @@ pub use io::{
 #[cfg(feature = "file-io")]
 pub use io::load_vortex_file_ref;
 
-pub use store::{
-    VortexRdfStore,
-    SimpleDictionaryStore,
-    ChainedHashStore,
-};
+pub use store::VortexRdfStore;
 
 pub use index::{
     RdfDictionary,
@@ -52,10 +48,10 @@ mod tests {
         let quad = Quad::new(s, p, o, g);
         let quads = vec![quad.clone()];
 
-        let dict_index = SimpleDictionaryStore::build_vortex_index(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
+        let dict_index = VortexRdfStore::<SimpleDictionary>::build_vortex_index(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
             .await
             .expect("Serialization failed");
-        let dict_store = SimpleDictionaryStore::new(dict_index).unwrap();
+        let dict_store = VortexRdfStore::<SimpleDictionary>::new(dict_index).unwrap();
         
         let decoded_quads: Vec<Quad> = dict_store.quads()
             .unwrap()
@@ -91,10 +87,10 @@ mod tests {
         let quad = Quad::new(s, p, o, g);
         let quads = vec![quad.clone()];
 
-        let chained_hash = ChainedHashStore::build_vortex_index(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
+        let chained_hash = VortexRdfStore::<ChainedHash>::build_vortex_index(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
             .await
             .expect("Serialization failed");
-        let chained_hash_store = ChainedHashStore::new(chained_hash).unwrap();
+        let chained_hash_store = VortexRdfStore::<ChainedHash>::new(chained_hash).unwrap();
         
         let decoded_quads: Vec<Quad> = chained_hash_store.quads()
             .unwrap()
@@ -138,10 +134,10 @@ mod tests {
 
         let quads = vec![q1.clone(), q2.clone()];
 
-        let dict_index = SimpleDictionaryStore::build_vortex_index(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
+        let dict_index = VortexRdfStore::<SimpleDictionary>::build_vortex_index(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
             .await
             .expect("Serialization failed");
-        let dict_store = SimpleDictionaryStore::new(dict_index).unwrap();
+        let dict_store = VortexRdfStore::<SimpleDictionary>::new(dict_index).unwrap();
 
         // Match ?s <p1> ?o ?g
         let filtered = dict_store.match_pattern(None, Some(&p1), None, None).await.unwrap();
@@ -182,10 +178,10 @@ mod tests {
 
         let quads = vec![q1.clone(), q2.clone()];
 
-        let chained_hash = ChainedHashStore::build_vortex_index(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
+        let chained_hash = VortexRdfStore::<ChainedHash>::build_vortex_index(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
             .await
             .expect("Serialization failed");
-        let chained_hash_store = ChainedHashStore::new(chained_hash).unwrap();
+        let chained_hash_store = VortexRdfStore::<ChainedHash>::new(chained_hash).unwrap();
 
         // Match ?s <p1> ?o ?g
         let filtered = chained_hash_store.match_pattern(None, Some(&p1), None, None).await.unwrap();
@@ -217,7 +213,7 @@ mod tests {
         let g1 = GraphName::DefaultGraph;
         let q1 = Quad::new(s1.clone(), p1.clone(), o1.clone(), g1.clone());
 
-        let store = SimpleDictionaryStore::empty();
+        let store = VortexRdfStore::<SimpleDictionary>::empty();
         assert_eq!(store.size(), 0);
 
         // Add quad
@@ -237,7 +233,7 @@ mod tests {
         let g1 = GraphName::DefaultGraph;
         let q1 = Quad::new(s1.clone(), p1.clone(), o1.clone(), g1.clone());
 
-        let store = ChainedHashStore::empty();
+        let store = VortexRdfStore::<ChainedHash>::empty();
         assert_eq!(store.size(), 0);
 
         // Add quad
@@ -251,7 +247,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_append_dict_index() {
-        let mut store = SimpleDictionaryStore::empty();
+        let mut store = VortexRdfStore::<SimpleDictionary>::empty();
         
         for i in 0..10 {
             let s = Subject::NamedNode(NamedNode::new(format!("http://example.org/s{}", i)).unwrap());
@@ -277,7 +273,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_append_chained_hash_index() {
-        let mut store = ChainedHashStore::empty();
+        let mut store = VortexRdfStore::<ChainedHash>::empty();
         
         for i in 0..10 {
             let s = Subject::NamedNode(NamedNode::new(format!("http://example.org/s{}", i)).unwrap());

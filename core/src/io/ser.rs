@@ -1,5 +1,6 @@
 use crate::error::{Result, VortexRdfError};
-use crate::store::SimpleDictionaryStore;
+use crate::store::VortexRdfStore;
+use crate::index::{SimpleDictionary};
 use crate::error;
 
 use std::time::Instant;
@@ -69,7 +70,7 @@ where
     W: VortexWrite + Unpin + Send,
 {
     // TODO: allow for index type selection
-    let stream = SimpleDictionaryStore::build_vortex_index(quads).await?;
+    let stream = VortexRdfStore::<SimpleDictionary>::build_vortex_index(quads).await?;
     serialize(stream, writer).await?;
     Ok(())
 }
