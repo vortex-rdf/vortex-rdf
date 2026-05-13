@@ -1,5 +1,5 @@
 use crate::error::{Result, VortexRdfError};
-use crate::store::VortexRdfStore;
+use crate::store::QuadStore;
 use crate::error;
 
 use oxrdfio::{RdfFormat, RdfSerializer};
@@ -29,7 +29,7 @@ pub async fn deserialize<Store, W>(
     format: RdfFormat,
 ) -> error::Result<()>
 where
-    Store: VortexRdfStore,
+    Store: QuadStore,
     W: Write,
 {
     let decode_start = Instant::now();

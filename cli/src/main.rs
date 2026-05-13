@@ -7,14 +7,15 @@ use std::io::{stdin, stdout, Read, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
+use tokio::fs::{File as TokioFile};
+
 use vortex::buffer::Buffer;
 
 
 use vortex_rdf_core::{
     io::{serialize, deserialize, load_vortex_file_ref},
-    SimpleDictionaryStore,
-    ChainedHashStore,
-    VortexRdfStore,
+    index::{SimpleDictionary, ChainedHash},
+    VortexRdfStore
 };
 use vortex_rdf_core::common::formats::{Format, detect_format};
 use vortex_rdf_core::common::indexes::{IndexType, detect_index_type};
@@ -126,16 +127,16 @@ async fn main() -> Result<()> {
                 Some(p) => Box::new(File::open(p).context("Failed to open input file")?),
                 None => Box::new(stdin()),
             };
-            let writer = tokio::fs::File::create(&output)
+            let writer = TokioFile::create(&output)
                 .await
                 .context("Failed to create output file")?;
             let quads_stream = parse_quads_from_reader(reader, format);
             
             let vortex_array = match index_type {
                 IndexType::SimpleDictionary 
-                    => SimpleDictionaryStore::build_vortex_index(quads_stream).await?,
+                    => VortexRdfStore::<SimpleDictionary>::build_vortex_index(quads_stream).await?,
                 IndexType::ChainedHash 
-                    => ChainedHashStore::build_vortex_index(quads_stream).await?,
+                    => VortexRdfStore::<ChainedHash>::build_vortex_index(quads_stream).await?,
             };
 
             serialize(vortex_array, writer)
@@ -172,7 +173,7 @@ async fn main() -> Result<()> {
             match detect_index_type(&vortex_index) {
                 IndexType::SimpleDictionary => {
                     log::debug!("[cli::deserialize] Dictionary index detected in {:?}", detect_start.elapsed());
-                    let store = SimpleDictionaryStore::new(vortex_index)
+                    let store = VortexRdfStore::<SimpleDictionary>::new(vortex_index)
                         .map_err(|e| anyhow::anyhow!(e))?;
                     deserialize(store, writer, format)
                         .await
@@ -180,7 +181,7 @@ async fn main() -> Result<()> {
                 },
                 IndexType::ChainedHash => {
                     log::debug!("[cli::deserialize] ChainedHash index detected in {:?}", detect_start.elapsed());
-                    let store = ChainedHashStore::new(vortex_index)
+                    let store = VortexRdfStore::<ChainedHash>::new(vortex_index)
                         .map_err(|e| anyhow::anyhow!(e))?;
                     deserialize(store, writer, format)
                         .await
@@ -235,8 +236,8 @@ async fn main() -> Result<()> {
                 let t = index_type.unwrap_or(IndexType::SimpleDictionary);
                 
                 let arr = match t {
-                    IndexType::SimpleDictionary => SimpleDictionaryStore::build_vortex_index(quads_stream).await?,
-                    IndexType::ChainedHash => ChainedHashStore::build_vortex_index(quads_stream).await?,
+                    IndexType::SimpleDictionary => VortexRdfStore::<SimpleDictionary>::build_vortex_index(quads_stream).await?,
+                    IndexType::ChainedHash => VortexRdfStore::<ChainedHash>::build_vortex_index(quads_stream).await?,
                 };
                 debug!("Vortex index created in {:?}", load_start.elapsed());
                 (arr, t)
@@ -259,7 +260,7 @@ async fn main() -> Result<()> {
             let match_start = Instant::now();
             match resolved_index_type {
                 IndexType::SimpleDictionary => {
-                    let store = SimpleDictionaryStore::new(vortex_array)
+                    let store = VortexRdfStore::<SimpleDictionary>::new(vortex_array)
                         .map_err(|e| anyhow::anyhow!(e))?;
                     debug!("DictionaryStore instance created in {:?}", start.elapsed());
                     
@@ -276,7 +277,7 @@ async fn main() -> Result<()> {
                         .context("Failed to deserialize filtered results")?;
                 },
                 IndexType::ChainedHash => {
-                    let store = ChainedHashStore::new(vortex_array)
+                    let store = VortexRdfStore::<ChainedHash>::new(vortex_array)
                          .map_err(|e| anyhow::anyhow!(e))?;
                     debug!("ChainedHashStore instance created in {:?}", start.elapsed());
                     

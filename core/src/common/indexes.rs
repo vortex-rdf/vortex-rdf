@@ -1,6 +1,9 @@
 use clap::ValueEnum;
-use vortex_array::{ToCanonical, ArrayRef};
+use vortex_array::{ToCanonical, ArrayRef, IntoArray};
+use vortex_array::arrays::{PrimitiveArray, ListArray};
+use vortex_array::validity::Validity;
 use vortex_dtype::DType;
+use crate::error::{Result, VortexRdfError};
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
 pub enum IndexType {
@@ -40,4 +43,12 @@ pub fn detect_index_type(array: &ArrayRef) -> IndexType {
     }
     // Fallback to ChainedHash
     IndexType::ChainedHash
+}
+
+pub fn wrap_array_in_list(array: ArrayRef) -> Result<ArrayRef> {
+    let offsets = PrimitiveArray::from_iter(vec![0i32, array.len() as i32]).into_array();
+    let list = ListArray::try_new(array, offsets, Validity::NonNullable)
+        .map_err(VortexRdfError::Vortex)?
+        .into_array();
+    Ok(list)
 }
