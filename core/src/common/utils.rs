@@ -117,14 +117,20 @@ pub fn parse_quads_from_reader<R: std::io::Read + Send + 'static>(
 */
 pub fn extract_vortex_struct_field(
     vortex_struct: &StructArray,
-    index: usize,
-    _name: &str
+    name: &str
 ) -> Result<ArrayRef> {
     let start = std::time::Instant::now();
+    
+    // Find index by name
+    let names = vortex_struct.names();
+    let idx = names.iter().position(|n| n.as_ref() == name)
+        .ok_or_else(|| VortexRdfError::Deserialization(format!("Field '{}' not found in struct", name)))?;
+
     let fields = vortex_struct.fields();
-    let list_ref = fields.get(index)
-        .ok_or_else(|| VortexRdfError::Deserialization(format!("Missing field '{}'", _name)))?
+    let list_ref = fields.get(idx)
+        .ok_or_else(|| VortexRdfError::Deserialization(format!("Missing field '{}'", name)))?
         .clone();
+
     let list = list_ref.to_listview();
     
     let offset = list.offsets().scalar_at(0)
@@ -132,16 +138,16 @@ pub fn extract_vortex_struct_field(
         .map_err(VortexRdfError::Vortex)?
         .as_primitive()
         .typed_value::<i32>()
-        .ok_or_else(|| VortexRdfError::Deserialization(format!("Missing offset for field '{}'", _name)))? as usize;
+        .ok_or_else(|| VortexRdfError::Deserialization(format!("Missing offset for field '{}'", name)))? as usize;
         
     let size = list.sizes().scalar_at(0)
         .cast(&DType::Primitive(PType::I32, Nullability::NonNullable))
         .map_err(VortexRdfError::Vortex)?
         .as_primitive()
         .typed_value::<i32>()
-        .ok_or_else(|| VortexRdfError::Deserialization(format!("Missing size for field '{}'", _name)))? as usize;
+        .ok_or_else(|| VortexRdfError::Deserialization(format!("Missing size for field '{}'", name)))? as usize;
     
-    log::debug!("[utils::extract_vortex_struct_field] Extracting Vortex struct field '{}' took {:?}", _name, start.elapsed());
+    log::debug!("[utils::extract_vortex_struct_field] Extracting Vortex struct field '{}' took {:?}", name, start.elapsed());
     Ok(list.elements().slice(offset..offset + size))
 }
 

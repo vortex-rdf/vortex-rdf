@@ -1,16 +1,16 @@
-use crate::error::{Result, VortexRdfError};
+use crate::error::Result;
 use crate::index::RdfDictionary;
-use crate::common::{utils, indexes::IndexType};
+use crate::common::{utils, indexes};
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
 use oxrdf::{GraphName, Term};
 
-use vortex::array::builders::{VarBinViewBuilder, PrimitiveBuilder};
-use vortex_array::builders::ArrayBuilder;
+use vortex::array::builders::{ArrayBuilder, VarBinViewBuilder, PrimitiveBuilder};
+
 use vortex_array::ArrayRef;
-use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
+use vortex_array::arrays::{PrimitiveArray, VarBinViewArray, StructArray};
 use vortex_array::{IntoArray, ToCanonical};
 use vortex_dtype::{DType, Nullability, PType};
 
@@ -81,22 +81,30 @@ impl RdfDictionary for ChainedHash {
         
         // The dictionary might be wrapped in a ListArray, or it might be the Struct directly
         // Try to unwrap as ListArray first, if that fails, use it directly
-        let dict_struct = if dict_array_ref.encoding().id().as_ref() == "vortex.listview" {
+        // The dictionary might be a Struct (new format), ListArray (old format), or direct array
+        let id = dict_array_ref.encoding().id();
+        log::debug!("[ChainedHash::from_vortex_array] Encoding ID: {}", id);
+
+        let dict_struct = if id.as_ref() == "vortex.struct" {
+            dict_array_ref.to_struct()
+        } else if let Some(s) = dict_array_ref.as_any().downcast_ref::<StructArray>() {
+             s.clone()
+        } else if id.as_ref() == "vortex.listview" {
             // It's a ListArray, unwrap it
             let dict_list = dict_array_ref.to_listview();
             // children()[1] is the values for ListArray
             let dict_struct_array = dict_list.children()[1].clone();
             dict_struct_array.to_struct()
         } else {
-            // It's already the Struct
+            // Use directly (though for ChainedHash it should be a struct)
             dict_array_ref.to_struct()
         };
         
         // Extract the three fields from the dictionary struct
         // These might be ListArrays or the actual data arrays directly
-        let values_field = utils::extract_vortex_struct_field(&dict_struct, 0, "values")?;
-        let buckets_field = utils::extract_vortex_struct_field(&dict_struct, 1, "buckets")?;
-        let next_field = utils::extract_vortex_struct_field(&dict_struct, 2, "next")?;
+        let values_field = utils::extract_vortex_struct_field(&dict_struct, "values")?;
+        let buckets_field = utils::extract_vortex_struct_field(&dict_struct, "buckets")?;
+        let next_field = utils::extract_vortex_struct_field(&dict_struct, "next")?;
         
         // Unwrap each field if it's a ListArray, otherwise use directly
         let values = if values_field.encoding().id().as_ref() == "vortex.listview" {
@@ -321,40 +329,15 @@ impl RdfDictionary for ChainedHash {
         }
     }
 
-    fn to_vortex_array(&self) -> Result<ArrayRef> {
-        use vortex_array::arrays::{ListArray, StructArray};
-        use vortex_array::validity::Validity;
-        
-        // The arrays are already in Vortex format, just wrap them in ListArrays
-        let values_offsets = PrimitiveArray::from_iter(vec![0i32, self.values.len() as i32]).into_array();
-        let values_list = ListArray::try_new(self.values.clone(), values_offsets, Validity::NonNullable)
-            .map_err(VortexRdfError::Vortex)?
-            .into_array();
-            
-        let buckets_offsets = PrimitiveArray::from_iter(vec![0i32, self.buckets.len() as i32]).into_array();
-        let buckets_list = ListArray::try_new(self.buckets.clone(), buckets_offsets, Validity::NonNullable)
-            .map_err(VortexRdfError::Vortex)?
-            .into_array();
-            
-        let next_offsets = PrimitiveArray::from_iter(vec![0i32, self.next.len() as i32]).into_array();
-        let next_list = ListArray::try_new(self.next.clone(), next_offsets.clone(), Validity::NonNullable)
-            .map_err(VortexRdfError::Vortex)?
-            .into_array();
-        
-        // Now create the struct with all fields having the same length (1)
-        let dict_struct = StructArray::try_new(
-            ["values", "buckets", "next"].into(),
-            vec![values_list, buckets_list, next_list],
-            next_offsets.len() - 1,
-            Validity::NonNullable
-        )
-        .map_err(VortexRdfError::Vortex)?
-        .into_array();
-        
-        Ok(dict_struct)
+    fn to_vortex_array(&self) -> Result<Vec<(String, ArrayRef)>> {        
+        Ok(vec![
+            ("values".to_string(), self.values.clone()),
+            ("buckets".to_string(), self.buckets.clone()),
+            ("next".to_string(), self.next.clone()),
+        ])
     }
 
     fn store_type() -> &'static str {
-        IndexType::ChainedHash.as_str()
+        indexes::IndexType::ChainedHash.as_str()
     }
 }

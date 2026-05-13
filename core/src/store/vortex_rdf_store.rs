@@ -1,7 +1,7 @@
 use crate::error::{Result, VortexRdfError};
 use crate::io::de;
 use crate::index::RdfDictionary;
-use crate::common::utils;
+use crate::common::{utils, indexes};
 
 use std::time::Instant;
 use futures::{Stream, StreamExt, stream};
@@ -12,7 +12,6 @@ use vortex::compute::{and, compare, filter, Operator};
 use vortex_array::arrays::{
     ChunkedArray, 
     ConstantArray, 
-    ListArray, 
     PrimitiveArray, 
     StructArray,
 };
@@ -29,15 +28,18 @@ pub struct VortexRdfStore<Dict: RdfDictionary> {
 impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
     /// Create a new store from a Vortex array
     pub fn new(vortex_array: ArrayRef) -> Result<Self> {
+        // First field is store_type
+        // Dictionary fields are flattened in the middle
+        // Last field is quads
         let vortex_struct = vortex_array.to_struct();
         
-        // Field 0 is store type
-        // Field 1 is dictionary
-        let dict_array_ref = utils::extract_vortex_struct_field(&vortex_struct, 1, "dictionary")?;
-        let dictionary = Dict::from_vortex_array(&dict_array_ref)?;
+        // We pass the whole struct to Dict::from_vortex_array. 
+        // Implementations must assume the struct contains their fields mingled with others
+        // and know the fixed position of the fields.
+        let dictionary = Dict::from_vortex_array(&vortex_array)?;
         
-        // Field 2 is quads
-        let quads = utils::extract_vortex_struct_field(&vortex_struct, 2, "quads")?;
+        // Quads field
+        let quads = utils::extract_vortex_struct_field(&vortex_struct, "quads")?;
         
         Ok(Self {
             dictionary,
@@ -137,40 +139,38 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
 
         // Encode the dictionary
         let start_dict_encode = Instant::now();
-        let dict_arr = dictionary.to_vortex_array()?;
+        let dict_fields_raw = dictionary.to_vortex_array()?;
+        
+        let mut field_names: Vec<std::sync::Arc<str>> = Vec::new();
+        let mut field_arrays: Vec<ArrayRef> = Vec::new();
+        
+        // 1. Add store type
+        field_names.push("store_type".into());
+        field_arrays.push(ConstantArray::new(Dict::store_type(), 1).into_array());
+        
+        // 2. Add dictionary fields (flattened)
+        for (name, arr) in dict_fields_raw {
+            field_names.push(name.into());
+            field_arrays.push(indexes::wrap_array_in_list(arr)?);
+        }
         log::debug!("[VortexRdfStore::build_vortex_index] Dictionary encoding took {:?}", start_dict_encode.elapsed());
 
-        // Wrap everything into a top-level StructArray using ListArrays for flexibility
+        // 3. Add quads
         let start_list = Instant::now();
-        let dict_offsets = PrimitiveArray::from_iter(vec![0i32, dict_arr.len() as i32]).into_array();
-        let dict_list = ListArray::try_new(
-            dict_arr,
-            dict_offsets,
-            Validity::NonNullable,
-        )
-        .map_err(VortexRdfError::Vortex)?
-        .into_array();
-
-        let quads_offsets = PrimitiveArray::from_iter(vec![0i32, quads_flat.len() as i32]).into_array();
-        let quads_list = ListArray::try_new(
-            quads_flat,
-            quads_offsets.clone(),
-            Validity::NonNullable
-        )
-        .map_err(VortexRdfError::Vortex)?
-        .into_array();
-
-        // Add store type metadata field
-        let store_type = ConstantArray::new(Dict::store_type(), 1).into_array();
+        // Wrap quads in ListArray (length 1)
+        let quads_list = indexes::wrap_array_in_list(quads_flat)?;
+        field_names.push("quads".into());
+        field_arrays.push(quads_list);
 
         let vortex_array = StructArray::try_new(
-            ["store_type", "dictionary", "quads"].into(),
-            vec![store_type, dict_list, quads_list],
-            quads_offsets.len() - 1,
+            field_names.into(),
+            field_arrays,
+            1,
             Validity::NonNullable
         )
         .map_err(VortexRdfError::Vortex)?
         .into_array();
+        
         log::debug!("[VortexRdfStore::build_vortex_index] Top-level Vortex StructArray creation took {:?}", start_list.elapsed());
 
         Ok(vortex_array)
@@ -374,7 +374,7 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
     /// Get all quads as a stream
     pub fn quads(&self) -> Result<Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + '_>> {
         let quads_start = Instant::now();
-        let quads_struct = self.get_quads_array()?.to_struct();
+        let quads_struct = self.quads.to_struct();
         let fields = quads_struct.fields();
 
         let s_ids = fields.get(0)

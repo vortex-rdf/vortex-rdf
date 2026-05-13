@@ -24,21 +24,16 @@ impl RdfDictionary for SimpleDictionary {
         Self::default()
     }
 
-    fn from_vortex_array(dict_array_ref: &ArrayRef) -> Result<Self> {
+    fn from_vortex_array(array_ref: &ArrayRef) -> Result<Self> {
         let start = Instant::now();
         
-        // The dictionary might be wrapped in a ListArray, or it might be the FSST-compressed array directly
-        // Try to unwrap as ListArray first, if that fails, use it directly
-        let dict_varbin = if dict_array_ref.encoding().id().as_ref() == "vortex.listview" {
-            // It's a ListArray, unwrap it
-            let dict_list = dict_array_ref.to_listview();
-            // children()[1] is the values for ListArray
-            let dict_values = dict_list.children()[1].clone();
-            dict_values.to_varbinview()
-        } else {
-            // It's already the FSST-compressed array
-            dict_array_ref.to_varbinview()
-        };
+        // The input is the top-level StructArray which contains "dictionary" field.
+        // We need to extract it.
+        let struct_array = array_ref.to_struct();
+        let dict_array = utils::extract_vortex_struct_field(&struct_array, "dictionary")?;
+        
+        // It's already unwrapped by extract_vortex_struct_field if it was a list
+        let dict_varbin = dict_array.to_varbinview();
         
         log::debug!("[SimpleDictionary::from_vortex_array] Vortex extraction took {:?}", start.elapsed());
 
@@ -106,19 +101,21 @@ impl RdfDictionary for SimpleDictionary {
         }
     }
 
-    fn to_vortex_array(&self) -> Result<ArrayRef> {
+    fn to_vortex_array(&self) -> Result<Vec<(String, ArrayRef)>> {
         let dict_raw = VarBinViewArray::from_iter(
             self.terms.iter().map(|s: &String| Some(s.as_str())),
             DType::Utf8(Nullability::NonNullable),
         );
 
-        // Apply FSST compression to the dictionary table
-        if dict_raw.len() > 0 {
+        let dict_arr = if dict_raw.len() > 0 {
+            // Apply FSST compression to the dictionary table
             let compressor = fsst_train_compressor(&dict_raw);
-            Ok(fsst_compress(dict_raw, &compressor).into_array())
+            fsst_compress(dict_raw, &compressor).into_array()
         } else {
-            Ok(dict_raw.into_array())
-        }
+            dict_raw.into_array()
+        };
+        
+        Ok(vec![("dictionary".to_string(), dict_arr)])
     }
 
     fn store_type() -> &'static str {

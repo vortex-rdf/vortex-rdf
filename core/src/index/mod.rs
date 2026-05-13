@@ -32,8 +32,8 @@ pub trait RdfDictionary: Clone + Send + Sync {
     /// Get a graph name by its ID
     fn get_graph_name(&self, id: u32) -> Option<GraphName>;
     
-    /// Encode the dictionary into a Vortex array
-    fn to_vortex_array(&self) -> Result<ArrayRef>;
+    /// Encode the dictionary into a list of named Vortex arrays
+    fn to_vortex_array(&self) -> Result<Vec<(String, ArrayRef)>>;
     
     /// Get the store type identifier for this dictionary implementation
     fn store_type() -> &'static str;
