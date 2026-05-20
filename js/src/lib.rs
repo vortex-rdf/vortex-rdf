@@ -1,4 +1,4 @@
-use oxrdf::{GraphName, NamedNode, Quad, Subject, Term};
+use oxrdf::{GraphName, NamedNode, Quad, NamedOrBlankNode, Term};
 use oxrdfio::RdfFormat;
 use std::io::Cursor;
 use vortex_rdf_core::io::{
@@ -456,10 +456,10 @@ fn js_to_term(val: JsValue) -> Option<Term> {
     }
 }
 
-fn js_to_subject(val: JsValue) -> Option<Subject> {
+fn js_to_subject(val: JsValue) -> Option<NamedOrBlankNode> {
     match js_to_term(val)? {
-        Term::NamedNode(n) => Some(Subject::NamedNode(n)),
-        Term::BlankNode(b) => Some(Subject::BlankNode(b)),
+        Term::NamedNode(n) => Some(NamedOrBlankNode::NamedNode(n)),
+        Term::BlankNode(b) => Some(NamedOrBlankNode::BlankNode(b)),
         _ => None
     }
 }

@@ -8,8 +8,8 @@ use std::time::Instant;
 
 use vortex_array::ArrayRef;
 use vortex_array::arrays::VarBinViewArray;
-use vortex_array::{IntoArray, ToCanonical};
-use vortex_dtype::{DType, Nullability};
+use vortex_array::{IntoArray, LEGACY_SESSION, VortexSessionExecute};
+use vortex_array::dtype::{DType, Nullability};
 use vortex_fsst::{fsst_compress, fsst_train_compressor};
 
 /// Simple dictionary implementation using a Vec and HashMap
@@ -29,16 +29,16 @@ impl RdfDictionary for SimpleDictionary {
 
         // The input is the top-level StructArray which contains "dictionary" field.
         // We need to extract it.
-        let struct_array = array_ref.to_struct();
+        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let struct_array = array_ref.clone().execute::<vortex_array::arrays::StructArray>(&mut ctx)
+            .map_err(crate::error::VortexRdfError::Vortex)?;
         let dict_array = utils::extract_vortex_struct_field(&struct_array, "dictionary")?;
 
         // It's already unwrapped by extract_vortex_struct_field if it was a list
-        let dict_varbin = dict_array.to_varbinview();
-
-        log::debug!(
-            "[SimpleDictionary::from_vortex_array] Vortex extraction took {:?}",
-            start.elapsed()
-        );
+        let dict_varbin = dict_array.clone().execute::<VarBinViewArray>(&mut ctx)
+            .map_err(crate::error::VortexRdfError::Vortex)?;
+        
+        log::debug!("[SimpleDictionary::from_vortex_array] Vortex extraction took {:?}", start.elapsed());
 
         let loop_start = Instant::now();
         let mut dictionary = SimpleDictionary::new();
@@ -116,7 +116,15 @@ impl RdfDictionary for SimpleDictionary {
         let dict_arr = if dict_raw.len() > 0 {
             // Apply FSST compression to the dictionary table
             let compressor = fsst_train_compressor(&dict_raw);
-            fsst_compress(dict_raw, &compressor).into_array()
+            let len = dict_raw.len();
+            let dtype = dict_raw.dtype().clone();
+            fsst_compress(
+                dict_raw,
+                len,
+                &dtype,
+                &compressor,
+                &mut vortex_array::LEGACY_SESSION.create_execution_ctx(),
+            ).into_array()
         } else {
             dict_raw.into_array()
         };

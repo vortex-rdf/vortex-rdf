@@ -2,7 +2,6 @@ pub mod de;
 pub mod ser;
 
 #[cfg(feature = "file-io")]
-pub use de::load_vortex_file_ref;
-pub use de::{array_from_reader, deserialize};
+pub use de::{load_vortex_file_ref, load_vortex_file_path};
 
 pub use ser::{quads_stream_to_vortex, quads_stream_to_vortex_writer, serialize};

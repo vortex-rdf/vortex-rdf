@@ -12,15 +12,14 @@ description.workspace = true
 vortex.workspace = true
 vortex-array.workspace = true
 vortex-error.workspace = true
-vortex-dtype.workspace = true
 vortex-ipc.workspace = true
 vortex-io.workspace = true
 vortex-session.workspace = true
 vortex-fsst.workspace = true
 vortex-mask.workspace = true
-vortex-scalar.workspace = true
-vortex-file = { version = "0.57.2", default-features = false }
-vortex-scan = { version = "0.57.2", default-features = false }
+vortex-layout.workspace = true
+vortex-file.workspace = true
+vortex-scan.workspace = true
 
 tokio.workspace = true
 
@@ -33,8 +32,8 @@ itertools.workspace = true
 thiserror.workspace = true
 
 futures.workspace = true
-log = "0.4"
-clap = { version = "4.5", features = ["derive"] }
+log = "0.4.29"
+clap.workspace = true
 mimalloc.workspace = true
 
 [features]

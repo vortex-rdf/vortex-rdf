@@ -12,6 +12,12 @@ use tokio::fs::File as TokioFile;
 
 use vortex::buffer::Buffer;
 
+
+use vortex_rdf_core::{
+    io::{serialize, deserialize, load_vortex_file_ref, load_vortex_file_path},
+    index::{SimpleDictionary, ChainedHash},
+    VortexRdfStore
+};
 use vortex_array::ToCanonical;
 use vortex_rdf_core::common::formats::{Format, detect_format};
 use vortex_rdf_core::common::indexes::{IndexType, detect_index_type};
@@ -227,7 +233,7 @@ async fn main() -> Result<()> {
             };
 
             let vortex_index = match &input {
-                Some(p) => load_vortex_file_ref(p.clone())
+                Some(p) => load_vortex_file_path(p)
                     .await
                     .context("Failed to read Vortex index from file")?,
                 None => {
@@ -311,7 +317,7 @@ async fn main() -> Result<()> {
                     VortexRdfError::Deserialization(format!("Vortex file sanity FAILED: {e}"))
                 })?;
                 let load_start = Instant::now();
-                let arr = load_vortex_file_ref(input.clone())
+                let arr = load_vortex_file_path(&input)
                     .await
                     .context("Failed to read Vortex index from file")?;
                 debug!(
