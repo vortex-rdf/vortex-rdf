@@ -1,9 +1,6 @@
 use crate::error::Result;
 use crate::index::RdfDictionary;
 use crate::common::{utils, indexes};
-
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::time::Instant;
 use oxrdf::{GraphName, Term};
 
@@ -26,10 +23,17 @@ pub struct ChainedHash {
 impl ChainedHash {
     const BUCKET_SIZE: usize = 1_000_003; // Prime number
 
+    /// Deterministic FNV-1a hash — produces identical bucket indices across
+    /// process runs (unlike `DefaultHasher` which is randomly seeded).
     fn hash(s: &str) -> usize {
-        let mut hasher = DefaultHasher::new();
-        s.hash(&mut hasher);
-        (hasher.finish() as usize) % Self::BUCKET_SIZE
+        const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
+        const FNV_PRIME: u64 = 1_099_511_628_211;
+        let mut h = FNV_OFFSET;
+        for byte in s.bytes() {
+            h ^= byte as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        (h as usize) % Self::BUCKET_SIZE
     }
 
     /// Get ID from ArrayRef-based representation (for lookups during queries)
@@ -195,22 +199,29 @@ impl RdfDictionary for ChainedHash {
         let mut ids = Vec::with_capacity(terms.len());
         let mut ctx = LEGACY_SESSION.create_execution_ctx();
 
-        // First pass: collect existing IDs and new terms
-        let mut new_terms: Vec<&str> = Vec::new();
-        let mut new_term_hashes: Vec<usize> = Vec::new();
-
         let buckets_prim = self.buckets.clone().execute::<PrimitiveArray>(&mut ctx).expect("buckets must be primitive");
         let buckets_slice = buckets_prim.as_slice::<i32>();
         let values_varbin = self.values.clone().execute::<VarBinViewArray>(&mut ctx).expect("values must be varbinview");
         let next_prim = self.next.clone().execute::<PrimitiveArray>(&mut ctx).expect("next must be primitive");
         let next_slice = next_prim.as_slice::<i32>();
 
+        let last_known_id = self.values.len() as u32;
+
+        // Track new terms first seen in this batch: maps term string -> assigned new ID.
+        // This is needed because `buckets_slice` / `next_slice` are frozen snapshots of
+        // the pre-call state, so repeated occurrences of the same term within the batch
+        // would otherwise all fail the chain-walk and each be inserted as a distinct entry
+        // with a different ID — causing query misses for all but one of those quads.
+        let mut batch_new_terms: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+        let mut new_terms: Vec<&str> = Vec::new();
+        let mut new_term_hashes: Vec<usize> = Vec::new();
+
         for &term_str in terms {
             let h = Self::hash(term_str);
             let mut row = buckets_slice[h];
             let mut found = false;
 
-            // Check if term exists
+            // Check existing (pre-call) hash table
             while row != -1 {
                 let idx = row as usize;
                 let bytes = values_varbin.bytes_at(idx);
@@ -223,10 +234,17 @@ impl RdfDictionary for ChainedHash {
             }
 
             if !found {
-                // Mark for insertion
-                new_terms.push(term_str);
-                new_term_hashes.push(h);
-                ids.push(u32::MAX); // Placeholder, will be replaced
+                // Check if this term was already encountered in the current batch
+                if let Some(&existing_id) = batch_new_terms.get(term_str) {
+                    ids.push(existing_id);
+                } else {
+                    // Brand-new term: assign the next available ID
+                    let new_id = last_known_id + new_terms.len() as u32;
+                    batch_new_terms.insert(term_str, new_id);
+                    new_terms.push(term_str);
+                    new_term_hashes.push(h);
+                    ids.push(new_id);
+                }
             }
         }
 
@@ -235,33 +253,24 @@ impl RdfDictionary for ChainedHash {
             return ids;
         }
 
-        // Second pass: bulk insert new terms using builders
-        let last_known_id = self.values.len() as u32;
-
-        // Build new values array
+        // Bulk-insert new terms using builders
         let mut values_builder = VarBinViewBuilder::with_capacity(
             values_varbin.dtype().clone(),
             values_varbin.len() + new_terms.len()
         );
         values_builder.extend_from_array(&self.values);
-
         for &term in &new_terms {
             values_builder.append_value(term.as_bytes());
         }
-
         self.values = values_builder.finish_into_varbinview().into_array();
 
-        // Build new next array
         let mut next_builder = PrimitiveBuilder::<i32>::with_capacity(
             Nullability::NonNullable,
             next_slice.len() + new_terms.len()
         );
         next_builder.extend_from_array(&self.next);
 
-        // Build new buckets array with updates
         let mut buckets_vec = buckets_slice.to_vec();
-
-        // Update buckets and next for each new term
         for (i, &h) in new_term_hashes.iter().enumerate() {
             let new_id = last_known_id + i as u32;
             let old_head = buckets_vec[h];
@@ -271,15 +280,6 @@ impl RdfDictionary for ChainedHash {
 
         self.next = next_builder.finish().into_array();
         self.buckets = PrimitiveArray::from_iter(buckets_vec).into_array();
-
-        // Third pass: replace placeholders with actual IDs
-        let mut new_term_idx = 0;
-        for id in &mut ids {
-            if *id == u32::MAX {
-                *id = last_known_id + new_term_idx;
-                new_term_idx += 1;
-            }
-        }
 
         ids
     }
