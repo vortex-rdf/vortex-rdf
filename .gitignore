@@ -1,1 +1,7 @@
 /target
+*.nt
+*.nq
+*.vortex
+*.ttl
+*.txt
+*.json

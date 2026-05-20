@@ -1,12 +1,10 @@
-
 use divan::Bencher;
+use oxrdf::{NamedNode, Subject};
 use tokio::runtime::Runtime;
-use oxrdf::{Subject, NamedNode};
 
 use vortex_rdf_core::common::utils::generate_rdf_data_stream;
-use vortex_rdf_core::store::VortexRdfStore;
 use vortex_rdf_core::index::SimpleDictionary;
-
+use vortex_rdf_core::store::VortexRdfStore;
 
 fn main() {
     // Run registered benchmarks.
@@ -20,7 +18,7 @@ fn main() {
 )]
 fn build_vortex_index<const SIZE: usize>(bencher: Bencher) {
     let rt = Runtime::new().unwrap();
-    
+
     bencher
         .with_inputs(|| {
             // Generate the quad stream - this time is NOT counted in the benchmark
@@ -43,7 +41,7 @@ fn build_vortex_index<const SIZE: usize>(bencher: Bencher) {
 )]
 fn instantiate_store<const SIZE: usize>(bencher: Bencher) {
     let rt = Runtime::new().unwrap();
-    
+
     bencher
         .with_inputs(|| {
             // Pre-generate the ArrayRef - this time is NOT counted in the benchmark
@@ -68,7 +66,7 @@ fn instantiate_store<const SIZE: usize>(bencher: Bencher) {
 )]
 fn match_pattern<const SIZE: usize>(bencher: Bencher) {
     let rt = Runtime::new().unwrap();
-    
+
     bencher
         .with_inputs(|| {
             // Pre-generate the ArrayRef - this time is NOT counted in the benchmark
@@ -83,21 +81,16 @@ fn match_pattern<const SIZE: usize>(bencher: Bencher) {
         })
         .bench_values(|store| {
             // Only this block is timed - measuring SimpleDictionaryStore::match()
-            let subject = Some(&Subject::NamedNode(
-                NamedNode::new_unchecked("http://example.org/subject/0")
-            ));
+            let subject = Some(&Subject::NamedNode(NamedNode::new_unchecked(
+                "http://example.org/subject/0",
+            )));
             let predicate = Some(&NamedNode::new_unchecked("http://example.org/predicate/0"));
-            
+
             rt.block_on(async {
-                store.match_pattern(
-                    subject,
-                    predicate,
-                    None,
-                    None
-                )
-                .await
-                .expect("Failed to match pattern")
+                store
+                    .match_pattern(subject, predicate, None, None)
+                    .await
+                    .expect("Failed to match pattern")
             })
-    });
+        });
 }
-    

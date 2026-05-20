@@ -1,10 +1,10 @@
+use crate::common::{indexes::IndexType, utils};
 use crate::error::Result;
 use crate::index::RdfDictionary;
-use crate::common::{utils, indexes::IndexType};
 
+use oxrdf::{GraphName, Term};
 use std::collections::HashMap;
 use std::time::Instant;
-use oxrdf::{GraphName, Term};
 
 use vortex_array::ArrayRef;
 use vortex_array::arrays::VarBinViewArray;
@@ -26,16 +26,19 @@ impl RdfDictionary for SimpleDictionary {
 
     fn from_vortex_array(array_ref: &ArrayRef) -> Result<Self> {
         let start = Instant::now();
-        
+
         // The input is the top-level StructArray which contains "dictionary" field.
         // We need to extract it.
         let struct_array = array_ref.to_struct();
         let dict_array = utils::extract_vortex_struct_field(&struct_array, "dictionary")?;
-        
+
         // It's already unwrapped by extract_vortex_struct_field if it was a list
         let dict_varbin = dict_array.to_varbinview();
-        
-        log::debug!("[SimpleDictionary::from_vortex_array] Vortex extraction took {:?}", start.elapsed());
+
+        log::debug!(
+            "[SimpleDictionary::from_vortex_array] Vortex extraction took {:?}",
+            start.elapsed()
+        );
 
         let loop_start = Instant::now();
         let mut dictionary = SimpleDictionary::new();
@@ -44,8 +47,11 @@ impl RdfDictionary for SimpleDictionary {
             let s = String::from_utf8_lossy(&bytes).into_owned();
             dictionary.get_or_insert(&s);
         }
-        log::debug!("[SimpleDictionary::from_vortex_array] HashMap build took {:?}", loop_start.elapsed());
-        
+        log::debug!(
+            "[SimpleDictionary::from_vortex_array] HashMap build took {:?}",
+            loop_start.elapsed()
+        );
+
         Ok(dictionary)
     }
 
@@ -63,7 +69,7 @@ impl RdfDictionary for SimpleDictionary {
 
     fn get_or_insert_bulk(&mut self, terms: &[&str]) -> Vec<u32> {
         let mut ids = Vec::with_capacity(terms.len());
-        
+
         for &term_str in terms {
             if let Some(&id) = self.term_to_id.get(term_str) {
                 ids.push(id);
@@ -75,7 +81,7 @@ impl RdfDictionary for SimpleDictionary {
                 ids.push(id);
             }
         }
-        
+
         ids
     }
 
@@ -114,7 +120,7 @@ impl RdfDictionary for SimpleDictionary {
         } else {
             dict_raw.into_array()
         };
-        
+
         Ok(vec![("dictionary".to_string(), dict_arr)])
     }
 

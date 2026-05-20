@@ -1,28 +1,173 @@
+use crate::common::{indexes, utils};
 use crate::error::{Result, VortexRdfError};
-use crate::io::de;
 use crate::index::RdfDictionary;
-use crate::common::{utils, indexes};
+use crate::io::de;
 
-use std::time::Instant;
 use futures::{Stream, StreamExt, stream};
 use oxrdf::{GraphName, NamedNode, Quad, Subject, Term};
+use std::time::Instant;
 
-use vortex_scalar::Scalar;
-use vortex::compute::{and, compare, filter, Operator};
-use vortex_array::arrays::{
-    ChunkedArray, 
-    ConstantArray, 
-    PrimitiveArray, 
-    StructArray,
-};
+use vortex::compute::{Operator, and, compare, filter};
+use vortex_array::arrays::{ChunkedArray, ConstantArray, PrimitiveArray, StructArray};
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, Canonical, IntoArray, ToCanonical};
 use vortex_mask::Mask;
+use vortex_scalar::Scalar;
+
+use crate::store::VortexRdfStoreLike;
+
+impl<Dict: RdfDictionary> VortexRdfStoreLike<Dict> for VortexRdfStore<Dict> {
+    fn dictionary(&self) -> &Dict {
+        &self.dictionary
+    }
+
+    fn quads_array(&self) -> &ArrayRef {
+        &self.quads
+    }
+
+    fn quads_stream(&self) -> Result<Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + '_>> {
+        self.quads() // reuse existing method
+    }
+}
+
+use std::sync::Arc;
+
+pub trait LayoutStrategy<Dict: RdfDictionary>: Send {
+    fn ingest(&mut self, quad: &Quad, dictionary: &mut Dict) -> Result<()>;
+
+    fn finalize(&mut self, dictionary: &mut Dict) -> Result<()>;
+
+    fn build_quads(&self) -> Result<ArrayRef>;
+
+    /// These fields must already be valid root-level fields of length 1.
+    ///
+    /// Examples:
+    /// - `storage_layout`: ConstantArray length 1
+    /// - `zone_maps`: ListArray length 1
+    /// - `file_metadata`: ListArray length 1
+    fn build_extra_root_fields(&self) -> Result<Vec<(Arc<str>, ArrayRef)>> {
+        Ok(Vec::new())
+    }
+}
+
+pub struct IndexBuilder;
+
+impl IndexBuilder {
+    pub async fn build<Dict, Strategy>(
+        mut quad_stream: impl Stream<Item = Result<Quad>> + Unpin + Send,
+        mut strategy: Strategy,
+    ) -> Result<ArrayRef>
+    where
+        Dict: RdfDictionary,
+        Strategy: LayoutStrategy<Dict>,
+    {
+        let mut dictionary = Dict::new();
+
+        while let Some(result) = quad_stream.next().await {
+            let quad = result?;
+            strategy.ingest(&quad, &mut dictionary)?;
+        }
+
+        strategy.finalize(&mut dictionary)?;
+
+        let quads = strategy.build_quads()?;
+        let quads_list = indexes::wrap_array_in_list(quads)?;
+
+        let dict_fields_raw = dictionary.to_vortex_array()?;
+
+        let mut field_names: Vec<Arc<str>> = Vec::new();
+        let mut field_arrays: Vec<ArrayRef> = Vec::new();
+
+        field_names.push("store_type".into());
+        field_arrays.push(ConstantArray::new(Dict::store_type(), 1).into_array());
+
+        for (name, arr) in dict_fields_raw {
+            field_names.push(name.into());
+            field_arrays.push(indexes::wrap_array_in_list(arr)?);
+        }
+
+        field_names.push("quads".into());
+        field_arrays.push(quads_list);
+
+        for (name, arr) in strategy.build_extra_root_fields()? {
+            field_names.push(name);
+            field_arrays.push(arr);
+        }
+
+        let root = StructArray::try_new(field_names.into(), field_arrays, 1, Validity::NonNullable)
+            .map_err(VortexRdfError::Vortex)?
+            .into_array();
+
+        Ok(root)
+    }
+}
 
 /// Unified VortexRdfStore that works with any RdfDictionary implementation
 pub struct VortexRdfStore<Dict: RdfDictionary> {
     pub dictionary: Dict,
     pub quads: ArrayRef,
+}
+
+pub struct PlainLayout {
+    s_ids: Vec<u32>,
+    p_ids: Vec<u32>,
+    o_ids: Vec<u32>,
+    g_ids: Vec<u32>,
+}
+
+impl PlainLayout {
+    pub fn new() -> Self {
+        Self {
+            s_ids: Vec::new(),
+            p_ids: Vec::new(),
+            o_ids: Vec::new(),
+            g_ids: Vec::new(),
+        }
+    }
+}
+
+impl<Dict: RdfDictionary> LayoutStrategy<Dict> for PlainLayout {
+    fn ingest(&mut self, quad: &Quad, dictionary: &mut Dict) -> Result<()> {
+        self.s_ids
+            .push(dictionary.get_or_insert(&quad.subject.to_string()));
+        self.p_ids
+            .push(dictionary.get_or_insert(&quad.predicate.to_string()));
+        self.o_ids
+            .push(dictionary.get_or_insert(&quad.object.to_string()));
+        self.g_ids
+            .push(dictionary.get_or_insert(&quad.graph_name.to_string()));
+
+        Ok(())
+    }
+
+    fn finalize(&mut self, _dictionary: &mut Dict) -> Result<()> {
+        Ok(())
+    }
+
+    fn build_quads(&self) -> Result<ArrayRef> {
+        let quads = StructArray::from_fields(&[
+            (
+                "s",
+                PrimitiveArray::from_iter(self.s_ids.clone()).into_array(),
+            ),
+            (
+                "p",
+                PrimitiveArray::from_iter(self.p_ids.clone()).into_array(),
+            ),
+            (
+                "o",
+                PrimitiveArray::from_iter(self.o_ids.clone()).into_array(),
+            ),
+            (
+                "g",
+                PrimitiveArray::from_iter(self.g_ids.clone()).into_array(),
+            ),
+        ])
+        .map_err(VortexRdfError::Vortex)?
+        .into_array();
+
+        Ok(quads)
+    }
 }
 
 impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
@@ -32,37 +177,43 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
         // Dictionary fields are flattened in the middle
         // Last field is quads
         let vortex_struct = vortex_array.to_struct();
-        
-        // We pass the whole struct to Dict::from_vortex_array. 
+
+        // We pass the whole struct to Dict::from_vortex_array.
         // Implementations must assume the struct contains their fields mingled with others
         // and know the fixed position of the fields.
         let dictionary = Dict::from_vortex_array(&vortex_array)?;
-        
+
         // Quads field
         let quads = utils::extract_vortex_struct_field(&vortex_struct, "quads")?;
-        
-        Ok(Self {
-            dictionary,
-            quads,
-        })
+
+        Ok(Self { dictionary, quads })
     }
 
     /// Create an empty store
     pub fn empty() -> Self {
         let dictionary = Dict::new();
         let quads = StructArray::from_fields(&[
-            ("s", PrimitiveArray::from_iter(Vec::<u32>::new()).into_array()),
-            ("p", PrimitiveArray::from_iter(Vec::<u32>::new()).into_array()),
-            ("o", PrimitiveArray::from_iter(Vec::<u32>::new()).into_array()),
-            ("g", PrimitiveArray::from_iter(Vec::<u32>::new()).into_array()),
+            (
+                "s",
+                PrimitiveArray::from_iter(Vec::<u32>::new()).into_array(),
+            ),
+            (
+                "p",
+                PrimitiveArray::from_iter(Vec::<u32>::new()).into_array(),
+            ),
+            (
+                "o",
+                PrimitiveArray::from_iter(Vec::<u32>::new()).into_array(),
+            ),
+            (
+                "g",
+                PrimitiveArray::from_iter(Vec::<u32>::new()).into_array(),
+            ),
         ])
         .unwrap()
         .into_array();
 
-        Self {
-            dictionary,
-            quads,
-        }
+        Self { dictionary, quads }
     }
 
     /// Load from file (requires file-io feature)
@@ -81,99 +232,9 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
 
     /// Build a Vortex index from a stream of quads
     pub async fn build_vortex_index(
-        quad_stream: impl Stream<Item = Result<Quad>> + Unpin + Send + 'static
+        quad_stream: impl Stream<Item = Result<Quad>> + Unpin + Send + 'static,
     ) -> Result<ArrayRef> {
-        let start_dict = Instant::now();
-        let mut dictionary = Dict::new();
-
-        // Collect all quads first using stream collect()
-        let start_collect = Instant::now();
-        let quads: Vec<Quad> = quad_stream.collect::<Vec<Result<Quad>>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<Quad>>>()?;
-        log::debug!("[VortexRdfStore::build_vortex_index] Collected {} quads in {:?}", 
-            quads.len(), start_collect.elapsed());
-        
-        // Pre-allocate ID vectors with exact capacity - avoids reallocations
-        let mut s_ids = Vec::with_capacity(quads.len());
-        let mut p_ids = Vec::with_capacity(quads.len());
-        let mut o_ids = Vec::with_capacity(quads.len());
-        let mut g_ids = Vec::with_capacity(quads.len());
-        
-        // Collect all terms for bulk insert
-        let mut term_strings = Vec::with_capacity(quads.len() * 4);
-        for quad in &quads {
-            term_strings.push(quad.subject.to_string());
-            term_strings.push(quad.predicate.to_string());
-            term_strings.push(quad.object.to_string());
-            term_strings.push(quad.graph_name.to_string());
-        }
-        
-        // Bulk insert - convert to &str slice inline
-        let all_ids = dictionary.get_or_insert_bulk(
-            &term_strings.iter().map(|s| s.as_str()).collect::<Vec<_>>()
-        );
-        
-        // Split IDs into s, p, o, g vectors
-        for i in 0..quads.len() {
-            s_ids.push(all_ids[i * 4]);
-            p_ids.push(all_ids[i * 4 + 1]);
-            o_ids.push(all_ids[i * 4 + 2]);
-            g_ids.push(all_ids[i * 4 + 3]);
-        }
-
-        log::debug!("[VortexRdfStore::build_vortex_index] Dictionary building took {:?}", start_dict.elapsed());
-        
-        // Encode quad IDs into a StructArray
-        let start_encode = Instant::now();
-        let quads_flat = StructArray::from_fields(&[
-            ("s", PrimitiveArray::from_iter(s_ids).into_array()),
-            ("p", PrimitiveArray::from_iter(p_ids).into_array()),
-            ("o", PrimitiveArray::from_iter(o_ids).into_array()),
-            ("g", PrimitiveArray::from_iter(g_ids).into_array()),
-        ])
-        .map_err(VortexRdfError::Vortex)?
-        .into_array();
-        log::debug!("[VortexRdfStore::build_vortex_index] Vortex encoding for quads took {:?}", start_encode.elapsed());
-
-        // Encode the dictionary
-        let start_dict_encode = Instant::now();
-        let dict_fields_raw = dictionary.to_vortex_array()?;
-        
-        let mut field_names: Vec<std::sync::Arc<str>> = Vec::new();
-        let mut field_arrays: Vec<ArrayRef> = Vec::new();
-        
-        // 1. Add store type
-        field_names.push("store_type".into());
-        field_arrays.push(ConstantArray::new(Dict::store_type(), 1).into_array());
-        
-        // 2. Add dictionary fields (flattened)
-        for (name, arr) in dict_fields_raw {
-            field_names.push(name.into());
-            field_arrays.push(indexes::wrap_array_in_list(arr)?);
-        }
-        log::debug!("[VortexRdfStore::build_vortex_index] Dictionary encoding took {:?}", start_dict_encode.elapsed());
-
-        // 3. Add quads
-        let start_list = Instant::now();
-        // Wrap quads in ListArray (length 1)
-        let quads_list = indexes::wrap_array_in_list(quads_flat)?;
-        field_names.push("quads".into());
-        field_arrays.push(quads_list);
-
-        let vortex_array = StructArray::try_new(
-            field_names.into(),
-            field_arrays,
-            1,
-            Validity::NonNullable
-        )
-        .map_err(VortexRdfError::Vortex)?
-        .into_array();
-        
-        log::debug!("[VortexRdfStore::build_vortex_index] Top-level Vortex StructArray creation took {:?}", start_list.elapsed());
-
-        Ok(vortex_array)
+        IndexBuilder::build::<Dict, _>(quad_stream, PlainLayout::new()).await
     }
 
     /// Get the quads array
@@ -225,11 +286,17 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
                         .map_err(VortexRdfError::Vortex)?;
 
                     let column_mask = self.compare_with_pruning(col, &scalar)?;
-                    log::debug!("[VortexRdfStore::find_mask] {} comparison took {:?}", label, start.elapsed());
+                    log::debug!(
+                        "[VortexRdfStore::find_mask] {} comparison took {:?}",
+                        label,
+                        start.elapsed()
+                    );
                     combine_mask(column_mask)?;
                 } else {
                     // ID not in dictionary means no possible match
-                    return Ok(Some(ConstantArray::new(false, self.quads.len()).into_array()));
+                    return Ok(Some(
+                        ConstantArray::new(false, self.quads.len()).into_array(),
+                    ));
                 }
             }
         }
@@ -273,16 +340,25 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
                 _ => {
                     return Err(VortexRdfError::Deserialization(
                         "Mask must be boolean".to_string(),
-                    ))
+                    ));
                 }
             };
-            log::debug!("[VortexRdfStore::match_pattern] Mask creation took {:?}", mask_start.elapsed());
+            log::debug!(
+                "[VortexRdfStore::match_pattern] Mask creation took {:?}",
+                mask_start.elapsed()
+            );
             let filter_start = Instant::now();
-            let filtered_quads = filter(&quads_array_ref, &canonical_mask)
-                .map_err(VortexRdfError::Vortex)?;
-            log::debug!("[VortexRdfStore::match_pattern] Filtering compute operation took {:?}", filter_start.elapsed());
+            let filtered_quads =
+                filter(&quads_array_ref, &canonical_mask).map_err(VortexRdfError::Vortex)?;
+            log::debug!(
+                "[VortexRdfStore::match_pattern] Filtering compute operation took {:?}",
+                filter_start.elapsed()
+            );
             let _self = self.with_quads(filtered_quads);
-            log::debug!("[VortexRdfStore::match_pattern] Pattern matching took overall {:?}", start.elapsed());
+            log::debug!(
+                "[VortexRdfStore::match_pattern] Pattern matching took overall {:?}",
+                start.elapsed()
+            );
             _self
         } else {
             Ok(Self {
@@ -307,14 +383,10 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
         let o_arr = PrimitiveArray::from_iter(vec![o_id]).into_array();
         let g_arr = PrimitiveArray::from_iter(vec![g_id]).into_array();
 
-        let new_row = StructArray::from_fields(&[
-            ("s", s_arr),
-            ("p", p_arr),
-            ("o", o_arr),
-            ("g", g_arr)
-        ])
-        .map_err(VortexRdfError::Vortex)?
-        .into_array();
+        let new_row =
+            StructArray::from_fields(&[("s", s_arr), ("p", p_arr), ("o", o_arr), ("g", g_arr)])
+                .map_err(VortexRdfError::Vortex)?
+                .into_array();
         let old_quads = self.get_quads_array()?;
 
         // Use vortex ChunkedArray for efficient zero-copy concatenation
@@ -355,13 +427,13 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
                 _ => {
                     return Err(VortexRdfError::Deserialization(
                         "Inverse mask must be boolean".to_string(),
-                    ))
+                    ));
                 }
             };
 
             let quads_array_ref = self.get_quads_array()?;
-            let filtered_quads = filter(&quads_array_ref, &canonical_mask)
-            .map_err(VortexRdfError::Vortex)?;
+            let filtered_quads =
+                filter(&quads_array_ref, &canonical_mask).map_err(VortexRdfError::Vortex)?;
             self.with_quads(filtered_quads)
         } else {
             Ok(Self {
@@ -377,23 +449,30 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
         let quads_struct = self.quads.to_struct();
         let fields = quads_struct.fields();
 
-        let s_ids = fields.get(0)
+        let s_ids = fields
+            .get(0)
             .ok_or_else(|| VortexRdfError::Deserialization("Missing S IDs".to_string()))?
             .clone()
             .to_primitive();
-        let p_ids = fields.get(1)
+        let p_ids = fields
+            .get(1)
             .ok_or_else(|| VortexRdfError::Deserialization("Missing P IDs".to_string()))?
             .clone()
             .to_primitive();
-        let o_ids = fields.get(2)
+        let o_ids = fields
+            .get(2)
             .ok_or_else(|| VortexRdfError::Deserialization("Missing O IDs".to_string()))?
             .clone()
             .to_primitive();
-        let g_ids = fields.get(3)
+        let g_ids = fields
+            .get(3)
             .ok_or_else(|| VortexRdfError::Deserialization("Missing G IDs".to_string()))?
             .clone()
             .to_primitive();
-        log::debug!("[VortexRdfStore::quads] Quads struct extraction took {:?}", quads_start.elapsed());
+        log::debug!(
+            "[VortexRdfStore::quads] Quads struct extraction took {:?}",
+            quads_start.elapsed()
+        );
 
         let len = s_ids.len();
 
@@ -403,24 +482,36 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
             let o_id = o_ids.as_slice::<u32>()[i];
             let g_id = g_ids.as_slice::<u32>()[i];
 
-            let s_term = self.dictionary.get_term(s_id)
-                .ok_or_else(|| VortexRdfError::Deserialization(format!("S ID {} not in dictionary", s_id)))?;
-            let p_term = self.dictionary.get_term(p_id)
-                .ok_or_else(|| VortexRdfError::Deserialization(format!("P ID {} not in dictionary", p_id)))?;
-            let o_term = self.dictionary.get_term(o_id)
-                .ok_or_else(|| VortexRdfError::Deserialization(format!("O ID {} not in dictionary", o_id)))?;
-            let g_name = self.dictionary.get_graph_name(g_id)
-                .ok_or_else(|| VortexRdfError::Deserialization(format!("G ID {} not in dictionary", g_id)))?;
+            let s_term = self.dictionary.get_term(s_id).ok_or_else(|| {
+                VortexRdfError::Deserialization(format!("S ID {} not in dictionary", s_id))
+            })?;
+            let p_term = self.dictionary.get_term(p_id).ok_or_else(|| {
+                VortexRdfError::Deserialization(format!("P ID {} not in dictionary", p_id))
+            })?;
+            let o_term = self.dictionary.get_term(o_id).ok_or_else(|| {
+                VortexRdfError::Deserialization(format!("O ID {} not in dictionary", o_id))
+            })?;
+            let g_name = self.dictionary.get_graph_name(g_id).ok_or_else(|| {
+                VortexRdfError::Deserialization(format!("G ID {} not in dictionary", g_id))
+            })?;
 
             let subject = match s_term {
                 Term::NamedNode(n) => Subject::NamedNode(n),
                 Term::BlankNode(b) => Subject::BlankNode(b),
-                _ => return Err(VortexRdfError::Deserialization("Invalid subject type".to_string())),
+                _ => {
+                    return Err(VortexRdfError::Deserialization(
+                        "Invalid subject type".to_string(),
+                    ));
+                }
             };
 
             let predicate = match p_term {
                 Term::NamedNode(n) => n,
-                _ => return Err(VortexRdfError::Deserialization("Invalid predicate type".to_string())),
+                _ => {
+                    return Err(VortexRdfError::Deserialization(
+                        "Invalid predicate type".to_string(),
+                    ));
+                }
             };
 
             Ok(Quad::new(subject, predicate, o_term, g_name))

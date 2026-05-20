@@ -1,20 +1,20 @@
-use crate::error::{Result, VortexRdfError};
-use crate::store::VortexRdfStore;
-use crate::index::{SimpleDictionary};
 use crate::error;
+use crate::error::{Result, VortexRdfError};
+use crate::index::SimpleDictionary;
+use crate::store::VortexRdfStore;
 
-use std::time::Instant;
 use oxrdf::Quad;
+use std::time::Instant;
 
-use vortex_array::ArrayRef;
-use vortex_array::stream::ArrayStreamAdapter;
 use futures::stream;
-use vortex_file::{WriteStrategyBuilder, WriteOptionsSessionExt};
-use vortex_session::VortexSession;
-use vortex_io::VortexWrite;
 use vortex::VortexSessionDefault;
 #[cfg(feature = "file-io")]
 use vortex::compressor::CompactCompressor;
+use vortex_array::ArrayRef;
+use vortex_array::stream::ArrayStreamAdapter;
+use vortex_file::{WriteOptionsSessionExt, WriteStrategyBuilder};
+use vortex_io::VortexWrite;
+use vortex_session::VortexSession;
 
 /// High-level function to serialize RDF from a reader directly to a Vortex-RDF writer.
 pub async fn serialize<W: VortexWrite + Unpin + Send>(
@@ -25,7 +25,7 @@ pub async fn serialize<W: VortexWrite + Unpin + Send>(
     let session = VortexSession::default();
 
     let mut strategy = WriteStrategyBuilder::new();
-    
+
     #[cfg(feature = "file-io")]
     {
         strategy = strategy.with_compressor(CompactCompressor::default());
@@ -35,17 +35,24 @@ pub async fn serialize<W: VortexWrite + Unpin + Send>(
     let dtype = vortex_array.dtype().clone();
     let vortex_stream = ArrayStreamAdapter::new(
         dtype,
-        Box::pin(stream::once(async move { Ok(vortex_array) }))
+        Box::pin(stream::once(async move { Ok(vortex_array) })),
     );
-    log::debug!("[ser::write_stream_to_vortex] Vortex writer options setup took {:?}", session_start.elapsed());
+    log::debug!(
+        "[ser::write_stream_to_vortex] Vortex writer options setup took {:?}",
+        session_start.elapsed()
+    );
 
     let write_start = Instant::now();
     let _summary = write_opts
         .write(&mut writer, vortex_stream)
         .await
         .map_err(|e: vortex_error::VortexError| VortexRdfError::from(e))?;
-    log::debug!("[ser::write_stream_to_vortex] Vortex writing took {:?}", write_start.elapsed());
-    
+
+    log::debug!(
+        "[ser::write_stream_to_vortex] Vortex writing took {:?}",
+        write_start.elapsed()
+    );
+
     Ok(())
 }
 

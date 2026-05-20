@@ -15,7 +15,7 @@ pub use io::{
 #[cfg(feature = "file-io")]
 pub use io::load_vortex_file_ref;
 
-pub use store::VortexRdfStore;
+pub use store::{CottasVortexStore, VortexRdfStore};
 
 pub use index::{
     RdfDictionary,
@@ -37,6 +37,7 @@ mod tests {
     use super::*;
     use futures::{TryStreamExt, stream};
     use oxrdf::{GraphName, Literal, NamedNode, Quad, Subject, Term};
+    use vortex::buffer::Buffer;
 
     #[tokio::test]
 
@@ -115,6 +116,95 @@ mod tests {
             quad.graph_name.to_string(),
             decoded_quads[0].graph_name.to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn test_roundtrip_cottas_spog_index() {
+        let s = Subject::NamedNode(NamedNode::new("http://example.org/s").unwrap());
+        let p = NamedNode::new("http://example.org/p").unwrap();
+        let o = Term::Literal(Literal::new_simple_literal("hello"));
+        let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
+        let quad = Quad::new(s, p, o, g);
+        let quads = vec![quad.clone()];
+
+        let cottas_index = CottasVortexStore::<SimpleDictionary>::build_spog_vortex_index(
+            stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q)))
+        )
+        .await
+        .expect("Serialization failed");
+        let cottas_store = CottasVortexStore::<SimpleDictionary>::new(cottas_index).unwrap();
+
+        let decoded_quads: Vec<Quad> = cottas_store.quads()
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(1, decoded_quads.len());
+        assert_eq!(
+            quad.subject.to_string(),
+            decoded_quads[0].subject.to_string()
+        );
+        assert_eq!(
+            quad.predicate.to_string(),
+            decoded_quads[0].predicate.to_string()
+        );
+        assert_eq!(
+            quad.object.to_string(),
+            decoded_quads[0].object.to_string()
+        );
+        assert_eq!(
+            quad.graph_name.to_string(),
+            decoded_quads[0].graph_name.to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_match_pattern_cottas_spog_index() {
+        let s1 = Subject::NamedNode(NamedNode::new("http://example.org/s1").unwrap());
+        let p1 = NamedNode::new("http://example.org/p1").unwrap();
+        let o1 = Term::Literal(Literal::new_simple_literal("o1"));
+        let g1 = GraphName::DefaultGraph;
+
+        let s2 = Subject::NamedNode(NamedNode::new("http://example.org/s2").unwrap());
+        let p2 = NamedNode::new("http://example.org/p2").unwrap();
+        let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+        let g2 = GraphName::DefaultGraph;
+
+        let q1 = Quad::new(s1.clone(), p1.clone(), o1.clone(), g1.clone());
+        let q2 = Quad::new(s2.clone(), p2.clone(), o2.clone(), g2.clone());
+
+        let quads = vec![q1.clone(), q2.clone()];
+
+        let cottas_index = CottasVortexStore::<SimpleDictionary>::build_spog_vortex_index(
+            stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q)))
+        )
+        .await
+        .expect("Serialization failed");
+        let cottas_store = CottasVortexStore::<SimpleDictionary>::new(cottas_index).unwrap();
+
+        // Match ?s <p1> ?o ?g
+        let filtered = cottas_store
+            .match_pattern(None, Some(&p1), None, None)
+            .await
+            .unwrap();
+        assert_eq!(filtered.size(), 1);
+
+        let results: Vec<Quad> = filtered.quads()
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let res_q = results.first().unwrap();
+
+        assert_eq!(res_q.subject.to_string(), s1.to_string());
+        assert_eq!(res_q.predicate.to_string(), p1.to_string());
+        assert_eq!(res_q.object.to_string(), o1.to_string());
+        assert_eq!(res_q.graph_name.to_string(), g1.to_string());
+
+        let p3 = NamedNode::new("http://example.org/p3").unwrap();
+        let empty = cottas_store.match_pattern(None, Some(&p3), None, None).await.unwrap();
+        assert_eq!(empty.size(), 0);
     }
 
     #[tokio::test]
@@ -295,5 +385,86 @@ mod tests {
         let s5 = Subject::NamedNode(NamedNode::new("http://example.org/s5").unwrap());
         let matched_s5 = store.match_pattern(Some(&s5), None, None, None).await.unwrap();
         assert_eq!(matched_s5.size(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_serialize_and_load_cottas_spog_index() {
+        let s = Subject::NamedNode(NamedNode::new("http://example.org/s").unwrap());
+        let p = NamedNode::new("http://example.org/p").unwrap();
+        let o = Term::Literal(Literal::new_simple_literal("hello"));
+        let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
+        let quad = Quad::new(s.clone(), p.clone(), o.clone(), g.clone());
+        let quads = vec![quad.clone()];
+
+        let cottas_array = CottasVortexStore::<SimpleDictionary>::build_spog_vortex_index(
+            stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))),
+        )
+        .await
+        .expect("Serialization failed");
+
+        let mut buffer = Vec::new();
+        serialize(cottas_array.clone(), &mut buffer).await.expect("Failed to serialize Cottas array");
+
+        let loaded_array = load_vortex_file_ref(Buffer::from(buffer))
+            .await
+            .expect("Failed to read serialized Cottas array");
+        let loaded_store = CottasVortexStore::<SimpleDictionary>::new(loaded_array).unwrap();
+
+        assert_eq!(loaded_store.size(), 1);
+        assert_eq!(loaded_store.metadata.num_triples, 1);
+        assert_eq!(loaded_store.metadata.row_group_size, 1024);
+        assert_eq!(format!("{}", loaded_store.metadata.ordering), "SPO");
+
+        let decoded_quads: Vec<Quad> = loaded_store.quads().unwrap().try_collect().await.unwrap();
+        assert_eq!(1, decoded_quads.len());
+        assert_eq!(decoded_quads[0].subject.to_string(), s.to_string());
+        assert_eq!(decoded_quads[0].predicate.to_string(), p.to_string());
+        assert_eq!(decoded_quads[0].object.to_string(), o.to_string());
+        assert_eq!(decoded_quads[0].graph_name.to_string(), g.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_cottas_spog_match_after_serialize() {
+        let s1 = Subject::NamedNode(NamedNode::new("http://example.org/s1").unwrap());
+        let p1 = NamedNode::new("http://example.org/p1").unwrap();
+        let o1 = Term::Literal(Literal::new_simple_literal("o1"));
+        let g1 = GraphName::DefaultGraph;
+
+        let s2 = Subject::NamedNode(NamedNode::new("http://example.org/s2").unwrap());
+        let p2 = NamedNode::new("http://example.org/p2").unwrap();
+        let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+        let g2 = GraphName::DefaultGraph;
+
+        let q1 = Quad::new(s1.clone(), p1.clone(), o1.clone(), g1.clone());
+        let q2 = Quad::new(s2.clone(), p2.clone(), o2.clone(), g2.clone());
+        let quads = vec![q1.clone(), q2.clone()];
+
+        let cottas_array = CottasVortexStore::<SimpleDictionary>::build_spog_vortex_index(
+            stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))),
+        )
+        .await
+        .expect("Serialization failed");
+
+        let mut buffer = Vec::new();
+        serialize(cottas_array.clone(), &mut buffer).await.expect("Failed to serialize Cottas array");
+
+        let loaded_array = load_vortex_file_ref(Buffer::from(buffer))
+            .await
+            .expect("Failed to read serialized Cottas array");
+        let loaded_store = CottasVortexStore::<SimpleDictionary>::new(loaded_array).unwrap();
+
+        let filtered = loaded_store
+            .match_pattern(None, Some(&p1), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(filtered.size(), 1);
+        let results: Vec<Quad> = filtered.quads().unwrap().try_collect().await.unwrap();
+        let res_q = results.first().unwrap();
+
+        assert_eq!(res_q.subject.to_string(), s1.to_string());
+        assert_eq!(res_q.predicate.to_string(), p1.to_string());
+        assert_eq!(res_q.object.to_string(), o1.to_string());
+        assert_eq!(res_q.graph_name.to_string(), g1.to_string());
     }
 }
