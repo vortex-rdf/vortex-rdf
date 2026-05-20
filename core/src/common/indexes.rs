@@ -1,8 +1,9 @@
 use clap::ValueEnum;
-use vortex_array::{ToCanonical, ArrayRef, IntoArray};
-use vortex_array::arrays::{PrimitiveArray, ListArray};
+use vortex_array::{ArrayRef, IntoArray, LEGACY_SESSION, VortexSessionExecute};
+use vortex_array::arrays::{PrimitiveArray, ListArray, StructArray};
+use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::validity::Validity;
-use vortex_dtype::DType;
+use vortex_array::dtype::DType;
 use crate::error::{Result, VortexRdfError};
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
@@ -23,21 +24,23 @@ impl IndexType {
 pub fn detect_index_type(array: &ArrayRef) -> IndexType {
     if let DType::Struct(fields, _) = array.dtype() {
         if fields.names().iter().any(|n| n.as_ref() == "store_type") {
-            // Attempt to read the store_type from the first row
             let slice = if array.len() > 0 {
-                array.slice(0..1)
+                array.slice(0..1).unwrap_or_else(|_| array.clone())
             } else {
                 array.clone()
             };
-            
-            let struct_arr = slice.to_struct();
-            if let Some(idx) = struct_arr.names().iter().position(|n| n.as_ref() == "store_type") {
-                 if let Some(col) = struct_arr.fields().get(idx) {
-                     let scalar = col.scalar_at(0);
-                     let val = format!("{}", scalar); 
-                     if val.contains("chained-hash") { return IndexType::ChainedHash; }
-                     if val.contains("simple-dictionary") { return IndexType::SimpleDictionary; }
-                 }
+
+            let mut ctx = LEGACY_SESSION.create_execution_ctx();
+            if let Ok(struct_arr) = slice.clone().execute::<StructArray>(&mut ctx) {
+                if let Some(idx) = struct_arr.names().iter().position(|n| n.as_ref() == "store_type") {
+                    if let Some(col) = struct_arr.unmasked_fields().get(idx) {
+                        if let Ok(scalar) = col.execute_scalar(0, &mut ctx) {
+                            let val = format!("{}", scalar);
+                            if val.contains("chained-hash") { return IndexType::ChainedHash; }
+                            if val.contains("simple-dictionary") { return IndexType::SimpleDictionary; }
+                        }
+                    }
+                }
             }
         }
     }
