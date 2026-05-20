@@ -3,17 +3,16 @@ use oxrdf::{
     Term,
     NamedNode,
     BlankNode,
-    Subject,
+    NamedOrBlankNode,
     Literal,
     GraphName
 };
 use oxrdfio::{RdfFormat, RdfParser};
 use futures::{stream, Stream};
 use crate::error::{VortexRdfError, Result};
-use vortex_array::ArrayRef;
-use vortex_array::arrays::StructArray;
-use vortex_dtype::{DType, Nullability, PType};
-use vortex_array::ToCanonical;
+use vortex_array::{ArrayRef, LEGACY_SESSION, VortexSessionExecute};
+use vortex_array::arrays::struct_::StructArray;
+use vortex_array::arrays::listview::{ListViewArray, ListViewArrayExt};
 
 pub fn parse_named_node(s: &str) -> Result<NamedNode> {
     let s = s.trim_matches(|c| c == '<' || c == '>');
@@ -31,11 +30,11 @@ pub fn parse_blank_node(s: &str) -> Result<BlankNode> {
         ))
 }
 
-pub fn parse_subject(s: &str) -> Result<Subject> {
+pub fn parse_subject(s: &str) -> Result<NamedOrBlankNode> {
     if s.starts_with("_:") {
-        Ok(Subject::BlankNode(parse_blank_node(s)?))
+        Ok(NamedOrBlankNode::BlankNode(parse_blank_node(s)?))
     } else {
-        Ok(Subject::NamedNode(parse_named_node(s)?))
+        Ok(NamedOrBlankNode::NamedNode(parse_named_node(s)?))
     }
 }
 
@@ -119,36 +118,38 @@ pub fn extract_vortex_struct_field(
     vortex_struct: &StructArray,
     name: &str
 ) -> Result<ArrayRef> {
+    use vortex_array::arrays::struct_::StructArrayExt;
+    use vortex_array::dtype::{DType, Nullability, PType};
     let start = std::time::Instant::now();
-    
-    // Find index by name
-    let names = vortex_struct.names();
-    let idx = names.iter().position(|n| n.as_ref() == name)
-        .ok_or_else(|| VortexRdfError::Deserialization(format!("Field '{}' not found in struct", name)))?;
+    let mut ctx = LEGACY_SESSION.create_execution_ctx();
 
-    let fields = vortex_struct.fields();
-    let list_ref = fields.get(idx)
-        .ok_or_else(|| VortexRdfError::Deserialization(format!("Missing field '{}'", name)))?
+    let list_ref = vortex_struct.unmasked_field_by_name(name)
+        .map_err(|_| VortexRdfError::Deserialization(format!("Field '{}' not found in struct", name)))?
         .clone();
 
-    let list = list_ref.to_listview();
-    
-    let offset = list.offsets().scalar_at(0)
+    let list = list_ref.clone().execute::<ListViewArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+
+    let offset = list.offsets().execute_scalar(0, &mut ctx)
+        .map_err(VortexRdfError::Vortex)?
         .cast(&DType::Primitive(PType::I32, Nullability::NonNullable))
         .map_err(VortexRdfError::Vortex)?
         .as_primitive()
         .typed_value::<i32>()
         .ok_or_else(|| VortexRdfError::Deserialization(format!("Missing offset for field '{}'", name)))? as usize;
-        
-    let size = list.sizes().scalar_at(0)
+
+    let size = list.sizes().execute_scalar(0, &mut ctx)
+        .map_err(VortexRdfError::Vortex)?
         .cast(&DType::Primitive(PType::I32, Nullability::NonNullable))
         .map_err(VortexRdfError::Vortex)?
         .as_primitive()
         .typed_value::<i32>()
         .ok_or_else(|| VortexRdfError::Deserialization(format!("Missing size for field '{}'", name)))? as usize;
-    
+
     log::debug!("[utils::extract_vortex_struct_field] Extracting Vortex struct field '{}' took {:?}", name, start.elapsed());
-    Ok(list.elements().slice(offset..offset + size))
+    let sliced = list.elements().slice(offset..offset + size)
+        .map_err(VortexRdfError::Vortex)?;
+    Ok(sliced)
 }
 
 /*
@@ -160,7 +161,7 @@ pub fn generate_rdf_data_stream(size: usize) -> impl Stream<Item = Result<Quad>>
     const EX: &str = "http://example.org/";
     
     stream::iter((0..size).map(|i| {
-        let subject = Subject::NamedNode(
+        let subject = NamedOrBlankNode::NamedNode(
             NamedNode::new_unchecked(format!("{}subject/{}", EX, i))
         );
         let predicate = NamedNode::new_unchecked(format!("{}predicate/{}", EX, i % 100));

@@ -1,7 +1,7 @@
 
 use divan::Bencher;
 use tokio::runtime::Runtime;
-use oxrdf::{Subject, NamedNode};
+use oxrdf::{NamedOrBlankNode, NamedNode};
 
 use vortex_rdf_core::common::utils::generate_rdf_data_stream;
 use vortex_rdf_core::store::VortexRdfStore;
@@ -83,7 +83,7 @@ fn match_pattern<const SIZE: usize>(bencher: Bencher) {
         })
         .bench_values(|store| {
             // Only this block is timed - measuring VortexRdfStore::<ChainedHash>::match()
-            let subject = Some(&Subject::NamedNode(
+            let subject = Some(&NamedOrBlankNode::NamedNode(
                 NamedNode::new_unchecked("http://example.org/subject/0")
             ));
             let predicate = Some(&NamedNode::new_unchecked("http://example.org/predicate/0"));

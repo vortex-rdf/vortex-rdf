@@ -1,8 +1,9 @@
 use crate::error::{Result, VortexRdfError};
 use crate::store::VortexRdfStore;
-use crate::index::{SimpleDictionary};
+use crate::index::SimpleDictionary;
 use crate::error;
 
+use std::sync::LazyLock;
 use std::time::Instant;
 use oxrdf::Quad;
 
@@ -12,9 +13,22 @@ use futures::stream;
 use vortex_file::{WriteStrategyBuilder, WriteOptionsSessionExt};
 use vortex_session::VortexSession;
 use vortex_io::VortexWrite;
-use vortex::VortexSessionDefault;
-#[cfg(feature = "file-io")]
-use vortex::compressor::CompactCompressor;
+
+/// A lazily-initialized session configured for Vortex file I/O.
+static WRITE_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    use vortex_array::session::ArraySession;
+    use vortex_array::scalar_fn::session::ScalarFnSession;
+    use vortex_io::session::RuntimeSession;
+    use vortex_layout::session::LayoutSession;
+
+    let session = VortexSession::empty()
+        .with::<ArraySession>()
+        .with::<LayoutSession>()
+        .with::<ScalarFnSession>()
+        .with::<RuntimeSession>();
+    vortex_file::register_default_encodings(&session);
+    session
+});
 
 /// High-level function to serialize RDF from a reader directly to a Vortex-RDF writer.
 pub async fn serialize<W: VortexWrite + Unpin + Send>(
@@ -22,16 +36,10 @@ pub async fn serialize<W: VortexWrite + Unpin + Send>(
     mut writer: W,
 ) -> Result<()> {
     let session_start = Instant::now();
-    let session = VortexSession::default();
 
-    let mut strategy = WriteStrategyBuilder::new();
-    
-    #[cfg(feature = "file-io")]
-    {
-        strategy = strategy.with_compressor(CompactCompressor::default());
-    }
-
-    let write_opts = session.write_options().with_strategy(strategy.build());
+    let write_opts = WRITE_SESSION
+        .write_options()
+        .with_strategy(WriteStrategyBuilder::default().build());
     let dtype = vortex_array.dtype().clone();
     let vortex_stream = ArrayStreamAdapter::new(
         dtype,
@@ -45,13 +53,18 @@ pub async fn serialize<W: VortexWrite + Unpin + Send>(
         .await
         .map_err(|e: vortex_error::VortexError| VortexRdfError::from(e))?;
     log::debug!("[ser::write_stream_to_vortex] Vortex writing took {:?}", write_start.elapsed());
-    
+
     Ok(())
 }
 
 pub fn write_array_to_ipc<W: std::io::Write>(vortex_array: ArrayRef, mut writer: W) -> Result<()> {
+    use vortex_array::LEGACY_SESSION;
     use vortex_ipc::iterator::ArrayIteratorIPC;
-    let ipc_iter = vortex_array.to_array_iterator().into_ipc();
+
+    let ipc_iter = vortex_array
+        .to_array_iterator()
+        .into_ipc(&LEGACY_SESSION)
+        .map_err(VortexRdfError::Vortex)?;
 
     for msg_res in ipc_iter {
         let msg = msg_res.map_err(VortexRdfError::Vortex)?;

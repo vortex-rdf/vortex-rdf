@@ -36,12 +36,12 @@ static GLOBAL: MiMalloc = MiMalloc;
 mod tests {
     use super::*;
     use futures::{TryStreamExt, stream};
-    use oxrdf::{GraphName, Literal, NamedNode, Quad, Subject, Term};
+    use oxrdf::{GraphName, Literal, NamedNode, Quad, NamedOrBlankNode, Term};
 
     #[tokio::test]
 
     async fn test_roundtrip_dict_index() {
-        let s = Subject::NamedNode(NamedNode::new("http://example.org/s").unwrap());
+        let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s").unwrap());
         let p = NamedNode::new("http://example.org/p").unwrap();
         let o = Term::Literal(Literal::new_simple_literal("hello"));
         let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
@@ -80,7 +80,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_roundtrip_chained_hash_index() {
-        let s = Subject::NamedNode(NamedNode::new("http://example.org/s").unwrap());
+        let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s").unwrap());
         let p = NamedNode::new("http://example.org/p").unwrap();
         let o = Term::Literal(Literal::new_simple_literal("hello"));
         let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
@@ -119,12 +119,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_match_pattern_dict_index() {
-        let s1 = Subject::NamedNode(NamedNode::new("http://example.org/s1").unwrap());
+        let s1 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s1").unwrap());
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
         let o1 = Term::Literal(Literal::new_simple_literal("o1"));
         let g1 = GraphName::DefaultGraph;
 
-        let s2 = Subject::NamedNode(NamedNode::new("http://example.org/s2").unwrap());
+        let s2 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s2").unwrap());
         let p2 = NamedNode::new("http://example.org/p2").unwrap();
         let o2 = Term::Literal(Literal::new_simple_literal("o2"));
         let g2 = GraphName::DefaultGraph;
@@ -163,12 +163,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_match_pattern_chained_hash_index() {
-        let s1 = Subject::NamedNode(NamedNode::new("http://example.org/s1").unwrap());
+        let s1 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s1").unwrap());
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
         let o1 = Term::Literal(Literal::new_simple_literal("o1"));
         let g1 = GraphName::DefaultGraph;
 
-        let s2 = Subject::NamedNode(NamedNode::new("http://example.org/s2").unwrap());
+        let s2 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s2").unwrap());
         let p2 = NamedNode::new("http://example.org/p2").unwrap();
         let o2 = Term::Literal(Literal::new_simple_literal("o2"));
         let g2 = GraphName::DefaultGraph;
@@ -207,7 +207,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_delete_quad_dict_index() {
-        let s1 = Subject::NamedNode(NamedNode::new("http://example.org/s1").unwrap());
+        let s1 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s1").unwrap());
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
         let o1 = Term::Literal(Literal::new_simple_literal("o1"));
         let g1 = GraphName::DefaultGraph;
@@ -227,7 +227,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_delete_quad_chained_hash_index() {
-        let s1 = Subject::NamedNode(NamedNode::new("http://example.org/s1").unwrap());
+        let s1 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s1").unwrap());
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
         let o1 = Term::Literal(Literal::new_simple_literal("o1"));
         let g1 = GraphName::DefaultGraph;
@@ -250,7 +250,7 @@ mod tests {
         let mut store = VortexRdfStore::<SimpleDictionary>::empty();
         
         for i in 0..10 {
-            let s = Subject::NamedNode(NamedNode::new(format!("http://example.org/s{}", i)).unwrap());
+            let s = NamedOrBlankNode::NamedNode(NamedNode::new(format!("http://example.org/s{}", i)).unwrap());
             let p = NamedNode::new("http://example.org/p").unwrap();
             let o = Term::Literal(Literal::new_simple_literal("o"));
             let g = GraphName::DefaultGraph;
@@ -266,7 +266,7 @@ mod tests {
         assert_eq!(matched.size(), 10);
         
         // Match specific subject s5
-        let s5 = Subject::NamedNode(NamedNode::new("http://example.org/s5").unwrap());
+        let s5 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s5").unwrap());
         let matched_s5 = store.match_pattern(Some(&s5), None, None, None).await.unwrap();
         assert_eq!(matched_s5.size(), 1);
     }
@@ -276,7 +276,7 @@ mod tests {
         let mut store = VortexRdfStore::<ChainedHash>::empty();
         
         for i in 0..10 {
-            let s = Subject::NamedNode(NamedNode::new(format!("http://example.org/s{}", i)).unwrap());
+            let s = NamedOrBlankNode::NamedNode(NamedNode::new(format!("http://example.org/s{}", i)).unwrap());
             let p = NamedNode::new("http://example.org/p").unwrap();
             let o = Term::Literal(Literal::new_simple_literal("o"));
             let g = GraphName::DefaultGraph;
@@ -292,7 +292,7 @@ mod tests {
         assert_eq!(matched.size(), 10);
         
         // Match specific subject s5
-        let s5 = Subject::NamedNode(NamedNode::new("http://example.org/s5").unwrap());
+        let s5 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s5").unwrap());
         let matched_s5 = store.match_pattern(Some(&s5), None, None, None).await.unwrap();
         assert_eq!(matched_s5.size(), 1);
     }
