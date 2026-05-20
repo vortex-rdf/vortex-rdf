@@ -1,5 +1,6 @@
 pub mod cottas_vortex_store;
 pub mod vortex_rdf_store;
+pub mod layout;
 use futures::Stream;
 use oxrdf::Quad;
 use crate::error::Result;

@@ -4,8 +4,7 @@ use vortex_array::{ArrayRef, IntoArray, LEGACY_SESSION, VortexSessionExecute};
 use vortex_array::arrays::{PrimitiveArray, ListArray, StructArray};
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::validity::Validity;
-use vortex_array::{ArrayRef, IntoArray, ToCanonical};
-use vortex_dtype::DType;
+use vortex_array::dtype::DType;
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
 pub enum IndexType {

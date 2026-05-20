@@ -9,17 +9,10 @@ use oxrdf::{
 };
 use crate::error::{Result, VortexRdfError};
 use futures::{Stream, stream};
-use oxrdf::{BlankNode, GraphName, Literal, NamedNode, Quad, Subject, Term};
 use oxrdfio::{RdfFormat, RdfParser};
-use futures::{stream, Stream};
-use crate::error::{VortexRdfError, Result};
 use vortex_array::{ArrayRef, LEGACY_SESSION, VortexSessionExecute};
 use vortex_array::arrays::struct_::StructArray;
 use vortex_array::arrays::listview::{ListViewArray, ListViewArrayExt};
-use vortex_array::ArrayRef;
-use vortex_array::ToCanonical;
-use vortex_array::arrays::StructArray;
-use vortex_dtype::{DType, Nullability, PType};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -161,27 +154,7 @@ pub fn extract_vortex_struct_field_optional(
     vortex_struct: &StructArray,
     name: &str,
 ) -> Option<ArrayRef> {
-    let names = vortex_struct.names();
-    let idx = names.iter().position(|n| n.as_ref() == name)?;
-    let fields = vortex_struct.fields();
-    let list_ref = fields.get(idx)?.clone();
-    let list = list_ref.to_listview();
-
-    let offset = list
-        .offsets()
-        .scalar_at(0)
-        .cast(&DType::Primitive(PType::I32, Nullability::NonNullable))
-        .ok()?;
-    let offset = offset.as_primitive().typed_value::<i32>()? as usize;
-
-    let size = list
-        .sizes()
-        .scalar_at(0)
-        .cast(&DType::Primitive(PType::I32, Nullability::NonNullable))
-        .ok()?;
-    let size = size.as_primitive().typed_value::<i32>()? as usize;
-
-    Some(list.elements().slice(offset..offset + size))
+    extract_vortex_struct_field(vortex_struct, name).ok()
 }
 
 /*

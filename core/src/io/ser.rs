@@ -2,8 +2,6 @@ use crate::error;
 use crate::error::{Result, VortexRdfError};
 use crate::index::SimpleDictionary;
 use crate::store::VortexRdfStore;
-use crate::index::SimpleDictionary;
-use crate::error;
 
 use std::sync::LazyLock;
 use oxrdf::Quad;
@@ -88,7 +86,7 @@ where
     W: VortexWrite + Unpin + Send,
 {
     // TODO: allow for index type selection
-    let stream = VortexRdfStore::<SimpleDictionary>::build_vortex_index(quads).await?;
+    let stream = VortexRdfStore::<SimpleDictionary, crate::store::layout::flat::FlatLayout>::build_vortex_index(quads).await?;
     serialize(stream, writer).await?;
     Ok(())
 }
