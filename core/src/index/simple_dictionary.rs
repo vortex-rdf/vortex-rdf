@@ -8,9 +8,11 @@ use std::time::Instant;
 
 use vortex_array::ArrayRef;
 use vortex_array::arrays::VarBinViewArray;
-use vortex_array::{IntoArray, LEGACY_SESSION, VortexSessionExecute};
+use vortex_array::{IntoArray, VortexSessionExecute};
 use vortex_array::dtype::{DType, Nullability};
 use vortex_fsst::{fsst_compress, fsst_train_compressor};
+use vortex::VortexSessionDefault;
+use vortex::session::VortexSession;
 
 /// Simple dictionary implementation using a Vec and HashMap
 #[derive(Debug, Clone, Default)]
@@ -29,7 +31,8 @@ impl RdfDictionary for SimpleDictionary {
 
         // The input is the top-level StructArray which contains "dictionary" field.
         // We need to extract it.
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let session = VortexSession::default();
+        let mut ctx = session.create_execution_ctx();
         let struct_array = array_ref.clone().execute::<vortex_array::arrays::StructArray>(&mut ctx)
             .map_err(crate::error::VortexRdfError::Vortex)?;
         let dict_array = utils::extract_vortex_struct_field(&struct_array, "dictionary")?;
@@ -123,7 +126,7 @@ impl RdfDictionary for SimpleDictionary {
                 len,
                 &dtype,
                 &compressor,
-                &mut vortex_array::LEGACY_SESSION.create_execution_ctx(),
+                &mut VortexSession::default().create_execution_ctx(),
             ).into_array()
         } else {
             dict_raw.into_array()

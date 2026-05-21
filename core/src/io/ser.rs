@@ -3,16 +3,17 @@ use crate::error::{Result, VortexRdfError};
 use crate::index::SimpleDictionary;
 use crate::store::VortexRdfStore;
 
-use std::sync::LazyLock;
 use oxrdf::Quad;
+use std::sync::LazyLock;
 use std::time::Instant;
+use vortex::VortexSessionDefault;
 
 use futures::stream;
 
 /// A lazily-initialized session configured for Vortex file I/O.
 static WRITE_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-    use vortex_array::session::ArraySession;
     use vortex_array::scalar_fn::session::ScalarFnSession;
+    use vortex_array::session::ArraySession;
     use vortex_io::session::RuntimeSession;
     use vortex_layout::session::LayoutSession;
 
@@ -24,11 +25,12 @@ static WRITE_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     vortex_file::register_default_encodings(&session);
     session
 });
-use vortex_array::ArrayRef;
 use vortex_array::stream::ArrayStreamAdapter;
+use vortex_array::{ArrayRef};
 use vortex_file::{WriteOptionsSessionExt, WriteStrategyBuilder};
 use vortex_io::VortexWrite;
 use vortex_session::VortexSession;
+use vortex_ipc::iterator::ArrayIteratorIPC;
 
 /// High-level function to serialize RDF from a reader directly to a Vortex-RDF writer.
 pub async fn serialize<W: VortexWrite + Unpin + Send>(
@@ -55,18 +57,23 @@ pub async fn serialize<W: VortexWrite + Unpin + Send>(
         .write(&mut writer, vortex_stream)
         .await
         .map_err(|e: vortex_error::VortexError| VortexRdfError::from(e))?;
-    log::debug!("[ser::write_stream_to_vortex] Vortex writing took {:?}", write_start.elapsed());
+    log::debug!(
+        "[ser::write_stream_to_vortex] Vortex writing took {:?}",
+        write_start.elapsed()
+    );
 
     Ok(())
 }
 
 pub fn write_array_to_ipc<W: std::io::Write>(vortex_array: ArrayRef, mut writer: W) -> Result<()> {
-    use vortex_array::LEGACY_SESSION;
-    use vortex_ipc::iterator::ArrayIteratorIPC;
+    // TODO: we should be able to reuse the same session for writing and reading, 
+    //otherwise we might run into issues with incompatible encodings, etc.
+    let session = VortexSession::default();
 
+    // Pass a reference to the local default session instead
     let ipc_iter = vortex_array
         .to_array_iterator()
-        .into_ipc(&LEGACY_SESSION)
+        .into_ipc(&session)
         .map_err(VortexRdfError::Vortex)?;
 
     for msg_res in ipc_iter {

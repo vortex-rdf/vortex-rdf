@@ -1,7 +1,7 @@
 use divan::Bencher;
-use oxrdf::{NamedNode, Subject};
+use oxrdf::{NamedNode};
 use tokio::runtime::Runtime;
-use oxrdf::{NamedOrBlankNode, NamedNode};
+use oxrdf::{NamedOrBlankNode};
 
 use vortex_rdf_core::common::utils::generate_rdf_data_stream;
 use vortex_rdf_core::index::ChainedHash;
@@ -11,8 +11,9 @@ fn main() {
     // Run registered benchmarks.
     divan::main();
 }
+use vortex_rdf_core::store::layout::flat::FlatLayout;
 
-/// Benchmark VortexRdfStore::<ChainedHash>::build_vortex_index with different dataset sizes
+/// Benchmark VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_index with different dataset sizes
 #[divan::bench(
     consts = [10_000, 100_000, 1_000_000],
     sample_count = 10
@@ -28,7 +29,7 @@ fn build_vortex_index<const SIZE: usize>(bencher: Bencher) {
         .bench_values(|quad_stream| {
             // Only this block is timed
             rt.block_on(async {
-                VortexRdfStore::<ChainedHash>::build_vortex_index(quad_stream)
+                VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_index(quad_stream)
                     .await
                     .expect("Failed to build vortex index")
             })
@@ -48,19 +49,19 @@ fn instantiate_store<const SIZE: usize>(bencher: Bencher) {
             // Pre-generate the ArrayRef - this time is NOT counted in the benchmark
             let quad_stream = generate_rdf_data_stream(SIZE);
             rt.block_on(async {
-                VortexRdfStore::<ChainedHash>::build_vortex_index(quad_stream)
+                VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_index(quad_stream)
                     .await
                     .expect("Failed to build vortex index")
             })
         })
         .bench_values(|vortex_array| {
-            // Only this block is timed - measuring VortexRdfStore::<ChainedHash>::new()
-            VortexRdfStore::<ChainedHash>::new(vortex_array)
-                .expect("Failed to create VortexRdfStore::<ChainedHash>")
+            // Only this block is timed - measuring VortexRdfStore::<ChainedHash, FlatLayout>::new()
+            VortexRdfStore::<ChainedHash, FlatLayout>::new(vortex_array)
+                .expect("Failed to create VortexRdfStore::<ChainedHash, FlatLayout>")
         });
 }
 
-/// Benchmark VortexRdfStore::<ChainedHash>::match()
+/// Benchmark VortexRdfStore::<ChainedHash, FlatLayout>::match()
 #[divan::bench(
     consts = [10_000, 100_000, 1_000_000],
     sample_count = 10
@@ -73,15 +74,15 @@ fn match_pattern<const SIZE: usize>(bencher: Bencher) {
             // Pre-generate the ArrayRef - this time is NOT counted in the benchmark
             let quad_stream = generate_rdf_data_stream(SIZE);
             rt.block_on(async {
-                let varray = VortexRdfStore::<ChainedHash>::build_vortex_index(quad_stream)
+                let varray = VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_index(quad_stream)
                     .await
                     .expect("Failed to build vortex index");
-                VortexRdfStore::<ChainedHash>::new(varray)
-                    .expect("Failed to create VortexRdfStore::<ChainedHash>")
+                VortexRdfStore::<ChainedHash, FlatLayout>::new(varray)
+                    .expect("Failed to create VortexRdfStore::<ChainedHash, FlatLayout>")
             })
         })
         .bench_values(|store| {
-            // Only this block is timed - measuring VortexRdfStore::<ChainedHash>::match()
+            // Only this block is timed - measuring VortexRdfStore::<ChainedHash, FlatLayout>::match()
             let subject = Some(&NamedOrBlankNode::NamedNode(
                 NamedNode::new_unchecked("http://example.org/subject/0")
             ));

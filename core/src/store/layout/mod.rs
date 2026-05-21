@@ -5,13 +5,16 @@ use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use std::sync::Arc;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::bool::BoolArrayExt;
-use vortex_array::{ArrayRef, LEGACY_SESSION, VortexSessionExecute};
+use vortex_array::{ArrayRef, VortexSessionExecute};
+use vortex::VortexSessionDefault;
+use vortex::session::VortexSession;
 
-pub mod flat;
 pub mod cottas;
+pub mod flat;
 
 pub fn filter_with_bool_mask(quads: &ArrayRef, mask: ArrayRef) -> Result<ArrayRef> {
-    let mut ctx = LEGACY_SESSION.create_execution_ctx();
+    let session = VortexSession::default();
+    let mut ctx = session.create_execution_ctx();
 
     let bool_arr = mask
         .execute::<BoolArray>(&mut ctx)
@@ -19,11 +22,10 @@ pub fn filter_with_bool_mask(quads: &ArrayRef, mask: ArrayRef) -> Result<ArrayRe
 
     let canonical_mask = bool_arr.to_mask_fill_null_false(&mut ctx);
 
-    quads
-        .filter(canonical_mask)
-        .map_err(VortexRdfError::Vortex)
+    quads.filter(canonical_mask).map_err(VortexRdfError::Vortex)
 }
 
+#[allow(async_fn_in_trait)]
 pub trait RdfQuadLayout<Dict>: Sized + Clone + Send + Sync + 'static
 where
     Dict: RdfDictionary,
@@ -59,24 +61,19 @@ where
     ) -> Result<Option<ArrayRef>>;
 
     /// Add one quad.
-    fn add_quad(
-        dictionary: &mut Dict,
-        quads: &ArrayRef,
-        quad: Quad,
-    ) -> Result<ArrayRef>;
+    fn add_quad(dictionary: &mut Dict, quads: &ArrayRef, quad: Quad) -> Result<ArrayRef>;
 
     /// Delete one quad.
-    fn delete_quad(
-        dictionary: &Dict,
-        quads: &ArrayRef,
-        quad: &Quad,
-    ) -> Result<ArrayRef>;
+    fn delete_quad(dictionary: &Dict, quads: &ArrayRef, quad: &Quad) -> Result<ArrayRef>;
 
     /// Extra root fields for this layout, if any.
     ///
     /// Flat layout returns empty vec.
     /// COTTAS returns row_group_stats, file_metadata, etc.
-    fn extra_root_fields(_dictionary: &Dict, _quads: &ArrayRef) -> Result<Vec<(Arc<str>, ArrayRef)>> {
+    fn extra_root_fields(
+        _dictionary: &Dict,
+        _quads: &ArrayRef,
+    ) -> Result<Vec<(Arc<str>, ArrayRef)>> {
         Ok(vec![])
     }
 }
@@ -108,9 +105,9 @@ impl IndexBuilder {
         Builder: RdfQuadLayoutBuilder<Dict>,
     {
         use futures::StreamExt;
+        use vortex_array::IntoArray;
         use vortex_array::arrays::{ConstantArray, StructArray};
         use vortex_array::validity::Validity;
-        use vortex_array::IntoArray;
 
         let mut dictionary = Dict::new();
 
@@ -149,14 +146,9 @@ impl IndexBuilder {
         field_names.push("quads".into());
         field_arrays.push(crate::common::indexes::wrap_array_in_list(quads_array)?);
 
-        let root = StructArray::try_new(
-            field_names.into(),
-            field_arrays,
-            1,
-            Validity::NonNullable,
-        )
-        .map_err(VortexRdfError::Vortex)?
-        .into_array();
+        let root = StructArray::try_new(field_names.into(), field_arrays, 1, Validity::NonNullable)
+            .map_err(VortexRdfError::Vortex)?
+            .into_array();
 
         Ok(root)
     }

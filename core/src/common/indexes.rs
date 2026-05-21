@@ -1,10 +1,13 @@
 use crate::error::{Result, VortexRdfError};
 use clap::ValueEnum;
-use vortex_array::{ArrayRef, IntoArray, LEGACY_SESSION, VortexSessionExecute};
-use vortex_array::arrays::{PrimitiveArray, ListArray, StructArray};
+use vortex::VortexSessionDefault;
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::validity::Validity;
+use vortex_array::arrays::{ListArray, PrimitiveArray, StructArray};
 use vortex_array::dtype::DType;
+use vortex_array::validity::Validity;
+use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
+use vortex::session::VortexSession;
+
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
 pub enum IndexType {
@@ -29,15 +32,23 @@ pub fn detect_index_type(array: &ArrayRef) -> IndexType {
             } else {
                 array.clone()
             };
-
-            let mut ctx = LEGACY_SESSION.create_execution_ctx();
+            let session = VortexSession::default(); // default session (registries etc.)
+            let mut ctx = session.create_execution_ctx(); // execution ctx
             if let Ok(struct_arr) = slice.clone().execute::<StructArray>(&mut ctx) {
-                if let Some(idx) = struct_arr.names().iter().position(|n| n.as_ref() == "store_type") {
+                if let Some(idx) = struct_arr
+                    .names()
+                    .iter()
+                    .position(|n| n.as_ref() == "store_type")
+                {
                     if let Some(col) = struct_arr.unmasked_fields().get(idx) {
                         if let Ok(scalar) = col.execute_scalar(0, &mut ctx) {
                             let val = format!("{}", scalar);
-                            if val.contains("chained-hash") { return IndexType::ChainedHash; }
-                            if val.contains("simple-dictionary") { return IndexType::SimpleDictionary; }
+                            if val.contains("chained-hash") {
+                                return IndexType::ChainedHash;
+                            }
+                            if val.contains("simple-dictionary") {
+                                return IndexType::SimpleDictionary;
+                            }
                         }
                     }
                 }
@@ -51,7 +62,10 @@ pub fn detect_index_type(array: &ArrayRef) -> IndexType {
 pub fn wrap_array_in_list(array: ArrayRef) -> Result<ArrayRef> {
     log::trace!("Wrapping array of length {} in a list array.", array.len());
     if array.len() > i32::MAX as usize {
-        log::warn!("Array length {} exceeds i32::MAX, consider using i64 offsets for list wrapping", array.len());
+        log::warn!(
+            "Array length {} exceeds i32::MAX, consider using i64 offsets for list wrapping",
+            array.len()
+        );
         return Err(VortexRdfError::Deserialization(format!(
             "Array length {} exceeds i32::MAX, cannot wrap in list",
             array.len()

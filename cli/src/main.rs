@@ -7,27 +7,30 @@ use std::io::{Read, Write, stdin, stdout};
 use std::path::PathBuf;
 use std::time::Instant;
 use tokio::io::AsyncWriteExt;
+use vortex::VortexSessionDefault;
+use vortex_array::ExecutionCtx;
 
 use tokio::fs::File as TokioFile;
 
 use vortex::buffer::Buffer;
 
+use vortex::session::VortexSession;
+use vortex_array::VortexSessionExecute;
+use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_rdf_core::{
-    CottasVortexStore,
-    VortexRdfError,
     VortexRdfStore,
     common::formats::{Format, detect_format},
     common::indexes::{IndexType, detect_index_type},
     common::utils::{
-        check_vtxf_sanity, parse_graph_name, parse_named_node, parse_quads_from_reader, parse_subject,
-        parse_term,
+        parse_graph_name, parse_named_node, parse_quads_from_reader, parse_subject, parse_term,
     },
     index::{ChainedHash, SimpleDictionary},
-    io::{deserialize, serialize, load_vortex_file_ref, load_vortex_file_path},
+    io::{deserialize, load_vortex_file_path, load_vortex_file_ref, serialize},
+    store::cottas_vortex_store::CottasVortexStore,
     store::layout::flat::FlatLayout,
 };
-use vortex_array::ToCanonical;
-use vortex_array::arrays::struct_::StructArrayExt;
+
+use vortex_array::Canonical;
 
 #[derive(Parser)]
 #[command(
@@ -124,23 +127,37 @@ enum StoreLayout {
     CottasSpog,
 }
 
-fn detect_storage_layout(vortex_array: &vortex_array::ArrayRef) -> StoreLayout {
-    let vortex_struct = vortex_array.to_struct();
+fn detect_storage_layout(
+    vortex_array: &vortex_array::ArrayRef,
+    ctx: &mut ExecutionCtx,
+) -> anyhow::Result<StoreLayout> {
+    let canonical = vortex_array
+        .clone()
+        .execute::<Canonical>(ctx)
+        .context("Failed to execute canonical conversion")?;
+
+    let vortex_struct = match canonical {
+        Canonical::Struct(s) => s,
+        _ => return Ok(StoreLayout::Default),
+    };
     if let Ok(field_ref) = vortex_struct.unmasked_field_by_name("storage_layout") {
-        if let Ok(scalar) = field_ref.scalar_at(0) {
+        if let Ok(scalar) = field_ref.execute_scalar(0, ctx) {
             let value = format!("{}", scalar);
             if value.contains("cottas-spog") {
-                return StoreLayout::CottasSpog;
+                return Ok(StoreLayout::CottasSpog);
             }
         }
     }
-    StoreLayout::Default
+    Ok(StoreLayout::Default)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
+
+    let session = VortexSession::default(); // default session (registries etc.)
+    let mut ctx = session.create_execution_ctx(); // execution ctx
 
     match cli.action {
         Action::Serialize {
@@ -170,10 +187,14 @@ async fn main() -> Result<()> {
             let vortex_array = match storage_layout {
                 StoreLayout::Default => match index_type {
                     IndexType::SimpleDictionary => {
-                        VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_index(quads_stream).await?
+                        VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_index(
+                            quads_stream,
+                        )
+                        .await?
                     }
                     IndexType::ChainedHash => {
-                        VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_index(quads_stream).await?
+                        VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_index(quads_stream)
+                            .await?
                     }
                 },
                 StoreLayout::CottasSpog => match index_type {
@@ -203,11 +224,6 @@ async fn main() -> Result<()> {
                 .context("Failed to sync output file")?;
 
             drop(writer); // Ensure file is closed before we check metadata
-
-            match check_vtxf_sanity(&output) {
-                Ok(info) => log::info!("Vortex file sanity OK: {:?}", info),
-                Err(e) => log::error!("Vortex file sanity FAILED: {e}"),
-            }
         }
         Action::Deserialize {
             input,
@@ -306,9 +322,6 @@ async fn main() -> Result<()> {
             let is_vortex_file = input.extension().map(|e| e == "vortex").unwrap_or(false);
 
             let (vortex_array, resolved_index_type, resolved_storage_layout) = if is_vortex_file {
-                check_vtxf_sanity(&input).map_err(|e| {
-                    VortexRdfError::Deserialization(format!("Vortex file sanity FAILED: {e}"))
-                })?;
                 let load_start = Instant::now();
                 let arr = load_vortex_file_path(&input)
                     .await
@@ -319,7 +332,7 @@ async fn main() -> Result<()> {
                 );
                 let detect_start = Instant::now();
                 let t = detect_index_type(&arr);
-                let resolved_layout = detect_storage_layout(&arr);
+                let resolved_layout = detect_storage_layout(&arr, &mut ctx)?;
                 debug!(
                     "Detected index type {:?} and storage layout {:?} in {:?}",
                     t,
@@ -344,11 +357,16 @@ async fn main() -> Result<()> {
                 let arr = match layout {
                     StoreLayout::Default => match t {
                         IndexType::SimpleDictionary => {
-                            VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_index(quads_stream)
-                                .await?
+                            VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_index(
+                                quads_stream,
+                            )
+                            .await?
                         }
                         IndexType::ChainedHash => {
-                            VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_index(quads_stream).await?
+                            VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_index(
+                                quads_stream,
+                            )
+                            .await?
                         }
                     },
                     StoreLayout::CottasSpog => match t {

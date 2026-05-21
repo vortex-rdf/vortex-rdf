@@ -3,6 +3,8 @@ use crate::error::Result;
 use crate::index::RdfDictionary;
 
 use oxrdf::{GraphName, Term};
+use vortex::VortexSessionDefault;
+use vortex_session::VortexSession;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
@@ -12,7 +14,7 @@ use vortex_array::arrays::listview::ListViewArrayExt;
 
 use vortex_array::ArrayRef;
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray, StructArray, ListViewArray};
-use vortex_array::{IntoArray, LEGACY_SESSION, VortexSessionExecute};
+use vortex_array::{IntoArray, VortexSessionExecute};
 use vortex_array::dtype::{DType, Nullability, PType};
 
 /// Chained hash dictionary implementation
@@ -41,7 +43,8 @@ impl ChainedHash {
     ) -> Option<u32> {
         let h = Self::hash(term_str);
         let bucket_idx = h;
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let session = VortexSession::default();
+        let mut ctx = session.create_execution_ctx();
 
         let mut curr = buckets_arr.clone().execute::<PrimitiveArray>(&mut ctx).ok()?
             .execute_scalar(bucket_idx, &mut ctx).ok()?
@@ -81,7 +84,8 @@ impl RdfDictionary for ChainedHash {
 
     fn from_vortex_array(dict_array_ref: &ArrayRef) -> Result<Self> {
         let start = Instant::now();
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let session = VortexSession::default();
+        let mut ctx = session.create_execution_ctx();
 
         // The dictionary might be wrapped in a ListArray, or it might be the Struct directly
         // Try to unwrap as ListArray first, if that fails, use it directly
@@ -141,7 +145,8 @@ impl RdfDictionary for ChainedHash {
 
     fn get_or_insert(&mut self, term_str: &str) -> u32 {
         let h = Self::hash(term_str);
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let session = VortexSession::default();
+        let mut ctx = session.create_execution_ctx();
 
         // Traverse chain to check if term exists
         let buckets_prim = self.buckets.clone().execute::<PrimitiveArray>(&mut ctx).expect("buckets must be primitive");
@@ -191,7 +196,8 @@ impl RdfDictionary for ChainedHash {
 
     fn get_or_insert_bulk(&mut self, terms: &[&str]) -> Vec<u32> {
         let mut ids = Vec::with_capacity(terms.len());
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let session = VortexSession::default();
+        let mut ctx = session.create_execution_ctx();
 
         // First pass: collect existing IDs and new terms
         let mut new_terms: Vec<&str> = Vec::new();
@@ -284,7 +290,8 @@ impl RdfDictionary for ChainedHash {
 
     fn get_id(&self, term_str: &str) -> Option<u32> {
         let h = Self::hash(term_str);
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let session = VortexSession::default();
+        let mut ctx = session.create_execution_ctx();
         let buckets_prim = self.buckets.clone().execute::<PrimitiveArray>(&mut ctx).ok()?;
         let mut curr = buckets_prim.as_slice::<i32>()[h];
 
@@ -304,7 +311,8 @@ impl RdfDictionary for ChainedHash {
     }
 
     fn get_term(&self, id: u32) -> Option<Term> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let session = VortexSession::default();
+        let mut ctx = session.create_execution_ctx();
         let values_varbin = self.values.clone().execute::<VarBinViewArray>(&mut ctx).ok()?;
         if (id as usize) >= values_varbin.len() {
             return None;
@@ -315,7 +323,8 @@ impl RdfDictionary for ChainedHash {
     }
 
     fn get_graph_name(&self, id: u32) -> Option<GraphName> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let session = VortexSession::default();
+        let mut ctx = session.create_execution_ctx();
         let values_varbin = self.values.clone().execute::<VarBinViewArray>(&mut ctx).ok()?;
         if (id as usize) >= values_varbin.len() {
             return None;

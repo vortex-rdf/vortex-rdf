@@ -4,6 +4,7 @@ use crate::store::QuadStore;
 
 use futures::StreamExt;
 use oxrdfio::{RdfFormat, RdfSerializer};
+use vortex::VortexSessionDefault;
 #[cfg(feature = "file-io")]
 use std::io::Write;
 use std::time::Instant;
@@ -20,6 +21,7 @@ use vortex_array::stream::ArrayStreamExt;
 use vortex_file::OpenOptionsSessionExt;
 #[cfg(feature = "file-io")]
 use vortex_io::VortexReadAt;
+use vortex_session::VortexSession;
 
 /// High-level function to deserialize Vortex-RDF data store into an RDF writer.
 pub async fn deserialize<Store, W>(store: Store, writer: W, format: RdfFormat) -> error::Result<()>
@@ -55,10 +57,14 @@ where
 }
 
 pub fn array_from_reader<R: std::io::Read>(reader: R) -> Result<ArrayRef> {
-    use vortex_array::LEGACY_SESSION;
+    // Completely isolated and safe to use if configurations are standard
+    // IMPORTANT: If we start using custom sessions with different configurations, 
+    // we need to make sure to use the same session for writing and reading,
+    // otherwise we might run into issues with incompatible encodings, etc.
+    let session = VortexSession::default();
 
     let mut ipc_reader =
-        SyncIPCReader::try_new(reader, &LEGACY_SESSION).map_err(VortexRdfError::Vortex)?;
+        SyncIPCReader::try_new(reader, &session).map_err(VortexRdfError::Vortex)?;
 
     let array = ipc_reader
         .next()

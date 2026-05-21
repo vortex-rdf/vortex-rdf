@@ -7,15 +7,14 @@ use oxrdf::{
     Literal,
     GraphName
 };
+use vortex::VortexSessionDefault;
 use crate::error::{Result, VortexRdfError};
 use futures::{Stream, stream};
 use oxrdfio::{RdfFormat, RdfParser};
-use vortex_array::{ArrayRef, LEGACY_SESSION, VortexSessionExecute};
+use vortex_array::{ArrayRef, VortexSessionExecute};
 use vortex_array::arrays::struct_::StructArray;
 use vortex_array::arrays::listview::{ListViewArray, ListViewArrayExt};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use vortex::session::VortexSession;
 
 pub fn parse_named_node(s: &str) -> Result<NamedNode> {
     let s = s.trim_matches(|c| c == '<' || c == '>');
@@ -119,7 +118,8 @@ pub fn extract_vortex_struct_field(vortex_struct: &StructArray, name: &str) -> R
     use vortex_array::arrays::struct_::StructArrayExt;
     use vortex_array::dtype::{DType, Nullability, PType};
     let start = std::time::Instant::now();
-    let mut ctx = LEGACY_SESSION.create_execution_ctx();
+    let session = VortexSession::default(); // default session (registries etc.)
+    let mut ctx = session.create_execution_ctx(); // execution ctx
 
     let list_ref = vortex_struct.unmasked_field_by_name(name)
         .map_err(|_| VortexRdfError::Deserialization(format!("Field '{}' not found in struct", name)))?
@@ -184,81 +184,4 @@ pub struct VortexFileSanity {
     pub end_magic: [u8; 4],
     pub version: u16,
     pub postscript_len: u16,
-}
-
-pub fn check_vtxf_sanity(path: impl AsRef<Path>) -> std::io::Result<VortexFileSanity> {
-    const MAGIC: [u8; 4] = *b"VTXF";
-    const EOF_SIZE: u64 = 8;
-
-    let path = path.as_ref();
-    let mut f = File::open(path)?;
-    let file_len = f.metadata()?.len();
-
-    if file_len < 4 + EOF_SIZE {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            format!("File too small to be a Vortex file: {file_len} bytes"),
-        ));
-    }
-
-    // Read start magic
-    let mut start_magic = [0u8; 4];
-    f.seek(SeekFrom::Start(0))?;
-    f.read_exact(&mut start_magic)?;
-
-    // Read EOF marker (last 8 bytes): [u16 version][u16 postscript_len][u32 magic]
-    let mut eof = [0u8; 8];
-    f.seek(SeekFrom::End(-(EOF_SIZE as i64)))?;
-    f.read_exact(&mut eof)?;
-
-    let version = u16::from_le_bytes([eof[0], eof[1]]);
-    let postscript_len = u16::from_le_bytes([eof[2], eof[3]]);
-    let end_magic = [eof[4], eof[5], eof[6], eof[7]];
-
-    // Basic checks from spec
-    if start_magic != MAGIC {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "Invalid Vortex start magic: {:?} (expected {:?})",
-                start_magic, MAGIC
-            ),
-        ));
-    }
-
-    if end_magic != MAGIC {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "Invalid Vortex end magic: {:?} (expected {:?})",
-                end_magic, MAGIC
-            ),
-        ));
-    }
-
-    // Postscript is located immediately before the EOF marker, and its length is u16.
-    // Spec guarantees postscript length won't exceed 65528 bytes. We'll sanity-check bounds. 【1-01ea59】
-    let ps_len_u64 = postscript_len as u64;
-    if ps_len_u64 > 65528 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Postscript length too large: {}", postscript_len),
-        ));
-    }
-    if ps_len_u64 + EOF_SIZE > file_len {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            format!(
-                "Postscript length {} + EOF {} exceeds file length {}",
-                ps_len_u64, EOF_SIZE, file_len
-            ),
-        ));
-    }
-    Ok(VortexFileSanity {
-        file_len,
-        start_magic,
-        end_magic,
-        version,
-        postscript_len,
-    })
 }
