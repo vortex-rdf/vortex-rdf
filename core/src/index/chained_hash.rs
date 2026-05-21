@@ -3,19 +3,19 @@ use crate::error::Result;
 use crate::index::RdfDictionary;
 
 use oxrdf::{GraphName, Term};
-use vortex::VortexSessionDefault;
-use vortex_session::VortexSession;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
+use vortex::VortexSessionDefault;
+use vortex_session::VortexSession;
 
-use vortex_array::builders::{ArrayBuilder, VarBinViewBuilder, PrimitiveBuilder};
 use vortex_array::arrays::listview::ListViewArrayExt;
+use vortex_array::builders::{ArrayBuilder, PrimitiveBuilder, VarBinViewBuilder};
 
 use vortex_array::ArrayRef;
-use vortex_array::arrays::{PrimitiveArray, VarBinViewArray, StructArray, ListViewArray};
-use vortex_array::{IntoArray, VortexSessionExecute};
+use vortex_array::arrays::{ListViewArray, PrimitiveArray, StructArray, VarBinViewArray};
 use vortex_array::dtype::{DType, Nullability, PType};
+use vortex_array::{IntoArray, VortexSessionExecute};
 
 /// Chained hash dictionary implementation
 #[derive(Clone)]
@@ -46,14 +46,21 @@ impl ChainedHash {
         let session = VortexSession::default();
         let mut ctx = session.create_execution_ctx();
 
-        let mut curr = buckets_arr.clone().execute::<PrimitiveArray>(&mut ctx).ok()?
-            .execute_scalar(bucket_idx, &mut ctx).ok()?
+        let mut curr = buckets_arr
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)
+            .ok()?
+            .execute_scalar(bucket_idx, &mut ctx)
+            .ok()?
             .cast(&DType::Primitive(PType::I32, Nullability::NonNullable))
             .ok()?
             .as_primitive()
             .typed_value::<i32>()?;
 
-        let values_varbin = values_arr.clone().execute::<VarBinViewArray>(&mut ctx).ok()?;
+        let values_varbin = values_arr
+            .clone()
+            .execute::<VarBinViewArray>(&mut ctx)
+            .ok()?;
         let next_prim = next_arr.clone().execute::<PrimitiveArray>(&mut ctx).ok()?;
 
         while curr != -1 {
@@ -62,7 +69,8 @@ impl ChainedHash {
             if bytes.as_ref() == term_str.as_bytes() {
                 return Some(idx as u32);
             }
-            curr = next_prim.execute_scalar(idx, &mut ctx)
+            curr = next_prim
+                .execute_scalar(idx, &mut ctx)
                 .ok()?
                 .cast(&DType::Primitive(PType::I32, Nullability::NonNullable))
                 .ok()?
@@ -94,13 +102,18 @@ impl RdfDictionary for ChainedHash {
 
         let dict_struct = if id.as_ref() == "vortex.listview" {
             // It's a ListArray, unwrap it
-            let dict_list = dict_array_ref.clone().execute::<ListViewArray>(&mut ctx)
+            let dict_list = dict_array_ref
+                .clone()
+                .execute::<ListViewArray>(&mut ctx)
                 .map_err(crate::error::VortexRdfError::Vortex)?;
             let dict_struct_array = dict_list.elements().clone();
-            dict_struct_array.execute::<StructArray>(&mut ctx)
+            dict_struct_array
+                .execute::<StructArray>(&mut ctx)
                 .map_err(crate::error::VortexRdfError::Vortex)?
         } else {
-            dict_array_ref.clone().execute::<StructArray>(&mut ctx)
+            dict_array_ref
+                .clone()
+                .execute::<StructArray>(&mut ctx)
                 .map_err(crate::error::VortexRdfError::Vortex)?
         };
 
@@ -111,30 +124,42 @@ impl RdfDictionary for ChainedHash {
 
         // Unwrap each field if it's a ListArray, otherwise use directly
         let values = if values_field.encoding_id().as_ref() == "vortex.listview" {
-            values_field.clone().execute::<ListViewArray>(&mut ctx)
+            values_field
+                .clone()
+                .execute::<ListViewArray>(&mut ctx)
                 .map_err(crate::error::VortexRdfError::Vortex)?
-                .elements().clone()
+                .elements()
+                .clone()
         } else {
             values_field
         };
 
         let buckets = if buckets_field.encoding_id().as_ref() == "vortex.listview" {
-            buckets_field.clone().execute::<ListViewArray>(&mut ctx)
+            buckets_field
+                .clone()
+                .execute::<ListViewArray>(&mut ctx)
                 .map_err(crate::error::VortexRdfError::Vortex)?
-                .elements().clone()
+                .elements()
+                .clone()
         } else {
             buckets_field
         };
 
         let next = if next_field.encoding_id().as_ref() == "vortex.listview" {
-            next_field.clone().execute::<ListViewArray>(&mut ctx)
+            next_field
+                .clone()
+                .execute::<ListViewArray>(&mut ctx)
                 .map_err(crate::error::VortexRdfError::Vortex)?
-                .elements().clone()
+                .elements()
+                .clone()
         } else {
             next_field
         };
 
-        log::debug!("[ChainedHash::from_vortex_array] Reconstruction took {:?}", start.elapsed());
+        log::debug!(
+            "[ChainedHash::from_vortex_array] Reconstruction took {:?}",
+            start.elapsed()
+        );
 
         Ok(Self {
             buckets,
@@ -149,12 +174,24 @@ impl RdfDictionary for ChainedHash {
         let mut ctx = session.create_execution_ctx();
 
         // Traverse chain to check if term exists
-        let buckets_prim = self.buckets.clone().execute::<PrimitiveArray>(&mut ctx).expect("buckets must be primitive");
+        let buckets_prim = self
+            .buckets
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)
+            .expect("buckets must be primitive");
         let buckets_slice = buckets_prim.as_slice::<i32>();
         let mut row = buckets_slice[h];
 
-        let values_varbin = self.values.clone().execute::<VarBinViewArray>(&mut ctx).expect("values must be varbinview");
-        let next_prim = self.next.clone().execute::<PrimitiveArray>(&mut ctx).expect("next must be primitive");
+        let values_varbin = self
+            .values
+            .clone()
+            .execute::<VarBinViewArray>(&mut ctx)
+            .expect("values must be varbinview");
+        let next_prim = self
+            .next
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)
+            .expect("next must be primitive");
         let next_slice = next_prim.as_slice::<i32>();
 
         while row != -1 {
@@ -203,10 +240,22 @@ impl RdfDictionary for ChainedHash {
         let mut new_terms: Vec<&str> = Vec::new();
         let mut new_term_hashes: Vec<usize> = Vec::new();
 
-        let buckets_prim = self.buckets.clone().execute::<PrimitiveArray>(&mut ctx).expect("buckets must be primitive");
+        let buckets_prim = self
+            .buckets
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)
+            .expect("buckets must be primitive");
         let buckets_slice = buckets_prim.as_slice::<i32>();
-        let values_varbin = self.values.clone().execute::<VarBinViewArray>(&mut ctx).expect("values must be varbinview");
-        let next_prim = self.next.clone().execute::<PrimitiveArray>(&mut ctx).expect("next must be primitive");
+        let values_varbin = self
+            .values
+            .clone()
+            .execute::<VarBinViewArray>(&mut ctx)
+            .expect("values must be varbinview");
+        let next_prim = self
+            .next
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)
+            .expect("next must be primitive");
         let next_slice = next_prim.as_slice::<i32>();
 
         for &term_str in terms {
@@ -292,10 +341,18 @@ impl RdfDictionary for ChainedHash {
         let h = Self::hash(term_str);
         let session = VortexSession::default();
         let mut ctx = session.create_execution_ctx();
-        let buckets_prim = self.buckets.clone().execute::<PrimitiveArray>(&mut ctx).ok()?;
+        let buckets_prim = self
+            .buckets
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)
+            .ok()?;
         let mut curr = buckets_prim.as_slice::<i32>()[h];
 
-        let values_varbin = self.values.clone().execute::<VarBinViewArray>(&mut ctx).ok()?;
+        let values_varbin = self
+            .values
+            .clone()
+            .execute::<VarBinViewArray>(&mut ctx)
+            .ok()?;
         let next_prim = self.next.clone().execute::<PrimitiveArray>(&mut ctx).ok()?;
         let next_slice = next_prim.as_slice::<i32>();
 
@@ -313,7 +370,11 @@ impl RdfDictionary for ChainedHash {
     fn get_term(&self, id: u32) -> Option<Term> {
         let session = VortexSession::default();
         let mut ctx = session.create_execution_ctx();
-        let values_varbin = self.values.clone().execute::<VarBinViewArray>(&mut ctx).ok()?;
+        let values_varbin = self
+            .values
+            .clone()
+            .execute::<VarBinViewArray>(&mut ctx)
+            .ok()?;
         if (id as usize) >= values_varbin.len() {
             return None;
         }
@@ -325,7 +386,11 @@ impl RdfDictionary for ChainedHash {
     fn get_graph_name(&self, id: u32) -> Option<GraphName> {
         let session = VortexSession::default();
         let mut ctx = session.create_execution_ctx();
-        let values_varbin = self.values.clone().execute::<VarBinViewArray>(&mut ctx).ok()?;
+        let values_varbin = self
+            .values
+            .clone()
+            .execute::<VarBinViewArray>(&mut ctx)
+            .ok()?;
         if (id as usize) >= values_varbin.len() {
             return None;
         }

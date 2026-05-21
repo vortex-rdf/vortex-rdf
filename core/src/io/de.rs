@@ -4,10 +4,10 @@ use crate::store::QuadStore;
 
 use futures::StreamExt;
 use oxrdfio::{RdfFormat, RdfSerializer};
-use vortex::VortexSessionDefault;
 #[cfg(feature = "file-io")]
 use std::io::Write;
 use std::time::Instant;
+use vortex::VortexSessionDefault;
 
 #[cfg(feature = "file-io")]
 use vortex_array::ArrayRef;
@@ -58,7 +58,7 @@ where
 
 pub fn array_from_reader<R: std::io::Read>(reader: R) -> Result<ArrayRef> {
     // Completely isolated and safe to use if configurations are standard
-    // IMPORTANT: If we start using custom sessions with different configurations, 
+    // IMPORTANT: If we start using custom sessions with different configurations,
     // we need to make sure to use the same session for writing and reading,
     // otherwise we might run into issues with incompatible encodings, etc.
     let session = VortexSession::default();

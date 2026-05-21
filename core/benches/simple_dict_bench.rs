@@ -1,7 +1,7 @@
 use divan::Bencher;
-use oxrdf::{NamedNode};
+use oxrdf::NamedNode;
+use oxrdf::NamedOrBlankNode;
 use tokio::runtime::Runtime;
-use oxrdf::{NamedOrBlankNode};
 
 use vortex_rdf_core::common::utils::generate_rdf_data_stream;
 use vortex_rdf_core::index::SimpleDictionary;
@@ -73,18 +73,19 @@ fn match_pattern<const SIZE: usize>(bencher: Bencher) {
             // Pre-generate the ArrayRef - this time is NOT counted in the benchmark
             let quad_stream = generate_rdf_data_stream(SIZE);
             rt.block_on(async {
-                let varray = VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_index(quad_stream)
-                    .await
-                    .expect("Failed to build vortex index");
+                let varray =
+                    VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_index(quad_stream)
+                        .await
+                        .expect("Failed to build vortex index");
                 VortexRdfStore::<SimpleDictionary, FlatLayout>::new(varray)
                     .expect("Failed to create VortexRdfStore::<SimpleDictionary, FlatLayout>")
             })
         })
         .bench_values(|store| {
             // Only this block is timed - measuring SimpleDictionaryStore::match()
-            let subject = Some(&NamedOrBlankNode::NamedNode(
-                NamedNode::new_unchecked("http://example.org/subject/0")
-            ));
+            let subject = Some(&NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(
+                "http://example.org/subject/0",
+            )));
             let predicate = Some(&NamedNode::new_unchecked("http://example.org/predicate/0"));
 
             rt.block_on(async {

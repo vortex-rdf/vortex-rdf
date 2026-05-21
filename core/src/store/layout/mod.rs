@@ -3,11 +3,11 @@ use crate::index::RdfDictionary;
 use futures::Stream;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use std::sync::Arc;
+use vortex::VortexSessionDefault;
+use vortex::session::VortexSession;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::bool::BoolArrayExt;
 use vortex_array::{ArrayRef, VortexSessionExecute};
-use vortex::VortexSessionDefault;
-use vortex::session::VortexSession;
 
 pub mod cottas;
 pub mod flat;
@@ -32,6 +32,7 @@ where
 {
     /// Human-readable / serialized layout identifier.
     const STORAGE_LAYOUT: &'static str;
+    const DEFAULT_APPEND_CHUNK_SIZE: usize = 8192;
 
     /// Create an empty physical quads array.
     fn empty_quads() -> Result<ArrayRef>;
@@ -75,6 +76,24 @@ where
         _quads: &ArrayRef,
     ) -> Result<Vec<(Arc<str>, ArrayRef)>> {
         Ok(vec![])
+    }
+
+    fn append_quads_chunked(
+        dictionary: &mut Dict,
+        quads: &ArrayRef,
+        new_quads: Vec<Quad>,
+        _chunk_size: usize,
+    ) -> Result<ArrayRef> {
+        let mut current = quads.clone();
+
+        for quad in new_quads {
+            current = Self::add_quad(dictionary, &current, quad)?;
+        }
+
+        Ok(current)
+    }
+    fn compact_quads(quads: &ArrayRef) -> Result<ArrayRef> {
+        Ok(quads.clone())
     }
 }
 
@@ -152,4 +171,9 @@ impl IndexBuilder {
 
         Ok(root)
     }
+}
+
+pub enum AppendStrategy {
+    Rebuild,
+    Chunked,
 }

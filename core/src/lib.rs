@@ -1,27 +1,20 @@
+pub mod common;
 pub mod error;
+pub mod index;
 pub mod io;
 pub mod store;
-pub mod common;
-pub mod index;
 
 pub use error::VortexRdfError;
-pub use io::{
-    deserialize,
-    array_from_reader,
-    serialize,
-    quads_stream_to_vortex,
-    quads_stream_to_vortex_writer
-};
 #[cfg(feature = "file-io")]
 pub use io::load_vortex_file_ref;
+pub use io::{
+    array_from_reader, deserialize, quads_stream_to_vortex, quads_stream_to_vortex_writer,
+    serialize,
+};
 
 pub use store::VortexRdfStore;
 
-pub use index::{
-    RdfDictionary,
-    SimpleDictionary,
-    ChainedHash,
-};
+pub use index::{ChainedHash, RdfDictionary, SimpleDictionary};
 
 use mimalloc::MiMalloc;
 /*
@@ -31,13 +24,12 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::{TryStreamExt, stream};
-    use oxrdf::{GraphName, Literal, NamedNode, Quad, NamedOrBlankNode, Term};
-use store::layout::flat::FlatLayout;
+    use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
+    use store::layout::flat::FlatLayout;
 
     #[tokio::test]
 
@@ -49,16 +41,14 @@ use store::layout::flat::FlatLayout;
         let quad = Quad::new(s, p, o, g);
         let quads = vec![quad.clone()];
 
-        let dict_index = VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_index(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
-            .await
-            .expect("Serialization failed");
+        let dict_index = VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_index(
+            stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))),
+        )
+        .await
+        .expect("Serialization failed");
         let dict_store = VortexRdfStore::<SimpleDictionary, FlatLayout>::new(dict_index).unwrap();
-        
-        let decoded_quads: Vec<Quad> = dict_store.quads()
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
+
+        let decoded_quads: Vec<Quad> = dict_store.quads().unwrap().try_collect().await.unwrap();
 
         assert_eq!(1, decoded_quads.len());
         assert_eq!(
@@ -69,10 +59,7 @@ use store::layout::flat::FlatLayout;
             quad.predicate.to_string(),
             decoded_quads[0].predicate.to_string()
         );
-        assert_eq!(
-            quad.object.to_string(),
-            decoded_quads[0].object.to_string()
-        );
+        assert_eq!(quad.object.to_string(), decoded_quads[0].object.to_string());
         assert_eq!(
             quad.graph_name.to_string(),
             decoded_quads[0].graph_name.to_string()
@@ -88,12 +75,16 @@ use store::layout::flat::FlatLayout;
         let quad = Quad::new(s, p, o, g);
         let quads = vec![quad.clone()];
 
-        let chained_hash = VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_index(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
-            .await
-            .expect("Serialization failed");
-        let chained_hash_store = VortexRdfStore::<ChainedHash, FlatLayout>::new(chained_hash).unwrap();
-        
-        let decoded_quads: Vec<Quad> = chained_hash_store.quads()
+        let chained_hash = VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_index(
+            stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))),
+        )
+        .await
+        .expect("Serialization failed");
+        let chained_hash_store =
+            VortexRdfStore::<ChainedHash, FlatLayout>::new(chained_hash).unwrap();
+
+        let decoded_quads: Vec<Quad> = chained_hash_store
+            .quads()
             .unwrap()
             .try_collect()
             .await
@@ -108,10 +99,7 @@ use store::layout::flat::FlatLayout;
             quad.predicate.to_string(),
             decoded_quads[0].predicate.to_string()
         );
-        assert_eq!(
-            quad.object.to_string(),
-            decoded_quads[0].object.to_string()
-        );
+        assert_eq!(quad.object.to_string(), decoded_quads[0].object.to_string());
         assert_eq!(
             quad.graph_name.to_string(),
             decoded_quads[0].graph_name.to_string()
@@ -135,20 +123,21 @@ use store::layout::flat::FlatLayout;
 
         let quads = vec![q1.clone(), q2.clone()];
 
-        let dict_index = VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_index(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
-            .await
-            .expect("Serialization failed");
+        let dict_index = VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_index(
+            stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))),
+        )
+        .await
+        .expect("Serialization failed");
         let dict_store = VortexRdfStore::<SimpleDictionary, FlatLayout>::new(dict_index).unwrap();
 
         // Match ?s <p1> ?o ?g
-        let filtered = dict_store.match_pattern(None, Some(&p1), None, None).await.unwrap();
-        assert_eq!(filtered.size(), 1);
-
-        let results: Vec<Quad> = filtered.quads()
-            .unwrap()
-            .try_collect()
+        let filtered = dict_store
+            .match_pattern(None, Some(&p1), None, None)
             .await
             .unwrap();
+        assert_eq!(filtered.size(), 1);
+
+        let results: Vec<Quad> = filtered.quads().unwrap().try_collect().await.unwrap();
         let res_q = results.first().unwrap();
 
         assert_eq!(res_q.subject.to_string(), s1.to_string());
@@ -158,7 +147,10 @@ use store::layout::flat::FlatLayout;
 
         // Match ?s <non-existent> ?o ?g
         let p3 = NamedNode::new("http://example.org/p3").unwrap();
-        let empty = dict_store.match_pattern(None, Some(&p3), None, None).await.unwrap();
+        let empty = dict_store
+            .match_pattern(None, Some(&p3), None, None)
+            .await
+            .unwrap();
         assert_eq!(empty.size(), 0);
     }
 
@@ -179,20 +171,22 @@ use store::layout::flat::FlatLayout;
 
         let quads = vec![q1.clone(), q2.clone()];
 
-        let chained_hash = VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_index(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
-            .await
-            .expect("Serialization failed");
-        let chained_hash_store = VortexRdfStore::<ChainedHash, FlatLayout>::new(chained_hash).unwrap();
+        let chained_hash = VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_index(
+            stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))),
+        )
+        .await
+        .expect("Serialization failed");
+        let chained_hash_store =
+            VortexRdfStore::<ChainedHash, FlatLayout>::new(chained_hash).unwrap();
 
         // Match ?s <p1> ?o ?g
-        let filtered = chained_hash_store.match_pattern(None, Some(&p1), None, None).await.unwrap();
-        assert_eq!(filtered.size(), 1);
-
-        let results: Vec<Quad> = filtered.quads()
-            .unwrap()
-            .try_collect()
+        let filtered = chained_hash_store
+            .match_pattern(None, Some(&p1), None, None)
             .await
             .unwrap();
+        assert_eq!(filtered.size(), 1);
+
+        let results: Vec<Quad> = filtered.quads().unwrap().try_collect().await.unwrap();
         let res_q = results.first().unwrap();
 
         assert_eq!(res_q.subject.to_string(), s1.to_string());
@@ -202,7 +196,10 @@ use store::layout::flat::FlatLayout;
 
         // Match ?s <non-existent> ?o ?g
         let p3 = NamedNode::new("http://example.org/p3").unwrap();
-        let empty = chained_hash_store.match_pattern(None, Some(&p3), None, None).await.unwrap();
+        let empty = chained_hash_store
+            .match_pattern(None, Some(&p3), None, None)
+            .await
+            .unwrap();
         assert_eq!(empty.size(), 0);
     }
 
@@ -249,52 +246,126 @@ use store::layout::flat::FlatLayout;
     #[tokio::test]
     async fn test_multiple_append_dict_index() {
         let mut store = VortexRdfStore::<SimpleDictionary, FlatLayout>::empty().unwrap();
-        
+
         for i in 0..10 {
-            let s = NamedOrBlankNode::NamedNode(NamedNode::new(format!("http://example.org/s{}", i)).unwrap());
+            let s = NamedOrBlankNode::NamedNode(
+                NamedNode::new(format!("http://example.org/s{}", i)).unwrap(),
+            );
             let p = NamedNode::new("http://example.org/p").unwrap();
             let o = Term::Literal(Literal::new_simple_literal("o"));
             let g = GraphName::DefaultGraph;
             let q = Quad::new(s, p, o, g);
             store = store.add_quad(q).await.unwrap();
         }
-        
+
         assert_eq!(store.size(), 10);
-        
+
         // Match p
         let p = NamedNode::new("http://example.org/p").unwrap();
-        let matched = store.match_pattern(None, Some(&p), None, None).await.unwrap();
+        let matched = store
+            .match_pattern(None, Some(&p), None, None)
+            .await
+            .unwrap();
         assert_eq!(matched.size(), 10);
-        
+
         // Match specific subject s5
         let s5 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s5").unwrap());
-        let matched_s5 = store.match_pattern(Some(&s5), None, None, None).await.unwrap();
+        let matched_s5 = store
+            .match_pattern(Some(&s5), None, None, None)
+            .await
+            .unwrap();
         assert_eq!(matched_s5.size(), 1);
     }
 
     #[tokio::test]
     async fn test_multiple_append_chained_hash_index() {
         let mut store = VortexRdfStore::<ChainedHash, FlatLayout>::empty().unwrap();
-        
+
         for i in 0..10 {
-            let s = NamedOrBlankNode::NamedNode(NamedNode::new(format!("http://example.org/s{}", i)).unwrap());
+            let s = NamedOrBlankNode::NamedNode(
+                NamedNode::new(format!("http://example.org/s{}", i)).unwrap(),
+            );
             let p = NamedNode::new("http://example.org/p").unwrap();
             let o = Term::Literal(Literal::new_simple_literal("o"));
             let g = GraphName::DefaultGraph;
             let q = Quad::new(s, p, o, g);
             store = store.add_quad(q).await.unwrap();
         }
-        
+
         assert_eq!(store.size(), 10);
-        
+
         // Match p
         let p = NamedNode::new("http://example.org/p").unwrap();
-        let matched = store.match_pattern(None, Some(&p), None, None).await.unwrap();
+        let matched = store
+            .match_pattern(None, Some(&p), None, None)
+            .await
+            .unwrap();
         assert_eq!(matched.size(), 10);
-        
+
         // Match specific subject s5
         let s5 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s5").unwrap());
-        let matched_s5 = store.match_pattern(Some(&s5), None, None, None).await.unwrap();
+        let matched_s5 = store
+            .match_pattern(Some(&s5), None, None, None)
+            .await
+            .unwrap();
         assert_eq!(matched_s5.size(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_chunked_append_delete_dict_index() {
+        let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s").unwrap());
+        let p = NamedNode::new("http://example.org/p").unwrap();
+        let o = Term::Literal(Literal::new_simple_literal("o"));
+        let g = GraphName::DefaultGraph;
+
+        let q = Quad::new(s, p, o, g);
+
+        let store = VortexRdfStore::<SimpleDictionary, FlatLayout>::empty()
+            .expect("Failed to create empty store");
+
+        let store = store
+            .append_quads_chunked(vec![q.clone()], 4)
+            .await
+            .unwrap();
+
+        assert_eq!(store.size(), 1);
+
+        let store = store.delete_quad(&q).await.unwrap();
+
+        assert_eq!(store.size(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_chunked_append_then_compact_dict_index() {
+        let store = VortexRdfStore::<SimpleDictionary, FlatLayout>::empty()
+            .expect("Failed to create empty store");
+
+        let mut new_quads = Vec::new();
+
+        for i in 0..10 {
+            let s = NamedOrBlankNode::NamedNode(
+                NamedNode::new(format!("http://example.org/s{}", i)).unwrap(),
+            );
+            let p = NamedNode::new("http://example.org/p").unwrap();
+            let o = Term::Literal(Literal::new_simple_literal("o"));
+            let g = GraphName::DefaultGraph;
+
+            new_quads.push(Quad::new(s, p, o, g));
+        }
+
+        let store = store.append_quads_chunked(new_quads, 4).await.unwrap();
+
+        let store = store.compact_quads().unwrap();
+
+        assert_eq!(store.size(), 10);
+
+        let p = NamedNode::new("http://example.org/p").unwrap();
+
+        let matched = store
+            .match_pattern(None, Some(&p), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(matched.size(), 10);
     }
 }

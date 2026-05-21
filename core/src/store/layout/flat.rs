@@ -1,20 +1,117 @@
 use crate::common::{indexes, utils};
 use crate::error::{Result, VortexRdfError};
 use crate::index::RdfDictionary;
+use crate::store::layout::AppendStrategy;
 use crate::store::layout::{RdfQuadLayout, RdfQuadLayoutBuilder};
 use futures::{Stream, StreamExt, stream};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use std::sync::Arc;
-use vortex_array::arrays::bool::BoolArrayExt;
+use vortex::VortexSessionDefault;
+use vortex::session::VortexSession;
+use vortex_array::LEGACY_SESSION;
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::arrays::{BoolArray, ConstantArray, PrimitiveArray, StructArray};
+use vortex_array::arrays::{ChunkedArray, ConstantArray, PrimitiveArray, StructArray};
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
-use vortex::VortexSessionDefault;
-use vortex::session::VortexSession;
+
+const S_FIELD: &str = "s";
+const P_FIELD: &str = "p";
+const O_FIELD: &str = "o";
+const G_FIELD: &str = "g";
+
+fn build_spog_struct_array(s: ArrayRef, p: ArrayRef, o: ArrayRef, g: ArrayRef) -> Result<ArrayRef> {
+    StructArray::from_fields(&[(S_FIELD, s), (P_FIELD, p), (O_FIELD, o), (G_FIELD, g)])
+        .map_err(VortexRdfError::Vortex)
+        .map(|arr| arr.into_array())
+}
+
+fn build_spog_primitive_struct_array(
+    s_ids: Vec<u32>,
+    p_ids: Vec<u32>,
+    o_ids: Vec<u32>,
+    g_ids: Vec<u32>,
+) -> Result<ArrayRef> {
+    build_spog_struct_array(
+        PrimitiveArray::from_iter(s_ids).into_array(),
+        PrimitiveArray::from_iter(p_ids).into_array(),
+        PrimitiveArray::from_iter(o_ids).into_array(),
+        PrimitiveArray::from_iter(g_ids).into_array(),
+    )
+}
+
+fn extract_spog_field_refs(quads: &ArrayRef) -> Result<(ArrayRef, ArrayRef, ArrayRef, ArrayRef)> {
+    let mut ctx = LEGACY_SESSION.create_execution_ctx();
+
+    let quads_struct = quads
+        .clone()
+        .execute::<StructArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+
+    let fields = quads_struct.unmasked_fields();
+
+    let s = fields
+        .get(0)
+        .ok_or_else(|| VortexRdfError::Deserialization("Missing s column".to_string()))?
+        .clone();
+
+    let p = fields
+        .get(1)
+        .ok_or_else(|| VortexRdfError::Deserialization("Missing p column".to_string()))?
+        .clone();
+
+    let o = fields
+        .get(2)
+        .ok_or_else(|| VortexRdfError::Deserialization("Missing o column".to_string()))?
+        .clone();
+
+    let g = fields
+        .get(3)
+        .ok_or_else(|| VortexRdfError::Deserialization("Missing g column".to_string()))?
+        .clone();
+
+    Ok((s, p, o, g))
+}
+
+fn build_column_from_chunks(mut chunks: Vec<ArrayRef>) -> Result<ArrayRef> {
+    match chunks.len() {
+        0 => Ok(PrimitiveArray::from_iter(Vec::<u32>::new()).into_array()),
+        1 => Ok(chunks.remove(0)),
+        _ => {
+            let dtype = chunks[0].dtype().clone();
+
+            ChunkedArray::try_new(chunks, dtype)
+                .map_err(VortexRdfError::Vortex)
+                .map(|arr| arr.into_array())
+        }
+    }
+}
+
+fn encode_quad_batch_as_primitive_columns<Dict: RdfDictionary>(
+    dictionary: &mut Dict,
+    batch: &[Quad],
+) -> (ArrayRef, ArrayRef, ArrayRef, ArrayRef) {
+    let mut s_ids = Vec::with_capacity(batch.len());
+    let mut p_ids = Vec::with_capacity(batch.len());
+    let mut o_ids = Vec::with_capacity(batch.len());
+    let mut g_ids = Vec::with_capacity(batch.len());
+
+    for quad in batch {
+        s_ids.push(dictionary.get_or_insert(&quad.subject.to_string()));
+        p_ids.push(dictionary.get_or_insert(&quad.predicate.to_string()));
+        o_ids.push(dictionary.get_or_insert(&quad.object.to_string()));
+        g_ids.push(dictionary.get_or_insert(&quad.graph_name.to_string()));
+    }
+
+    (
+        PrimitiveArray::from_iter(s_ids).into_array(),
+        PrimitiveArray::from_iter(p_ids).into_array(),
+        PrimitiveArray::from_iter(o_ids).into_array(),
+        PrimitiveArray::from_iter(g_ids).into_array(),
+    )
+}
 
 #[derive(Clone, Debug)]
 pub struct FlatLayout;
@@ -26,7 +123,7 @@ where
     const STORAGE_LAYOUT: &'static str = "flat-spog";
 
     fn empty_quads() -> Result<ArrayRef> {
-        build_spog_struct_array(vec![], vec![], vec![], vec![])
+        build_spog_primitive_struct_array(Vec::new(), Vec::new(), Vec::new(), Vec::new())
     }
 
     fn extract_quads(root: &ArrayRef) -> Result<ArrayRef> {
@@ -248,16 +345,55 @@ where
 
         Ok(mask)
     }
-
     fn add_quad(dictionary: &mut Dict, quads: &ArrayRef, quad: Quad) -> Result<ArrayRef> {
-        let (mut s_ids, mut p_ids, mut o_ids, mut g_ids) = extract_id_columns(quads)?;
+        <FlatLayout as RdfQuadLayout<Dict>>::append_quads_chunked(
+            dictionary,
+            quads,
+            vec![quad],
+            <FlatLayout as RdfQuadLayout<Dict>>::DEFAULT_APPEND_CHUNK_SIZE,
+        )
+    }
+    fn append_quads_chunked(
+        dictionary: &mut Dict,
+        quads: &ArrayRef,
+        new_quads: Vec<Quad>,
+        chunk_size: usize,
+    ) -> Result<ArrayRef> {
+        if new_quads.is_empty() {
+            return Ok(quads.clone());
+        }
 
-        s_ids.push(dictionary.get_or_insert(&quad.subject.to_string()));
-        p_ids.push(dictionary.get_or_insert(&quad.predicate.to_string()));
-        o_ids.push(dictionary.get_or_insert(&quad.object.to_string()));
-        g_ids.push(dictionary.get_or_insert(&quad.graph_name.to_string()));
+        let chunk_size = chunk_size.max(1);
 
-        build_spog_struct_array(s_ids, p_ids, o_ids, g_ids)
+        let (old_s, old_p, old_o, old_g) = extract_spog_field_refs(quads)?;
+
+        let mut s_chunks: Vec<ArrayRef> = Vec::new();
+        let mut p_chunks: Vec<ArrayRef> = Vec::new();
+        let mut o_chunks: Vec<ArrayRef> = Vec::new();
+        let mut g_chunks: Vec<ArrayRef> = Vec::new();
+
+        if old_s.len() > 0 {
+            s_chunks.push(old_s);
+            p_chunks.push(old_p);
+            o_chunks.push(old_o);
+            g_chunks.push(old_g);
+        }
+
+        for batch in new_quads.chunks(chunk_size) {
+            let (s, p, o, g) = encode_quad_batch_as_primitive_columns(dictionary, batch);
+
+            s_chunks.push(s);
+            p_chunks.push(p);
+            o_chunks.push(o);
+            g_chunks.push(g);
+        }
+
+        let s = build_column_from_chunks(s_chunks)?;
+        let p = build_column_from_chunks(p_chunks)?;
+        let o = build_column_from_chunks(o_chunks)?;
+        let g = build_column_from_chunks(g_chunks)?;
+
+        build_spog_struct_array(s, p, o, g)
     }
 
     fn delete_quad(dictionary: &Dict, quads: &ArrayRef, quad: &Quad) -> Result<ArrayRef> {
@@ -272,19 +408,57 @@ where
 
         if let Some(m) = mask {
             let inverse_mask = m.not().map_err(VortexRdfError::Vortex)?;
-            let session = VortexSession::default();
-            let mut ctx = session.create_execution_ctx();
-            let bool_arr = inverse_mask
-                .execute::<BoolArray>(&mut ctx)
-                .map_err(VortexRdfError::Vortex)?;
-            let canonical_mask = bool_arr.to_mask_fill_null_false(&mut ctx);
-            let filtered = quads
-                .filter(canonical_mask)
-                .map_err(VortexRdfError::Vortex)?;
-            Ok(filtered)
+
+            super::filter_with_bool_mask(quads, inverse_mask)
         } else {
             Ok(quads.clone())
         }
+    }
+
+    fn compact_quads(quads: &ArrayRef) -> Result<ArrayRef> {
+        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+
+        let quads_struct = quads
+            .clone()
+            .execute::<StructArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?;
+
+        let fields = quads_struct.unmasked_fields();
+
+        let s = fields
+            .get(0)
+            .ok_or_else(|| VortexRdfError::Deserialization("Missing s column".to_string()))?
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?;
+
+        let p = fields
+            .get(1)
+            .ok_or_else(|| VortexRdfError::Deserialization("Missing p column".to_string()))?
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?;
+
+        let o = fields
+            .get(2)
+            .ok_or_else(|| VortexRdfError::Deserialization("Missing o column".to_string()))?
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?;
+
+        let g = fields
+            .get(3)
+            .ok_or_else(|| VortexRdfError::Deserialization("Missing g column".to_string()))?
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?;
+
+        build_spog_struct_array(
+            PrimitiveArray::from_iter(s.as_slice::<u32>().to_vec()).into_array(),
+            PrimitiveArray::from_iter(p.as_slice::<u32>().to_vec()).into_array(),
+            PrimitiveArray::from_iter(o.as_slice::<u32>().to_vec()).into_array(),
+            PrimitiveArray::from_iter(g.as_slice::<u32>().to_vec()).into_array(),
+        )
     }
 }
 
@@ -304,6 +478,10 @@ impl FlatLayoutBuilder {
             g_ids: Vec::new(),
         }
     }
+}
+
+impl FlatLayout {
+    const DEFAULT_APPEND_STRATEGY: AppendStrategy = AppendStrategy::Rebuild;
 }
 
 impl<Dict> RdfQuadLayoutBuilder<Dict> for FlatLayoutBuilder
@@ -380,20 +558,4 @@ fn extract_id_columns(quads: &ArrayRef) -> Result<(Vec<u32>, Vec<u32>, Vec<u32>,
     let g_ids = extract(3, "g", &mut ctx)?;
 
     Ok((s_ids, p_ids, o_ids, g_ids))
-}
-
-fn build_spog_struct_array(
-    s_ids: Vec<u32>,
-    p_ids: Vec<u32>,
-    o_ids: Vec<u32>,
-    g_ids: Vec<u32>,
-) -> Result<ArrayRef> {
-    StructArray::from_fields(&[
-        ("s", PrimitiveArray::from_iter(s_ids).into_array()),
-        ("p", PrimitiveArray::from_iter(p_ids).into_array()),
-        ("o", PrimitiveArray::from_iter(o_ids).into_array()),
-        ("g", PrimitiveArray::from_iter(g_ids).into_array()),
-    ])
-    .map_err(VortexRdfError::Vortex)
-    .map(|arr| arr.into_array())
 }

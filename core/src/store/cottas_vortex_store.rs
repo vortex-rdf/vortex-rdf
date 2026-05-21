@@ -1,7 +1,7 @@
 use crate::error::Result;
 use crate::index::RdfDictionary;
-use crate::store::layout::cottas::{CottasLayout, CottasLayoutBuilder, TripleOrdering};
 use crate::store::layout::IndexBuilder;
+use crate::store::layout::cottas::{CottasLayout, CottasLayoutBuilder, TripleOrdering};
 use crate::store::vortex_rdf_store::VortexRdfStore;
 use futures::Stream;
 use oxrdf::Quad;

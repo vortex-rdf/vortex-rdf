@@ -88,9 +88,7 @@ where
         self.quads.len()
     }
 
-    pub fn quads(
-        &self,
-    ) -> Result<Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + '_>> {
+    pub fn quads(&self) -> Result<Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + '_>> {
         Layout::quads(&self.dictionary, &self.quads)
     }
 
@@ -127,8 +125,27 @@ where
     }
 
     pub async fn add_quad(&self, quad: Quad) -> Result<Self> {
+        self.append_quads_chunked(
+            vec![quad],
+            <Layout as RdfQuadLayout<Dict>>::DEFAULT_APPEND_CHUNK_SIZE,
+        )
+        .await
+    }
+
+    pub async fn delete_quad(&self, quad: &Quad) -> Result<Self> {
+        let quads = Layout::delete_quad(&self.dictionary, &self.quads, quad)?;
+        Ok(self.with_quads(quads))
+    }
+
+    pub async fn append_quads_chunked(
+        &self,
+        new_quads: Vec<Quad>,
+        chunk_size: usize,
+    ) -> Result<Self> {
         let mut dictionary = self.dictionary.clone();
-        let quads = Layout::add_quad(&mut dictionary, &self.quads, quad)?;
+
+        let quads =
+            Layout::append_quads_chunked(&mut dictionary, &self.quads, new_quads, chunk_size)?;
 
         Ok(Self {
             dictionary,
@@ -137,9 +154,14 @@ where
         })
     }
 
-    pub async fn delete_quad(&self, quad: &Quad) -> Result<Self> {
-        let quads = Layout::delete_quad(&self.dictionary, &self.quads, quad)?;
-        Ok(self.with_quads(quads))
+    pub fn compact_quads(&self) -> Result<Self> {
+        let quads = Layout::compact_quads(&self.quads)?;
+
+        Ok(Self {
+            dictionary: self.dictionary.clone(),
+            quads,
+            _layout: PhantomData,
+        })
     }
 }
 
@@ -148,9 +170,7 @@ where
     Dict: RdfDictionary,
     Layout: RdfQuadLayout<Dict>,
 {
-    fn quads(
-        &self,
-    ) -> Result<Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + '_>> {
+    fn quads(&self) -> Result<Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + '_>> {
         self.quads()
     }
 }

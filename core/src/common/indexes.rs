@@ -1,13 +1,12 @@
 use crate::error::{Result, VortexRdfError};
 use clap::ValueEnum;
 use vortex::VortexSessionDefault;
+use vortex::session::VortexSession;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{ListArray, PrimitiveArray, StructArray};
 use vortex_array::dtype::DType;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
-use vortex::session::VortexSession;
-
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
 pub enum IndexType {

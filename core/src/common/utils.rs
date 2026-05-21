@@ -1,27 +1,17 @@
-use oxrdf::{
-    Quad, 
-    Term,
-    NamedNode,
-    BlankNode,
-    NamedOrBlankNode,
-    Literal,
-    GraphName
-};
-use vortex::VortexSessionDefault;
 use crate::error::{Result, VortexRdfError};
 use futures::{Stream, stream};
+use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use oxrdfio::{RdfFormat, RdfParser};
-use vortex_array::{ArrayRef, VortexSessionExecute};
-use vortex_array::arrays::struct_::StructArray;
-use vortex_array::arrays::listview::{ListViewArray, ListViewArrayExt};
+use vortex::VortexSessionDefault;
 use vortex::session::VortexSession;
+use vortex_array::arrays::listview::{ListViewArray, ListViewArrayExt};
+use vortex_array::arrays::struct_::StructArray;
+use vortex_array::{ArrayRef, VortexSessionExecute};
 
 pub fn parse_named_node(s: &str) -> Result<NamedNode> {
     let s = s.trim_matches(|c| c == '<' || c == '>');
     NamedNode::new(s)
-        .map_err(|e| VortexRdfError::Deserialization(
-            format!("Invalid NamedNode '{}': {}", s, e)
-        ))
+        .map_err(|e| VortexRdfError::Deserialization(format!("Invalid NamedNode '{}': {}", s, e)))
 }
 
 pub fn parse_blank_node(s: &str) -> Result<BlankNode> {
@@ -121,31 +111,50 @@ pub fn extract_vortex_struct_field(vortex_struct: &StructArray, name: &str) -> R
     let session = VortexSession::default(); // default session (registries etc.)
     let mut ctx = session.create_execution_ctx(); // execution ctx
 
-    let list_ref = vortex_struct.unmasked_field_by_name(name)
-        .map_err(|_| VortexRdfError::Deserialization(format!("Field '{}' not found in struct", name)))?
+    let list_ref = vortex_struct
+        .unmasked_field_by_name(name)
+        .map_err(|_| {
+            VortexRdfError::Deserialization(format!("Field '{}' not found in struct", name))
+        })?
         .clone();
 
-    let list = list_ref.clone().execute::<ListViewArray>(&mut ctx)
+    let list = list_ref
+        .clone()
+        .execute::<ListViewArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)?;
 
-    let offset = list.offsets().execute_scalar(0, &mut ctx)
+    let offset = list
+        .offsets()
+        .execute_scalar(0, &mut ctx)
         .map_err(VortexRdfError::Vortex)?
         .cast(&DType::Primitive(PType::I32, Nullability::NonNullable))
         .map_err(VortexRdfError::Vortex)?
         .as_primitive()
         .typed_value::<i32>()
-        .ok_or_else(|| VortexRdfError::Deserialization(format!("Missing offset for field '{}'", name)))? as usize;
+        .ok_or_else(|| {
+            VortexRdfError::Deserialization(format!("Missing offset for field '{}'", name))
+        })? as usize;
 
-    let size = list.sizes().execute_scalar(0, &mut ctx)
+    let size = list
+        .sizes()
+        .execute_scalar(0, &mut ctx)
         .map_err(VortexRdfError::Vortex)?
         .cast(&DType::Primitive(PType::I32, Nullability::NonNullable))
         .map_err(VortexRdfError::Vortex)?
         .as_primitive()
         .typed_value::<i32>()
-        .ok_or_else(|| VortexRdfError::Deserialization(format!("Missing size for field '{}'", name)))? as usize;
+        .ok_or_else(|| {
+            VortexRdfError::Deserialization(format!("Missing size for field '{}'", name))
+        })? as usize;
 
-    log::debug!("[utils::extract_vortex_struct_field] Extracting Vortex struct field '{}' took {:?}", name, start.elapsed());
-    let sliced = list.elements().slice(offset..offset + size)
+    log::debug!(
+        "[utils::extract_vortex_struct_field] Extracting Vortex struct field '{}' took {:?}",
+        name,
+        start.elapsed()
+    );
+    let sliced = list
+        .elements()
+        .slice(offset..offset + size)
         .map_err(VortexRdfError::Vortex)?;
     Ok(sliced)
 }
@@ -166,9 +175,8 @@ pub fn generate_rdf_data_stream(size: usize) -> impl Stream<Item = Result<Quad>>
     const EX: &str = "http://example.org/";
 
     stream::iter((0..size).map(|i| {
-        let subject = NamedOrBlankNode::NamedNode(
-            NamedNode::new_unchecked(format!("{}subject/{}", EX, i))
-        );
+        let subject =
+            NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!("{}subject/{}", EX, i)));
         let predicate = NamedNode::new_unchecked(format!("{}predicate/{}", EX, i % 100));
         let object = Term::NamedNode(NamedNode::new_unchecked(format!("{}object/{}", EX, i % 50)));
         let graph = GraphName::NamedNode(NamedNode::new_unchecked(format!("{}graph", EX)));

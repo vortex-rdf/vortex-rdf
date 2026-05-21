@@ -25,12 +25,12 @@ static WRITE_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     vortex_file::register_default_encodings(&session);
     session
 });
+use vortex_array::ArrayRef;
 use vortex_array::stream::ArrayStreamAdapter;
-use vortex_array::{ArrayRef};
 use vortex_file::{WriteOptionsSessionExt, WriteStrategyBuilder};
 use vortex_io::VortexWrite;
-use vortex_session::VortexSession;
 use vortex_ipc::iterator::ArrayIteratorIPC;
+use vortex_session::VortexSession;
 
 /// High-level function to serialize RDF from a reader directly to a Vortex-RDF writer.
 pub async fn serialize<W: VortexWrite + Unpin + Send>(
@@ -66,7 +66,7 @@ pub async fn serialize<W: VortexWrite + Unpin + Send>(
 }
 
 pub fn write_array_to_ipc<W: std::io::Write>(vortex_array: ArrayRef, mut writer: W) -> Result<()> {
-    // TODO: we should be able to reuse the same session for writing and reading, 
+    // TODO: we should be able to reuse the same session for writing and reading,
     //otherwise we might run into issues with incompatible encodings, etc.
     let session = VortexSession::default();
 

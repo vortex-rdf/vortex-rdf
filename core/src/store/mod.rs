@@ -1,12 +1,11 @@
 pub mod cottas_vortex_store;
-pub mod vortex_rdf_store;
 pub mod layout;
-use futures::Stream;
-use oxrdf::Quad;
+pub mod vortex_rdf_store;
 use crate::error::Result;
 use crate::index::RdfDictionary;
+use futures::Stream;
+use oxrdf::Quad;
 use vortex_array::ArrayRef;
-
 
 // Trait for stores that can provide quads
 pub trait QuadStore {
@@ -30,7 +29,5 @@ pub trait VortexRdfStoreLike<Dict: RdfDictionary>: crate::store::QuadStore {
         self.quads_array().len()
     }
 
-    fn quads_stream(
-        &self,
-    ) -> Result<Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + '_>>;
+    fn quads_stream(&self) -> Result<Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + '_>>;
 }
