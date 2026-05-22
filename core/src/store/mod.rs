@@ -1,4 +1,3 @@
-pub mod cottas_vortex_store;
 pub mod layout;
 pub mod vortex_rdf_store;
 use crate::error::Result;
@@ -13,7 +12,6 @@ pub trait QuadStore {
 }
 
 // Re-export the main stores
-pub use cottas_vortex_store::CottasVortexStore;
 pub use vortex_rdf_store::VortexRdfStore;
 
 // store_like.rs (or inside store mod)

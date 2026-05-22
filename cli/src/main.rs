@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use log::{debug, info};
 use oxrdfio::RdfFormat;
+use vortex_rdf_core::store::layout::cottas::CottasLayout;
 use std::fs::File;
 use std::io::{Read, Write, stdin, stdout};
 use std::path::PathBuf;
@@ -26,7 +27,6 @@ use vortex_rdf_core::{
     },
     index::{ChainedHash, SimpleDictionary},
     io::{deserialize, load_vortex_file_path, load_vortex_file_ref, serialize},
-    store::cottas_vortex_store::CottasVortexStore,
     store::layout::flat::FlatLayout,
 };
 
@@ -199,11 +199,11 @@ async fn main() -> Result<()> {
                 },
                 StoreLayout::CottasSpog => match index_type {
                     IndexType::SimpleDictionary => {
-                        CottasVortexStore::<SimpleDictionary>::build_spog_vortex_index(quads_stream)
+                        VortexRdfStore::<SimpleDictionary, CottasLayout>::build_vortex_index(quads_stream)
                             .await?
                     }
                     IndexType::ChainedHash => {
-                        CottasVortexStore::<ChainedHash>::build_spog_vortex_index(quads_stream)
+                        VortexRdfStore::<ChainedHash, CottasLayout>::build_vortex_index(quads_stream)
                             .await?
                     }
                 },
@@ -371,13 +371,13 @@ async fn main() -> Result<()> {
                     },
                     StoreLayout::CottasSpog => match t {
                         IndexType::SimpleDictionary => {
-                            CottasVortexStore::<SimpleDictionary>::build_spog_vortex_index(
+                            VortexRdfStore::<SimpleDictionary, CottasLayout>::build_vortex_index(
                                 quads_stream,
                             )
                             .await?
                         }
                         IndexType::ChainedHash => {
-                            CottasVortexStore::<ChainedHash>::build_spog_vortex_index(quads_stream)
+                            VortexRdfStore::<ChainedHash, CottasLayout>::build_vortex_index(quads_stream)
                                 .await?
                         }
                     },
@@ -423,7 +423,7 @@ async fn main() -> Result<()> {
                         .context("Failed to deserialize filtered results")?;
                 }
                 (IndexType::SimpleDictionary, StoreLayout::CottasSpog) => {
-                    let store = CottasVortexStore::<SimpleDictionary>::new(vortex_array)
+                    let store = VortexRdfStore::<SimpleDictionary, CottasLayout>::new(vortex_array)
                         .map_err(|e| anyhow::anyhow!(e))?;
                     debug!(
                         "CottasDictionaryStore instance created in {:?}",
@@ -466,7 +466,7 @@ async fn main() -> Result<()> {
                         .context("Failed to deserialize filtered results")?;
                 }
                 (IndexType::ChainedHash, StoreLayout::CottasSpog) => {
-                    let store = CottasVortexStore::<ChainedHash>::new(vortex_array)
+                    let store = VortexRdfStore::<ChainedHash, CottasLayout>::new(vortex_array)
                         .map_err(|e| anyhow::anyhow!(e))?;
                     debug!(
                         "CottasChainedHashStore instance created in {:?}",
