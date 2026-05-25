@@ -1,18 +1,21 @@
-use crate::error::Result;
+use crate::error::{Result, VortexRdfError};
 use crate::index::RdfDictionary;
-use crate::common::{utils, indexes::IndexType};
+use crate::common::{utils, indexes::IndexType, indexes::array_from_dict_column};
+
 
 use std::collections::HashMap;
 use std::time::Instant;
 use oxrdf::{GraphName, Term};
 
 use vortex_array::ArrayRef;
-use vortex_array::arrays::VarBinViewArray;
+use vortex_array::arrays::{StructArray, VarBinViewArray};
+use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::{IntoArray, LEGACY_SESSION, VortexSessionExecute};
 use vortex_array::dtype::{DType, Nullability};
 use vortex_fsst::{fsst_compress, fsst_train_compressor};
 
-/// Simple dictionary implementation using a Vec and HashMap
+
+/// Simple dictionary implementation using a flat Vec and HashMap for fast bi-directional lookups.
 #[derive(Debug, Clone, Default)]
 pub struct SimpleDictionary {
     pub terms: Vec<String>,
@@ -24,31 +27,37 @@ impl RdfDictionary for SimpleDictionary {
         Self::default()
     }
 
+    /// Deserializes the dictionary mappings directly from a Vortex StructArray.
     fn from_vortex_array(array_ref: &ArrayRef) -> Result<Self> {
         let start = Instant::now();
-        
-        // The input is the top-level StructArray which contains "dictionary" field.
-        // We need to extract it.
         let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let struct_array = array_ref.clone().execute::<vortex_array::arrays::StructArray>(&mut ctx)
-            .map_err(crate::error::VortexRdfError::Vortex)?;
-        let dict_array = utils::extract_vortex_struct_field(&struct_array, "dictionary")?;
+        let struct_array = array_ref.clone()
+            .execute::<StructArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?;
+
+        // Retrieve the dictionary values array directly from root-level.
+        let arr = struct_array.unmasked_field_by_name("_dict_values")
+            .map_err(|_| VortexRdfError::Deserialization(
+                "_dict_values not found".into()
+            ))?;
         
-        // It's already unwrapped by extract_vortex_struct_field if it was a list
-        let dict_varbin = dict_array.clone().execute::<VarBinViewArray>(&mut ctx)
-            .map_err(crate::error::VortexRdfError::Vortex)?;
-        
-        log::debug!("[SimpleDictionary::from_vortex_array] Vortex extraction took {:?}", start.elapsed());
+        let dict_array = array_from_dict_column(arr)?;
+
+        let dict_varbin = dict_array.execute::<VarBinViewArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?;
+
+        log::debug!("[SimpleDictionary::from_vortex_array] Extraction took {:?}", start.elapsed());
 
         let loop_start = Instant::now();
         let mut dictionary = SimpleDictionary::new();
+        // Decode bytes and insert sequentially into host memory lookup maps.
         for i in 0..dict_varbin.len() {
             let bytes = dict_varbin.bytes_at(i);
             let s = String::from_utf8_lossy(&bytes).into_owned();
             dictionary.get_or_insert(&s);
         }
         log::debug!("[SimpleDictionary::from_vortex_array] HashMap build took {:?}", loop_start.elapsed());
-        
+
         Ok(dictionary)
     }
 
@@ -88,7 +97,7 @@ impl RdfDictionary for SimpleDictionary {
 
     fn get_term(&self, id: u32) -> Option<Term> {
         let s = self.terms.get(id as usize)?;
-        utils::get_as_term(&s)
+        utils::get_as_term(s)
     }
 
     fn get_graph_name(&self, id: u32) -> Option<GraphName> {
@@ -96,7 +105,7 @@ impl RdfDictionary for SimpleDictionary {
         if s.is_empty() || s == "[]" {
             Some(GraphName::DefaultGraph)
         } else {
-            match utils::get_as_term(&s) {
+            match utils::get_as_term(s) {
                 Some(Term::NamedNode(n)) => Some(GraphName::NamedNode(n)),
                 Some(Term::BlankNode(b)) => Some(GraphName::BlankNode(b)),
                 _ => Some(GraphName::DefaultGraph), // Fallback
@@ -104,6 +113,15 @@ impl RdfDictionary for SimpleDictionary {
         }
     }
 
+    fn values_view(&self) -> crate::error::Result<VarBinViewArray> {
+        Ok(VarBinViewArray::from_iter(
+            self.terms.iter().map(|s: &String| Some(s.as_str())),
+            DType::Utf8(Nullability::NonNullable),
+        ))
+    }
+
+    /// Serializes the dictionary table into a flat list of (name, array) fields.
+    /// Employs standard FSST (Fast Static String Table) compression for optimal storage.
     fn to_vortex_array(&self) -> Result<Vec<(String, ArrayRef)>> {
         let dict_raw = VarBinViewArray::from_iter(
             self.terms.iter().map(|s: &String| Some(s.as_str())),
@@ -111,7 +129,7 @@ impl RdfDictionary for SimpleDictionary {
         );
 
         let dict_arr = if dict_raw.len() > 0 {
-            // Apply FSST compression to the dictionary table
+            // Train compressor and execute FSST on the dictionary payload.
             let compressor = fsst_train_compressor(&dict_raw);
             let len = dict_raw.len();
             let dtype = dict_raw.dtype().clone();
@@ -126,10 +144,14 @@ impl RdfDictionary for SimpleDictionary {
             dict_raw.into_array()
         };
         
-        Ok(vec![("dictionary".to_string(), dict_arr)])
+        Ok(vec![("values".to_string(), dict_arr)])
     }
 
     fn store_type() -> &'static str {
         IndexType::SimpleDictionary.as_str()
+    }
+
+    fn vortex_field_names() -> &'static [&'static str] {
+        &["values"]
     }
 }

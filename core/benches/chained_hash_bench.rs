@@ -13,7 +13,7 @@ fn main() {
     divan::main();
 }
 
-/// Benchmark VortexRdfStore::<ChainedHash>::build_vortex_index with different dataset sizes
+/// Benchmark VortexRdfStore::<ChainedHash>::build_vortex_array with different dataset sizes
 #[divan::bench(
     consts = [10_000, 100_000, 1_000_000],
     sample_count = 10
@@ -29,9 +29,9 @@ fn build_vortex_index<const SIZE: usize>(bencher: Bencher) {
         .bench_values(|quad_stream| {
             // Only this block is timed
             rt.block_on(async {
-                VortexRdfStore::<ChainedHash>::build_vortex_index(quad_stream)
+                VortexRdfStore::<ChainedHash>::build_vortex_array(quad_stream)
                     .await
-                    .expect("Failed to build vortex index")
+                    .expect("Failed to build vortex array")
             })
         });
 }
@@ -49,9 +49,9 @@ fn instantiate_store<const SIZE: usize>(bencher: Bencher) {
             // Pre-generate the ArrayRef - this time is NOT counted in the benchmark
             let quad_stream = generate_rdf_data_stream(SIZE);
             rt.block_on(async {
-                VortexRdfStore::<ChainedHash>::build_vortex_index(quad_stream)
+                VortexRdfStore::<ChainedHash>::build_vortex_array(quad_stream)
                     .await
-                    .expect("Failed to build vortex index")
+                    .expect("Failed to build vortex array")
             })
         })
         .bench_values(|vortex_array| {
@@ -74,9 +74,9 @@ fn match_pattern<const SIZE: usize>(bencher: Bencher) {
             // Pre-generate the ArrayRef - this time is NOT counted in the benchmark
             let quad_stream = generate_rdf_data_stream(SIZE);
             rt.block_on(async {
-                let varray = VortexRdfStore::<ChainedHash>::build_vortex_index(quad_stream)
+                let varray = VortexRdfStore::<ChainedHash>::build_vortex_array(quad_stream)
                     .await
-                    .expect("Failed to build vortex index");
+                    .expect("Failed to build vortex array");
                 VortexRdfStore::<ChainedHash>::new(varray)
                     .expect("Failed to create VortexRdfStore::<ChainedHash>")
             })
