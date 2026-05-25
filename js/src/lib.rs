@@ -4,7 +4,7 @@ use std::io::Cursor;
 use vortex_rdf_core::io::{
     deserialize,
     quads_stream_to_vortex,
-    array_from_reader,
+    array_from_ipc_reader,
 };
 use vortex_rdf_core::VortexRdfStore;
 use vortex_rdf_core::index::{SimpleDictionary, ChainedHash};
@@ -72,8 +72,8 @@ impl SimpleDictionaryStore {
     #[wasm_bindgen(js_name = fromBytes)]
     pub async fn from_bytes(bytes: &[u8]) -> Result<SimpleDictionaryStore, JsValue> {
         let cursor = Cursor::new(bytes);
-        let array = array_from_reader(cursor)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let array = array_from_ipc_reader(cursor)
+            .map_err(|e: vortex_rdf_core::error::VortexRdfError| JsValue::from_str(&e.to_string()))?;
 
         // Verify index type
         match detect_index_type(&array) {
@@ -98,7 +98,7 @@ impl SimpleDictionaryStore {
         let quads_stream = parse_quads_from_reader(cursor, format);
         
         // Build SimpleDictionaryStore
-        let vortex_array = VortexRdfStore::<SimpleDictionary>::build_vortex_index(quads_stream)
+        let vortex_array = VortexRdfStore::<SimpleDictionary>::build_vortex_array(quads_stream)
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         
@@ -196,8 +196,8 @@ impl ChainedHashStore {
     #[wasm_bindgen(js_name = fromBytes)]
     pub async fn from_bytes(bytes: &[u8]) -> Result<ChainedHashStore, JsValue> {
         let cursor = Cursor::new(bytes);
-        let array = array_from_reader(cursor)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let array = array_from_ipc_reader(cursor)
+            .map_err(|e: vortex_rdf_core::error::VortexRdfError| JsValue::from_str(&e.to_string()))?;
 
         // Verify index type
         match detect_index_type(&array) {
@@ -222,7 +222,7 @@ impl ChainedHashStore {
         let quads_stream = parse_quads_from_reader(cursor, format);
         
         // Build ChainedHashStore
-        let vortex_array = VortexRdfStore::<ChainedHash>::build_vortex_index(quads_stream)
+        let vortex_array = VortexRdfStore::<ChainedHash>::build_vortex_array(quads_stream)
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         
@@ -492,7 +492,7 @@ pub async fn nquads_to_vortex(nquads: String) -> Result<Vec<u8>, JsValue> {
 #[wasm_bindgen]
 pub async fn vortex_to_nquads(vortex_bytes: &[u8]) -> Result<String, JsValue> {
     let cursor = Cursor::new(vortex_bytes);
-    let vortex_array = array_from_reader(cursor)
+    let vortex_array = array_from_ipc_reader(cursor)
         .map_err(|e| JsValue::from_str(&format!("Vortex read error: {}", e)))?;
 
     let mut output_buffer = Vec::new();

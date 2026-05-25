@@ -7,7 +7,7 @@ pub mod index;
 pub use error::VortexRdfError;
 pub use io::{
     deserialize,
-    array_from_reader,
+    array_from_ipc_reader,
     serialize,
     quads_stream_to_vortex,
     quads_stream_to_vortex_writer
@@ -48,7 +48,7 @@ mod tests {
         let quad = Quad::new(s, p, o, g);
         let quads = vec![quad.clone()];
 
-        let dict_index = VortexRdfStore::<SimpleDictionary>::build_vortex_index(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
+        let dict_index = VortexRdfStore::<SimpleDictionary>::build_vortex_array(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
             .await
             .expect("Serialization failed");
         let dict_store = VortexRdfStore::<SimpleDictionary>::new(dict_index).unwrap();
@@ -87,7 +87,7 @@ mod tests {
         let quad = Quad::new(s, p, o, g);
         let quads = vec![quad.clone()];
 
-        let chained_hash = VortexRdfStore::<ChainedHash>::build_vortex_index(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
+        let chained_hash = VortexRdfStore::<ChainedHash>::build_vortex_array(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
             .await
             .expect("Serialization failed");
         let chained_hash_store = VortexRdfStore::<ChainedHash>::new(chained_hash).unwrap();
@@ -134,7 +134,7 @@ mod tests {
 
         let quads = vec![q1.clone(), q2.clone()];
 
-        let dict_index = VortexRdfStore::<SimpleDictionary>::build_vortex_index(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
+        let dict_index = VortexRdfStore::<SimpleDictionary>::build_vortex_array(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
             .await
             .expect("Serialization failed");
         let dict_store = VortexRdfStore::<SimpleDictionary>::new(dict_index).unwrap();
@@ -178,7 +178,7 @@ mod tests {
 
         let quads = vec![q1.clone(), q2.clone()];
 
-        let chained_hash = VortexRdfStore::<ChainedHash>::build_vortex_index(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
+        let chained_hash = VortexRdfStore::<ChainedHash>::build_vortex_array(stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))))
             .await
             .expect("Serialization failed");
         let chained_hash_store = VortexRdfStore::<ChainedHash>::new(chained_hash).unwrap();
