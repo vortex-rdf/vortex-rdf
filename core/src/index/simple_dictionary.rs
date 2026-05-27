@@ -1,6 +1,6 @@
 use crate::error::{Result, VortexRdfError};
 use crate::index::RdfDictionary;
-use crate::common::{utils, indexes::IndexType, indexes::array_from_dict_column};
+use crate::common::{utils, indexes::IndexType};
 
 
 use std::collections::HashMap;
@@ -9,7 +9,6 @@ use oxrdf::{GraphName, Term};
 
 use vortex_array::ArrayRef;
 use vortex_array::arrays::{StructArray, VarBinViewArray};
-use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::{IntoArray, LEGACY_SESSION, VortexSessionExecute};
 use vortex_array::dtype::{DType, Nullability};
 use vortex_fsst::{fsst_compress, fsst_train_compressor};
@@ -35,13 +34,7 @@ impl RdfDictionary for SimpleDictionary {
             .execute::<StructArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
 
-        // Retrieve the dictionary values array directly from root-level.
-        let arr = struct_array.unmasked_field_by_name("_dict_values")
-            .map_err(|_| VortexRdfError::Deserialization(
-                "_dict_values not found".into()
-            ))?;
-        
-        let dict_array = array_from_dict_column(arr)?;
+        let dict_array = utils::extract_dictionary_column(&struct_array, "_dict_values")?;
 
         let dict_varbin = dict_array.execute::<VarBinViewArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;

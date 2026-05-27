@@ -1,6 +1,6 @@
 use crate::error::{Result, VortexRdfError};
 use crate::index::RdfDictionary;
-use crate::common::{utils, indexes::{self, IndexType}};
+use crate::common::{utils, indexes::IndexType};
 use std::time::Instant;
 use std::collections::HashMap;
 use oxrdf::{GraphName, Term};
@@ -8,9 +8,8 @@ use oxrdf::{GraphName, Term};
 use vortex_array::builders::{ArrayBuilder, VarBinViewBuilder, PrimitiveBuilder};
 use vortex_array::ArrayRef;
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray, StructArray};
-use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::{IntoArray, LEGACY_SESSION, VortexSessionExecute};
-use vortex_array::dtype::{DType, Nullability, PType};
+use vortex_array::dtype::Nullability;
 use vortex_fsst::{fsst_compress, fsst_train_compressor};
 use vortex_btrblocks::BtrBlocksCompressor;
 
@@ -51,48 +50,6 @@ impl ChainedHash {
         }
         (h as usize) % Self::BUCKET_SIZE
     }
-
-    /// Get ID from ArrayRef-based representation (for lookups during queries)
-    pub fn get_id_from_arrays(
-        term_str: &str,
-        buckets_arr: &ArrayRef,
-        next_arr: &ArrayRef,
-        values_arr: &ArrayRef,
-    ) -> Option<u32> {
-        let h = Self::hash(term_str);
-        let bucket_idx = h;
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-
-        // Retrieve bucket head ID.
-        let mut curr = buckets_arr.clone()
-            .execute::<PrimitiveArray>(&mut ctx).ok()?
-            .execute_scalar(bucket_idx, &mut ctx).ok()?
-            .cast(&DType::Primitive(PType::I32, Nullability::NonNullable))
-            .ok()?
-            .as_primitive()
-            .typed_value::<i32>()?;
-
-        let values_varbin = values_arr.clone()
-            .execute::<VarBinViewArray>(&mut ctx).ok()?;
-        let next_prim = next_arr.clone()
-            .execute::<PrimitiveArray>(&mut ctx).ok()?;
-
-        // Traverse collision chain to locate exact term string match.
-        while curr != -1 {
-            let idx = curr as usize;
-            let bytes = values_varbin.bytes_at(idx);
-            if bytes.as_ref() == term_str.as_bytes() {
-                return Some(idx as u32);
-            }
-            curr = next_prim.execute_scalar(idx, &mut ctx)
-                .ok()?
-                .cast(&DType::Primitive(PType::I32, Nullability::NonNullable))
-                .ok()?
-                .as_primitive()
-                .typed_value::<i32>()?;
-        }
-        None
-    }
 }
 
 impl RdfDictionary for ChainedHash {
@@ -112,18 +69,17 @@ impl RdfDictionary for ChainedHash {
         let dict_struct = dict_array_ref.clone().execute::<StructArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
 
-        // Helper closure to extract dictionary columns directly from standard root-level.
-        let get_field = |key: &str| -> Result<ArrayRef> {
-            let arr = dict_struct.unmasked_field_by_name(key)
-                .map_err(|_| VortexRdfError::Deserialization(
-                    format!("Field '{}' not found in dict struct", key)
-                ))?;
-            indexes::array_from_dict_column(arr)
-        };
+        let values  = utils::extract_dictionary_column(&dict_struct, "_dict_values")?;
+        let buckets_raw = utils::extract_dictionary_column(&dict_struct, "_dict_buckets")?;
+        let next_raw    = utils::extract_dictionary_column(&dict_struct, "_dict_next")?;
 
-        let values  = get_field("_dict_values")?;
-        let buckets = get_field("_dict_buckets")?;
-        let next    = get_field("_dict_next")?;
+        // Eagerly decompress/evaluate buckets and next to flat PrimitiveArrays
+        let buckets = buckets_raw.execute::<PrimitiveArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?
+            .into_array();
+        let next = next_raw.execute::<PrimitiveArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?
+            .into_array();
 
         log::debug!(
             "[ChainedHash::from_vortex_array] Reconstruction took {:?}",
@@ -374,7 +330,6 @@ impl RdfDictionary for ChainedHash {
             dict_raw.into_array()
         };
 
-        // Manually apply BtrBlocks integer compression to buckets and next arrays.
         let btr_compressor = BtrBlocksCompressor::default();
         let buckets_compressed = btr_compressor.compress(&self.buckets, &mut ctx)
             .map_err(VortexRdfError::Vortex)?;

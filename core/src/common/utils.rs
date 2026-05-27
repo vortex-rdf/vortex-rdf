@@ -10,9 +10,10 @@ use oxrdf::{
 use oxrdfio::{RdfFormat, RdfParser};
 use futures::{stream, Stream};
 use crate::error::{VortexRdfError, Result};
-use vortex_array::{LEGACY_SESSION, VortexSessionExecute};
+use vortex_array::{ArrayRef, LEGACY_SESSION, VortexSessionExecute};
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::primitive::PrimitiveArray;
+use vortex_array::arrays::VarBinViewArray;
 
 /// Parses a string representation of an RDF named node (URI), stripping optional `<` and `>` boundaries.
 pub fn parse_named_node(s: &str) -> Result<NamedNode> {
@@ -140,6 +141,98 @@ pub fn extract_flat_primitive_column(
     // 3. Resolve the array reference into a canonical flat PrimitiveArray of integers.
     col.clone().execute::<PrimitiveArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)
+}
+
+/// Decode a single chunk `ArrayRef` (a StructArray with fields s,p,o,g)
+/// into `Quad`s using the pre-decoded `values` view.
+pub fn decode_chunk(chunk: &ArrayRef, values: &VarBinViewArray) -> Vec<Result<Quad>> {
+    // 1. Establish an execution context to resolve/evaluate the compressed Vortex arrays.
+    let mut ctx = LEGACY_SESSION.create_execution_ctx();
+    
+    // 2. Evaluate and canonicalize the chunk array into a standard StructArray.
+    let struct_arr = match chunk.clone().execute::<StructArray>(&mut ctx) {
+        Ok(a) => a,
+        Err(e) => return vec![Err(VortexRdfError::Vortex(e))],
+    };
+
+    // 3. Extract subject, predicate, object, and graph ID columns using flat primitive extractor.
+    let s_ids = match extract_flat_primitive_column(&struct_arr, 0) {
+        Ok(ids) => ids,
+        Err(e) => return vec![Err(e)],
+    };
+    let p_ids = match extract_flat_primitive_column(&struct_arr, 1) {
+        Ok(ids) => ids,
+        Err(e) => return vec![Err(e)],
+    };
+    let o_ids = match extract_flat_primitive_column(&struct_arr, 2) {
+        Ok(ids) => ids,
+        Err(e) => return vec![Err(e)],
+    };
+    let g_ids = match extract_flat_primitive_column(&struct_arr, 3) {
+        Ok(ids) => ids,
+        Err(e) => return vec![Err(e)],
+    };
+
+    // 4. Iterate over each row in the chunk to decode ID sequences into RDF Terms and Quads.
+    (0..s_ids.len()).map(|i| {
+        // Retrieve the u32 index for each field and cast to usize.
+        let s_id = s_ids.as_slice::<u32>()[i] as usize;
+        let p_id = p_ids.as_slice::<u32>()[i] as usize;
+        let o_id = o_ids.as_slice::<u32>()[i] as usize;
+        let g_id = g_ids.as_slice::<u32>()[i] as usize;
+
+        // Perform zero-copy dictionary lookup to get raw string representation of each term.
+        let s_b = values.bytes_at(s_id); let s_s = String::from_utf8_lossy(s_b.as_ref());
+        let p_b = values.bytes_at(p_id); let p_s = String::from_utf8_lossy(p_b.as_ref());
+        let o_b = values.bytes_at(o_id); let o_s = String::from_utf8_lossy(o_b.as_ref());
+        let g_b = values.bytes_at(g_id); let g_s = String::from_utf8_lossy(g_b.as_ref());
+
+        // Parse the serialized term strings back into structural RDF Term types.
+        let s_term = get_as_term(&s_s)
+            .ok_or_else(|| VortexRdfError::Deserialization(format!("Invalid subject ID {s_id}")))?;
+        let p_term = get_as_term(&p_s)
+            .ok_or_else(|| VortexRdfError::Deserialization(format!("Invalid predicate ID {p_id}")))?;
+        let o_term = get_as_term(&o_s)
+            .ok_or_else(|| VortexRdfError::Deserialization(format!("Invalid object ID {o_id}")))?;
+
+        // Map the graph string to the appropriate structural GraphName.
+        let g_name = if g_s.is_empty() || g_s == "[]" {
+            GraphName::DefaultGraph
+        } else {
+            match get_as_term(&g_s) {
+                Some(Term::NamedNode(n)) => GraphName::NamedNode(n),
+                Some(Term::BlankNode(b)) => GraphName::BlankNode(b),
+                _ => GraphName::DefaultGraph,
+            }
+        };
+
+        // Construct standard structural components, validating subject and predicate constraints.
+        let subject = match s_term {
+            Term::NamedNode(n) => NamedOrBlankNode::NamedNode(n),
+            Term::BlankNode(b) => NamedOrBlankNode::BlankNode(b),
+            _ => return Err(VortexRdfError::Deserialization("Invalid subject type".into())),
+        };
+        let predicate = match p_term {
+            Term::NamedNode(n) => n,
+            _ => return Err(VortexRdfError::Deserialization("Invalid predicate type".into())),
+        };
+
+        // Assemble and return the complete structural RDF Quad.
+        Ok(Quad::new(subject, predicate, o_term, g_name))
+    }).collect()
+}
+
+/// Extract and decode a dictionary column from a serialized StructArray.
+/// E.g., extracts "_dict_values" and decodes any dictionary-encoded wrappers around it.
+pub fn extract_dictionary_column(
+    dict_struct: &StructArray,
+    key: &str,
+) -> Result<ArrayRef> {
+    let arr = dict_struct.unmasked_field_by_name(key)
+        .map_err(|_| VortexRdfError::Deserialization(
+            format!("Field '{}' not found in dict struct", key)
+        ))?;
+    crate::common::indexes::array_from_dict_column(arr)
 }
 
 /*

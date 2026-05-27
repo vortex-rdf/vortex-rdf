@@ -1,139 +1,67 @@
 use crate::error::{Result, VortexRdfError};
 use crate::io::de;
 use crate::index::RdfDictionary;
-use crate::common::{utils, indexes};
+use crate::common::utils;
+use crate::store::builders::{VortexArrayBuilder, UnsortedInMemoryBuilder};
+use crate::store::QuadsSource;
 
 use std::sync::Arc;
 use std::time::Instant;
+use std::io::Cursor;
 use futures::{Stream, StreamExt, stream};
 use oxrdf::{GraphName, NamedNode, Quad, NamedOrBlankNode, Term};
 
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::arrays::{
-    BoolArray, ChunkedArray, ConstantArray, PrimitiveArray, StructArray, VarBinViewArray,
+    BoolArray, ChunkedArray, ConstantArray, PrimitiveArray, StructArray,
 };
 use vortex_array::arrays::bool::BoolArrayExt;
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, LEGACY_SESSION, VortexSessionExecute};
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::expr::{Expression, root, select, and, eq, get_item, lit};
-use vortex_file::VortexFile;
-
-/// Lazily-decoded quad source — either fully in-memory (IPC / mutation path)
-/// or file-backed (lazy scan path, loaded via `from_file`).
-enum QuadsSource {
-    /// All quads held in a Vortex StructArray in host memory.
-    InMemory(ArrayRef),
-    /// Quads remain on disk; scanned lazily on each `quads()` or `match_pattern()` call.
-    #[cfg(feature = "file-io")]
-    File {
-        file: Arc<VortexFile>,
-        /// Optional filter expression (built by `match_pattern`).
-        filter: Option<Expression>,
-    },
-}
-
-impl Clone for QuadsSource {
-    fn clone(&self) -> Self {
-        match self {
-            QuadsSource::InMemory(arr) => QuadsSource::InMemory(arr.clone()),
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { file, filter } => QuadsSource::File {
-                file: file.clone(),
-                filter: filter.clone(),
-            },
-        }
-    }
-}
+use vortex_array::dtype::DType;
+use vortex_array::stream::ArrayStreamExt;
 
 /// Unified VortexRdfStore that works with any RdfDictionary implementation.
 /// Implements zero-copy, highly compressed, and scan-optimized RDF storage.
+///
+/// ### StructArray Schema Layout
+///
+/// The store serialized structure is a flat N-row Vortex `StructArray` representing all RDF quads
+/// along with (optional) sorted secondary indexes and dictionary data.
+/// This unified layout allows taking advantage of the Vortex Scan API 
+/// for push-down filtering and binary search routing leveraging Vortex zone maps metadata.
+///
+/// #### 1. Core Primary Columns
+/// * **`s`**: Subject ID (`u32`). Maps to the dictionary values.
+/// * **`p`**: Predicate ID (`u32`). Maps to the dictionary values.
+/// * **`o`**: Object ID (`u32`). Maps to the dictionary values.
+/// * **`g`**: Graph ID (`u32`). Maps to the dictionary values.
+///
+/// #### 2. (Optional) Sorted Secondary Indexes (Object & Predicate Routing)
+/// To support fast pattern matching without full scans and redundant full-data replicas (permutations),
+/// the store embeds secondary lookup indices sorted independently by field value:
+///
+/// * **Object Index**:
+///   * **`_idx_o_val`**: Object ID values (`u32`) sorted in ascending order.
+///   * **`_idx_o_rid`**: Global row IDs (`u32`) indicating the primary row index matching the object ID.
+///
+/// * **Predicate Index**:
+///   * **`_idx_p_val`**: Predicate ID values (`u32`) sorted in ascending order.
+///   * **`_idx_p_rid`**: Global row IDs (`u32`) indicating the primary row index matching the predicate ID.
+///
+/// When matching patterns like `(None, None, Some(Object), None)`, 
+/// the store scans `_idx_o_val` to locate all matched row IDs from `_idx_o_rid`, 
+/// taking only those specific primary quad rows.
+///
+/// #### 3. Dictionary & Metadata Projections
+/// * **`store_type`**: Constant column holding the dictionary/index identifier (e.g., `simple-dictionary`, `chained_hash`).
+/// * **`_dict_*`**: Specialized columns representing serialized internal structures of the dictionary.
 pub struct VortexRdfStore<Dict: RdfDictionary> {
     pub dictionary: Dict,
     quads: QuadsSource,
-}
-
-// ─── internal quad decoder ────────────────────────────
-
-/// Decode a single chunk `ArrayRef` (a StructArray with fields s,p,o,g)
-/// into `Quad`s using the pre-decoded `values` view.
-fn decode_chunk(chunk: &ArrayRef, values: &VarBinViewArray) -> Vec<Result<Quad>> {
-    // 1. Establish an execution context to resolve/evaluate the compressed Vortex arrays.
-    let mut ctx = LEGACY_SESSION.create_execution_ctx();
-    
-    // 2. Evaluate and canonicalize the chunk array into a standard StructArray.
-    let struct_arr = match chunk.clone().execute::<StructArray>(&mut ctx) {
-        Ok(a) => a,
-        Err(e) => return vec![Err(VortexRdfError::Vortex(e))],
-    };
-
-    // 3. Extract subject, predicate, object, and graph ID columns using flat primitive extractor.
-    let s_ids = match utils::extract_flat_primitive_column(&struct_arr, 0) {
-        Ok(ids) => ids,
-        Err(e) => return vec![Err(e)],
-    };
-    let p_ids = match utils::extract_flat_primitive_column(&struct_arr, 1) {
-        Ok(ids) => ids,
-        Err(e) => return vec![Err(e)],
-    };
-    let o_ids = match utils::extract_flat_primitive_column(&struct_arr, 2) {
-        Ok(ids) => ids,
-        Err(e) => return vec![Err(e)],
-    };
-    let g_ids = match utils::extract_flat_primitive_column(&struct_arr, 3) {
-        Ok(ids) => ids,
-        Err(e) => return vec![Err(e)],
-    };
-
-    // 4. Iterate over each row in the chunk to decode ID sequences into RDF Terms and Quads.
-    (0..s_ids.len()).map(|i| {
-        // Retrieve the u32 index for each field and cast to usize.
-        let s_id = s_ids.as_slice::<u32>()[i] as usize;
-        let p_id = p_ids.as_slice::<u32>()[i] as usize;
-        let o_id = o_ids.as_slice::<u32>()[i] as usize;
-        let g_id = g_ids.as_slice::<u32>()[i] as usize;
-
-        // Perform zero-copy dictionary lookup to get raw string representation of each term.
-        let s_b = values.bytes_at(s_id); let s_s = String::from_utf8_lossy(s_b.as_ref());
-        let p_b = values.bytes_at(p_id); let p_s = String::from_utf8_lossy(p_b.as_ref());
-        let o_b = values.bytes_at(o_id); let o_s = String::from_utf8_lossy(o_b.as_ref());
-        let g_b = values.bytes_at(g_id); let g_s = String::from_utf8_lossy(g_b.as_ref());
-
-        // Parse the serialized term strings back into structural RDF Term types.
-        let s_term = utils::get_as_term(&s_s)
-            .ok_or_else(|| VortexRdfError::Deserialization(format!("Invalid subject ID {s_id}")))?;
-        let p_term = utils::get_as_term(&p_s)
-            .ok_or_else(|| VortexRdfError::Deserialization(format!("Invalid predicate ID {p_id}")))?;
-        let o_term = utils::get_as_term(&o_s)
-            .ok_or_else(|| VortexRdfError::Deserialization(format!("Invalid object ID {o_id}")))?;
-
-        // Map the graph string to the appropriate structural GraphName.
-        let g_name = if g_s.is_empty() || g_s == "[]" {
-            GraphName::DefaultGraph
-        } else {
-            match utils::get_as_term(&g_s) {
-                Some(Term::NamedNode(n)) => GraphName::NamedNode(n),
-                Some(Term::BlankNode(b)) => GraphName::BlankNode(b),
-                _ => GraphName::DefaultGraph,
-            }
-        };
-
-        // Construct standard structural components, validating subject and predicate constraints.
-        let subject = match s_term {
-            Term::NamedNode(n) => NamedOrBlankNode::NamedNode(n),
-            Term::BlankNode(b) => NamedOrBlankNode::BlankNode(b),
-            _ => return Err(VortexRdfError::Deserialization("Invalid subject type".into())),
-        };
-        let predicate = match p_term {
-            Term::NamedNode(n) => n,
-            _ => return Err(VortexRdfError::Deserialization("Invalid predicate type".into())),
-        };
-
-        // Assemble and return the complete structural RDF Quad.
-        Ok(Quad::new(subject, predicate, o_term, g_name))
-    }).collect()
 }
 
 // ─── impl VortexRdfStore ─────────────────────────────────────────────────────
@@ -188,11 +116,9 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
 
     /// Load from a Vortex file lazily.
     /// Parses only the necessary dictionary columns eagerly and leaves
-    /// [s,p,o,g] columns on disk for streaming scan projection.
+    /// [s,p,o,g] and [_idx_*] columns on disk for streaming scan projection.
     #[cfg(feature = "file-io")]
     pub async fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
-        use vortex_array::stream::ArrayStreamExt;
-
         // Eagerly open the file session.
         let file = Arc::new(de::open_vortex_file(path).await?);
         
@@ -219,104 +145,37 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
         })
     }
 
+    /// Create a new store with the given quads (and associated dictionary).
+    fn with_quads(&self, quads: ArrayRef) -> Result<Self> {
+        Ok(Self { 
+            dictionary: self.dictionary.clone(), 
+            quads: QuadsSource::InMemory(quads) 
+        })
+    }
+
     /// Load from IPC bytes (always in-memory, flat format).
     pub async fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let cursor = std::io::Cursor::new(bytes);
+        let cursor = Cursor::new(bytes);
         let vortex_array = de::array_from_ipc_reader(cursor)?;
         Self::new(vortex_array)
     }
+}
 
+impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
     // ── serialization ─────────────────────────────────────────────────────────
 
-    /// Build the new Vortex file format:
-    /// ```text
-    /// StructArray(len=N) {
-    ///   s, p, o, g:    PrimitiveArray<u32>(N)   ← root-level, zone-map prunable
-    ///   store_type:    ConstantArray<Utf8>(N)
-    ///   _dict_values:  DictArray(codes=zeros(N), values=ListArray(1, VarBinaryArray))
-    ///   _dict_*:       DictArray(codes=zeros(N), values=ListArray(1, *_arr))
-    /// }
-    /// ```
+    /// Build the new Vortex file format using the default UnsortedInMemoryBuilder by default.
     pub async fn build_vortex_array(
         quad_stream: impl Stream<Item = Result<Quad>> + Unpin + Send + 'static
     ) -> Result<ArrayRef> {
-        let start_dict = Instant::now();
-        let mut dictionary = Dict::new();
+        Self::build_vortex_array_with_builder::<UnsortedInMemoryBuilder>(quad_stream).await
+    }
 
-        // 1. Collect stream results.
-        // TODO: check if it's better to process in chunks of quads and serialize each chunk separately.
-        //       This would enable for parallel processing of chunks and reduce peak memory usage.
-        // TODO: investigate ordering for indexed-structured storage + sub-indexes.
-        let quads: Vec<Quad> = quad_stream
-            .collect::<Vec<Result<Quad>>>().await
-            .into_iter().collect::<Result<Vec<Quad>>>()?;
-        let n = quads.len();
-        log::debug!("[build_vortex_array] Collected {} quads in {:?}", n, start_dict.elapsed());
-
-        // 2. Extract bulk term strings for dictionary insertion.
-        let mut term_strings = Vec::with_capacity(n * 4);
-        for q in &quads {
-            term_strings.push(q.subject.to_string());
-            term_strings.push(q.predicate.to_string());
-            term_strings.push(q.object.to_string());
-            term_strings.push(q.graph_name.to_string());
-        }
-        
-        // 3. Populate dictionary mapping to obtain stable term IDs.
-        let all_ids = dictionary.get_or_insert_bulk(
-            &term_strings.iter().map(|s| s.as_str()).collect::<Vec<_>>()
-        );
-
-        let mut s_ids = Vec::with_capacity(n);
-        let mut p_ids = Vec::with_capacity(n);
-        let mut o_ids = Vec::with_capacity(n);
-        let mut g_ids = Vec::with_capacity(n);
-        for i in 0..n {
-            s_ids.push(all_ids[i * 4]);
-            p_ids.push(all_ids[i * 4 + 1]);
-            o_ids.push(all_ids[i * 4 + 2]);
-            g_ids.push(all_ids[i * 4 + 3]);
-        }
-
-        // 4. Construct the serializable forms of the dictionary tables.
-        let dict_fields = dictionary.to_vortex_array()?;
-
-        // 5. Build flat N-row StructArray fields.
-        let mut field_names: Vec<Arc<str>> = vec![
-            "s".into(), 
-            "p".into(), 
-            "o".into(), 
-            "g".into()
-        ];
-        let mut field_arrays: Vec<ArrayRef> = vec![
-            PrimitiveArray::from_iter(s_ids).into_array(),
-            PrimitiveArray::from_iter(p_ids).into_array(),
-            PrimitiveArray::from_iter(o_ids).into_array(),
-            PrimitiveArray::from_iter(g_ids).into_array(),
-        ];
-
-        // store_type as ConstantArray(N)
-        field_names.push("store_type".into());
-        field_arrays.push(ConstantArray::new(Dict::store_type(), n).into_array());
-
-        // Dict fields as DictionaryArray(codes=all-zeros, values=ListArray(1, dict_arr))
-        // O(N) write, RLE compresses codes to ~16 bytes, dict stored exactly once.
-        for (name, arr) in dict_fields {
-            field_names.push(format!("_dict_{}", name).into());
-            field_arrays.push(indexes::array_as_dict_column(arr, n)?);
-        }
-
-        let vortex_array = StructArray::try_new(
-            field_names.into(),
-            field_arrays,
-            n,
-            Validity::NonNullable,
-        )
-        .map_err(VortexRdfError::Vortex)?
-        .into_array();
-
-        log::debug!("[build_vortex_array] Total build took {:?}", start_dict.elapsed());
-        Ok(vortex_array)
+    /// Build the new Vortex file format with a specified builder.
+    pub async fn build_vortex_array_with_builder<B: VortexArrayBuilder<Dict>>(
+        quad_stream: impl Stream<Item = Result<Quad>> + Unpin + Send + 'static
+    ) -> Result<ArrayRef> {
+        B::build_vortex_array(Box::new(quad_stream)).await
     }
 
     // ── accessors ─────────────────────────────────────────────────────────────
@@ -325,9 +184,18 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
         match &self.quads {
             QuadsSource::InMemory(arr) => Ok(arr.clone()),
             #[cfg(feature = "file-io")]
-            QuadsSource::File { .. } => Err(VortexRdfError::Deserialization(
-                "get_quads_array not supported for file-backed store".into()
-            )),
+            QuadsSource::File { file, filter } => {
+                let mut scan = file.scan().map_err(VortexRdfError::Vortex)?;
+                scan = scan.with_projection(select(["s", "p", "o", "g"], root()));
+                if let Some(expr) = filter {
+                    scan = scan.with_filter(expr.clone());
+                }
+                let stream = scan.into_array_stream().map_err(VortexRdfError::Vortex)?;
+                let array = futures::executor::block_on(async {
+                    stream.read_all().await
+                }).map_err(VortexRdfError::Vortex)?;
+                Ok(array)
+            }
         }
     }
 
@@ -345,10 +213,6 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
         }
     }
 
-    fn with_quads(&self, quads: ArrayRef) -> Result<Self> {
-        Ok(Self { dictionary: self.dictionary.clone(), quads: QuadsSource::InMemory(quads) })
-    }
-
     // ── quads streaming ───────────────────────────────────────────────────────
 
     /// Stream all quads out of the store.
@@ -359,7 +223,7 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
                 // Batch-decode: execute values once for the whole scan
                 let values = self.dictionary.values_view()?;
                 let chunk = quads_arr.clone();
-                let quads = decode_chunk(&chunk, &values);
+                let quads = utils::decode_chunk(&chunk, &values);
                 Ok(Box::new(stream::iter(quads)))
             }
             #[cfg(feature = "file-io")]
@@ -382,7 +246,7 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
                     let values = values.clone();
                     let quads = match chunk_res {
                         Err(e) => vec![Err(VortexRdfError::Vortex(e))],
-                        Ok(chunk) => decode_chunk(&chunk, &values),
+                        Ok(chunk) => utils::decode_chunk(&chunk, &values),
                     };
                     stream::iter(quads)
                 });
@@ -510,6 +374,155 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
             // ── file-backed: build filter expression, return lazy store ───
             #[cfg(feature = "file-io")]
             QuadsSource::File { file, .. } => {
+                let has_indices = if let DType::Struct(fields, _) = file.dtype() {
+                    fields.names().iter().any(|n| n.as_ref() == "_idx_o_val")
+                } else {
+                    false
+                };
+
+                if has_indices {
+                    if subject.is_none() && object.is_some() {
+                        let obj = object.unwrap();
+                        if let Some(o_id) = self.dictionary.get_id(&obj.to_string()) {
+                            let mut ctx = LEGACY_SESSION.create_execution_ctx();
+                            
+                            // 1. Scan sorted _idx_o_val to get matching _idx_o_rid
+                            let scan = file.scan()
+                                .map_err(VortexRdfError::Vortex)?
+                                .with_projection(select(["_idx_o_rid"], root()))
+                                .with_filter(eq(get_item("_idx_o_val", root()), lit(o_id)));
+                            
+                            let array = scan.into_array_stream().map_err(VortexRdfError::Vortex)?
+                                .read_all().await.map_err(VortexRdfError::Vortex)?;
+                            
+                            let struct_arr = array.execute::<StructArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
+                            let rid_col = struct_arr.unmasked_field_by_name("_idx_o_rid")
+                                .map_err(|_| VortexRdfError::Deserialization("Missing _idx_o_rid column".into()))?;
+                            let rid_prim = rid_col.clone().execute::<PrimitiveArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
+                            let rids = rid_prim.as_slice::<u32>();
+
+                            if rids.is_empty() {
+                                return Ok(Self::empty());
+                            }
+
+                            // 2. Fetch matching quads
+                            let chunk_size = 500_000;
+                            let mut chunk_matches: std::collections::HashMap<usize, Vec<u32>> = std::collections::HashMap::new();
+                            for &rid in rids {
+                                let chunk_idx = (rid as usize) / chunk_size;
+                                let local_rid = rid % (chunk_size as u32);
+                                chunk_matches.entry(chunk_idx).or_default().push(local_rid);
+                            }
+
+                            let primary_scan = file.scan().map_err(VortexRdfError::Vortex)?
+                                .with_projection(select(["s", "p", "o", "g"], root()));
+                            let mut stream = primary_scan.into_array_stream().map_err(VortexRdfError::Vortex)?;
+
+                            let mut chunks = Vec::new();
+                            let mut chunk_idx = 0;
+                            while let Some(chunk_res) = stream.next().await {
+                                let chunk = chunk_res.map_err(VortexRdfError::Vortex)?;
+                                if let Some(local_rids) = chunk_matches.get(&chunk_idx) {
+                                    let struct_chunk = chunk.execute::<StructArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
+                                    let indices = PrimitiveArray::from_iter(local_rids.clone()).into_array();
+                                    let taken = struct_chunk.take(indices).map_err(VortexRdfError::Vortex)?;
+                                    chunks.push(taken);
+                                }
+                                chunk_idx += 1;
+                            }
+
+                            let quads_arr = if chunks.len() == 1 {
+                                chunks.remove(0)
+                            } else {
+                                let dtype = chunks[0].dtype().clone();
+                                ChunkedArray::try_new(chunks, dtype)
+                                    .map_err(VortexRdfError::Vortex)?
+                                    .into_array()
+                            };
+
+                            let taken_store = Self {
+                                dictionary: self.dictionary.clone(),
+                                quads: QuadsSource::InMemory(quads_arr),
+                            };
+
+                            log::debug!("[match_pattern] Object index routing completed in {:?}", start.elapsed());
+                            return Box::pin(taken_store.match_pattern(subject, predicate, None, graph)).await;
+                        } else {
+                            return Ok(Self::empty());
+                        }
+                    } else if subject.is_none() && object.is_none() && predicate.is_some() {
+                        let pred = predicate.unwrap();
+                        if let Some(p_id) = self.dictionary.get_id(&pred.to_string()) {
+                            let mut ctx = LEGACY_SESSION.create_execution_ctx();
+                            
+                            // 1. Scan sorted _idx_p_val to get matching _idx_p_rid
+                            let scan = file.scan()
+                                .map_err(VortexRdfError::Vortex)?
+                                .with_projection(select(["_idx_p_rid"], root()))
+                                .with_filter(eq(get_item("_idx_p_val", root()), lit(p_id)));
+                            
+                            let array = scan.into_array_stream().map_err(VortexRdfError::Vortex)?
+                                .read_all().await.map_err(VortexRdfError::Vortex)?;
+                            
+                            let struct_arr = array.execute::<StructArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
+                            let rid_col = struct_arr.unmasked_field_by_name("_idx_p_rid")
+                                .map_err(|_| VortexRdfError::Deserialization("Missing _idx_p_rid column".into()))?;
+                            let rid_prim = rid_col.clone().execute::<PrimitiveArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
+                            let rids = rid_prim.as_slice::<u32>();
+
+                            if rids.is_empty() {
+                                return Ok(Self::empty());
+                            }
+
+                            // 2. Fetch matching quads
+                            let chunk_size = 500_000;
+                            let mut chunk_matches: std::collections::HashMap<usize, Vec<u32>> = std::collections::HashMap::new();
+                            for &rid in rids {
+                                let chunk_idx = (rid as usize) / chunk_size;
+                                let local_rid = rid % (chunk_size as u32);
+                                chunk_matches.entry(chunk_idx).or_default().push(local_rid);
+                            }
+
+                            let primary_scan = file.scan().map_err(VortexRdfError::Vortex)?
+                                .with_projection(select(["s", "p", "o", "g"], root()));
+                            let mut stream = primary_scan.into_array_stream().map_err(VortexRdfError::Vortex)?;
+
+                            let mut chunks = Vec::new();
+                            let mut chunk_idx = 0;
+                            while let Some(chunk_res) = stream.next().await {
+                                let chunk = chunk_res.map_err(VortexRdfError::Vortex)?;
+                                if let Some(local_rids) = chunk_matches.get(&chunk_idx) {
+                                    let struct_chunk = chunk.execute::<StructArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
+                                    let indices = PrimitiveArray::from_iter(local_rids.clone()).into_array();
+                                    let taken = struct_chunk.take(indices).map_err(VortexRdfError::Vortex)?;
+                                    chunks.push(taken);
+                                }
+                                chunk_idx += 1;
+                            }
+
+                            let quads_arr = if chunks.len() == 1 {
+                                chunks.remove(0)
+                            } else {
+                                let dtype = chunks[0].dtype().clone();
+                                ChunkedArray::try_new(chunks, dtype)
+                                    .map_err(VortexRdfError::Vortex)?
+                                    .into_array()
+                            };
+
+                            let taken_store = Self {
+                                dictionary: self.dictionary.clone(),
+                                quads: QuadsSource::InMemory(quads_arr),
+                            };
+
+                            log::debug!("[match_pattern] Predicate index routing completed in {:?}", start.elapsed());
+                            return Box::pin(taken_store.match_pattern(subject, None, object, graph)).await;
+                        } else {
+                            return Ok(Self::empty());
+                        }
+                    }
+                }
+
+                // Fallback to primary scan
                 let filter = self.build_file_filter(subject, predicate, object, graph)?;
                 log::debug!("[match_pattern] File filter expr built in {:?}", start.elapsed());
                 Ok(Self {

@@ -15,7 +15,12 @@ use vortex::buffer::Buffer;
 use vortex_rdf_core::{
     io::{serialize, deserialize, load_vortex_file_ref, open_vortex_file},
     index::{SimpleDictionary, ChainedHash},
-    VortexRdfStore
+    VortexRdfStore,
+    BuilderStrategy,
+    UnsortedInMemoryBuilder,
+    SortedInMemoryBuilder,
+    ChunkSortBuilder,
+    GlobalSortBuilder,
 };
 use vortex_rdf_core::common::formats::{Format, detect_format};
 use vortex_rdf_core::common::indexes::{IndexType, detect_index_type};
@@ -57,6 +62,10 @@ enum Action {
         /// RDF Format (auto-detected from file extension if not provided)
         #[arg(short, long, value_enum)]
         format: Option<Format>,
+
+        /// Builder strategy to use when serializing (defaults to unsorted-in-memory)
+        #[arg(short, long, value_enum, default_value = "unsorted-in-memory")]
+        builder_strategy: BuilderStrategy,
     },
     /// Convert from Vortex-RDF to RDF
     Deserialize {
@@ -114,7 +123,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.action {
-        Action::Serialize { index_type, input, output, format } => {
+        Action::Serialize { index_type, input, output, format, builder_strategy } => {
             let start = Instant::now();
             let format = format
                 .map(RdfFormat::from)
@@ -132,11 +141,31 @@ async fn main() -> Result<()> {
                 .context("Failed to create output file")?;
             let quads_stream = parse_quads_from_reader(reader, format);
             
-            let vortex_array = match index_type {
-                IndexType::SimpleDictionary 
-                    => VortexRdfStore::<SimpleDictionary>::build_vortex_array(quads_stream).await?,
-                IndexType::ChainedHash 
-                    => VortexRdfStore::<ChainedHash>::build_vortex_array(quads_stream).await?,
+            let vortex_array = match (index_type, builder_strategy) {
+                (IndexType::SimpleDictionary, BuilderStrategy::UnsortedInMemory) => {
+                    VortexRdfStore::<SimpleDictionary>::build_vortex_array_with_builder::<UnsortedInMemoryBuilder>(quads_stream).await?
+                }
+                (IndexType::SimpleDictionary, BuilderStrategy::SortedInMemory) => {
+                    VortexRdfStore::<SimpleDictionary>::build_vortex_array_with_builder::<SortedInMemoryBuilder>(quads_stream).await?
+                }
+                (IndexType::SimpleDictionary, BuilderStrategy::ChunkSort) => {
+                    VortexRdfStore::<SimpleDictionary>::build_vortex_array_with_builder::<ChunkSortBuilder>(quads_stream).await?
+                }
+                (IndexType::SimpleDictionary, BuilderStrategy::GlobalSort) => {
+                    VortexRdfStore::<SimpleDictionary>::build_vortex_array_with_builder::<GlobalSortBuilder>(quads_stream).await?
+                }
+                (IndexType::ChainedHash, BuilderStrategy::UnsortedInMemory) => {
+                    VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<UnsortedInMemoryBuilder>(quads_stream).await?
+                }
+                (IndexType::ChainedHash, BuilderStrategy::SortedInMemory) => {
+                    VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<SortedInMemoryBuilder>(quads_stream).await?
+                }
+                (IndexType::ChainedHash, BuilderStrategy::ChunkSort) => {
+                    VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<ChunkSortBuilder>(quads_stream).await?
+                }
+                (IndexType::ChainedHash, BuilderStrategy::GlobalSort) => {
+                    VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<GlobalSortBuilder>(quads_stream).await?
+                }
             };
 
             serialize(vortex_array, writer)
