@@ -1,9 +1,11 @@
 pub mod chained_hash;
 pub mod simple_dictionary;
+pub mod simple_dictionary_view;
 
 // Re-export dictionary implementations
 pub use chained_hash::ChainedHash;
 pub use simple_dictionary::SimpleDictionary;
+pub use simple_dictionary_view::SimpleDictionaryView;
 
 use crate::error::Result;
 use oxrdf::{GraphName, Term};

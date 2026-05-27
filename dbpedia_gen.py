@@ -1,7 +1,11 @@
 input_file = r"C:/Users/Fotis Kalioras/Documents/GitHub/pycottas/experiments/DBPedia/dbpedia_fixed_rust.nt"
-output_file = "dbpedia_sample.nq"
-
-limit = 1_000_000
+limit = 5_000_000
+if limit > 1_000_000:
+    output_file = f"dbpedia_{limit//1_000_000}M.nq"
+elif limit > 1_000:
+    output_file = f"dbpedia_{limit//1_000}K.nq"
+else:
+    output_file = f"dbpedia_{limit}.nq"
 
 with open(input_file, "r", encoding="utf-8", errors="ignore") as infile, \
      open(output_file, "w", encoding="utf-8") as outfile:

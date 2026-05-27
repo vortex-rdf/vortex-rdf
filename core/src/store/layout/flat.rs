@@ -1,7 +1,6 @@
 use crate::common::{indexes, utils};
 use crate::error::{Result, VortexRdfError};
 use crate::index::RdfDictionary;
-use crate::store::layout::AppendStrategy;
 use crate::store::layout::{RdfQuadLayout, RdfQuadLayoutBuilder};
 use futures::{Stream, StreamExt, stream};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
@@ -480,10 +479,6 @@ impl FlatLayoutBuilder {
     }
 }
 
-impl FlatLayout {
-    const DEFAULT_APPEND_STRATEGY: AppendStrategy = AppendStrategy::Rebuild;
-}
-
 impl<Dict> RdfQuadLayoutBuilder<Dict> for FlatLayoutBuilder
 where
     Dict: RdfDictionary,
@@ -528,34 +523,4 @@ where
 
         Ok(arr)
     }
-}
-
-fn extract_id_columns(quads: &ArrayRef) -> Result<(Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>)> {
-    let session = VortexSession::default();
-    let mut ctx = session.create_execution_ctx();
-
-    let quads_struct = quads
-        .clone()
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-
-    let fields = quads_struct.unmasked_fields();
-
-    let extract = |idx: usize, name: &str, ctx: &mut _| -> Result<Vec<u32>> {
-        let arr = fields
-            .get(idx)
-            .ok_or_else(|| VortexRdfError::Deserialization(format!("Missing {} column", name)))?
-            .clone()
-            .execute::<PrimitiveArray>(ctx)
-            .map_err(VortexRdfError::Vortex)?;
-
-        Ok(arr.as_slice::<u32>().to_vec())
-    };
-
-    let s_ids = extract(0, "s", &mut ctx)?;
-    let p_ids = extract(1, "p", &mut ctx)?;
-    let o_ids = extract(2, "o", &mut ctx)?;
-    let g_ids = extract(3, "g", &mut ctx)?;
-
-    Ok((s_ids, p_ids, o_ids, g_ids))
 }

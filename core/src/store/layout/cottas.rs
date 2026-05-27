@@ -1,20 +1,13 @@
-use crate::common::indexes;
 use crate::error::{Result, VortexRdfError};
 use crate::index::RdfDictionary;
 use crate::store::layout::flat::FlatLayout;
 use crate::store::layout::{RdfQuadLayout, RdfQuadLayoutBuilder};
-use futures::{Stream, stream};
+use futures::Stream;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use std::str::FromStr;
 use std::sync::Arc;
-use vortex_array::arrays::bool::BoolArrayExt;
-use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::arrays::{BoolArray, ChunkedArray, ConstantArray, PrimitiveArray, StructArray};
-use vortex_array::builtins::ArrayBuiltins;
-use vortex_array::scalar::Scalar;
-use vortex_array::scalar_fn::fns::operators::Operator;
+use vortex_array::arrays::{ChunkedArray, ConstantArray, PrimitiveArray, StructArray};
 use vortex_array::{ArrayRef, IntoArray};
-use vortex_array::{LEGACY_SESSION, VortexSessionExecute};
 
 #[derive(Clone, Debug)]
 pub struct CottasLayout;
@@ -142,7 +135,7 @@ impl CottasLayoutBuilder {
             return;
         }
 
-        self.buffer.sort_by(|a, b| a.cmp_by_order(b, self.ordering));
+        //self.buffer.sort_by(|a, b| a.cmp_by_order(b, self.ordering));
         let mut group = Vec::new();
         std::mem::swap(&mut group, &mut self.buffer);
         self.raw_row_groups.push(group);
@@ -228,61 +221,6 @@ impl CottasLayoutBuilder {
         self.raw_row_groups.iter().map(|group| group.len()).sum()
     }
 
-    fn build_row_group_stats_array(&self) -> Result<ArrayRef> {
-        let mut row_group_id = Vec::new();
-        let mut block_start = Vec::new();
-        let mut block_end = Vec::new();
-        let mut min_s = Vec::new();
-        let mut max_s = Vec::new();
-        let mut min_p = Vec::new();
-        let mut max_p = Vec::new();
-        let mut min_o = Vec::new();
-        let mut max_o = Vec::new();
-        let mut min_g = Vec::new();
-        let mut max_g = Vec::new();
-
-        for group in &self.encoded_row_groups {
-            row_group_id.push(group.row_group_id);
-            block_start.push(group.global_start);
-            block_end.push(group.global_end);
-            min_s.push(*group.s_ids.iter().min().unwrap_or(&0));
-            max_s.push(*group.s_ids.iter().max().unwrap_or(&0));
-            min_p.push(*group.p_ids.iter().min().unwrap_or(&0));
-            max_p.push(*group.p_ids.iter().max().unwrap_or(&0));
-            min_o.push(*group.o_ids.iter().min().unwrap_or(&0));
-            max_o.push(*group.o_ids.iter().max().unwrap_or(&0));
-            min_g.push(*group.g_ids.iter().min().unwrap_or(&0));
-            max_g.push(*group.g_ids.iter().max().unwrap_or(&0));
-        }
-
-        let stats = StructArray::from_fields(&[
-            (
-                "row_group_id",
-                PrimitiveArray::from_iter(row_group_id).into_array(),
-            ),
-            (
-                "block_start",
-                PrimitiveArray::from_iter(block_start).into_array(),
-            ),
-            (
-                "block_end",
-                PrimitiveArray::from_iter(block_end).into_array(),
-            ),
-            ("min_s", PrimitiveArray::from_iter(min_s).into_array()),
-            ("max_s", PrimitiveArray::from_iter(max_s).into_array()),
-            ("min_p", PrimitiveArray::from_iter(min_p).into_array()),
-            ("max_p", PrimitiveArray::from_iter(max_p).into_array()),
-            ("min_o", PrimitiveArray::from_iter(min_o).into_array()),
-            ("max_o", PrimitiveArray::from_iter(max_o).into_array()),
-            ("min_g", PrimitiveArray::from_iter(min_g).into_array()),
-            ("max_g", PrimitiveArray::from_iter(max_g).into_array()),
-        ])
-        .map_err(VortexRdfError::Vortex)?
-        .into_array();
-
-        Ok(stats)
-    }
-
     fn empty_quads_array() -> Result<ArrayRef> {
         let quads = StructArray::from_fields(&[
             (
@@ -354,14 +292,33 @@ where
 
         Ok(())
     }
-
     fn finalize(&mut self, dictionary: &mut Dict) -> Result<()> {
         self.flush_raw_row_group();
+
+        // flatten all row groups
+        let mut triples: Vec<Triple> = self.raw_row_groups.drain(..).flatten().collect();
+
+        // global sort
+        triples.sort_by(|a, b| a.cmp_by_order(b, self.ordering));
+
+        // repartition into row groups
+        self.raw_row_groups = triples
+            .chunks(self.row_group_size)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+
         self.seed_dictionary_in_lexical_order(dictionary);
         self.encode_row_groups(dictionary)?;
-
         Ok(())
     }
+
+    //fn finalize(&mut self, dictionary: &mut Dict) -> Result<()> {
+    //    self.flush_raw_row_group();
+    //    self.seed_dictionary_in_lexical_order(dictionary);
+    //    self.encode_row_groups(dictionary)?;
+    //
+    //    Ok(())
+    //}
 
     fn build_quads(&self) -> Result<ArrayRef> {
         if self.encoded_row_groups.is_empty() {
@@ -388,8 +345,6 @@ where
 
     fn build_extra_root_fields(&self) -> Result<Vec<(Arc<str>, ArrayRef)>> {
         let storage_layout = ConstantArray::new("cottas-vortex-row-groups", 1).into_array();
-        let row_group_stats = self.build_row_group_stats_array()?;
-        let row_group_stats_list = indexes::wrap_array_in_list(row_group_stats)?;
         let file_metadata = build_file_metadata(&FileMetadata {
             ordering: self.ordering,
             row_group_size: self.row_group_size,
@@ -398,7 +353,6 @@ where
 
         Ok(vec![
             ("storage_layout".into(), storage_layout),
-            ("row_group_stats".into(), row_group_stats_list),
             ("file_metadata".into(), file_metadata),
         ])
     }
@@ -432,90 +386,7 @@ where
         dictionary: &'a Dict,
         quads: &'a ArrayRef,
     ) -> Result<Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'a>> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-
-        let quads_struct = quads
-            .clone()
-            .execute::<StructArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-
-        let fields = quads_struct.unmasked_fields();
-
-        let s_ids = fields
-            .get(3)
-            .ok_or_else(|| VortexRdfError::Deserialization("Missing COTTAS S IDs".to_string()))?
-            .clone()
-            .execute::<PrimitiveArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-
-        let p_ids = fields
-            .get(4)
-            .ok_or_else(|| VortexRdfError::Deserialization("Missing COTTAS P IDs".to_string()))?
-            .clone()
-            .execute::<PrimitiveArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-
-        let o_ids = fields
-            .get(5)
-            .ok_or_else(|| VortexRdfError::Deserialization("Missing COTTAS O IDs".to_string()))?
-            .clone()
-            .execute::<PrimitiveArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-
-        let g_ids = fields
-            .get(6)
-            .ok_or_else(|| VortexRdfError::Deserialization("Missing COTTAS G IDs".to_string()))?
-            .clone()
-            .execute::<PrimitiveArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-
-        let len = s_ids.len();
-
-        let iter = (0..len).map(move |i| {
-            let s_id = s_ids.as_slice::<u32>()[i];
-            let p_id = p_ids.as_slice::<u32>()[i];
-            let o_id = o_ids.as_slice::<u32>()[i];
-            let g_id = g_ids.as_slice::<u32>()[i];
-
-            let s_term = dictionary.get_term(s_id).ok_or_else(|| {
-                VortexRdfError::Deserialization(format!("S ID {} not in dictionary", s_id))
-            })?;
-
-            let p_term = dictionary.get_term(p_id).ok_or_else(|| {
-                VortexRdfError::Deserialization(format!("P ID {} not in dictionary", p_id))
-            })?;
-
-            let o_term = dictionary.get_term(o_id).ok_or_else(|| {
-                VortexRdfError::Deserialization(format!("O ID {} not in dictionary", o_id))
-            })?;
-
-            let g_name = dictionary.get_graph_name(g_id).ok_or_else(|| {
-                VortexRdfError::Deserialization(format!("G ID {} not in dictionary", g_id))
-            })?;
-
-            let subject = match s_term {
-                Term::NamedNode(n) => NamedOrBlankNode::NamedNode(n),
-                Term::BlankNode(b) => NamedOrBlankNode::BlankNode(b),
-                _ => {
-                    return Err(VortexRdfError::Deserialization(
-                        "Invalid subject type".to_string(),
-                    ));
-                }
-            };
-
-            let predicate = match p_term {
-                Term::NamedNode(n) => n,
-                _ => {
-                    return Err(VortexRdfError::Deserialization(
-                        "Invalid predicate type".to_string(),
-                    ));
-                }
-            };
-
-            Ok(Quad::new(subject, predicate, o_term, g_name))
-        });
-
-        Ok(Box::new(stream::iter(iter)))
+        <FlatLayout as RdfQuadLayout<Dict>>::quads(dictionary, quads)
     }
 
     fn find_mask(
@@ -526,75 +397,22 @@ where
         object: Option<&Term>,
         graph: Option<&GraphName>,
     ) -> Result<Option<ArrayRef>> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
-
-        let quads_struct = quads
-            .clone()
-            .execute::<StructArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-
-        let fields = quads_struct.unmasked_fields();
-
-        let mut mask: Option<ArrayRef> = None;
-
-        let mut combine_mask = |new_mask: ArrayRef| -> Result<()> {
-            if let Some(existing) = mask.take() {
-                mask = Some(
-                    existing
-                        .binary(new_mask, Operator::And)
-                        .map_err(VortexRdfError::Vortex)?,
-                );
-            } else {
-                mask = Some(new_mask);
-            }
-
-            Ok(())
-        };
-
-        let patterns = [
-            (subject.map(|s| s.to_string()), 3usize, "Subject"),
-            (predicate.map(|p| p.to_string()), 4usize, "Predicate"),
-            (object.map(|o| o.to_string()), 5usize, "Object"),
-            (graph.map(|g| g.to_string()), 6usize, "Graph"),
-        ];
-
-        for (term_opt, col_idx, _label) in patterns {
-            if let Some(term_str) = term_opt {
-                if let Some(id) = dictionary.get_id(&term_str) {
-                    let col = fields.get(col_idx).ok_or_else(|| {
-                        VortexRdfError::Deserialization(format!(
-                            "Missing COTTAS column at index {}",
-                            col_idx
-                        ))
-                    })?;
-
-                    let scalar = Scalar::from(id)
-                        .cast(col.dtype())
-                        .map_err(VortexRdfError::Vortex)?;
-
-                    let column_mask = col
-                        .binary(
-                            ConstantArray::new(scalar, col.len()).into_array(),
-                            Operator::Eq,
-                        )
-                        .map_err(VortexRdfError::Vortex)?;
-
-                    combine_mask(column_mask)?;
-                } else {
-                    return Ok(Some(ConstantArray::new(false, quads.len()).into_array()));
-                }
-            }
-        }
-
-        Ok(mask)
+        <FlatLayout as RdfQuadLayout<Dict>>::find_mask(
+            dictionary, quads, subject, predicate, object, graph,
+        )
     }
 
-    fn add_quad(dictionary: &mut Dict, quads: &ArrayRef, quad: Quad) -> Result<ArrayRef> {
-        FlatLayout::add_quad(dictionary, quads, quad)
+    fn add_quad(_dictionary: &mut Dict, _quads: &ArrayRef, _quad: Quad) -> Result<ArrayRef> {
+        Err(VortexRdfError::InvalidOperation(
+            "CottasLayout::add_quad is not supported yet; rebuild the COTTAS layout instead"
+                .to_string(),
+        ))
+
+        //FlatLayout::add_quad(dictionary, quads, quad)
     }
 
     fn delete_quad(dictionary: &Dict, quads: &ArrayRef, quad: &Quad) -> Result<ArrayRef> {
-        let mask = Self::find_mask(
+        let _mask = Self::find_mask(
             dictionary,
             quads,
             Some(&quad.subject),
@@ -602,41 +420,49 @@ where
             Some(&quad.object),
             Some(&quad.graph_name),
         )?;
+        Err(VortexRdfError::InvalidOperation(
+            "CottasLayout::delete_quad is not supported yet; rebuild the COTTAS layout instead"
+                .to_string(),
+        ))
 
-        if let Some(m) = mask {
-            let inverse_mask = m.not().map_err(VortexRdfError::Vortex)?;
+        //if let Some(m) = mask {
+        //    let inverse_mask = m.not().map_err(VortexRdfError::Vortex)?;
 
-            let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        //    let mut ctx = LEGACY_SESSION.create_execution_ctx();
 
-            let bool_arr = inverse_mask
-                .execute::<BoolArray>(&mut ctx)
-                .map_err(VortexRdfError::Vortex)?;
+        //    let bool_arr = inverse_mask
+        //        .execute::<BoolArray>(&mut ctx)
+        //        .map_err(VortexRdfError::Vortex)?;
 
-            let canonical_mask = bool_arr.to_mask_fill_null_false(&mut ctx);
+        //    let canonical_mask = bool_arr.to_mask_fill_null_false(&mut ctx);
 
-            let filtered = quads
-                .filter(canonical_mask)
-                .map_err(VortexRdfError::Vortex)?;
+        //    let filtered = quads
+        //        .filter(canonical_mask)
+        //        .map_err(VortexRdfError::Vortex)?;
 
-            Ok(filtered)
-        } else {
-            Ok(quads.clone())
-        }
+        //    Ok(filtered)
+        //} else {
+        //    Ok(quads.clone())
+        //}
     }
 
     fn append_quads_chunked(
-        dictionary: &mut Dict,
-        quads: &ArrayRef,
-        new_quads: Vec<Quad>,
-        chunk_size: usize,
+        _dictionary: &mut Dict,
+        _quads: &ArrayRef,
+        _new_quads: Vec<Quad>,
+        _chunk_size: usize,
     ) -> Result<ArrayRef> {
-        <FlatLayout as RdfQuadLayout<Dict>>::append_quads_chunked(
-            dictionary, quads, new_quads, chunk_size,
-        )
+        Err(VortexRdfError::InvalidOperation(
+        "CottasLayout::append_quads_chunked is not supported yet; rebuild the COTTAS layout instead"
+            .to_string(),
+    ))
     }
 
-    fn compact_quads(quads: &ArrayRef) -> Result<ArrayRef> {
-        <FlatLayout as RdfQuadLayout<Dict>>::compact_quads(quads)
+    fn compact_quads(_quads: &ArrayRef) -> Result<ArrayRef> {
+        Err(VortexRdfError::InvalidOperation(
+            "CottasLayout::compact_quads is not supported yet; rebuild the COTTAS layout instead"
+                .to_string(),
+        ))
     }
 }
 

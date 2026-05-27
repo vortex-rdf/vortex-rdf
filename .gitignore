@@ -5,3 +5,7 @@
 *.ttl
 *.txt
 *.json
+vortex_bench/*
+*.png
+*.py
+*.py*
