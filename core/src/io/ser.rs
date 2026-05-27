@@ -3,20 +3,31 @@ use crate::error::{Result, VortexRdfError};
 use crate::index::SimpleDictionary;
 use crate::store::VortexRdfStore;
 
+use std::sync::Arc;
 use oxrdf::Quad;
 use std::sync::LazyLock;
 use std::time::Instant;
 use vortex::VortexSessionDefault;
 
-use futures::stream;
+use vortex_array::ArrayRef;
+use vortex_array::stream::ArrayStreamAdapter;
+use vortex_array::dtype::FieldPath;
+use vortex_array::LEGACY_SESSION;
+use vortex_array::session::ArraySession;
+use vortex_array::scalar_fn::session::ScalarFnSession;
+use vortex_io::VortexWrite;
+use vortex_io::session::RuntimeSession;
+use vortex_layout::LayoutStrategy;
+use vortex_layout::session::LayoutSession;
+use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
+use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
+use vortex_ipc::iterator::ArrayIteratorIPC;
+use futures::{stream, Stream};
+use vortex_file::{WriteStrategyBuilder, WriteOptionsSessionExt};
+use vortex_session::VortexSession;
 
 /// A lazily-initialized session configured for Vortex file I/O.
 static WRITE_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-    use vortex_array::scalar_fn::session::ScalarFnSession;
-    use vortex_array::session::ArraySession;
-    use vortex_io::session::RuntimeSession;
-    use vortex_layout::session::LayoutSession;
-
     let session = VortexSession::empty()
         .with::<ArraySession>()
         .with::<LayoutSession>()
@@ -39,9 +50,33 @@ pub async fn serialize<W: VortexWrite + Unpin + Send>(
 ) -> Result<()> {
     let session_start = Instant::now();
 
+    // Configure layout strategies for dictionary storage.
+    let flat_strategy: Arc<dyn LayoutStrategy> = Arc::new(FlatLayoutStrategy::default());
+    let chunked_strategy: Arc<dyn LayoutStrategy> = Arc::new(ChunkedLayoutStrategy::new(flat_strategy));
+
+    // Mark all _dict_* columns to be written in a [chunked[flat]] layout.
+    // This bypasses the default BtrBlocks adaptive compression heuristics on dictionary fields.
+    // The adaptive compressor can consume exponential memory when evaluating highly complex
+    // nested structures like listviews / dictionaries (which we already pre-compress using FSST anyway).
+    // TODO: check if we can directly apply suitable compression strategies based on DType.
+    let mut builder = WriteStrategyBuilder::default();
+    if let Some(struct_fields) = vortex_array.dtype().as_struct_fields_opt() {
+        for name in struct_fields.names().iter() {
+            let name_str: &str = name.as_ref();
+            if name_str.starts_with("_dict_") {
+                builder = builder.with_field_writer(
+                    FieldPath::from_name(name_str),
+                    chunked_strategy.clone(),
+                );
+            }
+        }
+    }
+
+    // Initialize the file write options with our layout bypass strategy.
     let write_opts = WRITE_SESSION
         .write_options()
-        .with_strategy(WriteStrategyBuilder::default().build());
+        .with_strategy(builder.build());
+        
     let dtype = vortex_array.dtype().clone();
     let vortex_stream = ArrayStreamAdapter::new(
         dtype,
@@ -53,6 +88,7 @@ pub async fn serialize<W: VortexWrite + Unpin + Send>(
     );
 
     let write_start = Instant::now();
+    // Serialize the stream to the destination writer.
     let _summary = write_opts
         .write(&mut writer, vortex_stream)
         .await
@@ -62,20 +98,27 @@ pub async fn serialize<W: VortexWrite + Unpin + Send>(
         write_start.elapsed()
     );
 
+    // Flush and finalize the writer stream.
+    writer.shutdown().await
+        .map_err(|e| VortexRdfError::Serialization(format!("Failed to shutdown/flush writer: {}", e)))?;
+
+    // Flush and finalize the writer stream.
+    writer.shutdown().await
+        .map_err(|e| VortexRdfError::Serialization(format!("Failed to shutdown/flush writer: {}", e)))?;
+
     Ok(())
 }
 
+/// Serializes an in-memory Vortex ArrayRef directly to an IPC byte writer.
+/// Exclusive to standard in-memory IPC transport layers.
 pub fn write_array_to_ipc<W: std::io::Write>(vortex_array: ArrayRef, mut writer: W) -> Result<()> {
-    // TODO: we should be able to reuse the same session for writing and reading,
-    //otherwise we might run into issues with incompatible encodings, etc.
-    let session = VortexSession::default();
-
-    // Pass a reference to the local default session instead
+    // Convert the array into an IPC-compatible iterator.
     let ipc_iter = vortex_array
         .to_array_iterator()
         .into_ipc(&session)
         .map_err(VortexRdfError::Vortex)?;
 
+    // Stream IPC messages sequentially to the output writer.
     for msg_res in ipc_iter {
         let msg = msg_res.map_err(VortexRdfError::Vortex)?;
         writer
@@ -89,11 +132,12 @@ pub fn write_array_to_ipc<W: std::io::Write>(vortex_array: ArrayRef, mut writer:
 /// High-level function to serialize a stream of quads to a Vortex-RDF writer.
 pub async fn quads_stream_to_vortex_writer<S, W>(quads: S, writer: W) -> error::Result<()>
 where
-    S: futures::Stream<Item = error::Result<Quad>> + Unpin + Send + 'static,
+    S: Stream<Item = error::Result<Quad>> + Unpin + Send + 'static,
     W: VortexWrite + Unpin + Send,
 {
+    // Build index using flat SimpleDictionary schema and serialize.
     // TODO: allow for index type selection
-    let stream = VortexRdfStore::<SimpleDictionary, crate::store::layout::flat::FlatLayout>::build_vortex_index(quads).await?;
+    let stream = VortexRdfStore::<SimpleDictionary>::build_vortex_array(quads).await?;
     serialize(stream, writer).await?;
     Ok(())
 }
@@ -101,7 +145,7 @@ where
 /// High-level function to serialize a stream of quads directly to a byte buffer.
 pub async fn quads_stream_to_vortex<S>(quads: S) -> error::Result<Vec<u8>>
 where
-    S: futures::Stream<Item = error::Result<Quad>> + Unpin + Send + 'static,
+    S: Stream<Item = error::Result<Quad>> + Unpin + Send + 'static,
 {
     let mut buffer = Vec::new();
     quads_stream_to_vortex_writer(quads, &mut buffer).await?;

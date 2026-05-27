@@ -3110,6 +3110,7 @@ dependencies = [
  "tokio",
  "vortex",
  "vortex-array",
+ "vortex-btrblocks",
  "vortex-error",
  "vortex-file",
  "vortex-fsst",

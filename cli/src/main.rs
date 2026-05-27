@@ -35,6 +35,24 @@ use vortex_rdf_core::{
 };
 
 use vortex_array::Canonical;
+    io::{serialize, deserialize, load_vortex_file_ref, open_vortex_file},
+    index::{SimpleDictionary, ChainedHash},
+    VortexRdfStore,
+    BuilderStrategy,
+    UnsortedInMemoryBuilder,
+    SortedInMemoryBuilder,
+    ChunkSortBuilder,
+    GlobalSortBuilder,
+};
+use vortex_rdf_core::common::formats::{Format, detect_format};
+use vortex_rdf_core::common::indexes::{IndexType, detect_index_type};
+use vortex_rdf_core::common::utils::{
+    parse_subject,
+    parse_named_node,
+    parse_term,
+    parse_graph_name,
+    parse_quads_from_reader
+};
 
 #[derive(Parser)]
 #[command(
@@ -69,6 +87,10 @@ enum Action {
         /// RDF Format (auto-detected from file extension if not provided)
         #[arg(short, long, value_enum)]
         format: Option<Format>,
+
+        /// Builder strategy to use when serializing (defaults to unsorted-in-memory)
+        #[arg(short, long, value_enum, default_value = "unsorted-in-memory")]
+        builder_strategy: BuilderStrategy,
     },
     /// Convert from Vortex-RDF to RDF
     Deserialize {
@@ -171,7 +193,7 @@ async fn main() -> Result<()> {
             input,
             output,
             format,
-        } => {
+       , builder_strategy } => {
             let start = Instant::now();
             let format = format
                 .map(RdfFormat::from)
@@ -274,10 +296,44 @@ async fn main() -> Result<()> {
                 None => Box::new(stdout()),
             };
 
-            let vortex_index = match &input {
-                Some(p) => load_vortex_file_path(p)
-                    .await
-                    .context("Failed to read Vortex index from file")?,
+            match &input {
+                Some(path) => {
+                    let file = open_vortex_file(path)
+                        .await
+                        .context("Failed to open Vortex file lazily")?;
+                    
+                    use vortex_array::stream::ArrayStreamExt;
+                    let store_type_array: vortex_array::ArrayRef = file.scan()
+                        .context("Failed to scan Vortex file")?
+                        .with_projection(vortex_array::expr::select(["store_type"], vortex_array::expr::root()))
+                        .into_array_stream()
+                        .context("Failed to get array stream")?
+                        .read_all()
+                        .await
+                        .context("Failed to read store_type column")?;
+                    
+                    let resolved_index_type = detect_index_type(&store_type_array);
+                    log::debug!("[cli::deserialize] Dictionary index detected in {:?}", start.elapsed());
+
+                    match resolved_index_type {
+                        IndexType::SimpleDictionary => {
+                            let store = VortexRdfStore::<SimpleDictionary>::from_file(path)
+                                .await
+                                .map_err(|e| anyhow::anyhow!(e))?;
+                            deserialize(store, writer, format)
+                                .await
+                                .context("Failed to deserialize from Vortex")?;
+                        }
+                        IndexType::ChainedHash => {
+                            let store = VortexRdfStore::<ChainedHash>::from_file(path)
+                                .await
+                                .map_err(|e| anyhow::anyhow!(e))?;
+                            deserialize(store, writer, format)
+                                .await
+                                .context("Failed to deserialize from Vortex")?;
+                        }
+                    }
+                }
                 None => {
                     let mut buffer = Vec::new();
                     stdin()
@@ -397,7 +453,16 @@ async fn main() -> Result<()> {
 
             let (vortex_array, resolved_index_type, resolved_storage_layout) = if is_vortex_file {
                 let load_start = Instant::now();
-                let arr = load_vortex_file_path(&input)
+                let file = open_vortex_file(&input)
+                    .await
+                    .context("Failed to open Vortex file lazily")?;
+                use vortex_array::stream::ArrayStreamExt;
+                let store_type_array: vortex_array::ArrayRef = file.scan()
+                    .context("Failed to scan Vortex file")?
+                    .with_projection(vortex_array::expr::select(["store_type"], vortex_array::expr::root()))
+                    .into_array_stream()
+                    .context("Failed to get array stream")?
+                    .read_all()
                     .await
                     .context("Failed to read Vortex index from file")?;
                 debug!(
@@ -521,10 +586,16 @@ async fn main() -> Result<()> {
                     deserialize(filtered, writer, output_format)
                         .await
                         .context("Failed to deserialize filtered results")?;
-                }
-                (IndexType::ChainedHash, StoreLayout::Default) => {
-                    let store = VortexRdfStore::<ChainedHash, FlatLayout>::new(vortex_array)
-                        .map_err(|e| anyhow::anyhow!(e))?;
+                },
+                IndexType::ChainedHash => {
+                    let store = if is_vortex_file {
+                        VortexRdfStore::<ChainedHash>::from_file(&input)
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e))?
+                    } else {
+                        VortexRdfStore::<ChainedHash>::new(vortex_array.expect("Must have vortex_array for in-memory store"))
+                             .map_err(|e| anyhow::anyhow!(e))?
+                    };
                     debug!("ChainedHashStore instance created in {:?}", start.elapsed());
 
                     let filtered = store
