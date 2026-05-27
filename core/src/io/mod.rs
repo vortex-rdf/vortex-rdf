@@ -2,12 +2,8 @@ pub mod de;
 pub mod ser;
 pub mod cottas_native;
 
-pub use de::{array_from_reader, deserialize};
+pub use de::{array_from_ipc_reader, deserialize};
 
-pub use de::{
-    deserialize,
-    array_from_ipc_reader
-};
 #[cfg(feature = "file-io")]
 pub use de::{load_vortex_file_ref, open_vortex_file};
 

@@ -12,8 +12,6 @@ use vortex_rdf_core::store::{
     GlobalSortBuilder,
 };
 use vortex_rdf_core::index::ChainedHash;
-use vortex_rdf_core::index::ChainedHash;
-use vortex_rdf_core::store::VortexRdfStore;
 
 fn main() {
     divan::main();
@@ -29,7 +27,7 @@ fn build_vortex_index_unsorted<const SIZE: usize>(bencher: Bencher) {
         .with_inputs(|| generate_rdf_data_stream(SIZE))
         .bench_values(|quad_stream| {
             rt.block_on(async {
-                VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<UnsortedInMemoryBuilder>(quad_stream)
+                VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_array_with_builder::<UnsortedInMemoryBuilder>(quad_stream)
                     .await
                     .expect("Failed to build vortex array")
             })
@@ -43,7 +41,7 @@ fn build_vortex_index_sorted<const SIZE: usize>(bencher: Bencher) {
         .with_inputs(|| generate_rdf_data_stream(SIZE))
         .bench_values(|quad_stream| {
             rt.block_on(async {
-                VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<SortedInMemoryBuilder>(quad_stream)
+                VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_array_with_builder::<SortedInMemoryBuilder>(quad_stream)
                     .await
                     .expect("Failed to build vortex array")
             })
@@ -57,7 +55,7 @@ fn build_vortex_index_chunk_sort<const SIZE: usize>(bencher: Bencher) {
         .with_inputs(|| generate_rdf_data_stream(SIZE))
         .bench_values(|quad_stream| {
             rt.block_on(async {
-                VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<ChunkSortBuilder>(quad_stream)
+                VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_array_with_builder::<ChunkSortBuilder>(quad_stream)
                     .await
                     .expect("Failed to build vortex array")
             })
@@ -71,7 +69,7 @@ fn build_vortex_index_global_sort<const SIZE: usize>(bencher: Bencher) {
         .with_inputs(|| generate_rdf_data_stream(SIZE))
         .bench_values(|quad_stream| {
             rt.block_on(async {
-                VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<GlobalSortBuilder>(quad_stream)
+                VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_array_with_builder::<GlobalSortBuilder>(quad_stream)
                     .await
                     .expect("Failed to build vortex array")
             })
@@ -87,13 +85,13 @@ fn instantiate_store_unsorted<const SIZE: usize>(bencher: Bencher) {
         .with_inputs(|| {
             let quad_stream = generate_rdf_data_stream(SIZE);
             rt.block_on(async {
-                VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<UnsortedInMemoryBuilder>(quad_stream)
+                VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_array_with_builder::<UnsortedInMemoryBuilder>(quad_stream)
                     .await
                     .expect("Failed to build vortex array")
             })
         })
         .bench_values(|vortex_array| {
-            VortexRdfStore::<ChainedHash>::new(vortex_array)
+            VortexRdfStore::<ChainedHash, FlatLayout>::new(vortex_array)
                 .expect("Failed to create store")
         });
 }
@@ -105,13 +103,13 @@ fn instantiate_store_sorted<const SIZE: usize>(bencher: Bencher) {
         .with_inputs(|| {
             let quad_stream = generate_rdf_data_stream(SIZE);
             rt.block_on(async {
-                VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<SortedInMemoryBuilder>(quad_stream)
+                VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_array_with_builder::<SortedInMemoryBuilder>(quad_stream)
                     .await
                     .expect("Failed to build vortex array")
             })
         })
         .bench_values(|vortex_array| {
-            VortexRdfStore::<ChainedHash>::new(vortex_array)
+            VortexRdfStore::<ChainedHash, FlatLayout>::new(vortex_array)
                 .expect("Failed to create store")
         });
 }
@@ -123,13 +121,13 @@ fn instantiate_store_chunk_sort<const SIZE: usize>(bencher: Bencher) {
         .with_inputs(|| {
             let quad_stream = generate_rdf_data_stream(SIZE);
             rt.block_on(async {
-                VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<ChunkSortBuilder>(quad_stream)
+                VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_array_with_builder::<ChunkSortBuilder>(quad_stream)
                     .await
                     .expect("Failed to build vortex array")
             })
         })
         .bench_values(|vortex_array| {
-            VortexRdfStore::<ChainedHash>::new(vortex_array)
+            VortexRdfStore::<ChainedHash, FlatLayout>::new(vortex_array)
                 .expect("Failed to create store")
         });
 }
@@ -141,13 +139,13 @@ fn instantiate_store_global_sort<const SIZE: usize>(bencher: Bencher) {
         .with_inputs(|| {
             let quad_stream = generate_rdf_data_stream(SIZE);
             rt.block_on(async {
-                VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<GlobalSortBuilder>(quad_stream)
+                VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_array_with_builder::<GlobalSortBuilder>(quad_stream)
                     .await
                     .expect("Failed to build vortex array")
             })
         })
         .bench_values(|vortex_array| {
-            VortexRdfStore::<ChainedHash>::new(vortex_array)
+            VortexRdfStore::<ChainedHash, FlatLayout>::new(vortex_array)
                 .expect("Failed to create store")
         });
 }
@@ -161,10 +159,10 @@ fn match_pattern_unsorted<const SIZE: usize>(bencher: Bencher) {
         .with_inputs(|| {
             let quad_stream = generate_rdf_data_stream(SIZE);
             rt.block_on(async {
-                let varray = VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<UnsortedInMemoryBuilder>(quad_stream)
+                let varray = VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_array_with_builder::<UnsortedInMemoryBuilder>(quad_stream)
                     .await
                     .expect("Failed to build vortex array");
-                VortexRdfStore::<ChainedHash>::new(varray).expect("Failed to create store")
+                VortexRdfStore::<ChainedHash, FlatLayout>::new(varray).expect("Failed to create store")
             })
         })
         .bench_values(|store| {
@@ -187,10 +185,10 @@ fn match_pattern_sorted<const SIZE: usize>(bencher: Bencher) {
         .with_inputs(|| {
             let quad_stream = generate_rdf_data_stream(SIZE);
             rt.block_on(async {
-                let varray = VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<SortedInMemoryBuilder>(quad_stream)
+                let varray = VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_array_with_builder::<SortedInMemoryBuilder>(quad_stream)
                     .await
                     .expect("Failed to build vortex array");
-                VortexRdfStore::<ChainedHash>::new(varray).expect("Failed to create store")
+                VortexRdfStore::<ChainedHash, FlatLayout>::new(varray).expect("Failed to create store")
             })
         })
         .bench_values(|store| {
@@ -213,10 +211,10 @@ fn match_pattern_chunk_sort<const SIZE: usize>(bencher: Bencher) {
         .with_inputs(|| {
             let quad_stream = generate_rdf_data_stream(SIZE);
             rt.block_on(async {
-                let varray = VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<ChunkSortBuilder>(quad_stream)
+                let varray = VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_array_with_builder::<ChunkSortBuilder>(quad_stream)
                     .await
                     .expect("Failed to build vortex array");
-                VortexRdfStore::<ChainedHash>::new(varray).expect("Failed to create store")
+                VortexRdfStore::<ChainedHash, FlatLayout>::new(varray).expect("Failed to create store")
             })
         })
         .bench_values(|store| {
@@ -239,10 +237,10 @@ fn match_pattern_global_sort<const SIZE: usize>(bencher: Bencher) {
         .with_inputs(|| {
             let quad_stream = generate_rdf_data_stream(SIZE);
             rt.block_on(async {
-                let varray = VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<GlobalSortBuilder>(quad_stream)
+                let varray = VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_array_with_builder::<GlobalSortBuilder>(quad_stream)
                     .await
                     .expect("Failed to build vortex array");
-                VortexRdfStore::<ChainedHash>::new(varray).expect("Failed to create store")
+                VortexRdfStore::<ChainedHash, FlatLayout>::new(varray).expect("Failed to create store")
             })
         })
         .bench_values(|store| {

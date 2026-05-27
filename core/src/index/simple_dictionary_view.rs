@@ -4,11 +4,12 @@ use crate::index::RdfDictionary;
 
 use oxrdf::{GraphName, Term};
 use std::time::Instant;
+use vortex::dtype::{DType, Nullability};
 
 use vortex::VortexSessionDefault;
 use vortex_array::ArrayRef;
+use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::{StructArray, VarBinViewArray};
-use vortex_array::{VortexSessionExecute};
 use vortex_session::VortexSession;
 
 #[derive(Debug, Clone)]
@@ -28,7 +29,7 @@ impl SimpleDictionaryView {
             .execute::<StructArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
 
-        let dict_array = utils::extract_vortex_struct_field(&struct_array, "dictionary")?;
+        let dict_array = utils::extract_vortex_struct_field(&struct_array, "values")?;
 
         let dict_varbin = dict_array
             .clone()
@@ -41,12 +42,6 @@ impl SimpleDictionaryView {
             let bytes = dict_varbin.bytes_at(i);
             terms.push(String::from_utf8_lossy(&bytes).into_owned());
         }
-
-        log::debug!(
-            "[SimpleDictionaryView::from_dictionary_sidecar_root] loaded {} terms without HashMap in {:?}",
-            terms.len(),
-            start.elapsed()
-        );
 
         Ok(Self { terms })
     }
@@ -119,6 +114,17 @@ impl RdfDictionary for SimpleDictionaryView {
     fn store_type() -> &'static str {
         "simple-dictionary-view"
     }
+
+    fn values_view(&self) -> crate::error::Result<VarBinViewArray> {
+        Ok(VarBinViewArray::from_iter(
+            self.terms.iter().map(|s: &String| Some(s.as_str())),
+            DType::Utf8(Nullability::NonNullable),
+        ))
+    }
+
+    fn vortex_field_names() -> &'static [&'static str] {
+        &["values"]
+    }
 }
 
 #[cfg(test)]
@@ -150,14 +156,8 @@ mod tests {
             ],
         };
 
-        assert_eq!(
-            view.get_term_str(0),
-            Some("<http://example.org/a>")
-        );
-        assert_eq!(
-            view.get_term_str(1),
-            Some("<http://example.org/b>")
-        );
+        assert_eq!(view.get_term_str(0), Some("<http://example.org/a>"));
+        assert_eq!(view.get_term_str(1), Some("<http://example.org/b>"));
         assert_eq!(view.get_term_str(2), None);
     }
 

@@ -607,6 +607,11 @@ pub async fn load_cottas_native_simple_dictionary_view(
 
     let dict_root = stream.read_all().await.map_err(VortexRdfError::from)?;
 
+    log::trace!(
+        "[cottas_native::load_cottas_native_simple_dictionary_view] loaded dictionary root array with {} rows",
+        dict_root.len()
+    );
+
     SimpleDictionaryView::from_dictionary_sidecar_root(&dict_root)
 }
 

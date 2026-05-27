@@ -1,9 +1,13 @@
+use crate::VortexRdfError;
 use crate::error::Result;
 use crate::index::RdfDictionary;
 use crate::common::utils;
 use crate::store::builders::{VortexArrayBuilder, UnsortedInMemoryBuilder};
 use crate::store::QuadsSource;
+use crate::store::layout::RdfQuadLayout;
+use crate::io::de;
 
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Instant;
 use std::io::Cursor;
@@ -58,14 +62,15 @@ use vortex_array::stream::ArrayStreamExt;
 /// #### 3. Dictionary & Metadata Projections
 /// * **`store_type`**: Constant column holding the dictionary/index identifier (e.g., `simple-dictionary`, `chained_hash`).
 /// * **`_dict_*`**: Specialized columns representing serialized internal structures of the dictionary.
-pub struct VortexRdfStore<Dict: RdfDictionary> {
+pub struct VortexRdfStore<Dict: RdfDictionary, Layout: RdfQuadLayout<Dict>> {
     pub dictionary: Dict,
     quads: QuadsSource,
+    _layout: PhantomData<Layout>,
 }
 
 // ─── impl VortexRdfStore ─────────────────────────────────────────────────────
 
-impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
+impl<Dict: RdfDictionary, Layout: RdfQuadLayout<Dict>> VortexRdfStore<Dict, Layout> {
     // ── constructors ─────────────────────────────────────────────────────────
 
     /// Load from a flat N-row Vortex struct array.
@@ -95,7 +100,7 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
         .map_err(VortexRdfError::Vortex)?
         .into_array();
 
-        Ok(Self { dictionary, quads: QuadsSource::InMemory(quads) })
+        Ok(Self { dictionary, quads: QuadsSource::InMemory(quads), _layout: PhantomData })
     }
 
     /// Create an empty in-memory store.
@@ -110,6 +115,7 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
         Self {
             dictionary: Dict::new(),
             quads: QuadsSource::InMemory(quads),
+            _layout: PhantomData
         }
     }
 
@@ -141,6 +147,7 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
         Ok(Self {
             dictionary,
             quads: QuadsSource::File { file, filter: None },
+            _layout: PhantomData,
         })
     }
 
@@ -148,7 +155,8 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
     fn with_quads(&self, quads: ArrayRef) -> Result<Self> {
         Ok(Self { 
             dictionary: self.dictionary.clone(), 
-            quads: QuadsSource::InMemory(quads) 
+            quads: QuadsSource::InMemory(quads),
+            _layout: PhantomData,
         })
     }
 
@@ -160,7 +168,7 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
     }
 }
 
-impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
+impl<Dict: RdfDictionary, Layout: RdfQuadLayout<Dict>> VortexRdfStore<Dict, Layout> {
     // ── serialization ─────────────────────────────────────────────────────────
 
     /// Build the new Vortex file format using the default UnsortedInMemoryBuilder by default.
@@ -366,7 +374,7 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
                     log::debug!("[match_pattern] In-memory filter took {:?}", start.elapsed());
                     self.with_quads(filtered)
                 } else {
-                    Ok(Self { dictionary: self.dictionary.clone(), quads: self.quads.clone() })
+                    Ok(Self { dictionary: self.dictionary.clone(), quads: self.quads.clone(), _layout: PhantomData })
                 }
             }
 
@@ -442,6 +450,7 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
                             let taken_store = Self {
                                 dictionary: self.dictionary.clone(),
                                 quads: QuadsSource::InMemory(quads_arr),
+                                _layout: PhantomData,
                             };
 
                             log::debug!("[match_pattern] Object index routing completed in {:?}", start.elapsed());
@@ -511,6 +520,7 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
                             let taken_store = Self {
                                 dictionary: self.dictionary.clone(),
                                 quads: QuadsSource::InMemory(quads_arr),
+                                _layout: PhantomData,
                             };
 
                             log::debug!("[match_pattern] Predicate index routing completed in {:?}", start.elapsed());
@@ -530,6 +540,7 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
                         file: file.clone(),
                         filter,
                     },
+                    _layout: PhantomData::<Layout>,
                 })
             }
         }
@@ -559,7 +570,7 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
             old_quads.dtype().clone(),
         ).map_err(VortexRdfError::Vortex)?.into_array();
 
-        Ok(Self { dictionary: new_dict, quads: QuadsSource::InMemory(combined) })
+        Ok(Self { dictionary: new_dict, quads: QuadsSource::InMemory(combined), _layout: PhantomData::<Layout> })
     }
 
     /// Delete a matching quad from the store.
@@ -578,13 +589,13 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
             let filtered = quads_arr.filter(canonical).map_err(VortexRdfError::Vortex)?;
             self.with_quads(filtered)
         } else {
-            Ok(Self { dictionary: self.dictionary.clone(), quads: self.quads.clone() })
+            Ok(Self { dictionary: self.dictionary.clone(), quads: self.quads.clone(), _layout: PhantomData::<Layout> })
         }
     }
 }
 
 // Implement QuadStore trait for VortexRdfStore
-impl<D: RdfDictionary> crate::store::QuadStore for VortexRdfStore<D> {
+impl<D: RdfDictionary, L: RdfQuadLayout<D>> crate::store::QuadStore for VortexRdfStore<D, L> {
     fn quads(&self) -> Result<Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + '_>> {
         self.quads()
     }

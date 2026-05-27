@@ -15,11 +15,8 @@ use std::sync::Arc;
 use vortex_array::ArrayRef;
 use vortex_array::expr::Expression;
 use vortex_file::VortexFile;use crate::error::Result;
-use crate::index::RdfDictionary;
 use futures::Stream;
 use oxrdf::Quad;
-use crate::error::Result;
-
 
 // Trait for stores that can provide quads
 pub trait QuadStore {

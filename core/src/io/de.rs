@@ -4,15 +4,14 @@ use crate::store::QuadStore;
 
 use futures::StreamExt;
 use oxrdfio::{RdfFormat, RdfSerializer};
+use vortex::VortexSessionDefault;
 #[cfg(feature = "file-io")]
 use std::io::Write;
 use std::time::Instant;
-use vortex::VortexSessionDefault;
 
 #[cfg(feature = "file-io")]
 use vortex_array::ArrayRef;
 use vortex_ipc::iterator::SyncIPCReader;
-use vortex_array::LEGACY_SESSION;
 
 #[cfg(feature = "file-io")]
 use std::sync::Arc;
@@ -71,6 +70,7 @@ where
 /// Reads a Vortex ArrayRef from a synchronous IPC reader stream.
 /// Used for decoding in-memory IPC message payloads.
 pub fn array_from_ipc_reader<R: std::io::Read>(reader: R) -> Result<ArrayRef> {
+    let session = VortexSession::default();
     let mut ipc_reader =
         SyncIPCReader::try_new(reader, &session).map_err(VortexRdfError::Vortex)?;
 

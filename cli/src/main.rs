@@ -28,30 +28,16 @@ use vortex_rdf_core::{
     },
     index::{ChainedHash, SimpleDictionary},
     io::{
-        CottasNativeConfig, deserialize, load_vortex_file_path, load_vortex_file_ref, serialize,
+        CottasNativeConfig, deserialize, load_vortex_file_ref, serialize,
         serialize_cottas_native_file,
     },
     store::layout::flat::FlatLayout,
 };
 
 use vortex_array::Canonical;
-    io::{serialize, deserialize, load_vortex_file_ref, open_vortex_file},
-    index::{SimpleDictionary, ChainedHash},
-    VortexRdfStore,
-    BuilderStrategy,
-    UnsortedInMemoryBuilder,
-    SortedInMemoryBuilder,
-    ChunkSortBuilder,
-    GlobalSortBuilder,
-};
-use vortex_rdf_core::common::formats::{Format, detect_format};
-use vortex_rdf_core::common::indexes::{IndexType, detect_index_type};
-use vortex_rdf_core::common::utils::{
-    parse_subject,
-    parse_named_node,
-    parse_term,
-    parse_graph_name,
-    parse_quads_from_reader
+use vortex_rdf_core::{
+    BuilderStrategy, ChunkSortBuilder, GlobalSortBuilder, SortedInMemoryBuilder,
+    UnsortedInMemoryBuilder, io::open_vortex_file,
 };
 
 #[derive(Parser)]
@@ -178,6 +164,45 @@ fn detect_storage_layout(
     Ok(StoreLayout::Default)
 }
 
+async fn build_with_strategy<Dict, Layout>(
+    quads_stream: impl futures::Stream<Item = vortex_rdf_core::error::Result<oxrdf::Quad>>
+    + Unpin
+    + Send
+    + 'static,
+    builder_strategy: BuilderStrategy,
+) -> vortex_rdf_core::error::Result<vortex_array::ArrayRef>
+where
+    Dict: vortex_rdf_core::index::RdfDictionary,
+    Layout: vortex_rdf_core::store::layout::RdfQuadLayout<Dict>,
+{
+    match builder_strategy {
+        BuilderStrategy::UnsortedInMemory => {
+            VortexRdfStore::<Dict, Layout>::build_vortex_array_with_builder::<
+                UnsortedInMemoryBuilder,
+            >(quads_stream)
+            .await
+        }
+        BuilderStrategy::SortedInMemory => {
+            VortexRdfStore::<Dict, Layout>::build_vortex_array_with_builder::<
+                SortedInMemoryBuilder,
+            >(quads_stream)
+            .await
+        }
+        BuilderStrategy::ChunkSort => {
+            VortexRdfStore::<Dict, Layout>::build_vortex_array_with_builder::<
+                ChunkSortBuilder,
+            >(quads_stream)
+            .await
+        }
+        BuilderStrategy::GlobalSort => {
+            VortexRdfStore::<Dict, Layout>::build_vortex_array_with_builder::<
+                GlobalSortBuilder,
+            >(quads_stream)
+            .await
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
@@ -193,7 +218,8 @@ async fn main() -> Result<()> {
             input,
             output,
             format,
-       , builder_strategy } => {
+            builder_strategy,
+        } => {
             let start = Instant::now();
             let format = format
                 .map(RdfFormat::from)
@@ -237,30 +263,38 @@ async fn main() -> Result<()> {
             let vortex_array = match storage_layout {
                 StoreLayout::Default => match index_type {
                     IndexType::SimpleDictionary => {
-                        VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_index(
+                        build_with_strategy::<SimpleDictionary, FlatLayout>(
                             quads_stream,
+                            builder_strategy,
                         )
                         .await?
                     }
                     IndexType::ChainedHash => {
-                        VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_index(quads_stream)
-                            .await?
+                        build_with_strategy::<ChainedHash, FlatLayout>(
+                            quads_stream,
+                            builder_strategy,
+                        )
+                        .await?
                     }
                 },
+
                 StoreLayout::CottasSpog => match index_type {
                     IndexType::SimpleDictionary => {
-                        VortexRdfStore::<SimpleDictionary, CottasLayout>::build_vortex_index(
+                        build_with_strategy::<SimpleDictionary, CottasLayout>(
                             quads_stream,
+                            builder_strategy,
                         )
                         .await?
                     }
                     IndexType::ChainedHash => {
-                        VortexRdfStore::<ChainedHash, CottasLayout>::build_vortex_index(
+                        build_with_strategy::<ChainedHash, CottasLayout>(
                             quads_stream,
+                            builder_strategy,
                         )
                         .await?
                     }
                 },
+
                 StoreLayout::CottasNative => unreachable!("handled above"),
             };
 
@@ -301,75 +335,151 @@ async fn main() -> Result<()> {
                     let file = open_vortex_file(path)
                         .await
                         .context("Failed to open Vortex file lazily")?;
-                    
+
                     use vortex_array::stream::ArrayStreamExt;
-                    let store_type_array: vortex_array::ArrayRef = file.scan()
+
+                    let store_type_array: vortex_array::ArrayRef = file
+                        .scan()
                         .context("Failed to scan Vortex file")?
-                        .with_projection(vortex_array::expr::select(["store_type"], vortex_array::expr::root()))
+                        .with_projection(vortex_array::expr::select(
+                            ["store_type"],
+                            vortex_array::expr::root(),
+                        ))
                         .into_array_stream()
                         .context("Failed to get array stream")?
                         .read_all()
                         .await
                         .context("Failed to read store_type column")?;
-                    
-                    let resolved_index_type = detect_index_type(&store_type_array);
-                    log::debug!("[cli::deserialize] Dictionary index detected in {:?}", start.elapsed());
 
-                    match resolved_index_type {
-                        IndexType::SimpleDictionary => {
-                            let store = VortexRdfStore::<SimpleDictionary>::from_file(path)
-                                .await
-                                .map_err(|e| anyhow::anyhow!(e))?;
+                    let resolved_index_type = detect_index_type(&store_type_array);
+
+                    let resolved_storage_layout =
+                        detect_storage_layout(&store_type_array, &mut ctx)
+                            .unwrap_or(StoreLayout::Default);
+
+                    log::debug!(
+                        "[cli::deserialize] Detected index {:?}, layout {:?}",
+                        resolved_index_type,
+                        resolved_storage_layout
+                    );
+
+                    match (resolved_index_type, resolved_storage_layout) {
+                        (IndexType::SimpleDictionary, StoreLayout::Default) => {
+                            let store =
+                                VortexRdfStore::<SimpleDictionary, FlatLayout>::from_file(path)
+                                    .await
+                                    .map_err(|e| anyhow::anyhow!(e))?;
+
                             deserialize(store, writer, format)
                                 .await
                                 .context("Failed to deserialize from Vortex")?;
                         }
-                        IndexType::ChainedHash => {
-                            let store = VortexRdfStore::<ChainedHash>::from_file(path)
+
+                        (IndexType::ChainedHash, StoreLayout::Default) => {
+                            let store = VortexRdfStore::<ChainedHash, FlatLayout>::from_file(path)
                                 .await
                                 .map_err(|e| anyhow::anyhow!(e))?;
+
                             deserialize(store, writer, format)
                                 .await
                                 .context("Failed to deserialize from Vortex")?;
+                        }
+
+                        (IndexType::SimpleDictionary, StoreLayout::CottasSpog) => {
+                            let store =
+                                VortexRdfStore::<SimpleDictionary, CottasLayout>::from_file(path)
+                                    .await
+                                    .map_err(|e| anyhow::anyhow!(e))?;
+
+                            deserialize(store, writer, format)
+                                .await
+                                .context("Failed to deserialize from Vortex")?;
+                        }
+
+                        (IndexType::ChainedHash, StoreLayout::CottasSpog) => {
+                            let store =
+                                VortexRdfStore::<ChainedHash, CottasLayout>::from_file(path)
+                                    .await
+                                    .map_err(|e| anyhow::anyhow!(e))?;
+
+                            deserialize(store, writer, format)
+                                .await
+                                .context("Failed to deserialize from Vortex")?;
+                        }
+
+                        (_, StoreLayout::CottasNative) => {
+                            return Err(anyhow!(
+                                "cottas-native deserialization is not handled by generic VortexRdfStore"
+                            ));
                         }
                     }
                 }
+
                 None => {
                     let mut buffer = Vec::new();
+
                     stdin()
                         .read_to_end(&mut buffer)
                         .context("Failed to read from stdin")?;
-                    load_vortex_file_ref(Buffer::from(buffer))
-                        .await
-                        .context("Failed to read Vortex index from buffer")?
-                }
-            };
 
-            let detect_start = Instant::now();
-            match detect_index_type(&vortex_index) {
-                IndexType::SimpleDictionary => {
-                    log::debug!(
-                        "[cli::deserialize] Dictionary index detected in {:?}",
-                        detect_start.elapsed()
-                    );
-                    let store = VortexRdfStore::<SimpleDictionary, FlatLayout>::new(vortex_index)
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                    deserialize(store, writer, format)
+                    let vortex_array = load_vortex_file_ref(Buffer::from(buffer))
                         .await
-                        .context("Failed to deserialize from Vortex")?;
+                        .context("Failed to read Vortex index from buffer")?;
+
+                    let resolved_index_type = detect_index_type(&vortex_array);
+                    let resolved_storage_layout = detect_storage_layout(&vortex_array, &mut ctx)
+                        .unwrap_or(StoreLayout::Default);
+
+                    match (resolved_index_type, resolved_storage_layout) {
+                        (IndexType::SimpleDictionary, StoreLayout::Default) => {
+                            let store =
+                                VortexRdfStore::<SimpleDictionary, FlatLayout>::new(vortex_array)
+                                    .map_err(|e| anyhow::anyhow!(e))?;
+
+                            deserialize(store, writer, format)
+                                .await
+                                .context("Failed to deserialize from Vortex")?;
+                        }
+
+                        (IndexType::ChainedHash, StoreLayout::Default) => {
+                            let store =
+                                VortexRdfStore::<ChainedHash, FlatLayout>::new(vortex_array)
+                                    .map_err(|e| anyhow::anyhow!(e))?;
+
+                            deserialize(store, writer, format)
+                                .await
+                                .context("Failed to deserialize from Vortex")?;
+                        }
+
+                        (IndexType::SimpleDictionary, StoreLayout::CottasSpog) => {
+                            let store =
+                                VortexRdfStore::<SimpleDictionary, CottasLayout>::new(vortex_array)
+                                    .map_err(|e| anyhow::anyhow!(e))?;
+
+                            deserialize(store, writer, format)
+                                .await
+                                .context("Failed to deserialize from Vortex")?;
+                        }
+
+                        (IndexType::ChainedHash, StoreLayout::CottasSpog) => {
+                            let store =
+                                VortexRdfStore::<ChainedHash, CottasLayout>::new(vortex_array)
+                                    .map_err(|e| anyhow::anyhow!(e))?;
+
+                            deserialize(store, writer, format)
+                                .await
+                                .context("Failed to deserialize from Vortex")?;
+                        }
+
+                        (_, StoreLayout::CottasNative) => {
+                            return Err(anyhow!(
+                                "cottas-native deserialization from stdin is not supported here"
+                            ));
+                        }
+                    }
                 }
-                IndexType::ChainedHash => {
-                    log::debug!(
-                        "[cli::deserialize] ChainedHash index detected in {:?}",
-                        detect_start.elapsed()
-                    );
-                    let store = VortexRdfStore::<ChainedHash, FlatLayout>::new(vortex_index)
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                    deserialize(store, writer, format)
-                        .await
-                        .context("Failed to deserialize from Vortex")?;
-                }
-            };
+            }
+
             info!("Deserialization took {:?}", start.elapsed());
         }
         Action::Match {
@@ -453,31 +563,25 @@ async fn main() -> Result<()> {
 
             let (vortex_array, resolved_index_type, resolved_storage_layout) = if is_vortex_file {
                 let load_start = Instant::now();
-                let file = open_vortex_file(&input)
-                    .await
-                    .context("Failed to open Vortex file lazily")?;
-                use vortex_array::stream::ArrayStreamExt;
-                let store_type_array: vortex_array::ArrayRef = file.scan()
-                    .context("Failed to scan Vortex file")?
-                    .with_projection(vortex_array::expr::select(["store_type"], vortex_array::expr::root()))
-                    .into_array_stream()
-                    .context("Failed to get array stream")?
-                    .read_all()
+
+                let arr = load_vortex_file_ref(Buffer::from(std::fs::read(&input)?))
                     .await
                     .context("Failed to read Vortex index from file")?;
-                debug!(
-                    "Vortex index reference created in {:?}",
-                    load_start.elapsed()
-                );
+
+                debug!("Vortex index loaded in {:?}", load_start.elapsed());
+
                 let detect_start = Instant::now();
+
                 let t = detect_index_type(&arr);
                 let resolved_layout = detect_storage_layout(&arr, &mut ctx)?;
+
                 debug!(
                     "Detected index type {:?} and storage layout {:?} in {:?}",
                     t,
                     resolved_layout,
                     detect_start.elapsed()
                 );
+
                 (arr, t, resolved_layout)
             } else {
                 let load_start = Instant::now();
@@ -496,13 +600,13 @@ async fn main() -> Result<()> {
                 let arr = match layout {
                     StoreLayout::Default => match t {
                         IndexType::SimpleDictionary => {
-                            VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_index(
+                            VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_array(
                                 quads_stream,
                             )
                             .await?
                         }
                         IndexType::ChainedHash => {
-                            VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_index(
+                            VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_array(
                                 quads_stream,
                             )
                             .await?
@@ -510,13 +614,13 @@ async fn main() -> Result<()> {
                     },
                     StoreLayout::CottasSpog => match t {
                         IndexType::SimpleDictionary => {
-                            VortexRdfStore::<SimpleDictionary, CottasLayout>::build_vortex_index(
+                            VortexRdfStore::<SimpleDictionary, CottasLayout>::build_vortex_array(
                                 quads_stream,
                             )
                             .await?
                         }
                         IndexType::ChainedHash => {
-                            VortexRdfStore::<ChainedHash, CottasLayout>::build_vortex_index(
+                            VortexRdfStore::<ChainedHash, CottasLayout>::build_vortex_array(
                                 quads_stream,
                             )
                             .await?
@@ -545,8 +649,14 @@ async fn main() -> Result<()> {
             let match_start = Instant::now();
             match (resolved_index_type, resolved_storage_layout) {
                 (IndexType::SimpleDictionary, StoreLayout::Default) => {
-                    let store = VortexRdfStore::<SimpleDictionary, FlatLayout>::new(vortex_array)
-                        .map_err(|e| anyhow::anyhow!(e))?;
+                    let store = if is_vortex_file {
+                        VortexRdfStore::<SimpleDictionary, FlatLayout>::from_file(&input)
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e))?
+                    } else {
+                        VortexRdfStore::<SimpleDictionary, FlatLayout>::new(vortex_array)
+                            .map_err(|e| anyhow::anyhow!(e))?
+                    };
                     debug!("DictionaryStore instance created in {:?}", start.elapsed());
 
                     let filtered = store
@@ -558,6 +668,7 @@ async fn main() -> Result<()> {
                         )
                         .await
                         .context("Failed to match pattern")?;
+
                     debug!("Applying match pattern took {:?}", match_start.elapsed());
 
                     deserialize(filtered, writer, output_format)
@@ -565,12 +676,14 @@ async fn main() -> Result<()> {
                         .context("Failed to deserialize filtered results")?;
                 }
                 (IndexType::SimpleDictionary, StoreLayout::CottasSpog) => {
-                    let store = VortexRdfStore::<SimpleDictionary, CottasLayout>::new(vortex_array)
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                    debug!(
-                        "CottasDictionaryStore instance created in {:?}",
-                        start.elapsed()
-                    );
+                    let store = if is_vortex_file {
+                        VortexRdfStore::<SimpleDictionary, CottasLayout>::from_file(&input)
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e))?
+                    } else {
+                        VortexRdfStore::<SimpleDictionary, CottasLayout>::new(vortex_array)
+                            .map_err(|e| anyhow::anyhow!(e))?
+                    };
 
                     let filtered = store
                         .match_pattern(
@@ -581,22 +694,22 @@ async fn main() -> Result<()> {
                         )
                         .await
                         .context("Failed to match pattern")?;
+
                     debug!("Applying match pattern took {:?}", match_start.elapsed());
 
                     deserialize(filtered, writer, output_format)
                         .await
                         .context("Failed to deserialize filtered results")?;
-                },
-                IndexType::ChainedHash => {
+                }
+                (IndexType::ChainedHash, StoreLayout::Default) => {
                     let store = if is_vortex_file {
-                        VortexRdfStore::<ChainedHash>::from_file(&input)
+                        VortexRdfStore::<ChainedHash, FlatLayout>::from_file(&input)
                             .await
                             .map_err(|e| anyhow::anyhow!(e))?
                     } else {
-                        VortexRdfStore::<ChainedHash>::new(vortex_array.expect("Must have vortex_array for in-memory store"))
-                             .map_err(|e| anyhow::anyhow!(e))?
+                        VortexRdfStore::<ChainedHash, FlatLayout>::new(vortex_array)
+                            .map_err(|e| anyhow::anyhow!(e))?
                     };
-                    debug!("ChainedHashStore instance created in {:?}", start.elapsed());
 
                     let filtered = store
                         .match_pattern(
@@ -607,6 +720,7 @@ async fn main() -> Result<()> {
                         )
                         .await
                         .context("Failed to match pattern")?;
+
                     debug!("Applying match pattern took {:?}", match_start.elapsed());
 
                     deserialize(filtered, writer, output_format)
@@ -614,12 +728,14 @@ async fn main() -> Result<()> {
                         .context("Failed to deserialize filtered results")?;
                 }
                 (IndexType::ChainedHash, StoreLayout::CottasSpog) => {
-                    let store = VortexRdfStore::<ChainedHash, CottasLayout>::new(vortex_array)
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                    debug!(
-                        "CottasChainedHashStore instance created in {:?}",
-                        start.elapsed()
-                    );
+                    let store = if is_vortex_file {
+                        VortexRdfStore::<ChainedHash, CottasLayout>::from_file(&input)
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e))?
+                    } else {
+                        VortexRdfStore::<ChainedHash, CottasLayout>::new(vortex_array)
+                            .map_err(|e| anyhow::anyhow!(e))?
+                    };
 
                     let filtered = store
                         .match_pattern(
@@ -630,6 +746,7 @@ async fn main() -> Result<()> {
                         )
                         .await
                         .context("Failed to match pattern")?;
+
                     debug!("Applying match pattern took {:?}", match_start.elapsed());
 
                     deserialize(filtered, writer, output_format)

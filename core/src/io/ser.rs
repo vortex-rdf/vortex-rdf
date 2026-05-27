@@ -1,7 +1,7 @@
 use crate::error;
 use crate::error::{Result, VortexRdfError};
 use crate::index::SimpleDictionary;
-use crate::store::VortexRdfStore;
+use crate::store::{VortexRdfStore, layout::flat::FlatLayout};
 
 use std::sync::Arc;
 use oxrdf::Quad;
@@ -12,7 +12,6 @@ use vortex::VortexSessionDefault;
 use vortex_array::ArrayRef;
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::dtype::FieldPath;
-use vortex_array::LEGACY_SESSION;
 use vortex_array::session::ArraySession;
 use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_io::VortexWrite;
@@ -36,12 +35,6 @@ static WRITE_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     vortex_file::register_default_encodings(&session);
     session
 });
-use vortex_array::ArrayRef;
-use vortex_array::stream::ArrayStreamAdapter;
-use vortex_file::{WriteOptionsSessionExt, WriteStrategyBuilder};
-use vortex_io::VortexWrite;
-use vortex_ipc::iterator::ArrayIteratorIPC;
-use vortex_session::VortexSession;
 
 /// High-level function to serialize RDF from a reader directly to a Vortex-RDF writer.
 pub async fn serialize<W: VortexWrite + Unpin + Send>(
@@ -112,6 +105,7 @@ pub async fn serialize<W: VortexWrite + Unpin + Send>(
 /// Serializes an in-memory Vortex ArrayRef directly to an IPC byte writer.
 /// Exclusive to standard in-memory IPC transport layers.
 pub fn write_array_to_ipc<W: std::io::Write>(vortex_array: ArrayRef, mut writer: W) -> Result<()> {
+    let session = VortexSession::default();
     // Convert the array into an IPC-compatible iterator.
     let ipc_iter = vortex_array
         .to_array_iterator()
@@ -137,7 +131,7 @@ where
 {
     // Build index using flat SimpleDictionary schema and serialize.
     // TODO: allow for index type selection
-    let stream = VortexRdfStore::<SimpleDictionary>::build_vortex_array(quads).await?;
+    let stream = VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_array(quads).await?;
     serialize(stream, writer).await?;
     Ok(())
 }

@@ -1,9 +1,9 @@
-use crate::common::{indexes, utils};
+use crate::common::{indexes::IndexType, utils};
 use crate::error::{Result, VortexRdfError};
 use crate::index::RdfDictionary;
-use crate::common::{utils, indexes::IndexType};
 use std::time::Instant;
 use std::collections::HashMap;
+use oxrdf::{GraphName, Term};
 use vortex::VortexSessionDefault;
 use vortex_session::VortexSession;
 

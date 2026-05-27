@@ -11,7 +11,6 @@ use crate::error::Result;
 use vortex_array::ArrayRef;
 use vortex_array::arrays::VarBinViewArray;
 use oxrdf::{GraphName, Term};
-use vortex_array::ArrayRef;
 
 /// Trait for RDF dictionary implementations that map between terms and IDs
 pub trait RdfDictionary: Clone + Send + Sync {

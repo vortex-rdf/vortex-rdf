@@ -2,8 +2,6 @@ use crate::error::{Result, VortexRdfError};
 use futures::{Stream, stream};
 use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use oxrdfio::{RdfFormat, RdfParser};
-use futures::{stream, Stream};
-use crate::error::{VortexRdfError, Result};
 use vortex_array::{ArrayRef, LEGACY_SESSION, VortexSessionExecute};
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::primitive::PrimitiveArray;
@@ -11,8 +9,6 @@ use vortex_array::arrays::VarBinViewArray;
 use vortex::VortexSessionDefault;
 use vortex::session::VortexSession;
 use vortex_array::arrays::listview::{ListViewArray, ListViewArrayExt};
-use vortex_array::arrays::struct_::StructArray;
-use vortex_array::{ArrayRef, VortexSessionExecute};
 
 /// Parses a string representation of an RDF named node (URI), stripping optional `<` and `>` boundaries.
 pub fn parse_named_node(s: &str) -> Result<NamedNode> {
@@ -235,6 +231,61 @@ pub fn extract_vortex_struct_field_optional(
     name: &str,
 ) -> Option<ArrayRef> {
     extract_vortex_struct_field(vortex_struct, name).ok()
+}
+
+pub fn extract_vortex_struct_field(vortex_struct: &StructArray, name: &str) -> Result<ArrayRef> {
+    use vortex_array::arrays::struct_::StructArrayExt;
+    use vortex_array::dtype::{DType, Nullability, PType};
+    let start = std::time::Instant::now();
+    let session = VortexSession::default(); // default session (registries etc.)
+    let mut ctx = session.create_execution_ctx(); // execution ctx
+
+    let list_ref = vortex_struct
+        .unmasked_field_by_name(name)
+        .map_err(|_| {
+            VortexRdfError::Deserialization(format!("Field '{}' not found in struct", name))
+        })?
+        .clone();
+
+    let list = list_ref
+        .clone()
+        .execute::<ListViewArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+
+    let offset = list
+        .offsets()
+        .execute_scalar(0, &mut ctx)
+        .map_err(VortexRdfError::Vortex)?
+        .cast(&DType::Primitive(PType::I32, Nullability::NonNullable))
+        .map_err(VortexRdfError::Vortex)?
+        .as_primitive()
+        .typed_value::<i32>()
+        .ok_or_else(|| {
+            VortexRdfError::Deserialization(format!("Missing offset for field '{}'", name))
+        })? as usize;
+
+    let size = list
+        .sizes()
+        .execute_scalar(0, &mut ctx)
+        .map_err(VortexRdfError::Vortex)?
+        .cast(&DType::Primitive(PType::I32, Nullability::NonNullable))
+        .map_err(VortexRdfError::Vortex)?
+        .as_primitive()
+        .typed_value::<i32>()
+        .ok_or_else(|| {
+            VortexRdfError::Deserialization(format!("Missing size for field '{}'", name))
+        })? as usize;
+
+    log::debug!(
+        "[utils::extract_vortex_struct_field] Extracting Vortex struct field '{}' took {:?}",
+        name,
+        start.elapsed()
+    );
+    let sliced = list
+        .elements()
+        .slice(offset..offset + size)
+        .map_err(VortexRdfError::Vortex)?;
+    Ok(sliced)
 }
 
 /*

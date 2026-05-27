@@ -12,7 +12,6 @@ use vortex_rdf_core::VortexRdfStore;
 use vortex_rdf_core::common::indexes::{IndexType, detect_index_type};
 use vortex_rdf_core::common::utils::parse_quads_from_reader;
 use vortex_rdf_core::index::{ChainedHash, SimpleDictionary};
-use vortex_rdf_core::io::{array_from_reader, deserialize, quads_stream_to_vortex};
 use vortex_rdf_core::store::layout::flat::FlatLayout;
 use wasm_bindgen::prelude::*;
 
@@ -91,8 +90,7 @@ impl SimpleDictionaryStore {
     }
 
     pub fn empty() -> SimpleDictionaryStore {
-        let inner = VortexRdfStore::<SimpleDictionary, FlatLayout>::empty()
-            .expect("Failed to create an empty SimpleDictionaryStore");
+        let inner = VortexRdfStore::<SimpleDictionary, FlatLayout>::empty();
         SimpleDictionaryStore { inner }
     }
 
@@ -106,11 +104,11 @@ impl SimpleDictionaryStore {
         let quads_stream = parse_quads_from_reader(cursor, format);
 
         // Build SimpleDictionaryStore
-        let vortex_array = VortexRdfStore::<SimpleDictionary>::build_vortex_array(quads_stream)
+        let vortex_array = VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_array(quads_stream)
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         
-        let inner = VortexRdfStore::<SimpleDictionary>::new(vortex_array)
+        let inner = VortexRdfStore::<SimpleDictionary, FlatLayout>::new(vortex_array)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         Ok(SimpleDictionaryStore { inner })
@@ -237,8 +235,7 @@ impl ChainedHashStore {
     }
 
     pub fn empty() -> ChainedHashStore {
-        let inner = VortexRdfStore::<ChainedHash, FlatLayout>::empty()
-            .expect("Failed to create an empty Chained Hash Store");
+        let inner = VortexRdfStore::<ChainedHash, FlatLayout>::empty();
         ChainedHashStore { inner }
     }
 
@@ -252,11 +249,11 @@ impl ChainedHashStore {
         let quads_stream = parse_quads_from_reader(cursor, format);
 
         // Build ChainedHashStore
-        let vortex_array = VortexRdfStore::<ChainedHash>::build_vortex_array(quads_stream)
+        let vortex_array = VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_array(quads_stream)
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         
-        let inner = VortexRdfStore::<ChainedHash>::new(vortex_array)
+        let inner = VortexRdfStore::<ChainedHash, FlatLayout>::new(vortex_array)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
         Ok(ChainedHashStore { inner })

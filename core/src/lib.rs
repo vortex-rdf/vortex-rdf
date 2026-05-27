@@ -14,10 +14,6 @@ pub use io::{
 };
 #[cfg(feature = "file-io")]
 pub use io::load_vortex_file_ref;
-pub use io::{
-    array_from_reader, deserialize, quads_stream_to_vortex, quads_stream_to_vortex_writer,
-    serialize,
-};
 
 pub use store::{
     VortexRdfStore, 
@@ -56,7 +52,7 @@ mod tests {
         let quad = Quad::new(s, p, o, g);
         let quads = vec![quad.clone()];
 
-        let dict_index = VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_index(
+        let dict_index = VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_array(
             stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))),
         )
         .await
@@ -90,7 +86,7 @@ mod tests {
         let quad = Quad::new(s, p, o, g);
         let quads = vec![quad.clone()];
 
-        let chained_hash = VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_index(
+        let chained_hash = VortexRdfStore::<ChainedHash, FlatLayout>::build_vortex_array(
             stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))),
         )
         .await
@@ -137,12 +133,12 @@ mod tests {
 
         let quads = vec![q1.clone(), q2.clone()];
 
-        let arr = VortexRdfStore::<Dict>::build_vortex_array_with_builder::<B>(
+        let arr = VortexRdfStore::<Dict, FlatLayout>::build_vortex_array_with_builder::<B>(
             stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q)))
         )
         .await
         .expect("Serialization failed");
-        let store = VortexRdfStore::<Dict>::new(arr).unwrap();
+        let store = VortexRdfStore::<Dict, FlatLayout>::new(arr).unwrap();
 
         // Match ?s <p1> ?o ?g
         let filtered = store.match_pattern(None, Some(&p1), None, None).await.unwrap();
@@ -217,12 +213,12 @@ mod tests {
         let q1 = Quad::new(s1.clone(), p1.clone(), o1.clone(), g1.clone());
 
         // Build a store with one initial quad using builder B
-        let arr = VortexRdfStore::<Dict>::build_vortex_array_with_builder::<B>(
+        let arr = VortexRdfStore::<Dict, FlatLayout>::build_vortex_array_with_builder::<B>(
             stream::iter(vec![Ok::<_, VortexRdfError>(q1.clone())])
         )
         .await
         .expect("Serialization failed");
-        let store = VortexRdfStore::<Dict>::new(arr).unwrap();
+        let store = VortexRdfStore::<Dict, FlatLayout>::new(arr).unwrap();
         assert_eq!(store.size(), 1);
 
         // Add a new quad
@@ -286,7 +282,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_append_dict_index() {
-        let mut store = VortexRdfStore::<SimpleDictionary, FlatLayout>::empty().unwrap();
+        let mut store = VortexRdfStore::<SimpleDictionary, FlatLayout>::empty();
 
         for i in 0..10 {
             let s = NamedOrBlankNode::NamedNode(
@@ -320,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_append_chained_hash_index() {
-        let mut store = VortexRdfStore::<ChainedHash, FlatLayout>::empty().unwrap();
+        let mut store = VortexRdfStore::<ChainedHash, FlatLayout>::empty();
 
         for i in 0..10 {
             let s = NamedOrBlankNode::NamedNode(
@@ -360,13 +356,13 @@ mod tests {
         let quad = Quad::new(s, p, o, g);
         let quads = vec![quad.clone()];
 
-        let arr = VortexRdfStore::<Dict>::build_vortex_array_with_builder::<B>(
+        let arr = VortexRdfStore::<Dict, FlatLayout>::build_vortex_array_with_builder::<B>(
             stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q)))
         )
         .await
         .expect("Serialization failed");
 
-        let store = VortexRdfStore::<Dict>::new(arr).unwrap();
+        let store = VortexRdfStore::<Dict, FlatLayout>::new(arr).unwrap();
         let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].subject.to_string(), quad.subject.to_string());

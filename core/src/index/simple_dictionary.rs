@@ -14,7 +14,7 @@ use vortex_array::arrays::{StructArray, VarBinViewArray};
 use vortex_array::dtype::{DType, Nullability};
 use vortex_array::{IntoArray, VortexSessionExecute};
 use vortex_fsst::{fsst_compress, fsst_train_compressor};
-
+use vortex_array::LEGACY_SESSION;
 
 /// Simple dictionary implementation using a flat Vec and HashMap for fast bi-directional lookups.
 #[derive(Debug, Clone, Default)]
@@ -30,6 +30,7 @@ impl RdfDictionary for SimpleDictionary {
 
     /// Deserializes the dictionary mappings directly from a Vortex StructArray.
     fn from_vortex_array(array_ref: &ArrayRef) -> Result<Self> {
+
         let start = Instant::now();
         let mut ctx = LEGACY_SESSION.create_execution_ctx();
         let struct_array = array_ref.clone()
