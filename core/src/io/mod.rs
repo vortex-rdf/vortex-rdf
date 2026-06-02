@@ -1,6 +1,7 @@
 pub mod de;
 pub mod ser;
 pub mod cottas_native;
+pub mod cottas_native_strings;
 
 pub use de::{array_from_ipc_reader, deserialize};
 
@@ -13,4 +14,10 @@ pub use cottas_native::{
     CottasNativeConfig,
     match_cottas_native_file,
     serialize_cottas_native_file,
+};
+
+pub use cottas_native_strings::{
+    CottasNativeStringConfig,
+    match_cottas_native_string_file,
+    serialize_cottas_native_string_file,
 };

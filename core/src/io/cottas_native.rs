@@ -363,6 +363,7 @@ fn build_native_pattern_filter<Dict>(
 where
     Dict: RdfDictionary,
 {
+    let build_native_pattern_start = Instant::now();
     let mut filters: Vec<Expression> = Vec::new();
 
     if let Some(subject) = subject {
@@ -443,6 +444,10 @@ where
     let Some(first) = filters.into_iter().reduce(and) else {
         return Ok(NativePatternFilter::All);
     };
+        log::debug!(
+        "[cottas_native::build_native_pattern_filter] Built filters in {:?}",
+        build_native_pattern_start.elapsed()
+    );
 
     Ok(NativePatternFilter::Expr(first))
 }
@@ -457,6 +462,7 @@ where
     Dict: RdfDictionary,
     W: Write,
 {
+    let write_start = Instant::now();
     let mut quads_stream = <FlatLayout as RdfQuadLayout<Dict>>::quads(dictionary, &quads)?;
 
     let mut rdf_serializer = RdfSerializer::from_format(format).for_writer(writer);
@@ -472,6 +478,11 @@ where
     rdf_serializer
         .finish()
         .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
+
+    log::debug!(
+        "[cottas_native::write_quads_array_as_rdf] Write completed in {:?}",
+        write_start.elapsed()
+    );
 
     Ok(())
 }
@@ -575,7 +586,7 @@ where
         scan_start.elapsed()
     );
 
-    let read_start = Instant::now();
+    let read_start: Instant = Instant::now();
 
     let matched_quads = stream.read_all().await.map_err(VortexRdfError::from)?;
 
@@ -591,6 +602,8 @@ where
 pub async fn load_cottas_native_simple_dictionary_view(
     data_path: &Path,
 ) -> Result<SimpleDictionaryView> {
+    let read_dict_start: Instant = Instant::now();
+
     let dict_path = native_dict_path(data_path);
 
     let file = NATIVE_FILE_SESSION
@@ -607,9 +620,10 @@ pub async fn load_cottas_native_simple_dictionary_view(
 
     let dict_root = stream.read_all().await.map_err(VortexRdfError::from)?;
 
-    log::trace!(
-        "[cottas_native::load_cottas_native_simple_dictionary_view] loaded dictionary root array with {} rows",
-        dict_root.len()
+    log::debug!(
+        "[cottas_native::load_cottas_native_simple_dictionary_view] loaded dictionary root array with {} rows in {:?}",
+        dict_root.len(),
+        read_dict_start.elapsed()
     );
 
     SimpleDictionaryView::from_dictionary_sidecar_root(&dict_root)

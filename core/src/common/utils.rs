@@ -51,7 +51,7 @@ pub fn parse_term(s: &str) -> Result<Term> {
 
 /// Parses an RDF graph name, which can be the default graph, a named node, or a blank node.
 pub fn parse_graph_name(s: &str) -> Result<GraphName> {
-    if s.is_empty() || s == "default" {
+    if s.is_empty() || s == "default" || s == "DEFAULT" {
         Ok(GraphName::DefaultGraph)
     } else if s.starts_with("_:") {
         Ok(GraphName::BlankNode(parse_blank_node(s)?))

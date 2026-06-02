@@ -42,6 +42,10 @@ impl SimpleDictionaryView {
             let bytes = dict_varbin.bytes_at(i);
             terms.push(String::from_utf8_lossy(&bytes).into_owned());
         }
+        log::debug!(
+            "[SimpleDictionaryView::from_dictionary_sidecar_root] Simple Dictionary created in: {:?}",
+            start.elapsed()
+        );
 
         Ok(Self { terms })
     }

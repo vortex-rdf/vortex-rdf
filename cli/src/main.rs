@@ -9,8 +9,6 @@ use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use vortex::VortexSessionDefault;
 use vortex_array::ExecutionCtx;
-use vortex_rdf_core::io::match_cottas_native_file;
-use vortex_rdf_core::store::layout::cottas::CottasLayout;
 
 use tokio::fs::File as TokioFile;
 
@@ -20,7 +18,8 @@ use vortex::session::VortexSession;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_rdf_core::{
-    VortexRdfStore,
+    BuilderStrategy, ChunkSortBuilder, GlobalSortBuilder, SortedInMemoryBuilder,
+    UnsortedInMemoryBuilder, VortexRdfStore,
     common::formats::{Format, detect_format},
     common::indexes::{IndexType, detect_index_type},
     common::utils::{
@@ -28,17 +27,14 @@ use vortex_rdf_core::{
     },
     index::{ChainedHash, SimpleDictionary},
     io::{
-        CottasNativeConfig, deserialize, load_vortex_file_ref, serialize,
-        serialize_cottas_native_file,
+        CottasNativeConfig, CottasNativeStringConfig, deserialize, load_vortex_file_ref,
+        match_cottas_native_file, match_cottas_native_string_file, open_vortex_file, serialize,
+        serialize_cottas_native_file, serialize_cottas_native_string_file,
     },
-    store::layout::flat::FlatLayout,
+    store::layout::{cottas::CottasLayout, flat::FlatLayout},
 };
 
 use vortex_array::Canonical;
-use vortex_rdf_core::{
-    BuilderStrategy, ChunkSortBuilder, GlobalSortBuilder, SortedInMemoryBuilder,
-    UnsortedInMemoryBuilder, io::open_vortex_file,
-};
 
 #[derive(Parser)]
 #[command(
@@ -138,6 +134,7 @@ enum StoreLayout {
     Default,
     CottasSpog,
     CottasNative,
+    CottasNativeStrings,
 }
 
 fn detect_storage_layout(
@@ -237,6 +234,23 @@ async fn main() -> Result<()> {
                 .context("Failed to create output file")?;
             let quads_stream = parse_quads_from_reader(reader, format);
 
+            if storage_layout == StoreLayout::CottasNativeStrings {
+                serialize_cottas_native_string_file(
+                    quads_stream,
+                    &output,
+                    CottasNativeStringConfig::default(),
+                )
+                .await
+                .context("Failed to serialize native string COTTAS Vortex file")?;
+
+                info!(
+                    "Serialized to native string COTTAS Vortex-RDF in {:?}",
+                    start.elapsed()
+                );
+
+                return Ok(());
+            }
+
             if storage_layout == StoreLayout::CottasNative {
                 if index_type != IndexType::SimpleDictionary {
                     return Err(anyhow!(
@@ -296,6 +310,7 @@ async fn main() -> Result<()> {
                 },
 
                 StoreLayout::CottasNative => unreachable!("handled above"),
+                StoreLayout::CottasNativeStrings => unreachable!("handled above"),
             };
 
             serialize(vortex_array, &mut writer)
@@ -412,6 +427,11 @@ async fn main() -> Result<()> {
                                 "cottas-native deserialization is not handled by generic VortexRdfStore"
                             ));
                         }
+                        (_, StoreLayout::CottasNativeStrings) => {
+                            return Err(anyhow!(
+                                "cottas-native-strings deserialization is not handled by generic VortexRdfStore yet"
+                            ));
+                        }
                     }
                 }
 
@@ -476,6 +496,11 @@ async fn main() -> Result<()> {
                                 "cottas-native deserialization from stdin is not supported here"
                             ));
                         }
+                        (_, StoreLayout::CottasNativeStrings) => {
+                            return Err(anyhow!(
+                                "cottas-native-strings deserialization from stdin is not supported here"
+                            ));
+                        }
                     }
                 }
             }
@@ -519,6 +544,39 @@ async fn main() -> Result<()> {
 
             // 2. Prepare/Load Vortex Array and Text IndexType
             let is_vortex_file = input.extension().map(|e| e == "vortex").unwrap_or(false);
+
+            if is_vortex_file && storage_layout == Some(StoreLayout::CottasNativeStrings) {
+                let output_format = format
+                    .map(RdfFormat::from)
+                    .or_else(|| detect_format(&output))
+                    .unwrap_or(RdfFormat::NQuads);
+
+                let writer: Box<dyn Write> = match &output {
+                    Some(p) => Box::new(File::create(p).context("Failed to create output file")?),
+                    None => Box::new(stdout()),
+                };
+
+                let native_match_start = Instant::now();
+
+                match_cottas_native_string_file(
+                    &input,
+                    subject_node.as_ref(),
+                    predicate_node.as_ref(),
+                    object_node.as_ref(),
+                    graph_node.as_ref(),
+                    writer,
+                    output_format,
+                )
+                .await
+                .context("Failed to match native string COTTAS file")?;
+
+                info!(
+                    "Native string COTTAS matching operation took {:?}",
+                    native_match_start.elapsed()
+                );
+
+                return Ok(());
+            }
 
             if is_vortex_file && storage_layout == Some(StoreLayout::CottasNative) {
                 let output_format = format
@@ -627,6 +685,7 @@ async fn main() -> Result<()> {
                         }
                     },
                     StoreLayout::CottasNative => unreachable!("handled in Serialize arm"),
+                    StoreLayout::CottasNativeStrings => unreachable!("handled above"),
                 };
                 debug!("Vortex index created in {:?}", load_start.elapsed());
                 (arr, t, layout)
@@ -757,6 +816,9 @@ async fn main() -> Result<()> {
                     unreachable!("handled above");
                 }
                 (IndexType::ChainedHash, StoreLayout::CottasNative) => {
+                    unreachable!("handled above");
+                }
+                (_, StoreLayout::CottasNativeStrings) => {
                     unreachable!("handled above");
                 }
             }
