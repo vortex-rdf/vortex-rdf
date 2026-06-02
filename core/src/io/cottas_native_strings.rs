@@ -20,6 +20,8 @@ use vortex_session::VortexSession;
 
 use vortex::dtype::{DType, Nullability};
 
+use vortex_btrblocks::BtrBlocksCompressorBuilder;
+
 static NATIVE_STRING_FILE_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     use vortex_array::scalar_fn::session::ScalarFnSession;
     use vortex_array::session::ArraySession;
@@ -39,10 +41,17 @@ static NATIVE_STRING_FILE_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
 use crate::common::utils::{parse_graph_name, parse_named_node, parse_subject, parse_term};
 use vortex_array::arrays::struct_::StructArrayExt;
 
+#[derive(Clone, Copy, Debug)]
+pub enum CottasVortexCompressionProfile {
+    Balanced,
+    Compact,
+}
+
 #[derive(Clone, Debug)]
 pub struct CottasNativeStringConfig {
     pub ordering: TripleOrdering,
     pub row_group_size: usize,
+    pub compression_profile: CottasVortexCompressionProfile,
 }
 
 impl Default for CottasNativeStringConfig {
@@ -51,6 +60,7 @@ impl Default for CottasNativeStringConfig {
             ordering: TripleOrdering::SPO,
             // COTTAS / DuckDB baseline from the paper.
             row_group_size: 122_880,
+            compression_profile: CottasVortexCompressionProfile::Balanced,
         }
     }
 }
@@ -163,6 +173,7 @@ async fn write_string_array_stream_to_vortex_file<W>(
     writer: &mut W,
     arrays: Vec<ArrayRef>,
     row_group_size: usize,
+    compression_profile: CottasVortexCompressionProfile,
 ) -> Result<()>
 where
     W: VortexWrite + Unpin + Send,
@@ -179,9 +190,17 @@ where
 
     let stream = ArrayStreamAdapter::new(dtype, Box::pin(stream::iter(arrays.into_iter().map(Ok))));
 
-    let strategy = WriteStrategyBuilder::default()
-        .with_row_block_size(row_group_size.max(1))
-        .build();
+    let strategy_builder =
+        WriteStrategyBuilder::default().with_row_block_size(row_group_size.max(1));
+
+    let strategy_builder = match compression_profile {
+        CottasVortexCompressionProfile::Balanced => strategy_builder,
+
+        CottasVortexCompressionProfile::Compact => strategy_builder
+            .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact()),
+    };
+
+    let strategy = strategy_builder.build();
 
     let write_opts = NATIVE_STRING_FILE_SESSION
         .write_options()
@@ -235,12 +254,14 @@ where
         &mut data_file,
         row_group_arrays,
         config.row_group_size,
+        config.compression_profile,
     )
     .await?;
 
     log::info!(
-        "[cottas_native_strings] wrote native string COTTAS Vortex file {:?}",
-        output_path
+        "[cottas_native_strings] wrote native string COTTAS Vortex file {:?} with profile {:?}",
+        output_path,
+        config.compression_profile
     );
 
     Ok(())

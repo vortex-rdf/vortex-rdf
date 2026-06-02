@@ -27,9 +27,10 @@ use vortex_rdf_core::{
     },
     index::{ChainedHash, SimpleDictionary},
     io::{
-        CottasNativeConfig, CottasNativeStringConfig, deserialize, load_vortex_file_ref,
-        match_cottas_native_file, match_cottas_native_string_file, open_vortex_file, serialize,
-        serialize_cottas_native_file, serialize_cottas_native_string_file,
+        CottasNativeConfig, CottasNativeStringConfig, CottasVortexCompressionProfile, deserialize,
+        load_vortex_file_ref, match_cottas_native_file, match_cottas_native_string_file,
+        open_vortex_file, serialize, serialize_cottas_native_file,
+        serialize_cottas_native_string_file,
     },
     store::layout::{cottas::CottasLayout, flat::FlatLayout},
 };
@@ -73,6 +74,10 @@ enum Action {
         /// Builder strategy to use when serializing (defaults to unsorted-in-memory)
         #[arg(short, long, value_enum, default_value = "unsorted-in-memory")]
         builder_strategy: BuilderStrategy,
+
+        /// Vortex compression profile for native COTTAS string files
+        #[arg(long, value_enum, default_value_t = CompressionProfile::Balanced)]
+        compression_profile: CompressionProfile,
     },
     /// Convert from Vortex-RDF to RDF
     Deserialize {
@@ -126,6 +131,22 @@ enum Action {
         #[arg(long, value_enum)]
         storage_layout: Option<StoreLayout>,
     },
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum, Debug)]
+#[clap(rename_all = "kebab_case")]
+enum CompressionProfile {
+    Balanced,
+    Compact,
+}
+
+impl From<CompressionProfile> for CottasVortexCompressionProfile {
+    fn from(value: CompressionProfile) -> Self {
+        match value {
+            CompressionProfile::Balanced => CottasVortexCompressionProfile::Balanced,
+            CompressionProfile::Compact => CottasVortexCompressionProfile::Compact,
+        }
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum, Debug)]
@@ -216,6 +237,7 @@ async fn main() -> Result<()> {
             output,
             format,
             builder_strategy,
+            compression_profile,
         } => {
             let start = Instant::now();
             let format = format
@@ -238,7 +260,10 @@ async fn main() -> Result<()> {
                 serialize_cottas_native_string_file(
                     quads_stream,
                     &output,
-                    CottasNativeStringConfig::default(),
+                    CottasNativeStringConfig {
+                        compression_profile: compression_profile.into(),
+                        ..CottasNativeStringConfig::default()
+                    },
                 )
                 .await
                 .context("Failed to serialize native string COTTAS Vortex file")?;
