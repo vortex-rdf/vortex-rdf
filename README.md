@@ -14,7 +14,7 @@ This library provides both serialization and deserialization capabilities for co
 - 🌍 **Cross-Platform**: Native Rust library with a CLI + WebAssembly (WASM) bindings for browsers/Node.js. Python bindings coming soon.
 
 #### How it works:
-1. **Zero-copy buffer views**: When you want to access a specific column (e.g., just the `predicates`) or a specific subset of Quads, Vortex creates a [_Layout_](https://docs.vortex.dev/concepts/layouts) either from a Vortex file stored on disk or from Vortex encoded data in memory. This view is just a pointer and some metadata—it doesn't duplicate the data.
+1. **Zero-copy buffer views**: When you want to access a specific column (e.g., just the `predicates`) or a specific subset of Quads, Vortex creates a [_Layout_](https://docs.vortex.dev/concepts/layouts) either from a Vortex file stored on disk or from Vortex encoded data in memory. This view is just a pointer and some metadata, it doesn't duplicate the data.
 2. **Lazy Decompression**: Even when compressed, Vortex is designed to decompress data "_just-in-time_" at the CPU register level, while leveraging [SIMD optimizations](https://en.wikipedia.org/wiki/Single_instruction,_multiple_data) and avoiding the creation of temporary intermediate strings.
 
 ### Vortex File format & IPC
@@ -33,39 +33,60 @@ Both formats share the same underlying principles:
 
 This versatile approach ensures that Vortex-RDF can serve as both a high-performance local database engine and an efficient interchange format for distributed RDF processing.
 
+---
+
 ## Architecture
 
-Vortex-RDF encodes RDF quads using two main data structures:
+Vortex-RDF encodes RDF quads using three main architectural concepts:
 
-### 1. Resource dictionary   
+### 1. Resource Dictionary   
 A data structure that encodes all IRIs, Literals, and Blank Nodes. Multiple encoding strategies are possible. Currently we support 2 types:
 
 #### **Simple Dictionary Index**
-
-The entire set of RDF Terms (IRIs, Blank Nodes and Literals) are persisted as a single FSST-compressed [`VarBinViewArray`](https://docs.rs/vortex/latest/vortex/array/arrays/struct.VarBinViewArray.html) storing all the unique term strings.
-
-**Pros**: Easier and faster to create.
-
-**Cons**: Requires an external auxiliary data structure (e.g., in-memory `HashMap`) to allow efficient look ups, which goes against the zero-copy principle. 
+The entire set of RDF Terms (IRIs, Blank Nodes and Literals) are persisted as a single FSST-compressed [`VarBinViewArray`]https://docs.rs/vortex/latest/vortex/array/arrays/type.VarBinViewArray.html) storing all the unique term strings.
+* **Pros**: Easier and faster to create.
+* **Cons**: Requires an external auxiliary data structure (e.g., in-memory `HashMap`) to allow efficient look ups (Term -> ID), which goes against the zero-copy principle. 
 
 #### **Chained Hash Index**
-
 Persists the entire set of RDF Terms as [chained hash map](https://en.wikipedia.org/wiki/Hash_table#Separate_chaining) using 2 additional Vortex arrays alongside a simple dictionary:
-
-1. **`Terms`**: Same as above (strings), stored as a (optionally compressed) `VarBinViewArray`.
+1. **`Terms`**: Same as above (strings), stored as a compressed `VarBinViewArray`.
 2. **`buckets`**: A fixed-size [`PrimitiveArray<i32>`](https://docs.rs/vortex/latest/vortex/array/arrays/struct.PrimitiveArray.html) acting as the hash table entry point.
 3. **`next`**: A `PrimitiveArray<i32>` acting as the linked list for collision resolution.
 
-**Pros**: Able to fully encode the set of unique RDF terms into a Vortex structure, including an index that allows for efficient lookups, while upholding the zero-copy principle.
+* **Pros**: Able to fully encode the set of unique RDF terms into a Vortex structure, including an index that allows for efficient lookups, while upholding the zero-copy principle.
+* **Cons**: Higher complexity for creation and lookups.   
 
-**Cons**: Higher complexity for creation and lookups.   
+### 2. Quad Collection  
+The graph structure is stored as a [`StructArray`](https://docs.rs/vortex/latest/vortex/array/arrays/struct.StructArray.html) of indices. By default, quads are sorted by **`Subject -> Predicate -> Object -> Graph`** during ingestion, allowing direct and efficient binary searches on the subject column (**`s`**). 
 
-### 2. Quad collection  
-The graph structure is stored as a [`StructArray`](https://docs.rs/vortex/latest/vortex/array/arrays/struct.StructArray.html) of indices:
-- **`Subject`**: `PrimitiveArray<u32>`.
-- **`Predicate`**: `PrimitiveArray<u32>`.
-- **`Object`**: `PrimitiveArray<u32>`.
-- **`Graph`**: `PrimitiveArray<u32>`.
+To optimize predicate and object lookups without sorting the entire dataset multiple times, the `StructArray` optionally includes four flat secondary permutation index columns:
+- **`s`** (Subject ID): `PrimitiveArray<u32>`.
+- **`p`** (Predicate ID): `PrimitiveArray<u32>`.
+- **`o`** (Object ID): `PrimitiveArray<u32>`.
+- **`g`** (Graph ID): `PrimitiveArray<u32>`.
+- **`_idx_o_val`** (Object Index Values - optional): A sorted `PrimitiveArray<u32>` listing all object IDs.
+- **`_idx_o_rid`** (Object Row Mappings - optional): A `PrimitiveArray<u32>` mapping each entry in `_idx_o_val` back to its original quad row offset.
+- **`_idx_p_val`** (Predicate Index Values - optional): A sorted `PrimitiveArray<u32>` listing all predicate IDs.
+- **`_idx_p_rid`** (Predicate Row Mappings - optional): A `PrimitiveArray<u32>` mapping each entry in `_idx_p_val` back to its original quad row offset.
+
+### 3. Ingestion Builders (Indexing Strategies)
+
+To compile the resource dictionary and quad collection into a highly compressed Vortex representation, Vortex-RDF supports **four distinct ingestion builders** depending on dataset size, RAM constraints, and target query requirements:
+
+| Ingestion Strategy | Memory Model | Sorting | Disk Spill (Runs) | Layout Structure | Indexed |
+|---|---|---|---|---|---|
+| **`UnsortedInMemory`** | In-Memory | No | No | Flat `StructArray` | No |
+| **`SortedInMemory`** | In-Memory | Global | No | Flat `StructArray` | Ordered by `subject` with secondary indexes by reference on `predicate` and `object` |
+| **`ChunkSort`** | Memory-Bounded | Chunk-Local | No | `ChunkedArray` of sorted `StructArray` blocks | Ordered by `subject` with secondary indexes by reference on `predicate` and `object` |
+| **`GlobalSort`** | Out-of-Core | Global | Yes | `ChunkedArray` of globally sorted `StructArray` blocks | Ordered by `subject` with secondary indexes by reference on `predicate` and `object` |
+
+#### Builder Details:
+* **`UnsortedInMemoryBuilder`**: The simplest pipeline. It preserves the exact ordering of the incoming RDF stream, loading all data to build a single, flat `StructArray`. It adds minimal overhead, but cannot leverage Vortex's native zone-map statistics for efficient pruning during query execution.
+* **`SortedInMemoryBuilder`**: Loads all quads in memory, performs a global sort on the quads, and appends global flat secondary indexes (`_idx_o_val`, `_idx_o_rid`, `_idx_p_val`, `_idx_p_rid`) to optimize `match_pattern` search. Best suited for queries on small-to-medium graphs.
+* **`ChunkSortBuilder`**: Processes incoming quads in memory-bounded batches (default: `500,000` quads), sorts each batch locally, generates local secondary indexes, and flushes them as separate thin chunks inside a parent `ChunkedArray`. This enables **chunk-level statistics (min/max zone maps)** for metadata-based query pruning.
+* **`GlobalSortBuilder` (Out-of-Core)**: It ingests data in memory-bounded batches, sorts them locally, and serializes sorted runs to disk (`runs`) to prevent memory exhaustion. It then performs an out-of-core heap-merge of the sorted runs and flushes them into sorted, indexed thin chunks wrapped in a final `ChunkedArray` layout.
+
+---
 
 ## Data Representation Examples
 
@@ -98,19 +119,6 @@ A Vortex-RDF file, using a **`Simple Dictionary Index`**, would store this data 
 
 > *`IDs` are not actually stored in the Vortex file, they are implicit and determined by the position of the terms in the array. Simply shown in this example for clarity.
 
-#### Quad Collection
-
-The quads are stored as an optimized `StructArray` of indices, which may be compressed using e.g.,  BitPacking or RLE.
-
-| S | P | O | G |
-|---|---|---|---|
-| 0 | 1 | 2 | 7 |
-| 0 | 3 | 4 | 7 |
-| 5 | 1 | 2 | 7 |
-| 5 | 6 | 0 | 7 |
-
-The **`G column`** could be compressed with RLE by Vortex because all values are the same (Default Graph), effectively reducing its size to near-zero. The **`S, P, O columns`** could be bitpacked to the minimum number of bits needed to represent the max ID.
-
 ### 2. Using a Chained Hash Index
 A Vortex-RDF file using a **`Chained Hash Index`**, would be stored as follows:
 
@@ -124,7 +132,7 @@ A Vortex-RDF file using a **`Chained Hash Index`**, would be stored as follows:
 | 1    | `<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>` |
 | 2    | `<http://xmlns.com/foaf/0.1/Person>`                |
 | 3    | `<http://xmlns.com/foaf/0.1/name>`                  |
-| 4    | `"Alice"@en`                                           |
+| 4    | `"Alice"@en`                                        |
 | 5    | `<http://example.org/bob>`                          |
 | 6    | `<http://xmlns.com/foaf/0.1/knows>`                 |
 | 7    | `""` (Default Graph)                                |
@@ -187,6 +195,26 @@ Based on the data encoded in this example **`Next Array`**, we can observe 2 han
 6. Check  `Terms[6]`. It is `<http://xmlns.com/foaf/0.1/knows>` **Still no match**.
 7. Check `Next[6]`. It points to ID `0`. Is it `<http://example.org/alice>`? **Yes**.
    - **Result**: ID is `0`.
+
+### Quad Collection (common to both dictionary types)
+
+The quads are stored as a `StructArray` of indices. Since the quads are globally (or chunk-locally) sorted by `Subject -> Predicate -> Object -> Graph`, binary search is highly efficient on the `s` column.
+
+To enable fast binary-search querying on the unsorted predicate (`p`) and object (`o`) columns, the struct array can optionally be extended with secondary sorted permutation indexes at serialization time:
+
+| s | p | o | g | _idx_o_val | _idx_o_rid | _idx_p_val | _idx_p_rid |
+|---|---|---|---|---|---|---|---|
+| 0 | 1 | 2 | 7 | 0 | 3 | 1 | 0 |
+| 0 | 3 | 4 | 7 | 2 | 0 | 1 | 2 |
+| 5 | 1 | 2 | 7 | 2 | 2 | 3 | 1 |
+| 5 | 6 | 0 | 7 | 4 | 1 | 6 | 3 |
+
+* **`_idx_o_val` / `_idx_o_rid` (Object Index):**
+  * `_idx_o_val` lists all object IDs in sorted order (`[0, 2, 2, 4]`).
+  * `_idx_o_rid` maps each value back to its original row ID in the quad collection (`Row 3` has object `0`, `Row 0` has object `2`, `Row 2` has object `2`, and `Row 1` has object `4`).
+* **`_idx_p_val` / `_idx_p_rid` (Predicate Index):**
+  * `_idx_p_val` lists all predicate IDs in sorted order (`[1, 1, 3, 6]`).
+  * `_idx_p_rid` maps each value back to its original row ID in the quad collection (`Row 0` has predicate `1`, `Row 2` has predicate `1`, `Row 1` has predicate `3`, and `Row 3` has predicate `6`).
 
 ## How Datatypes are Handled
 
@@ -357,6 +385,70 @@ vortex-rdf-cli match --input test/test.vortex --subject "http://example.org/s1" 
 # Enable debug logging (shows timing metrics)
 RUST_LOG=vortex_rdf_cli=debug,vortex_rdf_core=debug vortex-rdf-cli serialize --input data.ttl --output data.vortex
 ```
+
+---
+
+## Benchmarking with CodSpeed
+
+Vortex-RDF features a comprehensive benchmark suite built on top of [Divan](https://github.com/nvzqz/divan) and fully integrated with [CodSpeed](https://codspeed.io) for precise, CPU-instruction-level performance tracking.
+
+The benchmarks evaluate four builder strategies across both dictionary indices (`ChainedHash` and `SimpleDictionary`) and multiple selective query patterns:
+1. **Build Index (`build_vortex_index_*`)**: Profiles raw indexing and dictionary encoding throughput.
+2. **Instantiate Store (`instantiate_store_*`)**: Profiles metadata parsing and zero-copy store instantiation.
+3. **Match Pattern (`match_pattern_*`)**: Profiles vectorized scans and zone map pruning performance across 13 selective query patterns:
+   * **Subject Only `(s, ?, ?, ?)`**: Highly selective (retrieves exactly 1 unique matching row).
+   * **Predicate Only `(?, p, ?, ?)`**: Medium-high selectivity (retrieves $1\%$ of the dataset).
+   * **Object Only `(?, ?, o, ?)`**: Medium selectivity (retrieves $2\%$ of the dataset).
+   * **Graph Only `(?, ?, ?, g)`**: Non-selective (retrieves $100\%$ of all rows).
+   * **Subject & Predicate `(s, p, ?, ?)`**: Highly selective (retrieves exactly 1 or 0 rows).
+   * **Subject & Object `(s, ?, o, ?)`**: Restricts both endpoints of a triple/quad relation.
+   * **Subject & Graph `(s, ?, ?, g)`**: Targets a specific subject inside a named graph.
+   * **Predicate & Object `(?, p, o, ?)`**: Selective path querying typical for property-object relations.
+   * **Predicate & Graph `(?, p, ?, g)`**: Scans a property inside a named graph.
+   * **Subject, Predicate & Object `(s, p, o, ?)`**: Highly selective triple lookup.
+   * **Predicate, Object & Graph `(?, p, o, g)`**: Scans a property-value pair inside a named graph.
+   * **Subject, Object & Graph `(s, ?, o, g)`**: Restricts subject, object, and graph elements.
+   * **Subject, Predicate & Graph `(s, p, ?, g)`**: Restricts subject, predicate, and graph elements.
+
+### Running Benchmarks Locally
+
+#### 1. Fast Sanity Check (Test Mode)
+Running full statistical loops can take several minutes due to heavy sampling. You can execute all benchmarks **exactly once** in test-mode to instantly verify correctness:
+```bash
+# Run ChainedHash benchmarks in test mode
+cargo test --bench chained_hash_bench
+
+# Run SimpleDictionary benchmarks in test mode
+cargo test --bench simple_dict_bench
+```
+
+#### 2. Run Full Statistical Benchmarks
+To run the full Divan statistical profiling loops:
+```bash
+# Profile ChainedHash
+cargo bench --bench chained_hash_bench
+
+# Profile SimpleDictionary
+cargo bench --bench simple_dict_bench
+```
+
+#### 3. Filtering Benchmarks
+You can isolate specific builders, dictionary types, or query shapes:
+```bash
+# Profile only match pattern benchmarks
+cargo bench --bench chained_hash_bench -- match_pattern
+
+# Profile only Subject-selective patterns (_s)
+cargo bench --bench chained_hash_bench -- _s
+
+# Profile a specific builder
+cargo bench --bench chained_hash_bench -- global_sort
+```
+
+### Dynamic Index Caching
+To optimize local testing and prevent redundant index re-compilations, the benchmark suite leverages a thread-safe global index cache (`std::sync::OnceLock`). 
+* When `build_vortex_index_*` runs, it builds the array fresh to measure indexing throughput and automatically **populates the cache**.
+* All subsequent `instantiate_store_*` and `match_pattern_*` benchmarks reuse the cached index in $O(1)$ time, completely isolating query matching performance from indexing overhead and keeping CodSpeed telemetry clean and noise-free.
 
 ---
 

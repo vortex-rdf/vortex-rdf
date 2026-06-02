@@ -1,12 +1,14 @@
+use crate::io::VORTEX_LIGHT_SESSION;
+use crate::error::{Result, VortexRdfError};
+
 use clap::ValueEnum;
-use vortex_array::{ArrayRef, IntoArray, LEGACY_SESSION, VortexSessionExecute};
+use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_array::arrays::{PrimitiveArray, ListArray, StructArray, DictArray, ListViewArray, ChunkedArray};
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::dict::DictArraySlotsExt;
 use vortex_array::arrays::listview::ListViewArrayExt;
 use vortex_array::validity::Validity;
 use vortex_array::dtype::DType;
-use crate::error::{Result, VortexRdfError};
 
 /// The supported Vortex-RDF dictionary/indexing strategies.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
@@ -40,7 +42,7 @@ pub fn detect_index_type(array: &ArrayRef) -> IndexType {
                 array.clone()
             };
 
-            let mut ctx = LEGACY_SESSION.create_execution_ctx();
+            let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
             if let Ok(struct_arr) = slice.clone().execute::<StructArray>(&mut ctx) {
                 if let Some(idx) = struct_arr.names().iter().position(|n| n.as_ref() == "store_type") {
                     if let Some(col) = struct_arr.unmasked_fields().get(idx) {
@@ -90,7 +92,7 @@ pub fn array_as_dict_column(array: ArrayRef, n: usize) -> Result<ArrayRef> {
 /// Extracts the underlying array stored using the zero-copy `array_as_dict_column` wrapper.
 /// Supports both flat `DictArray` columns and multi-chunked columns (`ChunkedArray`) safely.
 pub fn array_from_dict_column(array: &ArrayRef) -> Result<ArrayRef> {
-    let mut ctx = LEGACY_SESSION.create_execution_ctx();
+    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
 
     // 1. Resolve chunked columns by targeting the first chunk.
     let target_array = if array.encoding_id().as_ref() == "vortex.chunked" {

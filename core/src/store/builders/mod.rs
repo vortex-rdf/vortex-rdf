@@ -48,7 +48,7 @@ pub trait VortexArrayBuilder<Dict: RdfDictionary> {
     ) -> impl std::future::Future<Output = Result<ArrayRef>> + Send;
 }
 
-#[derive(Copy, Clone, Eq, PartialEq)]
+#[derive(Copy, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EncodedQuad {
     pub s: u32,
     pub p: u32,

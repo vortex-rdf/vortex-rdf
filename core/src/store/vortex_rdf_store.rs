@@ -1,14 +1,15 @@
 use crate::error::{Result, VortexRdfError};
-use crate::io::de;
+use crate::io::{de, VORTEX_LIGHT_SESSION};
+#[cfg(feature = "file-io")]
+use crate::io::VORTEX_SESSION;
 use crate::index::RdfDictionary;
 use crate::common::utils;
 use crate::store::builders::{VortexArrayBuilder, UnsortedInMemoryBuilder};
 use crate::store::QuadsSource;
 
-use std::sync::Arc;
-use std::time::Instant;
+use web_time::Instant;
 use std::io::Cursor;
-use futures::{Stream, StreamExt, stream};
+use futures::{Stream, stream};
 use oxrdf::{GraphName, NamedNode, Quad, NamedOrBlankNode, Term};
 
 use vortex_array::scalar::Scalar;
@@ -18,11 +19,23 @@ use vortex_array::arrays::{
 };
 use vortex_array::arrays::bool::BoolArrayExt;
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::{ArrayRef, IntoArray, LEGACY_SESSION, VortexSessionExecute};
+use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_array::builtins::ArrayBuiltins;
-use vortex_array::expr::{Expression, root, select, and, eq, get_item, lit};
+use vortex_array::expr::stats::{Stat, StatsProvider, Precision};
+use vortex_array::search_sorted::{SearchSorted, SearchSortedSide, SearchResult};
+
+#[cfg(feature = "file-io")]
+use std::sync::Arc;
+#[cfg(feature = "file-io")]
+use futures::StreamExt;
+#[cfg(feature = "file-io")]
+use vortex_buffer::Buffer;
+#[cfg(feature = "file-io")]
 use vortex_array::dtype::DType;
+#[cfg(feature = "file-io")]
 use vortex_array::stream::ArrayStreamExt;
+#[cfg(feature = "file-io")]
+use vortex_array::expr::{Expression, root, select, and, eq, get_item, lit};
 
 /// Unified VortexRdfStore that works with any RdfDictionary implementation.
 /// Implements zero-copy, highly compressed, and scan-optimized RDF storage.
@@ -71,7 +84,7 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
 
     /// Load from a flat N-row Vortex struct array.
     pub fn new(vortex_array: ArrayRef) -> Result<Self> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
         let vortex_struct = vortex_array.clone().execute::<StructArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
 
@@ -266,7 +279,7 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
         object: Option<&Term>,
         graph: Option<&GraphName>,
     ) -> Result<Option<ArrayRef>> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
         let quads_struct = self.get_quads_array()?.execute::<StructArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
         let fields = quads_struct.unmasked_fields();
@@ -355,16 +368,146 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
         let start = Instant::now();
 
         match &self.quads {
-            // ── in-memory: existing boolean-mask approach ─────────────────
-            QuadsSource::InMemory(_) => {
+            // ── in-memory: search_sorted & slicing optimization with fallback ───
+            QuadsSource::InMemory(quads_arr) => {
+                let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+                let struct_arr = quads_arr.clone().execute::<StructArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
+                
+                let has_o_index = struct_arr.unmasked_field_by_name("_idx_o_val").is_ok();
+                let has_p_index = struct_arr.unmasked_field_by_name("_idx_p_val").is_ok();
+                
+                let s_col = struct_arr.unmasked_field_by_name("s").map_err(|_| VortexRdfError::Deserialization("Missing s column".into()))?;
+                let is_s_sorted = s_col.statistics()
+                    .get(Stat::IsSorted)
+                    .map(|precision| {
+                        let scalar = match precision {
+                            Precision::Exact(s) => s,
+                            Precision::Inexact(s) => s,
+                        };
+                        bool::try_from(&scalar).unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+
+                if is_s_sorted && subject.is_some() {
+                    let subj = subject.unwrap();
+                    let dict_id_opt = self.dictionary.get_id(&subj.to_string());
+                    if let Some(s_id) = dict_id_opt {
+                        let target_scalar = Scalar::from(s_id).cast(s_col.dtype()).map_err(VortexRdfError::Vortex)?;
+                        let start_res = s_col.search_sorted(&target_scalar, SearchSortedSide::Left).map_err(VortexRdfError::Vortex)?;
+                        let end_res = s_col.search_sorted(&target_scalar, SearchSortedSide::Right).map_err(VortexRdfError::Vortex)?;
+                        
+                        let range_start = match start_res {
+                            SearchResult::Found(idx) => idx,
+                            SearchResult::NotFound(idx) => idx,
+                        };
+                        let range_end = match end_res {
+                            SearchResult::Found(idx) => idx,
+                            SearchResult::NotFound(idx) => idx,
+                        };
+                        
+                        if range_start == range_end {
+                            return Ok(Self::empty());
+                        }
+                        
+                        let filtered = quads_arr.slice(range_start..range_end).map_err(VortexRdfError::Vortex)?;
+                        let taken_store = Self {
+                            dictionary: self.dictionary.clone(),
+                            quads: QuadsSource::InMemory(filtered),
+                        };
+                        
+                        let recurse_res = Box::pin(taken_store.match_pattern(None, predicate, object, graph)).await;
+                        log::debug!("[match_pattern] In-memory Subject search_sorted path took {:?}", start.elapsed());
+                        return recurse_res;
+                    } else {
+                        return Ok(Self::empty());
+                    }
+                } else if has_o_index && subject.is_none() && object.is_some() {
+                    let obj = object.unwrap();
+                    let dict_id_opt = self.dictionary.get_id(&obj.to_string());
+                    if let Some(o_id) = dict_id_opt {
+                        let o_val_arr = struct_arr.unmasked_field_by_name("_idx_o_val").map_err(|_| VortexRdfError::Deserialization("Missing _idx_o_val".into()))?;
+                        let o_rid_arr = struct_arr.unmasked_field_by_name("_idx_o_rid").map_err(|_| VortexRdfError::Deserialization("Missing _idx_o_rid".into()))?;
+                        
+                        let target_scalar = Scalar::from(o_id).cast(o_val_arr.dtype()).map_err(VortexRdfError::Vortex)?;
+                        let start_res = o_val_arr.search_sorted(&target_scalar, SearchSortedSide::Left).map_err(VortexRdfError::Vortex)?;
+                        let end_res = o_val_arr.search_sorted(&target_scalar, SearchSortedSide::Right).map_err(VortexRdfError::Vortex)?;
+                        
+                        let range_start = match start_res {
+                            SearchResult::Found(idx) => idx,
+                            SearchResult::NotFound(idx) => idx,
+                        };
+                        let range_end = match end_res {
+                            SearchResult::Found(idx) => idx,
+                            SearchResult::NotFound(idx) => idx,
+                        };
+                        
+                        if range_start == range_end {
+                            return Ok(Self::empty());
+                        }
+                        
+                        let sliced_rids = o_rid_arr.slice(range_start..range_end).map_err(VortexRdfError::Vortex)?;
+                        let filtered = quads_arr.take(sliced_rids).map_err(VortexRdfError::Vortex)?;
+                        
+                        let taken_store = Self {
+                            dictionary: self.dictionary.clone(),
+                            quads: QuadsSource::InMemory(filtered),
+                        };
+                        
+                        let recurse_res = Box::pin(taken_store.match_pattern(subject, predicate, None, graph)).await;
+                        log::debug!("[match_pattern] In-memory Object search_sorted path took {:?}", start.elapsed());
+                        return recurse_res;
+                    } else {
+                        return Ok(Self::empty());
+                    }
+                } else if has_p_index && subject.is_none() && object.is_none() && predicate.is_some() {
+                    let pred = predicate.unwrap();
+                    let dict_id_opt = self.dictionary.get_id(&pred.to_string());
+                    if let Some(p_id) = dict_id_opt {
+                        let p_val_arr = struct_arr.unmasked_field_by_name("_idx_p_val").map_err(|_| VortexRdfError::Deserialization("Missing _idx_p_val".into()))?;
+                        let p_rid_arr = struct_arr.unmasked_field_by_name("_idx_p_rid").map_err(|_| VortexRdfError::Deserialization("Missing _idx_p_rid".into()))?;
+                        
+                        let target_scalar = Scalar::from(p_id).cast(p_val_arr.dtype()).map_err(VortexRdfError::Vortex)?;
+                        let start_res = p_val_arr.search_sorted(&target_scalar, SearchSortedSide::Left).map_err(VortexRdfError::Vortex)?;
+                        let end_res = p_val_arr.search_sorted(&target_scalar, SearchSortedSide::Right).map_err(VortexRdfError::Vortex)?;
+                        
+                        let range_start = match start_res {
+                            SearchResult::Found(idx) => idx,
+                            SearchResult::NotFound(idx) => idx,
+                        };
+                        let range_end = match end_res {
+                            SearchResult::Found(idx) => idx,
+                            SearchResult::NotFound(idx) => idx,
+                        };
+                        
+                        if range_start == range_end {
+                            return Ok(Self::empty());
+                        }
+                        
+                        let sliced_rids = p_rid_arr.slice(range_start..range_end).map_err(VortexRdfError::Vortex)?;
+                        let filtered = quads_arr.take(sliced_rids).map_err(VortexRdfError::Vortex)?;
+                        
+                        let taken_store = Self {
+                            dictionary: self.dictionary.clone(),
+                            quads: QuadsSource::InMemory(filtered),
+                        };
+                        
+                        let recurse_res = Box::pin(taken_store.match_pattern(subject, None, object, graph)).await;
+                        log::debug!("[match_pattern] In-memory Predicate search_sorted path took {:?}", start.elapsed());
+                        return recurse_res;
+                    } else {
+                        return Ok(Self::empty());
+                    }
+                }
+
+                // Fallback to standard boolean mask search
                 let mask = self.find_mask(subject, predicate, object, graph)?;
                 if let Some(m) = mask {
                     let quads_arr = self.get_quads_array()?;
-                    let mut ctx = LEGACY_SESSION.create_execution_ctx();
+                    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
                     let bool_arr = m.execute::<BoolArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
                     let canonical = bool_arr.to_mask_fill_null_false(&mut ctx);
                     let filtered = quads_arr.filter(canonical).map_err(VortexRdfError::Vortex)?;
-                    log::debug!("[match_pattern] In-memory filter took {:?}", start.elapsed());
+                    log::debug!("[match_pattern] In-memory fallback filter took {:?}", start.elapsed());
                     self.with_quads(filtered)
                 } else {
                     Ok(Self { dictionary: self.dictionary.clone(), quads: self.quads.clone() })
@@ -383,10 +526,14 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
                 if has_indices {
                     if subject.is_none() && object.is_some() {
                         let obj = object.unwrap();
-                        if let Some(o_id) = self.dictionary.get_id(&obj.to_string()) {
-                            let mut ctx = LEGACY_SESSION.create_execution_ctx();
+                        let dict_start = Instant::now();
+                        let dict_id_opt = self.dictionary.get_id(&obj.to_string());
+                        log::debug!("[match_pattern] Object Dict get_id took {:?}", dict_start.elapsed());
+                        if let Some(o_id) = dict_id_opt {
+                            let mut ctx = VORTEX_SESSION.create_execution_ctx();
                             
                             // 1. Scan sorted _idx_o_val to get matching _idx_o_rid
+                            let scan_start = Instant::now();
                             let scan = file.scan()
                                 .map_err(VortexRdfError::Vortex)?
                                 .with_projection(select(["_idx_o_rid"], root()))
@@ -400,45 +547,23 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
                                 .map_err(|_| VortexRdfError::Deserialization("Missing _idx_o_rid column".into()))?;
                             let rid_prim = rid_col.clone().execute::<PrimitiveArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
                             let rids = rid_prim.as_slice::<u32>();
+                            log::debug!("[match_pattern] Object index scan took {:?} (got {} rids)", scan_start.elapsed(), rids.len());
 
                             if rids.is_empty() {
                                 return Ok(Self::empty());
                             }
 
                             // 2. Fetch matching quads
-                            let chunk_size = 500_000;
-                            let mut chunk_matches: std::collections::HashMap<usize, Vec<u32>> = std::collections::HashMap::new();
-                            for &rid in rids {
-                                let chunk_idx = (rid as usize) / chunk_size;
-                                let local_rid = rid % (chunk_size as u32);
-                                chunk_matches.entry(chunk_idx).or_default().push(local_rid);
-                            }
-
+                            let primary_start = Instant::now();
+                            let mut sorted_rids = rids.to_vec();
+                            sorted_rids.sort_unstable();
+                            let u64_rids: Vec<u64> = sorted_rids.iter().map(|&idx| idx as u64).collect();
                             let primary_scan = file.scan().map_err(VortexRdfError::Vortex)?
-                                .with_projection(select(["s", "p", "o", "g"], root()));
-                            let mut stream = primary_scan.into_array_stream().map_err(VortexRdfError::Vortex)?;
-
-                            let mut chunks = Vec::new();
-                            let mut chunk_idx = 0;
-                            while let Some(chunk_res) = stream.next().await {
-                                let chunk = chunk_res.map_err(VortexRdfError::Vortex)?;
-                                if let Some(local_rids) = chunk_matches.get(&chunk_idx) {
-                                    let struct_chunk = chunk.execute::<StructArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
-                                    let indices = PrimitiveArray::from_iter(local_rids.clone()).into_array();
-                                    let taken = struct_chunk.take(indices).map_err(VortexRdfError::Vortex)?;
-                                    chunks.push(taken);
-                                }
-                                chunk_idx += 1;
-                            }
-
-                            let quads_arr = if chunks.len() == 1 {
-                                chunks.remove(0)
-                            } else {
-                                let dtype = chunks[0].dtype().clone();
-                                ChunkedArray::try_new(chunks, dtype)
-                                    .map_err(VortexRdfError::Vortex)?
-                                    .into_array()
-                            };
+                                .with_projection(select(["s", "p", "o", "g"], root()))
+                                .with_row_indices(Buffer::from(u64_rids));
+                            let quads_arr = primary_scan.into_array_stream().map_err(VortexRdfError::Vortex)?
+                                .read_all().await.map_err(VortexRdfError::Vortex)?;
+                            log::debug!("[match_pattern] Object primary scan took {:?}", primary_start.elapsed());
 
                             let taken_store = Self {
                                 dictionary: self.dictionary.clone(),
@@ -446,16 +571,23 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
                             };
 
                             log::debug!("[match_pattern] Object index routing completed in {:?}", start.elapsed());
-                            return Box::pin(taken_store.match_pattern(subject, predicate, None, graph)).await;
+                            let recurse_start = Instant::now();
+                            let res = Box::pin(taken_store.match_pattern(subject, predicate, None, graph)).await;
+                            log::debug!("[match_pattern] Object recursion took {:?}", recurse_start.elapsed());
+                            return res;
                         } else {
                             return Ok(Self::empty());
                         }
                     } else if subject.is_none() && object.is_none() && predicate.is_some() {
                         let pred = predicate.unwrap();
-                        if let Some(p_id) = self.dictionary.get_id(&pred.to_string()) {
-                            let mut ctx = LEGACY_SESSION.create_execution_ctx();
+                        let dict_start = Instant::now();
+                        let dict_id_opt = self.dictionary.get_id(&pred.to_string());
+                        log::debug!("[match_pattern] Predicate Dict get_id took {:?}", dict_start.elapsed());
+                        if let Some(p_id) = dict_id_opt {
+                            let mut ctx = VORTEX_SESSION.create_execution_ctx();
                             
                             // 1. Scan sorted _idx_p_val to get matching _idx_p_rid
+                            let scan_start = Instant::now();
                             let scan = file.scan()
                                 .map_err(VortexRdfError::Vortex)?
                                 .with_projection(select(["_idx_p_rid"], root()))
@@ -469,45 +601,23 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
                                 .map_err(|_| VortexRdfError::Deserialization("Missing _idx_p_rid column".into()))?;
                             let rid_prim = rid_col.clone().execute::<PrimitiveArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
                             let rids = rid_prim.as_slice::<u32>();
+                            log::debug!("[match_pattern] Predicate index scan took {:?} (got {} rids)", scan_start.elapsed(), rids.len());
 
                             if rids.is_empty() {
-                                return Ok(Self::empty());
+                                  return Ok(Self::empty());
                             }
 
                             // 2. Fetch matching quads
-                            let chunk_size = 500_000;
-                            let mut chunk_matches: std::collections::HashMap<usize, Vec<u32>> = std::collections::HashMap::new();
-                            for &rid in rids {
-                                let chunk_idx = (rid as usize) / chunk_size;
-                                let local_rid = rid % (chunk_size as u32);
-                                chunk_matches.entry(chunk_idx).or_default().push(local_rid);
-                            }
-
+                            let primary_start = Instant::now();
+                            let mut sorted_rids = rids.to_vec();
+                            sorted_rids.sort_unstable();
+                            let u64_rids: Vec<u64> = sorted_rids.iter().map(|&idx| idx as u64).collect();
                             let primary_scan = file.scan().map_err(VortexRdfError::Vortex)?
-                                .with_projection(select(["s", "p", "o", "g"], root()));
-                            let mut stream = primary_scan.into_array_stream().map_err(VortexRdfError::Vortex)?;
-
-                            let mut chunks = Vec::new();
-                            let mut chunk_idx = 0;
-                            while let Some(chunk_res) = stream.next().await {
-                                let chunk = chunk_res.map_err(VortexRdfError::Vortex)?;
-                                if let Some(local_rids) = chunk_matches.get(&chunk_idx) {
-                                    let struct_chunk = chunk.execute::<StructArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
-                                    let indices = PrimitiveArray::from_iter(local_rids.clone()).into_array();
-                                    let taken = struct_chunk.take(indices).map_err(VortexRdfError::Vortex)?;
-                                    chunks.push(taken);
-                                }
-                                chunk_idx += 1;
-                            }
-
-                            let quads_arr = if chunks.len() == 1 {
-                                chunks.remove(0)
-                            } else {
-                                let dtype = chunks[0].dtype().clone();
-                                ChunkedArray::try_new(chunks, dtype)
-                                    .map_err(VortexRdfError::Vortex)?
-                                    .into_array()
-                            };
+                                .with_projection(select(["s", "p", "o", "g"], root()))
+                                .with_row_indices(Buffer::from(u64_rids));
+                            let quads_arr = primary_scan.into_array_stream().map_err(VortexRdfError::Vortex)?
+                                .read_all().await.map_err(VortexRdfError::Vortex)?;
+                            log::debug!("[match_pattern] Predicate primary scan took {:?}", primary_start.elapsed());
 
                             let taken_store = Self {
                                 dictionary: self.dictionary.clone(),
@@ -515,7 +625,10 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
                             };
 
                             log::debug!("[match_pattern] Predicate index routing completed in {:?}", start.elapsed());
-                            return Box::pin(taken_store.match_pattern(subject, None, object, graph)).await;
+                            let recurse_start = Instant::now();
+                            let res = Box::pin(taken_store.match_pattern(subject, None, object, graph)).await;
+                            log::debug!("[match_pattern] Predicate recursion took {:?}", recurse_start.elapsed());
+                            return res;
                         } else {
                             return Ok(Self::empty());
                         }
@@ -572,7 +685,7 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
 
         if let Some(m) = mask {
             let inverse = m.not().map_err(VortexRdfError::Vortex)?;
-            let mut ctx = LEGACY_SESSION.create_execution_ctx();
+            let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
             let bool_arr = inverse.execute::<BoolArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
             let canonical = bool_arr.to_mask_fill_null_false(&mut ctx);
             let quads_arr = self.get_quads_array()?;

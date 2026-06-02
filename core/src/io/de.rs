@@ -3,13 +3,12 @@ use crate::store::QuadStore;
 use crate::error;
 
 use oxrdfio::{RdfFormat, RdfSerializer};
-use std::time::Instant;
+use web_time::Instant;
 use std::io::Write;
 use futures::StreamExt;
 
 use vortex_array::ArrayRef;
 use vortex_ipc::iterator::SyncIPCReader;
-use vortex_array::LEGACY_SESSION;
 
 #[cfg(feature = "file-io")]
 use std::sync::Arc;
@@ -62,7 +61,7 @@ where
 /// Used for decoding in-memory IPC message payloads.
 pub fn array_from_ipc_reader<R: std::io::Read>(reader: R) -> Result<ArrayRef> {
     let mut ipc_reader =
-        SyncIPCReader::try_new(reader, &LEGACY_SESSION).map_err(VortexRdfError::Vortex)?;
+        SyncIPCReader::try_new(reader, &super::VORTEX_SESSION).map_err(VortexRdfError::Vortex)?;
 
     let array = ipc_reader
         .next()
@@ -73,27 +72,7 @@ pub fn array_from_ipc_reader<R: std::io::Read>(reader: R) -> Result<ArrayRef> {
     Ok(array)
 }
 
-/// Construct a lazily-initialized static VortexSession for file reading/scanning.
-#[cfg(feature = "file-io")]
-fn file_session() -> &'static vortex_session::VortexSession {
-    use std::sync::LazyLock;
-    use vortex_session::VortexSession;
-    use vortex_array::session::ArraySession;
-    use vortex_array::scalar_fn::session::ScalarFnSession;
-    use vortex_io::session::RuntimeSession;
-    use vortex_layout::session::LayoutSession;
 
-    static FILE_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-        let session = VortexSession::empty()
-            .with::<ArraySession>()
-            .with::<LayoutSession>()
-            .with::<ScalarFnSession>()
-            .with::<RuntimeSession>();
-        vortex_file::register_default_encodings(&session);
-        session
-    });
-    &FILE_SESSION
-}
 
 /// Loads a fully in-memory Vortex array from a generic read-at source (e.g. a byte buffer in memory).
 #[cfg(feature = "file-io")]
@@ -103,7 +82,7 @@ pub async fn load_vortex_file_ref<S: VortexReadAt + 'static>(
     let start = Instant::now();
 
     // 1. Open the source under our file read session context.
-    let file = file_session()
+    let file = super::VORTEX_SESSION
         .open_options()
         .open(Arc::new(source))
         .await
@@ -133,7 +112,7 @@ pub async fn load_vortex_file_ref<S: VortexReadAt + 'static>(
 pub async fn open_vortex_file<P: AsRef<std::path::Path>>(
     path: P,
 ) -> Result<vortex_file::VortexFile> {
-    file_session()
+    super::VORTEX_SESSION
         .open_options()
         .open_path(path)
         .await

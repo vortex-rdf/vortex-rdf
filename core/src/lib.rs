@@ -31,11 +31,13 @@ pub use index::{
     ChainedHash,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
 use mimalloc::MiMalloc;
 /*
  As indicated by vortex docs:
  https://docs.rs/vortex/latest/vortex/index.html#performance-optimization
 */
+#[cfg(not(target_arch = "wasm32"))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 

@@ -20,9 +20,10 @@ vortex-io = "0.71.0"
 vortex-session = "0.71.0"
 vortex-fsst = "0.71.0"
 vortex-mask = "0.71.0"
-vortex-file = { version = "0.71.0", features = ["tokio"] }
+vortex-file = { version = "0.71.0" }
 vortex-scan = "0.71.0"
 vortex-layout = "0.71.0"
+vortex-buffer = "0.71.0"
 vortex-btrblocks = "0.71.0"
 
 tokio = { version = "1.52", features = ["sync", "macros", "rt"] }
@@ -40,3 +41,4 @@ js-sys = "0.3.98"
 console_error_panic_hook = "0.1.7"
 getrandom = "0.4.2"
 mimalloc = "0.1.51"
+web-time = "1.1"

@@ -4,7 +4,7 @@ use crate::index::RdfDictionary;
 use super::{VortexArrayBuilder, EncodedQuad};
 
 use std::sync::Arc;
-use std::time::Instant;
+use web_time::Instant;
 use futures::{Stream, StreamExt};
 use oxrdf::Quad;
 
@@ -12,6 +12,12 @@ use vortex_array::{ArrayRef, IntoArray};
 use vortex_array::arrays::{PrimitiveArray, StructArray, ConstantArray};
 use vortex_array::validity::Validity;
 
+/// A fully in-memory, unsorted Vortex RDF Array Builder.
+///
+/// This is the simplest and fastest builder strategy:
+/// * Eagerly reads all quads from the stream directly into a flat in-memory vector.
+/// * Performs exactly one single highly optimized bulk insertion call to `get_or_insert_bulk` for RDF terms.
+/// * Assembles a single flat, unified `StructArray` directly from the encoded quads without any sorting or indexing.
 pub struct UnsortedInMemoryBuilder;
 
 impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for UnsortedInMemoryBuilder {
@@ -21,13 +27,15 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for UnsortedInMemoryBuilder {
         let mut dictionary = Dict::new();
         let start = Instant::now();
         
+        // ── Phase 1: Ingest all quads into memory ──
         let mut quads = Vec::new();
         let mut pinned_stream = Box::pin(quad_stream);
         while let Some(res) = pinned_stream.next().await {
             quads.push(res?);
         }
-        log::debug!("[UnsortedInMemoryBuilder] Read {} quads in {:?}", quads.len(), start.elapsed());
+        log::debug!("[UnsortedInMemoryBuilder] Read {} quads", quads.len());
 
+        // ── Phase 2: Single bulk dictionary insertion ──
         let dict_start = Instant::now();
         let mut terms = Vec::with_capacity(quads.len() * 4);
         for quad in &quads {
@@ -50,10 +58,12 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for UnsortedInMemoryBuilder {
         }
         log::debug!("[UnsortedInMemoryBuilder] Built dictionary in {:?}", dict_start.elapsed());
 
+        // Serialize the completed RdfDictionary to Vortex.
         let dict_vortex_start = Instant::now();
         let dict_fields = dictionary.to_vortex_array()?;
         log::debug!("[UnsortedInMemoryBuilder] Serialized dictionary to Vortex in {:?}", dict_vortex_start.elapsed());
 
+        // ── Phase 3: Construct flat arrays and assemble StructArray ──
         let build_array_start = Instant::now();
         let n = encoded.len();
         let mut s_ids = Vec::with_capacity(n);
@@ -79,6 +89,7 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for UnsortedInMemoryBuilder {
             PrimitiveArray::from_iter(g_ids).into_array(),
         ];
 
+        // Attach store type identifier and dictionary arrays exactly once at the root level.
         field_names.push("store_type".into());
         field_arrays.push(ConstantArray::new(Dict::store_type(), n).into_array());
 

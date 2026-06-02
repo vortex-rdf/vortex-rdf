@@ -4,37 +4,19 @@ use crate::index::SimpleDictionary;
 use crate::error;
 
 use std::sync::Arc;
-use std::sync::LazyLock;
-use std::time::Instant;
+use web_time::Instant;
 use oxrdf::Quad;
 
 use vortex_array::ArrayRef;
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::dtype::FieldPath;
-use vortex_array::LEGACY_SESSION;
-use vortex_array::session::ArraySession;
-use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_io::VortexWrite;
-use vortex_io::session::RuntimeSession;
 use vortex_layout::LayoutStrategy;
-use vortex_layout::session::LayoutSession;
 use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
 use vortex_ipc::iterator::ArrayIteratorIPC;
 use futures::{stream, Stream};
 use vortex_file::{WriteStrategyBuilder, WriteOptionsSessionExt};
-use vortex_session::VortexSession;
-
-/// A lazily-initialized session configured for Vortex file I/O.
-static WRITE_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-    let session = VortexSession::empty()
-        .with::<ArraySession>()
-        .with::<LayoutSession>()
-        .with::<ScalarFnSession>()
-        .with::<RuntimeSession>();
-    vortex_file::register_default_encodings(&session);
-    session
-});
 
 /// High-level function to serialize RDF from a reader directly to a Vortex-RDF writer.
 pub async fn serialize<W: VortexWrite + Unpin + Send>(
@@ -66,7 +48,7 @@ pub async fn serialize<W: VortexWrite + Unpin + Send>(
     }
 
     // Initialize the file write options with our layout bypass strategy.
-    let write_opts = WRITE_SESSION
+    let write_opts = super::VORTEX_SESSION
         .write_options()
         .with_strategy(builder.build());
         
@@ -98,7 +80,7 @@ pub fn write_array_to_ipc<W: std::io::Write>(vortex_array: ArrayRef, mut writer:
     // Convert the array into an IPC-compatible iterator.
     let ipc_iter = vortex_array
         .to_array_iterator()
-        .into_ipc(&LEGACY_SESSION)
+        .into_ipc(&super::VORTEX_SESSION)
         .map_err(VortexRdfError::Vortex)?;
 
     // Stream IPC messages sequentially to the output writer.

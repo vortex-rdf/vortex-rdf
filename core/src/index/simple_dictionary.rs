@@ -1,24 +1,31 @@
+use crate::io::VORTEX_LIGHT_SESSION;
 use crate::error::{Result, VortexRdfError};
 use crate::index::RdfDictionary;
 use crate::common::{utils, indexes::IndexType};
 
-
 use std::collections::HashMap;
-use std::time::Instant;
+use std::sync::Arc;
+use web_time::Instant;
 use oxrdf::{GraphName, Term};
 
 use vortex_array::ArrayRef;
 use vortex_array::arrays::{StructArray, VarBinViewArray};
-use vortex_array::{IntoArray, LEGACY_SESSION, VortexSessionExecute};
+use vortex_array::{IntoArray, VortexSessionExecute};
 use vortex_array::dtype::{DType, Nullability};
 use vortex_fsst::{fsst_compress, fsst_train_compressor};
 
+/// Internal shared structures of the simple dictionary
+#[derive(Debug, Clone, Default)]
+struct SimpleDictionaryInner {
+    terms: Vec<String>,
+    term_to_id: HashMap<String, u32>,
+}
 
 /// Simple dictionary implementation using a flat Vec and HashMap for fast bi-directional lookups.
+/// Uses an Arc-wrapped inner struct to make clones O(1) during query pattern matching.
 #[derive(Debug, Clone, Default)]
 pub struct SimpleDictionary {
-    pub terms: Vec<String>,
-    pub term_to_id: HashMap<String, u32>,
+    inner: Arc<SimpleDictionaryInner>,
 }
 
 impl RdfDictionary for SimpleDictionary {
@@ -29,7 +36,7 @@ impl RdfDictionary for SimpleDictionary {
     /// Deserializes the dictionary mappings directly from a Vortex StructArray.
     fn from_vortex_array(array_ref: &ArrayRef) -> Result<Self> {
         let start = Instant::now();
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
         let struct_array = array_ref.clone()
             .execute::<StructArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
@@ -55,28 +62,30 @@ impl RdfDictionary for SimpleDictionary {
     }
 
     fn get_or_insert(&mut self, term_str: &str) -> u32 {
-        if let Some(&id) = self.term_to_id.get(term_str) {
+        let inner = Arc::make_mut(&mut self.inner);
+        if let Some(&id) = inner.term_to_id.get(term_str) {
             id
         } else {
-            let id = self.terms.len() as u32;
+            let id = inner.terms.len() as u32;
             let term_string = term_str.to_string();
-            self.terms.push(term_string.clone());
-            self.term_to_id.insert(term_string, id);
+            inner.terms.push(term_string.clone());
+            inner.term_to_id.insert(term_string, id);
             id
         }
     }
 
     fn get_or_insert_bulk(&mut self, terms: &[&str]) -> Vec<u32> {
+        let inner = Arc::make_mut(&mut self.inner);
         let mut ids = Vec::with_capacity(terms.len());
         
         for &term_str in terms {
-            if let Some(&id) = self.term_to_id.get(term_str) {
+            if let Some(&id) = inner.term_to_id.get(term_str) {
                 ids.push(id);
             } else {
-                let id = self.terms.len() as u32;
+                let id = inner.terms.len() as u32;
                 let term_string = term_str.to_string();
-                self.terms.push(term_string.clone());
-                self.term_to_id.insert(term_string, id);
+                inner.terms.push(term_string.clone());
+                inner.term_to_id.insert(term_string, id);
                 ids.push(id);
             }
         }
@@ -85,16 +94,16 @@ impl RdfDictionary for SimpleDictionary {
     }
 
     fn get_id(&self, term_str: &str) -> Option<u32> {
-        self.term_to_id.get(term_str).copied()
+        self.inner.term_to_id.get(term_str).copied()
     }
 
     fn get_term(&self, id: u32) -> Option<Term> {
-        let s = self.terms.get(id as usize)?;
+        let s = self.inner.terms.get(id as usize)?;
         utils::get_as_term(s)
     }
 
     fn get_graph_name(&self, id: u32) -> Option<GraphName> {
-        let s = self.terms.get(id as usize)?;
+        let s = self.inner.terms.get(id as usize)?;
         if s.is_empty() || s == "[]" {
             Some(GraphName::DefaultGraph)
         } else {
@@ -108,7 +117,7 @@ impl RdfDictionary for SimpleDictionary {
 
     fn values_view(&self) -> crate::error::Result<VarBinViewArray> {
         Ok(VarBinViewArray::from_iter(
-            self.terms.iter().map(|s: &String| Some(s.as_str())),
+            self.inner.terms.iter().map(|s: &String| Some(s.as_str())),
             DType::Utf8(Nullability::NonNullable),
         ))
     }
@@ -117,7 +126,7 @@ impl RdfDictionary for SimpleDictionary {
     /// Employs standard FSST (Fast Static String Table) compression for optimal storage.
     fn to_vortex_array(&self) -> Result<Vec<(String, ArrayRef)>> {
         let dict_raw = VarBinViewArray::from_iter(
-            self.terms.iter().map(|s: &String| Some(s.as_str())),
+            self.inner.terms.iter().map(|s: &String| Some(s.as_str())),
             DType::Utf8(Nullability::NonNullable),
         );
 
@@ -131,7 +140,7 @@ impl RdfDictionary for SimpleDictionary {
                 len,
                 &dtype,
                 &compressor,
-                &mut vortex_array::LEGACY_SESSION.create_execution_ctx(),
+                &mut VORTEX_LIGHT_SESSION.create_execution_ctx(),
             ).into_array()
         } else {
             dict_raw.into_array()

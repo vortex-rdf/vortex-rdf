@@ -3,12 +3,19 @@ use oxrdfio::RdfFormat;
 use std::io::Cursor;
 use vortex_rdf_core::io::{
     deserialize,
-    quads_stream_to_vortex,
+    write_array_to_ipc,
     array_from_ipc_reader,
 };
 use vortex_rdf_core::VortexRdfStore;
 use vortex_rdf_core::index::{SimpleDictionary, ChainedHash};
 use vortex_rdf_core::common::indexes::{IndexType, detect_index_type};
+use vortex_rdf_core::store::builders::{
+    BuilderStrategy,
+    UnsortedInMemoryBuilder,
+    SortedInMemoryBuilder,
+    ChunkSortBuilder,
+    GlobalSortBuilder,
+};
 use vortex_rdf_core::common::utils::parse_quads_from_reader;
 use wasm_bindgen::prelude::*;
 use js_sys::{Object, Reflect};
@@ -20,36 +27,43 @@ use futures::StreamExt;
 const TS_APPEND_CONTENT: &'static str = r#"
 import { Quad, Term, NamedNode, BlankNode, Literal, Quad_Subject, Quad_Predicate, Quad_Object, Quad_Graph } from '@rdfjs/types';
 
+export type BuilderStrategy = 'UnsortedInMemory' | 'SortedInMemory' | 'ChunkSort' | 'GlobalSort';
+
 export interface VortexStore {
     addQuad(quad: Quad): Promise<void>;
     deleteQuad(quad: Quad): Promise<void>;
     has(quad: Quad): Promise<boolean>;
+    size(): number;
     values(): Promise<IterableIterator<Quad>>;
 }
 
 export class SimpleDictionaryStore implements VortexStore {
     static empty(): SimpleDictionaryStore;
     static fromBytes(bytes: Uint8Array): Promise<SimpleDictionaryStore>;
-    static fromString(input: string, format: string): Promise<SimpleDictionaryStore>;
+    static fromString(input: string, format: string, builderStrategy?: BuilderStrategy): Promise<SimpleDictionaryStore>;
     
     addQuad(quad: Quad): Promise<void>;
     deleteQuad(quad: Quad): Promise<void>;
     has(quad: Quad): Promise<boolean>;
     match(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): Promise<SimpleDictionaryStore>;
+    size(): number;
     values(): Promise<IterableIterator<Quad>>;
 }
 
 export class ChainedHashStore implements VortexStore {
     static empty(): ChainedHashStore;
     static fromBytes(bytes: Uint8Array): Promise<ChainedHashStore>;
-    static fromString(input: string, format: string): Promise<ChainedHashStore>;
+    static fromString(input: string, format: string, builderStrategy?: BuilderStrategy): Promise<ChainedHashStore>;
 
     addQuad(quad: Quad): Promise<void>;
     deleteQuad(quad: Quad): Promise<void>;
     has(quad: Quad): Promise<boolean>;
     match(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): Promise<ChainedHashStore>;
+    size(): number;
     values(): Promise<IterableIterator<Quad>>;
 }
+
+export function nquads_to_vortex(nquads: string, builderStrategy?: BuilderStrategy): Promise<Uint8Array>;
 "#;
 
 #[wasm_bindgen]
@@ -71,40 +85,21 @@ pub struct SimpleDictionaryStore {
 impl SimpleDictionaryStore {
     #[wasm_bindgen(js_name = fromBytes)]
     pub async fn from_bytes(bytes: &[u8]) -> Result<SimpleDictionaryStore, JsValue> {
-        let cursor = Cursor::new(bytes);
-        let array = array_from_ipc_reader(cursor)
-            .map_err(|e: vortex_rdf_core::error::VortexRdfError| JsValue::from_str(&e.to_string()))?;
-
-        // Verify index type
-        match detect_index_type(&array) {
-            IndexType::SimpleDictionary => {},
-            _ => return Err(JsValue::from_str("Provided bytes are not a SimpleDictionaryStore")),
-        }
-
-        let inner = VortexRdfStore::<SimpleDictionary>::new(array)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let inner = store_from_bytes(bytes, IndexType::SimpleDictionary, "Provided bytes are not a SimpleDictionaryStore").await?;
         Ok(SimpleDictionaryStore { inner })
     }
 
     pub fn empty() -> SimpleDictionaryStore {
-        let inner = VortexRdfStore::<SimpleDictionary>::empty();
-        SimpleDictionaryStore { inner }
+        SimpleDictionaryStore { inner: store_empty() }
     }
 
     #[wasm_bindgen(js_name = fromString)]
-    pub async fn from_string(input: String, format_name: &str) -> Result<SimpleDictionaryStore, JsValue> {
-        let format = parse_format(format_name)?;
-        let cursor = Cursor::new(input);
-        let quads_stream = parse_quads_from_reader(cursor, format);
-        
-        // Build SimpleDictionaryStore
-        let vortex_array = VortexRdfStore::<SimpleDictionary>::build_vortex_array(quads_stream)
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        
-        let inner = VortexRdfStore::<SimpleDictionary>::new(vortex_array)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
+    pub async fn from_string(
+        input: String,
+        format_name: &str,
+        builder_strategy: Option<String>,
+    ) -> Result<SimpleDictionaryStore, JsValue> {
+        let inner = store_from_string(input, format_name, builder_strategy).await?;
         Ok(SimpleDictionaryStore { inner })
     }
 
@@ -113,39 +108,17 @@ impl SimpleDictionaryStore {
     }
 
     pub async fn has(&self, quad_js: JsValue) -> bool {
-        if let Some(quad) = js_to_quad(quad_js) {
-            self.inner.match_pattern(
-                Some(&quad.subject),
-                Some(&quad.predicate),
-                Some(&quad.object),
-                Some(&quad.graph_name),
-            )
-            .await
-            .map(|ds| ds.size() > 0)
-            .unwrap_or(false)
-        } else {
-            false
-        }
+        store_has(&self.inner, quad_js).await
     }
 
     #[wasm_bindgen(js_name = addQuad)]
     pub async fn add_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
-        if let Some(quad) = js_to_quad(quad_js) {
-            self.inner = self.inner.add_quad(quad).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
-            Ok(())
-        } else {
-            Err(JsValue::from_str("Invalid quad object"))
-        }
+        store_add_quad(&mut self.inner, quad_js).await
     }
 
     #[wasm_bindgen(js_name = deleteQuad)]
     pub async fn delete_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
-        if let Some(quad) = js_to_quad(quad_js) {
-            self.inner = self.inner.delete_quad(&quad).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
-            Ok(())
-        } else {
-            Err(JsValue::from_str("Invalid quad object"))
-        }
+        store_delete_quad(&mut self.inner, quad_js).await
     }
 
     #[wasm_bindgen(js_name = match)]
@@ -169,15 +142,7 @@ impl SimpleDictionaryStore {
     }
 
     pub async fn values(&self) -> Result<js_sys::Iterator, JsValue> {
-        let mut quads_stream = self.inner.quads().map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let js_array = js_sys::Array::new();
-        while let Some(q_res) = quads_stream.next().await {
-            if let Ok(q) = q_res {
-                js_array.push(&quad_to_js(&q));
-            }
-        }
-        Ok(js_array.values())
+        store_values(&self.inner).await
     }
 }
 
@@ -195,40 +160,21 @@ pub struct ChainedHashStore {
 impl ChainedHashStore {
     #[wasm_bindgen(js_name = fromBytes)]
     pub async fn from_bytes(bytes: &[u8]) -> Result<ChainedHashStore, JsValue> {
-        let cursor = Cursor::new(bytes);
-        let array = array_from_ipc_reader(cursor)
-            .map_err(|e: vortex_rdf_core::error::VortexRdfError| JsValue::from_str(&e.to_string()))?;
-
-        // Verify index type
-        match detect_index_type(&array) {
-            IndexType::ChainedHash => {},
-            _ => return Err(JsValue::from_str("Provided bytes are not a ChainedHashStore")),
-        }
-
-        let inner = VortexRdfStore::<ChainedHash>::new(array)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let inner = store_from_bytes(bytes, IndexType::ChainedHash, "Provided bytes are not a ChainedHashStore").await?;
         Ok(ChainedHashStore { inner })
     }
 
     pub fn empty() -> ChainedHashStore {
-        let inner = VortexRdfStore::<ChainedHash>::empty();
-        ChainedHashStore { inner }
+        ChainedHashStore { inner: store_empty() }
     }
 
     #[wasm_bindgen(js_name = fromString)]
-    pub async fn from_string(input: String, format_name: &str) -> Result<ChainedHashStore, JsValue> {
-        let format = parse_format(format_name)?;
-        let cursor = Cursor::new(input);
-        let quads_stream = parse_quads_from_reader(cursor, format);
-        
-        // Build ChainedHashStore
-        let vortex_array = VortexRdfStore::<ChainedHash>::build_vortex_array(quads_stream)
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        
-        let inner = VortexRdfStore::<ChainedHash>::new(vortex_array)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
+    pub async fn from_string(
+        input: String,
+        format_name: &str,
+        builder_strategy: Option<String>,
+    ) -> Result<ChainedHashStore, JsValue> {
+        let inner = store_from_string(input, format_name, builder_strategy).await?;
         Ok(ChainedHashStore { inner })
     }
 
@@ -237,39 +183,17 @@ impl ChainedHashStore {
     }
 
     pub async fn has(&self, quad_js: JsValue) -> bool {
-        if let Some(quad) = js_to_quad(quad_js) {
-            self.inner.match_pattern(
-                Some(&quad.subject),
-                Some(&quad.predicate),
-                Some(&quad.object),
-                Some(&quad.graph_name),
-            )
-            .await
-            .map(|ds| ds.size() > 0)
-            .unwrap_or(false)
-        } else {
-            false
-        }
+        store_has(&self.inner, quad_js).await
     }
 
     #[wasm_bindgen(js_name = addQuad)]
     pub async fn add_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
-        if let Some(quad) = js_to_quad(quad_js) {
-            self.inner = self.inner.add_quad(quad).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
-            Ok(())
-        } else {
-            Err(JsValue::from_str("Invalid quad object"))
-        }
+        store_add_quad(&mut self.inner, quad_js).await
     }
 
     #[wasm_bindgen(js_name = deleteQuad)]
     pub async fn delete_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
-        if let Some(quad) = js_to_quad(quad_js) {
-            self.inner = self.inner.delete_quad(&quad).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
-            Ok(())
-        } else {
-            Err(JsValue::from_str("Invalid quad object"))
-        }
+        store_delete_quad(&mut self.inner, quad_js).await
     }
 
     #[wasm_bindgen(js_name = match)]
@@ -293,15 +217,7 @@ impl ChainedHashStore {
     }
 
     pub async fn values(&self) -> Result<js_sys::Iterator, JsValue> {
-        let mut quads_stream = self.inner.quads().map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let js_array = js_sys::Array::new();
-        while let Some(q_res) = quads_stream.next().await {
-            if let Ok(q) = q_res {
-                js_array.push(&quad_to_js(&q));
-            }
-        }
-        Ok(js_array.values())
+        store_values(&self.inner).await
     }
 }
 
@@ -481,11 +397,15 @@ fn js_to_quad(val: JsValue) -> Option<Quad> {
 }
 
 #[wasm_bindgen]
-pub async fn nquads_to_vortex(nquads: String) -> Result<Vec<u8>, JsValue> {
+pub async fn nquads_to_vortex(nquads: String, builder_strategy: Option<String>) -> Result<Vec<u8>, JsValue> {
+    let strategy = parse_builder_strategy(builder_strategy)?;
     let quads_stream = parse_quads_from_reader(Cursor::new(nquads), RdfFormat::NQuads);
-    let buffer = quads_stream_to_vortex(quads_stream)
+    let vortex_array = build_vortex_array_with_strategy::<SimpleDictionary>(quads_stream, strategy)
         .await
-        .map_err(|e| JsValue::from_str(&format!("Vortex error: {}", e)))?;
+        .map_err(|e| JsValue::from_str(&format!("Vortex build error: {}", e)))?;
+    let mut buffer = Vec::new();
+    write_array_to_ipc(vortex_array, &mut buffer)
+        .map_err(|e| JsValue::from_str(&format!("Vortex serialization error: {}", e)))?;
     Ok(buffer)
 }
 
@@ -516,4 +436,134 @@ pub async fn vortex_to_nquads(vortex_bytes: &[u8]) -> Result<String, JsValue> {
     }
 
     String::from_utf8(output_buffer).map_err(|e| JsValue::from_str(&format!("UTF-8 error: {}", e)))
+}
+
+fn parse_builder_strategy(strategy_name: Option<String>) -> Result<BuilderStrategy, JsValue> {
+    match strategy_name.as_deref() {
+        Some("UnsortedInMemory") | None => Ok(BuilderStrategy::UnsortedInMemory),
+        Some("SortedInMemory") => Ok(BuilderStrategy::SortedInMemory),
+        Some("ChunkSort") => Ok(BuilderStrategy::ChunkSort),
+        Some("GlobalSort") => Err(JsValue::from_str(
+            "Global-sort strategy is not supported in WebAssembly environments due to lack of filesystem access."
+        )),
+        Some(other) => Err(JsValue::from_str(&format!("Unknown builder strategy: {}", other))),
+    }
+}
+
+async fn build_vortex_array_with_strategy<Dict: vortex_rdf_core::index::RdfDictionary>(
+    quads_stream: impl futures::Stream<Item = vortex_rdf_core::error::Result<oxrdf::Quad>> + Unpin + Send + 'static,
+    strategy: BuilderStrategy,
+) -> vortex_rdf_core::error::Result<vortex_array::ArrayRef> {
+    match strategy {
+        BuilderStrategy::UnsortedInMemory => {
+            VortexRdfStore::<Dict>::build_vortex_array_with_builder::<UnsortedInMemoryBuilder>(quads_stream).await
+        }
+        BuilderStrategy::SortedInMemory => {
+            VortexRdfStore::<Dict>::build_vortex_array_with_builder::<SortedInMemoryBuilder>(quads_stream).await
+        }
+        BuilderStrategy::ChunkSort => {
+            VortexRdfStore::<Dict>::build_vortex_array_with_builder::<ChunkSortBuilder>(quads_stream).await
+        }
+        BuilderStrategy::GlobalSort => {
+            VortexRdfStore::<Dict>::build_vortex_array_with_builder::<GlobalSortBuilder>(quads_stream).await
+        }
+    }
+}
+
+// -------------------------
+// Generic Binding Helpers
+// -------------------------
+
+fn store_empty<Dict: vortex_rdf_core::index::RdfDictionary>() -> VortexRdfStore<Dict> {
+    VortexRdfStore::<Dict>::empty()
+}
+
+async fn store_from_bytes<Dict: vortex_rdf_core::index::RdfDictionary>(
+    bytes: &[u8],
+    expected_index: IndexType,
+    err_msg: &str,
+) -> Result<VortexRdfStore<Dict>, JsValue> {
+    let cursor = Cursor::new(bytes);
+    let array = array_from_ipc_reader(cursor)
+        .map_err(|e: vortex_rdf_core::error::VortexRdfError| JsValue::from_str(&e.to_string()))?;
+
+    if detect_index_type(&array) != expected_index {
+        return Err(JsValue::from_str(err_msg));
+    }
+
+    VortexRdfStore::<Dict>::new(array).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+async fn store_from_string<Dict: vortex_rdf_core::index::RdfDictionary>(
+    input: String,
+    format_name: &str,
+    builder_strategy: Option<String>,
+) -> Result<VortexRdfStore<Dict>, JsValue> {
+    let strategy = parse_builder_strategy(builder_strategy)?;
+    let format = parse_format(format_name)?;
+    let cursor = Cursor::new(input);
+    let quads_stream = parse_quads_from_reader(cursor, format);
+
+    let vortex_array = build_vortex_array_with_strategy::<Dict>(quads_stream, strategy)
+        .await
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    VortexRdfStore::<Dict>::new(vortex_array).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+async fn store_has<Dict: vortex_rdf_core::index::RdfDictionary>(
+    store: &VortexRdfStore<Dict>,
+    quad_js: JsValue,
+) -> bool {
+    if let Some(quad) = js_to_quad(quad_js) {
+        store.match_pattern(
+            Some(&quad.subject),
+            Some(&quad.predicate),
+            Some(&quad.object),
+            Some(&quad.graph_name),
+        )
+        .await
+        .map(|ds| ds.size() > 0)
+        .unwrap_or(false)
+    } else {
+        false
+    }
+}
+
+async fn store_add_quad<Dict: vortex_rdf_core::index::RdfDictionary>(
+    store: &mut VortexRdfStore<Dict>,
+    quad_js: JsValue,
+) -> Result<(), JsValue> {
+    if let Some(quad) = js_to_quad(quad_js) {
+        *store = store.add_quad(quad).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(())
+    } else {
+        Err(JsValue::from_str("Invalid quad object"))
+    }
+}
+
+async fn store_delete_quad<Dict: vortex_rdf_core::index::RdfDictionary>(
+    store: &mut VortexRdfStore<Dict>,
+    quad_js: JsValue,
+) -> Result<(), JsValue> {
+    if let Some(quad) = js_to_quad(quad_js) {
+        *store = store.delete_quad(&quad).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(())
+    } else {
+        Err(JsValue::from_str("Invalid quad object"))
+    }
+}
+
+async fn store_values<Dict: vortex_rdf_core::index::RdfDictionary>(
+    store: &VortexRdfStore<Dict>,
+) -> Result<js_sys::Iterator, JsValue> {
+    let mut quads_stream = store.quads().map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let js_array = js_sys::Array::new();
+    while let Some(q_res) = quads_stream.next().await {
+        if let Ok(q) = q_res {
+            js_array.push(&quad_to_js(&q));
+        }
+    }
+    Ok(js_array.values())
 }

@@ -1,14 +1,16 @@
+use crate::io::VORTEX_LIGHT_SESSION;
 use crate::error::{Result, VortexRdfError};
 use crate::index::RdfDictionary;
 use crate::common::{utils, indexes::IndexType};
-use std::time::Instant;
+
+use web_time::Instant;
 use std::collections::HashMap;
 use oxrdf::{GraphName, Term};
 
 use vortex_array::builders::{ArrayBuilder, VarBinViewBuilder, PrimitiveBuilder};
 use vortex_array::ArrayRef;
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray, StructArray};
-use vortex_array::{IntoArray, LEGACY_SESSION, VortexSessionExecute};
+use vortex_array::{IntoArray, VortexSessionExecute};
 use vortex_array::dtype::Nullability;
 use vortex_fsst::{fsst_compress, fsst_train_compressor};
 use vortex_btrblocks::BtrBlocksCompressor;
@@ -64,16 +66,19 @@ impl RdfDictionary for ChainedHash {
     /// Deserializes the ChainedHash tables from a Vortex StructArray.
     fn from_vortex_array(dict_array_ref: &ArrayRef) -> Result<Self> {
         let start = Instant::now();
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
 
         let dict_struct = dict_array_ref.clone().execute::<StructArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
 
-        let values  = utils::extract_dictionary_column(&dict_struct, "_dict_values")?;
+        let values_raw  = utils::extract_dictionary_column(&dict_struct, "_dict_values")?;
         let buckets_raw = utils::extract_dictionary_column(&dict_struct, "_dict_buckets")?;
         let next_raw    = utils::extract_dictionary_column(&dict_struct, "_dict_next")?;
 
-        // Eagerly decompress/evaluate buckets and next to flat PrimitiveArrays
+        // Eagerly decompress/evaluate values, buckets, and next to flat arrays
+        let values = values_raw.execute::<VarBinViewArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?
+            .into_array();
         let buckets = buckets_raw.execute::<PrimitiveArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?
             .into_array();
@@ -91,7 +96,7 @@ impl RdfDictionary for ChainedHash {
 
     fn get_or_insert(&mut self, term_str: &str) -> u32 {
         let h = Self::hash(term_str);
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
 
         // Traverse chain to check if term exists
         let buckets_prim = self.buckets.clone()
@@ -149,7 +154,7 @@ impl RdfDictionary for ChainedHash {
 
     fn get_or_insert_bulk(&mut self, terms: &[&str]) -> Vec<u32> {
         let mut ids = Vec::with_capacity(terms.len());
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
 
         let buckets_prim = self.buckets.clone()
             .execute::<PrimitiveArray>(&mut ctx)
@@ -244,7 +249,7 @@ impl RdfDictionary for ChainedHash {
 
     fn get_id(&self, term_str: &str) -> Option<u32> {
         let h = Self::hash(term_str);
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
         let buckets_prim = self.buckets.clone()
             .execute::<PrimitiveArray>(&mut ctx)
             .ok()?;
@@ -270,7 +275,7 @@ impl RdfDictionary for ChainedHash {
     }
 
     fn get_term(&self, id: u32) -> Option<Term> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
         let values_varbin = self.values.clone()
             .execute::<VarBinViewArray>(&mut ctx)
             .ok()?;
@@ -283,7 +288,7 @@ impl RdfDictionary for ChainedHash {
     }
 
     fn get_graph_name(&self, id: u32) -> Option<GraphName> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
         let values_varbin = self.values.clone()
             .execute::<VarBinViewArray>(&mut ctx)
             .ok()?;
@@ -304,13 +309,13 @@ impl RdfDictionary for ChainedHash {
     }
 
     fn values_view(&self) -> Result<VarBinViewArray> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
         self.values.clone().execute::<VarBinViewArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)
     }
 
     fn to_vortex_array(&self) -> Result<Vec<(String, ArrayRef)>> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
         let dict_raw = self.values.clone().execute::<VarBinViewArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
 

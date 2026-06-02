@@ -18,6 +18,7 @@ js-sys.workspace = true
 futures.workspace = true
 console_error_panic_hook.workspace = true
 getrandom = { workspace = true, features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
 oxrdf.workspace = true
 oxrdfio.workspace = true
 vortex-array.workspace = true

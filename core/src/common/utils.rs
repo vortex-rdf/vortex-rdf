@@ -1,3 +1,6 @@
+use crate::error::{VortexRdfError, Result};
+use crate::io::VORTEX_LIGHT_SESSION;
+
 use oxrdf::{
     Quad, 
     Term,
@@ -9,8 +12,8 @@ use oxrdf::{
 };
 use oxrdfio::{RdfFormat, RdfParser};
 use futures::{stream, Stream};
-use crate::error::{VortexRdfError, Result};
-use vortex_array::{ArrayRef, LEGACY_SESSION, VortexSessionExecute};
+
+use vortex_array::{ArrayRef, VortexSessionExecute};
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::primitive::PrimitiveArray;
 use vortex_array::arrays::VarBinViewArray;
@@ -133,7 +136,7 @@ pub fn extract_flat_primitive_column(
     idx: usize,
 ) -> Result<PrimitiveArray> {
     // 1. Create a legacy session context for executing/evaluating the possibly compressed array field.
-    let mut ctx = LEGACY_SESSION.create_execution_ctx();
+    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
     
     // 2. Fetch the unmasked field array ref at the target index.
     let col = vortex_struct.unmasked_field(idx);
@@ -147,7 +150,7 @@ pub fn extract_flat_primitive_column(
 /// into `Quad`s using the pre-decoded `values` view.
 pub fn decode_chunk(chunk: &ArrayRef, values: &VarBinViewArray) -> Vec<Result<Quad>> {
     // 1. Establish an execution context to resolve/evaluate the compressed Vortex arrays.
-    let mut ctx = LEGACY_SESSION.create_execution_ctx();
+    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
     
     // 2. Evaluate and canonicalize the chunk array into a standard StructArray.
     let struct_arr = match chunk.clone().execute::<StructArray>(&mut ctx) {

@@ -445,6 +445,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef0a3155e943e341e557863e69a708999c94ede624e37865c8e2a91b94efa78f"
 
 [[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1133,8 +1142,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "wasi",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3042,6 +3053,7 @@ version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
  "futures",
+ "getrandom 0.2.17",
  "getrandom 0.4.2",
  "js-sys",
  "oxrdf",
@@ -3078,6 +3090,7 @@ dependencies = [
 name = "vortex-rdf-core"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "clap",
  "codspeed-divan-compat",
  "futures",
@@ -3086,11 +3099,14 @@ dependencies = [
  "mimalloc",
  "oxrdf",
  "oxrdfio",
+ "serde",
  "thiserror",
  "tokio",
+ "uuid",
  "vortex",
  "vortex-array",
  "vortex-btrblocks",
+ "vortex-buffer",
  "vortex-error",
  "vortex-file",
  "vortex-fsst",
@@ -3100,6 +3116,7 @@ dependencies = [
  "vortex-mask",
  "vortex-scan",
  "vortex-session",
+ "web-time",
 ]
 
 [[package]]
@@ -3341,6 +3358,16 @@ name = "web-sys"
 version = "0.3.98"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b572dff8bcf38bad0fa19729c89bb5748b2b9b1d8be70cf90df697e3a8f32aa"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "web-time"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",

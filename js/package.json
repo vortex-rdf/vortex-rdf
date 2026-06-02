@@ -12,7 +12,7 @@
     "scripts": {
         "build:node": "wasm-pack build --target nodejs --out-dir pkg",
         "build:web": "wasm-pack build --target web --out-dir pkg",
-        "test": "echo \"Error: no test specified\" && exit 1"
+        "test": "vitest run"
     },
     "keywords": [
         "rdf",
@@ -25,7 +25,11 @@
     "author": "Julián Rojas",
     "license": "MIT",
     "devDependencies": {
-        "wasm-pack": "^0.13.1",
-        "@rdfjs/types": "^2.0.1"
+        "@rdfjs/types": "^2.0.1",
+        "@types/node": "^25.9.1",
+        "rdf-data-factory": "^2.0.2",
+        "typescript": "^6.0.3",
+        "vitest": "^4.1.8",
+        "wasm-pack": "^0.15.0"
     }
 }

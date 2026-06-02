@@ -1,31 +1,52 @@
-use std::sync::Arc;
-use futures::{Stream, StreamExt};
-use vortex_array::{ArrayRef, IntoArray};
-use vortex_array::arrays::{PrimitiveArray, StructArray, ConstantArray};
-use vortex_array::validity::Validity;
 use crate::error::{Result, VortexRdfError};
 use crate::common::indexes;
 use crate::index::RdfDictionary;
-use oxrdf::Quad;
 use super::{VortexArrayBuilder, EncodedQuad};
 
+use oxrdf::Quad;
+use web_time::Instant;
+use std::sync::Arc;
+use futures::{Stream, StreamExt};
+
+use vortex_array::{ArrayRef, IntoArray};
+use vortex_array::arrays::{PrimitiveArray, StructArray, ConstantArray};
+use vortex_array::validity::Validity;
+
+
+/// A fully in-memory, globally sorted Vortex RDF Array Builder.
+///
+/// This builder eager-loads all quads from the stream into RAM and is optimized for datasets
+/// that fit comfortably within system memory.
+///
+/// ### Serialization Phases:
+/// 1. **Eager Ingestion**: Reads all quads from the stream directly into a flat in-memory vector.
+/// 2. **Single Bulk Dictionary Insertion**: Collects all RDF terms and encodes them in a single,
+///    highly optimized bulk call to `get_or_insert_bulk`. This completely avoids re-allocating
+///    and re-compressing underlying Vortex structures.
+/// 3. **Global In-Memory Sort**: Sorts all encoded quads globally in memory according to the canonical order.
+/// 4. **Global Secondary Indexing**: Constructs flat, global sorted permutation indices (`_idx_o_*`, `_idx_p_*`)
+///    for the entire dataset at once, avoiding any chunking overhead or chunk assembly stages.
+/// 5. **Single-Dict StructArray Assembly**: Builds a single flat, unified `StructArray` with the specialized
+///    dictionary columns attached directly at the root level.
 pub struct SortedInMemoryBuilder;
 
 impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for SortedInMemoryBuilder {
     async fn build_vortex_array(
         quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>
     ) -> Result<ArrayRef> {
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let mut dictionary = Dict::new();
         
+        // ── Phase 1: Ingest all quads into memory ──
         let mut quads = Vec::new();
         let mut pinned_stream = Box::pin(quad_stream);
         while let Some(res) = pinned_stream.next().await {
             quads.push(res?);
         }
-        log::debug!("[SortedInMemoryBuilder] Read {} quads in {:?}", quads.len(), start.elapsed());
+        log::debug!("[SortedInMemoryBuilder] Read {} quads", quads.len());
 
-        let dict_start = std::time::Instant::now();
+        // ── Phase 2: Single bulk dictionary insertion ──
+        let dict_start = Instant::now();
         let mut terms = Vec::with_capacity(quads.len() * 4);
         for quad in &quads {
             terms.push(quad.subject.to_string());
@@ -47,15 +68,18 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for SortedInMemoryBuilder {
         }
         log::debug!("[SortedInMemoryBuilder] Built dictionary in {:?}", dict_start.elapsed());
 
-        let sort_start = std::time::Instant::now();
+        // ── Phase 3: Global in-memory sort ──
+        let sort_start = Instant::now();
         encoded.sort_unstable();
         log::debug!("[SortedInMemoryBuilder] Sorted quads in {:?}", sort_start.elapsed());
 
-        let dict_vortex_start = std::time::Instant::now();
+        // Serialize the completed RdfDictionary to Vortex.
+        let dict_vortex_start = Instant::now();
         let dict_fields = dictionary.to_vortex_array()?;
         log::debug!("[SortedInMemoryBuilder] Serialized dictionary to Vortex in {:?}", dict_vortex_start.elapsed());
 
-        let build_array_start = std::time::Instant::now();
+        // ── Phase 4: Construct global arrays and sorted secondary permutation indexes ──
+        let build_array_start = Instant::now();
         let n = encoded.len();
         let mut s_ids = Vec::with_capacity(n);
         let mut p_ids = Vec::with_capacity(n);
@@ -69,7 +93,7 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for SortedInMemoryBuilder {
             g_ids.push(quad.g);
         }
 
-        // Build global O-index
+        // Build global secondary sorted Object index.
         let mut o_index: Vec<(u32, u32)> = o_ids.iter().copied()
             .enumerate()
             .map(|(idx, o_id)| (o_id, idx as u32))
@@ -78,7 +102,7 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for SortedInMemoryBuilder {
         let idx_o_val: Vec<u32> = o_index.iter().map(|pair| pair.0).collect();
         let idx_o_rid: Vec<u32> = o_index.iter().map(|pair| pair.1).collect();
 
-        // Build global P-index
+        // Build global secondary sorted Predicate index.
         let mut p_index: Vec<(u32, u32)> = p_ids.iter().copied()
             .enumerate()
             .map(|(idx, p_id)| (p_id, idx as u32))
@@ -104,6 +128,8 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for SortedInMemoryBuilder {
             PrimitiveArray::from_iter(idx_p_rid).into_array(),
         ];
 
+        // ── Phase 5: Assembly of flat unified StructArray ──
+        // Attach store type identifier and dictionary arrays exactly once at the root level.
         field_names.push("store_type".into());
         field_arrays.push(ConstantArray::new(Dict::store_type(), n).into_array());
 

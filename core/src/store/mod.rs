@@ -10,13 +10,17 @@ pub use builders::{
 };
 pub use vortex_rdf_store::VortexRdfStore;
 
-use std::sync::Arc;
 use vortex_array::ArrayRef;
-use vortex_array::expr::Expression;
-use vortex_file::VortexFile;
 use futures::Stream;
 use oxrdf::Quad;
 use crate::error::Result;
+
+#[cfg(feature = "file-io")]
+use std::sync::Arc;
+#[cfg(feature = "file-io")]
+use vortex_array::expr::Expression;
+#[cfg(feature = "file-io")]
+use vortex_file::VortexFile;
 
 
 // Trait for stores that can provide quads
