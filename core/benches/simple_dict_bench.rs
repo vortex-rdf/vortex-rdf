@@ -9,8 +9,8 @@ use vortex_rdf_core::store::{
     VortexRdfStore,
     UnsortedInMemoryBuilder,
     SortedInMemoryBuilder,
-    ChunkSortBuilder,
-    GlobalSortBuilder,
+    SortedStreamBuilder,
+    UnsortedStreamBuilder,
 };
 use vortex_rdf_core::index::SimpleDictionary;
 
@@ -113,19 +113,21 @@ fn build_vortex_index_sorted<const SIZE: usize>(bencher: Bencher) {
         });
 }
 
+
+
 #[divan::bench(consts = [10_000, 100_000, 1_000_000], sample_count = 10)]
-fn build_vortex_index_chunk_sort<const SIZE: usize>(bencher: Bencher) {
+fn build_vortex_index_sorted_stream<const SIZE: usize>(bencher: Bencher) {
     let rt = get_runtime();
     bencher
         .with_inputs(|| generate_rdf_data_stream(SIZE))
         .bench_values(|quad_stream| {
             let arr = rt.block_on(async {
-                VortexRdfStore::<SimpleDictionary>::build_vortex_array_with_builder::<ChunkSortBuilder>(quad_stream)
+                VortexRdfStore::<SimpleDictionary>::build_vortex_array_with_builder::<SortedStreamBuilder>(quad_stream)
                     .await
                     .expect("Failed to build vortex array")
             });
             // Seed the file cache
-            let filename = format!("ChunkSortBuilder_SimpleDictionary_{}.vortex", SIZE);
+            let filename = format!("SortedStreamBuilder_SimpleDictionary_{}.vortex", SIZE);
             std::fs::create_dir_all("target/bench_vortex_files").unwrap();
             let filepath = std::path::PathBuf::from("target/bench_vortex_files").join(filename);
             rt.block_on(async {
@@ -133,24 +135,24 @@ fn build_vortex_index_chunk_sort<const SIZE: usize>(bencher: Bencher) {
                 vortex_rdf_core::io::serialize(arr.clone(), writer).await.expect("Failed to serialize");
             });
             let cache = FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-            cache.lock().unwrap().insert(("ChunkSortBuilder", "SimpleDictionary", SIZE), filepath);
+            cache.lock().unwrap().insert(("SortedStreamBuilder", "SimpleDictionary", SIZE), filepath);
             arr
         });
 }
 
 #[divan::bench(consts = [10_000, 100_000, 1_000_000], sample_count = 10)]
-fn build_vortex_index_global_sort<const SIZE: usize>(bencher: Bencher) {
+fn build_vortex_index_unsorted_stream<const SIZE: usize>(bencher: Bencher) {
     let rt = get_runtime();
     bencher
         .with_inputs(|| generate_rdf_data_stream(SIZE))
         .bench_values(|quad_stream| {
             let arr = rt.block_on(async {
-                VortexRdfStore::<SimpleDictionary>::build_vortex_array_with_builder::<GlobalSortBuilder>(quad_stream)
+                VortexRdfStore::<SimpleDictionary>::build_vortex_array_with_builder::<UnsortedStreamBuilder>(quad_stream)
                     .await
                     .expect("Failed to build vortex array")
             });
             // Seed the file cache
-            let filename = format!("GlobalSortBuilder_SimpleDictionary_{}.vortex", SIZE);
+            let filename = format!("UnsortedStreamBuilder_SimpleDictionary_{}.vortex", SIZE);
             std::fs::create_dir_all("target/bench_vortex_files").unwrap();
             let filepath = std::path::PathBuf::from("target/bench_vortex_files").join(filename);
             rt.block_on(async {
@@ -158,7 +160,7 @@ fn build_vortex_index_global_sort<const SIZE: usize>(bencher: Bencher) {
                 vortex_rdf_core::io::serialize(arr.clone(), writer).await.expect("Failed to serialize");
             });
             let cache = FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-            cache.lock().unwrap().insert(("GlobalSortBuilder", "SimpleDictionary", SIZE), filepath);
+            cache.lock().unwrap().insert(("UnsortedStreamBuilder", "SimpleDictionary", SIZE), filepath);
             arr
         });
 }
@@ -197,11 +199,13 @@ fn instantiate_store_sorted<const SIZE: usize>(bencher: Bencher) {
         });
 }
 
+
+
 #[divan::bench(consts = [10_000, 100_000, 1_000_000], sample_count = 10)]
-fn instantiate_store_chunk_sort<const SIZE: usize>(bencher: Bencher) {
+fn instantiate_store_sorted_stream<const SIZE: usize>(bencher: Bencher) {
     bencher
         .with_inputs(|| {
-            get_cached_file_path::<SimpleDictionary, ChunkSortBuilder>("ChunkSortBuilder", "SimpleDictionary", SIZE)
+            get_cached_file_path::<SimpleDictionary, SortedStreamBuilder>("SortedStreamBuilder", "SimpleDictionary", SIZE)
         })
         .bench_values(|filepath| {
             let rt = get_runtime();
@@ -214,10 +218,10 @@ fn instantiate_store_chunk_sort<const SIZE: usize>(bencher: Bencher) {
 }
 
 #[divan::bench(consts = [10_000, 100_000, 1_000_000], sample_count = 10)]
-fn instantiate_store_global_sort<const SIZE: usize>(bencher: Bencher) {
+fn instantiate_store_unsorted_stream<const SIZE: usize>(bencher: Bencher) {
     bencher
         .with_inputs(|| {
-            get_cached_file_path::<SimpleDictionary, GlobalSortBuilder>("GlobalSortBuilder", "SimpleDictionary", SIZE)
+            get_cached_file_path::<SimpleDictionary, UnsortedStreamBuilder>("UnsortedStreamBuilder", "SimpleDictionary", SIZE)
         })
         .bench_values(|filepath| {
             let rt = get_runtime();
@@ -293,30 +297,30 @@ define_match_bench!(match_pattern_sorted_pog, SimpleDictionary, SortedInMemoryBu
 define_match_bench!(match_pattern_sorted_sog, SimpleDictionary, SortedInMemoryBuilder, Some("http://example.org/subject/0"), None, Some("http://example.org/object/0"), Some("http://example.org/graph"));
 define_match_bench!(match_pattern_sorted_spg, SimpleDictionary, SortedInMemoryBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), None, Some("http://example.org/graph"));
 
-define_match_bench!(match_pattern_chunk_sort_s, SimpleDictionary, ChunkSortBuilder, Some("http://example.org/subject/0"), None, None, None);
-define_match_bench!(match_pattern_chunk_sort_p, SimpleDictionary, ChunkSortBuilder, None, Some("http://example.org/predicate/0"), None, None);
-define_match_bench!(match_pattern_chunk_sort_o, SimpleDictionary, ChunkSortBuilder, None, None, Some("http://example.org/object/0"), None);
-define_match_bench!(match_pattern_chunk_sort_g, SimpleDictionary, ChunkSortBuilder, None, None, None, Some("http://example.org/graph"));
-define_match_bench!(match_pattern_chunk_sort_sp, SimpleDictionary, ChunkSortBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), None, None);
-define_match_bench!(match_pattern_chunk_sort_so, SimpleDictionary, ChunkSortBuilder, Some("http://example.org/subject/0"), None, Some("http://example.org/object/0"), None);
-define_match_bench!(match_pattern_chunk_sort_sg, SimpleDictionary, ChunkSortBuilder, Some("http://example.org/subject/0"), None, None, Some("http://example.org/graph"));
-define_match_bench!(match_pattern_chunk_sort_po, SimpleDictionary, ChunkSortBuilder, None, Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), None);
-define_match_bench!(match_pattern_chunk_sort_pg, SimpleDictionary, ChunkSortBuilder, None, Some("http://example.org/predicate/0"), None, Some("http://example.org/graph"));
-define_match_bench!(match_pattern_chunk_sort_spo, SimpleDictionary, ChunkSortBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), None);
-define_match_bench!(match_pattern_chunk_sort_pog, SimpleDictionary, ChunkSortBuilder, None, Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), Some("http://example.org/graph"));
-define_match_bench!(match_pattern_chunk_sort_sog, SimpleDictionary, ChunkSortBuilder, Some("http://example.org/subject/0"), None, Some("http://example.org/object/0"), Some("http://example.org/graph"));
-define_match_bench!(match_pattern_chunk_sort_spg, SimpleDictionary, ChunkSortBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), None, Some("http://example.org/graph"));
+define_match_bench!(match_pattern_sorted_stream_s, SimpleDictionary, SortedStreamBuilder, Some("http://example.org/subject/0"), None, None, None);
+define_match_bench!(match_pattern_sorted_stream_p, SimpleDictionary, SortedStreamBuilder, None, Some("http://example.org/predicate/0"), None, None);
+define_match_bench!(match_pattern_sorted_stream_o, SimpleDictionary, SortedStreamBuilder, None, None, Some("http://example.org/object/0"), None);
+define_match_bench!(match_pattern_sorted_stream_g, SimpleDictionary, SortedStreamBuilder, None, None, None, Some("http://example.org/graph"));
+define_match_bench!(match_pattern_sorted_stream_sp, SimpleDictionary, SortedStreamBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), None, None);
+define_match_bench!(match_pattern_sorted_stream_so, SimpleDictionary, SortedStreamBuilder, Some("http://example.org/subject/0"), None, Some("http://example.org/object/0"), None);
+define_match_bench!(match_pattern_sorted_stream_sg, SimpleDictionary, SortedStreamBuilder, Some("http://example.org/subject/0"), None, None, Some("http://example.org/graph"));
+define_match_bench!(match_pattern_sorted_stream_po, SimpleDictionary, SortedStreamBuilder, None, Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), None);
+define_match_bench!(match_pattern_sorted_stream_pg, SimpleDictionary, SortedStreamBuilder, None, Some("http://example.org/predicate/0"), None, Some("http://example.org/graph"));
+define_match_bench!(match_pattern_sorted_stream_spo, SimpleDictionary, SortedStreamBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), None);
+define_match_bench!(match_pattern_sorted_stream_pog, SimpleDictionary, SortedStreamBuilder, None, Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), Some("http://example.org/graph"));
+define_match_bench!(match_pattern_sorted_stream_sog, SimpleDictionary, SortedStreamBuilder, Some("http://example.org/subject/0"), None, Some("http://example.org/object/0"), Some("http://example.org/graph"));
+define_match_bench!(match_pattern_sorted_stream_spg, SimpleDictionary, SortedStreamBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), None, Some("http://example.org/graph"));
 
-define_match_bench!(match_pattern_global_sort_s, SimpleDictionary, GlobalSortBuilder, Some("http://example.org/subject/0"), None, None, None);
-define_match_bench!(match_pattern_global_sort_p, SimpleDictionary, GlobalSortBuilder, None, Some("http://example.org/predicate/0"), None, None);
-define_match_bench!(match_pattern_global_sort_o, SimpleDictionary, GlobalSortBuilder, None, None, Some("http://example.org/object/0"), None);
-define_match_bench!(match_pattern_global_sort_g, SimpleDictionary, GlobalSortBuilder, None, None, None, Some("http://example.org/graph"));
-define_match_bench!(match_pattern_global_sort_sp, SimpleDictionary, GlobalSortBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), None, None);
-define_match_bench!(match_pattern_global_sort_so, SimpleDictionary, GlobalSortBuilder, Some("http://example.org/subject/0"), None, Some("http://example.org/object/0"), None);
-define_match_bench!(match_pattern_global_sort_sg, SimpleDictionary, GlobalSortBuilder, Some("http://example.org/subject/0"), None, None, Some("http://example.org/graph"));
-define_match_bench!(match_pattern_global_sort_po, SimpleDictionary, GlobalSortBuilder, None, Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), None);
-define_match_bench!(match_pattern_global_sort_pg, SimpleDictionary, GlobalSortBuilder, None, Some("http://example.org/predicate/0"), None, Some("http://example.org/graph"));
-define_match_bench!(match_pattern_global_sort_spo, SimpleDictionary, GlobalSortBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), None);
-define_match_bench!(match_pattern_global_sort_pog, SimpleDictionary, GlobalSortBuilder, None, Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), Some("http://example.org/graph"));
-define_match_bench!(match_pattern_global_sort_sog, SimpleDictionary, GlobalSortBuilder, Some("http://example.org/subject/0"), None, Some("http://example.org/object/0"), Some("http://example.org/graph"));
-define_match_bench!(match_pattern_global_sort_spg, SimpleDictionary, GlobalSortBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), None, Some("http://example.org/graph"));
+define_match_bench!(match_pattern_unsorted_stream_s, SimpleDictionary, UnsortedStreamBuilder, Some("http://example.org/subject/0"), None, None, None);
+define_match_bench!(match_pattern_unsorted_stream_p, SimpleDictionary, UnsortedStreamBuilder, None, Some("http://example.org/predicate/0"), None, None);
+define_match_bench!(match_pattern_unsorted_stream_o, SimpleDictionary, UnsortedStreamBuilder, None, None, Some("http://example.org/object/0"), None);
+define_match_bench!(match_pattern_unsorted_stream_g, SimpleDictionary, UnsortedStreamBuilder, None, None, None, Some("http://example.org/graph"));
+define_match_bench!(match_pattern_unsorted_stream_sp, SimpleDictionary, UnsortedStreamBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), None, None);
+define_match_bench!(match_pattern_unsorted_stream_so, SimpleDictionary, UnsortedStreamBuilder, Some("http://example.org/subject/0"), None, Some("http://example.org/object/0"), None);
+define_match_bench!(match_pattern_unsorted_stream_sg, SimpleDictionary, UnsortedStreamBuilder, Some("http://example.org/subject/0"), None, None, Some("http://example.org/graph"));
+define_match_bench!(match_pattern_unsorted_stream_po, SimpleDictionary, UnsortedStreamBuilder, None, Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), None);
+define_match_bench!(match_pattern_unsorted_stream_pg, SimpleDictionary, UnsortedStreamBuilder, None, Some("http://example.org/predicate/0"), None, Some("http://example.org/graph"));
+define_match_bench!(match_pattern_unsorted_stream_spo, SimpleDictionary, UnsortedStreamBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), None);
+define_match_bench!(match_pattern_unsorted_stream_pog, SimpleDictionary, UnsortedStreamBuilder, None, Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), Some("http://example.org/graph"));
+define_match_bench!(match_pattern_unsorted_stream_sog, SimpleDictionary, UnsortedStreamBuilder, Some("http://example.org/subject/0"), None, Some("http://example.org/object/0"), Some("http://example.org/graph"));
+define_match_bench!(match_pattern_unsorted_stream_spg, SimpleDictionary, UnsortedStreamBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), None, Some("http://example.org/graph"));

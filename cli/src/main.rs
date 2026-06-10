@@ -19,8 +19,8 @@ use vortex_rdf_core::{
     BuilderStrategy,
     UnsortedInMemoryBuilder,
     SortedInMemoryBuilder,
-    ChunkSortBuilder,
-    GlobalSortBuilder,
+    SortedStreamBuilder,
+    UnsortedStreamBuilder,
 };
 use vortex_rdf_core::common::formats::{Format, detect_format};
 use vortex_rdf_core::common::indexes::{IndexType, detect_index_type};
@@ -148,11 +148,12 @@ async fn main() -> Result<()> {
                 (IndexType::SimpleDictionary, BuilderStrategy::SortedInMemory) => {
                     VortexRdfStore::<SimpleDictionary>::build_vortex_array_with_builder::<SortedInMemoryBuilder>(quads_stream).await?
                 }
-                (IndexType::SimpleDictionary, BuilderStrategy::ChunkSort) => {
-                    VortexRdfStore::<SimpleDictionary>::build_vortex_array_with_builder::<ChunkSortBuilder>(quads_stream).await?
+
+                (IndexType::SimpleDictionary, BuilderStrategy::SortedStream) => {
+                    VortexRdfStore::<SimpleDictionary>::build_vortex_array_with_builder::<SortedStreamBuilder>(quads_stream).await?
                 }
-                (IndexType::SimpleDictionary, BuilderStrategy::GlobalSort) => {
-                    VortexRdfStore::<SimpleDictionary>::build_vortex_array_with_builder::<GlobalSortBuilder>(quads_stream).await?
+                (IndexType::SimpleDictionary, BuilderStrategy::UnsortedStream) => {
+                    VortexRdfStore::<SimpleDictionary>::build_vortex_array_with_builder::<UnsortedStreamBuilder>(quads_stream).await?
                 }
                 (IndexType::ChainedHash, BuilderStrategy::UnsortedInMemory) => {
                     VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<UnsortedInMemoryBuilder>(quads_stream).await?
@@ -160,11 +161,12 @@ async fn main() -> Result<()> {
                 (IndexType::ChainedHash, BuilderStrategy::SortedInMemory) => {
                     VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<SortedInMemoryBuilder>(quads_stream).await?
                 }
-                (IndexType::ChainedHash, BuilderStrategy::ChunkSort) => {
-                    VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<ChunkSortBuilder>(quads_stream).await?
+
+                (IndexType::ChainedHash, BuilderStrategy::SortedStream) => {
+                    VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<SortedStreamBuilder>(quads_stream).await?
                 }
-                (IndexType::ChainedHash, BuilderStrategy::GlobalSort) => {
-                    VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<GlobalSortBuilder>(quads_stream).await?
+                (IndexType::ChainedHash, BuilderStrategy::UnsortedStream) => {
+                    VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<UnsortedStreamBuilder>(quads_stream).await?
                 }
             };
 

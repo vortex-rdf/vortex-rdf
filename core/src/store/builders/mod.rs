@@ -15,10 +15,10 @@ pub enum BuilderStrategy {
     UnsortedInMemory,
     /// Global sort of quads by Subject -> Predicate -> Object -> Graph in memory.
     SortedInMemory,
-    /// Local sorting of quads inside individual chunks.
-    ChunkSort,
     /// External-memory out-of-core global sort using merge runs.
-    GlobalSort,
+    SortedStream,
+    /// External-memory out-of-core unsorted chunks using disk flush.
+    UnsortedStream,
 }
 
 impl BuilderStrategy {
@@ -26,21 +26,21 @@ impl BuilderStrategy {
         match self {
             BuilderStrategy::UnsortedInMemory => "unsorted-in-memory",
             BuilderStrategy::SortedInMemory => "sorted-in-memory",
-            BuilderStrategy::ChunkSort => "chunk-sort",
-            BuilderStrategy::GlobalSort => "global-sort",
+            BuilderStrategy::SortedStream => "sorted-stream",
+            BuilderStrategy::UnsortedStream => "unsorted-stream",
         }
     }
 }
 
 pub mod unsorted_in_memory;
 pub mod sorted_in_memory;
-pub mod chunk_sort;
-pub mod global_sort;
+pub mod sorted_stream;
+pub mod unsorted_stream;
 
 pub use unsorted_in_memory::UnsortedInMemoryBuilder;
 pub use sorted_in_memory::SortedInMemoryBuilder;
-pub use chunk_sort::ChunkSortBuilder;
-pub use global_sort::GlobalSortBuilder;
+pub use sorted_stream::SortedStreamBuilder;
+pub use unsorted_stream::UnsortedStreamBuilder;
 
 pub trait VortexArrayBuilder<Dict: RdfDictionary> {
     fn build_vortex_array(

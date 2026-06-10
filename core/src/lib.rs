@@ -20,8 +20,8 @@ pub use store::{
     VortexArrayBuilder, 
     UnsortedInMemoryBuilder, 
     SortedInMemoryBuilder, 
-    ChunkSortBuilder, 
-    GlobalSortBuilder,
+    SortedStreamBuilder,
+    UnsortedStreamBuilder,
     BuilderStrategy
 };
 
@@ -192,24 +192,26 @@ mod tests {
         run_match_pattern_test::<ChainedHash, SortedInMemoryBuilder>().await;
     }
 
+
+
     #[tokio::test]
-    async fn test_match_chunk_sort_simple_dict() {
-        run_match_pattern_test::<SimpleDictionary, ChunkSortBuilder>().await;
+    async fn test_match_sorted_stream_simple_dict() {
+        run_match_pattern_test::<SimpleDictionary, SortedStreamBuilder>().await;
     }
 
     #[tokio::test]
-    async fn test_match_chunk_sort_chained_hash() {
-        run_match_pattern_test::<ChainedHash, ChunkSortBuilder>().await;
+    async fn test_match_sorted_stream_chained_hash() {
+        run_match_pattern_test::<ChainedHash, SortedStreamBuilder>().await;
     }
 
     #[tokio::test]
-    async fn test_match_global_sort_simple_dict() {
-        run_match_pattern_test::<SimpleDictionary, GlobalSortBuilder>().await;
+    async fn test_match_unsorted_stream_simple_dict() {
+        run_match_pattern_test::<SimpleDictionary, UnsortedStreamBuilder>().await;
     }
 
     #[tokio::test]
-    async fn test_match_global_sort_chained_hash() {
-        run_match_pattern_test::<ChainedHash, GlobalSortBuilder>().await;
+    async fn test_match_unsorted_stream_chained_hash() {
+        run_match_pattern_test::<ChainedHash, UnsortedStreamBuilder>().await;
     }
 
     async fn run_add_delete_quad_test<Dict: RdfDictionary + 'static, B: VortexArrayBuilder<Dict>>() {
@@ -267,24 +269,26 @@ mod tests {
         run_add_delete_quad_test::<ChainedHash, SortedInMemoryBuilder>().await;
     }
 
+
+
     #[tokio::test]
-    async fn test_add_delete_chunk_sort_simple_dict() {
-        run_add_delete_quad_test::<SimpleDictionary, ChunkSortBuilder>().await;
+    async fn test_add_delete_sorted_stream_simple_dict() {
+        run_add_delete_quad_test::<SimpleDictionary, SortedStreamBuilder>().await;
     }
 
     #[tokio::test]
-    async fn test_add_delete_chunk_sort_chained_hash() {
-        run_add_delete_quad_test::<ChainedHash, ChunkSortBuilder>().await;
+    async fn test_add_delete_sorted_stream_chained_hash() {
+        run_add_delete_quad_test::<ChainedHash, SortedStreamBuilder>().await;
     }
 
     #[tokio::test]
-    async fn test_add_delete_global_sort_simple_dict() {
-        run_add_delete_quad_test::<SimpleDictionary, GlobalSortBuilder>().await;
+    async fn test_add_delete_unsorted_stream_simple_dict() {
+        run_add_delete_quad_test::<SimpleDictionary, UnsortedStreamBuilder>().await;
     }
 
     #[tokio::test]
-    async fn test_add_delete_global_sort_chained_hash() {
-        run_add_delete_quad_test::<ChainedHash, GlobalSortBuilder>().await;
+    async fn test_add_delete_unsorted_stream_chained_hash() {
+        run_add_delete_quad_test::<ChainedHash, UnsortedStreamBuilder>().await;
     }
 
     #[tokio::test]
@@ -382,23 +386,25 @@ mod tests {
         run_builder_roundtrip_test::<ChainedHash, SortedInMemoryBuilder>().await;
     }
 
+
+
     #[tokio::test]
-    async fn test_chunk_sort_simple_dict() {
-        run_builder_roundtrip_test::<SimpleDictionary, ChunkSortBuilder>().await;
+    async fn test_sorted_stream_simple_dict() {
+        run_builder_roundtrip_test::<SimpleDictionary, SortedStreamBuilder>().await;
     }
 
     #[tokio::test]
-    async fn test_chunk_sort_chained_hash() {
-        run_builder_roundtrip_test::<ChainedHash, ChunkSortBuilder>().await;
+    async fn test_sorted_stream_chained_hash() {
+        run_builder_roundtrip_test::<ChainedHash, SortedStreamBuilder>().await;
     }
 
     #[tokio::test]
-    async fn test_global_sort_simple_dict() {
-        run_builder_roundtrip_test::<SimpleDictionary, GlobalSortBuilder>().await;
+    async fn test_unsorted_stream_simple_dict() {
+        run_builder_roundtrip_test::<SimpleDictionary, UnsortedStreamBuilder>().await;
     }
 
     #[tokio::test]
-    async fn test_global_sort_chained_hash() {
-        run_builder_roundtrip_test::<ChainedHash, GlobalSortBuilder>().await;
+    async fn test_unsorted_stream_chained_hash() {
+        run_builder_roundtrip_test::<ChainedHash, UnsortedStreamBuilder>().await;
     }
 }

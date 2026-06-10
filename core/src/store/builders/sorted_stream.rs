@@ -18,7 +18,7 @@ use vortex_array::arrays::{PrimitiveArray, StructArray, ConstantArray};
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::validity::Validity;
 
-/// An out-of-core, highly scalable global-sorting Vortex RDF Array Builder.
+/// An out-of-core, scalable sorted stream Vortex RDF Array Builder.
 ///
 /// This builder is designed to process extremely large datasets that exceed available system memory.
 ///
@@ -39,7 +39,7 @@ use vortex_array::validity::Validity;
 ///    Assembles the thin chunks into a single unified `ChunkedArray`.
 ///    Appends the specialized dictionary columns exactly **once** at the root level of the final `StructArray`
 ///    to eliminate redundant dictionary copies and minimize file size.
-pub struct GlobalSortBuilder;
+pub struct SortedStreamBuilder;
 
 /// Min-heap item used for the K-way merge sort.
 struct HeapItem {
@@ -108,7 +108,7 @@ impl RunReader {
     }
 }
 
-impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for GlobalSortBuilder {
+impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for SortedStreamBuilder {
     async fn build_vortex_array(
         quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>
     ) -> Result<ArrayRef> {
@@ -124,7 +124,7 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for GlobalSortBuilder {
         let temp_dir = std::env::current_dir()
             .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?
             .join("target")
-            .join(format!("tmp_vortex_sort_{}_{}", now, id));
+            .join(format!("tmp_vortex_sorted_stream_{}_{}", now, id));
         std::fs::create_dir_all(&temp_dir)
             .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
 
@@ -153,7 +153,7 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for GlobalSortBuilder {
             let dict_encode_start = Instant::now();
             let ids = dict.get_or_insert_bulk(&term_refs);
             let dict_duration = dict_encode_start.elapsed();
-            log::debug!("[GlobalSortBuilder] Dictionary encoding of {} terms completed in {:?}", term_refs.len(), dict_duration);
+            log::debug!("[SortedStreamBuilder] Dictionary encoding of {} terms completed in {:?}", term_refs.len(), dict_duration);
 
             for i in 0..batch.len() {
                 buf.push(EncodedQuad {
@@ -180,7 +180,7 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for GlobalSortBuilder {
                     buffer.sort_unstable();
                     let run_path = temp_dir.join(format!("run_{}.bin", run_paths.len()));
                     write_run(&run_path, &buffer)?;
-                    log::debug!("[GlobalSortBuilder] Wrote sorted run {} of size {} to disk", run_paths.len(), buffer.len());
+                    log::debug!("[SortedStreamBuilder] Wrote sorted run {} of size {} to disk", run_paths.len(), buffer.len());
                     run_paths.push(run_path);
                     buffer.clear();
                 }
@@ -195,18 +195,18 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for GlobalSortBuilder {
             buffer.sort_unstable();
             let run_path = temp_dir.join(format!("run_{}.bin", run_paths.len()));
             write_run(&run_path, &buffer)?;
-            log::debug!("[GlobalSortBuilder] Wrote final sorted run {} of size {} to disk", run_paths.len(), buffer.len());
+            log::debug!("[SortedStreamBuilder] Wrote final sorted run {} of size {} to disk", run_paths.len(), buffer.len());
             run_paths.push(run_path);
             buffer.clear();
         }
 
-        log::debug!("[GlobalSortBuilder] Ingested and dictionary-encoded {} quads", total_ingested);
-        log::debug!("[GlobalSortBuilder] External merge sort - sorted and serialized runs");
+        log::debug!("[SortedStreamBuilder] Ingested and dictionary-encoded {} quads", total_ingested);
+        log::debug!("[SortedStreamBuilder] External merge sort - sorted and serialized runs");
 
         // Serialize the completed RdfDictionary to Vortex.
         let dict_vortex_start = Instant::now();
         let dict_fields = dictionary.to_vortex_array()?;
-        log::debug!("[GlobalSortBuilder] Serialized dictionary to Vortex in {:?}", dict_vortex_start.elapsed());
+        log::debug!("[SortedStreamBuilder] Serialized dictionary to Vortex in {:?}", dict_vortex_start.elapsed());
 
         // ── Phase 2: K-Way external merge sort using a min-heap ──
         let mut readers = Vec::with_capacity(run_paths.len());
@@ -287,7 +287,7 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for GlobalSortBuilder {
             .map_err(VortexRdfError::Vortex)?
             .into_array();
 
-            log::debug!("[GlobalSortBuilder] Sorted, indexed, and flushed thin chunk {} of size {} starting at index {}", chunks.len(), n, start_idx);
+            log::debug!("[SortedStreamBuilder] Sorted, indexed, and flushed thin chunk {} of size {} starting at index {}", chunks.len(), n, start_idx);
             chunks.push(struct_chunk);
             Ok(())
         };
@@ -366,8 +366,8 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for GlobalSortBuilder {
         .map_err(VortexRdfError::Vortex)?
         .into_array();
 
-        log::debug!("[GlobalSortBuilder] External merge sort serialization complete. Total rows: {}", total_rows);
-        log::debug!("[GlobalSortBuilder] Completed serialization of {} quads in {:?}", total_rows, start.elapsed());
+        log::debug!("[SortedStreamBuilder] External merge sort serialization complete. Total rows: {}", total_rows);
+        log::debug!("[SortedStreamBuilder] Completed serialization of {} quads in {:?}", total_rows, start.elapsed());
 
         Ok(final_struct)
     }

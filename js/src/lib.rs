@@ -13,8 +13,8 @@ use vortex_rdf_core::store::builders::{
     BuilderStrategy,
     UnsortedInMemoryBuilder,
     SortedInMemoryBuilder,
-    ChunkSortBuilder,
-    GlobalSortBuilder,
+    SortedStreamBuilder,
+    UnsortedStreamBuilder,
 };
 use vortex_rdf_core::common::utils::parse_quads_from_reader;
 use wasm_bindgen::prelude::*;
@@ -27,7 +27,7 @@ use futures::StreamExt;
 const TS_APPEND_CONTENT: &'static str = r#"
 import { Quad, Term, NamedNode, BlankNode, Literal, Quad_Subject, Quad_Predicate, Quad_Object, Quad_Graph } from '@rdfjs/types';
 
-export type BuilderStrategy = 'UnsortedInMemory' | 'SortedInMemory' | 'ChunkSort' | 'GlobalSort';
+export type BuilderStrategy = 'UnsortedInMemory' | 'SortedInMemory' | 'SortedStream' | 'UnsortedStream';
 
 export interface VortexStore {
     addQuad(quad: Quad): Promise<void>;
@@ -442,9 +442,12 @@ fn parse_builder_strategy(strategy_name: Option<String>) -> Result<BuilderStrate
     match strategy_name.as_deref() {
         Some("UnsortedInMemory") | None => Ok(BuilderStrategy::UnsortedInMemory),
         Some("SortedInMemory") => Ok(BuilderStrategy::SortedInMemory),
-        Some("ChunkSort") => Ok(BuilderStrategy::ChunkSort),
-        Some("GlobalSort") => Err(JsValue::from_str(
-            "Global-sort strategy is not supported in WebAssembly environments due to lack of filesystem access."
+
+        Some("SortedStream") => Err(JsValue::from_str(
+            "Sorted-stream strategy is not supported in WebAssembly environments due to lack of filesystem access."
+        )),
+        Some("UnsortedStream") => Err(JsValue::from_str(
+            "Unsorted-stream strategy is not supported in WebAssembly environments due to lack of filesystem access."
         )),
         Some(other) => Err(JsValue::from_str(&format!("Unknown builder strategy: {}", other))),
     }
@@ -461,11 +464,12 @@ async fn build_vortex_array_with_strategy<Dict: vortex_rdf_core::index::RdfDicti
         BuilderStrategy::SortedInMemory => {
             VortexRdfStore::<Dict>::build_vortex_array_with_builder::<SortedInMemoryBuilder>(quads_stream).await
         }
-        BuilderStrategy::ChunkSort => {
-            VortexRdfStore::<Dict>::build_vortex_array_with_builder::<ChunkSortBuilder>(quads_stream).await
+
+        BuilderStrategy::SortedStream => {
+            VortexRdfStore::<Dict>::build_vortex_array_with_builder::<SortedStreamBuilder>(quads_stream).await
         }
-        BuilderStrategy::GlobalSort => {
-            VortexRdfStore::<Dict>::build_vortex_array_with_builder::<GlobalSortBuilder>(quads_stream).await
+        BuilderStrategy::UnsortedStream => {
+            VortexRdfStore::<Dict>::build_vortex_array_with_builder::<UnsortedStreamBuilder>(quads_stream).await
         }
     }
 }

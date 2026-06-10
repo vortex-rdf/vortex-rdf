@@ -4,8 +4,8 @@ pub use builders::{
     VortexArrayBuilder,
     UnsortedInMemoryBuilder,
     SortedInMemoryBuilder,
-    ChunkSortBuilder,
-    GlobalSortBuilder,
+    SortedStreamBuilder,
+    UnsortedStreamBuilder,
     BuilderStrategy
 };
 pub use vortex_rdf_store::VortexRdfStore;

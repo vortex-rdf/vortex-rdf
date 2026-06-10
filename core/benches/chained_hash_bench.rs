@@ -9,8 +9,8 @@ use vortex_rdf_core::store::{
     VortexRdfStore,
     UnsortedInMemoryBuilder,
     SortedInMemoryBuilder,
-    ChunkSortBuilder,
-    GlobalSortBuilder,
+    SortedStreamBuilder,
+    UnsortedStreamBuilder,
 };
 use vortex_rdf_core::index::ChainedHash;
 
@@ -113,19 +113,21 @@ fn build_vortex_index_sorted<const SIZE: usize>(bencher: Bencher) {
         });
 }
 
+
+
 #[divan::bench(consts = [10_000, 100_000, 1_000_000], sample_count = 10)]
-fn build_vortex_index_chunk_sort<const SIZE: usize>(bencher: Bencher) {
+fn build_vortex_index_sorted_stream<const SIZE: usize>(bencher: Bencher) {
     let rt = get_runtime();
     bencher
         .with_inputs(|| generate_rdf_data_stream(SIZE))
         .bench_values(|quad_stream| {
             let arr = rt.block_on(async {
-                VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<ChunkSortBuilder>(quad_stream)
+                VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<SortedStreamBuilder>(quad_stream)
                     .await
                     .expect("Failed to build vortex array")
             });
             // Seed the file cache
-            let filename = format!("ChunkSortBuilder_ChainedHash_{}.vortex", SIZE);
+            let filename = format!("SortedStreamBuilder_ChainedHash_{}.vortex", SIZE);
             std::fs::create_dir_all("target/bench_vortex_files").unwrap();
             let filepath = std::path::PathBuf::from("target/bench_vortex_files").join(filename);
             rt.block_on(async {
@@ -133,24 +135,24 @@ fn build_vortex_index_chunk_sort<const SIZE: usize>(bencher: Bencher) {
                 vortex_rdf_core::io::serialize(arr.clone(), writer).await.expect("Failed to serialize");
             });
             let cache = FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-            cache.lock().unwrap().insert(("ChunkSortBuilder", "ChainedHash", SIZE), filepath);
+            cache.lock().unwrap().insert(("SortedStreamBuilder", "ChainedHash", SIZE), filepath);
             arr
         });
 }
 
 #[divan::bench(consts = [10_000, 100_000, 1_000_000], sample_count = 10)]
-fn build_vortex_index_global_sort<const SIZE: usize>(bencher: Bencher) {
+fn build_vortex_index_unsorted_stream<const SIZE: usize>(bencher: Bencher) {
     let rt = get_runtime();
     bencher
         .with_inputs(|| generate_rdf_data_stream(SIZE))
         .bench_values(|quad_stream| {
             let arr = rt.block_on(async {
-                VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<GlobalSortBuilder>(quad_stream)
+                VortexRdfStore::<ChainedHash>::build_vortex_array_with_builder::<UnsortedStreamBuilder>(quad_stream)
                     .await
                     .expect("Failed to build vortex array")
             });
             // Seed the file cache
-            let filename = format!("GlobalSortBuilder_ChainedHash_{}.vortex", SIZE);
+            let filename = format!("UnsortedStreamBuilder_ChainedHash_{}.vortex", SIZE);
             std::fs::create_dir_all("target/bench_vortex_files").unwrap();
             let filepath = std::path::PathBuf::from("target/bench_vortex_files").join(filename);
             rt.block_on(async {
@@ -158,7 +160,7 @@ fn build_vortex_index_global_sort<const SIZE: usize>(bencher: Bencher) {
                 vortex_rdf_core::io::serialize(arr.clone(), writer).await.expect("Failed to serialize");
             });
             let cache = FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-            cache.lock().unwrap().insert(("GlobalSortBuilder", "ChainedHash", SIZE), filepath);
+            cache.lock().unwrap().insert(("UnsortedStreamBuilder", "ChainedHash", SIZE), filepath);
             arr
         });
 }
@@ -197,11 +199,13 @@ fn instantiate_store_sorted<const SIZE: usize>(bencher: Bencher) {
         });
 }
 
+
+
 #[divan::bench(consts = [10_000, 100_000, 1_000_000], sample_count = 10)]
-fn instantiate_store_chunk_sort<const SIZE: usize>(bencher: Bencher) {
+fn instantiate_store_sorted_stream<const SIZE: usize>(bencher: Bencher) {
     bencher
         .with_inputs(|| {
-            get_cached_file_path::<ChainedHash, ChunkSortBuilder>("ChunkSortBuilder", "ChainedHash", SIZE)
+            get_cached_file_path::<ChainedHash, SortedStreamBuilder>("SortedStreamBuilder", "ChainedHash", SIZE)
         })
         .bench_values(|filepath| {
             let rt = get_runtime();
@@ -214,10 +218,10 @@ fn instantiate_store_chunk_sort<const SIZE: usize>(bencher: Bencher) {
 }
 
 #[divan::bench(consts = [10_000, 100_000, 1_000_000], sample_count = 10)]
-fn instantiate_store_global_sort<const SIZE: usize>(bencher: Bencher) {
+fn instantiate_store_unsorted_stream<const SIZE: usize>(bencher: Bencher) {
     bencher
         .with_inputs(|| {
-            get_cached_file_path::<ChainedHash, GlobalSortBuilder>("GlobalSortBuilder", "ChainedHash", SIZE)
+            get_cached_file_path::<ChainedHash, UnsortedStreamBuilder>("UnsortedStreamBuilder", "ChainedHash", SIZE)
         })
         .bench_values(|filepath| {
             let rt = get_runtime();
@@ -293,30 +297,30 @@ define_match_bench!(match_pattern_sorted_pog, ChainedHash, SortedInMemoryBuilder
 define_match_bench!(match_pattern_sorted_sog, ChainedHash, SortedInMemoryBuilder, Some("http://example.org/subject/0"), None, Some("http://example.org/object/0"), Some("http://example.org/graph"));
 define_match_bench!(match_pattern_sorted_spg, ChainedHash, SortedInMemoryBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), None, Some("http://example.org/graph"));
 
-define_match_bench!(match_pattern_chunk_sort_s, ChainedHash, ChunkSortBuilder, Some("http://example.org/subject/0"), None, None, None);
-define_match_bench!(match_pattern_chunk_sort_p, ChainedHash, ChunkSortBuilder, None, Some("http://example.org/predicate/0"), None, None);
-define_match_bench!(match_pattern_chunk_sort_o, ChainedHash, ChunkSortBuilder, None, None, Some("http://example.org/object/0"), None);
-define_match_bench!(match_pattern_chunk_sort_g, ChainedHash, ChunkSortBuilder, None, None, None, Some("http://example.org/graph"));
-define_match_bench!(match_pattern_chunk_sort_sp, ChainedHash, ChunkSortBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), None, None);
-define_match_bench!(match_pattern_chunk_sort_so, ChainedHash, ChunkSortBuilder, Some("http://example.org/subject/0"), None, Some("http://example.org/object/0"), None);
-define_match_bench!(match_pattern_chunk_sort_sg, ChainedHash, ChunkSortBuilder, Some("http://example.org/subject/0"), None, None, Some("http://example.org/graph"));
-define_match_bench!(match_pattern_chunk_sort_po, ChainedHash, ChunkSortBuilder, None, Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), None);
-define_match_bench!(match_pattern_chunk_sort_pg, ChainedHash, ChunkSortBuilder, None, Some("http://example.org/predicate/0"), None, Some("http://example.org/graph"));
-define_match_bench!(match_pattern_chunk_sort_spo, ChainedHash, ChunkSortBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), None);
-define_match_bench!(match_pattern_chunk_sort_pog, ChainedHash, ChunkSortBuilder, None, Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), Some("http://example.org/graph"));
-define_match_bench!(match_pattern_chunk_sort_sog, ChainedHash, ChunkSortBuilder, Some("http://example.org/subject/0"), None, Some("http://example.org/object/0"), Some("http://example.org/graph"));
-define_match_bench!(match_pattern_chunk_sort_spg, ChainedHash, ChunkSortBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), None, Some("http://example.org/graph"));
+define_match_bench!(match_pattern_sorted_stream_s, ChainedHash, SortedStreamBuilder, Some("http://example.org/subject/0"), None, None, None);
+define_match_bench!(match_pattern_sorted_stream_p, ChainedHash, SortedStreamBuilder, None, Some("http://example.org/predicate/0"), None, None);
+define_match_bench!(match_pattern_sorted_stream_o, ChainedHash, SortedStreamBuilder, None, None, Some("http://example.org/object/0"), None);
+define_match_bench!(match_pattern_sorted_stream_g, ChainedHash, SortedStreamBuilder, None, None, None, Some("http://example.org/graph"));
+define_match_bench!(match_pattern_sorted_stream_sp, ChainedHash, SortedStreamBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), None, None);
+define_match_bench!(match_pattern_sorted_stream_so, ChainedHash, SortedStreamBuilder, Some("http://example.org/subject/0"), None, Some("http://example.org/object/0"), None);
+define_match_bench!(match_pattern_sorted_stream_sg, ChainedHash, SortedStreamBuilder, Some("http://example.org/subject/0"), None, None, Some("http://example.org/graph"));
+define_match_bench!(match_pattern_sorted_stream_po, ChainedHash, SortedStreamBuilder, None, Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), None);
+define_match_bench!(match_pattern_sorted_stream_pg, ChainedHash, SortedStreamBuilder, None, Some("http://example.org/predicate/0"), None, Some("http://example.org/graph"));
+define_match_bench!(match_pattern_sorted_stream_spo, ChainedHash, SortedStreamBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), None);
+define_match_bench!(match_pattern_sorted_stream_pog, ChainedHash, SortedStreamBuilder, None, Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), Some("http://example.org/graph"));
+define_match_bench!(match_pattern_sorted_stream_sog, ChainedHash, SortedStreamBuilder, Some("http://example.org/subject/0"), None, Some("http://example.org/object/0"), Some("http://example.org/graph"));
+define_match_bench!(match_pattern_sorted_stream_spg, ChainedHash, SortedStreamBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), None, Some("http://example.org/graph"));
 
-define_match_bench!(match_pattern_global_sort_s, ChainedHash, GlobalSortBuilder, Some("http://example.org/subject/0"), None, None, None);
-define_match_bench!(match_pattern_global_sort_p, ChainedHash, GlobalSortBuilder, None, Some("http://example.org/predicate/0"), None, None);
-define_match_bench!(match_pattern_global_sort_o, ChainedHash, GlobalSortBuilder, None, None, Some("http://example.org/object/0"), None);
-define_match_bench!(match_pattern_global_sort_g, ChainedHash, GlobalSortBuilder, None, None, None, Some("http://example.org/graph"));
-define_match_bench!(match_pattern_global_sort_sp, ChainedHash, GlobalSortBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), None, None);
-define_match_bench!(match_pattern_global_sort_so, ChainedHash, GlobalSortBuilder, Some("http://example.org/subject/0"), None, Some("http://example.org/object/0"), None);
-define_match_bench!(match_pattern_global_sort_sg, ChainedHash, GlobalSortBuilder, Some("http://example.org/subject/0"), None, None, Some("http://example.org/graph"));
-define_match_bench!(match_pattern_global_sort_po, ChainedHash, GlobalSortBuilder, None, Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), None);
-define_match_bench!(match_pattern_global_sort_pg, ChainedHash, GlobalSortBuilder, None, Some("http://example.org/predicate/0"), None, Some("http://example.org/graph"));
-define_match_bench!(match_pattern_global_sort_spo, ChainedHash, GlobalSortBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), None);
-define_match_bench!(match_pattern_global_sort_pog, ChainedHash, GlobalSortBuilder, None, Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), Some("http://example.org/graph"));
-define_match_bench!(match_pattern_global_sort_sog, ChainedHash, GlobalSortBuilder, Some("http://example.org/subject/0"), None, Some("http://example.org/object/0"), Some("http://example.org/graph"));
-define_match_bench!(match_pattern_global_sort_spg, ChainedHash, GlobalSortBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), None, Some("http://example.org/graph"));
+define_match_bench!(match_pattern_unsorted_stream_s, ChainedHash, UnsortedStreamBuilder, Some("http://example.org/subject/0"), None, None, None);
+define_match_bench!(match_pattern_unsorted_stream_p, ChainedHash, UnsortedStreamBuilder, None, Some("http://example.org/predicate/0"), None, None);
+define_match_bench!(match_pattern_unsorted_stream_o, ChainedHash, UnsortedStreamBuilder, None, None, Some("http://example.org/object/0"), None);
+define_match_bench!(match_pattern_unsorted_stream_g, ChainedHash, UnsortedStreamBuilder, None, None, None, Some("http://example.org/graph"));
+define_match_bench!(match_pattern_unsorted_stream_sp, ChainedHash, UnsortedStreamBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), None, None);
+define_match_bench!(match_pattern_unsorted_stream_so, ChainedHash, UnsortedStreamBuilder, Some("http://example.org/subject/0"), None, Some("http://example.org/object/0"), None);
+define_match_bench!(match_pattern_unsorted_stream_sg, ChainedHash, UnsortedStreamBuilder, Some("http://example.org/subject/0"), None, None, Some("http://example.org/graph"));
+define_match_bench!(match_pattern_unsorted_stream_po, ChainedHash, UnsortedStreamBuilder, None, Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), None);
+define_match_bench!(match_pattern_unsorted_stream_pg, ChainedHash, UnsortedStreamBuilder, None, Some("http://example.org/predicate/0"), None, Some("http://example.org/graph"));
+define_match_bench!(match_pattern_unsorted_stream_spo, ChainedHash, UnsortedStreamBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), None);
+define_match_bench!(match_pattern_unsorted_stream_pog, ChainedHash, UnsortedStreamBuilder, None, Some("http://example.org/predicate/0"), Some("http://example.org/object/0"), Some("http://example.org/graph"));
+define_match_bench!(match_pattern_unsorted_stream_sog, ChainedHash, UnsortedStreamBuilder, Some("http://example.org/subject/0"), None, Some("http://example.org/object/0"), Some("http://example.org/graph"));
+define_match_bench!(match_pattern_unsorted_stream_spg, ChainedHash, UnsortedStreamBuilder, Some("http://example.org/subject/0"), Some("http://example.org/predicate/0"), None, Some("http://example.org/graph"));

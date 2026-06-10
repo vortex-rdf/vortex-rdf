@@ -162,7 +162,6 @@ describe('Builder strategies', () => {
     const supportedStrategies = [
         'UnsortedInMemory',
         'SortedInMemory',
-        'ChunkSort'
     ] as const;
 
     for (const strategy of supportedStrategies) {
@@ -190,17 +189,31 @@ describe('Builder strategies', () => {
         });
     }
 
-    test('SimpleDictionaryStore.fromString with GlobalSort throws unsupported error', async () => {
+    test('SimpleDictionaryStore.fromString with SortedStream throws unsupported error', async () => {
         const ttl = `<http://example.org/s1> <http://example.org/p1> "o1" .`;
-        await expect(SimpleDictionaryStore.fromString(ttl, "turtle", 'GlobalSort')).rejects.toThrow(
-            /Global-sort strategy is not supported/
+        await expect(SimpleDictionaryStore.fromString(ttl, "turtle", 'SortedStream')).rejects.toThrow(
+            /Sorted-stream strategy is not supported/
         );
     });
 
-    test('nquads_to_vortex with GlobalSort throws unsupported error', async () => {
+    test('SimpleDictionaryStore.fromString with UnsortedStream throws unsupported error', async () => {
+        const ttl = `<http://example.org/s1> <http://example.org/p1> "o1" .`;
+        await expect(SimpleDictionaryStore.fromString(ttl, "turtle", 'UnsortedStream')).rejects.toThrow(
+            /Unsorted-stream strategy is not supported/
+        );
+    });
+
+    test('nquads_to_vortex with SortedStream throws unsupported error', async () => {
         const nquads = `<http://example.org/s> <http://example.org/p> "hello" .\n`;
-        await expect(nquads_to_vortex(nquads, 'GlobalSort')).rejects.toThrow(
-            /Global-sort strategy is not supported/
+        await expect(nquads_to_vortex(nquads, 'SortedStream')).rejects.toThrow(
+            /Sorted-stream strategy is not supported/
+        );
+    });
+
+    test('nquads_to_vortex with UnsortedStream throws unsupported error', async () => {
+        const nquads = `<http://example.org/s> <http://example.org/p> "hello" .\n`;
+        await expect(nquads_to_vortex(nquads, 'UnsortedStream')).rejects.toThrow(
+            /Unsorted-stream strategy is not supported/
         );
     });
 });

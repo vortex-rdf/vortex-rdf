@@ -73,18 +73,18 @@ To optimize predicate and object lookups without sorting the entire dataset mult
 
 To compile the resource dictionary and quad collection into a highly compressed Vortex representation, Vortex-RDF supports **four distinct ingestion builders** depending on dataset size, RAM constraints, and target query requirements:
 
-| Ingestion Strategy | Memory Model | Sorting | Disk Spill (Runs) | Layout Structure | Indexed |
+| Ingestion Strategy | Memory Model | Sorting | Disk Spill | Layout Structure | Indexed |
 |---|---|---|---|---|---|
 | **`UnsortedInMemory`** | In-Memory | No | No | Flat `StructArray` | No |
 | **`SortedInMemory`** | In-Memory | Global | No | Flat `StructArray` | Ordered by `subject` with secondary indexes by reference on `predicate` and `object` |
-| **`ChunkSort`** | Memory-Bounded | Chunk-Local | No | `ChunkedArray` of sorted `StructArray` blocks | Ordered by `subject` with secondary indexes by reference on `predicate` and `object` |
-| **`GlobalSort`** | Out-of-Core | Global | Yes | `ChunkedArray` of globally sorted `StructArray` blocks | Ordered by `subject` with secondary indexes by reference on `predicate` and `object` |
+| **`UnsortedStream`** | Out-of-Core | No | Yes | `ChunkedArray` of unsorted `StructArray` blocks | No |
+| **`SortedStream`** | Out-of-Core | Global | Yes | `ChunkedArray` of globally sorted `StructArray` blocks | Ordered by `subject` with secondary indexes by reference on `predicate` and `object` |
 
 #### Builder Details:
 * **`UnsortedInMemoryBuilder`**: The simplest pipeline. It preserves the exact ordering of the incoming RDF stream, loading all data to build a single, flat `StructArray`. It adds minimal overhead, but cannot leverage Vortex's native zone-map statistics for efficient pruning during query execution.
 * **`SortedInMemoryBuilder`**: Loads all quads in memory, performs a global sort on the quads, and appends global flat secondary indexes (`_idx_o_val`, `_idx_o_rid`, `_idx_p_val`, `_idx_p_rid`) to optimize `match_pattern` search. Best suited for queries on small-to-medium graphs.
-* **`ChunkSortBuilder`**: Processes incoming quads in memory-bounded batches (default: `500,000` quads), sorts each batch locally, generates local secondary indexes, and flushes them as separate thin chunks inside a parent `ChunkedArray`. This enables **chunk-level statistics (min/max zone maps)** for metadata-based query pruning.
-* **`GlobalSortBuilder` (Out-of-Core)**: It ingests data in memory-bounded batches, sorts them locally, and serializes sorted runs to disk (`runs`) to prevent memory exhaustion. It then performs an out-of-core heap-merge of the sorted runs and flushes them into sorted, indexed thin chunks wrapped in a final `ChunkedArray` layout.
+* **`UnsortedStreamBuilder` (Out-of-Core)**: It ingests data in memory-bounded batches and flushes them directly to disk chunks without sorting to maximize ingestion speed, producing a `ChunkedArray` layout.
+* **`SortedStreamBuilder` (Out-of-Core)**: It ingests data in memory-bounded batches, sorts them locally, and serializes sorted runs to disk (`runs`) to prevent memory exhaustion. It then performs an out-of-core heap-merge of the sorted runs and flushes them into sorted, indexed thin chunks wrapped in a final `ChunkedArray` layout.
 
 ---
 
@@ -442,7 +442,7 @@ cargo bench --bench chained_hash_bench -- match_pattern
 cargo bench --bench chained_hash_bench -- _s
 
 # Profile a specific builder
-cargo bench --bench chained_hash_bench -- global_sort
+cargo bench --bench chained_hash_bench -- sorted_stream
 ```
 
 ### Dynamic Index Caching
