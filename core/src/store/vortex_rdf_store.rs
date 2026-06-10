@@ -377,16 +377,12 @@ impl<Dict: RdfDictionary> VortexRdfStore<Dict> {
                 let has_p_index = struct_arr.unmasked_field_by_name("_idx_p_val").is_ok();
                 
                 let s_col = struct_arr.unmasked_field_by_name("s").map_err(|_| VortexRdfError::Deserialization("Missing s column".into()))?;
-                let is_s_sorted = s_col.statistics()
-                    .get(Stat::IsSorted)
-                    .map(|precision| {
-                        let scalar = match precision {
-                            Precision::Exact(s) => s,
-                            Precision::Inexact(s) => s,
-                        };
+                let is_s_sorted = match s_col.statistics().get(Stat::IsSorted) {
+                    Precision::Exact(scalar) | Precision::Inexact(scalar) => {
                         bool::try_from(&scalar).unwrap_or(false)
-                    })
-                    .unwrap_or(false);
+                    }
+                    Precision::Absent => false,
+                };
 
                 if is_s_sorted && subject.is_some() {
                     let subj = subject.unwrap();
