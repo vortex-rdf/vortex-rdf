@@ -1,0 +1,22 @@
+[package]
+name = "vortex-rdf-python"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[lib]
+name = "vortex_rdf_python"
+crate-type = ["cdylib"]
+
+[dependencies]
+vortex-rdf-core.workspace = true
+oxrdf.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+
+pyo3 = { version = "0.28.3", features = ["extension-module"] }
+
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

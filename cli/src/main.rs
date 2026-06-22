@@ -29,12 +29,13 @@ use vortex_rdf_core::{
     io::{
         CottasNativeConfig, CottasNativeStringConfig, CottasVortexCompressionProfile, deserialize,
         load_vortex_file_ref, match_cottas_native_file, match_cottas_native_string_file,
-        open_vortex_file, serialize, serialize_cottas_native_file,
-        serialize_cottas_native_string_file,
+        match_cottas_native_string_file_with_diagnostics, open_vortex_file, serialize,
+        serialize_cottas_native_file, serialize_cottas_native_string_file,
     },
     store::layout::{cottas::CottasLayout, flat::FlatLayout},
 };
 
+use serde::Serialize;
 use vortex_array::Canonical;
 
 #[derive(Parser)]
@@ -130,6 +131,10 @@ enum Action {
         /// Storage layout for generated Vortex index
         #[arg(long, value_enum)]
         storage_layout: Option<StoreLayout>,
+
+        /// Write match diagnostics JSON to this file
+        #[arg(long)]
+        diagnostics_out: Option<PathBuf>,
     },
 }
 
@@ -542,6 +547,7 @@ async fn main() -> Result<()> {
             object,
             graph,
             storage_layout,
+            diagnostics_out,
         } => {
             let start = Instant::now();
 
@@ -583,22 +589,49 @@ async fn main() -> Result<()> {
 
                 let native_match_start = Instant::now();
 
-                match_cottas_native_string_file(
-                    &input,
-                    subject_node.as_ref(),
-                    predicate_node.as_ref(),
-                    object_node.as_ref(),
-                    graph_node.as_ref(),
-                    writer,
-                    output_format,
-                )
-                .await
-                .context("Failed to match native string COTTAS file")?;
+                if let Some(diag_path) = &diagnostics_out {
+                    let diag = match_cottas_native_string_file_with_diagnostics(
+                        &input,
+                        subject_node.as_ref(),
+                        predicate_node.as_ref(),
+                        object_node.as_ref(),
+                        graph_node.as_ref(),
+                        writer,
+                        output_format,
+                    )
+                    .await
+                    .context("Failed to match native string COTTAS file with diagnostics")?;
 
-                info!(
-                    "Native string COTTAS matching operation took {:?}",
-                    native_match_start.elapsed()
-                );
+                    let diag_json = serde_json::to_vec_pretty(&diag)
+                        .context("Failed to serialize native string diagnostics JSON")?;
+
+                    tokio::fs::write(diag_path, diag_json)
+                        .await
+                        .context("Failed to write diagnostics JSON file")?;
+
+                    info!(
+                        "Native string COTTAS matching operation took {:?} (diagnostics written to {:?})",
+                        native_match_start.elapsed(),
+                        diag_path
+                    );
+                } else {
+                    match_cottas_native_string_file(
+                        &input,
+                        subject_node.as_ref(),
+                        predicate_node.as_ref(),
+                        object_node.as_ref(),
+                        graph_node.as_ref(),
+                        writer,
+                        output_format,
+                    )
+                    .await
+                    .context("Failed to match native string COTTAS file")?;
+
+                    info!(
+                        "Native string COTTAS matching operation took {:?}",
+                        native_match_start.elapsed()
+                    );
+                }
 
                 return Ok(());
             }
