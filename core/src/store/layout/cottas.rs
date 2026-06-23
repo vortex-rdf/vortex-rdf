@@ -41,6 +41,9 @@ impl Triple {
                 .then_with(|| self.s.cmp(&other.s))
                 .then_with(|| self.p.cmp(&other.p))
                 .then_with(|| self.g.cmp(&other.g)),
+            TripleOrdering::None => {
+                unreachable!("cmp_by_order should not be called when ordering is None")
+            }
         }
     }
 }
@@ -50,6 +53,7 @@ pub enum TripleOrdering {
     SPO,
     PSO,
     OSP,
+    None,
 }
 
 impl TripleOrdering {
@@ -58,6 +62,7 @@ impl TripleOrdering {
             TripleOrdering::SPO => "SPO",
             TripleOrdering::PSO => "PSO",
             TripleOrdering::OSP => "OSP",
+            TripleOrdering::None => "None",
         }
     }
 }
@@ -70,6 +75,7 @@ impl FromStr for TripleOrdering {
             "SPO" | "spo" => Ok(TripleOrdering::SPO),
             "PSO" | "pso" => Ok(TripleOrdering::PSO),
             "OSP" | "osp" => Ok(TripleOrdering::OSP),
+            "None" | "none" => Ok(TripleOrdering::None),
             _ => Err(VortexRdfError::Deserialization(format!(
                 "Unknown TripleOrdering: {}",
                 value,
@@ -134,8 +140,9 @@ impl CottasLayoutBuilder {
         if self.buffer.is_empty() {
             return;
         }
-
-        //self.buffer.sort_by(|a, b| a.cmp_by_order(b, self.ordering));
+        if self.ordering != TripleOrdering::None {
+            self.buffer.sort_by(|a, b| a.cmp_by_order(b, self.ordering));
+        }
         let mut group = Vec::new();
         std::mem::swap(&mut group, &mut self.buffer);
         self.raw_row_groups.push(group);
@@ -297,10 +304,10 @@ where
 
         // flatten all row groups
         let mut triples: Vec<Triple> = self.raw_row_groups.drain(..).flatten().collect();
-
-        // global sort
-        triples.sort_by(|a, b| a.cmp_by_order(b, self.ordering));
-
+        if self.ordering != TripleOrdering::None {
+            // global sort
+            triples.sort_by(|a, b| a.cmp_by_order(b, self.ordering));
+        }
         // repartition into row groups
         self.raw_row_groups = triples
             .chunks(self.row_group_size)

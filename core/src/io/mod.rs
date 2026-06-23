@@ -1,7 +1,8 @@
-pub mod cottas_native;
+pub mod cottas_native_ids;
 pub mod cottas_native_strings;
 pub mod de;
 pub mod ser;
+pub mod utils;
 
 pub use de::{array_from_ipc_reader, deserialize};
 
@@ -10,11 +11,14 @@ pub use de::{load_vortex_file_ref, open_vortex_file};
 
 pub use ser::{quads_stream_to_vortex, quads_stream_to_vortex_writer, serialize};
 
-pub use cottas_native::{
-    CottasNativeConfig, match_cottas_native_file, serialize_cottas_native_file,
+pub use cottas_native_ids::{
+    CottasNativeConfig, CottasNativeIdsDiagnostics, match_cottas_native_file,
+    match_cottas_native_file_with_diagnostics, serialize_cottas_native_file,
 };
 
 pub use cottas_native_strings::{
-    CottasNativeStringConfig, CottasVortexCompressionProfile, match_cottas_native_string_file,
+    CottasNativeStringConfig, match_cottas_native_string_file,
     match_cottas_native_string_file_with_diagnostics, serialize_cottas_native_string_file,
 };
+
+pub use utils::CottasVortexCompressionProfile;

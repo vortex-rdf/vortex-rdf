@@ -2,7 +2,6 @@ use crate::common::{indexes::IndexType, utils};
 use crate::error::{Result, VortexRdfError};
 use crate::index::RdfDictionary;
 
-
 use oxrdf::{GraphName, Term};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -10,11 +9,11 @@ use std::time::Instant;
 use vortex::VortexSessionDefault;
 use vortex::session::VortexSession;
 use vortex_array::ArrayRef;
+use vortex_array::LEGACY_SESSION;
 use vortex_array::arrays::{StructArray, VarBinViewArray};
 use vortex_array::dtype::{DType, Nullability};
 use vortex_array::{IntoArray, VortexSessionExecute};
 use vortex_fsst::{fsst_compress, fsst_train_compressor};
-use vortex_array::LEGACY_SESSION;
 
 /// Simple dictionary implementation using a flat Vec and HashMap for fast bi-directional lookups.
 #[derive(Debug, Clone, Default)]
@@ -27,22 +26,32 @@ impl RdfDictionary for SimpleDictionary {
     fn new() -> Self {
         Self::default()
     }
+    fn term_id_pairs(&self) -> Vec<(u32, String)> {
+        self.term_to_id
+            .iter()
+            .map(|(term, id)| (*id, term.clone()))
+            .collect()
+    }
 
     /// Deserializes the dictionary mappings directly from a Vortex StructArray.
     fn from_vortex_array(array_ref: &ArrayRef) -> Result<Self> {
-
         let start = Instant::now();
         let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let struct_array = array_ref.clone()
+        let struct_array = array_ref
+            .clone()
             .execute::<StructArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
 
         let dict_array = utils::extract_dictionary_column(&struct_array, "_dict_values")?;
 
-        let dict_varbin = dict_array.execute::<VarBinViewArray>(&mut ctx)
+        let dict_varbin = dict_array
+            .execute::<VarBinViewArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
 
-        log::debug!("[SimpleDictionary::from_vortex_array] Extraction took {:?}", start.elapsed());
+        log::debug!(
+            "[SimpleDictionary::from_vortex_array] Extraction took {:?}",
+            start.elapsed()
+        );
 
         let loop_start = Instant::now();
         let mut dictionary = SimpleDictionary::new();
@@ -52,7 +61,10 @@ impl RdfDictionary for SimpleDictionary {
             let s = String::from_utf8_lossy(&bytes).into_owned();
             dictionary.get_or_insert(&s);
         }
-        log::debug!("[SimpleDictionary::from_vortex_array] HashMap build took {:?}", loop_start.elapsed());
+        log::debug!(
+            "[SimpleDictionary::from_vortex_array] HashMap build took {:?}",
+            loop_start.elapsed()
+        );
 
         Ok(dictionary)
     }
@@ -140,7 +152,7 @@ impl RdfDictionary for SimpleDictionary {
         } else {
             dict_raw.into_array()
         };
-        
+
         Ok(vec![("values".to_string(), dict_arr)])
     }
 

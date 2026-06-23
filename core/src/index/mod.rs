@@ -60,4 +60,6 @@ pub trait RdfDictionary: Clone + Send + Sync {
 
     /// Get the list of column suffix names used by this dictionary in serialized representation
     fn vortex_field_names() -> &'static [&'static str];
+
+    fn term_id_pairs(&self) -> Vec<(u32, String)>;
 }

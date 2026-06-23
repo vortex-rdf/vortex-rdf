@@ -1,6 +1,6 @@
 use crate::error::{Result, VortexRdfError};
 use crate::store::layout::cottas::TripleOrdering;
-
+use crate::io::utils::CottasVortexCompressionProfile;
 use futures::{Stream, StreamExt, stream};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use oxrdfio::{RdfFormat, RdfSerializer};
@@ -345,9 +345,19 @@ fn read_proc_io_snapshot() -> Option<ProcIoSnapshot> {
     let mut write_bytes = None;
 
     for line in raw.lines() {
-        let mut parts = line.split(':');
-        let key = parts.next()?.trim();
-        let val = parts.next()?.trim().parse::<u64>().ok()?;
+        let mut parts = line.splitn(2, ':');
+        let key = match parts.next() {
+            Some(k) => k.trim(),
+            None => continue,
+        };
+        let val_str = match parts.next() {
+            Some(v) => v.trim(),
+            None => continue,
+        };
+        let val = match val_str.parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
 
         match key {
             "rchar" => rchar = Some(val),
@@ -406,14 +416,8 @@ pub async fn scan_cottas_native_string_file_with_diagnostics(
 ) -> Result<(ArrayRef, NativeStringScanDiagnostics)> {
     let total_start = Instant::now();
 
-    let pruning_report = inspect_cottas_native_string_pruning(
-        input_path,
-        subject,
-        predicate,
-        object,
-        graph,
-    )
-    .await?;
+    let pruning_report =
+        inspect_cottas_native_string_pruning(input_path, subject, predicate, object, graph).await?;
 
     let filter = build_native_string_pattern_filter(subject, predicate, object, graph);
 
@@ -467,10 +471,7 @@ pub async fn scan_cottas_native_string_file_with_diagnostics(
 
     Ok((
         matched_quads,
-        NativeStringScanDiagnostics {
-            timings,
-            proc_io,
-        },
+        NativeStringScanDiagnostics { timings, proc_io },
     ))
 }
 
@@ -487,11 +488,7 @@ where
     W: Write,
 {
     let (matched_quads, mut diag) = scan_cottas_native_string_file_with_diagnostics(
-        input_path,
-        subject,
-        predicate,
-        object,
-        graph,
+        input_path, subject, predicate, object, graph,
     )
     .await?;
 
@@ -504,12 +501,6 @@ where
     Ok(diag)
 }
 
-
-#[derive(Clone, Copy, Debug)]
-pub enum CottasVortexCompressionProfile {
-    Balanced,
-    Compact,
-}
 
 #[derive(Clone, Debug)]
 pub struct CottasNativeStringConfig {
@@ -558,6 +549,9 @@ impl NativeStringQuad {
                 .then_with(|| self.s.cmp(&other.s))
                 .then_with(|| self.p.cmp(&other.p))
                 .then_with(|| self.g.cmp(&other.g)),
+            TripleOrdering::None => {
+                unreachable!("cmp_by_order should not be called when ordering is None")
+            }
         }
     }
 }
@@ -625,8 +619,9 @@ where
         quads.push(quad_to_native_string_quad(&quad));
     }
 
-    quads.sort_by(|a, b| a.cmp_by_order(b, ordering));
-
+    if ordering != TripleOrdering::None {
+        quads.sort_by(|a, b| a.cmp_by_order(b, ordering));
+    }
     Ok(quads
         .chunks(row_group_size)
         .map(|chunk| chunk.to_vec())
@@ -943,13 +938,7 @@ where
     W: Write,
 {
     let _diag = match_cottas_native_string_file_with_diagnostics(
-        input_path,
-        subject,
-        predicate,
-        object,
-        graph,
-        writer,
-        format,
+        input_path, subject, predicate, object, graph, writer, format,
     )
     .await?;
 

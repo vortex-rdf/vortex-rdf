@@ -126,6 +126,14 @@ impl RdfDictionary for SimpleDictionaryView {
         ))
     }
 
+    fn term_id_pairs(&self) -> Vec<(u32, String)> {
+        self.terms
+            .iter()
+            .enumerate()
+            .map(|(id, term)| (id as u32, term.clone()))
+            .collect()
+    }
+
     fn vortex_field_names() -> &'static [&'static str] {
         &["values"]
     }

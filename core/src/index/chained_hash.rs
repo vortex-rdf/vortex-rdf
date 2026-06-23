@@ -1,19 +1,19 @@
 use crate::common::{indexes::IndexType, utils};
 use crate::error::{Result, VortexRdfError};
 use crate::index::RdfDictionary;
-use std::time::Instant;
-use std::collections::HashMap;
 use oxrdf::{GraphName, Term};
+use std::collections::HashMap;
+use std::time::Instant;
 use vortex::VortexSessionDefault;
 use vortex_session::VortexSession;
 
-use vortex_array::builders::{ArrayBuilder, VarBinViewBuilder, PrimitiveBuilder};
 use vortex_array::ArrayRef;
-use vortex_array::arrays::{PrimitiveArray, VarBinViewArray, StructArray};
-use vortex_array::{IntoArray, LEGACY_SESSION, VortexSessionExecute};
+use vortex_array::arrays::{PrimitiveArray, StructArray, VarBinViewArray};
+use vortex_array::builders::{ArrayBuilder, PrimitiveBuilder, VarBinViewBuilder};
 use vortex_array::dtype::Nullability;
-use vortex_fsst::{fsst_compress, fsst_train_compressor};
+use vortex_array::{IntoArray, LEGACY_SESSION, VortexSessionExecute};
 use vortex_btrblocks::BtrBlocksCompressor;
+use vortex_fsst::{fsst_compress, fsst_train_compressor};
 
 /// Chained hash dictionary implementation.
 ///
@@ -69,18 +69,22 @@ impl RdfDictionary for ChainedHash {
         let session = VortexSession::default();
         let mut ctx = session.create_execution_ctx();
 
-        let dict_struct = dict_array_ref.clone().execute::<StructArray>(&mut ctx)
+        let dict_struct = dict_array_ref
+            .clone()
+            .execute::<StructArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
 
-        let values  = utils::extract_dictionary_column(&dict_struct, "_dict_values")?;
+        let values = utils::extract_dictionary_column(&dict_struct, "_dict_values")?;
         let buckets_raw = utils::extract_dictionary_column(&dict_struct, "_dict_buckets")?;
-        let next_raw    = utils::extract_dictionary_column(&dict_struct, "_dict_next")?;
+        let next_raw = utils::extract_dictionary_column(&dict_struct, "_dict_next")?;
 
         // Eagerly decompress/evaluate buckets and next to flat PrimitiveArrays
-        let buckets = buckets_raw.execute::<PrimitiveArray>(&mut ctx)
+        let buckets = buckets_raw
+            .execute::<PrimitiveArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?
             .into_array();
-        let next = next_raw.execute::<PrimitiveArray>(&mut ctx)
+        let next = next_raw
+            .execute::<PrimitiveArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?
             .into_array();
 
@@ -89,7 +93,11 @@ impl RdfDictionary for ChainedHash {
             start.elapsed()
         );
 
-        Ok(Self { buckets, next, values })
+        Ok(Self {
+            buckets,
+            next,
+            values,
+        })
     }
 
     fn get_or_insert(&mut self, term_str: &str) -> u32 {
@@ -98,16 +106,22 @@ impl RdfDictionary for ChainedHash {
         let mut ctx = session.create_execution_ctx();
 
         // Traverse chain to check if term exists
-        let buckets_prim = self.buckets.clone()
+        let buckets_prim = self
+            .buckets
+            .clone()
             .execute::<PrimitiveArray>(&mut ctx)
             .expect("buckets must be primitive");
         let buckets_slice = buckets_prim.as_slice::<i32>();
         let mut row = buckets_slice[h];
 
-        let values_varbin = self.values.clone()
+        let values_varbin = self
+            .values
+            .clone()
             .execute::<VarBinViewArray>(&mut ctx)
             .expect("values must be varbinview");
-        let next_prim = self.next.clone()
+        let next_prim = self
+            .next
+            .clone()
             .execute::<PrimitiveArray>(&mut ctx)
             .expect("next must be primitive");
         let next_slice = next_prim.as_slice::<i32>();
@@ -154,14 +168,20 @@ impl RdfDictionary for ChainedHash {
         let session = VortexSession::default();
         let mut ctx = session.create_execution_ctx();
 
-        let buckets_prim = self.buckets.clone()
+        let buckets_prim = self
+            .buckets
+            .clone()
             .execute::<PrimitiveArray>(&mut ctx)
             .expect("buckets must be primitive");
         let buckets_slice = buckets_prim.as_slice::<i32>();
-        let values_varbin = self.values.clone()
+        let values_varbin = self
+            .values
+            .clone()
             .execute::<VarBinViewArray>(&mut ctx)
             .expect("values must be varbinview");
-        let next_prim = self.next.clone()
+        let next_prim = self
+            .next
+            .clone()
             .execute::<PrimitiveArray>(&mut ctx)
             .expect("next must be primitive");
         let next_slice = next_prim.as_slice::<i32>();
@@ -248,17 +268,19 @@ impl RdfDictionary for ChainedHash {
     fn get_id(&self, term_str: &str) -> Option<u32> {
         let h = Self::hash(term_str);
         let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let buckets_prim = self.buckets.clone()
+        let buckets_prim = self
+            .buckets
+            .clone()
             .execute::<PrimitiveArray>(&mut ctx)
             .ok()?;
         let mut curr = buckets_prim.as_slice::<i32>()[h];
 
-        let values_varbin = self.values.clone()
+        let values_varbin = self
+            .values
+            .clone()
             .execute::<VarBinViewArray>(&mut ctx)
             .ok()?;
-        let next_prim = self.next.clone()
-            .execute::<PrimitiveArray>(&mut ctx)
-            .ok()?;
+        let next_prim = self.next.clone().execute::<PrimitiveArray>(&mut ctx).ok()?;
         let next_slice = next_prim.as_slice::<i32>();
 
         while curr != -1 {
@@ -314,13 +336,34 @@ impl RdfDictionary for ChainedHash {
 
     fn values_view(&self) -> Result<VarBinViewArray> {
         let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        self.values.clone().execute::<VarBinViewArray>(&mut ctx)
+        self.values
+            .clone()
+            .execute::<VarBinViewArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)
+    }
+
+    fn term_id_pairs(&self) -> Vec<(u32, String)> {
+        let values = self
+            .values_view()
+            .expect("failed to decode dictionary values for term_id_pairs");
+
+        let mut pairs = Vec::with_capacity(values.len());
+
+        for id in 0..values.len() {
+            let bytes = values.bytes_at(id);
+            let term = String::from_utf8_lossy(bytes.as_ref()).into_owned();
+            pairs.push((id as u32, term));
+        }
+
+        pairs
     }
 
     fn to_vortex_array(&self) -> Result<Vec<(String, ArrayRef)>> {
         let mut ctx = LEGACY_SESSION.create_execution_ctx();
-        let dict_raw = self.values.clone().execute::<VarBinViewArray>(&mut ctx)
+        let dict_raw = self
+            .values
+            .clone()
+            .execute::<VarBinViewArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
 
         let dict_arr = if dict_raw.len() > 0 {
@@ -328,21 +371,17 @@ impl RdfDictionary for ChainedHash {
             let compressor = fsst_train_compressor(&dict_raw);
             let len = dict_raw.len();
             let dtype = dict_raw.dtype().clone();
-            fsst_compress(
-                dict_raw,
-                len,
-                &dtype,
-                &compressor,
-                &mut ctx,
-            ).into_array()
+            fsst_compress(dict_raw, len, &dtype, &compressor, &mut ctx).into_array()
         } else {
             dict_raw.into_array()
         };
 
         let btr_compressor = BtrBlocksCompressor::default();
-        let buckets_compressed = btr_compressor.compress(&self.buckets, &mut ctx)
+        let buckets_compressed = btr_compressor
+            .compress(&self.buckets, &mut ctx)
             .map_err(VortexRdfError::Vortex)?;
-        let next_compressed = btr_compressor.compress(&self.next, &mut ctx)
+        let next_compressed = btr_compressor
+            .compress(&self.next, &mut ctx)
             .map_err(VortexRdfError::Vortex)?;
 
         Ok(vec![
