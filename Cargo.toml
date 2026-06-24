@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["core", "js", "cli", "python"]
+default-members = ["core", "js", "cli"]
 
 [workspace.package]
 version = "0.1.0"
