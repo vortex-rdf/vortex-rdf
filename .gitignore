@@ -10,3 +10,4 @@ vortex_bench/*
 *.py
 *.py*
 benchmark_cottas_results/dbpedia_10M/cottas_files/*
+*.so

@@ -1,15 +1,15 @@
 [build-system]
-requires = ["maturin>=1.7,<2.0"]
+requires = ["maturin>=1.8,<2"]
 build-backend = "maturin"
 
 [project]
-name = "vortex-rdf-python"
+name = "vortex-rdflib"
 version = "0.1.0"
 requires-python = ">=3.9"
 dependencies = [
-    "rdflib>=7.0"
+  "rdflib>=7,<8"
 ]
 
 [tool.maturin]
-module-name = "vortex_rdf_python"
-bindings = "pyo3"
+module-name = "vortex_rdflib.vortex_rdf_native"
+python-source = "."

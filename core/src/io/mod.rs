@@ -17,8 +17,9 @@ pub use cottas_native_ids::{
 };
 
 pub use cottas_native_strings::{
-    CottasNativeStringConfig, match_cottas_native_string_file,
-    match_cottas_native_string_file_with_diagnostics, serialize_cottas_native_string_file,
+    CottasNativeStringConfig, count_cottas_native_string_file, match_cottas_native_string_file,
+    match_cottas_native_string_file_as_triples, match_cottas_native_string_file_with_diagnostics,
+    serialize_cottas_native_string_file,
 };
 
 pub use utils::CottasVortexCompressionProfile;

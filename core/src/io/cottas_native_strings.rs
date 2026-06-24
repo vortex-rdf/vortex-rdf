@@ -1,6 +1,6 @@
 use crate::error::{Result, VortexRdfError};
-use crate::store::layout::cottas::TripleOrdering;
 use crate::io::utils::CottasVortexCompressionProfile;
+use crate::store::layout::cottas::TripleOrdering;
 use futures::{Stream, StreamExt, stream};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use oxrdfio::{RdfFormat, RdfSerializer};
@@ -501,7 +501,6 @@ where
     Ok(diag)
 }
 
-
 #[derive(Clone, Debug)]
 pub struct CottasNativeStringConfig {
     pub ordering: TripleOrdering,
@@ -837,6 +836,62 @@ where
     Ok(())
 }
 
+pub async fn match_cottas_native_string_file_as_triples(
+    input_path: &Path,
+    subject: Option<&NamedOrBlankNode>,
+    predicate: Option<&NamedNode>,
+    object: Option<&Term>,
+    graph: Option<&GraphName>,
+) -> Result<Vec<(String, String, String)>> {
+    use vortex::VortexSessionDefault;
+    use vortex_array::VortexSessionExecute;
+
+    let (matched_quads, _diag) = scan_cottas_native_string_file_with_diagnostics(
+        input_path, subject, predicate, object, graph,
+    )
+    .await?;
+
+    let session = VortexSession::default();
+    let mut ctx = session.create_execution_ctx();
+
+    let struct_array = matched_quads
+        .clone()
+        .execute::<StructArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+
+    let s_arr = struct_array
+        .unmasked_field_by_name("s")
+        .map_err(VortexRdfError::Vortex)?
+        .clone()
+        .execute::<VarBinViewArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+
+    let p_arr = struct_array
+        .unmasked_field_by_name("p")
+        .map_err(VortexRdfError::Vortex)?
+        .clone()
+        .execute::<VarBinViewArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+
+    let o_arr = struct_array
+        .unmasked_field_by_name("o")
+        .map_err(VortexRdfError::Vortex)?
+        .clone()
+        .execute::<VarBinViewArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+
+    let mut out = Vec::with_capacity(struct_array.len());
+
+    for i in 0..struct_array.len() {
+        let s = String::from_utf8_lossy(&s_arr.bytes_at(i)).into_owned();
+        let p = String::from_utf8_lossy(&p_arr.bytes_at(i)).into_owned();
+        let o = String::from_utf8_lossy(&o_arr.bytes_at(i)).into_owned();
+
+        out.push((s, p, o));
+    }
+
+    Ok(out)
+}
 //pub async fn match_cottas_native_string_file<W>(
 //    input_path: &Path,
 //    subject: Option<&NamedOrBlankNode>,
@@ -943,4 +998,14 @@ where
     .await?;
 
     Ok(())
+}
+
+pub async fn count_cottas_native_string_file(input_path: &Path) -> Result<usize> {
+    let file = NATIVE_STRING_FILE_SESSION
+        .open_options()
+        .open_path(input_path)
+        .await
+        .map_err(VortexRdfError::from)?;
+
+    Ok(file.row_count() as usize)
 }

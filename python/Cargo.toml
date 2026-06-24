@@ -8,15 +8,10 @@ repository.workspace = true
 description.workspace = true
 
 [lib]
-name = "vortex_rdf_python"
+name = "vortex_rdf_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-vortex-rdf-core.workspace = true
-oxrdf.workspace = true
-futures.workspace = true
-anyhow.workspace = true
-
-pyo3 = { version = "0.28.3", features = ["extension-module"] }
-
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+vortex-rdf-core = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+pyo3 = { workspace = true, features = ["extension-module"] }
