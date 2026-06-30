@@ -5,24 +5,16 @@ pub mod io;
 pub mod store;
 
 pub use error::VortexRdfError;
-pub use io::{
-    deserialize,
-    array_from_ipc_reader,
-    serialize,
-    quads_stream_to_vortex,
-    quads_stream_to_vortex_writer
-};
 #[cfg(feature = "file-io")]
 pub use io::load_vortex_file_ref;
+pub use io::{
+    array_from_ipc_reader, deserialize, quads_stream_to_vortex, quads_stream_to_vortex_writer,
+    serialize,
+};
 
 pub use store::{
-    VortexRdfStore, 
-    VortexArrayBuilder, 
-    UnsortedInMemoryBuilder, 
-    SortedInMemoryBuilder, 
-    ChunkSortBuilder, 
-    GlobalSortBuilder,
-    BuilderStrategy
+    BuilderStrategy, ChunkSortBuilder, GlobalSortBuilder, SortedInMemoryBuilder,
+    UnsortedInMemoryBuilder, VortexArrayBuilder, VortexRdfStore,
 };
 
 pub use index::{ChainedHash, RdfDictionary, SimpleDictionary};
@@ -134,21 +126,20 @@ mod tests {
         let quads = vec![q1.clone(), q2.clone()];
 
         let arr = VortexRdfStore::<Dict, FlatLayout>::build_vortex_array_with_builder::<B>(
-            stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q)))
+            stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))),
         )
         .await
         .expect("Serialization failed");
         let store = VortexRdfStore::<Dict, FlatLayout>::new(arr).unwrap();
 
         // Match ?s <p1> ?o ?g
-        let filtered = store.match_pattern(None, Some(&p1), None, None).await.unwrap();
-        assert_eq!(filtered.size(), 1);
-
-        let results: Vec<Quad> = filtered.quads()
-            .unwrap()
-            .try_collect()
+        let filtered = store
+            .match_pattern(None, Some(&p1), None, None)
             .await
             .unwrap();
+        assert_eq!(filtered.size(), 1);
+
+        let results: Vec<Quad> = filtered.quads().unwrap().try_collect().await.unwrap();
         assert_eq!(filtered.size(), 1);
 
         let results: Vec<Quad> = filtered.quads().unwrap().try_collect().await.unwrap();
@@ -161,7 +152,10 @@ mod tests {
 
         // Match ?s <non-existent> ?o ?g
         let p3 = NamedNode::new("http://example.org/p3").unwrap();
-        let empty = store.match_pattern(None, Some(&p3), None, None).await.unwrap();
+        let empty = store
+            .match_pattern(None, Some(&p3), None, None)
+            .await
+            .unwrap();
         assert_eq!(empty.size(), 0);
     }
 
@@ -205,7 +199,10 @@ mod tests {
         run_match_pattern_test::<ChainedHash, GlobalSortBuilder>().await;
     }
 
-    async fn run_add_delete_quad_test<Dict: RdfDictionary + 'static, B: VortexArrayBuilder<Dict>>() {
+    async fn run_add_delete_quad_test<
+        Dict: RdfDictionary + 'static,
+        B: VortexArrayBuilder<Dict>,
+    >() {
         let s1 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s1").unwrap());
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
         let o1 = Term::Literal(Literal::new_simple_literal("o1"));
@@ -214,7 +211,7 @@ mod tests {
 
         // Build a store with one initial quad using builder B
         let arr = VortexRdfStore::<Dict, FlatLayout>::build_vortex_array_with_builder::<B>(
-            stream::iter(vec![Ok::<_, VortexRdfError>(q1.clone())])
+            stream::iter(vec![Ok::<_, VortexRdfError>(q1.clone())]),
         )
         .await
         .expect("Serialization failed");
@@ -348,7 +345,10 @@ mod tests {
         assert_eq!(matched_s5.size(), 1);
     }
 
-    async fn run_builder_roundtrip_test<Dict: RdfDictionary + 'static, B: VortexArrayBuilder<Dict>>() {
+    async fn run_builder_roundtrip_test<
+        Dict: RdfDictionary + 'static,
+        B: VortexArrayBuilder<Dict>,
+    >() {
         let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s").unwrap());
         let p = NamedNode::new("http://example.org/p").unwrap();
         let o = Term::Literal(Literal::new_simple_literal("hello"));
@@ -357,7 +357,7 @@ mod tests {
         let quads = vec![quad.clone()];
 
         let arr = VortexRdfStore::<Dict, FlatLayout>::build_vortex_array_with_builder::<B>(
-            stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q)))
+            stream::iter(quads.into_iter().map(|q| Ok::<_, VortexRdfError>(q))),
         )
         .await
         .expect("Serialization failed");
@@ -368,7 +368,10 @@ mod tests {
         assert_eq!(decoded[0].subject.to_string(), quad.subject.to_string());
         assert_eq!(decoded[0].predicate.to_string(), quad.predicate.to_string());
         assert_eq!(decoded[0].object.to_string(), quad.object.to_string());
-        assert_eq!(decoded[0].graph_name.to_string(), quad.graph_name.to_string());
+        assert_eq!(
+            decoded[0].graph_name.to_string(),
+            quad.graph_name.to_string()
+        );
     }
 
     #[tokio::test]

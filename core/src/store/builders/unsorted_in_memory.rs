@@ -1,32 +1,36 @@
-use crate::error::{Result, VortexRdfError};
+use super::{EncodedQuad, VortexArrayBuilder};
 use crate::common::indexes;
+use crate::error::{Result, VortexRdfError};
 use crate::index::RdfDictionary;
-use super::{VortexArrayBuilder, EncodedQuad};
 
-use std::sync::Arc;
-use std::time::Instant;
 use futures::{Stream, StreamExt};
 use oxrdf::Quad;
+use std::sync::Arc;
+use std::time::Instant;
 
-use vortex_array::{ArrayRef, IntoArray};
-use vortex_array::arrays::{PrimitiveArray, StructArray, ConstantArray};
+use vortex_array::arrays::{ConstantArray, PrimitiveArray, StructArray};
 use vortex_array::validity::Validity;
+use vortex_array::{ArrayRef, IntoArray};
 
 pub struct UnsortedInMemoryBuilder;
 
 impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for UnsortedInMemoryBuilder {
     async fn build_vortex_array(
-        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>
+        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
     ) -> Result<ArrayRef> {
         let mut dictionary = Dict::new();
         let start = Instant::now();
-        
+
         let mut quads = Vec::new();
         let mut pinned_stream = Box::pin(quad_stream);
         while let Some(res) = pinned_stream.next().await {
             quads.push(res?);
         }
-        log::debug!("[UnsortedInMemoryBuilder] Read {} quads in {:?}", quads.len(), start.elapsed());
+        log::debug!(
+            "[UnsortedInMemoryBuilder] Read {} quads in {:?}",
+            quads.len(),
+            start.elapsed()
+        );
 
         let dict_start = Instant::now();
         let mut terms = Vec::with_capacity(quads.len() * 4);
@@ -48,11 +52,17 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for UnsortedInMemoryBuilder {
                 g: ids[i * 4 + 3],
             });
         }
-        log::debug!("[UnsortedInMemoryBuilder] Built dictionary in {:?}", dict_start.elapsed());
+        log::debug!(
+            "[UnsortedInMemoryBuilder] Built dictionary in {:?}",
+            dict_start.elapsed()
+        );
 
         let dict_vortex_start = Instant::now();
         let dict_fields = dictionary.to_vortex_array()?;
-        log::debug!("[UnsortedInMemoryBuilder] Serialized dictionary to Vortex in {:?}", dict_vortex_start.elapsed());
+        log::debug!(
+            "[UnsortedInMemoryBuilder] Serialized dictionary to Vortex in {:?}",
+            dict_vortex_start.elapsed()
+        );
 
         let build_array_start = Instant::now();
         let n = encoded.len();
@@ -68,9 +78,7 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for UnsortedInMemoryBuilder {
             g_ids.push(quad.g);
         }
 
-        let mut field_names: Vec<Arc<str>> = vec![
-            "s".into(), "p".into(), "o".into(), "g".into(),
-        ];
+        let mut field_names: Vec<Arc<str>> = vec!["s".into(), "p".into(), "o".into(), "g".into()];
 
         let mut field_arrays: Vec<ArrayRef> = vec![
             PrimitiveArray::from_iter(s_ids).into_array(),
@@ -87,17 +95,20 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for UnsortedInMemoryBuilder {
             field_arrays.push(indexes::array_as_dict_column(arr.clone(), n)?);
         }
 
-        let struct_array = StructArray::try_new(
-            field_names.into(),
-            field_arrays,
-            n,
-            Validity::NonNullable,
-        )
-        .map_err(VortexRdfError::Vortex)?
-        .into_array();
+        let struct_array =
+            StructArray::try_new(field_names.into(), field_arrays, n, Validity::NonNullable)
+                .map_err(VortexRdfError::Vortex)?
+                .into_array();
 
-        log::debug!("[UnsortedInMemoryBuilder] Constructed StructArray in {:?}", build_array_start.elapsed());
-        log::debug!("[UnsortedInMemoryBuilder] Completed serialization of {} quads in {:?}", n, start.elapsed());
+        log::debug!(
+            "[UnsortedInMemoryBuilder] Constructed StructArray in {:?}",
+            build_array_start.elapsed()
+        );
+        log::debug!(
+            "[UnsortedInMemoryBuilder] Completed serialization of {} quads in {:?}",
+            n,
+            start.elapsed()
+        );
 
         Ok(struct_array)
     }

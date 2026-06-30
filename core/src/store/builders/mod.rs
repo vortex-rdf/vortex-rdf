@@ -1,11 +1,11 @@
-use std::sync::Arc;
-use futures::Stream;
-use vortex_array::{ArrayRef, IntoArray};
-use vortex_array::arrays::{PrimitiveArray, StructArray, ChunkedArray};
-use vortex_array::validity::Validity;
 use crate::error::{Result, VortexRdfError};
 use crate::index::RdfDictionary;
+use futures::Stream;
 use oxrdf::Quad;
+use std::sync::Arc;
+use vortex_array::arrays::{ChunkedArray, PrimitiveArray, StructArray};
+use vortex_array::validity::Validity;
+use vortex_array::{ArrayRef, IntoArray};
 
 use clap::ValueEnum;
 
@@ -32,19 +32,19 @@ impl BuilderStrategy {
     }
 }
 
-pub mod unsorted_in_memory;
-pub mod sorted_in_memory;
 pub mod chunk_sort;
 pub mod global_sort;
+pub mod sorted_in_memory;
+pub mod unsorted_in_memory;
 
-pub use unsorted_in_memory::UnsortedInMemoryBuilder;
-pub use sorted_in_memory::SortedInMemoryBuilder;
 pub use chunk_sort::ChunkSortBuilder;
 pub use global_sort::GlobalSortBuilder;
+pub use sorted_in_memory::SortedInMemoryBuilder;
+pub use unsorted_in_memory::UnsortedInMemoryBuilder;
 
 pub trait VortexArrayBuilder<Dict: RdfDictionary> {
     fn build_vortex_array(
-        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>
+        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
     ) -> impl std::future::Future<Output = Result<ArrayRef>> + Send;
 }
 
@@ -58,7 +58,8 @@ pub struct EncodedQuad {
 
 impl Ord for EncodedQuad {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.s.cmp(&other.s)
+        self.s
+            .cmp(&other.s)
             .then_with(|| self.p.cmp(&other.p))
             .then_with(|| self.o.cmp(&other.o))
             .then_with(|| self.g.cmp(&other.g))
@@ -74,9 +75,14 @@ impl PartialOrd for EncodedQuad {
 pub fn assemble_chunks(mut chunks: Vec<ArrayRef>) -> Result<ArrayRef> {
     if chunks.is_empty() {
         let field_names: Vec<Arc<str>> = vec![
-            "s".into(), "p".into(), "o".into(), "g".into(),
-            "_idx_o_val".into(), "_idx_o_rid".into(),
-            "_idx_p_val".into(), "_idx_p_rid".into(),
+            "s".into(),
+            "p".into(),
+            "o".into(),
+            "g".into(),
+            "_idx_o_val".into(),
+            "_idx_o_rid".into(),
+            "_idx_p_val".into(),
+            "_idx_p_rid".into(),
         ];
         let empty_struct = StructArray::try_new(
             field_names.into(),

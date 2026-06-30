@@ -3,9 +3,7 @@ use oxrdf::{GraphName, NamedNode, Quad, Term};
 use vortex_rdf_core::common::utils::parse_subject;
 use vortex_rdf_core::index::SimpleDictionary;
 use vortex_rdf_core::io::{
-    CottasNativeConfig,
-    match_cottas_native_file,
-    serialize_cottas_native_file,
+    CottasNativeConfig, match_cottas_native_file, serialize_cottas_native_file,
 };
 
 #[tokio::test]
@@ -27,12 +25,7 @@ async fn native_cottas_subject_match_returns_expected_rows() {
         GraphName::DefaultGraph,
     );
 
-    let q2 = Quad::new(
-        s2,
-        p,
-        Term::NamedNode(o2),
-        GraphName::DefaultGraph,
-    );
+    let q2 = Quad::new(s2, p, Term::NamedNode(o2), GraphName::DefaultGraph);
 
     let quads = vec![Ok(q1), Ok(q2)];
 

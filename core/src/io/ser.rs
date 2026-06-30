@@ -3,26 +3,26 @@ use crate::error::{Result, VortexRdfError};
 use crate::index::SimpleDictionary;
 use crate::store::{VortexRdfStore, layout::flat::FlatLayout};
 
-use std::sync::Arc;
 use oxrdf::Quad;
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Instant;
 use vortex::VortexSessionDefault;
 
+use futures::{Stream, stream};
 use vortex_array::ArrayRef;
-use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::dtype::FieldPath;
-use vortex_array::session::ArraySession;
 use vortex_array::scalar_fn::session::ScalarFnSession;
+use vortex_array::session::ArraySession;
+use vortex_array::stream::ArrayStreamAdapter;
+use vortex_file::{WriteOptionsSessionExt, WriteStrategyBuilder};
 use vortex_io::VortexWrite;
 use vortex_io::session::RuntimeSession;
-use vortex_layout::LayoutStrategy;
-use vortex_layout::session::LayoutSession;
-use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
-use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
 use vortex_ipc::iterator::ArrayIteratorIPC;
-use futures::{stream, Stream};
-use vortex_file::{WriteStrategyBuilder, WriteOptionsSessionExt};
+use vortex_layout::LayoutStrategy;
+use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
+use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
+use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
 
 /// A lazily-initialized session configured for Vortex file I/O.
@@ -45,7 +45,8 @@ pub async fn serialize<W: VortexWrite + Unpin + Send>(
 
     // Configure layout strategies for dictionary storage.
     let flat_strategy: Arc<dyn LayoutStrategy> = Arc::new(FlatLayoutStrategy::default());
-    let chunked_strategy: Arc<dyn LayoutStrategy> = Arc::new(ChunkedLayoutStrategy::new(flat_strategy));
+    let chunked_strategy: Arc<dyn LayoutStrategy> =
+        Arc::new(ChunkedLayoutStrategy::new(flat_strategy));
 
     // Mark all _dict_* columns to be written in a [chunked[flat]] layout.
     // This bypasses the default BtrBlocks adaptive compression heuristics on dictionary fields.
@@ -57,19 +58,15 @@ pub async fn serialize<W: VortexWrite + Unpin + Send>(
         for name in struct_fields.names().iter() {
             let name_str: &str = name.as_ref();
             if name_str.starts_with("_dict_") {
-                builder = builder.with_field_writer(
-                    FieldPath::from_name(name_str),
-                    chunked_strategy.clone(),
-                );
+                builder = builder
+                    .with_field_writer(FieldPath::from_name(name_str), chunked_strategy.clone());
             }
         }
     }
 
     // Initialize the file write options with our layout bypass strategy.
-    let write_opts = WRITE_SESSION
-        .write_options()
-        .with_strategy(builder.build());
-        
+    let write_opts = WRITE_SESSION.write_options().with_strategy(builder.build());
+
     let dtype = vortex_array.dtype().clone();
     let vortex_stream = ArrayStreamAdapter::new(
         dtype,
@@ -92,12 +89,14 @@ pub async fn serialize<W: VortexWrite + Unpin + Send>(
     );
 
     // Flush and finalize the writer stream.
-    writer.shutdown().await
-        .map_err(|e| VortexRdfError::Serialization(format!("Failed to shutdown/flush writer: {}", e)))?;
+    writer.shutdown().await.map_err(|e| {
+        VortexRdfError::Serialization(format!("Failed to shutdown/flush writer: {}", e))
+    })?;
 
     // Flush and finalize the writer stream.
-    writer.shutdown().await
-        .map_err(|e| VortexRdfError::Serialization(format!("Failed to shutdown/flush writer: {}", e)))?;
+    writer.shutdown().await.map_err(|e| {
+        VortexRdfError::Serialization(format!("Failed to shutdown/flush writer: {}", e))
+    })?;
 
     Ok(())
 }

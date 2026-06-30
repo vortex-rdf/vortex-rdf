@@ -4,15 +4,12 @@ use oxrdf::NamedOrBlankNode;
 use tokio::runtime::Runtime;
 
 use vortex_rdf_core::common::utils::generate_rdf_data_stream;
-use vortex_rdf_core::store::{
-    VortexRdfStore,
-    UnsortedInMemoryBuilder,
-    SortedInMemoryBuilder,
-    ChunkSortBuilder,
-    GlobalSortBuilder,
-};
 use vortex_rdf_core::index::SimpleDictionary;
 use vortex_rdf_core::store::layout::flat::FlatLayout;
+use vortex_rdf_core::store::{
+    ChunkSortBuilder, GlobalSortBuilder, SortedInMemoryBuilder, UnsortedInMemoryBuilder,
+    VortexRdfStore,
+};
 
 fn main() {
     divan::main();
@@ -27,9 +24,11 @@ fn build_vortex_index_unsorted<const SIZE: usize>(bencher: Bencher) {
         .with_inputs(|| generate_rdf_data_stream(SIZE))
         .bench_values(|quad_stream| {
             rt.block_on(async {
-                VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_array_with_builder::<UnsortedInMemoryBuilder>(quad_stream)
-                    .await
-                    .expect("Failed to build vortex array")
+                VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_array_with_builder::<
+                    UnsortedInMemoryBuilder,
+                >(quad_stream)
+                .await
+                .expect("Failed to build vortex array")
             })
         });
 }
@@ -41,9 +40,11 @@ fn build_vortex_index_sorted<const SIZE: usize>(bencher: Bencher) {
         .with_inputs(|| generate_rdf_data_stream(SIZE))
         .bench_values(|quad_stream| {
             rt.block_on(async {
-                VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_array_with_builder::<SortedInMemoryBuilder>(quad_stream)
-                    .await
-                    .expect("Failed to build vortex array")
+                VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_array_with_builder::<
+                    SortedInMemoryBuilder,
+                >(quad_stream)
+                .await
+                .expect("Failed to build vortex array")
             })
         });
 }
@@ -55,9 +56,11 @@ fn build_vortex_index_chunk_sort<const SIZE: usize>(bencher: Bencher) {
         .with_inputs(|| generate_rdf_data_stream(SIZE))
         .bench_values(|quad_stream| {
             rt.block_on(async {
-                VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_array_with_builder::<ChunkSortBuilder>(quad_stream)
-                    .await
-                    .expect("Failed to build vortex array")
+                VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_array_with_builder::<
+                    ChunkSortBuilder,
+                >(quad_stream)
+                .await
+                .expect("Failed to build vortex array")
             })
         });
 }
@@ -69,9 +72,11 @@ fn build_vortex_index_global_sort<const SIZE: usize>(bencher: Bencher) {
         .with_inputs(|| generate_rdf_data_stream(SIZE))
         .bench_values(|quad_stream| {
             rt.block_on(async {
-                VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_array_with_builder::<GlobalSortBuilder>(quad_stream)
-                    .await
-                    .expect("Failed to build vortex array")
+                VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_array_with_builder::<
+                    GlobalSortBuilder,
+                >(quad_stream)
+                .await
+                .expect("Failed to build vortex array")
             })
         });
 }
@@ -85,9 +90,11 @@ fn instantiate_store_unsorted<const SIZE: usize>(bencher: Bencher) {
         .with_inputs(|| {
             let quad_stream = generate_rdf_data_stream(SIZE);
             rt.block_on(async {
-                VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_array_with_builder::<UnsortedInMemoryBuilder>(quad_stream)
-                    .await
-                    .expect("Failed to build vortex array")
+                VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_array_with_builder::<
+                    UnsortedInMemoryBuilder,
+                >(quad_stream)
+                .await
+                .expect("Failed to build vortex array")
             })
         })
         .bench_values(|vortex_array| {
@@ -103,9 +110,11 @@ fn instantiate_store_sorted<const SIZE: usize>(bencher: Bencher) {
         .with_inputs(|| {
             let quad_stream = generate_rdf_data_stream(SIZE);
             rt.block_on(async {
-                VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_array_with_builder::<SortedInMemoryBuilder>(quad_stream)
-                    .await
-                    .expect("Failed to build vortex array")
+                VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_array_with_builder::<
+                    SortedInMemoryBuilder,
+                >(quad_stream)
+                .await
+                .expect("Failed to build vortex array")
             })
         })
         .bench_values(|vortex_array| {
@@ -121,9 +130,11 @@ fn instantiate_store_chunk_sort<const SIZE: usize>(bencher: Bencher) {
         .with_inputs(|| {
             let quad_stream = generate_rdf_data_stream(SIZE);
             rt.block_on(async {
-                VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_array_with_builder::<ChunkSortBuilder>(quad_stream)
-                    .await
-                    .expect("Failed to build vortex array")
+                VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_array_with_builder::<
+                    ChunkSortBuilder,
+                >(quad_stream)
+                .await
+                .expect("Failed to build vortex array")
             })
         })
         .bench_values(|vortex_array| {
@@ -139,9 +150,11 @@ fn instantiate_store_global_sort<const SIZE: usize>(bencher: Bencher) {
         .with_inputs(|| {
             let quad_stream = generate_rdf_data_stream(SIZE);
             rt.block_on(async {
-                VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_array_with_builder::<GlobalSortBuilder>(quad_stream)
-                    .await
-                    .expect("Failed to build vortex array")
+                VortexRdfStore::<SimpleDictionary, FlatLayout>::build_vortex_array_with_builder::<
+                    GlobalSortBuilder,
+                >(quad_stream)
+                .await
+                .expect("Failed to build vortex array")
             })
         })
         .bench_values(|vortex_array| {

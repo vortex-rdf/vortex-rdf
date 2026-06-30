@@ -4,10 +4,10 @@ use crate::store::QuadStore;
 
 use futures::StreamExt;
 use oxrdfio::{RdfFormat, RdfSerializer};
-use vortex::VortexSessionDefault;
 #[cfg(feature = "file-io")]
 use std::io::Write;
 use std::time::Instant;
+use vortex::VortexSessionDefault;
 
 #[cfg(feature = "file-io")]
 use vortex_array::ArrayRef;
@@ -25,11 +25,7 @@ use vortex_session::VortexSession;
 
 /// High-level function to deserialize Vortex-RDF data store into an RDF writer.
 /// Pulls quads sequentially from the store and serializes them in the specified format (Turtle, N-Triples, etc.).
-pub async fn deserialize<Store, W>(
-    store: Store,
-    writer: W,
-    format: RdfFormat,
-) -> error::Result<()>
+pub async fn deserialize<Store, W>(store: Store, writer: W, format: RdfFormat) -> error::Result<()>
 where
     Store: QuadStore,
     W: Write,
@@ -45,7 +41,7 @@ where
     let write_start = Instant::now();
     // Construct the oxrdf serialization helper for streaming output.
     let mut rdf_serializer = RdfSerializer::from_format(format).for_writer(writer);
-    
+
     // Dynamically iterate over each quad and push it to the output writer.
     while let Some(quad_res) = quads_stream.next().await {
         let quad = quad_res?;
@@ -53,7 +49,7 @@ where
             .serialize_quad(&quad)
             .map_err(|e| error::VortexRdfError::Deserialization(e.to_string()))?;
     }
-    
+
     // Finalize the serialization output (e.g. closing syntax blocks).
     rdf_serializer
         .finish()

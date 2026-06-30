@@ -8,9 +8,9 @@ pub use simple_dictionary::SimpleDictionary;
 pub use simple_dictionary_view::SimpleDictionaryView;
 
 use crate::error::Result;
+use oxrdf::{GraphName, Term};
 use vortex_array::ArrayRef;
 use vortex_array::arrays::VarBinViewArray;
-use oxrdf::{GraphName, Term};
 
 /// Trait for RDF dictionary implementations that map between terms and IDs
 pub trait RdfDictionary: Clone + Send + Sync {

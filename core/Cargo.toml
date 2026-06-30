@@ -42,6 +42,8 @@ log = "0.4.29"
 clap.workspace = true
 mimalloc.workspace = true
 
+libc = "0.2"
+
 [features]
 default = ["file-io"]
 file-io = ["vortex-io/tokio", "vortex/zstd", "vortex/files"]

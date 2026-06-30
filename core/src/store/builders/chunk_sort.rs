@@ -1,25 +1,25 @@
-use std::sync::Arc;
-use futures::{Stream, StreamExt};
-use vortex_array::{ArrayRef, IntoArray};
-use vortex_array::arrays::{PrimitiveArray, StructArray, ConstantArray};
-use vortex_array::validity::Validity;
-use crate::error::{Result, VortexRdfError};
+use super::{EncodedQuad, VortexArrayBuilder, assemble_chunks};
 use crate::common::indexes;
+use crate::error::{Result, VortexRdfError};
 use crate::index::RdfDictionary;
+use futures::{Stream, StreamExt};
 use oxrdf::Quad;
-use super::{VortexArrayBuilder, EncodedQuad, assemble_chunks};
+use std::sync::Arc;
+use vortex_array::arrays::{ConstantArray, PrimitiveArray, StructArray};
+use vortex_array::validity::Validity;
+use vortex_array::{ArrayRef, IntoArray};
 
 pub struct ChunkSortBuilder;
 
 impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for ChunkSortBuilder {
     async fn build_vortex_array(
-        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>
+        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
     ) -> Result<ArrayRef> {
         let start = std::time::Instant::now();
         let mut dictionary = Dict::new();
         let chunk_size = 500_000;
         let mut buffer = Vec::with_capacity(chunk_size);
-        
+
         let batch_size = 100_000;
         let mut quad_batch = Vec::with_capacity(batch_size);
 
@@ -71,11 +71,18 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for ChunkSortBuilder {
             }
         }
 
-        log::debug!("[ChunkSortBuilder] Read and dictionary-inserted {} quads in {:?}", buffer.len(), start.elapsed());
+        log::debug!(
+            "[ChunkSortBuilder] Read and dictionary-inserted {} quads in {:?}",
+            buffer.len(),
+            start.elapsed()
+        );
 
         let dict_vortex_start = std::time::Instant::now();
         let dict_fields = dictionary.to_vortex_array()?;
-        log::debug!("[ChunkSortBuilder] Serialized dictionary to Vortex in {:?}", dict_vortex_start.elapsed());
+        log::debug!(
+            "[ChunkSortBuilder] Serialized dictionary to Vortex in {:?}",
+            dict_vortex_start.elapsed()
+        );
 
         let mut chunks = Vec::new();
 
@@ -97,7 +104,9 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for ChunkSortBuilder {
                 g_ids.push(quad.g);
             }
 
-            let mut o_index: Vec<(u32, u32)> = o_ids.iter().copied()
+            let mut o_index: Vec<(u32, u32)> = o_ids
+                .iter()
+                .copied()
                 .enumerate()
                 .map(|(local_idx, o_id)| (o_id, start_idx + local_idx as u32))
                 .collect();
@@ -105,7 +114,9 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for ChunkSortBuilder {
             let idx_o_val: Vec<u32> = o_index.iter().map(|pair| pair.0).collect();
             let idx_o_rid: Vec<u32> = o_index.iter().map(|pair| pair.1).collect();
 
-            let mut p_index: Vec<(u32, u32)> = p_ids.iter().copied()
+            let mut p_index: Vec<(u32, u32)> = p_ids
+                .iter()
+                .copied()
                 .enumerate()
                 .map(|(local_idx, p_id)| (p_id, start_idx + local_idx as u32))
                 .collect();
@@ -114,9 +125,14 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for ChunkSortBuilder {
             let idx_p_rid: Vec<u32> = p_index.iter().map(|pair| pair.1).collect();
 
             let mut field_names: Vec<Arc<str>> = vec![
-                "s".into(), "p".into(), "o".into(), "g".into(),
-                "_idx_o_val".into(), "_idx_o_rid".into(),
-                "_idx_p_val".into(), "_idx_p_rid".into(),
+                "s".into(),
+                "p".into(),
+                "o".into(),
+                "g".into(),
+                "_idx_o_val".into(),
+                "_idx_o_rid".into(),
+                "_idx_p_val".into(),
+                "_idx_p_rid".into(),
             ];
 
             let mut field_arrays: Vec<ArrayRef> = vec![
@@ -138,20 +154,24 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for ChunkSortBuilder {
                 field_arrays.push(indexes::array_as_dict_column(arr.clone(), n)?);
             }
 
-            let struct_chunk = StructArray::try_new(
-                field_names.into(),
-                field_arrays,
-                n,
-                Validity::NonNullable,
-            )
-            .map_err(VortexRdfError::Vortex)?
-            .into_array();
+            let struct_chunk =
+                StructArray::try_new(field_names.into(), field_arrays, n, Validity::NonNullable)
+                    .map_err(VortexRdfError::Vortex)?
+                    .into_array();
 
             chunks.push(struct_chunk);
             start_idx += n as u32;
         }
-        log::debug!("[ChunkSortBuilder] Built and chunk-sorted {} chunks in {:?}", chunks.len(), build_chunks_start.elapsed());
-        log::debug!("[ChunkSortBuilder] Completed serialization of {} quads in {:?}", buffer.len(), start.elapsed());
+        log::debug!(
+            "[ChunkSortBuilder] Built and chunk-sorted {} chunks in {:?}",
+            chunks.len(),
+            build_chunks_start.elapsed()
+        );
+        log::debug!(
+            "[ChunkSortBuilder] Completed serialization of {} quads in {:?}",
+            buffer.len(),
+            start.elapsed()
+        );
 
         assemble_chunks(chunks)
     }

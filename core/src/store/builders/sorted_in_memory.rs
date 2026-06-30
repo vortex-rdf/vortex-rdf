@@ -1,29 +1,33 @@
-use std::sync::Arc;
-use futures::{Stream, StreamExt};
-use vortex_array::{ArrayRef, IntoArray};
-use vortex_array::arrays::{PrimitiveArray, StructArray, ConstantArray};
-use vortex_array::validity::Validity;
-use crate::error::{Result, VortexRdfError};
+use super::{EncodedQuad, VortexArrayBuilder};
 use crate::common::indexes;
+use crate::error::{Result, VortexRdfError};
 use crate::index::RdfDictionary;
+use futures::{Stream, StreamExt};
 use oxrdf::Quad;
-use super::{VortexArrayBuilder, EncodedQuad};
+use std::sync::Arc;
+use vortex_array::arrays::{ConstantArray, PrimitiveArray, StructArray};
+use vortex_array::validity::Validity;
+use vortex_array::{ArrayRef, IntoArray};
 
 pub struct SortedInMemoryBuilder;
 
 impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for SortedInMemoryBuilder {
     async fn build_vortex_array(
-        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>
+        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
     ) -> Result<ArrayRef> {
         let start = std::time::Instant::now();
         let mut dictionary = Dict::new();
-        
+
         let mut quads = Vec::new();
         let mut pinned_stream = Box::pin(quad_stream);
         while let Some(res) = pinned_stream.next().await {
             quads.push(res?);
         }
-        log::debug!("[SortedInMemoryBuilder] Read {} quads in {:?}", quads.len(), start.elapsed());
+        log::debug!(
+            "[SortedInMemoryBuilder] Read {} quads in {:?}",
+            quads.len(),
+            start.elapsed()
+        );
 
         let dict_start = std::time::Instant::now();
         let mut terms = Vec::with_capacity(quads.len() * 4);
@@ -45,15 +49,24 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for SortedInMemoryBuilder {
                 g: ids[i * 4 + 3],
             });
         }
-        log::debug!("[SortedInMemoryBuilder] Built dictionary in {:?}", dict_start.elapsed());
+        log::debug!(
+            "[SortedInMemoryBuilder] Built dictionary in {:?}",
+            dict_start.elapsed()
+        );
 
         let sort_start = std::time::Instant::now();
         encoded.sort_unstable();
-        log::debug!("[SortedInMemoryBuilder] Sorted quads in {:?}", sort_start.elapsed());
+        log::debug!(
+            "[SortedInMemoryBuilder] Sorted quads in {:?}",
+            sort_start.elapsed()
+        );
 
         let dict_vortex_start = std::time::Instant::now();
         let dict_fields = dictionary.to_vortex_array()?;
-        log::debug!("[SortedInMemoryBuilder] Serialized dictionary to Vortex in {:?}", dict_vortex_start.elapsed());
+        log::debug!(
+            "[SortedInMemoryBuilder] Serialized dictionary to Vortex in {:?}",
+            dict_vortex_start.elapsed()
+        );
 
         let build_array_start = std::time::Instant::now();
         let n = encoded.len();
@@ -70,7 +83,9 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for SortedInMemoryBuilder {
         }
 
         // Build global O-index
-        let mut o_index: Vec<(u32, u32)> = o_ids.iter().copied()
+        let mut o_index: Vec<(u32, u32)> = o_ids
+            .iter()
+            .copied()
             .enumerate()
             .map(|(idx, o_id)| (o_id, idx as u32))
             .collect();
@@ -79,7 +94,9 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for SortedInMemoryBuilder {
         let idx_o_rid: Vec<u32> = o_index.iter().map(|pair| pair.1).collect();
 
         // Build global P-index
-        let mut p_index: Vec<(u32, u32)> = p_ids.iter().copied()
+        let mut p_index: Vec<(u32, u32)> = p_ids
+            .iter()
+            .copied()
             .enumerate()
             .map(|(idx, p_id)| (p_id, idx as u32))
             .collect();
@@ -88,9 +105,14 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for SortedInMemoryBuilder {
         let idx_p_rid: Vec<u32> = p_index.iter().map(|pair| pair.1).collect();
 
         let mut field_names: Vec<Arc<str>> = vec![
-            "s".into(), "p".into(), "o".into(), "g".into(),
-            "_idx_o_val".into(), "_idx_o_rid".into(),
-            "_idx_p_val".into(), "_idx_p_rid".into(),
+            "s".into(),
+            "p".into(),
+            "o".into(),
+            "g".into(),
+            "_idx_o_val".into(),
+            "_idx_o_rid".into(),
+            "_idx_p_val".into(),
+            "_idx_p_rid".into(),
         ];
 
         let mut field_arrays: Vec<ArrayRef> = vec![
@@ -112,17 +134,20 @@ impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for SortedInMemoryBuilder {
             field_arrays.push(indexes::array_as_dict_column(arr.clone(), n)?);
         }
 
-        let struct_array = StructArray::try_new(
-            field_names.into(),
-            field_arrays,
-            n,
-            Validity::NonNullable,
-        )
-        .map_err(VortexRdfError::Vortex)?
-        .into_array();
+        let struct_array =
+            StructArray::try_new(field_names.into(), field_arrays, n, Validity::NonNullable)
+                .map_err(VortexRdfError::Vortex)?
+                .into_array();
 
-        log::debug!("[SortedInMemoryBuilder] Constructed StructArray and global indexes in {:?}", build_array_start.elapsed());
-        log::debug!("[SortedInMemoryBuilder] Completed serialization of {} quads in {:?}", n, start.elapsed());
+        log::debug!(
+            "[SortedInMemoryBuilder] Constructed StructArray and global indexes in {:?}",
+            build_array_start.elapsed()
+        );
+        log::debug!(
+            "[SortedInMemoryBuilder] Completed serialization of {} quads in {:?}",
+            n,
+            start.elapsed()
+        );
 
         Ok(struct_array)
     }

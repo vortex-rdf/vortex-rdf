@@ -1,22 +1,19 @@
+pub mod builders;
 pub mod layout;
 pub mod vortex_rdf_store;
-pub mod builders;
 pub use builders::{
-    VortexArrayBuilder,
-    UnsortedInMemoryBuilder,
-    SortedInMemoryBuilder,
-    ChunkSortBuilder,
-    GlobalSortBuilder,
-    BuilderStrategy
+    BuilderStrategy, ChunkSortBuilder, GlobalSortBuilder, SortedInMemoryBuilder,
+    UnsortedInMemoryBuilder, VortexArrayBuilder,
 };
 pub use vortex_rdf_store::VortexRdfStore;
 
+use crate::error::Result;
+use futures::Stream;
+use oxrdf::Quad;
 use std::sync::Arc;
 use vortex_array::ArrayRef;
 use vortex_array::expr::Expression;
-use vortex_file::VortexFile;use crate::error::Result;
-use futures::Stream;
-use oxrdf::Quad;
+use vortex_file::VortexFile;
 
 // Trait for stores that can provide quads
 pub trait QuadStore {

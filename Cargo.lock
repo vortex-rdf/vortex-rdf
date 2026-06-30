@@ -3096,6 +3096,7 @@ dependencies = [
  "codspeed-divan-compat",
  "futures",
  "itertools 0.15.0",
+ "libc",
  "log",
  "mimalloc",
  "oxrdf",
