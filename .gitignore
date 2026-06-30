@@ -10,3 +10,4 @@ vortex_bench/*
 benchmark_cottas_results/dbpedia_10M/cottas_files/*
 *.so
 *.csv
+scripts/DBBench/dbbench_runs/*

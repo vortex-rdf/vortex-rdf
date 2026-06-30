@@ -1,12 +1,13 @@
 use crate::error::{Result, VortexRdfError};
 use crate::io::utils::CottasVortexCompressionProfile;
 use crate::store::layout::cottas::TripleOrdering;
-use futures::{Stream, StreamExt, stream};
+use futures::{Stream, StreamExt};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use oxrdfio::{RdfFormat, RdfSerializer};
 
+use std::collections::BinaryHeap;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Instant;
 
@@ -14,6 +15,7 @@ use vortex::expr::{Expression, and, col, eq, lit};
 use vortex_array::arrays::{StructArray, VarBinViewArray};
 use vortex_array::stream::{ArrayStreamAdapter, ArrayStreamExt};
 use vortex_array::{ArrayRef, IntoArray};
+use vortex_error::{VortexError, VortexResult};
 use vortex_file::{OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder};
 use vortex_io::VortexWrite;
 use vortex_session::VortexSession;
@@ -24,6 +26,9 @@ use vortex_btrblocks::BtrBlocksCompressorBuilder;
 
 use serde::{Deserialize, Serialize};
 use std::fs;
+
+use std::io::{BufRead, BufReader, BufWriter};
+use std::pin::Pin;
 
 static NATIVE_STRING_FILE_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     use vortex_array::scalar_fn::session::ScalarFnSession;
@@ -416,12 +421,22 @@ pub async fn scan_cottas_native_string_file_with_diagnostics(
 ) -> Result<(ArrayRef, NativeStringScanDiagnostics)> {
     let total_start = Instant::now();
 
-    let pruning_report =
-        inspect_cottas_native_string_pruning(input_path, subject, predicate, object, graph).await?;
-
     let filter = build_native_string_pattern_filter(subject, predicate, object, graph);
 
+    // Do not call inspect_cottas_native_string_pruning() in the hot query path.
+    // It opens the file and computes sidecar diagnostics, which distorts benchmark timings.
+    let pruning_report = NativeStringPruningReport {
+        filter_is_all: matches!(filter, NativeStringPatternFilter::All),
+        vortex_can_prune: None,
+        total_row_groups: None,
+        candidate_row_groups: None,
+        candidate_rows_upper_bound: None,
+        ordering: None,
+        row_group_size: None,
+    };
+
     let open_start = Instant::now();
+
     let file = NATIVE_STRING_FILE_SESSION
         .open_options()
         .open_path(input_path)
@@ -629,31 +644,22 @@ where
 
 async fn write_string_array_stream_to_vortex_file<W>(
     writer: &mut W,
-    arrays: Vec<ArrayRef>,
+    arrays: Pin<Box<dyn Stream<Item = VortexResult<ArrayRef>> + Send>>,
     row_group_size: usize,
     compression_profile: CottasVortexCompressionProfile,
 ) -> Result<()>
 where
     W: VortexWrite + Unpin + Send,
 {
-    let dtype = arrays
-        .first()
-        .map(|a| a.dtype().clone())
-        .unwrap_or_else(|| {
-            empty_string_spog_array()
-                .expect("empty string SPOG array must be constructible")
-                .dtype()
-                .clone()
-        });
+    let dtype = empty_string_spog_array()?.dtype().clone();
 
-    let stream = ArrayStreamAdapter::new(dtype, Box::pin(stream::iter(arrays.into_iter().map(Ok))));
+    let stream = ArrayStreamAdapter::new(dtype, arrays);
 
     let strategy_builder =
         WriteStrategyBuilder::default().with_row_block_size(row_group_size.max(1));
 
     let strategy_builder = match compression_profile {
         CottasVortexCompressionProfile::Balanced => strategy_builder,
-
         CottasVortexCompressionProfile::Compact => strategy_builder
             .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact()),
     };
@@ -687,25 +693,29 @@ pub async fn serialize_cottas_native_string_file<S>(
 where
     S: Stream<Item = Result<Quad>> + Unpin + Send + 'static,
 {
-    let groups = collect_globally_sorted_string_row_groups(
+    let row_group_size = config.row_group_size.max(1);
+
+    let sort_batch_size = std::env::var("VORTEX_RDF_NATIVE_STRING_SORT_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(row_group_size.saturating_mul(8).max(1_000_000));
+
+    let temp_dir = tempfile::tempdir().map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+
+    let run_paths = spill_sorted_native_string_runs(
         quad_stream,
         config.ordering,
-        config.row_group_size,
+        sort_batch_size,
+        temp_dir.path(),
     )
     .await?;
 
-    write_row_group_stats_sidecar(output_path, config.ordering, config.row_group_size, &groups)
-        .await?;
-
-    let mut row_group_arrays = Vec::with_capacity(groups.len());
-
-    for group in &groups {
-        row_group_arrays.push(build_string_spog_array(group)?);
-    }
-
-    if row_group_arrays.is_empty() {
-        row_group_arrays.push(empty_string_spog_array()?);
-    }
+    let array_stream = merge_sorted_native_string_runs_to_array_stream(
+        run_paths,
+        output_path.to_path_buf(),
+        config.ordering,
+        row_group_size,
+    )?;
 
     let mut data_file = tokio::fs::File::create(output_path)
         .await
@@ -713,14 +723,14 @@ where
 
     write_string_array_stream_to_vortex_file(
         &mut data_file,
-        row_group_arrays,
-        config.row_group_size,
+        Box::pin(array_stream),
+        row_group_size,
         config.compression_profile,
     )
     .await?;
 
     log::info!(
-        "[cottas_native_strings] wrote native string COTTAS Vortex file {:?} with profile {:?}",
+        "[cottas_native_strings] wrote globally sorted native string COTTAS Vortex file {:?} with profile {:?}",
         output_path,
         config.compression_profile
     );
@@ -891,6 +901,314 @@ pub async fn match_cottas_native_string_file_as_triples(
     }
 
     Ok(out)
+}
+
+async fn spill_sorted_native_string_runs<S>(
+    mut quad_stream: S,
+    ordering: TripleOrdering,
+    sort_batch_size: usize,
+    temp_dir: &Path,
+) -> Result<Vec<PathBuf>>
+where
+    S: Stream<Item = Result<Quad>> + Unpin + Send + 'static,
+{
+    let sort_batch_size = sort_batch_size.max(1);
+    let mut runs = Vec::new();
+    let mut batch = Vec::with_capacity(sort_batch_size);
+    let mut run_idx = 0usize;
+
+    while let Some(item) = quad_stream.next().await {
+        let quad = item?;
+        batch.push(quad_to_native_string_quad(&quad));
+
+        if batch.len() >= sort_batch_size {
+            if ordering != TripleOrdering::None {
+                batch.sort_by(|a, b| a.cmp_by_order(b, ordering));
+            }
+
+            let path = temp_dir.join(format!("native_string_run_{run_idx:06}.tsv"));
+            write_native_string_run(&path, &batch)?;
+            runs.push(path);
+
+            batch.clear();
+            run_idx += 1;
+        }
+    }
+
+    if !batch.is_empty() {
+        if ordering != TripleOrdering::None {
+            batch.sort_by(|a, b| a.cmp_by_order(b, ordering));
+        }
+
+        let path = temp_dir.join(format!("native_string_run_{run_idx:06}.tsv"));
+        write_native_string_run(&path, &batch)?;
+        runs.push(path);
+    }
+
+    Ok(runs)
+}
+
+fn write_native_string_run(path: &Path, quads: &[NativeStringQuad]) -> Result<()> {
+    let file =
+        std::fs::File::create(path).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    let mut writer = BufWriter::new(file);
+
+    for q in quads {
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{}",
+            escape_run_field(&q.s),
+            escape_run_field(&q.p),
+            escape_run_field(&q.o),
+            escape_run_field(&q.g),
+        )
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    }
+
+    writer
+        .flush()
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+
+    Ok(())
+}
+
+fn escape_run_field(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+fn unescape_run_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('\\') => out.push('\\'),
+                Some('t') => out.push('\t'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+
+    out
+}
+
+struct NativeStringRunReader {
+    reader: BufReader<std::fs::File>,
+}
+
+impl NativeStringRunReader {
+    fn new(path: &Path) -> Result<Self> {
+        let file =
+            std::fs::File::open(path).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+
+        Ok(Self {
+            reader: BufReader::new(file),
+        })
+    }
+
+    fn read_one(&mut self) -> Result<Option<NativeStringQuad>> {
+        let mut line = String::new();
+
+        let n = self
+            .reader
+            .read_line(&mut line)
+            .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+
+        if n == 0 {
+            return Ok(None);
+        }
+
+        while line.ends_with('\n') || line.ends_with('\r') {
+            line.pop();
+        }
+
+        let mut parts = line.splitn(4, '\t');
+
+        let subject = parts
+            .next()
+            .ok_or_else(|| VortexRdfError::Serialization("Malformed native string run".into()))?;
+        let predicate = parts
+            .next()
+            .ok_or_else(|| VortexRdfError::Serialization("Malformed native string run".into()))?;
+        let object = parts
+            .next()
+            .ok_or_else(|| VortexRdfError::Serialization("Malformed native string run".into()))?;
+        let graph = parts
+            .next()
+            .ok_or_else(|| VortexRdfError::Serialization("Malformed native string run".into()))?;
+
+        Ok(Some(NativeStringQuad {
+            s: unescape_run_field(subject),
+            p: unescape_run_field(predicate),
+            o: unescape_run_field(object),
+            g: unescape_run_field(graph),
+        }))
+    }
+}
+
+struct RunHeapItem {
+    quad: NativeStringQuad,
+    run_idx: usize,
+    ordering: TripleOrdering,
+}
+
+impl PartialEq for RunHeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.quad.cmp_by_order(&other.quad, self.ordering) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for RunHeapItem {}
+
+impl PartialOrd for RunHeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RunHeapItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reverse because BinaryHeap is max-heap; we need min-heap.
+        other
+            .quad
+            .cmp_by_order(&self.quad, self.ordering)
+            .then_with(|| other.run_idx.cmp(&self.run_idx))
+    }
+}
+
+fn merge_sorted_native_string_runs_to_array_stream(
+    run_paths: Vec<PathBuf>,
+    output_path: PathBuf,
+    ordering: TripleOrdering,
+    row_group_size: usize,
+) -> Result<impl Stream<Item = VortexResult<ArrayRef>> + Send> {
+    let row_group_size = row_group_size.max(1);
+
+    Ok(async_stream::try_stream! {
+        let mut readers = Vec::with_capacity(run_paths.len());
+
+        for path in &run_paths {
+            readers.push(
+                NativeStringRunReader::new(path)
+                    .map_err(rdf_err_to_vortex_err)?
+            );
+        }
+
+        let mut heap = BinaryHeap::new();
+
+        for run_idx in 0..readers.len() {
+            if let Some(quad) = readers[run_idx]
+                .read_one()
+                .map_err(rdf_err_to_vortex_err)?
+            {
+                heap.push(RunHeapItem {
+                    quad,
+                    run_idx,
+                    ordering,
+                });
+            }
+        }
+
+        let mut row_group = Vec::with_capacity(row_group_size);
+        let mut row_group_idx = 0usize;
+        let mut row_group_stats = Vec::new();
+
+        while let Some(item) = heap.pop() {
+            let run_idx = item.run_idx;
+            row_group.push(item.quad);
+
+            if let Some(next_quad) = readers[run_idx]
+                .read_one()
+                .map_err(rdf_err_to_vortex_err)?
+            {
+                heap.push(RunHeapItem {
+                    quad: next_quad,
+                    run_idx,
+                    ordering,
+                });
+            }
+
+            if row_group.len() >= row_group_size {
+                if let Some(stats) = compute_row_group_stats(row_group_idx, &row_group) {
+                    row_group_stats.push(stats);
+                }
+
+                let array = build_string_spog_array(&row_group)
+                    .map_err(rdf_err_to_vortex_err)?;
+
+                row_group.clear();
+                row_group_idx += 1;
+
+                yield array;
+            }
+        }
+
+        if !row_group.is_empty() {
+            if let Some(stats) = compute_row_group_stats(row_group_idx, &row_group) {
+                row_group_stats.push(stats);
+            }
+
+            let array = build_string_spog_array(&row_group)
+                .map_err(rdf_err_to_vortex_err)?;
+
+            yield array;
+        }
+
+        if row_group_idx == 0 && row_group_stats.is_empty() {
+            yield empty_string_spog_array()
+                .map_err(rdf_err_to_vortex_err)?;
+        }
+
+        write_row_group_stats_sidecar_from_stats(
+            &output_path,
+            ordering,
+            row_group_size,
+            row_group_stats,
+        )
+        .await
+        .map_err(rdf_err_to_vortex_err)?;
+    })
+}
+
+async fn write_row_group_stats_sidecar_from_stats(
+    output_path: &Path,
+    ordering: TripleOrdering,
+    row_group_size: usize,
+    row_groups: Vec<NativeStringRowGroupStats>,
+) -> Result<()> {
+    let stats = NativeStringFileStats {
+        ordering: format!("{ordering:?}"),
+        row_group_size,
+        row_groups,
+    };
+
+    let serialized = serde_json::to_vec_pretty(&stats)
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+
+    tokio::fs::write(stats_sidecar_path(output_path), serialized)
+        .await
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+
+    Ok(())
+}
+
+fn rdf_err_to_vortex_err(e: VortexRdfError) -> VortexError {
+    vortex_error::vortex_err!(
+        "vortex-rdf error while streaming native string row group: {}",
+        e
+    )
 }
 //pub async fn match_cottas_native_string_file<W>(
 //    input_path: &Path,

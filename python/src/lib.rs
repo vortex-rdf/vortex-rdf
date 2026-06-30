@@ -3,10 +3,15 @@ use std::path::Path;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
+use std::sync::LazyLock;
+use tokio::runtime::Runtime;
 use vortex_rdf_core::common::utils::{parse_named_node, parse_subject, parse_term};
 use vortex_rdf_core::io::{
     count_cottas_native_string_file, match_cottas_native_string_file_as_triples,
 };
+
+static PY_NATIVE_RUNTIME: LazyLock<Runtime> =
+    LazyLock::new(|| Runtime::new().expect("failed to create Tokio runtime for vortex_rdf_native"));
 
 #[pyfunction]
 fn match_triples(
@@ -42,16 +47,15 @@ fn match_triples(
         .transpose()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-    let rt = tokio::runtime::Runtime::new().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-    rt.block_on(match_cottas_native_string_file_as_triples(
-        Path::new(&path),
-        subject.as_ref(),
-        predicate.as_ref(),
-        object.as_ref(),
-        None,
-    ))
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    PY_NATIVE_RUNTIME
+        .block_on(match_cottas_native_string_file_as_triples(
+            Path::new(&path),
+            subject.as_ref(),
+            predicate.as_ref(),
+            object.as_ref(),
+            None,
+        ))
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 #[pyfunction]
@@ -64,9 +68,8 @@ fn count_triples(path: String, layout: Option<String>) -> PyResult<usize> {
         )));
     }
 
-    let rt = tokio::runtime::Runtime::new().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-    rt.block_on(count_cottas_native_string_file(Path::new(&path)))
+    PY_NATIVE_RUNTIME
+        .block_on(count_cottas_native_string_file(Path::new(&path)))
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 

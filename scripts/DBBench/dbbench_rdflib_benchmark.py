@@ -103,15 +103,22 @@ def make_graph(engine: str, cottas_path: str, vortex_path: str, vortex_layout: s
     raise ValueError(f"Unknown engine: {engine}")
 
 
+import psutil
+import os
+
+_process = psutil.Process(os.getpid())
+
+
 def run_one_query(graph: Graph, query: str, silence_stdout: bool):
     """
-    Apples-to-apples:
-    - use RDFLib Graph.query for both
-    - fully materialize result list for both
-    - no custom LIMIT pushdown
-    - no query rewriting
+    Measure:
+    - elapsed time
+    - result count
+    - memory usage (RSS)
     """
     gc.collect()
+
+    mem_before = _process.memory_info().rss
 
     sink = io.StringIO()
     stdout_ctx = contextlib.redirect_stdout(
@@ -122,9 +129,14 @@ def run_one_query(graph: Graph, query: str, silence_stdout: bool):
         rows = list(graph.query(query))
     end_ns = time.perf_counter_ns()
 
+    mem_after = _process.memory_info().rss
+
     return {
         "elapsed_s": (end_ns - start_ns) / 1_000_000_000,
         "result_count": len(rows),
+        "rss_before_mb": mem_before / (1024 * 1024),
+        "rss_after_mb": mem_after / (1024 * 1024),
+        "rss_delta_mb": (mem_after - mem_before) / (1024 * 1024),
     }
 
 

@@ -3090,6 +3090,7 @@ dependencies = [
 name = "vortex-rdf-core"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "clap",
  "codspeed-divan-compat",

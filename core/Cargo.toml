@@ -24,6 +24,8 @@ vortex-file.workspace = true
 vortex-scan.workspace = true
 vortex-btrblocks = { workspace = true }
 async-trait.workspace = true
+async-stream.workspace = true
+tempfile.workspace = true
 
 tokio.workspace = true
 
@@ -47,7 +49,7 @@ file-io = ["vortex-io/tokio", "vortex/zstd", "vortex/files"]
 [dev-dependencies]
 divan = { version = "*", package = "codspeed-divan-compat" }
 tokio = { workspace = true, features = ["time", "rt-multi-thread"] }
-tempfile = "3"
+
 
 [[bench]]
 name = "simple_dict_bench"

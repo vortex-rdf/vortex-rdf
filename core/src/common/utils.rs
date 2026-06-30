@@ -36,17 +36,29 @@ pub fn parse_subject(s: &str) -> Result<NamedOrBlankNode> {
 }
 
 /// Parses an arbitrary RDF term (blank node, literal, or named node) from its string form.
+/// Parses an arbitrary RDF term (blank node, literal, or named node) from its string form.
 pub fn parse_term(s: &str) -> Result<Term> {
-    if s.starts_with('_') {
-        Ok(Term::BlankNode(parse_blank_node(s)?))
-    } else if s.starts_with('"') {
-        // Simple literal string parsing.
-        // TODO: Add support for multi-line literals
-        let val = s.trim_matches('"');
-        Ok(Term::Literal(Literal::new_simple_literal(val)))
-    } else {
-        Ok(Term::NamedNode(parse_named_node(s)?))
+    let s = s.trim();
+
+    if let Some(term) = get_as_term(s) {
+        return Ok(term);
     }
+
+    if s.starts_with("_:") {
+        return Ok(Term::BlankNode(parse_blank_node(s)?));
+    }
+
+    if s.starts_with('<') && s.ends_with('>') {
+        return Ok(Term::NamedNode(parse_named_node(s)?));
+    }
+
+    if !s.is_empty() && !s.starts_with('"') {
+        return Ok(Term::NamedNode(parse_named_node(s)?));
+    }
+
+    Err(VortexRdfError::Deserialization(format!(
+        "Invalid RDF term: {s}"
+    )))
 }
 
 /// Parses an RDF graph name, which can be the default graph, a named node, or a blank node.
