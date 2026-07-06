@@ -29,7 +29,10 @@ use vortex_rdf_core::{
     index::{ChainedHash, SimpleDictionary},
     io::{
         CottasNativeConfig, CottasNativeStringConfig, CottasVortexCompressionProfile,
-        load_vortex_file_ref, match_cottas_native_file, match_cottas_native_file_with_diagnostics,
+        NativeIdsCountMode, NativeStringCountMode,
+        count_cottas_native_ids_file_with_diagnostics_mode,
+        count_cottas_native_string_file_with_diagnostics_mode, load_vortex_file_ref,
+        match_cottas_native_file, match_cottas_native_file_with_diagnostics,
         match_cottas_native_string_file, match_cottas_native_string_file_with_diagnostics,
         open_vortex_file, serialize, serialize_cottas_native_file,
         serialize_cottas_native_string_file,
@@ -141,6 +144,40 @@ enum Action {
         #[arg(long)]
         diagnostics_out: Option<PathBuf>,
     },
+    /// Count rows matching a pattern without RDF result serialization
+    Count {
+        /// Input file path required
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Subject pattern
+        #[arg(long)]
+        subject: Option<String>,
+
+        /// Predicate pattern
+        #[arg(long)]
+        predicate: Option<String>,
+
+        /// Object pattern
+        #[arg(long)]
+        object: Option<String>,
+
+        /// Graph pattern
+        #[arg(long)]
+        graph: Option<String>,
+
+        /// Storage layout
+        #[arg(long, value_enum)]
+        storage_layout: StoreLayout,
+
+        /// Write count diagnostics JSON to this file
+        #[arg(long)]
+        diagnostics_out: Option<PathBuf>,
+
+        /// Count diagnostic mode
+        #[arg(long, value_enum, default_value_t = CountMode::NativeFilter)]
+        mode: CountMode,
+    },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum, Debug)]
@@ -156,6 +193,42 @@ impl From<CompressionProfile> for CottasVortexCompressionProfile {
             CompressionProfile::Balanced => CottasVortexCompressionProfile::Balanced,
             CompressionProfile::Compact => CottasVortexCompressionProfile::Compact,
         }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum, Debug)]
+#[clap(rename_all = "kebab_case")]
+enum CountMode {
+    NativeFilter,
+    ManualEq,
+    DecodeOnly,
+    ExecuteOnly,
+    RowsOnly,
+}
+
+impl From<CountMode> for NativeStringCountMode {
+    fn from(value: CountMode) -> Self {
+        match value {
+            CountMode::NativeFilter => NativeStringCountMode::NativeFilter,
+            CountMode::ManualEq => NativeStringCountMode::ManualEq,
+            CountMode::DecodeOnly => NativeStringCountMode::DecodeOnly,
+            CountMode::ExecuteOnly => NativeStringCountMode::ExecuteOnly,
+            CountMode::RowsOnly => NativeStringCountMode::RowsOnly,
+        }
+    }
+}
+
+fn to_native_ids_count_mode(mode: CountMode) -> NativeIdsCountMode {
+    match mode {
+        CountMode::NativeFilter => NativeIdsCountMode::NativeFilter,
+        CountMode::ManualEq => NativeIdsCountMode::ManualEq,
+        CountMode::ExecuteOnly => NativeIdsCountMode::ExecuteOnly,
+        CountMode::RowsOnly => NativeIdsCountMode::RowsOnly,
+
+        // Native IDs do not need a separate string decode-only path.
+        // For primitive u32 IDs, decode-only is equivalent to manual equality
+        // when a bound term exists.
+        CountMode::DecodeOnly => NativeIdsCountMode::ManualEq,
     }
 }
 
@@ -545,6 +618,123 @@ async fn main() -> Result<()> {
             }
 
             info!("Deserialization took {:?}", start.elapsed());
+        }
+        Action::Count {
+            input,
+            subject,
+            predicate,
+            object,
+            graph,
+            storage_layout,
+            mode,
+            diagnostics_out,
+        } => {
+            let count_start = Instant::now();
+
+            let subject_node = if let Some(s) = &subject {
+                Some(parse_subject(s)?)
+            } else {
+                None
+            };
+            let predicate_node = if let Some(p) = &predicate {
+                Some(parse_named_node(p)?)
+            } else {
+                None
+            };
+            let object_node = if let Some(o) = &object {
+                Some(parse_term(o)?)
+            } else {
+                None
+            };
+            let graph_node = if let Some(g) = &graph {
+                Some(parse_graph_name(g)?)
+            } else {
+                None
+            };
+
+            let is_vortex_file = input.extension().map(|e| e == "vortex").unwrap_or(false);
+            if !is_vortex_file {
+                return Err(anyhow!("count currently expects a .vortex input file"));
+            }
+
+            match storage_layout {
+                StoreLayout::CottasNativeStrings => {
+                    let diag = count_cottas_native_string_file_with_diagnostics_mode(
+                        &input,
+                        subject_node.as_ref(),
+                        predicate_node.as_ref(),
+                        object_node.as_ref(),
+                        graph_node.as_ref(),
+                        mode.into(),
+                    )
+                    .await
+                    .context("Failed to count native string COTTAS file")?;
+
+                    let diag_json = serde_json::to_vec_pretty(&diag)
+                        .context("Failed to serialize native string count diagnostics JSON")?;
+
+                    if let Some(diag_path) = &diagnostics_out {
+                        tokio::fs::write(diag_path, &diag_json)
+                            .await
+                            .context("Failed to write count diagnostics JSON file")?;
+                    }
+
+                    stdout()
+                        .write_all(&diag_json)
+                        .context("Failed to write count diagnostics to stdout")?;
+                    stdout()
+                        .write_all(b"\n")
+                        .context("Failed to write trailing newline")?;
+
+                    info!(
+                        "Native string COTTAS count-only operation took {:?}",
+                        count_start.elapsed()
+                    );
+
+                    return Ok(());
+                }
+                StoreLayout::CottasNativeIds => {
+                    let diag = count_cottas_native_ids_file_with_diagnostics_mode(
+                        &input,
+                        subject_node.as_ref(),
+                        predicate_node.as_ref(),
+                        object_node.as_ref(),
+                        graph_node.as_ref(),
+                        to_native_ids_count_mode(mode),
+                    )
+                    .await
+                    .context("Failed to count native ID COTTAS file")?;
+
+                    let diag_json = serde_json::to_vec_pretty(&diag)
+                        .context("Failed to serialize native ID count diagnostics JSON")?;
+
+                    if let Some(diag_path) = &diagnostics_out {
+                        tokio::fs::write(diag_path, &diag_json)
+                            .await
+                            .context("Failed to write native ID count diagnostics JSON file")?;
+                    }
+
+                    stdout()
+                        .write_all(&diag_json)
+                        .context("Failed to write native ID count diagnostics to stdout")?;
+                    stdout()
+                        .write_all(b"\n")
+                        .context("Failed to write trailing newline")?;
+
+                    info!(
+                        "Native ID COTTAS count-only operation took {:?}",
+                        count_start.elapsed()
+                    );
+
+                    return Ok(());
+                }
+                other => {
+                    return Err(anyhow!(
+                        "count is currently implemented only for --storage-layout cottas-native-strings and cottas-native-ids, got {:?}",
+                        other
+                    ));
+                }
+            }
         }
         Action::Match {
             input,

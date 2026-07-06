@@ -7,7 +7,7 @@ use std::time::Instant;
 use vortex::VortexSessionDefault;
 use vortex_session::VortexSession;
 
-use vortex_array::ArrayRef;
+use vortex_array::{ArrayRef, ExecutionCtx};
 use vortex_array::arrays::{PrimitiveArray, StructArray, VarBinViewArray};
 use vortex_array::builders::{ArrayBuilder, PrimitiveBuilder, VarBinViewBuilder};
 use vortex_array::dtype::Nullability;
@@ -367,11 +367,16 @@ impl RdfDictionary for ChainedHash {
             .map_err(VortexRdfError::Vortex)?;
 
         let dict_arr = if dict_raw.len() > 0 {
-            // Train compressor and execute FSST on the dictionary payload.
-            let compressor = fsst_train_compressor(&dict_raw);
-            let len = dict_raw.len();
-            let dtype = dict_raw.dtype().clone();
-            fsst_compress(dict_raw, len, &dtype, &compressor, &mut ctx).into_array()
+            // Convert concrete VarBinView array into ArrayRef.
+            let dict_raw = dict_raw.into_array();
+
+            // Create execution context from a Vortex session.
+            let mut ctx = ExecutionCtx::new(VortexSession::default());
+
+            // Train FSST compressor and compress dictionary payload.
+            let compressor = fsst_train_compressor(&dict_raw, &mut ctx)?;
+
+            fsst_compress(&dict_raw, &compressor, &mut ctx)?.into_array()
         } else {
             dict_raw.into_array()
         };

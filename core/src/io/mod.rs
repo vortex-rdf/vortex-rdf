@@ -12,12 +12,17 @@ pub use de::{load_vortex_file_ref, open_vortex_file};
 pub use ser::{quads_stream_to_vortex, quads_stream_to_vortex_writer, serialize};
 
 pub use cottas_native_ids::{
-    CottasNativeConfig, CottasNativeIdsDiagnostics, match_cottas_native_file,
-    match_cottas_native_file_with_diagnostics, serialize_cottas_native_file,
+    CottasNativeConfig, CottasNativeIdsDiagnostics, NativeIdsCountMode,
+    count_cottas_native_ids_file_with_diagnostics,
+    count_cottas_native_ids_file_with_diagnostics_mode, match_cottas_native_file,
+    match_cottas_native_file_as_triples, match_cottas_native_file_with_diagnostics,
+    serialize_cottas_native_file,
 };
 
 pub use cottas_native_strings::{
-    CottasNativeStringConfig, count_cottas_native_string_file, match_cottas_native_string_file,
+    CottasNativeStringConfig, NativeStringCountMode, count_cottas_native_string_file,
+    count_cottas_native_string_file_with_diagnostics,
+    count_cottas_native_string_file_with_diagnostics_mode, match_cottas_native_string_file,
     match_cottas_native_string_file_as_triples, match_cottas_native_string_file_with_diagnostics,
     serialize_cottas_native_string_file,
 };

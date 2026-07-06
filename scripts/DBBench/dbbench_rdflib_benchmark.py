@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 from rdflib import Graph
 from pathlib import Path
 import time
@@ -10,6 +11,9 @@ import gc
 import argparse
 import contextlib
 import csv
+import psutil
+import os
+import signal
 
 
 def split_dbbench_queries(path: Path):
@@ -103,18 +107,25 @@ def make_graph(engine: str, cottas_path: str, vortex_path: str, vortex_layout: s
     raise ValueError(f"Unknown engine: {engine}")
 
 
-import psutil
-import os
-
 _process = psutil.Process(os.getpid())
 
 
-def run_one_query(graph: Graph, query: str, silence_stdout: bool):
+class QueryTimeoutError(TimeoutError):
+    pass
+
+
+def _query_timeout_handler(signum, frame):
+    raise QueryTimeoutError("Query exceeded timeout")
+
+
+def run_one_query(graph: Graph, query: str, silence_stdout: bool, timeout_s: float):
     """
     Measure:
     - elapsed time
     - result count
     - memory usage (RSS)
+
+    Raises QueryTimeoutError if the query exceeds timeout_s.
     """
     gc.collect()
 
@@ -122,13 +133,27 @@ def run_one_query(graph: Graph, query: str, silence_stdout: bool):
 
     sink = io.StringIO()
     stdout_ctx = contextlib.redirect_stdout(
-        sink) if silence_stdout else contextlib.nullcontext()
+        sink
+    ) if silence_stdout else contextlib.nullcontext()
+
+    old_handler = signal.getsignal(signal.SIGALRM)
 
     start_ns = time.perf_counter_ns()
-    with stdout_ctx:
-        rows = list(graph.query(query))
-    end_ns = time.perf_counter_ns()
 
+    try:
+        if timeout_s is not None and timeout_s > 0:
+            signal.signal(signal.SIGALRM, _query_timeout_handler)
+            signal.setitimer(signal.ITIMER_REAL, timeout_s)
+
+        with stdout_ctx:
+            rows = list(graph.query(query))
+
+    finally:
+        if timeout_s is not None and timeout_s > 0:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old_handler)
+
+    end_ns = time.perf_counter_ns()
     mem_after = _process.memory_info().rss
 
     return {
@@ -149,6 +174,7 @@ def summarize(results):
 
         key = (
             row["engine"],
+            row.get("vortex_layout"),
             row["query_id"],
             row["relative_path"],
             row["top_group"],
@@ -159,9 +185,10 @@ def summarize(results):
     out = []
 
     for key, times in grouped.items():
-        engine, query_id, relative_path, top_group, size_group = key
+        engine, vortex_layout, query_id, relative_path, top_group, size_group = key
         out.append({
             "engine": engine,
+            "vortex_layout": vortex_layout,
             "query_id": query_id,
             "relative_path": relative_path,
             "top_group": top_group,
@@ -192,19 +219,34 @@ def write_csv(path: Path, rows):
 
 def main():
     parser = argparse.ArgumentParser()
+
     parser.add_argument("--query-root", required=True)
     parser.add_argument("--dataset", default="dbpedia")
-    parser.add_argument("--groups", nargs="+",
-                        default=["TP", "JOINS"], choices=["TP", "JOINS"])
-    parser.add_argument("--join-sizes", nargs="+",
-                        default=["small", "big"], choices=["small", "big"])
+    parser.add_argument(
+        "--groups",
+        nargs="+",
+        default=["TP", "JOINS"],
+        choices=["TP", "JOINS"],
+    )
+    parser.add_argument(
+        "--join-sizes",
+        nargs="+",
+        default=["small", "big"],
+        choices=["small", "big"],
+    )
 
     parser.add_argument("--cottas-path", required=True)
     parser.add_argument("--vortex-path", required=True)
-    parser.add_argument("--vortex-layout", default="cottas-native-strings")
+    parser.add_argument("--vortex-layout", default="cottas-native-ids")
 
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--measured-runs", type=int, default=5)
+
+    # New argument:
+    # Per-query timeout in seconds.
+    # Use 0 or a negative value to disable timeout.
+    parser.add_argument("--query-timeout-s", type=float, default=60.0)
+
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
 
@@ -248,13 +290,19 @@ def main():
     print(f"Loaded {len(query_records)} individual queries")
 
     inventory_path = out_prefix.with_suffix(".queries.json")
-    inventory_path.write_text(json.dumps(
-        query_records, indent=2), encoding="utf-8")
+    inventory_path.write_text(
+        json.dumps(query_records, indent=2),
+        encoding="utf-8",
+    )
     print(f"Wrote query inventory: {inventory_path}")
 
     graphs = {
-        engine: make_graph(engine, args.cottas_path,
-                           args.vortex_path, args.vortex_layout)
+        engine: make_graph(
+            engine,
+            args.cottas_path,
+            args.vortex_path,
+            args.vortex_layout,
+        )
         for engine in args.engines
     }
 
@@ -277,6 +325,7 @@ def main():
 
                 row = {
                     "engine": engine,
+                    "vortex_layout": args.vortex_layout if engine.startswith("vortex") else None,
                     "phase": phase,
                     "run": measured_run_idx if phase == "measured" else run_idx,
                     "query_id": qrec["query_id"],
@@ -291,16 +340,36 @@ def main():
                     "status": "ok",
                     "elapsed_s": None,
                     "result_count": None,
+                    "rss_before_mb": None,
+                    "rss_after_mb": None,
+                    "rss_delta_mb": None,
                     "error": None,
                 }
 
                 try:
                     out = run_one_query(
-                        graph, qrec["query"], silence_stdout=silence_stdout)
+                        graph,
+                        qrec["query"],
+                        silence_stdout=silence_stdout,
+                        timeout_s=args.query_timeout_s,
+                    )
                     row.update(out)
 
                     if phase == "measured" and measured_run_idx == 0:
                         counts_by_engine[engine] = row["result_count"]
+
+                except QueryTimeoutError as e:
+                    row["status"] = "timeout"
+                    row["elapsed_s"] = args.query_timeout_s
+                    row["result_count"] = None
+                    row["error"] = str(e)
+
+                    # Try to record memory after timeout as well.
+                    try:
+                        mem_after = _process.memory_info().rss
+                        row["rss_after_mb"] = mem_after / (1024 * 1024)
+                    except Exception:
+                        pass
 
                 except Exception as e:
                     row["status"] = "error"
@@ -310,10 +379,15 @@ def main():
 
                 print(
                     f"  {engine:13s} {phase:8s} run={row['run']} "
-                    f"status={row['status']} time={row['elapsed_s']} rows={row['result_count']}"
+                    f"status={row['status']} time={row['elapsed_s']} "
+                    f"rows={row['result_count']}"
                 )
 
-        if set(args.engines) == {"cottas", "vortex"} and "cottas" in counts_by_engine and "vortex" in counts_by_engine:
+        if (
+            set(args.engines) == {"cottas", "vortex"}
+            and "cottas" in counts_by_engine
+            and "vortex" in counts_by_engine
+        ):
             if counts_by_engine["cottas"] != counts_by_engine["vortex"]:
                 print(
                     "  WARNING count mismatch: "
@@ -330,8 +404,7 @@ def main():
     write_csv(raw_csv, results)
 
     summary_rows = summarize(results)
-    summary_json.write_text(json.dumps(
-        summary_rows, indent=2), encoding="utf-8")
+    summary_json.write_text(json.dumps(summary_rows, indent=2), encoding="utf-8")
     write_csv(summary_csv, summary_rows)
 
     print(f"Wrote {raw_json}")

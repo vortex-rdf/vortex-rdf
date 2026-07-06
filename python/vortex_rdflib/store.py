@@ -1,13 +1,11 @@
 from pathlib import Path
+from typing import Optional
 
+from rdflib.term import Node
 from rdflib.store import Store, NO_STORE, VALID_STORE
 from rdflib.util import from_n3
 
 from .vortex_rdf_native import match_triples, count_triples
-
-
-def _sql_quote(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
 
 
 class VortexStore(Store):
@@ -18,212 +16,157 @@ class VortexStore(Store):
 
     def __init__(
         self,
-        vortex_file=None,
-        *,
-        layout="cottas-native-strings",
-        backend="native",
         configuration=None,
         identifier=None,
+        path: Optional[str] = None,
+        layout: str = "cottas-native-strings",
+        backend: str = "native",
+        **kwargs,
     ):
-        super().__init__(configuration=configuration, identifier=identifier)
-        self.vortex_file = str(vortex_file) if vortex_file is not None else None
+        # IMPORTANT:
+        # RDFLib Store.__init__ may call self.open(configuration).
+        # Therefore all attributes used by open() must exist BEFORE super().__init__.
+        if path is None:
+            path = configuration
+
+        self.path = str(Path(path)) if path is not None else None
         self.layout = layout
         self.backend = backend
-        self._num_triples = None
-        self._is_quad_table = None
-        self._duckdb_ready = False
+        self._backend = None
+
+        # Do not pass configuration here, otherwise RDFLib calls open()
+        # before our initialization logic is fully under control.
+        super().__init__(configuration=None, identifier=identifier)
+
+        # Explicitly open after initialization.
+        if self.path is not None:
+            self.open(self.path)
 
     def open(self, configuration, create=False):
+        """
+        RDFLib calls open() for some stores.
+        For this read-only Vortex store, configuration is the Vortex file path.
+        """
         if configuration is not None:
-            self.vortex_file = str(configuration)
+            self.path = str(Path(configuration))
 
-        if self.vortex_file is None or not Path(self.vortex_file).exists():
+        if self.path is None:
             return NO_STORE
 
-        if self.backend == "native":
-            self._num_triples = count_triples(self.vortex_file, self.layout)
-            return VALID_STORE
-
         if self.backend == "duckdb":
-            self._init_duckdb_vortex_repro()
-            return VALID_STORE
+            if self.layout in {"cottas-native-ids", "cottas-native"}:
+                raise ValueError(
+                    "DuckDB backend does not currently support cottas-native-ids. "
+                    "Use backend='native' for native-ID files."
+                )
 
-        raise ValueError(f"Unknown VortexStore backend: {self.backend}")
+            from .duckdb_backend import DuckDBVortexBackend
 
-    def _init_duckdb_vortex_repro(self):
+            self._backend = DuckDBVortexBackend(self.path)
+
+        return VALID_STORE
+
+    def close(self, commit_pending_transaction=False):
+        if self._backend is not None:
+            self._backend.close()
+            self._backend = None
+
+    def triples(self, triple_pattern, context=None):
         """
-        COTTAS-reproducible DuckDB/Vortex setup.
+        RDFLib Store API.
 
-        Mirrors COTTASStore.__init__ as closely as possible:
-        - uses module-level duckdb.query/execute
-        - sets progress bar off
-        - touches the file with SELECT * FROM ...
-        - computes COUNT(*)
-        - checks whether column g exists
+        Input:
+            triple_pattern = (subject, predicate, object)
 
-        Does NOT CREATE TEMP TABLE.
-        Does NOT CREATE INDEX.
-        Does NOT materialize the file into DuckDB memory.
+        Output:
+            yields ((s, p, o), context)
         """
-        if self._duckdb_ready:
+        if self.path is None:
             return
 
-        import duckdb
-
-        path_sql = _sql_quote(self.vortex_file)
-
-        try:
-            duckdb.execute("LOAD vortex")
-        except Exception:
-            try:
-                duckdb.execute("INSTALL vortex")
-                duckdb.execute("LOAD vortex")
-            except Exception:
-                try:
-                    from duckdb_extensions import import_extension
-
-                    import_extension("vortex")
-                    duckdb.execute("LOAD vortex")
-                except Exception as e:
-                    raise RuntimeError(
-                        "Could not load DuckDB vortex extension. Try:\n"
-                        "  pip install 'duckdb>=1.4.2'\n"
-                        "or:\n"
-                        "  pip install duckdb-extensions duckdb-extension-vortex"
-                    ) from e
-
-        # COTTAS does:
-        # duckdb.query("SET parquet_metadata_cache=true; SET enable_progress_bar=false; SELECT * FROM PARQUET_SCAN(...)")
-        #
-        # For Vortex, parquet_metadata_cache is irrelevant, but harmless if accepted.
-        try:
-            duckdb.query(
-                f"""
-                SET parquet_metadata_cache=true;
-                SET enable_progress_bar=false;
-                SELECT * FROM read_vortex({path_sql})
-                """
-            )
-        except Exception:
-            # Some DuckDB builds may reject parquet-specific setting with Vortex.
-            duckdb.query(
-                f"""
-                SET enable_progress_bar=false;
-                SELECT * FROM read_vortex({path_sql})
-                """
-            )
-
-        self._num_triples = duckdb.execute(
-            f"SELECT COUNT(*) FROM read_vortex({path_sql})"
-        ).fetchone()[0]
-
-        columns = [
-            row[0]
-            for row in duckdb.execute(
-                f"DESCRIBE SELECT * FROM read_vortex({path_sql}) LIMIT 1"
-            ).fetchall()
-        ]
-        self._is_quad_table = "g" in columns
-
-        self._duckdb_ready = True
-
-    def __len__(self, context=None):
-        if self.backend == "native":
-            if self._num_triples is None:
-                self._num_triples = count_triples(self.vortex_file, self.layout)
-            return self._num_triples
+        s, p, o = triple_pattern
 
         if self.backend == "duckdb":
-            self._init_duckdb_vortex_repro()
-            return self._num_triples
+            if self._backend is None:
+                from .duckdb_backend import DuckDBVortexBackend
 
-        raise ValueError(f"Unknown VortexStore backend: {self.backend}")
+                self._backend = DuckDBVortexBackend(self.path)
 
-    def triples(self, pattern, context=None):
-        if self.backend == "native":
-            yield from self._triples_native(pattern, context)
+            for triple in self._backend.triples(s, p, o):
+                yield triple, None
             return
 
-        if self.backend == "duckdb":
-            yield from self._triples_duckdb_repro(pattern, context)
-            return
+        if self.backend != "native":
+            raise ValueError(f"Unsupported Vortex backend: {self.backend}")
 
-        raise ValueError(f"Unknown VortexStore backend: {self.backend}")
+        s_n3 = self._node_to_n3(s)
+        p_n3 = self._node_to_n3(p)
+        o_n3 = self._node_to_n3(o)
 
-    def _triples_native(self, pattern, context=None):
-        s, p, o = pattern
-
-        rows = match_triples(
-            self.vortex_file,
-            s.n3() if s is not None else None,
-            p.n3() if p is not None else None,
-            o.n3() if o is not None else None,
+        triples_out = match_triples(
+            self.path,
+            s_n3,
+            p_n3,
+            o_n3,
             self.layout,
         )
 
-        for ss, pp, oo in rows:
-            yield (from_n3(ss), from_n3(pp), from_n3(oo)), None
+        for ss, pp, oo in triples_out:
+            yield (
+                self._from_n3_safe(ss),
+                self._from_n3_safe(pp),
+                self._from_n3_safe(oo),
+            ), None
 
-    def _triples_duckdb_repro(self, pattern, context=None):
-        """
-        Mirrors COTTASStore.triples:
-        - build SQL per triple pattern
-        - execute directly over file scan
-        - fetchall()
-        - from_n3 conversion
-        """
-        self._init_duckdb_vortex_repro()
+    def __len__(self, context=None):
+        if self.path is None:
+            return 0
 
-        import duckdb
+        if self.backend == "duckdb":
+            if self._backend is None:
+                from .duckdb_backend import DuckDBVortexBackend
 
-        sql = self._translate_vortex_triple_pattern_tuple(pattern)
+                self._backend = DuckDBVortexBackend(self.path)
 
-        for ss, pp, oo in duckdb.execute(sql).fetchall():
-            yield (from_n3(ss), from_n3(pp), from_n3(oo)), None
+            return len(self._backend)
 
-    def _translate_vortex_triple_pattern_tuple(self, pattern):
-        if len(pattern) != 3:
-            raise TypeError("The pattern must be a tuple of length 3.")
+        if self.backend != "native":
+            raise ValueError(f"Unsupported Vortex backend: {self.backend}")
 
-        path_sql = _sql_quote(self.vortex_file)
-        query = f"SELECT s, p, o FROM read_vortex({path_sql}) WHERE "
-
-        names = ["s", "p", "o"]
-
-        for i, term in enumerate(pattern):
-            if term is not None:
-                query += f"{names[i]}={_sql_quote(term.n3())} AND "
-
-        if query.endswith("AND "):
-            query = query[:-4]
-
-        if query.endswith("WHERE "):
-            query = query[:-6]
-
-        return query
-
-    def close(self, commit_pending_transaction=False):
-        # COTTASStore does not close the module-level DuckDB connection.
-        # Keep this minimal for behavioral similarity.
-        self._duckdb_ready = False
+        return count_triples(self.path, self.layout)
 
     def add(self, triple, context=None, quoted=False):
-        raise TypeError("VortexStore is read-only")
+        raise NotImplementedError("VortexStore is read-only")
 
     def addN(self, quads):
-        raise TypeError("VortexStore is read-only")
+        raise NotImplementedError("VortexStore is read-only")
 
-    def remove(self, triple, context=None):
-        raise TypeError("VortexStore is read-only")
+    def remove(self, triple_pattern, context=None):
+        raise NotImplementedError("VortexStore is read-only")
 
-    def create(self, configuration):
-        return self.open(configuration, create=True)
+    def bind(self, prefix, namespace, override=True):
+        return None
 
-    def destroy(self, configuration):
-        pass
+    def namespace(self, prefix):
+        return None
 
-    def commit(self):
-        pass
+    def namespaces(self):
+        return iter(())
 
-    def rollback(self):
-        pass
+    def prefix(self, namespace):
+        return None
+
+    @staticmethod
+    def _node_to_n3(node: Optional[Node]) -> Optional[str]:
+        if node is None:
+            return None
+        return node.n3()
+
+    @staticmethod
+    def _from_n3_safe(value: str) -> Node:
+        try:
+            return from_n3(value)
+        except Exception as e:
+            raise ValueError(
+                f"Could not parse returned RDF term as N3: {value!r}"
+            ) from e

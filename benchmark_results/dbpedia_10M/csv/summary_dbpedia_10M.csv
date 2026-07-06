@@ -1,9 +1,0 @@
-dataset_size,configuration,compression_profile,ordering,serialize_mean_s,serialize_std_s,file_size_mean_mb,file_size_std_mb
-10M,balanced-none,balanced,none,0.0,0.0
-10M,balanced-SPO,balanced,SPO,0.0,0.0
-10M,balanced-OSP,balanced,OSP,0.0,0.0
-10M,balanced-PSO,balanced,PSO,0.0,0.0
-10M,compact-none,compact,none,0.0,0.0
-10M,compact-SPO,compact,SPO,0.0,0.0
-10M,compact-OSP,compact,OSP,0.0,0.0
-10M,compact-PSO,compact,PSO,0.0,0.0

@@ -140,9 +140,6 @@ mod tests {
         assert_eq!(filtered.size(), 1);
 
         let results: Vec<Quad> = filtered.quads().unwrap().try_collect().await.unwrap();
-        assert_eq!(filtered.size(), 1);
-
-        let results: Vec<Quad> = filtered.quads().unwrap().try_collect().await.unwrap();
         let res_q = results.first().unwrap();
 
         assert_eq!(res_q.subject.to_string(), s1.to_string());

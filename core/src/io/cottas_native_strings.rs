@@ -14,7 +14,7 @@ use std::time::Instant;
 use vortex::expr::{Expression, and, col, eq, lit};
 use vortex_array::arrays::{StructArray, VarBinViewArray};
 use vortex_array::stream::{ArrayStreamAdapter, ArrayStreamExt};
-use vortex_array::{ArrayRef, IntoArray};
+use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_error::{VortexError, VortexResult};
 use vortex_file::{OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder};
 use vortex_io::VortexWrite;
@@ -168,34 +168,6 @@ fn stats_sidecar_path(output_path: &Path) -> std::path::PathBuf {
 
     let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
     parent.join(format!("{file_name}.rgstats.json"))
-}
-
-async fn write_row_group_stats_sidecar(
-    output_path: &Path,
-    ordering: TripleOrdering,
-    row_group_size: usize,
-    groups: &[Vec<NativeStringQuad>],
-) -> Result<()> {
-    let row_groups: Vec<NativeStringRowGroupStats> = groups
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, g)| compute_row_group_stats(idx, g))
-        .collect();
-
-    let stats = NativeStringFileStats {
-        ordering: format!("{ordering:?}"),
-        row_group_size,
-        row_groups,
-    };
-
-    let serialized = serde_json::to_vec_pretty(&stats)
-        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-
-    tokio::fs::write(stats_sidecar_path(output_path), serialized)
-        .await
-        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-
-    Ok(())
 }
 
 fn row_group_may_match(pattern: &NativeStringPatternProbe, rg: &NativeStringRowGroupStats) -> bool {
@@ -412,6 +384,42 @@ pub struct NativeStringScanDiagnostics {
     pub proc_io: Option<ProcIoDelta>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeStringCountMode {
+    NativeFilter,
+    ManualEq,
+    DecodeOnly,
+    ExecuteOnly,
+    RowsOnly,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeStringCountTimings {
+    pub open_ms: f64,
+    pub scan_build_ms: f64,
+    pub stream_init_ms: f64,
+    pub consume_ms: f64,
+    pub total_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeStringCountDiagnostics {
+    pub mode: NativeStringCountMode,
+    pub count: usize,
+    pub timings: NativeStringCountTimings,
+    pub proc_io: Option<ProcIoDelta>,
+
+    pub filter_is_all: bool,
+    pub projected_columns: Vec<String>,
+
+    pub batches: usize,
+    pub max_batch_rows: usize,
+
+    pub decoded_values: usize,
+    pub decoded_bytes: usize,
+}
+
 pub async fn scan_cottas_native_string_file_with_diagnostics(
     input_path: &Path,
     subject: Option<&NamedOrBlankNode>,
@@ -488,6 +496,216 @@ pub async fn scan_cottas_native_string_file_with_diagnostics(
         matched_quads,
         NativeStringScanDiagnostics { timings, proc_io },
     ))
+}
+
+pub async fn count_cottas_native_string_file_with_diagnostics(
+    input_path: &Path,
+    subject: Option<&NamedOrBlankNode>,
+    predicate: Option<&NamedNode>,
+    object: Option<&Term>,
+    graph: Option<&GraphName>,
+) -> Result<NativeStringCountDiagnostics> {
+    count_cottas_native_string_file_with_diagnostics_mode(
+        input_path,
+        subject,
+        predicate,
+        object,
+        graph,
+        NativeStringCountMode::NativeFilter,
+    )
+    .await
+}
+
+pub async fn count_cottas_native_string_file_with_diagnostics_mode(
+    input_path: &Path,
+    subject: Option<&NamedOrBlankNode>,
+    predicate: Option<&NamedNode>,
+    object: Option<&Term>,
+    graph: Option<&GraphName>,
+    mode: NativeStringCountMode,
+) -> Result<NativeStringCountDiagnostics> {
+    use vortex::VortexSessionDefault;
+
+    let total_start = Instant::now();
+
+    let filter = build_native_string_pattern_filter(subject, predicate, object, graph);
+    let filter_is_all = matches!(filter, NativeStringPatternFilter::All);
+
+    let projection_cols = count_projection_for_mode(mode, subject, predicate, object, graph);
+    let projected_columns: Vec<String> = projection_cols.iter().map(|c| c.to_string()).collect();
+
+    let open_start = Instant::now();
+    let file = NATIVE_STRING_FILE_SESSION
+        .open_options()
+        .open_path(input_path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let open_ms = open_start.elapsed().as_secs_f64() * 1000.0;
+
+    let scan_build_start = Instant::now();
+    let scan = file.scan().map_err(VortexRdfError::from)?;
+
+    let scan = match mode {
+        NativeStringCountMode::NativeFilter => match filter {
+            NativeStringPatternFilter::All => scan,
+            NativeStringPatternFilter::Expr(expr) => scan.with_filter(expr),
+        },
+        NativeStringCountMode::ManualEq
+        | NativeStringCountMode::DecodeOnly
+        | NativeStringCountMode::ExecuteOnly
+        | NativeStringCountMode::RowsOnly => scan,
+    };
+
+    let scan = scan.with_projection(vortex_array::expr::select(
+        projection_cols.as_slice(),
+        vortex_array::expr::root(),
+    ));
+
+    let scan_build_ms = scan_build_start.elapsed().as_secs_f64() * 1000.0;
+
+    let stream_init_start = Instant::now();
+    let mut stream = scan.into_array_stream().map_err(VortexRdfError::from)?;
+    let stream_init_ms = stream_init_start.elapsed().as_secs_f64() * 1000.0;
+
+    let proc_before = read_proc_io_snapshot();
+    let consume_start = Instant::now();
+
+    let session = VortexSession::default();
+    let mut ctx = session.create_execution_ctx();
+
+    let targets = projected_target_strings(subject, predicate, object, graph);
+    let target_bytes: Vec<(&'static str, Vec<u8>)> = targets
+        .iter()
+        .map(|(name, value)| (*name, value.as_bytes().to_vec()))
+        .collect();
+
+    let mut count = 0usize;
+    let mut batches = 0usize;
+    let mut max_batch_rows = 0usize;
+    let mut decoded_values = 0usize;
+    let mut decoded_bytes = 0usize;
+
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result.map_err(VortexRdfError::from)?;
+        let rows = batch.len();
+
+        batches += 1;
+        max_batch_rows = max_batch_rows.max(rows);
+
+        match mode {
+            NativeStringCountMode::NativeFilter | NativeStringCountMode::RowsOnly => {
+                count += rows;
+            }
+            NativeStringCountMode::ExecuteOnly => {
+                let struct_array = batch
+                    .clone()
+                    .execute::<StructArray>(&mut ctx)
+                    .map_err(VortexRdfError::Vortex)?;
+
+                for col_name in &projection_cols {
+                    let _arr = struct_array
+                        .unmasked_field_by_name(col_name)
+                        .map_err(VortexRdfError::Vortex)?
+                        .clone()
+                        .execute::<VarBinViewArray>(&mut ctx)
+                        .map_err(VortexRdfError::Vortex)?;
+                }
+
+                count += rows;
+            }
+            NativeStringCountMode::DecodeOnly => {
+                let struct_array = batch
+                    .clone()
+                    .execute::<StructArray>(&mut ctx)
+                    .map_err(VortexRdfError::Vortex)?;
+
+                for col_name in &projection_cols {
+                    let arr = struct_array
+                        .unmasked_field_by_name(col_name)
+                        .map_err(VortexRdfError::Vortex)?
+                        .clone()
+                        .execute::<VarBinViewArray>(&mut ctx)
+                        .map_err(VortexRdfError::Vortex)?;
+
+                    for i in 0..struct_array.len() {
+                        let bytes = arr.bytes_at(i);
+                        decoded_values += 1;
+                        decoded_bytes += bytes.len();
+                    }
+                }
+
+                count += rows;
+            }
+
+            NativeStringCountMode::ManualEq => {
+                let struct_array = batch
+                    .clone()
+                    .execute::<StructArray>(&mut ctx)
+                    .map_err(VortexRdfError::Vortex)?;
+
+                let mut arrays: Vec<(&'static str, VarBinViewArray)> = Vec::new();
+                for (col_name, _) in &target_bytes {
+                    let arr = struct_array
+                        .unmasked_field_by_name(col_name)
+                        .map_err(VortexRdfError::Vortex)?
+                        .clone()
+                        .execute::<VarBinViewArray>(&mut ctx)
+                        .map_err(VortexRdfError::Vortex)?;
+                    arrays.push((*col_name, arr));
+                }
+
+                for i in 0..struct_array.len() {
+                    let mut row_matches = true;
+
+                    for ((col_name, expected), (_, arr)) in target_bytes.iter().zip(arrays.iter()) {
+                        let bytes = arr.bytes_at(i);
+                        decoded_values += 1;
+                        decoded_bytes += bytes.len();
+
+                        if bytes.as_ref() != expected.as_slice() {
+                            row_matches = false;
+                            break;
+                        }
+
+                        let _ = col_name;
+                    }
+
+                    if row_matches {
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let consume_ms = consume_start.elapsed().as_secs_f64() * 1000.0;
+
+    let proc_after = read_proc_io_snapshot();
+    let proc_io = match (proc_before, proc_after) {
+        (Some(before), Some(after)) => Some(diff_proc_io(before, after)),
+        _ => None,
+    };
+
+    let timings = NativeStringCountTimings {
+        open_ms,
+        scan_build_ms,
+        stream_init_ms,
+        consume_ms,
+        total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+    };
+
+    Ok(NativeStringCountDiagnostics {
+        mode,
+        count,
+        timings,
+        proc_io,
+        filter_is_all,
+        projected_columns,
+        batches,
+        max_batch_rows,
+        decoded_values,
+        decoded_bytes,
+    })
 }
 
 pub async fn match_cottas_native_string_file_with_diagnostics<W>(
@@ -616,32 +834,6 @@ fn empty_string_spog_array() -> Result<ArrayRef> {
     build_string_spog_array(&[])
 }
 
-async fn collect_globally_sorted_string_row_groups<S>(
-    mut quad_stream: S,
-    ordering: TripleOrdering,
-    row_group_size: usize,
-) -> Result<Vec<Vec<NativeStringQuad>>>
-where
-    S: Stream<Item = Result<Quad>> + Unpin + Send + 'static,
-{
-    let row_group_size = row_group_size.max(1);
-
-    let mut quads = Vec::new();
-
-    while let Some(item) = quad_stream.next().await {
-        let quad = item?;
-        quads.push(quad_to_native_string_quad(&quad));
-    }
-
-    if ordering != TripleOrdering::None {
-        quads.sort_by(|a, b| a.cmp_by_order(b, ordering));
-    }
-    Ok(quads
-        .chunks(row_group_size)
-        .map(|chunk| chunk.to_vec())
-        .collect())
-}
-
 async fn write_string_array_stream_to_vortex_file<W>(
     writer: &mut W,
     arrays: Pin<Box<dyn Stream<Item = VortexResult<ArrayRef>> + Send>>,
@@ -741,6 +933,121 @@ where
 enum NativeStringPatternFilter {
     All,
     Expr(Expression),
+}
+
+fn count_projection_for_mode(
+    mode: NativeStringCountMode,
+    subject: Option<&NamedOrBlankNode>,
+    predicate: Option<&NamedNode>,
+    object: Option<&Term>,
+    graph: Option<&GraphName>,
+) -> Vec<&'static str> {
+    match mode {
+        NativeStringCountMode::NativeFilter => {
+            count_only_projection_columns(subject, predicate, object, graph)
+        }
+        NativeStringCountMode::RowsOnly => {
+            if object.is_some() {
+                vec!["o"]
+            } else if subject.is_some() {
+                vec!["s"]
+            } else if predicate.is_some() {
+                vec!["p"]
+            } else if graph.is_some() {
+                vec!["g"]
+            } else {
+                vec!["s"]
+            }
+        }
+        NativeStringCountMode::DecodeOnly | NativeStringCountMode::ExecuteOnly => {
+            if object.is_some() {
+                vec!["o"]
+            } else if subject.is_some() {
+                vec!["s"]
+            } else if predicate.is_some() {
+                vec!["p"]
+            } else if graph.is_some() {
+                vec!["g"]
+            } else {
+                vec!["s"]
+            }
+        }
+        NativeStringCountMode::ManualEq => {
+            let mut cols = Vec::new();
+            if subject.is_some() {
+                cols.push("s");
+            }
+            if predicate.is_some() {
+                cols.push("p");
+            }
+            if object.is_some() {
+                cols.push("o");
+            }
+            if graph.is_some() {
+                cols.push("g");
+            }
+            if cols.is_empty() {
+                cols.push("s");
+            }
+            cols
+        }
+    }
+}
+
+fn projected_target_strings(
+    subject: Option<&NamedOrBlankNode>,
+    predicate: Option<&NamedNode>,
+    object: Option<&Term>,
+    graph: Option<&GraphName>,
+) -> Vec<(&'static str, String)> {
+    let mut targets = Vec::new();
+    if let Some(s) = subject {
+        targets.push(("s", s.to_string()));
+    }
+    if let Some(p) = predicate {
+        targets.push(("p", p.to_string()));
+    }
+    if let Some(o) = object {
+        targets.push(("o", o.to_string()));
+    }
+    if let Some(g) = graph {
+        targets.push(("g", g.to_string()));
+    }
+    targets
+}
+
+fn count_only_projection_columns(
+    subject: Option<&NamedOrBlankNode>,
+    predicate: Option<&NamedNode>,
+    object: Option<&Term>,
+    graph: Option<&GraphName>,
+) -> Vec<&'static str> {
+    // For the key audit case:
+    //   ?s ?p <object>
+    // only the object column is needed to evaluate/count the filtered scan result.
+    if subject.is_none() && predicate.is_none() && object.is_some() && graph.is_none() {
+        return vec!["o"];
+    }
+
+    // For other patterns, project only columns that are actually bound.
+    // If no filter is bound, pick one cheap column just to count rows from streamed batches.
+    let mut cols = Vec::new();
+    if subject.is_some() {
+        cols.push("s");
+    }
+    if predicate.is_some() {
+        cols.push("p");
+    }
+    if object.is_some() {
+        cols.push("o");
+    }
+    if graph.is_some() {
+        cols.push("g");
+    }
+    if cols.is_empty() {
+        cols.push("s");
+    }
+    cols
 }
 
 fn build_native_string_pattern_filter(

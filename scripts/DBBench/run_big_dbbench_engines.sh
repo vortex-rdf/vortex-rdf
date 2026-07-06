@@ -3,20 +3,41 @@ set -eo pipefail
 
 PYTHON_BIN="python"
 BENCHMARK_SCRIPT="dbbench_rdflib_benchmark.py"
+
 DATASET="dbpedia"
 GROUP="TP"
 JOIN_SIZE_SMALL="small"
 JOIN_SIZE_BIG="big"
+
 WARMUP_RUNS="1"
-MEASURED_RUNS="1"
+MEASURED_RUNS="5"
 MAX_QUERIES=""
 ONLY_FILE_CONTAINS=""
-VORTEX_LAYOUT="cottas-native-ids"
+
 QUERY_ROOT=""
 COTTAS_PATH=""
-VORTEX_PATH=""
+VORTEX_IDS_PATH=""
+VORTEX_STRINGS_PATH=""
 OUT_DIR=""
+
 NO_SILENCE_STDOUT="0"
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 2
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+require_file() {
+  [[ -f "$1" ]] || die "File not found: $1"
+}
+
+require_int() {
+  [[ "$1" =~ ^[0-9]+$ ]] || die "Expected integer, got: $1"
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -32,10 +53,10 @@ while [[ $# -gt 0 ]]; do
       GROUP="$2"; shift 2 ;;
     --cottas-path)
       COTTAS_PATH="$2"; shift 2 ;;
-    --vortex-path)
-      VORTEX_PATH="$2"; shift 2 ;;
-    --vortex-layout)
-      VORTEX_LAYOUT="$2"; shift 2 ;;
+    --vortex-ids-path)
+      VORTEX_IDS_PATH="$2"; shift 2 ;;
+    --vortex-strings-path)
+      VORTEX_STRINGS_PATH="$2"; shift 2 ;;
     --warmup-runs)
       WARMUP_RUNS="$2"; shift 2 ;;
     --measured-runs)
@@ -49,27 +70,34 @@ while [[ $# -gt 0 ]]; do
     --no-silence-stdout)
       NO_SILENCE_STDOUT="1"; shift ;;
     -h|--help)
-      echo "Usage: $0 --query-root PATH --cottas-path PATH --vortex-path PATH [--groups TP] [--max-queries N] [--out-dir DIR]"
+      echo "Usage:"
+      echo "$0 --query-root PATH --cottas-path PATH --vortex-ids-path PATH --vortex-strings-path PATH [--max-queries N] [--out-dir DIR]"
       exit 0 ;;
     *)
-      echo "Unknown argument: $1" >&2
-      exit 2 ;;
+      die "Unknown argument: $1" ;;
   esac
 done
 
-if [[ -z "$QUERY_ROOT" || -z "$COTTAS_PATH" || -z "$VORTEX_PATH" ]]; then
-  echo "ERROR: --query-root, --cottas-path, and --vortex-path are required." >&2
-  echo "QUERY_ROOT=$QUERY_ROOT" >&2
-  echo "COTTAS_PATH=$COTTAS_PATH" >&2
-  echo "VORTEX_PATH=$VORTEX_PATH" >&2
-  exit 2
-fi
+# --- Required args ---
+[[ -n "$QUERY_ROOT" ]] || die "--query-root is required"
+[[ -n "$COTTAS_PATH" ]] || die "--cottas-path is required"
+[[ -n "$VORTEX_IDS_PATH" ]] || die "--vortex-ids-path is required"
+[[ -n "$VORTEX_STRINGS_PATH" ]] || die "--vortex-strings-path is required"
 
+# --- Validate environment ---
+require_cmd "$PYTHON_BIN"
+require_file "$BENCHMARK_SCRIPT"
+
+require_int "$WARMUP_RUNS"
+require_int "$MEASURED_RUNS"
+[[ -z "$MAX_QUERIES" ]] || require_int "$MAX_QUERIES"
+
+# --- Output dir ---
 if [[ -z "$OUT_DIR" ]]; then
-  OUT_DIR="dbbench_runs/${DATASET}_$(date +%Y%m%d_%H%M%S)"
+  OUT_DIR="dbbench_runs/${DATASET}_big_$(date +%Y%m%d_%H%M%S)"
 fi
 
-mkdir -p "$OUT_DIR/logs"
+mkdir -p "$OUT_DIR/logs" || die "Failed to create output directory: $OUT_DIR"
 
 MANIFEST="$OUT_DIR/manifest.txt"
 
@@ -78,12 +106,12 @@ MANIFEST="$OUT_DIR/manifest.txt"
   echo "PWD: $(pwd)"
   echo "Python: $PYTHON_BIN"
   echo "Benchmark script: $BENCHMARK_SCRIPT"
-  echo "Query root: $QUERY_ROOT"
   echo "Dataset: $DATASET"
   echo "Group: $GROUP"
+  echo "Query root: $QUERY_ROOT"
   echo "COTTAS path: $COTTAS_PATH"
-  echo "Vortex path: $VORTEX_PATH"
-  echo "Vortex layout: $VORTEX_LAYOUT"
+  echo "Vortex IDs path: $VORTEX_IDS_PATH"
+  echo "Vortex strings path: $VORTEX_STRINGS_PATH"
   echo "Warmup runs: $WARMUP_RUNS"
   echo "Measured runs: $MEASURED_RUNS"
   echo "Max queries: ${MAX_QUERIES:-<none>}"
@@ -92,17 +120,16 @@ MANIFEST="$OUT_DIR/manifest.txt"
   echo
 } | tee "$MANIFEST"
 
-#ENGINES=("cottas" "vortex" "vortex-duckdb")
-#ENGINES=("cottas" "vortex")
-ENGINES=("vortex")
-
-
 FAILED=0
 
-run_engine() {
-  local ENGINE="$1"
-  local PREFIX="$OUT_DIR/${DATASET}_${ENGINE}"
-  local LOG="$OUT_DIR/logs/${ENGINE}.log"
+run_config() {
+  local LABEL="$1"
+  local ENGINE="$2"
+  local VORTEX_PATH="$3"
+  local VORTEX_LAYOUT="$4"
+
+  local PREFIX="$OUT_DIR/${DATASET}_${LABEL}"
+  local LOG="$OUT_DIR/logs/${LABEL}.log"
 
   local CMD=(
     "$PYTHON_BIN" "$BENCHMARK_SCRIPT"
@@ -119,21 +146,16 @@ run_engine() {
     --out-prefix "$PREFIX"
   )
 
-  if [[ -n "$MAX_QUERIES" ]]; then
-    CMD+=(--max-queries "$MAX_QUERIES")
-  fi
-
-  if [[ -n "$ONLY_FILE_CONTAINS" ]]; then
-    CMD+=(--only-file-contains "$ONLY_FILE_CONTAINS")
-  fi
-
-  if [[ "$NO_SILENCE_STDOUT" == "1" ]]; then
-    CMD+=(--no-silence-stdout)
-  fi
+  [[ -n "$MAX_QUERIES" ]] && CMD+=(--max-queries "$MAX_QUERIES")
+  [[ -n "$ONLY_FILE_CONTAINS" ]] && CMD+=(--only-file-contains "$ONLY_FILE_CONTAINS")
+  [[ "$NO_SILENCE_STDOUT" == "1" ]] && CMD+=(--no-silence-stdout)
 
   {
     echo "============================================================"
+    echo "LABEL:  $LABEL"
     echo "ENGINE: $ENGINE"
+    echo "LAYOUT: $VORTEX_LAYOUT"
+    echo "PATH:   $VORTEX_PATH"
     echo "START:  $(date)"
     echo "CMD:    ${CMD[*]}"
     echo "============================================================"
@@ -142,9 +164,9 @@ run_engine() {
   set +e
   "${CMD[@]}" | tee -a "$LOG"
   local STATUS=$?
-  set -u
+  set -e
 
-  {
+    {
     echo "END:    $(date)"
     echo "STATUS: $STATUS"
     echo
@@ -153,16 +175,19 @@ run_engine() {
   if [[ "$STATUS" -ne 0 ]]; then
     FAILED=1
   fi
+
+  return 0
+
 }
 
-for ENGINE in "${ENGINES[@]}"; do
-  run_engine "$ENGINE"
-done
+run_config "cottas" "cottas" "$VORTEX_STRINGS_PATH" "cottas-native-strings"
+run_config "vortex_native_ids" "vortex" "$VORTEX_IDS_PATH" "cottas-native-ids"
+run_config "vortex_native_strings" "vortex" "$VORTEX_STRINGS_PATH" "cottas-native-strings"
 
 {
   echo "Finished: $(date)"
   if [[ "$FAILED" -ne 0 ]]; then
-    echo "Overall status: FAILED - at least one engine failed. Check $OUT_DIR/logs"
+    echo "Overall status: FAILED - check $OUT_DIR/logs"
   else
     echo "Overall status: OK"
   fi

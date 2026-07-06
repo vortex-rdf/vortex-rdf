@@ -8,10 +8,10 @@ use std::time::Instant;
 
 use vortex::VortexSessionDefault;
 use vortex::session::VortexSession;
-use vortex_array::ArrayRef;
 use vortex_array::LEGACY_SESSION;
 use vortex_array::arrays::{StructArray, VarBinViewArray};
 use vortex_array::dtype::{DType, Nullability};
+use vortex_array::{ArrayRef, ExecutionCtx};
 use vortex_array::{IntoArray, VortexSessionExecute};
 use vortex_fsst::{fsst_compress, fsst_train_compressor};
 
@@ -137,18 +137,17 @@ impl RdfDictionary for SimpleDictionary {
         );
 
         let dict_arr = if dict_raw.len() > 0 {
+            let mut ctx = ExecutionCtx::new(VortexSession::default());
+
+            let dict_raw = dict_raw.into_array();
+
             // Train compressor and execute FSST on the dictionary payload.
-            let compressor = fsst_train_compressor(&dict_raw);
+
+            let compressor = fsst_train_compressor(&dict_raw, &mut ctx)?;
             let len = dict_raw.len();
             let dtype = dict_raw.dtype().clone();
-            fsst_compress(
-                dict_raw,
-                len,
-                &dtype,
-                &compressor,
-                &mut VortexSession::default().create_execution_ctx(),
-            )
-            .into_array()
+
+            fsst_compress(&dict_raw, &compressor, &mut ctx)?.into_array()
         } else {
             dict_raw.into_array()
         };
