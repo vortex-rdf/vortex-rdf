@@ -144,8 +144,8 @@ impl RdfDictionary for SimpleDictionary {
             // Train compressor and execute FSST on the dictionary payload.
 
             let compressor = fsst_train_compressor(&dict_raw, &mut ctx)?;
-            let len = dict_raw.len();
-            let dtype = dict_raw.dtype().clone();
+            let _len = dict_raw.len();
+            let _dtype = dict_raw.dtype().clone();
 
             fsst_compress(&dict_raw, &compressor, &mut ctx)?.into_array()
         } else {
