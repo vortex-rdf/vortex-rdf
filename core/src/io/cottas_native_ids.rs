@@ -28,7 +28,7 @@ use vortex_session::VortexSession;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 use oxrdfio::{RdfFormat, RdfSerializer};
 
-use vortex::expr::{Expression, and, col, eq, lit};
+use vortex::expr::{Expression, and, col, eq, lit, or};
 use vortex_array::stream::ArrayStreamExt;
 
 static NATIVE_FILE_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
@@ -1209,7 +1209,92 @@ fn collect_unique_ids(s_ids: &[u32], p_ids: &[u32], o_ids: &[u32], g_ids: &[u32]
     ids
 }
 
+fn build_id_lookup_filter(ids: &[u32]) -> Option<Expression> {
+    ids.iter()
+        .copied()
+        .map(|id| eq(col("id"), lit(id)))
+        .reduce(or)
+}
+
+fn native_id_lookup_small_or_threshold() -> usize {
+    std::env::var("VORTEX_RDF_NATIVE_ID_LOOKUP_SMALL_OR_IDS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(32)
+}
+
 async fn lookup_terms_by_ids_from_sidecar(
+    data_path: &Path,
+    ids: &[u32],
+) -> Result<HashMap<u32, String>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let small_or_threshold = native_id_lookup_small_or_threshold();
+
+    if ids.len() <= small_or_threshold {
+        lookup_terms_by_ids_from_sidecar_small_or(data_path, ids).await
+    } else {
+        lookup_terms_by_ids_from_sidecar_streaming(data_path, ids).await
+    }
+}
+
+async fn lookup_terms_by_ids_from_sidecar_small_or(
+    data_path: &Path,
+    ids: &[u32],
+) -> Result<HashMap<u32, String>> {
+    let lookup_start = Instant::now();
+    let path = native_dict_id_to_term_path(data_path);
+
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&path)
+        .await
+        .map_err(VortexRdfError::from)?;
+
+    let Some(expr) = build_id_lookup_filter(ids) else {
+        return Ok(HashMap::new());
+    };
+
+    if let Ok(can_prune) = file.can_prune(&expr) {
+        log::debug!(
+            "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] small OR can_prune(ids={}) = {}",
+            ids.len(),
+            can_prune
+        );
+    }
+
+    log::debug!(
+        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] small OR lookup for {} ids",
+        ids.len()
+    );
+
+    let stream = file
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_filter(expr)
+        .with_projection(vortex_array::expr::select(
+            ["id", "term"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?;
+
+    let rows = stream.read_all().await.map_err(VortexRdfError::from)?;
+    let map = extract_id_term_map(&rows)?;
+
+    log::debug!(
+        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] small OR resolved {} / {} ids in {:?}",
+        map.len(),
+        ids.len(),
+        lookup_start.elapsed()
+    );
+
+    Ok(map)
+}
+
+async fn lookup_terms_by_ids_from_sidecar_streaming(
     data_path: &Path,
     ids: &[u32],
 ) -> Result<HashMap<u32, String>> {
@@ -1219,7 +1304,7 @@ async fn lookup_terms_by_ids_from_sidecar(
 
     let lookup_start = Instant::now();
     let requested: HashSet<u32> = ids.iter().copied().collect();
-    let mut out: HashMap<u32, String> = HashMap::with_capacity(ids.len());
+    let mut out: HashMap<u32, String> = HashMap::with_capacity(requested.len());
 
     let path = native_dict_id_to_term_path(data_path);
     let file = NATIVE_FILE_SESSION
@@ -1315,6 +1400,53 @@ async fn lookup_terms_by_ids_from_sidecar(
         decoded_rows,
         lookup_start.elapsed()
     );
+
+    Ok(out)
+}
+
+
+fn extract_id_term_map(array: &ArrayRef) -> Result<HashMap<u32, String>> {
+    let mut out = HashMap::new();
+
+    if array.len() == 0 {
+        return Ok(out);
+    }
+
+    let session = VortexSession::default();
+    let mut ctx = session.create_execution_ctx();
+
+    let struct_array = array
+        .clone()
+        .execute::<StructArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+
+    let id_col = struct_array
+        .unmasked_field_by_name("id")
+        .map_err(VortexRdfError::Vortex)?
+        .clone()
+        .execute::<PrimitiveArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+
+    let term_col = struct_array
+        .unmasked_field_by_name("term")
+        .map_err(VortexRdfError::Vortex)?
+        .clone()
+        .execute::<VarBinViewArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+
+    let ids = id_col.as_slice::<u32>();
+
+    for row in 0..array.len() {
+        let raw = term_col.bytes_at(row);
+        let term = String::from_utf8(raw.as_ref().to_vec()).map_err(|e| {
+            VortexRdfError::Deserialization(format!(
+                "Dictionary term is not valid UTF-8 at row {}: {}",
+                row, e
+            ))
+        })?;
+
+        out.insert(ids[row], term);
+    }
 
     Ok(out)
 }
@@ -1420,8 +1552,9 @@ where
     match file.splits() {
         Ok(splits) => {
             log::debug!(
-                "[cottas_native::match] native file has {} scan splits.",
+                "[cottas_native::match] native file has {} scan splits: {:?}",
                 splits.len(),
+                splits
             );
         }
         Err(e) => {
@@ -1476,7 +1609,6 @@ where
     );
 
     let materialize_start = Instant::now();
-
     let write_stats =
         write_quads_array_as_rdf_lazy(input_path, matched_quads, writer, format).await?;
 
