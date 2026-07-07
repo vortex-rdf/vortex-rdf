@@ -1552,9 +1552,8 @@ where
     match file.splits() {
         Ok(splits) => {
             log::debug!(
-                "[cottas_native::match] native file has {} scan splits: {:?}",
+                "[cottas_native::match] native file has {} scan splits.",
                 splits.len(),
-                splits
             );
         }
         Err(e) => {
