@@ -14,6 +14,8 @@ import csv
 import psutil
 import os
 import signal
+import multiprocessing as mp
+import traceback
 
 
 def split_dbbench_queries(path: Path):
@@ -129,7 +131,8 @@ def run_one_query(graph: Graph, query: str, silence_stdout: bool, timeout_s: flo
     """
     gc.collect()
 
-    mem_before = _process.memory_info().rss
+    process = psutil.Process(os.getpid())
+    mem_before = process.memory_info().rss
 
     sink = io.StringIO()
     stdout_ctx = contextlib.redirect_stdout(
@@ -154,7 +157,7 @@ def run_one_query(graph: Graph, query: str, silence_stdout: bool, timeout_s: flo
             signal.signal(signal.SIGALRM, old_handler)
 
     end_ns = time.perf_counter_ns()
-    mem_after = _process.memory_info().rss
+    mem_after = process.memory_info().rss
 
     return {
         "elapsed_s": (end_ns - start_ns) / 1_000_000_000,
@@ -163,6 +166,132 @@ def run_one_query(graph: Graph, query: str, silence_stdout: bool, timeout_s: flo
         "rss_after_mb": mem_after / (1024 * 1024),
         "rss_delta_mb": (mem_after - mem_before) / (1024 * 1024),
     }
+
+
+class QueryProcessTimeoutError(TimeoutError):
+    pass
+
+
+def _run_one_query_child(
+    queue,
+    engine: str,
+    cottas_path: str,
+    vortex_path: str,
+    vortex_layout: str,
+    query: str,
+    silence_stdout: bool,
+):
+    """
+    Child-process query runner.
+
+    Important: do not use SIGALRM here. The whole point is that a blocking
+    PyO3/Rust call might not yield to Python's signal machinery. If it blocks,
+    the parent kills this entire child process.
+    """
+    try:
+        graph = make_graph(engine, cottas_path, vortex_path, vortex_layout)
+        out = run_one_query(
+            graph,
+            query,
+            silence_stdout=silence_stdout,
+            timeout_s=None,
+        )
+        queue.put({"status": "ok", "out": out})
+    except BaseException as e:
+        queue.put({
+            "status": "error",
+            "error": repr(e),
+            "traceback": traceback.format_exc(),
+        })
+
+
+def _kill_process_tree(pid: int, grace_s: float = 1.0):
+    """Terminate a child and any descendants, then kill survivors."""
+    try:
+        parent = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return
+
+    children = parent.children(recursive=True)
+    processes = children + [parent]
+    for proc in processes:
+        try:
+            proc.terminate()
+        except psutil.NoSuchProcess:
+            pass
+
+    gone, alive = psutil.wait_procs(processes, timeout=max(grace_s, 0.0))
+    for proc in alive:
+        try:
+            proc.kill()
+        except psutil.NoSuchProcess:
+            pass
+    psutil.wait_procs(alive, timeout=max(grace_s, 0.0))
+
+
+def run_one_query_process_timeout(
+    engine: str,
+    cottas_path: str,
+    vortex_path: str,
+    vortex_layout: str,
+    query: str,
+    silence_stdout: bool,
+    timeout_s: float,
+    kill_grace_s: float,
+):
+    """
+    Robust per-query timeout wrapper.
+
+    Runs one query in a child process. If the child is still alive after
+    timeout_s, kill the process tree. This works even when the query is blocked
+    inside PyO3/Rust and Python SIGALRM would not interrupt it.
+    """
+    start_ns = time.perf_counter_ns()
+    queue = mp.Queue(maxsize=1)
+    proc = mp.Process(
+        target=_run_one_query_child,
+        args=(
+            queue,
+            engine,
+            cottas_path,
+            vortex_path,
+            vortex_layout,
+            query,
+            silence_stdout,
+        ),
+    )
+    proc.start()
+
+    join_timeout = timeout_s if timeout_s is not None and timeout_s > 0 else None
+    proc.join(join_timeout)
+
+    if proc.is_alive():
+        _kill_process_tree(proc.pid, grace_s=kill_grace_s)
+        proc.join(timeout=max(kill_grace_s, 0.0))
+        elapsed_s = (time.perf_counter_ns() - start_ns) / 1_000_000_000
+        raise QueryProcessTimeoutError(
+            f"Query exceeded process timeout of {timeout_s}s; killed child pid={proc.pid}; elapsed={elapsed_s:.3f}s"
+        )
+
+    if proc.exitcode not in (0, None):
+        # Try to surface a structured child error first, but do not block.
+        try:
+            msg = queue.get_nowait()
+            if msg.get("status") == "error":
+                raise RuntimeError(msg.get("error", f"child exitcode={proc.exitcode}"))
+        except Exception as e:
+            if isinstance(e, RuntimeError):
+                raise
+        raise RuntimeError(f"Query child process exited with code {proc.exitcode}")
+
+    try:
+        msg = queue.get(timeout=1.0)
+    except Exception as e:
+        raise RuntimeError(f"Query child process produced no result: {e!r}")
+
+    if msg.get("status") == "ok":
+        return msg["out"]
+    raise RuntimeError(msg.get("error", "unknown child-process query error"))
 
 
 def summarize(results):
@@ -246,6 +375,18 @@ def main():
     # Per-query timeout in seconds.
     # Use 0 or a negative value to disable timeout.
     parser.add_argument("--query-timeout-s", type=float, default=60.0)
+    parser.add_argument(
+        "--timeout-mode",
+        choices=["process", "signal"],
+        default="process",
+        help="process = robust child-process timeout; signal = old in-process SIGALRM timeout",
+    )
+    parser.add_argument(
+        "--timeout-kill-grace-s",
+        type=float,
+        default=1.0,
+        help="Seconds to wait after terminate() before kill() in process timeout mode",
+    )
 
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
@@ -288,6 +429,7 @@ def main():
         query_records = query_records[:args.max_queries]
 
     print(f"Loaded {len(query_records)} individual queries")
+    print(f"Timeout mode: {args.timeout_mode}; query timeout: {args.query_timeout_s}s; kill grace: {args.timeout_kill_grace_s}s")
 
     inventory_path = out_prefix.with_suffix(".queries.json")
     inventory_path.write_text(
@@ -296,15 +438,21 @@ def main():
     )
     print(f"Wrote query inventory: {inventory_path}")
 
-    graphs = {
-        engine: make_graph(
-            engine,
-            args.cottas_path,
-            args.vortex_path,
-            args.vortex_layout,
-        )
-        for engine in args.engines
-    }
+    if args.timeout_mode == "signal":
+        graphs = {
+            engine: make_graph(
+                engine,
+                args.cottas_path,
+                args.vortex_path,
+                args.vortex_layout,
+            )
+            for engine in args.engines
+        }
+    else:
+        # In process-timeout mode each query run creates its own child process
+        # and graph. This is more expensive, but it prevents a blocked PyO3/Rust
+        # call from hanging the entire benchmark driver.
+        graphs = {}
 
     results = []
     silence_stdout = not args.no_silence_stdout
@@ -347,18 +495,30 @@ def main():
                 }
 
                 try:
-                    out = run_one_query(
-                        graph,
-                        qrec["query"],
-                        silence_stdout=silence_stdout,
-                        timeout_s=args.query_timeout_s,
-                    )
+                    if args.timeout_mode == "process":
+                        out = run_one_query_process_timeout(
+                            engine=engine,
+                            cottas_path=args.cottas_path,
+                            vortex_path=args.vortex_path,
+                            vortex_layout=args.vortex_layout,
+                            query=qrec["query"],
+                            silence_stdout=silence_stdout,
+                            timeout_s=args.query_timeout_s,
+                            kill_grace_s=args.timeout_kill_grace_s,
+                        )
+                    else:
+                        out = run_one_query(
+                            graph,
+                            qrec["query"],
+                            silence_stdout=silence_stdout,
+                            timeout_s=args.query_timeout_s,
+                        )
                     row.update(out)
 
                     if phase == "measured" and measured_run_idx == 0:
                         counts_by_engine[engine] = row["result_count"]
 
-                except QueryTimeoutError as e:
+                except (QueryTimeoutError, QueryProcessTimeoutError) as e:
                     row["status"] = "timeout"
                     row["elapsed_s"] = args.query_timeout_s
                     row["result_count"] = None
@@ -366,7 +526,7 @@ def main():
 
                     # Try to record memory after timeout as well.
                     try:
-                        mem_after = _process.memory_info().rss
+                        mem_after = process.memory_info().rss
                         row["rss_after_mb"] = mem_after / (1024 * 1024)
                     except Exception:
                         pass
