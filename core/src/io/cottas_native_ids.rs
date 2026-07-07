@@ -1257,14 +1257,6 @@ async fn lookup_terms_by_ids_from_sidecar_small_or(
         return Ok(HashMap::new());
     };
 
-    if let Ok(can_prune) = file.can_prune(&expr) {
-        log::debug!(
-            "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] small OR can_prune(ids={}) = {}",
-            ids.len(),
-            can_prune
-        );
-    }
-
     log::debug!(
         "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] small OR lookup for {} ids",
         ids.len()
