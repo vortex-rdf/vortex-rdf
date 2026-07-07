@@ -28,7 +28,7 @@ use vortex_session::VortexSession;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 use oxrdfio::{RdfFormat, RdfSerializer};
 
-use vortex::expr::{Expression, and, col, eq, lit, or};
+use vortex::expr::{Expression, and, col, eq, lit};
 use vortex_array::stream::ArrayStreamExt;
 
 static NATIVE_FILE_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
@@ -1209,18 +1209,11 @@ fn collect_unique_ids(s_ids: &[u32], p_ids: &[u32], o_ids: &[u32], g_ids: &[u32]
     ids
 }
 
-fn build_id_lookup_filter(ids: &[u32]) -> Option<Expression> {
-    ids.iter()
-        .copied()
-        .map(|id| eq(col("id"), lit(id)))
-        .reduce(or)
-}
-
-fn native_id_lookup_small_or_threshold() -> usize {
-    std::env::var("VORTEX_RDF_NATIVE_ID_LOOKUP_SMALL_OR_IDS")
+fn native_id_lookup_single_eq_threshold() -> usize {
+    std::env::var("VORTEX_RDF_NATIVE_ID_LOOKUP_SINGLE_EQ_IDS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(32)
+        .unwrap_or(64)
 }
 
 async fn lookup_terms_by_ids_from_sidecar(
@@ -1231,59 +1224,83 @@ async fn lookup_terms_by_ids_from_sidecar(
         return Ok(HashMap::new());
     }
 
-    let small_or_threshold = native_id_lookup_small_or_threshold();
+    let single_eq_threshold = native_id_lookup_single_eq_threshold();
+    let strategy = if ids.len() <= single_eq_threshold {
+        "single-eq"
+    } else {
+        "streaming"
+    };
 
-    if ids.len() <= small_or_threshold {
-        lookup_terms_by_ids_from_sidecar_small_or(data_path, ids).await
+    log::debug!(
+        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] dispatch ids={}, single_eq_threshold={}, strategy={}",
+        ids.len(),
+        single_eq_threshold,
+        strategy
+    );
+
+    if ids.len() <= single_eq_threshold {
+        lookup_terms_by_ids_from_sidecar_single_eq(data_path, ids).await
     } else {
         lookup_terms_by_ids_from_sidecar_streaming(data_path, ids).await
     }
 }
 
-async fn lookup_terms_by_ids_from_sidecar_small_or(
+async fn lookup_terms_by_ids_from_sidecar_single_eq(
     data_path: &Path,
     ids: &[u32],
 ) -> Result<HashMap<u32, String>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
     let lookup_start = Instant::now();
     let path = native_dict_id_to_term_path(data_path);
-
     let file = NATIVE_FILE_SESSION
         .open_options()
         .open_path(&path)
         .await
         .map_err(VortexRdfError::from)?;
 
-    let Some(expr) = build_id_lookup_filter(ids) else {
-        return Ok(HashMap::new());
-    };
+    let requested: HashSet<u32> = ids.iter().copied().collect();
+    let mut out: HashMap<u32, String> = HashMap::with_capacity(requested.len());
 
     log::debug!(
-        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] small OR lookup for {} ids",
-        ids.len()
+        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] repeated single-ID equality lookup for {} ids",
+        requested.len()
     );
 
-    let stream = file
-        .scan()
-        .map_err(VortexRdfError::from)?
-        .with_filter(expr)
-        .with_projection(vortex_array::expr::select(
-            ["id", "term"],
-            vortex_array::expr::root(),
-        ))
-        .into_array_stream()
-        .map_err(VortexRdfError::from)?;
+    for id in ids.iter().copied() {
+        if out.contains_key(&id) {
+            continue;
+        }
 
-    let rows = stream.read_all().await.map_err(VortexRdfError::from)?;
-    let map = extract_id_term_map(&rows)?;
+        let expr = eq(col("id"), lit(id));
+        let stream = file
+            .scan()
+            .map_err(VortexRdfError::from)?
+            .with_filter(expr)
+            .with_projection(vortex_array::expr::select(
+                ["id", "term"],
+                vortex_array::expr::root(),
+            ))
+            .into_array_stream()
+            .map_err(VortexRdfError::from)?;
+
+        let rows = stream.read_all().await.map_err(VortexRdfError::from)?;
+        let partial = extract_id_term_map(&rows)?;
+        if let Some(term) = partial.get(&id) {
+            out.insert(id, term.clone());
+        }
+    }
 
     log::debug!(
-        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] small OR resolved {} / {} ids in {:?}",
-        map.len(),
-        ids.len(),
+        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] repeated single-ID equality resolved {} / {} ids in {:?}",
+        out.len(),
+        requested.len(),
         lookup_start.elapsed()
     );
 
-    Ok(map)
+    Ok(out)
 }
 
 async fn lookup_terms_by_ids_from_sidecar_streaming(
@@ -1395,7 +1412,6 @@ async fn lookup_terms_by_ids_from_sidecar_streaming(
 
     Ok(out)
 }
-
 
 fn extract_id_term_map(array: &ArrayRef) -> Result<HashMap<u32, String>> {
     let mut out = HashMap::new();
