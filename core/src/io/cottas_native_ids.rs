@@ -9,7 +9,8 @@ use std::cmp::Ordering;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::LazyLock;
+use std::os::unix::fs::FileExt;
 use std::time::Instant;
 use vortex::VortexSessionDefault;
 use vortex_error::{VortexError, VortexResult};
@@ -46,16 +47,6 @@ static NATIVE_FILE_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     vortex_file::register_default_encodings(&session);
     session
 });
-
-static NATIVE_ID_TO_TERM_BINARY_CACHE: LazyLock<Mutex<HashMap<PathBuf, Arc<NativeIdToTermBinaryIndex>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-#[derive(Debug)]
-struct NativeIdToTermBinaryIndex {
-    offsets: Vec<u64>,
-    blob: Vec<u8>,
-}
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug)]
@@ -1236,10 +1227,10 @@ async fn lookup_terms_by_ids_from_sidecar(
 
     if native_id_to_term_binary_sidecar_exists(data_path) {
         log::debug!(
-            "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] dispatch ids={}, strategy=binary-offset-blob",
+            "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] dispatch ids={}, strategy=binary-random-read",
             ids.len()
         );
-        return lookup_terms_by_ids_from_binary_index(data_path, ids);
+        return lookup_terms_by_ids_from_binary_index_random_read(data_path, ids);
     }
 
     let single_eq_threshold = native_id_lookup_single_eq_threshold();
@@ -1263,91 +1254,36 @@ async fn lookup_terms_by_ids_from_sidecar(
     }
 }
 
-fn load_id_to_term_binary_index(data_path: &Path) -> Result<Arc<NativeIdToTermBinaryIndex>> {
-    let offsets_path = native_dict_id_to_term_offsets_path(data_path);
-    let blob_path = native_dict_id_to_term_blob_path(data_path);
-
-    {
-        let cache = NATIVE_ID_TO_TERM_BINARY_CACHE.lock().map_err(|e| {
-            VortexRdfError::Deserialization(format!(
-                "Native id_to_term binary cache lock poisoned: {}",
-                e
-            ))
-        })?;
-        if let Some(index) = cache.get(&offsets_path) {
-            return Ok(Arc::clone(index));
-        }
-    }
-
-    let load_start = Instant::now();
-    let offsets_bytes = std::fs::read(&offsets_path).map_err(|e| {
-        VortexRdfError::Deserialization(format!(
-            "Failed to read native id_to_term offsets sidecar {:?}: {}",
-            offsets_path, e
-        ))
-    })?;
-    if offsets_bytes.len() % 8 != 0 {
-        return Err(VortexRdfError::Deserialization(format!(
-            "Malformed native id_to_term offsets sidecar {:?}: byte length {} is not divisible by 8",
-            offsets_path,
-            offsets_bytes.len()
-        )));
-    }
-
-    let mut offsets = Vec::with_capacity(offsets_bytes.len() / 8);
-    for chunk in offsets_bytes.chunks_exact(8) {
-        offsets.push(u64::from_le_bytes(chunk.try_into().unwrap()));
-    }
-    if offsets.is_empty() {
-        return Err(VortexRdfError::Deserialization(format!(
-            "Malformed native id_to_term offsets sidecar {:?}: no offsets",
-            offsets_path
-        )));
-    }
-
-    let blob = std::fs::read(&blob_path).map_err(|e| {
-        VortexRdfError::Deserialization(format!(
-            "Failed to read native id_to_term blob sidecar {:?}: {}",
-            blob_path, e
-        ))
-    })?;
-
-    let blob_len = blob.len() as u64;
-    let mut prev = 0u64;
-    for (idx, &offset) in offsets.iter().enumerate() {
-        if offset < prev || offset > blob_len {
+fn read_exact_at_native_sidecar(
+    file: &std::fs::File,
+    buf: &mut [u8],
+    mut offset: u64,
+    label: &str,
+) -> Result<()> {
+    let mut read_total = 0usize;
+    while read_total < buf.len() {
+        let n = file
+            .read_at(&mut buf[read_total..], offset)
+            .map_err(|e| VortexRdfError::Deserialization(format!(
+                "Failed to read {} at offset {} after {} bytes: {}",
+                label, offset, read_total, e
+            )))?;
+        if n == 0 {
             return Err(VortexRdfError::Deserialization(format!(
-                "Malformed native id_to_term offsets sidecar {:?}: offsets[{}]={} after previous {} with blob_len={}",
-                offsets_path, idx, offset, prev, blob_len
+                "Unexpected EOF while reading {} at offset {} after {} / {} bytes",
+                label,
+                offset,
+                read_total,
+                buf.len()
             )));
         }
-        prev = offset;
+        read_total += n;
+        offset += n as u64;
     }
-
-    let index = Arc::new(NativeIdToTermBinaryIndex { offsets, blob });
-    {
-        let mut cache = NATIVE_ID_TO_TERM_BINARY_CACHE.lock().map_err(|e| {
-            VortexRdfError::Deserialization(format!(
-                "Native id_to_term binary cache lock poisoned: {}",
-                e
-            ))
-        })?;
-        cache.insert(offsets_path.clone(), Arc::clone(&index));
-    }
-
-    log::debug!(
-        "[cottas_native_ids::load_id_to_term_binary_index] loaded offsets={} blob_bytes={} from {:?} and {:?} in {:?}",
-        index.offsets.len(),
-        index.blob.len(),
-        offsets_path,
-        blob_path,
-        load_start.elapsed()
-    );
-
-    Ok(index)
+    Ok(())
 }
 
-fn lookup_terms_by_ids_from_binary_index(
+fn lookup_terms_by_ids_from_binary_index_random_read(
     data_path: &Path,
     ids: &[u32],
 ) -> Result<HashMap<u32, String>> {
@@ -1356,46 +1292,123 @@ fn lookup_terms_by_ids_from_binary_index(
     }
 
     let lookup_start = Instant::now();
-    let index = load_id_to_term_binary_index(data_path)?;
-    let requested: HashSet<u32> = ids.iter().copied().collect();
+    let offsets_path = native_dict_id_to_term_offsets_path(data_path);
+    let blob_path = native_dict_id_to_term_blob_path(data_path);
+
+    let offsets_file = std::fs::File::open(&offsets_path).map_err(|e| {
+        VortexRdfError::Deserialization(format!(
+            "Failed to open native id_to_term offsets sidecar {:?}: {}",
+            offsets_path, e
+        ))
+    })?;
+    let blob_file = std::fs::File::open(&blob_path).map_err(|e| {
+        VortexRdfError::Deserialization(format!(
+            "Failed to open native id_to_term blob sidecar {:?}: {}",
+            blob_path, e
+        ))
+    })?;
+
+    let offsets_len = offsets_file
+        .metadata()
+        .map_err(|e| VortexRdfError::Deserialization(format!(
+            "Failed to stat native id_to_term offsets sidecar {:?}: {}",
+            offsets_path, e
+        )))?
+        .len();
+    let blob_len = blob_file
+        .metadata()
+        .map_err(|e| VortexRdfError::Deserialization(format!(
+            "Failed to stat native id_to_term blob sidecar {:?}: {}",
+            blob_path, e
+        )))?
+        .len();
+
+    if offsets_len < 16 || offsets_len % 8 != 0 {
+        return Err(VortexRdfError::Deserialization(format!(
+            "Malformed native id_to_term offsets sidecar {:?}: byte length {} must be >= 16 and divisible by 8",
+            offsets_path, offsets_len
+        )));
+    }
+
+    let mut requested: Vec<u32> = ids.to_vec();
+    requested.sort_unstable();
+    requested.dedup();
+
     let mut out = HashMap::with_capacity(requested.len());
+    let mut offset_reads = 0usize;
+    let mut blob_reads = 0usize;
+    let mut offset_bytes_read = 0usize;
+    let mut blob_bytes_read = 0usize;
 
     for id in requested.iter().copied() {
-        let pos = id as usize;
-        if pos + 1 >= index.offsets.len() {
+        let offset_pos = (id as u64)
+            .checked_mul(8)
+            .ok_or_else(|| VortexRdfError::Deserialization(format!(
+                "Offset position overflow for dictionary ID {}",
+                id
+            )))?;
+        if offset_pos + 16 > offsets_len {
             return Err(VortexRdfError::Deserialization(format!(
-                "ID {} is outside native id_to_term binary offsets range; offsets_len={}",
+                "ID {} is outside native id_to_term offsets range: need bytes {}..{}, offsets_len={}",
                 id,
-                index.offsets.len()
+                offset_pos,
+                offset_pos + 16,
+                offsets_len
             )));
         }
 
-        let start = index.offsets[pos] as usize;
-        let end = index.offsets[pos + 1] as usize;
-        if start > end || end > index.blob.len() {
+        let mut offset_buf = [0u8; 16];
+        read_exact_at_native_sidecar(
+            &offsets_file,
+            &mut offset_buf,
+            offset_pos,
+            "id_to_term offsets",
+        )?;
+        offset_reads += 1;
+        offset_bytes_read += offset_buf.len();
+
+        let start = u64::from_le_bytes(offset_buf[0..8].try_into().unwrap());
+        let end = u64::from_le_bytes(offset_buf[8..16].try_into().unwrap());
+        if start > end || end > blob_len {
             return Err(VortexRdfError::Deserialization(format!(
-                "ID {} has invalid native id_to_term byte range {}..{} for blob_len={}",
-                id,
+                "ID {} has invalid native id_to_term blob byte range {}..{} for blob_len={}",
+                id, start, end, blob_len
+            )));
+        }
+
+        let term_len = (end - start) as usize;
+        let mut term_buf = vec![0u8; term_len];
+        if term_len > 0 {
+            read_exact_at_native_sidecar(
+                &blob_file,
+                &mut term_buf,
                 start,
-                end,
-                index.blob.len()
-            )));
+                "id_to_term blob",
+            )?;
+            blob_reads += 1;
+            blob_bytes_read += term_len;
         }
 
-        let term = std::str::from_utf8(&index.blob[start..end]).map_err(|e| {
+        let term = String::from_utf8(term_buf).map_err(|e| {
             VortexRdfError::Deserialization(format!(
                 "Dictionary term for ID {} is not valid UTF-8 in binary sidecar byte range {}..{}: {}",
                 id, start, end, e
             ))
         })?;
-        out.insert(id, term.to_string());
+        out.insert(id, term);
     }
 
     log::debug!(
-        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] binary offset/blob resolved {} / {} ids in {:?}",
+        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] binary random-read resolved {} / {} ids in {:?}; offset_reads={}, offset_bytes={}, blob_reads={}, blob_bytes={}, offsets_file_bytes={}, blob_file_bytes={}",
         out.len(),
         requested.len(),
-        lookup_start.elapsed()
+        lookup_start.elapsed(),
+        offset_reads,
+        offset_bytes_read,
+        blob_reads,
+        blob_bytes_read,
+        offsets_len,
+        blob_len
     );
 
     Ok(out)
