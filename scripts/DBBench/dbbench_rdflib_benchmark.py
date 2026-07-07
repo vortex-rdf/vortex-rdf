@@ -463,7 +463,10 @@ def main():
         counts_by_engine = {}
 
         for engine in args.engines:
-            graph = graphs[engine]
+            # In process-timeout mode we intentionally do not keep Graph objects
+            # in the parent. Each run creates the graph inside a child process,
+            # so a blocked PyO3/Rust call can be killed safely.
+            graph = graphs.get(engine)
 
             total_runs = args.warmup_runs + args.measured_runs
 
