@@ -167,12 +167,18 @@ fn native_dict_term_to_id_path(data_path: &Path) -> PathBuf {
 }
 
 fn native_dict_term_to_id_entries_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path.file_name().and_then(|s| s.to_str()).unwrap_or("data.vortex");
+    let file_name = data_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("data.vortex");
     data_path.with_file_name(format!("{file_name}.dict.term_to_id.entries.bin"))
 }
 
 fn native_dict_term_to_id_blob_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path.file_name().and_then(|s| s.to_str()).unwrap_or("data.vortex");
+    let file_name = data_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("data.vortex");
     data_path.with_file_name(format!("{file_name}.dict.term_to_id.blob"))
 }
 
@@ -180,7 +186,6 @@ fn native_term_to_id_binary_sidecar_exists(data_path: &Path) -> bool {
     native_dict_term_to_id_entries_path(data_path).is_file()
         && native_dict_term_to_id_blob_path(data_path).is_file()
 }
-
 
 fn quad_to_native_triple(quad: &Quad) -> NativeTriple {
     NativeTriple {
@@ -1006,7 +1011,6 @@ enum NativePatternFilter {
     Expr(Expression),
 }
 
-
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct NativeTermToIdLookupStats {
     pub column: Option<String>,
@@ -1058,6 +1062,11 @@ pub struct CottasNativeIdsDiagnostics {
     pub unique_ids_requested: usize,
     pub unique_ids_loaded: usize,
     pub vortex_can_prune: Option<bool>,
+
+    pub total_splits: Option<usize>,
+    pub scan_batches: usize,
+    pub max_scan_batch_rows: usize,
+    pub scan_rows_materialized: usize,
 
     pub id_to_term_stats: NativeIdToTermLookupStats,
     pub term_to_id_stats: Vec<NativeTermToIdLookupStats>,
@@ -1798,12 +1807,57 @@ where
     W: Write,
 {
     let rdf_serializer = RdfSerializer::from_format(format).for_writer(writer);
-
     rdf_serializer
         .finish()
         .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
-
     Ok(())
+}
+
+async fn read_spog_stream_all_with_scan_stats<S>(stream: S) -> Result<(ArrayRef, usize, usize)>
+where
+    S: Stream<Item = VortexResult<ArrayRef>>,
+{
+    let mut stream = Box::pin(stream);
+
+    let mut batches = 0usize;
+    let mut max_batch_rows = 0usize;
+
+    let mut all_s_ids: Vec<u32> = Vec::new();
+    let mut all_p_ids: Vec<u32> = Vec::new();
+    let mut all_o_ids: Vec<u32> = Vec::new();
+    let mut all_g_ids: Vec<u32> = Vec::new();
+
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result.map_err(VortexRdfError::from)?;
+        let rows = batch.len();
+
+        batches += 1;
+        max_batch_rows = max_batch_rows.max(rows);
+
+        if rows == 0 {
+            continue;
+        }
+
+        let (s_ids, p_ids, o_ids, g_ids) = extract_spog_id_columns(&batch)?;
+
+        all_s_ids.reserve(s_ids.len());
+        all_p_ids.reserve(p_ids.len());
+        all_o_ids.reserve(o_ids.len());
+        all_g_ids.reserve(g_ids.len());
+
+        all_s_ids.extend_from_slice(&s_ids);
+        all_p_ids.extend_from_slice(&p_ids);
+        all_o_ids.extend_from_slice(&o_ids);
+        all_g_ids.extend_from_slice(&g_ids);
+    }
+
+    let out = if all_s_ids.is_empty() {
+        empty_spog_array()?
+    } else {
+        build_spog_array(all_s_ids, all_p_ids, all_o_ids, all_g_ids)?
+    };
+
+    Ok((out, batches, max_batch_rows))
 }
 
 pub async fn match_cottas_native_file<W>(
@@ -1842,8 +1896,10 @@ where
     let mut diagnostics = CottasNativeIdsDiagnostics::default();
 
     let (filter, term_lookup_ms, term_to_id_stats) =
-        build_native_pattern_filter_lazy_with_detailed_stats(input_path, subject, predicate, object, graph)
-            .await?;
+        build_native_pattern_filter_lazy_with_detailed_stats(
+            input_path, subject, predicate, object, graph,
+        )
+        .await?;
     diagnostics.term_lookup_ms = term_lookup_ms;
     diagnostics.term_to_id_stats = term_to_id_stats;
 
@@ -1894,12 +1950,14 @@ where
 
     match file.splits() {
         Ok(splits) => {
+            diagnostics.total_splits = Some(splits.len());
             log::debug!(
                 "[cottas_native::match] native file has {} scan splits.",
                 splits.len(),
             );
         }
         Err(e) => {
+            diagnostics.total_splits = None;
             log::debug!(
                 "[cottas_native::match] failed to inspect native file splits: {}",
                 e
@@ -1923,12 +1981,17 @@ where
     );
 
     let read_start = Instant::now();
-    let matched_quads = stream.read_all().await.map_err(VortexRdfError::from)?;
+    let (matched_quads, scan_batches, max_scan_batch_rows) =
+        read_spog_stream_all_with_scan_stats(stream).await?;
     diagnostics.read_all_ms = elapsed_ms(read_start);
-
+    diagnostics.scan_batches = scan_batches;
+    diagnostics.max_scan_batch_rows = max_scan_batch_rows;
+    diagnostics.scan_rows_materialized = matched_quads.len();
     log::debug!(
-        "[cottas_native::match] filtered scan materialized {} rows in {:.3}ms",
+        "[cottas_native::match] filtered scan materialized {} rows from {} batches, max_batch_rows={}, in {:.3}ms",
         matched_quads.len(),
+        diagnostics.scan_batches,
+        diagnostics.max_scan_batch_rows,
         diagnostics.read_all_ms
     );
 
@@ -2667,7 +2730,8 @@ async fn build_native_pattern_filter_lazy_with_detailed_stats(
 
     if let Some(subject) = subject {
         let term = subject.to_string();
-        let (id, stats) = lookup_term_id_from_sidecar_with_stats(data_path, &term, Some("s")).await?;
+        let (id, stats) =
+            lookup_term_id_from_sidecar_with_stats(data_path, &term, Some("s")).await?;
         term_lookup_ms += stats.total_ms;
         term_to_id_stats.push(stats);
         let Some(id) = id else {
@@ -2677,7 +2741,8 @@ async fn build_native_pattern_filter_lazy_with_detailed_stats(
     }
     if let Some(predicate) = predicate {
         let term = predicate.to_string();
-        let (id, stats) = lookup_term_id_from_sidecar_with_stats(data_path, &term, Some("p")).await?;
+        let (id, stats) =
+            lookup_term_id_from_sidecar_with_stats(data_path, &term, Some("p")).await?;
         term_lookup_ms += stats.total_ms;
         term_to_id_stats.push(stats);
         let Some(id) = id else {
@@ -2687,7 +2752,8 @@ async fn build_native_pattern_filter_lazy_with_detailed_stats(
     }
     if let Some(object) = object {
         let term = object.to_string();
-        let (id, stats) = lookup_term_id_from_sidecar_with_stats(data_path, &term, Some("o")).await?;
+        let (id, stats) =
+            lookup_term_id_from_sidecar_with_stats(data_path, &term, Some("o")).await?;
         term_lookup_ms += stats.total_ms;
         term_to_id_stats.push(stats);
         let Some(id) = id else {
@@ -2697,7 +2763,8 @@ async fn build_native_pattern_filter_lazy_with_detailed_stats(
     }
     if let Some(graph) = graph {
         let term = graph.to_string();
-        let (id, stats) = lookup_term_id_from_sidecar_with_stats(data_path, &term, Some("g")).await?;
+        let (id, stats) =
+            lookup_term_id_from_sidecar_with_stats(data_path, &term, Some("g")).await?;
         term_lookup_ms += stats.total_ms;
         term_to_id_stats.push(stats);
         let Some(id) = id else {
@@ -2715,9 +2782,15 @@ async fn build_native_pattern_filter_lazy_with_detailed_stats(
     };
     log::debug!(
         "[cottas_native_ids::build_native_pattern_filter_lazy_detailed] built filter in {:?}; bound_terms={}, term_lookup_ms={:.3}",
-        start.elapsed(), term_to_id_stats.len(), term_lookup_ms
+        start.elapsed(),
+        term_to_id_stats.len(),
+        term_lookup_ms
     );
-    Ok((NativePatternFilter::Expr(expr), term_lookup_ms, term_to_id_stats))
+    Ok((
+        NativePatternFilter::Expr(expr),
+        term_lookup_ms,
+        term_to_id_stats,
+    ))
 }
 async fn build_native_pattern_filter_lazy_with_stats(
     data_path: &Path,
@@ -2798,14 +2871,21 @@ async fn build_native_pattern_filter_lazy_with_stats(
     Ok((NativePatternFilter::Expr(expr), term_lookup_ms))
 }
 
-
 const NATIVE_TERM_TO_ID_ENTRY_BYTES: u64 = 24;
 
-fn read_term_to_id_entry_at(entries_file: &std::fs::File, entry_idx: u64) -> Result<(u64, u64, u32)> {
+fn read_term_to_id_entry_at(
+    entries_file: &std::fs::File,
+    entry_idx: u64,
+) -> Result<(u64, u64, u32)> {
     let mut buf = [0u8; 24];
-    let offset = entry_idx.checked_mul(NATIVE_TERM_TO_ID_ENTRY_BYTES).ok_or_else(|| {
-        VortexRdfError::Deserialization(format!("term_to_id entry offset overflow for entry {}", entry_idx))
-    })?;
+    let offset = entry_idx
+        .checked_mul(NATIVE_TERM_TO_ID_ENTRY_BYTES)
+        .ok_or_else(|| {
+            VortexRdfError::Deserialization(format!(
+                "term_to_id entry offset overflow for entry {}",
+                entry_idx
+            ))
+        })?;
     read_exact_at_native_sidecar(entries_file, &mut buf, offset, "term_to_id entry")?;
     let start = u64::from_le_bytes(buf[0..8].try_into().unwrap());
     let end = u64::from_le_bytes(buf[8..16].try_into().unwrap());
@@ -2831,21 +2911,36 @@ fn lookup_term_id_from_binary_index_with_stats(
     let blob_path = native_dict_term_to_id_blob_path(data_path);
     let open_start = Instant::now();
     let entries_file = std::fs::File::open(&entries_path).map_err(|e| {
-        VortexRdfError::Deserialization(format!("Failed to open native term_to_id entries sidecar {:?}: {}", entries_path, e))
+        VortexRdfError::Deserialization(format!(
+            "Failed to open native term_to_id entries sidecar {:?}: {}",
+            entries_path, e
+        ))
     })?;
     let blob_file = std::fs::File::open(&blob_path).map_err(|e| {
-        VortexRdfError::Deserialization(format!("Failed to open native term_to_id blob sidecar {:?}: {}", blob_path, e))
+        VortexRdfError::Deserialization(format!(
+            "Failed to open native term_to_id blob sidecar {:?}: {}",
+            blob_path, e
+        ))
     })?;
     stats.open_ms = elapsed_ms(open_start);
 
     let metadata_start = Instant::now();
-    let entries_len = entries_file.metadata().map_err(|e| VortexRdfError::Deserialization(e.to_string()))?.len();
-    let blob_len = blob_file.metadata().map_err(|e| VortexRdfError::Deserialization(e.to_string()))?.len();
+    let entries_len = entries_file
+        .metadata()
+        .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?
+        .len();
+    let blob_len = blob_file
+        .metadata()
+        .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?
+        .len();
     stats.binary_metadata_ms = elapsed_ms(metadata_start);
     stats.binary_entries_file_bytes = entries_len;
     stats.binary_blob_file_bytes = blob_len;
     if entries_len % NATIVE_TERM_TO_ID_ENTRY_BYTES != 0 {
-        return Err(VortexRdfError::Deserialization(format!("Malformed term_to_id entries size {}", entries_len)));
+        return Err(VortexRdfError::Deserialization(format!(
+            "Malformed term_to_id entries size {}",
+            entries_len
+        )));
     }
 
     let key = term.as_bytes();
@@ -2861,7 +2956,10 @@ fn lookup_term_id_from_binary_index_with_stats(
         stats.binary_probe_count += 1;
         stats.binary_entry_bytes_read += NATIVE_TERM_TO_ID_ENTRY_BYTES as usize;
         if start > end || end > blob_len {
-            return Err(VortexRdfError::Deserialization(format!("Invalid term_to_id blob range {}..{}", start, end)));
+            return Err(VortexRdfError::Deserialization(format!(
+                "Invalid term_to_id blob range {}..{}",
+                start, end
+            )));
         }
         let len = (end - start) as usize;
         let mut candidate = vec![0u8; len];
@@ -2874,7 +2972,10 @@ fn lookup_term_id_from_binary_index_with_stats(
         match candidate.as_slice().cmp(key) {
             Ordering::Less => lo = mid + 1,
             Ordering::Greater => hi = mid,
-            Ordering::Equal => { found = Some(id); break; }
+            Ordering::Equal => {
+                found = Some(id);
+                break;
+            }
         }
     }
     stats.read_all_ms = elapsed_ms(search_start);
@@ -2883,27 +2984,47 @@ fn lookup_term_id_from_binary_index_with_stats(
     stats.total_ms = elapsed_ms(lookup_start);
     log::debug!(
         "[cottas_native_ids::lookup_term_id_from_sidecar] binary term_to_id resolved column={:?}, term {:?} to {:?} in {:.3}ms; probes={}, entry_bytes={}, blob_bytes={}, open_ms={:.3}, metadata_ms={:.3}, search_ms={:.3}, entry_read_ms={:.3}, blob_read_ms={:.3}",
-        column, term, found, stats.total_ms, stats.binary_probe_count, stats.binary_entry_bytes_read,
-        stats.binary_blob_bytes_read, stats.open_ms, stats.binary_metadata_ms, stats.read_all_ms,
-        stats.binary_entry_read_ms, stats.binary_blob_read_ms
+        column,
+        term,
+        found,
+        stats.total_ms,
+        stats.binary_probe_count,
+        stats.binary_entry_bytes_read,
+        stats.binary_blob_bytes_read,
+        stats.open_ms,
+        stats.binary_metadata_ms,
+        stats.read_all_ms,
+        stats.binary_entry_read_ms,
+        stats.binary_blob_read_ms
     );
     Ok((found, stats))
 }
 
-fn write_term_to_id_binary_sidecar_from_term_runs(term_run_paths: &[PathBuf], data_path: &Path) -> Result<()> {
+fn write_term_to_id_binary_sidecar_from_term_runs(
+    term_run_paths: &[PathBuf],
+    data_path: &Path,
+) -> Result<()> {
     let write_start = Instant::now();
     let entries_path = native_dict_term_to_id_entries_path(data_path);
     let blob_path = native_dict_term_to_id_blob_path(data_path);
     let mut readers = Vec::with_capacity(term_run_paths.len());
-    for path in term_run_paths { readers.push(PairRunReader::new(path)?); }
+    for path in term_run_paths {
+        readers.push(PairRunReader::new(path)?);
+    }
     let mut heap = BinaryHeap::new();
     for run_idx in 0..readers.len() {
         if let Some(pair) = readers[run_idx].read_one()? {
-            heap.push(PairHeapItem { pair, run_idx, order: PairRunOrder::Term });
+            heap.push(PairHeapItem {
+                pair,
+                run_idx,
+                order: PairRunOrder::Term,
+            });
         }
     }
-    let blob_file = std::fs::File::create(&blob_path).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    let entries_file = std::fs::File::create(&entries_path).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    let blob_file = std::fs::File::create(&blob_path)
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    let entries_file = std::fs::File::create(&entries_path)
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
     let mut blob_writer = BufWriter::new(blob_file);
     let mut entries_writer = BufWriter::new(entries_file);
     let mut current_offset = 0u64;
@@ -2914,16 +3035,26 @@ fn write_term_to_id_binary_sidecar_from_term_runs(term_run_paths: &[PathBuf], da
         let pair = item.pair;
         if let Some(prev) = &last_term {
             if pair.term <= *prev {
-                return Err(VortexRdfError::Serialization(format!("Non-increasing term_to_id order: {:?} then {:?}", prev, pair.term)));
+                return Err(VortexRdfError::Serialization(format!(
+                    "Non-increasing term_to_id order: {:?} then {:?}",
+                    prev, pair.term
+                )));
             }
         }
         let start = current_offset;
-        blob_writer.write_all(pair.term.as_bytes()).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-        current_offset = current_offset.checked_add(pair.term.as_bytes().len() as u64).ok_or_else(|| {
-            VortexRdfError::Serialization("term_to_id binary blob offset overflowed u64".to_string())
-        })?;
+        blob_writer
+            .write_all(pair.term.as_bytes())
+            .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+        current_offset = current_offset
+            .checked_add(pair.term.as_bytes().len() as u64)
+            .ok_or_else(|| {
+                VortexRdfError::Serialization(
+                    "term_to_id binary blob offset overflowed u64".to_string(),
+                )
+            })?;
         let end = current_offset;
-        entries_writer.write_all(&start.to_le_bytes())
+        entries_writer
+            .write_all(&start.to_le_bytes())
             .and_then(|_| entries_writer.write_all(&end.to_le_bytes()))
             .and_then(|_| entries_writer.write_all(&pair.id.to_le_bytes()))
             .and_then(|_| entries_writer.write_all(&0u32.to_le_bytes()))
@@ -2931,14 +3062,27 @@ fn write_term_to_id_binary_sidecar_from_term_runs(term_run_paths: &[PathBuf], da
         last_term = Some(pair.term);
         pairs_written += 1;
         if let Some(next_pair) = readers[run_idx].read_one()? {
-            heap.push(PairHeapItem { pair: next_pair, run_idx, order: PairRunOrder::Term });
+            heap.push(PairHeapItem {
+                pair: next_pair,
+                run_idx,
+                order: PairRunOrder::Term,
+            });
         }
     }
-    blob_writer.flush().map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    entries_writer.flush().map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    blob_writer
+        .flush()
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    entries_writer
+        .flush()
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
     log::info!(
         "[cottas_native_ids] wrote binary term_to_id sidecars pairs={}, entry_bytes={}, blob_bytes={} to {:?} and {:?} in {:?}",
-        pairs_written, pairs_written as u64 * NATIVE_TERM_TO_ID_ENTRY_BYTES, current_offset, entries_path, blob_path, write_start.elapsed()
+        pairs_written,
+        pairs_written as u64 * NATIVE_TERM_TO_ID_ENTRY_BYTES,
+        current_offset,
+        entries_path,
+        blob_path,
+        write_start.elapsed()
     );
     Ok(())
 }
@@ -2966,7 +3110,11 @@ async fn lookup_term_id_from_sidecar_with_stats(
     };
     let path = native_dict_term_to_id_path(data_path);
     let open_start = Instant::now();
-    let file = NATIVE_FILE_SESSION.open_options().open_path(&path).await.map_err(VortexRdfError::from)?;
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&path)
+        .await
+        .map_err(VortexRdfError::from)?;
     stats.open_ms = elapsed_ms(open_start);
 
     let expr = eq(col("term"), lit(term));
@@ -2979,10 +3127,15 @@ async fn lookup_term_id_from_sidecar_with_stats(
 
     let scan_build_start = Instant::now();
     let stream = file
-        .scan().map_err(VortexRdfError::from)?
+        .scan()
+        .map_err(VortexRdfError::from)?
         .with_filter(expr)
-        .with_projection(vortex_array::expr::select(["id"], vortex_array::expr::root()))
-        .into_array_stream().map_err(VortexRdfError::from)?;
+        .with_projection(vortex_array::expr::select(
+            ["id"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?;
     stats.scan_build_ms = elapsed_ms(scan_build_start);
 
     let read_all_start = Instant::now();
@@ -2998,8 +3151,18 @@ async fn lookup_term_id_from_sidecar_with_stats(
 
     log::debug!(
         "[cottas_native_ids::lookup_term_id_from_sidecar] resolved column={:?}, term {:?} to {:?} in {:.3}ms; strategy={}, open_ms={:.3}, can_prune_ms={:.3}, scan_build_ms={:.3}, read_all_ms={:.3}, extract_ms={:.3}, result_array_len={}, can_prune={:?}",
-        column, term, id, stats.total_ms, stats.strategy, stats.open_ms, stats.can_prune_ms,
-        stats.scan_build_ms, stats.read_all_ms, stats.extract_ms, stats.result_array_len, stats.can_prune
+        column,
+        term,
+        id,
+        stats.total_ms,
+        stats.strategy,
+        stats.open_ms,
+        stats.can_prune_ms,
+        stats.scan_build_ms,
+        stats.read_all_ms,
+        stats.extract_ms,
+        stats.result_array_len,
+        stats.can_prune
     );
     Ok((id, stats))
 }
