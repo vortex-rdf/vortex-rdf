@@ -990,6 +990,35 @@ enum NativePatternFilter {
     Expr(Expression),
 }
 
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct NativeTermToIdLookupStats {
+    pub column: Option<String>,
+    pub term_len: usize,
+    pub term_preview: String,
+    pub found_id: Option<u32>,
+    pub total_ms: f64,
+    pub open_ms: f64,
+    pub can_prune_ms: f64,
+    pub scan_build_ms: f64,
+    pub read_all_ms: f64,
+    pub extract_ms: f64,
+    pub can_prune: Option<bool>,
+    pub result_array_len: usize,
+}
+
+fn native_term_preview(term: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    let mut out = String::new();
+    for (idx, ch) in term.chars().enumerate() {
+        if idx >= MAX_CHARS {
+            out.push_str("...");
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CottasNativeIdsDiagnostics {
     pub term_lookup_ms: f64,
@@ -1006,6 +1035,7 @@ pub struct CottasNativeIdsDiagnostics {
     pub vortex_can_prune: Option<bool>,
 
     pub id_to_term_stats: NativeIdToTermLookupStats,
+    pub term_to_id_stats: Vec<NativeTermToIdLookupStats>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1344,15 +1374,6 @@ fn read_exact_at_native_sidecar(
         offset += n as u64;
     }
     Ok(())
-}
-
-fn lookup_terms_by_ids_from_binary_index_random_read(
-    data_path: &Path,
-    ids: &[u32],
-) -> Result<HashMap<u32, String>> {
-    let (terms, _stats) =
-        lookup_terms_by_ids_from_binary_index_random_read_with_stats(data_path, ids)?;
-    Ok(terms)
 }
 
 fn lookup_terms_by_ids_from_binary_index_random_read_with_stats(
@@ -1795,10 +1816,11 @@ where
     let total_start = Instant::now();
     let mut diagnostics = CottasNativeIdsDiagnostics::default();
 
-    let (filter, term_lookup_ms) =
-        build_native_pattern_filter_lazy_with_stats(input_path, subject, predicate, object, graph)
+    let (filter, term_lookup_ms, term_to_id_stats) =
+        build_native_pattern_filter_lazy_with_detailed_stats(input_path, subject, predicate, object, graph)
             .await?;
     diagnostics.term_lookup_ms = term_lookup_ms;
+    diagnostics.term_to_id_stats = term_to_id_stats;
 
     if matches!(filter, NativePatternFilter::Empty) {
         log::debug!(
@@ -2605,6 +2627,72 @@ async fn resolve_single_bound_id_for_count(
     }
 }
 
+async fn build_native_pattern_filter_lazy_with_detailed_stats(
+    data_path: &Path,
+    subject: Option<&NamedOrBlankNode>,
+    predicate: Option<&NamedNode>,
+    object: Option<&Term>,
+    graph: Option<&GraphName>,
+) -> Result<(NativePatternFilter, f64, Vec<NativeTermToIdLookupStats>)> {
+    let start = Instant::now();
+    let mut term_lookup_ms = 0.0;
+    let mut term_to_id_stats: Vec<NativeTermToIdLookupStats> = Vec::new();
+    let mut filters: Vec<Expression> = Vec::new();
+
+    if let Some(subject) = subject {
+        let term = subject.to_string();
+        let (id, stats) = lookup_term_id_from_sidecar_with_stats(data_path, &term, Some("s")).await?;
+        term_lookup_ms += stats.total_ms;
+        term_to_id_stats.push(stats);
+        let Some(id) = id else {
+            return Ok((NativePatternFilter::Empty, term_lookup_ms, term_to_id_stats));
+        };
+        filters.push(eq(col("s"), lit(id)));
+    }
+    if let Some(predicate) = predicate {
+        let term = predicate.to_string();
+        let (id, stats) = lookup_term_id_from_sidecar_with_stats(data_path, &term, Some("p")).await?;
+        term_lookup_ms += stats.total_ms;
+        term_to_id_stats.push(stats);
+        let Some(id) = id else {
+            return Ok((NativePatternFilter::Empty, term_lookup_ms, term_to_id_stats));
+        };
+        filters.push(eq(col("p"), lit(id)));
+    }
+    if let Some(object) = object {
+        let term = object.to_string();
+        let (id, stats) = lookup_term_id_from_sidecar_with_stats(data_path, &term, Some("o")).await?;
+        term_lookup_ms += stats.total_ms;
+        term_to_id_stats.push(stats);
+        let Some(id) = id else {
+            return Ok((NativePatternFilter::Empty, term_lookup_ms, term_to_id_stats));
+        };
+        filters.push(eq(col("o"), lit(id)));
+    }
+    if let Some(graph) = graph {
+        let term = graph.to_string();
+        let (id, stats) = lookup_term_id_from_sidecar_with_stats(data_path, &term, Some("g")).await?;
+        term_lookup_ms += stats.total_ms;
+        term_to_id_stats.push(stats);
+        let Some(id) = id else {
+            return Ok((NativePatternFilter::Empty, term_lookup_ms, term_to_id_stats));
+        };
+        filters.push(eq(col("g"), lit(id)));
+    }
+
+    let Some(expr) = filters.into_iter().reduce(and) else {
+        log::debug!(
+            "[cottas_native_ids::build_native_pattern_filter_lazy_detailed] no bound terms; built All filter in {:?}",
+            start.elapsed()
+        );
+        return Ok((NativePatternFilter::All, term_lookup_ms, term_to_id_stats));
+    };
+    log::debug!(
+        "[cottas_native_ids::build_native_pattern_filter_lazy_detailed] built filter in {:?}; bound_terms={}, term_lookup_ms={:.3}",
+        start.elapsed(), term_to_id_stats.len(), term_lookup_ms
+    );
+    Ok((NativePatternFilter::Expr(expr), term_lookup_ms, term_to_id_stats))
+}
 async fn build_native_pattern_filter_lazy_with_stats(
     data_path: &Path,
     subject: Option<&NamedOrBlankNode>,
@@ -2685,25 +2773,54 @@ async fn build_native_pattern_filter_lazy_with_stats(
 }
 
 async fn lookup_term_id_from_sidecar(data_path: &Path, term: &str) -> Result<Option<u32>> {
-    let lookup_start = Instant::now();
-    let path = native_dict_term_to_id_path(data_path);
+    let (id, _stats) = lookup_term_id_from_sidecar_with_stats(data_path, term, None).await?;
+    Ok(id)
+}
 
+async fn lookup_term_id_from_sidecar_with_stats(
+    data_path: &Path,
+    term: &str,
+    column: Option<&'static str>,
+) -> Result<(Option<u32>, NativeTermToIdLookupStats)> {
+    let lookup_start = Instant::now();
+    let mut stats = NativeTermToIdLookupStats {
+        column: column.map(|c| c.to_string()),
+        term_len: term.len(),
+        term_preview: native_term_preview(term),
+        ..NativeTermToIdLookupStats::default()
+    };
+
+    let path = native_dict_term_to_id_path(data_path);
+    let open_start = Instant::now();
     let file = NATIVE_FILE_SESSION
         .open_options()
         .open_path(&path)
         .await
         .map_err(VortexRdfError::from)?;
+    stats.open_ms = elapsed_ms(open_start);
 
     let expr = eq(col("term"), lit(term));
 
-    if let Ok(can_prune) = file.can_prune(&expr) {
-        log::debug!(
-            "[cottas_native_ids::lookup_term_id_from_sidecar] can_prune(term={}) = {}",
-            term,
-            can_prune
-        );
+    let can_prune_start = Instant::now();
+    match file.can_prune(&expr) {
+        Ok(can_prune) => {
+            stats.can_prune = Some(can_prune);
+            log::debug!(
+                "[cottas_native_ids::lookup_term_id_from_sidecar] can_prune(column={:?}, term={}) = {}",
+                column, term, can_prune
+            );
+        }
+        Err(e) => {
+            stats.can_prune = None;
+            log::debug!(
+                "[cottas_native_ids::lookup_term_id_from_sidecar] can_prune(column={:?}, term={}) failed: {}",
+                column, term, e
+            );
+        }
     }
+    stats.can_prune_ms = elapsed_ms(can_prune_start);
 
+    let scan_build_start = Instant::now();
     let stream = file
         .scan()
         .map_err(VortexRdfError::from)?
@@ -2714,17 +2831,33 @@ async fn lookup_term_id_from_sidecar(data_path: &Path, term: &str) -> Result<Opt
         ))
         .into_array_stream()
         .map_err(VortexRdfError::from)?;
+    stats.scan_build_ms = elapsed_ms(scan_build_start);
 
+    let read_all_start = Instant::now();
     let ids = stream.read_all().await.map_err(VortexRdfError::from)?;
+    stats.read_all_ms = elapsed_ms(read_all_start);
+    stats.result_array_len = ids.len();
 
+    let extract_start = Instant::now();
     let id = extract_first_u32_from_single_column_array(&ids, "id")?;
+    stats.extract_ms = elapsed_ms(extract_start);
+    stats.found_id = id;
+    stats.total_ms = elapsed_ms(lookup_start);
 
     log::debug!(
-        "[cottas_native_ids::lookup_term_id_from_sidecar] resolved term {:?} to {:?} in {:?}",
+        "[cottas_native_ids::lookup_term_id_from_sidecar] resolved column={:?}, term {:?} to {:?} in {:.3}ms; open_ms={:.3}, can_prune_ms={:.3}, scan_build_ms={:.3}, read_all_ms={:.3}, extract_ms={:.3}, result_array_len={}, can_prune={:?}",
+        column,
         term,
         id,
-        lookup_start.elapsed()
+        stats.total_ms,
+        stats.open_ms,
+        stats.can_prune_ms,
+        stats.scan_build_ms,
+        stats.read_all_ms,
+        stats.extract_ms,
+        stats.result_array_len,
+        stats.can_prune,
     );
 
-    Ok(id)
+    Ok((id, stats))
 }
