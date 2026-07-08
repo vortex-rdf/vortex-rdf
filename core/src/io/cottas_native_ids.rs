@@ -7,10 +7,10 @@ use futures::{Stream, StreamExt};
 use oxrdf::Quad;
 use std::cmp::Ordering;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::LazyLock;
-use std::os::unix::fs::FileExt;
 use std::time::Instant;
 use vortex::VortexSessionDefault;
 use vortex_error::{VortexError, VortexResult};
@@ -1004,6 +1004,8 @@ pub struct CottasNativeIdsDiagnostics {
     pub unique_ids_requested: usize,
     pub unique_ids_loaded: usize,
     pub vortex_can_prune: Option<bool>,
+
+    pub id_to_term_stats: NativeIdToTermLookupStats,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1049,6 +1051,34 @@ struct LazyRdfWriteStats {
     rows_out: usize,
     unique_ids_requested: usize,
     unique_ids_loaded: usize,
+
+    id_to_term_stats: NativeIdToTermLookupStats,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct NativeIdToTermLookupStats {
+    pub strategy: String,
+
+    pub total_ms: f64,
+    pub open_files_ms: f64,
+    pub metadata_ms: f64,
+    pub sort_dedup_ms: f64,
+    pub offset_read_ms: f64,
+    pub blob_read_ms: f64,
+    pub utf8_decode_ms: f64,
+    pub hashmap_insert_ms: f64,
+
+    pub requested_ids_in: usize,
+    pub requested_ids_unique: usize,
+    pub ids_loaded: usize,
+
+    pub offset_reads: usize,
+    pub offset_bytes_read: usize,
+    pub blob_reads: usize,
+    pub blob_bytes_read: usize,
+
+    pub offsets_file_bytes: u64,
+    pub blob_file_bytes: u64,
 }
 
 fn elapsed_ms(start: Instant) -> f64 {
@@ -1073,7 +1103,10 @@ where
     let unique_ids = collect_unique_ids(&s_ids, &p_ids, &o_ids, &g_ids);
 
     let id_lookup_start = Instant::now();
-    let id_to_term = lookup_terms_by_ids_from_sidecar(data_path, &unique_ids).await?;
+
+    let (id_to_term, id_to_term_stats) =
+        lookup_terms_by_ids_from_sidecar_with_stats(data_path, &unique_ids).await?;
+
     let id_to_term_lookup_ms = elapsed_ms(id_lookup_start);
 
     let serialize_start = Instant::now();
@@ -1136,6 +1169,7 @@ where
         rows_out: s_ids.len(),
         unique_ids_requested: unique_ids.len(),
         unique_ids_loaded: id_to_term.len(),
+        id_to_term_stats,
     })
 }
 
@@ -1221,8 +1255,21 @@ async fn lookup_terms_by_ids_from_sidecar(
     data_path: &Path,
     ids: &[u32],
 ) -> Result<HashMap<u32, String>> {
+    let (terms, _stats) = lookup_terms_by_ids_from_sidecar_with_stats(data_path, ids).await?;
+    Ok(terms)
+}
+
+async fn lookup_terms_by_ids_from_sidecar_with_stats(
+    data_path: &Path,
+    ids: &[u32],
+) -> Result<(HashMap<u32, String>, NativeIdToTermLookupStats)> {
+    let total_start = Instant::now();
+
     if ids.is_empty() {
-        return Ok(HashMap::new());
+        let mut stats = NativeIdToTermLookupStats::default();
+        stats.strategy = "empty".to_string();
+        stats.total_ms = elapsed_ms(total_start);
+        return Ok((HashMap::new(), stats));
     }
 
     if native_id_to_term_binary_sidecar_exists(data_path) {
@@ -1230,28 +1277,44 @@ async fn lookup_terms_by_ids_from_sidecar(
             "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] dispatch ids={}, strategy=binary-random-read",
             ids.len()
         );
-        return lookup_terms_by_ids_from_binary_index_random_read(data_path, ids);
+
+        return lookup_terms_by_ids_from_binary_index_random_read_with_stats(data_path, ids);
     }
 
     let single_eq_threshold = native_id_lookup_single_eq_threshold();
-    let strategy = if ids.len() <= single_eq_threshold {
-        "single-eq"
-    } else {
-        "streaming"
-    };
-
-    log::debug!(
-        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] dispatch ids={}, single_eq_threshold={}, strategy={} (binary sidecar missing)",
-        ids.len(),
-        single_eq_threshold,
-        strategy
-    );
 
     if ids.len() <= single_eq_threshold {
-        lookup_terms_by_ids_from_sidecar_single_eq(data_path, ids).await
-    } else {
-        lookup_terms_by_ids_from_sidecar_streaming(data_path, ids).await
+        log::debug!(
+            "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] dispatch ids={}, single_eq_threshold={}, strategy=single-eq (binary sidecar missing)",
+            ids.len(),
+            single_eq_threshold,
+        );
+
+        let terms = lookup_terms_by_ids_from_sidecar_single_eq(data_path, ids).await?;
+        let mut stats = NativeIdToTermLookupStats::default();
+        stats.strategy = "single-eq".to_string();
+        stats.requested_ids_in = ids.len();
+        stats.requested_ids_unique = ids.iter().copied().collect::<HashSet<_>>().len();
+        stats.ids_loaded = terms.len();
+        stats.total_ms = elapsed_ms(total_start);
+        return Ok((terms, stats));
     }
+
+    log::debug!(
+        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] dispatch ids={}, single_eq_threshold={}, strategy=streaming (binary sidecar missing)",
+        ids.len(),
+        single_eq_threshold,
+    );
+
+    let terms = lookup_terms_by_ids_from_sidecar_streaming(data_path, ids).await?;
+    let mut stats = NativeIdToTermLookupStats::default();
+    stats.strategy = "streaming".to_string();
+    stats.requested_ids_in = ids.len();
+    stats.requested_ids_unique = ids.iter().copied().collect::<HashSet<_>>().len();
+    stats.ids_loaded = terms.len();
+    stats.total_ms = elapsed_ms(total_start);
+
+    Ok((terms, stats))
 }
 
 fn read_exact_at_native_sidecar(
@@ -1262,12 +1325,12 @@ fn read_exact_at_native_sidecar(
 ) -> Result<()> {
     let mut read_total = 0usize;
     while read_total < buf.len() {
-        let n = file
-            .read_at(&mut buf[read_total..], offset)
-            .map_err(|e| VortexRdfError::Deserialization(format!(
+        let n = file.read_at(&mut buf[read_total..], offset).map_err(|e| {
+            VortexRdfError::Deserialization(format!(
                 "Failed to read {} at offset {} after {} bytes: {}",
                 label, offset, read_total, e
-            )))?;
+            ))
+        })?;
         if n == 0 {
             return Err(VortexRdfError::Deserialization(format!(
                 "Unexpected EOF while reading {} at offset {} after {} / {} bytes",
@@ -1287,13 +1350,30 @@ fn lookup_terms_by_ids_from_binary_index_random_read(
     data_path: &Path,
     ids: &[u32],
 ) -> Result<HashMap<u32, String>> {
+    let (terms, _stats) =
+        lookup_terms_by_ids_from_binary_index_random_read_with_stats(data_path, ids)?;
+    Ok(terms)
+}
+
+fn lookup_terms_by_ids_from_binary_index_random_read_with_stats(
+    data_path: &Path,
+    ids: &[u32],
+) -> Result<(HashMap<u32, String>, NativeIdToTermLookupStats)> {
+    let lookup_start = Instant::now();
+
+    let mut stats = NativeIdToTermLookupStats::default();
+    stats.strategy = "binary-random-read".to_string();
+    stats.requested_ids_in = ids.len();
+
     if ids.is_empty() {
-        return Ok(HashMap::new());
+        stats.total_ms = elapsed_ms(lookup_start);
+        return Ok((HashMap::new(), stats));
     }
 
-    let lookup_start = Instant::now();
     let offsets_path = native_dict_id_to_term_offsets_path(data_path);
     let blob_path = native_dict_id_to_term_blob_path(data_path);
+
+    let open_start = Instant::now();
 
     let offsets_file = std::fs::File::open(&offsets_path).map_err(|e| {
         VortexRdfError::Deserialization(format!(
@@ -1301,6 +1381,7 @@ fn lookup_terms_by_ids_from_binary_index_random_read(
             offsets_path, e
         ))
     })?;
+
     let blob_file = std::fs::File::open(&blob_path).map_err(|e| {
         VortexRdfError::Deserialization(format!(
             "Failed to open native id_to_term blob sidecar {:?}: {}",
@@ -1308,20 +1389,33 @@ fn lookup_terms_by_ids_from_binary_index_random_read(
         ))
     })?;
 
+    stats.open_files_ms = elapsed_ms(open_start);
+
+    let metadata_start = Instant::now();
+
     let offsets_len = offsets_file
         .metadata()
-        .map_err(|e| VortexRdfError::Deserialization(format!(
-            "Failed to stat native id_to_term offsets sidecar {:?}: {}",
-            offsets_path, e
-        )))?
+        .map_err(|e| {
+            VortexRdfError::Deserialization(format!(
+                "Failed to stat native id_to_term offsets sidecar {:?}: {}",
+                offsets_path, e
+            ))
+        })?
         .len();
+
     let blob_len = blob_file
         .metadata()
-        .map_err(|e| VortexRdfError::Deserialization(format!(
-            "Failed to stat native id_to_term blob sidecar {:?}: {}",
-            blob_path, e
-        )))?
+        .map_err(|e| {
+            VortexRdfError::Deserialization(format!(
+                "Failed to stat native id_to_term blob sidecar {:?}: {}",
+                blob_path, e
+            ))
+        })?
         .len();
+
+    stats.metadata_ms = elapsed_ms(metadata_start);
+    stats.offsets_file_bytes = offsets_len;
+    stats.blob_file_bytes = blob_len;
 
     if offsets_len < 16 || offsets_len % 8 != 0 {
         return Err(VortexRdfError::Deserialization(format!(
@@ -1330,23 +1424,25 @@ fn lookup_terms_by_ids_from_binary_index_random_read(
         )));
     }
 
+    let sort_start = Instant::now();
+
     let mut requested: Vec<u32> = ids.to_vec();
     requested.sort_unstable();
     requested.dedup();
 
+    stats.sort_dedup_ms = elapsed_ms(sort_start);
+    stats.requested_ids_unique = requested.len();
+
     let mut out = HashMap::with_capacity(requested.len());
-    let mut offset_reads = 0usize;
-    let mut blob_reads = 0usize;
-    let mut offset_bytes_read = 0usize;
-    let mut blob_bytes_read = 0usize;
 
     for id in requested.iter().copied() {
-        let offset_pos = (id as u64)
-            .checked_mul(8)
-            .ok_or_else(|| VortexRdfError::Deserialization(format!(
+        let offset_pos = (id as u64).checked_mul(8).ok_or_else(|| {
+            VortexRdfError::Deserialization(format!(
                 "Offset position overflow for dictionary ID {}",
                 id
-            )))?;
+            ))
+        })?;
+
         if offset_pos + 16 > offsets_len {
             return Err(VortexRdfError::Deserialization(format!(
                 "ID {} is outside native id_to_term offsets range: need bytes {}..{}, offsets_len={}",
@@ -1358,17 +1454,23 @@ fn lookup_terms_by_ids_from_binary_index_random_read(
         }
 
         let mut offset_buf = [0u8; 16];
+
+        let offset_read_start = Instant::now();
+
         read_exact_at_native_sidecar(
             &offsets_file,
             &mut offset_buf,
             offset_pos,
             "id_to_term offsets",
         )?;
-        offset_reads += 1;
-        offset_bytes_read += offset_buf.len();
+
+        stats.offset_read_ms += elapsed_ms(offset_read_start);
+        stats.offset_reads += 1;
+        stats.offset_bytes_read += offset_buf.len();
 
         let start = u64::from_le_bytes(offset_buf[0..8].try_into().unwrap());
         let end = u64::from_le_bytes(offset_buf[8..16].try_into().unwrap());
+
         if start > end || end > blob_len {
             return Err(VortexRdfError::Deserialization(format!(
                 "ID {} has invalid native id_to_term blob byte range {}..{} for blob_len={}",
@@ -1378,16 +1480,18 @@ fn lookup_terms_by_ids_from_binary_index_random_read(
 
         let term_len = (end - start) as usize;
         let mut term_buf = vec![0u8; term_len];
+
         if term_len > 0 {
-            read_exact_at_native_sidecar(
-                &blob_file,
-                &mut term_buf,
-                start,
-                "id_to_term blob",
-            )?;
-            blob_reads += 1;
-            blob_bytes_read += term_len;
+            let blob_read_start = Instant::now();
+
+            read_exact_at_native_sidecar(&blob_file, &mut term_buf, start, "id_to_term blob")?;
+
+            stats.blob_read_ms += elapsed_ms(blob_read_start);
+            stats.blob_reads += 1;
+            stats.blob_bytes_read += term_len;
         }
+
+        let utf8_start = Instant::now();
 
         let term = String::from_utf8(term_buf).map_err(|e| {
             VortexRdfError::Deserialization(format!(
@@ -1395,23 +1499,38 @@ fn lookup_terms_by_ids_from_binary_index_random_read(
                 id, start, end, e
             ))
         })?;
+
+        stats.utf8_decode_ms += elapsed_ms(utf8_start);
+
+        let insert_start = Instant::now();
         out.insert(id, term);
+        stats.hashmap_insert_ms += elapsed_ms(insert_start);
     }
 
+    stats.ids_loaded = out.len();
+    stats.total_ms = elapsed_ms(lookup_start);
+
     log::debug!(
-        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] binary random-read resolved {} / {} ids in {:?}; offset_reads={}, offset_bytes={}, blob_reads={}, blob_bytes={}, offsets_file_bytes={}, blob_file_bytes={}",
+        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] binary random-read resolved {} / {} ids in {:.3}ms; open_files_ms={:.3}, metadata_ms={:.3}, sort_dedup_ms={:.3}, offset_read_ms={:.3}, blob_read_ms={:.3}, utf8_decode_ms={:.3}, hashmap_insert_ms={:.3}, offset_reads={}, offset_bytes={}, blob_reads={}, blob_bytes={}, offsets_file_bytes={}, blob_file_bytes={}",
         out.len(),
         requested.len(),
-        lookup_start.elapsed(),
-        offset_reads,
-        offset_bytes_read,
-        blob_reads,
-        blob_bytes_read,
-        offsets_len,
-        blob_len
+        stats.total_ms,
+        stats.open_files_ms,
+        stats.metadata_ms,
+        stats.sort_dedup_ms,
+        stats.offset_read_ms,
+        stats.blob_read_ms,
+        stats.utf8_decode_ms,
+        stats.hashmap_insert_ms,
+        stats.offset_reads,
+        stats.offset_bytes_read,
+        stats.blob_reads,
+        stats.blob_bytes_read,
+        stats.offsets_file_bytes,
+        stats.blob_file_bytes,
     );
 
-    Ok(out)
+    Ok((out, stats))
 }
 
 async fn lookup_terms_by_ids_from_sidecar_single_eq(
@@ -1805,6 +1924,7 @@ where
     diagnostics.rows_out = write_stats.rows_out;
     diagnostics.unique_ids_requested = write_stats.unique_ids_requested;
     diagnostics.unique_ids_loaded = write_stats.unique_ids_loaded;
+    diagnostics.id_to_term_stats = write_stats.id_to_term_stats;
     diagnostics.total_ms = elapsed_ms(total_start);
 
     log::debug!("[cottas_native_ids::diagnostics] {:?}", diagnostics);
