@@ -1062,12 +1062,15 @@ pub struct CottasNativeIdsDiagnostics {
     pub unique_ids_requested: usize,
     pub unique_ids_loaded: usize,
     pub vortex_can_prune: Option<bool>,
-
     pub total_splits: Option<usize>,
     pub scan_batches: usize,
     pub max_scan_batch_rows: usize,
     pub scan_rows_materialized: usize,
-
+    pub subject_range_index_used: bool,
+    pub subject_range_lookup_ms: f64,
+    pub subject_range_start: Option<u64>,
+    pub subject_range_end: Option<u64>,
+    pub subject_range_rows: Option<u64>,
     pub id_to_term_stats: NativeIdToTermLookupStats,
     pub term_to_id_stats: Vec<NativeTermToIdLookupStats>,
 }
@@ -1180,6 +1183,7 @@ fn collect_unique_ids_for_unbound_native_columns(
     ids
 }
 
+#[allow(dead_code)]
 fn lookup_unbound_or_use_bound<'a>(
     id_to_term: &'a HashMap<u32, String>,
     bound: &'a Option<String>,
@@ -1190,15 +1194,12 @@ fn lookup_unbound_or_use_bound<'a>(
         return Ok(value.as_str());
     }
 
-    id_to_term
-        .get(&id)
-        .map(|s| s.as_str())
-        .ok_or_else(|| {
-            VortexRdfError::Deserialization(format!(
-                "{} ID {} missing from id_to_term sidecar",
-                column_label, id
-            ))
-        })
+    id_to_term.get(&id).map(|s| s.as_str()).ok_or_else(|| {
+        VortexRdfError::Deserialization(format!(
+            "{} ID {} missing from id_to_term sidecar",
+            column_label, id
+        ))
+    })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1210,7 +1211,9 @@ struct NativeProjectedIdRows {
     rows: usize,
 }
 
-fn native_projection_columns_for_bound_terms(bound_terms: &BoundNativeRdfTerms) -> Vec<&'static str> {
+fn native_projection_columns_for_bound_terms(
+    bound_terms: &BoundNativeRdfTerms,
+) -> Vec<&'static str> {
     let mut columns = Vec::new();
 
     if bound_terms.s.is_none() {
@@ -1354,15 +1357,12 @@ fn lookup_projected_or_use_bound<'a>(
         ))
     })?;
 
-    id_to_term
-        .get(&id)
-        .map(|s| s.as_str())
-        .ok_or_else(|| {
-            VortexRdfError::Deserialization(format!(
-                "{} ID {} missing from id_to_term sidecar",
-                column_label, id
-            ))
-        })
+    id_to_term.get(&id).map(|s| s.as_str()).ok_or_else(|| {
+        VortexRdfError::Deserialization(format!(
+            "{} ID {} missing from id_to_term sidecar",
+            column_label, id
+        ))
+    })
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -1394,7 +1394,6 @@ pub struct NativeIdToTermLookupStats {
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
-
 
 async fn write_projected_native_id_rows_as_rdf_lazy<W>(
     data_path: &Path,
@@ -1466,6 +1465,7 @@ where
         id_to_term_stats,
     })
 }
+#[allow(dead_code)]
 async fn write_quads_array_as_rdf_lazy<W>(
     data_path: &Path,
     quads: ArrayRef,
@@ -1482,13 +1482,8 @@ where
     let (s_ids, p_ids, o_ids, g_ids) = extract_spog_id_columns(&quads)?;
     let id_extract_ms = elapsed_ms(id_extract_start);
 
-    let unique_ids = collect_unique_ids_for_unbound_native_columns(
-        &s_ids,
-        &p_ids,
-        &o_ids,
-        &g_ids,
-        bound_terms,
-    );
+    let unique_ids =
+        collect_unique_ids_for_unbound_native_columns(&s_ids, &p_ids, &o_ids, &g_ids, bound_terms);
     let id_lookup_start = Instant::now();
     let (id_to_term, id_to_term_stats) =
         lookup_terms_by_ids_from_sidecar_with_stats(data_path, &unique_ids).await?;
@@ -2115,6 +2110,7 @@ where
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn read_spog_stream_all_with_scan_stats<S>(stream: S) -> Result<(ArrayRef, usize, usize)>
 where
     S: Stream<Item = VortexResult<ArrayRef>>,
@@ -2274,8 +2270,49 @@ where
         projected_columns
     );
 
+    let mut subject_row_range: Option<std::ops::Range<u64>> = None;
+    if let Some(subject_node) = subject {
+        if native_subject_range_index_exists(input_path) {
+            let range_lookup_start = Instant::now();
+            let subject_term = subject_node.to_string();
+            let subject_id = lookup_term_id_from_sidecar(input_path, &subject_term).await?;
+            diagnostics.subject_range_lookup_ms = elapsed_ms(range_lookup_start);
+            if let Some(subject_id) = subject_id {
+                match lookup_subject_range_from_sidecar(input_path, subject_id)? {
+                    Some(range) => {
+                        diagnostics.subject_range_index_used = true;
+                        diagnostics.subject_range_start = Some(range.start);
+                        diagnostics.subject_range_end = Some(range.end);
+                        diagnostics.subject_range_rows = Some(range.end.saturating_sub(range.start));
+                        subject_row_range = Some(range.start..range.end);
+                        log::debug!(
+                            "[cottas_native::match] subject range index hit: subject_id={}, range={}..{}, rows={}",
+                            subject_id, range.start, range.end, range.end.saturating_sub(range.start)
+                        );
+                    }
+                    None => {
+                        log::debug!("[cottas_native::match] subject ID {} has no subject range; returning empty result", subject_id);
+                        let serialize_start = Instant::now();
+                        write_empty_rdf(writer, format).await?;
+                        diagnostics.serialize_ms = elapsed_ms(serialize_start);
+                        diagnostics.total_ms = elapsed_ms(total_start);
+                        return Ok(diagnostics);
+                    }
+                }
+            } else {
+                log::debug!("[cottas_native::match] subject term absent from dictionary during range lookup; returning empty result");
+                let serialize_start = Instant::now();
+                write_empty_rdf(writer, format).await?;
+                diagnostics.serialize_ms = elapsed_ms(serialize_start);
+                diagnostics.total_ms = elapsed_ms(total_start);
+                return Ok(diagnostics);
+            }
+        }
+    }
+
     let scan_start = Instant::now();
     let scan = file.scan().map_err(VortexRdfError::from)?;
+    let scan = if let Some(row_range) = subject_row_range { scan.with_row_range(row_range) } else { scan };
     let scan = match filter {
         NativePatternFilter::All => scan,
         NativePatternFilter::Empty => unreachable!("handled above"),
@@ -2324,8 +2361,14 @@ where
         matched_rows.rows
     );
     let materialize_start = Instant::now();
-    let write_stats =
-        write_projected_native_id_rows_as_rdf_lazy(input_path, matched_rows, &bound_terms, writer, format).await?;
+    let write_stats = write_projected_native_id_rows_as_rdf_lazy(
+        input_path,
+        matched_rows,
+        &bound_terms,
+        writer,
+        format,
+    )
+    .await?;
     log::debug!(
         "[cottas_native_ids::match] lazy RDF materialization finished in {:?}: rows_out={}, unique_ids_requested={}, unique_ids_loaded={}, id_extract_ms={:.3}, id_lookup_ms={:.3}, serialize_ms={:.3}",
         materialize_start.elapsed(),
@@ -2626,6 +2669,173 @@ fn native_dict_id_to_term_blob_path(data_path: &Path) -> PathBuf {
 fn native_id_to_term_binary_sidecar_exists(data_path: &Path) -> bool {
     native_dict_id_to_term_offsets_path(data_path).is_file()
         && native_dict_id_to_term_blob_path(data_path).is_file()
+}
+
+fn native_subject_range_index_path(data_path: &Path) -> PathBuf {
+    let file_name = data_path.file_name().and_then(|s| s.to_str()).unwrap_or("data.vortex");
+    data_path.with_file_name(format!("{file_name}.subject_ranges.bin"))
+}
+
+fn native_subject_range_index_exists(data_path: &Path) -> bool {
+    native_subject_range_index_path(data_path).is_file()
+}
+
+const NATIVE_SUBJECT_RANGE_ENTRY_BYTES: u64 = 20;
+
+#[derive(Clone, Copy, Debug)]
+struct NativeSubjectRange { start: u64, end: u64 }
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct NativeSubjectRangeIndexBuildStats {
+    pub input_path: String,
+    pub output_path: String,
+    pub rows_scanned: u64,
+    pub ranges_written: u64,
+    pub batches: usize,
+    pub max_batch_rows: usize,
+    pub open_ms: f64,
+    pub scan_ms: f64,
+    pub write_ms: f64,
+    pub total_ms: f64,
+}
+
+fn extract_projected_u32_column(array: &ArrayRef, column_name: &str) -> Result<Vec<u32>> {
+    if array.len() == 0 { return Ok(Vec::new()); }
+    let mut ctx = NATIVE_FILE_SESSION.create_execution_ctx();
+    let struct_array = array.clone().execute::<StructArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
+    let column = struct_array
+        .unmasked_field_by_name(column_name)
+        .map_err(VortexRdfError::Vortex)?
+        .clone()
+        .execute::<PrimitiveArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+    Ok(column.as_slice::<u32>().to_vec())
+}
+
+fn write_subject_range_entry<W: Write>(writer: &mut W, subject_id: u32, start: u64, end: u64) -> Result<()> {
+    writer
+        .write_all(&subject_id.to_le_bytes())
+        .and_then(|_| writer.write_all(&start.to_le_bytes()))
+        .and_then(|_| writer.write_all(&end.to_le_bytes()))
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))
+}
+
+fn read_subject_range_entry_at(file: &std::fs::File, entry_idx: u64) -> Result<(u32, u64, u64)> {
+    let mut buf = [0u8; 20];
+    let offset = entry_idx.checked_mul(NATIVE_SUBJECT_RANGE_ENTRY_BYTES).ok_or_else(|| {
+        VortexRdfError::Deserialization(format!("subject range index offset overflow for entry {}", entry_idx))
+    })?;
+    read_exact_at_native_sidecar(file, &mut buf, offset, "subject range index")?;
+    let subject_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let start = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+    let end = u64::from_le_bytes(buf[12..20].try_into().unwrap());
+    Ok((subject_id, start, end))
+}
+
+fn lookup_subject_range_from_sidecar(data_path: &Path, subject_id: u32) -> Result<Option<NativeSubjectRange>> {
+    let path = native_subject_range_index_path(data_path);
+    let file = std::fs::File::open(&path).map_err(|e| {
+        VortexRdfError::Deserialization(format!("Failed to open native subject range index {:?}: {}", path, e))
+    })?;
+    let len = file.metadata().map_err(|e| VortexRdfError::Deserialization(e.to_string()))?.len();
+    if len % NATIVE_SUBJECT_RANGE_ENTRY_BYTES != 0 {
+        return Err(VortexRdfError::Deserialization(format!(
+            "Malformed subject range index {:?}: byte length {} is not divisible by {}", path, len, NATIVE_SUBJECT_RANGE_ENTRY_BYTES
+        )));
+    }
+    let mut lo = 0u64;
+    let mut hi = len / NATIVE_SUBJECT_RANGE_ENTRY_BYTES;
+    while lo < hi {
+        let mid = lo + ((hi - lo) / 2);
+        let (candidate, start, end) = read_subject_range_entry_at(&file, mid)?;
+        match candidate.cmp(&subject_id) {
+            Ordering::Less => lo = mid + 1,
+            Ordering::Greater => hi = mid,
+            Ordering::Equal => return Ok(Some(NativeSubjectRange { start, end })),
+        }
+    }
+    Ok(None)
+}
+
+pub async fn build_cottas_native_subject_range_index(input_path: &Path) -> Result<NativeSubjectRangeIndexBuildStats> {
+    let total_start = Instant::now();
+    let output_path = native_subject_range_index_path(input_path);
+    let open_start = Instant::now();
+    let file = NATIVE_FILE_SESSION.open_options().open_path(input_path).await.map_err(VortexRdfError::from)?;
+    let open_ms = elapsed_ms(open_start);
+
+    let scan_start = Instant::now();
+    let mut stream = file
+        .scan().map_err(VortexRdfError::from)?
+        .with_projection(vortex_array::expr::select(["s"].as_slice(), vortex_array::expr::root()))
+        .into_array_stream().map_err(VortexRdfError::from)?;
+
+    let tmp_path = output_path.with_extension("subject_ranges.bin.tmp");
+    let tmp_file = std::fs::File::create(&tmp_path).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    let mut writer = BufWriter::new(tmp_file);
+    let mut rows_scanned = 0u64;
+    let mut ranges_written = 0u64;
+    let mut batches = 0usize;
+    let mut max_batch_rows = 0usize;
+    let mut current_subject: Option<u32> = None;
+    let mut current_start = 0u64;
+    let mut last_completed_subject: Option<u32> = None;
+
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result.map_err(VortexRdfError::from)?;
+        let batch_rows = batch.len();
+        batches += 1;
+        max_batch_rows = max_batch_rows.max(batch_rows);
+        if batch_rows == 0 { continue; }
+        let s_ids = extract_projected_u32_column(&batch, "s")?;
+        if s_ids.len() != batch_rows {
+            return Err(VortexRdfError::Serialization(format!("subject range index build saw {} s IDs for {} batch rows", s_ids.len(), batch_rows)));
+        }
+        for s_id in s_ids {
+            match current_subject {
+                None => { current_subject = Some(s_id); current_start = rows_scanned; }
+                Some(prev) if prev != s_id => {
+                    if let Some(last) = last_completed_subject {
+                        if prev <= last {
+                            return Err(VortexRdfError::Serialization(format!(
+                                "subject IDs are not strictly grouped/sorted: previous completed subject {}, current completed subject {}. Subject range index requires SPO-ordered native-ID data.", last, prev
+                            )));
+                        }
+                    }
+                    write_subject_range_entry(&mut writer, prev, current_start, rows_scanned)?;
+                    ranges_written += 1;
+                    last_completed_subject = Some(prev);
+                    current_subject = Some(s_id);
+                    current_start = rows_scanned;
+                }
+                Some(_) => {}
+            }
+            rows_scanned += 1;
+        }
+    }
+    let scan_ms = elapsed_ms(scan_start);
+    let write_start = Instant::now();
+    if let Some(last) = current_subject {
+        if let Some(prev_completed) = last_completed_subject {
+            if last <= prev_completed {
+                return Err(VortexRdfError::Serialization(format!(
+                    "subject IDs are not strictly grouped/sorted at final range: previous {}, final {}. Subject range index requires SPO-ordered native-ID data.", prev_completed, last
+                )));
+            }
+        }
+        write_subject_range_entry(&mut writer, last, current_start, rows_scanned)?;
+        ranges_written += 1;
+    }
+    writer.flush().map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    drop(writer);
+    std::fs::rename(&tmp_path, &output_path).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    let write_ms = elapsed_ms(write_start);
+    let total_ms = elapsed_ms(total_start);
+    log::info!("[cottas_native_ids] wrote subject range index {:?}: rows={}, ranges={}, batches={}, max_batch_rows={}, total_ms={:.3}", output_path, rows_scanned, ranges_written, batches, max_batch_rows, total_ms);
+    Ok(NativeSubjectRangeIndexBuildStats {
+        input_path: input_path.display().to_string(), output_path: output_path.display().to_string(),
+        rows_scanned, ranges_written, batches, max_batch_rows, open_ms, scan_ms, write_ms, total_ms,
+    })
 }
 
 fn build_term_to_id_lookup_array(pairs: &[(u32, String)]) -> Result<ArrayRef> {
