@@ -1115,8 +1115,90 @@ struct LazyRdfWriteStats {
     rows_out: usize,
     unique_ids_requested: usize,
     unique_ids_loaded: usize,
-
     id_to_term_stats: NativeIdToTermLookupStats,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BoundNativeRdfTerms {
+    s: Option<String>,
+    p: Option<String>,
+    o: Option<String>,
+    g: Option<String>,
+}
+
+impl BoundNativeRdfTerms {
+    fn from_pattern(
+        subject: Option<&NamedOrBlankNode>,
+        predicate: Option<&NamedNode>,
+        object: Option<&Term>,
+        graph: Option<&GraphName>,
+    ) -> Self {
+        Self {
+            s: subject.map(|v| v.to_string()),
+            p: predicate.map(|v| v.to_string()),
+            o: object.map(|v| v.to_string()),
+            g: graph.map(|v| v.to_string()),
+        }
+    }
+}
+
+fn collect_unique_ids_for_unbound_native_columns(
+    s_ids: &[u32],
+    p_ids: &[u32],
+    o_ids: &[u32],
+    g_ids: &[u32],
+    bound_terms: &BoundNativeRdfTerms,
+) -> Vec<u32> {
+    let mut set = HashSet::new();
+
+    if bound_terms.s.is_none() {
+        for id in s_ids {
+            set.insert(*id);
+        }
+    }
+
+    if bound_terms.p.is_none() {
+        for id in p_ids {
+            set.insert(*id);
+        }
+    }
+
+    if bound_terms.o.is_none() {
+        for id in o_ids {
+            set.insert(*id);
+        }
+    }
+
+    if bound_terms.g.is_none() {
+        for id in g_ids {
+            set.insert(*id);
+        }
+    }
+
+    let mut ids: Vec<u32> = set.into_iter().collect();
+    ids.sort_unstable();
+    ids
+}
+
+fn lookup_unbound_or_use_bound<'a>(
+    id_to_term: &'a HashMap<u32, String>,
+    bound: &'a Option<String>,
+    id: u32,
+    column_label: &str,
+) -> Result<&'a str> {
+    if let Some(value) = bound {
+        return Ok(value.as_str());
+    }
+
+    id_to_term
+        .get(&id)
+        .map(|s| s.as_str())
+        .ok_or_else(|| {
+            VortexRdfError::Deserialization(format!(
+                "{} ID {} missing from id_to_term sidecar",
+                column_label, id
+            ))
+        })
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -1152,6 +1234,7 @@ fn elapsed_ms(start: Instant) -> f64 {
 async fn write_quads_array_as_rdf_lazy<W>(
     data_path: &Path,
     quads: ArrayRef,
+    bound_terms: &BoundNativeRdfTerms,
     writer: W,
     format: RdfFormat,
 ) -> Result<LazyRdfWriteStats>
@@ -1164,10 +1247,14 @@ where
     let (s_ids, p_ids, o_ids, g_ids) = extract_spog_id_columns(&quads)?;
     let id_extract_ms = elapsed_ms(id_extract_start);
 
-    let unique_ids = collect_unique_ids(&s_ids, &p_ids, &o_ids, &g_ids);
-
+    let unique_ids = collect_unique_ids_for_unbound_native_columns(
+        &s_ids,
+        &p_ids,
+        &o_ids,
+        &g_ids,
+        bound_terms,
+    );
     let id_lookup_start = Instant::now();
-
     let (id_to_term, id_to_term_stats) =
         lookup_terms_by_ids_from_sidecar_with_stats(data_path, &unique_ids).await?;
 
@@ -1177,30 +1264,10 @@ where
     let mut rdf_serializer = RdfSerializer::from_format(format).for_writer(writer);
 
     for i in 0..s_ids.len() {
-        let s_raw = id_to_term.get(&s_ids[i]).ok_or_else(|| {
-            VortexRdfError::Deserialization(format!(
-                "S ID {} missing from id_to_term sidecar",
-                s_ids[i]
-            ))
-        })?;
-        let p_raw = id_to_term.get(&p_ids[i]).ok_or_else(|| {
-            VortexRdfError::Deserialization(format!(
-                "P ID {} missing from id_to_term sidecar",
-                p_ids[i]
-            ))
-        })?;
-        let o_raw = id_to_term.get(&o_ids[i]).ok_or_else(|| {
-            VortexRdfError::Deserialization(format!(
-                "O ID {} missing from id_to_term sidecar",
-                o_ids[i]
-            ))
-        })?;
-        let g_raw = id_to_term.get(&g_ids[i]).ok_or_else(|| {
-            VortexRdfError::Deserialization(format!(
-                "G ID {} missing from id_to_term sidecar",
-                g_ids[i]
-            ))
-        })?;
+        let s_raw = lookup_unbound_or_use_bound(&id_to_term, &bound_terms.s, s_ids[i], "S")?;
+        let p_raw = lookup_unbound_or_use_bound(&id_to_term, &bound_terms.p, p_ids[i], "P")?;
+        let o_raw = lookup_unbound_or_use_bound(&id_to_term, &bound_terms.o, o_ids[i], "O")?;
+        let g_raw = lookup_unbound_or_use_bound(&id_to_term, &bound_terms.g, g_ids[i], "G")?;
 
         let subject = crate::common::utils::parse_subject(s_raw)?;
         let predicate = crate::common::utils::parse_named_node(p_raw)?;
@@ -2014,8 +2081,9 @@ where
     );
 
     let materialize_start = Instant::now();
+    let bound_terms = BoundNativeRdfTerms::from_pattern(subject, predicate, object, graph);
     let write_stats =
-        write_quads_array_as_rdf_lazy(input_path, matched_quads, writer, format).await?;
+        write_quads_array_as_rdf_lazy(input_path, matched_quads, &bound_terms, writer, format).await?;
 
     log::debug!(
         "[cottas_native_ids::match] lazy RDF materialization finished in {:?}: rows_out={}, unique_ids_requested={}, unique_ids_loaded={}, id_extract_ms={:.3}, id_lookup_ms={:.3}, serialize_ms={:.3}",
