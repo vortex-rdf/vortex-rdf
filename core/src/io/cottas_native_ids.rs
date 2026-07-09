@@ -2061,7 +2061,6 @@ where
         diagnostics.max_scan_batch_rows,
         diagnostics.read_all_ms
     );
-
     if matched_quads.len() == 0 {
         log::debug!(
             "[cottas_native_ids::match] scan produced 0 rows; skipping dictionary decoding"
@@ -2079,7 +2078,6 @@ where
         "[cottas_native_ids::match] entering lazy RDF materialization for {} rows",
         matched_quads.len()
     );
-
     let materialize_start = Instant::now();
     let bound_terms = BoundNativeRdfTerms::from_pattern(subject, predicate, object, graph);
     let write_stats =
