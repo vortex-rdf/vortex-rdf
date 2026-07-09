@@ -13,7 +13,7 @@ pub use ser::{quads_stream_to_vortex, quads_stream_to_vortex_writer, serialize};
 
 pub use cottas_native_ids::{
     CottasNativeConfig, CottasNativeIdsDiagnostics, NativeIdsCountMode,
-    count_cottas_native_ids_file_with_diagnostics,
+    build_cottas_native_subject_range_index, count_cottas_native_ids_file_with_diagnostics,
     count_cottas_native_ids_file_with_diagnostics_mode, match_cottas_native_file,
     match_cottas_native_file_as_triples, match_cottas_native_file_with_diagnostics,
     serialize_cottas_native_file,
