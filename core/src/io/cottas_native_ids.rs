@@ -1670,12 +1670,25 @@ async fn lookup_terms_by_ids_from_sidecar_with_stats(
         return Ok((HashMap::new(), stats));
     }
 
+    let id_to_term_lookup_strategy = std::env::var("VORTEX_RDF_ID_TO_TERM_LOOKUP")
+        .unwrap_or_else(|_| "binary-random-read".to_string());
+    if id_to_term_lookup_strategy == "vortex-row-range" {
+        if native_id_to_term_row_lookup_sidecar_exists(data_path) {
+            log::debug!(
+                "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] dispatch ids={}, strategy=vortex-row-range",
+                ids.len()
+            );
+            return lookup_terms_by_ids_from_vortex_row_lookup_with_stats(data_path, ids).await;
+        }
+        log::debug!(
+            "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] requested strategy=vortex-row-range but row-lookup sidecar is missing; falling back"
+        );
+    }
     if native_id_to_term_binary_sidecar_exists(data_path) {
         log::debug!(
             "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] dispatch ids={}, strategy=binary-random-read",
             ids.len()
         );
-
         return lookup_terms_by_ids_from_binary_index_random_read_with_stats(data_path, ids);
     }
 
@@ -2684,6 +2697,18 @@ fn native_dict_id_to_term_path(data_path: &Path) -> PathBuf {
 
     data_path.with_file_name(format!("{file_name}.dict.id_to_term.vortex"))
 }
+fn native_dict_id_to_term_row_lookup_path(data_path: &Path) -> PathBuf {
+    let file_name = data_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("data.vortex");
+    data_path.with_file_name(format!("{file_name}.dict.id_to_term.row_lookup.vortex"))
+}
+
+fn native_id_to_term_row_lookup_sidecar_exists(data_path: &Path) -> bool {
+    native_dict_id_to_term_row_lookup_path(data_path).is_file()
+}
+
 
 fn native_dict_id_to_term_offsets_path(data_path: &Path) -> PathBuf {
     let file_name = data_path
@@ -2935,54 +2960,253 @@ fn build_id_to_term_lookup_array(pairs: &[(u32, String)]) -> Result<ArrayRef> {
         .map_err(VortexRdfError::Vortex)
         .map(|arr| arr.into_array())
 }
+fn build_id_to_term_row_lookup_array(terms: &[String]) -> Result<ArrayRef> {
+    let term_array = vortex_array::arrays::VarBinViewArray::from_iter(
+        terms.iter().map(|term| Some(term.as_str())),
+        vortex_array::dtype::DType::Utf8(vortex_array::dtype::Nullability::NonNullable),
+    )
+    .into_array();
+    StructArray::from_fields(&[("term", term_array)])
+        .map_err(VortexRdfError::Vortex)
+        .map(|arr| arr.into_array())
+}
+
+fn merge_id_runs_to_row_lookup_array_stream(
+    run_paths: Vec<PathBuf>,
+    row_group_size: usize,
+) -> Result<impl Stream<Item = VortexResult<ArrayRef>> + Send> {
+    let row_group_size = row_group_size.max(1);
+    Ok(async_stream::try_stream! {
+        let mut readers = Vec::with_capacity(run_paths.len());
+        for path in &run_paths {
+            readers.push(PairRunReader::new(path).map_err(rdf_err_to_vortex_err)?);
+        }
+        let mut heap = BinaryHeap::new();
+        for run_idx in 0..readers.len() {
+            if let Some(pair) = readers[run_idx].read_one().map_err(rdf_err_to_vortex_err)? {
+                heap.push(PairHeapItem { pair, run_idx, order: PairRunOrder::Id });
+            }
+        }
+
+        let mut next_expected_id = 0u32;
+        let mut terms: Vec<String> = Vec::with_capacity(row_group_size);
+        while let Some(item) = heap.pop() {
+            let run_idx = item.run_idx;
+            let pair = item.pair;
+            if pair.id != next_expected_id {
+                Err(rdf_err_to_vortex_err(VortexRdfError::Serialization(format!(
+                    "id_to_term row-lookup Vortex sidecar requires contiguous dictionary IDs: expected {}, saw {}",
+                    next_expected_id, pair.id
+                ))))?;
+            }
+            terms.push(pair.term);
+            next_expected_id = next_expected_id.checked_add(1).ok_or_else(|| {
+                rdf_err_to_vortex_err(VortexRdfError::Serialization(
+                    "u32 dictionary ID overflow while writing id_to_term row-lookup sidecar".to_string(),
+                ))
+            })?;
+            if let Some(next_pair) = readers[run_idx].read_one().map_err(rdf_err_to_vortex_err)? {
+                heap.push(PairHeapItem { pair: next_pair, run_idx, order: PairRunOrder::Id });
+            }
+            if terms.len() >= row_group_size {
+                let array = build_id_to_term_row_lookup_array(&terms).map_err(rdf_err_to_vortex_err)?;
+                terms.clear();
+                yield array;
+            }
+        }
+        if !terms.is_empty() {
+            yield build_id_to_term_row_lookup_array(&terms).map_err(rdf_err_to_vortex_err)?;
+        }
+    })
+}
+
+async fn write_id_to_term_vortex_row_lookup_sidecar_from_id_runs(
+    id_run_paths: &[PathBuf],
+    data_path: &Path,
+    row_group_size: usize,
+) -> Result<()> {
+    let write_start = Instant::now();
+    let path = native_dict_id_to_term_row_lookup_path(data_path);
+    let mut file = tokio::fs::File::create(&path)
+        .await
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    let dtype = build_id_to_term_row_lookup_array(&[])?.dtype().clone();
+    let arrays = merge_id_runs_to_row_lookup_array_stream(
+        id_run_paths.to_vec(),
+        row_group_size,
+    )?;
+    let stream = ArrayStreamAdapter::new(dtype, Box::pin(arrays));
+    let write_opts = NATIVE_FILE_SESSION.write_options().with_strategy(
+        WriteStrategyBuilder::default()
+            .with_row_block_size(row_group_size.max(1))
+            .build(),
+    );
+    write_opts
+        .write(&mut file, stream)
+        .await
+        .map_err(VortexRdfError::from)?;
+    log::info!(
+        "[cottas_native_ids] wrote Vortex id_to_term row-lookup sidecar {:?} in {:?}",
+        path,
+        write_start.elapsed()
+    );
+    Ok(())
+}
+
+fn extract_first_term_from_row_lookup_array(array: &ArrayRef) -> Result<Option<String>> {
+    if array.len() == 0 {
+        return Ok(None);
+    }
+    let mut ctx = NATIVE_FILE_SESSION.create_execution_ctx();
+    let struct_array = array
+        .clone()
+        .execute::<StructArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+    let term_col = struct_array
+        .unmasked_field_by_name("term")
+        .map_err(VortexRdfError::Vortex)?
+        .clone()
+        .execute::<VarBinViewArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+    let raw = term_col.bytes_at(0);
+    String::from_utf8(raw.as_ref().to_vec())
+        .map(Some)
+        .map_err(|e| VortexRdfError::Deserialization(format!(
+            "Dictionary term in Vortex row-lookup sidecar is not valid UTF-8: {}",
+            e
+        )))
+}
+
+async fn lookup_terms_by_ids_from_vortex_row_lookup_with_stats(
+    data_path: &Path,
+    ids: &[u32],
+) -> Result<(HashMap<u32, String>, NativeIdToTermLookupStats)> {
+    let lookup_start = Instant::now();
+    let mut stats = NativeIdToTermLookupStats::default();
+    stats.strategy = "vortex-row-range".to_string();
+    stats.requested_ids_in = ids.len();
+    if ids.is_empty() {
+        stats.total_ms = elapsed_ms(lookup_start);
+        return Ok((HashMap::new(), stats));
+    }
+
+    let sort_start = Instant::now();
+    let mut requested: Vec<u32> = ids.to_vec();
+    requested.sort_unstable();
+    requested.dedup();
+    stats.sort_dedup_ms = elapsed_ms(sort_start);
+    stats.requested_ids_unique = requested.len();
+
+    let path = native_dict_id_to_term_row_lookup_path(data_path);
+    let open_start = Instant::now();
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    stats.open_files_ms = elapsed_ms(open_start);
+
+    let mut out = HashMap::with_capacity(requested.len());
+    for id in requested.iter().copied() {
+        let read_start = Instant::now();
+        let rows = file
+            .scan()
+            .map_err(VortexRdfError::from)?
+            .with_row_range(id as u64..id as u64 + 1)
+            .with_projection(vortex_array::expr::select(["term"].as_slice(), vortex_array::expr::root()))
+            .into_array_stream()
+            .map_err(VortexRdfError::from)?
+            .read_all()
+            .await
+            .map_err(VortexRdfError::from)?;
+        stats.blob_read_ms += elapsed_ms(read_start);
+        stats.blob_reads += 1;
+        if let Some(term) = extract_first_term_from_row_lookup_array(&rows)? {
+            stats.blob_bytes_read += term.as_bytes().len();
+            out.insert(id, term);
+        }
+    }
+    stats.ids_loaded = out.len();
+    stats.total_ms = elapsed_ms(lookup_start);
+    log::debug!(
+        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] Vortex row-range resolved {} / {} ids in {:.3}ms; open_files_ms={:.3}, sort_dedup_ms={:.3}, row_range_read_ms={:.3}, row_range_reads={}",
+        out.len(),
+        requested.len(),
+        stats.total_ms,
+        stats.open_files_ms,
+        stats.sort_dedup_ms,
+        stats.blob_read_ms,
+        stats.blob_reads,
+    );
+    Ok((out, stats))
+}
+
 
 async fn write_dictionary_lookup_sidecars_from_pair_runs(
     pair_run_paths: &PairRunPaths,
     data_path: &Path,
     row_group_size: usize,
 ) -> Result<()> {
-    let term_to_id_path = native_dict_term_to_id_path(data_path);
-    let id_to_term_path = native_dict_id_to_term_path(data_path);
+    let write_legacy_vortex_dicts = std::env::var("VORTEX_RDF_WRITE_LEGACY_DICT_VORTEX")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
 
-    let mut term_to_id_file = tokio::fs::File::create(&term_to_id_path)
-        .await
-        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    if write_legacy_vortex_dicts {
+        let term_to_id_path = native_dict_term_to_id_path(data_path);
+        let id_to_term_path = native_dict_id_to_term_path(data_path);
+        let mut term_to_id_file = tokio::fs::File::create(&term_to_id_path)
+            .await
+            .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+        write_pair_runs_as_lookup_sidecar(
+            &mut term_to_id_file,
+            pair_run_paths.term_run_paths.clone(),
+            PairRunOrder::Term,
+            LookupSidecarKind::TermToId,
+            row_group_size,
+        )
+        .await?;
+        let mut id_to_term_file = tokio::fs::File::create(&id_to_term_path)
+            .await
+            .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+        write_pair_runs_as_lookup_sidecar(
+            &mut id_to_term_file,
+            pair_run_paths.id_run_paths.clone(),
+            PairRunOrder::Id,
+            LookupSidecarKind::IdToTerm,
+            row_group_size,
+        )
+        .await?;
+        log::info!(
+            "[cottas_native_ids] wrote legacy Vortex dictionary sidecars {:?} and {:?}",
+            term_to_id_path,
+            id_to_term_path
+        );
+    } else {
+        log::info!(
+            "[cottas_native_ids] skipped legacy Vortex dictionary sidecars; set VORTEX_RDF_WRITE_LEGACY_DICT_VORTEX=1 to write them"
+        );
+    }
 
-    write_pair_runs_as_lookup_sidecar(
-        &mut term_to_id_file,
-        pair_run_paths.term_run_paths.clone(),
-        PairRunOrder::Term,
-        LookupSidecarKind::TermToId,
+    write_id_to_term_vortex_row_lookup_sidecar_from_id_runs(
+        &pair_run_paths.id_run_paths,
+        data_path,
         row_group_size,
     )
     .await?;
-
-    let mut id_to_term_file = tokio::fs::File::create(&id_to_term_path)
-        .await
-        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-
-    write_pair_runs_as_lookup_sidecar(
-        &mut id_to_term_file,
-        pair_run_paths.id_run_paths.clone(),
-        PairRunOrder::Id,
-        LookupSidecarKind::IdToTerm,
-        row_group_size,
-    )
-    .await?;
-
     write_id_to_term_binary_sidecar_from_id_runs(&pair_run_paths.id_run_paths, data_path)?;
     write_term_to_id_binary_sidecar_from_term_runs(&pair_run_paths.term_run_paths, data_path)?;
-
     log::info!(
-        "[cottas_native_ids] wrote streaming dictionary sidecars {:?} and {:?}; binary id_to_term sidecars {:?} and {:?}",
-        term_to_id_path,
-        id_to_term_path,
+        "[cottas_native_ids] wrote binary dictionary sidecars {:?}, {:?}, {:?}, {:?}; wrote Vortex row-lookup sidecar {:?}",
         native_dict_id_to_term_offsets_path(data_path),
-        native_dict_id_to_term_blob_path(data_path)
+        native_dict_id_to_term_blob_path(data_path),
+        native_dict_term_to_id_entries_path(data_path),
+        native_dict_term_to_id_blob_path(data_path),
+        native_dict_id_to_term_row_lookup_path(data_path),
     );
-
     Ok(())
 }
+
 #[derive(Clone, Copy, Debug)]
 enum LookupSidecarKind {
     TermToId,
