@@ -1201,6 +1201,170 @@ fn lookup_unbound_or_use_bound<'a>(
         })
 }
 
+#[derive(Clone, Debug, Default)]
+struct NativeProjectedIdRows {
+    s: Option<Vec<u32>>,
+    p: Option<Vec<u32>>,
+    o: Option<Vec<u32>>,
+    g: Option<Vec<u32>>,
+    rows: usize,
+}
+
+fn native_projection_columns_for_bound_terms(bound_terms: &BoundNativeRdfTerms) -> Vec<&'static str> {
+    let mut columns = Vec::new();
+
+    if bound_terms.s.is_none() {
+        columns.push("s");
+    }
+    if bound_terms.p.is_none() {
+        columns.push("p");
+    }
+    if bound_terms.o.is_none() {
+        columns.push("o");
+    }
+    if bound_terms.g.is_none() {
+        columns.push("g");
+    }
+
+    // Vortex projection cannot be empty in this path because we still need row counts
+    // from the filtered stream for fully-bound quad patterns.
+    if columns.is_empty() {
+        columns.push("s");
+    }
+
+    columns
+}
+
+fn append_optional_projected_u32_column(
+    batch: &ArrayRef,
+    column_name: &str,
+    target: &mut Option<Vec<u32>>,
+) -> Result<()> {
+    let mut ctx = NATIVE_FILE_SESSION.create_execution_ctx();
+
+    let struct_array = batch
+        .clone()
+        .execute::<StructArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+
+    let field = match struct_array.unmasked_field_by_name(column_name) {
+        Ok(field) => field.clone(),
+        Err(_) => return Ok(()),
+    };
+
+    let col = field
+        .execute::<PrimitiveArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+
+    let values = col.as_slice::<u32>();
+
+    let out = target.get_or_insert_with(Vec::new);
+    out.extend_from_slice(values);
+
+    Ok(())
+}
+
+async fn read_native_projected_stream_all_with_scan_stats<S>(
+    stream: S,
+) -> Result<(NativeProjectedIdRows, usize, usize)>
+where
+    S: Stream<Item = VortexResult<ArrayRef>>,
+{
+    let mut stream = Box::pin(stream);
+
+    let mut rows = NativeProjectedIdRows::default();
+    let mut batches = 0usize;
+    let mut max_batch_rows = 0usize;
+
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result.map_err(VortexRdfError::from)?;
+        let batch_rows = batch.len();
+
+        batches += 1;
+        max_batch_rows = max_batch_rows.max(batch_rows);
+        rows.rows += batch_rows;
+
+        if batch_rows == 0 {
+            continue;
+        }
+
+        append_optional_projected_u32_column(&batch, "s", &mut rows.s)?;
+        append_optional_projected_u32_column(&batch, "p", &mut rows.p)?;
+        append_optional_projected_u32_column(&batch, "o", &mut rows.o)?;
+        append_optional_projected_u32_column(&batch, "g", &mut rows.g)?;
+    }
+
+    Ok((rows, batches, max_batch_rows))
+}
+
+fn collect_unique_ids_from_projected_unbound_rows(
+    rows: &NativeProjectedIdRows,
+    bound_terms: &BoundNativeRdfTerms,
+) -> Vec<u32> {
+    let empty: &[u32] = &[];
+
+    collect_unique_ids_for_unbound_native_columns(
+        rows.s.as_deref().unwrap_or(empty),
+        rows.p.as_deref().unwrap_or(empty),
+        rows.o.as_deref().unwrap_or(empty),
+        rows.g.as_deref().unwrap_or(empty),
+        bound_terms,
+    )
+}
+
+fn projected_id_at<'a>(
+    values: &'a Option<Vec<u32>>,
+    bound: &Option<String>,
+    row_idx: usize,
+    column_label: &str,
+) -> Result<Option<u32>> {
+    if bound.is_some() {
+        return Ok(None);
+    }
+
+    let values = values.as_ref().ok_or_else(|| {
+        VortexRdfError::Deserialization(format!(
+            "{} column was required for unbound output but was not projected",
+            column_label
+        ))
+    })?;
+
+    values.get(row_idx).copied().map(Some).ok_or_else(|| {
+        VortexRdfError::Deserialization(format!(
+            "{} projected column has no value at row {}",
+            column_label, row_idx
+        ))
+    })
+}
+
+fn lookup_projected_or_use_bound<'a>(
+    id_to_term: &'a HashMap<u32, String>,
+    bound: &'a Option<String>,
+    projected_id: Option<u32>,
+    column_label: &str,
+) -> Result<&'a str> {
+    if let Some(value) = bound {
+        return Ok(value.as_str());
+    }
+
+    let id = projected_id.ok_or_else(|| {
+        VortexRdfError::Deserialization(format!(
+            "{} projected ID missing for unbound column",
+            column_label
+        ))
+    })?;
+
+    id_to_term
+        .get(&id)
+        .map(|s| s.as_str())
+        .ok_or_else(|| {
+            VortexRdfError::Deserialization(format!(
+                "{} ID {} missing from id_to_term sidecar",
+                column_label, id
+            ))
+        })
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct NativeIdToTermLookupStats {
     pub strategy: String,
@@ -1231,6 +1395,77 @@ fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
+
+async fn write_projected_native_id_rows_as_rdf_lazy<W>(
+    data_path: &Path,
+    rows: NativeProjectedIdRows,
+    bound_terms: &BoundNativeRdfTerms,
+    writer: W,
+    format: RdfFormat,
+) -> Result<LazyRdfWriteStats>
+where
+    W: Write,
+{
+    let write_start = Instant::now();
+
+    let id_extract_start = Instant::now();
+    let unique_ids = collect_unique_ids_from_projected_unbound_rows(&rows, bound_terms);
+    let id_extract_ms = elapsed_ms(id_extract_start);
+
+    let id_lookup_start = Instant::now();
+    let (id_to_term, id_to_term_stats) =
+        lookup_terms_by_ids_from_sidecar_with_stats(data_path, &unique_ids).await?;
+    let id_to_term_lookup_ms = elapsed_ms(id_lookup_start);
+
+    let serialize_start = Instant::now();
+    let mut rdf_serializer = RdfSerializer::from_format(format).for_writer(writer);
+
+    for i in 0..rows.rows {
+        let s_id = projected_id_at(&rows.s, &bound_terms.s, i, "S")?;
+        let p_id = projected_id_at(&rows.p, &bound_terms.p, i, "P")?;
+        let o_id = projected_id_at(&rows.o, &bound_terms.o, i, "O")?;
+        let g_id = projected_id_at(&rows.g, &bound_terms.g, i, "G")?;
+
+        let s_raw = lookup_projected_or_use_bound(&id_to_term, &bound_terms.s, s_id, "S")?;
+        let p_raw = lookup_projected_or_use_bound(&id_to_term, &bound_terms.p, p_id, "P")?;
+        let o_raw = lookup_projected_or_use_bound(&id_to_term, &bound_terms.o, o_id, "O")?;
+        let g_raw = lookup_projected_or_use_bound(&id_to_term, &bound_terms.g, g_id, "G")?;
+
+        let subject = crate::common::utils::parse_subject(s_raw)?;
+        let predicate = crate::common::utils::parse_named_node(p_raw)?;
+        let object = crate::common::utils::parse_term(o_raw)?;
+        let graph_name = crate::common::utils::parse_graph_name(g_raw)?;
+
+        let quad = Quad::new(subject, predicate, object, graph_name);
+
+        rdf_serializer
+            .serialize_quad(&quad)
+            .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
+    }
+
+    rdf_serializer
+        .finish()
+        .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
+
+    let serialize_ms = elapsed_ms(serialize_start);
+
+    log::debug!(
+        "[cottas_native_ids::write_projected_native_id_rows_as_rdf_lazy] wrote {} rows using {} unique dictionary ids in {:?}",
+        rows.rows,
+        unique_ids.len(),
+        write_start.elapsed()
+    );
+
+    Ok(LazyRdfWriteStats {
+        id_extract_ms,
+        id_to_term_lookup_ms,
+        serialize_ms,
+        rows_out: rows.rows,
+        unique_ids_requested: unique_ids.len(),
+        unique_ids_loaded: id_to_term.len(),
+        id_to_term_stats,
+    })
+}
 async fn write_quads_array_as_rdf_lazy<W>(
     data_path: &Path,
     quads: ArrayRef,
@@ -2032,6 +2267,13 @@ where
         }
     }
 
+    let bound_terms = BoundNativeRdfTerms::from_pattern(subject, predicate, object, graph);
+    let projected_columns = native_projection_columns_for_bound_terms(&bound_terms);
+    log::debug!(
+        "[cottas_native::match] projected native ID columns for scan: {:?}",
+        projected_columns
+    );
+
     let scan_start = Instant::now();
     let scan = file.scan().map_err(VortexRdfError::from)?;
     let scan = match filter {
@@ -2039,6 +2281,10 @@ where
         NativePatternFilter::Empty => unreachable!("handled above"),
         NativePatternFilter::Expr(expr) => scan.with_filter(expr),
     };
+    let scan = scan.with_projection(vortex_array::expr::select(
+        projected_columns.as_slice(),
+        vortex_array::expr::root(),
+    ));
     let stream = scan.into_array_stream().map_err(VortexRdfError::from)?;
     diagnostics.scan_build_ms = elapsed_ms(scan_start);
 
@@ -2046,23 +2292,21 @@ where
         "[cottas_native::match] scan builder setup took {:.3}ms",
         diagnostics.scan_build_ms
     );
-
     let read_start = Instant::now();
-    let (matched_quads, scan_batches, max_scan_batch_rows) =
-        read_spog_stream_all_with_scan_stats(stream).await?;
+    let (matched_rows, scan_batches, max_scan_batch_rows) =
+        read_native_projected_stream_all_with_scan_stats(stream).await?;
     diagnostics.read_all_ms = elapsed_ms(read_start);
     diagnostics.scan_batches = scan_batches;
     diagnostics.max_scan_batch_rows = max_scan_batch_rows;
-    diagnostics.scan_rows_materialized = matched_quads.len();
+    diagnostics.scan_rows_materialized = matched_rows.rows;
     log::debug!(
         "[cottas_native::match] filtered scan materialized {} rows from {} batches, max_batch_rows={}, in {:.3}ms",
-        matched_quads.len(),
+        matched_rows.rows,
         diagnostics.scan_batches,
         diagnostics.max_scan_batch_rows,
         diagnostics.read_all_ms
     );
-
-    if matched_quads.len() == 0 {
+    if matched_rows.rows == 0 {
         log::debug!(
             "[cottas_native_ids::match] scan produced 0 rows; skipping dictionary decoding"
         );
@@ -2076,15 +2320,12 @@ where
     }
 
     log::debug!(
-        "[cottas_native_ids::match] entering lazy RDF materialization for {} rows",
-        matched_quads.len()
+        "[cottas_native_ids::match] entering projected lazy RDF materialization for {} rows",
+        matched_rows.rows
     );
-
     let materialize_start = Instant::now();
-    let bound_terms = BoundNativeRdfTerms::from_pattern(subject, predicate, object, graph);
     let write_stats =
-        write_quads_array_as_rdf_lazy(input_path, matched_quads, &bound_terms, writer, format).await?;
-
+        write_projected_native_id_rows_as_rdf_lazy(input_path, matched_rows, &bound_terms, writer, format).await?;
     log::debug!(
         "[cottas_native_ids::match] lazy RDF materialization finished in {:?}: rows_out={}, unique_ids_requested={}, unique_ids_loaded={}, id_extract_ms={:.3}, id_lookup_ms={:.3}, serialize_ms={:.3}",
         materialize_start.elapsed(),
