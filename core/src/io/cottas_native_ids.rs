@@ -310,8 +310,12 @@ where
         temp_dir.path(),
     )?;
 
-    let id_run_paths =
-        encode_string_runs_to_id_runs::<Dict>(&dictionary, &string_run_paths, temp_dir.path())?;
+    let id_run_paths = encode_string_runs_to_id_runs::<Dict>(
+        &dictionary,
+        &string_run_paths,
+        config.ordering,
+        temp_dir.path(),
+    )?;
 
     drop(string_run_paths);
 
@@ -336,6 +340,20 @@ where
         config.dict_row_group_size,
     )
     .await?;
+    if config.ordering == TripleOrdering::SPO {
+        let subject_index_stats = build_cottas_native_subject_range_index(output_path).await?;
+        log::info!(
+            "[cottas_native_ids] built SPO subject range index during serialization: ranges={}, rows={}, total_ms={:.3}",
+            subject_index_stats.ranges_written,
+            subject_index_stats.rows_scanned,
+            subject_index_stats.total_ms
+        );
+    } else {
+        log::info!(
+            "[cottas_native_ids] skipping subject range index for ordering {:?}; subject ranges require SPO ordering",
+            config.ordering
+        );
+    }
 
     Ok(())
 }
@@ -612,22 +630,20 @@ impl Ord for PairHeapItem {
 fn encode_string_runs_to_id_runs<Dict>(
     dictionary: &Dict,
     string_run_paths: &[PathBuf],
+    ordering: TripleOrdering,
     temp_dir: &Path,
 ) -> Result<Vec<PathBuf>>
 where
     Dict: RdfDictionary,
 {
     let mut id_run_paths = Vec::with_capacity(string_run_paths.len());
-
     for (run_idx, string_path) in string_run_paths.iter().enumerate() {
         let id_path = temp_dir.join(format!("native_id_encoded_run_{run_idx:06}.bin"));
         let mut reader = NativeStringRunReader::new(string_path)?;
-        let file = std::fs::File::create(&id_path)
-            .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-        let mut writer = BufWriter::new(file);
+        let mut encoded_batch: Vec<NativeIdTriple> = Vec::new();
 
         while let Some(triple) = reader.read_one()? {
-            let encoded = NativeIdTriple {
+            encoded_batch.push(NativeIdTriple {
                 s: dictionary.get_id(&triple.s).ok_or_else(|| {
                     VortexRdfError::Serialization(format!(
                         "Missing subject in dictionary: {}",
@@ -652,18 +668,39 @@ where
                         triple.g
                     ))
                 })?,
-            };
-            write_id_triple(&mut writer, encoded)?;
+            });
         }
 
+        // Critical v4 invariant fix: string runs were sorted by RDF lexical term order,
+        // but dictionary IDs are assigned independently. After encoding strings -> u32 IDs,
+        // each run must be re-sorted by native-ID order before the final k-way merge.
+        if ordering != TripleOrdering::None {
+            encoded_batch.sort_by(|a, b| a.cmp_by_order(b, ordering));
+
+            for pair in encoded_batch.windows(2) {
+                if pair[0].cmp_by_order(&pair[1], ordering) == Ordering::Greater {
+                    return Err(VortexRdfError::Serialization(format!(
+                        "Encoded native ID run {} is not sorted by {:?}",
+                        run_idx, ordering
+                    )));
+                }
+            }
+        }
+
+        let file = std::fs::File::create(&id_path)
+            .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+        let mut writer = BufWriter::new(file);
+        for encoded in encoded_batch {
+            write_id_triple(&mut writer, encoded)?;
+        }
         writer
             .flush()
             .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
         id_run_paths.push(id_path);
     }
-
     Ok(id_run_paths)
 }
+
 
 fn write_native_string_run(path: &Path, triples: &[NativeTriple]) -> Result<()> {
     let file =
