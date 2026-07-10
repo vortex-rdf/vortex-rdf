@@ -361,6 +361,14 @@ where
                 po_stats.unique_po_hashes_written,
                 po_stats.total_ms
             );
+            let po_hash_stats = build_cottas_native_po_hash_index(output_path).await?;
+            log::info!(
+                "[cottas_native_ids] built PO hash index during serialization: row_groups={}, rows={}, hash_ranges={}, total_ms={:.3}",
+                po_hash_stats.row_groups,
+                po_hash_stats.rows_scanned,
+                po_hash_stats.unique_po_hashes_written,
+                po_hash_stats.total_ms
+            );
         }
     } else {
         log::info!(
@@ -2402,7 +2410,11 @@ where
     let mut po_row_ranges: Option<Vec<std::ops::Range<u64>>> = None;
     if subject.is_none() && predicate.is_some() && object.is_some() && native_po_rowgroup_index_exists(input_path) {
         if let Some((p_id, o_id)) = resolve_po_bound_ids_for_index(input_path, predicate, object).await? {
-            let ranges = lookup_po_candidate_row_ranges_from_sidecar(input_path, p_id, o_id)?;
+            let ranges = if native_po_hash_index_exists(input_path) {
+                lookup_po_candidate_row_ranges_from_hash_index(input_path, p_id, o_id)?
+            } else {
+                lookup_po_candidate_row_ranges_from_sidecar(input_path, p_id, o_id)?
+            };
             diagnostics.po_rowgroup_index_used = true;
             diagnostics.po_candidate_ranges = ranges.len();
             diagnostics.po_candidate_rows = ranges.iter().map(|r| r.end.saturating_sub(r.start)).sum();
@@ -3016,6 +3028,158 @@ async fn resolve_po_bound_ids_for_index(data_path: &Path, predicate: Option<&Nam
     let Some(p_id) = lookup_term_id_from_sidecar(data_path, &p_term).await? else { return Ok(None); };
     let Some(o_id) = lookup_term_id_from_sidecar(data_path, &o_term).await? else { return Ok(None); };
     Ok(Some((p_id, o_id)))
+}
+
+fn native_po_hash_index_path(data_path: &Path) -> PathBuf {
+    let file_name = data_path.file_name().and_then(|s| s.to_str()).unwrap_or("data.vortex");
+    data_path.with_file_name(format!("{file_name}.po_hash_ranges.bin"))
+}
+
+fn native_po_hash_index_exists(data_path: &Path) -> bool {
+    native_po_hash_index_path(data_path).is_file()
+}
+
+const NATIVE_PO_HASH_INDEX_MAGIC: &[u8; 8] = b"VRDFPH1\0";
+const NATIVE_PO_HASH_INDEX_ENTRY_BYTES: u64 = 24;
+
+fn write_po_hash_index_entry<W: Write>(writer: &mut W, hash: u64, start: u64, end: u64) -> Result<()> {
+    writer.write_all(&hash.to_le_bytes())
+        .and_then(|_| writer.write_all(&start.to_le_bytes()))
+        .and_then(|_| writer.write_all(&end.to_le_bytes()))
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))
+}
+
+fn read_po_hash_index_entry_at(file: &std::fs::File, entry_idx: u64) -> Result<(u64, u64, u64)> {
+    let mut buf = [0u8; 24];
+    let offset = 16u64
+        .checked_add(entry_idx.checked_mul(NATIVE_PO_HASH_INDEX_ENTRY_BYTES).ok_or_else(|| {
+            VortexRdfError::Deserialization(format!("PO hash index offset overflow for entry {}", entry_idx))
+        })?)
+        .ok_or_else(|| VortexRdfError::Deserialization("PO hash index offset overflow".to_string()))?;
+    read_exact_at_native_sidecar(file, &mut buf, offset, "PO hash index entry")?;
+    let hash = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let start = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    let end = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+    Ok((hash, start, end))
+}
+
+pub async fn build_cottas_native_po_hash_index(input_path: &Path) -> Result<NativePoRowGroupIndexBuildStats> {
+    let total_start = Instant::now();
+    let output_path = native_po_hash_index_path(input_path);
+    let open_start = Instant::now();
+    let file = NATIVE_FILE_SESSION.open_options().open_path(input_path).await.map_err(VortexRdfError::from)?;
+    let open_ms = elapsed_ms(open_start);
+    let scan_start = Instant::now();
+    let mut stream = file.scan().map_err(VortexRdfError::from)?
+        .with_projection(vortex_array::expr::select(["p", "o"].as_slice(), vortex_array::expr::root()))
+        .into_array_stream().map_err(VortexRdfError::from)?;
+    let mut entries: Vec<(u64, u64, u64)> = Vec::new();
+    let mut row_groups = 0usize;
+    let mut rows_scanned = 0u64;
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result.map_err(VortexRdfError::from)?;
+        let batch_rows = batch.len();
+        if batch_rows == 0 { continue; }
+        let p_ids = extract_projected_u32_column(&batch, "p")?;
+        let o_ids = extract_projected_u32_column(&batch, "o")?;
+        if p_ids.len() != batch_rows || o_ids.len() != batch_rows {
+            return Err(VortexRdfError::Serialization(format!(
+                "PO hash index saw p/o length mismatch: p={}, o={}, rows={}",
+                p_ids.len(), o_ids.len(), batch_rows
+            )));
+        }
+        let start = rows_scanned;
+        let end = rows_scanned + batch_rows as u64;
+        let mut hashes: Vec<u64> = p_ids.iter().zip(o_ids.iter()).map(|(p, o)| native_po_hash(*p, *o)).collect();
+        hashes.sort_unstable();
+        hashes.dedup();
+        entries.reserve(hashes.len());
+        for hash in hashes {
+            entries.push((hash, start, end));
+        }
+        rows_scanned = end;
+        row_groups += 1;
+    }
+    let scan_ms = elapsed_ms(scan_start);
+    let write_start = Instant::now();
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
+    let tmp_path = output_path.with_extension("po_hash_ranges.bin.tmp");
+    let tmp_file = std::fs::File::create(&tmp_path).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    let mut writer = BufWriter::new(tmp_file);
+    writer.write_all(NATIVE_PO_HASH_INDEX_MAGIC).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    writer.write_all(&(entries.len() as u64).to_le_bytes()).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    for (hash, start, end) in &entries {
+        write_po_hash_index_entry(&mut writer, *hash, *start, *end)?;
+    }
+    writer.flush().map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    drop(writer);
+    std::fs::rename(&tmp_path, &output_path).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    let write_ms = elapsed_ms(write_start);
+    let total_ms = elapsed_ms(total_start);
+    Ok(NativePoRowGroupIndexBuildStats {
+        input_path: input_path.display().to_string(),
+        output_path: output_path.display().to_string(),
+        row_groups,
+        rows_scanned,
+        unique_po_hashes_written: entries.len() as u64,
+        open_ms,
+        scan_ms,
+        write_ms,
+        total_ms,
+    })
+}
+
+fn lookup_po_candidate_row_ranges_from_hash_index(data_path: &Path, p_id: u32, o_id: u32) -> Result<Vec<std::ops::Range<u64>>> {
+    let path = native_po_hash_index_path(data_path);
+    let file = std::fs::File::open(&path).map_err(|e| {
+        VortexRdfError::Deserialization(format!("Failed to open native PO hash index {:?}: {}", path, e))
+    })?;
+    let len = file.metadata().map_err(|e| VortexRdfError::Deserialization(e.to_string()))?.len();
+    if len < 16 || (len - 16) % NATIVE_PO_HASH_INDEX_ENTRY_BYTES != 0 {
+        return Err(VortexRdfError::Deserialization(format!("Malformed PO hash index {:?}: len={}", path, len)));
+    }
+    let mut magic = [0u8; 8];
+    read_exact_at_native_sidecar(&file, &mut magic, 0, "PO hash index magic")?;
+    if &magic != NATIVE_PO_HASH_INDEX_MAGIC {
+        return Err(VortexRdfError::Deserialization(format!("Malformed PO hash index {:?}: bad magic", path)));
+    }
+    let mut count_buf = [0u8; 8];
+    read_exact_at_native_sidecar(&file, &mut count_buf, 8, "PO hash index count")?;
+    let count = u64::from_le_bytes(count_buf);
+    if 16 + count.saturating_mul(NATIVE_PO_HASH_INDEX_ENTRY_BYTES) != len {
+        return Err(VortexRdfError::Deserialization(format!("Malformed PO hash index {:?}: count/len mismatch", path)));
+    }
+    let needle = native_po_hash(p_id, o_id);
+    let mut lo = 0u64;
+    let mut hi = count;
+    while lo < hi {
+        let mid = lo + ((hi - lo) / 2);
+        let (hash, _, _) = read_po_hash_index_entry_at(&file, mid)?;
+        match hash.cmp(&needle) {
+            Ordering::Less => lo = mid + 1,
+            Ordering::Greater => hi = mid,
+            Ordering::Equal => {
+                let mut first = mid;
+                while first > 0 {
+                    let (prev_hash, _, _) = read_po_hash_index_entry_at(&file, first - 1)?;
+                    if prev_hash != needle { break; }
+                    first -= 1;
+                }
+                let mut ranges = Vec::new();
+                let mut idx = first;
+                while idx < count {
+                    let (h, start, end) = read_po_hash_index_entry_at(&file, idx)?;
+                    if h != needle { break; }
+                    ranges.push(start..end);
+                    idx += 1;
+                }
+                ranges.sort_unstable_by(|a, b| a.start.cmp(&b.start).then_with(|| a.end.cmp(&b.end)));
+                ranges.dedup_by(|a, b| a.start == b.start && a.end == b.end);
+                return Ok(ranges);
+            }
+        }
+    }
+    Ok(Vec::new())
 }
 
 const NATIVE_SUBJECT_RANGE_ENTRY_BYTES: u64 = 20;
