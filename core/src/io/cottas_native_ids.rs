@@ -348,6 +348,20 @@ where
             subject_index_stats.rows_scanned,
             subject_index_stats.total_ms
         );
+        let write_po_index = std::env::var("VORTEX_RDF_WRITE_PO_ROWGROUP_INDEX")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(true);
+        if write_po_index {
+            let po_stats = build_cottas_native_po_rowgroup_index(output_path).await?;
+            log::info!(
+                "[cottas_native_ids] built PO row-group index during serialization: row_groups={}, rows={}, unique_hashes={}, total_ms={:.3}",
+                po_stats.row_groups,
+                po_stats.rows_scanned,
+                po_stats.unique_po_hashes_written,
+                po_stats.total_ms
+            );
+        }
     } else {
         log::info!(
             "[cottas_native_ids] skipping subject range index for ordering {:?}; subject ranges require SPO ordering",
@@ -1107,6 +1121,10 @@ pub struct CottasNativeIdsDiagnostics {
     pub subject_range_start: Option<u64>,
     pub subject_range_end: Option<u64>,
     pub subject_range_rows: Option<u64>,
+    pub po_rowgroup_index_used: bool,
+    pub po_rowgroup_lookup_ms: f64,
+    pub po_candidate_ranges: usize,
+    pub po_candidate_rows: u64,
     pub id_to_term_stats: NativeIdToTermLookupStats,
     pub term_to_id_stats: Vec<NativeTermToIdLookupStats>,
 }
@@ -2380,32 +2398,69 @@ where
         }
     }
 
-    let scan_start = Instant::now();
-    let scan = file.scan().map_err(VortexRdfError::from)?;
-    let scan = if let Some(row_range) = subject_row_range {
-        scan.with_row_range(row_range)
-    } else {
-        scan
-    };
-    let scan = match filter {
-        NativePatternFilter::All => scan,
-        NativePatternFilter::Empty => unreachable!("handled above"),
-        NativePatternFilter::Expr(expr) => scan.with_filter(expr),
-    };
-    let scan = scan.with_projection(vortex_array::expr::select(
-        projected_columns.as_slice(),
-        vortex_array::expr::root(),
-    ));
-    let stream = scan.into_array_stream().map_err(VortexRdfError::from)?;
-    diagnostics.scan_build_ms = elapsed_ms(scan_start);
+    let po_lookup_start = Instant::now();
+    let mut po_row_ranges: Option<Vec<std::ops::Range<u64>>> = None;
+    if subject.is_none() && predicate.is_some() && object.is_some() && native_po_rowgroup_index_exists(input_path) {
+        if let Some((p_id, o_id)) = resolve_po_bound_ids_for_index(input_path, predicate, object).await? {
+            let ranges = lookup_po_candidate_row_ranges_from_sidecar(input_path, p_id, o_id)?;
+            diagnostics.po_rowgroup_index_used = true;
+            diagnostics.po_candidate_ranges = ranges.len();
+            diagnostics.po_candidate_rows = ranges.iter().map(|r| r.end.saturating_sub(r.start)).sum();
+            po_row_ranges = Some(ranges);
+        }
+    }
+    diagnostics.po_rowgroup_lookup_ms = elapsed_ms(po_lookup_start);
 
-    log::debug!(
-        "[cottas_native::match] scan builder setup took {:.3}ms",
-        diagnostics.scan_build_ms
-    );
+    let scan_start = Instant::now();
     let read_start = Instant::now();
-    let (matched_rows, scan_batches, max_scan_batch_rows) =
-        read_native_projected_stream_all_with_scan_stats(stream).await?;
+    let mut matched_rows = NativeProjectedIdRows::default();
+    let mut scan_batches = 0usize;
+    let mut max_scan_batch_rows = 0usize;
+    if let Some(ranges) = po_row_ranges {
+        for row_range in ranges {
+            let scan = file.scan().map_err(VortexRdfError::from)?.with_row_range(row_range);
+            let scan = match &filter {
+                NativePatternFilter::All => scan,
+                NativePatternFilter::Empty => unreachable!("handled above"),
+                NativePatternFilter::Expr(expr) => scan.with_filter(expr.clone()),
+            };
+            let scan = scan.with_projection(vortex_array::expr::select(
+                projected_columns.as_slice(),
+                vortex_array::expr::root(),
+            ));
+            let stream = scan.into_array_stream().map_err(VortexRdfError::from)?;
+            let (partial_rows, partial_batches, partial_max) = read_native_projected_stream_all_with_scan_stats(stream).await?;
+            scan_batches += partial_batches;
+            max_scan_batch_rows = max_scan_batch_rows.max(partial_max);
+            matched_rows.rows += partial_rows.rows;
+            if let Some(v) = partial_rows.s { matched_rows.s.get_or_insert_with(Vec::new).extend(v); }
+            if let Some(v) = partial_rows.p { matched_rows.p.get_or_insert_with(Vec::new).extend(v); }
+            if let Some(v) = partial_rows.o { matched_rows.o.get_or_insert_with(Vec::new).extend(v); }
+            if let Some(v) = partial_rows.g { matched_rows.g.get_or_insert_with(Vec::new).extend(v); }
+        }
+    } else {
+        let scan = file.scan().map_err(VortexRdfError::from)?;
+        let scan = if let Some(row_range) = subject_row_range {
+            scan.with_row_range(row_range)
+        } else {
+            scan
+        };
+        let scan = match filter {
+            NativePatternFilter::All => scan,
+            NativePatternFilter::Empty => unreachable!("handled above"),
+            NativePatternFilter::Expr(expr) => scan.with_filter(expr),
+        };
+        let scan = scan.with_projection(vortex_array::expr::select(
+            projected_columns.as_slice(),
+            vortex_array::expr::root(),
+        ));
+        let stream = scan.into_array_stream().map_err(VortexRdfError::from)?;
+        let (rows, batches, max_batch_rows) = read_native_projected_stream_all_with_scan_stats(stream).await?;
+        matched_rows = rows;
+        scan_batches = batches;
+        max_scan_batch_rows = max_batch_rows;
+    }
+    diagnostics.scan_build_ms = elapsed_ms(scan_start);
     diagnostics.read_all_ms = elapsed_ms(read_start);
     diagnostics.scan_batches = scan_batches;
     diagnostics.max_scan_batch_rows = max_scan_batch_rows;
@@ -2794,6 +2849,173 @@ fn native_subject_range_index_path(data_path: &Path) -> PathBuf {
 
 fn native_subject_range_index_exists(data_path: &Path) -> bool {
     native_subject_range_index_path(data_path).is_file()
+}
+
+fn native_po_rowgroup_index_path(data_path: &Path) -> PathBuf {
+    let file_name = data_path.file_name().and_then(|s| s.to_str()).unwrap_or("data.vortex");
+    data_path.with_file_name(format!("{file_name}.po_rowgroups.bin"))
+}
+
+fn native_po_rowgroup_index_exists(data_path: &Path) -> bool {
+    native_po_rowgroup_index_path(data_path).is_file()
+}
+
+const NATIVE_PO_ROWGROUP_MAGIC: &[u8; 8] = b"VRDFPO1\0";
+const NATIVE_PO_ROWGROUP_ENTRY_HEADER_BYTES: u64 = 20;
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct NativePoRowGroupIndexBuildStats {
+    pub input_path: String,
+    pub output_path: String,
+    pub row_groups: usize,
+    pub rows_scanned: u64,
+    pub unique_po_hashes_written: u64,
+    pub open_ms: f64,
+    pub scan_ms: f64,
+    pub write_ms: f64,
+    pub total_ms: f64,
+}
+
+fn native_po_hash(p: u32, o: u32) -> u64 {
+    let mut x = ((p as u64) << 32) | (o as u64);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d049bb133111eb);
+    x ^ (x >> 31)
+}
+
+fn write_po_rowgroup_entry<W: Write>(writer: &mut W, start: u64, end: u64, hashes: &[u64]) -> Result<()> {
+    let count = u32::try_from(hashes.len()).map_err(|_| {
+        VortexRdfError::Serialization(format!("too many unique PO hashes in row group: {}", hashes.len()))
+    })?;
+    writer.write_all(&start.to_le_bytes())
+        .and_then(|_| writer.write_all(&end.to_le_bytes()))
+        .and_then(|_| writer.write_all(&count.to_le_bytes()))
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    for h in hashes {
+        writer.write_all(&h.to_le_bytes()).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    }
+    Ok(())
+}
+
+pub async fn build_cottas_native_po_rowgroup_index(input_path: &Path) -> Result<NativePoRowGroupIndexBuildStats> {
+    let total_start = Instant::now();
+    let output_path = native_po_rowgroup_index_path(input_path);
+    let open_start = Instant::now();
+    let file = NATIVE_FILE_SESSION.open_options().open_path(input_path).await.map_err(VortexRdfError::from)?;
+    let open_ms = elapsed_ms(open_start);
+    let scan_start = Instant::now();
+    let mut stream = file.scan().map_err(VortexRdfError::from)?
+        .with_projection(vortex_array::expr::select(["p", "o"].as_slice(), vortex_array::expr::root()))
+        .into_array_stream().map_err(VortexRdfError::from)?;
+    let tmp_path = output_path.with_extension("po_rowgroups.bin.tmp");
+    let tmp_file = std::fs::File::create(&tmp_path).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    let mut writer = BufWriter::new(tmp_file);
+    writer.write_all(NATIVE_PO_ROWGROUP_MAGIC).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    let mut row_groups = 0usize;
+    let mut rows_scanned = 0u64;
+    let mut unique_po_hashes_written = 0u64;
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result.map_err(VortexRdfError::from)?;
+        let batch_rows = batch.len();
+        if batch_rows == 0 { continue; }
+        let p_ids = extract_projected_u32_column(&batch, "p")?;
+        let o_ids = extract_projected_u32_column(&batch, "o")?;
+        if p_ids.len() != batch_rows || o_ids.len() != batch_rows {
+            return Err(VortexRdfError::Serialization(format!(
+                "PO row-group index saw p/o length mismatch: p={}, o={}, rows={}",
+                p_ids.len(), o_ids.len(), batch_rows
+            )));
+        }
+        let start = rows_scanned;
+        let end = rows_scanned + batch_rows as u64;
+        let mut hashes: Vec<u64> = p_ids.iter().zip(o_ids.iter()).map(|(p, o)| native_po_hash(*p, *o)).collect();
+        hashes.sort_unstable();
+        hashes.dedup();
+        unique_po_hashes_written += hashes.len() as u64;
+        write_po_rowgroup_entry(&mut writer, start, end, &hashes)?;
+        rows_scanned = end;
+        row_groups += 1;
+    }
+    let scan_ms = elapsed_ms(scan_start);
+    let write_start = Instant::now();
+    writer.flush().map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    drop(writer);
+    std::fs::rename(&tmp_path, &output_path).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    let write_ms = elapsed_ms(write_start);
+    let total_ms = elapsed_ms(total_start);
+    Ok(NativePoRowGroupIndexBuildStats {
+        input_path: input_path.display().to_string(),
+        output_path: output_path.display().to_string(),
+        row_groups,
+        rows_scanned,
+        unique_po_hashes_written,
+        open_ms,
+        scan_ms,
+        write_ms,
+        total_ms,
+    })
+}
+
+fn lookup_po_candidate_row_ranges_from_sidecar(data_path: &Path, p_id: u32, o_id: u32) -> Result<Vec<std::ops::Range<u64>>> {
+    let path = native_po_rowgroup_index_path(data_path);
+    let file = std::fs::File::open(&path).map_err(|e| {
+        VortexRdfError::Deserialization(format!("Failed to open native PO row-group index {:?}: {}", path, e))
+    })?;
+    let len = file.metadata().map_err(|e| VortexRdfError::Deserialization(e.to_string()))?.len();
+    let mut magic = [0u8; 8];
+    read_exact_at_native_sidecar(&file, &mut magic, 0, "PO row-group magic")?;
+    if &magic != NATIVE_PO_ROWGROUP_MAGIC {
+        return Err(VortexRdfError::Deserialization(format!("Malformed PO row-group index {:?}: bad magic", path)));
+    }
+    let needle = native_po_hash(p_id, o_id);
+    let mut ranges = Vec::new();
+    let mut offset = NATIVE_PO_ROWGROUP_MAGIC.len() as u64;
+    while offset < len {
+        let mut hdr = [0u8; 20];
+        read_exact_at_native_sidecar(&file, &mut hdr, offset, "PO row-group header")?;
+        offset += NATIVE_PO_ROWGROUP_ENTRY_HEADER_BYTES;
+        let start = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
+        let end = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+        let count = u32::from_le_bytes(hdr[16..20].try_into().unwrap()) as usize;
+        let bytes = count.checked_mul(8).ok_or_else(|| VortexRdfError::Deserialization("PO hash byte count overflow".to_string()))?;
+        if offset + bytes as u64 > len {
+            return Err(VortexRdfError::Deserialization(format!("Malformed PO row-group index {:?}: truncated hashes", path)));
+        }
+        let mut hash_buf = vec![0u8; bytes];
+        if bytes > 0 {
+            read_exact_at_native_sidecar(&file, &mut hash_buf, offset, "PO row-group hashes")?;
+        }
+        offset += bytes as u64;
+        let mut lo = 0usize;
+        let mut hi = count;
+        let mut found = false;
+        while lo < hi {
+            let mid = lo + ((hi - lo) / 2);
+            let byte = mid * 8;
+            let h = u64::from_le_bytes(hash_buf[byte..byte + 8].try_into().unwrap());
+            match h.cmp(&needle) {
+                Ordering::Less => lo = mid + 1,
+                Ordering::Greater => hi = mid,
+                Ordering::Equal => {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if found { ranges.push(start..end); }
+    }
+    Ok(ranges)
+}
+
+async fn resolve_po_bound_ids_for_index(data_path: &Path, predicate: Option<&NamedNode>, object: Option<&Term>) -> Result<Option<(u32, u32)>> {
+    let (Some(predicate), Some(object)) = (predicate, object) else { return Ok(None); };
+    let p_term = predicate.to_string();
+    let o_term = object.to_string();
+    let Some(p_id) = lookup_term_id_from_sidecar(data_path, &p_term).await? else { return Ok(None); };
+    let Some(o_id) = lookup_term_id_from_sidecar(data_path, &o_term).await? else { return Ok(None); };
+    Ok(Some((p_id, o_id)))
 }
 
 const NATIVE_SUBJECT_RANGE_ENTRY_BYTES: u64 = 20;
@@ -3665,12 +3887,22 @@ async fn write_dictionary_lookup_sidecars_from_pair_runs(
         );
     }
 
-    write_id_to_term_vortex_block_lookup_sidecar_from_id_runs(
-        &pair_run_paths.id_run_paths,
-        data_path,
-        row_group_size,
-    )
-    .await?;
+    let write_block_lookup = std::env::var("VORTEX_RDF_WRITE_BLOCK_DICT_VORTEX")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+    if write_block_lookup {
+        write_id_to_term_vortex_block_lookup_sidecar_from_id_runs(
+            &pair_run_paths.id_run_paths,
+            data_path,
+            row_group_size,
+        )
+        .await?;
+    } else {
+        log::info!(
+            "[cottas_native_ids] skipped experimental Vortex block-lookup id_to_term sidecar; set VORTEX_RDF_WRITE_BLOCK_DICT_VORTEX=1 to write it"
+        );
+    }
     let write_row_lookup = std::env::var("VORTEX_RDF_WRITE_ROW_LOOKUP_DICT_VORTEX")
         .ok()
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
@@ -3690,12 +3922,11 @@ async fn write_dictionary_lookup_sidecars_from_pair_runs(
     write_id_to_term_binary_sidecar_from_id_runs(&pair_run_paths.id_run_paths, data_path)?;
     write_term_to_id_binary_sidecar_from_term_runs(&pair_run_paths.term_run_paths, data_path)?;
     log::info!(
-        "[cottas_native_ids] wrote binary dictionary sidecars {:?}, {:?}, {:?}, {:?}; wrote Vortex block-lookup sidecar {:?}",
+        "[cottas_native_ids] wrote binary dictionary sidecars {:?}, {:?}, {:?}, {:?}; experimental Vortex dict sidecars are opt-in",
         native_dict_id_to_term_offsets_path(data_path),
         native_dict_id_to_term_blob_path(data_path),
         native_dict_term_to_id_entries_path(data_path),
         native_dict_term_to_id_blob_path(data_path),
-        native_dict_id_to_term_block_lookup_path(data_path),
     );
     Ok(())
 }
