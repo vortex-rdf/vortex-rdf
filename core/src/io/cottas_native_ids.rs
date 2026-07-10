@@ -2753,6 +2753,14 @@ fn native_id_to_term_block_size() -> u32 {
         .unwrap_or(65_536)
 }
 
+fn native_id_to_term_block_row_group_size() -> usize {
+    std::env::var("VORTEX_RDF_ID_TO_TERM_BLOCK_ROW_GROUPS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(64)
+}
+
 fn native_dict_id_to_term_offsets_path(data_path: &Path) -> PathBuf {
     let file_name = data_path
         .file_name()
@@ -3275,15 +3283,16 @@ async fn write_id_to_term_vortex_block_lookup_sidecar_from_id_runs(
     )?
     .dtype()
     .clone();
+    let block_row_group_size = native_id_to_term_block_row_group_size();
     let arrays = merge_id_runs_to_block_lookup_array_stream(
         id_run_paths.to_vec(),
-        row_group_size,
+        block_row_group_size,
         block_size,
     )?;
     let stream = ArrayStreamAdapter::new(dtype, Box::pin(arrays));
     let write_opts = NATIVE_FILE_SESSION.write_options().with_strategy(
         WriteStrategyBuilder::default()
-            .with_row_block_size(row_group_size.max(1))
+            .with_row_block_size(block_row_group_size.max(1))
             .build(),
     );
     write_opts
