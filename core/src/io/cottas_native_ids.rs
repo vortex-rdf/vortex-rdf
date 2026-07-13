@@ -18,7 +18,7 @@ use vortex_error::{VortexError, VortexResult};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::arrays::{PrimitiveArray, StructArray, VarBinViewArray};
+use vortex_array::arrays::{PrimitiveArray, StructArray};
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::{ArrayRef, IntoArray};
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
@@ -150,22 +150,6 @@ impl NativeIdTriple {
     }
 }
 
-fn native_dict_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("data.vortex");
-    data_path.with_file_name(format!("{file_name}.dict.vortex"))
-}
-
-fn native_dict_term_to_id_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("data.vortex");
-    data_path.with_file_name(format!("{file_name}.dict.term_to_id.vortex"))
-}
-
 fn native_dict_term_to_id_entries_path(data_path: &Path) -> PathBuf {
     let file_name = data_path
         .file_name()
@@ -185,6 +169,22 @@ fn native_dict_term_to_id_blob_path(data_path: &Path) -> PathBuf {
 fn native_term_to_id_binary_sidecar_exists(data_path: &Path) -> bool {
     native_dict_term_to_id_entries_path(data_path).is_file()
         && native_dict_term_to_id_blob_path(data_path).is_file()
+}
+
+fn native_dict_path(data_path: &Path) -> PathBuf {
+    let file_name = data_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("data.vortex");
+    data_path.with_file_name(format!("{file_name}.dict.vortex"))
+}
+
+fn native_dict_term_to_id_path(data_path: &Path) -> PathBuf {
+    let file_name = data_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("data.vortex");
+    data_path.with_file_name(format!("{file_name}.dict.term_to_id.vortex"))
 }
 
 fn quad_to_native_triple(quad: &Quad) -> NativeTriple {
@@ -348,36 +348,14 @@ where
             subject_index_stats.rows_scanned,
             subject_index_stats.total_ms
         );
-        let write_po_index = std::env::var("VORTEX_RDF_WRITE_PO_ROWGROUP_INDEX")
-            .ok()
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(true);
-        if write_po_index {
-            let po_stats = build_cottas_native_po_rowgroup_index(output_path).await?;
-            log::info!(
-                "[cottas_native_ids] built PO row-group index during serialization: row_groups={}, rows={}, unique_hashes={}, total_ms={:.3}",
-                po_stats.row_groups,
-                po_stats.rows_scanned,
-                po_stats.unique_po_hashes_written,
-                po_stats.total_ms
-            );
-            let po_hash_stats = build_cottas_native_po_hash_index(output_path).await?;
-            log::info!(
-                "[cottas_native_ids] built PO hash index during serialization: row_groups={}, rows={}, hash_ranges={}, total_ms={:.3}",
-                po_hash_stats.row_groups,
-                po_hash_stats.rows_scanned,
-                po_hash_stats.unique_po_hashes_written,
-                po_hash_stats.total_ms
-            );
-            let po_exact_stats = build_cottas_native_po_exact_ranges_index(output_path).await?;
-            log::info!(
-                "[cottas_native_ids] built PO exact-ranges index during serialization: row_groups={}, rows={}, exact_ranges={}, total_ms={:.3}",
-                po_exact_stats.row_groups,
-                po_exact_stats.rows_scanned,
-                po_exact_stats.unique_po_hashes_written,
-                po_exact_stats.total_ms
-            );
-        }
+        let po_exact_stats = build_cottas_native_po_exact_ranges_index(output_path).await?;
+        log::info!(
+            "[cottas_native_ids] built PO exact-ranges index during serialization: row_groups={}, rows={}, exact_ranges={}, total_ms={:.3}",
+            po_exact_stats.row_groups,
+            po_exact_stats.rows_scanned,
+            po_exact_stats.unique_po_hashes_written,
+            po_exact_stats.total_ms
+        );
     } else {
         log::info!(
             "[cottas_native_ids] skipping subject range index for ordering {:?}; subject ranges require SPO ordering",
@@ -1009,55 +987,6 @@ where
     Ok(())
 }
 
-// -----------------------------------------------------------------------------
-// Expected existing functions from your current cottas_native_ids.rs
-// -----------------------------------------------------------------------------
-// Keep these implementations from the current file unchanged and paste this
-// serializer block above them / use it to replace only the old serializer helpers:
-//
-//   fn build_dictionary_root<Dict: RdfDictionary>(&Dict) -> Result<ArrayRef>
-//   async fn write_single_array_to_vortex_file<W>(...) -> Result<()>
-//   async fn write_dictionary_lookup_sidecars<Dict: RdfDictionary>(...) -> Result<()>
-//
-// Also keep the existing match/count/query-time functions unchanged:
-//
-//   load_cottas_native_dictionary
-//   load_cottas_native_simple_dictionary_view
-//   match_cottas_native_file(_with_diagnostics)
-//   count_cottas_native_ids_file_with_diagnostics(_mode)
-//   lookup_term_id_from_sidecar
-//   lookup_terms_by_ids_from_sidecar
-//
-// The important long-term change is that the final data merge is ID-only:
-//
-//   string runs -> dictionary -> encoded ID runs -> merge u32 tuples -> Vortex
-//
-// There is no Vec<NativeTriple> and no String allocation in the final merge.
-pub async fn load_cottas_native_dictionary<Dict>(data_path: &Path) -> Result<Dict>
-where
-    Dict: RdfDictionary,
-{
-    let dict_path = native_dict_path(data_path);
-
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&dict_path)
-        .await
-        .map_err(VortexRdfError::from)?;
-
-    let stream = file
-        .scan()
-        .map_err(VortexRdfError::from)?
-        .into_array_stream()
-        .map_err(VortexRdfError::from)?;
-
-    let dict_root = vortex_array::stream::ArrayStreamExt::read_all(stream)
-        .await
-        .map_err(VortexRdfError::from)?;
-
-    Dict::from_vortex_array(&dict_root)
-}
-
 fn rdf_err_to_vortex_err(e: VortexRdfError) -> VortexError {
     vortex_error::vortex_err!(
         "vortex-rdf error while streaming native string row group: {}",
@@ -1251,25 +1180,6 @@ fn collect_unique_ids_for_unbound_native_columns(
     let mut ids: Vec<u32> = set.into_iter().collect();
     ids.sort_unstable();
     ids
-}
-
-#[allow(dead_code)]
-fn lookup_unbound_or_use_bound<'a>(
-    id_to_term: &'a HashMap<u32, String>,
-    bound: &'a Option<String>,
-    id: u32,
-    column_label: &str,
-) -> Result<&'a str> {
-    if let Some(value) = bound {
-        return Ok(value.as_str());
-    }
-
-    id_to_term.get(&id).map(|s| s.as_str()).ok_or_else(|| {
-        VortexRdfError::Deserialization(format!(
-            "{} ID {} missing from id_to_term sidecar",
-            column_label, id
-        ))
-    })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1535,75 +1445,6 @@ where
         id_to_term_stats,
     })
 }
-#[allow(dead_code)]
-async fn write_quads_array_as_rdf_lazy<W>(
-    data_path: &Path,
-    quads: ArrayRef,
-    bound_terms: &BoundNativeRdfTerms,
-    writer: W,
-    format: RdfFormat,
-) -> Result<LazyRdfWriteStats>
-where
-    W: Write,
-{
-    let write_start = Instant::now();
-
-    let id_extract_start = Instant::now();
-    let (s_ids, p_ids, o_ids, g_ids) = extract_spog_id_columns(&quads)?;
-    let id_extract_ms = elapsed_ms(id_extract_start);
-
-    let unique_ids =
-        collect_unique_ids_for_unbound_native_columns(&s_ids, &p_ids, &o_ids, &g_ids, bound_terms);
-    let id_lookup_start = Instant::now();
-    let (id_to_term, id_to_term_stats) =
-        lookup_terms_by_ids_from_sidecar_with_stats(data_path, &unique_ids).await?;
-
-    let id_to_term_lookup_ms = elapsed_ms(id_lookup_start);
-
-    let serialize_start = Instant::now();
-    let mut rdf_serializer = RdfSerializer::from_format(format).for_writer(writer);
-
-    for i in 0..s_ids.len() {
-        let s_raw = lookup_unbound_or_use_bound(&id_to_term, &bound_terms.s, s_ids[i], "S")?;
-        let p_raw = lookup_unbound_or_use_bound(&id_to_term, &bound_terms.p, p_ids[i], "P")?;
-        let o_raw = lookup_unbound_or_use_bound(&id_to_term, &bound_terms.o, o_ids[i], "O")?;
-        let g_raw = lookup_unbound_or_use_bound(&id_to_term, &bound_terms.g, g_ids[i], "G")?;
-
-        let subject = crate::common::utils::parse_subject(s_raw)?;
-        let predicate = crate::common::utils::parse_named_node(p_raw)?;
-        let object = crate::common::utils::parse_term(o_raw)?;
-        let graph_name = crate::common::utils::parse_graph_name(g_raw)?;
-
-        let quad = Quad::new(subject, predicate, object, graph_name);
-        rdf_serializer
-            .serialize_quad(&quad)
-            .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
-    }
-
-    rdf_serializer
-        .finish()
-        .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
-
-    let serialize_ms = elapsed_ms(serialize_start);
-
-    log::debug!(
-        "[cottas_native_ids::write_quads_array_as_rdf_lazy] wrote {} rows using {} unique dictionary ids in {:?}",
-        s_ids.len(),
-        unique_ids.len(),
-        write_start.elapsed()
-    );
-
-    Ok(LazyRdfWriteStats {
-        id_extract_ms,
-        id_to_term_lookup_ms,
-        serialize_ms,
-        rows_out: s_ids.len(),
-        unique_ids_requested: unique_ids.len(),
-        unique_ids_loaded: id_to_term.len(),
-        id_to_term_stats,
-    })
-}
-
 fn extract_spog_id_columns(quads: &ArrayRef) -> Result<(Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>)> {
     let session = VortexSession::default();
     let mut ctx = session.create_execution_ctx();
@@ -1675,13 +1516,6 @@ fn collect_unique_ids(s_ids: &[u32], p_ids: &[u32], o_ids: &[u32], g_ids: &[u32]
     ids
 }
 
-fn native_id_lookup_single_eq_threshold() -> usize {
-    std::env::var("VORTEX_RDF_NATIVE_ID_LOOKUP_SINGLE_EQ_IDS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(64)
-}
-
 async fn lookup_terms_by_ids_from_sidecar(
     data_path: &Path,
     ids: &[u32],
@@ -1695,82 +1529,19 @@ async fn lookup_terms_by_ids_from_sidecar_with_stats(
     ids: &[u32],
 ) -> Result<(HashMap<u32, String>, NativeIdToTermLookupStats)> {
     let total_start = Instant::now();
-
     if ids.is_empty() {
         let mut stats = NativeIdToTermLookupStats::default();
         stats.strategy = "empty".to_string();
         stats.total_ms = elapsed_ms(total_start);
         return Ok((HashMap::new(), stats));
     }
-
-    let id_to_term_lookup_strategy = std::env::var("VORTEX_RDF_ID_TO_TERM_LOOKUP")
-        .unwrap_or_else(|_| "binary-random-read".to_string());
-    if id_to_term_lookup_strategy == "vortex-block-dict" {
-        if native_id_to_term_block_lookup_sidecar_exists(data_path) {
-            log::debug!(
-                "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] dispatch ids={}, strategy=vortex-block-dict",
-                ids.len()
-            );
-            return lookup_terms_by_ids_from_vortex_block_lookup_with_stats(data_path, ids).await;
-        }
-        log::debug!(
-            "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] requested strategy=vortex-block-dict but block-lookup sidecar is missing; falling back"
-        );
+    if !native_id_to_term_binary_sidecar_exists(data_path) {
+        return Err(VortexRdfError::Deserialization(format!(
+            "Missing required binary id_to_term sidecars for {:?}",
+            data_path
+        )));
     }
-    if id_to_term_lookup_strategy == "vortex-row-range" {
-        if native_id_to_term_row_lookup_sidecar_exists(data_path) {
-            log::debug!(
-                "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] dispatch ids={}, strategy=vortex-row-range",
-                ids.len()
-            );
-            return lookup_terms_by_ids_from_vortex_row_lookup_with_stats(data_path, ids).await;
-        }
-        log::debug!(
-            "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] requested strategy=vortex-row-range but row-lookup sidecar is missing; falling back"
-        );
-    }
-    if native_id_to_term_binary_sidecar_exists(data_path) {
-        log::debug!(
-            "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] dispatch ids={}, strategy=binary-random-read",
-            ids.len()
-        );
-        return lookup_terms_by_ids_from_binary_index_random_read_with_stats(data_path, ids);
-    }
-
-    let single_eq_threshold = native_id_lookup_single_eq_threshold();
-
-    if ids.len() <= single_eq_threshold {
-        log::debug!(
-            "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] dispatch ids={}, single_eq_threshold={}, strategy=single-eq (binary sidecar missing)",
-            ids.len(),
-            single_eq_threshold,
-        );
-
-        let terms = lookup_terms_by_ids_from_sidecar_single_eq(data_path, ids).await?;
-        let mut stats = NativeIdToTermLookupStats::default();
-        stats.strategy = "single-eq".to_string();
-        stats.requested_ids_in = ids.len();
-        stats.requested_ids_unique = ids.iter().copied().collect::<HashSet<_>>().len();
-        stats.ids_loaded = terms.len();
-        stats.total_ms = elapsed_ms(total_start);
-        return Ok((terms, stats));
-    }
-
-    log::debug!(
-        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] dispatch ids={}, single_eq_threshold={}, strategy=streaming (binary sidecar missing)",
-        ids.len(),
-        single_eq_threshold,
-    );
-
-    let terms = lookup_terms_by_ids_from_sidecar_streaming(data_path, ids).await?;
-    let mut stats = NativeIdToTermLookupStats::default();
-    stats.strategy = "streaming".to_string();
-    stats.requested_ids_in = ids.len();
-    stats.requested_ids_unique = ids.iter().copied().collect::<HashSet<_>>().len();
-    stats.ids_loaded = terms.len();
-    stats.total_ms = elapsed_ms(total_start);
-
-    Ok((terms, stats))
+    lookup_terms_by_ids_from_binary_index_random_read_with_stats(data_path, ids)
 }
 
 fn read_exact_at_native_sidecar(
@@ -1980,220 +1751,6 @@ fn lookup_terms_by_ids_from_binary_index_random_read_with_stats(
     Ok((out, stats))
 }
 
-async fn lookup_terms_by_ids_from_sidecar_single_eq(
-    data_path: &Path,
-    ids: &[u32],
-) -> Result<HashMap<u32, String>> {
-    if ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let lookup_start = Instant::now();
-    let path = native_dict_id_to_term_path(data_path);
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
-
-    let requested: HashSet<u32> = ids.iter().copied().collect();
-    let mut out: HashMap<u32, String> = HashMap::with_capacity(requested.len());
-
-    log::debug!(
-        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] repeated single-ID equality lookup for {} ids",
-        requested.len()
-    );
-
-    for id in ids.iter().copied() {
-        if out.contains_key(&id) {
-            continue;
-        }
-
-        let expr = eq(col("id"), lit(id));
-        let stream = file
-            .scan()
-            .map_err(VortexRdfError::from)?
-            .with_filter(expr)
-            .with_projection(vortex_array::expr::select(
-                ["id", "term"],
-                vortex_array::expr::root(),
-            ))
-            .into_array_stream()
-            .map_err(VortexRdfError::from)?;
-
-        let rows = stream.read_all().await.map_err(VortexRdfError::from)?;
-        let partial = extract_id_term_map(&rows)?;
-        if let Some(term) = partial.get(&id) {
-            out.insert(id, term.clone());
-        }
-    }
-
-    log::debug!(
-        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] repeated single-ID equality resolved {} / {} ids in {:?}",
-        out.len(),
-        requested.len(),
-        lookup_start.elapsed()
-    );
-
-    Ok(out)
-}
-
-async fn lookup_terms_by_ids_from_sidecar_streaming(
-    data_path: &Path,
-    ids: &[u32],
-) -> Result<HashMap<u32, String>> {
-    if ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let lookup_start = Instant::now();
-    let requested: HashSet<u32> = ids.iter().copied().collect();
-    let mut out: HashMap<u32, String> = HashMap::with_capacity(requested.len());
-
-    let path = native_dict_id_to_term_path(data_path);
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
-
-    log::debug!(
-        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] streaming sidecar scan for {} requested ids",
-        requested.len()
-    );
-
-    let mut stream = file
-        .scan()
-        .map_err(VortexRdfError::from)?
-        .with_projection(vortex_array::expr::select(
-            ["id", "term"],
-            vortex_array::expr::root(),
-        ))
-        .into_array_stream()
-        .map_err(VortexRdfError::from)?;
-
-    let mut ctx = NATIVE_FILE_SESSION.create_execution_ctx();
-    let mut batches = 0usize;
-    let mut decoded_rows = 0usize;
-
-    while let Some(batch_result) = stream.next().await {
-        let batch = batch_result.map_err(VortexRdfError::from)?;
-        batches += 1;
-        decoded_rows += batch.len();
-
-        if batch.len() == 0 {
-            continue;
-        }
-
-        let struct_array = batch
-            .clone()
-            .execute::<StructArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-
-        let id_col = struct_array
-            .unmasked_field_by_name("id")
-            .map_err(VortexRdfError::Vortex)?
-            .clone()
-            .execute::<PrimitiveArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-
-        let term_col = struct_array
-            .unmasked_field_by_name("term")
-            .map_err(VortexRdfError::Vortex)?
-            .clone()
-            .execute::<VarBinViewArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-
-        let batch_ids = id_col.as_slice::<u32>();
-
-        for row in 0..batch.len() {
-            let id = batch_ids[row];
-
-            if !requested.contains(&id) || out.contains_key(&id) {
-                continue;
-            }
-
-            let raw = term_col.bytes_at(row);
-            let term = String::from_utf8(raw.as_ref().to_vec()).map_err(|e| {
-                VortexRdfError::Deserialization(format!(
-                    "Dictionary term is not valid UTF-8 at sidecar row {}: {}",
-                    row, e
-                ))
-            })?;
-
-            out.insert(id, term);
-
-            if out.len() >= requested.len() {
-                log::debug!(
-                    "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] resolved all {} ids after {} batches / {} decoded rows in {:?}",
-                    out.len(),
-                    batches,
-                    decoded_rows,
-                    lookup_start.elapsed()
-                );
-                return Ok(out);
-            }
-        }
-    }
-
-    log::debug!(
-        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] resolved {} / {} ids after full streaming scan, {} batches / {} decoded rows in {:?}",
-        out.len(),
-        requested.len(),
-        batches,
-        decoded_rows,
-        lookup_start.elapsed()
-    );
-
-    Ok(out)
-}
-
-fn extract_id_term_map(array: &ArrayRef) -> Result<HashMap<u32, String>> {
-    let mut out = HashMap::new();
-
-    if array.len() == 0 {
-        return Ok(out);
-    }
-
-    let session = VortexSession::default();
-    let mut ctx = session.create_execution_ctx();
-
-    let struct_array = array
-        .clone()
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-
-    let id_col = struct_array
-        .unmasked_field_by_name("id")
-        .map_err(VortexRdfError::Vortex)?
-        .clone()
-        .execute::<PrimitiveArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-
-    let term_col = struct_array
-        .unmasked_field_by_name("term")
-        .map_err(VortexRdfError::Vortex)?
-        .clone()
-        .execute::<VarBinViewArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-
-    let ids = id_col.as_slice::<u32>();
-
-    for row in 0..array.len() {
-        let raw = term_col.bytes_at(row);
-        let term = String::from_utf8(raw.as_ref().to_vec()).map_err(|e| {
-            VortexRdfError::Deserialization(format!(
-                "Dictionary term is not valid UTF-8 at row {}: {}",
-                row, e
-            ))
-        })?;
-
-        out.insert(ids[row], term);
-    }
-
-    Ok(out)
-}
-
 async fn write_empty_rdf<W>(writer: W, format: RdfFormat) -> Result<()>
 where
     W: Write,
@@ -2203,54 +1760,6 @@ where
         .finish()
         .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
     Ok(())
-}
-
-#[allow(dead_code)]
-async fn read_spog_stream_all_with_scan_stats<S>(stream: S) -> Result<(ArrayRef, usize, usize)>
-where
-    S: Stream<Item = VortexResult<ArrayRef>>,
-{
-    let mut stream = Box::pin(stream);
-
-    let mut batches = 0usize;
-    let mut max_batch_rows = 0usize;
-
-    let mut all_s_ids: Vec<u32> = Vec::new();
-    let mut all_p_ids: Vec<u32> = Vec::new();
-    let mut all_o_ids: Vec<u32> = Vec::new();
-    let mut all_g_ids: Vec<u32> = Vec::new();
-
-    while let Some(batch_result) = stream.next().await {
-        let batch = batch_result.map_err(VortexRdfError::from)?;
-        let rows = batch.len();
-
-        batches += 1;
-        max_batch_rows = max_batch_rows.max(rows);
-
-        if rows == 0 {
-            continue;
-        }
-
-        let (s_ids, p_ids, o_ids, g_ids) = extract_spog_id_columns(&batch)?;
-
-        all_s_ids.reserve(s_ids.len());
-        all_p_ids.reserve(p_ids.len());
-        all_o_ids.reserve(o_ids.len());
-        all_g_ids.reserve(g_ids.len());
-
-        all_s_ids.extend_from_slice(&s_ids);
-        all_p_ids.extend_from_slice(&p_ids);
-        all_o_ids.extend_from_slice(&o_ids);
-        all_g_ids.extend_from_slice(&g_ids);
-    }
-
-    let out = if all_s_ids.is_empty() {
-        empty_spog_array()?
-    } else {
-        build_spog_array(all_s_ids, all_p_ids, all_o_ids, all_g_ids)?
-    };
-
-    Ok((out, batches, max_batch_rows))
 }
 
 pub async fn match_cottas_native_file<W>(
@@ -2416,18 +1925,19 @@ where
 
     let po_lookup_start = Instant::now();
     let mut po_row_ranges: Option<Vec<std::ops::Range<u64>>> = None;
-    if subject.is_none() && predicate.is_some() && object.is_some() && native_po_rowgroup_index_exists(input_path) {
-        if let Some((p_id, o_id)) = resolve_po_bound_ids_for_index(input_path, predicate, object).await? {
-            let ranges = if native_po_exact_ranges_exists(input_path) {
-                lookup_po_candidate_row_ranges_from_exact_index(input_path, p_id, o_id)?
-            } else if native_po_hash_index_exists(input_path) {
-                lookup_po_candidate_row_ranges_from_hash_index(input_path, p_id, o_id)?
-            } else {
-                lookup_po_candidate_row_ranges_from_sidecar(input_path, p_id, o_id)?
-            };
+    if subject.is_none()
+        && predicate.is_some()
+        && object.is_some()
+        && native_po_exact_ranges_exists(input_path)
+    {
+        if let Some((p_id, o_id)) =
+            resolve_po_bound_ids_for_index(input_path, predicate, object).await?
+        {
+            let ranges = lookup_po_candidate_row_ranges_from_exact_index(input_path, p_id, o_id)?;
             diagnostics.po_rowgroup_index_used = true;
             diagnostics.po_candidate_ranges = ranges.len();
-            diagnostics.po_candidate_rows = ranges.iter().map(|r| r.end.saturating_sub(r.start)).sum();
+            diagnostics.po_candidate_rows =
+                ranges.iter().map(|r| r.end.saturating_sub(r.start)).sum();
             po_row_ranges = Some(ranges);
         }
     }
@@ -2440,7 +1950,10 @@ where
     let mut max_scan_batch_rows = 0usize;
     if let Some(ranges) = po_row_ranges {
         for row_range in ranges {
-            let scan = file.scan().map_err(VortexRdfError::from)?.with_row_range(row_range);
+            let scan = file
+                .scan()
+                .map_err(VortexRdfError::from)?
+                .with_row_range(row_range);
             let scan = match &filter {
                 NativePatternFilter::All => scan,
                 NativePatternFilter::Empty => unreachable!("handled above"),
@@ -2451,14 +1964,23 @@ where
                 vortex_array::expr::root(),
             ));
             let stream = scan.into_array_stream().map_err(VortexRdfError::from)?;
-            let (partial_rows, partial_batches, partial_max) = read_native_projected_stream_all_with_scan_stats(stream).await?;
+            let (partial_rows, partial_batches, partial_max) =
+                read_native_projected_stream_all_with_scan_stats(stream).await?;
             scan_batches += partial_batches;
             max_scan_batch_rows = max_scan_batch_rows.max(partial_max);
             matched_rows.rows += partial_rows.rows;
-            if let Some(v) = partial_rows.s { matched_rows.s.get_or_insert_with(Vec::new).extend(v); }
-            if let Some(v) = partial_rows.p { matched_rows.p.get_or_insert_with(Vec::new).extend(v); }
-            if let Some(v) = partial_rows.o { matched_rows.o.get_or_insert_with(Vec::new).extend(v); }
-            if let Some(v) = partial_rows.g { matched_rows.g.get_or_insert_with(Vec::new).extend(v); }
+            if let Some(v) = partial_rows.s {
+                matched_rows.s.get_or_insert_with(Vec::new).extend(v);
+            }
+            if let Some(v) = partial_rows.p {
+                matched_rows.p.get_or_insert_with(Vec::new).extend(v);
+            }
+            if let Some(v) = partial_rows.o {
+                matched_rows.o.get_or_insert_with(Vec::new).extend(v);
+            }
+            if let Some(v) = partial_rows.g {
+                matched_rows.g.get_or_insert_with(Vec::new).extend(v);
+            }
         }
     } else {
         let scan = file.scan().map_err(VortexRdfError::from)?;
@@ -2477,7 +1999,8 @@ where
             vortex_array::expr::root(),
         ));
         let stream = scan.into_array_stream().map_err(VortexRdfError::from)?;
-        let (rows, batches, max_batch_rows) = read_native_projected_stream_all_with_scan_stats(stream).await?;
+        let (rows, batches, max_batch_rows) =
+            read_native_projected_stream_all_with_scan_stats(stream).await?;
         matched_rows = rows;
         scan_batches = batches;
         max_scan_batch_rows = max_batch_rows;
@@ -2790,54 +2313,6 @@ pub async fn load_cottas_native_simple_dictionary_view(
     SimpleDictionaryView::from_dictionary_sidecar_root(&dict_root)
 }
 
-fn native_dict_id_to_term_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("data.vortex");
-
-    data_path.with_file_name(format!("{file_name}.dict.id_to_term.vortex"))
-}
-fn native_dict_id_to_term_row_lookup_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("data.vortex");
-    data_path.with_file_name(format!("{file_name}.dict.id_to_term.row_lookup.vortex"))
-}
-
-fn native_id_to_term_row_lookup_sidecar_exists(data_path: &Path) -> bool {
-    native_dict_id_to_term_row_lookup_path(data_path).is_file()
-}
-
-fn native_dict_id_to_term_block_lookup_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("data.vortex");
-    data_path.with_file_name(format!("{file_name}.dict.id_to_term.block_lookup.vortex"))
-}
-
-fn native_id_to_term_block_lookup_sidecar_exists(data_path: &Path) -> bool {
-    native_dict_id_to_term_block_lookup_path(data_path).is_file()
-}
-
-fn native_id_to_term_block_size() -> u32 {
-    std::env::var("VORTEX_RDF_ID_TO_TERM_BLOCK_SIZE")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(65_536)
-}
-
-fn native_id_to_term_block_row_group_size() -> usize {
-    std::env::var("VORTEX_RDF_ID_TO_TERM_BLOCK_ROW_GROUPS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(64)
-}
-
 fn native_dict_id_to_term_offsets_path(data_path: &Path) -> PathBuf {
     let file_name = data_path
         .file_name()
@@ -2873,18 +2348,6 @@ fn native_subject_range_index_exists(data_path: &Path) -> bool {
     native_subject_range_index_path(data_path).is_file()
 }
 
-fn native_po_rowgroup_index_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path.file_name().and_then(|s| s.to_str()).unwrap_or("data.vortex");
-    data_path.with_file_name(format!("{file_name}.po_rowgroups.bin"))
-}
-
-fn native_po_rowgroup_index_exists(data_path: &Path) -> bool {
-    native_po_rowgroup_index_path(data_path).is_file()
-}
-
-const NATIVE_PO_ROWGROUP_MAGIC: &[u8; 8] = b"VRDFPO1\0";
-const NATIVE_PO_ROWGROUP_ENTRY_HEADER_BYTES: u64 = 20;
-
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct NativePoRowGroupIndexBuildStats {
     pub input_path: String,
@@ -2907,141 +2370,30 @@ fn native_po_hash(p: u32, o: u32) -> u64 {
     x ^ (x >> 31)
 }
 
-fn write_po_rowgroup_entry<W: Write>(writer: &mut W, start: u64, end: u64, hashes: &[u64]) -> Result<()> {
-    let count = u32::try_from(hashes.len()).map_err(|_| {
-        VortexRdfError::Serialization(format!("too many unique PO hashes in row group: {}", hashes.len()))
-    })?;
-    writer.write_all(&start.to_le_bytes())
-        .and_then(|_| writer.write_all(&end.to_le_bytes()))
-        .and_then(|_| writer.write_all(&count.to_le_bytes()))
-        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    for h in hashes {
-        writer.write_all(&h.to_le_bytes()).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    }
-    Ok(())
-}
-
-pub async fn build_cottas_native_po_rowgroup_index(input_path: &Path) -> Result<NativePoRowGroupIndexBuildStats> {
-    let total_start = Instant::now();
-    let output_path = native_po_rowgroup_index_path(input_path);
-    let open_start = Instant::now();
-    let file = NATIVE_FILE_SESSION.open_options().open_path(input_path).await.map_err(VortexRdfError::from)?;
-    let open_ms = elapsed_ms(open_start);
-    let scan_start = Instant::now();
-    let mut stream = file.scan().map_err(VortexRdfError::from)?
-        .with_projection(vortex_array::expr::select(["p", "o"].as_slice(), vortex_array::expr::root()))
-        .into_array_stream().map_err(VortexRdfError::from)?;
-    let tmp_path = output_path.with_extension("po_rowgroups.bin.tmp");
-    let tmp_file = std::fs::File::create(&tmp_path).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    let mut writer = BufWriter::new(tmp_file);
-    writer.write_all(NATIVE_PO_ROWGROUP_MAGIC).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    let mut row_groups = 0usize;
-    let mut rows_scanned = 0u64;
-    let mut unique_po_hashes_written = 0u64;
-    while let Some(batch_result) = stream.next().await {
-        let batch = batch_result.map_err(VortexRdfError::from)?;
-        let batch_rows = batch.len();
-        if batch_rows == 0 { continue; }
-        let p_ids = extract_projected_u32_column(&batch, "p")?;
-        let o_ids = extract_projected_u32_column(&batch, "o")?;
-        if p_ids.len() != batch_rows || o_ids.len() != batch_rows {
-            return Err(VortexRdfError::Serialization(format!(
-                "PO row-group index saw p/o length mismatch: p={}, o={}, rows={}",
-                p_ids.len(), o_ids.len(), batch_rows
-            )));
-        }
-        let start = rows_scanned;
-        let end = rows_scanned + batch_rows as u64;
-        let mut hashes: Vec<u64> = p_ids.iter().zip(o_ids.iter()).map(|(p, o)| native_po_hash(*p, *o)).collect();
-        hashes.sort_unstable();
-        hashes.dedup();
-        unique_po_hashes_written += hashes.len() as u64;
-        write_po_rowgroup_entry(&mut writer, start, end, &hashes)?;
-        rows_scanned = end;
-        row_groups += 1;
-    }
-    let scan_ms = elapsed_ms(scan_start);
-    let write_start = Instant::now();
-    writer.flush().map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    drop(writer);
-    std::fs::rename(&tmp_path, &output_path).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    let write_ms = elapsed_ms(write_start);
-    let total_ms = elapsed_ms(total_start);
-    Ok(NativePoRowGroupIndexBuildStats {
-        input_path: input_path.display().to_string(),
-        output_path: output_path.display().to_string(),
-        row_groups,
-        rows_scanned,
-        unique_po_hashes_written,
-        open_ms,
-        scan_ms,
-        write_ms,
-        total_ms,
-    })
-}
-
-fn lookup_po_candidate_row_ranges_from_sidecar(data_path: &Path, p_id: u32, o_id: u32) -> Result<Vec<std::ops::Range<u64>>> {
-    let path = native_po_rowgroup_index_path(data_path);
-    let file = std::fs::File::open(&path).map_err(|e| {
-        VortexRdfError::Deserialization(format!("Failed to open native PO row-group index {:?}: {}", path, e))
-    })?;
-    let len = file.metadata().map_err(|e| VortexRdfError::Deserialization(e.to_string()))?.len();
-    let mut magic = [0u8; 8];
-    read_exact_at_native_sidecar(&file, &mut magic, 0, "PO row-group magic")?;
-    if &magic != NATIVE_PO_ROWGROUP_MAGIC {
-        return Err(VortexRdfError::Deserialization(format!("Malformed PO row-group index {:?}: bad magic", path)));
-    }
-    let needle = native_po_hash(p_id, o_id);
-    let mut ranges = Vec::new();
-    let mut offset = NATIVE_PO_ROWGROUP_MAGIC.len() as u64;
-    while offset < len {
-        let mut hdr = [0u8; 20];
-        read_exact_at_native_sidecar(&file, &mut hdr, offset, "PO row-group header")?;
-        offset += NATIVE_PO_ROWGROUP_ENTRY_HEADER_BYTES;
-        let start = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
-        let end = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
-        let count = u32::from_le_bytes(hdr[16..20].try_into().unwrap()) as usize;
-        let bytes = count.checked_mul(8).ok_or_else(|| VortexRdfError::Deserialization("PO hash byte count overflow".to_string()))?;
-        if offset + bytes as u64 > len {
-            return Err(VortexRdfError::Deserialization(format!("Malformed PO row-group index {:?}: truncated hashes", path)));
-        }
-        let mut hash_buf = vec![0u8; bytes];
-        if bytes > 0 {
-            read_exact_at_native_sidecar(&file, &mut hash_buf, offset, "PO row-group hashes")?;
-        }
-        offset += bytes as u64;
-        let mut lo = 0usize;
-        let mut hi = count;
-        let mut found = false;
-        while lo < hi {
-            let mid = lo + ((hi - lo) / 2);
-            let byte = mid * 8;
-            let h = u64::from_le_bytes(hash_buf[byte..byte + 8].try_into().unwrap());
-            match h.cmp(&needle) {
-                Ordering::Less => lo = mid + 1,
-                Ordering::Greater => hi = mid,
-                Ordering::Equal => {
-                    found = true;
-                    break;
-                }
-            }
-        }
-        if found { ranges.push(start..end); }
-    }
-    Ok(ranges)
-}
-
-async fn resolve_po_bound_ids_for_index(data_path: &Path, predicate: Option<&NamedNode>, object: Option<&Term>) -> Result<Option<(u32, u32)>> {
-    let (Some(predicate), Some(object)) = (predicate, object) else { return Ok(None); };
+async fn resolve_po_bound_ids_for_index(
+    data_path: &Path,
+    predicate: Option<&NamedNode>,
+    object: Option<&Term>,
+) -> Result<Option<(u32, u32)>> {
+    let (Some(predicate), Some(object)) = (predicate, object) else {
+        return Ok(None);
+    };
     let p_term = predicate.to_string();
     let o_term = object.to_string();
-    let Some(p_id) = lookup_term_id_from_sidecar(data_path, &p_term).await? else { return Ok(None); };
-    let Some(o_id) = lookup_term_id_from_sidecar(data_path, &o_term).await? else { return Ok(None); };
+    let Some(p_id) = lookup_term_id_from_sidecar(data_path, &p_term).await? else {
+        return Ok(None);
+    };
+    let Some(o_id) = lookup_term_id_from_sidecar(data_path, &o_term).await? else {
+        return Ok(None);
+    };
     Ok(Some((p_id, o_id)))
 }
 
 fn native_po_exact_ranges_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path.file_name().and_then(|s| s.to_str()).unwrap_or("data.vortex");
+    let file_name = data_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("data.vortex");
     data_path.with_file_name(format!("{file_name}.po_exact_ranges.bin"))
 }
 
@@ -3052,8 +2404,14 @@ fn native_po_exact_ranges_exists(data_path: &Path) -> bool {
 const NATIVE_PO_EXACT_RANGES_MAGIC: &[u8; 8] = b"VRDFPX1\0";
 const NATIVE_PO_EXACT_RANGE_ENTRY_BYTES: u64 = 24;
 
-fn write_po_exact_range_entry<W: Write>(writer: &mut W, hash: u64, start: u64, end: u64) -> Result<()> {
-    writer.write_all(&hash.to_le_bytes())
+fn write_po_exact_range_entry<W: Write>(
+    writer: &mut W,
+    hash: u64,
+    start: u64,
+    end: u64,
+) -> Result<()> {
+    writer
+        .write_all(&hash.to_le_bytes())
         .and_then(|_| writer.write_all(&start.to_le_bytes()))
         .and_then(|_| writer.write_all(&end.to_le_bytes()))
         .map_err(|e| VortexRdfError::Serialization(e.to_string()))
@@ -3062,10 +2420,19 @@ fn write_po_exact_range_entry<W: Write>(writer: &mut W, hash: u64, start: u64, e
 fn read_po_exact_range_entry_at(file: &std::fs::File, entry_idx: u64) -> Result<(u64, u64, u64)> {
     let mut buf = [0u8; 24];
     let offset = 16u64
-        .checked_add(entry_idx.checked_mul(NATIVE_PO_EXACT_RANGE_ENTRY_BYTES).ok_or_else(|| {
-            VortexRdfError::Deserialization(format!("PO exact range index offset overflow for entry {}", entry_idx))
-        })?)
-        .ok_or_else(|| VortexRdfError::Deserialization("PO exact range index offset overflow".to_string()))?;
+        .checked_add(
+            entry_idx
+                .checked_mul(NATIVE_PO_EXACT_RANGE_ENTRY_BYTES)
+                .ok_or_else(|| {
+                    VortexRdfError::Deserialization(format!(
+                        "PO exact range index offset overflow for entry {}",
+                        entry_idx
+                    ))
+                })?,
+        )
+        .ok_or_else(|| {
+            VortexRdfError::Deserialization("PO exact range index offset overflow".to_string())
+        })?;
     read_exact_at_native_sidecar(file, &mut buf, offset, "PO exact range entry")?;
     let hash = u64::from_le_bytes(buf[0..8].try_into().unwrap());
     let start = u64::from_le_bytes(buf[8..16].try_into().unwrap());
@@ -3073,16 +2440,28 @@ fn read_po_exact_range_entry_at(file: &std::fs::File, entry_idx: u64) -> Result<
     Ok((hash, start, end))
 }
 
-pub async fn build_cottas_native_po_exact_ranges_index(input_path: &Path) -> Result<NativePoRowGroupIndexBuildStats> {
+pub async fn build_cottas_native_po_exact_ranges_index(
+    input_path: &Path,
+) -> Result<NativePoRowGroupIndexBuildStats> {
     let total_start = Instant::now();
     let output_path = native_po_exact_ranges_path(input_path);
     let open_start = Instant::now();
-    let file = NATIVE_FILE_SESSION.open_options().open_path(input_path).await.map_err(VortexRdfError::from)?;
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(input_path)
+        .await
+        .map_err(VortexRdfError::from)?;
     let open_ms = elapsed_ms(open_start);
     let scan_start = Instant::now();
-    let mut stream = file.scan().map_err(VortexRdfError::from)?
-        .with_projection(vortex_array::expr::select(["p", "o"].as_slice(), vortex_array::expr::root()))
-        .into_array_stream().map_err(VortexRdfError::from)?;
+    let mut stream = file
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_projection(vortex_array::expr::select(
+            ["p", "o"].as_slice(),
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?;
 
     // Prototype exact access path: hash(p,o) -> exact consecutive row ranges.
     // This is intentionally collision-safe at query time because we still apply the exact p/o Vortex filter.
@@ -3092,13 +2471,17 @@ pub async fn build_cottas_native_po_exact_ranges_index(input_path: &Path) -> Res
     while let Some(batch_result) = stream.next().await {
         let batch = batch_result.map_err(VortexRdfError::from)?;
         let batch_rows = batch.len();
-        if batch_rows == 0 { continue; }
+        if batch_rows == 0 {
+            continue;
+        }
         let p_ids = extract_projected_u32_column(&batch, "p")?;
         let o_ids = extract_projected_u32_column(&batch, "o")?;
         if p_ids.len() != batch_rows || o_ids.len() != batch_rows {
             return Err(VortexRdfError::Serialization(format!(
                 "PO exact range index saw p/o length mismatch: p={}, o={}, rows={}",
-                p_ids.len(), o_ids.len(), batch_rows
+                p_ids.len(),
+                o_ids.len(),
+                batch_rows
             )));
         }
         for row in 0..batch_rows {
@@ -3126,19 +2509,31 @@ pub async fn build_cottas_native_po_exact_ranges_index(input_path: &Path) -> Res
             entries.push((hash, start, end));
         }
     }
-    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
+    entries.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
 
     let tmp_path = output_path.with_extension("po_exact_ranges.bin.tmp");
-    let tmp_file = std::fs::File::create(&tmp_path).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    let tmp_file = std::fs::File::create(&tmp_path)
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
     let mut writer = BufWriter::new(tmp_file);
-    writer.write_all(NATIVE_PO_EXACT_RANGES_MAGIC).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    writer.write_all(&(entries.len() as u64).to_le_bytes()).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    writer
+        .write_all(NATIVE_PO_EXACT_RANGES_MAGIC)
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    writer
+        .write_all(&(entries.len() as u64).to_le_bytes())
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
     for (hash, start, end) in &entries {
         write_po_exact_range_entry(&mut writer, *hash, *start, *end)?;
     }
-    writer.flush().map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    writer
+        .flush()
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
     drop(writer);
-    std::fs::rename(&tmp_path, &output_path).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    std::fs::rename(&tmp_path, &output_path)
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
     let write_ms = elapsed_ms(write_start);
     let total_ms = elapsed_ms(total_start);
     Ok(NativePoRowGroupIndexBuildStats {
@@ -3154,25 +2549,44 @@ pub async fn build_cottas_native_po_exact_ranges_index(input_path: &Path) -> Res
     })
 }
 
-fn lookup_po_candidate_row_ranges_from_exact_index(data_path: &Path, p_id: u32, o_id: u32) -> Result<Vec<std::ops::Range<u64>>> {
+fn lookup_po_candidate_row_ranges_from_exact_index(
+    data_path: &Path,
+    p_id: u32,
+    o_id: u32,
+) -> Result<Vec<std::ops::Range<u64>>> {
     let path = native_po_exact_ranges_path(data_path);
     let file = std::fs::File::open(&path).map_err(|e| {
-        VortexRdfError::Deserialization(format!("Failed to open native PO exact range index {:?}: {}", path, e))
+        VortexRdfError::Deserialization(format!(
+            "Failed to open native PO exact range index {:?}: {}",
+            path, e
+        ))
     })?;
-    let len = file.metadata().map_err(|e| VortexRdfError::Deserialization(e.to_string()))?.len();
+    let len = file
+        .metadata()
+        .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?
+        .len();
     if len < 16 || (len - 16) % NATIVE_PO_EXACT_RANGE_ENTRY_BYTES != 0 {
-        return Err(VortexRdfError::Deserialization(format!("Malformed PO exact range index {:?}: len={}", path, len)));
+        return Err(VortexRdfError::Deserialization(format!(
+            "Malformed PO exact range index {:?}: len={}",
+            path, len
+        )));
     }
     let mut magic = [0u8; 8];
     read_exact_at_native_sidecar(&file, &mut magic, 0, "PO exact range magic")?;
     if &magic != NATIVE_PO_EXACT_RANGES_MAGIC {
-        return Err(VortexRdfError::Deserialization(format!("Malformed PO exact range index {:?}: bad magic", path)));
+        return Err(VortexRdfError::Deserialization(format!(
+            "Malformed PO exact range index {:?}: bad magic",
+            path
+        )));
     }
     let mut count_buf = [0u8; 8];
     read_exact_at_native_sidecar(&file, &mut count_buf, 8, "PO exact range count")?;
     let count = u64::from_le_bytes(count_buf);
     if 16 + count.saturating_mul(NATIVE_PO_EXACT_RANGE_ENTRY_BYTES) != len {
-        return Err(VortexRdfError::Deserialization(format!("Malformed PO exact range index {:?}: count/len mismatch", path)));
+        return Err(VortexRdfError::Deserialization(format!(
+            "Malformed PO exact range index {:?}: count/len mismatch",
+            path
+        )));
     }
     let needle = native_po_hash(p_id, o_id);
     let mut lo = 0u64;
@@ -3187,169 +2601,21 @@ fn lookup_po_candidate_row_ranges_from_exact_index(data_path: &Path, p_id: u32, 
                 let mut first = mid;
                 while first > 0 {
                     let (prev_hash, _, _) = read_po_exact_range_entry_at(&file, first - 1)?;
-                    if prev_hash != needle { break; }
+                    if prev_hash != needle {
+                        break;
+                    }
                     first -= 1;
                 }
                 let mut ranges = Vec::new();
                 let mut idx = first;
                 while idx < count {
                     let (h, start, end) = read_po_exact_range_entry_at(&file, idx)?;
-                    if h != needle { break; }
+                    if h != needle {
+                        break;
+                    }
                     ranges.push(start..end);
                     idx += 1;
                 }
-                return Ok(ranges);
-            }
-        }
-    }
-    Ok(Vec::new())
-}
-
-fn native_po_hash_index_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path.file_name().and_then(|s| s.to_str()).unwrap_or("data.vortex");
-    data_path.with_file_name(format!("{file_name}.po_hash_ranges.bin"))
-}
-
-fn native_po_hash_index_exists(data_path: &Path) -> bool {
-    native_po_hash_index_path(data_path).is_file()
-}
-
-const NATIVE_PO_HASH_INDEX_MAGIC: &[u8; 8] = b"VRDFPH1\0";
-const NATIVE_PO_HASH_INDEX_ENTRY_BYTES: u64 = 24;
-
-fn write_po_hash_index_entry<W: Write>(writer: &mut W, hash: u64, start: u64, end: u64) -> Result<()> {
-    writer.write_all(&hash.to_le_bytes())
-        .and_then(|_| writer.write_all(&start.to_le_bytes()))
-        .and_then(|_| writer.write_all(&end.to_le_bytes()))
-        .map_err(|e| VortexRdfError::Serialization(e.to_string()))
-}
-
-fn read_po_hash_index_entry_at(file: &std::fs::File, entry_idx: u64) -> Result<(u64, u64, u64)> {
-    let mut buf = [0u8; 24];
-    let offset = 16u64
-        .checked_add(entry_idx.checked_mul(NATIVE_PO_HASH_INDEX_ENTRY_BYTES).ok_or_else(|| {
-            VortexRdfError::Deserialization(format!("PO hash index offset overflow for entry {}", entry_idx))
-        })?)
-        .ok_or_else(|| VortexRdfError::Deserialization("PO hash index offset overflow".to_string()))?;
-    read_exact_at_native_sidecar(file, &mut buf, offset, "PO hash index entry")?;
-    let hash = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let start = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let end = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-    Ok((hash, start, end))
-}
-
-pub async fn build_cottas_native_po_hash_index(input_path: &Path) -> Result<NativePoRowGroupIndexBuildStats> {
-    let total_start = Instant::now();
-    let output_path = native_po_hash_index_path(input_path);
-    let open_start = Instant::now();
-    let file = NATIVE_FILE_SESSION.open_options().open_path(input_path).await.map_err(VortexRdfError::from)?;
-    let open_ms = elapsed_ms(open_start);
-    let scan_start = Instant::now();
-    let mut stream = file.scan().map_err(VortexRdfError::from)?
-        .with_projection(vortex_array::expr::select(["p", "o"].as_slice(), vortex_array::expr::root()))
-        .into_array_stream().map_err(VortexRdfError::from)?;
-    let mut entries: Vec<(u64, u64, u64)> = Vec::new();
-    let mut row_groups = 0usize;
-    let mut rows_scanned = 0u64;
-    while let Some(batch_result) = stream.next().await {
-        let batch = batch_result.map_err(VortexRdfError::from)?;
-        let batch_rows = batch.len();
-        if batch_rows == 0 { continue; }
-        let p_ids = extract_projected_u32_column(&batch, "p")?;
-        let o_ids = extract_projected_u32_column(&batch, "o")?;
-        if p_ids.len() != batch_rows || o_ids.len() != batch_rows {
-            return Err(VortexRdfError::Serialization(format!(
-                "PO hash index saw p/o length mismatch: p={}, o={}, rows={}",
-                p_ids.len(), o_ids.len(), batch_rows
-            )));
-        }
-        let start = rows_scanned;
-        let end = rows_scanned + batch_rows as u64;
-        let mut hashes: Vec<u64> = p_ids.iter().zip(o_ids.iter()).map(|(p, o)| native_po_hash(*p, *o)).collect();
-        hashes.sort_unstable();
-        hashes.dedup();
-        entries.reserve(hashes.len());
-        for hash in hashes {
-            entries.push((hash, start, end));
-        }
-        rows_scanned = end;
-        row_groups += 1;
-    }
-    let scan_ms = elapsed_ms(scan_start);
-    let write_start = Instant::now();
-    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
-    let tmp_path = output_path.with_extension("po_hash_ranges.bin.tmp");
-    let tmp_file = std::fs::File::create(&tmp_path).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    let mut writer = BufWriter::new(tmp_file);
-    writer.write_all(NATIVE_PO_HASH_INDEX_MAGIC).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    writer.write_all(&(entries.len() as u64).to_le_bytes()).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    for (hash, start, end) in &entries {
-        write_po_hash_index_entry(&mut writer, *hash, *start, *end)?;
-    }
-    writer.flush().map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    drop(writer);
-    std::fs::rename(&tmp_path, &output_path).map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    let write_ms = elapsed_ms(write_start);
-    let total_ms = elapsed_ms(total_start);
-    Ok(NativePoRowGroupIndexBuildStats {
-        input_path: input_path.display().to_string(),
-        output_path: output_path.display().to_string(),
-        row_groups,
-        rows_scanned,
-        unique_po_hashes_written: entries.len() as u64,
-        open_ms,
-        scan_ms,
-        write_ms,
-        total_ms,
-    })
-}
-
-fn lookup_po_candidate_row_ranges_from_hash_index(data_path: &Path, p_id: u32, o_id: u32) -> Result<Vec<std::ops::Range<u64>>> {
-    let path = native_po_hash_index_path(data_path);
-    let file = std::fs::File::open(&path).map_err(|e| {
-        VortexRdfError::Deserialization(format!("Failed to open native PO hash index {:?}: {}", path, e))
-    })?;
-    let len = file.metadata().map_err(|e| VortexRdfError::Deserialization(e.to_string()))?.len();
-    if len < 16 || (len - 16) % NATIVE_PO_HASH_INDEX_ENTRY_BYTES != 0 {
-        return Err(VortexRdfError::Deserialization(format!("Malformed PO hash index {:?}: len={}", path, len)));
-    }
-    let mut magic = [0u8; 8];
-    read_exact_at_native_sidecar(&file, &mut magic, 0, "PO hash index magic")?;
-    if &magic != NATIVE_PO_HASH_INDEX_MAGIC {
-        return Err(VortexRdfError::Deserialization(format!("Malformed PO hash index {:?}: bad magic", path)));
-    }
-    let mut count_buf = [0u8; 8];
-    read_exact_at_native_sidecar(&file, &mut count_buf, 8, "PO hash index count")?;
-    let count = u64::from_le_bytes(count_buf);
-    if 16 + count.saturating_mul(NATIVE_PO_HASH_INDEX_ENTRY_BYTES) != len {
-        return Err(VortexRdfError::Deserialization(format!("Malformed PO hash index {:?}: count/len mismatch", path)));
-    }
-    let needle = native_po_hash(p_id, o_id);
-    let mut lo = 0u64;
-    let mut hi = count;
-    while lo < hi {
-        let mid = lo + ((hi - lo) / 2);
-        let (hash, _, _) = read_po_hash_index_entry_at(&file, mid)?;
-        match hash.cmp(&needle) {
-            Ordering::Less => lo = mid + 1,
-            Ordering::Greater => hi = mid,
-            Ordering::Equal => {
-                let mut first = mid;
-                while first > 0 {
-                    let (prev_hash, _, _) = read_po_hash_index_entry_at(&file, first - 1)?;
-                    if prev_hash != needle { break; }
-                    first -= 1;
-                }
-                let mut ranges = Vec::new();
-                let mut idx = first;
-                while idx < count {
-                    let (h, start, end) = read_po_hash_index_entry_at(&file, idx)?;
-                    if h != needle { break; }
-                    ranges.push(start..end);
-                    idx += 1;
-                }
-                ranges.sort_unstable_by(|a, b| a.start.cmp(&b.start).then_with(|| a.end.cmp(&b.end)));
-                ranges.dedup_by(|a, b| a.start == b.start && a.end == b.end);
                 return Ok(ranges);
             }
         }
@@ -3585,20 +2851,6 @@ pub async fn build_cottas_native_subject_range_index(
     })
 }
 
-fn build_term_to_id_lookup_array(pairs: &[(u32, String)]) -> Result<ArrayRef> {
-    let term_array = vortex_array::arrays::VarBinViewArray::from_iter(
-        pairs.iter().map(|(_, term)| Some(term.as_str())),
-        vortex_array::dtype::DType::Utf8(vortex_array::dtype::Nullability::NonNullable),
-    )
-    .into_array();
-
-    let id_array = PrimitiveArray::from_iter(pairs.iter().map(|(id, _)| *id)).into_array();
-
-    StructArray::from_fields(&[("term", term_array), ("id", id_array)])
-        .map_err(VortexRdfError::Vortex)
-        .map(|arr| arr.into_array())
-}
-
 fn extract_first_u32_from_single_column_array(
     array: &ArrayRef,
     column_name: &str,
@@ -3632,636 +2884,16 @@ fn extract_first_u32_from_single_column_array(
     })
 }
 
-fn build_id_to_term_lookup_array(pairs: &[(u32, String)]) -> Result<ArrayRef> {
-    let id_array = PrimitiveArray::from_iter(pairs.iter().map(|(id, _)| *id)).into_array();
-
-    let term_array = vortex_array::arrays::VarBinViewArray::from_iter(
-        pairs.iter().map(|(_, term)| Some(term.as_str())),
-        vortex_array::dtype::DType::Utf8(vortex_array::dtype::Nullability::NonNullable),
-    )
-    .into_array();
-
-    StructArray::from_fields(&[("id", id_array), ("term", term_array)])
-        .map_err(VortexRdfError::Vortex)
-        .map(|arr| arr.into_array())
-}
-fn build_id_to_term_row_lookup_array(terms: &[String]) -> Result<ArrayRef> {
-    let term_array = vortex_array::arrays::VarBinViewArray::from_iter(
-        terms.iter().map(|term| Some(term.as_str())),
-        vortex_array::dtype::DType::Utf8(vortex_array::dtype::Nullability::NonNullable),
-    )
-    .into_array();
-    StructArray::from_fields(&[("term", term_array)])
-        .map_err(VortexRdfError::Vortex)
-        .map(|arr| arr.into_array())
-}
-
-fn merge_id_runs_to_row_lookup_array_stream(
-    run_paths: Vec<PathBuf>,
-    row_group_size: usize,
-) -> Result<impl Stream<Item = VortexResult<ArrayRef>> + Send> {
-    let row_group_size = row_group_size.max(1);
-    Ok(async_stream::try_stream! {
-        let mut readers = Vec::with_capacity(run_paths.len());
-        for path in &run_paths {
-            readers.push(PairRunReader::new(path).map_err(rdf_err_to_vortex_err)?);
-        }
-        let mut heap = BinaryHeap::new();
-        for run_idx in 0..readers.len() {
-            if let Some(pair) = readers[run_idx].read_one().map_err(rdf_err_to_vortex_err)? {
-                heap.push(PairHeapItem { pair, run_idx, order: PairRunOrder::Id });
-            }
-        }
-
-        let mut next_expected_id = 0u32;
-        let mut terms: Vec<String> = Vec::with_capacity(row_group_size);
-        while let Some(item) = heap.pop() {
-            let run_idx = item.run_idx;
-            let pair = item.pair;
-            if pair.id != next_expected_id {
-                Err(rdf_err_to_vortex_err(VortexRdfError::Serialization(format!(
-                    "id_to_term row-lookup Vortex sidecar requires contiguous dictionary IDs: expected {}, saw {}",
-                    next_expected_id, pair.id
-                ))))?;
-            }
-            terms.push(pair.term);
-            next_expected_id = next_expected_id.checked_add(1).ok_or_else(|| {
-                rdf_err_to_vortex_err(VortexRdfError::Serialization(
-                    "u32 dictionary ID overflow while writing id_to_term row-lookup sidecar".to_string(),
-                ))
-            })?;
-            if let Some(next_pair) = readers[run_idx].read_one().map_err(rdf_err_to_vortex_err)? {
-                heap.push(PairHeapItem { pair: next_pair, run_idx, order: PairRunOrder::Id });
-            }
-            if terms.len() >= row_group_size {
-                let array = build_id_to_term_row_lookup_array(&terms).map_err(rdf_err_to_vortex_err)?;
-                terms.clear();
-                yield array;
-            }
-        }
-        if !terms.is_empty() {
-            yield build_id_to_term_row_lookup_array(&terms).map_err(rdf_err_to_vortex_err)?;
-        }
-    })
-}
-
-fn u32_offsets_to_le_bytes(offsets: &[u32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(offsets.len() * 4);
-    for offset in offsets {
-        out.extend_from_slice(&offset.to_le_bytes());
-    }
-    out
-}
-
-fn read_u32_le_from_slice(buf: &[u8], byte_offset: usize, label: &str) -> Result<u32> {
-    let end = byte_offset.checked_add(4).ok_or_else(|| {
-        VortexRdfError::Deserialization(format!("{} byte offset overflow", label))
-    })?;
-    if end > buf.len() {
-        return Err(VortexRdfError::Deserialization(format!(
-            "{} needs bytes {}..{} but buffer length is {}",
-            label,
-            byte_offset,
-            end,
-            buf.len()
-        )));
-    }
-    Ok(u32::from_le_bytes(
-        buf[byte_offset..end].try_into().unwrap(),
-    ))
-}
-
-fn build_id_to_term_block_lookup_array(
-    block_ids: Vec<u32>,
-    first_ids: Vec<u32>,
-    counts: Vec<u32>,
-    offsets_blobs: Vec<Vec<u8>>,
-    term_blobs: Vec<Vec<u8>>,
-) -> Result<ArrayRef> {
-    let block_id_array = PrimitiveArray::from_iter(block_ids).into_array();
-    let first_id_array = PrimitiveArray::from_iter(first_ids).into_array();
-    let count_array = PrimitiveArray::from_iter(counts).into_array();
-    let offsets_array = vortex_array::arrays::VarBinViewArray::from_iter(
-        offsets_blobs.iter().map(|blob| Some(blob.as_slice())),
-        vortex_array::dtype::DType::Binary(vortex_array::dtype::Nullability::NonNullable),
-    )
-    .into_array();
-    let terms_array = vortex_array::arrays::VarBinViewArray::from_iter(
-        term_blobs.iter().map(|blob| Some(blob.as_slice())),
-        vortex_array::dtype::DType::Binary(vortex_array::dtype::Nullability::NonNullable),
-    )
-    .into_array();
-    StructArray::from_fields(&[
-        ("block_id", block_id_array),
-        ("first_id", first_id_array),
-        ("count", count_array),
-        ("offsets", offsets_array),
-        ("terms", terms_array),
-    ])
-    .map_err(VortexRdfError::Vortex)
-    .map(|arr| arr.into_array())
-}
-
-fn merge_id_runs_to_block_lookup_array_stream(
-    run_paths: Vec<PathBuf>,
-    row_group_size: usize,
-    block_size: u32,
-) -> Result<impl Stream<Item = VortexResult<ArrayRef>> + Send> {
-    let row_group_size = row_group_size.max(1);
-    let block_size = block_size.max(1);
-    Ok(async_stream::try_stream! {
-        let mut readers = Vec::with_capacity(run_paths.len());
-        for path in &run_paths { readers.push(PairRunReader::new(path).map_err(rdf_err_to_vortex_err)?); }
-        let mut heap = BinaryHeap::new();
-        for run_idx in 0..readers.len() {
-            if let Some(pair) = readers[run_idx].read_one().map_err(rdf_err_to_vortex_err)? {
-                heap.push(PairHeapItem { pair, run_idx, order: PairRunOrder::Id });
-            }
-        }
-        let mut block_ids: Vec<u32> = Vec::with_capacity(row_group_size);
-        let mut first_ids: Vec<u32> = Vec::with_capacity(row_group_size);
-        let mut counts: Vec<u32> = Vec::with_capacity(row_group_size);
-        let mut offsets_blobs: Vec<Vec<u8>> = Vec::with_capacity(row_group_size);
-        let mut term_blobs: Vec<Vec<u8>> = Vec::with_capacity(row_group_size);
-        let mut current_block_id: Option<u32> = None;
-        let mut current_first_id: u32 = 0;
-        let mut current_count: u32 = 0;
-        let mut current_offsets: Vec<u32> = vec![0];
-        let mut current_terms: Vec<u8> = Vec::new();
-        let mut next_expected_id = 0u32;
-        macro_rules! flush_current_block { () => {{
-            if let Some(block_id) = current_block_id.take() {
-                block_ids.push(block_id);
-                first_ids.push(current_first_id);
-                counts.push(current_count);
-                offsets_blobs.push(u32_offsets_to_le_bytes(&current_offsets));
-                term_blobs.push(std::mem::take(&mut current_terms));
-                current_offsets.clear(); current_offsets.push(0); current_count = 0;
-            }
-        }}; }
-        while let Some(item) = heap.pop() {
-            let run_idx = item.run_idx;
-            let pair = item.pair;
-            if pair.id != next_expected_id {
-                Err(rdf_err_to_vortex_err(VortexRdfError::Serialization(format!("id_to_term block-lookup Vortex sidecar requires contiguous dictionary IDs: expected {}, saw {}", next_expected_id, pair.id))))?;
-            }
-            let block_id = pair.id / block_size;
-            if current_block_id != Some(block_id) { flush_current_block!(); current_block_id = Some(block_id); current_first_id = pair.id; }
-            current_terms.extend_from_slice(pair.term.as_bytes());
-            let next_offset = u32::try_from(current_terms.len()).map_err(|_| rdf_err_to_vortex_err(VortexRdfError::Serialization(format!("id_to_term block {} UTF-8 payload exceeded u32::MAX bytes; decrease VORTEX_RDF_ID_TO_TERM_BLOCK_SIZE", block_id))))?;
-            current_offsets.push(next_offset);
-            current_count = current_count.checked_add(1).ok_or_else(|| rdf_err_to_vortex_err(VortexRdfError::Serialization("id_to_term block count overflowed u32".to_string())))?;
-            next_expected_id = next_expected_id.checked_add(1).ok_or_else(|| rdf_err_to_vortex_err(VortexRdfError::Serialization("u32 dictionary ID overflow while writing id_to_term block-lookup sidecar".to_string())))?;
-            if let Some(next_pair) = readers[run_idx].read_one().map_err(rdf_err_to_vortex_err)? { heap.push(PairHeapItem { pair: next_pair, run_idx, order: PairRunOrder::Id }); }
-            if block_ids.len() >= row_group_size {
-                let array = build_id_to_term_block_lookup_array(std::mem::take(&mut block_ids), std::mem::take(&mut first_ids), std::mem::take(&mut counts), std::mem::take(&mut offsets_blobs), std::mem::take(&mut term_blobs)).map_err(rdf_err_to_vortex_err)?;
-                block_ids = Vec::with_capacity(row_group_size); first_ids = Vec::with_capacity(row_group_size); counts = Vec::with_capacity(row_group_size); offsets_blobs = Vec::with_capacity(row_group_size); term_blobs = Vec::with_capacity(row_group_size);
-                yield array;
-            }
-        }
-        flush_current_block!();
-        if !block_ids.is_empty() { yield build_id_to_term_block_lookup_array(block_ids, first_ids, counts, offsets_blobs, term_blobs).map_err(rdf_err_to_vortex_err)?; }
-    })
-}
-
-async fn write_id_to_term_vortex_block_lookup_sidecar_from_id_runs(
-    id_run_paths: &[PathBuf],
-    data_path: &Path,
-    row_group_size: usize,
-) -> Result<()> {
-    let write_start = Instant::now();
-    let path = native_dict_id_to_term_block_lookup_path(data_path);
-    let block_size = native_id_to_term_block_size();
-    let mut file = tokio::fs::File::create(&path)
-        .await
-        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    let dtype = build_id_to_term_block_lookup_array(
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-    )?
-    .dtype()
-    .clone();
-    let block_row_group_size = native_id_to_term_block_row_group_size();
-    let arrays = merge_id_runs_to_block_lookup_array_stream(
-        id_run_paths.to_vec(),
-        block_row_group_size,
-        block_size,
-    )?;
-    let stream = ArrayStreamAdapter::new(dtype, Box::pin(arrays));
-    let write_opts = NATIVE_FILE_SESSION.write_options().with_strategy(
-        WriteStrategyBuilder::default()
-            .with_row_block_size(block_row_group_size.max(1))
-            .build(),
-    );
-    write_opts
-        .write(&mut file, stream)
-        .await
-        .map_err(VortexRdfError::from)?;
-    log::info!(
-        "[cottas_native_ids] wrote Vortex id_to_term block-lookup sidecar {:?} with block_size={} in {:?}",
-        path,
-        block_size,
-        write_start.elapsed()
-    );
-    Ok(())
-}
-
-fn extract_single_block_lookup_row(
-    array: &ArrayRef,
-) -> Result<Option<(u32, u32, u32, Vec<u8>, Vec<u8>)>> {
-    if array.len() == 0 {
-        return Ok(None);
-    }
-    let mut ctx = NATIVE_FILE_SESSION.create_execution_ctx();
-    let struct_array = array
-        .clone()
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let block_id_col = struct_array
-        .unmasked_field_by_name("block_id")
-        .map_err(VortexRdfError::Vortex)?
-        .clone()
-        .execute::<PrimitiveArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let first_id_col = struct_array
-        .unmasked_field_by_name("first_id")
-        .map_err(VortexRdfError::Vortex)?
-        .clone()
-        .execute::<PrimitiveArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let count_col = struct_array
-        .unmasked_field_by_name("count")
-        .map_err(VortexRdfError::Vortex)?
-        .clone()
-        .execute::<PrimitiveArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let offsets_col = struct_array
-        .unmasked_field_by_name("offsets")
-        .map_err(VortexRdfError::Vortex)?
-        .clone()
-        .execute::<VarBinViewArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let terms_col = struct_array
-        .unmasked_field_by_name("terms")
-        .map_err(VortexRdfError::Vortex)?
-        .clone()
-        .execute::<VarBinViewArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let block_ids = block_id_col.as_slice::<u32>();
-    let first_ids = first_id_col.as_slice::<u32>();
-    let counts = count_col.as_slice::<u32>();
-    Ok(Some((
-        block_ids[0],
-        first_ids[0],
-        counts[0],
-        offsets_col.bytes_at(0).as_ref().to_vec(),
-        terms_col.bytes_at(0).as_ref().to_vec(),
-    )))
-}
-
-async fn lookup_terms_by_ids_from_vortex_block_lookup_with_stats(
-    data_path: &Path,
-    ids: &[u32],
-) -> Result<(HashMap<u32, String>, NativeIdToTermLookupStats)> {
-    let lookup_start = Instant::now();
-    let mut stats = NativeIdToTermLookupStats::default();
-    stats.strategy = "vortex-block-dict".to_string();
-    stats.requested_ids_in = ids.len();
-    if ids.is_empty() {
-        stats.total_ms = elapsed_ms(lookup_start);
-        return Ok((HashMap::new(), stats));
-    }
-    let sort_start = Instant::now();
-    let mut requested: Vec<u32> = ids.to_vec();
-    requested.sort_unstable();
-    requested.dedup();
-    stats.sort_dedup_ms = elapsed_ms(sort_start);
-    stats.requested_ids_unique = requested.len();
-    let block_size = native_id_to_term_block_size();
-    let mut ids_by_block: HashMap<u32, Vec<u32>> = HashMap::new();
-    for id in requested.iter().copied() {
-        ids_by_block.entry(id / block_size).or_default().push(id);
-    }
-    let mut block_ids: Vec<u32> = ids_by_block.keys().copied().collect();
-    block_ids.sort_unstable();
-    let path = native_dict_id_to_term_block_lookup_path(data_path);
-    let open_start = Instant::now();
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
-    stats.open_files_ms = elapsed_ms(open_start);
-    let mut out = HashMap::with_capacity(requested.len());
-    for block_id in block_ids {
-        let Some(ids_in_block) = ids_by_block.get(&block_id) else {
-            continue;
-        };
-        let read_start = Instant::now();
-        let rows = file
-            .scan()
-            .map_err(VortexRdfError::from)?
-            .with_row_range(block_id as u64..block_id as u64 + 1)
-            .with_projection(vortex_array::expr::select(
-                ["block_id", "first_id", "count", "offsets", "terms"].as_slice(),
-                vortex_array::expr::root(),
-            ))
-            .into_array_stream()
-            .map_err(VortexRdfError::from)?
-            .read_all()
-            .await
-            .map_err(VortexRdfError::from)?;
-        stats.blob_read_ms += elapsed_ms(read_start);
-        stats.blob_reads += 1;
-        let Some((actual_block_id, first_id, count, offsets_blob, terms_blob)) =
-            extract_single_block_lookup_row(&rows)?
-        else {
-            continue;
-        };
-        if actual_block_id != block_id {
-            return Err(VortexRdfError::Deserialization(format!(
-                "Vortex block dictionary row-range mismatch: requested block {}, read block {}",
-                block_id, actual_block_id
-            )));
-        }
-        let expected_offsets_len = (count as usize + 1).checked_mul(4).ok_or_else(|| {
-            VortexRdfError::Deserialization(format!(
-                "offset length overflow for block {}",
-                block_id
-            ))
-        })?;
-        if offsets_blob.len() != expected_offsets_len {
-            return Err(VortexRdfError::Deserialization(format!(
-                "Malformed block dictionary offsets for block {}: got {} bytes, expected {}",
-                block_id,
-                offsets_blob.len(),
-                expected_offsets_len
-            )));
-        }
-        stats.offset_reads += 1;
-        stats.offset_bytes_read += offsets_blob.len();
-        for id in ids_in_block.iter().copied() {
-            if id < first_id || id >= first_id.saturating_add(count) {
-                continue;
-            }
-            let local = (id - first_id) as usize;
-            let start =
-                read_u32_le_from_slice(&offsets_blob, local * 4, "block dictionary term start")?
-                    as usize;
-            let end = read_u32_le_from_slice(
-                &offsets_blob,
-                (local + 1) * 4,
-                "block dictionary term end",
-            )? as usize;
-            if start > end || end > terms_blob.len() {
-                return Err(VortexRdfError::Deserialization(format!(
-                    "Invalid block dictionary term range for id {} in block {}: {}..{} of {}",
-                    id,
-                    block_id,
-                    start,
-                    end,
-                    terms_blob.len()
-                )));
-            }
-            let utf8_start = Instant::now();
-            let term = String::from_utf8(terms_blob[start..end].to_vec()).map_err(|e| {
-                VortexRdfError::Deserialization(format!(
-                    "Dictionary term for ID {} is not valid UTF-8 in Vortex block dictionary: {}",
-                    id, e
-                ))
-            })?;
-            stats.utf8_decode_ms += elapsed_ms(utf8_start);
-            stats.blob_bytes_read += end - start;
-            let insert_start = Instant::now();
-            out.insert(id, term);
-            stats.hashmap_insert_ms += elapsed_ms(insert_start);
-        }
-    }
-    stats.ids_loaded = out.len();
-    stats.total_ms = elapsed_ms(lookup_start);
-    log::debug!(
-        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] Vortex block dictionary resolved {} / {} ids in {:.3}ms; blocks_read={}, block_size={}, open_files_ms={:.3}, read_ms={:.3}, offset_bytes={}, term_bytes={}",
-        out.len(),
-        requested.len(),
-        stats.total_ms,
-        stats.blob_reads,
-        block_size,
-        stats.open_files_ms,
-        stats.blob_read_ms,
-        stats.offset_bytes_read,
-        stats.blob_bytes_read
-    );
-    Ok((out, stats))
-}
-
-async fn write_id_to_term_vortex_row_lookup_sidecar_from_id_runs(
-    id_run_paths: &[PathBuf],
-    data_path: &Path,
-    row_group_size: usize,
-) -> Result<()> {
-    let write_start = Instant::now();
-    let path = native_dict_id_to_term_row_lookup_path(data_path);
-    let mut file = tokio::fs::File::create(&path)
-        .await
-        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    let dtype = build_id_to_term_row_lookup_array(&[])?.dtype().clone();
-    let arrays = merge_id_runs_to_row_lookup_array_stream(id_run_paths.to_vec(), row_group_size)?;
-    let stream = ArrayStreamAdapter::new(dtype, Box::pin(arrays));
-    let write_opts = NATIVE_FILE_SESSION.write_options().with_strategy(
-        WriteStrategyBuilder::default()
-            .with_row_block_size(row_group_size.max(1))
-            .build(),
-    );
-    write_opts
-        .write(&mut file, stream)
-        .await
-        .map_err(VortexRdfError::from)?;
-    log::info!(
-        "[cottas_native_ids] wrote Vortex id_to_term row-lookup sidecar {:?} in {:?}",
-        path,
-        write_start.elapsed()
-    );
-    Ok(())
-}
-
-fn extract_first_term_from_row_lookup_array(array: &ArrayRef) -> Result<Option<String>> {
-    if array.len() == 0 {
-        return Ok(None);
-    }
-    let mut ctx = NATIVE_FILE_SESSION.create_execution_ctx();
-    let struct_array = array
-        .clone()
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let term_col = struct_array
-        .unmasked_field_by_name("term")
-        .map_err(VortexRdfError::Vortex)?
-        .clone()
-        .execute::<VarBinViewArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let raw = term_col.bytes_at(0);
-    String::from_utf8(raw.as_ref().to_vec())
-        .map(Some)
-        .map_err(|e| {
-            VortexRdfError::Deserialization(format!(
-                "Dictionary term in Vortex row-lookup sidecar is not valid UTF-8: {}",
-                e
-            ))
-        })
-}
-
-async fn lookup_terms_by_ids_from_vortex_row_lookup_with_stats(
-    data_path: &Path,
-    ids: &[u32],
-) -> Result<(HashMap<u32, String>, NativeIdToTermLookupStats)> {
-    let lookup_start = Instant::now();
-    let mut stats = NativeIdToTermLookupStats::default();
-    stats.strategy = "vortex-row-range".to_string();
-    stats.requested_ids_in = ids.len();
-    if ids.is_empty() {
-        stats.total_ms = elapsed_ms(lookup_start);
-        return Ok((HashMap::new(), stats));
-    }
-
-    let sort_start = Instant::now();
-    let mut requested: Vec<u32> = ids.to_vec();
-    requested.sort_unstable();
-    requested.dedup();
-    stats.sort_dedup_ms = elapsed_ms(sort_start);
-    stats.requested_ids_unique = requested.len();
-
-    let path = native_dict_id_to_term_row_lookup_path(data_path);
-    let open_start = Instant::now();
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
-    stats.open_files_ms = elapsed_ms(open_start);
-
-    let mut out = HashMap::with_capacity(requested.len());
-    for id in requested.iter().copied() {
-        let read_start = Instant::now();
-        let rows = file
-            .scan()
-            .map_err(VortexRdfError::from)?
-            .with_row_range(id as u64..id as u64 + 1)
-            .with_projection(vortex_array::expr::select(
-                ["term"].as_slice(),
-                vortex_array::expr::root(),
-            ))
-            .into_array_stream()
-            .map_err(VortexRdfError::from)?
-            .read_all()
-            .await
-            .map_err(VortexRdfError::from)?;
-        stats.blob_read_ms += elapsed_ms(read_start);
-        stats.blob_reads += 1;
-        if let Some(term) = extract_first_term_from_row_lookup_array(&rows)? {
-            stats.blob_bytes_read += term.as_bytes().len();
-            out.insert(id, term);
-        }
-    }
-    stats.ids_loaded = out.len();
-    stats.total_ms = elapsed_ms(lookup_start);
-    log::debug!(
-        "[cottas_native_ids::lookup_terms_by_ids_from_sidecar] Vortex row-range resolved {} / {} ids in {:.3}ms; open_files_ms={:.3}, sort_dedup_ms={:.3}, row_range_read_ms={:.3}, row_range_reads={}",
-        out.len(),
-        requested.len(),
-        stats.total_ms,
-        stats.open_files_ms,
-        stats.sort_dedup_ms,
-        stats.blob_read_ms,
-        stats.blob_reads,
-    );
-    Ok((out, stats))
-}
-
 async fn write_dictionary_lookup_sidecars_from_pair_runs(
     pair_run_paths: &PairRunPaths,
     data_path: &Path,
     row_group_size: usize,
 ) -> Result<()> {
-    let write_legacy_vortex_dicts = std::env::var("VORTEX_RDF_WRITE_LEGACY_DICT_VORTEX")
-        .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false);
-
-    if write_legacy_vortex_dicts {
-        let term_to_id_path = native_dict_term_to_id_path(data_path);
-        let id_to_term_path = native_dict_id_to_term_path(data_path);
-        let mut term_to_id_file = tokio::fs::File::create(&term_to_id_path)
-            .await
-            .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-        write_pair_runs_as_lookup_sidecar(
-            &mut term_to_id_file,
-            pair_run_paths.term_run_paths.clone(),
-            PairRunOrder::Term,
-            LookupSidecarKind::TermToId,
-            row_group_size,
-        )
-        .await?;
-        let mut id_to_term_file = tokio::fs::File::create(&id_to_term_path)
-            .await
-            .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-        write_pair_runs_as_lookup_sidecar(
-            &mut id_to_term_file,
-            pair_run_paths.id_run_paths.clone(),
-            PairRunOrder::Id,
-            LookupSidecarKind::IdToTerm,
-            row_group_size,
-        )
-        .await?;
-        log::info!(
-            "[cottas_native_ids] wrote legacy Vortex dictionary sidecars {:?} and {:?}",
-            term_to_id_path,
-            id_to_term_path
-        );
-    } else {
-        log::info!(
-            "[cottas_native_ids] skipped legacy Vortex dictionary sidecars; set VORTEX_RDF_WRITE_LEGACY_DICT_VORTEX=1 to write them"
-        );
-    }
-
-    let write_block_lookup = std::env::var("VORTEX_RDF_WRITE_BLOCK_DICT_VORTEX")
-        .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false);
-    if write_block_lookup {
-        write_id_to_term_vortex_block_lookup_sidecar_from_id_runs(
-            &pair_run_paths.id_run_paths,
-            data_path,
-            row_group_size,
-        )
-        .await?;
-    } else {
-        log::info!(
-            "[cottas_native_ids] skipped experimental Vortex block-lookup id_to_term sidecar; set VORTEX_RDF_WRITE_BLOCK_DICT_VORTEX=1 to write it"
-        );
-    }
-    let write_row_lookup = std::env::var("VORTEX_RDF_WRITE_ROW_LOOKUP_DICT_VORTEX")
-        .ok()
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false);
-    if write_row_lookup {
-        write_id_to_term_vortex_row_lookup_sidecar_from_id_runs(
-            &pair_run_paths.id_run_paths,
-            data_path,
-            row_group_size,
-        )
-        .await?;
-    } else {
-        log::info!(
-            "[cottas_native_ids] skipped naive Vortex row-lookup id_to_term sidecar; set VORTEX_RDF_WRITE_ROW_LOOKUP_DICT_VORTEX=1 to write it"
-        );
-    }
+    let _ = row_group_size; // retained in the signature until config cleanup is propagated
     write_id_to_term_binary_sidecar_from_id_runs(&pair_run_paths.id_run_paths, data_path)?;
     write_term_to_id_binary_sidecar_from_term_runs(&pair_run_paths.term_run_paths, data_path)?;
     log::info!(
-        "[cottas_native_ids] wrote binary dictionary sidecars {:?}, {:?}, {:?}, {:?}; experimental Vortex dict sidecars are opt-in",
+        "[cottas_native_ids] wrote production dictionary sidecars {:?}, {:?}, {:?}, {:?}",
         native_dict_id_to_term_offsets_path(data_path),
         native_dict_id_to_term_blob_path(data_path),
         native_dict_term_to_id_entries_path(data_path),
@@ -4270,11 +2902,6 @@ async fn write_dictionary_lookup_sidecars_from_pair_runs(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug)]
-enum LookupSidecarKind {
-    TermToId,
-    IdToTerm,
-}
 fn write_id_to_term_binary_sidecar_from_id_runs(
     id_run_paths: &[PathBuf],
     data_path: &Path,
@@ -4379,121 +3006,6 @@ fn write_id_to_term_binary_sidecar_from_id_runs(
     );
 
     Ok(())
-}
-
-async fn write_pair_runs_as_lookup_sidecar<W>(
-    writer: &mut W,
-    run_paths: Vec<PathBuf>,
-    order: PairRunOrder,
-    kind: LookupSidecarKind,
-    row_group_size: usize,
-) -> Result<()>
-where
-    W: VortexWrite + Unpin + Send,
-{
-    let row_group_size = row_group_size.max(1);
-
-    let dtype = match kind {
-        LookupSidecarKind::TermToId => build_term_to_id_lookup_array(&[])?.dtype().clone(),
-        LookupSidecarKind::IdToTerm => build_id_to_term_lookup_array(&[])?.dtype().clone(),
-    };
-
-    let array_stream =
-        merge_pair_runs_to_lookup_array_stream(run_paths, order, kind, row_group_size)?;
-
-    let stream = ArrayStreamAdapter::new(dtype, Box::pin(array_stream));
-
-    let write_opts = NATIVE_FILE_SESSION.write_options().with_strategy(
-        WriteStrategyBuilder::default()
-            .with_row_block_size(row_group_size)
-            .build(),
-    );
-
-    write_opts
-        .write(writer, stream)
-        .await
-        .map_err(VortexRdfError::from)?;
-
-    Ok(())
-}
-fn merge_pair_runs_to_lookup_array_stream(
-    run_paths: Vec<PathBuf>,
-    order: PairRunOrder,
-    kind: LookupSidecarKind,
-    row_group_size: usize,
-) -> Result<impl Stream<Item = VortexResult<ArrayRef>> + Send> {
-    let row_group_size = row_group_size.max(1);
-
-    Ok(async_stream::try_stream! {
-        let mut readers = Vec::with_capacity(run_paths.len());
-
-        for path in &run_paths {
-            readers.push(PairRunReader::new(path).map_err(rdf_err_to_vortex_err)?);
-        }
-
-        let mut heap = BinaryHeap::new();
-
-        for run_idx in 0..readers.len() {
-            if let Some(pair) = readers[run_idx]
-                .read_one()
-                .map_err(rdf_err_to_vortex_err)?
-            {
-                heap.push(PairHeapItem {
-                    pair,
-                    run_idx,
-                    order,
-                });
-            }
-        }
-
-        let mut chunk: Vec<NativeDictPair> = Vec::with_capacity(row_group_size);
-
-        while let Some(item) = heap.pop() {
-            let run_idx = item.run_idx;
-            chunk.push(item.pair);
-
-            if let Some(next_pair) = readers[run_idx]
-                .read_one()
-                .map_err(rdf_err_to_vortex_err)?
-            {
-                heap.push(PairHeapItem {
-                    pair: next_pair,
-                    run_idx,
-                    order,
-                });
-            }
-
-            if chunk.len() >= row_group_size {
-                let array = build_lookup_array_from_pairs(&chunk, kind)
-                    .map_err(rdf_err_to_vortex_err)?;
-                chunk.clear();
-                yield array;
-            }
-        }
-
-        if !chunk.is_empty() {
-            yield build_lookup_array_from_pairs(&chunk, kind)
-                .map_err(rdf_err_to_vortex_err)?;
-        }
-    })
-}
-fn build_lookup_array_from_pairs(
-    pairs: &[NativeDictPair],
-    kind: LookupSidecarKind,
-) -> Result<ArrayRef> {
-    match kind {
-        LookupSidecarKind::TermToId => {
-            let temp: Vec<(u32, String)> = pairs.iter().map(|p| (p.id, p.term.clone())).collect();
-
-            build_term_to_id_lookup_array(&temp)
-        }
-
-        LookupSidecarKind::IdToTerm => {
-            let temp: Vec<(u32, String)> = pairs.iter().map(|p| (p.id, p.term.clone())).collect();
-
-            build_id_to_term_lookup_array(&temp)
-        }
-    }
 }
 
 fn first_bound_native_id_column(

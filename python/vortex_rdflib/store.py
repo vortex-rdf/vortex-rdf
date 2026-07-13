@@ -6,7 +6,7 @@ from rdflib.term import Node
 from rdflib.store import Store, NO_STORE, VALID_STORE
 from rdflib.util import from_n3
 
-from .vortex_rdf_native import match_triples, count_triples
+from .vortex_rdf_native import match_triples, count_triples, diagnose_match
 
 
 def _term_debug(t):
@@ -144,6 +144,33 @@ class VortexStore(Store):
                 self._from_n3_safe(pp),
                 self._from_n3_safe(oo),
             ), None
+
+    def diagnose_triples(self, triple_pattern):
+        """Return timings plus raw/unique rows for one native-ID triple pattern."""
+        if self.path is None:
+            raise ValueError("Store has no path")
+        s, p, o = triple_pattern
+        started_ns = __import__("time").perf_counter_ns()
+        result = dict(diagnose_match(
+            self.path,
+            self._node_to_n3(s),
+            self._node_to_n3(p),
+            self._node_to_n3(o),
+            self.layout,
+        ))
+        returned_ns = __import__("time").perf_counter_ns()
+
+        raw_rows = [tuple(row) for row in result.pop("legacy_rows_data")]
+        unique_rows = set(raw_rows)
+        result["python_call_ms"] = (returned_ns - started_ns) / 1_000_000
+        result["python_wrapper_ms"] = max(
+            0.0, result["python_call_ms"] - result["legacy_native_ms"]
+                 - result["optimized_binding_ms"]
+        )
+        result["legacy_unique_rows"] = len(unique_rows)
+        result["legacy_duplicate_rows"] = len(raw_rows) - len(unique_rows)
+        result["legacy_sample"] = raw_rows[:10]
+        return result
 
     def __len__(self, context=None):
         if self.path is None:
