@@ -10,7 +10,7 @@ use vortex_array::arrays::{
 };
 use vortex_array::dtype::DType;
 use vortex_array::validity::Validity;
-use vortex_array::{ArrayRef, IntoArray, LEGACY_SESSION, VortexSessionExecute};
+use vortex_array::{ArrayRef, IntoArray, legacy_session, VortexSessionExecute};
 
 /// The supported Vortex-RDF dictionary/indexing strategies.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
@@ -109,7 +109,7 @@ pub fn array_as_dict_column(array: ArrayRef, n: usize) -> Result<ArrayRef> {
 /// Extracts the underlying array stored using the zero-copy `array_as_dict_column` wrapper.
 /// Supports both flat `DictArray` columns and multi-chunked columns (`ChunkedArray`) safely.
 pub fn array_from_dict_column(array: &ArrayRef) -> Result<ArrayRef> {
-    let mut ctx = LEGACY_SESSION.create_execution_ctx();
+    let mut ctx = legacy_session().create_execution_ctx();
 
     // 1. Resolve chunked columns by targeting the first chunk.
     let target_array = if array.encoding_id().as_ref() == "vortex.chunked" {

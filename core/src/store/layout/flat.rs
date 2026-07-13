@@ -7,7 +7,7 @@ use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use std::sync::Arc;
 use vortex::VortexSessionDefault;
 use vortex::session::VortexSession;
-use vortex_array::LEGACY_SESSION;
+use vortex_array::legacy_session;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{ChunkedArray, ConstantArray, PrimitiveArray, StructArray};
 use vortex_array::builtins::ArrayBuiltins;
@@ -42,7 +42,7 @@ fn build_spog_primitive_struct_array(
 }
 
 fn extract_spog_field_refs(quads: &ArrayRef) -> Result<(ArrayRef, ArrayRef, ArrayRef, ArrayRef)> {
-    let mut ctx = LEGACY_SESSION.create_execution_ctx();
+    let mut ctx = legacy_session().create_execution_ctx();
 
     let quads_struct = quads
         .clone()
@@ -415,7 +415,7 @@ where
     }
 
     fn compact_quads(quads: &ArrayRef) -> Result<ArrayRef> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = legacy_session().create_execution_ctx();
 
         let quads_struct = quads
             .clone()

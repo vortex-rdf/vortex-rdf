@@ -9,9 +9,7 @@ use vortex_session::VortexSession;
 
 use vortex_array::{ArrayRef, ExecutionCtx};
 use vortex_array::arrays::{PrimitiveArray, StructArray, VarBinViewArray};
-use vortex_array::builders::{ArrayBuilder, PrimitiveBuilder, VarBinViewBuilder};
-use vortex_array::dtype::Nullability;
-use vortex_array::{IntoArray, LEGACY_SESSION, VortexSessionExecute};
+use vortex_array::{IntoArray, legacy_session, VortexSessionExecute};
 use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_fsst::{fsst_compress, fsst_train_compressor};
 
@@ -139,21 +137,19 @@ impl RdfDictionary for ChainedHash {
         let new_row_id = self.values.len() as i32;
 
         // Build new values array by appending.
-        let mut values_builder = VarBinViewBuilder::with_capacity(
-            values_varbin.dtype().clone(),
-            values_varbin.len() + 1,
-        );
-        values_builder.extend_from_array(&self.values);
-        values_builder.append_value(term_str.as_bytes());
-        self.values = values_builder.finish_into_varbinview().into_array();
+        let mut values: Vec<String> = (0..values_varbin.len())
+            .map(|i| {
+                String::from_utf8_lossy(values_varbin.bytes_at(i).as_ref()).into_owned()
+            })
+            .collect();
+        values.push(term_str.to_owned());
+        self.values = VarBinViewArray::from_iter_str::<String, _>(values).into_array();
 
         // Update next array - append old_head using builder.
         let old_head = buckets_slice[h];
-        let mut next_builder =
-            PrimitiveBuilder::<i32>::with_capacity(Nullability::NonNullable, next_slice.len() + 1);
-        next_builder.extend_from_array(&self.next);
-        next_builder.append_value(old_head);
-        self.next = next_builder.finish().into_array();
+        let mut next = next_slice.to_vec();
+        next.push(old_head);
+        self.next = PrimitiveArray::from_iter(next).into_array();
 
         // Update buckets array - modify bucket[h].
         let mut buckets_vec = buckets_slice.to_vec();
@@ -235,31 +231,24 @@ impl RdfDictionary for ChainedHash {
         }
 
         // Bulk-insert new terms using builders
-        let mut values_builder = VarBinViewBuilder::with_capacity(
-            values_varbin.dtype().clone(),
-            values_varbin.len() + new_terms.len(),
-        );
-        values_builder.extend_from_array(&self.values);
-        for &term in &new_terms {
-            values_builder.append_value(term.as_bytes());
-        }
-        self.values = values_builder.finish_into_varbinview().into_array();
-
-        let mut next_builder = PrimitiveBuilder::<i32>::with_capacity(
-            Nullability::NonNullable,
-            next_slice.len() + new_terms.len(),
-        );
-        next_builder.extend_from_array(&self.next);
+        let mut values: Vec<String> = (0..values_varbin.len())
+            .map(|i| {
+                String::from_utf8_lossy(values_varbin.bytes_at(i).as_ref()).into_owned()
+            })
+            .collect();
+        values.extend(new_terms.iter().map(|term| (*term).to_owned()));
+        self.values = VarBinViewArray::from_iter_str::<String, _>(values).into_array();
+        let mut next = next_slice.to_vec();
 
         let mut buckets_vec = buckets_slice.to_vec();
         for (i, &h) in new_term_hashes.iter().enumerate() {
             let new_id = last_known_id + i as u32;
             let old_head = buckets_vec[h];
-            next_builder.append_value(old_head);
+            next.push(old_head);
             buckets_vec[h] = new_id as i32;
         }
 
-        self.next = next_builder.finish().into_array();
+        self.next = PrimitiveArray::from_iter(next).into_array();
         self.buckets = PrimitiveArray::from_iter(buckets_vec).into_array();
 
         ids
@@ -267,7 +256,7 @@ impl RdfDictionary for ChainedHash {
 
     fn get_id(&self, term_str: &str) -> Option<u32> {
         let h = Self::hash(term_str);
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = legacy_session().create_execution_ctx();
         let buckets_prim = self
             .buckets
             .clone()
@@ -335,7 +324,7 @@ impl RdfDictionary for ChainedHash {
     }
 
     fn values_view(&self) -> Result<VarBinViewArray> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = legacy_session().create_execution_ctx();
         self.values
             .clone()
             .execute::<VarBinViewArray>(&mut ctx)
@@ -359,7 +348,7 @@ impl RdfDictionary for ChainedHash {
     }
 
     fn to_vortex_array(&self) -> Result<Vec<(String, ArrayRef)>> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = legacy_session().create_execution_ctx();
         let dict_raw = self
             .values
             .clone()

@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use vortex::VortexSessionDefault;
 use vortex::session::VortexSession;
-use vortex_array::LEGACY_SESSION;
+use vortex_array::legacy_session;
 use vortex_array::arrays::{StructArray, VarBinViewArray};
 use vortex_array::dtype::{DType, Nullability};
 use vortex_array::{ArrayRef, ExecutionCtx};
@@ -36,7 +36,7 @@ impl RdfDictionary for SimpleDictionary {
     /// Deserializes the dictionary mappings directly from a Vortex StructArray.
     fn from_vortex_array(array_ref: &ArrayRef) -> Result<Self> {
         let start = Instant::now();
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = legacy_session().create_execution_ctx();
         let struct_array = array_ref
             .clone()
             .execute::<StructArray>(&mut ctx)

@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 description.workspace = true
 
+
 [lib]
 name = "vortex_rdf_native"
 crate-type = ["cdylib"]
@@ -15,3 +16,4 @@ crate-type = ["cdylib"]
 vortex-rdf-core = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 pyo3 = { workspace = true, features = ["extension-module"] }
+oxrdfio.workspace = true

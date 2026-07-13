@@ -23,7 +23,7 @@ use vortex_array::expr::{Expression, and, eq, get_item, lit, root, select};
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::stream::ArrayStreamExt;
-use vortex_array::{ArrayRef, IntoArray, LEGACY_SESSION, VortexSessionExecute};
+use vortex_array::{ArrayRef, IntoArray, legacy_session, VortexSessionExecute};
 
 /// Unified VortexRdfStore that works with any RdfDictionary implementation.
 /// Implements zero-copy, highly compressed, and scan-optimized RDF storage.
@@ -73,7 +73,7 @@ impl<Dict: RdfDictionary, Layout: RdfQuadLayout<Dict>> VortexRdfStore<Dict, Layo
 
     /// Load from a flat N-row Vortex struct array.
     pub fn new(vortex_array: ArrayRef) -> Result<Self> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = legacy_session().create_execution_ctx();
         let vortex_struct = vortex_array
             .clone()
             .execute::<StructArray>(&mut ctx)
@@ -302,7 +302,7 @@ impl<Dict: RdfDictionary, Layout: RdfQuadLayout<Dict>> VortexRdfStore<Dict, Layo
         object: Option<&Term>,
         graph: Option<&GraphName>,
     ) -> Result<Option<ArrayRef>> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = legacy_session().create_execution_ctx();
         let quads_struct = self
             .get_quads_array()?
             .execute::<StructArray>(&mut ctx)
@@ -404,7 +404,7 @@ impl<Dict: RdfDictionary, Layout: RdfQuadLayout<Dict>> VortexRdfStore<Dict, Layo
                 let mask = self.find_mask(subject, predicate, object, graph)?;
                 if let Some(m) = mask {
                     let quads_arr = self.get_quads_array()?;
-                    let mut ctx = LEGACY_SESSION.create_execution_ctx();
+                    let mut ctx = legacy_session().create_execution_ctx();
                     let bool_arr = m
                         .execute::<BoolArray>(&mut ctx)
                         .map_err(VortexRdfError::Vortex)?;
@@ -439,7 +439,7 @@ impl<Dict: RdfDictionary, Layout: RdfQuadLayout<Dict>> VortexRdfStore<Dict, Layo
                     if subject.is_none() && object.is_some() {
                         let obj = object.unwrap();
                         if let Some(o_id) = self.dictionary.get_id(&obj.to_string()) {
-                            let mut ctx = LEGACY_SESSION.create_execution_ctx();
+                            let mut ctx = legacy_session().create_execution_ctx();
 
                             // 1. Scan sorted _idx_o_val to get matching _idx_o_rid
                             let scan = file
@@ -541,7 +541,7 @@ impl<Dict: RdfDictionary, Layout: RdfQuadLayout<Dict>> VortexRdfStore<Dict, Layo
                     } else if subject.is_none() && object.is_none() && predicate.is_some() {
                         let pred = predicate.unwrap();
                         if let Some(p_id) = self.dictionary.get_id(&pred.to_string()) {
-                            let mut ctx = LEGACY_SESSION.create_execution_ctx();
+                            let mut ctx = legacy_session().create_execution_ctx();
 
                             // 1. Scan sorted _idx_p_val to get matching _idx_p_rid
                             let scan = file
@@ -705,7 +705,7 @@ impl<Dict: RdfDictionary, Layout: RdfQuadLayout<Dict>> VortexRdfStore<Dict, Layo
 
         if let Some(m) = mask {
             let inverse = m.not().map_err(VortexRdfError::Vortex)?;
-            let mut ctx = LEGACY_SESSION.create_execution_ctx();
+            let mut ctx = legacy_session().create_execution_ctx();
             let bool_arr = inverse
                 .execute::<BoolArray>(&mut ctx)
                 .map_err(VortexRdfError::Vortex)?;
