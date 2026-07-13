@@ -23,7 +23,7 @@ use vortex_array::expr::{Expression, and, eq, get_item, lit, root, select};
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::stream::ArrayStreamExt;
-use vortex_array::{ArrayRef, IntoArray, legacy_session, VortexSessionExecute};
+use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute, legacy_session};
 
 /// Unified VortexRdfStore that works with any RdfDictionary implementation.
 /// Implements zero-copy, highly compressed, and scan-optimized RDF storage.

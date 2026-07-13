@@ -29,8 +29,7 @@ use vortex_rdf_core::{
     index::{ChainedHash, SimpleDictionary},
     io::{
         CottasNativeConfig, CottasNativeStringConfig, CottasVortexCompressionProfile,
-        NativeIdsCountMode, NativeStringCountMode,
-        build_cottas_native_subject_range_index,
+        NativeIdsCountMode, NativeStringCountMode, build_cottas_native_subject_range_index,
         count_cottas_native_ids_file_with_diagnostics_mode,
         count_cottas_native_string_file_with_diagnostics_mode, load_vortex_file_ref,
         match_cottas_native_file, match_cottas_native_file_with_diagnostics,
@@ -630,10 +629,15 @@ async fn main() -> Result<()> {
 
             info!("Deserialization took {:?}", start.elapsed());
         }
-        Action::BuildNativeSubjectIndex { input, diagnostics_out } => {
+        Action::BuildNativeSubjectIndex {
+            input,
+            diagnostics_out,
+        } => {
             let start = Instant::now();
             if !input.extension().map(|e| e == "vortex").unwrap_or(false) {
-                return Err(anyhow!("build-native-subject-index expects a .vortex input file"));
+                return Err(anyhow!(
+                    "build-native-subject-index expects a .vortex input file"
+                ));
             }
             let stats = build_cottas_native_subject_range_index(&input)
                 .await
@@ -645,10 +649,20 @@ async fn main() -> Result<()> {
                     .await
                     .context("Failed to write subject range index diagnostics JSON file")?;
             }
-            stdout().write_all(&stats_json).context("Failed to write subject range index diagnostics to stdout")?;
-            stdout().write_all(b"
-").context("Failed to write trailing newline")?;
-            info!("Built native subject range index for {:?} in {:?}", input, start.elapsed());
+            stdout()
+                .write_all(&stats_json)
+                .context("Failed to write subject range index diagnostics to stdout")?;
+            stdout()
+                .write_all(
+                    b"
+",
+                )
+                .context("Failed to write trailing newline")?;
+            info!(
+                "Built native subject range index for {:?} in {:?}",
+                input,
+                start.elapsed()
+            );
             return Ok(());
         }
         Action::Count {

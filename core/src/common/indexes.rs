@@ -10,7 +10,7 @@ use vortex_array::arrays::{
 };
 use vortex_array::dtype::DType;
 use vortex_array::validity::Validity;
-use vortex_array::{ArrayRef, IntoArray, legacy_session, VortexSessionExecute};
+use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute, legacy_session};
 
 /// The supported Vortex-RDF dictionary/indexing strategies.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]

@@ -8,9 +8,9 @@ use std::time::Instant;
 
 use vortex::VortexSessionDefault;
 use vortex::session::VortexSession;
-use vortex_array::legacy_session;
 use vortex_array::arrays::{StructArray, VarBinViewArray};
 use vortex_array::dtype::{DType, Nullability};
+use vortex_array::legacy_session;
 use vortex_array::{ArrayRef, ExecutionCtx};
 use vortex_array::{IntoArray, VortexSessionExecute};
 use vortex_fsst::{fsst_compress, fsst_train_compressor};

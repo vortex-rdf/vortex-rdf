@@ -27,7 +27,7 @@ use vortex_io::VortexWrite;
 use vortex_session::VortexSession;
 
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
-use oxrdfio::{RdfFormat, RdfSerializer};
+use oxrdfio::{RdfFormat, RdfParser, RdfSerializer};
 
 use vortex::expr::{Expression, and, col, eq, lit};
 use vortex_array::stream::ArrayStreamExt;
@@ -274,6 +274,71 @@ pub async fn match_cottas_native_file_as_triples(
     }
 
     Ok(out)
+}
+
+/// Executes the same optimized access planner used by
+/// `match_cottas_native_file_with_diagnostics`, but returns triples for the
+/// Python/RDFLib binding.
+///
+/// Transitional implementation:
+/// optimized projected scan
+///   -> in-memory N-Triples
+///   -> parsed SPO strings
+///
+/// This deliberately shares the indexed planner. A later refactor should
+/// expose projected ID rows directly and eliminate this serialization step.
+pub async fn match_cottas_native_file_as_triples_optimized(
+    input_path: &Path,
+    subject: Option<&NamedOrBlankNode>,
+    predicate: Option<&NamedNode>,
+    object: Option<&Term>,
+    graph: Option<&GraphName>,
+) -> Result<Vec<(String, String, String)>> {
+    let mut rdf_bytes = Vec::<u8>::new();
+
+    let diagnostics = match_cottas_native_file_with_diagnostics(
+        input_path,
+        subject,
+        predicate,
+        object,
+        graph,
+        &mut rdf_bytes,
+        RdfFormat::NTriples,
+    )
+    .await?;
+
+    if diagnostics.rows_out == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut triples = Vec::with_capacity(diagnostics.rows_out);
+
+    let parser = RdfParser::from_format(RdfFormat::NTriples).for_reader(rdf_bytes.as_slice());
+
+    for item in parser {
+        let quad = item.map_err(|error| {
+            VortexRdfError::Deserialization(format!(
+                "Failed to parse optimized in-memory N-Triples output: {error}"
+            ))
+        })?;
+
+        triples.push((
+            quad.subject.to_string(),
+            quad.predicate.to_string(),
+            quad.object.to_string(),
+        ));
+    }
+
+    if triples.len() != diagnostics.rows_out {
+        return Err(VortexRdfError::Deserialization(format!(
+            "Optimized RDFLib path row-count mismatch: \
+             diagnostics.rows_out={}, parsed_triples={}",
+            diagnostics.rows_out,
+            triples.len(),
+        )));
+    }
+
+    Ok(triples)
 }
 
 pub async fn serialize_cottas_native_file<Dict, S>(

@@ -4,15 +4,15 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+use oxrdfio::RdfFormat;
 use std::sync::LazyLock;
+use std::time::Instant;
 use tokio::runtime::Runtime;
 use vortex_rdf_core::common::utils::{parse_named_node, parse_subject, parse_term};
-use oxrdfio::RdfFormat;
-use std::time::Instant;
 use vortex_rdf_core::io::{
     NativeIdsCountMode, count_cottas_native_ids_file_with_diagnostics_mode,
-    match_cottas_native_file_with_diagnostics,
     count_cottas_native_string_file, match_cottas_native_file_as_triples,
+    match_cottas_native_file_as_triples_optimized, match_cottas_native_file_with_diagnostics,
     match_cottas_native_string_file_as_triples,
 };
 
@@ -59,7 +59,7 @@ fn match_triples(
             .map_err(|e| PyRuntimeError::new_err(e.to_string())),
 
         "cottas-native-ids" | "cottas-native" => PY_NATIVE_RUNTIME
-            .block_on(match_cottas_native_file_as_triples(
+            .block_on(match_cottas_native_file_as_triples_optimized(
                 Path::new(&path),
                 subject.as_ref(),
                 predicate.as_ref(),
@@ -146,7 +146,10 @@ fn diagnose_match<'py>(
     out.set_item("optimized_binding_ms", optimized_binding_ms)?;
     out.set_item("optimized_rdf_bytes", rdf_bytes.len())?;
     out.set_item("core_total_ms", diagnostics.total_ms)?;
-    out.set_item("binding_overhead_ms", (optimized_binding_ms - diagnostics.total_ms).max(0.0))?;
+    out.set_item(
+        "binding_overhead_ms",
+        (optimized_binding_ms - diagnostics.total_ms).max(0.0),
+    )?;
     out.set_item("term_lookup_ms", diagnostics.term_lookup_ms)?;
     out.set_item("open_ms", diagnostics.open_ms)?;
     out.set_item("scan_build_ms", diagnostics.scan_build_ms)?;
@@ -157,7 +160,10 @@ fn diagnose_match<'py>(
     out.set_item("rows_out", diagnostics.rows_out)?;
     out.set_item("scan_batches", diagnostics.scan_batches)?;
     out.set_item("scan_rows_materialized", diagnostics.scan_rows_materialized)?;
-    out.set_item("subject_range_index_used", diagnostics.subject_range_index_used)?;
+    out.set_item(
+        "subject_range_index_used",
+        diagnostics.subject_range_index_used,
+    )?;
     out.set_item("po_exact_index_used", diagnostics.po_rowgroup_index_used)?;
     out.set_item("po_candidate_ranges", diagnostics.po_candidate_ranges)?;
     out.set_item("po_candidate_rows", diagnostics.po_candidate_rows)?;

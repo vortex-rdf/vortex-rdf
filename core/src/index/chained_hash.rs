@@ -7,9 +7,9 @@ use std::time::Instant;
 use vortex::VortexSessionDefault;
 use vortex_session::VortexSession;
 
-use vortex_array::{ArrayRef, ExecutionCtx};
 use vortex_array::arrays::{PrimitiveArray, StructArray, VarBinViewArray};
-use vortex_array::{IntoArray, legacy_session, VortexSessionExecute};
+use vortex_array::{ArrayRef, ExecutionCtx};
+use vortex_array::{IntoArray, VortexSessionExecute, legacy_session};
 use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_fsst::{fsst_compress, fsst_train_compressor};
 
@@ -138,9 +138,7 @@ impl RdfDictionary for ChainedHash {
 
         // Build new values array by appending.
         let mut values: Vec<String> = (0..values_varbin.len())
-            .map(|i| {
-                String::from_utf8_lossy(values_varbin.bytes_at(i).as_ref()).into_owned()
-            })
+            .map(|i| String::from_utf8_lossy(values_varbin.bytes_at(i).as_ref()).into_owned())
             .collect();
         values.push(term_str.to_owned());
         self.values = VarBinViewArray::from_iter_str::<String, _>(values).into_array();
@@ -232,9 +230,7 @@ impl RdfDictionary for ChainedHash {
 
         // Bulk-insert new terms using builders
         let mut values: Vec<String> = (0..values_varbin.len())
-            .map(|i| {
-                String::from_utf8_lossy(values_varbin.bytes_at(i).as_ref()).into_owned()
-            })
+            .map(|i| String::from_utf8_lossy(values_varbin.bytes_at(i).as_ref()).into_owned())
             .collect();
         values.extend(new_terms.iter().map(|term| (*term).to_owned()));
         self.values = VarBinViewArray::from_iter_str::<String, _>(values).into_array();

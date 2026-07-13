@@ -8,7 +8,7 @@ use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::listview::{ListViewArray, ListViewArrayExt};
 use vortex_array::arrays::primitive::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
-use vortex_array::{ArrayRef, legacy_session, VortexSessionExecute};
+use vortex_array::{ArrayRef, VortexSessionExecute, legacy_session};
 
 /// Parses a string representation of an RDF named node (URI), stripping optional `<` and `>` boundaries.
 pub fn parse_named_node(s: &str) -> Result<NamedNode> {
@@ -36,29 +36,61 @@ pub fn parse_subject(s: &str) -> Result<NamedOrBlankNode> {
 }
 
 /// Parses an arbitrary RDF term (blank node, literal, or named node) from its string form.
-/// Parses an arbitrary RDF term (blank node, literal, or named node) from its string form.
-pub fn parse_term(s: &str) -> Result<Term> {
-    let s = s.trim();
+/// Parses one RDF term written in Turtle/N3 syntax.
+///
+/// RDFLib's `Node.n3()` can produce:
+/// - IRIs: <http://example.org/resource>
+/// - blank nodes: _:b1
+/// - plain literals: "value"
+/// - language literals: "value"@en
+/// - typed literals: "42"^^<http://www.w3.org/2001/XMLSchema#integer>
+/// - escaped quotes: "\"quoted\""
+/// - multiline literals: """line 1
+///   line 2"""@en
+///
+/// Parsing the term through a synthetic Turtle statement avoids manually
+/// handling escaping, language tags, datatypes, Unicode, and multiline strings.
+pub fn parse_term(input: &str) -> Result<Term> {
+    let input = input.trim();
 
-    if let Some(term) = get_as_term(s) {
-        return Ok(term);
+    if input.is_empty() {
+        return Err(VortexRdfError::Deserialization(
+            "Cannot parse an empty RDF term".to_string(),
+        ));
     }
 
-    if s.starts_with("_:") {
-        return Ok(Term::BlankNode(parse_blank_node(s)?));
+    let statement = format!(
+        "<urn:vortex-rdf:subject> \
+         <urn:vortex-rdf:predicate> \
+         {input} ."
+    );
+
+    let mut parser = RdfParser::from_format(RdfFormat::Turtle).for_reader(statement.as_bytes());
+
+    let quad = parser
+        .next()
+        .ok_or_else(|| {
+            VortexRdfError::Deserialization(format!(
+                "RDF parser produced no statement for term: {input:?}"
+            ))
+        })?
+        .map_err(|error| {
+            VortexRdfError::Deserialization(format!("Invalid RDF term {input:?}: {error}"))
+        })?;
+
+    if let Some(extra) = parser.next() {
+        extra.map_err(|error| {
+            VortexRdfError::Deserialization(format!(
+                "Trailing RDF syntax after term {input:?}: {error}"
+            ))
+        })?;
+
+        return Err(VortexRdfError::Deserialization(format!(
+            "Expected exactly one RDF term, but input produced multiple statements: {input:?}"
+        )));
     }
 
-    if s.starts_with('<') && s.ends_with('>') {
-        return Ok(Term::NamedNode(parse_named_node(s)?));
-    }
-
-    if !s.is_empty() && !s.starts_with('"') {
-        return Ok(Term::NamedNode(parse_named_node(s)?));
-    }
-
-    Err(VortexRdfError::Deserialization(format!(
-        "Invalid RDF term: {s}"
-    )))
+    Ok(quad.object)
 }
 
 /// Parses an RDF graph name, which can be the default graph, a named node, or a blank node.
@@ -340,4 +372,73 @@ pub struct VortexFileSanity {
     pub end_magic: [u8; 4],
     pub version: u16,
     pub postscript_len: u16,
+}
+
+#[cfg(test)]
+mod term_parser_tests {
+    use super::*;
+    use oxrdf::{Literal, NamedNode, Term};
+
+    #[test]
+    fn parses_named_node() {
+        let term = parse_term("<http://dbpedia.org/resource/Fishburn>").unwrap();
+
+        assert_eq!(
+            term,
+            Term::NamedNode(NamedNode::new("http://dbpedia.org/resource/Fishburn").unwrap())
+        );
+    }
+
+    #[test]
+    fn parses_language_tagged_literal() {
+        let term = parse_term("\"hello\"@en").unwrap();
+
+        assert_eq!(
+            term,
+            Term::Literal(Literal::new_language_tagged_literal("hello", "en").unwrap())
+        );
+    }
+
+    #[test]
+    fn parses_escaped_quotes() {
+        let term = parse_term(r#""\"Cute Papa\""@en"#).unwrap();
+
+        assert_eq!(
+            term,
+            Term::Literal(Literal::new_language_tagged_literal("\"Cute Papa\"", "en").unwrap())
+        );
+    }
+
+    #[test]
+    fn parses_typed_literal() {
+        let term = parse_term("\"54.68309\"^^<http://www.w3.org/2001/XMLSchema#float>").unwrap();
+
+        assert_eq!(
+            term,
+            Term::Literal(Literal::new_typed_literal(
+                "54.68309",
+                NamedNode::new("http://www.w3.org/2001/XMLSchema#float").unwrap(),
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_multiline_literal() {
+        let input = "\"\"\"first line\nsecond line\"\"\"@en";
+        let term = parse_term(input).unwrap();
+
+        assert_eq!(
+            term,
+            Term::Literal(
+                Literal::new_language_tagged_literal("first line\nsecond line", "en",).unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_statement() {
+        let input = concat!("\"first\" . ", "<urn:extra:s> <urn:extra:p> \"second\"");
+
+        assert!(parse_term(input).is_err());
+    }
 }
