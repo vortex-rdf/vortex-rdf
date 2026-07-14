@@ -27,7 +27,7 @@ use vortex_io::VortexWrite;
 use vortex_session::VortexSession;
 
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
-use oxrdfio::{RdfFormat, RdfParser, RdfSerializer};
+use oxrdfio::{RdfFormat, RdfSerializer};
 
 use vortex::expr::{Expression, and, col, eq, lit};
 use vortex_array::stream::ArrayStreamExt;
@@ -294,51 +294,21 @@ pub async fn match_cottas_native_file_as_triples_optimized(
     object: Option<&Term>,
     graph: Option<&GraphName>,
 ) -> Result<Vec<(String, String, String)>> {
-    let mut rdf_bytes = Vec::<u8>::new();
-
-    let diagnostics = match_cottas_native_file_with_diagnostics(
+    let planned = execute_cottas_native_match(
         input_path,
         subject,
         predicate,
         object,
         graph,
-        &mut rdf_bytes,
-        RdfFormat::NTriples,
     )
     .await?;
 
-    if diagnostics.rows_out == 0 {
-        return Ok(Vec::new());
-    }
-
-    let mut triples = Vec::with_capacity(diagnostics.rows_out);
-
-    let parser = RdfParser::from_format(RdfFormat::NTriples).for_reader(rdf_bytes.as_slice());
-
-    for item in parser {
-        let quad = item.map_err(|error| {
-            VortexRdfError::Deserialization(format!(
-                "Failed to parse optimized in-memory N-Triples output: {error}"
-            ))
-        })?;
-
-        triples.push((
-            quad.subject.to_string(),
-            quad.predicate.to_string(),
-            quad.object.to_string(),
-        ));
-    }
-
-    if triples.len() != diagnostics.rows_out {
-        return Err(VortexRdfError::Deserialization(format!(
-            "Optimized RDFLib path row-count mismatch: \
-             diagnostics.rows_out={}, parsed_triples={}",
-            diagnostics.rows_out,
-            triples.len(),
-        )));
-    }
-
-    Ok(triples)
+    projected_native_id_rows_as_triples(
+        input_path,
+        &planned.rows,
+        &planned.bound_terms,
+    )
+    .await
 }
 
 pub async fn serialize_cottas_native_file<Dict, S>(
@@ -420,6 +390,15 @@ where
             po_exact_stats.rows_scanned,
             po_exact_stats.unique_po_hashes_written,
             po_exact_stats.total_ms
+        );
+        let p_exact_stats =
+            build_cottas_native_p_exact_ranges_index(output_path).await?;
+        log::info!(
+            "[cottas_native_ids] built predicate exact-ranges index during serialization: row_groups={}, rows={}, exact_ranges={}, total_ms={:.3}",
+            p_exact_stats.row_groups,
+            p_exact_stats.rows_scanned,
+            p_exact_stats.unique_po_hashes_written,
+            p_exact_stats.total_ms
         );
     } else {
         log::info!(
@@ -1135,6 +1114,10 @@ pub struct CottasNativeIdsDiagnostics {
     pub po_rowgroup_lookup_ms: f64,
     pub po_candidate_ranges: usize,
     pub po_candidate_rows: u64,
+    pub access_index_strategy: String,
+    pub access_index_lookup_ms: f64,
+    pub access_candidate_ranges: usize,
+    pub access_candidate_rows: u64,
     pub id_to_term_stats: NativeIdToTermLookupStats,
     pub term_to_id_stats: Vec<NativeTermToIdLookupStats>,
 }
@@ -1247,6 +1230,13 @@ fn collect_unique_ids_for_unbound_native_columns(
     ids
 }
 
+#[derive(Debug)]
+struct NativeMatchPlanResult {
+    rows: NativeProjectedIdRows,
+    bound_terms: BoundNativeRdfTerms,
+    diagnostics: CottasNativeIdsDiagnostics,
+}
+
 #[derive(Clone, Debug, Default)]
 struct NativeProjectedIdRows {
     s: Option<Vec<u32>>,
@@ -1310,6 +1300,26 @@ fn append_optional_projected_u32_column(
     out.extend_from_slice(values);
 
     Ok(())
+}
+
+
+fn append_projected_rows(
+    destination: &mut NativeProjectedIdRows,
+    source: NativeProjectedIdRows,
+) {
+    destination.rows += source.rows;
+    for (destination_column, source_column) in [
+        (&mut destination.s, source.s),
+        (&mut destination.p, source.p),
+        (&mut destination.o, source.o),
+        (&mut destination.g, source.g),
+    ] {
+        if let Some(values) = source_column {
+            destination_column
+                .get_or_insert_with(Vec::new)
+                .extend(values);
+        }
+    }
 }
 
 async fn read_native_projected_stream_all_with_scan_stats<S>(
@@ -1438,6 +1448,56 @@ pub struct NativeIdToTermLookupStats {
 
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
+}
+
+
+async fn projected_native_id_rows_as_triples(
+    data_path: &Path,
+    rows: &NativeProjectedIdRows,
+    bound_terms: &BoundNativeRdfTerms,
+) -> Result<Vec<(String, String, String)>> {
+    if rows.rows == 0 {
+        return Ok(Vec::new());
+    }
+
+    let unique_ids =
+        collect_unique_ids_from_projected_unbound_rows(rows, bound_terms);
+    let id_to_term =
+        lookup_terms_by_ids_from_sidecar(data_path, &unique_ids).await?;
+    let mut triples = Vec::with_capacity(rows.rows);
+
+    for row_idx in 0..rows.rows {
+        let s_id = projected_id_at(&rows.s, &bound_terms.s, row_idx, "S")?;
+        let p_id = projected_id_at(&rows.p, &bound_terms.p, row_idx, "P")?;
+        let o_id = projected_id_at(&rows.o, &bound_terms.o, row_idx, "O")?;
+
+        let subject = lookup_projected_or_use_bound(
+            &id_to_term,
+            &bound_terms.s,
+            s_id,
+            "S",
+        )?;
+        let predicate = lookup_projected_or_use_bound(
+            &id_to_term,
+            &bound_terms.p,
+            p_id,
+            "P",
+        )?;
+        let object = lookup_projected_or_use_bound(
+            &id_to_term,
+            &bound_terms.o,
+            o_id,
+            "O",
+        )?;
+
+        triples.push((
+            subject.to_owned(),
+            predicate.to_owned(),
+            object.to_owned(),
+        ));
+    }
+
+    Ok(triples)
 }
 
 async fn write_projected_native_id_rows_as_rdf_lazy<W>(
@@ -1827,6 +1887,251 @@ where
     Ok(())
 }
 
+
+async fn execute_cottas_native_match(
+    input_path: &Path,
+    subject: Option<&NamedOrBlankNode>,
+    predicate: Option<&NamedNode>,
+    object: Option<&Term>,
+    graph: Option<&GraphName>,
+) -> Result<NativeMatchPlanResult> {
+    let total_start = Instant::now();
+    let mut diagnostics = CottasNativeIdsDiagnostics::default();
+    let bound_terms =
+        BoundNativeRdfTerms::from_pattern(subject, predicate, object, graph);
+
+    let (filter, term_lookup_ms, term_to_id_stats) =
+        build_native_pattern_filter_lazy_with_detailed_stats(
+            input_path,
+            subject,
+            predicate,
+            object,
+            graph,
+        )
+        .await?;
+    diagnostics.term_lookup_ms = term_lookup_ms;
+    diagnostics.term_to_id_stats = term_to_id_stats;
+
+    if matches!(filter, NativePatternFilter::Empty) {
+        diagnostics.total_ms = elapsed_ms(total_start);
+        return Ok(NativeMatchPlanResult {
+            rows: NativeProjectedIdRows::default(),
+            bound_terms,
+            diagnostics,
+        });
+    }
+
+    let open_start = Instant::now();
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(input_path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    diagnostics.open_ms = elapsed_ms(open_start);
+
+    if let NativePatternFilter::Expr(expr) = &filter {
+        diagnostics.vortex_can_prune = file.can_prune(expr).ok();
+    }
+    diagnostics.total_splits = file.splits().ok().map(|splits| splits.len());
+
+    let projected_columns =
+        native_projection_columns_for_bound_terms(&bound_terms);
+    let mut selected_ranges: Option<Vec<std::ops::Range<u64>>> = None;
+
+    // SPO subject range has first priority.
+    if let Some(subject_node) = subject {
+        if native_subject_range_index_exists(input_path) {
+            let lookup_start = Instant::now();
+            let subject_id = lookup_term_id_from_sidecar(
+                input_path,
+                &subject_node.to_string(),
+            )
+            .await?;
+            diagnostics.subject_range_lookup_ms = elapsed_ms(lookup_start);
+
+            let Some(subject_id) = subject_id else {
+                diagnostics.total_ms = elapsed_ms(total_start);
+                return Ok(NativeMatchPlanResult {
+                    rows: NativeProjectedIdRows::default(),
+                    bound_terms,
+                    diagnostics,
+                });
+            };
+            let Some(range) =
+                lookup_subject_range_from_sidecar(input_path, subject_id)?
+            else {
+                diagnostics.total_ms = elapsed_ms(total_start);
+                return Ok(NativeMatchPlanResult {
+                    rows: NativeProjectedIdRows::default(),
+                    bound_terms,
+                    diagnostics,
+                });
+            };
+
+            diagnostics.subject_range_index_used = true;
+            diagnostics.subject_range_start = Some(range.start);
+            diagnostics.subject_range_end = Some(range.end);
+            diagnostics.subject_range_rows =
+                Some(range.end.saturating_sub(range.start));
+            diagnostics.access_index_strategy = "subject-ranges".to_string();
+            diagnostics.access_index_lookup_ms =
+                diagnostics.subject_range_lookup_ms;
+            diagnostics.access_candidate_ranges = 1;
+            diagnostics.access_candidate_rows =
+                range.end.saturating_sub(range.start);
+            selected_ranges = Some(vec![range.start..range.end]);
+        }
+    }
+
+    // Exact (predicate, object) ranges have second priority.
+    if selected_ranges.is_none()
+        && subject.is_none()
+        && predicate.is_some()
+        && object.is_some()
+        && native_po_exact_ranges_exists(input_path)
+    {
+        let lookup_start = Instant::now();
+        if let Some((p_id, o_id)) =
+            resolve_po_bound_ids_for_index(input_path, predicate, object).await?
+        {
+            let ranges = lookup_exact_row_ranges(
+                &native_po_exact_ranges_path(input_path),
+                NATIVE_PO_EXACT_RANGES_MAGIC,
+                native_po_hash(p_id, o_id),
+                "PO exact range",
+            )?;
+            let candidate_rows = range_rows(&ranges);
+            diagnostics.po_rowgroup_index_used = true;
+            diagnostics.po_candidate_ranges = ranges.len();
+            diagnostics.po_candidate_rows = candidate_rows;
+            diagnostics.access_index_strategy = "po-exact-ranges".to_string();
+            diagnostics.access_candidate_ranges = ranges.len();
+            diagnostics.access_candidate_rows = candidate_rows;
+            selected_ranges = Some(ranges);
+        }
+        diagnostics.po_rowgroup_lookup_ms = elapsed_ms(lookup_start);
+        diagnostics.access_index_lookup_ms =
+            diagnostics.po_rowgroup_lookup_ms;
+    }
+
+    // Predicate-only exact ranges are used only for selective predicates.
+    if selected_ranges.is_none()
+        && subject.is_none()
+        && predicate.is_some()
+        && object.is_none()
+        && native_p_exact_ranges_exists(input_path)
+    {
+        let lookup_start = Instant::now();
+        let predicate_id = lookup_term_id_from_sidecar(
+            input_path,
+            &predicate.expect("checked above").to_string(),
+        )
+        .await?;
+
+        if let Some(predicate_id) = predicate_id {
+            let ranges = lookup_exact_row_ranges(
+                &native_p_exact_ranges_path(input_path),
+                NATIVE_P_EXACT_RANGES_MAGIC,
+                u64::from(predicate_id),
+                "predicate exact range",
+            )?;
+            let candidate_rows = range_rows(&ranges);
+            diagnostics.access_candidate_ranges = ranges.len();
+            diagnostics.access_candidate_rows = candidate_rows;
+
+            if ranges.is_empty()
+                || (ranges.len() <= predicate_exact_max_ranges()
+                    && candidate_rows <= predicate_exact_max_rows())
+            {
+                diagnostics.access_index_strategy =
+                    "p-exact-ranges".to_string();
+                selected_ranges = Some(ranges);
+            } else {
+                diagnostics.access_index_strategy =
+                    "none-high-cardinality-predicate".to_string();
+            }
+        }
+        diagnostics.access_index_lookup_ms = elapsed_ms(lookup_start);
+    }
+
+    if diagnostics.access_index_strategy.is_empty() {
+        diagnostics.access_index_strategy = "none".to_string();
+    }
+
+    let mut scan_build_ms = 0.0;
+    let mut read_all_ms = 0.0;
+    let mut matched_rows = NativeProjectedIdRows::default();
+    let mut scan_batches = 0usize;
+    let mut max_scan_batch_rows = 0usize;
+
+    if let Some(ranges) = selected_ranges {
+        for row_range in ranges {
+            let scan_build_start = Instant::now();
+            let scan = file
+                .scan()
+                .map_err(VortexRdfError::from)?
+                .with_row_range(row_range);
+            let scan = match &filter {
+                NativePatternFilter::All => scan,
+                NativePatternFilter::Empty => unreachable!("handled above"),
+                NativePatternFilter::Expr(expr) => scan.with_filter(expr.clone()),
+            };
+            let stream = scan
+                .with_projection(vortex_array::expr::select(
+                    projected_columns.as_slice(),
+                    vortex_array::expr::root(),
+                ))
+                .into_array_stream()
+                .map_err(VortexRdfError::from)?;
+            scan_build_ms += elapsed_ms(scan_build_start);
+            let read_start = Instant::now();
+            let (partial, batches, max_rows) =
+                read_native_projected_stream_all_with_scan_stats(stream).await?;
+            read_all_ms += elapsed_ms(read_start);
+            scan_batches += batches;
+            max_scan_batch_rows = max_scan_batch_rows.max(max_rows);
+            append_projected_rows(&mut matched_rows, partial);
+        }
+    } else {
+        let scan_build_start = Instant::now();
+        let scan = file.scan().map_err(VortexRdfError::from)?;
+        let scan = match &filter {
+            NativePatternFilter::All => scan,
+            NativePatternFilter::Empty => unreachable!("handled above"),
+            NativePatternFilter::Expr(expr) => scan.with_filter(expr.clone()),
+        };
+        let stream = scan
+            .with_projection(vortex_array::expr::select(
+                projected_columns.as_slice(),
+                vortex_array::expr::root(),
+            ))
+            .into_array_stream()
+            .map_err(VortexRdfError::from)?;
+        scan_build_ms += elapsed_ms(scan_build_start);
+        let read_start = Instant::now();
+        let (rows, batches, max_rows) =
+            read_native_projected_stream_all_with_scan_stats(stream).await?;
+        read_all_ms += elapsed_ms(read_start);
+        matched_rows = rows;
+        scan_batches = batches;
+        max_scan_batch_rows = max_rows;
+    }
+
+    diagnostics.scan_build_ms = scan_build_ms;
+    diagnostics.read_all_ms = read_all_ms;
+    diagnostics.scan_batches = scan_batches;
+    diagnostics.max_scan_batch_rows = max_scan_batch_rows;
+    diagnostics.scan_rows_materialized = matched_rows.rows;
+    diagnostics.rows_out = matched_rows.rows;
+    diagnostics.total_ms = elapsed_ms(total_start);
+
+    Ok(NativeMatchPlanResult {
+        rows: matched_rows,
+        bound_terms,
+        diagnostics,
+    })
+}
+
 pub async fn match_cottas_native_file<W>(
     input_path: &Path,
     subject: Option<&NamedOrBlankNode>,
@@ -1860,264 +2165,32 @@ where
     W: Write,
 {
     let total_start = Instant::now();
-    let mut diagnostics = CottasNativeIdsDiagnostics::default();
+    let planned = execute_cottas_native_match(
+        input_path,
+        subject,
+        predicate,
+        object,
+        graph,
+    )
+    .await?;
+    let mut diagnostics = planned.diagnostics;
 
-    let (filter, term_lookup_ms, term_to_id_stats) =
-        build_native_pattern_filter_lazy_with_detailed_stats(
-            input_path, subject, predicate, object, graph,
-        )
-        .await?;
-    diagnostics.term_lookup_ms = term_lookup_ms;
-    diagnostics.term_to_id_stats = term_to_id_stats;
-
-    if matches!(filter, NativePatternFilter::Empty) {
-        log::debug!(
-            "[cottas_native::match] at least one bound term is absent from dictionary; returning empty result"
-        );
-
+    if planned.rows.rows == 0 {
         let serialize_start = Instant::now();
         write_empty_rdf(writer, format).await?;
         diagnostics.serialize_ms = elapsed_ms(serialize_start);
         diagnostics.total_ms = elapsed_ms(total_start);
-
         return Ok(diagnostics);
     }
 
-    let open_start = Instant::now();
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(input_path)
-        .await
-        .map_err(VortexRdfError::from)?;
-    diagnostics.open_ms = elapsed_ms(open_start);
-
-    log::debug!(
-        "[cottas_native::match] opened native COTTAS file in {:.3}ms",
-        diagnostics.open_ms
-    );
-
-    if let NativePatternFilter::Expr(expr) = &filter {
-        match file.can_prune(expr) {
-            Ok(can_prune) => {
-                diagnostics.vortex_can_prune = Some(can_prune);
-                log::debug!(
-                    "[cottas_native::match] file.can_prune(filter) = {}",
-                    can_prune
-                );
-            }
-            Err(e) => {
-                diagnostics.vortex_can_prune = None;
-                log::debug!(
-                    "[cottas_native::match] file.can_prune(filter) failed: {}",
-                    e
-                );
-            }
-        }
-    }
-
-    match file.splits() {
-        Ok(splits) => {
-            diagnostics.total_splits = Some(splits.len());
-            log::debug!(
-                "[cottas_native::match] native file has {} scan splits.",
-                splits.len(),
-            );
-        }
-        Err(e) => {
-            diagnostics.total_splits = None;
-            log::debug!(
-                "[cottas_native::match] failed to inspect native file splits: {}",
-                e
-            );
-        }
-    }
-
-    let bound_terms = BoundNativeRdfTerms::from_pattern(subject, predicate, object, graph);
-    let projected_columns = native_projection_columns_for_bound_terms(&bound_terms);
-    log::debug!(
-        "[cottas_native::match] projected native ID columns for scan: {:?}",
-        projected_columns
-    );
-
-    let mut subject_row_range: Option<std::ops::Range<u64>> = None;
-    if let Some(subject_node) = subject {
-        if native_subject_range_index_exists(input_path) {
-            let range_lookup_start = Instant::now();
-            let subject_term = subject_node.to_string();
-            let subject_id = lookup_term_id_from_sidecar(input_path, &subject_term).await?;
-            diagnostics.subject_range_lookup_ms = elapsed_ms(range_lookup_start);
-            if let Some(subject_id) = subject_id {
-                match lookup_subject_range_from_sidecar(input_path, subject_id)? {
-                    Some(range) => {
-                        diagnostics.subject_range_index_used = true;
-                        diagnostics.subject_range_start = Some(range.start);
-                        diagnostics.subject_range_end = Some(range.end);
-                        diagnostics.subject_range_rows =
-                            Some(range.end.saturating_sub(range.start));
-                        subject_row_range = Some(range.start..range.end);
-                        log::debug!(
-                            "[cottas_native::match] subject range index hit: subject_id={}, range={}..{}, rows={}",
-                            subject_id,
-                            range.start,
-                            range.end,
-                            range.end.saturating_sub(range.start)
-                        );
-                    }
-                    None => {
-                        log::debug!(
-                            "[cottas_native::match] subject ID {} has no subject range; returning empty result",
-                            subject_id
-                        );
-                        let serialize_start = Instant::now();
-                        write_empty_rdf(writer, format).await?;
-                        diagnostics.serialize_ms = elapsed_ms(serialize_start);
-                        diagnostics.total_ms = elapsed_ms(total_start);
-                        return Ok(diagnostics);
-                    }
-                }
-            } else {
-                log::debug!(
-                    "[cottas_native::match] subject term absent from dictionary during range lookup; returning empty result"
-                );
-                let serialize_start = Instant::now();
-                write_empty_rdf(writer, format).await?;
-                diagnostics.serialize_ms = elapsed_ms(serialize_start);
-                diagnostics.total_ms = elapsed_ms(total_start);
-                return Ok(diagnostics);
-            }
-        }
-    }
-
-    let po_lookup_start = Instant::now();
-    let mut po_row_ranges: Option<Vec<std::ops::Range<u64>>> = None;
-    if subject.is_none()
-        && predicate.is_some()
-        && object.is_some()
-        && native_po_exact_ranges_exists(input_path)
-    {
-        if let Some((p_id, o_id)) =
-            resolve_po_bound_ids_for_index(input_path, predicate, object).await?
-        {
-            let ranges = lookup_po_candidate_row_ranges_from_exact_index(input_path, p_id, o_id)?;
-            diagnostics.po_rowgroup_index_used = true;
-            diagnostics.po_candidate_ranges = ranges.len();
-            diagnostics.po_candidate_rows =
-                ranges.iter().map(|r| r.end.saturating_sub(r.start)).sum();
-            po_row_ranges = Some(ranges);
-        }
-    }
-    diagnostics.po_rowgroup_lookup_ms = elapsed_ms(po_lookup_start);
-
-    let scan_start = Instant::now();
-    let read_start = Instant::now();
-    let mut matched_rows = NativeProjectedIdRows::default();
-    let mut scan_batches = 0usize;
-    let mut max_scan_batch_rows = 0usize;
-    if let Some(ranges) = po_row_ranges {
-        for row_range in ranges {
-            let scan = file
-                .scan()
-                .map_err(VortexRdfError::from)?
-                .with_row_range(row_range);
-            let scan = match &filter {
-                NativePatternFilter::All => scan,
-                NativePatternFilter::Empty => unreachable!("handled above"),
-                NativePatternFilter::Expr(expr) => scan.with_filter(expr.clone()),
-            };
-            let scan = scan.with_projection(vortex_array::expr::select(
-                projected_columns.as_slice(),
-                vortex_array::expr::root(),
-            ));
-            let stream = scan.into_array_stream().map_err(VortexRdfError::from)?;
-            let (partial_rows, partial_batches, partial_max) =
-                read_native_projected_stream_all_with_scan_stats(stream).await?;
-            scan_batches += partial_batches;
-            max_scan_batch_rows = max_scan_batch_rows.max(partial_max);
-            matched_rows.rows += partial_rows.rows;
-            if let Some(v) = partial_rows.s {
-                matched_rows.s.get_or_insert_with(Vec::new).extend(v);
-            }
-            if let Some(v) = partial_rows.p {
-                matched_rows.p.get_or_insert_with(Vec::new).extend(v);
-            }
-            if let Some(v) = partial_rows.o {
-                matched_rows.o.get_or_insert_with(Vec::new).extend(v);
-            }
-            if let Some(v) = partial_rows.g {
-                matched_rows.g.get_or_insert_with(Vec::new).extend(v);
-            }
-        }
-    } else {
-        let scan = file.scan().map_err(VortexRdfError::from)?;
-        let scan = if let Some(row_range) = subject_row_range {
-            scan.with_row_range(row_range)
-        } else {
-            scan
-        };
-        let scan = match filter {
-            NativePatternFilter::All => scan,
-            NativePatternFilter::Empty => unreachable!("handled above"),
-            NativePatternFilter::Expr(expr) => scan.with_filter(expr),
-        };
-        let scan = scan.with_projection(vortex_array::expr::select(
-            projected_columns.as_slice(),
-            vortex_array::expr::root(),
-        ));
-        let stream = scan.into_array_stream().map_err(VortexRdfError::from)?;
-        let (rows, batches, max_batch_rows) =
-            read_native_projected_stream_all_with_scan_stats(stream).await?;
-        matched_rows = rows;
-        scan_batches = batches;
-        max_scan_batch_rows = max_batch_rows;
-    }
-    diagnostics.scan_build_ms = elapsed_ms(scan_start);
-    diagnostics.read_all_ms = elapsed_ms(read_start);
-    diagnostics.scan_batches = scan_batches;
-    diagnostics.max_scan_batch_rows = max_scan_batch_rows;
-    diagnostics.scan_rows_materialized = matched_rows.rows;
-    log::debug!(
-        "[cottas_native::match] filtered scan materialized {} rows from {} batches, max_batch_rows={}, in {:.3}ms",
-        matched_rows.rows,
-        diagnostics.scan_batches,
-        diagnostics.max_scan_batch_rows,
-        diagnostics.read_all_ms
-    );
-    if matched_rows.rows == 0 {
-        log::debug!(
-            "[cottas_native_ids::match] scan produced 0 rows; skipping dictionary decoding"
-        );
-
-        let serialize_start = Instant::now();
-        write_empty_rdf(writer, format).await?;
-        diagnostics.serialize_ms = elapsed_ms(serialize_start);
-        diagnostics.total_ms = elapsed_ms(total_start);
-
-        return Ok(diagnostics);
-    }
-
-    log::debug!(
-        "[cottas_native_ids::match] entering projected lazy RDF materialization for {} rows",
-        matched_rows.rows
-    );
-    let materialize_start = Instant::now();
     let write_stats = write_projected_native_id_rows_as_rdf_lazy(
         input_path,
-        matched_rows,
-        &bound_terms,
+        planned.rows,
+        &planned.bound_terms,
         writer,
         format,
     )
     .await?;
-    log::debug!(
-        "[cottas_native_ids::match] lazy RDF materialization finished in {:?}: rows_out={}, unique_ids_requested={}, unique_ids_loaded={}, id_extract_ms={:.3}, id_lookup_ms={:.3}, serialize_ms={:.3}",
-        materialize_start.elapsed(),
-        write_stats.rows_out,
-        write_stats.unique_ids_requested,
-        write_stats.unique_ids_loaded,
-        write_stats.id_extract_ms,
-        write_stats.id_to_term_lookup_ms,
-        write_stats.serialize_ms
-    );
 
     diagnostics.id_extract_ms = write_stats.id_extract_ms;
     diagnostics.id_to_term_lookup_ms = write_stats.id_to_term_lookup_ms;
@@ -2127,11 +2200,10 @@ where
     diagnostics.unique_ids_loaded = write_stats.unique_ids_loaded;
     diagnostics.id_to_term_stats = write_stats.id_to_term_stats;
     diagnostics.total_ms = elapsed_ms(total_start);
-
-    log::debug!("[cottas_native_ids::diagnostics] {:?}", diagnostics);
-
     Ok(diagnostics)
 }
+
+
 
 pub async fn count_cottas_native_ids_file_with_diagnostics_mode(
     input_path: &Path,
@@ -2469,7 +2541,7 @@ fn native_po_exact_ranges_exists(data_path: &Path) -> bool {
 const NATIVE_PO_EXACT_RANGES_MAGIC: &[u8; 8] = b"VRDFPX1\0";
 const NATIVE_PO_EXACT_RANGE_ENTRY_BYTES: u64 = 24;
 
-fn write_po_exact_range_entry<W: Write>(
+fn write_exact_range_entry<W: Write>(
     writer: &mut W,
     hash: u64,
     start: u64,
@@ -2482,7 +2554,7 @@ fn write_po_exact_range_entry<W: Write>(
         .map_err(|e| VortexRdfError::Serialization(e.to_string()))
 }
 
-fn read_po_exact_range_entry_at(file: &std::fs::File, entry_idx: u64) -> Result<(u64, u64, u64)> {
+fn read_exact_range_entry_at(file: &std::fs::File, entry_idx: u64) -> Result<(u64, u64, u64)> {
     let mut buf = [0u8; 24];
     let offset = 16u64
         .checked_add(
@@ -2503,6 +2575,139 @@ fn read_po_exact_range_entry_at(file: &std::fs::File, entry_idx: u64) -> Result<
     let start = u64::from_le_bytes(buf[8..16].try_into().unwrap());
     let end = u64::from_le_bytes(buf[16..24].try_into().unwrap());
     Ok((hash, start, end))
+}
+
+
+const NATIVE_P_EXACT_RANGES_MAGIC: &[u8; 8] = b"VRDFPR1\0";
+
+fn native_p_exact_ranges_path(data_path: &Path) -> PathBuf {
+    let file_name = data_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("data.vortex");
+    data_path.with_file_name(format!("{file_name}.p_exact_ranges.bin"))
+}
+
+fn native_p_exact_ranges_exists(data_path: &Path) -> bool {
+    native_p_exact_ranges_path(data_path).is_file()
+}
+
+fn predicate_exact_max_ranges() -> usize {
+    std::env::var("VORTEX_RDF_P_EXACT_MAX_RANGES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(256)
+}
+
+fn predicate_exact_max_rows() -> u64 {
+    std::env::var("VORTEX_RDF_P_EXACT_MAX_ROWS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(100_000)
+}
+
+fn range_rows(ranges: &[std::ops::Range<u64>]) -> u64 {
+    ranges
+        .iter()
+        .map(|range| range.end.saturating_sub(range.start))
+        .sum()
+}
+
+fn lookup_exact_row_ranges(
+    path: &Path,
+    expected_magic: &[u8; 8],
+    needle: u64,
+    label: &str,
+) -> Result<Vec<std::ops::Range<u64>>> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        VortexRdfError::Deserialization(format!(
+            "Failed to open {label} index {:?}: {error}",
+            path,
+        ))
+    })?;
+    let len = file
+        .metadata()
+        .map_err(|error| VortexRdfError::Deserialization(error.to_string()))?
+        .len();
+    if len < 16 || (len - 16) % NATIVE_PO_EXACT_RANGE_ENTRY_BYTES != 0 {
+        return Err(VortexRdfError::Deserialization(format!(
+            "Malformed {label} index {:?}: len={len}",
+            path,
+        )));
+    }
+
+    let mut magic = [0u8; 8];
+    read_exact_at_native_sidecar(&file, &mut magic, 0, label)?;
+    if &magic != expected_magic {
+        return Err(VortexRdfError::Deserialization(format!(
+            "Malformed {label} index {:?}: bad magic",
+            path,
+        )));
+    }
+    let mut count_buffer = [0u8; 8];
+    read_exact_at_native_sidecar(&file, &mut count_buffer, 8, label)?;
+    let count = u64::from_le_bytes(count_buffer);
+    if 16 + count.saturating_mul(NATIVE_PO_EXACT_RANGE_ENTRY_BYTES) != len {
+        return Err(VortexRdfError::Deserialization(format!(
+            "Malformed {label} index {:?}: count/len mismatch",
+            path,
+        )));
+    }
+
+    let mut low = 0u64;
+    let mut high = count;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let (key, _, _) = read_exact_range_entry_at(&file, middle)?;
+        if key < needle {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+
+    let mut ranges = Vec::new();
+    let mut index = low;
+    while index < count {
+        let (key, start, end) = read_exact_range_entry_at(&file, index)?;
+        if key != needle {
+            break;
+        }
+        ranges.push(start..end);
+        index += 1;
+    }
+    Ok(ranges)
+}
+
+fn write_exact_range_index(
+    output_path: &Path,
+    magic: &[u8; 8],
+    entries: &mut Vec<(u64, u64, u64)>,
+) -> Result<()> {
+    entries.sort_unstable_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    let temporary_path = output_path.with_extension("exact_ranges.bin.tmp");
+    let temporary_file = std::fs::File::create(&temporary_path)
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    let mut writer = BufWriter::new(temporary_file);
+    writer
+        .write_all(magic)
+        .and_then(|_| writer.write_all(&(entries.len() as u64).to_le_bytes()))
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    for (key, start, end) in entries.iter().copied() {
+        write_exact_range_entry(&mut writer, key, start, end)?;
+    }
+    writer
+        .flush()
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    drop(writer);
+    std::fs::rename(&temporary_path, output_path)
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    Ok(())
 }
 
 pub async fn build_cottas_native_po_exact_ranges_index(
@@ -2574,31 +2779,11 @@ pub async fn build_cottas_native_po_exact_ranges_index(
             entries.push((hash, start, end));
         }
     }
-    entries.sort_unstable_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| a.2.cmp(&b.2))
-    });
-
-    let tmp_path = output_path.with_extension("po_exact_ranges.bin.tmp");
-    let tmp_file = std::fs::File::create(&tmp_path)
-        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    let mut writer = BufWriter::new(tmp_file);
-    writer
-        .write_all(NATIVE_PO_EXACT_RANGES_MAGIC)
-        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    writer
-        .write_all(&(entries.len() as u64).to_le_bytes())
-        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    for (hash, start, end) in &entries {
-        write_po_exact_range_entry(&mut writer, *hash, *start, *end)?;
-    }
-    writer
-        .flush()
-        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    drop(writer);
-    std::fs::rename(&tmp_path, &output_path)
-        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    write_exact_range_index(
+        &output_path,
+        NATIVE_PO_EXACT_RANGES_MAGIC,
+        &mut entries,
+    )?;
     let write_ms = elapsed_ms(write_start);
     let total_ms = elapsed_ms(total_start);
     Ok(NativePoRowGroupIndexBuildStats {
@@ -2614,79 +2799,91 @@ pub async fn build_cottas_native_po_exact_ranges_index(
     })
 }
 
-fn lookup_po_candidate_row_ranges_from_exact_index(
-    data_path: &Path,
-    p_id: u32,
-    o_id: u32,
-) -> Result<Vec<std::ops::Range<u64>>> {
-    let path = native_po_exact_ranges_path(data_path);
-    let file = std::fs::File::open(&path).map_err(|e| {
-        VortexRdfError::Deserialization(format!(
-            "Failed to open native PO exact range index {:?}: {}",
-            path, e
+
+pub async fn build_cottas_native_p_exact_ranges_index(
+    input_path: &Path,
+) -> Result<NativePoRowGroupIndexBuildStats> {
+    let total_start = Instant::now();
+    let output_path = native_p_exact_ranges_path(input_path);
+    let open_start = Instant::now();
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(input_path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let open_ms = elapsed_ms(open_start);
+    let scan_start = Instant::now();
+    let mut stream = file
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_projection(vortex_array::expr::select(
+            ["p"].as_slice(),
+            vortex_array::expr::root(),
         ))
-    })?;
-    let len = file
-        .metadata()
-        .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?
-        .len();
-    if len < 16 || (len - 16) % NATIVE_PO_EXACT_RANGE_ENTRY_BYTES != 0 {
-        return Err(VortexRdfError::Deserialization(format!(
-            "Malformed PO exact range index {:?}: len={}",
-            path, len
-        )));
-    }
-    let mut magic = [0u8; 8];
-    read_exact_at_native_sidecar(&file, &mut magic, 0, "PO exact range magic")?;
-    if &magic != NATIVE_PO_EXACT_RANGES_MAGIC {
-        return Err(VortexRdfError::Deserialization(format!(
-            "Malformed PO exact range index {:?}: bad magic",
-            path
-        )));
-    }
-    let mut count_buf = [0u8; 8];
-    read_exact_at_native_sidecar(&file, &mut count_buf, 8, "PO exact range count")?;
-    let count = u64::from_le_bytes(count_buf);
-    if 16 + count.saturating_mul(NATIVE_PO_EXACT_RANGE_ENTRY_BYTES) != len {
-        return Err(VortexRdfError::Deserialization(format!(
-            "Malformed PO exact range index {:?}: count/len mismatch",
-            path
-        )));
-    }
-    let needle = native_po_hash(p_id, o_id);
-    let mut lo = 0u64;
-    let mut hi = count;
-    while lo < hi {
-        let mid = lo + ((hi - lo) / 2);
-        let (hash, _, _) = read_po_exact_range_entry_at(&file, mid)?;
-        match hash.cmp(&needle) {
-            Ordering::Less => lo = mid + 1,
-            Ordering::Greater => hi = mid,
-            Ordering::Equal => {
-                let mut first = mid;
-                while first > 0 {
-                    let (prev_hash, _, _) = read_po_exact_range_entry_at(&file, first - 1)?;
-                    if prev_hash != needle {
-                        break;
-                    }
-                    first -= 1;
-                }
-                let mut ranges = Vec::new();
-                let mut idx = first;
-                while idx < count {
-                    let (h, start, end) = read_po_exact_range_entry_at(&file, idx)?;
-                    if h != needle {
-                        break;
-                    }
-                    ranges.push(start..end);
-                    idx += 1;
-                }
-                return Ok(ranges);
-            }
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?;
+
+    let mut ranges_by_predicate: HashMap<u32, Vec<(u64, u64)>> = HashMap::new();
+    let mut row_groups = 0usize;
+    let mut rows_scanned = 0u64;
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result.map_err(VortexRdfError::from)?;
+        let predicates = extract_projected_u32_column(&batch, "p")?;
+        if predicates.len() != batch.len() {
+            return Err(VortexRdfError::Serialization(format!(
+                "predicate exact range index saw {} IDs for {} rows",
+                predicates.len(),
+                batch.len(),
+            )));
         }
+        for (offset, predicate_id) in predicates.into_iter().enumerate() {
+            let row_id = rows_scanned + offset as u64;
+            let ranges = ranges_by_predicate.entry(predicate_id).or_default();
+            if let Some(last) = ranges.last_mut() {
+                if last.1 == row_id {
+                    last.1 = row_id + 1;
+                    continue;
+                }
+            }
+            ranges.push((row_id, row_id + 1));
+        }
+        rows_scanned += batch.len() as u64;
+        row_groups += 1;
     }
-    Ok(Vec::new())
+    let scan_ms = elapsed_ms(scan_start);
+
+    let write_start = Instant::now();
+    let mut entries = Vec::new();
+    for (predicate_id, ranges) in ranges_by_predicate {
+        entries.extend(
+            ranges
+                .into_iter()
+                .map(|(start, end)| (u64::from(predicate_id), start, end)),
+        );
+    }
+    write_exact_range_index(
+        &output_path,
+        NATIVE_P_EXACT_RANGES_MAGIC,
+        &mut entries,
+    )?;
+    let write_ms = elapsed_ms(write_start);
+
+    Ok(NativePoRowGroupIndexBuildStats {
+        input_path: input_path.display().to_string(),
+        output_path: output_path.display().to_string(),
+        row_groups,
+        rows_scanned,
+        unique_po_hashes_written: entries.len() as u64,
+        open_ms,
+        scan_ms,
+        write_ms,
+        total_ms: elapsed_ms(total_start),
+    })
 }
+
+
+
+
 
 const NATIVE_SUBJECT_RANGE_ENTRY_BYTES: u64 = 20;
 
