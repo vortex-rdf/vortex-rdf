@@ -2,11 +2,13 @@ use crate::error::{Result, VortexRdfError};
 use crate::index::{RdfDictionary, SimpleDictionaryView};
 use crate::io::utils::CottasVortexCompressionProfile;
 use crate::store::layout::cottas::TripleOrdering;
+use async_trait::async_trait;
 
 use futures::{Stream, StreamExt};
 use oxrdf::Quad;
 use std::cmp::Ordering;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -280,13 +282,8 @@ pub async fn match_cottas_native_file_as_triples(
 /// `match_cottas_native_file_with_diagnostics`, but returns triples for the
 /// Python/RDFLib binding.
 ///
-/// Transitional implementation:
-/// optimized projected scan
-///   -> in-memory N-Triples
-///   -> parsed SPO strings
-///
-/// This deliberately shares the indexed planner. A later refactor should
-/// expose projected ID rows directly and eliminate this serialization step.
+/// The indexed planner returns projected native-ID rows directly; only IDs from
+/// unbound output columns are decoded before constructing returned triples.
 pub async fn match_cottas_native_file_as_triples_optimized(
     input_path: &Path,
     subject: Option<&NamedOrBlankNode>,
@@ -294,21 +291,10 @@ pub async fn match_cottas_native_file_as_triples_optimized(
     object: Option<&Term>,
     graph: Option<&GraphName>,
 ) -> Result<Vec<(String, String, String)>> {
-    let planned = execute_cottas_native_match(
-        input_path,
-        subject,
-        predicate,
-        object,
-        graph,
-    )
-    .await?;
+    let planned =
+        execute_cottas_native_match(input_path, subject, predicate, object, graph).await?;
 
-    projected_native_id_rows_as_triples(
-        input_path,
-        &planned.rows,
-        &planned.bound_terms,
-    )
-    .await
+    projected_native_id_rows_as_triples(input_path, &planned.rows, &planned.bound_terms).await
 }
 
 pub async fn serialize_cottas_native_file<Dict, S>(
@@ -391,8 +377,7 @@ where
             po_exact_stats.unique_po_hashes_written,
             po_exact_stats.total_ms
         );
-        let p_exact_stats =
-            build_cottas_native_p_exact_ranges_index(output_path).await?;
+        let p_exact_stats = build_cottas_native_p_exact_ranges_index(output_path).await?;
         log::info!(
             "[cottas_native_ids] built predicate exact-ranges index during serialization: row_groups={}, rows={}, exact_ranges={}, total_ms={:.3}",
             p_exact_stats.row_groups,
@@ -1038,6 +1023,251 @@ fn rdf_err_to_vortex_err(e: VortexRdfError) -> VortexError {
     )
 }
 
+/// Format-independent dictionary access for native-ID planning and decoding.
+/// The current implementation delegates to binary sidecars; a Vortex-native
+/// dictionary can implement this contract without changing the planner.
+#[async_trait]
+pub trait NativeDictionaryProvider: Send + Sync {
+    async fn lookup_term_id(
+        &self,
+        term: &str,
+        column: Option<&'static str>,
+    ) -> Result<(Option<u32>, NativeTermToIdLookupStats)>;
+
+    async fn lookup_terms_by_ids(
+        &self,
+        ids: &[u32],
+    ) -> Result<(HashMap<u32, String>, NativeIdToTermLookupStats)>;
+}
+
+/// Format-independent exact row-range access used by the native-ID planner.
+pub trait NativeIndexProvider: Send + Sync {
+    fn subject_range(&self, subject_id: u32) -> Result<Option<Range<u64>>>;
+    fn po_ranges(&self, predicate_id: u32, object_id: u32) -> Result<Option<Vec<Range<u64>>>>;
+    fn predicate_ranges(&self, predicate_id: u32) -> Result<Option<Vec<Range<u64>>>>;
+}
+
+#[derive(Clone, Debug)]
+pub struct BinaryNativeProviders {
+    data_path: PathBuf,
+}
+
+impl BinaryNativeProviders {
+    pub fn new(data_path: &Path) -> Self {
+        Self {
+            data_path: data_path.to_path_buf(),
+        }
+    }
+}
+
+#[async_trait]
+impl NativeDictionaryProvider for BinaryNativeProviders {
+    async fn lookup_term_id(
+        &self,
+        term: &str,
+        column: Option<&'static str>,
+    ) -> Result<(Option<u32>, NativeTermToIdLookupStats)> {
+        lookup_term_id_from_sidecar_with_stats(&self.data_path, term, column).await
+    }
+
+    async fn lookup_terms_by_ids(
+        &self,
+        ids: &[u32],
+    ) -> Result<(HashMap<u32, String>, NativeIdToTermLookupStats)> {
+        lookup_terms_by_ids_from_sidecar_with_stats(&self.data_path, ids).await
+    }
+}
+
+impl NativeIndexProvider for BinaryNativeProviders {
+    fn subject_range(&self, subject_id: u32) -> Result<Option<Range<u64>>> {
+        if !native_subject_range_index_exists(&self.data_path) {
+            return Ok(None);
+        }
+        Ok(
+            lookup_subject_range_from_sidecar(&self.data_path, subject_id)?
+                .map(|range| range.start..range.end),
+        )
+    }
+
+    fn po_ranges(&self, predicate_id: u32, object_id: u32) -> Result<Option<Vec<Range<u64>>>> {
+        if !native_po_exact_ranges_exists(&self.data_path) {
+            return Ok(None);
+        }
+        lookup_exact_row_ranges(
+            &native_po_exact_ranges_path(&self.data_path),
+            NATIVE_PO_EXACT_RANGES_MAGIC,
+            native_po_hash(predicate_id, object_id),
+            "PO exact range",
+        )
+        .map(Some)
+    }
+
+    fn predicate_ranges(&self, predicate_id: u32) -> Result<Option<Vec<Range<u64>>>> {
+        if !native_p_exact_ranges_exists(&self.data_path) {
+            return Ok(None);
+        }
+        lookup_exact_row_ranges(
+            &native_p_exact_ranges_path(&self.data_path),
+            NATIVE_P_EXACT_RANGES_MAGIC,
+            u64::from(predicate_id),
+            "predicate exact range",
+        )
+        .map(Some)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ResolvedNativePattern {
+    s: Option<u32>,
+    p: Option<u32>,
+    o: Option<u32>,
+    g: Option<u32>,
+}
+
+impl ResolvedNativePattern {
+    fn filter(self) -> NativePatternFilter {
+        let mut filters = Vec::new();
+        if let Some(id) = self.s {
+            filters.push(eq(col("s"), lit(id)));
+        }
+        if let Some(id) = self.p {
+            filters.push(eq(col("p"), lit(id)));
+        }
+        if let Some(id) = self.o {
+            filters.push(eq(col("o"), lit(id)));
+        }
+        if let Some(id) = self.g {
+            filters.push(eq(col("g"), lit(id)));
+        }
+        match filters.into_iter().reduce(and) {
+            Some(expr) => NativePatternFilter::Expr(expr),
+            None => NativePatternFilter::All,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct NativeAccessPlan {
+    ranges: Option<Vec<Range<u64>>>,
+    strategy: String,
+    lookup_ms: f64,
+    candidate_ranges: usize,
+    candidate_rows: u64,
+    subject_range: Option<Range<u64>>,
+    po_index_used: bool,
+}
+
+async fn resolve_native_pattern<D: NativeDictionaryProvider + ?Sized>(
+    dictionary: &D,
+    subject: Option<&NamedOrBlankNode>,
+    predicate: Option<&NamedNode>,
+    object: Option<&Term>,
+    graph: Option<&GraphName>,
+) -> Result<(
+    Option<ResolvedNativePattern>,
+    f64,
+    Vec<NativeTermToIdLookupStats>,
+)> {
+    let mut resolved = ResolvedNativePattern::default();
+    let mut total_lookup_ms = 0.0;
+    let mut stats_out = Vec::new();
+
+    macro_rules! resolve_bound {
+        ($value:expr, $field:ident, $column:literal) => {
+            if let Some(value) = $value {
+                let (id, stats) = dictionary
+                    .lookup_term_id(&value.to_string(), Some($column))
+                    .await?;
+                total_lookup_ms += stats.total_ms;
+                stats_out.push(stats);
+                let Some(id) = id else {
+                    return Ok((None, total_lookup_ms, stats_out));
+                };
+                resolved.$field = Some(id);
+            }
+        };
+    }
+
+    resolve_bound!(subject, s, "s");
+    resolve_bound!(predicate, p, "p");
+    resolve_bound!(object, o, "o");
+    resolve_bound!(graph, g, "g");
+    Ok((Some(resolved), total_lookup_ms, stats_out))
+}
+
+fn plan_native_access<I: NativeIndexProvider + ?Sized>(
+    indexes: &I,
+    resolved: ResolvedNativePattern,
+    subject_bound: bool,
+    predicate_bound: bool,
+    object_bound: bool,
+) -> Result<NativeAccessPlan> {
+    let start = Instant::now();
+
+    if subject_bound {
+        if let Some(subject_id) = resolved.s {
+            if let Some(range) = indexes.subject_range(subject_id)? {
+                return Ok(NativeAccessPlan {
+                    ranges: Some(vec![range.clone()]),
+                    strategy: "subject-ranges".to_string(),
+                    lookup_ms: elapsed_ms(start),
+                    candidate_ranges: 1,
+                    candidate_rows: range.end.saturating_sub(range.start),
+                    subject_range: Some(range),
+                    po_index_used: false,
+                });
+            }
+        }
+    }
+
+    if !subject_bound && predicate_bound && object_bound {
+        if let (Some(predicate_id), Some(object_id)) = (resolved.p, resolved.o) {
+            if let Some(ranges) = indexes.po_ranges(predicate_id, object_id)? {
+                let candidate_rows = range_rows(&ranges);
+                return Ok(NativeAccessPlan {
+                    candidate_ranges: ranges.len(),
+                    candidate_rows,
+                    ranges: Some(ranges),
+                    strategy: "po-exact-ranges".to_string(),
+                    lookup_ms: elapsed_ms(start),
+                    subject_range: None,
+                    po_index_used: true,
+                });
+            }
+        }
+    }
+
+    if !subject_bound && predicate_bound && !object_bound {
+        if let Some(predicate_id) = resolved.p {
+            if let Some(ranges) = indexes.predicate_ranges(predicate_id)? {
+                let candidate_rows = range_rows(&ranges);
+                let use_ranges = ranges.is_empty()
+                    || (ranges.len() <= predicate_exact_max_ranges()
+                        && candidate_rows <= predicate_exact_max_rows());
+                return Ok(NativeAccessPlan {
+                    candidate_ranges: ranges.len(),
+                    candidate_rows,
+                    ranges: use_ranges.then_some(ranges),
+                    strategy: if use_ranges {
+                        "p-exact-ranges".to_string()
+                    } else {
+                        "none-high-cardinality-predicate".to_string()
+                    },
+                    lookup_ms: elapsed_ms(start),
+                    subject_range: None,
+                    po_index_used: false,
+                });
+            }
+        }
+    }
+
+    Ok(NativeAccessPlan {
+        strategy: "none".to_string(),
+        lookup_ms: elapsed_ms(start),
+        ..NativeAccessPlan::default()
+    })
+}
+
 enum NativePatternFilter {
     /// No bound RDF terms, so scan all rows.
     All,
@@ -1302,11 +1532,7 @@ fn append_optional_projected_u32_column(
     Ok(())
 }
 
-
-fn append_projected_rows(
-    destination: &mut NativeProjectedIdRows,
-    source: NativeProjectedIdRows,
-) {
+fn append_projected_rows(destination: &mut NativeProjectedIdRows, source: NativeProjectedIdRows) {
     destination.rows += source.rows;
     for (destination_column, source_column) in [
         (&mut destination.s, source.s),
@@ -1450,7 +1676,6 @@ fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
-
 async fn projected_native_id_rows_as_triples(
     data_path: &Path,
     rows: &NativeProjectedIdRows,
@@ -1460,10 +1685,8 @@ async fn projected_native_id_rows_as_triples(
         return Ok(Vec::new());
     }
 
-    let unique_ids =
-        collect_unique_ids_from_projected_unbound_rows(rows, bound_terms);
-    let id_to_term =
-        lookup_terms_by_ids_from_sidecar(data_path, &unique_ids).await?;
+    let unique_ids = collect_unique_ids_from_projected_unbound_rows(rows, bound_terms);
+    let id_to_term = lookup_terms_by_ids_from_sidecar(data_path, &unique_ids).await?;
     let mut triples = Vec::with_capacity(rows.rows);
 
     for row_idx in 0..rows.rows {
@@ -1471,30 +1694,11 @@ async fn projected_native_id_rows_as_triples(
         let p_id = projected_id_at(&rows.p, &bound_terms.p, row_idx, "P")?;
         let o_id = projected_id_at(&rows.o, &bound_terms.o, row_idx, "O")?;
 
-        let subject = lookup_projected_or_use_bound(
-            &id_to_term,
-            &bound_terms.s,
-            s_id,
-            "S",
-        )?;
-        let predicate = lookup_projected_or_use_bound(
-            &id_to_term,
-            &bound_terms.p,
-            p_id,
-            "P",
-        )?;
-        let object = lookup_projected_or_use_bound(
-            &id_to_term,
-            &bound_terms.o,
-            o_id,
-            "O",
-        )?;
+        let subject = lookup_projected_or_use_bound(&id_to_term, &bound_terms.s, s_id, "S")?;
+        let predicate = lookup_projected_or_use_bound(&id_to_term, &bound_terms.p, p_id, "P")?;
+        let object = lookup_projected_or_use_bound(&id_to_term, &bound_terms.o, o_id, "O")?;
 
-        triples.push((
-            subject.to_owned(),
-            predicate.to_owned(),
-            object.to_owned(),
-        ));
+        triples.push((subject.to_owned(), predicate.to_owned(), object.to_owned()));
     }
 
     Ok(triples)
@@ -1645,7 +1849,8 @@ async fn lookup_terms_by_ids_from_sidecar(
     data_path: &Path,
     ids: &[u32],
 ) -> Result<HashMap<u32, String>> {
-    let (terms, _stats) = lookup_terms_by_ids_from_sidecar_with_stats(data_path, ids).await?;
+    let provider = BinaryNativeProviders::new(data_path);
+    let (terms, _stats) = provider.lookup_terms_by_ids(ids).await?;
     Ok(terms)
 }
 
@@ -1887,7 +2092,6 @@ where
     Ok(())
 }
 
-
 async fn execute_cottas_native_match(
     input_path: &Path,
     subject: Option<&NamedOrBlankNode>,
@@ -1897,29 +2101,21 @@ async fn execute_cottas_native_match(
 ) -> Result<NativeMatchPlanResult> {
     let total_start = Instant::now();
     let mut diagnostics = CottasNativeIdsDiagnostics::default();
-    let bound_terms =
-        BoundNativeRdfTerms::from_pattern(subject, predicate, object, graph);
-
-    let (filter, term_lookup_ms, term_to_id_stats) =
-        build_native_pattern_filter_lazy_with_detailed_stats(
-            input_path,
-            subject,
-            predicate,
-            object,
-            graph,
-        )
-        .await?;
+    let bound_terms = BoundNativeRdfTerms::from_pattern(subject, predicate, object, graph);
+    let providers = BinaryNativeProviders::new(input_path);
+    let (resolved, term_lookup_ms, term_to_id_stats) =
+        resolve_native_pattern(&providers, subject, predicate, object, graph).await?;
     diagnostics.term_lookup_ms = term_lookup_ms;
     diagnostics.term_to_id_stats = term_to_id_stats;
-
-    if matches!(filter, NativePatternFilter::Empty) {
+    let Some(resolved) = resolved else {
         diagnostics.total_ms = elapsed_ms(total_start);
         return Ok(NativeMatchPlanResult {
             rows: NativeProjectedIdRows::default(),
             bound_terms,
             diagnostics,
         });
-    }
+    };
+    let filter = resolved.filter();
 
     let open_start = Instant::now();
     let file = NATIVE_FILE_SESSION
@@ -1934,129 +2130,42 @@ async fn execute_cottas_native_match(
     }
     diagnostics.total_splits = file.splits().ok().map(|splits| splits.len());
 
-    let projected_columns =
-        native_projection_columns_for_bound_terms(&bound_terms);
-    let mut selected_ranges: Option<Vec<std::ops::Range<u64>>> = None;
-
-    // SPO subject range has first priority.
-    if let Some(subject_node) = subject {
-        if native_subject_range_index_exists(input_path) {
-            let lookup_start = Instant::now();
-            let subject_id = lookup_term_id_from_sidecar(
-                input_path,
-                &subject_node.to_string(),
-            )
-            .await?;
-            diagnostics.subject_range_lookup_ms = elapsed_ms(lookup_start);
-
-            let Some(subject_id) = subject_id else {
-                diagnostics.total_ms = elapsed_ms(total_start);
-                return Ok(NativeMatchPlanResult {
-                    rows: NativeProjectedIdRows::default(),
-                    bound_terms,
-                    diagnostics,
-                });
-            };
-            let Some(range) =
-                lookup_subject_range_from_sidecar(input_path, subject_id)?
-            else {
-                diagnostics.total_ms = elapsed_ms(total_start);
-                return Ok(NativeMatchPlanResult {
-                    rows: NativeProjectedIdRows::default(),
-                    bound_terms,
-                    diagnostics,
-                });
-            };
-
-            diagnostics.subject_range_index_used = true;
-            diagnostics.subject_range_start = Some(range.start);
-            diagnostics.subject_range_end = Some(range.end);
-            diagnostics.subject_range_rows =
-                Some(range.end.saturating_sub(range.start));
-            diagnostics.access_index_strategy = "subject-ranges".to_string();
-            diagnostics.access_index_lookup_ms =
-                diagnostics.subject_range_lookup_ms;
-            diagnostics.access_candidate_ranges = 1;
-            diagnostics.access_candidate_rows =
-                range.end.saturating_sub(range.start);
-            selected_ranges = Some(vec![range.start..range.end]);
-        }
+    let projected_columns = native_projection_columns_for_bound_terms(&bound_terms);
+    let access_plan = plan_native_access(
+        &providers,
+        resolved,
+        subject.is_some(),
+        predicate.is_some(),
+        object.is_some(),
+    )?;
+    diagnostics.access_index_strategy = access_plan.strategy.clone();
+    diagnostics.access_index_lookup_ms = access_plan.lookup_ms;
+    diagnostics.access_candidate_ranges = access_plan.candidate_ranges;
+    diagnostics.access_candidate_rows = access_plan.candidate_rows;
+    diagnostics.po_rowgroup_index_used = access_plan.po_index_used;
+    diagnostics.po_rowgroup_lookup_ms = if access_plan.po_index_used {
+        access_plan.lookup_ms
+    } else {
+        0.0
+    };
+    diagnostics.po_candidate_ranges = if access_plan.po_index_used {
+        access_plan.candidate_ranges
+    } else {
+        0
+    };
+    diagnostics.po_candidate_rows = if access_plan.po_index_used {
+        access_plan.candidate_rows
+    } else {
+        0
+    };
+    if let Some(range) = &access_plan.subject_range {
+        diagnostics.subject_range_index_used = true;
+        diagnostics.subject_range_lookup_ms = access_plan.lookup_ms;
+        diagnostics.subject_range_start = Some(range.start);
+        diagnostics.subject_range_end = Some(range.end);
+        diagnostics.subject_range_rows = Some(range.end.saturating_sub(range.start));
     }
-
-    // Exact (predicate, object) ranges have second priority.
-    if selected_ranges.is_none()
-        && subject.is_none()
-        && predicate.is_some()
-        && object.is_some()
-        && native_po_exact_ranges_exists(input_path)
-    {
-        let lookup_start = Instant::now();
-        if let Some((p_id, o_id)) =
-            resolve_po_bound_ids_for_index(input_path, predicate, object).await?
-        {
-            let ranges = lookup_exact_row_ranges(
-                &native_po_exact_ranges_path(input_path),
-                NATIVE_PO_EXACT_RANGES_MAGIC,
-                native_po_hash(p_id, o_id),
-                "PO exact range",
-            )?;
-            let candidate_rows = range_rows(&ranges);
-            diagnostics.po_rowgroup_index_used = true;
-            diagnostics.po_candidate_ranges = ranges.len();
-            diagnostics.po_candidate_rows = candidate_rows;
-            diagnostics.access_index_strategy = "po-exact-ranges".to_string();
-            diagnostics.access_candidate_ranges = ranges.len();
-            diagnostics.access_candidate_rows = candidate_rows;
-            selected_ranges = Some(ranges);
-        }
-        diagnostics.po_rowgroup_lookup_ms = elapsed_ms(lookup_start);
-        diagnostics.access_index_lookup_ms =
-            diagnostics.po_rowgroup_lookup_ms;
-    }
-
-    // Predicate-only exact ranges are used only for selective predicates.
-    if selected_ranges.is_none()
-        && subject.is_none()
-        && predicate.is_some()
-        && object.is_none()
-        && native_p_exact_ranges_exists(input_path)
-    {
-        let lookup_start = Instant::now();
-        let predicate_id = lookup_term_id_from_sidecar(
-            input_path,
-            &predicate.expect("checked above").to_string(),
-        )
-        .await?;
-
-        if let Some(predicate_id) = predicate_id {
-            let ranges = lookup_exact_row_ranges(
-                &native_p_exact_ranges_path(input_path),
-                NATIVE_P_EXACT_RANGES_MAGIC,
-                u64::from(predicate_id),
-                "predicate exact range",
-            )?;
-            let candidate_rows = range_rows(&ranges);
-            diagnostics.access_candidate_ranges = ranges.len();
-            diagnostics.access_candidate_rows = candidate_rows;
-
-            if ranges.is_empty()
-                || (ranges.len() <= predicate_exact_max_ranges()
-                    && candidate_rows <= predicate_exact_max_rows())
-            {
-                diagnostics.access_index_strategy =
-                    "p-exact-ranges".to_string();
-                selected_ranges = Some(ranges);
-            } else {
-                diagnostics.access_index_strategy =
-                    "none-high-cardinality-predicate".to_string();
-            }
-        }
-        diagnostics.access_index_lookup_ms = elapsed_ms(lookup_start);
-    }
-
-    if diagnostics.access_index_strategy.is_empty() {
-        diagnostics.access_index_strategy = "none".to_string();
-    }
+    let selected_ranges = access_plan.ranges;
 
     let mut scan_build_ms = 0.0;
     let mut read_all_ms = 0.0;
@@ -2165,14 +2274,8 @@ where
     W: Write,
 {
     let total_start = Instant::now();
-    let planned = execute_cottas_native_match(
-        input_path,
-        subject,
-        predicate,
-        object,
-        graph,
-    )
-    .await?;
+    let planned =
+        execute_cottas_native_match(input_path, subject, predicate, object, graph).await?;
     let mut diagnostics = planned.diagnostics;
 
     if planned.rows.rows == 0 {
@@ -2202,8 +2305,6 @@ where
     diagnostics.total_ms = elapsed_ms(total_start);
     Ok(diagnostics)
 }
-
-
 
 pub async fn count_cottas_native_ids_file_with_diagnostics_mode(
     input_path: &Path,
@@ -2507,25 +2608,6 @@ fn native_po_hash(p: u32, o: u32) -> u64 {
     x ^ (x >> 31)
 }
 
-async fn resolve_po_bound_ids_for_index(
-    data_path: &Path,
-    predicate: Option<&NamedNode>,
-    object: Option<&Term>,
-) -> Result<Option<(u32, u32)>> {
-    let (Some(predicate), Some(object)) = (predicate, object) else {
-        return Ok(None);
-    };
-    let p_term = predicate.to_string();
-    let o_term = object.to_string();
-    let Some(p_id) = lookup_term_id_from_sidecar(data_path, &p_term).await? else {
-        return Ok(None);
-    };
-    let Some(o_id) = lookup_term_id_from_sidecar(data_path, &o_term).await? else {
-        return Ok(None);
-    };
-    Ok(Some((p_id, o_id)))
-}
-
 fn native_po_exact_ranges_path(data_path: &Path) -> PathBuf {
     let file_name = data_path
         .file_name()
@@ -2577,7 +2659,6 @@ fn read_exact_range_entry_at(file: &std::fs::File, entry_idx: u64) -> Result<(u6
     Ok((hash, start, end))
 }
 
-
 const NATIVE_P_EXACT_RANGES_MAGIC: &[u8; 8] = b"VRDFPR1\0";
 
 fn native_p_exact_ranges_path(data_path: &Path) -> PathBuf {
@@ -2620,10 +2701,9 @@ fn lookup_exact_row_ranges(
     label: &str,
 ) -> Result<Vec<std::ops::Range<u64>>> {
     let file = std::fs::File::open(path).map_err(|error| {
-        VortexRdfError::Deserialization(format!(
-            "Failed to open {label} index {:?}: {error}",
-            path,
-        ))
+        VortexRdfError::Deserialization(
+            format!("Failed to open {label} index {:?}: {error}", path,),
+        )
     })?;
     let len = file
         .metadata()
@@ -2779,11 +2859,7 @@ pub async fn build_cottas_native_po_exact_ranges_index(
             entries.push((hash, start, end));
         }
     }
-    write_exact_range_index(
-        &output_path,
-        NATIVE_PO_EXACT_RANGES_MAGIC,
-        &mut entries,
-    )?;
+    write_exact_range_index(&output_path, NATIVE_PO_EXACT_RANGES_MAGIC, &mut entries)?;
     let write_ms = elapsed_ms(write_start);
     let total_ms = elapsed_ms(total_start);
     Ok(NativePoRowGroupIndexBuildStats {
@@ -2798,7 +2874,6 @@ pub async fn build_cottas_native_po_exact_ranges_index(
         total_ms,
     })
 }
-
 
 pub async fn build_cottas_native_p_exact_ranges_index(
     input_path: &Path,
@@ -2861,11 +2936,7 @@ pub async fn build_cottas_native_p_exact_ranges_index(
                 .map(|(start, end)| (u64::from(predicate_id), start, end)),
         );
     }
-    write_exact_range_index(
-        &output_path,
-        NATIVE_P_EXACT_RANGES_MAGIC,
-        &mut entries,
-    )?;
+    write_exact_range_index(&output_path, NATIVE_P_EXACT_RANGES_MAGIC, &mut entries)?;
     let write_ms = elapsed_ms(write_start);
 
     Ok(NativePoRowGroupIndexBuildStats {
@@ -2880,10 +2951,6 @@ pub async fn build_cottas_native_p_exact_ranges_index(
         total_ms: elapsed_ms(total_start),
     })
 }
-
-
-
-
 
 const NATIVE_SUBJECT_RANGE_ENTRY_BYTES: u64 = 20;
 
@@ -3333,82 +3400,6 @@ async fn resolve_single_bound_id_for_count(
     }
 }
 
-async fn build_native_pattern_filter_lazy_with_detailed_stats(
-    data_path: &Path,
-    subject: Option<&NamedOrBlankNode>,
-    predicate: Option<&NamedNode>,
-    object: Option<&Term>,
-    graph: Option<&GraphName>,
-) -> Result<(NativePatternFilter, f64, Vec<NativeTermToIdLookupStats>)> {
-    let start = Instant::now();
-    let mut term_lookup_ms = 0.0;
-    let mut term_to_id_stats: Vec<NativeTermToIdLookupStats> = Vec::new();
-    let mut filters: Vec<Expression> = Vec::new();
-
-    if let Some(subject) = subject {
-        let term = subject.to_string();
-        let (id, stats) =
-            lookup_term_id_from_sidecar_with_stats(data_path, &term, Some("s")).await?;
-        term_lookup_ms += stats.total_ms;
-        term_to_id_stats.push(stats);
-        let Some(id) = id else {
-            return Ok((NativePatternFilter::Empty, term_lookup_ms, term_to_id_stats));
-        };
-        filters.push(eq(col("s"), lit(id)));
-    }
-    if let Some(predicate) = predicate {
-        let term = predicate.to_string();
-        let (id, stats) =
-            lookup_term_id_from_sidecar_with_stats(data_path, &term, Some("p")).await?;
-        term_lookup_ms += stats.total_ms;
-        term_to_id_stats.push(stats);
-        let Some(id) = id else {
-            return Ok((NativePatternFilter::Empty, term_lookup_ms, term_to_id_stats));
-        };
-        filters.push(eq(col("p"), lit(id)));
-    }
-    if let Some(object) = object {
-        let term = object.to_string();
-        let (id, stats) =
-            lookup_term_id_from_sidecar_with_stats(data_path, &term, Some("o")).await?;
-        term_lookup_ms += stats.total_ms;
-        term_to_id_stats.push(stats);
-        let Some(id) = id else {
-            return Ok((NativePatternFilter::Empty, term_lookup_ms, term_to_id_stats));
-        };
-        filters.push(eq(col("o"), lit(id)));
-    }
-    if let Some(graph) = graph {
-        let term = graph.to_string();
-        let (id, stats) =
-            lookup_term_id_from_sidecar_with_stats(data_path, &term, Some("g")).await?;
-        term_lookup_ms += stats.total_ms;
-        term_to_id_stats.push(stats);
-        let Some(id) = id else {
-            return Ok((NativePatternFilter::Empty, term_lookup_ms, term_to_id_stats));
-        };
-        filters.push(eq(col("g"), lit(id)));
-    }
-
-    let Some(expr) = filters.into_iter().reduce(and) else {
-        log::debug!(
-            "[cottas_native_ids::build_native_pattern_filter_lazy_detailed] no bound terms; built All filter in {:?}",
-            start.elapsed()
-        );
-        return Ok((NativePatternFilter::All, term_lookup_ms, term_to_id_stats));
-    };
-    log::debug!(
-        "[cottas_native_ids::build_native_pattern_filter_lazy_detailed] built filter in {:?}; bound_terms={}, term_lookup_ms={:.3}",
-        start.elapsed(),
-        term_to_id_stats.len(),
-        term_lookup_ms
-    );
-    Ok((
-        NativePatternFilter::Expr(expr),
-        term_lookup_ms,
-        term_to_id_stats,
-    ))
-}
 async fn build_native_pattern_filter_lazy_with_stats(
     data_path: &Path,
     subject: Option<&NamedOrBlankNode>,
