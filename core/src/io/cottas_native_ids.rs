@@ -12,7 +12,7 @@ use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 use vortex::VortexSessionDefault;
 use vortex_error::{VortexError, VortexResult};
@@ -3119,19 +3119,6 @@ fn extract_projected_u64_column(array: &ArrayRef, column_name: &str) -> Result<V
     Ok(column.as_slice::<u64>().to_vec())
 }
 
-fn write_subject_range_entry<W: Write>(
-    writer: &mut W,
-    subject_id: u32,
-    start: u64,
-    end: u64,
-) -> Result<()> {
-    writer
-        .write_all(&subject_id.to_le_bytes())
-        .and_then(|_| writer.write_all(&start.to_le_bytes()))
-        .and_then(|_| writer.write_all(&end.to_le_bytes()))
-        .map_err(|e| VortexRdfError::Serialization(e.to_string()))
-}
-
 fn read_subject_range_entry_at(file: &std::fs::File, entry_idx: u64) -> Result<(u32, u64, u64)> {
     let mut buf = [0u8; 20];
     let offset = entry_idx
@@ -3184,99 +3171,55 @@ fn lookup_subject_range_from_sidecar(
     Ok(None)
 }
 
-async fn build_cottas_native_subject_range_vortex_index(
-    data_path: &Path,
-    binary_path: &Path,
-) -> Result<()> {
-    const CHUNK_ROWS: usize = 1_000_000;
-    let output_path = native_subject_range_vortex_path(data_path);
-    let input = std::fs::File::open(binary_path)
-        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
-    let binary_len = input
-        .metadata()
-        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?
-        .len();
-    if binary_len % NATIVE_SUBJECT_RANGE_ENTRY_BYTES != 0 {
-        return Err(VortexRdfError::Serialization(format!(
-            "Cannot convert malformed binary subject index {:?}: {} bytes is not divisible by {}",
-            binary_path, binary_len, NATIVE_SUBJECT_RANGE_ENTRY_BYTES
-        )));
-    }
-    let mut reader = BufReader::new(input);
-    let arrays = async_stream::try_stream! {
-        loop {
-            let mut subject_ids = Vec::with_capacity(CHUNK_ROWS);
-            let mut row_starts = Vec::with_capacity(CHUNK_ROWS);
-            let mut row_ends = Vec::with_capacity(CHUNK_ROWS);
-            for _ in 0..CHUNK_ROWS {
-                let mut bytes = [0u8; 20];
-                match reader.read_exact(&mut bytes) {
-                    Ok(()) => {
-                        subject_ids.push(u32::from_le_bytes(bytes[0..4].try_into().unwrap()));
-                        row_starts.push(u64::from_le_bytes(bytes[4..12].try_into().unwrap()));
-                        row_ends.push(u64::from_le_bytes(bytes[12..20].try_into().unwrap()));
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    Err(error) => Err(vortex_error::vortex_err!(
-                        "failed reading binary subject index during Vortex conversion: {}",
-                        error
-                    ))?,
-                }
-            }
-            if subject_ids.is_empty() {
-                break;
-            }
-            let array = StructArray::from_fields(&[
-                ("subject_id", PrimitiveArray::from_iter(subject_ids).into_array()),
-                ("row_start", PrimitiveArray::from_iter(row_starts).into_array()),
-                ("row_end", PrimitiveArray::from_iter(row_ends).into_array()),
-            ])?;
-            yield array.into_array();
-        }
-    };
-    let dtype = StructArray::from_fields(&[
-        (
-            "subject_id",
-            PrimitiveArray::from_iter(Vec::<u32>::new()).into_array(),
-        ),
-        (
-            "row_start",
-            PrimitiveArray::from_iter(Vec::<u64>::new()).into_array(),
-        ),
-        (
-            "row_end",
-            PrimitiveArray::from_iter(Vec::<u64>::new()).into_array(),
-        ),
-    ])
-    .map_err(VortexRdfError::Vortex)?
-    .dtype()
-    .clone();
-    let stream = ArrayStreamAdapter::new(dtype, arrays);
-    let temporary_path = output_path.with_extension("vortex.tmp");
-    let mut output = tokio::fs::File::create(&temporary_path)
-        .await
-        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
-    let strategy = WriteStrategyBuilder::default()
-        .with_row_block_size(65_536)
-        .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
-        .build();
-    NATIVE_FILE_SESSION
-        .write_options()
-        .with_strategy(strategy)
-        .write(&mut output, stream)
-        .await
-        .map_err(VortexRdfError::from)?;
-    drop(output);
-    std::fs::rename(&temporary_path, &output_path)
-        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+#[derive(Clone, Debug, Default)]
+struct NativeSubjectRangeBuildState {
+    rows_scanned: u64,
+    ranges_written: u64,
+    batches: usize,
+    max_batch_rows: usize,
+}
+
+fn store_subject_range_build_state(
+    shared_state: &Mutex<NativeSubjectRangeBuildState>,
+    state: NativeSubjectRangeBuildState,
+) -> VortexResult<()> {
+    let mut guard = shared_state.lock().map_err(|_| {
+        vortex_error::vortex_err!("subject range build-state mutex was poisoned")
+    })?;
+    *guard = state;
     Ok(())
 }
 
+fn build_subject_range_array(
+    subject_ids: Vec<u32>,
+    row_starts: Vec<u64>,
+    row_ends: Vec<u64>,
+) -> Result<ArrayRef> {
+    StructArray::from_fields(&[
+        ("subject_id", PrimitiveArray::from_iter(subject_ids).into_array()),
+        ("row_start", PrimitiveArray::from_iter(row_starts).into_array()),
+        ("row_end", PrimitiveArray::from_iter(row_ends).into_array()),
+    ])
+    .map_err(VortexRdfError::Vortex)
+    .map(|array| array.into_array())
+}
+
+fn empty_subject_range_array() -> Result<ArrayRef> {
+    build_subject_range_array(Vec::new(), Vec::new(), Vec::new())
+}
+
+/// Writes the production subject index directly to Vortex. The legacy binary
+/// reader is retained for old datasets, but new serializations do not produce
+/// `subject_ranges.bin`.
 pub async fn build_cottas_native_subject_range_index(
     input_path: &Path,
 ) -> Result<NativeSubjectRangeIndexBuildStats> {
+    const OUTPUT_BATCH_ROWS: usize = 65_536;
+
     let total_start = Instant::now();
-    let output_path = native_subject_range_index_path(input_path);
+    let output_path = native_subject_range_vortex_path(input_path);
+    let temporary_path = output_path.with_extension("vortex.tmp");
+
     let open_start = Instant::now();
     let file = NATIVE_FILE_SESSION
         .open_options()
@@ -3286,112 +3229,176 @@ pub async fn build_cottas_native_subject_range_index(
     let open_ms = elapsed_ms(open_start);
 
     let scan_start = Instant::now();
-    let mut stream = file
+    let mut input_stream = file
         .scan()
         .map_err(VortexRdfError::from)?
         .with_projection(vortex_array::expr::select(
-            ["s"].as_slice(),
+            ["s"],
             vortex_array::expr::root(),
         ))
         .into_array_stream()
         .map_err(VortexRdfError::from)?;
 
-    let tmp_path = output_path.with_extension("subject_ranges.bin.tmp");
-    let tmp_file = std::fs::File::create(&tmp_path)
-        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    let mut writer = BufWriter::new(tmp_file);
-    let mut rows_scanned = 0u64;
-    let mut ranges_written = 0u64;
-    let mut batches = 0usize;
-    let mut max_batch_rows = 0usize;
-    let mut current_subject: Option<u32> = None;
-    let mut current_start = 0u64;
-    let mut last_completed_subject: Option<u32> = None;
+    let shared_state = Arc::new(Mutex::new(NativeSubjectRangeBuildState::default()));
+    let stream_state = Arc::clone(&shared_state);
+    let output_arrays = async_stream::try_stream! {
+        let mut subject_ids = Vec::with_capacity(OUTPUT_BATCH_ROWS);
+        let mut row_starts = Vec::with_capacity(OUTPUT_BATCH_ROWS);
+        let mut row_ends = Vec::with_capacity(OUTPUT_BATCH_ROWS);
+        let mut rows_scanned = 0u64;
+        let mut ranges_written = 0u64;
+        let mut batches = 0usize;
+        let mut max_batch_rows = 0usize;
+        let mut current_subject: Option<u32> = None;
+        let mut current_start = 0u64;
+        let mut last_completed_subject: Option<u32> = None;
 
-    while let Some(batch_result) = stream.next().await {
-        let batch = batch_result.map_err(VortexRdfError::from)?;
-        let batch_rows = batch.len();
-        batches += 1;
-        max_batch_rows = max_batch_rows.max(batch_rows);
-        if batch_rows == 0 {
-            continue;
-        }
-        let s_ids = extract_projected_u32_column(&batch, "s")?;
-        if s_ids.len() != batch_rows {
-            return Err(VortexRdfError::Serialization(format!(
-                "subject range index build saw {} s IDs for {} batch rows",
-                s_ids.len(),
-                batch_rows
-            )));
-        }
-        for s_id in s_ids {
-            match current_subject {
-                None => {
-                    current_subject = Some(s_id);
-                    current_start = rows_scanned;
-                }
-                Some(prev) if prev != s_id => {
-                    if let Some(last) = last_completed_subject {
-                        if prev <= last {
-                            return Err(VortexRdfError::Serialization(format!(
-                                "subject IDs are not strictly grouped/sorted: previous completed subject {}, current completed subject {}. Subject range index requires SPO-ordered native-ID data.",
-                                last, prev
-                            )));
+        while let Some(batch_result) = input_stream.next().await {
+            let batch = batch_result?;
+            let batch_rows = batch.len();
+            batches += 1;
+            max_batch_rows = max_batch_rows.max(batch_rows);
+            if batch_rows == 0 {
+                continue;
+            }
+
+            let values = extract_projected_u32_column(&batch, "s")
+                .map_err(rdf_err_to_vortex_err)?;
+            if values.len() != batch_rows {
+                Err(vortex_error::vortex_err!(
+                    "subject range build saw {} subject IDs for {} rows",
+                    values.len(),
+                    batch_rows
+                ))?;
+            }
+
+            for subject_id in values {
+                match current_subject {
+                    None => {
+                        current_subject = Some(subject_id);
+                        current_start = rows_scanned;
+                    }
+                    Some(previous) if previous != subject_id => {
+                        if let Some(completed) = last_completed_subject {
+                            if previous <= completed {
+                                Err(vortex_error::vortex_err!(
+                                    "subject IDs are not strictly grouped/increasing: completed={}, next={}; SPO ordering is required",
+                                    completed,
+                                    previous
+                                ))?;
+                            }
+                        }
+
+                        subject_ids.push(previous);
+                        row_starts.push(current_start);
+                        row_ends.push(rows_scanned);
+                        ranges_written += 1;
+                        last_completed_subject = Some(previous);
+                        current_subject = Some(subject_id);
+                        current_start = rows_scanned;
+
+                        if subject_ids.len() >= OUTPUT_BATCH_ROWS {
+                            yield build_subject_range_array(
+                                std::mem::take(&mut subject_ids),
+                                std::mem::take(&mut row_starts),
+                                std::mem::take(&mut row_ends),
+                            ).map_err(rdf_err_to_vortex_err)?;
+                            subject_ids = Vec::with_capacity(OUTPUT_BATCH_ROWS);
+                            row_starts = Vec::with_capacity(OUTPUT_BATCH_ROWS);
+                            row_ends = Vec::with_capacity(OUTPUT_BATCH_ROWS);
                         }
                     }
-                    write_subject_range_entry(&mut writer, prev, current_start, rows_scanned)?;
-                    ranges_written += 1;
-                    last_completed_subject = Some(prev);
-                    current_subject = Some(s_id);
-                    current_start = rows_scanned;
+                    Some(_) => {}
                 }
-                Some(_) => {}
+                rows_scanned += 1;
             }
-            rows_scanned += 1;
         }
-    }
+
+        if let Some(subject_id) = current_subject {
+            if let Some(completed) = last_completed_subject {
+                if subject_id <= completed {
+                    Err(vortex_error::vortex_err!(
+                        "final subject ID {} is not greater than completed ID {}; SPO ordering is required",
+                        subject_id,
+                        completed
+                    ))?;
+                }
+            }
+            subject_ids.push(subject_id);
+            row_starts.push(current_start);
+            row_ends.push(rows_scanned);
+            ranges_written += 1;
+        }
+
+        if !subject_ids.is_empty() {
+            yield build_subject_range_array(subject_ids, row_starts, row_ends)
+                .map_err(rdf_err_to_vortex_err)?;
+        } else if rows_scanned == 0 {
+            yield empty_subject_range_array().map_err(rdf_err_to_vortex_err)?;
+        }
+
+        store_subject_range_build_state(
+            stream_state.as_ref(),
+            NativeSubjectRangeBuildState {
+                rows_scanned,
+                ranges_written,
+                batches,
+                max_batch_rows,
+            },
+        )?;
+    };
+
+    let dtype = empty_subject_range_array()?.dtype().clone();
+    let output_stream = ArrayStreamAdapter::new(dtype, output_arrays);
+    let mut output_file = tokio::fs::File::create(&temporary_path)
+        .await
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    let strategy = WriteStrategyBuilder::default()
+        .with_row_block_size(OUTPUT_BATCH_ROWS)
+        .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+        .build();
+
+    NATIVE_FILE_SESSION
+        .write_options()
+        .with_strategy(strategy)
+        .write(&mut output_file, output_stream)
+        .await
+        .map_err(VortexRdfError::from)?;
+    drop(output_file);
+    std::fs::rename(&temporary_path, &output_path)
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+
     let scan_ms = elapsed_ms(scan_start);
-    let write_start = Instant::now();
-    if let Some(last) = current_subject {
-        if let Some(prev_completed) = last_completed_subject {
-            if last <= prev_completed {
-                return Err(VortexRdfError::Serialization(format!(
-                    "subject IDs are not strictly grouped/sorted at final range: previous {}, final {}. Subject range index requires SPO-ordered native-ID data.",
-                    prev_completed, last
-                )));
-            }
-        }
-        write_subject_range_entry(&mut writer, last, current_start, rows_scanned)?;
-        ranges_written += 1;
-    }
-    writer
-        .flush()
-        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    drop(writer);
-    std::fs::rename(&tmp_path, &output_path)
-        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    build_cottas_native_subject_range_vortex_index(input_path, &output_path).await?;
-    let write_ms = elapsed_ms(write_start);
+    let state = shared_state
+        .lock()
+        .map_err(|_| {
+            VortexRdfError::Serialization(
+                "subject range build-state mutex was poisoned".to_string(),
+            )
+        })?
+        .clone();
     let total_ms = elapsed_ms(total_start);
+
     log::info!(
-        "[cottas_native_ids] wrote subject range index {:?}: rows={}, ranges={}, batches={}, max_batch_rows={}, total_ms={:.3}",
+        "[cottas_native_ids] wrote direct Vortex subject index {:?}: rows={}, ranges={}, batches={}, max_batch_rows={}, total_ms={:.3}",
         output_path,
-        rows_scanned,
-        ranges_written,
-        batches,
-        max_batch_rows,
+        state.rows_scanned,
+        state.ranges_written,
+        state.batches,
+        state.max_batch_rows,
         total_ms
     );
+
     Ok(NativeSubjectRangeIndexBuildStats {
         input_path: input_path.display().to_string(),
         output_path: output_path.display().to_string(),
-        rows_scanned,
-        ranges_written,
-        batches,
-        max_batch_rows,
+        rows_scanned: state.rows_scanned,
+        ranges_written: state.ranges_written,
+        batches: state.batches,
+        max_batch_rows: state.max_batch_rows,
         open_ms,
         scan_ms,
-        write_ms,
+        write_ms: scan_ms,
         total_ms,
     })
 }
