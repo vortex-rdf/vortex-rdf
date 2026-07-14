@@ -170,6 +170,13 @@ fn diagnose_match<'py>(
     out.set_item("unique_ids_requested", diagnostics.unique_ids_requested)?;
     out.set_item("unique_ids_loaded", diagnostics.unique_ids_loaded)?;
     out.set_item("id_to_term_strategy", diagnostics.id_to_term_stats.strategy)?;
+    out.set_item("access_index_strategy", diagnostics.access_index_strategy)?;
+    out.set_item("access_index_lookup_ms", diagnostics.access_index_lookup_ms)?;
+    out.set_item(
+        "access_candidate_ranges",
+        diagnostics.access_candidate_ranges,
+    )?;
+    out.set_item("access_candidate_rows", diagnostics.access_candidate_rows)?;
     Ok(out)
 }
 
