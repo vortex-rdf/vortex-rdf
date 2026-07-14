@@ -1041,10 +1041,16 @@ pub trait NativeDictionaryProvider: Send + Sync {
 }
 
 /// Format-independent exact row-range access used by the native-ID planner.
+#[async_trait]
 pub trait NativeIndexProvider: Send + Sync {
-    fn subject_range(&self, subject_id: u32) -> Result<Option<Range<u64>>>;
-    fn po_ranges(&self, predicate_id: u32, object_id: u32) -> Result<Option<Vec<Range<u64>>>>;
-    fn predicate_ranges(&self, predicate_id: u32) -> Result<Option<Vec<Range<u64>>>>;
+    async fn subject_range(&self, subject_id: u32) -> Result<Option<Range<u64>>>;
+    async fn po_ranges(
+        &self,
+        predicate_id: u32,
+        object_id: u32,
+    ) -> Result<Option<Vec<Range<u64>>>>;
+    async fn predicate_ranges(&self, predicate_id: u32) -> Result<Option<Vec<Range<u64>>>>;
+    fn subject_strategy(&self) -> &'static str;
 }
 
 #[derive(Clone, Debug)]
@@ -1078,18 +1084,28 @@ impl NativeDictionaryProvider for BinaryNativeProviders {
     }
 }
 
+#[async_trait]
 impl NativeIndexProvider for BinaryNativeProviders {
-    fn subject_range(&self, subject_id: u32) -> Result<Option<Range<u64>>> {
-        if !native_subject_range_index_exists(&self.data_path) {
-            return Ok(None);
+    async fn subject_range(&self, subject_id: u32) -> Result<Option<Range<u64>>> {
+        match native_subject_index_backend(&self.data_path)? {
+            NativeSubjectIndexBackend::Binary => {
+                if !native_subject_range_index_exists(&self.data_path) {
+                    return Ok(None);
+                }
+                Ok(lookup_subject_range_from_sidecar(&self.data_path, subject_id)?
+                    .map(|range| range.start..range.end))
+            }
+            NativeSubjectIndexBackend::Vortex => {
+                lookup_subject_range_from_vortex(&self.data_path, subject_id).await
+            }
         }
-        Ok(
-            lookup_subject_range_from_sidecar(&self.data_path, subject_id)?
-                .map(|range| range.start..range.end),
-        )
     }
 
-    fn po_ranges(&self, predicate_id: u32, object_id: u32) -> Result<Option<Vec<Range<u64>>>> {
+    async fn po_ranges(
+        &self,
+        predicate_id: u32,
+        object_id: u32,
+    ) -> Result<Option<Vec<Range<u64>>>> {
         if !native_po_exact_ranges_exists(&self.data_path) {
             return Ok(None);
         }
@@ -1102,7 +1118,7 @@ impl NativeIndexProvider for BinaryNativeProviders {
         .map(Some)
     }
 
-    fn predicate_ranges(&self, predicate_id: u32) -> Result<Option<Vec<Range<u64>>>> {
+    async fn predicate_ranges(&self, predicate_id: u32) -> Result<Option<Vec<Range<u64>>>> {
         if !native_p_exact_ranges_exists(&self.data_path) {
             return Ok(None);
         }
@@ -1114,8 +1130,14 @@ impl NativeIndexProvider for BinaryNativeProviders {
         )
         .map(Some)
     }
-}
 
+    fn subject_strategy(&self) -> &'static str {
+        match native_subject_index_backend(&self.data_path) {
+            Ok(NativeSubjectIndexBackend::Vortex) => "subject-ranges-vortex-v1",
+            _ => "subject-ranges-binary",
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Default)]
 struct ResolvedNativePattern {
     s: Option<u32>,
@@ -1195,7 +1217,7 @@ async fn resolve_native_pattern<D: NativeDictionaryProvider + ?Sized>(
     Ok((Some(resolved), total_lookup_ms, stats_out))
 }
 
-fn plan_native_access<I: NativeIndexProvider + ?Sized>(
+async fn plan_native_access<I: NativeIndexProvider + ?Sized>(
     indexes: &I,
     resolved: ResolvedNativePattern,
     subject_bound: bool,
@@ -1206,10 +1228,10 @@ fn plan_native_access<I: NativeIndexProvider + ?Sized>(
 
     if subject_bound {
         if let Some(subject_id) = resolved.s {
-            if let Some(range) = indexes.subject_range(subject_id)? {
+            if let Some(range) = indexes.subject_range(subject_id).await? {
                 return Ok(NativeAccessPlan {
                     ranges: Some(vec![range.clone()]),
-                    strategy: "subject-ranges".to_string(),
+                    strategy: indexes.subject_strategy().to_string(),
                     lookup_ms: elapsed_ms(start),
                     candidate_ranges: 1,
                     candidate_rows: range.end.saturating_sub(range.start),
@@ -1222,7 +1244,7 @@ fn plan_native_access<I: NativeIndexProvider + ?Sized>(
 
     if !subject_bound && predicate_bound && object_bound {
         if let (Some(predicate_id), Some(object_id)) = (resolved.p, resolved.o) {
-            if let Some(ranges) = indexes.po_ranges(predicate_id, object_id)? {
+            if let Some(ranges) = indexes.po_ranges(predicate_id, object_id).await? {
                 let candidate_rows = range_rows(&ranges);
                 return Ok(NativeAccessPlan {
                     candidate_ranges: ranges.len(),
@@ -1239,7 +1261,7 @@ fn plan_native_access<I: NativeIndexProvider + ?Sized>(
 
     if !subject_bound && predicate_bound && !object_bound {
         if let Some(predicate_id) = resolved.p {
-            if let Some(ranges) = indexes.predicate_ranges(predicate_id)? {
+            if let Some(ranges) = indexes.predicate_ranges(predicate_id).await? {
                 let candidate_rows = range_rows(&ranges);
                 let use_ranges = ranges.is_empty()
                     || (ranges.len() <= predicate_exact_max_ranges()
@@ -2137,7 +2159,8 @@ async fn execute_cottas_native_match(
         subject.is_some(),
         predicate.is_some(),
         object.is_some(),
-    )?;
+    )
+    .await?;
     diagnostics.access_index_strategy = access_plan.strategy.clone();
     diagnostics.access_index_lookup_ms = access_plan.lookup_ms;
     diagnostics.access_candidate_ranges = access_plan.candidate_ranges;
@@ -2586,6 +2609,93 @@ fn native_subject_range_index_exists(data_path: &Path) -> bool {
     native_subject_range_index_path(data_path).is_file()
 }
 
+fn native_subject_range_vortex_path(data_path: &Path) -> PathBuf {
+    let file_name = data_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("data.vortex");
+    data_path.with_file_name(format!("{file_name}.subject_ranges.v1.vortex"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeSubjectIndexBackend {
+    Binary,
+    Vortex,
+}
+
+fn native_subject_index_backend(data_path: &Path) -> Result<NativeSubjectIndexBackend> {
+    let configured = std::env::var("VORTEX_RDF_NATIVE_SUBJECT_INDEX_BACKEND")
+        .unwrap_or_else(|_| "auto".to_string());
+    match configured.as_str() {
+        "auto" => {
+            if native_subject_range_vortex_path(data_path).is_file() {
+                Ok(NativeSubjectIndexBackend::Vortex)
+            } else {
+                Ok(NativeSubjectIndexBackend::Binary)
+            }
+        }
+        "binary" => Ok(NativeSubjectIndexBackend::Binary),
+        "vortex" => {
+            let path = native_subject_range_vortex_path(data_path);
+            if !path.is_file() {
+                return Err(VortexRdfError::InvalidOperation(format!(
+                    "Vortex subject index backend requested but {:?} does not exist",
+                    path
+                )));
+            }
+            Ok(NativeSubjectIndexBackend::Vortex)
+        }
+        other => Err(VortexRdfError::InvalidOperation(format!(
+            "Unsupported VORTEX_RDF_NATIVE_SUBJECT_INDEX_BACKEND={other:?}; expected auto, binary, or vortex"
+        ))),
+    }
+}
+
+async fn lookup_subject_range_from_vortex(
+    data_path: &Path,
+    subject_id: u32,
+) -> Result<Option<Range<u64>>> {
+    let path = native_subject_range_vortex_path(data_path);
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let stream = file
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_filter(eq(col("subject_id"), lit(subject_id)))
+        .with_projection(vortex_array::expr::select(
+            ["row_start", "row_end"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?;
+    let result = stream.read_all().await.map_err(VortexRdfError::from)?;
+    if result.len() == 0 {
+        return Ok(None);
+    }
+    if result.len() != 1 {
+        return Err(VortexRdfError::Deserialization(format!(
+            "Vortex subject index {:?} returned {} rows for subject ID {}; expected at most one",
+            path,
+            result.len(),
+            subject_id
+        )));
+    }
+    let starts = extract_projected_u64_column(&result, "row_start")?;
+    let ends = extract_projected_u64_column(&result, "row_end")?;
+    let start = starts[0];
+    let end = ends[0];
+    if start > end {
+        return Err(VortexRdfError::Deserialization(format!(
+            "Vortex subject index {:?} contains invalid range {}..{} for subject ID {}",
+            path, start, end, subject_id
+        )));
+    }
+    Ok(Some(start..end))
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct NativePoRowGroupIndexBuildStats {
     pub input_path: String,
@@ -2992,6 +3102,24 @@ fn extract_projected_u32_column(array: &ArrayRef, column_name: &str) -> Result<V
     Ok(column.as_slice::<u32>().to_vec())
 }
 
+fn extract_projected_u64_column(array: &ArrayRef, column_name: &str) -> Result<Vec<u64>> {
+    if array.len() == 0 {
+        return Ok(Vec::new());
+    }
+    let mut ctx = NATIVE_FILE_SESSION.create_execution_ctx();
+    let struct_array = array
+        .clone()
+        .execute::<StructArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+    let column = struct_array
+        .unmasked_field_by_name(column_name)
+        .map_err(VortexRdfError::Vortex)?
+        .clone()
+        .execute::<PrimitiveArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+    Ok(column.as_slice::<u64>().to_vec())
+}
+
 fn write_subject_range_entry<W: Write>(
     writer: &mut W,
     subject_id: u32,
@@ -3055,6 +3183,85 @@ fn lookup_subject_range_from_sidecar(
         }
     }
     Ok(None)
+}
+
+async fn build_cottas_native_subject_range_vortex_index(
+    data_path: &Path,
+    binary_path: &Path,
+) -> Result<()> {
+    const CHUNK_ROWS: usize = 1_000_000;
+    let output_path = native_subject_range_vortex_path(data_path);
+    let input = std::fs::File::open(binary_path)
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    let binary_len = input
+        .metadata()
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?
+        .len();
+    if binary_len % NATIVE_SUBJECT_RANGE_ENTRY_BYTES != 0 {
+        return Err(VortexRdfError::Serialization(format!(
+            "Cannot convert malformed binary subject index {:?}: {} bytes is not divisible by {}",
+            binary_path, binary_len, NATIVE_SUBJECT_RANGE_ENTRY_BYTES
+        )));
+    }
+    let mut reader = BufReader::new(input);
+    let arrays = async_stream::try_stream! {
+        loop {
+            let mut subject_ids = Vec::with_capacity(CHUNK_ROWS);
+            let mut row_starts = Vec::with_capacity(CHUNK_ROWS);
+            let mut row_ends = Vec::with_capacity(CHUNK_ROWS);
+            for _ in 0..CHUNK_ROWS {
+                let mut bytes = [0u8; 20];
+                match reader.read_exact(&mut bytes) {
+                    Ok(()) => {
+                        subject_ids.push(u32::from_le_bytes(bytes[0..4].try_into().unwrap()));
+                        row_starts.push(u64::from_le_bytes(bytes[4..12].try_into().unwrap()));
+                        row_ends.push(u64::from_le_bytes(bytes[12..20].try_into().unwrap()));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(error) => Err(vortex_error::vortex_err!(
+                        "failed reading binary subject index during Vortex conversion: {}",
+                        error
+                    ))?,
+                }
+            }
+            if subject_ids.is_empty() {
+                break;
+            }
+            let array = StructArray::from_fields(&[
+                ("subject_id", PrimitiveArray::from_iter(subject_ids).into_array()),
+                ("row_start", PrimitiveArray::from_iter(row_starts).into_array()),
+                ("row_end", PrimitiveArray::from_iter(row_ends).into_array()),
+            ])?;
+            yield array.into_array();
+        }
+    };
+    let dtype = StructArray::from_fields(&[
+        ("subject_id", PrimitiveArray::from_iter(Vec::<u32>::new()).into_array()),
+        ("row_start", PrimitiveArray::from_iter(Vec::<u64>::new()).into_array()),
+        ("row_end", PrimitiveArray::from_iter(Vec::<u64>::new()).into_array()),
+    ])
+    .map_err(VortexRdfError::Vortex)?
+    .dtype()
+    .clone();
+    let stream = ArrayStreamAdapter::new(dtype, arrays);
+    let temporary_path = output_path.with_extension("vortex.tmp");
+    let mut output = tokio::fs::File::create(&temporary_path)
+        .await
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    let strategy = WriteStrategyBuilder::default()
+        .with_row_block_size(65_536)
+        .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+        .build();
+    NATIVE_FILE_SESSION
+        .write_options()
+        .with_strategy(strategy)
+        .write(&mut output, stream)
+        .await
+        .map_err(VortexRdfError::from)?;
+    drop(output);
+    std::fs::rename(&temporary_path, &output_path)
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    Ok(())
 }
 
 pub async fn build_cottas_native_subject_range_index(
@@ -3155,6 +3362,7 @@ pub async fn build_cottas_native_subject_range_index(
     drop(writer);
     std::fs::rename(&tmp_path, &output_path)
         .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    build_cottas_native_subject_range_vortex_index(input_path, &output_path).await?;
     let write_ms = elapsed_ms(write_start);
     let total_ms = elapsed_ms(total_start);
     log::info!(
