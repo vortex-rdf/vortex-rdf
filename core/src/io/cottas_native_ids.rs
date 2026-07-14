@@ -1044,11 +1044,8 @@ pub trait NativeDictionaryProvider: Send + Sync {
 #[async_trait]
 pub trait NativeIndexProvider: Send + Sync {
     async fn subject_range(&self, subject_id: u32) -> Result<Option<Range<u64>>>;
-    async fn po_ranges(
-        &self,
-        predicate_id: u32,
-        object_id: u32,
-    ) -> Result<Option<Vec<Range<u64>>>>;
+    async fn po_ranges(&self, predicate_id: u32, object_id: u32)
+    -> Result<Option<Vec<Range<u64>>>>;
     async fn predicate_ranges(&self, predicate_id: u32) -> Result<Option<Vec<Range<u64>>>>;
     fn subject_strategy(&self) -> &'static str;
 }
@@ -1092,8 +1089,10 @@ impl NativeIndexProvider for BinaryNativeProviders {
                 if !native_subject_range_index_exists(&self.data_path) {
                     return Ok(None);
                 }
-                Ok(lookup_subject_range_from_sidecar(&self.data_path, subject_id)?
-                    .map(|range| range.start..range.end))
+                Ok(
+                    lookup_subject_range_from_sidecar(&self.data_path, subject_id)?
+                        .map(|range| range.start..range.end),
+                )
             }
             NativeSubjectIndexBackend::Vortex => {
                 lookup_subject_range_from_vortex(&self.data_path, subject_id).await
@@ -3236,9 +3235,18 @@ async fn build_cottas_native_subject_range_vortex_index(
         }
     };
     let dtype = StructArray::from_fields(&[
-        ("subject_id", PrimitiveArray::from_iter(Vec::<u32>::new()).into_array()),
-        ("row_start", PrimitiveArray::from_iter(Vec::<u64>::new()).into_array()),
-        ("row_end", PrimitiveArray::from_iter(Vec::<u64>::new()).into_array()),
+        (
+            "subject_id",
+            PrimitiveArray::from_iter(Vec::<u32>::new()).into_array(),
+        ),
+        (
+            "row_start",
+            PrimitiveArray::from_iter(Vec::<u64>::new()).into_array(),
+        ),
+        (
+            "row_end",
+            PrimitiveArray::from_iter(Vec::<u64>::new()).into_array(),
+        ),
     ])
     .map_err(VortexRdfError::Vortex)?
     .dtype()
