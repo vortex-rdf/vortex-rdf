@@ -377,6 +377,14 @@ where
             po_exact_stats.unique_po_hashes_written,
             po_exact_stats.total_ms
         );
+        let po_v2_stats = build_cottas_native_po_exact_ranges_v2_index(output_path).await?;
+        log::info!(
+            "[cottas_native_ids] built typed PO v2 directory/payload: row_groups={}, rows={}, exact_ranges={}, total_ms={:.3}",
+            po_v2_stats.row_groups,
+            po_v2_stats.rows_scanned,
+            po_v2_stats.unique_po_hashes_written,
+            po_v2_stats.total_ms
+        );
         let p_exact_stats = build_cottas_native_p_exact_ranges_index(output_path).await?;
         log::info!(
             "[cottas_native_ids] built predicate exact-ranges index during serialization: row_groups={}, rows={}, exact_ranges={}, total_ms={:.3}",
@@ -3125,7 +3133,7 @@ fn predicate_exact_max_ranges() -> usize {
     std::env::var("VORTEX_RDF_P_EXACT_MAX_RANGES")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(256)
+        .unwrap_or(64)
 }
 
 fn predicate_exact_max_rows() -> u64 {
@@ -3316,6 +3324,454 @@ pub async fn build_cottas_native_po_exact_ranges_index(
         row_groups,
         rows_scanned,
         unique_po_hashes_written: entries.len() as u64,
+        open_ms,
+        scan_ms,
+        write_ms,
+        total_ms,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativePoRangeRecord {
+    predicate_id: u32,
+    object_id: u32,
+    row_start: u64,
+    row_end: u64,
+}
+
+impl Ord for NativePoRangeRecord {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (
+            self.predicate_id,
+            self.object_id,
+            self.row_start,
+            self.row_end,
+        )
+            .cmp(&(
+                other.predicate_id,
+                other.object_id,
+                other.row_start,
+                other.row_end,
+            ))
+    }
+}
+impl PartialOrd for NativePoRangeRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn native_po_exact_directory_v2_path(data_path: &Path) -> PathBuf {
+    native_sidecar_path(data_path, "po_exact_directory.v2.vortex")
+}
+
+fn native_po_exact_ranges_v2_path(data_path: &Path) -> PathBuf {
+    native_sidecar_path(data_path, "po_exact_ranges.v2.vortex")
+}
+
+fn native_sidecar_path(data_path: &Path, suffix: &str) -> PathBuf {
+    let name = data_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("data.vortex");
+    data_path.with_file_name(format!("{name}.{suffix}"))
+}
+
+fn write_po_range_record<W: Write>(writer: &mut W, value: NativePoRangeRecord) -> Result<()> {
+    writer
+        .write_all(&value.predicate_id.to_le_bytes())
+        .and_then(|_| writer.write_all(&value.object_id.to_le_bytes()))
+        .and_then(|_| writer.write_all(&value.row_start.to_le_bytes()))
+        .and_then(|_| writer.write_all(&value.row_end.to_le_bytes()))
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))
+}
+
+struct NativePoRangeRunReader {
+    reader: BufReader<std::fs::File>,
+}
+
+impl NativePoRangeRunReader {
+    fn new(path: &Path) -> Result<Self> {
+        Ok(Self {
+            reader: BufReader::new(
+                std::fs::File::open(path)
+                    .map_err(|error| VortexRdfError::Serialization(error.to_string()))?,
+            ),
+        })
+    }
+
+    fn read_one(&mut self) -> Result<Option<NativePoRangeRecord>> {
+        let mut buf = [0u8; 24];
+        match self.reader.read_exact(&mut buf) {
+            Ok(()) => Ok(Some(NativePoRangeRecord {
+                predicate_id: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+                object_id: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+                row_start: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+                row_end: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+            })),
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(error) => Err(VortexRdfError::Serialization(error.to_string())),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativePoRangeHeapItem {
+    value: NativePoRangeRecord,
+    run_idx: usize,
+}
+
+impl Ord for NativePoRangeHeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .value
+            .cmp(&self.value)
+            .then_with(|| other.run_idx.cmp(&self.run_idx))
+    }
+}
+impl PartialOrd for NativePoRangeHeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn flush_po_range_run(
+    records: &mut Vec<NativePoRangeRecord>,
+    temp_dir: &Path,
+    run_idx: usize,
+    runs: &mut Vec<PathBuf>,
+) -> Result<()> {
+    records.sort_unstable();
+    let path = temp_dir.join(format!("po_range_run_{run_idx:06}.bin"));
+    let mut writer = BufWriter::new(
+        std::fs::File::create(&path)
+            .map_err(|error| VortexRdfError::Serialization(error.to_string()))?,
+    );
+    for value in records.iter().copied() {
+        write_po_range_record(&mut writer, value)?;
+    }
+    writer
+        .flush()
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    records.clear();
+    runs.push(path);
+    Ok(())
+}
+
+fn build_po_directory_array(
+    predicate_ids: Vec<u32>,
+    object_ids: Vec<u32>,
+    offsets: Vec<u64>,
+    counts: Vec<u32>,
+    rows: Vec<u64>,
+) -> Result<ArrayRef> {
+    StructArray::from_fields(&[
+        (
+            "predicate_id",
+            PrimitiveArray::from_iter(predicate_ids).into_array(),
+        ),
+        (
+            "object_id",
+            PrimitiveArray::from_iter(object_ids).into_array(),
+        ),
+        (
+            "range_offset",
+            PrimitiveArray::from_iter(offsets).into_array(),
+        ),
+        (
+            "range_count",
+            PrimitiveArray::from_iter(counts).into_array(),
+        ),
+        (
+            "candidate_rows",
+            PrimitiveArray::from_iter(rows).into_array(),
+        ),
+    ])
+    .map_err(VortexRdfError::Vortex)
+    .map(|array| array.into_array())
+}
+
+pub async fn build_cottas_native_po_exact_ranges_v2_index(
+    input_path: &Path,
+) -> Result<NativePoRowGroupIndexBuildStats> {
+    const OUTPUT_BATCH_ROWS: usize = 65_536;
+    let total_start = Instant::now();
+    let directory_path = native_po_exact_directory_v2_path(input_path);
+    let payload_path = native_po_exact_ranges_v2_path(input_path);
+    let directory_tmp = directory_path.with_extension("vortex.tmp");
+    let payload_tmp = payload_path.with_extension("vortex.tmp");
+    let temp_dir =
+        tempfile::tempdir().map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    let sort_batch = std::env::var("VORTEX_RDF_PO_V2_SORT_BATCH_RANGES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1_000_000)
+        .max(1);
+
+    let open_start = Instant::now();
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(input_path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let open_ms = elapsed_ms(open_start);
+    let scan_start = Instant::now();
+    let mut stream = file
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_projection(vortex_array::expr::select(
+            ["p", "o"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?;
+
+    let mut records = Vec::with_capacity(sort_batch);
+    let mut runs = Vec::new();
+    let mut rows_scanned = 0u64;
+    let mut row_groups = 0usize;
+    let mut active_key: Option<(u32, u32)> = None;
+    let mut active_start = 0u64;
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result.map_err(VortexRdfError::from)?;
+        let predicates = extract_projected_u32_column(&batch, "p")?;
+        let objects = extract_projected_u32_column(&batch, "o")?;
+        if predicates.len() != objects.len() || predicates.len() != batch.len() {
+            return Err(VortexRdfError::Serialization(format!(
+                "PO v2 scan column mismatch: rows={}, predicates={}, objects={}",
+                batch.len(),
+                predicates.len(),
+                objects.len()
+            )));
+        }
+        row_groups += 1;
+        for key in predicates.into_iter().zip(objects) {
+            match active_key {
+                None => {
+                    active_key = Some(key);
+                    active_start = rows_scanned;
+                }
+                Some(previous) if previous != key => {
+                    records.push(NativePoRangeRecord {
+                        predicate_id: previous.0,
+                        object_id: previous.1,
+                        row_start: active_start,
+                        row_end: rows_scanned,
+                    });
+                    active_key = Some(key);
+                    active_start = rows_scanned;
+                    if records.len() >= sort_batch {
+                        let run_idx = runs.len();
+                        flush_po_range_run(&mut records, temp_dir.path(), run_idx, &mut runs)?;
+                    }
+                }
+                Some(_) => {}
+            }
+            rows_scanned += 1;
+        }
+    }
+    if let Some((predicate_id, object_id)) = active_key {
+        records.push(NativePoRangeRecord {
+            predicate_id,
+            object_id,
+            row_start: active_start,
+            row_end: rows_scanned,
+        });
+    }
+    if !records.is_empty() {
+        let run_idx = runs.len();
+        flush_po_range_run(&mut records, temp_dir.path(), run_idx, &mut runs)?;
+    }
+    let scan_ms = elapsed_ms(scan_start);
+
+    let merge_start = Instant::now();
+    let merged_path = temp_dir.path().join("po_ranges_merged.bin");
+    let mut merged_writer = BufWriter::new(
+        std::fs::File::create(&merged_path)
+            .map_err(|error| VortexRdfError::Serialization(error.to_string()))?,
+    );
+    let mut readers = runs
+        .iter()
+        .map(|path| NativePoRangeRunReader::new(path))
+        .collect::<Result<Vec<_>>>()?;
+    let mut heap = BinaryHeap::new();
+    for (run_idx, reader) in readers.iter_mut().enumerate() {
+        if let Some(value) = reader.read_one()? {
+            heap.push(NativePoRangeHeapItem { value, run_idx });
+        }
+    }
+
+    let mut dir_predicates = Vec::new();
+    let mut dir_objects = Vec::new();
+    let mut dir_offsets = Vec::new();
+    let mut dir_counts = Vec::new();
+    let mut dir_rows = Vec::new();
+    let mut payload_offset = 0u64;
+    let mut active_key: Option<(u32, u32)> = None;
+    let mut active_offset = 0u64;
+    let mut active_count = 0u32;
+    let mut active_rows = 0u64;
+    let finish_entry = |key: (u32, u32),
+                        offset: u64,
+                        count: u32,
+                        rows: u64,
+                        predicates: &mut Vec<u32>,
+                        objects: &mut Vec<u32>,
+                        offsets: &mut Vec<u64>,
+                        counts: &mut Vec<u32>,
+                        row_counts: &mut Vec<u64>| {
+        predicates.push(key.0);
+        objects.push(key.1);
+        offsets.push(offset);
+        counts.push(count);
+        row_counts.push(rows);
+    };
+
+    while let Some(item) = heap.pop() {
+        let value = item.value;
+        let key = (value.predicate_id, value.object_id);
+        if active_key != Some(key) {
+            if let Some(previous) = active_key {
+                finish_entry(
+                    previous,
+                    active_offset,
+                    active_count,
+                    active_rows,
+                    &mut dir_predicates,
+                    &mut dir_objects,
+                    &mut dir_offsets,
+                    &mut dir_counts,
+                    &mut dir_rows,
+                );
+            }
+            active_key = Some(key);
+            active_offset = payload_offset;
+            active_count = 0;
+            active_rows = 0;
+        }
+        if value.row_start >= value.row_end {
+            return Err(VortexRdfError::Serialization(format!(
+                "PO v2 contains invalid range {}..{} for ({}, {})",
+                value.row_start, value.row_end, value.predicate_id, value.object_id
+            )));
+        }
+        write_po_range_record(&mut merged_writer, value)?;
+        active_count = active_count
+            .checked_add(1)
+            .ok_or_else(|| VortexRdfError::Serialization("PO v2 range count overflow".into()))?;
+        active_rows = active_rows
+            .checked_add(value.row_end - value.row_start)
+            .ok_or_else(|| VortexRdfError::Serialization("PO v2 row count overflow".into()))?;
+        payload_offset = payload_offset
+            .checked_add(1)
+            .ok_or_else(|| VortexRdfError::Serialization("PO v2 payload offset overflow".into()))?;
+        if let Some(next) = readers[item.run_idx].read_one()? {
+            heap.push(NativePoRangeHeapItem {
+                value: next,
+                run_idx: item.run_idx,
+            });
+        }
+    }
+    if let Some(key) = active_key {
+        finish_entry(
+            key,
+            active_offset,
+            active_count,
+            active_rows,
+            &mut dir_predicates,
+            &mut dir_objects,
+            &mut dir_offsets,
+            &mut dir_counts,
+            &mut dir_rows,
+        );
+    }
+    merged_writer
+        .flush()
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    drop(merged_writer);
+    let merge_ms = elapsed_ms(merge_start);
+
+    let payload_reader = NativePoRangeRunReader::new(&merged_path)?;
+    let payload_arrays = async_stream::try_stream! {
+        let mut reader = payload_reader;
+        loop {
+            let mut starts = Vec::with_capacity(OUTPUT_BATCH_ROWS);
+            let mut ends = Vec::with_capacity(OUTPUT_BATCH_ROWS);
+            while starts.len() < OUTPUT_BATCH_ROWS {
+                let Some(value) = reader.read_one().map_err(rdf_err_to_vortex_err)? else { break; };
+                starts.push(value.row_start);
+                ends.push(value.row_end);
+            }
+            if starts.is_empty() { break; }
+            yield build_predicate_payload_array(starts, ends).map_err(rdf_err_to_vortex_err)?;
+        }
+    };
+    let payload_dtype = build_predicate_payload_array(Vec::new(), Vec::new())?
+        .dtype()
+        .clone();
+    let payload_stream = ArrayStreamAdapter::new(payload_dtype, payload_arrays);
+    let strategy = WriteStrategyBuilder::default()
+        .with_row_block_size(OUTPUT_BATCH_ROWS)
+        .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+        .build();
+    let write_start = Instant::now();
+    let mut payload_file = tokio::fs::File::create(&payload_tmp)
+        .await
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    NATIVE_FILE_SESSION
+        .write_options()
+        .with_strategy(
+            WriteStrategyBuilder::default()
+                .with_row_block_size(OUTPUT_BATCH_ROWS)
+                .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+                .build(),
+        )
+        .write(&mut payload_file, payload_stream)
+        .await
+        .map_err(VortexRdfError::from)?;
+    drop(payload_file);
+
+    let directory_entries = dir_predicates.len();
+    let directory_array = build_po_directory_array(
+        dir_predicates,
+        dir_objects,
+        dir_offsets,
+        dir_counts,
+        dir_rows,
+    )?;
+    let directory_dtype =
+        build_po_directory_array(Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())?
+            .dtype()
+            .clone();
+    let directory_stream = ArrayStreamAdapter::new(
+        directory_dtype,
+        futures::stream::iter(vec![Ok(directory_array)]),
+    );
+    let mut directory_file = tokio::fs::File::create(&directory_tmp)
+        .await
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    NATIVE_FILE_SESSION
+        .write_options()
+        .with_strategy(strategy)
+        .write(&mut directory_file, directory_stream)
+        .await
+        .map_err(VortexRdfError::from)?;
+    drop(directory_file);
+    std::fs::rename(&payload_tmp, &payload_path)
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    std::fs::rename(&directory_tmp, &directory_path)
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    let write_ms = elapsed_ms(write_start);
+    let total_ms = elapsed_ms(total_start);
+    log::info!(
+        "[cottas_native_ids] PO v2 scan_ms={scan_ms:.3}, merge_ms={merge_ms:.3}, directory_entries={directory_entries}, payload_ranges={payload_offset}"
+    );
+    Ok(NativePoRowGroupIndexBuildStats {
+        input_path: input_path.display().to_string(),
+        output_path: directory_path.display().to_string(),
+        row_groups,
+        rows_scanned,
+        unique_po_hashes_written: payload_offset,
         open_ms,
         scan_ms,
         write_ms,
