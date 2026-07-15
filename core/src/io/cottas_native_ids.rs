@@ -1046,8 +1046,16 @@ pub trait NativeIndexProvider: Send + Sync {
     async fn subject_range(&self, subject_id: u32) -> Result<Option<Range<u64>>>;
     async fn po_ranges(&self, predicate_id: u32, object_id: u32)
     -> Result<Option<Vec<Range<u64>>>>;
-    async fn predicate_ranges(&self, predicate_id: u32) -> Result<Option<Vec<Range<u64>>>>;
+    async fn predicate_access(&self, predicate_id: u32) -> Result<Option<NativePredicateAccess>>;
     fn subject_strategy(&self) -> &'static str;
+}
+
+#[derive(Clone, Debug)]
+struct NativePredicateAccess {
+    ranges: Option<Vec<Range<u64>>>,
+    candidate_ranges: usize,
+    candidate_rows: u64,
+    strategy: &'static str,
 }
 
 #[derive(Clone, Debug)]
@@ -1117,28 +1125,44 @@ impl NativeIndexProvider for BinaryNativeProviders {
         .map(Some)
     }
 
-    async fn predicate_ranges(&self, predicate_id: u32) -> Result<Option<Vec<Range<u64>>>> {
+    async fn predicate_access(&self, predicate_id: u32) -> Result<Option<NativePredicateAccess>> {
         match native_predicate_index_backend(&self.data_path)? {
             NativePredicateIndexBackend::Binary => {
-                if !native_p_exact_ranges_exists(&self.data_path) {
-                    return Ok(None);
-                }
-                lookup_exact_row_ranges(
+                let ranges = lookup_exact_row_ranges(
                     &native_p_exact_ranges_path(&self.data_path),
                     NATIVE_P_EXACT_RANGES_MAGIC,
                     u64::from(predicate_id),
                     "predicate exact range",
-                )
-                .map(Some)
+                )?;
+                let candidate_rows = range_rows(&ranges);
+                let candidate_ranges = ranges.len();
+                let use_ranges = candidate_ranges <= predicate_exact_max_ranges()
+                    && candidate_rows <= predicate_exact_max_rows();
+                Ok(Some(NativePredicateAccess {
+                    ranges: use_ranges.then_some(ranges),
+                    candidate_ranges,
+                    candidate_rows,
+                    strategy: "p-exact-ranges-binary",
+                }))
             }
-            NativePredicateIndexBackend::Vortex => {
-                lookup_predicate_ranges_from_vortex(&self.data_path, predicate_id)
-                    .await
-                    .map(Some)
+            NativePredicateIndexBackend::VortexV1 => {
+                let ranges = lookup_predicate_ranges_from_vortex(&self.data_path, predicate_id).await?;
+                let candidate_rows = range_rows(&ranges);
+                let candidate_ranges = ranges.len();
+                let use_ranges = candidate_ranges <= predicate_exact_max_ranges()
+                    && candidate_rows <= predicate_exact_max_rows();
+                Ok(Some(NativePredicateAccess {
+                    ranges: use_ranges.then_some(ranges),
+                    candidate_ranges,
+                    candidate_rows,
+                    strategy: "p-exact-ranges-vortex-v1",
+                }))
+            }
+            NativePredicateIndexBackend::VortexV2 => {
+                lookup_predicate_access_from_vortex_v2(&self.data_path, predicate_id).await
             }
         }
     }
-
     fn subject_strategy(&self) -> &'static str {
         match native_subject_index_backend(&self.data_path) {
             Ok(NativeSubjectIndexBackend::Vortex) => "subject-ranges-vortex-v1",
@@ -1269,17 +1293,14 @@ async fn plan_native_access<I: NativeIndexProvider + ?Sized>(
 
     if !subject_bound && predicate_bound && !object_bound {
         if let Some(predicate_id) = resolved.p {
-            if let Some(ranges) = indexes.predicate_ranges(predicate_id).await? {
-                let candidate_rows = range_rows(&ranges);
-                let use_ranges = ranges.is_empty()
-                    || (ranges.len() <= predicate_exact_max_ranges()
-                        && candidate_rows <= predicate_exact_max_rows());
+            if let Some(access) = indexes.predicate_access(predicate_id).await? {
+                let use_ranges = access.ranges.is_some();
                 return Ok(NativeAccessPlan {
-                    candidate_ranges: ranges.len(),
-                    candidate_rows,
-                    ranges: use_ranges.then_some(ranges),
+                    candidate_ranges: access.candidate_ranges,
+                    candidate_rows: access.candidate_rows,
+                    ranges: access.ranges,
                     strategy: if use_ranges {
-                        "p-exact-ranges".to_string()
+                        access.strategy.to_string()
                     } else {
                         "none-high-cardinality-predicate".to_string()
                     },
@@ -2802,22 +2823,24 @@ fn native_p_exact_ranges_vortex_path(data_path: &Path) -> PathBuf {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativePredicateIndexBackend {
     Binary,
-    Vortex,
+    VortexV1,
+    VortexV2,
 }
 
 fn native_predicate_index_backend(data_path: &Path) -> Result<NativePredicateIndexBackend> {
     let configured = std::env::var("VORTEX_RDF_NATIVE_PREDICATE_INDEX_BACKEND")
         .unwrap_or_else(|_| "auto".to_string());
+    let v2_exists = native_p_exact_directory_v2_path(data_path).is_file()
+        && native_p_exact_ranges_v2_path(data_path).is_file();
     match configured.as_str() {
-        // Vortex v1 has correct results but an unacceptable fixed lookup cost.
-        // Never select it implicitly. Prefer the proven binary index until v2 exists.
         "auto" => {
-            if native_p_exact_ranges_exists(data_path) {
+            if v2_exists {
+                Ok(NativePredicateIndexBackend::VortexV2)
+            } else if native_p_exact_ranges_exists(data_path) {
                 Ok(NativePredicateIndexBackend::Binary)
             } else {
                 Err(VortexRdfError::InvalidOperation(format!(
-                    "No production predicate index exists for {:?}; flat Vortex v1 is experimental and must be selected explicitly with VORTEX_RDF_NATIVE_PREDICATE_INDEX_BACKEND=vortex",
-                    data_path
+                    "No production predicate index exists for {:?}", data_path
                 )))
             }
         }
@@ -2825,8 +2848,7 @@ fn native_predicate_index_backend(data_path: &Path) -> Result<NativePredicateInd
             let path = native_p_exact_ranges_path(data_path);
             if !path.is_file() {
                 return Err(VortexRdfError::InvalidOperation(format!(
-                    "Binary predicate index backend requested but {:?} does not exist",
-                    path
+                    "Binary predicate index backend requested but {:?} does not exist", path
                 )));
             }
             Ok(NativePredicateIndexBackend::Binary)
@@ -2835,14 +2857,23 @@ fn native_predicate_index_backend(data_path: &Path) -> Result<NativePredicateInd
             let path = native_p_exact_ranges_vortex_path(data_path);
             if !path.is_file() {
                 return Err(VortexRdfError::InvalidOperation(format!(
-                    "Vortex predicate v1 backend requested but {:?} does not exist",
-                    path
+                    "Vortex predicate v1 backend requested but {:?} does not exist", path
                 )));
             }
-            Ok(NativePredicateIndexBackend::Vortex)
+            Ok(NativePredicateIndexBackend::VortexV1)
+        }
+        "vortex-v2" => {
+            if !v2_exists {
+                return Err(VortexRdfError::InvalidOperation(format!(
+                    "Vortex predicate v2 backend requested but directory {:?} or payload {:?} is missing",
+                    native_p_exact_directory_v2_path(data_path),
+                    native_p_exact_ranges_v2_path(data_path)
+                )));
+            }
+            Ok(NativePredicateIndexBackend::VortexV2)
         }
         other => Err(VortexRdfError::InvalidOperation(format!(
-            "Unsupported VORTEX_RDF_NATIVE_PREDICATE_INDEX_BACKEND={other:?}; expected auto, binary, vortex, or vortex-v1"
+            "Unsupported VORTEX_RDF_NATIVE_PREDICATE_INDEX_BACKEND={other:?}; expected auto, binary, vortex-v1, or vortex-v2"
         ))),
     }
 }
@@ -2894,6 +2925,114 @@ async fn lookup_predicate_ranges_from_vortex(
     }
     ranges.sort_unstable_by_key(|r| (r.start, r.end));
     Ok(ranges)
+}
+
+async fn lookup_predicate_access_from_vortex_v2(
+    data_path: &Path,
+    predicate_id: u32,
+) -> Result<Option<NativePredicateAccess>> {
+    let directory_path = native_p_exact_directory_v2_path(data_path);
+    let directory_file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&directory_path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let directory = directory_file
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_filter(eq(col("predicate_id"), lit(predicate_id)))
+        .with_projection(vortex_array::expr::select(
+            ["range_offset", "range_count", "candidate_rows"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?
+        .read_all()
+        .await
+        .map_err(VortexRdfError::from)?;
+    if directory.len() == 0 {
+        return Ok(Some(NativePredicateAccess {
+            ranges: Some(Vec::new()),
+            candidate_ranges: 0,
+            candidate_rows: 0,
+            strategy: "p-exact-ranges-vortex-v2",
+        }));
+    }
+    if directory.len() != 1 {
+        return Err(VortexRdfError::Deserialization(format!(
+            "predicate v2 directory {:?} returned {} rows for predicate ID {}; expected one",
+            directory_path, directory.len(), predicate_id
+        )));
+    }
+    let offsets = extract_projected_u64_column(&directory, "range_offset")?;
+    let counts = extract_projected_u32_column(&directory, "range_count")?;
+    let rows = extract_projected_u64_column(&directory, "candidate_rows")?;
+    let range_offset = offsets[0];
+    let range_count = counts[0] as usize;
+    let candidate_rows = rows[0];
+    if range_count > predicate_exact_max_ranges()
+        || candidate_rows > predicate_exact_max_rows()
+    {
+        return Ok(Some(NativePredicateAccess {
+            ranges: None,
+            candidate_ranges: range_count,
+            candidate_rows,
+            strategy: "p-exact-ranges-vortex-v2",
+        }));
+    }
+    let range_end = range_offset.checked_add(range_count as u64).ok_or_else(|| {
+        VortexRdfError::Deserialization("predicate v2 payload row range overflow".to_string())
+    })?;
+    let payload_path = native_p_exact_ranges_v2_path(data_path);
+    let payload_file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&payload_path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let payload = payload_file
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_row_range(range_offset..range_end)
+        .with_projection(vortex_array::expr::select(
+            ["row_start", "row_end"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?
+        .read_all()
+        .await
+        .map_err(VortexRdfError::from)?;
+    if payload.len() != range_count {
+        return Err(VortexRdfError::Deserialization(format!(
+            "predicate v2 payload {:?} returned {} rows for expected slice {}..{}",
+            payload_path, payload.len(), range_offset, range_end
+        )));
+    }
+    let starts = extract_projected_u64_column(&payload, "row_start")?;
+    let ends = extract_projected_u64_column(&payload, "row_end")?;
+    let mut ranges = Vec::with_capacity(range_count);
+    for (start, end) in starts.into_iter().zip(ends) {
+        if start > end {
+            return Err(VortexRdfError::Deserialization(format!(
+                "predicate v2 contains invalid row range {}..{} for predicate ID {}",
+                start, end, predicate_id
+            )));
+        }
+        ranges.push(start..end);
+    }
+    let actual_rows = range_rows(&ranges);
+    if actual_rows != candidate_rows {
+        return Err(VortexRdfError::Deserialization(format!(
+            "predicate v2 candidate row mismatch for predicate ID {}: directory={}, payload={}",
+            predicate_id, candidate_rows, actual_rows
+        )));
+    }
+    Ok(Some(NativePredicateAccess {
+        ranges: Some(ranges),
+        candidate_ranges: range_count,
+        candidate_rows,
+        strategy: "p-exact-ranges-vortex-v2",
+    }))
 }
 
 fn predicate_exact_max_ranges() -> usize {
