@@ -2792,34 +2792,57 @@ fn native_p_exact_ranges_exists(data_path: &Path) -> bool {
 }
 
 fn native_p_exact_ranges_vortex_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path.file_name().and_then(|v| v.to_str()).unwrap_or("data.vortex");
+    let file_name = data_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("data.vortex");
     data_path.with_file_name(format!("{file_name}.p_exact_ranges.v1.vortex"))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NativePredicateIndexBackend { Binary, Vortex }
+enum NativePredicateIndexBackend {
+    Binary,
+    Vortex,
+}
 
 fn native_predicate_index_backend(data_path: &Path) -> Result<NativePredicateIndexBackend> {
     let configured = std::env::var("VORTEX_RDF_NATIVE_PREDICATE_INDEX_BACKEND")
         .unwrap_or_else(|_| "auto".to_string());
     match configured.as_str() {
-        "auto" => if native_p_exact_ranges_vortex_path(data_path).is_file() {
-            Ok(NativePredicateIndexBackend::Vortex)
-        } else {
+        // Vortex v1 has correct results but an unacceptable fixed lookup cost.
+        // Never select it implicitly. Prefer the proven binary index until v2 exists.
+        "auto" => {
+            if native_p_exact_ranges_exists(data_path) {
+                Ok(NativePredicateIndexBackend::Binary)
+            } else {
+                Err(VortexRdfError::InvalidOperation(format!(
+                    "No production predicate index exists for {:?}; flat Vortex v1 is experimental and must be selected explicitly with VORTEX_RDF_NATIVE_PREDICATE_INDEX_BACKEND=vortex",
+                    data_path
+                )))
+            }
+        }
+        "binary" => {
+            let path = native_p_exact_ranges_path(data_path);
+            if !path.is_file() {
+                return Err(VortexRdfError::InvalidOperation(format!(
+                    "Binary predicate index backend requested but {:?} does not exist",
+                    path
+                )));
+            }
             Ok(NativePredicateIndexBackend::Binary)
-        },
-        "binary" => Ok(NativePredicateIndexBackend::Binary),
-        "vortex" => {
+        }
+        "vortex" | "vortex-v1" => {
             let path = native_p_exact_ranges_vortex_path(data_path);
             if !path.is_file() {
                 return Err(VortexRdfError::InvalidOperation(format!(
-                    "Vortex predicate index backend requested but {:?} does not exist", path
+                    "Vortex predicate v1 backend requested but {:?} does not exist",
+                    path
                 )));
             }
             Ok(NativePredicateIndexBackend::Vortex)
         }
         other => Err(VortexRdfError::InvalidOperation(format!(
-            "Unsupported VORTEX_RDF_NATIVE_PREDICATE_INDEX_BACKEND={other:?}; expected auto, binary, or vortex"
+            "Unsupported VORTEX_RDF_NATIVE_PREDICATE_INDEX_BACKEND={other:?}; expected auto, binary, vortex, or vortex-v1"
         ))),
     }
 }
@@ -2829,22 +2852,34 @@ async fn lookup_predicate_ranges_from_vortex(
     predicate_id: u32,
 ) -> Result<Vec<Range<u64>>> {
     let path = native_p_exact_ranges_vortex_path(data_path);
-    let file = NATIVE_FILE_SESSION.open_options().open_path(&path).await
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&path)
+        .await
         .map_err(VortexRdfError::from)?;
-    let stream = file.scan().map_err(VortexRdfError::from)?
+    let stream = file
+        .scan()
+        .map_err(VortexRdfError::from)?
         .with_filter(eq(col("predicate_id"), lit(predicate_id)))
         .with_projection(vortex_array::expr::select(
-            ["row_start", "row_end"], vortex_array::expr::root(),
+            ["row_start", "row_end"],
+            vortex_array::expr::root(),
         ))
-        .into_array_stream().map_err(VortexRdfError::from)?;
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?;
     let result = stream.read_all().await.map_err(VortexRdfError::from)?;
-    if result.len() == 0 { return Ok(Vec::new()); }
+    if result.len() == 0 {
+        return Ok(Vec::new());
+    }
     let starts = extract_projected_u64_column(&result, "row_start")?;
     let ends = extract_projected_u64_column(&result, "row_end")?;
     if starts.len() != ends.len() || starts.len() != result.len() {
         return Err(VortexRdfError::Deserialization(format!(
             "Vortex predicate index {:?} returned inconsistent columns: rows={}, starts={}, ends={}",
-            path, result.len(), starts.len(), ends.len()
+            path,
+            result.len(),
+            starts.len(),
+            ends.len()
         )));
     }
     let mut ranges = Vec::with_capacity(starts.len());
@@ -3063,37 +3098,153 @@ pub async fn build_cottas_native_po_exact_ranges_index(
     })
 }
 
-#[derive(Clone, Debug, Default)]
-struct NativePredicateRangeBuildState {
-    rows_scanned: u64,
-    ranges_written: u64,
-    batches: usize,
-    max_batch_rows: usize,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativePredicateRangeRecord {
+    predicate_id: u32,
+    row_start: u64,
+    row_end: u64,
 }
 
-fn store_predicate_range_build_state(
-    shared: &Mutex<NativePredicateRangeBuildState>,
-    state: NativePredicateRangeBuildState,
-) -> VortexResult<()> {
-    let mut guard = shared.lock().map_err(|_| {
-        vortex_error::vortex_err!("predicate range build-state mutex was poisoned")
-    })?;
-    *guard = state;
+impl Ord for NativePredicateRangeRecord {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.predicate_id
+            .cmp(&other.predicate_id)
+            .then_with(|| self.row_start.cmp(&other.row_start))
+            .then_with(|| self.row_end.cmp(&other.row_end))
+    }
+}
+impl PartialOrd for NativePredicateRangeRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn native_p_exact_directory_v2_path(data_path: &Path) -> PathBuf {
+    let name = data_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("data.vortex");
+    data_path.with_file_name(format!("{name}.p_exact_directory.v2.vortex"))
+}
+
+fn native_p_exact_ranges_v2_path(data_path: &Path) -> PathBuf {
+    let name = data_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("data.vortex");
+    data_path.with_file_name(format!("{name}.p_exact_ranges.v2.vortex"))
+}
+
+fn write_predicate_range_record<W: Write>(
+    writer: &mut W,
+    value: NativePredicateRangeRecord,
+) -> Result<()> {
+    writer
+        .write_all(&value.predicate_id.to_le_bytes())
+        .and_then(|_| writer.write_all(&value.row_start.to_le_bytes()))
+        .and_then(|_| writer.write_all(&value.row_end.to_le_bytes()))
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))
+}
+
+struct NativePredicateRangeRunReader {
+    reader: BufReader<std::fs::File>,
+}
+impl NativePredicateRangeRunReader {
+    fn new(path: &Path) -> Result<Self> {
+        Ok(Self {
+            reader: BufReader::new(
+                std::fs::File::open(path)
+                    .map_err(|e| VortexRdfError::Serialization(e.to_string()))?,
+            ),
+        })
+    }
+    fn read_one(&mut self) -> Result<Option<NativePredicateRangeRecord>> {
+        let mut buf = [0u8; 20];
+        match self.reader.read_exact(&mut buf) {
+            Ok(()) => Ok(Some(NativePredicateRangeRecord {
+                predicate_id: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+                row_start: u64::from_le_bytes(buf[4..12].try_into().unwrap()),
+                row_end: u64::from_le_bytes(buf[12..20].try_into().unwrap()),
+            })),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(e) => Err(VortexRdfError::Serialization(e.to_string())),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativePredicateRangeHeapItem {
+    value: NativePredicateRangeRecord,
+    run_idx: usize,
+}
+impl Ord for NativePredicateRangeHeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .value
+            .cmp(&self.value)
+            .then_with(|| other.run_idx.cmp(&self.run_idx))
+    }
+}
+impl PartialOrd for NativePredicateRangeHeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn flush_predicate_range_run(
+    records: &mut Vec<NativePredicateRangeRecord>,
+    temp_dir: &Path,
+    run_idx: usize,
+    runs: &mut Vec<PathBuf>,
+) -> Result<()> {
+    records.sort_unstable();
+    let path = temp_dir.join(format!("predicate_range_run_{run_idx:06}.bin"));
+    let mut writer = BufWriter::new(
+        std::fs::File::create(&path).map_err(|e| VortexRdfError::Serialization(e.to_string()))?,
+    );
+    for value in records.iter().copied() {
+        write_predicate_range_record(&mut writer, value)?;
+    }
+    writer
+        .flush()
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    records.clear();
+    runs.push(path);
     Ok(())
 }
 
-fn build_predicate_range_array(
-    predicate_ids: Vec<u32>, row_starts: Vec<u64>, row_ends: Vec<u64>,
-) -> Result<ArrayRef> {
+fn build_predicate_payload_array(starts: Vec<u64>, ends: Vec<u64>) -> Result<ArrayRef> {
     StructArray::from_fields(&[
-        ("predicate_id", PrimitiveArray::from_iter(predicate_ids).into_array()),
-        ("row_start", PrimitiveArray::from_iter(row_starts).into_array()),
-        ("row_end", PrimitiveArray::from_iter(row_ends).into_array()),
-    ]).map_err(VortexRdfError::Vortex).map(|a| a.into_array())
+        ("row_start", PrimitiveArray::from_iter(starts).into_array()),
+        ("row_end", PrimitiveArray::from_iter(ends).into_array()),
+    ])
+    .map_err(VortexRdfError::Vortex)
+    .map(|a| a.into_array())
 }
 
-fn empty_predicate_range_array() -> Result<ArrayRef> {
-    build_predicate_range_array(Vec::new(), Vec::new(), Vec::new())
+fn build_predicate_directory_array(
+    ids: Vec<u32>,
+    offsets: Vec<u64>,
+    counts: Vec<u32>,
+    rows: Vec<u64>,
+) -> Result<ArrayRef> {
+    StructArray::from_fields(&[
+        ("predicate_id", PrimitiveArray::from_iter(ids).into_array()),
+        (
+            "range_offset",
+            PrimitiveArray::from_iter(offsets).into_array(),
+        ),
+        (
+            "range_count",
+            PrimitiveArray::from_iter(counts).into_array(),
+        ),
+        (
+            "candidate_rows",
+            PrimitiveArray::from_iter(rows).into_array(),
+        ),
+    ])
+    .map_err(VortexRdfError::Vortex)
+    .map(|a| a.into_array())
 }
 
 pub async fn build_cottas_native_p_exact_ranges_index(
@@ -3101,120 +3252,238 @@ pub async fn build_cottas_native_p_exact_ranges_index(
 ) -> Result<NativePoRowGroupIndexBuildStats> {
     const OUTPUT_BATCH_ROWS: usize = 65_536;
     let total_start = Instant::now();
-    let output_path = native_p_exact_ranges_vortex_path(input_path);
-    let temporary_path = output_path.with_extension("vortex.tmp");
+    let directory_path = native_p_exact_directory_v2_path(input_path);
+    let payload_path = native_p_exact_ranges_v2_path(input_path);
+    let directory_tmp = directory_path.with_extension("vortex.tmp");
+    let payload_tmp = payload_path.with_extension("vortex.tmp");
+    let temp_dir = tempfile::tempdir().map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    let sort_batch = std::env::var("VORTEX_RDF_P_V2_SORT_BATCH_RANGES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1_000_000)
+        .max(1);
+
     let open_start = Instant::now();
-    let file = NATIVE_FILE_SESSION.open_options().open_path(input_path).await
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(input_path)
+        .await
         .map_err(VortexRdfError::from)?;
     let open_ms = elapsed_ms(open_start);
     let scan_start = Instant::now();
-    let mut input_stream = file.scan().map_err(VortexRdfError::from)?
-        .with_projection(vortex_array::expr::select(["p"], vortex_array::expr::root()))
-        .into_array_stream().map_err(VortexRdfError::from)?;
-    let shared_state = Arc::new(Mutex::new(NativePredicateRangeBuildState::default()));
-    let stream_state = Arc::clone(&shared_state);
-    let output_arrays = async_stream::try_stream! {
-        let mut predicate_ids = Vec::with_capacity(OUTPUT_BATCH_ROWS);
-        let mut row_starts = Vec::with_capacity(OUTPUT_BATCH_ROWS);
-        let mut row_ends = Vec::with_capacity(OUTPUT_BATCH_ROWS);
-        let mut rows_scanned = 0u64;
-        let mut ranges_written = 0u64;
-        let mut batches = 0usize;
-        let mut max_batch_rows = 0usize;
-        let mut current_predicate: Option<u32> = None;
-        let mut current_start = 0u64;
-        while let Some(batch_result) = input_stream.next().await {
-            let batch = batch_result?;
-            let batch_rows = batch.len();
-            batches += 1;
-            max_batch_rows = max_batch_rows.max(batch_rows);
-            if batch_rows == 0 { continue; }
-            let values = extract_projected_u32_column(&batch, "p")
-                .map_err(rdf_err_to_vortex_err)?;
-            if values.len() != batch_rows {
-                Err(vortex_error::vortex_err!(
-                    "predicate range build saw {} predicate IDs for {} rows",
-                    values.len(), batch_rows
-                ))?;
-            }
-            for predicate_id in values {
-                match current_predicate {
-                    None => { current_predicate = Some(predicate_id); current_start = rows_scanned; }
-                    Some(previous) if previous != predicate_id => {
-                        predicate_ids.push(previous);
-                        row_starts.push(current_start);
-                        row_ends.push(rows_scanned);
-                        ranges_written += 1;
-                        current_predicate = Some(predicate_id);
-                        current_start = rows_scanned;
-                        if predicate_ids.len() >= OUTPUT_BATCH_ROWS {
-                            yield build_predicate_range_array(
-                                std::mem::take(&mut predicate_ids),
-                                std::mem::take(&mut row_starts),
-                                std::mem::take(&mut row_ends),
-                            ).map_err(rdf_err_to_vortex_err)?;
-                            predicate_ids = Vec::with_capacity(OUTPUT_BATCH_ROWS);
-                            row_starts = Vec::with_capacity(OUTPUT_BATCH_ROWS);
-                            row_ends = Vec::with_capacity(OUTPUT_BATCH_ROWS);
-                        }
-                    }
-                    Some(_) => {}
+    let mut stream = file
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_projection(vortex_array::expr::select(
+            ["p"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?;
+
+    let mut records = Vec::with_capacity(sort_batch);
+    let mut runs = Vec::new();
+    let mut rows_scanned = 0u64;
+    let mut row_groups = 0usize;
+    let mut current_predicate = None;
+    let mut current_start = 0u64;
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result.map_err(VortexRdfError::from)?;
+        let values = extract_projected_u32_column(&batch, "p")?;
+        row_groups += 1;
+        for predicate_id in values {
+            match current_predicate {
+                None => {
+                    current_predicate = Some(predicate_id);
+                    current_start = rows_scanned;
                 }
-                rows_scanned += 1;
+                Some(previous) if previous != predicate_id => {
+                    records.push(NativePredicateRangeRecord {
+                        predicate_id: previous,
+                        row_start: current_start,
+                        row_end: rows_scanned,
+                    });
+                    current_predicate = Some(predicate_id);
+                    current_start = rows_scanned;
+                    if records.len() >= sort_batch {
+                        let idx = runs.len();
+                        flush_predicate_range_run(&mut records, temp_dir.path(), idx, &mut runs)?;
+                    }
+                }
+                Some(_) => {}
             }
+            rows_scanned += 1;
         }
-        if let Some(predicate_id) = current_predicate {
-            predicate_ids.push(predicate_id);
-            row_starts.push(current_start);
-            row_ends.push(rows_scanned);
-            ranges_written += 1;
+    }
+    if let Some(predicate_id) = current_predicate {
+        records.push(NativePredicateRangeRecord {
+            predicate_id,
+            row_start: current_start,
+            row_end: rows_scanned,
+        });
+    }
+    if !records.is_empty() {
+        let idx = runs.len();
+        flush_predicate_range_run(&mut records, temp_dir.path(), idx, &mut runs)?;
+    }
+    let scan_ms = elapsed_ms(scan_start);
+
+    let merge_start = Instant::now();
+    let merged_path = temp_dir.path().join("predicate_ranges_merged.bin");
+    let mut merged_writer = BufWriter::new(
+        std::fs::File::create(&merged_path)
+            .map_err(|e| VortexRdfError::Serialization(e.to_string()))?,
+    );
+    let mut readers = Vec::with_capacity(runs.len());
+    let mut heap = BinaryHeap::new();
+    for path in &runs {
+        readers.push(NativePredicateRangeRunReader::new(path)?);
+    }
+    for run_idx in 0..readers.len() {
+        if let Some(value) = readers[run_idx].read_one()? {
+            heap.push(NativePredicateRangeHeapItem { value, run_idx });
         }
-        if !predicate_ids.is_empty() {
-            yield build_predicate_range_array(predicate_ids, row_starts, row_ends)
-                .map_err(rdf_err_to_vortex_err)?;
-        } else if rows_scanned == 0 {
-            yield empty_predicate_range_array().map_err(rdf_err_to_vortex_err)?;
+    }
+    let mut dir_ids = Vec::new();
+    let mut dir_offsets = Vec::new();
+    let mut dir_counts = Vec::new();
+    let mut dir_rows = Vec::new();
+    let mut payload_offset = 0u64;
+    let mut active_predicate = None;
+    let mut active_offset = 0u64;
+    let mut active_count = 0u32;
+    let mut active_rows = 0u64;
+    while let Some(item) = heap.pop() {
+        let value = item.value;
+        if active_predicate != Some(value.predicate_id) {
+            if let Some(predicate_id) = active_predicate {
+                dir_ids.push(predicate_id);
+                dir_offsets.push(active_offset);
+                dir_counts.push(active_count);
+                dir_rows.push(active_rows);
+            }
+            active_predicate = Some(value.predicate_id);
+            active_offset = payload_offset;
+            active_count = 0;
+            active_rows = 0;
         }
-        store_predicate_range_build_state(stream_state.as_ref(), NativePredicateRangeBuildState {
-            rows_scanned, ranges_written, batches, max_batch_rows,
+        if value.row_start > value.row_end {
+            return Err(VortexRdfError::Serialization(
+                "predicate v2 range start exceeds end".into(),
+            ));
+        }
+        write_predicate_range_record(&mut merged_writer, value)?;
+        active_count = active_count.checked_add(1).ok_or_else(|| {
+            VortexRdfError::Serialization("predicate v2 range count overflow".into())
         })?;
-    };
-    let dtype = empty_predicate_range_array()?.dtype().clone();
-    let output_stream = ArrayStreamAdapter::new(dtype, output_arrays);
-    let mut output_file = tokio::fs::File::create(&temporary_path).await
+        active_rows = active_rows.saturating_add(value.row_end - value.row_start);
+        payload_offset += 1;
+        if let Some(next) = readers[item.run_idx].read_one()? {
+            heap.push(NativePredicateRangeHeapItem {
+                value: next,
+                run_idx: item.run_idx,
+            });
+        }
+    }
+    if let Some(predicate_id) = active_predicate {
+        dir_ids.push(predicate_id);
+        dir_offsets.push(active_offset);
+        dir_counts.push(active_count);
+        dir_rows.push(active_rows);
+    }
+    merged_writer
+        .flush()
         .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    let strategy = WriteStrategyBuilder::default()
+    drop(merged_writer);
+    let merge_ms = elapsed_ms(merge_start);
+
+    let payload_reader = NativePredicateRangeRunReader::new(&merged_path)?;
+    let payload_arrays = async_stream::try_stream! {
+        let mut reader = payload_reader;
+        loop {
+            let mut starts = Vec::with_capacity(OUTPUT_BATCH_ROWS);
+            let mut ends = Vec::with_capacity(OUTPUT_BATCH_ROWS);
+            while starts.len() < OUTPUT_BATCH_ROWS {
+                let Some(value) = reader.read_one().map_err(rdf_err_to_vortex_err)? else { break; };
+                starts.push(value.row_start);
+                ends.push(value.row_end);
+            }
+            if starts.is_empty() { break; }
+            yield build_predicate_payload_array(starts, ends).map_err(rdf_err_to_vortex_err)?;
+        }
+    };
+    let payload_dtype = build_predicate_payload_array(Vec::new(), Vec::new())?
+        .dtype()
+        .clone();
+    let payload_stream = ArrayStreamAdapter::new(payload_dtype, payload_arrays);
+    let payload_strategy = WriteStrategyBuilder::default()
         .with_row_block_size(OUTPUT_BATCH_ROWS)
         .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
         .build();
-    NATIVE_FILE_SESSION.write_options().with_strategy(strategy)
-        .write(&mut output_file, output_stream).await.map_err(VortexRdfError::from)?;
-    drop(output_file);
-    std::fs::rename(&temporary_path, &output_path)
+    let mut payload_file = tokio::fs::File::create(&payload_tmp)
+        .await
         .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    let scan_ms = elapsed_ms(scan_start);
-    let state = shared_state.lock().map_err(|_| {
-        VortexRdfError::Serialization("predicate range build-state mutex was poisoned".into())
-    })?.clone();
+    NATIVE_FILE_SESSION
+        .write_options()
+        .with_strategy(payload_strategy)
+        .write(&mut payload_file, payload_stream)
+        .await
+        .map_err(VortexRdfError::from)?;
+    drop(payload_file);
+
+    let directory_rows = dir_ids.len();
+    let directory_array =
+        build_predicate_directory_array(dir_ids, dir_offsets, dir_counts, dir_rows)?;
+    let directory_dtype =
+        build_predicate_directory_array(Vec::new(), Vec::new(), Vec::new(), Vec::new())?
+            .dtype()
+            .clone();
+    let directory_arrays = futures::stream::iter(vec![Ok(directory_array)]);
+    let directory_stream = ArrayStreamAdapter::new(directory_dtype, directory_arrays);
+    let mut directory_file = tokio::fs::File::create(&directory_tmp)
+        .await
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    let directory_strategy = WriteStrategyBuilder::default()
+        .with_row_block_size(OUTPUT_BATCH_ROWS)
+        .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+        .build();
+    NATIVE_FILE_SESSION
+        .write_options()
+        .with_strategy(directory_strategy)
+        .write(&mut directory_file, directory_stream)
+        .await
+        .map_err(VortexRdfError::from)?;
+    drop(directory_file);
+    std::fs::rename(&payload_tmp, &payload_path)
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    std::fs::rename(&directory_tmp, &directory_path)
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+
     let total_ms = elapsed_ms(total_start);
     log::info!(
-        "[cottas_native_ids] wrote direct Vortex predicate index {:?}: rows={}, ranges={}, batches={}, max_batch_rows={}, total_ms={:.3}",
-        output_path, state.rows_scanned, state.ranges_written, state.batches,
-        state.max_batch_rows, total_ms
+        "[cottas_native_ids] wrote predicate v2 directory {:?} predicates={} and payload {:?} ranges={} rows={} runs={} scan_ms={:.3} merge_ms={:.3} total_ms={:.3}",
+        directory_path,
+        directory_rows,
+        payload_path,
+        payload_offset,
+        rows_scanned,
+        runs.len(),
+        scan_ms,
+        merge_ms,
+        total_ms
     );
     Ok(NativePoRowGroupIndexBuildStats {
         input_path: input_path.display().to_string(),
-        output_path: output_path.display().to_string(),
-        row_groups: state.batches,
-        rows_scanned: state.rows_scanned,
-        unique_po_hashes_written: state.ranges_written,
+        output_path: directory_path.display().to_string(),
+        row_groups,
+        rows_scanned,
+        unique_po_hashes_written: payload_offset,
         open_ms,
         scan_ms,
-        write_ms: scan_ms,
+        write_ms: merge_ms,
         total_ms,
     })
 }
-
 const NATIVE_SUBJECT_RANGE_ENTRY_BYTES: u64 = 20;
 
 #[derive(Clone, Copy, Debug)]
@@ -3337,9 +3606,9 @@ fn store_subject_range_build_state(
     shared_state: &Mutex<NativeSubjectRangeBuildState>,
     state: NativeSubjectRangeBuildState,
 ) -> VortexResult<()> {
-    let mut guard = shared_state.lock().map_err(|_| {
-        vortex_error::vortex_err!("subject range build-state mutex was poisoned")
-    })?;
+    let mut guard = shared_state
+        .lock()
+        .map_err(|_| vortex_error::vortex_err!("subject range build-state mutex was poisoned"))?;
     *guard = state;
     Ok(())
 }
@@ -3350,8 +3619,14 @@ fn build_subject_range_array(
     row_ends: Vec<u64>,
 ) -> Result<ArrayRef> {
     StructArray::from_fields(&[
-        ("subject_id", PrimitiveArray::from_iter(subject_ids).into_array()),
-        ("row_start", PrimitiveArray::from_iter(row_starts).into_array()),
+        (
+            "subject_id",
+            PrimitiveArray::from_iter(subject_ids).into_array(),
+        ),
+        (
+            "row_start",
+            PrimitiveArray::from_iter(row_starts).into_array(),
+        ),
         ("row_end", PrimitiveArray::from_iter(row_ends).into_array()),
     ])
     .map_err(VortexRdfError::Vortex)
