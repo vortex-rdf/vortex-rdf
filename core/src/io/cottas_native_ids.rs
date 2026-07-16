@@ -1052,10 +1052,17 @@ pub trait NativeDictionaryProvider: Send + Sync {
 #[async_trait]
 pub trait NativeIndexProvider: Send + Sync {
     async fn subject_range(&self, subject_id: u32) -> Result<Option<Range<u64>>>;
-    async fn po_ranges(&self, predicate_id: u32, object_id: u32)
-    -> Result<Option<Vec<Range<u64>>>>;
+    async fn po_access(&self, predicate_id: u32, object_id: u32) -> Result<Option<NativePoAccess>>;
     async fn predicate_access(&self, predicate_id: u32) -> Result<Option<NativePredicateAccess>>;
     fn subject_strategy(&self) -> &'static str;
+}
+
+#[derive(Clone, Debug)]
+pub struct NativePoAccess {
+    ranges: Option<Vec<Range<u64>>>,
+    candidate_ranges: usize,
+    candidate_rows: u64,
+    strategy: &'static str,
 }
 
 #[derive(Clone, Debug)]
@@ -1116,21 +1123,29 @@ impl NativeIndexProvider for BinaryNativeProviders {
         }
     }
 
-    async fn po_ranges(
-        &self,
-        predicate_id: u32,
-        object_id: u32,
-    ) -> Result<Option<Vec<Range<u64>>>> {
-        if !native_po_exact_ranges_exists(&self.data_path) {
-            return Ok(None);
+    async fn po_access(&self, predicate_id: u32, object_id: u32) -> Result<Option<NativePoAccess>> {
+        match native_po_index_backend(&self.data_path)? {
+            NativePoIndexBackend::Binary => {
+                let ranges = lookup_exact_row_ranges(
+                    &native_po_exact_ranges_path(&self.data_path),
+                    NATIVE_PO_EXACT_RANGES_MAGIC,
+                    native_po_hash(predicate_id, object_id),
+                    "PO exact range",
+                )?;
+                let candidate_ranges = ranges.len();
+                let candidate_rows = range_rows(&ranges);
+                let accepted = po_exact_access_accepted(candidate_ranges, candidate_rows);
+                Ok(Some(NativePoAccess {
+                    ranges: accepted.then_some(ranges),
+                    candidate_ranges,
+                    candidate_rows,
+                    strategy: "po-exact-ranges-binary",
+                }))
+            }
+            NativePoIndexBackend::VortexV2 => {
+                lookup_po_access_from_vortex_v2(&self.data_path, predicate_id, object_id).await
+            }
         }
-        lookup_exact_row_ranges(
-            &native_po_exact_ranges_path(&self.data_path),
-            NATIVE_PO_EXACT_RANGES_MAGIC,
-            native_po_hash(predicate_id, object_id),
-            "PO exact range",
-        )
-        .map(Some)
     }
 
     async fn predicate_access(&self, predicate_id: u32) -> Result<Option<NativePredicateAccess>> {
@@ -1285,16 +1300,20 @@ async fn plan_native_access<I: NativeIndexProvider + ?Sized>(
 
     if !subject_bound && predicate_bound && object_bound {
         if let (Some(predicate_id), Some(object_id)) = (resolved.p, resolved.o) {
-            if let Some(ranges) = indexes.po_ranges(predicate_id, object_id).await? {
-                let candidate_rows = range_rows(&ranges);
+            if let Some(access) = indexes.po_access(predicate_id, object_id).await? {
+                let use_ranges = access.ranges.is_some();
                 return Ok(NativeAccessPlan {
-                    candidate_ranges: ranges.len(),
-                    candidate_rows,
-                    ranges: Some(ranges),
-                    strategy: "po-exact-ranges".to_string(),
+                    candidate_ranges: access.candidate_ranges,
+                    candidate_rows: access.candidate_rows,
+                    ranges: access.ranges,
+                    strategy: if use_ranges {
+                        access.strategy.to_string()
+                    } else {
+                        "none-high-cardinality-po".to_string()
+                    },
                     lookup_ms: elapsed_ms(start),
                     subject_range: None,
-                    po_index_used: true,
+                    po_index_used: use_ranges,
                 });
             }
         }
@@ -2805,6 +2824,218 @@ fn read_exact_range_entry_at(file: &std::fs::File, entry_idx: u64) -> Result<(u6
     let start = u64::from_le_bytes(buf[8..16].try_into().unwrap());
     let end = u64::from_le_bytes(buf[16..24].try_into().unwrap());
     Ok((hash, start, end))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativePoIndexBackend {
+    Binary,
+    VortexV2,
+}
+
+fn native_po_v2_exists(data_path: &Path) -> bool {
+    native_po_exact_directory_v2_path(data_path).is_file()
+        && native_po_exact_ranges_v2_path(data_path).is_file()
+}
+
+fn native_po_index_backend(data_path: &Path) -> Result<NativePoIndexBackend> {
+    let configured =
+        std::env::var("VORTEX_RDF_NATIVE_PO_INDEX_BACKEND").unwrap_or_else(|_| "auto".to_string());
+    match configured.as_str() {
+        "auto" if native_po_v2_exists(data_path) => Ok(NativePoIndexBackend::VortexV2),
+        "auto" if native_po_exact_ranges_exists(data_path) => Ok(NativePoIndexBackend::Binary),
+        "auto" => Err(VortexRdfError::InvalidOperation(format!(
+            "No production PO index exists for {:?}",
+            data_path
+        ))),
+        "binary" if native_po_exact_ranges_exists(data_path) => Ok(NativePoIndexBackend::Binary),
+        "binary" => Err(VortexRdfError::InvalidOperation(format!(
+            "Binary PO index {:?} does not exist",
+            native_po_exact_ranges_path(data_path)
+        ))),
+        "vortex-v2" if native_po_v2_exists(data_path) => Ok(NativePoIndexBackend::VortexV2),
+        "vortex-v2" => Err(VortexRdfError::InvalidOperation(format!(
+            "Vortex PO v2 directory {:?} or payload {:?} is missing",
+            native_po_exact_directory_v2_path(data_path),
+            native_po_exact_ranges_v2_path(data_path)
+        ))),
+        other => Err(VortexRdfError::InvalidOperation(format!(
+            "Unsupported VORTEX_RDF_NATIVE_PO_INDEX_BACKEND={other:?}; expected auto, binary, or vortex-v2"
+        ))),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativePoDirectoryEntry {
+    range_offset: u64,
+    range_count: u32,
+    candidate_rows: u64,
+}
+
+async fn lookup_po_directory_entry_from_vortex_v2(
+    data_path: &Path,
+    predicate_id: u32,
+    object_id: u32,
+) -> Result<Option<NativePoDirectoryEntry>> {
+    let path = native_po_exact_directory_v2_path(data_path);
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let result = file
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_filter(and(
+            eq(col("predicate_id"), lit(predicate_id)),
+            eq(col("object_id"), lit(object_id)),
+        ))
+        .with_projection(vortex_array::expr::select(
+            ["range_offset", "range_count", "candidate_rows"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?
+        .read_all()
+        .await
+        .map_err(VortexRdfError::from)?;
+    if result.len() == 0 {
+        return Ok(None);
+    }
+    if result.len() != 1 {
+        return Err(VortexRdfError::Deserialization(format!(
+            "PO v2 directory {:?} returned {} rows for ({}, {}); expected one",
+            path,
+            result.len(),
+            predicate_id,
+            object_id
+        )));
+    }
+    let offsets = extract_projected_u64_column(&result, "range_offset")?;
+    let counts = extract_projected_u32_column(&result, "range_count")?;
+    let rows = extract_projected_u64_column(&result, "candidate_rows")?;
+    if offsets.len() != 1 || counts.len() != 1 || rows.len() != 1 {
+        return Err(VortexRdfError::Deserialization(format!(
+            "PO v2 directory {:?} returned inconsistent metadata columns",
+            path
+        )));
+    }
+    Ok(Some(NativePoDirectoryEntry {
+        range_offset: offsets[0],
+        range_count: counts[0],
+        candidate_rows: rows[0],
+    }))
+}
+
+async fn read_po_v2_payload(
+    data_path: &Path,
+    entry: NativePoDirectoryEntry,
+) -> Result<Vec<Range<u64>>> {
+    let range_end = entry
+        .range_offset
+        .checked_add(u64::from(entry.range_count))
+        .ok_or_else(|| VortexRdfError::Deserialization("PO v2 payload slice overflow".into()))?;
+    let path = native_po_exact_ranges_v2_path(data_path);
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let payload = file
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_row_range(entry.range_offset..range_end)
+        .with_projection(vortex_array::expr::select(
+            ["row_start", "row_end"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?
+        .read_all()
+        .await
+        .map_err(VortexRdfError::from)?;
+    if payload.len() != entry.range_count as usize {
+        return Err(VortexRdfError::Deserialization(format!(
+            "PO v2 payload {:?} returned {} rows for expected slice {}..{}",
+            path,
+            payload.len(),
+            entry.range_offset,
+            range_end
+        )));
+    }
+    let starts = extract_projected_u64_column(&payload, "row_start")?;
+    let ends = extract_projected_u64_column(&payload, "row_end")?;
+    if starts.len() != payload.len() || ends.len() != payload.len() {
+        return Err(VortexRdfError::Deserialization(format!(
+            "PO v2 payload {:?} returned inconsistent range columns",
+            path
+        )));
+    }
+    let mut ranges = Vec::with_capacity(payload.len());
+    for (start, end) in starts.into_iter().zip(ends) {
+        if start >= end {
+            return Err(VortexRdfError::Deserialization(format!(
+                "PO v2 payload {:?} contains invalid range {}..{}",
+                path, start, end
+            )));
+        }
+        ranges.push(start..end);
+    }
+    let payload_rows = range_rows(&ranges);
+    if payload_rows != entry.candidate_rows {
+        return Err(VortexRdfError::Deserialization(format!(
+            "PO v2 candidate row mismatch: directory={}, payload={}",
+            entry.candidate_rows, payload_rows
+        )));
+    }
+    Ok(ranges)
+}
+
+async fn lookup_po_access_from_vortex_v2(
+    data_path: &Path,
+    predicate_id: u32,
+    object_id: u32,
+) -> Result<Option<NativePoAccess>> {
+    let Some(entry) =
+        lookup_po_directory_entry_from_vortex_v2(data_path, predicate_id, object_id).await?
+    else {
+        return Ok(Some(NativePoAccess {
+            ranges: Some(Vec::new()),
+            candidate_ranges: 0,
+            candidate_rows: 0,
+            strategy: "po-exact-ranges-vortex-v2",
+        }));
+    };
+    let candidate_ranges = entry.range_count as usize;
+    let accepted = po_exact_access_accepted(candidate_ranges, entry.candidate_rows);
+    let ranges = if accepted {
+        Some(read_po_v2_payload(data_path, entry).await?)
+    } else {
+        None
+    };
+    Ok(Some(NativePoAccess {
+        ranges,
+        candidate_ranges,
+        candidate_rows: entry.candidate_rows,
+        strategy: "po-exact-ranges-vortex-v2",
+    }))
+}
+
+fn po_exact_access_accepted(candidate_ranges: usize, candidate_rows: u64) -> bool {
+    candidate_ranges <= po_exact_max_ranges() && candidate_rows <= po_exact_max_rows()
+}
+
+fn po_exact_max_ranges() -> usize {
+    std::env::var("VORTEX_RDF_PO_EXACT_MAX_RANGES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(64)
+}
+
+fn po_exact_max_rows() -> u64 {
+    std::env::var("VORTEX_RDF_PO_EXACT_MAX_ROWS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(100_000)
 }
 
 const NATIVE_P_EXACT_RANGES_MAGIC: &[u8; 8] = b"VRDFPR1\0";
