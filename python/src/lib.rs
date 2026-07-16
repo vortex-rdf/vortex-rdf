@@ -177,6 +177,19 @@ fn diagnose_match<'py>(
         diagnostics.access_candidate_ranges,
     )?;
     out.set_item("access_candidate_rows", diagnostics.access_candidate_rows)?;
+    out.set_item(
+        "access_execution_strategy",
+        diagnostics.access_execution_strategy,
+    )?;
+    out.set_item(
+        "access_original_range_count",
+        diagnostics.access_original_range_count,
+    )?;
+    out.set_item(
+        "access_executed_scan_count",
+        diagnostics.access_executed_scan_count,
+    )?;
+    out.set_item("access_selected_rows", diagnostics.access_selected_rows)?;
     Ok(out)
 }
 
