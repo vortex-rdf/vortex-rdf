@@ -24,6 +24,7 @@ use vortex_array::arrays::{PrimitiveArray, StructArray};
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::{ArrayRef, IntoArray};
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
+use vortex_buffer::Buffer;
 use vortex_file::{OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder};
 use vortex_io::VortexWrite;
 use vortex_session::VortexSession;
@@ -1427,6 +1428,10 @@ pub struct CottasNativeIdsDiagnostics {
     pub access_index_lookup_ms: f64,
     pub access_candidate_ranges: usize,
     pub access_candidate_rows: u64,
+    pub access_execution_strategy: String,
+    pub access_original_range_count: usize,
+    pub access_executed_scan_count: usize,
+    pub access_selected_rows: u64,
     pub id_to_term_stats: NativeIdToTermLookupStats,
     pub term_to_id_stats: Vec<NativeTermToIdLookupStats>,
 }
@@ -1611,20 +1616,51 @@ fn append_optional_projected_u32_column(
     Ok(())
 }
 
-fn append_projected_rows(destination: &mut NativeProjectedIdRows, source: NativeProjectedIdRows) {
-    destination.rows += source.rows;
-    for (destination_column, source_column) in [
-        (&mut destination.s, source.s),
-        (&mut destination.p, source.p),
-        (&mut destination.o, source.o),
-        (&mut destination.g, source.g),
-    ] {
-        if let Some(values) = source_column {
-            destination_column
-                .get_or_insert_with(Vec::new)
-                .extend(values);
+fn exact_ranges_to_row_indices(ranges: &[Range<u64>], expected_rows: u64) -> Result<Buffer<u64>> {
+    let capacity = usize::try_from(expected_rows).map_err(|_| {
+        VortexRdfError::InvalidOperation(format!(
+            "selected row count {expected_rows} does not fit in usize"
+        ))
+    })?;
+    let mut indices = Vec::with_capacity(capacity);
+    let mut previous_end = None;
+    let mut actual_rows = 0u64;
+
+    for range in ranges {
+        if range.start >= range.end {
+            return Err(VortexRdfError::Deserialization(format!(
+                "selected row range is empty or reversed: {}..{}",
+                range.start, range.end
+            )));
         }
+        if let Some(end) = previous_end {
+            if range.start < end {
+                return Err(VortexRdfError::Deserialization(format!(
+                    "selected row ranges overlap or are not sorted: previous_end={}, next={}..{}",
+                    end, range.start, range.end
+                )));
+            }
+        }
+        actual_rows = actual_rows
+            .checked_add(range.end - range.start)
+            .ok_or_else(|| {
+                VortexRdfError::Deserialization(
+                    "selected row count overflow while expanding ranges".into(),
+                )
+            })?;
+        indices.extend(range.clone());
+        previous_end = Some(range.end);
     }
+
+    if actual_rows != expected_rows || indices.len() != capacity {
+        return Err(VortexRdfError::Deserialization(format!(
+            "selected row count mismatch: expected={}, ranges={}, expanded={}",
+            expected_rows,
+            actual_rows,
+            indices.len()
+        )));
+    }
+    Ok(Buffer::from(indices))
 }
 
 async fn read_native_projected_stream_all_with_scan_stats<S>(
@@ -2246,20 +2282,40 @@ async fn execute_cottas_native_match(
         diagnostics.subject_range_rows = Some(range.end.saturating_sub(range.start));
     }
     let selected_ranges = access_plan.ranges;
-
     let mut scan_build_ms = 0.0;
     let mut read_all_ms = 0.0;
     let mut matched_rows = NativeProjectedIdRows::default();
     let mut scan_batches = 0usize;
     let mut max_scan_batch_rows = 0usize;
+    let mut execution_strategy = "full-scan";
+    let mut original_range_count = 0usize;
+    let mut executed_scan_count = 0usize;
+    let mut selected_rows = 0u64;
 
     if let Some(ranges) = selected_ranges {
-        for row_range in ranges {
+        original_range_count = ranges.len();
+        selected_rows = range_rows(&ranges);
+        if selected_rows != access_plan.candidate_rows {
+            return Err(VortexRdfError::Deserialization(format!(
+                "access-plan row mismatch: metadata={}, ranges={}",
+                access_plan.candidate_rows, selected_rows
+            )));
+        }
+        if ranges.is_empty() {
+            execution_strategy = "empty-index-result";
+        } else {
             let scan_build_start = Instant::now();
-            let scan = file
-                .scan()
-                .map_err(VortexRdfError::from)?
-                .with_row_range(row_range);
+            let scan = file.scan().map_err(VortexRdfError::from)?;
+            let scan = if ranges.len() == 1 {
+                execution_strategy = "single-row-range";
+                scan.with_row_range(ranges[0].clone())
+            } else {
+                execution_strategy = "include-by-index";
+                scan.with_row_indices(exact_ranges_to_row_indices(
+                    &ranges,
+                    access_plan.candidate_rows,
+                )?)
+            };
             let scan = match &filter {
                 NativePatternFilter::All => scan,
                 NativePatternFilter::Empty => unreachable!("handled above"),
@@ -2273,13 +2329,14 @@ async fn execute_cottas_native_match(
                 .into_array_stream()
                 .map_err(VortexRdfError::from)?;
             scan_build_ms += elapsed_ms(scan_build_start);
+            executed_scan_count = 1;
             let read_start = Instant::now();
-            let (partial, batches, max_rows) =
+            let (rows, batches, max_rows) =
                 read_native_projected_stream_all_with_scan_stats(stream).await?;
             read_all_ms += elapsed_ms(read_start);
-            scan_batches += batches;
-            max_scan_batch_rows = max_scan_batch_rows.max(max_rows);
-            append_projected_rows(&mut matched_rows, partial);
+            matched_rows = rows;
+            scan_batches = batches;
+            max_scan_batch_rows = max_rows;
         }
     } else {
         let scan_build_start = Instant::now();
@@ -2297,6 +2354,7 @@ async fn execute_cottas_native_match(
             .into_array_stream()
             .map_err(VortexRdfError::from)?;
         scan_build_ms += elapsed_ms(scan_build_start);
+        executed_scan_count = 1;
         let read_start = Instant::now();
         let (rows, batches, max_rows) =
             read_native_projected_stream_all_with_scan_stats(stream).await?;
@@ -2305,9 +2363,12 @@ async fn execute_cottas_native_match(
         scan_batches = batches;
         max_scan_batch_rows = max_rows;
     }
-
     diagnostics.scan_build_ms = scan_build_ms;
     diagnostics.read_all_ms = read_all_ms;
+    diagnostics.access_execution_strategy = execution_strategy.to_string();
+    diagnostics.access_original_range_count = original_range_count;
+    diagnostics.access_executed_scan_count = executed_scan_count;
+    diagnostics.access_selected_rows = selected_rows;
     diagnostics.scan_batches = scan_batches;
     diagnostics.max_scan_batch_rows = max_scan_batch_rows;
     diagnostics.scan_rows_materialized = matched_rows.rows;

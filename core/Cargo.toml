@@ -23,6 +23,7 @@ vortex-layout.workspace = true
 vortex-file.workspace = true
 vortex-scan.workspace = true
 vortex-btrblocks = { workspace = true }
+vortex-buffer.workspace = true
 async-trait.workspace = true
 async-stream.workspace = true
 tempfile.workspace = true
