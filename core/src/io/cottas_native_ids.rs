@@ -394,6 +394,14 @@ where
             p_exact_stats.unique_po_hashes_written,
             p_exact_stats.total_ms
         );
+        let o_exact_stats = build_cottas_native_o_exact_ranges_index(output_path).await?;
+        log::info!(
+            "[cottas_native_ids] built object exact-ranges index during serialization: row_groups={}, rows={}, exact_ranges={}, total_ms={:.3}",
+            o_exact_stats.row_groups,
+            o_exact_stats.rows_scanned,
+            o_exact_stats.unique_po_hashes_written,
+            o_exact_stats.total_ms
+        );
     } else {
         log::info!(
             "[cottas_native_ids] skipping subject range index for ordering {:?}; subject ranges require SPO ordering",
@@ -1055,6 +1063,7 @@ pub trait NativeIndexProvider: Send + Sync {
     async fn subject_range(&self, subject_id: u32) -> Result<Option<Range<u64>>>;
     async fn po_access(&self, predicate_id: u32, object_id: u32) -> Result<Option<NativePoAccess>>;
     async fn predicate_access(&self, predicate_id: u32) -> Result<Option<NativePredicateAccess>>;
+    async fn object_access(&self, object_id: u32) -> Result<Option<NativeObjectAccess>>;
     fn subject_strategy(&self) -> &'static str;
 }
 
@@ -1073,6 +1082,7 @@ pub struct NativePredicateAccess {
     candidate_rows: u64,
     strategy: &'static str,
 }
+pub type NativeObjectAccess = NativePredicateAccess;
 
 #[derive(Clone, Debug)]
 pub struct BinaryNativeProviders {
@@ -1188,6 +1198,29 @@ impl NativeIndexProvider for BinaryNativeProviders {
             }
         }
     }
+    async fn object_access(&self, object_id: u32) -> Result<Option<NativeObjectAccess>> {
+        let directory = native_o_exact_directory_v2_path(&self.data_path);
+        let payload = native_o_exact_ranges_v2_path(&self.data_path);
+        let configured = std::env::var("VORTEX_RDF_NATIVE_OBJECT_INDEX_BACKEND")
+            .unwrap_or_else(|_| "auto".to_string());
+        match configured.as_str() {
+            "auto" if directory.is_file() && payload.is_file() => {
+                lookup_object_access_from_vortex_v2(&self.data_path, object_id).await
+            }
+            "auto" | "none" => Ok(None),
+            "vortex-v2" if directory.is_file() && payload.is_file() => {
+                lookup_object_access_from_vortex_v2(&self.data_path, object_id).await
+            }
+            "vortex-v2" => Err(VortexRdfError::InvalidOperation(format!(
+                "Vortex object v2 directory {:?} or payload {:?} is missing",
+                directory, payload
+            ))),
+            other => Err(VortexRdfError::InvalidOperation(format!(
+                "Unsupported VORTEX_RDF_NATIVE_OBJECT_INDEX_BACKEND={other:?}; expected auto, none, or vortex-v2"
+            ))),
+        }
+    }
+
     fn subject_strategy(&self) -> &'static str {
         match native_subject_index_backend(&self.data_path) {
             Ok(NativeSubjectIndexBackend::Vortex) => "subject-ranges-vortex-v1",
@@ -1341,6 +1374,26 @@ async fn plan_native_access<I: NativeIndexProvider + ?Sized>(
         }
     }
 
+    if !subject_bound && !predicate_bound && object_bound {
+        if let Some(object_id) = resolved.o {
+            if let Some(access) = indexes.object_access(object_id).await? {
+                let use_ranges = access.ranges.is_some();
+                return Ok(NativeAccessPlan {
+                    candidate_ranges: access.candidate_ranges,
+                    candidate_rows: access.candidate_rows,
+                    ranges: access.ranges,
+                    strategy: if use_ranges {
+                        access.strategy.to_string()
+                    } else {
+                        "none-high-cardinality-object".to_string()
+                    },
+                    lookup_ms: elapsed_ms(start),
+                    subject_range: None,
+                    po_index_used: false,
+                });
+            }
+        }
+    }
     Ok(NativeAccessPlan {
         strategy: "none".to_string(),
         lookup_ms: elapsed_ms(start),
@@ -4338,6 +4391,206 @@ pub async fn build_cottas_native_po_exact_ranges_v2_index(
     })
 }
 
+// VVO_TYPED_OBJECT_INDEX_V1
+#[derive(Clone, Copy, Debug)]
+struct NativeObjectDirectoryEntry {
+    object_id: u32,
+    range_offset: u64,
+    range_count: u32,
+    candidate_rows: u64,
+}
+
+static NATIVE_OBJECT_V2_DIRECTORY_CACHE: LazyLock<
+    Mutex<HashMap<PathBuf, Arc<[NativeObjectDirectoryEntry]>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn object_v2_cache_lock()
+-> Result<std::sync::MutexGuard<'static, HashMap<PathBuf, Arc<[NativeObjectDirectoryEntry]>>>> {
+    NATIVE_OBJECT_V2_DIRECTORY_CACHE.lock().map_err(|_| {
+        VortexRdfError::Deserialization("object v2 directory cache mutex was poisoned".into())
+    })
+}
+
+async fn object_v2_directory(data_path: &Path) -> Result<Arc<[NativeObjectDirectoryEntry]>> {
+    let path = native_o_exact_directory_v2_path(data_path);
+    if let Some(cached) = object_v2_cache_lock()?.get(&path).cloned() {
+        return Ok(cached);
+    }
+
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let array = file
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_projection(vortex_array::expr::select(
+            ["object_id", "range_offset", "range_count", "candidate_rows"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?
+        .read_all()
+        .await
+        .map_err(VortexRdfError::from)?;
+
+    let ids = extract_projected_u32_column(&array, "object_id")?;
+    let offsets = extract_projected_u64_column(&array, "range_offset")?;
+    let counts = extract_projected_u32_column(&array, "range_count")?;
+    let rows = extract_projected_u64_column(&array, "candidate_rows")?;
+    let len = array.len();
+    if [ids.len(), offsets.len(), counts.len(), rows.len()]
+        .into_iter()
+        .any(|column_len| column_len != len)
+    {
+        return Err(VortexRdfError::Deserialization(format!(
+            "object v2 directory {:?} has inconsistent column lengths",
+            path
+        )));
+    }
+
+    let mut entries = Vec::with_capacity(len);
+    for index in 0..len {
+        entries.push(NativeObjectDirectoryEntry {
+            object_id: ids[index],
+            range_offset: offsets[index],
+            range_count: counts[index],
+            candidate_rows: rows[index],
+        });
+    }
+    if entries
+        .windows(2)
+        .any(|pair| pair[0].object_id >= pair[1].object_id)
+    {
+        return Err(VortexRdfError::Deserialization(format!(
+            "object v2 directory {:?} is not strictly sorted by object_id",
+            path
+        )));
+    }
+
+    let entries: Arc<[NativeObjectDirectoryEntry]> = entries.into();
+    let mut cache = object_v2_cache_lock()?;
+    Ok(cache
+        .entry(path)
+        .or_insert_with(|| Arc::clone(&entries))
+        .clone())
+}
+
+fn object_access_from_directory_entry(
+    entry: Option<NativeObjectDirectoryEntry>,
+) -> NativeObjectAccess {
+    let Some(entry) = entry else {
+        return NativeObjectAccess {
+            ranges: Some(Vec::new()),
+            candidate_ranges: 0,
+            candidate_rows: 0,
+            strategy: "o-exact-ranges-vortex-v2-cached",
+        };
+    };
+    let candidate_ranges = entry.range_count as usize;
+    let accepted = candidate_ranges <= object_exact_max_ranges()
+        && entry.candidate_rows <= object_exact_max_rows();
+    NativeObjectAccess {
+        ranges: accepted.then(Vec::new),
+        candidate_ranges,
+        candidate_rows: entry.candidate_rows,
+        strategy: "o-exact-ranges-vortex-v2-cached",
+    }
+}
+
+async fn read_object_v2_payload(
+    data_path: &Path,
+    entry: NativeObjectDirectoryEntry,
+) -> Result<Vec<Range<u64>>> {
+    let range_end = entry
+        .range_offset
+        .checked_add(u64::from(entry.range_count))
+        .ok_or_else(|| {
+            VortexRdfError::Deserialization("object v2 payload row range overflow".into())
+        })?;
+    let path = native_o_exact_ranges_v2_path(data_path);
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let payload = file
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_row_range(entry.range_offset..range_end)
+        .with_projection(vortex_array::expr::select(
+            ["row_start", "row_end"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?
+        .read_all()
+        .await
+        .map_err(VortexRdfError::from)?;
+    if payload.len() != entry.range_count as usize {
+        return Err(VortexRdfError::Deserialization(format!(
+            "object v2 payload {:?} returned {} rows for expected slice {}..{}",
+            path,
+            payload.len(),
+            entry.range_offset,
+            range_end
+        )));
+    }
+
+    let starts = extract_projected_u64_column(&payload, "row_start")?;
+    let ends = extract_projected_u64_column(&payload, "row_end")?;
+    let mut ranges = Vec::with_capacity(payload.len());
+    for (start, end) in starts.into_iter().zip(ends) {
+        if start > end {
+            return Err(VortexRdfError::Deserialization(format!(
+                "object v2 contains invalid row range {start}..{end}"
+            )));
+        }
+        ranges.push(start..end);
+    }
+    if range_rows(&ranges) != entry.candidate_rows {
+        return Err(VortexRdfError::Deserialization(format!(
+            "object v2 candidate row mismatch: directory={}, payload={}",
+            entry.candidate_rows,
+            range_rows(&ranges)
+        )));
+    }
+    Ok(ranges)
+}
+
+async fn lookup_object_access_from_vortex_v2(
+    data_path: &Path,
+    object_id: u32,
+) -> Result<Option<NativeObjectAccess>> {
+    let directory = object_v2_directory(data_path).await?;
+    let entry = directory
+        .binary_search_by_key(&object_id, |entry| entry.object_id)
+        .ok()
+        .map(|index| directory[index]);
+    let mut access = object_access_from_directory_entry(entry);
+    if access.ranges.is_some() {
+        if let Some(entry) = entry {
+            access.ranges = Some(read_object_v2_payload(data_path, entry).await?);
+        }
+    }
+    Ok(Some(access))
+}
+
+fn object_exact_max_ranges() -> usize {
+    std::env::var("VORTEX_RDF_O_EXACT_MAX_RANGES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(64)
+}
+
+fn object_exact_max_rows() -> u64 {
+    std::env::var("VORTEX_RDF_O_EXACT_MAX_ROWS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(100_000)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativePredicateRangeRecord {
     predicate_id: u32,
@@ -4726,6 +4979,394 @@ pub async fn build_cottas_native_p_exact_ranges_index(
         total_ms,
     })
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeObjectRangeRecord {
+    object_id: u32,
+    row_start: u64,
+    row_end: u64,
+}
+
+impl Ord for NativeObjectRangeRecord {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.object_id
+            .cmp(&other.object_id)
+            .then_with(|| self.row_start.cmp(&other.row_start))
+            .then_with(|| self.row_end.cmp(&other.row_end))
+    }
+}
+impl PartialOrd for NativeObjectRangeRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn native_o_exact_directory_v2_path(data_path: &Path) -> PathBuf {
+    let name = data_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("data.vortex");
+    data_path.with_file_name(format!("{name}.o_exact_directory.v2.vortex"))
+}
+
+fn native_o_exact_ranges_v2_path(data_path: &Path) -> PathBuf {
+    let name = data_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("data.vortex");
+    data_path.with_file_name(format!("{name}.o_exact_ranges.v2.vortex"))
+}
+
+fn write_object_range_record<W: Write>(
+    writer: &mut W,
+    value: NativeObjectRangeRecord,
+) -> Result<()> {
+    writer
+        .write_all(&value.object_id.to_le_bytes())
+        .and_then(|_| writer.write_all(&value.row_start.to_le_bytes()))
+        .and_then(|_| writer.write_all(&value.row_end.to_le_bytes()))
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))
+}
+
+struct NativeObjectRangeRunReader {
+    reader: BufReader<std::fs::File>,
+}
+impl NativeObjectRangeRunReader {
+    fn new(path: &Path) -> Result<Self> {
+        Ok(Self {
+            reader: BufReader::new(
+                std::fs::File::open(path)
+                    .map_err(|e| VortexRdfError::Serialization(e.to_string()))?,
+            ),
+        })
+    }
+    fn read_one(&mut self) -> Result<Option<NativeObjectRangeRecord>> {
+        let mut buf = [0u8; 20];
+        match self.reader.read_exact(&mut buf) {
+            Ok(()) => Ok(Some(NativeObjectRangeRecord {
+                object_id: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+                row_start: u64::from_le_bytes(buf[4..12].try_into().unwrap()),
+                row_end: u64::from_le_bytes(buf[12..20].try_into().unwrap()),
+            })),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(e) => Err(VortexRdfError::Serialization(e.to_string())),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeObjectRangeHeapItem {
+    value: NativeObjectRangeRecord,
+    run_idx: usize,
+}
+impl Ord for NativeObjectRangeHeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .value
+            .cmp(&self.value)
+            .then_with(|| other.run_idx.cmp(&self.run_idx))
+    }
+}
+impl PartialOrd for NativeObjectRangeHeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn flush_object_range_run(
+    records: &mut Vec<NativeObjectRangeRecord>,
+    temp_dir: &Path,
+    run_idx: usize,
+    runs: &mut Vec<PathBuf>,
+) -> Result<()> {
+    records.sort_unstable();
+    let path = temp_dir.join(format!("object_range_run_{run_idx:06}.bin"));
+    let mut writer = BufWriter::new(
+        std::fs::File::create(&path).map_err(|e| VortexRdfError::Serialization(e.to_string()))?,
+    );
+    for value in records.iter().copied() {
+        write_object_range_record(&mut writer, value)?;
+    }
+    writer
+        .flush()
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    records.clear();
+    runs.push(path);
+    Ok(())
+}
+
+fn build_object_payload_array(starts: Vec<u64>, ends: Vec<u64>) -> Result<ArrayRef> {
+    StructArray::from_fields(&[
+        ("row_start", PrimitiveArray::from_iter(starts).into_array()),
+        ("row_end", PrimitiveArray::from_iter(ends).into_array()),
+    ])
+    .map_err(VortexRdfError::Vortex)
+    .map(|a| a.into_array())
+}
+
+fn build_object_directory_array(
+    ids: Vec<u32>,
+    offsets: Vec<u64>,
+    counts: Vec<u32>,
+    rows: Vec<u64>,
+) -> Result<ArrayRef> {
+    StructArray::from_fields(&[
+        ("object_id", PrimitiveArray::from_iter(ids).into_array()),
+        (
+            "range_offset",
+            PrimitiveArray::from_iter(offsets).into_array(),
+        ),
+        (
+            "range_count",
+            PrimitiveArray::from_iter(counts).into_array(),
+        ),
+        (
+            "candidate_rows",
+            PrimitiveArray::from_iter(rows).into_array(),
+        ),
+    ])
+    .map_err(VortexRdfError::Vortex)
+    .map(|a| a.into_array())
+}
+
+pub async fn build_cottas_native_o_exact_ranges_index(
+    input_path: &Path,
+) -> Result<NativePoRowGroupIndexBuildStats> {
+    const OUTPUT_BATCH_ROWS: usize = 65_536;
+    let total_start = Instant::now();
+    let directory_path = native_o_exact_directory_v2_path(input_path);
+    let payload_path = native_o_exact_ranges_v2_path(input_path);
+    let directory_tmp = directory_path.with_extension("vortex.tmp");
+    let payload_tmp = payload_path.with_extension("vortex.tmp");
+    let temp_dir = tempfile::tempdir().map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    let sort_batch = std::env::var("VORTEX_RDF_O_V2_SORT_BATCH_RANGES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1_000_000)
+        .max(1);
+
+    let open_start = Instant::now();
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(input_path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let open_ms = elapsed_ms(open_start);
+    let scan_start = Instant::now();
+    let mut stream = file
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_projection(vortex_array::expr::select(
+            ["o"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?;
+
+    let mut records = Vec::with_capacity(sort_batch);
+    let mut runs = Vec::new();
+    let mut rows_scanned = 0u64;
+    let mut row_groups = 0usize;
+    let mut current_object = None;
+    let mut current_start = 0u64;
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result.map_err(VortexRdfError::from)?;
+        let values = extract_projected_u32_column(&batch, "o")?;
+        row_groups += 1;
+        for object_id in values {
+            match current_object {
+                None => {
+                    current_object = Some(object_id);
+                    current_start = rows_scanned;
+                }
+                Some(previous) if previous != object_id => {
+                    records.push(NativeObjectRangeRecord {
+                        object_id: previous,
+                        row_start: current_start,
+                        row_end: rows_scanned,
+                    });
+                    current_object = Some(object_id);
+                    current_start = rows_scanned;
+                    if records.len() >= sort_batch {
+                        let idx = runs.len();
+                        flush_object_range_run(&mut records, temp_dir.path(), idx, &mut runs)?;
+                    }
+                }
+                Some(_) => {}
+            }
+            rows_scanned += 1;
+        }
+    }
+    if let Some(object_id) = current_object {
+        records.push(NativeObjectRangeRecord {
+            object_id,
+            row_start: current_start,
+            row_end: rows_scanned,
+        });
+    }
+    if !records.is_empty() {
+        let idx = runs.len();
+        flush_object_range_run(&mut records, temp_dir.path(), idx, &mut runs)?;
+    }
+    let scan_ms = elapsed_ms(scan_start);
+
+    let merge_start = Instant::now();
+    let merged_path = temp_dir.path().join("object_ranges_merged.bin");
+    let mut merged_writer = BufWriter::new(
+        std::fs::File::create(&merged_path)
+            .map_err(|e| VortexRdfError::Serialization(e.to_string()))?,
+    );
+    let mut readers = Vec::with_capacity(runs.len());
+    let mut heap = BinaryHeap::new();
+    for path in &runs {
+        readers.push(NativeObjectRangeRunReader::new(path)?);
+    }
+    for run_idx in 0..readers.len() {
+        if let Some(value) = readers[run_idx].read_one()? {
+            heap.push(NativeObjectRangeHeapItem { value, run_idx });
+        }
+    }
+    let mut dir_ids = Vec::new();
+    let mut dir_offsets = Vec::new();
+    let mut dir_counts = Vec::new();
+    let mut dir_rows = Vec::new();
+    let mut payload_offset = 0u64;
+    let mut active_object = None;
+    let mut active_offset = 0u64;
+    let mut active_count = 0u32;
+    let mut active_rows = 0u64;
+    while let Some(item) = heap.pop() {
+        let value = item.value;
+        if active_object != Some(value.object_id) {
+            if let Some(object_id) = active_object {
+                dir_ids.push(object_id);
+                dir_offsets.push(active_offset);
+                dir_counts.push(active_count);
+                dir_rows.push(active_rows);
+            }
+            active_object = Some(value.object_id);
+            active_offset = payload_offset;
+            active_count = 0;
+            active_rows = 0;
+        }
+        if value.row_start > value.row_end {
+            return Err(VortexRdfError::Serialization(
+                "object v2 range start exceeds end".into(),
+            ));
+        }
+        write_object_range_record(&mut merged_writer, value)?;
+        active_count = active_count.checked_add(1).ok_or_else(|| {
+            VortexRdfError::Serialization("object v2 range count overflow".into())
+        })?;
+        active_rows = active_rows.saturating_add(value.row_end - value.row_start);
+        payload_offset += 1;
+        if let Some(next) = readers[item.run_idx].read_one()? {
+            heap.push(NativeObjectRangeHeapItem {
+                value: next,
+                run_idx: item.run_idx,
+            });
+        }
+    }
+    if let Some(object_id) = active_object {
+        dir_ids.push(object_id);
+        dir_offsets.push(active_offset);
+        dir_counts.push(active_count);
+        dir_rows.push(active_rows);
+    }
+    merged_writer
+        .flush()
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    drop(merged_writer);
+    let merge_ms = elapsed_ms(merge_start);
+
+    let payload_reader = NativeObjectRangeRunReader::new(&merged_path)?;
+    let payload_arrays = async_stream::try_stream! {
+        let mut reader = payload_reader;
+        loop {
+            let mut starts = Vec::with_capacity(OUTPUT_BATCH_ROWS);
+            let mut ends = Vec::with_capacity(OUTPUT_BATCH_ROWS);
+            while starts.len() < OUTPUT_BATCH_ROWS {
+                let Some(value) = reader.read_one().map_err(rdf_err_to_vortex_err)? else { break; };
+                starts.push(value.row_start);
+                ends.push(value.row_end);
+            }
+            if starts.is_empty() { break; }
+            yield build_object_payload_array(starts, ends).map_err(rdf_err_to_vortex_err)?;
+        }
+    };
+    let payload_dtype = build_object_payload_array(Vec::new(), Vec::new())?
+        .dtype()
+        .clone();
+    let payload_stream = ArrayStreamAdapter::new(payload_dtype, payload_arrays);
+    let payload_strategy = WriteStrategyBuilder::default()
+        .with_row_block_size(OUTPUT_BATCH_ROWS)
+        .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+        .build();
+    let mut payload_file = tokio::fs::File::create(&payload_tmp)
+        .await
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    NATIVE_FILE_SESSION
+        .write_options()
+        .with_strategy(payload_strategy)
+        .write(&mut payload_file, payload_stream)
+        .await
+        .map_err(VortexRdfError::from)?;
+    drop(payload_file);
+
+    let directory_rows = dir_ids.len();
+    let directory_array = build_object_directory_array(dir_ids, dir_offsets, dir_counts, dir_rows)?;
+    let directory_dtype =
+        build_object_directory_array(Vec::new(), Vec::new(), Vec::new(), Vec::new())?
+            .dtype()
+            .clone();
+    let directory_arrays = futures::stream::iter(vec![Ok(directory_array)]);
+    let directory_stream = ArrayStreamAdapter::new(directory_dtype, directory_arrays);
+    let mut directory_file = tokio::fs::File::create(&directory_tmp)
+        .await
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    let directory_strategy = WriteStrategyBuilder::default()
+        .with_row_block_size(OUTPUT_BATCH_ROWS)
+        .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+        .build();
+    NATIVE_FILE_SESSION
+        .write_options()
+        .with_strategy(directory_strategy)
+        .write(&mut directory_file, directory_stream)
+        .await
+        .map_err(VortexRdfError::from)?;
+    drop(directory_file);
+    std::fs::rename(&payload_tmp, &payload_path)
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    std::fs::rename(&directory_tmp, &directory_path)
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    // A rebuild in the same process must not retain old directory metadata.
+    object_v2_cache_lock()?.remove(&directory_path);
+
+    let total_ms = elapsed_ms(total_start);
+    log::info!(
+        "[cottas_native_ids] wrote object v2 directory {:?} objects={} and payload {:?} ranges={} rows={} runs={} scan_ms={:.3} merge_ms={:.3} total_ms={:.3}",
+        directory_path,
+        directory_rows,
+        payload_path,
+        payload_offset,
+        rows_scanned,
+        runs.len(),
+        scan_ms,
+        merge_ms,
+        total_ms
+    );
+    Ok(NativePoRowGroupIndexBuildStats {
+        input_path: input_path.display().to_string(),
+        output_path: directory_path.display().to_string(),
+        row_groups,
+        rows_scanned,
+        unique_po_hashes_written: payload_offset,
+        open_ms,
+        scan_ms,
+        write_ms: merge_ms,
+        total_ms,
+    })
+}
+
 const NATIVE_SUBJECT_RANGE_ENTRY_BYTES: u64 = 20;
 
 #[derive(Clone, Copy, Debug)]

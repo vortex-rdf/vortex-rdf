@@ -29,8 +29,8 @@ use vortex_rdf_core::{
     index::{ChainedHash, SimpleDictionary},
     io::{
         CottasNativeConfig, CottasNativeStringConfig, CottasVortexCompressionProfile,
-        NativeIdsCountMode, NativeStringCountMode, build_cottas_native_po_predicate_partitions_v2,
-        build_cottas_native_subject_range_index,
+        NativeIdsCountMode, NativeStringCountMode, build_cottas_native_o_exact_ranges_index,
+        build_cottas_native_po_predicate_partitions_v2, build_cottas_native_subject_range_index,
         count_cottas_native_ids_file_with_diagnostics_mode,
         count_cottas_native_string_file_with_diagnostics_mode, load_vortex_file_ref,
         match_cottas_native_file, match_cottas_native_file_with_diagnostics,
@@ -162,6 +162,14 @@ enum Action {
         #[arg(short, long)]
         input: PathBuf,
         /// Write build diagnostics JSON to this file
+        #[arg(long)]
+        diagnostics_out: Option<PathBuf>,
+    },
+    /// Build the typed object-only exact-range index for an existing native-ID file
+    #[command(name = "build-native-object-index")]
+    BuildNativeObjectIndex {
+        #[arg(short, long)]
+        input: PathBuf,
         #[arg(long)]
         diagnostics_out: Option<PathBuf>,
     },
@@ -710,6 +718,32 @@ async fn main() -> Result<()> {
                 input,
                 start.elapsed()
             );
+            return Ok(());
+        }
+        Action::BuildNativeObjectIndex {
+            input,
+            diagnostics_out,
+        } => {
+            if !input.extension().map(|e| e == "vortex").unwrap_or(false) {
+                return Err(anyhow!(
+                    "build-native-object-index expects a .vortex input file"
+                ));
+            }
+            let stats = build_cottas_native_o_exact_ranges_index(&input)
+                .await
+                .context("Failed to build native object index")?;
+            let json = serde_json::to_vec_pretty(&stats)
+                .context("Failed to serialize object-index diagnostics")?;
+            if let Some(path) = diagnostics_out {
+                tokio::fs::write(path, &json)
+                    .await
+                    .context("Failed to write object-index diagnostics")?;
+            }
+            stdout().write_all(&json)?;
+            stdout().write_all(
+                b"
+",
+            )?;
             return Ok(());
         }
         Action::Count {
