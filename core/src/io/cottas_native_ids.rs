@@ -2871,20 +2871,282 @@ struct NativePoDirectoryEntry {
     candidate_rows: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct NativePoPredicatePartition {
+    predicate_id: u32,
+    directory_start: u64,
+    directory_end: u64,
+}
+
+static NATIVE_PO_PREDICATE_PARTITION_CACHE: LazyLock<
+    Mutex<HashMap<PathBuf, Arc<[NativePoPredicatePartition]>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn po_partition_cache_lock()
+-> Result<std::sync::MutexGuard<'static, HashMap<PathBuf, Arc<[NativePoPredicatePartition]>>>> {
+    NATIVE_PO_PREDICATE_PARTITION_CACHE.lock().map_err(|_| {
+        VortexRdfError::Deserialization("PO predicate partition cache mutex was poisoned".into())
+    })
+}
+
+async fn po_predicate_partitions(
+    data_path: &Path,
+) -> Result<Option<Arc<[NativePoPredicatePartition]>>> {
+    let path = native_po_predicate_partitions_v2_path(data_path);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    if let Some(cached) = po_partition_cache_lock()?.get(&path).cloned() {
+        return Ok(Some(cached));
+    }
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let array = file
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_projection(vortex_array::expr::select(
+            ["predicate_id", "directory_start", "directory_end"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?
+        .read_all()
+        .await
+        .map_err(VortexRdfError::from)?;
+    let ids = extract_projected_u32_column(&array, "predicate_id")?;
+    let starts = extract_projected_u64_column(&array, "directory_start")?;
+    let ends = extract_projected_u64_column(&array, "directory_end")?;
+    if ids.len() != array.len() || starts.len() != array.len() || ends.len() != array.len() {
+        return Err(VortexRdfError::Deserialization(format!(
+            "PO predicate partition {:?} has inconsistent column lengths",
+            path
+        )));
+    }
+    let mut entries = Vec::with_capacity(array.len());
+    for index in 0..array.len() {
+        if starts[index] >= ends[index] {
+            return Err(VortexRdfError::Deserialization(format!(
+                "PO predicate partition {:?} has invalid range {}..{} for predicate {}",
+                path, starts[index], ends[index], ids[index]
+            )));
+        }
+        entries.push(NativePoPredicatePartition {
+            predicate_id: ids[index],
+            directory_start: starts[index],
+            directory_end: ends[index],
+        });
+    }
+    if entries.windows(2).any(|pair| {
+        pair[0].predicate_id >= pair[1].predicate_id
+            || pair[0].directory_end != pair[1].directory_start
+    }) {
+        return Err(VortexRdfError::Deserialization(format!(
+            "PO predicate partition {:?} is not strictly sorted and contiguous",
+            path
+        )));
+    }
+    if entries.first().map(|entry| entry.directory_start) != Some(0) {
+        return Err(VortexRdfError::Deserialization(format!(
+            "PO predicate partition {:?} does not start at directory row zero",
+            path
+        )));
+    }
+    let entries: Arc<[NativePoPredicatePartition]> = entries.into();
+    let mut cache = po_partition_cache_lock()?;
+    Ok(Some(
+        cache
+            .entry(path)
+            .or_insert_with(|| Arc::clone(&entries))
+            .clone(),
+    ))
+}
+
+async fn po_predicate_partition(
+    data_path: &Path,
+    predicate_id: u32,
+) -> Result<Option<NativePoPredicatePartition>> {
+    let Some(partitions) = po_predicate_partitions(data_path).await? else {
+        return Ok(None);
+    };
+    Ok(partitions
+        .binary_search_by_key(&predicate_id, |entry| entry.predicate_id)
+        .ok()
+        .map(|index| partitions[index]))
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct NativePoPredicatePartitionBuildStats {
+    pub input_path: String,
+    pub output_path: String,
+    pub directory_rows: u64,
+    pub predicates: usize,
+    pub open_ms: f64,
+    pub scan_ms: f64,
+    pub write_ms: f64,
+    pub total_ms: f64,
+}
+
+fn build_po_partition_array(ids: Vec<u32>, starts: Vec<u64>, ends: Vec<u64>) -> Result<ArrayRef> {
+    StructArray::from_fields(&[
+        ("predicate_id", PrimitiveArray::from_iter(ids).into_array()),
+        (
+            "directory_start",
+            PrimitiveArray::from_iter(starts).into_array(),
+        ),
+        (
+            "directory_end",
+            PrimitiveArray::from_iter(ends).into_array(),
+        ),
+    ])
+    .map_err(VortexRdfError::Vortex)
+    .map(|array| array.into_array())
+}
+
+pub async fn build_cottas_native_po_predicate_partitions_v2(
+    data_path: &Path,
+) -> Result<NativePoPredicatePartitionBuildStats> {
+    let total_start = Instant::now();
+    let directory_path = native_po_exact_directory_v2_path(data_path);
+    if !directory_path.is_file() {
+        return Err(VortexRdfError::InvalidOperation(format!(
+            "Cannot build PO predicate partitions: directory {:?} does not exist",
+            directory_path
+        )));
+    }
+    let output_path = native_po_predicate_partitions_v2_path(data_path);
+    let temporary_path = output_path.with_extension("vortex.tmp");
+    let open_start = Instant::now();
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&directory_path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let open_ms = elapsed_ms(open_start);
+    let scan_start = Instant::now();
+    let mut stream = file
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_projection(vortex_array::expr::select(
+            ["predicate_id"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?;
+    let mut ids = Vec::new();
+    let mut starts = Vec::new();
+    let mut ends = Vec::new();
+    let mut current = None;
+    let mut current_start = 0u64;
+    let mut directory_rows = 0u64;
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result.map_err(VortexRdfError::from)?;
+        let values = extract_projected_u32_column(&batch, "predicate_id")?;
+        if values.len() != batch.len() {
+            return Err(VortexRdfError::Deserialization(format!(
+                "PO directory predicate projection returned {} values for {} rows",
+                values.len(),
+                batch.len()
+            )));
+        }
+        for predicate_id in values {
+            match current {
+                None => {
+                    current = Some(predicate_id);
+                    current_start = directory_rows;
+                }
+                Some(previous) if previous != predicate_id => {
+                    if predicate_id <= previous {
+                        return Err(VortexRdfError::Deserialization(format!(
+                            "PO directory is not sorted by predicate_id: {} followed by {}",
+                            previous, predicate_id
+                        )));
+                    }
+                    ids.push(previous);
+                    starts.push(current_start);
+                    ends.push(directory_rows);
+                    current = Some(predicate_id);
+                    current_start = directory_rows;
+                }
+                Some(_) => {}
+            }
+            directory_rows += 1;
+        }
+    }
+    if let Some(predicate_id) = current {
+        ids.push(predicate_id);
+        starts.push(current_start);
+        ends.push(directory_rows);
+    }
+    let scan_ms = elapsed_ms(scan_start);
+    let predicates = ids.len();
+    let array = build_po_partition_array(ids, starts, ends)?;
+    let dtype = build_po_partition_array(Vec::new(), Vec::new(), Vec::new())?
+        .dtype()
+        .clone();
+    let output_stream = ArrayStreamAdapter::new(dtype, futures::stream::iter(vec![Ok(array)]));
+    let write_start = Instant::now();
+    let mut output_file = tokio::fs::File::create(&temporary_path)
+        .await
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    let strategy = WriteStrategyBuilder::default()
+        .with_row_block_size(65_536)
+        .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+        .build();
+    NATIVE_FILE_SESSION
+        .write_options()
+        .with_strategy(strategy)
+        .write(&mut output_file, output_stream)
+        .await
+        .map_err(VortexRdfError::from)?;
+    drop(output_file);
+    std::fs::rename(&temporary_path, &output_path)
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    po_partition_cache_lock()?.remove(&output_path);
+    let write_ms = elapsed_ms(write_start);
+    let total_ms = elapsed_ms(total_start);
+    log::info!(
+        "[cottas_native_ids] wrote PO predicate partitions {:?}: directory_rows={}, predicates={}, total_ms={:.3}",
+        output_path,
+        directory_rows,
+        predicates,
+        total_ms
+    );
+    Ok(NativePoPredicatePartitionBuildStats {
+        input_path: directory_path.display().to_string(),
+        output_path: output_path.display().to_string(),
+        directory_rows,
+        predicates,
+        open_ms,
+        scan_ms,
+        write_ms,
+        total_ms,
+    })
+}
+
 async fn lookup_po_directory_entry_from_vortex_v2(
     data_path: &Path,
     predicate_id: u32,
     object_id: u32,
 ) -> Result<Option<NativePoDirectoryEntry>> {
     let path = native_po_exact_directory_v2_path(data_path);
+    let partition = po_predicate_partition(data_path, predicate_id).await?;
+    if native_po_predicate_partitions_v2_path(data_path).is_file() && partition.is_none() {
+        return Ok(None);
+    }
     let file = NATIVE_FILE_SESSION
         .open_options()
         .open_path(&path)
         .await
         .map_err(VortexRdfError::from)?;
-    let result = file
-        .scan()
-        .map_err(VortexRdfError::from)?
+    let scan = file.scan().map_err(VortexRdfError::from)?;
+    let scan = match partition {
+        Some(entry) => scan.with_row_range(entry.directory_start..entry.directory_end),
+        None => scan,
+    };
+    let result = scan
         .with_filter(and(
             eq(col("predicate_id"), lit(predicate_id)),
             eq(col("object_id"), lit(object_id)),
@@ -3596,6 +3858,10 @@ fn native_po_exact_directory_v2_path(data_path: &Path) -> PathBuf {
     native_sidecar_path(data_path, "po_exact_directory.v2.vortex")
 }
 
+fn native_po_predicate_partitions_v2_path(data_path: &Path) -> PathBuf {
+    native_sidecar_path(data_path, "po_predicate_partitions.v2.vortex")
+}
+
 fn native_po_exact_ranges_v2_path(data_path: &Path) -> PathBuf {
     native_sidecar_path(data_path, "po_exact_ranges.v2.vortex")
 }
@@ -3992,6 +4258,7 @@ pub async fn build_cottas_native_po_exact_ranges_v2_index(
         .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
     std::fs::rename(&directory_tmp, &directory_path)
         .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    build_cottas_native_po_predicate_partitions_v2(input_path).await?;
     let write_ms = elapsed_ms(write_start);
     let total_ms = elapsed_ms(total_start);
     log::info!(

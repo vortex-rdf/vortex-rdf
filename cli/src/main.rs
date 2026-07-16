@@ -29,7 +29,8 @@ use vortex_rdf_core::{
     index::{ChainedHash, SimpleDictionary},
     io::{
         CottasNativeConfig, CottasNativeStringConfig, CottasVortexCompressionProfile,
-        NativeIdsCountMode, NativeStringCountMode, build_cottas_native_subject_range_index,
+        NativeIdsCountMode, NativeStringCountMode, build_cottas_native_po_predicate_partitions_v2,
+        build_cottas_native_subject_range_index,
         count_cottas_native_ids_file_with_diagnostics_mode,
         count_cottas_native_string_file_with_diagnostics_mode, load_vortex_file_ref,
         match_cottas_native_file, match_cottas_native_file_with_diagnostics,
@@ -148,6 +149,16 @@ enum Action {
     #[command(name = "build-native-subject-index")]
     BuildNativeSubjectIndex {
         /// Input .vortex file path
+        #[arg(short, long)]
+        input: PathBuf,
+        /// Write build diagnostics JSON to this file
+        #[arg(long)]
+        diagnostics_out: Option<PathBuf>,
+    },
+    /// Build the compact predicate partition sidecar for an existing PO v2 directory
+    #[command(name = "build-native-po-partitions")]
+    BuildNativePoPartitions {
+        /// Input cottas-native-ids .vortex data file
         #[arg(short, long)]
         input: PathBuf,
         /// Write build diagnostics JSON to this file
@@ -660,6 +671,42 @@ async fn main() -> Result<()> {
                 .context("Failed to write trailing newline")?;
             info!(
                 "Built native subject range index for {:?} in {:?}",
+                input,
+                start.elapsed()
+            );
+            return Ok(());
+        }
+        Action::BuildNativePoPartitions {
+            input,
+            diagnostics_out,
+        } => {
+            let start = Instant::now();
+            if !input.extension().map(|e| e == "vortex").unwrap_or(false) {
+                return Err(anyhow!(
+                    "build-native-po-partitions expects a .vortex input file"
+                ));
+            }
+            let stats = build_cottas_native_po_predicate_partitions_v2(&input)
+                .await
+                .context("Failed to build native PO predicate partitions")?;
+            let stats_json = serde_json::to_vec_pretty(&stats)
+                .context("Failed to serialize PO partition build diagnostics JSON")?;
+            if let Some(diag_path) = &diagnostics_out {
+                tokio::fs::write(diag_path, &stats_json)
+                    .await
+                    .context("Failed to write PO partition diagnostics JSON file")?;
+            }
+            stdout()
+                .write_all(&stats_json)
+                .context("Failed to write PO partition diagnostics to stdout")?;
+            stdout()
+                .write_all(
+                    b"
+",
+                )
+                .context("Failed to write trailing newline")?;
+            info!(
+                "Built native PO predicate partitions for {:?} in {:?}",
                 input,
                 start.elapsed()
             );
