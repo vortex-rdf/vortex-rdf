@@ -4581,7 +4581,7 @@ fn object_exact_max_ranges() -> usize {
     std::env::var("VORTEX_RDF_O_EXACT_MAX_RANGES")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(64)
+        .unwrap_or(512)
 }
 
 fn object_exact_max_rows() -> u64 {
