@@ -4394,39 +4394,27 @@ pub async fn build_cottas_native_po_exact_ranges_v2_index(
 // VVO_TYPED_OBJECT_INDEX_V1
 #[derive(Clone, Copy, Debug)]
 struct NativeObjectDirectoryEntry {
-    object_id: u32,
     range_offset: u64,
     range_count: u32,
     candidate_rows: u64,
 }
 
-static NATIVE_OBJECT_V2_DIRECTORY_CACHE: LazyLock<
-    Mutex<HashMap<PathBuf, Arc<[NativeObjectDirectoryEntry]>>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn object_v2_cache_lock()
--> Result<std::sync::MutexGuard<'static, HashMap<PathBuf, Arc<[NativeObjectDirectoryEntry]>>>> {
-    NATIVE_OBJECT_V2_DIRECTORY_CACHE.lock().map_err(|_| {
-        VortexRdfError::Deserialization("object v2 directory cache mutex was poisoned".into())
-    })
-}
-
-async fn object_v2_directory(data_path: &Path) -> Result<Arc<[NativeObjectDirectoryEntry]>> {
+async fn lookup_object_v2_directory_entry(
+    data_path: &Path,
+    object_id: u32,
+) -> Result<Option<NativeObjectDirectoryEntry>> {
     let path = native_o_exact_directory_v2_path(data_path);
-    if let Some(cached) = object_v2_cache_lock()?.get(&path).cloned() {
-        return Ok(cached);
-    }
-
     let file = NATIVE_FILE_SESSION
         .open_options()
         .open_path(&path)
         .await
         .map_err(VortexRdfError::from)?;
-    let array = file
+    let result = file
         .scan()
         .map_err(VortexRdfError::from)?
+        .with_filter(eq(col("object_id"), lit(object_id)))
         .with_projection(vortex_array::expr::select(
-            ["object_id", "range_offset", "range_count", "candidate_rows"],
+            ["range_offset", "range_count", "candidate_rows"],
             vortex_array::expr::root(),
         ))
         .into_array_stream()
@@ -4435,46 +4423,33 @@ async fn object_v2_directory(data_path: &Path) -> Result<Arc<[NativeObjectDirect
         .await
         .map_err(VortexRdfError::from)?;
 
-    let ids = extract_projected_u32_column(&array, "object_id")?;
-    let offsets = extract_projected_u64_column(&array, "range_offset")?;
-    let counts = extract_projected_u32_column(&array, "range_count")?;
-    let rows = extract_projected_u64_column(&array, "candidate_rows")?;
-    let len = array.len();
-    if [ids.len(), offsets.len(), counts.len(), rows.len()]
-        .into_iter()
-        .any(|column_len| column_len != len)
-    {
+    if result.len() == 0 {
+        return Ok(None);
+    }
+    if result.len() != 1 {
         return Err(VortexRdfError::Deserialization(format!(
-            "object v2 directory {:?} has inconsistent column lengths",
-            path
+            "object v2 directory {:?} returned {} rows for object ID {}; expected at most one",
+            path,
+            result.len(),
+            object_id
         )));
     }
 
-    let mut entries = Vec::with_capacity(len);
-    for index in 0..len {
-        entries.push(NativeObjectDirectoryEntry {
-            object_id: ids[index],
-            range_offset: offsets[index],
-            range_count: counts[index],
-            candidate_rows: rows[index],
-        });
-    }
-    if entries
-        .windows(2)
-        .any(|pair| pair[0].object_id >= pair[1].object_id)
-    {
+    let offsets = extract_projected_u64_column(&result, "range_offset")?;
+    let counts = extract_projected_u32_column(&result, "range_count")?;
+    let rows = extract_projected_u64_column(&result, "candidate_rows")?;
+    if offsets.len() != 1 || counts.len() != 1 || rows.len() != 1 {
         return Err(VortexRdfError::Deserialization(format!(
-            "object v2 directory {:?} is not strictly sorted by object_id",
-            path
+            "object v2 directory {:?} returned inconsistent metadata columns for object ID {}",
+            path, object_id
         )));
     }
 
-    let entries: Arc<[NativeObjectDirectoryEntry]> = entries.into();
-    let mut cache = object_v2_cache_lock()?;
-    Ok(cache
-        .entry(path)
-        .or_insert_with(|| Arc::clone(&entries))
-        .clone())
+    Ok(Some(NativeObjectDirectoryEntry {
+        range_offset: offsets[0],
+        range_count: counts[0],
+        candidate_rows: rows[0],
+    }))
 }
 
 fn object_access_from_directory_entry(
@@ -4485,7 +4460,7 @@ fn object_access_from_directory_entry(
             ranges: Some(Vec::new()),
             candidate_ranges: 0,
             candidate_rows: 0,
-            strategy: "o-exact-ranges-vortex-v2-cached",
+            strategy: "o-exact-ranges-vortex-v2-point",
         };
     };
     let candidate_ranges = entry.range_count as usize;
@@ -4495,7 +4470,7 @@ fn object_access_from_directory_entry(
         ranges: accepted.then(Vec::new),
         candidate_ranges,
         candidate_rows: entry.candidate_rows,
-        strategy: "o-exact-ranges-vortex-v2-cached",
+        strategy: "o-exact-ranges-vortex-v2-point",
     }
 }
 
@@ -4563,11 +4538,7 @@ async fn lookup_object_access_from_vortex_v2(
     data_path: &Path,
     object_id: u32,
 ) -> Result<Option<NativeObjectAccess>> {
-    let directory = object_v2_directory(data_path).await?;
-    let entry = directory
-        .binary_search_by_key(&object_id, |entry| entry.object_id)
-        .ok()
-        .map(|index| directory[index]);
+    let entry = lookup_object_v2_directory_entry(data_path, object_id).await?;
     let mut access = object_access_from_directory_entry(entry);
     if access.ranges.is_some() {
         if let Some(entry) = entry {
@@ -5338,8 +5309,6 @@ pub async fn build_cottas_native_o_exact_ranges_index(
         .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
     std::fs::rename(&directory_tmp, &directory_path)
         .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    // A rebuild in the same process must not retain old directory metadata.
-    object_v2_cache_lock()?.remove(&directory_path);
 
     let total_ms = elapsed_ms(total_start);
     log::info!(
