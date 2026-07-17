@@ -3740,7 +3740,7 @@ fn predicate_exact_max_ranges() -> usize {
     std::env::var("VORTEX_RDF_P_EXACT_MAX_RANGES")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(64)
+        .unwrap_or(256)
 }
 
 fn predicate_exact_max_rows() -> u64 {
