@@ -1,8 +1,7 @@
 import { describe, test, expect } from 'vitest';
 import { DataFactory } from "rdf-data-factory";
 import {
-    SimpleDictionaryStore,
-    ChainedHashStore,
+    VortexStore,
     init_panic_hook,
     nquads_to_vortex,
     vortex_to_nquads
@@ -13,10 +12,10 @@ const df = new DataFactory();
 // Initialize panic hook for better error messages
 init_panic_hook();
 
-describe('SimpleDictionaryStore basic operations', () => {
-    test('create empty store', () => {
-        const store = SimpleDictionaryStore.empty();
-        expect(store.size()).toBe(0);
+describe('VortexStore basic operations', () => {
+    test('create empty store', async () => {
+        const store = VortexStore.empty();
+        expect(await store.size()).toBe(0);
     });
 
     test('fromString and size', async () => {
@@ -25,8 +24,8 @@ describe('SimpleDictionaryStore basic operations', () => {
             <http://example.org/s1> <http://example.org/p2> "o2" .
             <http://example.org/s2> <http://example.org/p1> "o3" .
         `;
-        const store = await SimpleDictionaryStore.fromString(ttl, "turtle");
-        expect(store.size()).toBe(3);
+        const store = await VortexStore.fromString(ttl, "turtle");
+        expect(await store.size()).toBe(3);
     });
 
     test('match and iteration', async () => {
@@ -35,11 +34,11 @@ describe('SimpleDictionaryStore basic operations', () => {
             <http://example.org/s1> <http://example.org/p2> "o2" .
             <http://example.org/s2> <http://example.org/p1> "o3" .
         `;
-        const store = await SimpleDictionaryStore.fromString(ttl, "turtle");
+        const store = await VortexStore.fromString(ttl, "turtle");
 
         // Match ?s <p1> ?o
         const matches = await store.match(null, df.namedNode("http://example.org/p1"), null, null);
-        expect(matches.size()).toBe(2);
+        expect(await matches.size()).toBe(2);
 
         const iterator = await matches.values();
         const results: any[] = [];
@@ -56,8 +55,8 @@ describe('SimpleDictionaryStore basic operations', () => {
     });
 
     test('add and delete quads', async () => {
-        const store = SimpleDictionaryStore.empty();
-        expect(store.size()).toBe(0);
+        const store = VortexStore.empty();
+        expect(await store.size()).toBe(0);
 
         const quad = {
             subject: { termType: 'NamedNode' as const, value: 'http://example.org/s' },
@@ -68,7 +67,7 @@ describe('SimpleDictionaryStore basic operations', () => {
 
         // Add
         await store.addQuad(quad as any);
-        expect(store.size()).toBe(1);
+        expect(await store.size()).toBe(1);
 
         // Check has
         const hasQuad = await store.has(quad as any);
@@ -76,73 +75,7 @@ describe('SimpleDictionaryStore basic operations', () => {
 
         // Delete
         await store.deleteQuad(quad as any);
-        expect(store.size()).toBe(0);
-    });
-});
-
-describe('ChainedHashStore basic operations', () => {
-    test('create empty store', () => {
-        const store = ChainedHashStore.empty();
-        expect(store.size()).toBe(0);
-    });
-
-    test('fromString and size', async () => {
-        const ttl = `
-            <http://example.org/s1> <http://example.org/p1> "o1" .
-            <http://example.org/s1> <http://example.org/p2> "o2" .
-        `;
-        const store = await ChainedHashStore.fromString(ttl, "turtle");
-        expect(store.size()).toBe(2);
-    });
-
-    test('match and iteration', async () => {
-        const ttl = `
-            <http://example.org/s1> <http://example.org/p1> "o1" .
-            <http://example.org/s1> <http://example.org/p2> "o2" .
-            <http://example.org/s2> <http://example.org/p1> "o3" .
-        `;
-        const store = await ChainedHashStore.fromString(ttl, "turtle");
-        
-        // Match ?s <p1> ?o
-        const matches = await store.match(null, df.namedNode("http://example.org/p1"), null, null);
-        expect(matches.size()).toBe(2);
-
-        const iterator = await matches.values();
-        const results: any[] = [];
-        for (const quad of iterator as any) {
-            results.push(quad);
-        }
-
-        expect(results.length).toBe(2);
-        
-        // Assert contents
-        const subjects = results.map(q => q.subject.value);
-        expect(subjects).toContain('http://example.org/s1');
-        expect(subjects).toContain('http://example.org/s2');
-    });
-
-    test('add and delete quads', async () => {
-        const store = ChainedHashStore.empty();
-        expect(store.size()).toBe(0);
-
-        const quad = {
-            subject: { termType: 'NamedNode' as const, value: 'http://example.org/s' },
-            predicate: { termType: 'NamedNode' as const, value: 'http://example.org/p' },
-            object: { termType: 'Literal' as const, value: 'hello' },
-            graph: { termType: 'DefaultGraph' as const, value: '' }
-        };
-
-        // Add
-        await store.addQuad(quad as any);
-        expect(store.size()).toBe(1);
-        
-        // Check has
-        const hasQuad = await store.has(quad as any);
-        expect(hasQuad).toBe(true);
-
-        // Delete
-        await store.deleteQuad(quad as any);
-        expect(store.size()).toBe(0);
+        expect(await store.size()).toBe(0);
     });
 });
 
@@ -160,22 +93,22 @@ describe('Helper serialization methods', () => {
 
 describe('Builder strategies', () => {
     const supportedStrategies = [
-        'UnsortedInMemory',
-        'SortedInMemory',
+        'Unsorted',
+        'Sorted',
     ] as const;
 
     for (const strategy of supportedStrategies) {
-        test(`SimpleDictionaryStore.fromString with ${strategy}`, async () => {
+        test(`VortexStore.fromString with ${strategy}`, async () => {
             const ttl = `
                 <http://example.org/s1> <http://example.org/p1> "o1" .
                 <http://example.org/s1> <http://example.org/p2> "o2" .
                 <http://example.org/s2> <http://example.org/p1> "o3" .
             `;
-            const store = await SimpleDictionaryStore.fromString(ttl, "turtle", strategy);
-            expect(store.size()).toBe(3);
+            const store = await VortexStore.fromString(ttl, "turtle", strategy);
+            expect(await store.size()).toBe(3);
 
             const matches = await store.match(null, df.namedNode("http://example.org/p1"), null, null);
-            expect(matches.size()).toBe(2);
+            expect(await matches.size()).toBe(2);
         });
 
         test(`nquads_to_vortex with ${strategy}`, async () => {
@@ -189,31 +122,10 @@ describe('Builder strategies', () => {
         });
     }
 
-    test('SimpleDictionaryStore.fromString with SortedStream throws unsupported error', async () => {
-        const ttl = `<http://example.org/s1> <http://example.org/p1> "o1" .`;
-        await expect(SimpleDictionaryStore.fromString(ttl, "turtle", 'SortedStream')).rejects.toThrow(
-            /Sorted-stream strategy is not supported/
-        );
-    });
-
-    test('SimpleDictionaryStore.fromString with UnsortedStream throws unsupported error', async () => {
-        const ttl = `<http://example.org/s1> <http://example.org/p1> "o1" .`;
-        await expect(SimpleDictionaryStore.fromString(ttl, "turtle", 'UnsortedStream')).rejects.toThrow(
-            /Unsorted-stream strategy is not supported/
-        );
-    });
-
-    test('nquads_to_vortex with SortedStream throws unsupported error', async () => {
+    test('nquads_to_vortex with an unknown strategy throws', async () => {
         const nquads = `<http://example.org/s> <http://example.org/p> "hello" .\n`;
-        await expect(nquads_to_vortex(nquads, 'SortedStream')).rejects.toThrow(
-            /Sorted-stream strategy is not supported/
-        );
-    });
-
-    test('nquads_to_vortex with UnsortedStream throws unsupported error', async () => {
-        const nquads = `<http://example.org/s> <http://example.org/p> "hello" .\n`;
-        await expect(nquads_to_vortex(nquads, 'UnsortedStream')).rejects.toThrow(
-            /Unsorted-stream strategy is not supported/
+        await expect(nquads_to_vortex(nquads, 'SortedStream' as any)).rejects.toThrow(
+            /Unknown builder strategy/
         );
     });
 });

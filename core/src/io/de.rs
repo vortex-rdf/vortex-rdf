@@ -1,5 +1,5 @@
 use crate::error::{Result, VortexRdfError};
-use crate::store::QuadStore;
+use crate::store::VortexRdfStore;
 use crate::error;
 
 use oxrdfio::{RdfFormat, RdfSerializer};
@@ -7,7 +7,8 @@ use web_time::Instant;
 use std::io::Write;
 use futures::StreamExt;
 
-use vortex_array::ArrayRef;
+use vortex_array::{ArrayRef, IntoArray};
+use vortex_array::arrays::ChunkedArray;
 use vortex_ipc::iterator::SyncIPCReader;
 
 #[cfg(feature = "file-io")]
@@ -21,15 +22,11 @@ use vortex_file::OpenOptionsSessionExt;
 
 /// High-level function to deserialize Vortex-RDF data store into an RDF writer.
 /// Pulls quads sequentially from the store and serializes them in the specified format (Turtle, N-Triples, etc.).
-pub async fn deserialize<Store, W>(
-    store: Store,
+pub async fn deserialize<W: Write>(
+    store: VortexRdfStore,
     writer: W,
     format: RdfFormat,
-) -> error::Result<()>
-where
-    Store: QuadStore,
-    W: Write,
-{
+) -> error::Result<()> {
     let decode_start = Instant::now();
     // Retrieve the quad stream (either in-memory or lazy file-backed stream).
     let mut quads_stream = store.quads()?;
@@ -59,17 +56,31 @@ where
 
 /// Reads a Vortex ArrayRef from a synchronous IPC reader stream.
 /// Used for decoding in-memory IPC message payloads.
+///
+/// [`write_array_to_ipc`](super::write_array_to_ipc) emits one IPC message per
+/// chunk, so a chunked array arrives as a sequence of arrays. All of them are
+/// collected and reassembled into the original [`ChunkedArray`]; reading only
+/// the first message would silently drop every quad past the first chunk.
 pub fn array_from_ipc_reader<R: std::io::Read>(reader: R) -> Result<ArrayRef> {
-    let mut ipc_reader =
-        SyncIPCReader::try_new(reader, &super::VORTEX_SESSION).map_err(VortexRdfError::Vortex)?;
+    let ipc_reader =
+        SyncIPCReader::try_new(reader, &super::VORTEX_LIGHT_SESSION).map_err(VortexRdfError::Vortex)?;
 
-    let array = ipc_reader
-        .next()
-        .transpose()
-        .map_err(VortexRdfError::Vortex)?
-        .ok_or_else(|| VortexRdfError::Deserialization("No array in IPC stream".to_string()))?;
+    let mut chunks = Vec::new();
+    for chunk in ipc_reader {
+        chunks.push(chunk.map_err(VortexRdfError::Vortex)?);
+    }
 
-    Ok(array)
+    match chunks.len() {
+        0 => Err(VortexRdfError::Deserialization("No array in IPC stream".to_string())),
+        // Keep a single-chunk payload as the plain array it was written as.
+        1 => Ok(chunks.pop().expect("length checked above")),
+        _ => {
+            let dtype = chunks[0].dtype().clone();
+            Ok(ChunkedArray::try_new(chunks, dtype)
+                .map_err(VortexRdfError::Vortex)?
+                .into_array())
+        }
+    }
 }
 
 
@@ -108,12 +119,17 @@ pub async fn load_vortex_file_ref<S: VortexReadAt + 'static>(
 
 /// Open a Vortex file lazily — no data is read until the returned `VortexFile`
 /// is scanned. This is the core entrypoint for our zero-copy, memory-efficient lazy store.
+///
+/// The layout reader is cached on the file handle: every scan and pruning
+/// evaluation over the store shares one reader tree, so zone-map stats tables
+/// are read and decoded once and per-expression pruning masks are reused across data access calls.
 #[cfg(feature = "file-io")]
 pub async fn open_vortex_file<P: AsRef<std::path::Path>>(
     path: P,
 ) -> Result<vortex_file::VortexFile> {
     super::VORTEX_SESSION
         .open_options()
+        .with_layout_reader_cache()
         .open_path(path)
         .await
         .map_err(VortexRdfError::from)

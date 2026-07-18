@@ -1,155 +1,174 @@
-use crate::error::{Result, VortexRdfError};
-use crate::common::indexes;
-use crate::index::RdfDictionary;
-use super::{VortexArrayBuilder, EncodedQuad};
+use crate::error::Result;
+use crate::store::RawQuad;
+use crate::store::layouts::{dictionary, LayoutStrategy};
+use crate::store::indexes::{GlobalIndexes, Indexes};
+use crate::store::layouts::term_dictionary::TermDictionary;
+use super::{
+    VortexArrayBuilder, ChunkStream,
+    build_struct_array, build_struct_array_global, make_empty_struct, into_vortex_error,
+    DEFAULT_CHUNK_SIZE,
+};
 
-use oxrdf::Quad;
-use web_time::Instant;
 use std::sync::Arc;
-use futures::{Stream, StreamExt};
+use web_time::Instant;
+use futures::{stream, Stream, StreamExt};
+use oxrdf::Quad;
 
-use vortex_array::{ArrayRef, IntoArray};
-use vortex_array::arrays::{PrimitiveArray, StructArray, ConstantArray};
-use vortex_array::validity::Validity;
+use vortex_array::ArrayRef;
+use vortex_array::dtype::DType;
 
-
-/// A fully in-memory, globally sorted Vortex RDF Array Builder.
+/// Fully in-memory, globally sorted Vortex RDF Array Builder.
 ///
-/// This builder eager-loads all quads from the stream into RAM and is optimized for datasets
-/// that fit comfortably within system memory.
-///
-/// ### Serialization Phases:
-/// 1. **Eager Ingestion**: Reads all quads from the stream directly into a flat in-memory vector.
-/// 2. **Single Bulk Dictionary Insertion**: Collects all RDF terms and encodes them in a single,
-///    highly optimized bulk call to `get_or_insert_bulk`. This completely avoids re-allocating
-///    and re-compressing underlying Vortex structures.
-/// 3. **Global In-Memory Sort**: Sorts all encoded quads globally in memory according to the canonical order.
-/// 4. **Global Secondary Indexing**: Constructs flat, global sorted permutation indices (`_idx_o_*`, `_idx_p_*`)
-///    for the entire dataset at once, avoiding any chunking overhead or chunk assembly stages.
-/// 5. **Single-Dict StructArray Assembly**: Builds a single flat, unified `StructArray` with the specialized
-///    dictionary columns attached directly at the root level.
+/// Sorts all quads in memory by (s, p, o, g) before writing columns.
+/// Produces Reference secondary indexes when requested; their columns are
+/// emitted in global sorted order (stamped `IsSorted`), so `match_pattern`
+/// can binary-search them.
 pub struct SortedInMemoryBuilder;
 
-impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for SortedInMemoryBuilder {
+impl VortexArrayBuilder for SortedInMemoryBuilder {
     async fn build_vortex_array(
-        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>
+        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+        layout: LayoutStrategy,
+        indexes: Indexes,
     ) -> Result<ArrayRef> {
         let start = Instant::now();
-        let mut dictionary = Dict::new();
-        
-        // ── Phase 1: Ingest all quads into memory ──
-        let mut quads = Vec::new();
-        let mut pinned_stream = Box::pin(quad_stream);
-        while let Some(res) = pinned_stream.next().await {
-            quads.push(res?);
-        }
-        log::debug!("[SortedInMemoryBuilder] Read {} quads", quads.len());
 
-        // ── Phase 2: Single bulk dictionary insertion ──
-        let dict_start = Instant::now();
-        let mut terms = Vec::with_capacity(quads.len() * 4);
-        for quad in &quads {
-            terms.push(quad.subject.to_string());
-            terms.push(quad.predicate.to_string());
-            terms.push(quad.object.to_string());
-            terms.push(quad.graph_name.to_string());
-        }
-        let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
-        let ids = dictionary.get_or_insert_bulk(&term_refs);
+        let quads = ingest_and_sort(quad_stream).await?;
 
-        let mut encoded = Vec::with_capacity(quads.len());
-        for i in 0..quads.len() {
-            encoded.push(EncodedQuad {
-                s: ids[i * 4],
-                p: ids[i * 4 + 1],
-                o: ids[i * 4 + 2],
-                g: ids[i * 4 + 3],
-            });
-        }
-        log::debug!("[SortedInMemoryBuilder] Built dictionary in {:?}", dict_start.elapsed());
-
-        // ── Phase 3: Global in-memory sort ──
-        let sort_start = Instant::now();
-        encoded.sort_unstable();
-        log::debug!("[SortedInMemoryBuilder] Sorted quads in {:?}", sort_start.elapsed());
-
-        // Serialize the completed RdfDictionary to Vortex.
-        let dict_vortex_start = Instant::now();
-        let dict_fields = dictionary.to_vortex_array()?;
-        log::debug!("[SortedInMemoryBuilder] Serialized dictionary to Vortex in {:?}", dict_vortex_start.elapsed());
-
-        // ── Phase 4: Construct global arrays and sorted secondary permutation indexes ──
-        let build_array_start = Instant::now();
-        let n = encoded.len();
-        let mut s_ids = Vec::with_capacity(n);
-        let mut p_ids = Vec::with_capacity(n);
-        let mut o_ids = Vec::with_capacity(n);
-        let mut g_ids = Vec::with_capacity(n);
-
-        for quad in &encoded {
-            s_ids.push(quad.s);
-            p_ids.push(quad.p);
-            o_ids.push(quad.o);
-            g_ids.push(quad.g);
-        }
-
-        // Build global secondary sorted Object index.
-        let mut o_index: Vec<(u32, u32)> = o_ids.iter().copied()
-            .enumerate()
-            .map(|(idx, o_id)| (o_id, idx as u32))
-            .collect();
-        o_index.sort_unstable_by_key(|pair| pair.0);
-        let idx_o_val: Vec<u32> = o_index.iter().map(|pair| pair.0).collect();
-        let idx_o_rid: Vec<u32> = o_index.iter().map(|pair| pair.1).collect();
-
-        // Build global secondary sorted Predicate index.
-        let mut p_index: Vec<(u32, u32)> = p_ids.iter().copied()
-            .enumerate()
-            .map(|(idx, p_id)| (p_id, idx as u32))
-            .collect();
-        p_index.sort_unstable_by_key(|pair| pair.0);
-        let idx_p_val: Vec<u32> = p_index.iter().map(|pair| pair.0).collect();
-        let idx_p_rid: Vec<u32> = p_index.iter().map(|pair| pair.1).collect();
-
-        let mut field_names: Vec<Arc<str>> = vec![
-            "s".into(), "p".into(), "o".into(), "g".into(),
-            "_idx_o_val".into(), "_idx_o_rid".into(),
-            "_idx_p_val".into(), "_idx_p_rid".into(),
-        ];
-
-        let mut field_arrays: Vec<ArrayRef> = vec![
-            PrimitiveArray::from_iter(s_ids).into_array(),
-            PrimitiveArray::from_iter(p_ids).into_array(),
-            PrimitiveArray::from_iter(o_ids).into_array(),
-            PrimitiveArray::from_iter(g_ids).into_array(),
-            PrimitiveArray::from_iter(idx_o_val).into_array(),
-            PrimitiveArray::from_iter(idx_o_rid).into_array(),
-            PrimitiveArray::from_iter(idx_p_val).into_array(),
-            PrimitiveArray::from_iter(idx_p_rid).into_array(),
-        ];
-
-        // ── Phase 5: Assembly of flat unified StructArray ──
-        // Attach store type identifier and dictionary arrays exactly once at the root level.
-        field_names.push("store_type".into());
-        field_arrays.push(ConstantArray::new(Dict::store_type(), n).into_array());
-
-        for (name, arr) in &dict_fields {
-            field_names.push(format!("_dict_{}", name).into());
-            field_arrays.push(indexes::array_as_dict_column(arr.clone(), n)?);
-        }
-
-        let struct_array = StructArray::try_new(
-            field_names.into(),
-            field_arrays,
-            n,
-            Validity::NonNullable,
-        )
-        .map_err(VortexRdfError::Vortex)?
-        .into_array();
-
-        log::debug!("[SortedInMemoryBuilder] Constructed StructArray and global indexes in {:?}", build_array_start.elapsed());
+        // Build a single contiguous StructArray: for in-memory stores this
+        // keeps index columns global and the s column monotonically sorted.
+        let n = quads.len();
+        let build_start = Instant::now();
+        let struct_array = if layout == LayoutStrategy::Dictionary {
+            let dict = TermDictionary::from_quads(&quads)?;
+            let id_map = dict.build_id_map();
+            dictionary::build_chunk(&quads, &dict, &id_map, &indexes, 0, true, true, true)?
+        } else {
+            build_struct_array(&quads, layout, &indexes, n, 0, true, true)?
+        };
+        log::debug!("[SortedInMemoryBuilder] Constructed StructArray in {:?}", build_start.elapsed());
         log::debug!("[SortedInMemoryBuilder] Completed serialization of {} quads in {:?}", n, start.elapsed());
 
         Ok(struct_array)
     }
+
+    /// Streaming override for file writes: the sort still requires the whole
+    /// dataset in memory as `RawQuad`s, but column chunks are built lazily as
+    /// the writer polls, so only one chunk's Vortex arrays exist at a time —
+    /// peak memory drops from ~2× dataset to ~1× dataset + one chunk.
+    async fn build_vortex_stream(
+        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+        layout: LayoutStrategy,
+        indexes: Indexes,
+    ) -> Result<(DType, ChunkStream)> {
+        build_sorted_chunk_stream(quad_stream, layout, indexes, DEFAULT_CHUNK_SIZE).await
+    }
+}
+
+/// Ingest the full quad stream and sort it globally by (s, p, o, g).
+async fn ingest_and_sort(
+    mut quads_in: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+) -> Result<Vec<RawQuad>> {
+    let mut quads: Vec<RawQuad> = Vec::new();
+    while let Some(res) = quads_in.next().await {
+        quads.push(RawQuad::from_quad(&res?));
+    }
+    log::debug!("[SortedInMemoryBuilder] Read {} quads", quads.len());
+
+    let sort_start = Instant::now();
+    quads.sort_unstable();
+    log::debug!("[SortedInMemoryBuilder] Sorted quads in {:?}", sort_start.elapsed());
+
+    Ok(quads)
+}
+
+/// Ingest, sort, then emit fixed-size StructArray chunks over slices of the
+/// sorted vec. The first chunk is built eagerly so the schema dtype is known
+/// up front; subsequent chunks are built only when polled.
+///
+/// Index columns are precomputed once in global sorted order and sliced per
+/// chunk, so their concatenation across chunks stays globally sorted (each
+/// slice is stamped `IsSorted`) and row IDs address the assembled array.
+pub(crate) async fn build_sorted_chunk_stream(
+    quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+    layout: LayoutStrategy,
+    indexes: Indexes,
+    chunk_size: usize,
+) -> Result<(DType, ChunkStream)> {
+    let quads = ingest_and_sort(quad_stream).await?;
+
+    if layout == LayoutStrategy::Dictionary {
+        let dict = Arc::new(TermDictionary::from_quads(&quads)?);
+        let id_map = Arc::new(dict.build_id_map());
+        return emit_dict_chunks(quads, dict, id_map, indexes, chunk_size);
+    }
+
+    let global_idx = Arc::new(GlobalIndexes::from_quads(&indexes, &quads));
+
+    let n0 = quads.len().min(chunk_size);
+    let first = if quads.is_empty() {
+        make_empty_struct(layout, &indexes)?
+    } else {
+        build_struct_array_global(&quads[..n0], layout, &global_idx, 0..n0, true)?
+    };
+    let dtype = first.dtype().clone();
+
+    let rest = stream::unfold(
+        (quads, layout, global_idx, n0),
+        move |(quads, layout, global_idx, offset)| async move {
+            if offset >= quads.len() {
+                return None;
+            }
+            let end = (offset + chunk_size).min(quads.len());
+            let chunk =
+                build_struct_array_global(&quads[offset..end], layout, &global_idx, offset..end, true)
+                    .map_err(into_vortex_error);
+            Some((chunk, (quads, layout, global_idx, end)))
+        },
+    );
+
+    let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
+    Ok((dtype, chunks))
+}
+
+/// Dictionary-layout emission over the sorted vec: the dataset is encoded to
+/// u32 codes once, the index order is precomputed globally over those codes,
+/// and chunks are cut as ranges of both — with the dictionary payload carried
+/// only by the first chunk.
+fn emit_dict_chunks(
+    quads: Vec<RawQuad>,
+    dict: Arc<TermDictionary>,
+    id_map: Arc<crate::store::layouts::term_dictionary::TermIdMap>,
+    indexes: Indexes,
+    chunk_size: usize,
+) -> Result<(DType, ChunkStream)> {
+    let codes = dictionary::encode_quads(&quads, &dict, &id_map)?;
+    drop(quads); // chunks are built from the codes alone
+    let global_idx = GlobalIndexes::from_codes(&indexes, &codes);
+    let n = codes.s.len();
+
+    let n0 = n.min(chunk_size);
+    let first = if n == 0 {
+        dictionary::empty_struct(&indexes)?
+    } else {
+        dictionary::build_chunk_global(&codes, 0..n0, &dict, &global_idx, true, true)?
+    };
+    let dtype = first.dtype().clone();
+
+    let rest = stream::unfold(
+        (codes, dict, global_idx, n0),
+        move |(codes, dict, global_idx, offset)| async move {
+            if offset >= n {
+                return None;
+            }
+            let end = (offset + chunk_size).min(n);
+            let chunk =
+                dictionary::build_chunk_global(&codes, offset..end, &dict, &global_idx, true, false)
+                    .map_err(into_vortex_error);
+            Some((chunk, (codes, dict, global_idx, end)))
+        },
+    );
+
+    let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
+    Ok((dtype, chunks))
 }

@@ -17,29 +17,35 @@ npm install vortex-rdf
 
 ## Usage
 
-### Loading Data
+### Loading data
 
 ```javascript
-import { SimpleDictionaryStore, ChainedHashStore } from 'vortex-rdf';
+import { VortexStore } from 'vortex-rdf';
 
-// From a Vortex binary file (SimpleDictionaryStore)
-const store = await SimpleDictionaryStore.fromBytes(vortexBytes);
+// From a Turtle/N-Quads/... string
+const store = await VortexStore.fromString(ttlData, 'turtle');
 
-// Or from a Turtle/N-Quads string
-const store = await SimpleDictionaryStore.fromString(ttlData, "turtle");
+// From RDF-JS quads, skipping a serialize/parse round-trip
+const store = await VortexStore.fromQuads(quads);
+
+// From Vortex binary data
+const store = await VortexStore.fromBytes(vortexBytes);
 
 // Or create a new empty store
-const store = SimpleDictionaryStore.empty();
+const store = VortexStore.empty();
 ```
+
+Supported formats: `ntriples`, `nquads`, `turtle`, `trig`, `n3`, `rdfxml`, `jsonld`
+(plus the short aliases `nt`, `nq`, `ttl`, `rdf`, `xml`).
 
 ### Querying
 
 ```javascript
-// Perform a match (subject, predicate, object, graph)
-// Patterns can be Iris, Literals, or null/undefined for variables
-const matches = await store.match(null, "http://schema.org/name", null, null);
+// Perform a match (subject, predicate, object, graph).
+// Pass null/undefined for a variable position.
+const matches = await store.match(null, myPredicate, null, null);
 
-console.log(`Found ${matches.size()} results`);
+console.log(`Found ${await matches.size()} results`);
 
 // .values() is async and returns an iterator
 const iterator = await matches.values();
@@ -48,38 +54,112 @@ for (const quad of iterator) {
 }
 ```
 
+`match` returns another `VortexStore`, so matches compose and can themselves be
+counted, iterated, or serialized.
+
 ### Manipulation
 
 ```javascript
 await store.addQuad(myQuad);
+await store.addQuads([quadA, quadB]);
 await store.deleteQuad(existingQuad);
 ```
 
-### TypeScript Support
+Mutations follow RDF/JS dataset semantics: adding a quad already present is a
+no-op, and deleting never rewrites the columnar data (rows are tombstoned).
+Added quads accumulate in a small in-memory tail beside the immutable base, so
+the store's indexes keep working across edits; when the tail outgrows the base
+(a tenth of its rows, or 100K rows) the store compacts itself back into one
+sorted, indexed array. Prefer `addQuads` over a loop of `addQuad` calls; for
+bulk loading, build once with `fromString`/`fromQuads`.
 
-Both `SimpleDictionaryStore` and `ChainedHashStore` implement the `VortexStore` interface.
+### Serializing
+
+```javascript
+// Back to RDF text, in any supported format
+const turtle = await store.toRdf('turtle');
+
+// To Vortex binary data; read back with VortexStore.fromBytes
+const bytes = await store.toBytes();
+```
+
+### Build options
+
+Ingestion accepts an optional `BuildOptions` object that trades build cost
+against query speed and size. All fields are optional.
+
+```javascript
+const store = await VortexStore.fromString(data, 'nquads', {
+  builder: 'Sorted',                  // 'Unsorted' (default) | 'Sorted'
+  layout: 'Dictionary',               // 'Default' (default) | 'TypedObject' | 'Dictionary'
+  indexes: ['SecondaryByReference'],  // default: []
+});
+```
+
+**`builder`** — how quads are ordered while building:
+
+| Value | Build cost | Effect on queries |
+| --- | --- | --- |
+| `'Unsorted'` (default) | Cheapest; natural insertion order | Every `match` is a full column scan |
+| `'Sorted'` | Global in-memory sort by subject → predicate → object → graph | Subject lookups use a binary search |
+
+**`layout`** — how terms are encoded into columns:
+
+| Value | Notes |
+| --- | --- |
+| `'Default'` | All four terms as N-Triples strings |
+| `'TypedObject'` | Object split into kind/value/datatype/language columns |
+| `'Dictionary'` | Terms replaced by codes into a sorted term dictionary. Most compact and fastest to query; added quads live in an in-memory string tail until serialized |
+
+**`indexes`** — `'SecondaryByReference'` adds sorted predicate/object columns
+plus row-id back-references, so predicate-only and object-only patterns use a
+binary search instead of a full scan. `'SecondaryByCopy'` embeds two complete
+extra copies of the quad columns — one sorted by `(p, o, s, g)`, one by
+`(o, s, p, g)` — giving predicate- and object-bound patterns (including
+combined predicate+object lookups, resolved in one prefix search) the same
+sorted access path subjects have, at roughly 2× the storage. Both cost extra
+space and are only effective alongside `builder: 'Sorted'`.
+
+A good query-optimized default is
+`{ builder: 'Sorted', layout: 'Dictionary', indexes: ['SecondaryByReference'] }`;
+the default `{ builder: 'Unsorted', layout: 'Default' }` is the fastest to build.
+
+> The core's out-of-core `SortedStream` builder is not available here: it spills
+> sorted runs to disk, which WebAssembly has no access to.
+
+### Helper functions
+
+For one-shot conversions without holding a store:
+
+```javascript
+import { rdf_to_vortex, vortex_to_rdf, nquads_to_vortex, vortex_to_nquads } from 'vortex-rdf';
+
+const bytes = await rdf_to_vortex(turtleText, 'turtle', { builder: 'Sorted' });
+const text  = await vortex_to_rdf(bytes, 'nquads');
+
+// N-Quads shorthands
+const bytes2 = await nquads_to_vortex(nquadsText);
+const text2  = await vortex_to_nquads(bytes2);
+```
+
+### TypeScript support
+
+The package ships typings generated from the Rust bindings, using RDF-JS types.
 
 ```typescript
-import { SimpleDictionaryStore, VortexStore } from 'vortex-rdf';
-import { Quad, NamedNode, Term } from '@rdfjs/types';
+import { VortexStore, type BuildOptions } from 'vortex-rdf';
+import { DataFactory } from 'rdf-data-factory';
 
-async function queryExample(store: VortexStore) {
-  // Methods are strictly typed to RDF-JS types
-  const predicate: NamedNode = {
-    termType: 'NamedNode',
-    value: 'http://schema.org/name',
-    equals: (other: Term) => other.termType === 'NamedNode' && other.value === 'http://schema.org/name'
-  };
+const df = new DataFactory();
 
-  // Note: match returns the concrete store type (SimpleDictionaryStore or ChainedHashStore)
-  const matches = await store.match(null, predicate, null, null);
-  
-  // We can iterate values
-  const iterator = await matches.values();
-  for (const quad of iterator) {
-    const s: Quad['subject'] = quad.subject;
-    console.log(`Subject: ${s.value}`);
-  }
+const options: BuildOptions = { builder: 'Sorted', layout: 'Dictionary' };
+const store = await VortexStore.fromString(data, 'nquads', options);
+
+const matches = await store.match(null, df.namedNode('http://schema.org/name'), null, null);
+console.log(store.layout()); // 'Dictionary'
+
+for (const quad of await matches.values()) {
+  console.log(quad.subject.value);
 }
 ```
 
@@ -89,10 +169,13 @@ This package is built using [wasm-pack](https://rustwasm.github.io/wasm-pack/).
 
 ```bash
 # Build for Node.js
-npm run build
+npm run build:node
 
 # Build for the Web
 npm run build:web
+
+# Run the test suite (requires a build first)
+npm test
 ```
 
 ## License

@@ -1,228 +1,300 @@
-use crate::io::VORTEX_SESSION;
 use crate::error::{Result, VortexRdfError};
-use crate::common::indexes;
-use crate::index::RdfDictionary;
-use super::{VortexArrayBuilder, EncodedQuad, assemble_chunks};
+use crate::store::RawQuad;
+use crate::store::layouts::{dictionary, LayoutStrategy};
+use crate::store::layouts::default::DirectChunkBuilder;
+use crate::store::layouts::term_dictionary::{TermDictionary, TermDictionaryBuilder};
+use crate::store::indexes::Indexes;
+use super::{
+    VortexArrayBuilder, ChunkStream,
+    build_struct_array, make_empty_struct, assemble_chunks, into_vortex_error,
+    DEFAULT_CHUNK_SIZE,
+};
+use super::spill::{make_temp_dir, RunReader, RunWriter, TempRunsGuard};
 
 use std::sync::Arc;
-use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
-use web_time::{SystemTime, UNIX_EPOCH, Instant};
-use futures::{Stream, StreamExt};
+use web_time::Instant;
+use futures::{stream, Stream, StreamExt, TryStreamExt};
 use oxrdf::Quad;
 
-use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
-use vortex_array::arrays::{PrimitiveArray, StructArray, ConstantArray};
-use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::validity::Validity;
+use vortex_array::ArrayRef;
+use vortex_array::dtype::DType;
 
-/// An out-of-core, memory-efficient unsorted stream Vortex RDF Array Builder.
+/// Unsorted Vortex RDF Array Builder.
 ///
-/// This builder is designed to process extremely large datasets that exceed available system memory
-/// without sorting the input quads.
+/// Quads are ingested in natural insertion order and built into fixed-size
+/// StructArray chunks:
 ///
-/// ### Serialization Phases:
-/// 1. **Ingestion & Disk Flush**:
-///    Reads quads from the stream in memory-bounded batches (e.g., 500k quads).
-///    Maps terms to unique numeric IDs using zero-copy bulk ingestion via `get_or_insert_bulk`.
-///    Writes the unsorted encoded quads directly to a temporary file on disk.
-/// 2. **Thin Chunking**:
-///    Reads the quads back from the temporary file and groups them into chunks.
-///    Each chunk builds its struct array without any sorting or secondary indexes.
-/// 3. **De-duplicated Root-Level Dictionary**:
-///    Assembles the thin chunks into a single unified `ChunkedArray`.
-///    Appends the specialized dictionary columns exactly **once** at the root level of the final `StructArray`
-///    to eliminate redundant dictionary copies and minimize file size.
+/// - `build_vortex_stream` (used when serializing to a file) produces chunks
+///   lazily as the Vortex writer polls for them, so peak memory is bounded by
+///   the chunk size rather than the dataset size.
+/// - `build_vortex_array` (used for in-memory stores) collects the same chunks
+///   into a single (possibly chunked) array.
 pub struct UnsortedStreamBuilder;
 
-impl<Dict: RdfDictionary> VortexArrayBuilder<Dict> for UnsortedStreamBuilder {
+impl VortexArrayBuilder for UnsortedStreamBuilder {
     async fn build_vortex_array(
-        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>
+        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+        layout: LayoutStrategy,
+        indexes: Indexes,
     ) -> Result<ArrayRef> {
         let start = Instant::now();
-        let mut dictionary = Dict::new();
-        
-        // Generate a unique temporary directory to store the unsorted quads file.
-        let id = uuid::Uuid::new_v4();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let temp_dir = std::env::current_dir()
-            .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?
-            .join("target")
-            .join(format!("tmp_vortex_unsorted_stream_{}_{}", now, id));
-        std::fs::create_dir_all(&temp_dir)
-            .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
 
-        let temp_file_path = temp_dir.join("quads.bin");
-        let file = File::create(&temp_file_path)
-            .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
-        let mut writer = BufWriter::new(file);
-
-        let batch_size = 500_000;
-        let mut quad_batch = Vec::with_capacity(batch_size);
-        let mut total_ingested = 0;
-
-        // Helper closure to process, dictionary-encode, and write a batch of quads.
-        let process_batch = |batch: &mut Vec<Quad>, dict: &mut Dict, writer: &mut BufWriter<File>, total: &mut usize| -> Result<()> {
-            if batch.is_empty() {
-                return Ok(());
+        // Dictionary layout: the result is materialized anyway, so buffer the
+        // quads in memory (no disk spill) and build one contiguous chunk.
+        if layout == LayoutStrategy::Dictionary {
+            let mut quads = quad_stream;
+            let mut buf: Vec<RawQuad> = Vec::new();
+            while let Some(res) = quads.next().await {
+                buf.push(RawQuad::from_quad(&res?));
             }
-            *total += batch.len();
-            let mut batch_terms = Vec::with_capacity(batch.len() * 4);
-            for quad in batch.iter() {
-                batch_terms.push(quad.subject.to_string());
-                batch_terms.push(quad.predicate.to_string());
-                batch_terms.push(quad.object.to_string());
-                batch_terms.push(quad.graph_name.to_string());
-            }
-            let term_refs: Vec<&str> = batch_terms.iter().map(|s| s.as_str()).collect();
-            let dict_encode_start = Instant::now();
-            let ids = dict.get_or_insert_bulk(&term_refs);
-            let dict_duration = dict_encode_start.elapsed();
-            log::debug!("[UnsortedStreamBuilder] Dictionary encoding of {} terms completed in {:?}", term_refs.len(), dict_duration);
-
-            for i in 0..batch.len() {
-                let eq = EncodedQuad {
-                    s: ids[i * 4],
-                    p: ids[i * 4 + 1],
-                    o: ids[i * 4 + 2],
-                    g: ids[i * 4 + 3],
-                };
-                bincode::serialize_into(&mut *writer, &eq)
-                    .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
-            }
-            batch.clear();
-            Ok(())
-        };
-
-        // ── Phase 1: Ingest, dictionary-encode, and write to disk ──
-        let mut pinned_stream = Box::pin(quad_stream);
-        while let Some(res) = pinned_stream.next().await {
-            quad_batch.push(res?);
-
-            if quad_batch.len() >= batch_size {
-                process_batch(&mut quad_batch, &mut dictionary, &mut writer, &mut total_ingested)?;
-            }
+            let dict = TermDictionary::from_quads(&buf)?;
+            let id_map = dict.build_id_map();
+            // Single contiguous chunk == whole dataset: index columns are
+            // globally sorted and stamped for binary-search routing.
+            let result =
+                dictionary::build_chunk(&buf, &dict, &id_map, &indexes, 0, false, true, true)?;
+            log::debug!(
+                "[UnsortedStreamBuilder] Materialized {} dictionary-encoded quads in {:?}",
+                result.len(),
+                start.elapsed()
+            );
+            return Ok(result);
         }
-        process_batch(&mut quad_batch, &mut dictionary, &mut writer, &mut total_ingested)?;
-        writer.flush().map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
-        drop(writer);
 
-        log::debug!("[UnsortedStreamBuilder] Ingested and dictionary-encoded {} quads", total_ingested);
+        let (_dtype, chunks) =
+            build_chunk_stream(quad_stream, layout, indexes.clone(), DEFAULT_CHUNK_SIZE).await?;
+        let chunks: Vec<ArrayRef> = chunks.try_collect().await.map_err(VortexRdfError::Vortex)?;
 
-        // Serialize the completed RdfDictionary to Vortex.
-        let dict_vortex_start = Instant::now();
-        let dict_fields = dictionary.to_vortex_array()?;
-        log::debug!("[UnsortedStreamBuilder] Serialized dictionary to Vortex in {:?}", dict_vortex_start.elapsed());
+        let result = assemble_chunks(chunks, layout, &indexes)?;
+        log::debug!(
+            "[UnsortedStreamBuilder] Materialized {} quads in {:?}",
+            result.len(),
+            start.elapsed()
+        );
+        Ok(result)
+    }
 
-        // ── Phase 2: Thin chunking ──
-        let file = File::open(&temp_file_path)
-            .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
-        let mut reader = BufReader::new(file);
+    /// True streaming implementation: chunks are built on demand as the file
+    /// writer polls the stream.
+    async fn build_vortex_stream(
+        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+        layout: LayoutStrategy,
+        indexes: Indexes,
+    ) -> Result<(DType, ChunkStream)> {
+        build_chunk_stream(quad_stream, layout, indexes, DEFAULT_CHUNK_SIZE).await
+    }
+}
 
-        let mut chunks = Vec::new();
-        let chunk_size = 500_000;
-        let mut total_rows = 0;
+/// Produce the schema dtype and a lazily-evaluated stream of StructArray chunks.
+///
+/// The first chunk is read eagerly because the Vortex writer needs the schema
+/// dtype before the first chunk arrives (and it surfaces input errors early).
+/// Subsequent chunks are built only when the consumer polls for them, each
+/// carrying global row IDs via `start_row` so index columns stay valid across
+/// the assembled file.
+pub(crate) async fn build_chunk_stream(
+    quads: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+    layout: LayoutStrategy,
+    indexes: Indexes,
+    chunk_size: usize,
+) -> Result<(DType, ChunkStream)> {
+    // Dictionary layout: the global dictionary must be complete before any
+    // encoded chunk can be emitted, so this runs a two-pass spill pipeline.
+    if layout == LayoutStrategy::Dictionary {
+        return build_dict_chunk_stream(quads, indexes, chunk_size).await;
+    }
+    // Fast path: with the Default layout and no index columns, terms are
+    // formatted straight into the column builders — no intermediate RawQuad
+    // strings are allocated.
+    if layout == LayoutStrategy::Default && indexes.is_empty() {
+        return build_direct_chunk_stream(quads, chunk_size).await;
+    }
+    build_buffered_chunk_stream(quads, layout, indexes, chunk_size).await
+}
 
-        loop {
-            let mut chunk_s = Vec::with_capacity(chunk_size);
-            let mut chunk_p = Vec::with_capacity(chunk_size);
-            let mut chunk_o = Vec::with_capacity(chunk_size);
-            let mut chunk_g = Vec::with_capacity(chunk_size);
+/// Two-pass Dictionary-layout chunk stream.
+///
+/// Pass 1 spills quads to a temp file in arrival order while incrementally
+/// collecting the unique terms; the dictionary is then sorted and frozen.
+/// Pass 2 reads the spill back and lazily emits u32-encoded chunks, the first
+/// carrying the dictionary payload. Peak memory: O(unique terms + chunk).
+async fn build_dict_chunk_stream(
+    mut quads: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+    indexes: Indexes,
+    chunk_size: usize,
+) -> Result<(DType, ChunkStream)> {
+    // ── Pass 1: spill + incremental dictionary ──
+    let temp_dir = make_temp_dir("unsorted_dict")?;
+    let guard = TempRunsGuard { dir: temp_dir.clone() };
+    let spill_path = temp_dir.join("quads.bin");
 
-            for _ in 0..chunk_size {
-                match bincode::deserialize_from::<_, EncodedQuad>(&mut reader) {
-                    Ok(q) => {
-                        chunk_s.push(q.s);
-                        chunk_p.push(q.p);
-                        chunk_o.push(q.o);
-                        chunk_g.push(q.g);
-                    }
-                    Err(e) => {
-                        if let bincode::ErrorKind::Io(ref io_err) = *e {
-                            if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
-                                break;
-                            }
-                        }
-                        return Err(VortexRdfError::Deserialization(e.to_string()));
-                    }
+    let mut writer = RunWriter::create(&spill_path)?;
+    let mut dict_builder = TermDictionaryBuilder::new();
+    let mut total = 0usize;
+    while let Some(res) = quads.next().await {
+        let raw = RawQuad::from_quad(&res?);
+        dict_builder.insert_quad(&raw);
+        writer.push(&raw)?;
+        total += 1;
+    }
+    writer.finish()?;
+    let dict = Arc::new(dict_builder.finish()?);
+    let id_map = Arc::new(dict.build_id_map());
+    log::debug!(
+        "[UnsortedStreamBuilder] Spilled {} quads; dictionary of {} terms",
+        total,
+        dict.len()
+    );
+
+    // ── Pass 2: lazily emit encoded chunks from the spill ──
+    let mut reader: RunReader<RawQuad> = RunReader::new(&spill_path)?;
+    let mut buf: Vec<RawQuad> = Vec::with_capacity(chunk_size.min(4096));
+    while buf.len() < chunk_size {
+        match reader.next()? {
+            Some(q) => buf.push(q),
+            None => break,
+        }
+    }
+
+    let first = if buf.is_empty() {
+        dictionary::empty_struct(&indexes)?
+    } else {
+        // `total` is known from pass 1: a first chunk that covers everything
+        // holds globally sorted index columns and gets them stamped.
+        dictionary::build_chunk(
+            &buf,
+            &dict,
+            &id_map,
+            &indexes,
+            0,
+            false,
+            true,
+            total <= chunk_size,
+        )?
+    };
+    let dtype = first.dtype().clone();
+    let next_row = buf.len() as u32;
+    drop(buf);
+
+    let rest = stream::unfold(
+        (reader, dict, id_map, indexes, next_row, guard),
+        move |(mut reader, dict, id_map, indexes, row, guard)| async move {
+            let mut buf: Vec<RawQuad> = Vec::with_capacity(chunk_size.min(4096));
+            while buf.len() < chunk_size {
+                match reader.next() {
+                    Ok(Some(q)) => buf.push(q),
+                    Ok(None) => break,
+                    Err(e) => return Some((Err(into_vortex_error(e)), (reader, dict, id_map, indexes, row, guard))),
                 }
             }
-
-            let n = chunk_s.len();
-            if n == 0 {
-                break;
+            if buf.is_empty() {
+                return None;
             }
-            total_rows += n;
-
-            let field_names: Vec<Arc<str>> = vec![
-                "s".into(), "p".into(), "o".into(), "g".into(),
-            ];
-
-            let field_arrays: Vec<ArrayRef> = vec![
-                PrimitiveArray::from_iter(chunk_s).into_array(),
-                PrimitiveArray::from_iter(chunk_p).into_array(),
-                PrimitiveArray::from_iter(chunk_o).into_array(),
-                PrimitiveArray::from_iter(chunk_g).into_array(),
-            ];
-
-            let struct_chunk = StructArray::try_new(
-                field_names.into(),
-                field_arrays,
-                n,
-                Validity::NonNullable,
+            let n = buf.len() as u32;
+            let chunk = dictionary::build_chunk(
+                &buf, &dict, &id_map, &indexes, row, false, false, false,
             )
-            .map_err(VortexRdfError::Vortex)?
-            .into_array();
+                .map_err(into_vortex_error);
+            Some((chunk, (reader, dict, id_map, indexes, row + n, guard)))
+        },
+    );
 
-            log::debug!("[UnsortedStreamBuilder] Flushed thin chunk {} of size {}", chunks.len(), n);
-            chunks.push(struct_chunk);
+    let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
+    Ok((dtype, chunks))
+}
+
+/// General chunk-stream path: quads are buffered as `RawQuad`s per chunk, as
+/// required by index building (whole-chunk sorts) and the TypedObject layout.
+async fn build_buffered_chunk_stream(
+    mut quads: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+    layout: LayoutStrategy,
+    indexes: Indexes,
+    chunk_size: usize,
+) -> Result<(DType, ChunkStream)> {
+    let mut buf: Vec<RawQuad> = Vec::with_capacity(chunk_size.min(4096));
+    while buf.len() < chunk_size {
+        match quads.next().await {
+            Some(res) => buf.push(RawQuad::from_quad(&res?)),
+            None => break,
         }
-
-        // Clean up temporary files.
-        let _ = std::fs::remove_file(&temp_file_path);
-        let _ = std::fs::remove_dir(&temp_dir);
-
-        // ── Phase 3: Root-level dictionary construction ──
-        let assembled = assemble_chunks(chunks)?;
-        let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let assembled_struct = assembled.clone().execute::<StructArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-
-        let mut field_names: Vec<Arc<str>> = vec![
-            "s".into(), "p".into(), "o".into(), "g".into(),
-        ];
-
-        let mut field_arrays: Vec<ArrayRef> = vec![
-            assembled_struct.unmasked_field_by_name("s").map_err(VortexRdfError::Vortex)?.clone(),
-            assembled_struct.unmasked_field_by_name("p").map_err(VortexRdfError::Vortex)?.clone(),
-            assembled_struct.unmasked_field_by_name("o").map_err(VortexRdfError::Vortex)?.clone(),
-            assembled_struct.unmasked_field_by_name("g").map_err(VortexRdfError::Vortex)?.clone(),
-        ];
-
-        // Attach store type identifier and dictionary arrays exactly once at the root level.
-        field_names.push("store_type".into());
-        field_arrays.push(ConstantArray::new(Dict::store_type(), total_rows).into_array());
-
-        for (name, arr) in &dict_fields {
-            field_names.push(format!("_dict_{}", name).into());
-            field_arrays.push(indexes::array_as_dict_column(arr.clone(), total_rows)?);
-        }
-
-        let final_struct = StructArray::try_new(
-            field_names.into(),
-            field_arrays,
-            total_rows,
-            Validity::NonNullable,
-        )
-        .map_err(VortexRdfError::Vortex)?
-        .into_array();
-
-        log::debug!("[UnsortedStreamBuilder] Stream serialization complete. Total rows: {}", total_rows);
-        log::debug!("[UnsortedStreamBuilder] Completed serialization of {} quads in {:?}", total_rows, start.elapsed());
-
-        Ok(final_struct)
     }
+
+    let first = if buf.is_empty() {
+        make_empty_struct(layout, &indexes)?
+    } else {
+        // A first chunk shorter than chunk_size means the stream is exhausted:
+        // the chunk is the whole dataset and its index columns are globally
+        // sorted (stamped for binary-search routing).
+        build_struct_array(&buf, layout, &indexes, buf.len(), 0, false, buf.len() < chunk_size)?
+    };
+    let dtype = first.dtype().clone();
+    let next_row = buf.len() as u32;
+    drop(buf);
+
+    let rest = stream::unfold(
+        (quads, layout, indexes, next_row),
+        move |(mut quads, layout, indexes, row)| async move {
+            let mut buf: Vec<RawQuad> = Vec::with_capacity(chunk_size.min(4096));
+            while buf.len() < chunk_size {
+                match quads.next().await {
+                    Some(Ok(q)) => buf.push(RawQuad::from_quad(&q)),
+                    Some(Err(e)) => {
+                        return Some((Err(into_vortex_error(e)), (quads, layout, indexes, row)));
+                    }
+                    None => break,
+                }
+            }
+            if buf.is_empty() {
+                return None;
+            }
+            let n = buf.len();
+            let chunk = build_struct_array(&buf, layout, &indexes, n, row, false, false)
+                .map_err(into_vortex_error);
+            Some((chunk, (quads, layout, indexes, row + n as u32)))
+        },
+    );
+
+    let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
+    Ok((dtype, chunks))
+}
+
+/// Fast chunk-stream path for the Default layout without indexes: appends
+/// term strings directly into per-column builders, skipping the `RawQuad`
+/// intermediate (4 String allocations + frees per quad) entirely.
+async fn build_direct_chunk_stream(
+    mut quads: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+    chunk_size: usize,
+) -> Result<(DType, ChunkStream)> {
+    let mut builder = DirectChunkBuilder::new(chunk_size.min(4096));
+    while builder.len() < chunk_size {
+        match quads.next().await {
+            Some(res) => builder.push(&res?),
+            None => break,
+        }
+    }
+
+    let first = if builder.is_empty() {
+        make_empty_struct(LayoutStrategy::Default, &Vec::new())?
+    } else {
+        builder.finish()?
+    };
+    let dtype = first.dtype().clone();
+
+    let rest = stream::unfold(quads, move |mut quads| async move {
+        let mut builder = DirectChunkBuilder::new(chunk_size.min(4096));
+        while builder.len() < chunk_size {
+            match quads.next().await {
+                Some(Ok(q)) => builder.push(&q),
+                Some(Err(e)) => return Some((Err(into_vortex_error(e)), quads)),
+                None => break,
+            }
+        }
+        if builder.is_empty() {
+            return None;
+        }
+        Some((builder.finish().map_err(into_vortex_error), quads))
+    });
+
+    let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
+    Ok((dtype, chunks))
 }

@@ -1,17 +1,18 @@
 {
     "compilerOptions": {
         "target": "ESNext",
-        "module": "ESNext",
-        "moduleResolution": "node",
+        "module": "NodeNext",
+        "moduleResolution": "nodenext",
         "strict": true,
         "declaration": true,
         "outDir": "dist",
+        "rootDir": "test",
         "lib": [
             "ESNext",
             "DOM"
         ]
     },
     "include": [
-        "src/**/*.ts"
+        "test/**/*.ts"
     ]
 }

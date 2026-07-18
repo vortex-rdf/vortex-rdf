@@ -1,2 +1,9 @@
-/target
+target
 core/target
+
+# Local RDF datasets and generated Vortex files used for manual testing/benchmarks
+/test
+.claude
+# Local scripts and files to analyze benchmark results
+scripts
+.venv

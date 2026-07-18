@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-tests:
+    name: Rust Tests (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: workspace
+            command: cargo test --workspace
+          - label: core-no-default-features
+            command: cargo test -p vortex-rdf-core --no-default-features
+    steps:
+      - uses: actions/checkout@v5
+      - name: Setup Rust toolchain
+        uses: moonrepo/setup-rust@v1
+        with:
+          channel: stable
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Run Rust tests
+        run: ${{ matrix.command }}
+
+  js-tests:
+    name: JS Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: js/package-lock.json
+      - name: Install dependencies
+        working-directory: js
+        run: npm ci
+      - name: Run tests
+        working-directory: js
+        run: npm test

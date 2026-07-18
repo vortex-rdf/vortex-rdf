@@ -32,4 +32,6 @@ jobs:
         uses: CodSpeedHQ/action@v4
         with:
           mode: simulation
-          run: cargo codspeed run
+          run: cargo codspeed run --bench benchmark 1000000
+        env:
+          DIVAN_SAMPLE_COUNT: 3
