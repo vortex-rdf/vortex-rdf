@@ -34,7 +34,7 @@ jobs:
         uses: CodSpeedHQ/action@v4
         with:
           mode: simulation
-          # run only match_pattern benchmarks with 1M quads
-          run: cargo codspeed run --bench benchmark "match_pattern.*1000000"
+          # run only match_pattern benchmarks for sorted_stream builder with 1M quads
+          run: cargo codspeed run --bench benchmark "match_pattern_sorted_stream.*1000000"
         env:
           DIVAN_SAMPLE_COUNT: 3
