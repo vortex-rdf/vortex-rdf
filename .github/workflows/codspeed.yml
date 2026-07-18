@@ -19,12 +19,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Setup rust toolchain, cache and cargo-codspeed binary
-        uses: moonrepo/setup-rust@v1
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
         with:
-          channel: stable
-          cache-target: release
-          bins: cargo-codspeed
+          cache-targets: "true"
+      - name: Install cargo-codspeed
+        run: cargo install cargo-codspeed --locked
 
       - name: Build the benchmark target(s)
         run: cargo codspeed build
@@ -32,6 +34,7 @@ jobs:
         uses: CodSpeedHQ/action@v4
         with:
           mode: simulation
-          run: cargo codspeed run --bench benchmark 1000000
+          # run only match_pattern benchmarks with 1M quads
+          run: cargo codspeed run --bench benchmark "match_pattern.*1000000"
         env:
           DIVAN_SAMPLE_COUNT: 3
