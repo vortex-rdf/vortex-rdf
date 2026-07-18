@@ -122,6 +122,7 @@ fn finish_chunk(names: Vec<Arc<str>>, arrays: Vec<ArrayRef>, n: usize) -> Result
 /// and `whole_dataset` the same index-stamping semantics: pass `true` only
 /// when `quads` is the entire dataset, so the per-chunk index sort is the
 /// global order.
+#[allow(clippy::too_many_arguments)] // each input is distinct; bundling would only add ceremony
 pub(crate) fn build_chunk(
     quads: &[RawQuad],
     dict: &TermDictionary,
@@ -187,6 +188,13 @@ pub(crate) fn build_chunk_global(
     Ok(chunk)
 }
 
+/// The two `SecondaryByReference` code columns of a presorted chunk, as
+/// borrowed globally sorted (code, row ID) slices: (objects, predicates).
+type RefPairSlices<'a> = (&'a [(u32, u32)], &'a [(u32, u32)]);
+/// The two `SecondaryByCopy` code columns of a presorted chunk, as borrowed
+/// globally sorted (sort key, row ID) slices: (POSG, OSPG).
+type CopyKeySlices<'a> = (&'a [(CopyKey<u32>, u32)], &'a [(CopyKey<u32>, u32)]);
+
 /// Build a Dictionary-layout chunk with index columns taken from
 /// already-globally-sorted (code, row ID) entries — the out-of-core sorted
 /// builder's emission path, where the entries are merged from disk runs.
@@ -195,8 +203,8 @@ pub(crate) fn build_chunk_presorted_indexes(
     quads: &[RawQuad],
     dict: &TermDictionary,
     id_map: &TermIdMap,
-    ref_pairs: Option<(&[(u32, u32)], &[(u32, u32)])>,
-    copy_keys: Option<(&[(CopyKey<u32>, u32)], &[(CopyKey<u32>, u32)])>,
+    ref_pairs: Option<RefPairSlices<'_>>,
+    copy_keys: Option<CopyKeySlices<'_>>,
     s_sorted: bool,
     carry_dict: bool,
 ) -> Result<ArrayRef> {

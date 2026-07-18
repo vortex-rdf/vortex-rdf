@@ -46,7 +46,7 @@ mimalloc.workspace = true
 
 [features]
 default = ["file-io"]
-file-io = ["vortex-io/tokio", "vortex/zstd", "vortex/files", "vortex-file/tokio"]
+file-io = ["vortex-io/tokio", "vortex/zstd", "vortex/files", "vortex-file/tokio", "tokio/fs"]
 
 [dev-dependencies]
 divan = { version = "*", package = "codspeed-divan-compat" }

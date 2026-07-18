@@ -24,12 +24,13 @@ use crate::store::selection::RowSelection;
 #[cfg(feature = "file-io")]
 use std::sync::Arc;
 #[cfg(feature = "file-io")]
+use std::path::PathBuf;
+#[cfg(feature = "file-io")]
 use vortex_array::expr::Expression;
 #[cfg(feature = "file-io")]
 use vortex_file::VortexFile;
 
-#[cfg(feature = "file-io")]
-use crate::store::indexes::secondary_by_copy::Family;
+use crate::store::indexes::ServePlan;
 
 /// A raw (un-encoded) quad holding term strings in N-Triples form.
 /// This is the shared in-memory (and on-disk, for external sorting)
@@ -38,6 +39,8 @@ use crate::store::indexes::secondary_by_copy::Family;
 #[derive(
     Clone,
     Hash,
+    PartialEq,
+    Eq,
     serde::Serialize,
     serde::Deserialize,
     rkyv::Archive,
@@ -49,13 +52,6 @@ pub struct RawQuad {
     pub p: String,
     pub o: String,
     pub g: String,
-}
-
-impl Eq for RawQuad {}
-impl PartialEq for RawQuad {
-    fn eq(&self, other: &Self) -> bool {
-        self.s == other.s && self.p == other.p && self.o == other.o && self.g == other.g
-    }
 }
 
 impl Ord for RawQuad {
@@ -123,12 +119,28 @@ pub(crate) enum QuadsSource {
         /// ids survive a delete and the secondary indexes built against them
         /// stay usable. Every read path must apply this — see
         /// [`RowSelection::live_mask`]. The tombstoned rows are only reclaimed
-        /// by materializing.
+        /// by compaction.
         deleted: Option<Mask>,
+        /// When this view's selection came from an index resolution over an
+        /// otherwise-unrefined base, and that index holds the matched rows as a
+        /// contiguous run of its own columns, the plan for `quads()` to slice
+        /// them straight from `base` instead of gathering the primary columns at
+        /// scattered row ids. Index-agnostic: only `SecondaryByCopy` currently
+        /// supplies one (see [`ServePlan`]). `None` on any view narrowed further
+        /// — the plan is only valid while its row run is exactly the selection.
+        ///
+        /// [`ServePlan`]: crate::store::indexes::ServePlan
+        serve: Option<ServePlan>,
     },
     #[cfg(feature = "file-io")]
     /// Quad data read lazily from a Vortex file when a query is executed.
     File {
+        /// The path the file was opened from. Kept so compaction can rewrite
+        /// the store's rows back over their own source file (atomically) and
+        /// reopen it, rather than degrading a file-backed store to an in-memory
+        /// one. Carried across every derived view so a compaction of a match
+        /// result still knows which file to overwrite.
+        path: PathBuf,
         /// The shared file handle, including its cached schema, metadata, and
         /// layout reader used by scans and pruning.
         file: Arc<VortexFile>,
@@ -146,34 +158,21 @@ pub(crate) enum QuadsSource {
         /// the file cannot change underneath), so the secondary indexes built
         /// against them survive a delete. Every read path must apply this —
         /// see [`RowSelection::live_mask`] — and it is only reclaimed by
-        /// materializing.
+        /// compaction.
         deleted: Option<Mask>,
-        /// When this view's selection came from a `SecondaryByCopy` resolution
-        /// over an otherwise-unrefined store, how `quads()` can *serve* the
-        /// same rows from the copy family's columns — where they sit in a
-        /// contiguous, zone-prunable run — instead of scattering row-id reads
-        /// across the primary columns. `None` on any view whose selection has
-        /// been narrowed further: the plan is only valid while the copy filter
-        /// selects exactly the selection's rows.
-        copy_scan: Option<CopyScan>,
+        /// When this view's selection came from an index resolution over an
+        /// otherwise-unrefined store, and that index can serve the matched rows
+        /// from its own columns — where they sit in a contiguous, zone-prunable
+        /// run — the plan for `quads()` to stream them from there instead of
+        /// scattering row-id reads across the primary columns. Index-agnostic:
+        /// any serving index supplies one, and only `SecondaryByCopy` currently
+        /// does (see [`ServePlan`]). `None` on any view whose selection has been
+        /// narrowed further — the plan is only valid while its filter selects
+        /// exactly the selection's rows.
+        ///
+        /// [`ServePlan`]: crate::store::indexes::ServePlan
+        serve: Option<ServePlan>,
     },
-}
-
-/// A plan for streaming a file view's matched quads straight from one of the
-/// `SecondaryByCopy` families (see `QuadsSource::File::copy_scan`).
-///
-/// The plan is an *alternative physical path* to the same logical rows the
-/// view's [`RowSelection`] names: correctness never depends on it, and any
-/// operation that can't honor it (chained matches, counting, materializing)
-/// simply ignores it and uses the row ids.
-#[cfg(feature = "file-io")]
-#[derive(Clone)]
-pub(crate) struct CopyScan {
-    /// The copy family whose sort order clusters the matched rows.
-    pub(crate) family: Family,
-    /// The full pattern as term equalities over the family's columns —
-    /// selecting exactly the quads the view's selection names.
-    pub(crate) filter: Expression,
 }
 
 /// Rows appended after construction: the write-optimized delta over the

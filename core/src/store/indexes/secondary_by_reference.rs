@@ -161,6 +161,8 @@ pub(crate) fn resolve_in_memory(
     Ok(IndexResolution::Resolved {
         row_ids,
         resolves: probe.resolves,
+        // A back-reference index stores no whole quads to serve from.
+        serve: None,
     })
 }
 
@@ -192,6 +194,8 @@ pub(crate) async fn resolve_file(
     Ok(IndexResolution::Resolved {
         row_ids,
         resolves: probe.resolves,
+        // A back-reference index stores no whole quads to serve from.
+        serve: None,
     })
 }
 

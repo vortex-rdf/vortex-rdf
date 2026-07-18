@@ -277,21 +277,30 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
     Ok((dtype, chunks))
 }
 
+/// The two `SecondaryByReference` mergers of a build: (objects, predicates).
+type RefMergers<V> = (PairMerger<V>, PairMerger<V>);
+/// The two `SecondaryByCopy` mergers of a build: (POSG keys, OSPG keys).
+type CopyMergers<V> = (PairMerger<CopyKey<V>>, PairMerger<CopyKey<V>>);
+/// One chunk of the two reference index columns: (objects, predicates), each a
+/// run of (value, row ID) entries.
+type RefBatches<V> = (Vec<(V, u32)>, Vec<(V, u32)>);
+/// One chunk of the two copy index columns: (POSG, OSPG), each a run of
+/// (sort key, row ID) entries.
+type CopyBatches<V> = (Vec<(CopyKey<V>, u32)>, Vec<(CopyKey<V>, u32)>);
+
 /// The external-sort mergers for one build's secondary indexes, present only
 /// for the index types the build requested. `V` is the term encoding: strings,
 /// or u32 dictionary codes.
 struct SpilledIndexes<V> {
-    /// `SecondaryByReference` (value, row ID) pairs: (objects, predicates).
-    ref_pairs: Option<(PairMerger<V>, PairMerger<V>)>,
-    /// `SecondaryByCopy` (sort key, row ID) pairs: (POSG, OSPG).
-    copy_keys: Option<(PairMerger<CopyKey<V>>, PairMerger<CopyKey<V>>)>,
+    ref_pairs: Option<RefMergers<V>>,
+    copy_keys: Option<CopyMergers<V>>,
 }
 
 /// One chunk's worth of every present merger's output, pulled in lockstep with
 /// the merged-quad reader by [`next_index_batches`].
 struct IndexBatches<V> {
-    ref_pairs: Option<(Vec<(V, u32)>, Vec<(V, u32)>)>,
-    copy_keys: Option<(Vec<(CopyKey<V>, u32)>, Vec<(CopyKey<V>, u32)>)>,
+    ref_pairs: Option<RefBatches<V>>,
+    copy_keys: Option<CopyBatches<V>>,
 }
 
 /// Run the K-way quad merge to completion (pass A of the indexed pipeline):

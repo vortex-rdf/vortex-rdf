@@ -628,29 +628,30 @@ mod tests {
             ]
         );
 
-        // Materializing is the one step that breaks row identity, so it is also
-        // the only one that drops the indexes — the quads must survive intact.
-        let standalone = chained.materialize().await.unwrap();
+        // A sort-only compaction (empty index set) gathers the chained view
+        // into a standalone store; it renumbers rows and so drops the indexes —
+        // the quads must survive intact.
+        let standalone = chained.compact_with_indexes(vec![]).await.unwrap();
         assert!(
             standalone.indexes().is_empty(),
-            "materializing renumbers rows, so index ids cannot survive it"
+            "gathering renumbers rows, so index ids cannot survive it"
         );
         assert_eq!(standalone.size().await.unwrap(), 2);
-        let mut materialized: Vec<String> = standalone
+        let mut compacted: Vec<String> = standalone
             .quads()
             .unwrap()
             .map(|q| q.unwrap().subject.to_string())
             .collect()
             .await;
-        materialized.sort();
-        assert_eq!(materialized, got);
+        compacted.sort();
+        assert_eq!(compacted, got);
     }
 
-    /// `compact_with_indexes` gathers the live rows like `materialize`, but
-    /// rebuilds the requested indexes over the fresh `0..n` row order — so an
-    /// independent, compacted store keeps routing through its index instead of
-    /// degrading to a full scan. It also lets a store be re-indexed: the
-    /// requested set is what the result carries, whatever the source had.
+    /// `compact_with_indexes` gathers the live rows and rebuilds the requested
+    /// indexes over the fresh `0..n` row order — so an independent, compacted
+    /// store keeps routing through its index instead of degrading to a full
+    /// scan. It also lets a store be re-indexed: the requested set is what the
+    /// result carries, whatever the source had.
     #[tokio::test]
     async fn test_compact_with_indexes_rebuilds() {
         let quads: Vec<Quad> = (0..24)
@@ -678,8 +679,8 @@ mod tests {
         let view = store.match_pattern(None, None, Some(&object), None).await.unwrap();
         assert_eq!(view.size().await.unwrap(), 6);
 
-        // Plain materialize drops the index; compact_with_indexes rebuilds it.
-        assert!(view.materialize().await.unwrap().indexes().is_empty());
+        // An empty index set drops the index; a non-empty one rebuilds it.
+        assert!(view.compact_with_indexes(vec![]).await.unwrap().indexes().is_empty());
         let indexed = view
             .compact_with_indexes(vec![IndexType::SecondaryByReference])
             .await
@@ -701,7 +702,7 @@ mod tests {
         ]);
         assert_eq!(store.size().await.unwrap(), 24, "source untouched");
 
-        // Re-indexing from nothing: an empty set behaves like plain materialize,
+        // Re-indexing from nothing: an empty set drops every index,
         // and a store built without indexes gains one it never had.
         let bare = VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
             quad_stream(quads.clone()),
@@ -851,8 +852,8 @@ mod tests {
             ]
         );
 
-        // Materializing reclaims the tombstoned row (and drops the index).
-        let compacted = after.materialize().await.unwrap();
+        // A sort-only compaction reclaims the tombstoned row (and drops the index).
+        let compacted = after.compact_with_indexes(vec![]).await.unwrap();
         assert_eq!(compacted.size().await.unwrap(), 11);
         assert!(compacted.indexes().is_empty());
     }
@@ -970,11 +971,92 @@ mod tests {
             3,
         );
 
-        // Materializing reclaims every tombstone and drops the index.
-        let compacted = after2.materialize().await.unwrap();
+        // A sort-only compaction reclaims every tombstone and drops the index.
+        let compacted = after2.compact_with_indexes(vec![]).await.unwrap();
         assert_eq!(compacted.size().await.unwrap(), 7);
         assert!(compacted.indexes().is_empty());
         assert_eq!(compacted.quads().unwrap().count().await, 7);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Compacting a file-backed store rewrites the compacted rows back over its
+    /// own source file and stays file-backed: an independent reopen of the path
+    /// sees the folded-in, tombstone-free data, the rebuilt index survives, and
+    /// a later append is folded into the file too.
+    #[cfg(feature = "file-io")]
+    #[tokio::test]
+    async fn test_file_backed_compaction_rewrites_source_file() {
+        let quads: Vec<Quad> = (0..12)
+            .map(|i| {
+                make_quad(
+                    &format!("http://example.org/s{:02}", i),
+                    &format!("http://example.org/p{}", i % 2),
+                    &format!("object {}", i % 3),
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect();
+
+        let mut bytes: Vec<u8> = Vec::new();
+        quads_stream_to_vortex_writer_with_builder::<SortedInMemoryBuilder, _, _>(
+            quad_stream(quads.clone()),
+            &mut bytes,
+            LayoutStrategy::Default,
+            vec![IndexType::SecondaryByReference],
+        )
+        .await
+        .unwrap();
+        let path = std::env::temp_dir()
+            .join(format!("vortex_rdf_compact_{}.vortex", uuid::Uuid::new_v4()));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+
+        // Delete "object 0" (i = 0, 3, 6, 9): 4 rows tombstoned, 8 live.
+        let object0 = Term::Literal(Literal::new_simple_literal("object 0"));
+        let after = store.delete_matching(None, None, Some(&object0), None).await.unwrap();
+        assert_eq!(after.size().await.unwrap(), 8);
+
+        // Compact, keeping the index set: tombstoned rows are reclaimed and the
+        // source file is rewritten in place.
+        let compacted = after.compact().await.unwrap();
+        assert_eq!(compacted.size().await.unwrap(), 8);
+        assert_eq!(
+            compacted.indexes(),
+            &vec![IndexType::SecondaryByReference],
+            "compaction rebuilds the store's index set"
+        );
+        // The rebuilt index routes over the compacted rows: the deleted object
+        // is gone for good.
+        assert_eq!(
+            compacted.match_pattern(None, None, Some(&object0), None).await.unwrap()
+                .size().await.unwrap(),
+            0,
+        );
+
+        // Proof the file itself was overwritten: an independent reopen of the
+        // path sees the compacted, tombstone-free data — not the original 12.
+        let reopened = VortexRdfStore::from_file(&path).await.unwrap();
+        assert_eq!(reopened.size().await.unwrap(), 8);
+        assert_eq!(reopened.indexes(), &vec![IndexType::SecondaryByReference]);
+
+        // A file-backed store keeps its tail until an explicit compact; that
+        // compaction folds the appended row into the file too.
+        let extra = make_quad(
+            "http://example.org/s99",
+            "http://example.org/p0",
+            "object 9",
+            GraphName::DefaultGraph,
+        );
+        let appended = reopened.add_quad(extra).await.unwrap();
+        assert_eq!(appended.tail_len(), 1);
+        let recompacted = appended.compact().await.unwrap();
+        assert_eq!(recompacted.tail_len(), 0);
+        assert_eq!(recompacted.size().await.unwrap(), 9);
+        // The append now lives in the file on disk.
+        let reopened2 = VortexRdfStore::from_file(&path).await.unwrap();
+        assert_eq!(reopened2.size().await.unwrap(), 9);
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1014,14 +1096,14 @@ mod tests {
         ] {
             let message = result.expect("a derived view must reject mutations").to_string();
             assert!(
-                message.contains("materialize()"),
+                message.contains("owned()"),
                 "the error should point at the way out, got: {message}"
             );
         }
 
-        // Materializing yields an independent copy that mutates freely, and
-        // leaves the store it came from alone.
-        let owned = view.materialize().await.unwrap();
+        // `owned()` yields an independent copy that mutates freely, and leaves
+        // the store it came from alone.
+        let owned = view.owned().await.unwrap();
         let edited = owned.delete_quad(&quads[0]).await.unwrap();
         assert_eq!(edited.size().await.unwrap(), 2);
         assert_eq!(store.size().await.unwrap(), 6);
@@ -1247,6 +1329,113 @@ mod tests {
         assert_eq!(chained.size().await.unwrap(), 2);
     }
 
+    /// The in-memory copy index's serving path: predicate / object /
+    /// predicate+object matches read the matched quads straight from the copy
+    /// family's contiguous run (a plain slice of the base, no row-id gather),
+    /// while a residual graph constraint or a chained match — which force a mask
+    /// scan or narrow the selection further — fall back to the row ids. Serving
+    /// applies exactly when the index fully resolves the pattern, which is also
+    /// exactly when no gather would otherwise happen.
+    #[cfg(feature = "file-io")]
+    #[tokio::test]
+    async fn test_in_memory_copy_index_serving() {
+        async fn matched_strings(view: &VortexRdfStore) -> Vec<String> {
+            let quads: Vec<Quad> = view.quads().unwrap().try_collect().await.unwrap();
+            let mut strings: Vec<String> = quads.iter().map(|q| q.to_string()).collect();
+            strings.sort();
+            strings
+        }
+
+        let graphs = [
+            GraphName::NamedNode(NamedNode::new("http://example.org/g0").unwrap()),
+            GraphName::NamedNode(NamedNode::new("http://example.org/g1").unwrap()),
+        ];
+        let quads: Vec<Quad> = (0..30)
+            .map(|i| {
+                make_quad(
+                    &format!("http://example.org/s{:02}", i),
+                    &format!("http://example.org/p{}", i % 3),
+                    &format!("o{}", i % 5),
+                    graphs[i % 2].clone(),
+                )
+            })
+            .collect();
+        let expected = |keep: &dyn Fn(usize) -> bool| -> Vec<String> {
+            let mut strings: Vec<String> = quads
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| keep(*i))
+                .map(|(_, q)| q.to_string())
+                .collect();
+            strings.sort();
+            strings
+        };
+
+        let arr = VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
+            quad_stream(quads.clone()),
+            LayoutStrategy::Default,
+            vec![IndexType::SecondaryByCopy],
+        )
+        .await
+        .unwrap();
+        let store = VortexRdfStore::new(arr).unwrap();
+        assert_eq!(store.indexes(), &[IndexType::SecondaryByCopy]);
+
+        // Predicate-bound: served from the POSG family's contiguous run — the
+        // served `quads()` and the row-id `size()` must agree.
+        let p1 = NamedNode::new("http://example.org/p1").unwrap();
+        let by_p = store.match_pattern(None, Some(&p1), None, None).await.unwrap();
+        assert!(by_p.debug_has_serve_plan());
+        assert_eq!(by_p.size().await.unwrap(), 10);
+        assert_eq!(matched_strings(&by_p).await, expected(&|i| i % 3 == 1));
+
+        // Object-bound: served from the OSPG family.
+        let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+        let by_o = store.match_pattern(None, None, Some(&o2), None).await.unwrap();
+        assert!(by_o.debug_has_serve_plan());
+        assert_eq!(matched_strings(&by_o).await, expected(&|i| i % 5 == 2));
+
+        // Predicate and object: one (p, o) prefix probe fully resolves the
+        // pattern, so the narrowed run is served directly.
+        let o1 = Term::Literal(Literal::new_simple_literal("o1"));
+        let by_po = store.match_pattern(None, Some(&p1), Some(&o1), None).await.unwrap();
+        assert!(by_po.debug_has_serve_plan());
+        assert_eq!(matched_strings(&by_po).await, expected(&|i| i % 15 == 1));
+
+        // A residual graph constraint leaves a mask scan to run — which already
+        // gathers the rows — so the serve plan is dropped (it would save
+        // nothing), and the result still comes out right.
+        let p2 = NamedNode::new("http://example.org/p2").unwrap();
+        let by_pg = store
+            .match_pattern(None, Some(&p2), None, Some(&graphs[0]))
+            .await
+            .unwrap();
+        assert!(!by_pg.debug_has_serve_plan());
+        assert_eq!(
+            matched_strings(&by_pg).await,
+            expected(&|i| i % 3 == 2 && i % 2 == 0)
+        );
+
+        // Chaining narrows the first view's row ids, so its serve plan drops.
+        let chained = by_p.match_pattern(None, None, Some(&o1), None).await.unwrap();
+        assert!(!chained.debug_has_serve_plan());
+        assert_eq!(
+            matched_strings(&chained).await,
+            expected(&|i| i % 3 == 1 && i % 5 == 1)
+        );
+
+        // A tombstoned row vanishes from served streams too: the slice reads
+        // copy rows, so the delete reaches it through the rid column.
+        let deleted = store.delete_quad(&quads[4]).await.unwrap();
+        let by_p_after = deleted.match_pattern(None, Some(&p1), None, None).await.unwrap();
+        assert!(by_p_after.debug_has_serve_plan());
+        assert_eq!(by_p_after.size().await.unwrap(), 9);
+        assert_eq!(
+            matched_strings(&by_p_after).await,
+            expected(&|i| i % 3 == 1 && i != 4)
+        );
+    }
+
     /// The file-backed copy index end to end: pattern shapes it accelerates,
     /// copy-served `quads()` streams (including residual graph constraints and
     /// tombstoned rows filtered through the family's rid column), and chained
@@ -1311,14 +1500,14 @@ mod tests {
         // Predicate-bound: i ≡ 1 (mod 3), served from the POSG family.
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
         let by_p = store.match_pattern(None, Some(&p1), None, None).await.unwrap();
-        assert!(by_p.debug_has_copy_scan());
+        assert!(by_p.debug_has_serve_plan());
         assert_eq!(by_p.size().await.unwrap(), 10);
         assert_eq!(matched_strings(&by_p).await, expected(&|i| i % 3 == 1));
 
         // Object-bound: i ≡ 2 (mod 5), served from the OSPG family.
         let o2 = Term::Literal(Literal::new_simple_literal("o2"));
         let by_o = store.match_pattern(None, None, Some(&o2), None).await.unwrap();
-        assert!(by_o.debug_has_copy_scan());
+        assert!(by_o.debug_has_serve_plan());
         assert_eq!(by_o.size().await.unwrap(), 6);
         assert_eq!(matched_strings(&by_o).await, expected(&|i| i % 5 == 2));
 
@@ -1347,7 +1536,7 @@ mod tests {
         // Chaining a second match narrows the first view's row ids (the copy
         // plan is dropped — its filter no longer selects exactly the rows).
         let chained = by_p.match_pattern(None, None, Some(&o1), None).await.unwrap();
-        assert!(!chained.debug_has_copy_scan());
+        assert!(!chained.debug_has_serve_plan());
         assert_eq!(
             matched_strings(&chained).await,
             expected(&|i| i % 3 == 1 && i % 5 == 1)
@@ -1634,12 +1823,13 @@ mod tests {
         );
     }
 
-    /// File-backed stores never auto-compact: folding the tail would pull the
-    /// whole file into memory, a backend change an append must not make
-    /// implicitly. The tail accumulates until `compact()` is called.
+    /// File-backed stores auto-compact like in-memory ones: an append that
+    /// pushes the tail past the thresholds folds it in — rewriting the source
+    /// file in place and staying file-backed — while smaller appends leave the
+    /// tail (and the file on disk) untouched.
     #[cfg(feature = "file-io")]
     #[tokio::test]
-    async fn test_file_backed_add_never_auto_compacts() {
+    async fn test_file_backed_add_auto_compacts_past_threshold() {
         let quads: Vec<Quad> = (0..4)
             .map(|i| {
                 make_quad(
@@ -1651,8 +1841,8 @@ mod tests {
             })
             .collect();
 
-        let path =
-            std::env::temp_dir().join(format!("vortex_rdf_autocompact_{}.vortex", std::process::id()));
+        let path = std::env::temp_dir()
+            .join(format!("vortex_rdf_autocompact_{}.vortex", uuid::Uuid::new_v4()));
         let file = tokio::fs::File::create(&path).await.unwrap();
         quads_stream_to_vortex_writer_with_builder::<SortedInMemoryBuilder, _, _>(
             quad_stream(quads.clone()),
@@ -1664,6 +1854,29 @@ mod tests {
         .unwrap();
 
         let store = VortexRdfStore::from_file(&path).await.unwrap();
+
+        // A small append stays below the floor: the tail accumulates and the
+        // file on disk is not rewritten.
+        let small_batch: Vec<Quad> = (4..14)
+            .map(|i| {
+                make_quad(
+                    &format!("http://example.org/s{:05}", i),
+                    "http://example.org/p0",
+                    "object 1",
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect();
+        let small = store.add_quads(small_batch).await.unwrap();
+        assert_eq!(small.tail_len(), 10);
+        assert_eq!(
+            VortexRdfStore::from_file(&path).await.unwrap().size().await.unwrap(),
+            4,
+            "a sub-threshold append must not rewrite the file"
+        );
+
+        // This append lands the tail past the 4_096 floor, so it comes back
+        // compacted: tail folded, indexes rebuilt.
         let batch: Vec<Quad> = (4..4_204)
             .map(|i| {
                 make_quad(
@@ -1674,19 +1887,22 @@ mod tests {
                 )
             })
             .collect();
-
-        // 4_200 tail rows is past every in-memory threshold, yet the file
-        // store keeps them as a tail.
-        let added = store.add_quads(batch).await.unwrap();
-        assert_eq!(added.tail_len(), 4_200);
-        assert_eq!(added.size().await.unwrap(), 4_204);
-
-        // Folding is explicit — and converts the store into a compacted
-        // in-memory one, current indexes preserved.
-        let compacted = added.compact().await.unwrap();
-        assert_eq!(compacted.tail_len(), 0);
+        let compacted = store.add_quads(batch).await.unwrap();
+        assert_eq!(compacted.tail_len(), 0, "the threshold add must compact");
         assert_eq!(compacted.size().await.unwrap(), 4_204);
         assert_eq!(compacted.indexes(), &[IndexType::SecondaryByReference]);
+
+        // It stayed file-backed: an independent reopen of the path sees the
+        // folded-in rows — the append rewrote the source file — and the rebuilt
+        // subject fast path and object index both answer.
+        let reopened = VortexRdfStore::from_file(&path).await.unwrap();
+        assert_eq!(reopened.size().await.unwrap(), 4_204);
+        assert_eq!(reopened.indexes(), &[IndexType::SecondaryByReference]);
+        let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s02050").unwrap());
+        assert_eq!(
+            reopened.match_pattern(Some(&s), None, None, None).await.unwrap().size().await.unwrap(),
+            1
+        );
 
         tokio::fs::remove_file(&path).await.ok();
     }

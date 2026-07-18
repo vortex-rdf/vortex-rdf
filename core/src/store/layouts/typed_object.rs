@@ -115,7 +115,7 @@ fn compose_object(
 /// secondary index stores — from the typed sub-columns, one per row.
 ///
 /// The counterpart to [`build_columns`]' object decomposition, used when
-/// rebuilding indexes after a materialize: the index's `_idx_o_val` column
+/// rebuilding indexes during compaction: the index's `_idx_o_val` column
 /// holds the full object term, which under this layout has to be recomposed
 /// from `o_kind`/`o_value`/`o_datatype`/`o_lang`.
 pub(crate) fn object_terms(struct_arr: &StructArray) -> Result<Vec<String>> {

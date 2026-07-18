@@ -5,10 +5,6 @@ use crate::common::utils::{
     column_is_sorted,
     search_sorted_bounds
 };
-#[cfg(feature = "file-io")]
-use crate::common::utils::graph_name_str;
-#[cfg(feature = "file-io")]
-use vortex_array::arrays::PrimitiveArray;
 use crate::store::builders::{
     VortexArrayBuilder,
     UnsortedStreamBuilder,
@@ -25,16 +21,13 @@ use crate::store::indexes::{
     resolve_indexes_in_memory,
     strip_index_columns,
     unique_indexes,
-    IndexResolution
+    IndexResolution,
+    ServePlan
 };
 #[cfg(feature = "file-io")]
 use crate::store::indexes::resolve_indexes_file;
-#[cfg(feature = "file-io")]
-use crate::store::indexes::secondary_by_copy;
 use crate::store::selection::RowSelection;
 use crate::store::{QuadsSource, Tail};
-#[cfg(feature = "file-io")]
-use crate::store::CopyScan;
 
 #[cfg(feature = "file-io")]
 use crate::io::de;
@@ -108,10 +101,11 @@ pub struct VortexRdfStore {
     /// Views derived through `match_pattern` keep their indexes: a view narrows
     /// a [`RowSelection`] over the base rather than rewriting rows, so the
     /// `_idx_*_rid` columns still address the base the ids were built against.
-    /// Only [`materialize`] — which physically gathers rows and so destroys row
-    /// identity — drops them.
+    /// Only physically gathering the rows — which renumbers them from zero, as
+    /// [`compact_with_indexes`] does — invalidates those ids; it rebuilds the
+    /// index set over the new order rather than carrying the old one across.
     ///
-    /// [`materialize`]: Self::materialize
+    /// [`compact_with_indexes`]: Self::compact_with_indexes
     indexes: Indexes,
     /// Rows appended since construction ([`add_quads`]), kept outside the base
     /// so appending never rewrites it — which is what lets the base's indexes
@@ -154,6 +148,7 @@ impl VortexRdfStore {
                 base: vortex_array,
                 selection: RowSelection::All,
                 deleted: None,
+                serve: None,
             },
             tail: None,
         })
@@ -182,6 +177,7 @@ impl VortexRdfStore {
                 base: quads,
                 selection: RowSelection::All,
                 deleted: None,
+                serve: None,
             },
             tail: None,
         }
@@ -192,6 +188,9 @@ impl VortexRdfStore {
     /// single-column projection) so queries can translate terms to codes.
     #[cfg(feature = "file-io")]
     pub async fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        // Remember the source path before it is consumed below, so compaction
+        // can later rewrite the compacted rows back over it.
+        let source_path = path.as_ref().to_path_buf();
         // Opens the file footer only (schema + layout metadata); no row data
         // is read yet. The returned handle caches its layout reader tree so
         // later scans/prunes across this store (and stores derived from it)
@@ -213,11 +212,12 @@ impl VortexRdfStore {
             layout,
             indexes,
             quads: QuadsSource::File {
+                path: source_path,
                 file,
                 filter: None,
                 selection: RowSelection::All,
                 deleted: None,
-                copy_scan: None,
+                serve: None,
             },
             tail: None,
         })
@@ -245,17 +245,21 @@ impl VortexRdfStore {
                 base: base.clone(),
                 selection,
                 deleted: deleted.clone(),
+                // A re-selection breaks the serve plan's "row run is exactly the
+                // selection" invariant, so it never carries across (as for File).
+                serve: None,
             },
             #[cfg(feature = "file-io")]
-            QuadsSource::File { file, filter, deleted, .. } => QuadsSource::File {
+            QuadsSource::File { path, file, filter, deleted, .. } => QuadsSource::File {
+                path: path.clone(),
                 file: file.clone(),
                 filter: filter.clone(),
                 selection,
                 deleted: deleted.clone(),
-                // A different selection breaks the copy plan's "filter selects
+                // A different selection breaks the serve plan's "filter selects
                 // exactly the selection's rows" invariant, so it never carries
                 // across a re-selection.
-                copy_scan: None,
+                serve: None,
             },
         };
         Self {
@@ -281,55 +285,6 @@ impl VortexRdfStore {
         view
     }
 
-    /// Collapse this view into a standalone store holding only the rows it
-    /// selects, physically gathered.
-    ///
-    /// This is the one operation that breaks row identity — the gathered rows
-    /// are renumbered from zero — so secondary-index columns are projected away
-    /// and the index set emptied: their row ids address the base, and searching
-    /// them here would silently misresolve.
-    ///
-    /// Views are the cheaper default (matching composes selections instead of
-    /// copying rows, and keeps the indexes). Reach for this when a result must
-    /// stand on its own: to hand it across a boundary, or to stop a small match
-    /// result from pinning a large base alive.
-    pub async fn materialize(&self) -> Result<Self> {
-        // An unrefined in-memory view with nothing tombstoned or appended
-        // already is exactly its own rows — and its indexes are still valid,
-        // so don't gather (and strip) needlessly.
-        if self.tail.is_none()
-            && let QuadsSource::InMemory {
-                selection: RowSelection::All,
-                deleted: None,
-                ..
-            } = &self.quads
-        {
-            return Ok(self.clone());
-        }
-        // Without a tail the selected rows can be gathered as columns, with no
-        // decode round-trip.
-        if self.tail.is_none() {
-            return Ok(Self {
-                layout: self.layout.clone(),
-                indexes: vec![],
-                quads: QuadsSource::InMemory {
-                    base: self.selected_rows().await?,
-                    selection: RowSelection::All,
-                    // Gathering leaves only live rows behind, reclaiming
-                    // whatever the tombstones were holding.
-                    deleted: None,
-                },
-                tail: None,
-            });
-        }
-        // A tail can't in general be concatenated onto the gathered base (its
-        // schema differs under the Dictionary layout, whose codes an appended
-        // term isn't in), so rebuild from the quads themselves, in view order:
-        // base rows first, then tail rows.
-        let raws = self.live_raw_quads().await?;
-        Self::from_raw_quads(&raws, self.layout.strategy(), vec![], false)
-    }
-
     /// Compact the store, keeping its current index set: fold the appended
     /// tail into the base, reclaim tombstoned rows, re-sort by (s, p, o, g),
     /// and rebuild the indexes the store already carries.
@@ -337,44 +292,85 @@ impl VortexRdfStore {
     /// See [`compact_with_indexes`] for the mechanics and for choosing a
     /// different index set. `add_quads` calls this automatically when the tail
     /// outgrows the auto-compaction thresholds (in-memory bases only); calling
-    /// it explicitly is how a file-backed store's tail is folded — note that
-    /// this converts the store into an in-memory one.
+    /// it explicitly is how a file-backed store's tail is folded — the compacted
+    /// rows are rewritten back over the store's own file (atomically) and it
+    /// stays file-backed.
     ///
     /// [`compact_with_indexes`]: Self::compact_with_indexes
     pub async fn compact(&self) -> Result<Self> {
         self.compact_with_indexes(self.indexes.clone()).await
     }
 
-    /// Like [`materialize`], but compacts fully: the gathered quads are
-    /// re-sorted by (s, p, o, g) and the given secondary indexes are rebuilt
-    /// over them, instead of every index being dropped.
+    /// Gather this view's live rows into a standalone, owning store, re-sorted
+    /// by (s, p, o, g), with the given secondary indexes rebuilt over them.
     ///
-    /// Materializing renumbers rows to a fresh `0..n`, which is exactly why
-    /// plain [`materialize`] has to drop indexes — their `_idx_*_rid` columns
-    /// addressed the old base. This variant turns that into an opportunity:
-    /// the rows are rebuilt in SPOG order (restoring the subject binary-search
-    /// fast path that gathering forfeits, and folding any appended tail back
-    /// into the base — re-encoded against a fresh term dictionary under the
-    /// Dictionary layout) and the requested indexes are rebuilt over the new
-    /// order. Pass the store's current [`indexes`](Self::indexes) to preserve
-    /// them (or use [`compact`]), an empty set for a sort-only compaction, or
-    /// a different set to re-index.
+    /// Physically gathering the rows renumbers them to a fresh `0..n`, so the
+    /// source's `_idx_*_rid` columns — which addressed the old base — cannot
+    /// carry across. This variant turns that into an opportunity: the rows are
+    /// rebuilt in SPOG order (restoring the subject binary-search fast path that
+    /// a narrowed view forfeits, and folding any appended tail back into the
+    /// base — re-encoded against a fresh term dictionary under the Dictionary
+    /// layout) and the requested indexes are rebuilt over the new order. Pass
+    /// the store's current [`indexes`](Self::indexes) to preserve them (or use
+    /// [`compact`]), an empty set for a sort-only compaction, or a different set
+    /// to re-index.
     ///
     /// This is the store's compaction step: it reclaims tombstoned rows,
     /// absorbs the tail, and restores every sorted-order fast path, at the
     /// cost of an O(n log n) rebuild.
     ///
-    /// [`materialize`]: Self::materialize
+    /// A file-backed store stays file-backed: the compacted rows are written
+    /// back over its own source file (via a temp file and an atomic rename) and
+    /// the store is reopened from it. An in-memory store returns the in-memory
+    /// rebuild directly.
+    ///
     /// [`compact`]: Self::compact
     pub async fn compact_with_indexes(&self, indexes: Indexes) -> Result<Self> {
         let unique = unique_indexes(&indexes);
         let mut raws = self.live_raw_quads().await?;
         raws.sort_unstable();
-        Self::from_raw_quads(&raws, self.layout.strategy(), unique, true)
+        let compacted = Self::from_raw_quads(&raws, self.layout.strategy(), unique, true)?;
+        // A file-backed store stays file-backed: rewrite the compacted rows
+        // over their own source file and reopen it, rather than returning the
+        // in-memory rebuild.
+        #[cfg(feature = "file-io")]
+        if let QuadsSource::File { path, .. } = &self.quads {
+            return compacted.write_back_to_file(path).await;
+        }
+        Ok(compacted)
+    }
+
+    /// Persist this freshly-compacted, in-memory store over `path` and reopen
+    /// it, so a file-backed store stays file-backed after compaction.
+    ///
+    /// The compacted array is written to a temporary sibling file and then
+    /// atomically renamed over `path`. Overwriting the file in place would be
+    /// unsafe while a reader still maps the original, and a crash mid-write must
+    /// never leave the only on-disk copy half-written; the rename makes the swap
+    /// atomic and leaves `path` untouched on any earlier failure.
+    #[cfg(feature = "file-io")]
+    async fn write_back_to_file(&self, path: &std::path::Path) -> Result<Self> {
+        let array = self.to_serializable_array().await?;
+        // A sibling temp file keeps the rename on one filesystem (so it is
+        // atomic); the uuid suffix avoids colliding with a temp left behind by
+        // an earlier interrupted compaction.
+        let tmp = path.with_extension(format!("compact-{}.tmp", uuid::Uuid::new_v4()));
+        let writer = tokio::fs::File::create(&tmp).await.map_err(|e| {
+            VortexRdfError::Serialization(format!("failed to create {}: {e}", tmp.display()))
+        })?;
+        if let Err(e) = crate::io::ser::serialize(array, writer).await {
+            // Don't leave a partial temp file behind on a write failure.
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+        tokio::fs::rename(&tmp, path).await.map_err(|e| {
+            VortexRdfError::Serialization(format!("failed to replace {}: {e}", path.display()))
+        })?;
+        Self::from_file(path).await
     }
 
     /// Build a fresh owning in-memory store from raw quads under `strategy` —
-    /// the shared back half of materializing.
+    /// the shared back half of compaction.
     ///
     /// The Dictionary layout re-derives its term dictionary from the quads
     /// (they may hold appended terms the old dictionary has no code for); the
@@ -417,6 +413,7 @@ impl VortexRdfStore {
                 base,
                 selection: RowSelection::All,
                 deleted: None,
+                serve: None,
             },
             tail: None,
         })
@@ -455,34 +452,35 @@ impl VortexRdfStore {
     ///
     /// The tail is the store's only unindexed, unsorted region, so this is the
     /// number to watch when tuning compaction: `add_quads` folds it back into
-    /// the base automatically for in-memory bases, but a file-backed store
-    /// keeps growing its tail until [`compact`](Self::compact) is called
-    /// explicitly.
+    /// the base automatically once it crosses the thresholds — rewriting the
+    /// source file for a file-backed store — and [`compact`](Self::compact)
+    /// folds it on demand.
     pub fn tail_len(&self) -> usize {
         self.tail.as_ref().map_or(0, |tail| tail.rows.len())
     }
 
     /// Whether `add_quads` should fold the tail into the base now.
     ///
-    /// Only in-memory bases auto-compact: compacting a file-backed store pulls
-    /// the whole file into memory — a change of backend and memory footprint
-    /// too consequential to trigger implicitly from an append. File-backed
-    /// stores compact only through an explicit [`compact`](Self::compact).
+    /// Both in-memory and file-backed bases auto-compact once the tail crosses
+    /// the compaction thresholds. For a file-backed store this rewrites its
+    /// source file in place (see [`compact`](Self::compact)) and keeps it
+    /// file-backed — an append past the threshold performs a disk write.
     fn should_auto_compact(&self) -> bool {
-        match (&self.quads, &self.tail) {
-            (QuadsSource::InMemory { base, .. }, Some(tail)) => {
-                tail_needs_compaction(base.len(), tail.rows.len())
-            }
-            _ => false,
-        }
+        let (base_rows, tail) = match (&self.quads, &self.tail) {
+            (QuadsSource::InMemory { base, .. }, Some(tail)) => (base.len(), tail),
+            #[cfg(feature = "file-io")]
+            (QuadsSource::File { file, .. }, Some(tail)) => (file.row_count() as usize, tail),
+            _ => return false,
+        };
+        tail_needs_compaction(base_rows, tail.rows.len())
     }
 
     /// This store as one that owns its rows and can be mutated — cheaply when it
-    /// already is an owner, otherwise an independent materialized copy.
+    /// already is an owner, otherwise an independent, compacted copy.
     ///
     /// A view derived from `match_pattern` shares a base it does not own, so it
     /// cannot be mutated in place. This turns such a view into an owner by
-    /// materializing, rebuilding its declared indexes
+    /// compacting, rebuilding its declared indexes
     /// ([`compact_with_indexes`]) so mutating a match result yields an
     /// independent store that is still indexed rather than one degraded to full
     /// scans. An owner is returned as a cheap clone, preserving its tombstones
@@ -531,7 +529,7 @@ impl VortexRdfStore {
         Err(VortexRdfError::Serialization(format!(
             "{operation} is not supported on a store derived from match_pattern: its rows are a \
              view onto a larger base, so mutating it would either silently drop the rows outside \
-             the view or write through to data it does not own. Call materialize() for an \
+             the view or write through to data it does not own. Call owned() for an \
              independent copy to mutate, or call the mutation on the store the view came from."
         )))
     }
@@ -577,10 +575,10 @@ impl VortexRdfStore {
             // In-memory patterns resolve to exact row ids at match time, so the
             // selection alone knows the answer — no rows are touched. Deletions
             // are only counted out, never gathered.
-            QuadsSource::InMemory { base, selection, deleted: None } => {
+            QuadsSource::InMemory { base, selection, deleted: None, .. } => {
                 selection.len(base.len())
             }
-            QuadsSource::InMemory { base, selection, deleted: Some(deleted) } => {
+            QuadsSource::InMemory { base, selection, deleted: Some(deleted), .. } => {
                 selection.live_mask(deleted, base.len()).true_count()
             }
             #[cfg(feature = "file-io")]
@@ -815,10 +813,11 @@ impl VortexRdfStore {
                 base,
                 selection: RowSelection::All,
                 deleted: None,
+                ..
             } => Ok(base.clone()),
             // Anything narrower: gather the live selected rows, dropping index
             // columns whose ids no longer address them.
-            QuadsSource::InMemory { base, selection, deleted } => {
+            QuadsSource::InMemory { base, selection, deleted, .. } => {
                 strip_index_columns(gather_live(base, selection, deleted.as_ref())?)
             }
             #[cfg(feature = "file-io")]
@@ -886,37 +885,40 @@ impl VortexRdfStore {
             )?),
         };
         match &self.quads {
-            QuadsSource::InMemory { base, selection, deleted } => {
-                // The data is already in memory: gather the live selected rows
-                // and decode them up front, then hand back a simple iterator
-                // wrapped as a stream.
-                let mut quads =
-                    layout.decode_chunk(&gather_live(base, selection, deleted.as_ref())?);
+            QuadsSource::InMemory { base, selection, deleted, serve } => {
+                // The data is already in memory. Decode the base rows up front,
+                // then hand back a simple iterator wrapped as a stream.
+                let mut quads = match serve {
+                    // A served view reads the matched quads straight from the
+                    // copy family's contiguous run in `base` (a plain slice),
+                    // instead of gathering the primary columns at scattered row
+                    // ids; tombstones are applied through the rid column.
+                    Some(serve) => serve.decode_in_memory(base, deleted.as_ref()),
+                    None => layout.decode_chunk(&gather_live(base, selection, deleted.as_ref())?),
+                };
                 quads.extend(tail_quads);
                 Ok(Box::new(stream::iter(quads)))
             }
             #[cfg(feature = "file-io")]
-            QuadsSource::File { file, filter, selection, deleted, copy_scan } => {
-                // A copy-served view streams from the matched family's own
-                // columns instead: the family's sort order clusters the
-                // matching rows into a contiguous run of zones, so the scan
-                // prunes to those rather than scattering row-id reads across
-                // the whole file. The plan's filter selects exactly the rows
-                // this view's selection names (see `CopyScan`); tombstones are
-                // applied through the family's rid column.
-                if let Some(copy_scan) = copy_scan {
-                    let family = copy_scan.family;
-                    let copy_layout = self.copy_layout();
+            QuadsSource::File { file, filter, selection, deleted, serve, path: _ } => {
+                // A served view streams from the answering index's own columns
+                // instead: the index clusters the matching rows into a
+                // contiguous run of zones, so the scan prunes to those rather
+                // than scattering row-id reads across the whole file. The plan's
+                // filter selects exactly the rows this view's selection names
+                // (see `ServePlan`); tombstones are applied through its rid
+                // column. The store executes the plan without knowing which
+                // index produced it.
+                if let Some(serve) = serve {
+                    let serve = serve.clone();
                     let deleted = deleted.clone();
                     let scan = file
                         .scan()
                         .map_err(VortexRdfError::Vortex)?
-                        .with_projection(select(family.column_names(), root()))
-                        .with_filter(copy_scan.filter.clone());
+                        .with_projection(select(serve.projection(), root()))
+                        .with_filter(serve.filter());
                     let stream = scan
-                        .map(move |chunk| {
-                            Ok(decode_copy_chunk(&chunk, family, &copy_layout, deleted.as_ref()))
-                        })
+                        .map(move |chunk| Ok(serve.decode_columns(&chunk, deleted.as_ref())))
                         .into_stream()
                         .map_err(VortexRdfError::Vortex)?;
                     let quad_stream = stream
@@ -1045,7 +1047,7 @@ impl VortexRdfStore {
             // without the result ever showing them. Keeping them out also keeps
             // the mask scan's positions aligned with `selection.apply`, which is
             // what `refine` maps back through.
-            QuadsSource::InMemory { base, selection, deleted: _ } => {
+            QuadsSource::InMemory { base, selection, deleted, .. } => {
                 // A pattern the layout can prove unmatchable (e.g. a term
                 // absent from the dictionary) needs no search at all.
                 if matches!(
@@ -1066,10 +1068,18 @@ impl VortexRdfStore {
                     .execute::<StructArray>(&mut ctx)
                     .map_err(VortexRdfError::Vortex)?;
 
+                // A serving index's plan reads exactly a contiguous row run, so
+                // it is only valid when that run *is* the whole result: the view
+                // must start unrestricted and nothing but the serving index's
+                // own resolution may narrow it (no subject range, no mask scan).
+                let unrefined = matches!(selection, RowSelection::All);
+                let mut narrowed_elsewhere = false;
+
                 let mut selection = selection.clone();
                 // The components still to be resolved. Each fast path below
                 // clears the one it answers, since its ids already satisfy it.
                 let (mut s, mut p, mut o, mut g) = (subject, predicate, object, graph);
+                let mut serve: Option<ServePlan> = None;
 
                 // ── Subject binary search on sorted s column ──────────────
                 // If a subject is bound and the base's primary `s` column is
@@ -1087,6 +1097,7 @@ impl VortexRdfStore {
                     let (lo, hi) = search_sorted_bounds(s_col, &scalar)?;
                     selection = selection.intersect_range(lo as u64..hi as u64);
                     s = None;
+                    narrowed_elsewhere = true;
                     log::debug!("[match_pattern] s binary search {:?}", t.elapsed());
                 }
 
@@ -1108,9 +1119,13 @@ impl VortexRdfStore {
                     )? {
                         // The probed term is absent from the data — nothing matches.
                         IndexResolution::Empty => return Ok(self.empty_view()),
-                        IndexResolution::Resolved { row_ids, resolves } => {
+                        // Fold the exact ids into the selection, and hold onto any
+                        // serving plan the index handed back to decide below
+                        // whether it still describes exactly the result.
+                        IndexResolution::Resolved { row_ids, resolves, serve: candidate } => {
                             selection = selection.intersect_ids(row_ids);
                             (s, p, o, g) = resolves.clear(s, p, o, g);
+                            serve = candidate;
                             log::debug!("[match_pattern] index (sorted search) {:?}", t.elapsed());
                         }
                         // No index accelerates this pattern: whatever is still
@@ -1129,14 +1144,31 @@ impl VortexRdfStore {
                         Self::mask_for(&self.layout, &selection.apply(base)?, s, p, o, g)?
                 {
                     selection = selection.refine(&bool_array_to_mask(mask)?);
+                    narrowed_elsewhere = true;
                     log::debug!("[match_pattern] mask scan {:?}", t.elapsed());
                 }
 
-                Ok(self.with_selection(selection))
+                // Keep the serving plan only if the serving index's resolution
+                // is the sole thing that narrowed this view — otherwise its
+                // contiguous run over-covers the actual selection.
+                let serve = if unrefined && !narrowed_elsewhere { serve } else { None };
+
+                Ok(Self {
+                    layout: self.layout.clone(),
+                    indexes: self.indexes.clone(),
+                    quads: QuadsSource::InMemory {
+                        base: base.clone(),
+                        selection,
+                        deleted: deleted.clone(),
+                        serve,
+                    },
+                    tail: self.tail.clone(),
+                })
             }
 
             #[cfg(feature = "file-io")]
             QuadsSource::File {
+                path,
                 file,
                 filter: existing_filter,
                 selection: existing_selection,
@@ -1157,7 +1189,7 @@ impl VortexRdfStore {
                 // resolved component is then left out of the pushed-down filter:
                 // the row ids already are exactly its matches, so re-filtering
                 // them would only re-read and re-compare that column.
-                let (resolution, resolved_by) = resolve_indexes_file(
+                let resolution = resolve_indexes_file(
                     &self.indexes,
                     file,
                     &self.layout,
@@ -1167,26 +1199,26 @@ impl VortexRdfStore {
                     graph,
                 )
                 .await?;
-                let (next_filter, index_ids, copy_scan) = match resolution {
+                let (next_filter, index_ids, serve) = match resolution {
                     // The probed term is absent — nothing can match. Short-
                     // circuit to the empty view (an empty id set would just
                     // intersect every other restriction down to nothing anyway).
                     IndexResolution::Empty => return Ok(self.empty_view()),
                     // An index resolved one component: push down a filter for
                     // the rest of the pattern only, alongside its exact row ids.
-                    IndexResolution::Resolved { row_ids, resolves } => {
+                    IndexResolution::Resolved { row_ids, resolves, serve } => {
                         let (s, p, o, g) = resolves.clear(subject, predicate, object, graph);
-                        // When the copy index answered and this match is the
-                        // view's only restriction, the matched rows can also be
-                        // *served* from the copy family — its sort order holds
-                        // them contiguously — instead of being scattered reads
-                        // over the primary columns (see `CopyScan`).
-                        let copy_scan = (resolved_by == Some(IndexType::SecondaryByCopy)
-                            && existing_filter.is_none()
+                        // If the index handed back a serving plan, keep it only
+                        // when this match is the view's sole restriction: the
+                        // plan's filter selects exactly the matched rows over the
+                        // index's own columns, which no longer equals the
+                        // selection once an earlier filter or narrowing also
+                        // applies (see `ServePlan`).
+                        let serve = (existing_filter.is_none()
                             && matches!(existing_selection, RowSelection::All))
-                        .then(|| self.build_copy_scan(subject, predicate, object, graph))
+                        .then_some(serve)
                         .flatten();
-                        (self.build_file_filter(s, p, o, g), Some(row_ids), copy_scan)
+                        (self.build_file_filter(s, p, o, g), Some(row_ids), serve)
                     }
                     // No index applies: the whole pattern becomes the pushed-down filter.
                     IndexResolution::Declined => {
@@ -1233,6 +1265,7 @@ impl VortexRdfStore {
                     layout: self.layout.clone(),
                     indexes: self.indexes.clone(),
                     quads: QuadsSource::File {
+                        path: path.clone(),
                         file: file.clone(),
                         filter,
                         selection,
@@ -1240,7 +1273,7 @@ impl VortexRdfStore {
                         // pattern, so they carry across the match unchanged; the
                         // read paths apply them (see `restrict_scan`).
                         deleted: existing_deleted.clone(),
-                        copy_scan,
+                        serve,
                     },
                     tail: self.tail.clone(),
                 })
@@ -1309,58 +1342,6 @@ impl VortexRdfStore {
             });
         }
         Ok(mask)
-    }
-
-    /// The copy-family plan serving exactly the rows of the given pattern, or
-    /// `None` when the pattern isn't copy-servable (no family covers its
-    /// shape, or a bound residual term has no dictionary code — a case the
-    /// caller has already short-circuited to an empty view).
-    ///
-    /// The copy columns hold each component as one full term (a string, or a
-    /// dictionary code), so every bound component — including a TypedObject
-    /// store's object — probes as a single term equality on the family's
-    /// column. The subject never appears here: the copy index declines
-    /// subject-bound patterns, so a resolved pattern has no bound subject.
-    #[cfg(feature = "file-io")]
-    fn build_copy_scan(
-        &self,
-        subject: Option<&NamedOrBlankNode>,
-        predicate: Option<&NamedNode>,
-        object: Option<&Term>,
-        graph: Option<&GraphName>,
-    ) -> Option<CopyScan> {
-        let family = secondary_by_copy::family_for(subject, predicate, object)?;
-        let bound = [
-            (family.p_col(), predicate.map(|p| p.to_string())),
-            (family.o_col(), object.map(|o| o.to_string())),
-            (family.g_col(), graph.map(graph_name_str)),
-        ];
-        let mut filter: Option<Expression> = None;
-        for (column, term) in bound {
-            let Some(term) = term else { continue };
-            let scalar = self.layout.probe_scalar(&term)?;
-            let expr = eq(get_item(column, root()), lit(scalar));
-            filter = Some(match filter.take() {
-                Some(f) => and(f, expr),
-                None => expr,
-            });
-        }
-        Some(CopyScan {
-            family,
-            filter: filter?,
-        })
-    }
-
-    /// The layout a copy family's rows decode through: the copies always store
-    /// each component as one term — u32 codes under the Dictionary layout,
-    /// N-Triples strings otherwise (a TypedObject store's copies hold the
-    /// object as its full term string, so they decode as Default).
-    #[cfg(feature = "file-io")]
-    fn copy_layout(&self) -> ResolvedLayout {
-        match &self.layout {
-            ResolvedLayout::Dictionary(dict) => ResolvedLayout::Dictionary(dict.clone()),
-            _ => ResolvedLayout::Default,
-        }
     }
 
     /// Convert an RDF pattern (subject, predicate, object, graph) into a Vortex filter expression
@@ -1470,12 +1451,15 @@ impl VortexRdfStore {
         })
     }
 
-    /// Test-only hook: whether this view plans to serve `quads()` from a
-    /// `SecondaryByCopy` family, so tests can assert the plan actually
-    /// attaches (and drops) where intended instead of only observing results.
+    /// Test-only hook: whether this view carries an index serving plan for
+    /// `quads()`, so tests can assert the plan actually attaches (and drops)
+    /// where intended instead of only observing results.
     #[cfg(all(test, feature = "file-io"))]
-    pub(crate) fn debug_has_copy_scan(&self) -> bool {
-        matches!(&self.quads, QuadsSource::File { copy_scan: Some(_), .. })
+    pub(crate) fn debug_has_serve_plan(&self) -> bool {
+        match &self.quads {
+            QuadsSource::InMemory { serve, .. } => serve.is_some(),
+            QuadsSource::File { serve, .. } => serve.is_some(),
+        }
     }
 
     /// Test-only hook exposing the zone-map row-range envelope computed for a
@@ -1554,10 +1538,10 @@ impl VortexRdfStore {
     /// base (with a floor so small stores don't thrash) or a builder chunk's
     /// worth of rows, whichever comes first — the add that crossed the line
     /// finishes by folding the tail into the base ([`compact`]): occasional
-    /// O(n log n) work, amortized constant per appended row. Only in-memory
-    /// bases do this; a file-backed store never implicitly converts itself
-    /// into an in-memory one, so its tail grows until [`compact`] is called
-    /// explicitly (watch [`tail_len`](Self::tail_len)).
+    /// O(n log n) work, amortized constant per appended row. A file-backed
+    /// store does this too, rewriting its source file in place and staying
+    /// file-backed — so an append past the threshold performs a disk write
+    /// (watch [`tail_len`](Self::tail_len)).
     ///
     /// [`compact`]: Self::compact
     pub async fn add_quads(&self, quads: impl IntoIterator<Item = Quad>) -> Result<Self> {
@@ -1646,14 +1630,14 @@ impl VortexRdfStore {
     /// The matched rows are tombstoned rather than rewritten away, so this
     /// costs a mask, not a copy of the surviving data, and the base's row ids —
     /// and with them any secondary index — stay valid across the delete.
-    /// Tombstoned rows are only reclaimed by [`materialize`], which is also how
+    /// Tombstoned rows are only reclaimed by [`compact`], which is also how
     /// a store that has accumulated many deletes is compacted.
     ///
     /// Only a store that owns its rows can be mutated; call it on the store a
-    /// view came from, or on `view.materialize()`.
+    /// view came from, or on `view.owned()`.
     ///
     /// [`match_pattern`]: Self::match_pattern
-    /// [`materialize`]: Self::materialize
+    /// [`compact`]: Self::compact
     pub async fn delete_matching(
         &self,
         subject: Option<&NamedOrBlankNode>,
@@ -1693,7 +1677,7 @@ impl VortexRdfStore {
         #[cfg_attr(not(feature = "file-io"), allow(unreachable_patterns))]
         match (&self.quads, &doomed.quads) {
             (
-                QuadsSource::InMemory { base, selection, deleted },
+                QuadsSource::InMemory { base, selection, deleted, .. },
                 QuadsSource::InMemory { selection: doomed, .. },
             ) => {
                 // In memory the matched view's selection is already exact row
@@ -1706,13 +1690,14 @@ impl VortexRdfStore {
                         base: base.clone(),
                         selection: selection.clone(),
                         deleted: Some(union_deleted(deleted.as_ref(), doomed)),
+                        serve: None,
                     },
                     tail,
                 })
             }
             #[cfg(feature = "file-io")]
             (
-                QuadsSource::File { file, selection, deleted, .. },
+                QuadsSource::File { path, file, selection, deleted, .. },
                 QuadsSource::File { .. },
             ) => {
                 // A file view may still carry an unresolved filter, so the
@@ -1723,13 +1708,14 @@ impl VortexRdfStore {
                     layout: self.layout.clone(),
                     indexes: self.indexes.clone(),
                     quads: QuadsSource::File {
+                        path: path.clone(),
                         file: file.clone(),
                         // An owner has no pending filter, and deleting doesn't
                         // introduce one — it only widens the tombstones.
                         filter: None,
                         selection: selection.clone(),
                         deleted: Some(union_deleted(deleted.as_ref(), doomed)),
-                        copy_scan: None,
+                        serve: None,
                     },
                     tail,
                 })
@@ -1769,79 +1755,6 @@ fn union_deleted(existing: Option<&Mask>, doomed: Mask) -> Mask {
         Some(existing) => existing | &doomed,
         None => doomed,
     }
-}
-
-/// Decode one copy-served scan chunk into quads: the family's columns are
-/// re-labeled as primary (s, p, o, g) columns, tombstoned rows are dropped via
-/// the family's rid column, and the result decodes through `layout` (the
-/// store's copy encoding — Default strings, or Dictionary codes).
-#[cfg(feature = "file-io")]
-fn decode_copy_chunk(
-    chunk: &ArrayRef,
-    family: secondary_by_copy::Family,
-    layout: &crate::store::layouts::ResolvedLayout,
-    deleted: Option<&Mask>,
-) -> Vec<Result<Quad>> {
-    match copy_chunk_rows(chunk, family, deleted) {
-        Ok(rows) => layout.decode_chunk(&rows),
-        Err(e) => vec![Err(e)],
-    }
-}
-
-/// A copy-served chunk's live rows as a primary-named (s, p, o, g) struct.
-#[cfg(feature = "file-io")]
-fn copy_chunk_rows(
-    chunk: &ArrayRef,
-    family: secondary_by_copy::Family,
-    deleted: Option<&Mask>,
-) -> Result<ArrayRef> {
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
-    let struct_arr = chunk
-        .clone()
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let col = |name: &'static str| {
-        struct_arr
-            .unmasked_field_by_name(name)
-            .cloned()
-            .map_err(VortexRdfError::Vortex)
-    };
-    let len = struct_arr.len();
-    let rows = StructArray::try_new(
-        FieldNames::from(["s", "p", "o", "g"]),
-        vec![
-            col(family.s_col())?,
-            col(family.p_col())?,
-            col(family.o_col())?,
-            col(family.g_col())?,
-        ],
-        len,
-        Validity::NonNullable,
-    )
-    .map_err(VortexRdfError::Vortex)?
-    .into_array();
-
-    let Some(deleted) = deleted else {
-        return Ok(rows);
-    };
-    // Tombstones are defined over primary row ids; the family's rid column
-    // says which primary row each copy row mirrors.
-    let rid_col = col(family.rid_col())?
-        .execute::<PrimitiveArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let live = Mask::from_indices(
-        len,
-        rid_col
-            .as_slice::<u32>()
-            .iter()
-            .enumerate()
-            .filter(|&(_, &rid)| !deleted.value(rid as usize))
-            .map(|(position, _)| position),
-    );
-    if live.all_true() {
-        return Ok(rows);
-    }
-    rows.filter(live).map_err(VortexRdfError::Vortex)
 }
 
 /// Auto-compaction floor: below this many tail rows, never compact — a small

@@ -20,8 +20,9 @@
 //! and chained matches unchanged. What the full copies add over the reference
 //! index is locality: the rows matching a bound predicate/object are a
 //! *contiguous* run of the copy columns, which file-backed stores exploit by
-//! streaming `quads()` straight from the copy family (see the store's
-//! `CopyScan`) instead of scattering row-id reads across the primary columns.
+//! streaming `quads()` straight from the copy family — this index hands back a
+//! [`ServePlan`](super::ServePlan) during resolution to describe that read —
+//! instead of scattering row-id reads across the primary columns.
 //!
 //! The copies come in two encodings — term strings (Default and TypedObject
 //! layouts, the object as its full N-Triples term string), or u32 dictionary
@@ -54,6 +55,9 @@ use crate::store::{QuadCodes, RawQuad};
 use crate::store::layouts::ResolvedLayout;
 use super::{sorted_row_ids, IndexResolution, IndexedComponent};
 
+use super::ServePlan;
+#[cfg(feature = "file-io")]
+use crate::common::utils::graph_name_str;
 #[cfg(feature = "file-io")]
 use vortex_array::scalar::Scalar;
 #[cfg(feature = "file-io")]
@@ -112,6 +116,12 @@ impl Family {
     /// rid).
     pub(crate) fn column_names(self) -> [&'static str; 5] {
         [self.s_col(), self.p_col(), self.o_col(), self.g_col(), self.rid_col()]
+    }
+
+    /// This family's four quad-component columns, in primary `(s, p, o, g)`
+    /// order — the columns a serve reads and relabels as the primaries.
+    fn primary_columns(self) -> [&'static str; 4] {
+        [self.s_col(), self.p_col(), self.o_col(), self.g_col()]
     }
 
     /// The column holding this family's leading sort key — the one binary
@@ -234,18 +244,6 @@ fn choose(
     }
 }
 
-/// The copy family this index would serve a pattern shape from, or `None` when
-/// it declines the shape — exposed so the store can plan copy-served reads
-/// against the same decision the resolvers make.
-#[cfg(feature = "file-io")]
-pub(crate) fn family_for(
-    subject: Option<&NamedOrBlankNode>,
-    predicate: Option<&NamedNode>,
-    object: Option<&Term>,
-) -> Option<Family> {
-    choose(subject, predicate, object).map(|probe| probe.family)
-}
-
 /// Resolve a pattern against this index's copy columns in an in-memory base
 /// array.
 ///
@@ -322,7 +320,27 @@ pub(crate) fn resolve_in_memory(
     Ok(IndexResolution::Resolved {
         row_ids,
         resolves: probe.resolves,
+        // The matched quads are the contiguous `[lo, hi)` run of this family's
+        // copy columns, so a read can slice them straight from the base instead
+        // of gathering the primary columns at the row ids (see `ServePlan`).
+        serve: Some(ServePlan::in_memory(
+            probe.family.primary_columns(),
+            probe.family.rid_col(),
+            copy_decode_layout(layout),
+            lo..hi,
+        )),
     })
+}
+
+/// The layout a copy family's columns decode through: the copies always store
+/// each component as one full term — dictionary codes under the Dictionary
+/// layout, N-Triples strings otherwise, so even a TypedObject store's copies
+/// decode as Default.
+fn copy_decode_layout(layout: &ResolvedLayout) -> ResolvedLayout {
+    match layout {
+        ResolvedLayout::Dictionary(dict) => ResolvedLayout::Dictionary(dict.clone()),
+        _ => ResolvedLayout::Default,
+    }
 }
 
 /// Resolve a pattern against this index's copy columns in a file-backed store
@@ -336,7 +354,7 @@ pub(crate) async fn resolve_file(
     subject: Option<&NamedOrBlankNode>,
     predicate: Option<&NamedNode>,
     object: Option<&Term>,
-    _graph: Option<&GraphName>,
+    graph: Option<&GraphName>,
 ) -> Result<IndexResolution> {
     let Some(probe) = choose(subject, predicate, object) else {
         return Ok(IndexResolution::Declined);
@@ -360,7 +378,46 @@ pub(crate) async fn resolve_file(
     Ok(IndexResolution::Resolved {
         row_ids,
         resolves: probe.resolves,
+        // The copies hold the whole quad in family order, so the matched rows
+        // are a contiguous run the store can stream directly (see `ServePlan`).
+        serve: build_serve_plan(probe.family, layout, predicate, object, graph),
     })
+}
+
+/// Build the [`ServePlan`] letting the store stream a resolved pattern's quads
+/// from this index's own copy columns, or `None` when a bound residual term has
+/// no dictionary code (the pattern matches nothing — a case `match_pattern`
+/// already short-circuits before resolving, so this is only a safety fallback
+/// to the row-id path).
+///
+/// Every bound non-subject component (predicate, object, graph) becomes a term
+/// equality on the family's matching column: the copies store each component as
+/// one full term, so — unlike the primary layout's split TypedObject columns —
+/// even the object probes as a single equality. The copy index declines
+/// subject-bound patterns, so the subject never appears here.
+#[cfg(feature = "file-io")]
+fn build_serve_plan(
+    family: Family,
+    layout: &ResolvedLayout,
+    predicate: Option<&NamedNode>,
+    object: Option<&Term>,
+    graph: Option<&GraphName>,
+) -> Option<ServePlan> {
+    let mut constraints: Vec<(&'static str, Scalar)> = Vec::new();
+    for (column, term) in [
+        (family.p_col(), predicate.map(|p| p.to_string())),
+        (family.o_col(), object.map(|o| o.to_string())),
+        (family.g_col(), graph.map(graph_name_str)),
+    ] {
+        let Some(term) = term else { continue };
+        constraints.push((column, layout.probe_scalar(&term)?));
+    }
+    Some(ServePlan::file(
+        family.primary_columns(),
+        family.rid_col(),
+        copy_decode_layout(layout),
+        constraints,
+    ))
 }
 
 // ── build side ───────────────────────────────────────────────────────────────
