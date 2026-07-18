@@ -118,7 +118,7 @@ Compared to `SecondaryByReference`, this costs roughly 2× the primary columns i
 
 | Builder | Memory model | Sorting | Disk spill | Result |
 |---|---|---|---|---|
-| **`UnsortedStream`** (default) | Streaming / bounded by chunk size | None (insertion order) | Only for the Dictionary layout* | Chunks of ≤500K quads |
+| **`UnsortedStream`** (default) | Streaming / bounded by chunk size | None (insertion order) | Only for the Dictionary layout* | Chunks of ≤100K quads |
 | **`SortedInMemory`** | Full dataset in memory | Global `S → P → O → G` | No | Globally sorted array + globally sorted index columns |
 | **`SortedStream`** | Out-of-core, bounded by chunk size | Global `S → P → O → G` | Yes | Globally sorted chunks + globally sorted index columns |
 
@@ -399,6 +399,7 @@ Vortex-RDF features a benchmark suite built on top of [Divan](https://github.com
 The consolidated **`benchmark`** target evaluates the full supported matrix of:
 * Builder strategies: `SortedInMemory`, `SortedStream`, `UnsortedStream`
 * Layout strategies: `Default`, `TypedObject`, `Dictionary`
+* Secondary indexes: none, `SecondaryByReference`, `SecondaryByCopy`
 * Workloads: serialization and file-backed `match_pattern` queries (`s`, `p`, `o`, `g`)
 
 ### Running Benchmarks Locally

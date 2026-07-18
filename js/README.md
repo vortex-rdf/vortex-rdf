@@ -57,6 +57,14 @@ for (const quad of iterator) {
 `match` returns another `VortexStore`, so matches compose and can themselves be
 counted, iterated, or serialized.
 
+Test membership of a single quad with `has` (an exact four-component lookup):
+
+```javascript
+if (await store.has(myQuad)) {
+  console.log('present');
+}
+```
+
 ### Manipulation
 
 ```javascript
