@@ -24,9 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Setup Rust toolchain
-        uses: moonrepo/setup-rust@v1
-        with:
-          channel: stable
+        uses: dtolnay/rust-toolchain@stable
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
       - name: Run Rust tests
@@ -43,9 +41,22 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: js/package-lock.json
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: js
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
       - name: Install dependencies
         working-directory: js
         run: npm ci
+      - name: Build WASM package (dev)
+        working-directory: js
+        run: wasm-pack build --target nodejs --out-dir pkg --dev
       - name: Run tests
         working-directory: js
         run: npm test
