@@ -9,9 +9,9 @@ on:
   # performance analysis in order to generate initial data.
   workflow_dispatch:
 
-permissions: # optional for public repositories
- contents: read # required for actions/checkout
- id-token: write # required for OIDC authentication with CodSpeed
+# permissions: # optional for public repositories
+#  contents: read # required for actions/checkout
+#  id-token: write # required for OIDC authentication with CodSpeed
   
 jobs:
   benchmarks:
