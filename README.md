@@ -1,6 +1,6 @@
 # Vortex-RDF
-[![CodSpeed Badge](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://codspeed.io/julianrojas87/vortex-rdf?utm_source=badge)
-[![CI](https://github.com/julianrojas87/vortex-rdf/actions/workflows/ci.yml/badge.svg)](https://github.com/julianrojas87/vortex-rdf/actions/workflows/ci.yml)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/vortex-rdf/vortex-rdf?utm_source=badge)
+[![CI](https://github.com/vortex-rdf/vortex-rdf/actions/workflows/ci.yml/badge.svg)](https://github.com/vortex-rdf/vortex-rdf/actions/workflows/ci.yml)
 
 Vortex-RDF is a columnar RDF serialization built on top of the [Vortex](https://docs.vortex.dev) data format. It combines the flexible graph-based model of RDF with the efficiency of modern columnar data formats. Its main goal is to **provide a compact, zero-copy and high-performance serialization format for exchanging and read/write RDF data**.
 
