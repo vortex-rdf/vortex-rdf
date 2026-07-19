@@ -9,9 +9,9 @@ on:
   # performance analysis in order to generate initial data.
   workflow_dispatch:
 
-permissions: # optional for public repositories
-  contents: read # required for actions/checkout
-  id-token: write # required for OIDC authentication with CodSpeed
+#permissions: # optional for public repositories
+#  contents: read # required for actions/checkout
+#  id-token: write # required for OIDC authentication with CodSpeed
   
 jobs:
   benchmarks:
@@ -34,6 +34,7 @@ jobs:
         uses: CodSpeedHQ/action@v4
         with:
           mode: simulation
+          token: ${{ secrets.CODSPEED_TOKEN }}
           # run only match_pattern benchmarks for sorted_stream builder with 1M quads and single patterns (S, P, O, G)
           run: cargo codspeed run --bench benchmark "match_pattern_sorted_stream.*1000000.*\\{(S|P|O|G)\\}"
         env:
