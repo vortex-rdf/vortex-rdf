@@ -370,6 +370,12 @@ def main():
 
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--measured-runs", type=int, default=5)
+    parser.add_argument(
+        "--skip-after-warmup-timeout",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip measured runs when the warmup times out (default: enabled)",
+    )
 
     # New argument:
     # Per-query timeout in seconds.
@@ -469,6 +475,7 @@ def main():
             graph = graphs.get(engine)
 
             total_runs = args.warmup_runs + args.measured_runs
+            skip_remaining_reason = None
 
             for run_idx in range(total_runs):
                 phase = "warmup" if run_idx < args.warmup_runs else "measured"
@@ -496,6 +503,16 @@ def main():
                     "rss_delta_mb": None,
                     "error": None,
                 }
+
+                if skip_remaining_reason is not None:
+                    row["status"] = "skipped"
+                    row["error"] = skip_remaining_reason
+                    results.append(row)
+                    print(
+                        f"  {engine:13s} {phase:8s} run={row['run']} "
+                        f"status=skipped time=None rows=None"
+                    )
+                    continue
 
                 try:
                     if args.timeout_mode == "process":
@@ -527,12 +544,17 @@ def main():
                     row["result_count"] = None
                     row["error"] = str(e)
 
-                    # Try to record memory after timeout as well.
-                    try:
-                        mem_after = process.memory_info().rss
-                        row["rss_after_mb"] = mem_after / (1024 * 1024)
-                    except Exception:
-                        pass
+                    # Parent RSS is meaningful only for in-process signal mode.
+                    if args.timeout_mode == "signal":
+                        try:
+                            mem_after = _process.memory_info().rss
+                            row["rss_after_mb"] = mem_after / (1024 * 1024)
+                        except Exception:
+                            pass
+                    if phase == "warmup" and args.skip_after_warmup_timeout:
+                        skip_remaining_reason = (
+                            f"Skipped because warmup timed out after {args.query_timeout_s}s"
+                        )
 
                 except Exception as e:
                     row["status"] = "error"
