@@ -13,39 +13,39 @@ description = "Modern and high-performance columnar RDF serialization format"
 
 [workspace.dependencies]
 vortex-rdf-core = { path = "core" }
-vortex = { version = "0.78.0", default-features = false }
-vortex-array = { version = "0.78.0" }
-vortex-error = "0.78.0"
-vortex-ipc = "0.78.0"
-vortex-io = "0.78.0"
-vortex-session = "0.78.0"
-vortex-fsst = "0.78.0"
-vortex-mask = "0.78.0"
-vortex-file = { version = "0.78.0", features = ["tokio"] }
-vortex-scan = "0.78.0"
-vortex-layout = "0.78.0"
-async-trait = "0.1.64"
-vortex-btrblocks = "0.78.0"
-vortex-buffer = "0.78.0"
+vortex = { version = "0.79.0", default-features = false }
+vortex-array = { version = "0.79.0" }
+vortex-error = "0.79.0"
+vortex-ipc = "0.79.0"
+vortex-io = "0.79.0"
+vortex-session = "0.79.0"
+vortex-fsst = "0.79.0"
+vortex-mask = "0.79.0"
+vortex-file = { version = "0.79.0", features = ["tokio"] }
+vortex-scan = "0.79.0"
+vortex-layout = "0.79.0"
+async-trait = "0.1.91"
+vortex-btrblocks = "0.79.0"
+vortex-buffer = "0.79.0"
 
-tokio = { version = "1.52", features = ["sync", "macros", "rt"] }
-futures = "0.3.32"
+tokio = { version = "1.53", features = ["sync", "macros", "rt"] }
+futures = "0.3.33"
 
 oxrdf = "0.3.3"
 oxrdfio = "0.2.5"
 itertools = "0.15.0"
-thiserror = "2.0"
-anyhow = "1.0.103"
+thiserror = "2.0.19"
+anyhow = "1.0.104"
 
-clap = { version = "4.6", features = ["derive"] }
+clap = { version = "4.6.3", features = ["derive"] }
 wasm-bindgen = "0.2.126"
 js-sys = "0.3.103"
 console_error_panic_hook = "0.1.7"
 getrandom = "0.4.3"
 mimalloc = "0.1.52"
 
-serde = { version = "1", features = ["derive"] }
-serde_json = "1.0.150"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 
 pyo3 = "0.29.0"
 
