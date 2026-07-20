@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Optional
 import os
 
-from rdflib.term import Node
+from rdflib.term import BNode, Node, URIRef
 from rdflib.store import Store, NO_STORE, VALID_STORE
 from rdflib.util import from_n3
 
@@ -95,6 +95,13 @@ class VortexStore(Store):
             return
 
         s, p, o = triple_pattern
+
+        # RDFLib can propagate an object binding into subject or predicate
+        # position during joins. That pattern is unsatisfiable, not an error.
+        if s is not None and not isinstance(s, (URIRef, BNode)):
+            return
+        if p is not None and not isinstance(p, URIRef):
+            return
 
         trace = os.environ.get("VORTEX_RDF_TRACE_TRIPLES") == "1"
         n = 0
