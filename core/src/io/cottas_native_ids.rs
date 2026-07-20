@@ -1170,8 +1170,7 @@ impl NativeIndexProvider for BinaryNativeProviders {
                 )?;
                 let candidate_rows = range_rows(&ranges);
                 let candidate_ranges = ranges.len();
-                let use_ranges = candidate_ranges <= predicate_exact_max_ranges()
-                    && candidate_rows <= predicate_exact_max_rows();
+                let use_ranges = predicate_exact_limits().accepts(candidate_ranges, candidate_rows);
                 Ok(Some(NativePredicateAccess {
                     ranges: use_ranges.then_some(ranges),
                     candidate_ranges,
@@ -1184,8 +1183,7 @@ impl NativeIndexProvider for BinaryNativeProviders {
                     lookup_predicate_ranges_from_vortex(&self.data_path, predicate_id).await?;
                 let candidate_rows = range_rows(&ranges);
                 let candidate_ranges = ranges.len();
-                let use_ranges = candidate_ranges <= predicate_exact_max_ranges()
-                    && candidate_rows <= predicate_exact_max_rows();
+                let use_ranges = predicate_exact_limits().accepts(candidate_ranges, candidate_rows);
                 Ok(Some(NativePredicateAccess {
                     ranges: use_ranges.then_some(ranges),
                     candidate_ranges,
@@ -3302,6 +3300,50 @@ async fn lookup_po_directory_entry_from_vortex_v2(
     }))
 }
 
+fn decode_exact_range_payload(
+    payload: &ArrayRef,
+    expected_range_count: usize,
+    expected_candidate_rows: u64,
+    context: &str,
+) -> Result<Vec<Range<u64>>> {
+    if payload.len() != expected_range_count {
+        return Err(VortexRdfError::Deserialization(format!(
+            "{context} returned {} rows; expected {expected_range_count}",
+            payload.len()
+        )));
+    }
+    let starts = extract_projected_u64_column(payload, "row_start")?;
+    let ends = extract_projected_u64_column(payload, "row_end")?;
+    if starts.len() != payload.len() || ends.len() != payload.len() {
+        return Err(VortexRdfError::Deserialization(format!(
+            "{context} returned inconsistent range columns"
+        )));
+    }
+    let mut ranges = Vec::with_capacity(payload.len());
+    let mut previous_end = None;
+    for (start, end) in starts.into_iter().zip(ends) {
+        if start >= end {
+            return Err(VortexRdfError::Deserialization(format!(
+                "{context} contains invalid range {start}..{end}"
+            )));
+        }
+        if previous_end.is_some_and(|value| start < value) {
+            return Err(VortexRdfError::Deserialization(format!(
+                "{context} contains overlapping or unsorted ranges"
+            )));
+        }
+        previous_end = Some(end);
+        ranges.push(start..end);
+    }
+    let actual_rows = range_rows(&ranges);
+    if actual_rows != expected_candidate_rows {
+        return Err(VortexRdfError::Deserialization(format!(
+            "{context} candidate-row mismatch: expected={expected_candidate_rows}, actual={actual_rows}"
+        )));
+    }
+    Ok(ranges)
+}
+
 async fn read_po_v2_payload(
     data_path: &Path,
     entry: NativePoDirectoryEntry,
@@ -3329,41 +3371,15 @@ async fn read_po_v2_payload(
         .read_all()
         .await
         .map_err(VortexRdfError::from)?;
-    if payload.len() != entry.range_count as usize {
-        return Err(VortexRdfError::Deserialization(format!(
-            "PO v2 payload {:?} returned {} rows for expected slice {}..{}",
-            path,
-            payload.len(),
-            entry.range_offset,
-            range_end
-        )));
-    }
-    let starts = extract_projected_u64_column(&payload, "row_start")?;
-    let ends = extract_projected_u64_column(&payload, "row_end")?;
-    if starts.len() != payload.len() || ends.len() != payload.len() {
-        return Err(VortexRdfError::Deserialization(format!(
-            "PO v2 payload {:?} returned inconsistent range columns",
-            path
-        )));
-    }
-    let mut ranges = Vec::with_capacity(payload.len());
-    for (start, end) in starts.into_iter().zip(ends) {
-        if start >= end {
-            return Err(VortexRdfError::Deserialization(format!(
-                "PO v2 payload {:?} contains invalid range {}..{}",
-                path, start, end
-            )));
-        }
-        ranges.push(start..end);
-    }
-    let payload_rows = range_rows(&ranges);
-    if payload_rows != entry.candidate_rows {
-        return Err(VortexRdfError::Deserialization(format!(
-            "PO v2 candidate row mismatch: directory={}, payload={}",
-            entry.candidate_rows, payload_rows
-        )));
-    }
-    Ok(ranges)
+    decode_exact_range_payload(
+        &payload,
+        entry.range_count as usize,
+        entry.candidate_rows,
+        &format!(
+            "PO v2 payload {:?} slice {}..{}",
+            path, entry.range_offset, range_end
+        ),
+    )
 }
 
 async fn lookup_po_access_from_vortex_v2(
@@ -3396,22 +3412,69 @@ async fn lookup_po_access_from_vortex_v2(
     }))
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ExactAccessLimits {
+    max_ranges: usize,
+    max_rows: u64,
+}
+
+impl ExactAccessLimits {
+    fn from_env(
+        ranges_var: &str,
+        rows_var: &str,
+        default_max_ranges: usize,
+        default_max_rows: u64,
+    ) -> Self {
+        Self {
+            max_ranges: env_value_or(ranges_var, default_max_ranges),
+            max_rows: env_value_or(rows_var, default_max_rows),
+        }
+    }
+
+    fn accepts(self, candidate_ranges: usize, candidate_rows: u64) -> bool {
+        candidate_ranges <= self.max_ranges && candidate_rows <= self.max_rows
+    }
+}
+
+fn env_value_or<T>(name: &str, default: T) -> T
+where
+    T: std::str::FromStr,
+{
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn predicate_exact_limits() -> ExactAccessLimits {
+    ExactAccessLimits::from_env(
+        "VORTEX_RDF_P_EXACT_MAX_RANGES",
+        "VORTEX_RDF_P_EXACT_MAX_ROWS",
+        256,
+        100_000,
+    )
+}
+
+fn po_exact_limits() -> ExactAccessLimits {
+    ExactAccessLimits::from_env(
+        "VORTEX_RDF_PO_EXACT_MAX_RANGES",
+        "VORTEX_RDF_PO_EXACT_MAX_ROWS",
+        64,
+        100_000,
+    )
+}
+
+fn object_exact_limits() -> ExactAccessLimits {
+    ExactAccessLimits::from_env(
+        "VORTEX_RDF_O_EXACT_MAX_RANGES",
+        "VORTEX_RDF_O_EXACT_MAX_ROWS",
+        512,
+        100_000,
+    )
+}
+
 fn po_exact_access_accepted(candidate_ranges: usize, candidate_rows: u64) -> bool {
-    candidate_ranges <= po_exact_max_ranges() && candidate_rows <= po_exact_max_rows()
-}
-
-fn po_exact_max_ranges() -> usize {
-    std::env::var("VORTEX_RDF_PO_EXACT_MAX_RANGES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(64)
-}
-
-fn po_exact_max_rows() -> u64 {
-    std::env::var("VORTEX_RDF_PO_EXACT_MAX_ROWS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(100_000)
+    po_exact_limits().accepts(candidate_ranges, candidate_rows)
 }
 
 const NATIVE_P_EXACT_RANGES_MAGIC: &[u8; 8] = b"VRDFPR1\0";
@@ -3648,8 +3711,7 @@ fn predicate_access_from_directory_entry(
         };
     };
     let candidate_ranges = entry.range_count as usize;
-    let accepted = candidate_ranges <= predicate_exact_max_ranges()
-        && entry.candidate_rows <= predicate_exact_max_rows();
+    let accepted = predicate_exact_limits().accepts(candidate_ranges, entry.candidate_rows);
     NativePredicateAccess {
         ranges: accepted.then(Vec::new),
         candidate_ranges,
@@ -3687,35 +3749,15 @@ async fn read_predicate_v2_payload(
         .read_all()
         .await
         .map_err(VortexRdfError::from)?;
-    if payload.len() != entry.range_count as usize {
-        return Err(VortexRdfError::Deserialization(format!(
-            "predicate v2 payload {:?} returned {} rows for expected slice {}..{}",
-            path,
-            payload.len(),
-            entry.range_offset,
-            range_end
-        )));
-    }
-
-    let starts = extract_projected_u64_column(&payload, "row_start")?;
-    let ends = extract_projected_u64_column(&payload, "row_end")?;
-    let mut ranges = Vec::with_capacity(payload.len());
-    for (start, end) in starts.into_iter().zip(ends) {
-        if start > end {
-            return Err(VortexRdfError::Deserialization(format!(
-                "predicate v2 contains invalid row range {start}..{end}"
-            )));
-        }
-        ranges.push(start..end);
-    }
-    if range_rows(&ranges) != entry.candidate_rows {
-        return Err(VortexRdfError::Deserialization(format!(
-            "predicate v2 candidate row mismatch: directory={}, payload={}",
-            entry.candidate_rows,
-            range_rows(&ranges)
-        )));
-    }
-    Ok(ranges)
+    decode_exact_range_payload(
+        &payload,
+        entry.range_count as usize,
+        entry.candidate_rows,
+        &format!(
+            "predicate v2 payload {:?} slice {}..{}",
+            path, entry.range_offset, range_end
+        ),
+    )
 }
 
 async fn lookup_predicate_access_from_vortex_v2(
@@ -3734,20 +3776,6 @@ async fn lookup_predicate_access_from_vortex_v2(
         }
     }
     Ok(Some(access))
-}
-
-fn predicate_exact_max_ranges() -> usize {
-    std::env::var("VORTEX_RDF_P_EXACT_MAX_RANGES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(256)
-}
-
-fn predicate_exact_max_rows() -> u64 {
-    std::env::var("VORTEX_RDF_P_EXACT_MAX_ROWS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(100_000)
 }
 
 fn range_rows(ranges: &[std::ops::Range<u64>]) -> u64 {
@@ -4464,8 +4492,7 @@ fn object_access_from_directory_entry(
         };
     };
     let candidate_ranges = entry.range_count as usize;
-    let accepted = candidate_ranges <= object_exact_max_ranges()
-        && entry.candidate_rows <= object_exact_max_rows();
+    let accepted = object_exact_limits().accepts(candidate_ranges, entry.candidate_rows);
     NativeObjectAccess {
         ranges: accepted.then(Vec::new),
         candidate_ranges,
@@ -4503,35 +4530,15 @@ async fn read_object_v2_payload(
         .read_all()
         .await
         .map_err(VortexRdfError::from)?;
-    if payload.len() != entry.range_count as usize {
-        return Err(VortexRdfError::Deserialization(format!(
-            "object v2 payload {:?} returned {} rows for expected slice {}..{}",
-            path,
-            payload.len(),
-            entry.range_offset,
-            range_end
-        )));
-    }
-
-    let starts = extract_projected_u64_column(&payload, "row_start")?;
-    let ends = extract_projected_u64_column(&payload, "row_end")?;
-    let mut ranges = Vec::with_capacity(payload.len());
-    for (start, end) in starts.into_iter().zip(ends) {
-        if start > end {
-            return Err(VortexRdfError::Deserialization(format!(
-                "object v2 contains invalid row range {start}..{end}"
-            )));
-        }
-        ranges.push(start..end);
-    }
-    if range_rows(&ranges) != entry.candidate_rows {
-        return Err(VortexRdfError::Deserialization(format!(
-            "object v2 candidate row mismatch: directory={}, payload={}",
-            entry.candidate_rows,
-            range_rows(&ranges)
-        )));
-    }
-    Ok(ranges)
+    decode_exact_range_payload(
+        &payload,
+        entry.range_count as usize,
+        entry.candidate_rows,
+        &format!(
+            "object v2 payload {:?} slice {}..{}",
+            path, entry.range_offset, range_end
+        ),
+    )
 }
 
 async fn lookup_object_access_from_vortex_v2(
@@ -4546,20 +4553,6 @@ async fn lookup_object_access_from_vortex_v2(
         }
     }
     Ok(Some(access))
-}
-
-fn object_exact_max_ranges() -> usize {
-    std::env::var("VORTEX_RDF_O_EXACT_MAX_RANGES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(512)
-}
-
-fn object_exact_max_rows() -> u64 {
-    std::env::var("VORTEX_RDF_O_EXACT_MAX_ROWS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(100_000)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
