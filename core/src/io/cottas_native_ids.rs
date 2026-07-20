@@ -161,13 +161,9 @@ enum NativeComponent {
     DictionaryTermToIdBlob,
     DictionaryIdToTermOffsets,
     DictionaryIdToTermBlob,
-    SubjectRangesBinary,
     SubjectRangesVortex,
-    PredicateRangesBinary,
-    PredicateRangesVortexV1,
     PredicateDirectoryVortexV2,
     PredicateRangesVortexV2,
-    PredicateObjectRangesBinary,
     PredicateObjectPartitionsVortexV2,
     PredicateObjectDirectoryVortexV2,
     PredicateObjectRangesVortexV2,
@@ -184,13 +180,9 @@ impl NativeComponent {
             Self::DictionaryTermToIdBlob => "rdf.dictionary.term-to-id.blob",
             Self::DictionaryIdToTermOffsets => "rdf.dictionary.id-to-term.offsets",
             Self::DictionaryIdToTermBlob => "rdf.dictionary.id-to-term.blob",
-            Self::SubjectRangesBinary => "rdf.index.subject.ranges.binary",
             Self::SubjectRangesVortex => "rdf.index.subject.ranges.vortex-v1",
-            Self::PredicateRangesBinary => "rdf.index.p.ranges.binary",
-            Self::PredicateRangesVortexV1 => "rdf.index.p.ranges.vortex-v1",
             Self::PredicateDirectoryVortexV2 => "rdf.index.p.directory.vortex-v2",
             Self::PredicateRangesVortexV2 => "rdf.index.p.ranges.vortex-v2",
-            Self::PredicateObjectRangesBinary => "rdf.index.po.ranges.binary",
             Self::PredicateObjectPartitionsVortexV2 => "rdf.index.po.partitions.vortex-v2",
             Self::PredicateObjectDirectoryVortexV2 => "rdf.index.po.directory.vortex-v2",
             Self::PredicateObjectRangesVortexV2 => "rdf.index.po.ranges.vortex-v2",
@@ -207,13 +199,9 @@ impl NativeComponent {
             Self::DictionaryTermToIdBlob => "dict.term_to_id.blob",
             Self::DictionaryIdToTermOffsets => "dict.id_to_term.offsets.bin",
             Self::DictionaryIdToTermBlob => "dict.id_to_term.blob",
-            Self::SubjectRangesBinary => "subject_ranges.bin",
             Self::SubjectRangesVortex => "subject_ranges.v1.vortex",
-            Self::PredicateRangesBinary => "p_exact_ranges.bin",
-            Self::PredicateRangesVortexV1 => "p_exact_ranges.v1.vortex",
             Self::PredicateDirectoryVortexV2 => "p_exact_directory.v2.vortex",
             Self::PredicateRangesVortexV2 => "p_exact_ranges.v2.vortex",
-            Self::PredicateObjectRangesBinary => "po_exact_ranges.bin",
             Self::PredicateObjectPartitionsVortexV2 => "po_predicate_partitions.v2.vortex",
             Self::PredicateObjectDirectoryVortexV2 => "po_exact_directory.v2.vortex",
             Self::PredicateObjectRangesVortexV2 => "po_exact_ranges.v2.vortex",
@@ -231,12 +219,76 @@ impl NativeComponent {
     }
 }
 
+#[derive(Clone, Debug)]
+enum ComponentLocation {
+    External(PathBuf),
+    Embedded {
+        artifact_path: PathBuf,
+        component: NativeComponent,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct NativeComponentResolver {
+    artifact_path: PathBuf,
+}
+
+impl NativeComponentResolver {
+    fn new(artifact_path: &Path) -> Self {
+        Self {
+            artifact_path: artifact_path.to_path_buf(),
+        }
+    }
+
+    fn location(&self, component: NativeComponent) -> ComponentLocation {
+        // Phase B keeps the proven external Vortex components. Phase C changes
+        // this single decision to Embedded using the artifact manifest.
+        ComponentLocation::External(component.external_path(&self.artifact_path))
+    }
+
+    fn external_path(&self, component: NativeComponent) -> Result<PathBuf> {
+        match self.location(component) {
+            ComponentLocation::External(path) => Ok(path),
+            ComponentLocation::Embedded {
+                artifact_path,
+                component,
+            } => Err(VortexRdfError::InvalidOperation(format!(
+                "embedded component {} in {:?} requires the Phase-C component reader",
+                component.logical_name(),
+                artifact_path
+            ))),
+        }
+    }
+}
+
+fn native_component_path(data_path: &Path, component: NativeComponent) -> PathBuf {
+    NativeComponentResolver::new(data_path)
+        .external_path(component)
+        .expect("external component resolution is infallible before Phase C")
+}
+
+fn require_vortex_component(
+    data_path: &Path,
+    component: NativeComponent,
+    label: &str,
+) -> Result<PathBuf> {
+    let path = native_component_path(data_path, component);
+    if !path.is_file() {
+        return Err(VortexRdfError::InvalidOperation(format!(
+            "required {label} component {} is missing at {:?}",
+            component.logical_name(),
+            path
+        )));
+    }
+    Ok(path)
+}
+
 fn native_dict_term_to_id_entries_path(data_path: &Path) -> PathBuf {
-    NativeComponent::DictionaryTermToIdEntries.external_path(data_path)
+    native_component_path(data_path, NativeComponent::DictionaryTermToIdEntries)
 }
 
 fn native_dict_term_to_id_blob_path(data_path: &Path) -> PathBuf {
-    NativeComponent::DictionaryTermToIdBlob.external_path(data_path)
+    native_component_path(data_path, NativeComponent::DictionaryTermToIdBlob)
 }
 
 fn native_term_to_id_binary_sidecar_exists(data_path: &Path) -> bool {
@@ -245,11 +297,11 @@ fn native_term_to_id_binary_sidecar_exists(data_path: &Path) -> bool {
 }
 
 fn native_dict_path(data_path: &Path) -> PathBuf {
-    NativeComponent::DictionaryVortex.external_path(data_path)
+    native_component_path(data_path, NativeComponent::DictionaryVortex)
 }
 
 fn native_dict_term_to_id_path(data_path: &Path) -> PathBuf {
-    NativeComponent::DictionaryTermToIdVortex.external_path(data_path)
+    native_component_path(data_path, NativeComponent::DictionaryTermToIdVortex)
 }
 
 fn quad_to_native_triple(quad: &Quad) -> NativeTriple {
@@ -431,14 +483,6 @@ where
             subject_index_stats.ranges_written,
             subject_index_stats.rows_scanned,
             subject_index_stats.total_ms
-        );
-        let po_exact_stats = build_cottas_native_po_exact_ranges_index(output_path).await?;
-        log::info!(
-            "[cottas_native_ids] built PO exact-ranges index during serialization: row_groups={}, rows={}, exact_ranges={}, total_ms={:.3}",
-            po_exact_stats.row_groups,
-            po_exact_stats.rows_scanned,
-            po_exact_stats.unique_po_hashes_written,
-            po_exact_stats.total_ms
         );
         let po_v2_stats = build_cottas_native_po_exact_ranges_v2_index(output_path).await?;
         log::info!(
@@ -1103,8 +1147,7 @@ fn rdf_err_to_vortex_err(e: VortexRdfError) -> VortexError {
 }
 
 /// Format-independent dictionary access for native-ID planning and decoding.
-/// The current implementation delegates to binary sidecars; a Vortex-native
-/// dictionary can implement this contract without changing the planner.
+/// Dictionary access remains behind this contract until Phase C embeds it.
 #[async_trait]
 pub trait NativeDictionaryProvider: Send + Sync {
     async fn lookup_term_id(
@@ -1147,11 +1190,11 @@ pub struct NativePredicateAccess {
 pub type NativeObjectAccess = NativePredicateAccess;
 
 #[derive(Clone, Debug)]
-pub struct BinaryNativeProviders {
+pub struct NativeRdfProviders {
     data_path: PathBuf,
 }
 
-impl BinaryNativeProviders {
+impl NativeRdfProviders {
     pub fn new(data_path: &Path) -> Self {
         Self {
             data_path: data_path.to_path_buf(),
@@ -1160,7 +1203,7 @@ impl BinaryNativeProviders {
 }
 
 #[async_trait]
-impl NativeDictionaryProvider for BinaryNativeProviders {
+impl NativeDictionaryProvider for NativeRdfProviders {
     async fn lookup_term_id(
         &self,
         term: &str,
@@ -1178,86 +1221,44 @@ impl NativeDictionaryProvider for BinaryNativeProviders {
 }
 
 #[async_trait]
-impl NativeIndexProvider for BinaryNativeProviders {
+impl NativeIndexProvider for NativeRdfProviders {
     async fn subject_range(&self, subject_id: u32) -> Result<Option<Range<u64>>> {
-        match native_subject_index_backend(&self.data_path)? {
-            NativeSubjectIndexBackend::Binary => {
-                if !native_subject_range_index_exists(&self.data_path) {
-                    return Ok(None);
-                }
-                Ok(
-                    lookup_subject_range_from_sidecar(&self.data_path, subject_id)?
-                        .map(|range| range.start..range.end),
-                )
-            }
-            NativeSubjectIndexBackend::Vortex => {
-                lookup_subject_range_from_vortex(&self.data_path, subject_id).await
-            }
-        }
+        require_vortex_component(
+            &self.data_path,
+            NativeComponent::SubjectRangesVortex,
+            "subject index",
+        )?;
+        lookup_subject_range_from_vortex(&self.data_path, subject_id).await
     }
 
     async fn po_access(&self, predicate_id: u32, object_id: u32) -> Result<Option<NativePoAccess>> {
-        match native_po_index_backend(&self.data_path)? {
-            NativePoIndexBackend::Binary => {
-                let ranges = lookup_exact_row_ranges(
-                    &native_po_exact_ranges_path(&self.data_path),
-                    NATIVE_PO_EXACT_RANGES_MAGIC,
-                    native_po_hash(predicate_id, object_id),
-                    "PO exact range",
-                )?;
-                let candidate_ranges = ranges.len();
-                let candidate_rows = range_rows(&ranges);
-                let accepted = po_exact_access_accepted(candidate_ranges, candidate_rows);
-                Ok(Some(NativePoAccess {
-                    ranges: accepted.then_some(ranges),
-                    candidate_ranges,
-                    candidate_rows,
-                    strategy: "po-exact-ranges-binary",
-                }))
-            }
-            NativePoIndexBackend::VortexV2 => {
-                lookup_po_access_from_vortex_v2(&self.data_path, predicate_id, object_id).await
-            }
-        }
+        require_vortex_component(
+            &self.data_path,
+            NativeComponent::PredicateObjectDirectoryVortexV2,
+            "PO v2 directory",
+        )?;
+        require_vortex_component(
+            &self.data_path,
+            NativeComponent::PredicateObjectRangesVortexV2,
+            "PO v2 payload",
+        )?;
+        lookup_po_access_from_vortex_v2(&self.data_path, predicate_id, object_id).await
     }
 
     async fn predicate_access(&self, predicate_id: u32) -> Result<Option<NativePredicateAccess>> {
-        match native_predicate_index_backend(&self.data_path)? {
-            NativePredicateIndexBackend::Binary => {
-                let ranges = lookup_exact_row_ranges(
-                    &native_p_exact_ranges_path(&self.data_path),
-                    NATIVE_P_EXACT_RANGES_MAGIC,
-                    u64::from(predicate_id),
-                    "predicate exact range",
-                )?;
-                let candidate_rows = range_rows(&ranges);
-                let candidate_ranges = ranges.len();
-                let use_ranges = predicate_exact_limits().accepts(candidate_ranges, candidate_rows);
-                Ok(Some(NativePredicateAccess {
-                    ranges: use_ranges.then_some(ranges),
-                    candidate_ranges,
-                    candidate_rows,
-                    strategy: "p-exact-ranges-binary",
-                }))
-            }
-            NativePredicateIndexBackend::VortexV1 => {
-                let ranges =
-                    lookup_predicate_ranges_from_vortex(&self.data_path, predicate_id).await?;
-                let candidate_rows = range_rows(&ranges);
-                let candidate_ranges = ranges.len();
-                let use_ranges = predicate_exact_limits().accepts(candidate_ranges, candidate_rows);
-                Ok(Some(NativePredicateAccess {
-                    ranges: use_ranges.then_some(ranges),
-                    candidate_ranges,
-                    candidate_rows,
-                    strategy: "p-exact-ranges-vortex-v1",
-                }))
-            }
-            NativePredicateIndexBackend::VortexV2 => {
-                lookup_predicate_access_from_vortex_v2(&self.data_path, predicate_id).await
-            }
-        }
+        require_vortex_component(
+            &self.data_path,
+            NativeComponent::PredicateDirectoryVortexV2,
+            "predicate v2 directory",
+        )?;
+        require_vortex_component(
+            &self.data_path,
+            NativeComponent::PredicateRangesVortexV2,
+            "predicate v2 payload",
+        )?;
+        lookup_predicate_access_from_vortex_v2(&self.data_path, predicate_id).await
     }
+
     async fn object_access(&self, object_id: u32) -> Result<Option<NativeObjectAccess>> {
         let directory = native_o_exact_directory_v2_path(&self.data_path);
         let payload = native_o_exact_ranges_v2_path(&self.data_path);
@@ -1282,12 +1283,10 @@ impl NativeIndexProvider for BinaryNativeProviders {
     }
 
     fn subject_strategy(&self) -> &'static str {
-        match native_subject_index_backend(&self.data_path) {
-            Ok(NativeSubjectIndexBackend::Vortex) => "subject-ranges-vortex-v1",
-            _ => "subject-ranges-binary",
-        }
+        "subject-ranges-vortex-v1"
     }
 }
+
 #[derive(Clone, Copy, Debug, Default)]
 struct ResolvedNativePattern {
     s: Option<u32>,
@@ -2077,7 +2076,7 @@ async fn lookup_terms_by_ids_from_sidecar(
     data_path: &Path,
     ids: &[u32],
 ) -> Result<HashMap<u32, String>> {
-    let provider = BinaryNativeProviders::new(data_path);
+    let provider = NativeRdfProviders::new(data_path);
     let (terms, _stats) = provider.lookup_terms_by_ids(ids).await?;
     Ok(terms)
 }
@@ -2330,7 +2329,7 @@ async fn execute_cottas_native_match(
     let total_start = Instant::now();
     let mut diagnostics = CottasNativeIdsDiagnostics::default();
     let bound_terms = BoundNativeRdfTerms::from_pattern(subject, predicate, object, graph);
-    let providers = BinaryNativeProviders::new(input_path);
+    let providers = NativeRdfProviders::new(input_path);
     let (resolved, term_lookup_ms, term_to_id_stats) =
         resolve_native_pattern(&providers, subject, predicate, object, graph).await?;
     diagnostics.term_lookup_ms = term_lookup_ms;
@@ -2806,11 +2805,11 @@ pub async fn load_cottas_native_simple_dictionary_view(
 }
 
 fn native_dict_id_to_term_offsets_path(data_path: &Path) -> PathBuf {
-    NativeComponent::DictionaryIdToTermOffsets.external_path(data_path)
+    native_component_path(data_path, NativeComponent::DictionaryIdToTermOffsets)
 }
 
 fn native_dict_id_to_term_blob_path(data_path: &Path) -> PathBuf {
-    NativeComponent::DictionaryIdToTermBlob.external_path(data_path)
+    native_component_path(data_path, NativeComponent::DictionaryIdToTermBlob)
 }
 
 fn native_id_to_term_binary_sidecar_exists(data_path: &Path) -> bool {
@@ -2818,50 +2817,8 @@ fn native_id_to_term_binary_sidecar_exists(data_path: &Path) -> bool {
         && native_dict_id_to_term_blob_path(data_path).is_file()
 }
 
-fn native_subject_range_index_path(data_path: &Path) -> PathBuf {
-    NativeComponent::SubjectRangesBinary.external_path(data_path)
-}
-
-fn native_subject_range_index_exists(data_path: &Path) -> bool {
-    native_subject_range_index_path(data_path).is_file()
-}
-
 fn native_subject_range_vortex_path(data_path: &Path) -> PathBuf {
-    NativeComponent::SubjectRangesVortex.external_path(data_path)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NativeSubjectIndexBackend {
-    Binary,
-    Vortex,
-}
-
-fn native_subject_index_backend(data_path: &Path) -> Result<NativeSubjectIndexBackend> {
-    let configured = std::env::var("VORTEX_RDF_NATIVE_SUBJECT_INDEX_BACKEND")
-        .unwrap_or_else(|_| "auto".to_string());
-    match configured.as_str() {
-        "auto" => {
-            if native_subject_range_vortex_path(data_path).is_file() {
-                Ok(NativeSubjectIndexBackend::Vortex)
-            } else {
-                Ok(NativeSubjectIndexBackend::Binary)
-            }
-        }
-        "binary" => Ok(NativeSubjectIndexBackend::Binary),
-        "vortex" => {
-            let path = native_subject_range_vortex_path(data_path);
-            if !path.is_file() {
-                return Err(VortexRdfError::InvalidOperation(format!(
-                    "Vortex subject index backend requested but {:?} does not exist",
-                    path
-                )));
-            }
-            Ok(NativeSubjectIndexBackend::Vortex)
-        }
-        other => Err(VortexRdfError::InvalidOperation(format!(
-            "Unsupported VORTEX_RDF_NATIVE_SUBJECT_INDEX_BACKEND={other:?}; expected auto, binary, or vortex"
-        ))),
-    }
+    native_component_path(data_path, NativeComponent::SubjectRangesVortex)
 }
 
 async fn lookup_subject_range_from_vortex(
@@ -2922,98 +2879,9 @@ pub struct NativePoRowGroupIndexBuildStats {
     pub total_ms: f64,
 }
 
-fn native_po_hash(p: u32, o: u32) -> u64 {
-    let mut x = ((p as u64) << 32) | (o as u64);
-    x ^= x >> 30;
-    x = x.wrapping_mul(0xbf58476d1ce4e5b9);
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x94d049bb133111eb);
-    x ^ (x >> 31)
-}
-
-fn native_po_exact_ranges_path(data_path: &Path) -> PathBuf {
-    NativeComponent::PredicateObjectRangesBinary.external_path(data_path)
-}
-
-fn native_po_exact_ranges_exists(data_path: &Path) -> bool {
-    native_po_exact_ranges_path(data_path).is_file()
-}
-
-const NATIVE_PO_EXACT_RANGES_MAGIC: &[u8; 8] = b"VRDFPX1\0";
-const NATIVE_PO_EXACT_RANGE_ENTRY_BYTES: u64 = 24;
-
-fn write_exact_range_entry<W: Write>(
-    writer: &mut W,
-    hash: u64,
-    start: u64,
-    end: u64,
-) -> Result<()> {
-    writer
-        .write_all(&hash.to_le_bytes())
-        .and_then(|_| writer.write_all(&start.to_le_bytes()))
-        .and_then(|_| writer.write_all(&end.to_le_bytes()))
-        .map_err(|e| VortexRdfError::Serialization(e.to_string()))
-}
-
-fn read_exact_range_entry_at(file: &std::fs::File, entry_idx: u64) -> Result<(u64, u64, u64)> {
-    let mut buf = [0u8; 24];
-    let offset = 16u64
-        .checked_add(
-            entry_idx
-                .checked_mul(NATIVE_PO_EXACT_RANGE_ENTRY_BYTES)
-                .ok_or_else(|| {
-                    VortexRdfError::Deserialization(format!(
-                        "PO exact range index offset overflow for entry {}",
-                        entry_idx
-                    ))
-                })?,
-        )
-        .ok_or_else(|| {
-            VortexRdfError::Deserialization("PO exact range index offset overflow".to_string())
-        })?;
-    read_exact_at_native_sidecar(file, &mut buf, offset, "PO exact range entry")?;
-    let hash = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let start = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let end = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-    Ok((hash, start, end))
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NativePoIndexBackend {
-    Binary,
-    VortexV2,
-}
-
 fn native_po_v2_exists(data_path: &Path) -> bool {
     native_po_exact_directory_v2_path(data_path).is_file()
         && native_po_exact_ranges_v2_path(data_path).is_file()
-}
-
-fn native_po_index_backend(data_path: &Path) -> Result<NativePoIndexBackend> {
-    let configured =
-        std::env::var("VORTEX_RDF_NATIVE_PO_INDEX_BACKEND").unwrap_or_else(|_| "auto".to_string());
-    match configured.as_str() {
-        "auto" if native_po_v2_exists(data_path) => Ok(NativePoIndexBackend::VortexV2),
-        "auto" if native_po_exact_ranges_exists(data_path) => Ok(NativePoIndexBackend::Binary),
-        "auto" => Err(VortexRdfError::InvalidOperation(format!(
-            "No production PO index exists for {:?}",
-            data_path
-        ))),
-        "binary" if native_po_exact_ranges_exists(data_path) => Ok(NativePoIndexBackend::Binary),
-        "binary" => Err(VortexRdfError::InvalidOperation(format!(
-            "Binary PO index {:?} does not exist",
-            native_po_exact_ranges_path(data_path)
-        ))),
-        "vortex-v2" if native_po_v2_exists(data_path) => Ok(NativePoIndexBackend::VortexV2),
-        "vortex-v2" => Err(VortexRdfError::InvalidOperation(format!(
-            "Vortex PO v2 directory {:?} or payload {:?} is missing",
-            native_po_exact_directory_v2_path(data_path),
-            native_po_exact_ranges_v2_path(data_path)
-        ))),
-        other => Err(VortexRdfError::InvalidOperation(format!(
-            "Unsupported VORTEX_RDF_NATIVE_PO_INDEX_BACKEND={other:?}; expected auto, binary, or vortex-v2"
-        ))),
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3517,130 +3385,6 @@ fn po_exact_access_accepted(candidate_ranges: usize, candidate_rows: u64) -> boo
     po_exact_limits().accepts(candidate_ranges, candidate_rows)
 }
 
-const NATIVE_P_EXACT_RANGES_MAGIC: &[u8; 8] = b"VRDFPR1\0";
-
-fn native_p_exact_ranges_path(data_path: &Path) -> PathBuf {
-    NativeComponent::PredicateRangesBinary.external_path(data_path)
-}
-
-fn native_p_exact_ranges_exists(data_path: &Path) -> bool {
-    native_p_exact_ranges_path(data_path).is_file()
-}
-
-fn native_p_exact_ranges_vortex_path(data_path: &Path) -> PathBuf {
-    NativeComponent::PredicateRangesVortexV1.external_path(data_path)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NativePredicateIndexBackend {
-    Binary,
-    VortexV1,
-    VortexV2,
-}
-
-fn native_predicate_index_backend(data_path: &Path) -> Result<NativePredicateIndexBackend> {
-    let configured = std::env::var("VORTEX_RDF_NATIVE_PREDICATE_INDEX_BACKEND")
-        .unwrap_or_else(|_| "auto".to_string());
-    let v2_exists = native_p_exact_directory_v2_path(data_path).is_file()
-        && native_p_exact_ranges_v2_path(data_path).is_file();
-    match configured.as_str() {
-        "auto" => {
-            if v2_exists {
-                Ok(NativePredicateIndexBackend::VortexV2)
-            } else if native_p_exact_ranges_exists(data_path) {
-                Ok(NativePredicateIndexBackend::Binary)
-            } else {
-                Err(VortexRdfError::InvalidOperation(format!(
-                    "No production predicate index exists for {:?}",
-                    data_path
-                )))
-            }
-        }
-        "binary" => {
-            let path = native_p_exact_ranges_path(data_path);
-            if !path.is_file() {
-                return Err(VortexRdfError::InvalidOperation(format!(
-                    "Binary predicate index backend requested but {:?} does not exist",
-                    path
-                )));
-            }
-            Ok(NativePredicateIndexBackend::Binary)
-        }
-        "vortex" | "vortex-v1" => {
-            let path = native_p_exact_ranges_vortex_path(data_path);
-            if !path.is_file() {
-                return Err(VortexRdfError::InvalidOperation(format!(
-                    "Vortex predicate v1 backend requested but {:?} does not exist",
-                    path
-                )));
-            }
-            Ok(NativePredicateIndexBackend::VortexV1)
-        }
-        "vortex-v2" => {
-            if !v2_exists {
-                return Err(VortexRdfError::InvalidOperation(format!(
-                    "Vortex predicate v2 backend requested but directory {:?} or payload {:?} is missing",
-                    native_p_exact_directory_v2_path(data_path),
-                    native_p_exact_ranges_v2_path(data_path)
-                )));
-            }
-            Ok(NativePredicateIndexBackend::VortexV2)
-        }
-        other => Err(VortexRdfError::InvalidOperation(format!(
-            "Unsupported VORTEX_RDF_NATIVE_PREDICATE_INDEX_BACKEND={other:?}; expected auto, binary, vortex-v1, or vortex-v2"
-        ))),
-    }
-}
-
-async fn lookup_predicate_ranges_from_vortex(
-    data_path: &Path,
-    predicate_id: u32,
-) -> Result<Vec<Range<u64>>> {
-    let path = native_p_exact_ranges_vortex_path(data_path);
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
-    let stream = file
-        .scan()
-        .map_err(VortexRdfError::from)?
-        .with_filter(eq(col("predicate_id"), lit(predicate_id)))
-        .with_projection(vortex_array::expr::select(
-            ["row_start", "row_end"],
-            vortex_array::expr::root(),
-        ))
-        .into_array_stream()
-        .map_err(VortexRdfError::from)?;
-    let result = stream.read_all().await.map_err(VortexRdfError::from)?;
-    if result.len() == 0 {
-        return Ok(Vec::new());
-    }
-    let starts = extract_projected_u64_column(&result, "row_start")?;
-    let ends = extract_projected_u64_column(&result, "row_end")?;
-    if starts.len() != ends.len() || starts.len() != result.len() {
-        return Err(VortexRdfError::Deserialization(format!(
-            "Vortex predicate index {:?} returned inconsistent columns: rows={}, starts={}, ends={}",
-            path,
-            result.len(),
-            starts.len(),
-            ends.len()
-        )));
-    }
-    let mut ranges = Vec::with_capacity(starts.len());
-    for (start, end) in starts.into_iter().zip(ends) {
-        if start > end {
-            return Err(VortexRdfError::Deserialization(format!(
-                "Vortex predicate index {:?} contains invalid range {}..{} for predicate ID {}",
-                path, start, end, predicate_id
-            )));
-        }
-        ranges.push(start..end);
-    }
-    ranges.sort_unstable_by_key(|r| (r.start, r.end));
-    Ok(ranges)
-}
-
 #[derive(Clone, Copy, Debug)]
 struct NativePredicateDirectoryEntry {
     predicate_id: u32,
@@ -3817,187 +3561,6 @@ fn range_rows(ranges: &[std::ops::Range<u64>]) -> u64 {
         .sum()
 }
 
-fn lookup_exact_row_ranges(
-    path: &Path,
-    expected_magic: &[u8; 8],
-    needle: u64,
-    label: &str,
-) -> Result<Vec<std::ops::Range<u64>>> {
-    let file = std::fs::File::open(path).map_err(|error| {
-        VortexRdfError::Deserialization(
-            format!("Failed to open {label} index {:?}: {error}", path,),
-        )
-    })?;
-    let len = file
-        .metadata()
-        .map_err(|error| VortexRdfError::Deserialization(error.to_string()))?
-        .len();
-    if len < 16 || (len - 16) % NATIVE_PO_EXACT_RANGE_ENTRY_BYTES != 0 {
-        return Err(VortexRdfError::Deserialization(format!(
-            "Malformed {label} index {:?}: len={len}",
-            path,
-        )));
-    }
-
-    let mut magic = [0u8; 8];
-    read_exact_at_native_sidecar(&file, &mut magic, 0, label)?;
-    if &magic != expected_magic {
-        return Err(VortexRdfError::Deserialization(format!(
-            "Malformed {label} index {:?}: bad magic",
-            path,
-        )));
-    }
-    let mut count_buffer = [0u8; 8];
-    read_exact_at_native_sidecar(&file, &mut count_buffer, 8, label)?;
-    let count = u64::from_le_bytes(count_buffer);
-    if 16 + count.saturating_mul(NATIVE_PO_EXACT_RANGE_ENTRY_BYTES) != len {
-        return Err(VortexRdfError::Deserialization(format!(
-            "Malformed {label} index {:?}: count/len mismatch",
-            path,
-        )));
-    }
-
-    let mut low = 0u64;
-    let mut high = count;
-    while low < high {
-        let middle = low + (high - low) / 2;
-        let (key, _, _) = read_exact_range_entry_at(&file, middle)?;
-        if key < needle {
-            low = middle + 1;
-        } else {
-            high = middle;
-        }
-    }
-
-    let mut ranges = Vec::new();
-    let mut index = low;
-    while index < count {
-        let (key, start, end) = read_exact_range_entry_at(&file, index)?;
-        if key != needle {
-            break;
-        }
-        ranges.push(start..end);
-        index += 1;
-    }
-    Ok(ranges)
-}
-
-fn write_exact_range_index(
-    output_path: &Path,
-    magic: &[u8; 8],
-    entries: &mut Vec<(u64, u64, u64)>,
-) -> Result<()> {
-    entries.sort_unstable_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.cmp(&right.1))
-            .then_with(|| left.2.cmp(&right.2))
-    });
-    let temporary_path = output_path.with_extension("exact_ranges.bin.tmp");
-    let temporary_file = std::fs::File::create(&temporary_path)
-        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
-    let mut writer = BufWriter::new(temporary_file);
-    writer
-        .write_all(magic)
-        .and_then(|_| writer.write_all(&(entries.len() as u64).to_le_bytes()))
-        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
-    for (key, start, end) in entries.iter().copied() {
-        write_exact_range_entry(&mut writer, key, start, end)?;
-    }
-    writer
-        .flush()
-        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
-    drop(writer);
-    std::fs::rename(&temporary_path, output_path)
-        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
-    Ok(())
-}
-
-pub async fn build_cottas_native_po_exact_ranges_index(
-    input_path: &Path,
-) -> Result<NativePoRowGroupIndexBuildStats> {
-    let total_start = Instant::now();
-    let output_path = native_po_exact_ranges_path(input_path);
-    let open_start = Instant::now();
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(input_path)
-        .await
-        .map_err(VortexRdfError::from)?;
-    let open_ms = elapsed_ms(open_start);
-    let scan_start = Instant::now();
-    let mut stream = file
-        .scan()
-        .map_err(VortexRdfError::from)?
-        .with_projection(vortex_array::expr::select(
-            ["p", "o"].as_slice(),
-            vortex_array::expr::root(),
-        ))
-        .into_array_stream()
-        .map_err(VortexRdfError::from)?;
-
-    // Prototype exact access path: hash(p,o) -> exact consecutive row ranges.
-    // This is intentionally collision-safe at query time because we still apply the exact p/o Vortex filter.
-    let mut ranges_by_hash: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
-    let mut row_groups = 0usize;
-    let mut rows_scanned = 0u64;
-    while let Some(batch_result) = stream.next().await {
-        let batch = batch_result.map_err(VortexRdfError::from)?;
-        let batch_rows = batch.len();
-        if batch_rows == 0 {
-            continue;
-        }
-        let p_ids = extract_projected_u32_column(&batch, "p")?;
-        let o_ids = extract_projected_u32_column(&batch, "o")?;
-        if p_ids.len() != batch_rows || o_ids.len() != batch_rows {
-            return Err(VortexRdfError::Serialization(format!(
-                "PO exact range index saw p/o length mismatch: p={}, o={}, rows={}",
-                p_ids.len(),
-                o_ids.len(),
-                batch_rows
-            )));
-        }
-        for row in 0..batch_rows {
-            let row_id = rows_scanned + row as u64;
-            let hash = native_po_hash(p_ids[row], o_ids[row]);
-            let ranges = ranges_by_hash.entry(hash).or_default();
-            if let Some(last) = ranges.last_mut() {
-                if last.1 == row_id {
-                    last.1 = row_id + 1;
-                    continue;
-                }
-            }
-            ranges.push((row_id, row_id + 1));
-        }
-        rows_scanned += batch_rows as u64;
-        row_groups += 1;
-    }
-    let scan_ms = elapsed_ms(scan_start);
-    let write_start = Instant::now();
-
-    let mut entries: Vec<(u64, u64, u64)> = Vec::new();
-    for (hash, ranges) in ranges_by_hash {
-        entries.reserve(ranges.len());
-        for (start, end) in ranges {
-            entries.push((hash, start, end));
-        }
-    }
-    write_exact_range_index(&output_path, NATIVE_PO_EXACT_RANGES_MAGIC, &mut entries)?;
-    let write_ms = elapsed_ms(write_start);
-    let total_ms = elapsed_ms(total_start);
-    Ok(NativePoRowGroupIndexBuildStats {
-        input_path: input_path.display().to_string(),
-        output_path: output_path.display().to_string(),
-        row_groups,
-        rows_scanned,
-        unique_po_hashes_written: entries.len() as u64,
-        open_ms,
-        scan_ms,
-        write_ms,
-        total_ms,
-    })
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativePoRangeRecord {
     predicate_id: u32,
@@ -4029,15 +3592,18 @@ impl PartialOrd for NativePoRangeRecord {
 }
 
 fn native_po_exact_directory_v2_path(data_path: &Path) -> PathBuf {
-    NativeComponent::PredicateObjectDirectoryVortexV2.external_path(data_path)
+    native_component_path(data_path, NativeComponent::PredicateObjectDirectoryVortexV2)
 }
 
 fn native_po_predicate_partitions_v2_path(data_path: &Path) -> PathBuf {
-    NativeComponent::PredicateObjectPartitionsVortexV2.external_path(data_path)
+    native_component_path(
+        data_path,
+        NativeComponent::PredicateObjectPartitionsVortexV2,
+    )
 }
 
 fn native_po_exact_ranges_v2_path(data_path: &Path) -> PathBuf {
-    NativeComponent::PredicateObjectRangesVortexV2.external_path(data_path)
+    native_component_path(data_path, NativeComponent::PredicateObjectRangesVortexV2)
 }
 
 fn write_po_range_record<W: Write>(writer: &mut W, value: NativePoRangeRecord) -> Result<()> {
@@ -4601,11 +4167,11 @@ impl PartialOrd for NativePredicateRangeRecord {
 }
 
 fn native_p_exact_directory_v2_path(data_path: &Path) -> PathBuf {
-    NativeComponent::PredicateDirectoryVortexV2.external_path(data_path)
+    native_component_path(data_path, NativeComponent::PredicateDirectoryVortexV2)
 }
 
 fn native_p_exact_ranges_v2_path(data_path: &Path) -> PathBuf {
-    NativeComponent::PredicateRangesVortexV2.external_path(data_path)
+    native_component_path(data_path, NativeComponent::PredicateRangesVortexV2)
 }
 
 fn write_predicate_range_record<W: Write>(
@@ -4981,11 +4547,11 @@ impl PartialOrd for NativeObjectRangeRecord {
 }
 
 fn native_o_exact_directory_v2_path(data_path: &Path) -> PathBuf {
-    NativeComponent::ObjectDirectoryVortexV2.external_path(data_path)
+    native_component_path(data_path, NativeComponent::ObjectDirectoryVortexV2)
 }
 
 fn native_o_exact_ranges_v2_path(data_path: &Path) -> PathBuf {
-    NativeComponent::ObjectRangesVortexV2.external_path(data_path)
+    native_component_path(data_path, NativeComponent::ObjectRangesVortexV2)
 }
 
 fn write_object_range_record<W: Write>(
@@ -5337,14 +4903,6 @@ pub async fn build_cottas_native_o_exact_ranges_index(
     })
 }
 
-const NATIVE_SUBJECT_RANGE_ENTRY_BYTES: u64 = 20;
-
-#[derive(Clone, Copy, Debug)]
-struct NativeSubjectRange {
-    start: u64,
-    end: u64,
-}
-
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct NativeSubjectRangeIndexBuildStats {
     pub input_path: String,
@@ -5395,58 +4953,6 @@ fn extract_projected_u64_column(array: &ArrayRef, column_name: &str) -> Result<V
     Ok(column.as_slice::<u64>().to_vec())
 }
 
-fn read_subject_range_entry_at(file: &std::fs::File, entry_idx: u64) -> Result<(u32, u64, u64)> {
-    let mut buf = [0u8; 20];
-    let offset = entry_idx
-        .checked_mul(NATIVE_SUBJECT_RANGE_ENTRY_BYTES)
-        .ok_or_else(|| {
-            VortexRdfError::Deserialization(format!(
-                "subject range index offset overflow for entry {}",
-                entry_idx
-            ))
-        })?;
-    read_exact_at_native_sidecar(file, &mut buf, offset, "subject range index")?;
-    let subject_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-    let start = u64::from_le_bytes(buf[4..12].try_into().unwrap());
-    let end = u64::from_le_bytes(buf[12..20].try_into().unwrap());
-    Ok((subject_id, start, end))
-}
-
-fn lookup_subject_range_from_sidecar(
-    data_path: &Path,
-    subject_id: u32,
-) -> Result<Option<NativeSubjectRange>> {
-    let path = native_subject_range_index_path(data_path);
-    let file = std::fs::File::open(&path).map_err(|e| {
-        VortexRdfError::Deserialization(format!(
-            "Failed to open native subject range index {:?}: {}",
-            path, e
-        ))
-    })?;
-    let len = file
-        .metadata()
-        .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?
-        .len();
-    if len % NATIVE_SUBJECT_RANGE_ENTRY_BYTES != 0 {
-        return Err(VortexRdfError::Deserialization(format!(
-            "Malformed subject range index {:?}: byte length {} is not divisible by {}",
-            path, len, NATIVE_SUBJECT_RANGE_ENTRY_BYTES
-        )));
-    }
-    let mut lo = 0u64;
-    let mut hi = len / NATIVE_SUBJECT_RANGE_ENTRY_BYTES;
-    while lo < hi {
-        let mid = lo + ((hi - lo) / 2);
-        let (candidate, start, end) = read_subject_range_entry_at(&file, mid)?;
-        match candidate.cmp(&subject_id) {
-            Ordering::Less => lo = mid + 1,
-            Ordering::Greater => hi = mid,
-            Ordering::Equal => return Ok(Some(NativeSubjectRange { start, end })),
-        }
-    }
-    Ok(None)
-}
-
 #[derive(Clone, Debug, Default)]
 struct NativeSubjectRangeBuildState {
     rows_scanned: u64,
@@ -5490,9 +4996,7 @@ fn empty_subject_range_array() -> Result<ArrayRef> {
     build_subject_range_array(Vec::new(), Vec::new(), Vec::new())
 }
 
-/// Writes the production subject index directly to Vortex. The legacy binary
-/// reader is retained for old datasets, but new serializations do not produce
-/// `subject_ranges.bin`.
+/// Writes the production subject index directly to Vortex.
 pub async fn build_cottas_native_subject_range_index(
     input_path: &Path,
 ) -> Result<NativeSubjectRangeIndexBuildStats> {
