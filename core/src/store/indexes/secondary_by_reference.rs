@@ -29,6 +29,7 @@
 //! correct whatever the order, and sortedness only decides how much prunes.
 //!
 //! [`IndexType::SecondaryByReference`]: super::IndexType::SecondaryByReference
+// Inspired by https://clickhouse.com/blog/projections-secondary-indices
 
 use std::ops::Range;
 use std::sync::Arc;

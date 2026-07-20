@@ -396,11 +396,17 @@ RUST_LOG=vortex_rdf_cli=debug,vortex_rdf_core=debug vortex-rdf-cli serialize --i
 
 Vortex-RDF features a benchmark suite built on top of [Divan](https://github.com/nvzqz/divan) and fully integrated with [CodSpeed](https://codspeed.io) for precise, CPU-instruction-level performance tracking.
 
-The consolidated **`benchmark`** target evaluates the full supported matrix of:
+The consolidated **`benchmark`** target covers the axes of:
 * Builder strategies: `SortedInMemory`, `SortedStream`, `UnsortedStream`
 * Layout strategies: `Default`, `TypedObject`, `Dictionary`
 * Secondary indexes: none, `SecondaryByReference`, `SecondaryByCopy`
-* Workloads: serialization and file-backed `match_pattern` queries (`s`, `p`, `o`, `g`)
+* Sources: file-backed and in-memory
+* Workloads, grouped by the operation they exercise:
+  * **`serialize`** — the write path (build + encode + write).
+  * **`match_*`** / **`match_chained`** — `match_pattern` queries across the six shapes the query router actually branches on (`S`, `P`, `O`, `PO`, `G`, `SPOG`), plus chained view refinement.
+  * **`decode_all`** / **`open_file`** / **`from_bytes`** — the read-back path: full-scan decode, lazy file open, and IPC load.
+
+Rather than the full cross product of these axes — thousands of instances, most measuring identical code paths — the suite is a **star (one-factor-at-a-time) design**: each group fixes a baseline and varies one axis at a time, adding back only the interactions that genuinely change behaviour. This keeps CodSpeed lean (~66 instances, all run in CI) without losing coverage of any distinct path. The dataset size is a single `BENCH_SIZE` constant, since simulation mode counts instructions deterministically and one representative size catches regressions in every path. See the module docs in [`core/benches/benchmark.rs`](core/benches/benchmark.rs) for the full rationale.
 
 ### Running Benchmarks Locally
 
@@ -417,20 +423,20 @@ cargo bench --bench benchmark
 ```
 
 #### 3. Filtering Benchmarks
-You can isolate specific builders or query shapes:
+Divan filters on the benchmark's full path, so you can isolate a group, a config, or a query shape:
 ```bash
-# Profile only match pattern benchmarks
-cargo bench --bench benchmark -- match_pattern
+# Profile only the serialization (write-path) benchmarks
+cargo bench --bench benchmark -- serialize
 
-# Profile only subject-selective patterns
-cargo bench --bench benchmark -- _s
+# Profile only match queries
+cargo bench --bench benchmark -- match
 
-# Profile a specific builder
-cargo bench --bench benchmark -- sorted_stream
+# Profile a specific config across all its patterns
+cargo bench --bench benchmark -- match_sorted_default_bycopy_file
 ```
 
-### Store File Caching
-To prevent redundant re-builds, the suite keeps a thread-safe global cache of serialized `.vortex` files (under `target/bench_vortex_files`), keyed by builder, layout, and dataset size. Each store is built and serialized once; all `match_pattern_*` benchmarks reuse the cached file, isolating query performance from ingestion overhead and keeping CodSpeed telemetry clean and noise-free.
+### Artifact Caching
+To keep query measurements isolated from ingestion cost, the suite builds each config's data **once** and reuses it. A thread-safe global cache holds the built in-memory arrays, the serialized `.vortex` files (under `target/bench_vortex_files`), and the IPC byte buffers, keyed by builder, layout, index, and dataset size. Store construction and materialized query inputs stay in Divan's untimed `with_inputs` setup, so each benchmark measures only its own operation and CodSpeed telemetry stays clean and noise-free. Under the star design only a handful of distinct configs are ever requested, so the cache stays naturally bounded.
 
 ---
 

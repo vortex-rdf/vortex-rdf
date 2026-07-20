@@ -1,410 +1,582 @@
-use divan::Bencher;
-use tokio::runtime::Runtime;
-use oxrdf::{NamedOrBlankNode, NamedNode};
-use std::sync::{OnceLock, Mutex};
+//! Benchmark suite for `vortex-rdf-core`.
+//!
+//! # Design: a star (one-factor-at-a-time) layout, not a full factorial
+//!
+//! The library exposes four independent axes — builder strategy, layout,
+//! secondary index, and source (file vs in-memory) — plus a query pattern with
+//! 15 shapes. Their full cross product is ~2,400 match instances, most of which
+//! measure the *same* code path: at query time both sorted builders emit
+//! identically stamped columns (the store reads only the `IsSorted` stat, so it
+//! cannot tell `SortedInMemory` from `SortedStream`), a bound subject always
+//! declines every secondary index in favour of the primary sorted `s` column,
+//! and a bound graph never routes through an index at all. Measuring those
+//! combinations three times over buys no signal and bloats CodSpeed.
+//!
+//! Instead we fix a baseline and vary one axis at a time, adding back only the
+//! interactions that genuinely change behaviour (e.g. Dictionary × index, where
+//! the index columns hold u32 codes rather than term strings). Each group below
+//! documents its baseline and which axis it sweeps.
+//!
+//! ## Query patterns, reduced to routing classes
+//!
+//! The 15 pattern shapes collapse to the six the resolver actually branches on:
+//! `S` (primary binary search), `P` and `O` (single-column index probes), `PO`
+//! (the two-column family prefix probe — `SecondaryByCopy`'s distinguishing
+//! capability), `G` (no index covers graph, so the mask-scan / pushdown
+//! fallback), and `SPOG` (every component bound — maximum residual filtering).
+//!
+//! ## Selectivity of the generated data (`generate_rdf_data_stream`)
+//!
+//! Subjects are unique; predicates repeat every 100 rows; objects every 50;
+//! graphs every 10. Probe terms are chosen to hit rows that actually exist, so
+//! at `BENCH_SIZE = 100_000` the matched-row counts are: `S`→1, `P`→1,000,
+//! `O`→2,000, `PO`→1,000, `G`→10,000, `SPOG`→1. (The previous suite probed a
+//! graph term — `.../graph` — that the generator never emits, so every
+//! graph-bound benchmark silently matched zero rows.)
+
 use std::collections::HashMap;
+use std::fmt;
 use std::hint::black_box;
-use futures::TryStreamExt;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+
+use futures::{stream, StreamExt, TryStreamExt};
+use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use tokio::runtime::Runtime;
 use vortex_array::ArrayRef;
 
 use vortex_rdf_core::common::utils::generate_rdf_data_stream;
 use vortex_rdf_core::{
-    io::quads_stream_to_vortex_writer_with_builder,
-    IndexType,
-    VortexRdfStore,
-    VortexArrayBuilder,
-    SortedInMemoryBuilder,
-    SortedStreamBuilder,
-    UnsortedStreamBuilder,
-    LayoutStrategy,
+    io, IndexType, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder,
+    UnsortedStreamBuilder, VortexRdfError, VortexRdfStore,
 };
 
 fn main() {
     divan::main();
 }
 
+/// Single dataset size for the whole suite. In simulation mode CodSpeed counts
+/// instructions deterministically, so one representative size catches
+/// regressions in every path; larger sizes only multiply valgrind cost without
+/// adding signal (CodSpeed does not analyse scaling curves). Tune here.
+const BENCH_SIZE: usize = 100_000;
+
+// ── shared tokio runtime ────────────────────────────────────────────────────
+
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
-fn get_runtime() -> &'static Runtime {
+fn rt() -> &'static Runtime {
     TOKIO_RUNTIME.get_or_init(|| Runtime::new().unwrap())
 }
 
-#[derive(Copy, Clone, Debug)]
-enum IndexConfig {
-    None,
-    SecondaryByReference,
-    SecondaryByCopy,
+// ── configuration axes ──────────────────────────────────────────────────────
+
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+enum Builder {
+    Unsorted,
+    SortedInMemory,
+    SortedStream,
 }
 
-impl IndexConfig {
-    fn name(self) -> &'static str {
+impl Builder {
+    fn short(self) -> &'static str {
         match self {
-            Self::None => "no-index",
-            Self::SecondaryByReference => "secondary-by-reference",
-            Self::SecondaryByCopy => "secondary-by-copy",
+            Self::Unsorted => "unsorted",
+            Self::SortedInMemory => "sorted_in_memory",
+            Self::SortedStream => "sorted_stream",
         }
     }
+}
 
-    fn indexes(self) -> Vec<IndexType> {
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+enum Layout {
+    Default,
+    TypedObject,
+    Dictionary,
+}
+
+impl Layout {
+    fn strategy(self) -> LayoutStrategy {
+        match self {
+            Self::Default => LayoutStrategy::Default,
+            Self::TypedObject => LayoutStrategy::TypedObject,
+            Self::Dictionary => LayoutStrategy::Dictionary,
+        }
+    }
+    fn short(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::TypedObject => "typed_object",
+            Self::Dictionary => "dictionary",
+        }
+    }
+}
+
+impl fmt::Debug for Layout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.short())
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+enum Index {
+    None,
+    ByReference,
+    ByCopy,
+}
+
+impl Index {
+    fn types(self) -> Vec<IndexType> {
         match self {
             Self::None => vec![],
-            Self::SecondaryByReference => vec![IndexType::SecondaryByReference],
-            Self::SecondaryByCopy => vec![IndexType::SecondaryByCopy],
+            Self::ByReference => vec![IndexType::SecondaryByReference],
+            Self::ByCopy => vec![IndexType::SecondaryByCopy],
+        }
+    }
+    fn short(self) -> &'static str {
+        match self {
+            Self::None => "no_index",
+            Self::ByReference => "by_reference",
+            Self::ByCopy => "by_copy",
         }
     }
 }
 
-#[derive(Copy, Clone, Debug)]
-enum SourceConfig {
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+enum Source {
     File,
     InMemory,
 }
 
-impl SourceConfig {
+impl Source {
+    fn short(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::InMemory => "in_memory",
+        }
+    }
 }
 
-static ARRAY_CACHE: OnceLock<Mutex<HashMap<
-    (&'static str, &'static str, &'static str, usize), 
-    ArrayRef
->>> = OnceLock::new();
-static FILE_CACHE: OnceLock<Mutex<HashMap<
-    (&'static str, &'static str, &'static str, usize), 
-    std::path::PathBuf
->>> = OnceLock::new();
+impl fmt::Debug for Source {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.short())
+    }
+}
 
-fn get_cached_array<Builder: VortexArrayBuilder>(
-    builder_name: &'static str,
-    layout_name: &'static str,
-    layout: LayoutStrategy,
-    index_config: IndexConfig,
-    size: usize,
-) -> ArrayRef {
+// ── dataset + artifact construction (all untimed helpers) ────────────────────
+
+/// Materialize the generated quads into an owned `Vec`, eagerly. The generator
+/// is a *lazy* stream whose per-quad `format!` allocations would otherwise be
+/// polled — and charged — inside the timed serialization region; draining it
+/// here keeps those allocations out of the measurement.
+fn materialize_quads(size: usize) -> Vec<Quad> {
+    rt().block_on(async move {
+        generate_rdf_data_stream(size)
+            .map(|q| q.expect("quad generation is infallible"))
+            .collect()
+            .await
+    })
+}
+
+/// Build the in-memory Vortex array for a config, dispatching the generic
+/// builder on the runtime `Builder` enum.
+fn build_array(builder: Builder, layout: Layout, index: Index, size: usize) -> ArrayRef {
+    rt().block_on(async move {
+        let stream = generate_rdf_data_stream(size);
+        let strategy = layout.strategy();
+        let indexes = index.types();
+        match builder {
+            Builder::Unsorted => VortexRdfStore::build_vortex_array_with_builder::<
+                UnsortedStreamBuilder,
+            >(stream, strategy, indexes)
+            .await,
+            Builder::SortedInMemory => VortexRdfStore::build_vortex_array_with_builder::<
+                SortedInMemoryBuilder,
+            >(stream, strategy, indexes)
+            .await,
+            Builder::SortedStream => VortexRdfStore::build_vortex_array_with_builder::<
+                SortedStreamBuilder,
+            >(stream, strategy, indexes)
+            .await,
+        }
+        .expect("failed to build vortex array")
+    })
+}
+
+type CacheKey = (Builder, Layout, Index, usize);
+
+/// Cache of built in-memory arrays. Under the star design only a handful of
+/// distinct configs are ever requested, so this stays naturally bounded (unlike
+/// the old full-factorial cache, which held every combination for the process
+/// lifetime).
+static ARRAY_CACHE: OnceLock<Mutex<HashMap<CacheKey, ArrayRef>>> = OnceLock::new();
+static FILE_CACHE: OnceLock<Mutex<HashMap<CacheKey, PathBuf>>> = OnceLock::new();
+static IPC_CACHE: OnceLock<Mutex<HashMap<CacheKey, Vec<u8>>>> = OnceLock::new();
+
+fn cached_array(builder: Builder, layout: Layout, index: Index, size: usize) -> ArrayRef {
     let cache = ARRAY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut lock = cache.lock().unwrap();
-    let index_name = index_config.name();
-    let key = (builder_name, layout_name, index_name, size);
-    if let Some(arr) = lock.get(&key) {
+    let key = (builder, layout, index, size);
+    if let Some(arr) = cache.lock().unwrap().get(&key) {
         return arr.clone();
     }
-
-    let rt = get_runtime();
-    let quad_stream = generate_rdf_data_stream(size);
-    let arr = rt.block_on(async {
-        VortexRdfStore::build_vortex_array_with_builder::<Builder>(
-            quad_stream, layout, index_config.indexes(),
-        )
-        .await
-        .expect("Failed to build vortex array")
-    });
-
-    lock.insert(key, arr.clone());
+    let arr = build_array(builder, layout, index, size);
+    cache.lock().unwrap().insert(key, arr.clone());
     arr
 }
 
-fn get_cached_file_path<Builder: VortexArrayBuilder>(
-    builder_name: &'static str,
-    layout_name: &'static str,
-    layout: LayoutStrategy,
-    index_config: IndexConfig,
-    size: usize,
-) -> std::path::PathBuf {
+fn cached_file(builder: Builder, layout: Layout, index: Index, size: usize) -> PathBuf {
     let cache = FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut lock = cache.lock().unwrap();
-    let index_name = index_config.name();
-    let key = (builder_name, layout_name, index_name, size);
-    if let Some(path) = lock.get(&key) {
+    let key = (builder, layout, index, size);
+    if let Some(path) = cache.lock().unwrap().get(&key) {
         return path.clone();
     }
-
-    let rt = get_runtime();
-    let quad_stream = generate_rdf_data_stream(size);
-    let arr = rt.block_on(async {
-        VortexRdfStore::build_vortex_array_with_builder::<Builder>(
-            quad_stream, layout, index_config.indexes(),
-        )
-        .await
-        .expect("Failed to build vortex array")
-    });
-
-    let filename = format!(
+    let arr = cached_array(builder, layout, index, size);
+    let dir = PathBuf::from("target/bench_vortex_files");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!(
         "{}_{}_{}_{}.vortex",
-        builder_name,
-        layout_name,
-        index_name,
+        builder.short(),
+        layout.short(),
+        index.short(),
         size
-    );
-    std::fs::create_dir_all("target/bench_vortex_files").unwrap();
-    let filepath = std::path::PathBuf::from("target/bench_vortex_files").join(filename);
-
-    rt.block_on(async {
-        let writer = tokio::fs::File::create(&filepath).await.expect("Failed to create file");
-        vortex_rdf_core::io::serialize(arr, writer).await.expect("Failed to serialize");
+    ));
+    rt().block_on(async {
+        let writer = tokio::fs::File::create(&path).await.expect("create file");
+        io::serialize(arr, writer).await.expect("serialize file");
     });
-
-    lock.insert(key, filepath.clone());
-    filepath
+    cache.lock().unwrap().insert(key, path.clone());
+    path
 }
 
-// ==================== SERIALIZATION MATRIX ====================
+fn cached_ipc_bytes(builder: Builder, layout: Layout, index: Index, size: usize) -> Vec<u8> {
+    let cache = IPC_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (builder, layout, index, size);
+    if let Some(bytes) = cache.lock().unwrap().get(&key) {
+        return bytes.clone();
+    }
+    let arr = cached_array(builder, layout, index, size);
+    let mut buf = Vec::new();
+    io::write_array_to_ipc(arr, &mut buf).expect("write ipc");
+    cache.lock().unwrap().insert(key, buf.clone());
+    buf
+}
 
-macro_rules! define_serialize_bench {
-    ($name:ident, $builder:ty, $layout:expr) => {
-        #[divan::bench(
-            consts = [10_000, 100_000, 1_000_000],
-            args = [
-                IndexConfig::None,
-                IndexConfig::SecondaryByReference,
-                IndexConfig::SecondaryByCopy,
-            ],
-            sample_count = 10
-        )]
-        fn $name<const SIZE: usize>(bencher: Bencher, index_config: IndexConfig) {
-            let rt = get_runtime();
-            bencher
-                .with_inputs(|| generate_rdf_data_stream(SIZE))
-                .bench_values(|quad_stream| {
-                    rt.block_on(async {
-                        let mut buffer = Vec::new();
-                        quads_stream_to_vortex_writer_with_builder::<$builder, _, _>(
-                            quad_stream,
-                            &mut buffer,
-                            $layout,
-                            index_config.indexes(),
-                        )
-                        .await
-                        .expect("Failed to serialize with builder/layout");
-                        black_box(buffer.len())
-                    })
-                });
+/// Construct a store over a config's data, from the requested source. Both are
+/// untimed: `from_file` reads the footer only, and `new` wraps a cached
+/// (Arc-shared) array.
+fn make_store(
+    source: Source,
+    builder: Builder,
+    layout: Layout,
+    index: Index,
+    size: usize,
+) -> VortexRdfStore {
+    match source {
+        Source::File => {
+            let path = cached_file(builder, layout, index, size);
+            rt().block_on(async { VortexRdfStore::from_file(path).await.expect("open file store") })
         }
-    };
-}
-
-define_serialize_bench!(serialize_sorted_in_memory_default, SortedInMemoryBuilder, LayoutStrategy::Default);
-define_serialize_bench!(serialize_sorted_in_memory_typed_object, SortedInMemoryBuilder, LayoutStrategy::TypedObject);
-define_serialize_bench!(serialize_sorted_in_memory_dictionary, SortedInMemoryBuilder, LayoutStrategy::Dictionary);
-
-define_serialize_bench!(serialize_sorted_stream_default, SortedStreamBuilder, LayoutStrategy::Default);
-define_serialize_bench!(serialize_sorted_stream_typed_object, SortedStreamBuilder, LayoutStrategy::TypedObject);
-define_serialize_bench!(serialize_sorted_stream_dictionary, SortedStreamBuilder, LayoutStrategy::Dictionary);
-
-define_serialize_bench!(serialize_unsorted_stream_default, UnsortedStreamBuilder, LayoutStrategy::Default);
-define_serialize_bench!(serialize_unsorted_stream_typed_object, UnsortedStreamBuilder, LayoutStrategy::TypedObject);
-define_serialize_bench!(serialize_unsorted_stream_dictionary, UnsortedStreamBuilder, LayoutStrategy::Dictionary);
-
-// ==================== MATCH QUERY MATRIX ====================
-
-#[derive(Copy, Clone, Debug)]
-enum QueryPattern {
-    S,
-    P,
-    O,
-    G,
-    SP,
-    SO,
-    SG,
-    PO,
-    PG,
-    OG,
-    SPO,
-    SPG,
-    SOG,
-    POG,
-    SPOG,
-}
-
-fn terms_for_pattern(
-    pattern: QueryPattern,
-) -> (
-    Option<NamedOrBlankNode>,
-    Option<NamedNode>,
-    Option<oxrdf::Term>,
-    Option<oxrdf::GraphName>,
-) {
-    let s = Some(NamedOrBlankNode::NamedNode(NamedNode::new_unchecked("http://example.org/subject/0")));
-    let p = Some(NamedNode::new_unchecked("http://example.org/predicate/0"));
-    let o = Some(oxrdf::Term::NamedNode(NamedNode::new_unchecked("http://example.org/object/0")));
-    let g = Some(oxrdf::GraphName::NamedNode(NamedNode::new_unchecked("http://example.org/graph")));
-
-    match pattern {
-        QueryPattern::S => (s, None, None, None),
-        QueryPattern::P => (None, p, None, None),
-        QueryPattern::O => (None, None, o, None),
-        QueryPattern::G => (None, None, None, g),
-        QueryPattern::SP => (s, p, None, None),
-        QueryPattern::SO => (s, None, o, None),
-        QueryPattern::SG => (s, None, None, g),
-        QueryPattern::PO => (None, p, o, None),
-        QueryPattern::PG => (None, p, None, g),
-        QueryPattern::OG => (None, None, o, g),
-        QueryPattern::SPO => (s, p, o, None),
-        QueryPattern::SPG => (s, p, None, g),
-        QueryPattern::SOG => (s, None, o, g),
-        QueryPattern::POG => (None, p, o, g),
-        QueryPattern::SPOG => (s, p, o, g),
+        Source::InMemory => {
+            VortexRdfStore::new(cached_array(builder, layout, index, size))
+                .expect("build in-memory store")
+        }
     }
 }
 
-fn run_match_bench_for_combo<Builder: VortexArrayBuilder, const SIZE: usize>(
-    bencher: Bencher,
-    builder_name: &'static str,
-    layout_name: &'static str,
-    layout: LayoutStrategy,
-    index_config: IndexConfig,
-    source: SourceConfig,
-    pattern: QueryPattern,
-) {
-    bencher
-        .with_inputs(|| {
-            let rt = get_runtime();
-            match source {
-                SourceConfig::File => {
-                    let path = get_cached_file_path::<Builder>(
-                        builder_name,
-                        layout_name,
-                        layout,
-                        index_config,
-                        SIZE,
-                    );
-                    rt.block_on(async {
-                        VortexRdfStore::from_file(path)
-                            .await
-                            .expect("Failed to create file-backed store")
-                    })
-                }
-                SourceConfig::InMemory => {
-                    let arr = get_cached_array::<Builder>(
-                        builder_name,
-                        layout_name,
-                        layout,
-                        index_config,
-                        SIZE,
-                    );
-                    VortexRdfStore::new(arr).expect("Failed to create in-memory store")
-                }
-            }
-        })
-        .bench_values(|store| {
-            let (s_term, p_term, o_term, g_term) = terms_for_pattern(pattern);
+// ══════════════════════════════════════════════════════════════════════════
+// Group 1 — SERIALIZE (write path)
+//
+// The write path is the one place all three axes genuinely differ, so we vary
+// them one at a time around a `sorted_stream / default / no_index` baseline and
+// add the two real interactions (Dictionary encodes the index as codes; an
+// unsorted builder leaves the index columns unstamped, unlike a sorted one).
+// ══════════════════════════════════════════════════════════════════════════
 
-            let rt = get_runtime();
-            rt.block_on(async {
-                let filtered = store
-                    .match_pattern(
-                        s_term.as_ref(),
-                        p_term.as_ref(),
-                        o_term.as_ref(),
-                        g_term.as_ref(),
-                    )
-                    .await
-                    .expect("Failed to match pattern");
-                // `match_pattern` returns a lazy derived store. Force execution
-                // by materializing the matched quads in this benchmark.
-                let matched: Vec<_> = filtered
-                    .quads()
-                    .expect("Failed to create quad stream")
-                    .try_collect()
-                    .await
-                    .expect("Failed to execute filtered query");
-                black_box(matched)
+#[derive(Copy, Clone)]
+struct SerCfg {
+    builder: Builder,
+    layout: Layout,
+    index: Index,
+}
+
+impl fmt::Debug for SerCfg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}_{}_{}",
+            self.builder.short(),
+            self.layout.short(),
+            self.index.short()
+        )
+    }
+}
+
+const SERIALIZE_CONFIGS: &[SerCfg] = &[
+    // Builder axis (Default layout, no index).
+    SerCfg { builder: Builder::Unsorted, layout: Layout::Default, index: Index::None },
+    SerCfg { builder: Builder::SortedInMemory, layout: Layout::Default, index: Index::None },
+    SerCfg { builder: Builder::SortedStream, layout: Layout::Default, index: Index::None }, // baseline
+    // Layout axis (SortedStream, no index).
+    SerCfg { builder: Builder::SortedStream, layout: Layout::TypedObject, index: Index::None },
+    SerCfg { builder: Builder::SortedStream, layout: Layout::Dictionary, index: Index::None },
+    // Index axis (SortedStream, Default layout).
+    SerCfg { builder: Builder::SortedStream, layout: Layout::Default, index: Index::ByReference },
+    SerCfg { builder: Builder::SortedStream, layout: Layout::Default, index: Index::ByCopy },
+    // Interactions worth keeping: index columns as dictionary codes, and an
+    // unsorted (per-chunk, unstamped) index vs the sorted global one above.
+    SerCfg { builder: Builder::SortedStream, layout: Layout::Dictionary, index: Index::ByCopy },
+    SerCfg { builder: Builder::Unsorted, layout: Layout::Default, index: Index::ByCopy },
+];
+
+#[divan::bench(args = SERIALIZE_CONFIGS)]
+fn serialize(bencher: divan::Bencher, cfg: &SerCfg) {
+    let cfg = *cfg;
+    bencher
+        .with_inputs(|| materialize_quads(BENCH_SIZE))
+        .bench_values(|quads| {
+            rt().block_on(async move {
+                let mut buf = Vec::new();
+                let stream = stream::iter(quads.into_iter().map(Ok::<_, VortexRdfError>));
+                match cfg.builder {
+                    Builder::Unsorted => {
+                        io::quads_stream_to_vortex_writer_with_builder::<UnsortedStreamBuilder, _, _>(
+                            stream, &mut buf, cfg.layout.strategy(), cfg.index.types(),
+                        )
+                        .await
+                    }
+                    Builder::SortedInMemory => {
+                        io::quads_stream_to_vortex_writer_with_builder::<SortedInMemoryBuilder, _, _>(
+                            stream, &mut buf, cfg.layout.strategy(), cfg.index.types(),
+                        )
+                        .await
+                    }
+                    Builder::SortedStream => {
+                        io::quads_stream_to_vortex_writer_with_builder::<SortedStreamBuilder, _, _>(
+                            stream, &mut buf, cfg.layout.strategy(), cfg.index.types(),
+                        )
+                        .await
+                    }
+                }
+                .expect("serialize failed");
+                black_box(buf.len())
             })
         });
 }
 
-macro_rules! define_match_matrix_bench {
-    ($name:ident, $builder:ty, $builder_name:expr, $layout:expr, $layout_name:expr, $index_config:expr, $source:expr) => {
-        #[divan::bench(
-            consts = [10_000, 100_000, 1_000_000],
-            args = [
-                QueryPattern::S,
-                QueryPattern::P,
-                QueryPattern::O,
-                QueryPattern::G,
-                QueryPattern::SP,
-                QueryPattern::SO,
-                QueryPattern::SG,
-                QueryPattern::PO,
-                QueryPattern::PG,
-                QueryPattern::OG,
-                QueryPattern::SPO,
-                QueryPattern::SPG,
-                QueryPattern::SOG,
-                QueryPattern::POG,
-                QueryPattern::SPOG,
-            ],
-            sample_count = 10
-        )]
-        fn $name<const SIZE: usize>(bencher: Bencher, pattern: QueryPattern) {
-            run_match_bench_for_combo::<$builder, SIZE>(
-                bencher,
-                $builder_name,
-                $layout_name,
-                $layout,
-                $index_config,
-                $source,
-                pattern,
-            );
+// ══════════════════════════════════════════════════════════════════════════
+// Group 2 — MATCH (query path)
+//
+// Baseline: sorted_stream / default / by_copy / file. Each config sweeps the
+// six routing patterns. We use SortedStream as the "sorted" representative and
+// UnsortedStream as the "unsorted" one; SortedInMemory is omitted because it is
+// query-indistinguishable from SortedStream (identical stamped columns).
+// ══════════════════════════════════════════════════════════════════════════
+
+#[derive(Copy, Clone, Debug)]
+enum Pattern {
+    S,
+    P,
+    O,
+    PO,
+    G,
+    SPOG,
+}
+
+const PATTERNS: &[Pattern] = &[
+    Pattern::S,
+    Pattern::P,
+    Pattern::O,
+    Pattern::PO,
+    Pattern::G,
+    Pattern::SPOG,
+];
+
+/// Probe terms, all chosen to hit rows the generator actually emits (see the
+/// module docs on selectivity).
+#[allow(clippy::type_complexity)]
+fn terms_for(
+    pattern: Pattern,
+) -> (
+    Option<NamedOrBlankNode>,
+    Option<NamedNode>,
+    Option<Term>,
+    Option<GraphName>,
+) {
+    let s = || NamedOrBlankNode::NamedNode(NamedNode::new_unchecked("http://example.org/subject/0"));
+    let p = || NamedNode::new_unchecked("http://example.org/predicate/0");
+    let o = || Term::NamedNode(NamedNode::new_unchecked("http://example.org/object/0"));
+    let g = || GraphName::NamedNode(NamedNode::new_unchecked("http://example.org/graph/0"));
+
+    match pattern {
+        Pattern::S => (Some(s()), None, None, None),
+        Pattern::P => (None, Some(p()), None, None),
+        Pattern::O => (None, None, Some(o()), None),
+        Pattern::PO => (None, Some(p()), Some(o()), None),
+        Pattern::G => (None, None, None, Some(g())),
+        Pattern::SPOG => (Some(s()), Some(p()), Some(o()), Some(g())),
+    }
+}
+
+/// Run one match config across a pattern: build the store once (untimed), then
+/// time `match_pattern` plus materialization of the matched quads (so the lazy
+/// derived view is actually executed).
+fn run_match(
+    bencher: divan::Bencher,
+    builder: Builder,
+    layout: Layout,
+    index: Index,
+    source: Source,
+    pattern: Pattern,
+) {
+    bencher
+        .with_inputs(|| make_store(source, builder, layout, index, BENCH_SIZE))
+        .bench_refs(|store| {
+            let (s, p, o, g) = terms_for(pattern);
+            rt().block_on(async {
+                let matched = store
+                    .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+                    .await
+                    .expect("match_pattern failed");
+                let quads: Vec<_> = matched
+                    .quads()
+                    .expect("quad stream")
+                    .try_collect()
+                    .await
+                    .expect("execute match");
+                black_box(quads)
+            })
+        });
+}
+
+macro_rules! match_bench {
+    ($name:ident, $builder:expr, $layout:expr, $index:expr, $source:expr) => {
+        #[divan::bench(args = PATTERNS)]
+        fn $name(bencher: divan::Bencher, pattern: &Pattern) {
+            run_match(bencher, $builder, $layout, $index, $source, *pattern);
         }
     };
 }
 
-/// All combinations with an unsorted quad array
-define_match_matrix_bench!(match_pattern_unsorted_stream_default_no_index_file, UnsortedStreamBuilder, "UnsortedStreamBuilder", LayoutStrategy::Default, "default", IndexConfig::None, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_unsorted_stream_default_no_index_in_memory, UnsortedStreamBuilder, "UnsortedStreamBuilder", LayoutStrategy::Default, "default", IndexConfig::None, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_unsorted_stream_default_secondary_by_reference_file, UnsortedStreamBuilder, "UnsortedStreamBuilder", LayoutStrategy::Default, "default", IndexConfig::SecondaryByReference, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_unsorted_stream_default_secondary_by_reference_in_memory, UnsortedStreamBuilder, "UnsortedStreamBuilder", LayoutStrategy::Default, "default", IndexConfig::SecondaryByReference, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_unsorted_stream_default_secondary_by_copy_file, UnsortedStreamBuilder, "UnsortedStreamBuilder", LayoutStrategy::Default, "default", IndexConfig::SecondaryByCopy, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_unsorted_stream_default_secondary_by_copy_in_memory, UnsortedStreamBuilder, "UnsortedStreamBuilder", LayoutStrategy::Default, "default", IndexConfig::SecondaryByCopy, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_unsorted_stream_typed_object_no_index_file, UnsortedStreamBuilder, "UnsortedStreamBuilder", LayoutStrategy::TypedObject, "typed-object", IndexConfig::None, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_unsorted_stream_typed_object_no_index_in_memory, UnsortedStreamBuilder, "UnsortedStreamBuilder", LayoutStrategy::TypedObject, "typed-object", IndexConfig::None, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_unsorted_stream_typed_object_secondary_by_reference_file, UnsortedStreamBuilder, "UnsortedStreamBuilder", LayoutStrategy::TypedObject, "typed-object", IndexConfig::SecondaryByReference, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_unsorted_stream_typed_object_secondary_by_reference_in_memory, UnsortedStreamBuilder, "UnsortedStreamBuilder", LayoutStrategy::TypedObject, "typed-object", IndexConfig::SecondaryByReference, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_unsorted_stream_typed_object_secondary_by_copy_file, UnsortedStreamBuilder, "UnsortedStreamBuilder", LayoutStrategy::TypedObject, "typed-object", IndexConfig::SecondaryByCopy, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_unsorted_stream_typed_object_secondary_by_copy_in_memory, UnsortedStreamBuilder, "UnsortedStreamBuilder", LayoutStrategy::TypedObject, "typed-object", IndexConfig::SecondaryByCopy, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_unsorted_stream_dictionary_no_index_file, UnsortedStreamBuilder, "UnsortedStreamBuilder", LayoutStrategy::Dictionary, "dictionary", IndexConfig::None, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_unsorted_stream_dictionary_no_index_in_memory, UnsortedStreamBuilder, "UnsortedStreamBuilder", LayoutStrategy::Dictionary, "dictionary", IndexConfig::None, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_unsorted_stream_dictionary_secondary_by_reference_file, UnsortedStreamBuilder, "UnsortedStreamBuilder", LayoutStrategy::Dictionary, "dictionary", IndexConfig::SecondaryByReference, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_unsorted_stream_dictionary_secondary_by_reference_in_memory, UnsortedStreamBuilder, "UnsortedStreamBuilder", LayoutStrategy::Dictionary, "dictionary", IndexConfig::SecondaryByReference, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_unsorted_stream_dictionary_secondary_by_copy_file, UnsortedStreamBuilder, "UnsortedStreamBuilder", LayoutStrategy::Dictionary, "dictionary", IndexConfig::SecondaryByCopy, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_unsorted_stream_dictionary_secondary_by_copy_in_memory, UnsortedStreamBuilder, "UnsortedStreamBuilder", LayoutStrategy::Dictionary, "dictionary", IndexConfig::SecondaryByCopy, SourceConfig::InMemory);
+// Baseline + source axis.
+match_bench!(match_sorted_default_bycopy_file, Builder::SortedStream, Layout::Default, Index::ByCopy, Source::File);
+match_bench!(match_sorted_default_bycopy_mem, Builder::SortedStream, Layout::Default, Index::ByCopy, Source::InMemory);
+// Layout axis (file).
+match_bench!(match_sorted_typedobj_bycopy_file, Builder::SortedStream, Layout::TypedObject, Index::ByCopy, Source::File);
+match_bench!(match_sorted_dict_bycopy_file, Builder::SortedStream, Layout::Dictionary, Index::ByCopy, Source::File);
+// Index axis (file).
+match_bench!(match_sorted_default_noindex_file, Builder::SortedStream, Layout::Default, Index::None, Source::File);
+match_bench!(match_sorted_default_byref_file, Builder::SortedStream, Layout::Default, Index::ByReference, Source::File);
+// Sortedness axis: unsorted builder leaves nothing stamped, so indexes decline
+// and everything falls to the mask scan — the worst case, and the typical
+// in-memory (JS bindings) case.
+match_bench!(match_unsorted_default_bycopy_file, Builder::Unsorted, Layout::Default, Index::ByCopy, Source::File);
+match_bench!(match_unsorted_default_bycopy_mem, Builder::Unsorted, Layout::Default, Index::ByCopy, Source::InMemory);
 
-/// All combinations with a sorted in memory quad array
-define_match_matrix_bench!(match_pattern_sorted_in_memory_default_no_index_file, SortedInMemoryBuilder, "SortedInMemoryBuilder", LayoutStrategy::Default, "default", IndexConfig::None, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_sorted_in_memory_default_no_index_in_memory, SortedInMemoryBuilder, "SortedInMemoryBuilder", LayoutStrategy::Default, "default", IndexConfig::None, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_sorted_in_memory_default_secondary_by_reference_file, SortedInMemoryBuilder, "SortedInMemoryBuilder", LayoutStrategy::Default, "default", IndexConfig::SecondaryByReference, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_sorted_in_memory_default_secondary_by_reference_in_memory, SortedInMemoryBuilder, "SortedInMemoryBuilder", LayoutStrategy::Default, "default", IndexConfig::SecondaryByReference, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_sorted_in_memory_default_secondary_by_copy_file, SortedInMemoryBuilder, "SortedInMemoryBuilder", LayoutStrategy::Default, "default", IndexConfig::SecondaryByCopy, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_sorted_in_memory_default_secondary_by_copy_in_memory, SortedInMemoryBuilder, "SortedInMemoryBuilder", LayoutStrategy::Default, "default", IndexConfig::SecondaryByCopy, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_sorted_in_memory_typed_object_no_index_file, SortedInMemoryBuilder, "SortedInMemoryBuilder", LayoutStrategy::TypedObject, "typed-object", IndexConfig::None, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_sorted_in_memory_typed_object_no_index_in_memory, SortedInMemoryBuilder, "SortedInMemoryBuilder", LayoutStrategy::TypedObject, "typed-object", IndexConfig::None, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_sorted_in_memory_typed_object_secondary_by_reference_file, SortedInMemoryBuilder, "SortedInMemoryBuilder", LayoutStrategy::TypedObject, "typed-object", IndexConfig::SecondaryByReference, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_sorted_in_memory_typed_object_secondary_by_reference_in_memory, SortedInMemoryBuilder, "SortedInMemoryBuilder", LayoutStrategy::TypedObject, "typed-object", IndexConfig::SecondaryByReference, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_sorted_in_memory_typed_object_secondary_by_copy_file, SortedInMemoryBuilder, "SortedInMemoryBuilder", LayoutStrategy::TypedObject, "typed-object", IndexConfig::SecondaryByCopy, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_sorted_in_memory_typed_object_secondary_by_copy_in_memory, SortedInMemoryBuilder, "SortedInMemoryBuilder", LayoutStrategy::TypedObject, "typed-object", IndexConfig::SecondaryByCopy, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_sorted_in_memory_dictionary_no_index_file, SortedInMemoryBuilder, "SortedInMemoryBuilder", LayoutStrategy::Dictionary, "dictionary", IndexConfig::None, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_sorted_in_memory_dictionary_no_index_in_memory, SortedInMemoryBuilder, "SortedInMemoryBuilder", LayoutStrategy::Dictionary, "dictionary", IndexConfig::None, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_sorted_in_memory_dictionary_secondary_by_reference_file, SortedInMemoryBuilder, "SortedInMemoryBuilder", LayoutStrategy::Dictionary, "dictionary", IndexConfig::SecondaryByReference, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_sorted_in_memory_dictionary_secondary_by_reference_in_memory, SortedInMemoryBuilder, "SortedInMemoryBuilder", LayoutStrategy::Dictionary, "dictionary", IndexConfig::SecondaryByReference, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_sorted_in_memory_dictionary_secondary_by_copy_file, SortedInMemoryBuilder, "SortedInMemoryBuilder", LayoutStrategy::Dictionary, "dictionary", IndexConfig::SecondaryByCopy, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_sorted_in_memory_dictionary_secondary_by_copy_in_memory, SortedInMemoryBuilder, "SortedInMemoryBuilder", LayoutStrategy::Dictionary, "dictionary", IndexConfig::SecondaryByCopy, SourceConfig::InMemory);
+/// Chained refinement: `match_pattern(P)` then `match_pattern(O)` on the
+/// resulting view — the headline "views narrow the same coordinate space"
+/// feature, which no single-pattern benchmark exercises.
+#[divan::bench(args = [Source::File, Source::InMemory])]
+fn match_chained(bencher: divan::Bencher, source: &Source) {
+    let source = *source;
+    bencher
+        .with_inputs(|| make_store(source, Builder::SortedStream, Layout::Default, Index::ByCopy, BENCH_SIZE))
+        .bench_refs(|store| {
+            let p = NamedNode::new_unchecked("http://example.org/predicate/0");
+            let o = Term::NamedNode(NamedNode::new_unchecked("http://example.org/object/0"));
+            rt().block_on(async {
+                let after_p = store
+                    .match_pattern(None, Some(&p), None, None)
+                    .await
+                    .expect("match P");
+                let after_po = after_p
+                    .match_pattern(None, None, Some(&o), None)
+                    .await
+                    .expect("match O on view");
+                let quads: Vec<_> = after_po
+                    .quads()
+                    .expect("quad stream")
+                    .try_collect()
+                    .await
+                    .expect("execute chained match");
+                black_box(quads)
+            })
+        });
+}
 
-/// All combinations with a sorted stream quad array
-define_match_matrix_bench!(match_pattern_sorted_stream_default_no_index_file, SortedStreamBuilder, "SortedStreamBuilder", LayoutStrategy::Default, "default", IndexConfig::None, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_sorted_stream_default_no_index_in_memory, SortedStreamBuilder, "SortedStreamBuilder", LayoutStrategy::Default, "default", IndexConfig::None, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_sorted_stream_default_secondary_by_reference_file, SortedStreamBuilder, "SortedStreamBuilder", LayoutStrategy::Default, "default", IndexConfig::SecondaryByReference, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_sorted_stream_default_secondary_by_reference_in_memory, SortedStreamBuilder, "SortedStreamBuilder", LayoutStrategy::Default, "default", IndexConfig::SecondaryByReference, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_sorted_stream_default_secondary_by_copy_file, SortedStreamBuilder, "SortedStreamBuilder", LayoutStrategy::Default, "default", IndexConfig::SecondaryByCopy, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_sorted_stream_default_secondary_by_copy_in_memory, SortedStreamBuilder, "SortedStreamBuilder", LayoutStrategy::Default, "default", IndexConfig::SecondaryByCopy, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_sorted_stream_typed_object_no_index_file, SortedStreamBuilder, "SortedStreamBuilder", LayoutStrategy::TypedObject, "typed-object", IndexConfig::None, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_sorted_stream_typed_object_no_index_in_memory, SortedStreamBuilder, "SortedStreamBuilder", LayoutStrategy::TypedObject, "typed-object", IndexConfig::None, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_sorted_stream_typed_object_secondary_by_reference_file, SortedStreamBuilder, "SortedStreamBuilder", LayoutStrategy::TypedObject, "typed-object", IndexConfig::SecondaryByReference, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_sorted_stream_typed_object_secondary_by_reference_in_memory, SortedStreamBuilder, "SortedStreamBuilder", LayoutStrategy::TypedObject, "typed-object", IndexConfig::SecondaryByReference, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_sorted_stream_typed_object_secondary_by_copy_file, SortedStreamBuilder, "SortedStreamBuilder", LayoutStrategy::TypedObject, "typed-object", IndexConfig::SecondaryByCopy, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_sorted_stream_typed_object_secondary_by_copy_in_memory, SortedStreamBuilder, "SortedStreamBuilder", LayoutStrategy::TypedObject, "typed-object", IndexConfig::SecondaryByCopy, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_sorted_stream_dictionary_no_index_file, SortedStreamBuilder, "SortedStreamBuilder", LayoutStrategy::Dictionary, "dictionary", IndexConfig::None, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_sorted_stream_dictionary_no_index_in_memory, SortedStreamBuilder, "SortedStreamBuilder", LayoutStrategy::Dictionary, "dictionary", IndexConfig::None, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_sorted_stream_dictionary_secondary_by_reference_file, SortedStreamBuilder, "SortedStreamBuilder", LayoutStrategy::Dictionary, "dictionary", IndexConfig::SecondaryByReference, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_sorted_stream_dictionary_secondary_by_reference_in_memory, SortedStreamBuilder, "SortedStreamBuilder", LayoutStrategy::Dictionary, "dictionary", IndexConfig::SecondaryByReference, SourceConfig::InMemory);
-define_match_matrix_bench!(match_pattern_sorted_stream_dictionary_secondary_by_copy_file, SortedStreamBuilder, "SortedStreamBuilder", LayoutStrategy::Dictionary, "dictionary", IndexConfig::SecondaryByCopy, SourceConfig::File);
-define_match_matrix_bench!(match_pattern_sorted_stream_dictionary_secondary_by_copy_in_memory, SortedStreamBuilder, "SortedStreamBuilder", LayoutStrategy::Dictionary, "dictionary", IndexConfig::SecondaryByCopy, SourceConfig::InMemory);
+// ══════════════════════════════════════════════════════════════════════════
+// Group 3 — DECODE / LOAD (read-back path)
+//
+// The full-scan decode is the single most fundamental read and was entirely
+// unbenchmarked. It is where layouts diverge most: Dictionary decodes codes to
+// terms, TypedObject reassembles the object from four columns. Load costs
+// (opening a file, decoding IPC) were previously hidden in untimed setup.
+// ══════════════════════════════════════════════════════════════════════════
 
+#[derive(Copy, Clone)]
+struct DecodeCfg {
+    layout: Layout,
+    source: Source,
+}
+
+impl fmt::Debug for DecodeCfg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}_{}", self.layout.short(), self.source.short())
+    }
+}
+
+const DECODE_CONFIGS: &[DecodeCfg] = &[
+    DecodeCfg { layout: Layout::Default, source: Source::File }, // baseline full scan
+    DecodeCfg { layout: Layout::TypedObject, source: Source::File }, // object reassembly
+    DecodeCfg { layout: Layout::Dictionary, source: Source::File }, // code → term
+    DecodeCfg { layout: Layout::Default, source: Source::InMemory }, // in-memory decode path
+];
+
+/// Decode every quad in the store (`quads()` → `Vec`). Index is irrelevant to a
+/// full scan, so it is fixed to `None`.
+#[divan::bench(args = DECODE_CONFIGS)]
+fn decode_all(bencher: divan::Bencher, cfg: &DecodeCfg) {
+    let cfg = *cfg;
+    bencher
+        .with_inputs(|| make_store(cfg.source, Builder::SortedStream, cfg.layout, Index::None, BENCH_SIZE))
+        .bench_refs(|store| {
+            rt().block_on(async {
+                let quads: Vec<_> = store
+                    .quads()
+                    .expect("quad stream")
+                    .try_collect()
+                    .await
+                    .expect("decode all");
+                black_box(quads.len())
+            })
+        });
+}
+
+/// Open a file-backed store. Default reads the footer only; Dictionary also
+/// reads its term dictionary up front (an extra single-column scan), so the two
+/// are worth distinguishing.
+#[divan::bench(args = [Layout::Default, Layout::Dictionary])]
+fn open_file(bencher: divan::Bencher, layout: &Layout) {
+    let layout = *layout;
+    bencher
+        .with_inputs(|| cached_file(Builder::SortedStream, layout, Index::None, BENCH_SIZE))
+        .bench_refs(|path| {
+            rt().block_on(async {
+                let store = VortexRdfStore::from_file(path).await.expect("open file");
+                black_box(store.layout())
+            })
+        });
+}
+
+/// Load a store from IPC bytes (`from_bytes`): full in-memory IPC decode plus
+/// layout detection.
+#[divan::bench]
+fn from_bytes(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(|| cached_ipc_bytes(Builder::SortedStream, Layout::Default, Index::None, BENCH_SIZE))
+        .bench_refs(|bytes| {
+            rt().block_on(async {
+                let store = VortexRdfStore::from_bytes(bytes).await.expect("from_bytes");
+                black_box(store)
+            })
+        });
+}
