@@ -64,7 +64,7 @@ impl Default for CottasNativeConfig {
         Self {
             ordering: TripleOrdering::SPO,
             row_group_size: 122_880,
-            dict_row_group_size: 16_384,
+            dict_row_group_size: 1_024,
             compression_profile: CottasVortexCompressionProfile::Balanced,
         }
     }
@@ -5195,6 +5195,148 @@ async fn write_dictionary_lookup_sidecars_from_pair_runs(
         term_to_id_path
     );
     Ok(())
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct NativeDictionaryRebuildStats {
+    pub data_path: String,
+    pub source_path: String,
+    pub output_path: String,
+    pub terms_read: u64,
+    pub temporary_runs: usize,
+    pub row_group_size: usize,
+    pub scan_ms: f64,
+    pub sort_spill_ms: f64,
+    pub write_ms: f64,
+    pub total_ms: f64,
+}
+
+/// Rebuilds only the lexicographically ordered Vortex term-to-ID dictionary.
+///
+/// The triple artifact, ID-to-term dictionary, and all native indexes remain
+/// untouched. Temporary files are private external-sort runs and are deleted
+/// when this function returns; they are not runtime components.
+pub async fn rebuild_cottas_native_term_dictionary(
+    data_path: &Path,
+    row_group_size: usize,
+) -> Result<NativeDictionaryRebuildStats> {
+    let total_start = Instant::now();
+    let row_group_size = row_group_size.max(1);
+    let source_path = native_dict_path(data_path);
+    let output_path = native_dict_term_to_id_path(data_path);
+    if !source_path.is_file() {
+        return Err(VortexRdfError::InvalidOperation(format!(
+            "cannot rebuild term dictionary: ID-to-term Vortex component is missing at {:?}",
+            source_path
+        )));
+    }
+
+    let sort_batch_size = std::env::var("VORTEX_RDF_TERM_DICT_REBUILD_BATCH_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(500_000)
+        .max(1);
+    let temp_dir =
+        tempfile::tempdir().map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+
+    let scan_start = Instant::now();
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&source_path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let mut stream = file
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_projection(vortex_array::expr::select(
+            ["id", "term"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?;
+    let open_and_scan_build_ms = elapsed_ms(scan_start);
+
+    let spill_start = Instant::now();
+    let mut batch = Vec::with_capacity(sort_batch_size);
+    let mut term_run_paths = Vec::new();
+    let mut terms_read = 0u64;
+    while let Some(batch_result) = stream.next().await {
+        let array = batch_result.map_err(VortexRdfError::from)?;
+        let ids = extract_projected_u32_column(&array, "id")?;
+        let terms = extract_projected_utf8_column(&array, "term")?;
+        if ids.len() != array.len() || terms.len() != array.len() {
+            return Err(VortexRdfError::Deserialization(format!(
+                "ID-to-term dictionary projection mismatch: rows={}, ids={}, terms={}",
+                array.len(),
+                ids.len(),
+                terms.len()
+            )));
+        }
+        for (id, term) in ids.into_iter().zip(terms) {
+            batch.push(NativeDictPair { id, term });
+            terms_read += 1;
+            if batch.len() >= sort_batch_size {
+                batch.sort_by(|left, right| {
+                    left.term
+                        .cmp(&right.term)
+                        .then_with(|| left.id.cmp(&right.id))
+                });
+                let path = temp_dir.path().join(format!(
+                    "term_dictionary_rebuild_{:06}.tsv",
+                    term_run_paths.len()
+                ));
+                write_pair_run(&path, &batch)?;
+                term_run_paths.push(path);
+                batch.clear();
+            }
+        }
+    }
+    let scan_ms = open_and_scan_build_ms + elapsed_ms(spill_start);
+    if !batch.is_empty() {
+        batch.sort_by(|left, right| {
+            left.term
+                .cmp(&right.term)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let path = temp_dir.path().join(format!(
+            "term_dictionary_rebuild_{:06}.tsv",
+            term_run_paths.len()
+        ));
+        write_pair_run(&path, &batch)?;
+        term_run_paths.push(path);
+    }
+    let sort_spill_ms = elapsed_ms(spill_start);
+
+    let write_start = Instant::now();
+    write_native_dictionary_component(
+        &output_path,
+        &term_run_paths,
+        PairRunOrder::Term,
+        row_group_size,
+    )
+    .await?;
+    let write_ms = elapsed_ms(write_start);
+    let total_ms = elapsed_ms(total_start);
+    log::info!(
+        "[cottas_native_ids] rebuilt only {:?}: terms={}, runs={}, row_group_size={}, total_ms={:.3}",
+        output_path,
+        terms_read,
+        term_run_paths.len(),
+        row_group_size,
+        total_ms
+    );
+    Ok(NativeDictionaryRebuildStats {
+        data_path: data_path.display().to_string(),
+        source_path: source_path.display().to_string(),
+        output_path: output_path.display().to_string(),
+        terms_read,
+        temporary_runs: term_run_paths.len(),
+        row_group_size,
+        scan_ms,
+        sort_spill_ms,
+        write_ms,
+        total_ms,
+    })
 }
 
 fn first_bound_native_id_column(

@@ -35,8 +35,8 @@ use vortex_rdf_core::{
         count_cottas_native_string_file_with_diagnostics_mode, load_vortex_file_ref,
         match_cottas_native_file, match_cottas_native_file_with_diagnostics,
         match_cottas_native_string_file, match_cottas_native_string_file_with_diagnostics,
-        open_vortex_file, serialize, serialize_cottas_native_file,
-        serialize_cottas_native_string_file,
+        open_vortex_file, rebuild_cottas_native_term_dictionary, serialize,
+        serialize_cottas_native_file, serialize_cottas_native_string_file,
     },
     store::layout::{
         cottas::{CottasLayout, TripleOrdering},
@@ -170,6 +170,19 @@ enum Action {
     BuildNativeObjectIndex {
         #[arg(short, long)]
         input: PathBuf,
+        #[arg(long)]
+        diagnostics_out: Option<PathBuf>,
+    },
+    /// Rebuild only the Vortex term-to-ID dictionary from the existing
+    /// Vortex ID-to-term component. Triples and native indexes are untouched.
+    #[command(name = "rebuild-native-term-dictionary")]
+    RebuildNativeTermDictionary {
+        #[arg(short, long)]
+        input: PathBuf,
+        /// Rows per sorted term zone. Smaller values improve point lookup at
+        /// the cost of modestly larger layout/statistics metadata.
+        #[arg(long, default_value_t = 1_024)]
+        row_group_size: usize,
         #[arg(long)]
         diagnostics_out: Option<PathBuf>,
     },
@@ -744,6 +757,34 @@ async fn main() -> Result<()> {
                 b"
 ",
             )?;
+            return Ok(());
+        }
+        Action::RebuildNativeTermDictionary {
+            input,
+            row_group_size,
+            diagnostics_out,
+        } => {
+            if !input
+                .extension()
+                .map(|value| value == "vortex")
+                .unwrap_or(false)
+            {
+                return Err(anyhow!(
+                    "rebuild-native-term-dictionary expects a .vortex input file"
+                ));
+            }
+            let stats = rebuild_cottas_native_term_dictionary(&input, row_group_size)
+                .await
+                .context("Failed to rebuild Vortex term dictionary")?;
+            let json = serde_json::to_vec_pretty(&stats)
+                .context("Failed to serialize dictionary rebuild diagnostics")?;
+            if let Some(path) = diagnostics_out {
+                tokio::fs::write(path, &json)
+                    .await
+                    .context("Failed to write dictionary rebuild diagnostics")?;
+            }
+            stdout().write_all(&json)?;
+            stdout().write_all(b"\n")?;
             return Ok(());
         }
         Action::Count {
