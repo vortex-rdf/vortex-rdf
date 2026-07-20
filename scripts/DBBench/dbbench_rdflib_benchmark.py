@@ -376,6 +376,12 @@ def main():
         default=True,
         help="Skip measured runs when the warmup times out (default: enabled)",
     )
+    parser.add_argument(
+        "--skip-after-warmup-error",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip measured runs when the warmup errors (default: enabled)",
+    )
 
     # New argument:
     # Per-query timeout in seconds.
@@ -559,6 +565,11 @@ def main():
                 except Exception as e:
                     row["status"] = "error"
                     row["error"] = repr(e)
+                    if phase == "warmup" and args.skip_after_warmup_error:
+                        skip_remaining_reason = (
+                            "Skipped because warmup failed with error: "
+                            f"{type(e).__name__}: {e}"
+                        )
 
                 results.append(row)
 
