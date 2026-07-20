@@ -153,20 +153,90 @@ impl NativeIdTriple {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum NativeComponent {
+    DictionaryVortex,
+    DictionaryTermToIdVortex,
+    DictionaryTermToIdEntries,
+    DictionaryTermToIdBlob,
+    DictionaryIdToTermOffsets,
+    DictionaryIdToTermBlob,
+    SubjectRangesBinary,
+    SubjectRangesVortex,
+    PredicateRangesBinary,
+    PredicateRangesVortexV1,
+    PredicateDirectoryVortexV2,
+    PredicateRangesVortexV2,
+    PredicateObjectRangesBinary,
+    PredicateObjectPartitionsVortexV2,
+    PredicateObjectDirectoryVortexV2,
+    PredicateObjectRangesVortexV2,
+    ObjectDirectoryVortexV2,
+    ObjectRangesVortexV2,
+}
+
+impl NativeComponent {
+    fn logical_name(self) -> &'static str {
+        match self {
+            Self::DictionaryVortex => "rdf.dictionary.id-to-term.vortex",
+            Self::DictionaryTermToIdVortex => "rdf.dictionary.term-to-id.vortex",
+            Self::DictionaryTermToIdEntries => "rdf.dictionary.term-to-id.entries",
+            Self::DictionaryTermToIdBlob => "rdf.dictionary.term-to-id.blob",
+            Self::DictionaryIdToTermOffsets => "rdf.dictionary.id-to-term.offsets",
+            Self::DictionaryIdToTermBlob => "rdf.dictionary.id-to-term.blob",
+            Self::SubjectRangesBinary => "rdf.index.subject.ranges.binary",
+            Self::SubjectRangesVortex => "rdf.index.subject.ranges.vortex-v1",
+            Self::PredicateRangesBinary => "rdf.index.p.ranges.binary",
+            Self::PredicateRangesVortexV1 => "rdf.index.p.ranges.vortex-v1",
+            Self::PredicateDirectoryVortexV2 => "rdf.index.p.directory.vortex-v2",
+            Self::PredicateRangesVortexV2 => "rdf.index.p.ranges.vortex-v2",
+            Self::PredicateObjectRangesBinary => "rdf.index.po.ranges.binary",
+            Self::PredicateObjectPartitionsVortexV2 => "rdf.index.po.partitions.vortex-v2",
+            Self::PredicateObjectDirectoryVortexV2 => "rdf.index.po.directory.vortex-v2",
+            Self::PredicateObjectRangesVortexV2 => "rdf.index.po.ranges.vortex-v2",
+            Self::ObjectDirectoryVortexV2 => "rdf.index.o.directory.vortex-v2",
+            Self::ObjectRangesVortexV2 => "rdf.index.o.ranges.vortex-v2",
+        }
+    }
+
+    fn external_suffix(self) -> &'static str {
+        match self {
+            Self::DictionaryVortex => "dict.vortex",
+            Self::DictionaryTermToIdVortex => "dict.term_to_id.vortex",
+            Self::DictionaryTermToIdEntries => "dict.term_to_id.entries.bin",
+            Self::DictionaryTermToIdBlob => "dict.term_to_id.blob",
+            Self::DictionaryIdToTermOffsets => "dict.id_to_term.offsets.bin",
+            Self::DictionaryIdToTermBlob => "dict.id_to_term.blob",
+            Self::SubjectRangesBinary => "subject_ranges.bin",
+            Self::SubjectRangesVortex => "subject_ranges.v1.vortex",
+            Self::PredicateRangesBinary => "p_exact_ranges.bin",
+            Self::PredicateRangesVortexV1 => "p_exact_ranges.v1.vortex",
+            Self::PredicateDirectoryVortexV2 => "p_exact_directory.v2.vortex",
+            Self::PredicateRangesVortexV2 => "p_exact_ranges.v2.vortex",
+            Self::PredicateObjectRangesBinary => "po_exact_ranges.bin",
+            Self::PredicateObjectPartitionsVortexV2 => "po_predicate_partitions.v2.vortex",
+            Self::PredicateObjectDirectoryVortexV2 => "po_exact_directory.v2.vortex",
+            Self::PredicateObjectRangesVortexV2 => "po_exact_ranges.v2.vortex",
+            Self::ObjectDirectoryVortexV2 => "o_exact_directory.v2.vortex",
+            Self::ObjectRangesVortexV2 => "o_exact_ranges.v2.vortex",
+        }
+    }
+
+    fn external_path(self, data_path: &Path) -> PathBuf {
+        let name = data_path
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("data.vortex");
+        data_path.with_file_name(format!("{name}.{}", self.external_suffix()))
+    }
+}
+
 fn native_dict_term_to_id_entries_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("data.vortex");
-    data_path.with_file_name(format!("{file_name}.dict.term_to_id.entries.bin"))
+    NativeComponent::DictionaryTermToIdEntries.external_path(data_path)
 }
 
 fn native_dict_term_to_id_blob_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("data.vortex");
-    data_path.with_file_name(format!("{file_name}.dict.term_to_id.blob"))
+    NativeComponent::DictionaryTermToIdBlob.external_path(data_path)
 }
 
 fn native_term_to_id_binary_sidecar_exists(data_path: &Path) -> bool {
@@ -175,19 +245,11 @@ fn native_term_to_id_binary_sidecar_exists(data_path: &Path) -> bool {
 }
 
 fn native_dict_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("data.vortex");
-    data_path.with_file_name(format!("{file_name}.dict.vortex"))
+    NativeComponent::DictionaryVortex.external_path(data_path)
 }
 
 fn native_dict_term_to_id_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("data.vortex");
-    data_path.with_file_name(format!("{file_name}.dict.term_to_id.vortex"))
+    NativeComponent::DictionaryTermToIdVortex.external_path(data_path)
 }
 
 fn quad_to_native_triple(quad: &Quad) -> NativeTriple {
@@ -2744,21 +2806,11 @@ pub async fn load_cottas_native_simple_dictionary_view(
 }
 
 fn native_dict_id_to_term_offsets_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("data.vortex");
-
-    data_path.with_file_name(format!("{file_name}.dict.id_to_term.offsets.bin"))
+    NativeComponent::DictionaryIdToTermOffsets.external_path(data_path)
 }
 
 fn native_dict_id_to_term_blob_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("data.vortex");
-
-    data_path.with_file_name(format!("{file_name}.dict.id_to_term.blob"))
+    NativeComponent::DictionaryIdToTermBlob.external_path(data_path)
 }
 
 fn native_id_to_term_binary_sidecar_exists(data_path: &Path) -> bool {
@@ -2767,11 +2819,7 @@ fn native_id_to_term_binary_sidecar_exists(data_path: &Path) -> bool {
 }
 
 fn native_subject_range_index_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("data.vortex");
-    data_path.with_file_name(format!("{file_name}.subject_ranges.bin"))
+    NativeComponent::SubjectRangesBinary.external_path(data_path)
 }
 
 fn native_subject_range_index_exists(data_path: &Path) -> bool {
@@ -2779,11 +2827,7 @@ fn native_subject_range_index_exists(data_path: &Path) -> bool {
 }
 
 fn native_subject_range_vortex_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("data.vortex");
-    data_path.with_file_name(format!("{file_name}.subject_ranges.v1.vortex"))
+    NativeComponent::SubjectRangesVortex.external_path(data_path)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2888,11 +2932,7 @@ fn native_po_hash(p: u32, o: u32) -> u64 {
 }
 
 fn native_po_exact_ranges_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("data.vortex");
-    data_path.with_file_name(format!("{file_name}.po_exact_ranges.bin"))
+    NativeComponent::PredicateObjectRangesBinary.external_path(data_path)
 }
 
 fn native_po_exact_ranges_exists(data_path: &Path) -> bool {
@@ -3480,11 +3520,7 @@ fn po_exact_access_accepted(candidate_ranges: usize, candidate_rows: u64) -> boo
 const NATIVE_P_EXACT_RANGES_MAGIC: &[u8; 8] = b"VRDFPR1\0";
 
 fn native_p_exact_ranges_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("data.vortex");
-    data_path.with_file_name(format!("{file_name}.p_exact_ranges.bin"))
+    NativeComponent::PredicateRangesBinary.external_path(data_path)
 }
 
 fn native_p_exact_ranges_exists(data_path: &Path) -> bool {
@@ -3492,11 +3528,7 @@ fn native_p_exact_ranges_exists(data_path: &Path) -> bool {
 }
 
 fn native_p_exact_ranges_vortex_path(data_path: &Path) -> PathBuf {
-    let file_name = data_path
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or("data.vortex");
-    data_path.with_file_name(format!("{file_name}.p_exact_ranges.v1.vortex"))
+    NativeComponent::PredicateRangesVortexV1.external_path(data_path)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3997,23 +4029,15 @@ impl PartialOrd for NativePoRangeRecord {
 }
 
 fn native_po_exact_directory_v2_path(data_path: &Path) -> PathBuf {
-    native_sidecar_path(data_path, "po_exact_directory.v2.vortex")
+    NativeComponent::PredicateObjectDirectoryVortexV2.external_path(data_path)
 }
 
 fn native_po_predicate_partitions_v2_path(data_path: &Path) -> PathBuf {
-    native_sidecar_path(data_path, "po_predicate_partitions.v2.vortex")
+    NativeComponent::PredicateObjectPartitionsVortexV2.external_path(data_path)
 }
 
 fn native_po_exact_ranges_v2_path(data_path: &Path) -> PathBuf {
-    native_sidecar_path(data_path, "po_exact_ranges.v2.vortex")
-}
-
-fn native_sidecar_path(data_path: &Path, suffix: &str) -> PathBuf {
-    let name = data_path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("data.vortex");
-    data_path.with_file_name(format!("{name}.{suffix}"))
+    NativeComponent::PredicateObjectRangesVortexV2.external_path(data_path)
 }
 
 fn write_po_range_record<W: Write>(writer: &mut W, value: NativePoRangeRecord) -> Result<()> {
@@ -4577,19 +4601,11 @@ impl PartialOrd for NativePredicateRangeRecord {
 }
 
 fn native_p_exact_directory_v2_path(data_path: &Path) -> PathBuf {
-    let name = data_path
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or("data.vortex");
-    data_path.with_file_name(format!("{name}.p_exact_directory.v2.vortex"))
+    NativeComponent::PredicateDirectoryVortexV2.external_path(data_path)
 }
 
 fn native_p_exact_ranges_v2_path(data_path: &Path) -> PathBuf {
-    let name = data_path
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or("data.vortex");
-    data_path.with_file_name(format!("{name}.p_exact_ranges.v2.vortex"))
+    NativeComponent::PredicateRangesVortexV2.external_path(data_path)
 }
 
 fn write_predicate_range_record<W: Write>(
@@ -4965,19 +4981,11 @@ impl PartialOrd for NativeObjectRangeRecord {
 }
 
 fn native_o_exact_directory_v2_path(data_path: &Path) -> PathBuf {
-    let name = data_path
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or("data.vortex");
-    data_path.with_file_name(format!("{name}.o_exact_directory.v2.vortex"))
+    NativeComponent::ObjectDirectoryVortexV2.external_path(data_path)
 }
 
 fn native_o_exact_ranges_v2_path(data_path: &Path) -> PathBuf {
-    let name = data_path
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or("data.vortex");
-    data_path.with_file_name(format!("{name}.o_exact_ranges.v2.vortex"))
+    NativeComponent::ObjectRangesVortexV2.external_path(data_path)
 }
 
 fn write_object_range_record<W: Write>(
