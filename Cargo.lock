@@ -3364,7 +3364,6 @@ dependencies = [
  "env_logger",
  "futures",
  "log",
- "mimalloc",
  "oxrdf",
  "oxrdfio",
  "tokio",

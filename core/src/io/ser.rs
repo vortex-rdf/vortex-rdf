@@ -6,25 +6,25 @@ use vortex_ipc::iterator::ArrayIteratorIPC;
 #[cfg(feature = "file-io")]
 use crate::error;
 #[cfg(feature = "file-io")]
-use crate::store::builders::{VortexArrayBuilder, UnsortedStreamBuilder};
+use crate::store::builders::{UnsortedStreamBuilder, VortexArrayBuilder};
 #[cfg(feature = "file-io")]
 use crate::store::{Indexes, LayoutStrategy};
 #[cfg(feature = "file-io")]
-use web_time::Instant;
+use futures::{Stream, stream};
 #[cfg(feature = "file-io")]
 use oxrdf::Quad;
 #[cfg(feature = "file-io")]
-use futures::{stream, Stream};
-#[cfg(feature = "file-io")]
 use vortex_array::expr::stats::Stat;
-#[cfg(feature = "file-io")]
-use vortex_array::stream::ArrayStreamAdapter;
 #[cfg(feature = "file-io")]
 use vortex_array::stats::PRUNING_STATS;
 #[cfg(feature = "file-io")]
-use vortex_io::VortexWrite;
+use vortex_array::stream::ArrayStreamAdapter;
 #[cfg(feature = "file-io")]
 use vortex_file::WriteOptionsSessionExt;
+#[cfg(feature = "file-io")]
+use vortex_io::VortexWrite;
+#[cfg(feature = "file-io")]
+use web_time::Instant;
 
 #[cfg(feature = "file-io")]
 fn write_options_with_subject_stats() -> vortex_file::VortexWriteOptions {
@@ -32,7 +32,9 @@ fn write_options_with_subject_stats() -> vortex_file::VortexWriteOptions {
     if !stats.contains(&Stat::IsSorted) {
         stats.push(Stat::IsSorted);
     }
-    super::VORTEX_SESSION.write_options().with_file_statistics(stats)
+    super::VORTEX_SESSION
+        .write_options()
+        .with_file_statistics(stats)
 }
 
 /// Serialize an already-materialized Vortex array to a Vortex file writer.
@@ -117,7 +119,10 @@ where
         .await
         .map_err(|e| VortexRdfError::Serialization(format!("Failed to shutdown writer: {}", e)))?;
 
-    log::debug!("[ser::quads_stream_to_vortex_writer_with_builder] Streaming write took {:?}", start.elapsed());
+    log::debug!(
+        "[ser::quads_stream_to_vortex_writer_with_builder] Streaming write took {:?}",
+        start.elapsed()
+    );
     Ok(())
 }
 

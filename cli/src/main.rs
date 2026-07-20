@@ -1,31 +1,22 @@
-use anyhow::{anyhow, Context, Result};
-use log::{debug, info};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
+use log::{debug, info};
 use oxrdfio::RdfFormat;
 use std::fs::File;
-use std::io::{stdin, stdout, Read, Write};
+use std::io::{Read, Write, stdin, stdout};
 use std::path::PathBuf;
 use std::time::Instant;
 
 use tokio::fs::File as TokioFile;
 
-use vortex_rdf_core::{
-    io::{deserialize, quads_stream_to_vortex_writer_with_builder},
-    VortexRdfStore,
-    BuilderStrategy,
-    SortedInMemoryBuilder,
-    SortedStreamBuilder,
-    UnsortedStreamBuilder,
-    IndexType,
-    LayoutStrategy,
-};
 use vortex_rdf_core::common::formats::{Format, detect_format};
 use vortex_rdf_core::common::utils::{
-    parse_subject,
-    parse_named_node,
-    parse_term,
-    parse_graph_name,
-    parse_quads_from_reader,
+    parse_graph_name, parse_named_node, parse_quads_from_reader, parse_subject, parse_term,
+};
+use vortex_rdf_core::{
+    BuilderStrategy, IndexType, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder,
+    UnsortedStreamBuilder, VortexRdfStore,
+    io::{deserialize, quads_stream_to_vortex_writer_with_builder},
 };
 
 #[derive(Parser)]
@@ -119,7 +110,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.action {
-        Action::Serialize { layout, indexes, input, output, format, builder_strategy } => {
+        Action::Serialize {
+            layout,
+            indexes,
+            input,
+            output,
+            format,
+            builder_strategy,
+        } => {
             let start = Instant::now();
             let format = format
                 .map(RdfFormat::from)
@@ -140,24 +138,43 @@ async fn main() -> Result<()> {
             // Chunks are streamed into the Vortex writer as they are built;
             // streaming-capable builders never materialize the full dataset.
             match builder_strategy {
-                BuilderStrategy::UnsortedStream =>
+                BuilderStrategy::UnsortedStream => {
                     quads_stream_to_vortex_writer_with_builder::<UnsortedStreamBuilder, _, _>(
-                        quads_stream, writer, layout, indexes,
-                    ).await,
-                BuilderStrategy::SortedInMemory =>
+                        quads_stream,
+                        writer,
+                        layout,
+                        indexes,
+                    )
+                    .await
+                }
+                BuilderStrategy::SortedInMemory => {
                     quads_stream_to_vortex_writer_with_builder::<SortedInMemoryBuilder, _, _>(
-                        quads_stream, writer, layout, indexes,
-                    ).await,
-                BuilderStrategy::SortedStream =>
+                        quads_stream,
+                        writer,
+                        layout,
+                        indexes,
+                    )
+                    .await
+                }
+                BuilderStrategy::SortedStream => {
                     quads_stream_to_vortex_writer_with_builder::<SortedStreamBuilder, _, _>(
-                        quads_stream, writer, layout, indexes,
-                    ).await,
+                        quads_stream,
+                        writer,
+                        layout,
+                        indexes,
+                    )
+                    .await
+                }
             }
             .context("Failed to serialize to Vortex")?;
             info!("Fully serialized to Vortex-RDF in {:?}", start.elapsed());
         }
 
-        Action::Deserialize { input, output, format } => {
+        Action::Deserialize {
+            input,
+            output,
+            format,
+        } => {
             let start = Instant::now();
             let format = format
                 .map(RdfFormat::from)
@@ -180,7 +197,9 @@ async fn main() -> Result<()> {
                 }
                 None => {
                     let mut buffer = Vec::new();
-                    stdin().read_to_end(&mut buffer).context("Failed to read from stdin")?;
+                    stdin()
+                        .read_to_end(&mut buffer)
+                        .context("Failed to read from stdin")?;
                     let store = VortexRdfStore::from_bytes(&buffer)
                         .await
                         .map_err(|e| anyhow::anyhow!(e))?;
@@ -192,13 +211,21 @@ async fn main() -> Result<()> {
             info!("Deserialization took {:?}", start.elapsed());
         }
 
-        Action::Match { input, output, format, subject, predicate, object, graph } => {
+        Action::Match {
+            input,
+            output,
+            format,
+            subject,
+            predicate,
+            object,
+            graph,
+        } => {
             let start = Instant::now();
 
-            let subject_node   = subject.as_deref().map(parse_subject).transpose()?;
+            let subject_node = subject.as_deref().map(parse_subject).transpose()?;
             let predicate_node = predicate.as_deref().map(parse_named_node).transpose()?;
-            let object_node    = object.as_deref().map(parse_term).transpose()?;
-            let graph_node     = graph.as_deref().map(parse_graph_name).transpose()?;
+            let object_node = object.as_deref().map(parse_term).transpose()?;
+            let graph_node = graph.as_deref().map(parse_graph_name).transpose()?;
 
             let output_format = format
                 .map(RdfFormat::from)
@@ -220,12 +247,15 @@ async fn main() -> Result<()> {
                 debug!("Opened Vortex file in {:?}", load_start.elapsed());
 
                 let match_start = Instant::now();
-                let filtered = store.match_pattern(
-                    subject_node.as_ref(),
-                    predicate_node.as_ref(),
-                    object_node.as_ref(),
-                    graph_node.as_ref(),
-                ).await.context("Failed to match pattern")?;
+                let filtered = store
+                    .match_pattern(
+                        subject_node.as_ref(),
+                        predicate_node.as_ref(),
+                        object_node.as_ref(),
+                        graph_node.as_ref(),
+                    )
+                    .await
+                    .context("Failed to match pattern")?;
                 debug!("Applying match pattern took {:?}", match_start.elapsed());
 
                 deserialize(filtered, writer, output_format)
@@ -248,12 +278,15 @@ async fn main() -> Result<()> {
                 debug!("Vortex store built in {:?}", load_start.elapsed());
 
                 let match_start = Instant::now();
-                let filtered = store.match_pattern(
-                    subject_node.as_ref(),
-                    predicate_node.as_ref(),
-                    object_node.as_ref(),
-                    graph_node.as_ref(),
-                ).await.context("Failed to match pattern")?;
+                let filtered = store
+                    .match_pattern(
+                        subject_node.as_ref(),
+                        predicate_node.as_ref(),
+                        object_node.as_ref(),
+                        graph_node.as_ref(),
+                    )
+                    .await
+                    .context("Failed to match pattern")?;
                 debug!("Applying match pattern took {:?}", match_start.elapsed());
 
                 deserialize(filtered, writer, output_format)

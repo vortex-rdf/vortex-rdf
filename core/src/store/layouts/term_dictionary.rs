@@ -12,17 +12,17 @@
 use std::collections::{HashMap, HashSet};
 use web_time::Instant;
 
-use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
-use vortex_array::arrays::{ListArray, ListViewArray, PrimitiveArray, VarBinViewArray};
 use vortex_array::arrays::listview::ListViewArrayExt as _;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
-use vortex_array::scalar::Scalar;
-use vortex_array::search_sorted::{SearchSorted, SearchSortedSide, SearchResult};
-use vortex_array::validity::Validity;
+use vortex_array::arrays::{ListArray, ListViewArray, PrimitiveArray, VarBinViewArray};
 #[cfg(feature = "file-io")]
 use vortex_array::expr::{root, select};
+use vortex_array::scalar::Scalar;
+use vortex_array::search_sorted::{SearchResult, SearchSorted, SearchSortedSide};
 #[cfg(feature = "file-io")]
 use vortex_array::stream::ArrayStreamExt as _;
+use vortex_array::validity::Validity;
+use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 #[cfg(feature = "file-io")]
 use vortex_file::VortexFile;
 
@@ -47,7 +47,9 @@ pub(crate) struct TermDictionaryBuilder {
 
 impl TermDictionaryBuilder {
     pub(crate) fn new() -> Self {
-        Self { set: HashSet::new() }
+        Self {
+            set: HashSet::new(),
+        }
     }
 
     pub(crate) fn insert_quad(&mut self, q: &RawQuad) {
@@ -92,12 +94,16 @@ pub(crate) struct TermDictionary {
 
 impl TermDictionary {
     pub(crate) fn empty() -> Self {
-        Self { terms: VarBinViewArray::from_iter_str(std::iter::empty::<&str>()) }
+        Self {
+            terms: VarBinViewArray::from_iter_str(std::iter::empty::<&str>()),
+        }
     }
 
     /// Build from already-sorted unique term strings.
     fn from_sorted<'a>(terms: impl Iterator<Item = &'a str> + Clone) -> Result<Self> {
-        let dict = Self { terms: VarBinViewArray::from_iter_str(terms) };
+        let dict = Self {
+            terms: VarBinViewArray::from_iter_str(terms),
+        };
         // List offsets are i32, so the term count must fit in one.
         if dict.len() > i32::MAX as usize {
             return Err(VortexRdfError::Serialization(format!(
@@ -177,7 +183,7 @@ impl TermDictionary {
     /// Falls back to manual binary search only if the kernel fails.
     pub(crate) fn get_id(&self, term: &str) -> Option<u32> {
         let probe = Scalar::from(term);
-        
+
         // Try the SearchSorted kernel first (optimized path for sorted columns)
         let arr_ref = self.terms.clone().into_array();
         if let Ok(result) = arr_ref.search_sorted(&probe, SearchSortedSide::Left) {
@@ -191,7 +197,7 @@ impl TermDictionary {
             }
             return None;
         }
-        
+
         // Fallback: manual binary search (should not happen in normal operation)
         let needle = term.as_bytes();
         let (mut lo, mut hi) = (0usize, self.len());
@@ -206,7 +212,6 @@ impl TermDictionary {
         }
         None
     }
-
 }
 
 /// Build the `_dict_terms` column for a chunk of `n_rows` quads.
@@ -214,13 +219,19 @@ impl TermDictionary {
 /// When `carry_payload` is set (the first chunk of a build), row 0 holds the
 /// entire dictionary as one list; otherwise every row is an empty list. Either
 /// way the column dtype is identical across chunks.
-pub(crate) fn dict_column(dict: &TermDictionary, n_rows: usize, carry_payload: bool) -> Result<ArrayRef> {
+pub(crate) fn dict_column(
+    dict: &TermDictionary,
+    n_rows: usize,
+    carry_payload: bool,
+) -> Result<ArrayRef> {
     let start = Instant::now();
     let m = dict.len() as i32;
     let (elements, offsets): (ArrayRef, Vec<i32>) = if carry_payload && n_rows > 0 {
         (
             dict.view().clone().into_array(),
-            std::iter::once(0).chain(std::iter::repeat_n(m, n_rows)).collect(),
+            std::iter::once(0)
+                .chain(std::iter::repeat_n(m, n_rows))
+                .collect(),
         )
     } else {
         (

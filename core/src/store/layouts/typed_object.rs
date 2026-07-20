@@ -7,9 +7,9 @@
 use std::sync::Arc;
 
 use oxrdf::{BlankNode, Literal, NamedNode, Quad, Term};
-use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
+use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
 use crate::common::utils::{
     buf_as_str, get_as_term, make_nullable_string_array, make_string_array, parse_graph_name,
@@ -23,8 +23,12 @@ use crate::store::RawQuad;
 /// `s`, `p`, `o_kind`, `o_value`, `o_datatype`, `o_lang`, `g`.
 pub(crate) fn field_names() -> Vec<Arc<str>> {
     vec![
-        "s".into(), "p".into(),
-        "o_kind".into(), "o_value".into(), "o_datatype".into(), "o_lang".into(),
+        "s".into(),
+        "p".into(),
+        "o_kind".into(),
+        "o_value".into(),
+        "o_datatype".into(),
+        "o_lang".into(),
         "g".into(),
     ]
 }
@@ -40,10 +44,9 @@ pub(crate) fn build_columns(quads: &[RawQuad]) -> Result<Vec<ArrayRef>> {
     let mut langs: Vec<Option<String>> = Vec::with_capacity(n);
 
     for q in quads {
-        let term = get_as_term(&q.o)
-            .ok_or_else(|| VortexRdfError::Deserialization(
-                format!("Cannot parse object string: {}", q.o)
-            ))?;
+        let term = get_as_term(&q.o).ok_or_else(|| {
+            VortexRdfError::Deserialization(format!("Cannot parse object string: {}", q.o))
+        })?;
         let (kind, value, dt, lang) = decompose_object(&term);
         kinds.push(kind);
         values.push(value);
@@ -107,7 +110,10 @@ fn compose_object(
                 .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
             Ok(Term::Literal(Literal::new_typed_literal(value, dt)))
         }
-        _ => Err(VortexRdfError::Deserialization(format!("Unknown object kind: {}", kind))),
+        _ => Err(VortexRdfError::Deserialization(format!(
+            "Unknown object kind: {}",
+            kind
+        ))),
     }
 }
 
@@ -188,8 +194,11 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
             match struct_arr
                 .unmasked_field_by_name($name)
                 .map_err(VortexRdfError::Vortex)
-                .and_then(|c| c.clone().execute::<VarBinViewArray>(&mut ctx).map_err(VortexRdfError::Vortex))
-            {
+                .and_then(|c| {
+                    c.clone()
+                        .execute::<VarBinViewArray>(&mut ctx)
+                        .map_err(VortexRdfError::Vortex)
+                }) {
                 Ok(arr) => arr,
                 Err(e) => return vec![Err(e)],
             }
@@ -201,8 +210,11 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
     let kind_col = match struct_arr
         .unmasked_field_by_name("o_kind")
         .map_err(VortexRdfError::Vortex)
-        .and_then(|c| c.clone().execute::<PrimitiveArray>(&mut ctx).map_err(VortexRdfError::Vortex))
-    {
+        .and_then(|c| {
+            c.clone()
+                .execute::<PrimitiveArray>(&mut ctx)
+                .map_err(VortexRdfError::Vortex)
+        }) {
         Ok(a) => a,
         Err(e) => return vec![Err(e)],
     };

@@ -1,46 +1,74 @@
+//! A columnar RDF serialization format and queryable quad store, built on
+//! [Vortex](https://docs.vortex.dev).
+//!
+//! Converts RDF quads (parsed from any format [`oxrdfio`] supports) into a
+//! Vortex [`StructArray`](vortex_array::arrays::struct_::StructArray),
+//! storable as a `.vortex` file or streamed over Vortex IPC, and queryable
+//! in place through [`VortexRdfStore`] without decompressing or copying the
+//! underlying data. See the [repository README](https://github.com/vortex-rdf/vortex-rdf)
+//! for the full architecture: column layouts, secondary indexes, and
+//! ingestion builders.
+//!
+//! # Example
+//!
+//! ```
+//! use futures::{executor::block_on, stream};
+//! use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
+//! use vortex_rdf_core::{VortexRdfError, VortexRdfStore};
+//!
+//! block_on(async {
+//!     let quad = Quad::new(
+//!         NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s").unwrap()),
+//!         NamedNode::new("http://example.org/p").unwrap(),
+//!         Term::Literal(Literal::new_simple_literal("hello")),
+//!         GraphName::DefaultGraph,
+//!     );
+//!     let quads = stream::iter(vec![Ok::<_, VortexRdfError>(quad)]);
+//!
+//!     // Build an in-memory Vortex array from the quad stream, then wrap it
+//!     // in a queryable store.
+//!     let array = VortexRdfStore::build_vortex_array(quads).await.unwrap();
+//!     let store = VortexRdfStore::new(array).unwrap();
+//!
+//!     // Pattern matching narrows a view over the store without copying data.
+//!     let p = NamedNode::new("http://example.org/p").unwrap();
+//!     let matched = store
+//!         .match_pattern(None, Some(&p), None, None)
+//!         .await
+//!         .unwrap();
+//!     assert_eq!(matched.size().await.unwrap(), 1);
+//! });
+//! ```
+
+pub mod common;
 pub mod error;
 pub mod io;
 pub mod store;
-pub mod common;
 
 pub use error::VortexRdfError;
-pub use io::{
-    deserialize,
-    array_from_ipc_reader,
-};
+pub use io::{array_from_ipc_reader, deserialize};
 #[cfg(feature = "file-io")]
 pub use io::{
-    serialize,
-    quads_stream_to_vortex,
-    quads_stream_to_vortex_writer,
-    quads_stream_to_vortex_writer_with_builder,
-    load_vortex_file_ref,
+    load_vortex_file_ref, quads_stream_to_vortex, quads_stream_to_vortex_writer,
+    quads_stream_to_vortex_writer_with_builder, serialize,
 };
 
 pub use store::{
-    VortexRdfStore,
-    VortexArrayBuilder,
-    SortedInMemoryBuilder,
-    SortedStreamBuilder,
-    UnsortedStreamBuilder,
-    BuilderStrategy,
-    IndexType,
-    Indexes,
-    LayoutStrategy,
+    BuilderStrategy, IndexType, Indexes, LayoutStrategy, SortedInMemoryBuilder,
+    SortedStreamBuilder, UnsortedStreamBuilder, VortexArrayBuilder, VortexRdfStore,
 };
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "mimalloc", not(target_arch = "wasm32")))]
 use mimalloc::MiMalloc;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "mimalloc", not(target_arch = "wasm32")))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::{StreamExt, TryStreamExt, stream};
-    use oxrdf::{GraphName, Literal, NamedNode, Quad, NamedOrBlankNode, Term};
+    use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 
     fn make_quad(s: &str, p: &str, o_lit: &str, g: GraphName) -> Quad {
         Quad::new(
@@ -51,7 +79,9 @@ mod tests {
         )
     }
 
-    fn quad_stream(quads: Vec<Quad>) -> impl futures::Stream<Item = crate::error::Result<Quad>> + Unpin + Send + 'static {
+    fn quad_stream(
+        quads: Vec<Quad>,
+    ) -> impl futures::Stream<Item = crate::error::Result<Quad>> + Unpin + Send + 'static {
         stream::iter(quads.into_iter().map(Ok::<_, VortexRdfError>))
     }
 
@@ -76,7 +106,10 @@ mod tests {
         assert_eq!(decoded[0].subject.to_string(), quad.subject.to_string());
         assert_eq!(decoded[0].predicate.to_string(), quad.predicate.to_string());
         assert_eq!(decoded[0].object.to_string(), quad.object.to_string());
-        assert_eq!(decoded[0].graph_name.to_string(), quad.graph_name.to_string());
+        assert_eq!(
+            decoded[0].graph_name.to_string(),
+            quad.graph_name.to_string()
+        );
     }
 
     async fn run_builder_roundtrip<B: VortexArrayBuilder>() {
@@ -101,16 +134,38 @@ mod tests {
         assert_eq!(decoded[0].subject.to_string(), quad.subject.to_string());
         assert_eq!(decoded[0].predicate.to_string(), quad.predicate.to_string());
         assert_eq!(decoded[0].object.to_string(), quad.object.to_string());
-        assert_eq!(decoded[0].graph_name.to_string(), quad.graph_name.to_string());
+        assert_eq!(
+            decoded[0].graph_name.to_string(),
+            quad.graph_name.to_string()
+        );
     }
 
-    #[tokio::test] async fn test_sorted_in_memory()    { run_builder_roundtrip::<SortedInMemoryBuilder>().await; }
-    #[tokio::test] async fn test_sorted_stream()       { run_builder_roundtrip::<SortedStreamBuilder>().await; }
-    #[tokio::test] async fn test_unsorted_stream()     { run_builder_roundtrip::<UnsortedStreamBuilder>().await; }
+    #[tokio::test]
+    async fn test_sorted_in_memory() {
+        run_builder_roundtrip::<SortedInMemoryBuilder>().await;
+    }
+    #[tokio::test]
+    async fn test_sorted_stream() {
+        run_builder_roundtrip::<SortedStreamBuilder>().await;
+    }
+    #[tokio::test]
+    async fn test_unsorted_stream() {
+        run_builder_roundtrip::<UnsortedStreamBuilder>().await;
+    }
 
     async fn run_match_pattern_test<B: VortexArrayBuilder>() {
-        let q1 = make_quad("http://example.org/s1", "http://example.org/p1", "o1", GraphName::DefaultGraph);
-        let q2 = make_quad("http://example.org/s2", "http://example.org/p2", "o2", GraphName::DefaultGraph);
+        let q1 = make_quad(
+            "http://example.org/s1",
+            "http://example.org/p1",
+            "o1",
+            GraphName::DefaultGraph,
+        );
+        let q2 = make_quad(
+            "http://example.org/s2",
+            "http://example.org/p2",
+            "o2",
+            GraphName::DefaultGraph,
+        );
 
         let arr = VortexRdfStore::build_vortex_array_with_builder::<B>(
             quad_stream(vec![q1.clone(), q2.clone()]),
@@ -122,14 +177,20 @@ mod tests {
         let store = VortexRdfStore::new(arr).unwrap();
 
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
-        let filtered = store.match_pattern(None, Some(&p1), None, None).await.unwrap();
+        let filtered = store
+            .match_pattern(None, Some(&p1), None, None)
+            .await
+            .unwrap();
         assert_eq!(filtered.size().await.unwrap(), 1);
 
         let results: Vec<Quad> = filtered.quads().unwrap().try_collect().await.unwrap();
         assert_eq!(results[0].subject.to_string(), q1.subject.to_string());
 
         let p3 = NamedNode::new("http://example.org/p3").unwrap();
-        let empty = store.match_pattern(None, Some(&p3), None, None).await.unwrap();
+        let empty = store
+            .match_pattern(None, Some(&p3), None, None)
+            .await
+            .unwrap();
         assert_eq!(empty.size().await.unwrap(), 0);
     }
 
@@ -139,8 +200,18 @@ mod tests {
     async fn run_match_pattern_file_test<B: VortexArrayBuilder>(layout: LayoutStrategy) {
         use crate::io::ser::quads_stream_to_vortex_writer_with_builder;
 
-        let q1 = make_quad("http://example.org/s1", "http://example.org/p1", "o1", GraphName::DefaultGraph);
-        let q2 = make_quad("http://example.org/s2", "http://example.org/p2", "o2", GraphName::DefaultGraph);
+        let q1 = make_quad(
+            "http://example.org/s1",
+            "http://example.org/p1",
+            "o1",
+            GraphName::DefaultGraph,
+        );
+        let q2 = make_quad(
+            "http://example.org/s2",
+            "http://example.org/p2",
+            "o2",
+            GraphName::DefaultGraph,
+        );
 
         let mut bytes: Vec<u8> = Vec::new();
         quads_stream_to_vortex_writer_with_builder::<B, _, _>(
@@ -163,13 +234,19 @@ mod tests {
         let store = VortexRdfStore::from_file(&path).await.unwrap();
 
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
-        let filtered = store.match_pattern(None, Some(&p1), None, None).await.unwrap();
+        let filtered = store
+            .match_pattern(None, Some(&p1), None, None)
+            .await
+            .unwrap();
         assert_eq!(filtered.size().await.unwrap(), 1);
         let results: Vec<Quad> = filtered.quads().unwrap().try_collect().await.unwrap();
         assert_eq!(results[0].subject.to_string(), q1.subject.to_string());
 
         let p3 = NamedNode::new("http://example.org/p3").unwrap();
-        let empty = store.match_pattern(None, Some(&p3), None, None).await.unwrap();
+        let empty = store
+            .match_pattern(None, Some(&p3), None, None)
+            .await
+            .unwrap();
         assert_eq!(empty.size().await.unwrap(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -179,8 +256,18 @@ mod tests {
     async fn run_match_pattern_file_typed_object_test<B: VortexArrayBuilder>() {
         use crate::io::ser::quads_stream_to_vortex_writer_with_builder;
 
-        let q1 = make_quad("http://example.org/s1", "http://example.org/p1", "o1", GraphName::DefaultGraph);
-        let q2 = make_quad("http://example.org/s2", "http://example.org/p2", "o2", GraphName::DefaultGraph);
+        let q1 = make_quad(
+            "http://example.org/s1",
+            "http://example.org/p1",
+            "o1",
+            GraphName::DefaultGraph,
+        );
+        let q2 = make_quad(
+            "http://example.org/s2",
+            "http://example.org/p2",
+            "o2",
+            GraphName::DefaultGraph,
+        );
 
         let mut bytes: Vec<u8> = Vec::new();
         quads_stream_to_vortex_writer_with_builder::<B, _, _>(
@@ -203,13 +290,19 @@ mod tests {
         let store = VortexRdfStore::from_file(&path).await.unwrap();
 
         let o1 = Term::Literal(Literal::new_simple_literal("o1"));
-        let filtered = store.match_pattern(None, None, Some(&o1), None).await.unwrap();
+        let filtered = store
+            .match_pattern(None, None, Some(&o1), None)
+            .await
+            .unwrap();
         assert_eq!(filtered.size().await.unwrap(), 1);
         let results: Vec<Quad> = filtered.quads().unwrap().try_collect().await.unwrap();
         assert_eq!(results[0].subject.to_string(), q1.subject.to_string());
 
         let o3 = Term::Literal(Literal::new_simple_literal("o3"));
-        let empty = store.match_pattern(None, None, Some(&o3), None).await.unwrap();
+        let empty = store
+            .match_pattern(None, None, Some(&o3), None)
+            .await
+            .unwrap();
         assert_eq!(empty.size().await.unwrap(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -242,57 +335,81 @@ mod tests {
         let store = VortexRdfStore::from_file(&path).await.unwrap();
 
         let p0 = NamedNode::new("http://example.org/p0").unwrap();
-        let filtered = store.match_pattern(None, Some(&p0), None, None).await.unwrap();
+        let filtered = store
+            .match_pattern(None, Some(&p0), None, None)
+            .await
+            .unwrap();
         assert_eq!(filtered.size().await.unwrap(), 4);
 
         let missing_p = NamedNode::new("http://example.org/nope").unwrap();
-        let empty = store.match_pattern(None, Some(&missing_p), None, None).await.unwrap();
+        let empty = store
+            .match_pattern(None, Some(&missing_p), None, None)
+            .await
+            .unwrap();
         assert_eq!(empty.size().await.unwrap(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test] async fn test_match_sorted_in_memory()    { run_match_pattern_test::<SortedInMemoryBuilder>().await; }
-    #[tokio::test] async fn test_match_sorted_stream()       { run_match_pattern_test::<SortedStreamBuilder>().await; }
-    #[tokio::test] async fn test_match_unsorted_stream()     { run_match_pattern_test::<UnsortedStreamBuilder>().await; }
+    #[tokio::test]
+    async fn test_match_sorted_in_memory() {
+        run_match_pattern_test::<SortedInMemoryBuilder>().await;
+    }
+    #[tokio::test]
+    async fn test_match_sorted_stream() {
+        run_match_pattern_test::<SortedStreamBuilder>().await;
+    }
+    #[tokio::test]
+    async fn test_match_unsorted_stream() {
+        run_match_pattern_test::<UnsortedStreamBuilder>().await;
+    }
 
     // ─── 2b) File-backed matching matrix (by layout/builder) ───────────────
 
     #[cfg(feature = "file-io")]
-    #[tokio::test] async fn test_match_file_sorted_in_memory() {
-        run_match_pattern_file_test::<SortedInMemoryBuilder>(LayoutStrategy::Default).await; 
+    #[tokio::test]
+    async fn test_match_file_sorted_in_memory() {
+        run_match_pattern_file_test::<SortedInMemoryBuilder>(LayoutStrategy::Default).await;
     }
     #[cfg(feature = "file-io")]
-    #[tokio::test] async fn test_match_file_sorted_stream() { 
+    #[tokio::test]
+    async fn test_match_file_sorted_stream() {
         run_match_pattern_file_test::<SortedStreamBuilder>(LayoutStrategy::Default).await;
     }
     #[cfg(feature = "file-io")]
-    #[tokio::test] async fn test_match_file_unsorted_stream() { 
+    #[tokio::test]
+    async fn test_match_file_unsorted_stream() {
         run_match_pattern_file_test::<UnsortedStreamBuilder>(LayoutStrategy::Default).await;
     }
     #[cfg(feature = "file-io")]
-    #[tokio::test] async fn test_match_file_typed_sorted_in_memory() { 
+    #[tokio::test]
+    async fn test_match_file_typed_sorted_in_memory() {
         run_match_pattern_file_typed_object_test::<SortedInMemoryBuilder>().await;
     }
     #[cfg(feature = "file-io")]
-    #[tokio::test] async fn test_match_file_typed_sorted_stream() { 
-        run_match_pattern_file_typed_object_test::<SortedStreamBuilder>().await; 
+    #[tokio::test]
+    async fn test_match_file_typed_sorted_stream() {
+        run_match_pattern_file_typed_object_test::<SortedStreamBuilder>().await;
     }
     #[cfg(feature = "file-io")]
-    #[tokio::test] async fn test_match_file_typed_unsorted_stream() { 
-        run_match_pattern_file_typed_object_test::<UnsortedStreamBuilder>().await; 
+    #[tokio::test]
+    async fn test_match_file_typed_unsorted_stream() {
+        run_match_pattern_file_typed_object_test::<UnsortedStreamBuilder>().await;
     }
     #[cfg(feature = "file-io")]
-    #[tokio::test] async fn test_match_file_dictionary_sorted_in_memory() { 
-        run_match_pattern_file_dictionary_test::<SortedInMemoryBuilder>().await; 
+    #[tokio::test]
+    async fn test_match_file_dictionary_sorted_in_memory() {
+        run_match_pattern_file_dictionary_test::<SortedInMemoryBuilder>().await;
     }
     #[cfg(feature = "file-io")]
-    #[tokio::test] async fn test_match_file_dictionary_sorted_stream() { 
-        run_match_pattern_file_dictionary_test::<SortedStreamBuilder>().await; 
+    #[tokio::test]
+    async fn test_match_file_dictionary_sorted_stream() {
+        run_match_pattern_file_dictionary_test::<SortedStreamBuilder>().await;
     }
     #[cfg(feature = "file-io")]
-    #[tokio::test] async fn test_match_file_dictionary_unsorted_stream() { 
-        run_match_pattern_file_dictionary_test::<UnsortedStreamBuilder>().await; 
+    #[tokio::test]
+    async fn test_match_file_dictionary_unsorted_stream() {
+        run_match_pattern_file_dictionary_test::<UnsortedStreamBuilder>().await;
     }
 
     // ─── 3) Streaming/chunking behavior ─────────────────────────────────────
@@ -302,11 +419,14 @@ mod tests {
         use crate::store::builders::unsorted_stream::build_chunk_stream;
 
         let quads: Vec<Quad> = (0..10)
-            .map(|i| make_quad(
-                &format!("http://example.org/s{}", i),
-                "http://example.org/p", "o",
-                GraphName::DefaultGraph,
-            ))
+            .map(|i| {
+                make_quad(
+                    &format!("http://example.org/s{}", i),
+                    "http://example.org/p",
+                    "o",
+                    GraphName::DefaultGraph,
+                )
+            })
             .collect();
 
         // chunk_size = 3 over 10 quads → chunks of 3, 3, 3, 1.
@@ -327,7 +447,10 @@ mod tests {
         }
 
         let collected: Vec<_> = chunks.collect().await;
-        let lens: Vec<usize> = collected.iter().map(|c| c.as_ref().unwrap().len()).collect();
+        let lens: Vec<usize> = collected
+            .iter()
+            .map(|c| c.as_ref().unwrap().len())
+            .collect();
         assert_eq!(lens, [3, 3, 3, 1]);
     }
 
@@ -335,19 +458,25 @@ mod tests {
     #[tokio::test]
     async fn test_streaming_write_read_roundtrip() {
         let quads: Vec<Quad> = (0..25)
-            .map(|i| make_quad(
-                &format!("http://example.org/s{}", i),
-                "http://example.org/p",
-                &format!("object value {}", i),
-                GraphName::DefaultGraph,
-            ))
+            .map(|i| {
+                make_quad(
+                    &format!("http://example.org/s{}", i),
+                    "http://example.org/p",
+                    &format!("object value {}", i),
+                    GraphName::DefaultGraph,
+                )
+            })
             .collect();
 
         // Streaming write to an in-memory Vortex file...
-        let bytes = quads_stream_to_vortex(quad_stream(quads.clone())).await.unwrap();
+        let bytes = quads_stream_to_vortex(quad_stream(quads.clone()))
+            .await
+            .unwrap();
 
         // ...then load it back as a Vortex file and decode.
-        let arr = load_vortex_file_ref(vortex::buffer::Buffer::from(bytes)).await.unwrap();
+        let arr = load_vortex_file_ref(vortex::buffer::Buffer::from(bytes))
+            .await
+            .unwrap();
         let store = VortexRdfStore::new(arr).unwrap();
         assert_eq!(store.size().await.unwrap(), 25);
 
@@ -363,31 +492,55 @@ mod tests {
 
         // Quads fed in REVERSE subject order; both sorted builders must emit
         // globally sorted output across chunk boundaries.
-        let quads: Vec<Quad> = (0..10).rev()
-            .map(|i| make_quad(
-                &format!("http://example.org/s{:02}", i),
-                "http://example.org/p", "o",
-                GraphName::DefaultGraph,
-            ))
+        let quads: Vec<Quad> = (0..10)
+            .rev()
+            .map(|i| {
+                make_quad(
+                    &format!("http://example.org/s{:02}", i),
+                    "http://example.org/p",
+                    "o",
+                    GraphName::DefaultGraph,
+                )
+            })
             .collect();
 
         for (name, result) in [
-            ("sorted_in_memory", build_sorted_chunk_stream(
-                Box::new(quad_stream(quads.clone())), LayoutStrategy::Default, vec![], 3,
-            ).await),
-            ("sorted_stream", build_sorted_stream_chunk_stream(
-                Box::new(quad_stream(quads.clone())), LayoutStrategy::Default, vec![], 3,
-            ).await),
+            (
+                "sorted_in_memory",
+                build_sorted_chunk_stream(
+                    Box::new(quad_stream(quads.clone())),
+                    LayoutStrategy::Default,
+                    vec![],
+                    3,
+                )
+                .await,
+            ),
+            (
+                "sorted_stream",
+                build_sorted_stream_chunk_stream(
+                    Box::new(quad_stream(quads.clone())),
+                    LayoutStrategy::Default,
+                    vec![],
+                    3,
+                )
+                .await,
+            ),
         ] {
             let (_dtype, chunks) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
             let collected: Vec<_> = chunks.collect().await;
 
-            let lens: Vec<usize> = collected.iter().map(|c| c.as_ref().unwrap().len()).collect();
+            let lens: Vec<usize> = collected
+                .iter()
+                .map(|c| c.as_ref().unwrap().len())
+                .collect();
             assert_eq!(lens, [3, 3, 3, 1], "{name}: unexpected chunk sizes");
 
             // Decode all chunks in order and verify global subject sort.
-            let subjects: Vec<String> = collected.iter()
-                .flat_map(|c| store::layouts::ResolvedLayout::Default.decode_chunk(c.as_ref().unwrap()))
+            let subjects: Vec<String> = collected
+                .iter()
+                .flat_map(|c| {
+                    store::layouts::ResolvedLayout::Default.decode_chunk(c.as_ref().unwrap())
+                })
                 .map(|q| q.unwrap().subject.to_string())
                 .collect();
             let mut sorted = subjects.clone();
@@ -399,12 +552,16 @@ mod tests {
 
     #[cfg(feature = "file-io")]
     async fn run_sorted_streaming_write_test<B: VortexArrayBuilder>() {
-        let quads: Vec<Quad> = (0..25).rev()
-            .map(|i| make_quad(
-                &format!("http://example.org/s{:02}", i),
-                "http://example.org/p", "o",
-                GraphName::DefaultGraph,
-            ))
+        let quads: Vec<Quad> = (0..25)
+            .rev()
+            .map(|i| {
+                make_quad(
+                    &format!("http://example.org/s{:02}", i),
+                    "http://example.org/p",
+                    "o",
+                    GraphName::DefaultGraph,
+                )
+            })
             .collect();
 
         let mut buffer = Vec::new();
@@ -417,7 +574,9 @@ mod tests {
         .await
         .unwrap();
 
-        let arr = load_vortex_file_ref(vortex::buffer::Buffer::from(buffer.clone())).await.unwrap();
+        let arr = load_vortex_file_ref(vortex::buffer::Buffer::from(buffer.clone()))
+            .await
+            .unwrap();
         let store = VortexRdfStore::new(arr).unwrap();
         assert_eq!(store.size().await.unwrap(), 25);
 
@@ -427,24 +586,35 @@ mod tests {
     }
 
     #[cfg(feature = "file-io")]
-    #[tokio::test] async fn test_sorted_in_memory_streaming_write() { run_sorted_streaming_write_test::<SortedInMemoryBuilder>().await; }
+    #[tokio::test]
+    async fn test_sorted_in_memory_streaming_write() {
+        run_sorted_streaming_write_test::<SortedInMemoryBuilder>().await;
+    }
     #[cfg(feature = "file-io")]
-    #[tokio::test] async fn test_sorted_stream_streaming_write()    { run_sorted_streaming_write_test::<SortedStreamBuilder>().await; }
+    #[tokio::test]
+    async fn test_sorted_stream_streaming_write() {
+        run_sorted_streaming_write_test::<SortedStreamBuilder>().await;
+    }
 
     #[cfg(feature = "file-io")]
     #[tokio::test]
     async fn test_file_backed_subject_metadata_range_for_missing_subject() {
-        let quads: Vec<Quad> = (0..25).rev()
-            .map(|i| make_quad(
-                &format!("http://example.org/s{:02}", i),
-                "http://example.org/p",
-                "o",
-                GraphName::DefaultGraph,
-            ))
+        let quads: Vec<Quad> = (0..25)
+            .rev()
+            .map(|i| {
+                make_quad(
+                    &format!("http://example.org/s{:02}", i),
+                    "http://example.org/p",
+                    "o",
+                    GraphName::DefaultGraph,
+                )
+            })
             .collect();
 
-        let path = std::env::temp_dir()
-            .join(format!("vortex_rdf_subject_range_{}.vortex", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!(
+            "vortex_rdf_subject_range_{}.vortex",
+            uuid::Uuid::new_v4()
+        ));
         let mut buffer = Vec::new();
         quads_stream_to_vortex_writer_with_builder::<SortedInMemoryBuilder, _, _>(
             quad_stream(quads),
@@ -457,26 +627,40 @@ mod tests {
         std::fs::write(&path, &buffer).unwrap();
 
         let store = VortexRdfStore::from_file(&path).await.unwrap();
-        let missing = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s99").unwrap());
+        let missing =
+            NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s99").unwrap());
         let row_range = store.debug_subject_row_range(&missing).await.unwrap();
         assert_eq!(row_range, Some(0..0));
-        assert_eq!(store.match_pattern(Some(&missing), None, None, None).await.unwrap().size().await.unwrap(), 0);
+        assert_eq!(
+            store
+                .match_pattern(Some(&missing), None, None, None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
+            0
+        );
 
         let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
     async fn test_sorted_builder_stamps_is_sorted() {
-        use vortex_array::expr::stats::{Stat, StatsProvider, Precision};
-        use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
         use vortex_array::VortexSessionExecute;
+        use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
+        use vortex_array::expr::stats::{Precision, Stat, StatsProvider};
 
-        let quads: Vec<Quad> = (0..10).rev()
-            .map(|i| make_quad(
-                &format!("http://example.org/s{:02}", i),
-                "http://example.org/p", "o",
-                GraphName::DefaultGraph,
-            ))
+        let quads: Vec<Quad> = (0..10)
+            .rev()
+            .map(|i| {
+                make_quad(
+                    &format!("http://example.org/s{:02}", i),
+                    "http://example.org/p",
+                    "o",
+                    GraphName::DefaultGraph,
+                )
+            })
             .collect();
 
         let check = |arr: vortex_array::ArrayRef, expect_sorted: bool, name: &str| {
@@ -484,20 +668,30 @@ mod tests {
             let struct_arr = arr.execute::<StructArray>(&mut ctx).unwrap();
             let s_col = struct_arr.unmasked_field_by_name("s").unwrap();
             let is_sorted = match s_col.statistics().get(Stat::IsSorted) {
-                Precision::Exact(sc) | Precision::Inexact(sc) => bool::try_from(&sc).unwrap_or(false),
+                Precision::Exact(sc) | Precision::Inexact(sc) => {
+                    bool::try_from(&sc).unwrap_or(false)
+                }
                 Precision::Absent => false,
             };
             assert_eq!(is_sorted, expect_sorted, "{name}: IsSorted stat mismatch");
         };
 
         let sorted = VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
-            quad_stream(quads.clone()), LayoutStrategy::Default, vec![],
-        ).await.unwrap();
+            quad_stream(quads.clone()),
+            LayoutStrategy::Default,
+            vec![],
+        )
+        .await
+        .unwrap();
         check(sorted, true, "sorted_in_memory");
 
         let unsorted = VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
-            quad_stream(quads), LayoutStrategy::Default, vec![],
-        ).await.unwrap();
+            quad_stream(quads),
+            LayoutStrategy::Default,
+            vec![],
+        )
+        .await
+        .unwrap();
         check(unsorted, false, "unsorted");
     }
 
@@ -510,29 +704,43 @@ mod tests {
             for p in ["http://example.org/p1", "http://example.org/p2"] {
                 quads.push(make_quad(
                     &format!("http://example.org/s{:02}", i),
-                    p, "o",
+                    p,
+                    "o",
                     GraphName::DefaultGraph,
                 ));
             }
         }
 
         let arr = VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
-            quad_stream(quads), LayoutStrategy::Default, vec![],
-        ).await.unwrap();
+            quad_stream(quads),
+            LayoutStrategy::Default,
+            vec![],
+        )
+        .await
+        .unwrap();
         let store = VortexRdfStore::new(arr).unwrap();
 
         let s5 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s05").unwrap());
-        let matched = store.match_pattern(Some(&s5), None, None, None).await.unwrap();
+        let matched = store
+            .match_pattern(Some(&s5), None, None, None)
+            .await
+            .unwrap();
         assert_eq!(matched.size().await.unwrap(), 2);
 
         // Subject + predicate narrows within the sliced range.
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
-        let matched_sp = store.match_pattern(Some(&s5), Some(&p1), None, None).await.unwrap();
+        let matched_sp = store
+            .match_pattern(Some(&s5), Some(&p1), None, None)
+            .await
+            .unwrap();
         assert_eq!(matched_sp.size().await.unwrap(), 1);
 
         // Missing subject → empty via binary search short-circuit.
         let s99 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s99").unwrap());
-        let empty = store.match_pattern(Some(&s99), None, None, None).await.unwrap();
+        let empty = store
+            .match_pattern(Some(&s99), None, None, None)
+            .await
+            .unwrap();
         assert_eq!(empty.size().await.unwrap(), 0);
     }
 
@@ -540,14 +748,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_indexes_deduplicated() {
-        let q1 = make_quad("http://example.org/s1", "http://example.org/p1", "o1", GraphName::DefaultGraph);
-        let q2 = make_quad("http://example.org/s2", "http://example.org/p2", "o2", GraphName::DefaultGraph);
+        let q1 = make_quad(
+            "http://example.org/s1",
+            "http://example.org/p1",
+            "o1",
+            GraphName::DefaultGraph,
+        );
+        let q2 = make_quad(
+            "http://example.org/s2",
+            "http://example.org/p2",
+            "o2",
+            GraphName::DefaultGraph,
+        );
 
         // The same index requested twice must not produce duplicate columns.
         let arr = VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
             quad_stream(vec![q1.clone(), q2.clone()]),
             LayoutStrategy::Default,
-            vec![IndexType::SecondaryByReference, IndexType::SecondaryByReference],
+            vec![
+                IndexType::SecondaryByReference,
+                IndexType::SecondaryByReference,
+            ],
         )
         .await
         .expect("build failed");
@@ -555,7 +776,19 @@ mod tests {
         // Schema: 4 primary columns + 4 reference index columns, exactly once.
         if let vortex_array::dtype::DType::Struct(fields, _) = arr.dtype() {
             let names: Vec<&str> = fields.names().iter().map(|n| n.as_ref()).collect();
-            assert_eq!(names, ["s", "p", "o", "g", "_idx_o_val", "_idx_o_rid", "_idx_p_val", "_idx_p_rid"]);
+            assert_eq!(
+                names,
+                [
+                    "s",
+                    "p",
+                    "o",
+                    "g",
+                    "_idx_o_val",
+                    "_idx_o_rid",
+                    "_idx_p_val",
+                    "_idx_p_rid"
+                ]
+            );
         } else {
             panic!("expected StructArray dtype");
         }
@@ -563,7 +796,10 @@ mod tests {
         // Index-routed matching still works.
         let store = VortexRdfStore::new(arr).unwrap();
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
-        let matched = store.match_pattern(None, Some(&p1), None, None).await.unwrap();
+        let matched = store
+            .match_pattern(None, Some(&p1), None, None)
+            .await
+            .unwrap();
         assert_eq!(matched.size().await.unwrap(), 1);
     }
 
@@ -596,7 +832,10 @@ mod tests {
 
         // Match on the object index: 24 quads over 4 objects ⇒ 6 rows.
         let object = Term::Literal(Literal::new_simple_literal("object 1"));
-        let matched = store.match_pattern(None, None, Some(&object), None).await.unwrap();
+        let matched = store
+            .match_pattern(None, None, Some(&object), None)
+            .await
+            .unwrap();
         assert_eq!(matched.size().await.unwrap(), 6);
         assert_eq!(
             matched.indexes(),
@@ -676,11 +915,20 @@ mod tests {
 
         // A view over the object index: i = 1, 5, 9, 13, 17, 21 ⇒ 6 rows.
         let object = Term::Literal(Literal::new_simple_literal("object 1"));
-        let view = store.match_pattern(None, None, Some(&object), None).await.unwrap();
+        let view = store
+            .match_pattern(None, None, Some(&object), None)
+            .await
+            .unwrap();
         assert_eq!(view.size().await.unwrap(), 6);
 
         // An empty index set drops the index; a non-empty one rebuilds it.
-        assert!(view.compact_with_indexes(vec![]).await.unwrap().indexes().is_empty());
+        assert!(
+            view.compact_with_indexes(vec![])
+                .await
+                .unwrap()
+                .indexes()
+                .is_empty()
+        );
         let indexed = view
             .compact_with_indexes(vec![IndexType::SecondaryByReference])
             .await
@@ -696,10 +944,13 @@ mod tests {
             .match_pattern(None, Some(&predicate), None, None)
             .await
             .unwrap();
-        assert_eq!(subjects_of(&routed).await, vec![
-            "<http://example.org/s01>".to_string(),
-            "<http://example.org/s13>".to_string(),
-        ]);
+        assert_eq!(
+            subjects_of(&routed).await,
+            vec![
+                "<http://example.org/s01>".to_string(),
+                "<http://example.org/s13>".to_string(),
+            ]
+        );
         assert_eq!(store.size().await.unwrap(), 24, "source untouched");
 
         // Re-indexing from nothing: an empty set drops every index,
@@ -713,7 +964,13 @@ mod tests {
         .unwrap();
         let bare = VortexRdfStore::new(bare).unwrap();
         assert!(bare.indexes().is_empty());
-        assert!(bare.compact_with_indexes(vec![]).await.unwrap().indexes().is_empty());
+        assert!(
+            bare.compact_with_indexes(vec![])
+                .await
+                .unwrap()
+                .indexes()
+                .is_empty()
+        );
         let reindexed = bare
             .compact_with_indexes(vec![IndexType::SecondaryByReference])
             .await
@@ -764,12 +1021,27 @@ mod tests {
 
         // Route through both the rebuilt object and predicate columns.
         let predicate = NamedNode::new("http://example.org/p1").unwrap();
-        assert_eq!(subjects_of(&indexed.match_pattern(None, Some(&predicate), None, None).await.unwrap()).await, vec![
-            "<http://example.org/s01>".to_string(),
-            "<http://example.org/s13>".to_string(),
-        ]);
         assert_eq!(
-            indexed.match_pattern(None, None, Some(&object), None).await.unwrap().size().await.unwrap(),
+            subjects_of(
+                &indexed
+                    .match_pattern(None, Some(&predicate), None, None)
+                    .await
+                    .unwrap()
+            )
+            .await,
+            vec![
+                "<http://example.org/s01>".to_string(),
+                "<http://example.org/s13>".to_string(),
+            ]
+        );
+        assert_eq!(
+            indexed
+                .match_pattern(None, None, Some(&object), None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             6,
         );
     }
@@ -834,7 +1106,10 @@ mod tests {
         // "object 0" is on i = 0, 3, 6, 9; the index still routes the lookup,
         // and the tombstoned row must not come back.
         let object = Term::Literal(Literal::new_simple_literal("object 0"));
-        let matched = after.match_pattern(None, None, Some(&object), None).await.unwrap();
+        let matched = after
+            .match_pattern(None, None, Some(&object), None)
+            .await
+            .unwrap();
         assert_eq!(matched.size().await.unwrap(), 3);
         let mut subjects: Vec<String> = matched
             .quads()
@@ -884,21 +1159,36 @@ mod tests {
 
         // Delete every quad with predicate p0 (i even): 6 of the 12.
         let p0 = NamedNode::new("http://example.org/p0").unwrap();
-        let after = store.delete_matching(None, Some(&p0), None, None).await.unwrap();
+        let after = store
+            .delete_matching(None, Some(&p0), None, None)
+            .await
+            .unwrap();
         assert_eq!(after.size().await.unwrap(), 6);
         assert_eq!(
-            after.match_pattern(None, Some(&p0), None, None).await.unwrap().size().await.unwrap(),
+            after
+                .match_pattern(None, Some(&p0), None, None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             0
         );
         assert_eq!(after.quads().unwrap().count().await, 6);
 
         // Deleting the same pattern twice is idempotent, not a double-count.
-        let again = after.delete_matching(None, Some(&p0), None, None).await.unwrap();
+        let again = after
+            .delete_matching(None, Some(&p0), None, None)
+            .await
+            .unwrap();
         assert_eq!(again.size().await.unwrap(), 6);
 
         // A pattern matching nothing leaves the store alone.
         let missing = NamedNode::new("http://example.org/nope").unwrap();
-        let untouched = again.delete_matching(None, Some(&missing), None, None).await.unwrap();
+        let untouched = again
+            .delete_matching(None, Some(&missing), None, None)
+            .await
+            .unwrap();
         assert_eq!(untouched.size().await.unwrap(), 6);
     }
 
@@ -928,8 +1218,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let path = std::env::temp_dir()
-            .join(format!("vortex_rdf_file_delete_{}.vortex", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!(
+            "vortex_rdf_file_delete_{}.vortex",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::write(&path, &bytes).unwrap();
 
         let store = VortexRdfStore::from_file(&path).await.unwrap();
@@ -937,7 +1229,10 @@ mod tests {
         // Index-resolved delete: "object 0" is indexed, so this resolves to
         // exact file row ids (i = 0, 3, 6, 9) without a filter scan.
         let object0 = Term::Literal(Literal::new_simple_literal("object 0"));
-        let after = store.delete_matching(None, None, Some(&object0), None).await.unwrap();
+        let after = store
+            .delete_matching(None, None, Some(&object0), None)
+            .await
+            .unwrap();
         assert_eq!(after.size().await.unwrap(), 8);
         assert_eq!(
             after.indexes(),
@@ -950,24 +1245,42 @@ mod tests {
         // The index still routes the lookup after the delete, and the
         // tombstoned rows must not come back.
         assert_eq!(
-            after.match_pattern(None, None, Some(&object0), None).await.unwrap().size().await.unwrap(),
+            after
+                .match_pattern(None, None, Some(&object0), None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             0
         );
         // Predicate p0 (i even: 0,2,4,6,8,10) had rows 0 and 6 tombstoned.
         let p0 = NamedNode::new("http://example.org/p0").unwrap();
-        let by_p0 = after.match_pattern(None, Some(&p0), None, None).await.unwrap();
+        let by_p0 = after
+            .match_pattern(None, Some(&p0), None, None)
+            .await
+            .unwrap();
         assert_eq!(by_p0.size().await.unwrap(), 4);
         assert_eq!(by_p0.quads().unwrap().count().await, 4);
 
         // Filter-scan delete: a subject isn't index-resolved, so this exercises
         // the pruning + filter evaluation path that resolves the doomed rows.
         let s05 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s05").unwrap());
-        let after2 = after.delete_matching(Some(&s05), None, None, None).await.unwrap();
+        let after2 = after
+            .delete_matching(Some(&s05), None, None, None)
+            .await
+            .unwrap();
         assert_eq!(after2.size().await.unwrap(), 7);
         // s05 is object "object 2" (5 % 3); that lookup now returns one fewer.
         let object2 = Term::Literal(Literal::new_simple_literal("object 2"));
         assert_eq!(
-            after2.match_pattern(None, None, Some(&object2), None).await.unwrap().size().await.unwrap(),
+            after2
+                .match_pattern(None, None, Some(&object2), None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             3,
         );
 
@@ -1007,15 +1320,20 @@ mod tests {
         )
         .await
         .unwrap();
-        let path = std::env::temp_dir()
-            .join(format!("vortex_rdf_compact_{}.vortex", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!(
+            "vortex_rdf_compact_{}.vortex",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::write(&path, &bytes).unwrap();
 
         let store = VortexRdfStore::from_file(&path).await.unwrap();
 
         // Delete "object 0" (i = 0, 3, 6, 9): 4 rows tombstoned, 8 live.
         let object0 = Term::Literal(Literal::new_simple_literal("object 0"));
-        let after = store.delete_matching(None, None, Some(&object0), None).await.unwrap();
+        let after = store
+            .delete_matching(None, None, Some(&object0), None)
+            .await
+            .unwrap();
         assert_eq!(after.size().await.unwrap(), 8);
 
         // Compact, keeping the index set: tombstoned rows are reclaimed and the
@@ -1030,8 +1348,13 @@ mod tests {
         // The rebuilt index routes over the compacted rows: the deleted object
         // is gone for good.
         assert_eq!(
-            compacted.match_pattern(None, None, Some(&object0), None).await.unwrap()
-                .size().await.unwrap(),
+            compacted
+                .match_pattern(None, None, Some(&object0), None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             0,
         );
 
@@ -1086,15 +1409,22 @@ mod tests {
         let store = VortexRdfStore::new(arr).unwrap();
 
         let object = Term::Literal(Literal::new_simple_literal("object 0"));
-        let view = store.match_pattern(None, None, Some(&object), None).await.unwrap();
+        let view = store
+            .match_pattern(None, None, Some(&object), None)
+            .await
+            .unwrap();
         assert_eq!(view.size().await.unwrap(), 3);
 
         for result in [
             view.add_quad(quads[0].clone()).await.err(),
             view.delete_quad(&quads[0]).await.err(),
-            view.delete_matching(None, None, Some(&object), None).await.err(),
+            view.delete_matching(None, None, Some(&object), None)
+                .await
+                .err(),
         ] {
-            let message = result.expect("a derived view must reject mutations").to_string();
+            let message = result
+                .expect("a derived view must reject mutations")
+                .to_string();
             assert!(
                 message.contains("owned()"),
                 "the error should point at the way out, got: {message}"
@@ -1111,7 +1441,16 @@ mod tests {
         // An unconstrained view covers exactly the base, so it counts as an
         // owner: mutating it is the same as mutating the store it came from.
         let whole = store.match_pattern(None, None, None, None).await.unwrap();
-        assert_eq!(whole.delete_quad(&quads[0]).await.unwrap().size().await.unwrap(), 5);
+        assert_eq!(
+            whole
+                .delete_quad(&quads[0])
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
+            5
+        );
     }
 
     /// The base a view was derived from stays reachable: matching narrows a
@@ -1139,7 +1478,10 @@ mod tests {
         let store = VortexRdfStore::new(arr).unwrap();
 
         let object = Term::Literal(Literal::new_simple_literal("object 0"));
-        let matched = store.match_pattern(None, None, Some(&object), None).await.unwrap();
+        let matched = store
+            .match_pattern(None, None, Some(&object), None)
+            .await
+            .unwrap();
         assert_eq!(matched.size().await.unwrap(), 5);
 
         // Widening back out from the derived view reaches only what the view
@@ -1169,7 +1511,10 @@ mod tests {
         ];
         let index_configs: [(&str, Indexes); 4] = [
             ("none", vec![]),
-            ("secondary-by-reference", vec![IndexType::SecondaryByReference]),
+            (
+                "secondary-by-reference",
+                vec![IndexType::SecondaryByReference],
+            ),
             ("secondary-by-copy", vec![IndexType::SecondaryByCopy]),
             (
                 "both",
@@ -1195,8 +1540,16 @@ mod tests {
                     let names: Vec<&str> = fields.names().iter().map(|n| n.as_ref()).collect();
                     let ref_cols = ["_idx_o_val", "_idx_o_rid", "_idx_p_val", "_idx_p_rid"];
                     let copy_cols = [
-                        "_idx_posg_s", "_idx_posg_p", "_idx_posg_o", "_idx_posg_g", "_idx_posg_rid",
-                        "_idx_ospg_s", "_idx_ospg_p", "_idx_ospg_o", "_idx_ospg_g", "_idx_ospg_rid",
+                        "_idx_posg_s",
+                        "_idx_posg_p",
+                        "_idx_posg_o",
+                        "_idx_posg_g",
+                        "_idx_posg_rid",
+                        "_idx_ospg_s",
+                        "_idx_ospg_p",
+                        "_idx_ospg_o",
+                        "_idx_ospg_g",
+                        "_idx_ospg_rid",
                     ];
                     let expect_ref = indexes.contains(&IndexType::SecondaryByReference);
                     let expect_copy = indexes.contains(&IndexType::SecondaryByCopy);
@@ -1219,7 +1572,10 @@ mod tests {
                 );
 
                 let p0 = NamedNode::new("http://example.org/p0").unwrap();
-                let by_pred = store.match_pattern(None, Some(&p0), None, None).await.unwrap();
+                let by_pred = store
+                    .match_pattern(None, Some(&p0), None, None)
+                    .await
+                    .unwrap();
                 assert_eq!(
                     by_pred.size().await.unwrap(),
                     8,
@@ -1227,7 +1583,10 @@ mod tests {
                 );
 
                 let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
-                let by_obj = store.match_pattern(None, None, Some(&o1), None).await.unwrap();
+                let by_obj = store
+                    .match_pattern(None, None, Some(&o1), None)
+                    .await
+                    .unwrap();
                 assert_eq!(
                     by_obj.size().await.unwrap(),
                     6,
@@ -1235,7 +1594,10 @@ mod tests {
                 );
 
                 let p1 = NamedNode::new("http://example.org/p1").unwrap();
-                let by_both = store.match_pattern(None, Some(&p1), Some(&o1), None).await.unwrap();
+                let by_both = store
+                    .match_pattern(None, Some(&p1), Some(&o1), None)
+                    .await
+                    .unwrap();
                 assert_eq!(
                     by_both.size().await.unwrap(),
                     2,
@@ -1243,7 +1605,10 @@ mod tests {
                 );
 
                 let missing_p = NamedNode::new("http://example.org/nope").unwrap();
-                let empty = store.match_pattern(None, Some(&missing_p), None, None).await.unwrap();
+                let empty = store
+                    .match_pattern(None, Some(&missing_p), None, None)
+                    .await
+                    .unwrap();
                 assert_eq!(
                     empty.size().await.unwrap(),
                     0,
@@ -1295,12 +1660,18 @@ mod tests {
 
         // Predicate p1 marks i ≡ 1 (mod 3): 8 rows, via the POSG lead search.
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
-        let by_p = store.match_pattern(None, Some(&p1), None, None).await.unwrap();
+        let by_p = store
+            .match_pattern(None, Some(&p1), None, None)
+            .await
+            .unwrap();
         assert_eq!(by_p.size().await.unwrap(), 8);
 
         // Object "object 1" marks i ≡ 1 (mod 4): 6 rows, via the OSPG lead.
         let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
-        let by_o = store.match_pattern(None, None, Some(&o1), None).await.unwrap();
+        let by_o = store
+            .match_pattern(None, None, Some(&o1), None)
+            .await
+            .unwrap();
         assert_eq!(by_o.size().await.unwrap(), 6);
 
         // Both bound resolves in one (p, o) prefix probe:
@@ -1320,12 +1691,18 @@ mod tests {
             .map(|q| q.subject.to_string())
             .collect();
         subjects.sort();
-        assert_eq!(subjects, ["<http://example.org/s01>", "<http://example.org/s13>"]);
+        assert_eq!(
+            subjects,
+            ["<http://example.org/s01>", "<http://example.org/s13>"]
+        );
 
         // The derived view keeps the index, and a chained match through it
         // must agree with the single-call prefix probe.
         assert_eq!(by_p.indexes(), &[IndexType::SecondaryByCopy]);
-        let chained = by_p.match_pattern(None, None, Some(&o1), None).await.unwrap();
+        let chained = by_p
+            .match_pattern(None, None, Some(&o1), None)
+            .await
+            .unwrap();
         assert_eq!(chained.size().await.unwrap(), 2);
     }
 
@@ -1384,21 +1761,30 @@ mod tests {
         // Predicate-bound: served from the POSG family's contiguous run — the
         // served `quads()` and the row-id `size()` must agree.
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
-        let by_p = store.match_pattern(None, Some(&p1), None, None).await.unwrap();
+        let by_p = store
+            .match_pattern(None, Some(&p1), None, None)
+            .await
+            .unwrap();
         assert!(by_p.debug_has_serve_plan());
         assert_eq!(by_p.size().await.unwrap(), 10);
         assert_eq!(matched_strings(&by_p).await, expected(&|i| i % 3 == 1));
 
         // Object-bound: served from the OSPG family.
         let o2 = Term::Literal(Literal::new_simple_literal("o2"));
-        let by_o = store.match_pattern(None, None, Some(&o2), None).await.unwrap();
+        let by_o = store
+            .match_pattern(None, None, Some(&o2), None)
+            .await
+            .unwrap();
         assert!(by_o.debug_has_serve_plan());
         assert_eq!(matched_strings(&by_o).await, expected(&|i| i % 5 == 2));
 
         // Predicate and object: one (p, o) prefix probe fully resolves the
         // pattern, so the narrowed run is served directly.
         let o1 = Term::Literal(Literal::new_simple_literal("o1"));
-        let by_po = store.match_pattern(None, Some(&p1), Some(&o1), None).await.unwrap();
+        let by_po = store
+            .match_pattern(None, Some(&p1), Some(&o1), None)
+            .await
+            .unwrap();
         assert!(by_po.debug_has_serve_plan());
         assert_eq!(matched_strings(&by_po).await, expected(&|i| i % 15 == 1));
 
@@ -1417,7 +1803,10 @@ mod tests {
         );
 
         // Chaining narrows the first view's row ids, so its serve plan drops.
-        let chained = by_p.match_pattern(None, None, Some(&o1), None).await.unwrap();
+        let chained = by_p
+            .match_pattern(None, None, Some(&o1), None)
+            .await
+            .unwrap();
         assert!(!chained.debug_has_serve_plan());
         assert_eq!(
             matched_strings(&chained).await,
@@ -1427,7 +1816,10 @@ mod tests {
         // A tombstoned row vanishes from served streams too: the slice reads
         // copy rows, so the delete reaches it through the rid column.
         let deleted = store.delete_quad(&quads[4]).await.unwrap();
-        let by_p_after = deleted.match_pattern(None, Some(&p1), None, None).await.unwrap();
+        let by_p_after = deleted
+            .match_pattern(None, Some(&p1), None, None)
+            .await
+            .unwrap();
         assert!(by_p_after.debug_has_serve_plan());
         assert_eq!(by_p_after.size().await.unwrap(), 9);
         assert_eq!(
@@ -1499,14 +1891,20 @@ mod tests {
 
         // Predicate-bound: i ≡ 1 (mod 3), served from the POSG family.
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
-        let by_p = store.match_pattern(None, Some(&p1), None, None).await.unwrap();
+        let by_p = store
+            .match_pattern(None, Some(&p1), None, None)
+            .await
+            .unwrap();
         assert!(by_p.debug_has_serve_plan());
         assert_eq!(by_p.size().await.unwrap(), 10);
         assert_eq!(matched_strings(&by_p).await, expected(&|i| i % 3 == 1));
 
         // Object-bound: i ≡ 2 (mod 5), served from the OSPG family.
         let o2 = Term::Literal(Literal::new_simple_literal("o2"));
-        let by_o = store.match_pattern(None, None, Some(&o2), None).await.unwrap();
+        let by_o = store
+            .match_pattern(None, None, Some(&o2), None)
+            .await
+            .unwrap();
         assert!(by_o.debug_has_serve_plan());
         assert_eq!(by_o.size().await.unwrap(), 6);
         assert_eq!(matched_strings(&by_o).await, expected(&|i| i % 5 == 2));
@@ -1535,7 +1933,10 @@ mod tests {
 
         // Chaining a second match narrows the first view's row ids (the copy
         // plan is dropped — its filter no longer selects exactly the rows).
-        let chained = by_p.match_pattern(None, None, Some(&o1), None).await.unwrap();
+        let chained = by_p
+            .match_pattern(None, None, Some(&o1), None)
+            .await
+            .unwrap();
         assert!(!chained.debug_has_serve_plan());
         assert_eq!(
             matched_strings(&chained).await,
@@ -1544,13 +1945,19 @@ mod tests {
 
         // A term the store has never seen short-circuits to empty.
         let missing = NamedNode::new("http://example.org/nope").unwrap();
-        let none = store.match_pattern(None, Some(&missing), None, None).await.unwrap();
+        let none = store
+            .match_pattern(None, Some(&missing), None, None)
+            .await
+            .unwrap();
         assert_eq!(none.size().await.unwrap(), 0);
 
         // A tombstoned row must vanish from copy-served streams too: the scan
         // reads copy rows, so the delete reaches it through the rid column.
         let deleted = store.delete_quad(&quads[4]).await.unwrap();
-        let by_p_after = deleted.match_pattern(None, Some(&p1), None, None).await.unwrap();
+        let by_p_after = deleted
+            .match_pattern(None, Some(&p1), None, None)
+            .await
+            .unwrap();
         assert_eq!(by_p_after.size().await.unwrap(), 9);
         assert_eq!(
             matched_strings(&by_p_after).await,
@@ -1593,7 +2000,12 @@ mod tests {
     // ─── 5) Mutation behavior ───────────────────────────────────────────────
 
     async fn run_add_delete_test<B: VortexArrayBuilder>() {
-        let q1 = make_quad("http://example.org/s1", "http://example.org/p1", "o1", GraphName::DefaultGraph);
+        let q1 = make_quad(
+            "http://example.org/s1",
+            "http://example.org/p1",
+            "o1",
+            GraphName::DefaultGraph,
+        );
 
         let arr = VortexRdfStore::build_vortex_array_with_builder::<B>(
             quad_stream(vec![q1.clone()]),
@@ -1605,7 +2017,12 @@ mod tests {
         let store = VortexRdfStore::new(arr).unwrap();
         assert_eq!(store.size().await.unwrap(), 1);
 
-        let q2 = make_quad("http://example.org/s2", "http://example.org/p2", "o2", GraphName::DefaultGraph);
+        let q2 = make_quad(
+            "http://example.org/s2",
+            "http://example.org/p2",
+            "o2",
+            GraphName::DefaultGraph,
+        );
         let store = store.add_quad(q2.clone()).await.unwrap();
         assert_eq!(store.size().await.unwrap(), 2);
 
@@ -1616,9 +2033,18 @@ mod tests {
         assert_eq!(store.size().await.unwrap(), 0);
     }
 
-    #[tokio::test] async fn test_add_delete_sorted_in_memory()    { run_add_delete_test::<SortedInMemoryBuilder>().await; }
-    #[tokio::test] async fn test_add_delete_sorted_stream()       { run_add_delete_test::<SortedStreamBuilder>().await; }
-    #[tokio::test] async fn test_add_delete_unsorted_stream()     { run_add_delete_test::<UnsortedStreamBuilder>().await; }
+    #[tokio::test]
+    async fn test_add_delete_sorted_in_memory() {
+        run_add_delete_test::<SortedInMemoryBuilder>().await;
+    }
+    #[tokio::test]
+    async fn test_add_delete_sorted_stream() {
+        run_add_delete_test::<SortedStreamBuilder>().await;
+    }
+    #[tokio::test]
+    async fn test_add_delete_unsorted_stream() {
+        run_add_delete_test::<UnsortedStreamBuilder>().await;
+    }
 
     #[tokio::test]
     async fn test_multiple_append() {
@@ -1637,11 +2063,17 @@ mod tests {
         assert_eq!(store.size().await.unwrap(), 10);
 
         let p = NamedNode::new("http://example.org/p").unwrap();
-        let matched = store.match_pattern(None, Some(&p), None, None).await.unwrap();
+        let matched = store
+            .match_pattern(None, Some(&p), None, None)
+            .await
+            .unwrap();
         assert_eq!(matched.size().await.unwrap(), 10);
 
         let s5 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s5").unwrap());
-        let matched_s5 = store.match_pattern(Some(&s5), None, None, None).await.unwrap();
+        let matched_s5 = store
+            .match_pattern(Some(&s5), None, None, None)
+            .await
+            .unwrap();
         assert_eq!(matched_s5.size().await.unwrap(), 1);
     }
 
@@ -1672,8 +2104,18 @@ mod tests {
 
         let added = store
             .add_quads([
-                make_quad("http://example.org/s90", "http://example.org/p0", "object 0", GraphName::DefaultGraph),
-                make_quad("http://example.org/s91", "http://example.org/p9", "object 9", GraphName::DefaultGraph),
+                make_quad(
+                    "http://example.org/s90",
+                    "http://example.org/p0",
+                    "object 0",
+                    GraphName::DefaultGraph,
+                ),
+                make_quad(
+                    "http://example.org/s91",
+                    "http://example.org/p9",
+                    "object 9",
+                    GraphName::DefaultGraph,
+                ),
             ])
             .await
             .unwrap();
@@ -1688,7 +2130,10 @@ mod tests {
         // An index-routed base lookup unions with the tail scan: "object 0" is
         // on base rows 0, 3, 6, 9 and on the appended s90.
         let object = Term::Literal(Literal::new_simple_literal("object 0"));
-        let matched = added.match_pattern(None, None, Some(&object), None).await.unwrap();
+        let matched = added
+            .match_pattern(None, None, Some(&object), None)
+            .await
+            .unwrap();
         let subjects = subjects_of(&matched).await;
         assert_eq!(subjects.len(), 5);
         assert!(subjects.contains(&"<http://example.org/s90>".to_string()));
@@ -1697,19 +2142,34 @@ mod tests {
         // still match in the tail.
         let p9 = NamedNode::new("http://example.org/p9").unwrap();
         assert_eq!(
-            added.match_pattern(None, Some(&p9), None, None).await.unwrap().size().await.unwrap(),
+            added
+                .match_pattern(None, Some(&p9), None, None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             1
         );
         let s90 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s90").unwrap());
         assert_eq!(
-            added.match_pattern(Some(&s90), None, None, None).await.unwrap().size().await.unwrap(),
+            added
+                .match_pattern(Some(&s90), None, None, None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             1
         );
 
         // Chained matches narrow base and tail together: of the five
         // "object 0" rows, p0 holds on base rows 0 and 6, and on s90.
         let p0 = NamedNode::new("http://example.org/p0").unwrap();
-        let chained = matched.match_pattern(None, Some(&p0), None, None).await.unwrap();
+        let chained = matched
+            .match_pattern(None, Some(&p0), None, None)
+            .await
+            .unwrap();
         assert_eq!(chained.size().await.unwrap(), 3);
 
         // Deletes tombstone in the tail exactly as in the base.
@@ -1719,13 +2179,25 @@ mod tests {
             .unwrap();
         assert_eq!(deleted_tail.size().await.unwrap(), 13);
         assert_eq!(
-            deleted_tail.match_pattern(None, None, Some(&object), None).await.unwrap().size().await.unwrap(),
+            deleted_tail
+                .match_pattern(None, None, Some(&object), None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             4
         );
         let deleted_base = deleted_tail.delete_quad(&quads[0]).await.unwrap();
         assert_eq!(deleted_base.size().await.unwrap(), 12);
         assert_eq!(
-            deleted_base.match_pattern(None, None, Some(&object), None).await.unwrap().size().await.unwrap(),
+            deleted_base
+                .match_pattern(None, None, Some(&object), None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             3
         );
     }
@@ -1735,9 +2207,24 @@ mod tests {
     /// quad counts as absent, so it can be re-added.
     #[tokio::test]
     async fn test_add_quads_set_semantics() {
-        let q1 = make_quad("http://example.org/s1", "http://example.org/p1", "o1", GraphName::DefaultGraph);
-        let q2 = make_quad("http://example.org/s2", "http://example.org/p2", "o2", GraphName::DefaultGraph);
-        let q3 = make_quad("http://example.org/s3", "http://example.org/p3", "o3", GraphName::DefaultGraph);
+        let q1 = make_quad(
+            "http://example.org/s1",
+            "http://example.org/p1",
+            "o1",
+            GraphName::DefaultGraph,
+        );
+        let q2 = make_quad(
+            "http://example.org/s2",
+            "http://example.org/p2",
+            "o2",
+            GraphName::DefaultGraph,
+        );
+        let q3 = make_quad(
+            "http://example.org/s3",
+            "http://example.org/p3",
+            "o3",
+            GraphName::DefaultGraph,
+        );
 
         let arr = VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
             quad_stream(vec![q1.clone(), q2.clone()]),
@@ -1813,12 +2300,24 @@ mod tests {
         // binary search and the rebuilt object index both answer.
         let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s02050").unwrap());
         assert_eq!(
-            compacted.match_pattern(Some(&s), None, None, None).await.unwrap().size().await.unwrap(),
+            compacted
+                .match_pattern(Some(&s), None, None, None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             1
         );
         let object = Term::Literal(Literal::new_simple_literal("object 3"));
         assert_eq!(
-            compacted.match_pattern(None, None, Some(&object), None).await.unwrap().size().await.unwrap(),
+            compacted
+                .match_pattern(None, None, Some(&object), None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             822
         );
     }
@@ -1841,8 +2340,10 @@ mod tests {
             })
             .collect();
 
-        let path = std::env::temp_dir()
-            .join(format!("vortex_rdf_autocompact_{}.vortex", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!(
+            "vortex_rdf_autocompact_{}.vortex",
+            uuid::Uuid::new_v4()
+        ));
         let file = tokio::fs::File::create(&path).await.unwrap();
         quads_stream_to_vortex_writer_with_builder::<SortedInMemoryBuilder, _, _>(
             quad_stream(quads.clone()),
@@ -1870,7 +2371,12 @@ mod tests {
         let small = store.add_quads(small_batch).await.unwrap();
         assert_eq!(small.tail_len(), 10);
         assert_eq!(
-            VortexRdfStore::from_file(&path).await.unwrap().size().await.unwrap(),
+            VortexRdfStore::from_file(&path)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             4,
             "a sub-threshold append must not rewrite the file"
         );
@@ -1900,7 +2406,13 @@ mod tests {
         assert_eq!(reopened.indexes(), &[IndexType::SecondaryByReference]);
         let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s02050").unwrap());
         assert_eq!(
-            reopened.match_pattern(Some(&s), None, None, None).await.unwrap().size().await.unwrap(),
+            reopened
+                .match_pattern(Some(&s), None, None, None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             1
         );
 
@@ -1948,13 +2460,25 @@ mod tests {
         // the tail must still answer.
         let new_object = Term::Literal(Literal::new_simple_literal("brand new object"));
         assert_eq!(
-            added.match_pattern(None, None, Some(&new_object), None).await.unwrap().size().await.unwrap(),
+            added
+                .match_pattern(None, None, Some(&new_object), None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             1
         );
         // Dictionary-coded base terms keep routing as before.
         let old_object = Term::Literal(Literal::new_simple_literal("object 1"));
         assert_eq!(
-            added.match_pattern(None, None, Some(&old_object), None).await.unwrap().size().await.unwrap(),
+            added
+                .match_pattern(None, None, Some(&old_object), None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             4
         );
 
@@ -1964,7 +2488,13 @@ mod tests {
         let reloaded = VortexRdfStore::new(arr).unwrap();
         assert_eq!(reloaded.size().await.unwrap(), 13);
         assert_eq!(
-            reloaded.match_pattern(None, None, Some(&new_object), None).await.unwrap().size().await.unwrap(),
+            reloaded
+                .match_pattern(None, None, Some(&new_object), None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             1
         );
 
@@ -1977,11 +2507,23 @@ mod tests {
         assert_eq!(compacted.size().await.unwrap(), 13);
         assert_eq!(compacted.indexes(), &[IndexType::SecondaryByReference]);
         assert_eq!(
-            compacted.match_pattern(None, None, Some(&new_object), None).await.unwrap().size().await.unwrap(),
+            compacted
+                .match_pattern(None, None, Some(&new_object), None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             1
         );
         assert_eq!(
-            compacted.match_pattern(None, None, Some(&old_object), None).await.unwrap().size().await.unwrap(),
+            compacted
+                .match_pattern(None, None, Some(&old_object), None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             4
         );
     }
@@ -2016,8 +2558,18 @@ mod tests {
 
         let added = store
             .add_quads([
-                make_quad("http://example.org/s9", "http://example.org/p0", "object 0", GraphName::DefaultGraph),
-                make_quad("http://example.org/s8", "http://example.org/p0", "object 1", GraphName::DefaultGraph),
+                make_quad(
+                    "http://example.org/s9",
+                    "http://example.org/p0",
+                    "object 0",
+                    GraphName::DefaultGraph,
+                ),
+                make_quad(
+                    "http://example.org/s8",
+                    "http://example.org/p0",
+                    "object 1",
+                    GraphName::DefaultGraph,
+                ),
             ])
             .await
             .unwrap();
@@ -2033,31 +2585,51 @@ mod tests {
 
         // The rows come back in global SPOG order (tail rows interleaved, the
         // tombstoned s5 gone) — not in the unsorted insertion order.
-        assert_eq!(subjects_of(&compacted).await, vec![
-            "<http://example.org/s0>".to_string(),
-            "<http://example.org/s1>".to_string(),
-            "<http://example.org/s2>".to_string(),
-            "<http://example.org/s3>".to_string(),
-            "<http://example.org/s4>".to_string(),
-            "<http://example.org/s8>".to_string(),
-            "<http://example.org/s9>".to_string(),
-        ]);
+        assert_eq!(
+            subjects_of(&compacted).await,
+            vec![
+                "<http://example.org/s0>".to_string(),
+                "<http://example.org/s1>".to_string(),
+                "<http://example.org/s2>".to_string(),
+                "<http://example.org/s3>".to_string(),
+                "<http://example.org/s4>".to_string(),
+                "<http://example.org/s8>".to_string(),
+                "<http://example.org/s9>".to_string(),
+            ]
+        );
 
         // Subject lookups and the rebuilt object index both answer.
         let s9 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s9").unwrap());
         assert_eq!(
-            compacted.match_pattern(Some(&s9), None, None, None).await.unwrap().size().await.unwrap(),
+            compacted
+                .match_pattern(Some(&s9), None, None, None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             1
         );
         let object = Term::Literal(Literal::new_simple_literal("object 0"));
         assert_eq!(
-            compacted.match_pattern(None, None, Some(&object), None).await.unwrap().size().await.unwrap(),
+            compacted
+                .match_pattern(None, None, Some(&object), None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             4
         );
 
         // The compacted store owns its rows: it mutates freely.
         let again = compacted
-            .add_quad(make_quad("http://example.org/s7", "http://example.org/p0", "object 0", GraphName::DefaultGraph))
+            .add_quad(make_quad(
+                "http://example.org/s7",
+                "http://example.org/p0",
+                "object 0",
+                GraphName::DefaultGraph,
+            ))
             .await
             .unwrap();
         assert_eq!(again.size().await.unwrap(), 8);
@@ -2080,7 +2652,8 @@ mod tests {
             })
             .collect();
 
-        let path = std::env::temp_dir().join(format!("vortex_rdf_add_{}.vortex", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("vortex_rdf_add_{}.vortex", std::process::id()));
         let file = tokio::fs::File::create(&path).await.unwrap();
         quads_stream_to_vortex_writer_with_builder::<SortedInMemoryBuilder, _, _>(
             quad_stream(quads.clone()),
@@ -2094,24 +2667,50 @@ mod tests {
         let store = VortexRdfStore::from_file(&path).await.unwrap();
         let added = store
             .add_quads([
-                make_quad("http://example.org/s90", "http://example.org/p0", "object 0", GraphName::DefaultGraph),
-                make_quad("http://example.org/s91", "http://example.org/p9", "object 9", GraphName::DefaultGraph),
+                make_quad(
+                    "http://example.org/s90",
+                    "http://example.org/p0",
+                    "object 0",
+                    GraphName::DefaultGraph,
+                ),
+                make_quad(
+                    "http://example.org/s91",
+                    "http://example.org/p9",
+                    "object 9",
+                    GraphName::DefaultGraph,
+                ),
             ])
             .await
             .unwrap();
         assert_eq!(added.size().await.unwrap(), 14);
         assert_eq!(added.indexes(), &[IndexType::SecondaryByReference]);
-        assert_eq!(store.size().await.unwrap(), 12, "the file view is untouched");
+        assert_eq!(
+            store.size().await.unwrap(),
+            12,
+            "the file view is untouched"
+        );
 
         // Index-routed file lookup + tail scan union.
         let object = Term::Literal(Literal::new_simple_literal("object 0"));
-        let subjects = subjects_of(&added.match_pattern(None, None, Some(&object), None).await.unwrap()).await;
+        let subjects = subjects_of(
+            &added
+                .match_pattern(None, None, Some(&object), None)
+                .await
+                .unwrap(),
+        )
+        .await;
         assert_eq!(subjects.len(), 5);
         assert!(subjects.contains(&"<http://example.org/s90>".to_string()));
         // A term only the tail knows.
         let object9 = Term::Literal(Literal::new_simple_literal("object 9"));
         assert_eq!(
-            added.match_pattern(None, None, Some(&object9), None).await.unwrap().size().await.unwrap(),
+            added
+                .match_pattern(None, None, Some(&object9), None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             1
         );
 
@@ -2127,7 +2726,13 @@ mod tests {
         assert_eq!(compacted.size().await.unwrap(), 13);
         assert_eq!(compacted.indexes(), &[IndexType::SecondaryByReference]);
         assert_eq!(
-            compacted.match_pattern(None, None, Some(&object9), None).await.unwrap().size().await.unwrap(),
+            compacted
+                .match_pattern(None, None, Some(&object9), None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
             1
         );
 
@@ -2141,17 +2746,21 @@ mod tests {
     async fn test_file_backed_filtered_size() {
         // 20 quads alternating between two predicates (10 each).
         let quads: Vec<Quad> = (0..20)
-            .map(|i| make_quad(
-                &format!("http://example.org/s{}", i),
-                &format!("http://example.org/p{}", i % 2),
-                "o",
-                GraphName::DefaultGraph,
-            ))
+            .map(|i| {
+                make_quad(
+                    &format!("http://example.org/s{}", i),
+                    &format!("http://example.org/p{}", i % 2),
+                    "o",
+                    GraphName::DefaultGraph,
+                )
+            })
             .collect();
 
         let bytes = quads_stream_to_vortex(quad_stream(quads)).await.unwrap();
-        let path = std::env::temp_dir()
-            .join(format!("vortex_rdf_size_test_{}.vortex", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!(
+            "vortex_rdf_size_test_{}.vortex",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::write(&path, &bytes).unwrap();
 
         let store = VortexRdfStore::from_file(&path).await.unwrap();
@@ -2160,7 +2769,10 @@ mod tests {
         // size() on a filtered file-backed store must report the *filtered*
         // count, not file.row_count().
         let p0 = NamedNode::new("http://example.org/p0").unwrap();
-        let filtered = store.match_pattern(None, Some(&p0), None, None).await.unwrap();
+        let filtered = store
+            .match_pattern(None, Some(&p0), None, None)
+            .await
+            .unwrap();
         assert_eq!(filtered.size().await.unwrap(), 10);
 
         let _ = std::fs::remove_file(&path);
@@ -2170,12 +2782,14 @@ mod tests {
     #[tokio::test]
     async fn test_file_backed_secondary_index_object_predicate() {
         let quads: Vec<Quad> = (0..30)
-            .map(|i| make_quad(
-                &format!("http://example.org/s{}", i),
-                &format!("http://example.org/p{}", i % 3),
-                &format!("o{}", i % 5),
-                GraphName::DefaultGraph,
-            ))
+            .map(|i| {
+                make_quad(
+                    &format!("http://example.org/s{}", i),
+                    &format!("http://example.org/p{}", i % 3),
+                    &format!("o{}", i % 5),
+                    GraphName::DefaultGraph,
+                )
+            })
             .collect();
 
         let mut bytes: Vec<u8> = Vec::new();
@@ -2188,21 +2802,32 @@ mod tests {
         .await
         .unwrap();
 
-        let path = std::env::temp_dir()
-            .join(format!("vortex_rdf_file_index_match_{}.vortex", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!(
+            "vortex_rdf_file_index_match_{}.vortex",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::write(&path, &bytes).unwrap();
 
         let store = VortexRdfStore::from_file(&path).await.unwrap();
 
         let o1 = Term::Literal(Literal::new_simple_literal("o1"));
-        let by_object = store.match_pattern(None, None, Some(&o1), None).await.unwrap();
+        let by_object = store
+            .match_pattern(None, None, Some(&o1), None)
+            .await
+            .unwrap();
         assert_eq!(by_object.size().await.unwrap(), 6);
 
         let p2 = NamedNode::new("http://example.org/p2").unwrap();
-        let by_predicate = store.match_pattern(None, Some(&p2), None, None).await.unwrap();
+        let by_predicate = store
+            .match_pattern(None, Some(&p2), None, None)
+            .await
+            .unwrap();
         assert_eq!(by_predicate.size().await.unwrap(), 10);
 
-        let by_both = store.match_pattern(None, Some(&p2), Some(&o1), None).await.unwrap();
+        let by_both = store
+            .match_pattern(None, Some(&p2), Some(&o1), None)
+            .await
+            .unwrap();
         assert_eq!(by_both.size().await.unwrap(), 2);
 
         let _ = std::fs::remove_file(&path);
@@ -2223,7 +2848,7 @@ mod tests {
         const CLUSTER: usize = 64;
         let quads: Vec<Quad> = (0..N)
             .map(|i| {
-                let p = if i < CLUSTER || i >= N - CLUSTER {
+                let p = if !(CLUSTER..N - CLUSTER).contains(&i) {
                     "http://example.org/pAAA"
                 } else {
                     "http://example.org/pMMM"
@@ -2246,24 +2871,33 @@ mod tests {
         )
         .await
         .unwrap();
-        let path = std::env::temp_dir()
-            .join(format!("vortex_rdf_noncontig_{}.vortex", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!(
+            "vortex_rdf_noncontig_{}.vortex",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::write(&path, &bytes).unwrap();
 
         let store = VortexRdfStore::from_file(&path).await.unwrap();
         let p_rare = NamedNode::new("http://example.org/pAAA").unwrap();
-        let matched = store.match_pattern(None, Some(&p_rare), None, None).await.unwrap();
+        let matched = store
+            .match_pattern(None, Some(&p_rare), None, None)
+            .await
+            .unwrap();
         assert_eq!(matched.size().await.unwrap(), 2 * CLUSTER);
 
         let results: Vec<Quad> = matched.quads().unwrap().try_collect().await.unwrap();
         assert_eq!(results.len(), 2 * CLUSTER);
         // Both the leading and the trailing cluster must be present.
-        assert!(results
-            .iter()
-            .any(|q| q.subject.to_string() == "<http://example.org/s000000>"));
-        assert!(results
-            .iter()
-            .any(|q| q.subject.to_string() == format!("<http://example.org/s{:06}>", N - 1)));
+        assert!(
+            results
+                .iter()
+                .any(|q| q.subject.to_string() == "<http://example.org/s000000>")
+        );
+        assert!(
+            results
+                .iter()
+                .any(|q| q.subject.to_string() == format!("<http://example.org/s{:06}>", N - 1))
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2277,12 +2911,14 @@ mod tests {
     async fn test_file_backed_chained_subject_then_object_index() {
         const N: usize = 3 * 8192;
         let quads: Vec<Quad> = (0..N)
-            .map(|i| make_quad(
-                &format!("http://example.org/s{:06}", i),
-                &format!("http://example.org/p{}", i % 3),
-                &format!("o{}", i % 5),
-                GraphName::DefaultGraph,
-            ))
+            .map(|i| {
+                make_quad(
+                    &format!("http://example.org/s{:06}", i),
+                    &format!("http://example.org/p{}", i % 3),
+                    &format!("o{}", i % 5),
+                    GraphName::DefaultGraph,
+                )
+            })
             .collect();
 
         let mut bytes: Vec<u8> = Vec::new();
@@ -2294,49 +2930,70 @@ mod tests {
         )
         .await
         .unwrap();
-        let path = std::env::temp_dir()
-            .join(format!("vortex_rdf_chained_index_{}.vortex", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!(
+            "vortex_rdf_chained_index_{}.vortex",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::write(&path, &bytes).unwrap();
 
         let store = VortexRdfStore::from_file(&path).await.unwrap();
 
         // The sorted subject column narrows a bound subject to a sub-range of
         // the file via zone-map pruning (row 12000 lives in the middle zone).
-        let s_mid = NamedOrBlankNode::NamedNode(
-            NamedNode::new("http://example.org/s012000").unwrap(),
-        );
+        let s_mid =
+            NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s012000").unwrap());
         let range = store.debug_subject_row_range(&s_mid).await.unwrap();
         let range = range.expect("sorted multi-zone file must narrow a bound subject");
         assert!(range.start <= 12000 && 12000 < range.end);
-        assert!(range.end - range.start < N as u64, "envelope must exclude other zones");
+        assert!(
+            range.end - range.start < N as u64,
+            "envelope must exclude other zones"
+        );
 
         // Subject match first (row range), then indexed object match: the
         // object index ids are restricted to the subject's range.
-        let by_subject = store.match_pattern(Some(&s_mid), None, None, None).await.unwrap();
+        let by_subject = store
+            .match_pattern(Some(&s_mid), None, None, None)
+            .await
+            .unwrap();
         let o0 = Term::Literal(Literal::new_simple_literal("o0"));
-        let chained = by_subject.match_pattern(None, None, Some(&o0), None).await.unwrap();
+        let chained = by_subject
+            .match_pattern(None, None, Some(&o0), None)
+            .await
+            .unwrap();
         assert_eq!(chained.size().await.unwrap(), 1); // 12000 % 5 == 0
         let results: Vec<Quad> = chained.quads().unwrap().try_collect().await.unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].subject.to_string(), "<http://example.org/s012000>");
+        assert_eq!(
+            results[0].subject.to_string(),
+            "<http://example.org/s012000>"
+        );
         assert_eq!(results[0].object.to_string(), "\"o0\"");
 
         // Same chain with an object the subject's row doesn't carry.
         let o1 = Term::Literal(Literal::new_simple_literal("o1"));
-        let empty = by_subject.match_pattern(None, None, Some(&o1), None).await.unwrap();
+        let empty = by_subject
+            .match_pattern(None, None, Some(&o1), None)
+            .await
+            .unwrap();
         assert_eq!(empty.size().await.unwrap(), 0);
 
         // Index-to-index chaining: object ids ∩ predicate ids.
         let p2 = NamedNode::new("http://example.org/p2").unwrap();
-        let step1 = store.match_pattern(None, None, Some(&o1), None).await.unwrap();
-        let step2 = step1.match_pattern(None, Some(&p2), None, None).await.unwrap();
+        let step1 = store
+            .match_pattern(None, None, Some(&o1), None)
+            .await
+            .unwrap();
+        let step2 = step1
+            .match_pattern(None, Some(&p2), None, None)
+            .await
+            .unwrap();
         let expected = (0..N).filter(|i| i % 5 == 1 && i % 3 == 2).count();
         assert_eq!(step2.size().await.unwrap(), expected);
         let results: Vec<Quad> = step2.quads().unwrap().try_collect().await.unwrap();
         assert_eq!(results.len(), expected);
         assert!(results.iter().all(|q| {
-            q.predicate.to_string() == "<http://example.org/p2>"
-                && q.object.to_string() == "\"o1\""
+            q.predicate == "http://example.org/p2" && q.object.to_string() == "\"o1\""
         }));
 
         let _ = std::fs::remove_file(&path);
@@ -2344,8 +3001,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_match_typed_object_layout() {
-        let q1 = make_quad("http://example.org/s1", "http://example.org/p1", "o1", GraphName::DefaultGraph);
-        let q2 = make_quad("http://example.org/s2", "http://example.org/p2", "o2", GraphName::DefaultGraph);
+        let q1 = make_quad(
+            "http://example.org/s1",
+            "http://example.org/p1",
+            "o1",
+            GraphName::DefaultGraph,
+        );
+        let q2 = make_quad(
+            "http://example.org/s2",
+            "http://example.org/p2",
+            "o2",
+            GraphName::DefaultGraph,
+        );
 
         let arr = VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
             quad_stream(vec![q1.clone(), q2.clone()]),
@@ -2359,7 +3026,10 @@ mod tests {
 
         // Match by object literal — exercises the typed o_kind/o_value columns.
         let o1 = Term::Literal(Literal::new_simple_literal("o1"));
-        let matched = store.match_pattern(None, None, Some(&o1), None).await.unwrap();
+        let matched = store
+            .match_pattern(None, None, Some(&o1), None)
+            .await
+            .unwrap();
         assert_eq!(matched.size().await.unwrap(), 1);
         let results: Vec<Quad> = matched.quads().unwrap().try_collect().await.unwrap();
         assert_eq!(results[0].subject.to_string(), q1.subject.to_string());
@@ -2367,12 +3037,18 @@ mod tests {
 
         // Match by predicate.
         let p2 = NamedNode::new("http://example.org/p2").unwrap();
-        let matched_p = store.match_pattern(None, Some(&p2), None, None).await.unwrap();
+        let matched_p = store
+            .match_pattern(None, Some(&p2), None, None)
+            .await
+            .unwrap();
         assert_eq!(matched_p.size().await.unwrap(), 1);
 
         // Non-existent object yields nothing.
         let o3 = Term::Literal(Literal::new_simple_literal("o3"));
-        let empty = store.match_pattern(None, None, Some(&o3), None).await.unwrap();
+        let empty = store
+            .match_pattern(None, None, Some(&o3), None)
+            .await
+            .unwrap();
         assert_eq!(empty.size().await.unwrap(), 0);
     }
 
@@ -2423,47 +3099,82 @@ mod tests {
         assert_eq!(quad_strings(&decoded), quad_strings(&quads));
     }
 
-    #[tokio::test] async fn test_dictionary_sorted_in_memory() { run_dictionary_roundtrip::<SortedInMemoryBuilder>().await; }
-    #[tokio::test] async fn test_dictionary_sorted_stream()    { run_dictionary_roundtrip::<SortedStreamBuilder>().await; }
-    #[tokio::test] async fn test_dictionary_unsorted_stream()  { run_dictionary_roundtrip::<UnsortedStreamBuilder>().await; }
+    #[tokio::test]
+    async fn test_dictionary_sorted_in_memory() {
+        run_dictionary_roundtrip::<SortedInMemoryBuilder>().await;
+    }
+    #[tokio::test]
+    async fn test_dictionary_sorted_stream() {
+        run_dictionary_roundtrip::<SortedStreamBuilder>().await;
+    }
+    #[tokio::test]
+    async fn test_dictionary_unsorted_stream() {
+        run_dictionary_roundtrip::<UnsortedStreamBuilder>().await;
+    }
 
     #[tokio::test]
     async fn test_dictionary_streaming_chunk_boundaries() {
         use crate::store::builders::assemble_chunks;
-        use crate::store::builders::unsorted_stream::build_chunk_stream;
         use crate::store::builders::sorted_in_memory::build_sorted_chunk_stream;
         use crate::store::builders::sorted_stream::build_sorted_stream_chunk_stream;
+        use crate::store::builders::unsorted_stream::build_chunk_stream;
 
         let quads = dictionary_test_quads();
 
         for (name, result) in [
-            ("unsorted_stream", build_chunk_stream(
-                Box::new(quad_stream(quads.clone())),
-                LayoutStrategy::Dictionary, dictionary_indexes(), 3,
-            ).await),
-            ("sorted_in_memory", build_sorted_chunk_stream(
-                Box::new(quad_stream(quads.clone())),
-                LayoutStrategy::Dictionary, dictionary_indexes(), 3,
-            ).await),
-            ("sorted_stream", build_sorted_stream_chunk_stream(
-                Box::new(quad_stream(quads.clone())),
-                LayoutStrategy::Dictionary, dictionary_indexes(), 3,
-            ).await),
+            (
+                "unsorted_stream",
+                build_chunk_stream(
+                    Box::new(quad_stream(quads.clone())),
+                    LayoutStrategy::Dictionary,
+                    dictionary_indexes(),
+                    3,
+                )
+                .await,
+            ),
+            (
+                "sorted_in_memory",
+                build_sorted_chunk_stream(
+                    Box::new(quad_stream(quads.clone())),
+                    LayoutStrategy::Dictionary,
+                    dictionary_indexes(),
+                    3,
+                )
+                .await,
+            ),
+            (
+                "sorted_stream",
+                build_sorted_stream_chunk_stream(
+                    Box::new(quad_stream(quads.clone())),
+                    LayoutStrategy::Dictionary,
+                    dictionary_indexes(),
+                    3,
+                )
+                .await,
+            ),
         ] {
             let (_dtype, chunks) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
             let collected: Vec<_> = chunks.collect().await;
-            let lens: Vec<usize> = collected.iter().map(|c| c.as_ref().unwrap().len()).collect();
+            let lens: Vec<usize> = collected
+                .iter()
+                .map(|c| c.as_ref().unwrap().len())
+                .collect();
             assert_eq!(lens, [3, 3, 3, 1], "{name}: unexpected chunk sizes");
 
             // Reassemble and decode through a store: this fails unless chunk 0
             // carries the dictionary payload (row 0 of the assembled array)
             // and all chunks' codes reference the same global dictionary.
             let chunks: Vec<_> = collected.into_iter().map(|c| c.unwrap()).collect();
-            let arr = assemble_chunks(chunks, LayoutStrategy::Dictionary, &dictionary_indexes()).unwrap();
+            let arr =
+                assemble_chunks(chunks, LayoutStrategy::Dictionary, &dictionary_indexes()).unwrap();
             let store = VortexRdfStore::new(arr).unwrap();
             assert_eq!(store.layout(), LayoutStrategy::Dictionary, "{name}");
             let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
-            assert_eq!(quad_strings(&decoded), quad_strings(&quads), "{name}: bad roundtrip");
+            assert_eq!(
+                quad_strings(&decoded),
+                quad_strings(&quads),
+                "{name}: bad roundtrip"
+            );
         }
     }
 
@@ -2481,21 +3192,46 @@ mod tests {
 
         // Subject match: hits the IsSorted binary-search fast path on the u32 column.
         let s3 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s03").unwrap());
-        let by_subject = store.match_pattern(Some(&s3), None, None, None).await.unwrap();
+        let by_subject = store
+            .match_pattern(Some(&s3), None, None, None)
+            .await
+            .unwrap();
         assert_eq!(by_subject.size().await.unwrap(), 1);
         let results: Vec<Quad> = by_subject.quads().unwrap().try_collect().await.unwrap();
         assert_eq!(results[0].subject.to_string(), "<http://example.org/s03>");
 
         // Predicate match: mask scan over the u32 codes (p0 occurs for i = 0,3,6,9).
         let p0 = NamedNode::new("http://example.org/p0").unwrap();
-        let by_pred = store.match_pattern(None, Some(&p0), None, None).await.unwrap();
+        let by_pred = store
+            .match_pattern(None, Some(&p0), None, None)
+            .await
+            .unwrap();
         assert_eq!(by_pred.size().await.unwrap(), 4);
 
         // Terms absent from the dictionary match nothing (both routing paths).
-        let missing_s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/nope").unwrap());
-        assert_eq!(store.match_pattern(Some(&missing_s), None, None, None).await.unwrap().size().await.unwrap(), 0);
+        let missing_s =
+            NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/nope").unwrap());
+        assert_eq!(
+            store
+                .match_pattern(Some(&missing_s), None, None, None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
+            0
+        );
         let missing_p = NamedNode::new("http://example.org/nope").unwrap();
-        assert_eq!(store.match_pattern(None, Some(&missing_p), None, None).await.unwrap().size().await.unwrap(), 0);
+        assert_eq!(
+            store
+                .match_pattern(None, Some(&missing_p), None, None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
+            0
+        );
 
         // delete_quad works (mask-based); the cached dictionary is propagated.
         let deleted = store.delete_quad(&quads[0]).await.unwrap();
@@ -2521,7 +3257,10 @@ mod tests {
         let arr = VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
             quad_stream(quads.clone()),
             LayoutStrategy::Dictionary,
-            vec![IndexType::SecondaryByReference, IndexType::SecondaryByReference],
+            vec![
+                IndexType::SecondaryByReference,
+                IndexType::SecondaryByReference,
+            ],
         )
         .await
         .unwrap();
@@ -2533,7 +3272,17 @@ mod tests {
             let names: Vec<&str> = fields.names().iter().map(|n| n.as_ref()).collect();
             assert_eq!(
                 names,
-                ["s", "p", "o", "g", "_dict_terms", "_idx_o_val", "_idx_o_rid", "_idx_p_val", "_idx_p_rid"],
+                [
+                    "s",
+                    "p",
+                    "o",
+                    "g",
+                    "_dict_terms",
+                    "_idx_o_val",
+                    "_idx_o_rid",
+                    "_idx_p_val",
+                    "_idx_p_rid"
+                ],
             );
             assert_eq!(fields.field("_idx_o_val"), fields.field("o"));
             assert_eq!(fields.field("_idx_p_val"), fields.field("p"));
@@ -2550,33 +3299,68 @@ mod tests {
         // Predicate-only match: routes through the code-based `_idx_p_*` index
         // (p0 occurs for i = 0,3,6,9).
         let p0 = NamedNode::new("http://example.org/p0").unwrap();
-        let by_pred = store.match_pattern(None, Some(&p0), None, None).await.unwrap();
+        let by_pred = store
+            .match_pattern(None, Some(&p0), None, None)
+            .await
+            .unwrap();
         assert_eq!(by_pred.size().await.unwrap(), 4);
         let results: Vec<Quad> = by_pred.quads().unwrap().try_collect().await.unwrap();
-        assert!(results.iter().all(|q| q.predicate == "http://example.org/p0"));
+        assert!(
+            results
+                .iter()
+                .all(|q| q.predicate == "http://example.org/p0")
+        );
 
         // Object-only match: routes through the code-based `_idx_o_*` index and
         // decodes through the store-cached dictionary ("object 1" for i = 1,5,9).
         let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
-        let by_obj = store.match_pattern(None, None, Some(&o1), None).await.unwrap();
+        let by_obj = store
+            .match_pattern(None, None, Some(&o1), None)
+            .await
+            .unwrap();
         assert_eq!(by_obj.size().await.unwrap(), 3);
         let results: Vec<Quad> = by_obj.quads().unwrap().try_collect().await.unwrap();
-        assert!(results.iter().all(|q| q.object.to_string() == "\"object 1\""));
+        assert!(
+            results
+                .iter()
+                .all(|q| q.object.to_string() == "\"object 1\"")
+        );
 
         // Combined o+p pattern: the object index narrows first; the derived
         // store (stale index columns stripped) mask-scans the predicate
         // (i = 1,5,9 with p1 → only i = 1).
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
-        let by_both = store.match_pattern(None, Some(&p1), Some(&o1), None).await.unwrap();
+        let by_both = store
+            .match_pattern(None, Some(&p1), Some(&o1), None)
+            .await
+            .unwrap();
         assert_eq!(by_both.size().await.unwrap(), 1);
         let results: Vec<Quad> = by_both.quads().unwrap().try_collect().await.unwrap();
         assert_eq!(results[0].subject.to_string(), "<http://example.org/s01>");
 
         // Terms absent from the dictionary match nothing through the index paths.
         let missing_o = Term::Literal(Literal::new_simple_literal("nope"));
-        assert_eq!(store.match_pattern(None, None, Some(&missing_o), None).await.unwrap().size().await.unwrap(), 0);
+        assert_eq!(
+            store
+                .match_pattern(None, None, Some(&missing_o), None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
+            0
+        );
         let missing_p = NamedNode::new("http://example.org/nope").unwrap();
-        assert_eq!(store.match_pattern(None, Some(&missing_p), None, None).await.unwrap().size().await.unwrap(), 0);
+        assert_eq!(
+            store
+                .match_pattern(None, Some(&missing_p), None, None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -2601,7 +3385,10 @@ mod tests {
         // s + o pattern (i = 5: s05 has "object 1").
         let s5 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s05").unwrap());
         let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
-        let matched = store.match_pattern(Some(&s5), None, Some(&o1), None).await.unwrap();
+        let matched = store
+            .match_pattern(Some(&s5), None, Some(&o1), None)
+            .await
+            .unwrap();
         assert_eq!(matched.size().await.unwrap(), 1);
         let results: Vec<Quad> = matched.quads().unwrap().try_collect().await.unwrap();
         assert_eq!(results[0].subject.to_string(), "<http://example.org/s05>");
@@ -2609,7 +3396,16 @@ mod tests {
 
         // s + o with an object that exists but not on that subject.
         let o0 = Term::Literal(Literal::new_simple_literal("object 0"));
-        assert_eq!(store.match_pattern(Some(&s5), None, Some(&o0), None).await.unwrap().size().await.unwrap(), 0);
+        assert_eq!(
+            store
+                .match_pattern(Some(&s5), None, Some(&o0), None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -2650,7 +3446,8 @@ mod tests {
 
         // ...then open it as a file-backed store (loads the dictionary via a
         // single-column projection scan).
-        let dir = std::env::temp_dir().join(format!("vortex_rdf_dict_test_{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("vortex_rdf_dict_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dict.vortex");
         std::fs::write(&path, &bytes).unwrap();
@@ -2664,14 +3461,24 @@ mod tests {
 
         // Pushed-down integer filter on the code columns.
         let p0 = NamedNode::new("http://example.org/p0").unwrap();
-        let filtered = store.match_pattern(None, Some(&p0), None, None).await.unwrap();
+        let filtered = store
+            .match_pattern(None, Some(&p0), None, None)
+            .await
+            .unwrap();
         assert_eq!(filtered.size().await.unwrap(), 4);
         let results: Vec<Quad> = filtered.quads().unwrap().try_collect().await.unwrap();
-        assert!(results.iter().all(|q| q.predicate == "http://example.org/p0"));
+        assert!(
+            results
+                .iter()
+                .all(|q| q.predicate == "http://example.org/p0")
+        );
 
         // A term absent from the dictionary yields an always-false filter.
         let missing_p = NamedNode::new("http://example.org/nope").unwrap();
-        let empty = store.match_pattern(None, Some(&missing_p), None, None).await.unwrap();
+        let empty = store
+            .match_pattern(None, Some(&missing_p), None, None)
+            .await
+            .unwrap();
         assert_eq!(empty.size().await.unwrap(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -3,26 +3,26 @@ use std::sync::Arc;
 
 use clap::ValueEnum;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
-use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::dtype::{DType, FieldName, FieldNames};
-use vortex_array::validity::Validity;
-use vortex_buffer::Buffer;
-use vortex_mask::Mask;
 #[cfg(feature = "file-io")]
-use vortex_array::expr::{and, eq, get_item, gt_eq, lt_eq, lit, root, select, Expression};
+use vortex_array::expr::{Expression, and, eq, get_item, gt_eq, lit, lt_eq, root, select};
 #[cfg(feature = "file-io")]
 use vortex_array::scalar::Scalar;
 #[cfg(feature = "file-io")]
 use vortex_array::stream::ArrayStreamExt;
+use vortex_array::validity::Validity;
+use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
+use vortex_buffer::Buffer;
 #[cfg(feature = "file-io")]
 use vortex_file::VortexFile;
+use vortex_mask::Mask;
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
-use crate::store::{QuadCodes, RawQuad};
 use crate::store::layouts::ResolvedLayout;
+use crate::store::{QuadCodes, RawQuad};
 
 pub mod secondary_by_copy;
 pub mod secondary_by_reference;
@@ -31,7 +31,7 @@ pub mod secondary_by_reference;
 ///
 /// Variant declaration order is the resolution preference order: pattern
 /// matching tries each detected index in this order and takes the first that
-/// doesn't decline (see [`resolve_indexes_in_memory`]).
+/// doesn't decline (see `resolve_indexes_in_memory`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, ValueEnum)]
 pub enum IndexType {
     /// Appends two complete extra copies of the quad columns, each in its own
@@ -111,10 +111,18 @@ impl IndexType {
     ) {
         match self {
             IndexType::SecondaryByCopy => secondary_by_copy::append_columns(
-                field_names, field_arrays, quads, start_row, whole_dataset,
+                field_names,
+                field_arrays,
+                quads,
+                start_row,
+                whole_dataset,
             ),
             IndexType::SecondaryByReference => secondary_by_reference::append_columns(
-                field_names, field_arrays, quads, start_row, whole_dataset,
+                field_names,
+                field_arrays,
+                quads,
+                start_row,
+                whole_dataset,
             ),
         }
     }
@@ -137,10 +145,18 @@ impl IndexType {
     ) {
         match self {
             IndexType::SecondaryByCopy => secondary_by_copy::append_encoded_columns(
-                field_names, field_arrays, codes, start_row, whole_dataset,
+                field_names,
+                field_arrays,
+                codes,
+                start_row,
+                whole_dataset,
             ),
             IndexType::SecondaryByReference => secondary_by_reference::append_encoded_columns(
-                field_names, field_arrays, codes, start_row, whole_dataset,
+                field_names,
+                field_arrays,
+                codes,
+                start_row,
+                whole_dataset,
             ),
         }
     }
@@ -206,8 +222,10 @@ impl IndexType {
                     .await
             }
             IndexType::SecondaryByReference => {
-                secondary_by_reference::resolve_file(file, layout, subject, predicate, object, graph)
-                    .await
+                secondary_by_reference::resolve_file(
+                    file, layout, subject, predicate, object, graph,
+                )
+                .await
             }
         }
     }
@@ -345,7 +363,12 @@ impl ServePlan {
         decode_layout: ResolvedLayout,
         range: Range<usize>,
     ) -> Self {
-        Self { primary_columns, rid_column, decode_layout, source: ServeSource::InMemory(range) }
+        Self {
+            primary_columns,
+            rid_column,
+            decode_layout,
+            source: ServeSource::InMemory(range),
+        }
     }
 
     /// A plan serving a file's index columns by a pushed-down scan filtered to
@@ -357,7 +380,12 @@ impl ServePlan {
         decode_layout: ResolvedLayout,
         constraints: Vec<(&'static str, Scalar)>,
     ) -> Self {
-        Self { primary_columns, rid_column, decode_layout, source: ServeSource::File(constraints) }
+        Self {
+            primary_columns,
+            rid_column,
+            decode_layout,
+            source: ServeSource::File(constraints),
+        }
     }
 
     /// Decode an in-memory base's matched quads straight from its index columns:
@@ -384,7 +412,11 @@ impl ServePlan {
     /// Decode the `(s, p, o, g)` quads out of a chunk of this plan's projected
     /// index columns, dropping rows tombstoned in `deleted` via the row-id
     /// column — the shared tail of both backends' serving.
-    pub(crate) fn decode_columns(&self, chunk: &ArrayRef, deleted: Option<&Mask>) -> Vec<Result<Quad>> {
+    pub(crate) fn decode_columns(
+        &self,
+        chunk: &ArrayRef,
+        deleted: Option<&Mask>,
+    ) -> Vec<Result<Quad>> {
         match self.chunk_rows(chunk, deleted) {
             Ok(rows) => self.decode_layout.decode_chunk(&rows),
             Err(e) => vec![Err(e)],
@@ -688,7 +720,10 @@ impl GlobalIndexes {
                 }
             }
         }
-        Self { by_copy, by_reference }
+        Self {
+            by_copy,
+            by_reference,
+        }
     }
 
     /// Dictionary-layout variant: build from the dataset's u32 codes.
@@ -706,7 +741,10 @@ impl GlobalIndexes {
                 }
             }
         }
-        Self { by_copy, by_reference }
+        Self {
+            by_copy,
+            by_reference,
+        }
     }
 
     /// Append window `range` of every index's global order as one chunk's
@@ -735,7 +773,10 @@ pub(crate) fn strip_index_columns(arr: ArrayRef) -> Result<ArrayRef> {
     // no `_idx_*` columns to strip in the first place (the common case).
     let keep: Vec<FieldName> = match arr.dtype() {
         DType::Struct(fields, _)
-            if fields.names().iter().any(|n| n.as_ref().starts_with("_idx_")) =>
+            if fields
+                .names()
+                .iter()
+                .any(|n| n.as_ref().starts_with("_idx_")) =>
         {
             fields
                 .names()
@@ -756,7 +797,8 @@ pub(crate) fn strip_index_columns(arr: ArrayRef) -> Result<ArrayRef> {
         .iter()
         .map(|n| {
             struct_arr
-                .unmasked_field_by_name(n.as_ref()).cloned()
+                .unmasked_field_by_name(n.as_ref())
+                .cloned()
                 .map_err(VortexRdfError::Vortex)
         })
         .collect::<Result<_>>()?;
@@ -787,25 +829,59 @@ mod tests {
     fn detect_indexes_by_schema() {
         // All four columns present: the index is detected.
         let with_idx = struct_dtype(&[
-            "s", "p", "o", "g",
-            "_idx_o_val", "_idx_o_rid", "_idx_p_val", "_idx_p_rid",
+            "s",
+            "p",
+            "o",
+            "g",
+            "_idx_o_val",
+            "_idx_o_rid",
+            "_idx_p_val",
+            "_idx_p_rid",
         ]);
-        assert_eq!(detect_indexes(&with_idx), vec![IndexType::SecondaryByReference]);
+        assert_eq!(
+            detect_indexes(&with_idx),
+            vec![IndexType::SecondaryByReference]
+        );
 
         // The ten copy-family columns mark the SecondaryByCopy index.
         let with_copy = struct_dtype(&[
-            "s", "p", "o", "g",
-            "_idx_posg_s", "_idx_posg_p", "_idx_posg_o", "_idx_posg_g", "_idx_posg_rid",
-            "_idx_ospg_s", "_idx_ospg_p", "_idx_ospg_o", "_idx_ospg_g", "_idx_ospg_rid",
+            "s",
+            "p",
+            "o",
+            "g",
+            "_idx_posg_s",
+            "_idx_posg_p",
+            "_idx_posg_o",
+            "_idx_posg_g",
+            "_idx_posg_rid",
+            "_idx_ospg_s",
+            "_idx_ospg_p",
+            "_idx_ospg_o",
+            "_idx_ospg_g",
+            "_idx_ospg_rid",
         ]);
         assert_eq!(detect_indexes(&with_copy), vec![IndexType::SecondaryByCopy]);
 
         // Both index families in one schema: copy first (preference order).
         let with_both = struct_dtype(&[
-            "s", "p", "o", "g",
-            "_idx_o_val", "_idx_o_rid", "_idx_p_val", "_idx_p_rid",
-            "_idx_posg_s", "_idx_posg_p", "_idx_posg_o", "_idx_posg_g", "_idx_posg_rid",
-            "_idx_ospg_s", "_idx_ospg_p", "_idx_ospg_o", "_idx_ospg_g", "_idx_ospg_rid",
+            "s",
+            "p",
+            "o",
+            "g",
+            "_idx_o_val",
+            "_idx_o_rid",
+            "_idx_p_val",
+            "_idx_p_rid",
+            "_idx_posg_s",
+            "_idx_posg_p",
+            "_idx_posg_o",
+            "_idx_posg_g",
+            "_idx_posg_rid",
+            "_idx_ospg_s",
+            "_idx_ospg_p",
+            "_idx_ospg_o",
+            "_idx_ospg_g",
+            "_idx_ospg_rid",
         ]);
         assert_eq!(
             detect_indexes(&with_both),
@@ -821,8 +897,15 @@ mod tests {
         let partial = struct_dtype(&["s", "p", "o", "g", "_idx_o_val", "_idx_o_rid"]);
         assert!(detect_indexes(&partial).is_empty());
         let partial_copy = struct_dtype(&[
-            "s", "p", "o", "g",
-            "_idx_posg_s", "_idx_posg_p", "_idx_posg_o", "_idx_posg_g", "_idx_posg_rid",
+            "s",
+            "p",
+            "o",
+            "g",
+            "_idx_posg_s",
+            "_idx_posg_p",
+            "_idx_posg_o",
+            "_idx_posg_g",
+            "_idx_posg_rid",
         ]);
         assert!(detect_indexes(&partial_copy).is_empty());
 

@@ -1,20 +1,19 @@
+use super::spill::{RunReader, RunWriter, TempRunsGuard, make_temp_dir};
+use super::{
+    ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder, assemble_chunks, build_struct_array,
+    into_vortex_error, make_empty_struct,
+};
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
-use crate::store::layouts::{dictionary, LayoutStrategy};
+use crate::store::indexes::Indexes;
 use crate::store::layouts::default::DirectChunkBuilder;
 use crate::store::layouts::term_dictionary::{TermDictionary, TermDictionaryBuilder};
-use crate::store::indexes::Indexes;
-use super::{
-    VortexArrayBuilder, ChunkStream,
-    build_struct_array, make_empty_struct, assemble_chunks, into_vortex_error,
-    DEFAULT_CHUNK_SIZE,
-};
-use super::spill::{make_temp_dir, RunReader, RunWriter, TempRunsGuard};
+use crate::store::layouts::{LayoutStrategy, dictionary};
 
+use futures::{Stream, StreamExt, TryStreamExt, stream};
+use oxrdf::Quad;
 use std::sync::Arc;
 use web_time::Instant;
-use futures::{stream, Stream, StreamExt, TryStreamExt};
-use oxrdf::Quad;
 
 use vortex_array::ArrayRef;
 use vortex_array::dtype::DType;
@@ -125,7 +124,9 @@ async fn build_dict_chunk_stream(
 ) -> Result<(DType, ChunkStream)> {
     // ── Pass 1: spill + incremental dictionary ──
     let temp_dir = make_temp_dir("unsorted_dict")?;
-    let guard = TempRunsGuard { dir: temp_dir.clone() };
+    let guard = TempRunsGuard {
+        dir: temp_dir.clone(),
+    };
     let spill_path = temp_dir.join("quads.bin");
 
     let mut writer = RunWriter::create(&spill_path)?;
@@ -184,17 +185,21 @@ async fn build_dict_chunk_stream(
                 match reader.next() {
                     Ok(Some(q)) => buf.push(q),
                     Ok(None) => break,
-                    Err(e) => return Some((Err(into_vortex_error(e)), (reader, dict, id_map, indexes, row, guard))),
+                    Err(e) => {
+                        return Some((
+                            Err(into_vortex_error(e)),
+                            (reader, dict, id_map, indexes, row, guard),
+                        ));
+                    }
                 }
             }
             if buf.is_empty() {
                 return None;
             }
             let n = buf.len() as u32;
-            let chunk = dictionary::build_chunk(
-                &buf, &dict, &id_map, &indexes, row, false, false, false,
-            )
-                .map_err(into_vortex_error);
+            let chunk =
+                dictionary::build_chunk(&buf, &dict, &id_map, &indexes, row, false, false, false)
+                    .map_err(into_vortex_error);
             Some((chunk, (reader, dict, id_map, indexes, row + n, guard)))
         },
     );
@@ -225,7 +230,15 @@ async fn build_buffered_chunk_stream(
         // A first chunk shorter than chunk_size means the stream is exhausted:
         // the chunk is the whole dataset and its index columns are globally
         // sorted (stamped for binary-search routing).
-        build_struct_array(&buf, layout, &indexes, buf.len(), 0, false, buf.len() < chunk_size)?
+        build_struct_array(
+            &buf,
+            layout,
+            &indexes,
+            buf.len(),
+            0,
+            false,
+            buf.len() < chunk_size,
+        )?
     };
     let dtype = first.dtype().clone();
     let next_row = buf.len() as u32;

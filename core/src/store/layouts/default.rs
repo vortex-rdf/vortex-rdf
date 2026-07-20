@@ -7,12 +7,12 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use oxrdf::{GraphName, Quad};
-use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
-use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::VarBinViewArray;
+use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::builders::VarBinViewBuilder;
 use vortex_array::dtype::{DType, Nullability};
 use vortex_array::validity::Validity;
+use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
 use crate::common::utils::{
     buf_as_str, get_as_term, make_string_array, parse_graph_name, parse_named_node, parse_subject,
@@ -53,8 +53,11 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
             match struct_arr
                 .unmasked_field_by_name($name)
                 .map_err(VortexRdfError::Vortex)
-                .and_then(|c| c.clone().execute::<VarBinViewArray>(&mut ctx).map_err(VortexRdfError::Vortex))
-            {
+                .and_then(|c| {
+                    c.clone()
+                        .execute::<VarBinViewArray>(&mut ctx)
+                        .map_err(VortexRdfError::Vortex)
+                }) {
                 Ok(arr) => arr,
                 Err(e) => return vec![Err(e)],
             }
@@ -109,7 +112,8 @@ pub(crate) struct DirectChunkBuilder {
 
 impl DirectChunkBuilder {
     pub(crate) fn new(capacity: usize) -> Self {
-        let col = || VarBinViewBuilder::with_capacity(DType::Utf8(Nullability::NonNullable), capacity);
+        let col =
+            || VarBinViewBuilder::with_capacity(DType::Utf8(Nullability::NonNullable), capacity);
         Self {
             s: col(),
             p: col(),

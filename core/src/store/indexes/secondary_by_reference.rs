@@ -2,30 +2,30 @@
 //! value columns, each paired with the primary row IDs they point at. This
 //! module owns both halves of the index's lifecycle — building the columns at
 //! write time, and executing lookups against them at query time
-//! ([`resolve_in_memory`] / [`resolve_file`], which produce primary row ids
+//! (`resolve_in_memory` / `resolve_file`, which produce primary row ids
 //! directly for each backend).
 //!
 //! The value columns come in two encodings — term strings, or u32 dictionary
 //! codes under the Dictionary layout — and in two scopes:
 //!
-//! - **Per-chunk** ([`append_columns`] / [`append_encoded_columns`]): each
+//! - **Per-chunk** (`append_columns` / `append_encoded_columns`): each
 //!   chunk sorts its own quads. Cheap and single-pass, but the concatenation
 //!   of several chunks is *not* globally sorted, so the `IsSorted` stat is
 //!   stamped only when the chunk spans the whole dataset. The chunk-local sort
-//!   still pays off in a file-backed store: [`resolve_file`] pushes the probe
+//!   still pays off in a file-backed store: `resolve_file` pushes the probe
 //!   down as a range predicate, and clustering the values shrinks each zone's
 //!   min/max so the scan prunes to the few zones that can hold the probe.
 //!   Zones are smaller than a chunk (8192 rows), so this holds within a chunk
 //!   even though the whole column is unsorted.
-//! - **Global** ([`GlobalIndexArrays`] and the `append_sorted_*` helpers):
+//! - **Global** (`GlobalIndexArrays` and the `append_sorted_*` helpers):
 //!   the complete dataset's sorted order, emitted per chunk as consecutive
 //!   windows. Every value column is stamped `IsSorted`, and the concatenated
 //!   columns stay globally binary-searchable.
 //!
-//! The two backends read that stamp differently. [`resolve_in_memory`] needs
+//! The two backends read that stamp differently. `resolve_in_memory` needs
 //! it: binary search over a concatenation of per-chunk orders would be wrong,
 //! so an unstamped column makes it decline and `match_pattern` falls back to a
-//! mask scan. [`resolve_file`] never consults it — the range predicate is
+//! mask scan. `resolve_file` never consults it — the range predicate is
 //! correct whatever the order, and sortedness only decides how much prunes.
 //!
 //! [`IndexType::SecondaryByReference`]: super::IndexType::SecondaryByReference
@@ -35,18 +35,18 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
-use vortex_array::{ArrayRef, IntoArray};
-use vortex_array::arrays::{PrimitiveArray, StructArray};
 use vortex_array::arrays::struct_::StructArrayExt;
+use vortex_array::arrays::{PrimitiveArray, StructArray};
 use vortex_array::dtype::DType;
+use vortex_array::{ArrayRef, IntoArray};
 
+use super::{IndexResolution, IndexedComponent, sorted_row_ids};
 use crate::common::utils::{
     column_is_sorted, make_string_array, search_sorted_bounds, stamp_is_sorted,
 };
 use crate::error::{Result, VortexRdfError};
-use crate::store::{QuadCodes, RawQuad};
 use crate::store::layouts::ResolvedLayout;
-use super::{sorted_row_ids, IndexResolution, IndexedComponent};
+use crate::store::{QuadCodes, RawQuad};
 
 #[cfg(feature = "file-io")]
 use vortex_file::VortexFile;
@@ -219,7 +219,8 @@ pub(crate) fn append_columns(
     whole_dataset: bool,
 ) {
     let sorted_pairs = |term_of: fn(&RawQuad) -> &str| -> Vec<(&str, u32)> {
-        let mut pairs: Vec<(&str, u32)> = quads.iter()
+        let mut pairs: Vec<(&str, u32)> = quads
+            .iter()
             .enumerate()
             .map(|(i, q)| (term_of(q), start_row + i as u32))
             .collect();
@@ -248,7 +249,8 @@ pub(crate) fn append_encoded_columns(
     whole_dataset: bool,
 ) {
     let sorted_pairs = |column: &[u32]| -> Vec<(u32, u32)> {
-        let mut pairs: Vec<(u32, u32)> = column.iter()
+        let mut pairs: Vec<(u32, u32)> = column
+            .iter()
             .enumerate()
             .map(|(i, &code)| (code, start_row + i as u32))
             .collect();
@@ -281,8 +283,10 @@ pub(crate) fn append_sorted_string_pairs(
         stamp_is_sorted(&p_val);
     }
     field_names.extend_from_slice(&[
-        "_idx_o_val".into(), "_idx_o_rid".into(),
-        "_idx_p_val".into(), "_idx_p_rid".into(),
+        "_idx_o_val".into(),
+        "_idx_o_rid".into(),
+        "_idx_p_val".into(),
+        "_idx_p_rid".into(),
     ]);
     field_arrays.extend([
         o_val,
@@ -307,8 +311,10 @@ pub(crate) fn append_sorted_code_pairs(
         stamp_is_sorted(&p_val);
     }
     field_names.extend_from_slice(&[
-        "_idx_o_val".into(), "_idx_o_rid".into(),
-        "_idx_p_val".into(), "_idx_p_rid".into(),
+        "_idx_o_val".into(),
+        "_idx_o_rid".into(),
+        "_idx_p_val".into(),
+        "_idx_p_rid".into(),
     ]);
     field_arrays.extend([
         o_val,
@@ -354,7 +360,8 @@ impl GlobalIndexArrays {
     /// Dictionary-layout variant: sort the u32 codes.
     pub(crate) fn from_codes(codes: &QuadCodes) -> Self {
         let sorted = |column: &[u32]| -> (ArrayRef, Vec<u32>) {
-            let mut pairs: Vec<(u32, u32)> = column.iter()
+            let mut pairs: Vec<(u32, u32)> = column
+                .iter()
                 .enumerate()
                 .map(|(i, &code)| (code, i as u32))
                 .collect();

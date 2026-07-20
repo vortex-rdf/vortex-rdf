@@ -5,13 +5,17 @@ members = ["core", "js", "cli"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["Julián Rojas <julianandres.rojasmelendez@ugent.be>"]
 license = "MIT"
-repository = "https://github.com/julianrojas87/vortex-rdf"
+repository = "https://github.com/vortex-rdf/vortex-rdf"
 description = "Modern and high-performance columnar RDF serialization format"
+readme = "README.md"
+keywords = ["rdf", "columnar", "vortex", "semantic-web", "quad-store"]
+categories = ["database-implementations", "encoding", "data-structures"]
 
 [workspace.dependencies]
-vortex-rdf-core = { path = "core" }
+vortex-rdf-core = { path = "core", version = "0.1.0" }
 vortex = { version = "0.78.0", default-features = false }
 vortex-array = { version = "0.78.0" }
 vortex-error = "0.78.0"

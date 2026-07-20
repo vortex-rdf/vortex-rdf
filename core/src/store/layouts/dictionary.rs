@@ -4,11 +4,11 @@
 //! [`super::term_dictionary`]).
 //!
 //! Unlike the other layouts, chunks are not built through the generic
-//! `build_struct_array` path: encoding requires the global [`TermDictionary`]
+//! `build_struct_array` path: encoding requires the global `TermDictionary`
 //! (complete only after the whole dataset has been ingested), so the builders
-//! run a dedicated two-pass pipeline that calls [`build_chunk`] directly.
+//! run a dedicated two-pass pipeline that calls `build_chunk` directly.
 //! Secondary indexes compose normally: they are appended per chunk via
-//! [`IndexType::append_dictionary_columns`], working on the encoded codes.
+//! `IndexType::append_dictionary_columns`, working on the encoded codes.
 //!
 //! [`LayoutStrategy::Dictionary`]: super::LayoutStrategy::Dictionary
 
@@ -17,20 +17,20 @@ use std::sync::Arc;
 use web_time::Instant;
 
 use oxrdf::Quad;
-use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
-use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::dtype::DType;
 use vortex_array::validity::Validity;
+use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
+use super::default::decode_spog;
+use super::term_dictionary::{self, DICT_FIELD, TermDictionary, TermIdMap};
 use crate::common::utils::{buf_as_str, stamp_is_sorted};
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
-use crate::store::{QuadCodes, RawQuad};
-use crate::store::indexes::{unique_indexes, GlobalIndexes, IndexType};
 use crate::store::indexes::secondary_by_copy::CopyKey;
-use super::term_dictionary::{self, TermDictionary, TermIdMap, DICT_FIELD};
-use super::default::decode_spog;
+use crate::store::indexes::{GlobalIndexes, IndexType, unique_indexes};
+use crate::store::{QuadCodes, RawQuad};
 
 /// Field names of the primary columns: `s`, `p`, `o`, `g` (all u32 codes).
 pub(crate) fn field_names() -> Vec<Arc<str>> {
@@ -271,7 +271,7 @@ pub(crate) fn attach_payload(array: ArrayRef, dict: &TermDictionary) -> Result<A
         _ => {
             return Err(VortexRdfError::Serialization(
                 "Dictionary-layout array is not a struct".to_string(),
-            ))
+            ));
         }
     };
 
@@ -317,8 +317,11 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Resul
             match struct_arr
                 .unmasked_field_by_name($name)
                 .map_err(VortexRdfError::Vortex)
-                .and_then(|c| c.clone().execute::<PrimitiveArray>(&mut ctx).map_err(VortexRdfError::Vortex))
-            {
+                .and_then(|c| {
+                    c.clone()
+                        .execute::<PrimitiveArray>(&mut ctx)
+                        .map_err(VortexRdfError::Vortex)
+                }) {
                 Ok(arr) => arr,
                 Err(e) => return vec![Err(e)],
             }

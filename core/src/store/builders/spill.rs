@@ -21,13 +21,15 @@ use crate::error::{Result, VortexRdfError};
 /// Create a unique temp directory under `target/` for spill files.
 pub(crate) fn make_temp_dir(prefix: &str) -> Result<PathBuf> {
     let id = uuid::Uuid::new_v4();
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let dir = std::env::current_dir()
         .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?
         .join("target")
         .join(format!("tmp_vortex_{}_{}_{}", prefix, now, id));
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
+    std::fs::create_dir_all(&dir).map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
     Ok(dir)
 }
 
@@ -51,8 +53,12 @@ pub(crate) struct RunWriter<T> {
 
 impl<T> RunWriter<T> {
     pub(crate) fn create(path: &Path) -> Result<Self> {
-        let file = File::create(path).map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
-        Ok(Self { writer: BufWriter::new(file), _marker: PhantomData })
+        let file =
+            File::create(path).map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
+        Ok(Self {
+            writer: BufWriter::new(file),
+            _marker: PhantomData,
+        })
     }
 
     pub(crate) fn push(&mut self, item: &T) -> Result<()>
@@ -106,7 +112,10 @@ pub(crate) struct RunReader<T> {
 impl<T> RunReader<T> {
     pub(crate) fn new(path: &Path) -> Result<Self> {
         let file = File::open(path).map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
-        Ok(Self { reader: BufReader::new(file), _marker: PhantomData })
+        Ok(Self {
+            reader: BufReader::new(file),
+            _marker: PhantomData,
+        })
     }
 
     pub(crate) fn next(&mut self) -> Result<Option<T>>
@@ -125,31 +134,27 @@ impl<T> RunReader<T> {
 
         let mut len_bytes = [0u8; 4];
         len_bytes[0] = first_len_byte[0];
-        self.reader
-            .read_exact(&mut len_bytes[1..])
-            .map_err(|e| {
-                if e.kind() == ErrorKind::UnexpectedEof {
-                    VortexRdfError::Deserialization(
-                        "Unexpected EOF while reading spill record length".to_string(),
-                    )
-                } else {
-                    VortexRdfError::Deserialization(e.to_string())
-                }
-            })?;
+        self.reader.read_exact(&mut len_bytes[1..]).map_err(|e| {
+            if e.kind() == ErrorKind::UnexpectedEof {
+                VortexRdfError::Deserialization(
+                    "Unexpected EOF while reading spill record length".to_string(),
+                )
+            } else {
+                VortexRdfError::Deserialization(e.to_string())
+            }
+        })?;
 
         let len = u32::from_le_bytes(len_bytes) as usize;
         let mut payload = vec![0u8; len];
-        self.reader
-            .read_exact(&mut payload)
-            .map_err(|e| {
-                if e.kind() == ErrorKind::UnexpectedEof {
-                    VortexRdfError::Deserialization(
-                        "Unexpected EOF while reading spill record payload".to_string(),
-                    )
-                } else {
-                    VortexRdfError::Deserialization(e.to_string())
-                }
-            })?;
+        self.reader.read_exact(&mut payload).map_err(|e| {
+            if e.kind() == ErrorKind::UnexpectedEof {
+                VortexRdfError::Deserialization(
+                    "Unexpected EOF while reading spill record payload".to_string(),
+                )
+            } else {
+                VortexRdfError::Deserialization(e.to_string())
+            }
+        })?;
 
         // SAFETY: spill files are produced by this process using the matching
         // rkyv serializer and consumed immediately; we don't accept external
@@ -176,15 +181,7 @@ pub(crate) struct PairRunSpiller<V> {
 }
 
 #[derive(
-    Clone,
-    Debug,
-    Eq,
-    PartialEq,
-    Ord,
-    PartialOrd,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
+    Clone, Debug, Eq, PartialEq, Ord, PartialOrd, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 struct PairRecord<V> {
     value: V,
@@ -193,7 +190,9 @@ struct PairRecord<V> {
 
 impl<V> PairRunSpiller<V>
 where
-    V: Ord + Archive + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
+    V: Ord
+        + Archive
+        + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
     V::Archived: RkyvDeserialize<V, HighDeserializer<RkyvError>>,
 {
     pub(crate) fn new(dir: &Path, name: &'static str, capacity: usize) -> Self {
@@ -216,7 +215,9 @@ where
 
     fn flush_run(&mut self) -> Result<()> {
         self.buf.sort_unstable();
-        let path = self.dir.join(format!("{}_run_{}.bin", self.name, self.run_paths.len()));
+        let path = self
+            .dir
+            .join(format!("{}_run_{}.bin", self.name, self.run_paths.len()));
         write_run(&path, &self.buf)?;
         self.run_paths.push(path);
         self.buf.clear();
@@ -228,13 +229,18 @@ where
         if !self.buf.is_empty() {
             self.flush_run()?;
         }
-        let mut readers: Vec<RunReader<PairRecord<V>>> = self.run_paths.iter()
+        let mut readers: Vec<RunReader<PairRecord<V>>> = self
+            .run_paths
+            .iter()
             .map(|p| RunReader::new(p))
             .collect::<Result<_>>()?;
         let mut heap = BinaryHeap::new();
         for (i, r) in readers.iter_mut().enumerate() {
             if let Some(pair) = r.next()? {
-                heap.push(PairHeapItem { pair, reader_idx: i });
+                heap.push(PairHeapItem {
+                    pair,
+                    reader_idx: i,
+                });
             }
         }
         Ok(PairMerger { readers, heap })
@@ -250,7 +256,9 @@ pub(crate) struct PairMerger<V> {
 
 impl<V> PairMerger<V>
 where
-    V: Ord + Archive + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
+    V: Ord
+        + Archive
+        + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
     V::Archived: RkyvDeserialize<V, HighDeserializer<RkyvError>>,
 {
     /// Pull the next `n` pairs off the merge (fewer at the end of the data).
@@ -261,7 +269,10 @@ where
             let r_idx = item.reader_idx;
             batch.push((item.pair.value, item.pair.rid));
             if let Some(next_pair) = self.readers[r_idx].next()? {
-                self.heap.push(PairHeapItem { pair: next_pair, reader_idx: r_idx });
+                self.heap.push(PairHeapItem {
+                    pair: next_pair,
+                    reader_idx: r_idx,
+                });
             }
         }
         Ok(batch)
@@ -275,7 +286,9 @@ struct PairHeapItem<V> {
 
 impl<V: Ord> Eq for PairHeapItem<V> {}
 impl<V: Ord> PartialEq for PairHeapItem<V> {
-    fn eq(&self, other: &Self) -> bool { self.pair == other.pair }
+    fn eq(&self, other: &Self) -> bool {
+        self.pair == other.pair
+    }
 }
 impl<V: Ord> Ord for PairHeapItem<V> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -283,5 +296,7 @@ impl<V: Ord> Ord for PairHeapItem<V> {
     }
 }
 impl<V: Ord> PartialOrd for PairHeapItem<V> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }

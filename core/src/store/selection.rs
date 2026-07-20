@@ -1,7 +1,7 @@
 //! Which rows of a store's base data a view covers.
 //!
 //! A [`VortexRdfStore`] never rewrites its data to answer a pattern: it keeps
-//! the base data it was constructed from and narrows a [`RowSelection`] over
+//! the base data it was constructed from and narrows a `RowSelection` over
 //! it. Everything a selection names is a *base* row id, so ids stay meaningful
 //! however many times a view is refined — which is what lets secondary indexes
 //! (whose `_idx_*_rid` columns address the base rows) survive `match_pattern`,
@@ -20,9 +20,9 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray};
 use vortex_buffer::Buffer;
-use vortex_mask::{AllOr, Mask};
 #[cfg(feature = "file-io")]
 use vortex_layout::scan::scan_builder::ScanBuilder;
+use vortex_mask::{AllOr, Mask};
 #[cfg(feature = "file-io")]
 use vortex_scan::selection::Selection;
 
@@ -72,13 +72,16 @@ impl RowSelection {
         match self {
             RowSelection::All => Ok(base.clone()),
             RowSelection::Range(range) => {
-                let start = usize::try_from(range.start).unwrap_or(usize::MAX).min(base.len());
-                let end = usize::try_from(range.end).unwrap_or(usize::MAX).min(base.len());
+                let start = usize::try_from(range.start)
+                    .unwrap_or(usize::MAX)
+                    .min(base.len());
+                let end = usize::try_from(range.end)
+                    .unwrap_or(usize::MAX)
+                    .min(base.len());
                 base.slice(start..end).map_err(VortexRdfError::Vortex)
             }
             RowSelection::Ids(ids) => {
-                let indices =
-                    PrimitiveArray::new(ids.clone(), Validity::NonNullable).into_array();
+                let indices = PrimitiveArray::new(ids.clone(), Validity::NonNullable).into_array();
                 base.take(indices).map_err(VortexRdfError::Vortex)
             }
         }
@@ -118,8 +121,12 @@ impl RowSelection {
         match self {
             RowSelection::All => Mask::new_true(base_len),
             RowSelection::Range(range) => {
-                let start = usize::try_from(range.start).unwrap_or(usize::MAX).min(base_len);
-                let end = usize::try_from(range.end).unwrap_or(usize::MAX).min(base_len);
+                let start = usize::try_from(range.start)
+                    .unwrap_or(usize::MAX)
+                    .min(base_len);
+                let end = usize::try_from(range.end)
+                    .unwrap_or(usize::MAX)
+                    .min(base_len);
                 // `from_slices` rejects an empty slice, and the canonical empty
                 // selection (`0..0`) is exactly that.
                 if start >= end {
@@ -145,8 +152,12 @@ impl RowSelection {
         match self {
             RowSelection::All => !deleted,
             RowSelection::Range(range) => {
-                let start = usize::try_from(range.start).unwrap_or(usize::MAX).min(base_len);
-                let end = usize::try_from(range.end).unwrap_or(usize::MAX).min(base_len);
+                let start = usize::try_from(range.start)
+                    .unwrap_or(usize::MAX)
+                    .min(base_len);
+                let end = usize::try_from(range.end)
+                    .unwrap_or(usize::MAX)
+                    .min(base_len);
                 !&deleted.slice(start..end)
             }
             // A sparse selection asks the mask about only the rows it names.
@@ -308,7 +319,10 @@ mod tests {
 
     #[test]
     fn intersect_range_narrows() {
-        assert_eq!(as_vec(&RowSelection::All.intersect_range(2..5)), vec![2, 3, 4]);
+        assert_eq!(
+            as_vec(&RowSelection::All.intersect_range(2..5)),
+            vec![2, 3, 4]
+        );
         assert_eq!(
             as_vec(&RowSelection::Range(1..8).intersect_range(4..20)),
             vec![4, 5, 6, 7]
@@ -380,7 +394,10 @@ mod tests {
         assert_eq!(as_vec(&RowSelection::All.refine(&keep)), vec![0, 2]);
 
         // Of rows 10..14, local 0 and 2 are base rows 10 and 12.
-        assert_eq!(as_vec(&RowSelection::Range(10..14).refine(&keep)), vec![10, 12]);
+        assert_eq!(
+            as_vec(&RowSelection::Range(10..14).refine(&keep)),
+            vec![10, 12]
+        );
 
         // Of ids [5, 6, 8, 11], local 0 and 2 are base rows 5 and 8.
         assert_eq!(

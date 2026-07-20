@@ -2,10 +2,14 @@
 name = "vortex-rdf-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 # The format engine
@@ -42,11 +46,14 @@ clap.workspace = true
 web-time = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-mimalloc.workspace = true
+mimalloc = { workspace = true, optional = true }
 
 [features]
 default = ["file-io"]
 file-io = ["vortex-io/tokio", "vortex/zstd", "vortex/files", "vortex-file/tokio", "tokio/fs"]
+# Opt-in: let a binary that depends on this crate have it install mimalloc as
+# the process's global allocator, instead of picking one itself.
+mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
 divan = { version = "*", package = "codspeed-divan-compat" }

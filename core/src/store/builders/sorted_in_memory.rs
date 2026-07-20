@@ -1,18 +1,17 @@
+use super::{
+    ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder, build_struct_array,
+    build_struct_array_global, into_vortex_error, make_empty_struct,
+};
 use crate::error::Result;
 use crate::store::RawQuad;
-use crate::store::layouts::{dictionary, LayoutStrategy};
 use crate::store::indexes::{GlobalIndexes, Indexes};
 use crate::store::layouts::term_dictionary::TermDictionary;
-use super::{
-    VortexArrayBuilder, ChunkStream,
-    build_struct_array, build_struct_array_global, make_empty_struct, into_vortex_error,
-    DEFAULT_CHUNK_SIZE,
-};
+use crate::store::layouts::{LayoutStrategy, dictionary};
 
+use futures::{Stream, StreamExt, stream};
+use oxrdf::Quad;
 use std::sync::Arc;
 use web_time::Instant;
-use futures::{stream, Stream, StreamExt};
-use oxrdf::Quad;
 
 use vortex_array::ArrayRef;
 use vortex_array::dtype::DType;
@@ -46,8 +45,15 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
         } else {
             build_struct_array(&quads, layout, &indexes, n, 0, true, true)?
         };
-        log::debug!("[SortedInMemoryBuilder] Constructed StructArray in {:?}", build_start.elapsed());
-        log::debug!("[SortedInMemoryBuilder] Completed serialization of {} quads in {:?}", n, start.elapsed());
+        log::debug!(
+            "[SortedInMemoryBuilder] Constructed StructArray in {:?}",
+            build_start.elapsed()
+        );
+        log::debug!(
+            "[SortedInMemoryBuilder] Completed serialization of {} quads in {:?}",
+            n,
+            start.elapsed()
+        );
 
         Ok(struct_array)
     }
@@ -77,7 +83,10 @@ async fn ingest_and_sort(
 
     let sort_start = Instant::now();
     quads.sort_unstable();
-    log::debug!("[SortedInMemoryBuilder] Sorted quads in {:?}", sort_start.elapsed());
+    log::debug!(
+        "[SortedInMemoryBuilder] Sorted quads in {:?}",
+        sort_start.elapsed()
+    );
 
     Ok(quads)
 }
@@ -120,9 +129,14 @@ pub(crate) async fn build_sorted_chunk_stream(
                 return None;
             }
             let end = (offset + chunk_size).min(quads.len());
-            let chunk =
-                build_struct_array_global(&quads[offset..end], layout, &global_idx, offset..end, true)
-                    .map_err(into_vortex_error);
+            let chunk = build_struct_array_global(
+                &quads[offset..end],
+                layout,
+                &global_idx,
+                offset..end,
+                true,
+            )
+            .map_err(into_vortex_error);
             Some((chunk, (quads, layout, global_idx, end)))
         },
     );
@@ -162,9 +176,15 @@ fn emit_dict_chunks(
                 return None;
             }
             let end = (offset + chunk_size).min(n);
-            let chunk =
-                dictionary::build_chunk_global(&codes, offset..end, &dict, &global_idx, true, false)
-                    .map_err(into_vortex_error);
+            let chunk = dictionary::build_chunk_global(
+                &codes,
+                offset..end,
+                &dict,
+                &global_idx,
+                true,
+                false,
+            )
+            .map_err(into_vortex_error);
             Some((chunk, (codes, dict, global_idx, end)))
         },
     );

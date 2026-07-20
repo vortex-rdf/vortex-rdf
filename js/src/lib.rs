@@ -1,27 +1,19 @@
-use oxrdf::{GraphName, NamedNode, Quad, NamedOrBlankNode, Term};
+use futures::{Stream, StreamExt, stream};
+use js_sys::{Object, Reflect};
+use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use oxrdfio::RdfFormat;
 use std::io::Cursor;
-use vortex_rdf_core::io::{
-    deserialize,
-    write_array_to_ipc,
-    array_from_ipc_reader,
-    VORTEX_LIGHT_SESSION,
-};
-use vortex_rdf_core::{
-    VortexRdfStore,
-    BuilderStrategy,
-    UnsortedStreamBuilder,
-    SortedInMemoryBuilder,
-    LayoutStrategy,
-    IndexType,
-    Indexes,
-};
+use vortex_array::{ArrayRef, IntoArray, RecursiveCanonical, VortexSessionExecute};
 use vortex_rdf_core::common::utils::parse_quads_from_reader;
 use vortex_rdf_core::error::Result as CoreResult;
-use vortex_array::{ArrayRef, IntoArray, RecursiveCanonical, VortexSessionExecute};
+use vortex_rdf_core::io::{
+    VORTEX_LIGHT_SESSION, array_from_ipc_reader, deserialize, write_array_to_ipc,
+};
+use vortex_rdf_core::{
+    BuilderStrategy, IndexType, Indexes, LayoutStrategy, SortedInMemoryBuilder,
+    UnsortedStreamBuilder, VortexRdfStore,
+};
 use wasm_bindgen::prelude::*;
-use js_sys::{Object, Reflect};
-use futures::{Stream, StreamExt, stream};
 
 #[wasm_bindgen(typescript_custom_section)]
 const TS_APPEND_CONTENT: &'static str = r#"
@@ -134,16 +126,16 @@ pub struct VortexStore {
 impl VortexStore {
     #[wasm_bindgen(skip_typescript)]
     pub fn empty() -> VortexStore {
-        VortexStore { inner: VortexRdfStore::empty() }
+        VortexStore {
+            inner: VortexRdfStore::empty(),
+        }
     }
 
     #[wasm_bindgen(js_name = fromBytes, skip_typescript)]
     pub async fn from_bytes(bytes: &[u8]) -> Result<VortexStore, JsValue> {
         let cursor = Cursor::new(bytes);
-        let array = array_from_ipc_reader(cursor)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let inner = VortexRdfStore::new(array)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let array = array_from_ipc_reader(cursor).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let inner = VortexRdfStore::new(array).map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(VortexStore { inner })
     }
 
@@ -158,20 +150,23 @@ impl VortexStore {
         let quads_stream = parse_quads_from_reader(Cursor::new(input), format);
         let vortex_array = build_array(quads_stream, config).await?;
 
-        let inner = VortexRdfStore::new(vortex_array)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let inner =
+            VortexRdfStore::new(vortex_array).map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(VortexStore { inner })
     }
 
     /// Build directly from RDF/JS quads, skipping a serialize/parse round-trip.
     #[wasm_bindgen(js_name = fromQuads, skip_typescript)]
-    pub async fn from_quads(quads: js_sys::Array, options: JsValue) -> Result<VortexStore, JsValue> {
+    pub async fn from_quads(
+        quads: js_sys::Array,
+        options: JsValue,
+    ) -> Result<VortexStore, JsValue> {
         let config = parse_build_options(options)?;
         let quads = js_array_to_quads(quads)?;
         let vortex_array = build_array(stream::iter(quads.into_iter().map(Ok)), config).await?;
 
-        let inner = VortexRdfStore::new(vortex_array)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let inner =
+            VortexRdfStore::new(vortex_array).map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(VortexStore { inner })
     }
 
@@ -185,7 +180,10 @@ impl VortexStore {
         // Not `get_quads_array`: a Dictionary-layout store derived from `match`
         // may have lost the term-dictionary payload that its codes decode
         // against, which would make the written bytes unreadable.
-        let array = self.inner.to_serializable_array().await
+        let array = self
+            .inner
+            .to_serializable_array()
+            .await
             .map_err(|e| JsValue::from_str(&format!("Vortex read error: {}", e)))?;
 
         // A store derived from `match` holds an unevaluated `filter` node, which
@@ -220,7 +218,10 @@ impl VortexStore {
 
     #[wasm_bindgen(skip_typescript)]
     pub async fn size(&self) -> Result<usize, JsValue> {
-        self.inner.size().await.map_err(|e| JsValue::from_str(&e.to_string()))
+        self.inner
+            .size()
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     #[wasm_bindgen(skip_typescript)]
@@ -298,7 +299,8 @@ impl VortexStore {
         let o = js_to_term(object);
         let g = js_to_graph(graph);
 
-        let inner = self.inner
+        let inner = self
+            .inner
             .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
@@ -307,7 +309,10 @@ impl VortexStore {
 
     #[wasm_bindgen(skip_typescript)]
     pub async fn values(&self) -> Result<js_sys::Iterator, JsValue> {
-        let mut quads_stream = self.inner.quads().map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let mut quads_stream = self
+            .inner
+            .quads()
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
         let js_array = js_sys::Array::new();
         while let Some(q_res) = quads_stream.next().await {
             if let Ok(q) = q_res {
@@ -375,7 +380,9 @@ fn parse_format(format_name: &str) -> Result<RdfFormat, JsValue> {
         "trig" => Ok(RdfFormat::TriG),
         "n3" => Ok(RdfFormat::N3),
         "rdf" | "rdfxml" | "xml" => Ok(RdfFormat::RdfXml),
-        "jsonld" => Ok(RdfFormat::JsonLd { profile: Default::default() }),
+        "jsonld" => Ok(RdfFormat::JsonLd {
+            profile: Default::default(),
+        }),
         other => Err(JsValue::from_str(&format!(
             "Unsupported format: {}. Supported formats are 'ntriples', 'nquads', 'turtle', \
              'trig', 'n3', 'rdfxml' and 'jsonld'.",
@@ -409,20 +416,30 @@ async fn build_array(
     quads: impl Stream<Item = CoreResult<Quad>> + Unpin + Send + 'static,
     config: BuildConfig,
 ) -> Result<ArrayRef, JsValue> {
-    let BuildConfig { builder, layout, indexes } = config;
+    let BuildConfig {
+        builder,
+        layout,
+        indexes,
+    } = config;
     match builder {
-        BuilderStrategy::UnsortedStream =>
+        BuilderStrategy::UnsortedStream => {
             VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
                 quads, layout, indexes,
-            ).await,
-        BuilderStrategy::SortedInMemory =>
+            )
+            .await
+        }
+        BuilderStrategy::SortedInMemory => {
             VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
                 quads, layout, indexes,
-            ).await,
+            )
+            .await
+        }
         // Defensive: `parse_builder` never yields SortedStream, which spills to disk.
-        BuilderStrategy::SortedStream => return Err(JsValue::from_str(
-            "The sorted-stream builder strategy is not available in WebAssembly."
-        )),
+        BuilderStrategy::SortedStream => {
+            return Err(JsValue::from_str(
+                "The sorted-stream builder strategy is not available in WebAssembly.",
+            ));
+        }
     }
     .map_err(|e| JsValue::from_str(&format!("Vortex build error: {}", e)))
 }
@@ -434,7 +451,10 @@ fn parse_build_options(options: JsValue) -> Result<BuildConfig, JsValue> {
         return Ok(BuildConfig::default());
     }
     if let Some(name) = options.as_string() {
-        return Ok(BuildConfig { builder: parse_builder(&name)?, ..BuildConfig::default() });
+        return Ok(BuildConfig {
+            builder: parse_builder(&name)?,
+            ..BuildConfig::default()
+        });
     }
 
     let mut config = BuildConfig::default();
@@ -470,7 +490,10 @@ fn get_string_option(options: &JsValue, key: &str) -> Result<Option<String>, JsV
     }
     match value.as_string() {
         Some(name) => Ok(Some(name)),
-        None => Err(JsValue::from_str(&format!("Option '{}' must be a string", key))),
+        None => Err(JsValue::from_str(&format!(
+            "Option '{}' must be a string",
+            key
+        ))),
     }
 }
 
@@ -543,7 +566,12 @@ fn term_to_js(term: &Term) -> JsValue {
         Term::Literal(l) => {
             Reflect::set(&obj, &"termType".into(), &"Literal".into()).unwrap();
             Reflect::set(&obj, &"value".into(), &l.value().into()).unwrap();
-            Reflect::set(&obj, &"datatype".into(), &term_to_js(&Term::NamedNode(l.datatype().into()))).unwrap();
+            Reflect::set(
+                &obj,
+                &"datatype".into(),
+                &term_to_js(&Term::NamedNode(l.datatype().into())),
+            )
+            .unwrap();
             if let Some(lang) = l.language() {
                 Reflect::set(&obj, &"language".into(), &lang.into()).unwrap();
             } else {
@@ -587,8 +615,18 @@ fn graph_name_to_js(graph: &GraphName) -> JsValue {
 
 fn quad_to_js(quad: &Quad) -> JsValue {
     let obj = Object::new();
-    Reflect::set(&obj, &"subject".into(), &term_to_js(&quad.subject.clone().into())).unwrap();
-    Reflect::set(&obj, &"predicate".into(), &term_to_js(&quad.predicate.clone().into())).unwrap();
+    Reflect::set(
+        &obj,
+        &"subject".into(),
+        &term_to_js(&quad.subject.clone().into()),
+    )
+    .unwrap();
+    Reflect::set(
+        &obj,
+        &"predicate".into(),
+        &term_to_js(&quad.predicate.clone().into()),
+    )
+    .unwrap();
     Reflect::set(&obj, &"object".into(), &term_to_js(&quad.object)).unwrap();
     Reflect::set(&obj, &"graph".into(), &graph_name_to_js(&quad.graph_name)).unwrap();
     let equals_fn = js_sys::Function::new_with_args(
@@ -612,15 +650,28 @@ fn js_to_term_raw(val: JsValue) -> Option<RawTerm> {
         return None;
     }
     if let Some(s) = val.as_string() {
-        return Some(RawTerm { term_type: "NamedNode".into(), value: s, language: None, datatype_iri: None });
+        return Some(RawTerm {
+            term_type: "NamedNode".into(),
+            value: s,
+            language: None,
+            datatype_iri: None,
+        });
     }
     let term_type = Reflect::get(&val, &"termType".into()).ok()?.as_string()?;
     let value = Reflect::get(&val, &"value".into()).ok()?.as_string()?;
-    let language = Reflect::get(&val, &"language".into()).ok().and_then(|v| v.as_string());
-    let datatype_iri = Reflect::get(&val, &"datatype".into()).ok()
+    let language = Reflect::get(&val, &"language".into())
+        .ok()
+        .and_then(|v| v.as_string());
+    let datatype_iri = Reflect::get(&val, &"datatype".into())
+        .ok()
         .and_then(|dt| Reflect::get(&dt, &"value".into()).ok())
         .and_then(|v| v.as_string());
-    Some(RawTerm { term_type, value, language, datatype_iri })
+    Some(RawTerm {
+        term_type,
+        value,
+        language,
+        datatype_iri,
+    })
 }
 
 fn js_to_term(val: JsValue) -> Option<Term> {
@@ -630,13 +681,19 @@ fn js_to_term(val: JsValue) -> Option<Term> {
         "BlankNode" => Some(Term::BlankNode(oxrdf::BlankNode::new_unchecked(raw.value))),
         "Literal" => {
             if let Some(l) = raw.language
-                && !l.is_empty() {
-                    return oxrdf::Literal::new_language_tagged_literal(raw.value, l).ok().map(Term::Literal);
-                }
+                && !l.is_empty()
+            {
+                return oxrdf::Literal::new_language_tagged_literal(raw.value, l)
+                    .ok()
+                    .map(Term::Literal);
+            }
             if let Some(dt_iri) = raw.datatype_iri
-                && let Ok(dt_node) = NamedNode::new(dt_iri) {
-                    return Some(Term::Literal(oxrdf::Literal::new_typed_literal(raw.value, dt_node)));
-                }
+                && let Ok(dt_node) = NamedNode::new(dt_iri)
+            {
+                return Some(Term::Literal(oxrdf::Literal::new_typed_literal(
+                    raw.value, dt_node,
+                )));
+            }
             Some(Term::Literal(oxrdf::Literal::new_simple_literal(raw.value)))
         }
         _ => None,
@@ -662,7 +719,9 @@ fn js_to_graph(val: JsValue) -> Option<GraphName> {
     if let Some(term) = js_to_term_raw(val) {
         match term.term_type.as_str() {
             "NamedNode" => Some(GraphName::NamedNode(NamedNode::new(term.value).ok()?)),
-            "BlankNode" => Some(GraphName::BlankNode(oxrdf::BlankNode::new_unchecked(term.value))),
+            "BlankNode" => Some(GraphName::BlankNode(oxrdf::BlankNode::new_unchecked(
+                term.value,
+            ))),
             "DefaultGraph" => Some(GraphName::DefaultGraph),
             _ => None,
         }
@@ -675,6 +734,7 @@ fn js_to_quad(val: JsValue) -> Option<Quad> {
     let s = js_to_subject(Reflect::get(&val, &"subject".into()).ok()?)?;
     let p = js_to_named_node(Reflect::get(&val, &"predicate".into()).ok()?)?;
     let o = js_to_term(Reflect::get(&val, &"object".into()).ok()?)?;
-    let g = js_to_graph(Reflect::get(&val, &"graph".into()).ok()?).unwrap_or(GraphName::DefaultGraph);
+    let g =
+        js_to_graph(Reflect::get(&val, &"graph".into()).ok()?).unwrap_or(GraphName::DefaultGraph);
     Some(Quad::new(s, p, o, g))
 }

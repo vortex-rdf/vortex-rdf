@@ -1,4 +1,7 @@
 # Vortex-RDF
+[![Crates.io](https://img.shields.io/crates/v/vortex-rdf-core.svg)](https://crates.io/crates/vortex-rdf-core)
+[![docs.rs](https://img.shields.io/docsrs/vortex-rdf-core)](https://docs.rs/vortex-rdf-core)
+[![License](https://img.shields.io/crates/l/vortex-rdf-core)](https://github.com/vortex-rdf/vortex-rdf/blob/main/LICENSE)
 [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/vortex-rdf/vortex-rdf?utm_source=badge)
 [![CI](https://github.com/vortex-rdf/vortex-rdf/actions/workflows/ci.yml/badge.svg)](https://github.com/vortex-rdf/vortex-rdf/actions/workflows/ci.yml)
 
@@ -406,7 +409,7 @@ The consolidated **`benchmark`** target covers the axes of:
   * **`match_*`** / **`match_chained`** — `match_pattern` queries across the six shapes the query router actually branches on (`S`, `P`, `O`, `PO`, `G`, `SPOG`), plus chained view refinement.
   * **`decode_all`** / **`open_file`** / **`from_bytes`** — the read-back path: full-scan decode, lazy file open, and IPC load.
 
-Rather than the full cross product of these axes — thousands of instances, most measuring identical code paths — the suite is a **star (one-factor-at-a-time) design**: each group fixes a baseline and varies one axis at a time, adding back only the interactions that genuinely change behaviour. This keeps CodSpeed lean (~66 instances, all run in CI) without losing coverage of any distinct path. The dataset size is a single `BENCH_SIZE` constant, since simulation mode counts instructions deterministically and one representative size catches regressions in every path. See the module docs in [`core/benches/benchmark.rs`](core/benches/benchmark.rs) for the full rationale.
+Rather than the full cross product of these axes — thousands of instances, most measuring identical code paths — the suite is a **star (one-factor-at-a-time) design**: each group fixes a baseline and varies one axis at a time, adding back only the interactions that genuinely change behaviour. This keeps CodSpeed lean (~66 instances, all run in CI) without losing coverage of any distinct path. The dataset size is a single `BENCH_SIZE` constant, since simulation mode counts instructions deterministically and one representative size catches regressions in every path. See the module docs in [`core/benches/benchmark.rs`](https://github.com/vortex-rdf/vortex-rdf/blob/main/core/benches/benchmark.rs) for the full rationale.
 
 ### Running Benchmarks Locally
 

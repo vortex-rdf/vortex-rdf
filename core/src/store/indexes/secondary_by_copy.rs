@@ -3,7 +3,7 @@
 //! permutes — the classic triple-store permutation indexes (POS/OSP) adapted
 //! to quads. This module owns both halves of the index's lifecycle — building
 //! the copy columns at write time, and executing lookups against them at query
-//! time ([`resolve_in_memory`] / [`resolve_file`]).
+//! time (`resolve_in_memory` / `resolve_file`).
 //!
 //! The two families are:
 //!
@@ -11,7 +11,7 @@
 //!   patterns by binary search on `_idx_posg_p`, and predicate+object patterns
 //!   by a two-key *prefix* search: within a predicate's run the object column
 //!   is itself sorted, so a second binary search inside the run resolves both
-//!   components at once ([`IndexedComponent::PredicateObject`]).
+//!   components at once (`IndexedComponent::PredicateObject`).
 //! - **`_idx_ospg_*`** — quads sorted by (o, s, p, g). Serves object-bound
 //!   patterns by binary search on `_idx_ospg_o`.
 //!
@@ -21,20 +21,19 @@
 //! index is locality: the rows matching a bound predicate/object are a
 //! *contiguous* run of the copy columns, which file-backed stores exploit by
 //! streaming `quads()` straight from the copy family — this index hands back a
-//! [`ServePlan`](super::ServePlan) during resolution to describe that read —
+//! `ServePlan` during resolution to describe that read —
 //! instead of scattering row-id reads across the primary columns.
 //!
 //! The copies come in two encodings — term strings (Default and TypedObject
 //! layouts, the object as its full N-Triples term string), or u32 dictionary
 //! codes under the Dictionary layout — and in the same two scopes as the
 //! reference index: per-chunk (chunk-local sort, `IsSorted` stamped only when
-//! the chunk spans the dataset) and global ([`GlobalCopyArrays`] and the
+//! the chunk spans the dataset) and global (`GlobalCopyArrays` and the
 //! `append_sorted_*_keys` helpers, always stamped). The in-memory resolver
 //! requires the lead value column's `IsSorted` stamp; the file resolver pushes
 //! range predicates down and only prunes better when the columns are sorted.
 //!
 //! [`IndexType::SecondaryByCopy`]: super::IndexType::SecondaryByCopy
-//! [`IndexedComponent::PredicateObject`]: super::IndexedComponent::PredicateObject
 //! [`secondary_by_reference`]: super::secondary_by_reference
 
 use std::cmp::Ordering;
@@ -42,18 +41,18 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
-use vortex_array::{ArrayRef, IntoArray};
-use vortex_array::arrays::{PrimitiveArray, StructArray};
 use vortex_array::arrays::struct_::StructArrayExt;
+use vortex_array::arrays::{PrimitiveArray, StructArray};
 use vortex_array::dtype::DType;
+use vortex_array::{ArrayRef, IntoArray};
 
+use super::{IndexResolution, IndexedComponent, sorted_row_ids};
 use crate::common::utils::{
     column_is_sorted, make_string_array, search_sorted_bounds, stamp_is_sorted,
 };
 use crate::error::{Result, VortexRdfError};
-use crate::store::{QuadCodes, RawQuad};
 use crate::store::layouts::ResolvedLayout;
-use super::{sorted_row_ids, IndexResolution, IndexedComponent};
+use crate::store::{QuadCodes, RawQuad};
 
 use super::ServePlan;
 #[cfg(feature = "file-io")]
@@ -115,7 +114,13 @@ impl Family {
     /// The five column names in the order the builders emit them (s, p, o, g,
     /// rid).
     pub(crate) fn column_names(self) -> [&'static str; 5] {
-        [self.s_col(), self.p_col(), self.o_col(), self.g_col(), self.rid_col()]
+        [
+            self.s_col(),
+            self.p_col(),
+            self.o_col(),
+            self.g_col(),
+            self.rid_col(),
+        ]
     }
 
     /// This family's four quad-component columns, in primary `(s, p, o, g)`
@@ -153,14 +158,18 @@ impl Family {
     /// This family's quad comparator over term strings.
     fn cmp_quads(self, a: &RawQuad, b: &RawQuad) -> Ordering {
         match self {
-            Family::Posg => a.p.cmp(&b.p)
-                .then_with(|| a.o.cmp(&b.o))
-                .then_with(|| a.s.cmp(&b.s))
-                .then_with(|| a.g.cmp(&b.g)),
-            Family::Ospg => a.o.cmp(&b.o)
-                .then_with(|| a.s.cmp(&b.s))
-                .then_with(|| a.p.cmp(&b.p))
-                .then_with(|| a.g.cmp(&b.g)),
+            Family::Posg => {
+                a.p.cmp(&b.p)
+                    .then_with(|| a.o.cmp(&b.o))
+                    .then_with(|| a.s.cmp(&b.s))
+                    .then_with(|| a.g.cmp(&b.g))
+            }
+            Family::Ospg => {
+                a.o.cmp(&b.o)
+                    .then_with(|| a.s.cmp(&b.s))
+                    .then_with(|| a.p.cmp(&b.p))
+                    .then_with(|| a.g.cmp(&b.g))
+            }
         }
     }
 
@@ -363,8 +372,7 @@ pub(crate) async fn resolve_file(
     let Some(lead_native) = layout.probe_scalar(&probe.lead_term) else {
         return Ok(IndexResolution::Empty);
     };
-    let mut constraints: Vec<(&'static str, Scalar)> =
-        vec![(probe.family.lead_col(), lead_native)];
+    let mut constraints: Vec<(&'static str, Scalar)> = vec![(probe.family.lead_col(), lead_native)];
     if let Some(second_term) = &probe.second_term {
         let Some(second_native) = layout.probe_scalar(second_term) else {
             return Ok(IndexResolution::Empty);
@@ -472,7 +480,12 @@ fn push_family(
     family: Family,
     columns: [ArrayRef; 5],
 ) {
-    field_names.extend(family.column_names().iter().map(|name| Arc::<str>::from(*name)));
+    field_names.extend(
+        family
+            .column_names()
+            .iter()
+            .map(|name| Arc::<str>::from(*name)),
+    );
     field_arrays.extend(columns);
 }
 
@@ -533,27 +546,29 @@ pub(crate) fn append_encoded_columns(
 /// [`Family::key_positions`] maps the components back out when the sorted
 /// keys are turned into columns.
 #[derive(
-    Clone,
-    Debug,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub(crate) struct CopyKey<V>(pub(crate) [V; 4]);
 
 impl<V: Clone> CopyKey<V> {
     /// The POSG key of a quad given as `[s, p, o, g]`.
     pub(crate) fn posg(spog: &[V; 4]) -> Self {
-        Self([spog[1].clone(), spog[2].clone(), spog[0].clone(), spog[3].clone()])
+        Self([
+            spog[1].clone(),
+            spog[2].clone(),
+            spog[0].clone(),
+            spog[3].clone(),
+        ])
     }
 
     /// The OSPG key of a quad given as `[s, p, o, g]`.
     pub(crate) fn ospg(spog: &[V; 4]) -> Self {
-        Self([spog[2].clone(), spog[0].clone(), spog[1].clone(), spog[3].clone()])
+        Self([
+            spog[2].clone(),
+            spog[0].clone(),
+            spog[1].clone(),
+            spog[3].clone(),
+        ])
     }
 }
 
@@ -769,7 +784,12 @@ mod tests {
     fn copy_key_positions_roundtrip() {
         // Rearranging [s, p, o, g] into a key and reading it back through
         // key_positions must return the original components.
-        let spog = ["s".to_string(), "p".to_string(), "o".to_string(), "g".to_string()];
+        let spog = [
+            "s".to_string(),
+            "p".to_string(),
+            "o".to_string(),
+            "g".to_string(),
+        ];
 
         let posg = CopyKey::posg(&spog);
         let [s_ix, p_ix, o_ix, g_ix] = Family::Posg.key_positions();

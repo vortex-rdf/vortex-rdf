@@ -1,17 +1,17 @@
-use std::future::Future;
-use futures::{stream, Stream, StreamExt};
-use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
-use vortex_array::arrays::StructArray;
-use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::dtype::DType;
-use vortex_array::validity::Validity;
 use crate::common::utils::stamp_is_sorted;
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
 use crate::store::RawQuad;
+use crate::store::indexes::{GlobalIndexes, IndexType, Indexes, unique_indexes};
 use crate::store::layouts::LayoutStrategy;
-use crate::store::indexes::{unique_indexes, GlobalIndexes, IndexType, Indexes};
+use futures::{Stream, StreamExt, stream};
 use oxrdf::Quad;
+use std::future::Future;
+use vortex_array::arrays::StructArray;
+use vortex_array::arrays::struct_::StructArrayExt;
+use vortex_array::dtype::DType;
+use vortex_array::validity::Validity;
+use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
 use clap::ValueEnum;
 
@@ -20,7 +20,7 @@ pub const DEFAULT_CHUNK_SIZE: usize = 100_000;
 
 /// A stream of StructArray chunks ready for consumption by the Vortex file
 /// writer. Items use `VortexResult` because the writer polls the stream
-/// directly; builder errors are converted via [`into_vortex_error`].
+/// directly; builder errors are converted via `into_vortex_error`.
 pub type ChunkStream = stream::BoxStream<'static, vortex_error::VortexResult<ArrayRef>>;
 
 /// Convert a builder error into a `VortexError` for use inside a [`ChunkStream`].
@@ -44,8 +44,8 @@ pub enum BuilderStrategy {
 
 pub mod sorted_in_memory;
 pub mod sorted_stream;
-pub mod unsorted_stream;
 pub(crate) mod spill;
+pub mod unsorted_stream;
 
 pub use sorted_in_memory::SortedInMemoryBuilder;
 pub use sorted_stream::SortedStreamBuilder;
@@ -118,7 +118,13 @@ pub(crate) fn build_struct_array(
     }
 
     for idx in unique_indexes(indexes) {
-        idx.append_columns(&mut field_names, &mut field_arrays, quads, start_row, whole_dataset);
+        idx.append_columns(
+            &mut field_names,
+            &mut field_arrays,
+            quads,
+            start_row,
+            whole_dataset,
+        );
     }
 
     StructArray::try_new(field_names.into(), field_arrays, n, Validity::NonNullable)
@@ -145,9 +151,14 @@ pub(crate) fn build_struct_array_global(
 
     global_indexes.append_slice(&mut field_names, &mut field_arrays, range)?;
 
-    StructArray::try_new(field_names.into(), field_arrays, quads.len(), Validity::NonNullable)
-        .map_err(VortexRdfError::Vortex)
-        .map(|a| a.into_array())
+    StructArray::try_new(
+        field_names.into(),
+        field_arrays,
+        quads.len(),
+        Validity::NonNullable,
+    )
+    .map_err(VortexRdfError::Vortex)
+    .map(|a| a.into_array())
 }
 
 /// Canonicalize a sorted builder's (possibly chunked) materialized array and
@@ -162,7 +173,13 @@ pub(crate) fn canonicalize_sorted(arr: ArrayRef) -> Result<ArrayRef> {
         .execute::<StructArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)?;
 
-    for field in ["s", "_idx_o_val", "_idx_p_val", "_idx_posg_p", "_idx_ospg_o"] {
+    for field in [
+        "s",
+        "_idx_o_val",
+        "_idx_p_val",
+        "_idx_posg_p",
+        "_idx_ospg_o",
+    ] {
         if let Ok(col) = struct_arr.unmasked_field_by_name(field) {
             stamp_is_sorted(col);
         }

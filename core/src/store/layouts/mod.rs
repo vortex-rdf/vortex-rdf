@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use clap::ValueEnum;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
-use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
-use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
+use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 use vortex_array::dtype::{DType, FieldNames};
 use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
+use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
 use crate::common::utils::{buf_as_str, graph_name_str};
 use crate::error::{Result, VortexRdfError};
@@ -19,7 +19,7 @@ pub mod dictionary;
 pub mod term_dictionary;
 pub mod typed_object;
 
-use self::term_dictionary::{TermDictionary, DICT_FIELD};
+use self::term_dictionary::{DICT_FIELD, TermDictionary};
 
 /// Determines the columnar schema used to store RDF quads in the Vortex StructArray.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
@@ -127,7 +127,6 @@ impl LayoutStrategy {
             )),
         }
     }
-
 }
 
 /// Query-time layout: the build-time [`LayoutStrategy`] resolved against a
@@ -183,7 +182,12 @@ impl ResolvedLayout {
         let names: FieldNames = primary.iter().copied().collect();
         let arrays: Vec<ArrayRef> = primary
             .iter()
-            .map(|n| struct_arr.unmasked_field_by_name(n).cloned().map_err(VortexRdfError::Vortex))
+            .map(|n| {
+                struct_arr
+                    .unmasked_field_by_name(n)
+                    .cloned()
+                    .map_err(VortexRdfError::Vortex)
+            })
             .collect::<Result<_>>()?;
 
         let len = arrays.first().map(|a| a.len()).unwrap_or(0);

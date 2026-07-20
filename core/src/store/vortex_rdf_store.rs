@@ -1,31 +1,18 @@
+use crate::common::utils::{bool_array_to_mask, column_is_sorted, search_sorted_bounds};
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
-use crate::common::utils::{
-    bool_array_to_mask,
-    column_is_sorted,
-    search_sorted_bounds
-};
-use crate::store::builders::{
-    VortexArrayBuilder,
-    UnsortedStreamBuilder,
-    build_struct_array,
-    DEFAULT_CHUNK_SIZE
-};
 use crate::store::RawQuad;
-use crate::store::layouts::{dictionary, Constraints, LayoutStrategy, ResolvedLayout};
-use crate::store::layouts::term_dictionary::{self, TermDictionary};
-use crate::store::indexes::{
-    Indexes,
-    IndexType,
-    detect_indexes,
-    resolve_indexes_in_memory,
-    strip_index_columns,
-    unique_indexes,
-    IndexResolution,
-    ServePlan
+use crate::store::builders::{
+    DEFAULT_CHUNK_SIZE, UnsortedStreamBuilder, VortexArrayBuilder, build_struct_array,
 };
 #[cfg(feature = "file-io")]
 use crate::store::indexes::resolve_indexes_file;
+use crate::store::indexes::{
+    IndexResolution, IndexType, Indexes, ServePlan, detect_indexes, resolve_indexes_in_memory,
+    strip_index_columns, unique_indexes,
+};
+use crate::store::layouts::term_dictionary::{self, TermDictionary};
+use crate::store::layouts::{Constraints, LayoutStrategy, ResolvedLayout, dictionary};
 use crate::store::selection::RowSelection;
 use crate::store::{QuadsSource, Tail};
 
@@ -34,50 +21,42 @@ use crate::io::de;
 #[cfg(feature = "file-io")]
 use vortex_file::VortexFile;
 
-use web_time::Instant;
+use futures::{Stream, stream};
+use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use std::collections::HashSet;
 use std::io::Cursor;
 #[cfg(feature = "file-io")]
 use std::ops::Range;
 use std::sync::Arc;
-use futures::{Stream, stream};
-use oxrdf::{GraphName, NamedNode, Quad, NamedOrBlankNode, Term};
+use web_time::Instant;
 
-use vortex_array::scalar::Scalar;
-use vortex_array::scalar_fn::fns::operators::Operator;
-use vortex_array::arrays::{ChunkedArray, StructArray};
-use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::constant::ConstantArray;
-use vortex_array::{ArrayRef, IntoArray, RecursiveCanonical, VortexSessionExecute};
+use vortex_array::arrays::struct_::StructArrayExt;
+use vortex_array::arrays::{ChunkedArray, StructArray};
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::FieldNames;
+use vortex_array::scalar::Scalar;
+use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::validity::Validity;
+use vortex_array::{ArrayRef, IntoArray, RecursiveCanonical, VortexSessionExecute};
 use vortex_mask::Mask;
 
 #[cfg(feature = "file-io")]
-use vortex_array::expr::{
-    Expression,
-    root,
-    select,
-    and,
-    eq,
-    get_item,
-    lit
-};
-#[cfg(feature = "file-io")]
-use vortex_array::expr::forms::conjuncts;
-#[cfg(feature = "file-io")]
-use vortex_array::MaskFuture;
-#[cfg(feature = "file-io")]
-use vortex_array::stream::ArrayStreamExt;
-#[cfg(feature = "file-io")]
-use vortex_scan::selection::Selection;
-#[cfg(feature = "file-io")]
-use vortex_layout::LayoutReader;
+use futures::StreamExt;
 #[cfg(feature = "file-io")]
 use std::ops::BitAnd;
 #[cfg(feature = "file-io")]
-use futures::StreamExt;
+use vortex_array::MaskFuture;
+#[cfg(feature = "file-io")]
+use vortex_array::expr::forms::conjuncts;
+#[cfg(feature = "file-io")]
+use vortex_array::expr::{Expression, and, eq, get_item, lit, root, select};
+#[cfg(feature = "file-io")]
+use vortex_array::stream::ArrayStreamExt;
+#[cfg(feature = "file-io")]
+use vortex_layout::LayoutReader;
+#[cfg(feature = "file-io")]
+use vortex_scan::selection::Selection;
 
 /// Columnar RDF quad storage backed by Vortex.
 ///
@@ -132,9 +111,9 @@ impl VortexRdfStore {
                 // Dictionary layout stores terms as codes; eagerly pull the
                 // term dictionary out of row 0 so later queries can translate
                 // RDF terms to codes before comparing.
-                ResolvedLayout::Dictionary(
-                    Arc::new(term_dictionary::dict_from_array(&vortex_array)?)
-                )
+                ResolvedLayout::Dictionary(Arc::new(term_dictionary::dict_from_array(
+                    &vortex_array,
+                )?))
             }
         };
         // Discover which secondary indexes the schema carries, so pattern
@@ -250,7 +229,13 @@ impl VortexRdfStore {
                 serve: None,
             },
             #[cfg(feature = "file-io")]
-            QuadsSource::File { path, file, filter, deleted, .. } => QuadsSource::File {
+            QuadsSource::File {
+                path,
+                file,
+                filter,
+                deleted,
+                ..
+            } => QuadsSource::File {
                 path: path.clone(),
                 file: file.clone(),
                 filter: filter.clone(),
@@ -516,9 +501,9 @@ impl VortexRdfStore {
             && match &self.quads {
                 QuadsSource::InMemory { selection, .. } => matches!(selection, RowSelection::All),
                 #[cfg(feature = "file-io")]
-                QuadsSource::File { filter, selection, .. } => {
-                    filter.is_none() && matches!(selection, RowSelection::All)
-                }
+                QuadsSource::File {
+                    filter, selection, ..
+                } => filter.is_none() && matches!(selection, RowSelection::All),
             }
     }
 
@@ -575,19 +560,33 @@ impl VortexRdfStore {
             // In-memory patterns resolve to exact row ids at match time, so the
             // selection alone knows the answer — no rows are touched. Deletions
             // are only counted out, never gathered.
-            QuadsSource::InMemory { base, selection, deleted: None, .. } => {
-                selection.len(base.len())
-            }
-            QuadsSource::InMemory { base, selection, deleted: Some(deleted), .. } => {
-                selection.live_mask(deleted, base.len()).true_count()
-            }
+            QuadsSource::InMemory {
+                base,
+                selection,
+                deleted: None,
+                ..
+            } => selection.len(base.len()),
+            QuadsSource::InMemory {
+                base,
+                selection,
+                deleted: Some(deleted),
+                ..
+            } => selection.live_mask(deleted, base.len()).true_count(),
             #[cfg(feature = "file-io")]
-            QuadsSource::File { file, filter, selection, deleted, .. } => match filter {
+            QuadsSource::File {
+                file,
+                filter,
+                selection,
+                deleted,
+                ..
+            } => match filter {
                 // No filter pending: the selection is exact, minus whatever the
                 // tombstones have removed from it.
                 None => match deleted {
                     None => selection.len(file.row_count() as usize),
-                    Some(d) => selection.live_mask(d, file.row_count() as usize).true_count(),
+                    Some(d) => selection
+                        .live_mask(d, file.row_count() as usize)
+                        .true_count(),
                 },
                 // A filter is pending: its selectivity is unknown ahead of
                 // time, so the rows actually have to be evaluated (with the
@@ -602,7 +601,10 @@ impl VortexRdfStore {
         // are resolved eagerly), minus its own tombstones.
         let tail = self.tail.as_ref().map_or(0, |tail| match &tail.deleted {
             None => tail.selection.len(tail.rows.len()),
-            Some(deleted) => tail.selection.live_mask(deleted, tail.rows.len()).true_count(),
+            Some(deleted) => tail
+                .selection
+                .live_mask(deleted, tail.rows.len())
+                .true_count(),
         });
         Ok(base + tail)
     }
@@ -652,8 +654,8 @@ impl VortexRdfStore {
                 async move {
                     // The final mask's true-count is this split's contribution
                     // — no column is ever projected or decoded to get it.
-                    let mask =
-                        evaluate_filter_split(reader, &filter_conjuncts, &range, start_mask).await?;
+                    let mask = evaluate_filter_split(reader, &filter_conjuncts, &range, start_mask)
+                        .await?;
                     Ok::<usize, VortexRdfError>(mask.true_count())
                 }
             });
@@ -684,7 +686,13 @@ impl VortexRdfStore {
     /// caller unions the result into the existing tombstones.
     #[cfg(feature = "file-io")]
     async fn matching_file_row_mask(&self) -> Result<Mask> {
-        let QuadsSource::File { file, filter, selection, .. } = &self.quads else {
+        let QuadsSource::File {
+            file,
+            filter,
+            selection,
+            ..
+        } = &self.quads
+        else {
             unreachable!("matching_file_row_mask is only called on a file-backed view")
         };
         let row_count = file.row_count();
@@ -717,8 +725,8 @@ impl VortexRdfStore {
                 // what this computes.
                 let start_mask = split_start_mask(&row_selection, None, &range);
                 async move {
-                    let mask =
-                        evaluate_filter_split(reader, &filter_conjuncts, &range, start_mask).await?;
+                    let mask = evaluate_filter_split(reader, &filter_conjuncts, &range, start_mask)
+                        .await?;
                     // Lift the split-relative survivors back to absolute file
                     // row ids.
                     let ids: Vec<usize> = match mask.indices() {
@@ -746,7 +754,6 @@ impl VortexRdfStore {
         matched.sort_unstable();
         Ok(Mask::from_indices(row_count as usize, matched))
     }
-
 
     pub fn layout(&self) -> LayoutStrategy {
         // Report the build-time strategy tag regardless of whether extra
@@ -817,15 +824,25 @@ impl VortexRdfStore {
             } => Ok(base.clone()),
             // Anything narrower: gather the live selected rows, dropping index
             // columns whose ids no longer address them.
-            QuadsSource::InMemory { base, selection, deleted, .. } => {
-                strip_index_columns(gather_live(base, selection, deleted.as_ref())?)
-            }
+            QuadsSource::InMemory {
+                base,
+                selection,
+                deleted,
+                ..
+            } => strip_index_columns(gather_live(base, selection, deleted.as_ref())?),
             #[cfg(feature = "file-io")]
-            QuadsSource::File { file, filter, selection, deleted, .. } => {
+            QuadsSource::File {
+                file,
+                filter,
+                selection,
+                deleted,
+                ..
+            } => {
                 // Project only the layout's primary columns (index columns
                 // are internal and never surfaced to callers of this method).
                 let proj = self.layout.primary_column_names();
-                let mut scan = file.scan()
+                let mut scan = file
+                    .scan()
                     .map_err(VortexRdfError::Vortex)?
                     .with_projection(select(proj, root()));
                 // Apply the restrictions this view accumulated via
@@ -885,7 +902,12 @@ impl VortexRdfStore {
             )?),
         };
         match &self.quads {
-            QuadsSource::InMemory { base, selection, deleted, serve } => {
+            QuadsSource::InMemory {
+                base,
+                selection,
+                deleted,
+                serve,
+            } => {
                 // The data is already in memory. Decode the base rows up front,
                 // then hand back a simple iterator wrapped as a stream.
                 let mut quads = match serve {
@@ -900,7 +922,14 @@ impl VortexRdfStore {
                 Ok(Box::new(stream::iter(quads)))
             }
             #[cfg(feature = "file-io")]
-            QuadsSource::File { file, filter, selection, deleted, serve, path: _ } => {
+            QuadsSource::File {
+                file,
+                filter,
+                selection,
+                deleted,
+                serve,
+                path: _,
+            } => {
                 // A served view streams from the answering index's own columns
                 // instead: the index clusters the matching rows into a
                 // contiguous run of zones, so the scan prunes to those rather
@@ -936,7 +965,9 @@ impl VortexRdfStore {
                 // the primary columns and apply any pending filter/selection
                 // (with tombstoned rows excluded).
                 let proj = layout.primary_column_names();
-                let mut scan = file.scan().map_err(VortexRdfError::Vortex)?
+                let mut scan = file
+                    .scan()
+                    .map_err(VortexRdfError::Vortex)?
                     .with_projection(select(proj, root()));
                 if let Some(f) = filter {
                     scan = scan.with_filter(f.clone());
@@ -1047,7 +1078,12 @@ impl VortexRdfStore {
             // without the result ever showing them. Keeping them out also keeps
             // the mask scan's positions aligned with `selection.apply`, which is
             // what `refine` maps back through.
-            QuadsSource::InMemory { base, selection, deleted, .. } => {
+            QuadsSource::InMemory {
+                base,
+                selection,
+                deleted,
+                ..
+            } => {
                 // A pattern the layout can prove unmatchable (e.g. a term
                 // absent from the dictionary) needs no search at all.
                 if matches!(
@@ -1122,7 +1158,11 @@ impl VortexRdfStore {
                         // Fold the exact ids into the selection, and hold onto any
                         // serving plan the index handed back to decide below
                         // whether it still describes exactly the result.
-                        IndexResolution::Resolved { row_ids, resolves, serve: candidate } => {
+                        IndexResolution::Resolved {
+                            row_ids,
+                            resolves,
+                            serve: candidate,
+                        } => {
                             selection = selection.intersect_ids(row_ids);
                             (s, p, o, g) = resolves.clear(s, p, o, g);
                             serve = candidate;
@@ -1151,7 +1191,11 @@ impl VortexRdfStore {
                 // Keep the serving plan only if the serving index's resolution
                 // is the sole thing that narrowed this view — otherwise its
                 // contiguous run over-covers the actual selection.
-                let serve = if unrefined && !narrowed_elsewhere { serve } else { None };
+                let serve = if unrefined && !narrowed_elsewhere {
+                    serve
+                } else {
+                    None
+                };
 
                 Ok(Self {
                     layout: self.layout.clone(),
@@ -1206,7 +1250,11 @@ impl VortexRdfStore {
                     IndexResolution::Empty => return Ok(self.empty_view()),
                     // An index resolved one component: push down a filter for
                     // the rest of the pattern only, alongside its exact row ids.
-                    IndexResolution::Resolved { row_ids, resolves, serve } => {
+                    IndexResolution::Resolved {
+                        row_ids,
+                        resolves,
+                        serve,
+                    } => {
                         let (s, p, o, g) = resolves.clear(subject, predicate, object, graph);
                         // If the index handed back a serving plan, keep it only
                         // when this match is the view's sole restriction: the
@@ -1221,9 +1269,11 @@ impl VortexRdfStore {
                         (self.build_file_filter(s, p, o, g), Some(row_ids), serve)
                     }
                     // No index applies: the whole pattern becomes the pushed-down filter.
-                    IndexResolution::Declined => {
-                        (self.build_file_filter(subject, predicate, object, graph), None, None)
-                    }
+                    IndexResolution::Declined => (
+                        self.build_file_filter(subject, predicate, object, graph),
+                        None,
+                        None,
+                    ),
                 };
                 // Combine with whatever filter this view already carried
                 // from earlier match_pattern calls (AND, since both must hold).
@@ -1329,15 +1379,17 @@ impl VortexRdfStore {
                 .map_err(VortexRdfError::Vortex)?;
             // Cast the scalar to the column's dtype (so numeric columns like
             // `o_kind` compare against a scalar of matching type/nullability).
-            let scalar = value
-                .cast(col.dtype())
-                .map_err(VortexRdfError::Vortex)?;
+            let scalar = value.cast(col.dtype()).map_err(VortexRdfError::Vortex)?;
             // Broadcast the scalar to a constant column and compare element-wise.
             let rhs = ConstantArray::new(scalar, col.len()).into_array();
-            let m = col.binary(rhs, Operator::Eq).map_err(VortexRdfError::Vortex)?;
+            let m = col
+                .binary(rhs, Operator::Eq)
+                .map_err(VortexRdfError::Vortex)?;
             // Fold this column's mask into the running AND of all constraints.
             mask = Some(match mask.take() {
-                Some(prev) => prev.binary(m, Operator::And).map_err(VortexRdfError::Vortex)?,
+                Some(prev) => prev
+                    .binary(m, Operator::And)
+                    .map_err(VortexRdfError::Vortex)?,
                 None => m,
             });
         }
@@ -1360,7 +1412,7 @@ impl VortexRdfStore {
             // term that doesn't exist in a dictionary layout), return a filter that matches
             // nothing (always evaluates to false).
             Constraints::AlwaysFalse => Some(lit(false)),
-            
+
             // If the layout provides equality constraints (field_name, value pairs), build a
             // filter expression by combining them with AND operations. Each constraint requires
             // a specific column to equal a specific value.
@@ -1444,7 +1496,11 @@ impl VortexRdfStore {
                 let range = first as u64..last as u64 + 1;
                 // No trimming actually happened — leave the range unset
                 // rather than recording a no-op range.
-                if range == (0..row_count) { None } else { Some(range) }
+                if range == (0..row_count) {
+                    None
+                } else {
+                    Some(range)
+                }
             }
             // No bit survived: the filter provably matches nothing in this file.
             _ => Some(0..0),
@@ -1489,7 +1545,7 @@ impl VortexRdfStore {
             QuadsSource::InMemory { .. } => Ok(None),
         }
     }
-    
+
     /// Whether the store holds a quad equal to `quad` (tombstoned rows count
     /// as absent). One fully-bound `match_pattern`, so it rides whatever fast
     /// path the store has — subject binary search, secondary indexes, or file
@@ -1520,7 +1576,7 @@ impl VortexRdfStore {
     /// semantics: a quad equal to an existing one — or to an earlier quad in
     /// the same batch — is skipped.
     ///
-    /// Appends land in the in-memory [`Tail`], never the base, so the base —
+    /// Appends land in the in-memory `Tail`, never the base, so the base —
     /// its row ids, secondary indexes, tombstones, or file handle — carries
     /// over untouched; queries run the base's fast paths plus a mask scan over
     /// the tail. This also makes Dictionary-layout appends possible: an
@@ -1561,16 +1617,15 @@ impl VortexRdfStore {
             return Ok(self.clone());
         }
 
-        let fresh_rows =
-            build_struct_array(
-                &fresh, 
-                self.tail_layout().strategy(), 
-                &[], 
-                fresh.len(), 
-                0, 
-                false, 
-                false
-            )?;
+        let fresh_rows = build_struct_array(
+            &fresh,
+            self.tail_layout().strategy(),
+            &[],
+            fresh.len(),
+            0,
+            false,
+            false,
+        )?;
         let rows = match &self.tail {
             None => fresh_rows,
             // Append = rebuild: the old live tail rows plus the fresh ones,
@@ -1650,7 +1705,9 @@ impl VortexRdfStore {
         // Reuse the matcher: which rows a pattern names is exactly the question
         // `match_pattern` answers, and the view it returns shares this store's
         // base (or file), so the doomed rows are already in base row ids.
-        let doomed = self.match_pattern(subject, predicate, object, graph).await?;
+        let doomed = self
+            .match_pattern(subject, predicate, object, graph)
+            .await?;
 
         // The tail tombstones exactly as the base does: the doomed view's
         // tail selection is already exact tail-local ids, so it folds into
@@ -1677,8 +1734,15 @@ impl VortexRdfStore {
         #[cfg_attr(not(feature = "file-io"), allow(unreachable_patterns))]
         match (&self.quads, &doomed.quads) {
             (
-                QuadsSource::InMemory { base, selection, deleted, .. },
-                QuadsSource::InMemory { selection: doomed, .. },
+                QuadsSource::InMemory {
+                    base,
+                    selection,
+                    deleted,
+                    ..
+                },
+                QuadsSource::InMemory {
+                    selection: doomed, ..
+                },
             ) => {
                 // In memory the matched view's selection is already exact row
                 // ids, so it maps straight to a mask.
@@ -1697,7 +1761,13 @@ impl VortexRdfStore {
             }
             #[cfg(feature = "file-io")]
             (
-                QuadsSource::File { path, file, selection, deleted, .. },
+                QuadsSource::File {
+                    path,
+                    file,
+                    selection,
+                    deleted,
+                    ..
+                },
                 QuadsSource::File { .. },
             ) => {
                 // A file view may still carry an unresolved filter, so the

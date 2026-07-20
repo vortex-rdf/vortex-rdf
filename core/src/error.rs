@@ -5,7 +5,7 @@ use vortex_error::VortexError;
 pub enum VortexRdfError {
     #[error("Vortex error: {0}")]
     Vortex(#[from] VortexError),
-    
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

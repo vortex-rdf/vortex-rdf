@@ -1,36 +1,37 @@
+use super::spill::{
+    PairMerger, PairRunSpiller, RunReader, RunWriter, TempRunsGuard, make_temp_dir, write_run,
+};
+use super::{
+    ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder, assemble_chunks, build_struct_array,
+    canonicalize_sorted, into_vortex_error, make_empty_struct,
+};
 use crate::common::utils::stamp_is_sorted;
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
-use crate::store::layouts::{dictionary, LayoutStrategy};
-use crate::store::layouts::term_dictionary::{TermDictionary, TermDictionaryBuilder};
-use crate::store::indexes::{indexes_need_global_sorted_emission, unique_indexes, Indexes, IndexType};
 use crate::store::indexes::secondary_by_copy::{self, CopyKey};
 use crate::store::indexes::secondary_by_reference::append_sorted_string_pairs;
-use super::{
-    VortexArrayBuilder, ChunkStream,
-    assemble_chunks, build_struct_array, canonicalize_sorted, make_empty_struct,
-    into_vortex_error, DEFAULT_CHUNK_SIZE,
+use crate::store::indexes::{
+    IndexType, Indexes, indexes_need_global_sorted_emission, unique_indexes,
 };
-use super::spill::{
-    make_temp_dir, write_run, PairMerger, PairRunSpiller, RunReader, RunWriter, TempRunsGuard,
-};
+use crate::store::layouts::term_dictionary::{TermDictionary, TermDictionaryBuilder};
+use crate::store::layouts::{LayoutStrategy, dictionary};
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use web_time::Instant;
-use std::collections::BinaryHeap;
-use futures::{stream, Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use oxrdf::Quad;
 use rkyv::api::high::{HighDeserializer, HighSerializer};
 use rkyv::rancor::Error as RkyvError;
 use rkyv::ser::allocator::ArenaHandle;
 use rkyv::util::AlignedVec;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
+use std::collections::BinaryHeap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use web_time::Instant;
 
 use vortex_array::ArrayRef;
 use vortex_array::arrays::StructArray;
-use vortex_array::{IntoArray, dtype::DType};
 use vortex_array::validity::Validity;
+use vortex_array::{IntoArray, dtype::DType};
 
 /// Out-of-core globally sorted Vortex RDF Array Builder.
 ///
@@ -53,7 +54,9 @@ struct HeapItem {
 
 impl Eq for HeapItem {}
 impl PartialEq for HeapItem {
-    fn eq(&self, other: &Self) -> bool { self.quad == other.quad }
+    fn eq(&self, other: &Self) -> bool {
+        self.quad == other.quad
+    }
 }
 impl Ord for HeapItem {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -61,7 +64,9 @@ impl Ord for HeapItem {
     }
 }
 impl PartialOrd for HeapItem {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl VortexArrayBuilder for SortedStreamBuilder {
@@ -130,7 +135,9 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
     // ── Phase 1: Ingest and write sorted runs ──
     let ingest_start = Instant::now();
     let temp_dir = make_temp_dir("sorted_stream")?;
-    let guard = TempRunsGuard { dir: temp_dir.clone() };
+    let guard = TempRunsGuard {
+        dir: temp_dir.clone(),
+    };
 
     // For the Dictionary layout, the global term dictionary is built
     // incrementally during this same ingestion pass.
@@ -152,7 +159,11 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
             buffer.sort_unstable();
             let run_path = temp_dir.join(format!("run_{}.bin", run_paths.len()));
             write_run(&run_path, &buffer)?;
-            log::debug!("[SortedStreamBuilder] Wrote sorted run {} ({} quads)", run_paths.len(), buffer.len());
+            log::debug!(
+                "[SortedStreamBuilder] Wrote sorted run {} ({} quads)",
+                run_paths.len(),
+                buffer.len()
+            );
             run_paths.push(run_path);
             buffer.clear();
         }
@@ -162,7 +173,11 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
         buffer.sort_unstable();
         let run_path = temp_dir.join(format!("run_{}.bin", run_paths.len()));
         write_run(&run_path, &buffer)?;
-        log::debug!("[SortedStreamBuilder] Wrote final sorted run {} ({} quads)", run_paths.len(), buffer.len());
+        log::debug!(
+            "[SortedStreamBuilder] Wrote final sorted run {} ({} quads)",
+            run_paths.len(),
+            buffer.len()
+        );
         run_paths.push(run_path);
         drop(buffer);
     }
@@ -175,14 +190,18 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
     );
 
     // ── Phase 2: K-way merge setup ──
-    let mut readers: Vec<RunReader<RawQuad>> = run_paths.iter()
+    let mut readers: Vec<RunReader<RawQuad>> = run_paths
+        .iter()
         .map(|p| RunReader::new(p))
         .collect::<Result<_>>()?;
 
     let mut heap = BinaryHeap::new();
     for (i, r) in readers.iter_mut().enumerate() {
         if let Some(q) = r.next()? {
-            heap.push(HeapItem { quad: q, reader_idx: i });
+            heap.push(HeapItem {
+                quad: q,
+                reader_idx: i,
+            });
         }
     }
 
@@ -206,8 +225,14 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
                 build_start.elapsed()
             );
             let ids = id_map.clone();
-            let (merged_path, spilled) =
-                merge_to_spill(readers, heap, &temp_dir, chunk_size, want_ref, want_copy, move |q| {
+            let (merged_path, spilled) = merge_to_spill(
+                readers,
+                heap,
+                &temp_dir,
+                chunk_size,
+                want_ref,
+                want_copy,
+                move |q| {
                     let encode = |term: &str| {
                         ids.get(term).copied().ok_or_else(|| {
                             VortexRdfError::Serialization(format!(
@@ -217,15 +242,27 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
                         })
                     };
                     Ok([encode(&q.s)?, encode(&q.p)?, encode(&q.o)?, encode(&q.g)?])
-                })?;
+                },
+            )?;
             return emit_presorted_dict_chunks(
-                merged_path, spilled, dict, id_map, indexes, chunk_size, guard,
+                merged_path,
+                spilled,
+                dict,
+                id_map,
+                indexes,
+                chunk_size,
+                guard,
             );
         }
-        let (merged_path, spilled) =
-            merge_to_spill(readers, heap, &temp_dir, chunk_size, want_ref, want_copy, |q| {
-                Ok([q.s.clone(), q.p.clone(), q.o.clone(), q.g.clone()])
-            })?;
+        let (merged_path, spilled) = merge_to_spill(
+            readers,
+            heap,
+            &temp_dir,
+            chunk_size,
+            want_ref,
+            want_copy,
+            |q| Ok([q.s.clone(), q.p.clone(), q.o.clone(), q.g.clone()]),
+        )?;
         return emit_presorted_chunks(merged_path, spilled, layout, indexes, chunk_size, guard);
     }
 
@@ -248,7 +285,15 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
     let first = if first_buf.is_empty() {
         make_empty_struct(layout, &indexes)?
     } else {
-        build_struct_array(&first_buf, layout, &indexes, first_buf.len(), 0, true, false)?
+        build_struct_array(
+            &first_buf,
+            layout,
+            &indexes,
+            first_buf.len(),
+            0,
+            true,
+            false,
+        )?
     };
     let dtype = first.dtype().clone();
     let next_row = first_buf.len() as u32;
@@ -260,7 +305,10 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
             let buf = match next_sorted_chunk(&mut readers, &mut heap, chunk_size) {
                 Ok(b) => b,
                 Err(e) => {
-                    return Some((Err(into_vortex_error(e)), (readers, heap, layout, indexes, row, guard)));
+                    return Some((
+                        Err(into_vortex_error(e)),
+                        (readers, heap, layout, indexes, row, guard),
+                    ));
                 }
             };
             if buf.is_empty() {
@@ -269,7 +317,10 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
             let n = buf.len();
             let chunk = build_struct_array(&buf, layout, &indexes, n, row, true, false)
                 .map_err(into_vortex_error);
-            Some((chunk, (readers, heap, layout, indexes, row + n as u32, guard)))
+            Some((
+                chunk,
+                (readers, heap, layout, indexes, row + n as u32, guard),
+            ))
         },
     );
 
@@ -320,9 +371,14 @@ fn merge_to_spill<V>(
     mut spog_of: impl FnMut(&RawQuad) -> Result<[V; 4]>,
 ) -> Result<(PathBuf, SpilledIndexes<V>)>
 where
-    V: Clone + Ord + Archive + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
+    V: Clone
+        + Ord
+        + Archive
+        + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
     V::Archived: RkyvDeserialize<V, HighDeserializer<RkyvError>>,
-    CopyKey<V>: Ord + Archive + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
+    CopyKey<V>: Ord
+        + Archive
+        + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
     <CopyKey<V> as Archive>::Archived: RkyvDeserialize<CopyKey<V>, HighDeserializer<RkyvError>>,
 {
     let merged_path = temp_dir.join("merged.bin");
@@ -356,11 +412,17 @@ where
         merged.push(&quad)?;
         rid += 1;
         if let Some(next_q) = readers[r_idx].next()? {
-            heap.push(HeapItem { quad: next_q, reader_idx: r_idx });
+            heap.push(HeapItem {
+                quad: next_q,
+                reader_idx: r_idx,
+            });
         }
     }
     merged.finish()?;
-    log::debug!("[SortedStreamBuilder] Merged {} quads to spill; index pair runs written", rid);
+    log::debug!(
+        "[SortedStreamBuilder] Merged {} quads to spill; index pair runs written",
+        rid
+    );
 
     let ref_pairs = match (o_spill, p_spill) {
         (Some(o), Some(p)) => Some((o.into_merger()?, p.into_merger()?)),
@@ -370,16 +432,26 @@ where
         (Some(posg), Some(ospg)) => Some((posg.into_merger()?, ospg.into_merger()?)),
         _ => None,
     };
-    Ok((merged_path, SpilledIndexes { ref_pairs, copy_keys }))
+    Ok((
+        merged_path,
+        SpilledIndexes {
+            ref_pairs,
+            copy_keys,
+        },
+    ))
 }
 
 /// Pull the next `n` entries off every present merger — one chunk's worth of
 /// index columns, advancing in lockstep with the merged-quad reader.
 fn next_index_batches<V>(spilled: &mut SpilledIndexes<V>, n: usize) -> Result<IndexBatches<V>>
 where
-    V: Ord + Archive + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
+    V: Ord
+        + Archive
+        + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
     V::Archived: RkyvDeserialize<V, HighDeserializer<RkyvError>>,
-    CopyKey<V>: Ord + Archive + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
+    CopyKey<V>: Ord
+        + Archive
+        + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
     <CopyKey<V> as Archive>::Archived: RkyvDeserialize<CopyKey<V>, HighDeserializer<RkyvError>>,
 {
     Ok(IndexBatches {
@@ -509,7 +581,10 @@ fn emit_presorted_dict_chunks(
             match chunk {
                 Ok(None) => None,
                 Ok(Some(c)) => Some((Ok(c), (reader, spilled, dict, id_map, guard))),
-                Err(e) => Some((Err(into_vortex_error(e)), (reader, spilled, dict, id_map, guard))),
+                Err(e) => Some((
+                    Err(into_vortex_error(e)),
+                    (reader, spilled, dict, id_map, guard),
+                )),
             }
         },
     );
@@ -571,18 +646,23 @@ fn emit_dict_chunks(
             let buf = match next_sorted_chunk(&mut readers, &mut heap, chunk_size) {
                 Ok(b) => b,
                 Err(e) => {
-                    return Some((Err(into_vortex_error(e)), (readers, heap, dict, id_map, indexes, row, guard)));
+                    return Some((
+                        Err(into_vortex_error(e)),
+                        (readers, heap, dict, id_map, indexes, row, guard),
+                    ));
                 }
             };
             if buf.is_empty() {
                 return None;
             }
             let n = buf.len() as u32;
-            let chunk = dictionary::build_chunk(
-                &buf, &dict, &id_map, &indexes, row, true, false, false,
-            )
-                .map_err(into_vortex_error);
-            Some((chunk, (readers, heap, dict, id_map, indexes, row + n, guard)))
+            let chunk =
+                dictionary::build_chunk(&buf, &dict, &id_map, &indexes, row, true, false, false)
+                    .map_err(into_vortex_error);
+            Some((
+                chunk,
+                (readers, heap, dict, id_map, indexes, row + n, guard),
+            ))
         },
     );
 
@@ -602,7 +682,10 @@ fn next_sorted_chunk(
         let r_idx = item.reader_idx;
         buf.push(item.quad);
         if let Some(next_q) = readers[r_idx].next()? {
-            heap.push(HeapItem { quad: next_q, reader_idx: r_idx });
+            heap.push(HeapItem {
+                quad: next_q,
+                reader_idx: r_idx,
+            });
         }
     }
     Ok(buf)

@@ -1,30 +1,27 @@
-pub mod vortex_rdf_store;
 pub mod builders;
 pub mod indexes;
 pub mod layouts;
 pub mod selection;
+pub mod vortex_rdf_store;
 
 pub use builders::{
+    BuilderStrategy, SortedInMemoryBuilder, SortedStreamBuilder, UnsortedStreamBuilder,
     VortexArrayBuilder,
-    UnsortedStreamBuilder,
-    SortedInMemoryBuilder,
-    SortedStreamBuilder,
-    BuilderStrategy,
 };
 pub use indexes::{IndexType, Indexes};
 pub use layouts::LayoutStrategy;
 pub use vortex_rdf_store::VortexRdfStore;
 
+use oxrdf::Quad;
 use vortex_array::ArrayRef;
 use vortex_mask::Mask;
-use oxrdf::Quad;
 
 use crate::store::selection::RowSelection;
 
 #[cfg(feature = "file-io")]
-use std::sync::Arc;
-#[cfg(feature = "file-io")]
 use std::path::PathBuf;
+#[cfg(feature = "file-io")]
+use std::sync::Arc;
 #[cfg(feature = "file-io")]
 use vortex_array::expr::Expression;
 #[cfg(feature = "file-io")]
@@ -56,7 +53,8 @@ pub struct RawQuad {
 
 impl Ord for RawQuad {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.s.cmp(&other.s)
+        self.s
+            .cmp(&other.s)
             .then_with(|| self.p.cmp(&other.p))
             .then_with(|| self.o.cmp(&other.o))
             .then_with(|| self.g.cmp(&other.g))

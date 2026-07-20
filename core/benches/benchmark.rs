@@ -40,15 +40,15 @@ use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use tokio::runtime::Runtime;
 use vortex_array::ArrayRef;
 
 use vortex_rdf_core::common::utils::generate_rdf_data_stream;
 use vortex_rdf_core::{
-    io, IndexType, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder,
-    UnsortedStreamBuilder, VortexRdfError, VortexRdfStore,
+    IndexType, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder, UnsortedStreamBuilder,
+    VortexRdfError, VortexRdfStore, io,
 };
 
 fn main() {
@@ -186,18 +186,24 @@ fn build_array(builder: Builder, layout: Layout, index: Index, size: usize) -> A
         let strategy = layout.strategy();
         let indexes = index.types();
         match builder {
-            Builder::Unsorted => VortexRdfStore::build_vortex_array_with_builder::<
-                UnsortedStreamBuilder,
-            >(stream, strategy, indexes)
-            .await,
-            Builder::SortedInMemory => VortexRdfStore::build_vortex_array_with_builder::<
-                SortedInMemoryBuilder,
-            >(stream, strategy, indexes)
-            .await,
-            Builder::SortedStream => VortexRdfStore::build_vortex_array_with_builder::<
-                SortedStreamBuilder,
-            >(stream, strategy, indexes)
-            .await,
+            Builder::Unsorted => {
+                VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
+                    stream, strategy, indexes,
+                )
+                .await
+            }
+            Builder::SortedInMemory => {
+                VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
+                    stream, strategy, indexes,
+                )
+                .await
+            }
+            Builder::SortedStream => {
+                VortexRdfStore::build_vortex_array_with_builder::<SortedStreamBuilder>(
+                    stream, strategy, indexes,
+                )
+                .await
+            }
         }
         .expect("failed to build vortex array")
     })
@@ -274,12 +280,14 @@ fn make_store(
     match source {
         Source::File => {
             let path = cached_file(builder, layout, index, size);
-            rt().block_on(async { VortexRdfStore::from_file(path).await.expect("open file store") })
+            rt().block_on(async {
+                VortexRdfStore::from_file(path)
+                    .await
+                    .expect("open file store")
+            })
         }
-        Source::InMemory => {
-            VortexRdfStore::new(cached_array(builder, layout, index, size))
-                .expect("build in-memory store")
-        }
+        Source::InMemory => VortexRdfStore::new(cached_array(builder, layout, index, size))
+            .expect("build in-memory store"),
     }
 }
 
@@ -313,19 +321,55 @@ impl fmt::Debug for SerCfg {
 
 const SERIALIZE_CONFIGS: &[SerCfg] = &[
     // Builder axis (Default layout, no index).
-    SerCfg { builder: Builder::Unsorted, layout: Layout::Default, index: Index::None },
-    SerCfg { builder: Builder::SortedInMemory, layout: Layout::Default, index: Index::None },
-    SerCfg { builder: Builder::SortedStream, layout: Layout::Default, index: Index::None }, // baseline
+    SerCfg {
+        builder: Builder::Unsorted,
+        layout: Layout::Default,
+        index: Index::None,
+    },
+    SerCfg {
+        builder: Builder::SortedInMemory,
+        layout: Layout::Default,
+        index: Index::None,
+    },
+    SerCfg {
+        builder: Builder::SortedStream,
+        layout: Layout::Default,
+        index: Index::None,
+    }, // baseline
     // Layout axis (SortedStream, no index).
-    SerCfg { builder: Builder::SortedStream, layout: Layout::TypedObject, index: Index::None },
-    SerCfg { builder: Builder::SortedStream, layout: Layout::Dictionary, index: Index::None },
+    SerCfg {
+        builder: Builder::SortedStream,
+        layout: Layout::TypedObject,
+        index: Index::None,
+    },
+    SerCfg {
+        builder: Builder::SortedStream,
+        layout: Layout::Dictionary,
+        index: Index::None,
+    },
     // Index axis (SortedStream, Default layout).
-    SerCfg { builder: Builder::SortedStream, layout: Layout::Default, index: Index::ByReference },
-    SerCfg { builder: Builder::SortedStream, layout: Layout::Default, index: Index::ByCopy },
+    SerCfg {
+        builder: Builder::SortedStream,
+        layout: Layout::Default,
+        index: Index::ByReference,
+    },
+    SerCfg {
+        builder: Builder::SortedStream,
+        layout: Layout::Default,
+        index: Index::ByCopy,
+    },
     // Interactions worth keeping: index columns as dictionary codes, and an
     // unsorted (per-chunk, unstamped) index vs the sorted global one above.
-    SerCfg { builder: Builder::SortedStream, layout: Layout::Dictionary, index: Index::ByCopy },
-    SerCfg { builder: Builder::Unsorted, layout: Layout::Default, index: Index::ByCopy },
+    SerCfg {
+        builder: Builder::SortedStream,
+        layout: Layout::Dictionary,
+        index: Index::ByCopy,
+    },
+    SerCfg {
+        builder: Builder::Unsorted,
+        layout: Layout::Default,
+        index: Index::ByCopy,
+    },
 ];
 
 #[divan::bench(args = SERIALIZE_CONFIGS)]
@@ -338,21 +382,34 @@ fn serialize(bencher: divan::Bencher, cfg: &SerCfg) {
                 let mut buf = Vec::new();
                 let stream = stream::iter(quads.into_iter().map(Ok::<_, VortexRdfError>));
                 match cfg.builder {
-                    Builder::Unsorted => {
-                        io::quads_stream_to_vortex_writer_with_builder::<UnsortedStreamBuilder, _, _>(
-                            stream, &mut buf, cfg.layout.strategy(), cfg.index.types(),
-                        )
-                        .await
-                    }
-                    Builder::SortedInMemory => {
-                        io::quads_stream_to_vortex_writer_with_builder::<SortedInMemoryBuilder, _, _>(
-                            stream, &mut buf, cfg.layout.strategy(), cfg.index.types(),
-                        )
-                        .await
-                    }
+                    Builder::Unsorted => io::quads_stream_to_vortex_writer_with_builder::<
+                        UnsortedStreamBuilder,
+                        _,
+                        _,
+                    >(
+                        stream,
+                        &mut buf,
+                        cfg.layout.strategy(),
+                        cfg.index.types(),
+                    )
+                    .await,
+                    Builder::SortedInMemory => io::quads_stream_to_vortex_writer_with_builder::<
+                        SortedInMemoryBuilder,
+                        _,
+                        _,
+                    >(
+                        stream,
+                        &mut buf,
+                        cfg.layout.strategy(),
+                        cfg.index.types(),
+                    )
+                    .await,
                     Builder::SortedStream => {
                         io::quads_stream_to_vortex_writer_with_builder::<SortedStreamBuilder, _, _>(
-                            stream, &mut buf, cfg.layout.strategy(), cfg.index.types(),
+                            stream,
+                            &mut buf,
+                            cfg.layout.strategy(),
+                            cfg.index.types(),
                         )
                         .await
                     }
@@ -372,6 +429,10 @@ fn serialize(bencher: divan::Bencher, cfg: &SerCfg) {
 // query-indistinguishable from SortedStream (identical stamped columns).
 // ══════════════════════════════════════════════════════════════════════════
 
+// Each variant names the bound components by letter (Subject/Predicate/
+// Object/Graph), so `SPOG` is consistent with its siblings, not a word to
+// re-case.
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Copy, Clone, Debug)]
 enum Pattern {
     S,
@@ -402,7 +463,8 @@ fn terms_for(
     Option<Term>,
     Option<GraphName>,
 ) {
-    let s = || NamedOrBlankNode::NamedNode(NamedNode::new_unchecked("http://example.org/subject/0"));
+    let s =
+        || NamedOrBlankNode::NamedNode(NamedNode::new_unchecked("http://example.org/subject/0"));
     let p = || NamedNode::new_unchecked("http://example.org/predicate/0");
     let o = || Term::NamedNode(NamedNode::new_unchecked("http://example.org/object/0"));
     let g = || GraphName::NamedNode(NamedNode::new_unchecked("http://example.org/graph/0"));
@@ -458,19 +520,67 @@ macro_rules! match_bench {
 }
 
 // Baseline + source axis.
-match_bench!(match_sorted_default_bycopy_file, Builder::SortedStream, Layout::Default, Index::ByCopy, Source::File);
-match_bench!(match_sorted_default_bycopy_mem, Builder::SortedStream, Layout::Default, Index::ByCopy, Source::InMemory);
+match_bench!(
+    match_sorted_default_bycopy_file,
+    Builder::SortedStream,
+    Layout::Default,
+    Index::ByCopy,
+    Source::File
+);
+match_bench!(
+    match_sorted_default_bycopy_mem,
+    Builder::SortedStream,
+    Layout::Default,
+    Index::ByCopy,
+    Source::InMemory
+);
 // Layout axis (file).
-match_bench!(match_sorted_typedobj_bycopy_file, Builder::SortedStream, Layout::TypedObject, Index::ByCopy, Source::File);
-match_bench!(match_sorted_dict_bycopy_file, Builder::SortedStream, Layout::Dictionary, Index::ByCopy, Source::File);
+match_bench!(
+    match_sorted_typedobj_bycopy_file,
+    Builder::SortedStream,
+    Layout::TypedObject,
+    Index::ByCopy,
+    Source::File
+);
+match_bench!(
+    match_sorted_dict_bycopy_file,
+    Builder::SortedStream,
+    Layout::Dictionary,
+    Index::ByCopy,
+    Source::File
+);
 // Index axis (file).
-match_bench!(match_sorted_default_noindex_file, Builder::SortedStream, Layout::Default, Index::None, Source::File);
-match_bench!(match_sorted_default_byref_file, Builder::SortedStream, Layout::Default, Index::ByReference, Source::File);
+match_bench!(
+    match_sorted_default_noindex_file,
+    Builder::SortedStream,
+    Layout::Default,
+    Index::None,
+    Source::File
+);
+match_bench!(
+    match_sorted_default_byref_file,
+    Builder::SortedStream,
+    Layout::Default,
+    Index::ByReference,
+    Source::File
+);
 // Sortedness axis: unsorted builder leaves nothing stamped, so indexes decline
 // and everything falls to the mask scan — the worst case, and the typical
 // in-memory (JS bindings) case.
-match_bench!(match_unsorted_default_bycopy_file, Builder::Unsorted, Layout::Default, Index::ByCopy, Source::File);
-match_bench!(match_unsorted_default_bycopy_mem, Builder::Unsorted, Layout::Default, Index::ByCopy, Source::InMemory);
+match_bench!(
+    match_unsorted_default_bycopy_file,
+    Builder::Unsorted,
+    Layout::Default,
+    Index::ByCopy,
+    Source::File
+);
+match_bench!(
+    match_unsorted_default_bycopy_mem,
+    Builder::Unsorted,
+    Layout::Default,
+    Index::ByCopy,
+    Source::InMemory
+);
 
 /// Chained refinement: `match_pattern(P)` then `match_pattern(O)` on the
 /// resulting view — the headline "views narrow the same coordinate space"
@@ -479,7 +589,15 @@ match_bench!(match_unsorted_default_bycopy_mem, Builder::Unsorted, Layout::Defau
 fn match_chained(bencher: divan::Bencher, source: &Source) {
     let source = *source;
     bencher
-        .with_inputs(|| make_store(source, Builder::SortedStream, Layout::Default, Index::ByCopy, BENCH_SIZE))
+        .with_inputs(|| {
+            make_store(
+                source,
+                Builder::SortedStream,
+                Layout::Default,
+                Index::ByCopy,
+                BENCH_SIZE,
+            )
+        })
         .bench_refs(|store| {
             let p = NamedNode::new_unchecked("http://example.org/predicate/0");
             let o = Term::NamedNode(NamedNode::new_unchecked("http://example.org/object/0"));
@@ -525,10 +643,22 @@ impl fmt::Debug for DecodeCfg {
 }
 
 const DECODE_CONFIGS: &[DecodeCfg] = &[
-    DecodeCfg { layout: Layout::Default, source: Source::File }, // baseline full scan
-    DecodeCfg { layout: Layout::TypedObject, source: Source::File }, // object reassembly
-    DecodeCfg { layout: Layout::Dictionary, source: Source::File }, // code → term
-    DecodeCfg { layout: Layout::Default, source: Source::InMemory }, // in-memory decode path
+    DecodeCfg {
+        layout: Layout::Default,
+        source: Source::File,
+    }, // baseline full scan
+    DecodeCfg {
+        layout: Layout::TypedObject,
+        source: Source::File,
+    }, // object reassembly
+    DecodeCfg {
+        layout: Layout::Dictionary,
+        source: Source::File,
+    }, // code → term
+    DecodeCfg {
+        layout: Layout::Default,
+        source: Source::InMemory,
+    }, // in-memory decode path
 ];
 
 /// Decode every quad in the store (`quads()` → `Vec`). Index is irrelevant to a
@@ -537,7 +667,15 @@ const DECODE_CONFIGS: &[DecodeCfg] = &[
 fn decode_all(bencher: divan::Bencher, cfg: &DecodeCfg) {
     let cfg = *cfg;
     bencher
-        .with_inputs(|| make_store(cfg.source, Builder::SortedStream, cfg.layout, Index::None, BENCH_SIZE))
+        .with_inputs(|| {
+            make_store(
+                cfg.source,
+                Builder::SortedStream,
+                cfg.layout,
+                Index::None,
+                BENCH_SIZE,
+            )
+        })
         .bench_refs(|store| {
             rt().block_on(async {
                 let quads: Vec<_> = store
@@ -572,7 +710,14 @@ fn open_file(bencher: divan::Bencher, layout: &Layout) {
 #[divan::bench]
 fn from_bytes(bencher: divan::Bencher) {
     bencher
-        .with_inputs(|| cached_ipc_bytes(Builder::SortedStream, Layout::Default, Index::None, BENCH_SIZE))
+        .with_inputs(|| {
+            cached_ipc_bytes(
+                Builder::SortedStream,
+                Layout::Default,
+                Index::None,
+                BENCH_SIZE,
+            )
+        })
         .bench_refs(|bytes| {
             rt().block_on(async {
                 let store = VortexRdfStore::from_bytes(bytes).await.expect("from_bytes");

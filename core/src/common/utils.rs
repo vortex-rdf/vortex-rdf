@@ -1,20 +1,12 @@
-use crate::error::{VortexRdfError, Result};
+use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
 
-use oxrdf::{
-    Quad,
-    Term,
-    NamedNode,
-    BlankNode,
-    NamedOrBlankNode,
-    Literal,
-    GraphName
-};
+use futures::{Stream, stream};
+use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use oxrdfio::{RdfFormat, RdfParser};
-use futures::{stream, Stream};
 
-use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_array::arrays::{BoolArray, VarBinViewArray};
+use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_mask::Mask;
 
 /// Build a Vortex string array (`VarBinView<Utf8>`, non-nullable) from string refs.
@@ -36,18 +28,18 @@ pub fn make_nullable_string_array(values: impl IntoIterator<Item = Option<String
 /// this stat to binary-search the column, so a false stamp corrupts query
 /// results.
 pub(crate) fn stamp_is_sorted(arr: &ArrayRef) {
-    use vortex_array::expr::stats::{Stat, Precision};
-    arr.statistics().set(Stat::IsSorted, Precision::Exact(true.into()));
+    use vortex_array::expr::stats::{Precision, Stat};
+    arr.statistics()
+        .set(Stat::IsSorted, Precision::Exact(true.into()));
 }
 
 /// Read back the `IsSorted` statistic written by [`stamp_is_sorted`]. An
 /// absent stat counts as unsorted — order is never assumed, only trusted
 /// when explicitly recorded.
 pub(crate) fn column_is_sorted(arr: &ArrayRef) -> bool {
-    use vortex_array::expr::stats::{Stat, StatsProvider, Precision};
+    use vortex_array::expr::stats::{Precision, Stat, StatsProvider};
     match arr.statistics().get(Stat::IsSorted) {
-        Precision::Exact(sc) | Precision::Inexact(sc) 
-            => bool::try_from(&sc).unwrap_or(false),
+        Precision::Exact(sc) | Precision::Inexact(sc) => bool::try_from(&sc).unwrap_or(false),
         Precision::Absent => false,
     }
 }
@@ -59,7 +51,7 @@ pub(crate) fn search_sorted_bounds(
     arr: &ArrayRef,
     probe: &vortex_array::scalar::Scalar,
 ) -> Result<(usize, usize)> {
-    use vortex_array::search_sorted::{SearchSorted, SearchSortedSide, SearchResult};
+    use vortex_array::search_sorted::{SearchResult, SearchSorted, SearchSortedSide};
     let index_of = |result: SearchResult| match result {
         SearchResult::Found(i) | SearchResult::NotFound(i) => i,
     };
@@ -77,7 +69,9 @@ pub(crate) fn bool_array_to_mask(arr: ArrayRef) -> Result<Mask> {
     // Canonicalize to a concrete boolean array, then reinterpret its packed
     // bit buffer directly as a Mask (no per-bit conversion loop).
     let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
-    let bool_arr = arr.execute::<BoolArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
+    let bool_arr = arr
+        .execute::<BoolArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
     Ok(Mask::from_buffer(bool_arr.into_bit_buffer()))
 }
 
@@ -85,18 +79,14 @@ pub(crate) fn bool_array_to_mask(arr: ArrayRef) -> Result<Mask> {
 pub fn parse_named_node(s: &str) -> Result<NamedNode> {
     let s = s.trim_matches(|c| c == '<' || c == '>');
     NamedNode::new(s)
-        .map_err(|e| VortexRdfError::Deserialization(
-            format!("Invalid NamedNode '{}': {}", s, e)
-        ))
+        .map_err(|e| VortexRdfError::Deserialization(format!("Invalid NamedNode '{}': {}", s, e)))
 }
 
 /// Parses a string representation of an RDF blank node, stripping the `_:` prefix if present.
 pub fn parse_blank_node(s: &str) -> Result<BlankNode> {
     let s = s.trim_start_matches("_:");
     BlankNode::new(s)
-        .map_err(|e| VortexRdfError::Deserialization(
-            format!("Invalid BlankNode '{}': {}", s, e)
-        ))
+        .map_err(|e| VortexRdfError::Deserialization(format!("Invalid BlankNode '{}': {}", s, e)))
 }
 
 /// Parses an RDF subject node, which can either be a NamedNode (URI) or a BlankNode.
@@ -168,10 +158,14 @@ pub fn get_as_term(s: &str) -> Option<Term> {
                     Literal::new_language_tagged_literal(val, lang).ok()?,
                 ))
             } else {
-                Some(Term::Literal(Literal::new_simple_literal(s.trim_matches('"'))))
+                Some(Term::Literal(Literal::new_simple_literal(
+                    s.trim_matches('"'),
+                )))
             }
         } else {
-            Some(Term::Literal(Literal::new_simple_literal(s.trim_matches('"'))))
+            Some(Term::Literal(Literal::new_simple_literal(
+                s.trim_matches('"'),
+            )))
         }
     } else {
         None
@@ -192,9 +186,9 @@ pub fn parse_quads_from_reader<R: std::io::Read + Send + 'static>(
     format: RdfFormat,
 ) -> impl Stream<Item = Result<Quad>> {
     let parser = RdfParser::from_format(format);
-    let iter = parser.for_reader(reader).map(|x| {
-        x.map_err(|e| VortexRdfError::Deserialization(format!("Parse error: {}", e)))
-    });
+    let iter = parser
+        .for_reader(reader)
+        .map(|x| x.map_err(|e| VortexRdfError::Deserialization(format!("Parse error: {}", e))));
     stream::iter(iter)
 }
 
@@ -205,16 +199,15 @@ pub fn generate_rdf_data_stream(size: usize) -> impl Stream<Item = Result<Quad>>
     const NUM_GRAPHS: u64 = 10;
 
     stream::iter((0..size).map(|i| {
-        let subject = NamedOrBlankNode::NamedNode(
-            NamedNode::new_unchecked(format!("{}subject/{}", EX, i))
-        );
+        let subject =
+            NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!("{}subject/{}", EX, i)));
         let predicate = NamedNode::new_unchecked(format!("{}predicate/{}", EX, i % 100));
-        let object = Term::NamedNode(
-            NamedNode::new_unchecked(format!("{}object/{}", EX, i % 50))
-        );
-        let graph = GraphName::NamedNode(
-            NamedNode::new_unchecked(format!("{}graph/{}", EX, (i as u64) % NUM_GRAPHS))
-        );
+        let object = Term::NamedNode(NamedNode::new_unchecked(format!("{}object/{}", EX, i % 50)));
+        let graph = GraphName::NamedNode(NamedNode::new_unchecked(format!(
+            "{}graph/{}",
+            EX,
+            (i as u64) % NUM_GRAPHS
+        )));
 
         Ok(Quad::new(subject, predicate, object, graph))
     }))

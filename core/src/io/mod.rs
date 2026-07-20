@@ -2,9 +2,9 @@ pub mod de;
 pub mod ser;
 
 use std::sync::LazyLock;
-use vortex_session::VortexSession;
-use vortex_array::session::ArraySession;
 use vortex_array::scalar_fn::session::ScalarFnSession;
+use vortex_array::session::ArraySession;
+use vortex_session::VortexSession;
 
 #[cfg(feature = "file-io")]
 use vortex_io::session::RuntimeSession;
@@ -37,18 +37,13 @@ pub static VORTEX_LIGHT_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     session
 });
 
-pub use de::{
-    deserialize,
-    array_from_ipc_reader
-};
+pub use de::{array_from_ipc_reader, deserialize};
 #[cfg(feature = "file-io")]
 pub use de::{load_vortex_file_ref, open_vortex_file};
 
 pub use ser::write_array_to_ipc;
 #[cfg(feature = "file-io")]
 pub use ser::{
-    serialize,
-    quads_stream_to_vortex,
-    quads_stream_to_vortex_writer,
-    quads_stream_to_vortex_writer_with_builder,
+    quads_stream_to_vortex, quads_stream_to_vortex_writer,
+    quads_stream_to_vortex_writer_with_builder, serialize,
 };
