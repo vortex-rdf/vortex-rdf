@@ -6,5 +6,43 @@
   "lockFileMaintenance": {
     "enabled": true,
     "schedule": ["before 6am on monday"]
-  }
+  },
+  "packageRules": [
+    {
+      "description": "Group and automerge cargo patch updates (safe regardless of pre-1.0 status)",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["patch"],
+      "automerge": true,
+      "groupName": "cargo non-major dependencies",
+      "groupSlug": "cargo-non-major",
+      "platformAutomerge": true
+    },
+    {
+      "description": "Also automerge cargo minor updates, but only once a dependency is past 1.0",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor"],
+      "matchCurrentVersion": ">=1.0.0",
+      "automerge": true,
+      "groupName": "cargo non-major dependencies",
+      "groupSlug": "cargo-non-major",
+      "platformAutomerge": true
+    },
+    {
+      "description": "Group and automerge npm non-major dependencies",
+      "matchManagers": ["npm"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true,
+      "groupName": "npm non-major dependencies",
+      "groupSlug": "npm-non-major",
+      "platformAutomerge": true
+    },
+    {
+      "description": "Group and automerge Github Actions updates",
+      "matchManagers": ["github-actions"],
+      "automerge": true,
+      "groupName": "github-actions",
+      "groupSlug": "github-actions",
+      "platformAutomerge": true
+    }
+  ]
 }

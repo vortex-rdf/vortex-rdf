@@ -32,7 +32,6 @@ jobs:
         uses: CodSpeedHQ/action@v4
         with:
           mode: simulation
-          #token: ${{ secrets.CODSPEED_TOKEN }}
           run: cargo codspeed run --bench benchmark
         env:
-          DIVAN_SAMPLE_COUNT: 3
+          DIVAN_SAMPLE_COUNT: 10
