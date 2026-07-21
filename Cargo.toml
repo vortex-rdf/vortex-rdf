@@ -5,38 +5,43 @@ members = ["core", "js", "cli"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["Julián Rojas <julianandres.rojasmelendez@ugent.be>"]
 license = "MIT"
-repository = "https://github.com/julianrojas87/vortex-rdf"
+repository = "https://github.com/vortex-rdf/vortex-rdf"
 description = "Modern and high-performance columnar RDF serialization format"
+readme = "README.md"
+keywords = ["rdf", "columnar", "vortex", "semantic-web", "quad-store"]
+categories = ["database-implementations", "encoding", "data-structures"]
 
 [workspace.dependencies]
-vortex-rdf-core = { path = "core" }
-vortex = { version = "0.71.0", default-features = false }
-vortex-array = { version = "0.71.0" }
-vortex-error = "0.71.0"
-vortex-ipc = "0.71.0"
-vortex-io = "0.71.0"
-vortex-session = "0.71.0"
-vortex-fsst = "0.71.0"
-vortex-mask = "0.71.0"
-vortex-file = { version = "0.71.0", features = ["tokio"] }
-vortex-scan = "0.71.0"
-vortex-layout = "0.71.0"
-vortex-btrblocks = "0.71.0"
+vortex-rdf-core = { path = "core", version = "0.1.0" }
+vortex = { version = "0.78.0", default-features = false }
+vortex-array = { version = "0.78.0" }
+vortex-error = "0.78.0"
+vortex-ipc = "0.78.0"
+vortex-io = "0.78.0"
+vortex-session = "0.78.0"
+vortex-fsst = "0.78.0"
+vortex-mask = "0.78.0"
+vortex-file = { version = "0.78.0" }
+vortex-scan = "0.78.0"
+vortex-layout = "0.78.0"
+vortex-buffer = "0.78.0"
+vortex-btrblocks = "0.78.0"
 
 tokio = { version = "1.52", features = ["sync", "macros", "rt"] }
 futures = "0.3.32"
 
 oxrdf = "0.3.3"
 oxrdfio = "0.2.5"
-itertools = "0.14"
+itertools = "0.15"
 thiserror = "2.0"
-anyhow = "1.0.102"
+anyhow = "1.0.103"
 
 clap = { version = "4.6", features = ["derive"] }
-wasm-bindgen = "0.2.121"
-js-sys = "0.3.98"
+wasm-bindgen = "0.2.126"
+js-sys = "0.3.103"
 console_error_panic_hook = "0.1.7"
-getrandom = "0.4.2"
-mimalloc = "0.1.51"
+mimalloc = "0.1.52"
+web-time = "1.1"

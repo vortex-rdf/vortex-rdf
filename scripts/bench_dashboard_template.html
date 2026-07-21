@@ -1,0 +1,702 @@
+<title>vortex-rdf · bench dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    color-scheme: light;
+    --page:        #f9f9f7;
+    --surface:     #fcfcfb;
+    --surface-2:   #f3f2ee;
+    --ink:         #0b0b0b;
+    --ink-2:       #52514e;
+    --ink-muted:   #898781;
+    --grid:        #e1e0d9;
+    --baseline:    #c3c2b7;
+    --border:      rgba(11,11,11,0.10);
+    --border-strong: rgba(11,11,11,0.18);
+    --accent:      #2a78d6;
+    --good:        #0ca30c;
+    --c1: #2a78d6;
+    --c2: #008300;
+    --c3: #e87ba4;
+    --c4: #eda100;
+    --focus:       #2a78d6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page:        #0d0d0d;
+      --surface:     #1a1a19;
+      --surface-2:   #232322;
+      --ink:         #ffffff;
+      --ink-2:       #c3c2b7;
+      --ink-muted:   #898781;
+      --grid:        #2c2c2a;
+      --baseline:    #383835;
+      --border:      rgba(255,255,255,0.10);
+      --border-strong: rgba(255,255,255,0.18);
+      --accent:      #3987e5;
+      --good:        #0ca30c;
+      --c1: #3987e5;
+      --c2: #008300;
+      --c3: #d55181;
+      --c4: #c98500;
+      --focus:       #3987e5;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page:        #0d0d0d;
+    --surface:     #1a1a19;
+    --surface-2:   #232322;
+    --ink:         #ffffff;
+    --ink-2:       #c3c2b7;
+    --ink-muted:   #898781;
+    --grid:        #2c2c2a;
+    --baseline:    #383835;
+    --border:      rgba(255,255,255,0.10);
+    --border-strong: rgba(255,255,255,0.18);
+    --accent:      #3987e5;
+    --good:        #0ca30c;
+    --c1: #3987e5;
+    --c2: #008300;
+    --c3: #d55181;
+    --c4: #c98500;
+    --focus:       #3987e5;
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --page: #f9f9f7; --surface:#fcfcfb; --surface-2:#f3f2ee;
+    --ink:#0b0b0b; --ink-2:#52514e; --ink-muted:#898781;
+    --grid:#e1e0d9; --baseline:#c3c2b7; --border:rgba(11,11,11,0.10);
+    --border-strong: rgba(11,11,11,0.18);
+    --accent:#2a78d6; --good:#0ca30c;
+    --c1:#2a78d6; --c2:#008300; --c3:#e87ba4; --c4:#eda100;
+    --focus:#2a78d6;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--page);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 15px;
+    line-height: 1.5;
+  }
+  .mono {
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  a { color: var(--accent); }
+  :focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
+  }
+
+  /* ---- shell ---- */
+  header.topbar {
+    position: sticky; top: 0; z-index: 20;
+    background: color-mix(in srgb, var(--surface) 92%, transparent);
+    backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--border);
+    padding: 14px 24px;
+  }
+  .topbar-row { display:flex; align-items:baseline; justify-content:space-between; gap:16px; flex-wrap:wrap; max-width: 1280px; margin: 0 auto; }
+  .brand { display:flex; align-items:baseline; gap:10px; }
+  .brand .mark { font-weight:700; letter-spacing:0.02em; font-size:14px; text-transform:uppercase; }
+  .brand .sub { color:var(--ink-2); font-size:13px; }
+  nav.seclinks { display:flex; gap:18px; flex-wrap:wrap; }
+  nav.seclinks a {
+    text-decoration:none; color:var(--ink-2); font-size:12px; text-transform:uppercase;
+    letter-spacing:0.06em; font-weight:600; border-bottom:2px solid transparent; padding-bottom:2px;
+  }
+  nav.seclinks a:hover { color:var(--ink); border-color: var(--accent); }
+
+  main { max-width: 1280px; margin: 0 auto; padding: 28px 24px 80px; }
+
+  .lede { max-width: 74ch; color:var(--ink-2); font-size:14.5px; margin: 4px 0 28px; }
+  .lede code { font-family: ui-monospace, monospace; font-size:0.93em; background:var(--surface-2); padding:1px 5px; border-radius:3px; }
+
+  /* ---- KPI strip ---- */
+  .kpi-row {
+    display:grid; grid-template-columns:repeat(auto-fit, minmax(180px,1fr));
+    gap:1px; background:var(--border); border:1px solid var(--border);
+    border-radius:8px; overflow:hidden; margin-bottom:36px;
+  }
+  .kpi {
+    background:var(--surface); padding:16px 18px; display:flex; flex-direction:column; gap:6px;
+  }
+  .kpi .label { font-size:11px; text-transform:uppercase; letter-spacing:0.07em; color:var(--ink-muted); font-weight:600; }
+  .kpi .value { font-size:22px; font-weight:600; font-variant-numeric: proportional-nums; }
+  .kpi .value.mono { font-variant-numeric: normal; }
+  .kpi .sub { font-size:12px; color:var(--ink-2); }
+  .kpi .sub .mono { font-size:11.5px; }
+
+  /* ---- sections ---- */
+  section.group { margin-bottom: 52px; scroll-margin-top: 84px; }
+  .group-head { display:flex; align-items:center; gap:12px; margin-bottom:6px; }
+  .chan-tag {
+    font-size:11px; font-weight:700; letter-spacing:0.08em; padding:3px 8px;
+    border:1px solid var(--border-strong); border-radius:4px; color:var(--ink-2);
+  }
+  .group-head h2 { margin:0; font-size:20px; font-weight:650; text-wrap: balance; }
+  .group-desc { color:var(--ink-2); font-size:13.5px; max-width:80ch; margin: 0 0 18px; }
+
+  .panel-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(420px,1fr)); gap:16px; }
+  .panel {
+    background:var(--surface); border:1px solid var(--border); border-radius:8px;
+    padding:16px 18px 18px;
+  }
+  .panel h3 { margin:0 0 2px; font-size:14.5px; font-weight:650; }
+  .panel .note { color:var(--ink-2); font-size:12.5px; margin: 0 0 12px; max-width:60ch; }
+
+  .legend { display:flex; flex-wrap:wrap; gap:14px; margin-bottom:12px; }
+  .legend-item { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--ink-2); }
+  .swatch { width:10px; height:10px; border-radius:2px; flex:none; }
+
+  .filmstrip { display:grid; grid-template-columns:repeat(auto-fit, minmax(96px,1fr)); gap:10px; }
+  .filmstrip.simple { grid-template-columns: minmax(0,1fr); max-width: 340px; }
+  .mini { display:flex; flex-direction:column; align-items:center; gap:4px; }
+  .mini svg { width:100%; height:auto; overflow:visible; }
+  .mini .cap { font-size:11px; color:var(--ink-muted); font-weight:600; letter-spacing:0.03em; }
+  .bar-label { font-size:9.5px; fill:var(--ink-2); font-family: ui-monospace, monospace; }
+  .bar-label.best { fill:var(--ink); font-weight:700; }
+  .best-badge { font-size:9px; fill:var(--good); font-weight:700; }
+  .baseline-rule { stroke:var(--baseline); stroke-width:1; }
+
+  .insight {
+    margin-top:12px; padding-top:10px; border-top:1px solid var(--border);
+    font-size:12.5px; color:var(--ink-2);
+  }
+  .insight b { color:var(--ink); font-weight:650; }
+
+  .rank-list { list-style:none; margin:12px 0 0; padding:0; display:flex; flex-direction:column; gap:6px; }
+  .rank-list li {
+    display:flex; align-items:center; gap:10px; font-size:13px;
+    padding:6px 8px; border-radius:5px; background:var(--surface-2);
+  }
+  .rank-list li.win { background: color-mix(in srgb, var(--good) 12%, var(--surface-2)); }
+  .rank-pos { font-family: ui-monospace, monospace; font-weight:700; color:var(--ink-muted); width:1.4em; text-align:right; flex:none; }
+  .rank-list li.win .rank-pos { color: var(--good); }
+  .rank-name { flex:1; display:flex; align-items:center; gap:7px; }
+  .rank-val { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; font-weight:600; }
+  .rank-delta { font-family: ui-monospace, monospace; font-size:11.5px; color:var(--ink-muted); min-width:5.5em; text-align:right; }
+
+  .interact-table { width:100%; border-collapse:collapse; margin-top:10px; font-size:12.5px; }
+  .interact-table th, .interact-table td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border); }
+  .interact-table th { color:var(--ink-muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:0.05em; }
+  .interact-table td.num { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+
+  /* ---- data table ---- */
+  .table-toolbar { display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap; }
+  .table-toolbar input {
+    background:var(--surface); border:1px solid var(--border-strong); border-radius:6px;
+    padding:7px 10px; font-size:13px; color:var(--ink); min-width:220px;
+    font-family: ui-monospace, monospace;
+  }
+  .table-toolbar input::placeholder { color:var(--ink-muted); }
+  .table-toolbar .count { font-size:12px; color:var(--ink-muted); }
+  .table-wrap { overflow-x:auto; border:1px solid var(--border); border-radius:8px; }
+  table.data {
+    width:100%; border-collapse:collapse; font-size:12.5px; background:var(--surface);
+    min-width: 720px;
+  }
+  table.data th, table.data td { padding:8px 12px; text-align:right; white-space:nowrap; }
+  table.data td:first-child, table.data th:first-child { text-align:left; }
+  table.data thead th {
+    position:sticky; top:0; background:var(--surface-2); cursor:pointer; user-select:none;
+    font-size:11px; text-transform:uppercase; letter-spacing:0.05em; color:var(--ink-2);
+    border-bottom:1px solid var(--border-strong);
+  }
+  table.data thead th:hover { color:var(--ink); }
+  table.data thead th .arrow { opacity:0.5; margin-left:3px; }
+  table.data tbody tr:nth-child(odd) { background: color-mix(in srgb, var(--surface-2) 45%, transparent); }
+  table.data td.name { font-family: ui-monospace, monospace; text-align:left; }
+  table.data td.num { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+
+  footer.prov {
+    margin-top:36px; padding-top:16px; border-top:1px solid var(--border);
+    color:var(--ink-muted); font-size:11.5px;
+  }
+
+  #tooltip {
+    position:fixed; pointer-events:none; z-index:50;
+    background:var(--ink); color:var(--page); font-size:12px;
+    padding:6px 9px; border-radius:5px; transform:translate(-50%,-100%);
+    margin-top:-8px; opacity:0; transition:opacity 0.08s ease; max-width:240px;
+  }
+  #tooltip.show { opacity:1; }
+  #tooltip .tt-val { font-family: ui-monospace, monospace; font-weight:700; font-variant-numeric: tabular-nums; }
+  #tooltip .tt-name { opacity:0.8; margin-top:2px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition:none !important; animation:none !important; }
+  }
+</style>
+
+<div id="tooltip" role="tooltip"></div>
+
+<header class="topbar">
+  <div class="topbar-row">
+    <div class="brand">
+      <span class="mark mono">vortex-rdf · bench</span>
+      <span class="sub">divan micro-benchmark results</span>
+    </div>
+    <nav class="seclinks">
+      <a href="#overview">Overview</a>
+      <a href="#write">Write</a>
+      <a href="#query">Query</a>
+      <a href="#decode">Decode</a>
+      <a href="#data">Raw data</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section id="overview" class="group">
+    <p class="lede">
+      One <code>cargo bench</code> run of <code>core/benches/benchmark.rs</code> — a star
+      (one-factor-at-a-time) design over four axes: builder strategy, column layout, secondary
+      index, and source. Each panel below isolates one axis against a fixed baseline; the raw
+      table at the bottom holds every measured configuration.
+    </p>
+    <div class="kpi-row" id="kpi-row"></div>
+  </section>
+
+  <section id="write" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">WRITE</span>
+      <h2>Serialize — ingest &amp; encode</h2>
+    </div>
+    <p class="group-desc">Building a Vortex array from 100,000 generated quads and writing it out. Baseline: sorted-stream builder, default layout, no secondary index.</p>
+    <div class="panel-grid" id="write-panels"></div>
+  </section>
+
+  <section id="query" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">QUERY</span>
+      <h2>Match — pattern resolution</h2>
+    </div>
+    <p class="group-desc">
+      Resolving <code>match_pattern</code> and materializing the matching quads, across the six
+      routing shapes the resolver branches on: <span class="mono">S</span> (primary binary
+      search, 1 row), <span class="mono">P</span>/<span class="mono">O</span> (single-column
+      index probe, 1–2k rows), <span class="mono">PO</span> (two-column prefix probe, 1k rows),
+      <span class="mono">G</span> (no index covers graph — mask scan, 10k rows), and
+      <span class="mono">SPOG</span> (every component bound, 1 row).
+    </p>
+    <div class="panel-grid" id="query-panels"></div>
+  </section>
+
+  <section id="decode" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">DECODE</span>
+      <h2>Load &amp; decode — read-back</h2>
+    </div>
+    <p class="group-desc">Opening a store and decoding every quad back out (full scan), independent of any match pattern.</p>
+    <div class="panel-grid" id="decode-panels"></div>
+  </section>
+
+  <section id="data" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">DATA</span>
+      <h2>Every measured configuration</h2>
+    </div>
+    <p class="group-desc">All 66 leaf benchmarks from this run. Click a column to sort.</p>
+    <div class="table-toolbar">
+      <input id="table-filter" type="text" placeholder="filter by name…" autocomplete="off" />
+      <span class="count" id="table-count"></span>
+    </div>
+    <div class="table-wrap">
+      <table class="data" id="data-table">
+        <thead><tr>
+          <th data-key="id" tabindex="0" role="button" aria-label="Sort by benchmark name">Benchmark</th>
+          <th data-key="fastest_ns" tabindex="0" role="button" aria-label="Sort by fastest">Fastest</th>
+          <th data-key="slowest_ns" tabindex="0" role="button" aria-label="Sort by slowest">Slowest</th>
+          <th data-key="median_ns" tabindex="0" role="button" aria-label="Sort by median">Median</th>
+          <th data-key="mean_ns" tabindex="0" role="button" aria-label="Sort by mean">Mean</th>
+          <th data-key="samples" tabindex="0" role="button" aria-label="Sort by sample count">Samples</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer class="prov mono" id="provenance"></footer>
+</main>
+
+<script>
+const DATA = __BENCH_DATA__;
+const byId = new Map(DATA.map(d => [d.id, d]));
+const PATTERNS = ["S","P","O","PO","G","SPOG"];
+const NS = { ns:1, "µs":1e3, us:1e3, ms:1e6, s:1e9 };
+
+function get(id){ const r = byId.get(id); if(!r) console.warn("missing bench id", id); return r; }
+function fmtRatio(a,b){ return (a/b).toFixed(2) + "×"; }
+function fmtNs(ns){
+  if (ns < 1e3) return ns.toFixed(0) + " ns";
+  if (ns < 1e6) return (ns/1e3).toPrecision(3) + " µs";
+  if (ns < 1e9) return (ns/1e6).toPrecision(3) + " ms";
+  return (ns/1e9).toPrecision(3) + " s";
+}
+
+const svgNS = "http://www.w3.org/2000/svg";
+function svgEl(tag, attrs){
+  const el = document.createElementNS(svgNS, tag);
+  for (const k in attrs) el.setAttribute(k, attrs[k]);
+  return el;
+}
+function roundedTopPath(x, y, w, h, r){
+  r = Math.min(r, w/2, Math.max(h,0.01));
+  const top = y;
+  const bottom = y + h;
+  return `M${x},${bottom} L${x},${top+r} Q${x},${top} ${x+r},${top} L${x+w-r},${top} Q${x+w},${top} ${x+w},${top+r} L${x+w},${bottom} Z`;
+}
+
+const tooltip = document.getElementById("tooltip");
+function showTip(evt, name, valueStr){
+  tooltip.innerHTML = "";
+  const v = document.createElement("div"); v.className = "tt-val"; v.textContent = valueStr;
+  const n = document.createElement("div"); n.className = "tt-name"; n.textContent = name;
+  tooltip.append(v, n);
+  tooltip.classList.add("show");
+  moveTip(evt);
+}
+function moveTip(evt){
+  const x = evt.clientX ?? (evt.target.getBoundingClientRect().left + evt.target.getBoundingClientRect().width/2);
+  const y = evt.clientY ?? evt.target.getBoundingClientRect().top;
+  tooltip.style.left = x + "px";
+  tooltip.style.top = y + "px";
+}
+function hideTip(){ tooltip.classList.remove("show"); }
+
+function attachTip(el, name, valueStr){
+  el.addEventListener("pointerenter", e => showTip(e, name, valueStr));
+  el.addEventListener("pointermove", moveTip);
+  el.addEventListener("pointerleave", hideTip);
+  el.addEventListener("focus", e => showTip(e, name, valueStr));
+  el.addEventListener("blur", hideTip);
+}
+
+function legend(container, series){
+  const row = document.createElement("div");
+  row.className = "legend";
+  for (const s of series){
+    const item = document.createElement("span");
+    item.className = "legend-item";
+    const sw = document.createElement("span");
+    sw.className = "swatch";
+    sw.style.background = s.color;
+    const label = document.createElement("span");
+    label.textContent = s.label;
+    item.append(sw, label);
+    row.appendChild(item);
+  }
+  container.appendChild(row);
+}
+
+/** One small bar-group: series = [{label, color, id}], drawn on its own scale. */
+function drawBarGroup(host, series, caption){
+  const recs = series.map(s => ({...s, rec: get(s.id)})).filter(s => s.rec);
+  if (!recs.length) return;
+  const maxV = Math.max(...recs.map(s => s.rec.median_ns)) * 1.18;
+  const minV = Math.min(...recs.map(s => s.rec.median_ns));
+  const n = recs.length;
+  const slot = 40, barW = Math.min(24, slot*0.62), gap = slot - barW;
+  const chartW = n*slot, chartH = 110, baseY = 92, topPad = 20;
+
+  const wrap = document.createElement("div");
+  wrap.className = "mini";
+  const svg = svgEl("svg", { viewBox: `0 0 ${chartW} ${chartH}`, role:"img",
+    "aria-label": (caption ? caption+": " : "") + recs.map(s=>`${s.label} ${s.rec.median}`).join(", ") });
+
+  svg.appendChild(svgEl("line", { x1:0, y1:baseY, x2:chartW, y2:baseY, class:"baseline-rule" }));
+
+  recs.forEach((s, i) => {
+    const h = (baseY - topPad) * (s.rec.median_ns / maxV);
+    const x = i*slot + gap/2;
+    const y = baseY - h;
+    const isBest = s.rec.median_ns === minV;
+    const path = svgEl("path", { d: roundedTopPath(x, y, barW, h, 4), class: "s"+((i%4)+1) });
+    path.style.fill = s.color;
+    path.tabIndex = 0;
+    svg.appendChild(path);
+    attachTip(path, (caption ? caption+" · " : "") + s.label, s.rec.median);
+
+    const label = svgEl("text", { x: x+barW/2, y: y-9, "text-anchor":"middle",
+      class: "bar-label" + (isBest ? " best" : "") });
+    label.textContent = s.rec.median;
+    svg.appendChild(label);
+    if (isBest){
+      const badge = svgEl("text", { x: x+barW/2, y: y-19, "text-anchor":"middle", class:"best-badge" });
+      badge.textContent = "✓";
+      svg.appendChild(badge);
+    }
+  });
+
+  wrap.appendChild(svg);
+  if (caption){
+    const cap = document.createElement("div");
+    cap.className = "cap mono";
+    cap.textContent = caption;
+    wrap.appendChild(cap);
+  }
+  host.appendChild(wrap);
+}
+
+/** Axis panel with a pattern dimension: one mini bar-group per S/P/O/PO/G/SPOG. */
+function renderPatternPanel(container, cfg){
+  const panel = document.createElement("div");
+  panel.className = "panel";
+  panel.innerHTML = `<h3>${cfg.title}</h3><p class="note">${cfg.note}</p>`;
+  legend(panel, cfg.series);
+
+  const strip = document.createElement("div");
+  strip.className = "filmstrip";
+  const wins = new Map(cfg.series.map(s => [s.label, 0]));
+
+  for (const p of PATTERNS){
+    const series = cfg.series.map(s => ({ label:s.label, color:s.color, id:`${s.group}::${p}` }));
+    drawBarGroup(strip, series, p);
+    const recs = series.map(s => ({...s, rec: get(s.id)})).filter(s => s.rec);
+    if (recs.length){
+      const best = recs.reduce((a,b) => a.rec.median_ns < b.rec.median_ns ? a : b);
+      wins.set(best.label, (wins.get(best.label)||0) + 1);
+    }
+  }
+  panel.appendChild(strip);
+
+  const ranked = [...wins.entries()].sort((a,b) => b[1]-a[1]).filter(([,n]) => n>0);
+  const insight = document.createElement("div");
+  insight.className = "insight";
+  insight.innerHTML = "Fastest most often: " +
+    ranked.map(([label,n]) => `<b>${label}</b> (${n}/${PATTERNS.length})`).join(", ");
+  panel.appendChild(insight);
+
+  container.appendChild(panel);
+}
+
+/** Axis panel without a pattern dimension: one bar-group + explicit rank list. */
+function renderSimplePanel(container, cfg){
+  const panel = document.createElement("div");
+  panel.className = "panel";
+  panel.innerHTML = `<h3>${cfg.title}</h3><p class="note">${cfg.note}</p>`;
+  legend(panel, cfg.series);
+
+  const strip = document.createElement("div");
+  strip.className = "filmstrip simple";
+  drawBarGroup(strip, cfg.series, null);
+  panel.appendChild(strip);
+
+  const recs = cfg.series.map(s => ({...s, rec: get(s.id)})).filter(s => s.rec)
+    .sort((a,b) => a.rec.median_ns - b.rec.median_ns);
+  const fastest = recs[0];
+  const list = document.createElement("ol");
+  list.className = "rank-list";
+  recs.forEach((s, i) => {
+    const li = document.createElement("li");
+    if (i===0) li.classList.add("win");
+    const pos = document.createElement("span"); pos.className="rank-pos mono"; pos.textContent = (i+1)+".";
+    const name = document.createElement("span"); name.className="rank-name";
+    const sw = document.createElement("span"); sw.className="swatch"; sw.style.background=s.color;
+    const nm = document.createElement("span"); nm.textContent = s.label;
+    name.append(sw, nm);
+    const val = document.createElement("span"); val.className="rank-val"; val.textContent = s.rec.median;
+    const delta = document.createElement("span"); delta.className="rank-delta";
+    delta.textContent = i===0 ? "baseline" : fmtRatio(s.rec.median_ns, fastest.rec.median_ns) + " slower";
+    li.append(pos, name, val, delta);
+    list.appendChild(li);
+  });
+  panel.appendChild(list);
+  container.appendChild(panel);
+}
+
+// ---- panel configs ----
+const writePanels = [
+  { title:"Builder", note:"Default layout, no secondary index.", series:[
+    {label:"Sorted stream", color:"var(--c1)", id:"serialize::sorted_stream_default_no_index"},
+    {label:"Sorted in-memory", color:"var(--c2)", id:"serialize::sorted_in_memory_default_no_index"},
+    {label:"Unsorted", color:"var(--c3)", id:"serialize::unsorted_default_no_index"},
+  ]},
+  { title:"Layout", note:"Sorted-stream builder, no secondary index.", series:[
+    {label:"Default", color:"var(--c1)", id:"serialize::sorted_stream_default_no_index"},
+    {label:"Typed-object", color:"var(--c2)", id:"serialize::sorted_stream_typed_object_no_index"},
+    {label:"Dictionary", color:"var(--c3)", id:"serialize::sorted_stream_dictionary_no_index"},
+  ]},
+  { title:"Secondary index", note:"Sorted-stream builder, default layout.", series:[
+    {label:"No index", color:"var(--c1)", id:"serialize::sorted_stream_default_no_index"},
+    {label:"By reference", color:"var(--c2)", id:"serialize::sorted_stream_default_by_reference"},
+    {label:"By copy", color:"var(--c3)", id:"serialize::sorted_stream_default_by_copy"},
+  ]},
+];
+
+const queryPanels = [
+  { title:"Source: file vs in-memory", note:"Baseline sorted-stream / default layout / by-copy index.", series:[
+    {label:"File", color:"var(--c1)", group:"match_sorted_default_bycopy_file"},
+    {label:"In-memory", color:"var(--c2)", group:"match_sorted_default_bycopy_mem"},
+  ]},
+  { title:"Layout: default vs typed-object vs dictionary", note:"Sorted-stream builder, by-copy index, file-backed.", series:[
+    {label:"Default", color:"var(--c1)", group:"match_sorted_default_bycopy_file"},
+    {label:"Typed-object", color:"var(--c2)", group:"match_sorted_typedobj_bycopy_file"},
+    {label:"Dictionary", color:"var(--c3)", group:"match_sorted_dict_bycopy_file"},
+  ]},
+  { title:"Secondary index: none vs by-reference vs by-copy", note:"Sorted-stream builder, default layout, file-backed.", series:[
+    {label:"No index", color:"var(--c1)", group:"match_sorted_default_noindex_file"},
+    {label:"By reference", color:"var(--c2)", group:"match_sorted_default_byref_file"},
+    {label:"By copy", color:"var(--c3)", group:"match_sorted_default_bycopy_file"},
+  ]},
+  { title:"Builder × source: sorted vs unsorted, file vs in-memory", note:"Default layout, by-copy index. An unsorted builder leaves nothing stamped, so every index declines and the resolver falls back to a full mask scan.", series:[
+    {label:"Sorted / file", color:"var(--c1)", group:"match_sorted_default_bycopy_file"},
+    {label:"Sorted / mem", color:"var(--c2)", group:"match_sorted_default_bycopy_mem"},
+    {label:"Unsorted / file", color:"var(--c3)", group:"match_unsorted_default_bycopy_file"},
+    {label:"Unsorted / mem", color:"var(--c4)", group:"match_unsorted_default_bycopy_mem"},
+  ]},
+];
+
+const chainedPanel = { title:"Chained refinement (match P, then O)", note:"Two sequential match_pattern calls on the same view — the “views narrow the same coordinate space” feature.", series:[
+  {label:"File", color:"var(--c1)", id:"match_chained::file"},
+  {label:"In-memory", color:"var(--c2)", id:"match_chained::in_memory"},
+]};
+
+const decodePanels = [
+  { title:"Layout", note:"Sorted-stream builder, file-backed, full-scan decode.", series:[
+    {label:"Default", color:"var(--c1)", id:"decode_all::default_file"},
+    {label:"Typed-object", color:"var(--c2)", id:"decode_all::typed_object_file"},
+    {label:"Dictionary", color:"var(--c3)", id:"decode_all::dictionary_file"},
+  ]},
+  { title:"Source", note:"Default layout, full-scan decode.", series:[
+    {label:"File", color:"var(--c1)", id:"decode_all::default_file"},
+    {label:"In-memory", color:"var(--c2)", id:"decode_all::default_in_memory"},
+  ]},
+  { title:"Open file (footer read only)", note:"Time to open a file-backed store, before any decode.", series:[
+    {label:"Default", color:"var(--c1)", id:"open_file::default"},
+    {label:"Dictionary", color:"var(--c2)", id:"open_file::dictionary"},
+  ]},
+];
+
+// ---- render ----
+const writeHost = document.getElementById("write-panels");
+writePanels.forEach(cfg => renderSimplePanel(writeHost, cfg));
+
+const queryHost = document.getElementById("query-panels");
+queryPanels.forEach(cfg => renderPatternPanel(queryHost, cfg));
+renderSimplePanel(queryHost, chainedPanel);
+
+const decodeHost = document.getElementById("decode-panels");
+decodePanels.forEach(cfg => renderSimplePanel(decodeHost, cfg));
+
+// from_bytes stat + serialize interaction effects, folded into the write section as a table
+(function renderInteractions(){
+  const panel = document.createElement("div");
+  panel.className = "panel";
+  panel.innerHTML = `<h3>Interaction effects</h3><p class="note">Two combinations that don't reduce to a single axis: a dictionary layout's index holds codes rather than term strings, and an unsorted builder never stamps a sortedness marker.</p>`;
+  const rows = [
+    { name:"Dictionary + by-copy index", id:"serialize::sorted_stream_dictionary_by_copy",
+      refs:[["dictionary alone","serialize::sorted_stream_dictionary_no_index"], ["by-copy alone","serialize::sorted_stream_default_by_copy"]] },
+    { name:"Unsorted + by-copy index", id:"serialize::unsorted_default_by_copy",
+      refs:[["unsorted alone","serialize::unsorted_default_no_index"], ["by-copy alone","serialize::sorted_stream_default_by_copy"]] },
+  ];
+  const table = document.createElement("table");
+  table.className = "interact-table";
+  table.innerHTML = "<thead><tr><th>Configuration</th><th>Median</th><th>vs. each axis alone</th></tr></thead>";
+  const tbody = document.createElement("tbody");
+  for (const r of rows){
+    const rec = get(r.id);
+    if (!rec) continue;
+    const tr = document.createElement("tr");
+    const tdName = document.createElement("td"); tdName.textContent = r.name;
+    const tdVal = document.createElement("td"); tdVal.className="num"; tdVal.textContent = rec.median;
+    const tdRefs = document.createElement("td"); tdRefs.className="num";
+    tdRefs.textContent = r.refs.map(([label,id]) => {
+      const refRec = get(id);
+      return refRec ? `${fmtRatio(rec.median_ns, refRec.median_ns)} of ${label} (${refRec.median})` : "";
+    }).join("  ·  ");
+    tr.append(tdName, tdVal, tdRefs);
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  panel.appendChild(table);
+  writeHost.appendChild(panel);
+})();
+
+// ---- KPI strip ----
+(function renderKpis(){
+  const host = document.getElementById("kpi-row");
+  const withMedian = DATA.filter(d => d.median_ns != null);
+  const fastest = withMedian.reduce((a,b) => a.median_ns < b.median_ns ? a : b);
+  const slowest = withMedian.reduce((a,b) => a.median_ns > b.median_ns ? a : b);
+  const tiles = [
+    { label:"Dataset size", value:"100,000", sub:"generated quads" },
+    { label:"Benchmarks", value:String(DATA.length), sub:"leaf measurements" },
+    { label:"Samples / benchmark", value:String(DATA[0].samples), sub:"iterations" },
+    { label:"Fastest op", value:fastest.median, sub:fastest.id },
+    { label:"Slowest op", value:slowest.median, sub:slowest.id },
+  ];
+  for (const t of tiles){
+    const el = document.createElement("div");
+    el.className = "kpi";
+    el.innerHTML = `<span class="label">${t.label}</span><span class="value mono">${t.value}</span><span class="sub mono">${t.sub}</span>`;
+    host.appendChild(el);
+  }
+})();
+
+// ---- data table ----
+(function renderTable(){
+  const tbody = document.querySelector("#data-table tbody");
+  const countEl = document.getElementById("table-count");
+  const filterEl = document.getElementById("table-filter");
+  let sortKey = "median_ns", sortDir = 1;
+  let filterText = "";
+
+  function draw(){
+    const rows = DATA
+      .filter(d => d.id.toLowerCase().includes(filterText))
+      .sort((a,b) => {
+        const av = a[sortKey], bv = b[sortKey];
+        if (av == null && bv == null) return 0;
+        if (av == null) return 1;
+        if (bv == null) return -1;
+        if (typeof av === "string") return sortDir * av.localeCompare(bv);
+        return sortDir * (av - bv);
+      });
+    tbody.innerHTML = "";
+    for (const d of rows){
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td class="name">${d.id}</td>
+        <td class="num">${d.fastest||""}</td>
+        <td class="num">${d.slowest||""}</td>
+        <td class="num">${d.median||""}</td>
+        <td class="num">${d.mean||""}</td>
+        <td class="num">${d.samples||""}</td>`;
+      tbody.appendChild(tr);
+    }
+    countEl.textContent = rows.length + " / " + DATA.length + " rows";
+    document.querySelectorAll("#data-table th").forEach(th => {
+      th.querySelector(".arrow")?.remove();
+      if (th.dataset.key === sortKey){
+        const arrow = document.createElement("span");
+        arrow.className = "arrow";
+        arrow.textContent = sortDir === 1 ? "↑" : "↓";
+        th.appendChild(arrow);
+      }
+    });
+  }
+
+  document.querySelectorAll("#data-table th").forEach(th => {
+    const activate = () => {
+      const key = th.dataset.key;
+      if (key === sortKey) sortDir *= -1; else { sortKey = key; sortDir = 1; }
+      draw();
+    };
+    th.addEventListener("click", activate);
+    th.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); activate(); }
+    });
+  });
+  filterEl.addEventListener("input", () => { filterText = filterEl.value.trim().toLowerCase(); draw(); });
+
+  draw();
+})();
+
+// ---- provenance ----
+document.getElementById("provenance").textContent = __PROVENANCE__;
+</script>

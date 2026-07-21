@@ -2,13 +2,17 @@
 name = "vortex-rdf-cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description.workspace = true
+readme.workspace = true
+description = "Command-line interface for converting and querying RDF data in the Vortex-RDF columnar format"
+keywords = ["rdf", "vortex", "cli", "columnar", "semantic-web"]
+categories = ["command-line-utilities"]
 
 [dependencies]
-vortex-rdf-core.workspace = true
+vortex-rdf-core = { workspace = true, features = ["mimalloc"] }
 clap.workspace = true
 oxrdf.workspace = true
 oxrdfio.workspace = true
@@ -17,8 +21,7 @@ vortex-array.workspace = true
 vortex-ipc.workspace = true
 vortex-session.workspace = true
 vortex.workspace = true
-mimalloc.workspace = true
 tokio = { workspace = true, features = ["full"] }
 futures.workspace = true
-env_logger = "0.11.10"
-log = "0.4.29"
+env_logger = "0.11.11"
+log = "0.4.33"

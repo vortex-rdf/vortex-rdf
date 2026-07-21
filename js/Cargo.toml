@@ -6,6 +6,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description.workspace = true
+# This crate is built with wasm-pack and published to npm, not crates.io.
+publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -13,16 +15,17 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 vortex-rdf-core = { path = "../core", default-features = false }
 wasm-bindgen.workspace = true
-wasm-bindgen-futures = "0.4.71"
+wasm-bindgen-futures = "0.4.76"
 js-sys.workspace = true
 futures.workspace = true
 console_error_panic_hook.workspace = true
-getrandom = { workspace = true, features = ["wasm_js"] }
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
+getrandom_04 = { package = "getrandom", version = "0.4.3", features = ["wasm_js"] }
 oxrdf.workspace = true
 oxrdfio.workspace = true
 vortex-array.workspace = true
 vortex.workspace = true
 
 [dependencies.web-sys]
-version = "0.3.98"
+version = "0.3.103"
 features = ["console"]

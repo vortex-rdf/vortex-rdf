@@ -2,10 +2,14 @@
 name = "vortex-rdf-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 # The format engine
@@ -20,6 +24,7 @@ vortex-mask.workspace = true
 vortex-layout.workspace = true
 vortex-file.workspace = true
 vortex-scan.workspace = true
+vortex-buffer.workspace = true
 vortex-btrblocks = { workspace = true }
 
 tokio.workspace = true
@@ -31,24 +36,29 @@ oxrdfio.workspace = true
 # Utilities
 itertools.workspace = true
 thiserror.workspace = true
+uuid = { version = "1", features = ["v4"] }
+rkyv = { version = "0.8.17", features = ["std", "bytecheck"] }
+serde = { version = "1.0", features = ["derive"] }
 
 futures.workspace = true
-log = "0.4.29"
+log = "0.4.33"
 clap.workspace = true
-mimalloc.workspace = true
+web-time = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+mimalloc = { workspace = true, optional = true }
 
 [features]
 default = ["file-io"]
-file-io = ["vortex-io/tokio", "vortex/zstd", "vortex/files"]
+file-io = ["vortex-io/tokio", "vortex/zstd", "vortex/files", "vortex-file/tokio", "tokio/fs"]
+# Opt-in: let a binary that depends on this crate have it install mimalloc as
+# the process's global allocator, instead of picking one itself.
+mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
 divan = { version = "*", package = "codspeed-divan-compat" }
 tokio = { workspace = true, features = ["time", "rt-multi-thread"] }
 
 [[bench]]
-name = "simple_dict_bench"
-harness = false
-
-[[bench]]
-name = "chained_hash_bench"
+name = "benchmark"
 harness = false

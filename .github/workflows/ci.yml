@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  rust-tests:
+    name: Rust Tests (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: workspace
+            command: cargo test --workspace
+          - label: core-no-default-features
+            command: cargo test -p vortex-rdf-core --no-default-features
+    steps:
+      - uses: actions/checkout@v5
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Run Rust tests
+        run: ${{ matrix.command }}
+
+  js-tests:
+    name: JS Tests
+    runs-on: ubuntu-latest
+    env:
+      # 1. Force the compiler to use a single code generation thread (Massive memory saver)
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+      # 2. Tell the compiler to prioritize binary size/memory reduction over raw execution speed
+      # "s" optimizes for size; "z" optimizes for size even further
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "s"
+      # 3. Limit parallel crate compilation threads so multiple dependencies don't compile at once
+      CARGO_BUILD_JOBS: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: js/package-lock.json
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: js
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Install dependencies
+        working-directory: js
+        run: npm ci
+      - name: Build WASM package
+        working-directory: js
+        run: npm run build:node
+      - name: Run tests
+        working-directory: js
+        run: npm test
