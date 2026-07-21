@@ -24,7 +24,7 @@ vortex-io = "0.78.0"
 vortex-session = "0.78.0"
 vortex-fsst = "0.78.0"
 vortex-mask = "0.78.0"
-vortex-file = { version = "0.78.0" }
+vortex-file = { version = "0.79.0" }
 vortex-scan = "0.78.0"
 vortex-layout = "0.78.0"
 vortex-buffer = "0.78.0"
