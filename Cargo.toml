@@ -18,7 +18,7 @@ categories = ["database-implementations", "encoding", "data-structures"]
 vortex-rdf-core = { path = "core", version = "0.1.0" }
 vortex = { version = "0.78.0", default-features = false }
 vortex-array = { version = "0.78.0" }
-vortex-error = "0.78.0"
+vortex-error = "0.79.0"
 vortex-ipc = "0.78.0"
 vortex-io = "0.78.0"
 vortex-session = "0.78.0"
