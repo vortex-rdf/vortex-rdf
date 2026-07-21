@@ -56,7 +56,7 @@ file-io = ["vortex-io/tokio", "vortex/zstd", "vortex/files", "vortex-file/tokio"
 mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
-divan = { version = "*", package = "codspeed-divan-compat" }
+divan = { version = "5.0.1", package = "codspeed-divan-compat" }
 tokio = { workspace = true, features = ["time", "rt-multi-thread"] }
 
 [[bench]]
