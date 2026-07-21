@@ -28,7 +28,7 @@ vortex-file = { version = "0.78.0" }
 vortex-scan = "0.78.0"
 vortex-layout = "0.78.0"
 vortex-buffer = "0.78.0"
-vortex-btrblocks = "0.78.0"
+vortex-btrblocks = "0.79.0"
 
 tokio = { version = "1.52", features = ["sync", "macros", "rt"] }
 futures = "0.3.32"
