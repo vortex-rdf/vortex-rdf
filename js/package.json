@@ -29,7 +29,7 @@
         "@types/node": "^26.1.1",
         "rdf-data-factory": "^2.0.2",
         "typescript": "^7.0.2",
-        "vitest": "^4.1.8",
+        "vitest": "^4.1.10",
         "wasm-pack": "^0.15.0"
     }
 }
