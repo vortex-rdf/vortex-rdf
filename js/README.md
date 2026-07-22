@@ -15,6 +15,30 @@ High-performance, columnar RDF storage and serialization for Node.js and the Web
 npm install vortex-rdf
 ```
 
+The package is ESM-only (no CommonJS `require`) and works identically in
+Node.js and browsers — the same `import` statement resolves to a Node-specific
+entry point or a browser one depending on where it runs, so there's no
+environment-specific code to write:
+
+```javascript
+// Works unchanged whether this file is loaded by Node, or bundled by
+// Vite/webpack/Rollup for the browser, or loaded directly via a
+// <script type="module"> from a CDN.
+import { VortexStore } from 'vortex-rdf';
+
+const store = await VortexStore.fromString(ttlData, 'turtle');
+```
+
+Under the hood, a single `wasm-pack --target web` build backs both: the Node
+entry point reads the `.wasm` file straight off disk (`node:fs`), and the
+browser entry point uses the standard `fetch`-based loading that bundlers and
+browsers already understand via `import.meta.url`. Both call the WASM module's
+async initialization for you, so there's no `init()` to await yourself.
+
+> **Bundler note:** both entry points use top-level `await`. Vite and Rollup
+> support this by default; webpack 5 needs
+> `experiments: { topLevelAwait: true }` enabled in its config.
+
 ## Usage
 
 ### Loading data
@@ -173,18 +197,22 @@ for (const quad of await matches.values()) {
 
 ## Building
 
-This package is built using [wasm-pack](https://rustwasm.github.io/wasm-pack/).
+This package is built using [wasm-pack](https://rustwasm.github.io/wasm-pack/),
+targeting `web` — the same wasm build is shared by both environments:
 
 ```bash
-# Build for Node.js
-npm run build:node
-
-# Build for the Web
-npm run build:web
+# Build the wasm module (writes to pkg/web/)
+npm run build
 
 # Run the test suite (requires a build first)
 npm test
 ```
+
+`entry/node.js` and `entry/browser.js` are small, hand-written wrappers around
+that single build — they differ only in how they supply the `.wasm` bytes to
+the generated `init()` (a direct file read vs. the default `fetch`-based
+path), and `package.json`'s `exports` map picks the right one per environment.
+There's no separate Node-targeted wasm build to maintain.
 
 ## License
 

@@ -5,7 +5,7 @@ import {
     init_panic_hook,
     nquads_to_vortex,
     vortex_to_nquads
-} from '../pkg/vortex_rdf.js';
+} from '../entry/node.js';
 
 const df = new DataFactory();
 

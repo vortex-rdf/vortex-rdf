@@ -1,5 +1,6 @@
 import { describe, test, expect } from 'vitest';
 import { DataFactory } from 'rdf-data-factory';
+import { Readable } from 'node:stream';
 import {
     VortexStore,
     init_panic_hook,
@@ -8,7 +9,7 @@ import {
     nquads_to_vortex,
     vortex_to_nquads,
     type BuildOptions,
-} from '../pkg/vortex_rdf.js';
+} from '../entry/node.js';
 
 const df = new DataFactory();
 
@@ -143,6 +144,32 @@ describe('build variants', () => {
             });
         });
     }
+});
+
+describe('fromQuads with an RDF/JS Stream', () => {
+    test('accepts a Node Readable in object mode', async () => {
+        const viaString = await VortexStore.fromString(NQUADS, 'nquads');
+        const quads = [...(await viaString.values() as any)];
+        expect(quads.length).toBe(6);
+
+        const stream = Readable.from(quads, { objectMode: true });
+        const viaStream = await VortexStore.fromQuads(stream as any);
+        expect(await viaStream.size()).toBe(6);
+
+        const p1 = await viaStream.match(null, df.namedNode('http://example.org/p1'), null, null);
+        expect(await p1.size()).toBe(3);
+    });
+
+    test('propagates a stream error', async () => {
+        const stream = new Readable({
+            objectMode: true,
+            read() {
+                this.emit('error', new Error('boom'));
+            },
+        });
+
+        await expect(VortexStore.fromQuads(stream as any)).rejects.toThrow(/boom/);
+    });
 });
 
 describe('RDF format support', () => {

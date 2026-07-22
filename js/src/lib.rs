@@ -1,3 +1,4 @@
+use futures::channel::mpsc;
 use futures::{Stream, StreamExt, stream};
 use js_sys::{Object, Reflect};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
@@ -5,7 +6,7 @@ use oxrdfio::RdfFormat;
 use std::io::Cursor;
 use vortex_array::{ArrayRef, IntoArray, RecursiveCanonical, VortexSessionExecute};
 use vortex_rdf_core::common::utils::parse_quads_from_reader;
-use vortex_rdf_core::error::Result as CoreResult;
+use vortex_rdf_core::error::{Result as CoreResult, VortexRdfError};
 use vortex_rdf_core::io::{
     VORTEX_LIGHT_SESSION, array_from_ipc_reader, deserialize, write_array_to_ipc,
 };
@@ -17,7 +18,7 @@ use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(typescript_custom_section)]
 const TS_APPEND_CONTENT: &'static str = r#"
-import { Quad, Term, NamedNode, BlankNode, Literal, Quad_Subject, Quad_Predicate, Quad_Object, Quad_Graph } from '@rdfjs/types';
+import { Quad, Term, NamedNode, BlankNode, Literal, Quad_Subject, Quad_Predicate, Quad_Object, Quad_Graph, Stream } from '@rdfjs/types';
 
 /**
  * How quads are ordered while the columnar array is built.
@@ -81,7 +82,8 @@ export class VortexStore {
     static empty(): VortexStore;
     static fromBytes(bytes: Uint8Array): Promise<VortexStore>;
     static fromString(input: string, format: RdfFormatName, options?: BuildOptionsInput): Promise<VortexStore>;
-    static fromQuads(quads: Quad[], options?: BuildOptionsInput): Promise<VortexStore>;
+    /** `quads` may be an array, or an RDF/JS `Stream<Quad>` (a Node-style event emitter). */
+    static fromQuads(quads: Quad[] | Stream<Quad>, options?: BuildOptionsInput): Promise<VortexStore>;
 
     /** The layout this store's columns are encoded with. */
     layout(): LayoutStrategy;
@@ -155,15 +157,13 @@ impl VortexStore {
         Ok(VortexStore { inner })
     }
 
-    /// Build directly from RDF/JS quads, skipping a serialize/parse round-trip.
+    /// Build directly from RDF/JS quads — either an array or a `Stream<Quad>`
+    /// (a Node-style event emitter) — skipping a serialize/parse round-trip.
     #[wasm_bindgen(js_name = fromQuads, skip_typescript)]
-    pub async fn from_quads(
-        quads: js_sys::Array,
-        options: JsValue,
-    ) -> Result<VortexStore, JsValue> {
+    pub async fn from_quads(quads: JsValue, options: JsValue) -> Result<VortexStore, JsValue> {
         let config = parse_build_options(options)?;
-        let quads = js_array_to_quads(quads)?;
-        let vortex_array = build_array(stream::iter(quads.into_iter().map(Ok)), config).await?;
+        let quad_stream = js_to_quad_stream(quads)?;
+        let vortex_array = build_array(quad_stream, config).await?;
 
         let inner =
             VortexRdfStore::new(vortex_array).map_err(|e| JsValue::from_str(&e.to_string()))?;
@@ -550,6 +550,83 @@ fn js_array_to_quads(quads: js_sys::Array) -> Result<Vec<Quad>, JsValue> {
                 .ok_or_else(|| JsValue::from_str(&format!("Invalid quad object at index {}", i)))
         })
         .collect()
+}
+
+/// A quad stream boxed for `build_array`, whichever of the two `fromQuads`
+/// input shapes it came from.
+type BoxedQuadStream = Box<dyn Stream<Item = CoreResult<Quad>> + Unpin + Send>;
+
+/// Accept either shape `fromQuads` allows: a plain array (eagerly validated
+/// and wrapped in `stream::iter`), or an RDF/JS `Stream<Quad>` (consumed
+/// through its event-emitter interface).
+fn js_to_quad_stream(value: JsValue) -> Result<BoxedQuadStream, JsValue> {
+    if js_sys::Array::is_array(&value) {
+        let quads = js_array_to_quads(js_sys::Array::from(&value))?;
+        let stream: BoxedQuadStream =
+            Box::new(stream::iter(quads.into_iter().map(Ok::<Quad, VortexRdfError>)));
+        return Ok(stream);
+    }
+    rdfjs_stream_to_quads(value)
+}
+
+/// Consume an RDF/JS `Stream<Quad>` — a Node-style event emitter with
+/// `'data'`/`'end'`/`'error'` events — by registering listeners that forward
+/// each event into an unbounded channel, and handing back the receiving end
+/// as a plain Rust stream.
+///
+/// The listeners are intentionally leaked (`Closure::forget`): `fromQuads` is
+/// called once per stream and the callbacks must stay valid for as long as
+/// the JS source stream can still fire events, which for a one-shot event
+/// listener has no natural Rust-side owner to drop them. Without an explicit
+/// `close_channel()` on `'end'`, the receiver would otherwise wait forever
+/// for a value that will never come.
+fn rdfjs_stream_to_quads(stream_val: JsValue) -> Result<BoxedQuadStream, JsValue> {
+    let on = Reflect::get(&stream_val, &"on".into())
+        .ok()
+        .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+        .ok_or_else(|| {
+            JsValue::from_str(
+                "fromQuads expects an array of quads or an RDF/JS Stream \
+                 (an object with an 'on' method)",
+            )
+        })?;
+
+    let (tx, rx) = mpsc::unbounded::<CoreResult<Quad>>();
+
+    let tx_data = tx.clone();
+    let on_data = Closure::wrap(Box::new(move |quad_js: JsValue| {
+        let item = js_to_quad(quad_js).ok_or_else(|| {
+            VortexRdfError::Deserialization("Invalid quad object in RDF/JS stream".to_string())
+        });
+        let _ = tx_data.unbounded_send(item);
+    }) as Box<dyn FnMut(JsValue)>);
+
+    let tx_error = tx.clone();
+    let on_error = Closure::wrap(Box::new(move |err: JsValue| {
+        let message = err
+            .as_string()
+            .or_else(|| Reflect::get(&err, &"message".into()).ok()?.as_string())
+            .unwrap_or_else(|| "RDF/JS stream error".to_string());
+        let _ = tx_error.unbounded_send(Err(VortexRdfError::Deserialization(message)));
+    }) as Box<dyn FnMut(JsValue)>);
+
+    let tx_end = tx;
+    let on_end = Closure::wrap(Box::new(move || {
+        tx_end.close_channel();
+    }) as Box<dyn FnMut()>);
+
+    on.call2(&stream_val, &"data".into(), on_data.as_ref())
+        .map_err(|_| JsValue::from_str("Failed to attach a 'data' listener to the stream"))?;
+    on.call2(&stream_val, &"error".into(), on_error.as_ref())
+        .map_err(|_| JsValue::from_str("Failed to attach an 'error' listener to the stream"))?;
+    on.call2(&stream_val, &"end".into(), on_end.as_ref())
+        .map_err(|_| JsValue::from_str("Failed to attach an 'end' listener to the stream"))?;
+
+    on_data.forget();
+    on_error.forget();
+    on_end.forget();
+
+    Ok(Box::new(rx))
 }
 
 fn term_to_js(term: &Term) -> JsValue {

@@ -2,16 +2,28 @@
     "name": "vortex-rdf",
     "version": "0.1.0",
     "description": "High-performance, columnar RDF serialization format",
-    "main": "pkg/vortex_rdf.js",
-    "types": "pkg/vortex_rdf.d.ts",
+    "type": "module",
+    "main": "./entry/browser.js",
+    "types": "./pkg/web/vortex_rdf.d.ts",
+    "exports": {
+        ".": {
+            "types": "./pkg/web/vortex_rdf.d.ts",
+            "node": "./entry/node.js",
+            "browser": "./entry/browser.js",
+            "default": "./entry/browser.js"
+        }
+    },
     "files": [
-        "pkg/vortex_rdf_bg.wasm",
-        "pkg/vortex_rdf.js",
-        "pkg/vortex_rdf.d.ts"
+        "entry/node.js",
+        "entry/browser.js",
+        "pkg/web/vortex_rdf.js",
+        "pkg/web/vortex_rdf.d.ts",
+        "pkg/web/vortex_rdf_bg.wasm",
+        "pkg/web/vortex_rdf_bg.wasm.d.ts"
     ],
     "scripts": {
-        "build:node": "wasm-pack build --target nodejs --out-dir pkg",
-        "build:web": "wasm-pack build --target web --out-dir pkg",
+        "build:wasm": "wasm-pack build --target web --out-dir pkg/web",
+        "build": "npm run build:wasm",
         "test": "vitest run"
     },
     "keywords": [
