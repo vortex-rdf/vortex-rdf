@@ -1,7 +1,7 @@
 import { describe, test, expect } from 'vitest';
 import { DataFactory } from "rdf-data-factory";
 import {
-    VortexStore,
+    VortexRdfStore,
     init_panic_hook,
     nquads_to_vortex,
     vortex_to_nquads
@@ -12,9 +12,16 @@ const df = new DataFactory();
 // Initialize panic hook for better error messages
 init_panic_hook();
 
-describe('VortexStore basic operations', () => {
+/** Drain the quads of a match() result (via its Symbol.asyncIterator) into an array. */
+async function collect(stream: any): Promise<any[]> {
+    const out: any[] = [];
+    for await (const quad of stream) out.push(quad);
+    return out;
+}
+
+describe('VortexRdfStore basic operations', () => {
     test('create empty store', async () => {
-        const store = VortexStore.empty();
+        const store = VortexRdfStore.empty();
         expect(await store.size()).toBe(0);
     });
 
@@ -24,38 +31,64 @@ describe('VortexStore basic operations', () => {
             <http://example.org/s1> <http://example.org/p2> "o2" .
             <http://example.org/s2> <http://example.org/p1> "o3" .
         `;
-        const store = await VortexStore.fromString(ttl, "turtle");
+        const store = await VortexRdfStore.fromString(ttl, "turtle");
         expect(await store.size()).toBe(3);
     });
 
-    test('match and iteration', async () => {
+    test('match streams the matching quads (Source.match)', async () => {
         const ttl = `
             <http://example.org/s1> <http://example.org/p1> "o1" .
             <http://example.org/s1> <http://example.org/p2> "o2" .
             <http://example.org/s2> <http://example.org/p1> "o3" .
         `;
-        const store = await VortexStore.fromString(ttl, "turtle");
+        const store = await VortexRdfStore.fromString(ttl, "turtle");
 
-        // Match ?s <p1> ?o
-        const matches = await store.match(null, df.namedNode("http://example.org/p1"), null, null);
-        expect(await matches.size()).toBe(2);
-
-        const iterator = await matches.values();
-        const results: any[] = [];
-        for (const quad of iterator as any) {
-            results.push(quad);
-        }
-
+        // Match ?s <p1> ?o — `match` returns synchronously; the Stream<Quad>
+        // also supports `for await` (Symbol.asyncIterator).
+        const results = await collect(store.match(null, df.namedNode("http://example.org/p1"), null, null));
         expect(results.length).toBe(2);
 
-        // Assert contents
         const subjects = results.map(q => q.subject.value);
         expect(subjects).toContain('http://example.org/s1');
         expect(subjects).toContain('http://example.org/s2');
     });
 
+    test('match result is also an RDF/JS Stream (data/end events)', async () => {
+        const ttl = `
+            <http://example.org/s1> <http://example.org/p1> "o1" .
+            <http://example.org/s2> <http://example.org/p1> "o3" .
+        `;
+        const store = await VortexRdfStore.fromString(ttl, "turtle");
+
+        const stream = store.match(null, df.namedNode("http://example.org/p1"), null, null);
+        const got = await new Promise<any[]>((resolve, reject) => {
+            const acc: any[] = [];
+            stream.on('data', (q: any) => acc.push(q));
+            stream.on('end', () => resolve(acc));
+            stream.on('error', reject);
+        });
+        expect(got.length).toBe(2);
+    });
+
+    test('getQuads materializes the matching quads into an array', async () => {
+        const ttl = `
+            <http://example.org/s1> <http://example.org/p1> "o1" .
+            <http://example.org/s1> <http://example.org/p2> "o2" .
+            <http://example.org/s2> <http://example.org/p1> "o3" .
+        `;
+        const store = await VortexRdfStore.fromString(ttl, "turtle");
+
+        const quads = await store.getQuads(null, df.namedNode("http://example.org/p1"), null, null);
+        expect(quads.length).toBe(2);
+        expect(quads.map(q => q.subject.value).sort())
+            .toEqual(['http://example.org/s1', 'http://example.org/s2']);
+
+        // No pattern → every quad.
+        expect((await store.getQuads()).length).toBe(3);
+    });
+
     test('add and delete quads', async () => {
-        const store = VortexStore.empty();
+        const store = VortexRdfStore.empty();
         expect(await store.size()).toBe(0);
 
         const quad = {
@@ -98,17 +131,17 @@ describe('Builder strategies', () => {
     ] as const;
 
     for (const strategy of supportedStrategies) {
-        test(`VortexStore.fromString with ${strategy}`, async () => {
+        test(`VortexRdfStore.fromString with ${strategy}`, async () => {
             const ttl = `
                 <http://example.org/s1> <http://example.org/p1> "o1" .
                 <http://example.org/s1> <http://example.org/p2> "o2" .
                 <http://example.org/s2> <http://example.org/p1> "o3" .
             `;
-            const store = await VortexStore.fromString(ttl, "turtle", strategy);
+            const store = await VortexRdfStore.fromString(ttl, "turtle", strategy);
             expect(await store.size()).toBe(3);
 
-            const matches = await store.match(null, df.namedNode("http://example.org/p1"), null, null);
-            expect(await matches.size()).toBe(2);
+            const matches = await store.getQuads(null, df.namedNode("http://example.org/p1"), null, null);
+            expect(matches.length).toBe(2);
         });
 
         test(`nquads_to_vortex with ${strategy}`, async () => {

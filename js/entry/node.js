@@ -10,7 +10,7 @@ const wasmPath = fileURLToPath(new URL('../pkg/web/vortex_rdf_bg.wasm', import.m
 await init({ module_or_path: await readFile(wasmPath) });
 
 export {
-    VortexStore,
+    VortexRdfStore,
     init_panic_hook,
     rdf_to_vortex,
     vortex_to_rdf,

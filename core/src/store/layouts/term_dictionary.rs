@@ -154,6 +154,19 @@ impl TermDictionary {
         &self.terms
     }
 
+    /// Decode a code back to its term string (canonical N-Triples form), or
+    /// `None` if the code is out of the dictionary's range. Zero-copy read of
+    /// the term bytes; the returned `String` is the single owned copy.
+    pub(crate) fn term_at(&self, code: u32) -> Option<String> {
+        let i = code as usize;
+        if i < self.len() {
+            let buf = self.terms.bytes_at(i);
+            std::str::from_utf8(buf.as_ref()).ok().map(str::to_owned)
+        } else {
+            None
+        }
+    }
+
     /// Materialize a temporary O(1) lookup table for bulk encoding.
     ///
     /// Query-side lookups remain binary searches over the compact dictionary,

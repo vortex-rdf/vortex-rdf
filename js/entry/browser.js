@@ -8,7 +8,7 @@ import init from '../pkg/web/vortex_rdf.js';
 await init();
 
 export {
-    VortexStore,
+    VortexRdfStore,
     init_panic_hook,
     rdf_to_vortex,
     vortex_to_rdf,

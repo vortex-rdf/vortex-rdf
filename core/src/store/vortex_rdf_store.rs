@@ -761,6 +761,54 @@ impl VortexRdfStore {
         self.layout.strategy()
     }
 
+    /// Decode a Dictionary-layout term code back to its N-Triples term string.
+    ///
+    /// Returns `None` when this store is not Dictionary-layout, or the code is
+    /// out of the term dictionary's range. The code space is the store's cached
+    /// dictionary, so codes obtained from this store's arrays (e.g. via
+    /// [`get_quads_array`](Self::get_quads_array)) decode consistently here.
+    pub fn decode_code(&self, code: u32) -> Option<String> {
+        match &self.layout {
+            ResolvedLayout::Dictionary(dict) => dict.term_at(code),
+            _ => None,
+        }
+    }
+
+    /// Encode an N-Triples term string to its Dictionary-layout code (its
+    /// position in the sorted dictionary), or `None` when this store is not
+    /// Dictionary-layout or the term is absent. The inverse of
+    /// [`decode_code`](Self::decode_code); a binary search over the dictionary.
+    pub fn encode_code(&self, term: &str) -> Option<u32> {
+        match &self.layout {
+            ResolvedLayout::Dictionary(dict) => dict.get_id(term),
+            _ => None,
+        }
+    }
+
+    /// The whole sorted term dictionary packed for zero-copy transfer: a length
+    /// array of `n + 1` prefix-sum byte offsets and a single concatenated bytes
+    /// buffer (`term i = bytes[offsets[i]..offsets[i + 1]]`). `None` when this
+    /// store is not Dictionary-layout. Consumers ship these two buffers across
+    /// the FFI/wasm boundary once and decode any term host-side without a
+    /// per-term round trip.
+    pub fn dictionary_buffers(&self) -> Option<(Vec<u32>, Vec<u8>)> {
+        match &self.layout {
+            ResolvedLayout::Dictionary(dict) => {
+                let n = dict.len();
+                let view = dict.view();
+                let mut offsets = Vec::with_capacity(n + 1);
+                let mut bytes = Vec::new();
+                offsets.push(0u32);
+                for i in 0..n {
+                    bytes.extend_from_slice(view.bytes_at(i).as_ref());
+                    offsets.push(bytes.len() as u32);
+                }
+                Some((offsets, bytes))
+            }
+            _ => None,
+        }
+    }
+
     /// Gather the rows this view selects into a single in-memory StructArray.
     ///
     /// Index columns survive only when the view still *is* its base (an
