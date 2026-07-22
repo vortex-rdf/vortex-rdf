@@ -1,17 +1,37 @@
 {
-    "name": "vortex-rdf",
+    "name": "@vortex-rdf/vortex-rdf-store",
     "version": "0.1.0",
-    "description": "High-performance, columnar RDF serialization format",
-    "main": "pkg/vortex_rdf.js",
-    "types": "pkg/vortex_rdf.d.ts",
+    "description": "High-performance, zero-copy columnar RDF serialization format",
+    "type": "module",
+    "publishConfig": {
+        "access": "public"
+    },
+    "main": "./entry/browser.js",
+    "types": "./pkg/web/vortex_rdf.d.ts",
+    "exports": {
+        ".": {
+            "types": "./pkg/web/vortex_rdf.d.ts",
+            "node": "./entry/node.js",
+            "browser": "./entry/browser.js",
+            "default": "./entry/browser.js"
+        }
+    },
     "files": [
-        "pkg/vortex_rdf_bg.wasm",
-        "pkg/vortex_rdf.js",
-        "pkg/vortex_rdf.d.ts"
+        "entry/node.js",
+        "entry/node.d.ts",
+        "entry/browser.js",
+        "entry/browser.d.ts",
+        "pkg/web/vortex_rdf.js",
+        "pkg/web/vortex_rdf.d.ts",
+        "pkg/web/vortex_rdf_bg.wasm",
+        "pkg/web/vortex_rdf_bg.wasm.d.ts",
+        "pkg/web/snippets/**"
     ],
     "scripts": {
-        "build:node": "wasm-pack build --target nodejs --out-dir pkg",
-        "build:web": "wasm-pack build --target web --out-dir pkg",
+        "build:wasm": "wasm-pack build --target web --out-dir pkg/web --no-pack",
+        "build:clean-manifest": "node -e \"require('fs').rmSync('pkg/web/package.json',{force:true})\"",
+        "build": "npm run build:wasm && npm run build:clean-manifest",
+        "prepublishOnly": "npm run build",
         "test": "vitest run"
     },
     "keywords": [
@@ -25,11 +45,13 @@
     "author": "Julián Rojas",
     "license": "MIT",
     "devDependencies": {
-        "@rdfjs/types": "^2.0.1",
         "@types/node": "^26.1.1",
         "rdf-data-factory": "^2.0.2",
         "typescript": "^7.0.2",
         "vitest": "^4.1.10",
         "wasm-pack": "^0.15.0"
+    },
+    "dependencies": {
+        "@rdfjs/types": "^2.0.1"
     }
 }

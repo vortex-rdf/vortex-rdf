@@ -1,23 +1,48 @@
+use futures::channel::mpsc;
 use futures::{Stream, StreamExt, stream};
 use js_sys::{Object, Reflect};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use oxrdfio::RdfFormat;
+use std::cell::RefCell;
 use std::io::Cursor;
+use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::{ArrayRef, IntoArray, RecursiveCanonical, VortexSessionExecute};
 use vortex_rdf_core::common::utils::parse_quads_from_reader;
-use vortex_rdf_core::error::Result as CoreResult;
+use vortex_rdf_core::error::{Result as CoreResult, VortexRdfError};
 use vortex_rdf_core::io::{
     VORTEX_LIGHT_SESSION, array_from_ipc_reader, deserialize, write_array_to_ipc,
 };
 use vortex_rdf_core::{
     BuilderStrategy, IndexType, Indexes, LayoutStrategy, SortedInMemoryBuilder,
-    UnsortedStreamBuilder, VortexRdfStore,
+    UnsortedStreamBuilder, VortexRdfStore as CoreStore,
 };
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::future_to_promise;
+
+// The lazy RDF/JS read model (LazyQuad/LazyTerm + stream) lives in a local
+// snippet (copied verbatim into the generated pkg; no runtime npm dependency).
+// See js/js-snippets/lazy-rdf.js.
+#[wasm_bindgen(module = "/js-snippets/lazy-rdf.js")]
+extern "C" {
+    /// Wrap the packed dictionary buffers into a `LazyDict` (decodes a term code
+    /// to its string host-side, interned). Built once per store.
+    #[wasm_bindgen(js_name = makeDictView)]
+    fn make_dict_view(offsets: js_sys::Uint32Array, bytes: js_sys::Uint8Array) -> JsValue;
+
+    /// Build a `LazyQuad[]` from a column payload — for `getQuads`.
+    #[wasm_bindgen(js_name = buildLazyQuads)]
+    fn build_lazy_quads(payload: &JsValue) -> js_sys::Array;
+
+    /// Build a `Stream<LazyQuad>` from a `Promise<payload>` — so `match` returns
+    /// synchronously while resolving its rows lazily.
+    #[wasm_bindgen(js_name = makeLazyQuadStream)]
+    fn make_lazy_quad_stream(payload_promise: &JsValue) -> JsValue;
+}
 
 #[wasm_bindgen(typescript_custom_section)]
 const TS_APPEND_CONTENT: &'static str = r#"
-import { Quad, Term, NamedNode, BlankNode, Literal, Quad_Subject, Quad_Predicate, Quad_Object, Quad_Graph } from '@rdfjs/types';
+import { Quad, Term, NamedNode, BlankNode, Literal, Quad_Subject, Quad_Predicate, Quad_Object, Quad_Graph, Stream } from '@rdfjs/types';
 
 /**
  * How quads are ordered while the columnar array is built.
@@ -68,7 +93,7 @@ export type RdfFormatName =
 export interface BuildOptions {
     /** @default 'Unsorted' */
     builder?: BuilderStrategy;
-    /** @default 'Default' */
+    /** @default 'Dictionary' */
     layout?: LayoutStrategy;
     /** @default [] */
     indexes?: IndexType[];
@@ -77,11 +102,12 @@ export interface BuildOptions {
 /** A bare BuilderStrategy string is accepted as shorthand for `{ builder }`. */
 export type BuildOptionsInput = BuildOptions | BuilderStrategy;
 
-export class VortexStore {
-    static empty(): VortexStore;
-    static fromBytes(bytes: Uint8Array): Promise<VortexStore>;
-    static fromString(input: string, format: RdfFormatName, options?: BuildOptionsInput): Promise<VortexStore>;
-    static fromQuads(quads: Quad[], options?: BuildOptionsInput): Promise<VortexStore>;
+export class VortexRdfStore {
+    static empty(): VortexRdfStore;
+    static fromBytes(bytes: Uint8Array): Promise<VortexRdfStore>;
+    static fromString(input: string, format: RdfFormatName, options?: BuildOptionsInput): Promise<VortexRdfStore>;
+    /** `quads` may be an array, or an RDF/JS `Stream<Quad>` (a Node-style event emitter). */
+    static fromQuads(quads: Quad[] | Stream<Quad>, options?: BuildOptionsInput): Promise<VortexRdfStore>;
 
     /** The layout this store's columns are encoded with. */
     layout(): LayoutStrategy;
@@ -95,9 +121,35 @@ export class VortexStore {
      */
     addQuads(quads: Quad[]): Promise<void>;
     deleteQuad(quad: Quad): Promise<void>;
-    match(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): Promise<VortexStore>;
-    values(): Promise<IterableIterator<Quad>>;
-    /** Serialize to Vortex IPC bytes; read back with `VortexStore.fromBytes`. */
+    /**
+     * Stream the quads matching a pattern (the RDF/JS `Source.match` contract).
+     * Pass `null`/`undefined` for a variable position. Returns **synchronously**
+     * an RDF/JS `Stream<Quad>` (`.on('data'|'end'|'error', …)`, `.read()`) of
+     * lazy `Quad`s: a term's string is decoded from the columnar data only when
+     * its `.value`/`.termType` is read, and never eagerly. The stream also
+     * implements `Symbol.asyncIterator`, so it can be consumed with `for await`
+     * (cast to `AsyncIterable<Quad>` in typed code).
+     */
+    match(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): Stream<Quad>;
+    /**
+     * Materialize the quads matching a pattern into an array of lazy `Quad`s —
+     * the array-returning counterpart of `match`. `async` (returns a `Promise`)
+     * because resolving the match crosses the WebAssembly boundary; the returned
+     * `Quad`s still decode their term strings lazily on access.
+     */
+    getQuads(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): Promise<Quad[]>;
+    /**
+     * Low-level (Dictionary layout only). Resolve a pattern to the matched rows'
+     * raw u32 term codes — four columnar `Uint32Array`s — without materializing
+     * any term strings. Returns `null` if the store is not Dictionary layout.
+     * Resolve codes to terms with `decodeTerm`. `match`/`getQuads` build on this.
+     */
+    matchCodes(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): Promise<{ s: Uint32Array; p: Uint32Array; o: Uint32Array; g: Uint32Array; length: number } | null>;
+    /** Low-level. Decode a Dictionary-layout term code to its N-Triples term string. */
+    decodeTerm(code: number): string | undefined;
+    /** Low-level. Encode an N-Triples term string to its Dictionary-layout code (inverse of decodeTerm). */
+    encodeTerm(term: string): number | undefined;
+    /** Serialize to Vortex IPC bytes; read back with `VortexRdfStore.fromBytes`. */
     toBytes(): Promise<Uint8Array>;
     /** Serialize the quads to an RDF syntax. */
     toRdf(format: RdfFormatName): Promise<string>;
@@ -114,29 +166,68 @@ pub fn init_panic_hook() {
     console_error_panic_hook::set_once();
 }
 
-// ─── VortexStore ─────────────────────────────────────────────────────────────
+// ─── VortexRdfStore ─────────────────────────────────────────────────────────────
 
 #[wasm_bindgen(skip_typescript)]
-pub struct VortexStore {
+pub struct VortexRdfStore {
     #[wasm_bindgen(skip)]
-    pub inner: VortexRdfStore,
+    pub inner: CoreStore,
+    // The store's term dictionary as a JS `LazyDict`, built once on the first
+    // Dictionary-layout read and shared by every LazyTerm this store produces
+    // (their `.equals` fast path keys on its identity). Not exposed to JS.
+    dict_view: RefCell<Option<JsValue>>,
 }
 
-#[wasm_bindgen]
-impl VortexStore {
-    #[wasm_bindgen(skip_typescript)]
-    pub fn empty() -> VortexStore {
-        VortexStore {
-            inner: VortexRdfStore::empty(),
+impl VortexRdfStore {
+    fn wrap(inner: CoreStore) -> Self {
+        Self {
+            inner,
+            dict_view: RefCell::new(None),
         }
     }
 
+    /// The dictionary for decoding a match's `u32` code columns, or `None` when
+    /// the code path does not apply (non-Dictionary layout, or the store carries
+    /// an append tail — appended quads are re-encoded against a *fresh*
+    /// dictionary, so `get_quads_array`'s codes would not match the store's
+    /// cached one; those reads fall back to the always-correct term path).
+    fn code_path_dict(&self) -> Option<JsValue> {
+        if self.inner.tail_len() != 0 {
+            return None;
+        }
+        self.dict_view()
+    }
+
+    /// The store's `LazyDict` (built once from the packed dictionary buffers),
+    /// or `None` when this store is not Dictionary-layout.
+    fn dict_view(&self) -> Option<JsValue> {
+        if let Some(dv) = self.dict_view.borrow().as_ref() {
+            return Some(dv.clone());
+        }
+        let (offsets, bytes) = self.inner.dictionary_buffers()?;
+        let offs = js_sys::Uint32Array::new_with_length(offsets.len() as u32);
+        offs.copy_from(&offsets);
+        let bys = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+        bys.copy_from(&bytes);
+        let dv = make_dict_view(offs, bys);
+        *self.dict_view.borrow_mut() = Some(dv.clone());
+        Some(dv)
+    }
+}
+
+#[wasm_bindgen]
+impl VortexRdfStore {
+    #[wasm_bindgen(skip_typescript)]
+    pub fn empty() -> VortexRdfStore {
+        VortexRdfStore::wrap(CoreStore::empty())
+    }
+
     #[wasm_bindgen(js_name = fromBytes, skip_typescript)]
-    pub async fn from_bytes(bytes: &[u8]) -> Result<VortexStore, JsValue> {
+    pub async fn from_bytes(bytes: &[u8]) -> Result<VortexRdfStore, JsValue> {
         let cursor = Cursor::new(bytes);
         let array = array_from_ipc_reader(cursor).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let inner = VortexRdfStore::new(array).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(VortexStore { inner })
+        let inner = CoreStore::new(array).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(VortexRdfStore::wrap(inner))
     }
 
     #[wasm_bindgen(js_name = fromString, skip_typescript)]
@@ -144,30 +235,26 @@ impl VortexStore {
         input: String,
         format_name: &str,
         options: JsValue,
-    ) -> Result<VortexStore, JsValue> {
+    ) -> Result<VortexRdfStore, JsValue> {
         let format = parse_format(format_name)?;
         let config = parse_build_options(options)?;
         let quads_stream = parse_quads_from_reader(Cursor::new(input), format);
         let vortex_array = build_array(quads_stream, config).await?;
 
-        let inner =
-            VortexRdfStore::new(vortex_array).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(VortexStore { inner })
+        let inner = CoreStore::new(vortex_array).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(VortexRdfStore::wrap(inner))
     }
 
-    /// Build directly from RDF/JS quads, skipping a serialize/parse round-trip.
+    /// Build directly from RDF/JS quads — either an array or a `Stream<Quad>`
+    /// (a Node-style event emitter) — skipping a serialize/parse round-trip.
     #[wasm_bindgen(js_name = fromQuads, skip_typescript)]
-    pub async fn from_quads(
-        quads: js_sys::Array,
-        options: JsValue,
-    ) -> Result<VortexStore, JsValue> {
+    pub async fn from_quads(quads: JsValue, options: JsValue) -> Result<VortexRdfStore, JsValue> {
         let config = parse_build_options(options)?;
-        let quads = js_array_to_quads(quads)?;
-        let vortex_array = build_array(stream::iter(quads.into_iter().map(Ok)), config).await?;
+        let quad_stream = js_to_quad_stream(quads)?;
+        let vortex_array = build_array(quad_stream, config).await?;
 
-        let inner =
-            VortexRdfStore::new(vortex_array).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(VortexStore { inner })
+        let inner = CoreStore::new(vortex_array).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(VortexRdfStore::wrap(inner))
     }
 
     #[wasm_bindgen(skip_typescript)]
@@ -243,7 +330,7 @@ impl VortexStore {
     /// requires the matched dataset to be independent of its source; core
     /// materializes it into an owning copy, rebuilding its indexes so the copy
     /// stays query-accelerated. Either way the source is never touched.
-    async fn owned(&self) -> Result<VortexRdfStore, JsValue> {
+    async fn owned(&self) -> Result<CoreStore, JsValue> {
         self.inner
             .owned()
             .await
@@ -259,6 +346,9 @@ impl VortexStore {
             .add_quad(quad)
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        // The dictionary may have changed (auto-compaction re-encodes); drop the
+        // cached view so the next read rebuilds it from the new base.
+        self.dict_view.replace(None);
         Ok(())
     }
 
@@ -271,6 +361,7 @@ impl VortexStore {
             .add_quads(quads)
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        self.dict_view.replace(None);
         Ok(())
     }
 
@@ -283,44 +374,257 @@ impl VortexStore {
             .delete_quad(&quad)
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        self.dict_view.replace(None);
         Ok(())
     }
 
+    /// RDF/JS `Source.match`: stream the quads matching a pattern as a
+    /// `Stream<Quad>` of lazy, zero-copy `LazyQuad`s.
+    ///
+    /// Returns synchronously. The pattern is resolved lazily inside a `Promise`
+    /// that yields a columnar payload, handed to a minimal RDF/JS `Stream`
+    /// (`.on('data'|'end'|'error', …)`, `.read()`, and — as a convenience —
+    /// `Symbol.asyncIterator` for `for await`). No term strings are materialized
+    /// until a `LazyTerm`'s `.value`/`.termType` is read.
     #[wasm_bindgen(js_name = match, skip_typescript)]
-    pub async fn match_pattern(
+    pub fn match_pattern(
         &self,
         subject: JsValue,
         predicate: JsValue,
         object: JsValue,
         graph: JsValue,
-    ) -> Result<VortexStore, JsValue> {
+    ) -> JsValue {
+        // Parse the pattern eagerly (cheap, synchronous) so only owned oxrdf
+        // terms — not JsValues — are moved into the resolving future.
         let s = js_to_subject(subject);
         let p = js_to_named_node(predicate);
         let o = js_to_term(object);
         let g = js_to_graph(graph);
+        // Ensure the shared dictionary view synchronously (Dictionary layout);
+        // it is not dependent on the matched rows and must be built off `self`.
+        let dict = self.code_path_dict();
+        let inner = self.inner.clone();
+        let promise =
+            future_to_promise(async move { match_columns(inner, dict, s, p, o, g).await });
+        make_lazy_quad_stream(&promise.into())
+    }
 
-        let inner = self
+    /// Materialize the quads matching a pattern into a `LazyQuad[]` — the
+    /// array-returning counterpart of [`match`](Self::match_pattern).
+    #[wasm_bindgen(js_name = getQuads, skip_typescript)]
+    pub async fn get_quads(
+        &self,
+        subject: JsValue,
+        predicate: JsValue,
+        object: JsValue,
+        graph: JsValue,
+    ) -> Result<js_sys::Array, JsValue> {
+        let s = js_to_subject(subject);
+        let p = js_to_named_node(predicate);
+        let o = js_to_term(object);
+        let g = js_to_graph(graph);
+        let dict = self.code_path_dict();
+        let payload = match_columns(self.inner.clone(), dict, s, p, o, g).await?;
+        Ok(build_lazy_quads(&payload))
+    }
+
+    /// **Prototype (Dictionary layout only).** Resolve a pattern and hand back
+    /// the matched rows as raw `u32` term codes — four `Uint32Array` columns
+    /// `{ s, p, o, g, length }`, or `null` if this store is not Dictionary
+    /// layout. No term strings are materialized; the caller resolves codes to
+    /// terms lazily via [`decodeTerm`](Self::decode_term). This is the
+    /// zero-copy-until-observed read path being evaluated against `getQuads`.
+    #[wasm_bindgen(js_name = matchCodes, skip_typescript)]
+    pub async fn match_codes(
+        &self,
+        subject: JsValue,
+        predicate: JsValue,
+        object: JsValue,
+        graph: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        // Codes are only meaningful against the store's cached dictionary, which
+        // holds for a pristine Dictionary store. An append tail re-encodes
+        // against a fresh dictionary, so codes would not resolve via `decodeTerm`.
+        if self.inner.layout() != LayoutStrategy::Dictionary || self.inner.tail_len() != 0 {
+            return Ok(JsValue::NULL);
+        }
+        let s = js_to_subject(subject);
+        let p = js_to_named_node(predicate);
+        let o = js_to_term(object);
+        let g = js_to_graph(graph);
+        let matched = self
             .inner
             .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        Ok(VortexStore { inner })
+        let arr = matched
+            .get_quads_array()
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+        let struct_arr = arr
+            .execute::<StructArray>(&mut ctx)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        macro_rules! u32_col {
+            ($name:expr) => {{
+                let col = struct_arr
+                    .unmasked_field_by_name($name)
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+                let prim = col
+                    .clone()
+                    .execute::<PrimitiveArray>(&mut ctx)
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+                let slice = prim.as_slice::<u32>();
+                // Copy into a JS-owned Uint32Array (safe against wasm memory
+                // growth, which would detach a zero-copy view).
+                let ta = js_sys::Uint32Array::new_with_length(slice.len() as u32);
+                ta.copy_from(slice);
+                JsValue::from(ta)
+            }};
+        }
+
+        let result = Object::new();
+        Reflect::set(&result, &"s".into(), &u32_col!("s"))?;
+        Reflect::set(&result, &"p".into(), &u32_col!("p"))?;
+        Reflect::set(&result, &"o".into(), &u32_col!("o"))?;
+        Reflect::set(&result, &"g".into(), &u32_col!("g"))?;
+        Reflect::set(
+            &result,
+            &"length".into(),
+            &JsValue::from_f64(struct_arr.len() as f64),
+        )?;
+        Ok(result.into())
     }
 
-    #[wasm_bindgen(skip_typescript)]
-    pub async fn values(&self) -> Result<js_sys::Iterator, JsValue> {
-        let mut quads_stream = self
-            .inner
+    /// **Prototype.** Decode a Dictionary-layout term code to its N-Triples term
+    /// string (`<iri>`, `_:blank`, `"lit"@lang`, `"lit"^^<dt>`, or `""` for the
+    /// default graph). `undefined` if not Dictionary layout or out of range.
+    #[wasm_bindgen(js_name = decodeTerm, skip_typescript)]
+    pub fn decode_term(&self, code: u32) -> Option<String> {
+        self.inner.decode_code(code)
+    }
+
+    /// **Prototype.** Encode an N-Triples term string to its Dictionary-layout
+    /// code (inverse of `decodeTerm`). `undefined` if not Dictionary layout or
+    /// the term is absent from the dictionary.
+    #[wasm_bindgen(js_name = encodeTerm, skip_typescript)]
+    pub fn encode_term(&self, term: &str) -> Option<u32> {
+        self.inner.encode_code(term)
+    }
+}
+
+/// Resolve a pattern and pack the matched rows into the columnar payload the JS
+/// lazy read model consumes. Shared by `match` and `getQuads`.
+///
+/// Dictionary layout (`dict` is `Some`) ships four `u32` code columns plus the
+/// shared dictionary — no term strings are touched. Other layouts ship packed
+/// N-Triples term columns (`{offsets, bytes}`), decoded once from `quads()`.
+async fn match_columns(
+    store: CoreStore,
+    dict: Option<JsValue>,
+    subject: Option<NamedOrBlankNode>,
+    predicate: Option<NamedNode>,
+    object: Option<Term>,
+    graph: Option<GraphName>,
+) -> Result<JsValue, JsValue> {
+    let matched = store
+        .match_pattern(
+            subject.as_ref(),
+            predicate.as_ref(),
+            object.as_ref(),
+            graph.as_ref(),
+        )
+        .await
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let payload = Object::new();
+
+    if let Some(dict) = dict {
+        // Code payload: u32 columns + the shared dictionary.
+        let arr = matched
+            .get_quads_array()
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+        let struct_arr = arr
+            .execute::<StructArray>(&mut ctx)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        macro_rules! u32_col {
+            ($name:expr) => {{
+                let col = struct_arr
+                    .unmasked_field_by_name($name)
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+                let prim = col
+                    .clone()
+                    .execute::<PrimitiveArray>(&mut ctx)
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+                let slice = prim.as_slice::<u32>();
+                let ta = js_sys::Uint32Array::new_with_length(slice.len() as u32);
+                ta.copy_from(slice);
+                JsValue::from(ta)
+            }};
+        }
+        Reflect::set(&payload, &"kind".into(), &"code".into())?;
+        Reflect::set(&payload, &"s".into(), &u32_col!("s"))?;
+        Reflect::set(&payload, &"p".into(), &u32_col!("p"))?;
+        Reflect::set(&payload, &"o".into(), &u32_col!("o"))?;
+        Reflect::set(&payload, &"g".into(), &u32_col!("g"))?;
+        Reflect::set(&payload, &"dict".into(), &dict)?;
+        Reflect::set(
+            &payload,
+            &"length".into(),
+            &JsValue::from_f64(struct_arr.len() as f64),
+        )?;
+    } else {
+        // Term payload: packed N-Triples term columns for non-Dictionary layouts.
+        let mut quads_stream = matched
             .quads()
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let js_array = js_sys::Array::new();
+        // (offsets seeded with a leading 0, bytes) per s/p/o/g column.
+        let mut cols: [(Vec<u32>, Vec<u8>); 4] = [
+            (vec![0], Vec::new()),
+            (vec![0], Vec::new()),
+            (vec![0], Vec::new()),
+            (vec![0], Vec::new()),
+        ];
+        let mut n = 0u32;
         while let Some(q_res) = quads_stream.next().await {
-            if let Ok(q) = q_res {
-                js_array.push(&quad_to_js(&q));
+            let q = q_res.map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let terms = [
+                q.subject.to_string(),
+                q.predicate.to_string(),
+                q.object.to_string(),
+                match &q.graph_name {
+                    GraphName::DefaultGraph => String::new(),
+                    other => other.to_string(),
+                },
+            ];
+            for (col, term) in cols.iter_mut().zip(terms.iter()) {
+                col.1.extend_from_slice(term.as_bytes());
+                col.0.push(col.1.len() as u32);
             }
+            n += 1;
         }
-        Ok(js_array.values())
+        Reflect::set(&payload, &"kind".into(), &"term".into())?;
+        for (name, (offsets, bytes)) in ["s", "p", "o", "g"].iter().zip(cols.iter()) {
+            Reflect::set(&payload, &(*name).into(), &term_column(offsets, bytes))?;
+        }
+        Reflect::set(&payload, &"length".into(), &JsValue::from_f64(n as f64))?;
     }
+    Ok(payload.into())
+}
+
+/// Pack one term column's offsets/bytes into a `{offsets, bytes}` JS object.
+fn term_column(offsets: &[u32], bytes: &[u8]) -> JsValue {
+    let offs = js_sys::Uint32Array::new_with_length(offsets.len() as u32);
+    offs.copy_from(offsets);
+    let bys = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+    bys.copy_from(bytes);
+    let obj = Object::new();
+    Reflect::set(&obj, &"offsets".into(), &offs).unwrap();
+    Reflect::set(&obj, &"bytes".into(), &bys).unwrap();
+    obj.into()
 }
 
 // ─── Free functions ───────────────────────────────────────────────────────────
@@ -349,7 +653,7 @@ pub async fn vortex_to_rdf(vortex_bytes: &[u8], format_name: &str) -> Result<Str
     let vortex_array = array_from_ipc_reader(cursor)
         .map_err(|e| JsValue::from_str(&format!("Vortex read error: {}", e)))?;
 
-    let store = VortexRdfStore::new(vortex_array)
+    let store = CoreStore::new(vortex_array)
         .map_err(|e| JsValue::from_str(&format!("Store init error: {}", e)))?;
 
     let mut output_buffer = Vec::new();
@@ -402,7 +706,9 @@ impl Default for BuildConfig {
     fn default() -> Self {
         Self {
             builder: BuilderStrategy::UnsortedStream,
-            layout: LayoutStrategy::Default,
+            // Dictionary is the JS default: it is the most compact layout and
+            // backs the zero-copy code-based read model (integer `.equals`).
+            layout: LayoutStrategy::Dictionary,
             indexes: Vec::new(),
         }
     }
@@ -423,13 +729,13 @@ async fn build_array(
     } = config;
     match builder {
         BuilderStrategy::UnsortedStream => {
-            VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
+            CoreStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
                 quads, layout, indexes,
             )
             .await
         }
         BuilderStrategy::SortedInMemory => {
-            VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
+            CoreStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
                 quads, layout, indexes,
             )
             .await
@@ -552,92 +858,83 @@ fn js_array_to_quads(quads: js_sys::Array) -> Result<Vec<Quad>, JsValue> {
         .collect()
 }
 
-fn term_to_js(term: &Term) -> JsValue {
-    let obj = Object::new();
-    match term {
-        Term::NamedNode(n) => {
-            Reflect::set(&obj, &"termType".into(), &"NamedNode".into()).unwrap();
-            Reflect::set(&obj, &"value".into(), &n.as_str().into()).unwrap();
-        }
-        Term::BlankNode(b) => {
-            Reflect::set(&obj, &"termType".into(), &"BlankNode".into()).unwrap();
-            Reflect::set(&obj, &"value".into(), &b.as_str().into()).unwrap();
-        }
-        Term::Literal(l) => {
-            Reflect::set(&obj, &"termType".into(), &"Literal".into()).unwrap();
-            Reflect::set(&obj, &"value".into(), &l.value().into()).unwrap();
-            Reflect::set(
-                &obj,
-                &"datatype".into(),
-                &term_to_js(&Term::NamedNode(l.datatype().into())),
+/// A quad stream boxed for `build_array`, whichever of the two `fromQuads`
+/// input shapes it came from.
+type BoxedQuadStream = Box<dyn Stream<Item = CoreResult<Quad>> + Unpin + Send>;
+
+/// Accept either shape `fromQuads` allows: a plain array (eagerly validated
+/// and wrapped in `stream::iter`), or an RDF/JS `Stream<Quad>` (consumed
+/// through its event-emitter interface).
+fn js_to_quad_stream(value: JsValue) -> Result<BoxedQuadStream, JsValue> {
+    if js_sys::Array::is_array(&value) {
+        let quads = js_array_to_quads(js_sys::Array::from(&value))?;
+        let stream: BoxedQuadStream = Box::new(stream::iter(
+            quads.into_iter().map(Ok::<Quad, VortexRdfError>),
+        ));
+        return Ok(stream);
+    }
+    rdfjs_stream_to_quads(value)
+}
+
+/// Consume an RDF/JS `Stream<Quad>` — a Node-style event emitter with
+/// `'data'`/`'end'`/`'error'` events — by registering listeners that forward
+/// each event into an unbounded channel, and handing back the receiving end
+/// as a plain Rust stream.
+///
+/// The listeners are intentionally leaked (`Closure::forget`): `fromQuads` is
+/// called once per stream and the callbacks must stay valid for as long as
+/// the JS source stream can still fire events, which for a one-shot event
+/// listener has no natural Rust-side owner to drop them. Without an explicit
+/// `close_channel()` on `'end'`, the receiver would otherwise wait forever
+/// for a value that will never come.
+fn rdfjs_stream_to_quads(stream_val: JsValue) -> Result<BoxedQuadStream, JsValue> {
+    let on = Reflect::get(&stream_val, &"on".into())
+        .ok()
+        .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+        .ok_or_else(|| {
+            JsValue::from_str(
+                "fromQuads expects an array of quads or an RDF/JS Stream \
+                 (an object with an 'on' method)",
             )
-            .unwrap();
-            if let Some(lang) = l.language() {
-                Reflect::set(&obj, &"language".into(), &lang.into()).unwrap();
-            } else {
-                Reflect::set(&obj, &"language".into(), &"".into()).unwrap();
-            }
-        }
-    }
-    let equals_fn = js_sys::Function::new_with_args(
-        "other",
-        "return other && this.termType === other.termType && this.value === other.value && \
-         this.language === (other.language || '') && \
-         (this.datatype ? this.datatype.equals(other.datatype) : !other.datatype)",
-    );
-    Reflect::set(&obj, &"equals".into(), &equals_fn).unwrap();
-    obj.into()
-}
+        })?;
 
-fn graph_name_to_js(graph: &GraphName) -> JsValue {
-    let obj = Object::new();
-    match graph {
-        GraphName::DefaultGraph => {
-            Reflect::set(&obj, &"termType".into(), &"DefaultGraph".into()).unwrap();
-            Reflect::set(&obj, &"value".into(), &"".into()).unwrap();
-        }
-        GraphName::NamedNode(n) => {
-            Reflect::set(&obj, &"termType".into(), &"NamedNode".into()).unwrap();
-            Reflect::set(&obj, &"value".into(), &n.as_str().into()).unwrap();
-        }
-        GraphName::BlankNode(b) => {
-            Reflect::set(&obj, &"termType".into(), &"BlankNode".into()).unwrap();
-            Reflect::set(&obj, &"value".into(), &b.as_str().into()).unwrap();
-        }
-    }
-    let equals_fn = js_sys::Function::new_with_args(
-        "other",
-        "return other && this.termType === other.termType && this.value === other.value",
-    );
-    Reflect::set(&obj, &"equals".into(), &equals_fn).unwrap();
-    obj.into()
-}
+    let (tx, rx) = mpsc::unbounded::<CoreResult<Quad>>();
 
-fn quad_to_js(quad: &Quad) -> JsValue {
-    let obj = Object::new();
-    Reflect::set(
-        &obj,
-        &"subject".into(),
-        &term_to_js(&quad.subject.clone().into()),
-    )
-    .unwrap();
-    Reflect::set(
-        &obj,
-        &"predicate".into(),
-        &term_to_js(&quad.predicate.clone().into()),
-    )
-    .unwrap();
-    Reflect::set(&obj, &"object".into(), &term_to_js(&quad.object)).unwrap();
-    Reflect::set(&obj, &"graph".into(), &graph_name_to_js(&quad.graph_name)).unwrap();
-    let equals_fn = js_sys::Function::new_with_args(
-        "other",
-        "return other && this.subject.equals(other.subject) && this.predicate.equals(other.predicate) && \
-         this.object.equals(other.object) && this.graph.equals(other.graph)",
-    );
-    Reflect::set(&obj, &"equals".into(), &equals_fn).unwrap();
-    obj.into()
-}
+    let tx_data = tx.clone();
+    let on_data = Closure::wrap(Box::new(move |quad_js: JsValue| {
+        let item = js_to_quad(quad_js).ok_or_else(|| {
+            VortexRdfError::Deserialization("Invalid quad object in RDF/JS stream".to_string())
+        });
+        let _ = tx_data.unbounded_send(item);
+    }) as Box<dyn FnMut(JsValue)>);
 
+    let tx_error = tx.clone();
+    let on_error = Closure::wrap(Box::new(move |err: JsValue| {
+        let message = err
+            .as_string()
+            .or_else(|| Reflect::get(&err, &"message".into()).ok()?.as_string())
+            .unwrap_or_else(|| "RDF/JS stream error".to_string());
+        let _ = tx_error.unbounded_send(Err(VortexRdfError::Deserialization(message)));
+    }) as Box<dyn FnMut(JsValue)>);
+
+    let tx_end = tx;
+    let on_end = Closure::wrap(Box::new(move || {
+        tx_end.close_channel();
+    }) as Box<dyn FnMut()>);
+
+    on.call2(&stream_val, &"data".into(), on_data.as_ref())
+        .map_err(|_| JsValue::from_str("Failed to attach a 'data' listener to the stream"))?;
+    on.call2(&stream_val, &"error".into(), on_error.as_ref())
+        .map_err(|_| JsValue::from_str("Failed to attach an 'error' listener to the stream"))?;
+    on.call2(&stream_val, &"end".into(), on_end.as_ref())
+        .map_err(|_| JsValue::from_str("Failed to attach an 'end' listener to the stream"))?;
+
+    on_data.forget();
+    on_error.forget();
+    on_end.forget();
+
+    Ok(Box::new(rx))
+}
 struct RawTerm {
     term_type: String,
     value: String,

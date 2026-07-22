@@ -80,7 +80,7 @@ jobs:
         run: npm ci
       - name: Build WASM package
         working-directory: js
-        run: npm run build:node
+        run: npm run build
       - name: Run tests
         working-directory: js
         run: npm test

@@ -7,27 +7,27 @@
 
 Vortex-RDF is a columnar RDF serialization built on top of the [Vortex](https://docs.vortex.dev) data format. It combines the flexible graph-based model of RDF with the efficiency of modern columnar data formats. Its main goal is to **provide a compact, zero-copy and high-performance serialization format for exchanging and read/write RDF data**.
 
-This library provides both serialization and deserialization capabilities for converting traditional RDF formats (everything supported by [`oxrdfio`](https://docs.rs/oxrdfio/latest/oxrdfio/)) to Vortex-RDF and vice-versa. It also provides a queryable RDF quad store (`VortexRdfStore`) with pattern matching, exposed to JavaScript/WASM through an interface modeled after the [RDF-JS specification](https://rdf.js.org/dataset-spec/#datasetcore-interface).
+This library provides both serialization and deserialization capabilities for converting traditional RDF formats (everything supported by [`oxrdfio`](https://docs.rs/oxrdfio/latest/oxrdfio/)) to Vortex-RDF and vice-versa. It also provides a queryable RDF quad store (`VortexRdfStore`) with basic graph pattern matching, exposed to JavaScript/WASM through an interface modeled after the [RDF-JS specification](https://rdf.js.org/dataset-spec/#datasetcore-interface).
 
 ## Key Features
 
 - 📊 **Advanced Columnar Storage**: Leverages [Vortex format specifications](https://docs.vortex.dev/specs/file-format) for flexible arrays organized in columnar layouts, both on disk and in memory.
 - ♻️ **Zero-Copy**: Vortex-RDF is built on a ["Zero-Copy" philosophy](https://en.wikipedia.org/wiki/Zero-copy). This means that after the RDF data is serialized into the Vortex format, it can be read, filtered, and queried without ever moving or copying the bytes in memory.
-- 📦 **Adaptive Compression**: Smart compression strategies can be applied based on the [BtrBlocks approach](https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/papers/btrblocks.pdf) [1], which provides a sophisticated multi-level compression system that adaptively selects optimal compression schemes based on data characteristics. These include e.g., [Fast Static Symbol Table (FSST)](https://doi.org/10.14778/3407790.3407851) [2], [Run-Length Encoding (RLE)](https://en.wikipedia.org/wiki/Run-length_encoding), [BitPacking](https://doi.org/10.1002/spe.2326) [3] among others.
-- 🌊 **Streaming & Out-of-Core Ingestion**: Quads can be streamed directly into a Vortex file in fixed-size chunks with bounded memory, and datasets larger than RAM can be globally sorted via an external merge sort that spills sorted runs to disk.
+- 📦 **Adaptive Compression**: Smart compression strategies can be applied based on the [BtrBlocks approach](https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/papers/btrblocks.pdf), which provides a sophisticated multi-level compression system that adaptively selects optimal compression schemes based on data characteristics. These include e.g., [Fast Static Symbol Table (FSST)](https://doi.org/10.14778/3407790.3407851), [Run-Length Encoding (RLE)](https://en.wikipedia.org/wiki/Run-length_encoding), [BitPacking](https://doi.org/10.1002/spe.2326), among others.
+- ☄️ **Streaming & Out-of-Core Ingestion**: Quads can be streamed directly into and out of Vortex files with bounded memory. Larger than RAM knowledge graphs can be globally sorted via an external merge sort that spills sorted runs to disk, when serializing.
 - 🍀 **RDF Quads Support**: Full support for named Graphs `(S, P, O, G)` and in general for [RDF 1.1](https://www.w3.org/TR/rdf11-concepts/).
 - 🌍 **Cross-Platform**: Native Rust library with a CLI + WebAssembly (WASM) bindings for browsers/Node.js. Python bindings coming soon.
 
 #### How it works:
-1. **Zero-copy buffer views**: When you want to access a specific column (e.g., just the `predicates`) or a specific subset of Quads, Vortex creates a [_Layout_](https://docs.vortex.dev/concepts/layouts) either from a Vortex file stored on disk or from Vortex encoded data in memory. This view is just a pointer and some metadata, it doesn't duplicate the data.
-2. **Lazy Decompression**: Even when compressed, Vortex is designed to decompress data "_just-in-time_" at the CPU register level, while leveraging [SIMD optimizations](https://en.wikipedia.org/wiki/Single_instruction,_multiple_data) and avoiding the creation of temporary intermediate strings.
+1. **Zero-copy buffer views**: When you want to access a specific column (e.g., just the `predicates`) or a specific subset of Quads, Vortex creates a [_Layout_](https://docs.vortex.dev/concepts/layouts) either from a Vortex file stored on disk or from Vortex encoded data in memory. Both representations are structured in the same way, which avoids having to convert data before reading it. Bottom line, the Layout is just metadata and pointers to the actual data, it doesn't need to duplicate it.
+2. **Lazy Decompression**: Even when compressed, Vortex is designed to decompress data "_just-in-time_" at the CPU register level, while leveraging [SIMD optimizations](https://en.wikipedia.org/wiki/Single_instruction,_multiple_data) and avoiding the decompression of unnecessary data.
 
 ### Vortex File format & IPC
 
-Vortex-RDF leverages the [Vortex File specification](https://docs.vortex.dev/specs/file-format) and the [Vortex IPC (Inter-Process Communication) protocol](https://docs.rs/vortex-ipc/latest/vortex_ipc/) to provide versatile serialization options optimized for both local storage and remote data exchange.
+Vortex-RDF leverages the [Vortex File specification](https://docs.vortex.dev/specs/file-format) and the [Vortex IPC (Inter-Process Communication) protocol](https://docs.vortex.dev/developer-guide/internals/serialization#ipc-format) to provide versatile serialization options optimized for both local storage and remote data exchange.
 
 1. **Vortex Files**: Zero-Copy
-The `.vortex` files are optimized for **local usage** with disk-based storage (Cloud-based alternatives based on blob storage solutions, e.g., Amazon S3 buckets, could be also supported via technologies such as [Apache Iceberg](https://iceberg.apache.org/)). These files are designed to allow efficient compression and random access, allowing the OS to load only necessary chunks on demand without any parsing overhead. Opening a file (`VortexRdfStore::from_file`) is lazy: no data is read until queried, and `match_pattern` filters are pushed down into the file scan as Vortex filter expressions.
+The `.vortex` files are optimized for **local usage** with disk-based storage (Cloud-based alternatives based on blob storage solutions, e.g., Amazon S3 buckets, could be also supported). These files are designed to allow efficient compression and random access, allowing the OS to load only necessary chunks on demand without any parsing overhead. Opening a file (`VortexRdfStore::from_file`) is lazy: no data is read until queried, and `match_pattern` filters are pushed down into the file scan as Vortex filter [expressions](https://docs.vortex.dev/concepts/expressions).
 
 2. **IPC Streams**: Remote Exchange
 For exchanging data between different systems or over a network, the library can serialize RDF graphs into a **Vortex IPC Stream**. This format follows the Vortex IPC streaming protocol, making it suitable for pipes, sockets, and network transfers. These streams can be consumed by any Vortex-compatible client (Rust, Python, C++, etc.) to receive the Vortex-RDF data, while avoiding any deserialization and decompression overhead. The WASM bindings use IPC as their byte-exchange format.
@@ -85,11 +85,9 @@ Because term IDs are **lexicographic ranks**:
 - Term → ID lookup is a binary search over zero-copy string views (no `HashMap` needed on the query side); ID → term is a positional read.
 - Query patterns are translated to integer comparisons host-side, so file scans push down cheap `u32` equality filters instead of string comparisons.
 
-Appended quads cannot be dictionary-encoded (a new term has no code in the sorted dictionary), so on Dictionary-layout stores they live in the in-memory string tail: patterns probe the base by code and the tail by string, and compaction (`compact_with_indexes`) re-encodes everything against a fresh dictionary.
-
 ### 2. Secondary Indexes
 
-Indexes are opt-in, embedded as extra columns at build time. Two types are supported:
+Indexes are opt-in, embedded as extra columns at build time. Indexes are static and can only incorporate mutations by full reconstruction of the dataset (a.k.a. [compaction](https://github.com/vortex-rdf/vortex-rdf/blob/ff9add07c6ba855abb30d12f407777778de562de/core/src/store/vortex_rdf_store.rs#L313)). Two types are supported:
 
 #### `SecondaryByReference`
 Sorted permutation indexes for the predicate and object columns, enabling binary-search routing for predicate-only and object-only patterns without re-sorting the whole dataset:
@@ -101,7 +99,9 @@ Sorted permutation indexes for the predicate and object columns, enabling binary
 | `_idx_p_val` | All predicate values in sorted order (same dtype rules as above) |
 | `_idx_p_rid` | Row ID (`u32`) of the quad each sorted predicate value came from |
 
-Binary-search routing only engages when the value columns carry the `IsSorted` statistic, which builders stamp when the columns hold a *globally* sorted order (single-chunk builds, or the sorted builders' global index emission). Indexes are build-time only: stores derived by slicing, filtering, or mutation strip the index columns, because their row IDs would be stale.
+The two backends engage this index differently:
+- **In-memory**: binary-search routing only engages when the value columns carry the `IsSorted` statistic, which builders stamp when the columns hold a *globally* sorted order (single-chunk builds, or the sorted builders' global index emission) — an unstamped column (e.g. the concatenation of several per-chunk sorts) makes the store decline and fall back to a [mask scan](https://docs.rs/vortex/latest/vortex/scan/selection/enum.Selection.html).
+- **File-backed**: the probe is always pushed down as a range-predicate scan over the index columns, regardless of the `IsSorted` stamp — sortedness only decides how tightly the scan's zone pruning shrinks the read, not whether the index is used. The index columns live in the file itself, so they're never re-derived or stripped; they stay valid however the store's view has been narrowed, and are simply never projected into the quads a caller sees.
 
 #### `SecondaryByCopy`
 Two complete extra copies of the quad columns — the classic triple-store permutation indexes (POS/OSP), adapted to quads — each paired with the primary row IDs it permutes. This gives predicate- and object-bound patterns the same sorted-column access path the primary `(s, p, o, g)` order gives subjects:
@@ -113,9 +113,11 @@ Two complete extra copies of the quad columns — the classic triple-store permu
 | `_idx_ospg_{s,p,o,g}` | The quads re-sorted by `(o, s, p, g)` |
 | `_idx_ospg_rid` | Row ID (`u32`) of the primary quad each copy row mirrors |
 
-Predicate-bound patterns binary-search `_idx_posg_p`; a bound predicate **and** object resolve in one `(p, o)` *prefix* search; object-bound patterns binary-search `_idx_ospg_o`. On file-backed stores the copies additionally let `quads()` stream matched rows straight from the copy family — where they sit in a contiguous, zone-prunable run — instead of scattering row-ID reads across the primary columns, mirroring the subject fast path's locality. The same `IsSorted` stamping rules as `SecondaryByReference` apply for in-memory binary-search routing.
+Predicate-bound patterns binary-search `_idx_posg_p`; a bound predicate **and** object resolve in one `(p, o)` *prefix* search; object-bound patterns binary-search `_idx_ospg_o`. The two backends engage this index the same way `SecondaryByReference` does:
+- **In-memory**: routing requires the lead value column's `IsSorted` stamp; an unstamped copy (a per-chunk sort that doesn't span the whole array) makes the store decline to a mask scan.
+- **File-backed**: the probe is always pushed down as a range predicate, `IsSorted` or not — sortedness only sharpens zone pruning. File-backed stores additionally let `quads()` stream matched rows straight from the copy family — where they sit in a contiguous, zone-prunable run — instead of scattering row-ID reads across the primary columns, mirroring the subject fast path's locality.
 
-Compared to `SecondaryByReference`, this costs roughly 2× the primary columns in extra storage (before compression; the sorted copies compress well) in exchange for contiguous reads on predicate/object patterns — choose it when those reads dominate. When both index types are embedded, `SecondaryByCopy` is preferred at query time.
+Compared to `SecondaryByReference`, this costs roughly 2× the primary columns in extra storage (before compression; the sorted copies compress well) in exchange for contiguous reads on predicate/object patterns.
 
 ### 3. Ingestion Builders
 
@@ -126,26 +128,64 @@ Compared to `SecondaryByReference`, this costs roughly 2× the primary columns i
 | **`SortedStream`** | Out-of-core, bounded by chunk size | Global `S → P → O → G` | Yes | Globally sorted chunks + globally sorted index columns |
 
 - **`UnsortedStreamBuilder`**: The simplest and fastest pipeline. It preserves the exact ordering of the incoming RDF stream and emits fixed-size chunks lazily; when serializing to a file, the Vortex writer compresses and flushes each chunk as it arrives, so peak memory is bounded by the chunk size instead of the dataset size. It cannot leverage subject ordering for binary-search pruning.
-- **`SortedInMemoryBuilder`**: Loads all quads in memory and performs a global sort by `(s, p, o, g)`. Requested secondary index columns are built once over the whole dataset and emitted in global order (stamped `IsSorted`), so `match_pattern` can binary-search subjects, predicates, and objects. Best suited for small-to-medium graphs that fit in RAM.
-- **`SortedStreamBuilder`**: External merge sort for datasets larger than memory. Quads are ingested in bounded batches, sorted locally, and spilled to disk as sorted runs; a K-way heap merge then emits globally sorted, fixed-size chunks. When secondary indexes are requested, a second external sort over `(value, row ID)` pairs produces globally sorted index columns as well. Spill files are internal, length-prefixed `rkyv` records under `target/` and are cleaned up automatically.
+- **`SortedInMemoryBuilder`**: Loads all quads in memory and performs a global sort by `(s, p, o, g)`. Requested secondary index columns are built once over the whole dataset and emitted in global order (stamped `IsSorted`), so `match_pattern` can binary-search subjects, predicates, and objects.
+- **`SortedStreamBuilder`**: External [merge-sort](https://en.wikipedia.org/wiki/Merge_sort) for datasets larger than memory. Quads are ingested in bounded batches, sorted locally, and spilled to disk as sorted runs; a K-way heap merge then emits globally sorted, fixed-size chunks. When secondary indexes are requested, a second external sort over `(value, row ID)` pairs produces globally sorted index columns as well. Spill files are internal, length-prefixed [`rkyv` records](https://github.com/rkyv/rkyv) under `target/` and are cleaned up automatically.
 
-\* The Dictionary layout always needs two passes (the global dictionary is only complete after ingesting the whole stream), so even the unsorted builder spills raw quads to disk and re-reads them for encoding.
+\* The Dictionary layout always needs two passes (the global dictionary is only complete after ingesting the whole stream), so even the unsorted builder spills raw quads to disk and re-reads them for encoding (except when called from the JS/WASM library).
 
-### 4. The Store & Query Routing
+The JS/WASM bindings only expose `UnsortedStream` (`'Unsorted'`) and `SortedInMemory` (`'Sorted'`) — `SortedStreamBuilder` spills sorted runs to disk, which WebAssembly has no access to, so it is unreachable from `VortexRdfStore`'s `BuildOptions`.
 
-`VortexRdfStore` wraps either an in-memory array or a lazily-scanned Vortex file. `match_pattern(s?, p?, o?, g?)` resolves patterns with a routing cascade:
+## The Store & Query Routing
 
-1. **Subject binary search**: if a subject is bound and the `s` column is stamped `IsSorted`, the matching row range is found via binary search and sliced — no scan at all.
-2. **Index routing**: if `SecondaryByCopy` columns are present (and globally sorted), predicate-bound patterns binary-search `_idx_posg_p`, object-bound patterns `_idx_ospg_o`, and predicate+object patterns resolve both components in one `(p, o)` prefix search; on file-backed stores the matched rows are then *streamed from the copy family itself* (a contiguous run) rather than gathered by row ID. Otherwise, if `SecondaryByReference` columns are present, object-only and predicate-only patterns binary-search `_idx_*_val` and `take` the referenced rows.
+`VortexRdfStore` wraps either an in-memory array or a lazily-scanned Vortex file. `match_pattern(s?, p?, o?, g?)` routes each bound component to the cheapest available access path, but the two backends get there differently.
+
+**In-memory** resolves patterns with a routing cascade, each step clearing whichever components it answers:
+1. **Subject binary search**: if a subject is bound and the base's `s` column is stamped `IsSorted`, the matching row range is found via a fast binary search and sliced — no scan at all.
+2. **Index routing**: if `SecondaryByCopy` columns are present and stamped `IsSorted`, predicate-bound patterns binary-search `_idx_posg_p`, object-bound patterns `_idx_ospg_o`, and predicate+object patterns resolve both components in one `(p, o)` prefix search. Otherwise, if `SecondaryByReference` columns are present and stamped `IsSorted`, object-only and predicate-only patterns binary-search `_idx_*_val` and `take` the referenced rows from the quads columns.
 3. **Vectorized mask scan**: remaining constraints are resolved with columnar equality masks (SIMD-friendly, no string materialization).
 
-For **file-backed stores**, patterns compile to Vortex filter expressions pushed down into the lazy scan, which benefits from zone-map pruning and minimal column projection. Under the Dictionary layout, bound terms are first translated to their `u32` codes through the cached dictionary; a term absent from the dictionary short-circuits to an empty result.
+**File-backed** stores skip host-side binary search entirely: every bound component — subject included — compiles to a Vortex equality filter [expression](https://docs.vortex.dev/concepts/expressions) pushed down into the lazy scan, and the filter's zone-map envelope [narrows the read](https://docs.vortex.dev/developer-guide/internals/execution) to a contiguous row range before any data is fetched. Index columns (`SecondaryByCopy`/`SecondaryByReference`) are read the same way, as a range-predicate scan rather than a binary search, with `SecondaryByCopy` additionally streaming matched rows straight from the copy family (a contiguous, zone-prunable run) instead of gathering by row ID. `IsSorted` never gates whether a file-backed pattern uses its filter or index — sortedness only sharpens how tightly zone pruning shrinks the scanned range. Under the Dictionary layout, bound terms are first translated to their `u32` codes through the cached dictionary; a term absent from the dictionary short-circuits to an empty result on either backend.
 
-**Mutations** are virtual (in-memory only, never persisted back to the original file):
-- `add_quad`/`add_quads` append into an in-memory tail beside the base (never rewriting it), so secondary indexes survive appends; quads already present are skipped, per RDF/JS set semantics. Works on every layout, including Dictionary (the tail stores strings).
-- `delete_quad`/`delete_matching` tombstone the matched rows with a bitmask; the data is untouched and indexes stay valid.
-- `compact` / `compact_with_indexes` reclaim tombstones, fold the tail in, re-sort by (s, p, o, g), and rebuild the store's current (or a chosen) index set.
-- In-memory stores **auto-compact** when an append leaves the tail past a tenth of the base (floor: 4,096 rows) or past one builder chunk (100K rows), whichever comes first — amortized-constant cost per added row. File-backed stores never auto-compact (folding would pull the file into memory); watch `tail_len()` and call `compact()` deliberately.
+## Mutations
+
+`VortexRdfStore` never rewrites its data in place to answer a mutation. Instead it follows a [**merge-on-read** pattern](https://iceberglakehouse.com/iceberg/iceberg-merge-on-read/): the store you built or opened (the "base") stays exactly as it was written — sorted order, secondary indexes, file bytes and all — and mutations are layered on top of it as two lightweight side-structures, (i) an append-only [**Tail**](https://github.com/vortex-rdf/vortex-rdf/blob/ff9add07c6ba855abb30d12f407777778de562de/core/src/store/vortex_rdf_store.rs#L97) for additions and; (ii)  **Tombstone masks** (for [in-memory](https://github.com/vortex-rdf/vortex-rdf/blob/ff9add07c6ba855abb30d12f407777778de562de/core/src/store/mod.rs#L121) and [file-backed](https://github.com/vortex-rdf/vortex-rdf/blob/ff9add07c6ba855abb30d12f407777778de562de/core/src/store/mod.rs#L160) stores) for deletions. Reads transparently merge base + tail, minus tombstones, so the store still behaves as one dataset; nothing is actually rewritten, and none of the base's row ids ever move, which is what lets secondary indexes (whose `_idx_*_rid` columns address base row ids) and any in-flight views survive a mutation. 
+
+All of this is virtual: nothing is written back to the original Vortex file unless a compaction takes place.
+
+#### Additions: the append Tail
+
+`add_quad`/`add_quads` never touch the base — they append into a second, in-memory array kept beside it, the **Tail** (the write-optimized delta half of the design, with the base as its read-optimized main half):
+
+- The tail is always **one flat, contiguous `StructArray`**, never a chain of per-add chunks: each `add_quads` call gathers the tail's current live rows plus the new ones and rebuilds it in one shot, so a scan over the tail never has to walk fragments.
+- Quads already present are skipped (as per RDF/JS set semantics) — an in-batch `HashSet` catches duplicates within the call, and each remaining quad is checked with `contains()` against the store (base + existing tail).
+- The tail has its own `RowSelection` and its own `deleted` mask, in **tail-local ids** (`0..rows.len()`), entirely separate from the base's — a view can narrow or tombstone the tail independently of the base it sits beside.
+- Works under every layout, including **Dictionary**: an appended term has no code in the base's sorted dictionary, so the tail stores plain Default-layout N-Triples strings instead of `u32` codes. Pattern matching probes the base by dictionary code and the tail by string, and a query that touches both unions the results.
+- `match_pattern` runs the base's normal routing (binary search / index / mask scan) and a mask scan over the tail independently, then unions the two — base short-circuits (e.g. `AlwaysFalse` from a Dictionary miss) don't skip the tail, since a term absent from the base's dictionary may still exist in the tail's plain strings.
+
+#### Deletions: tombstone masks
+
+`delete_quad`/`delete_matching` never remove or rewrite rows either — they mark them dead:
+- Both calls reuse `match_pattern` to find the doomed rows, then fold that set into a `deleted: Option<Mask>` — one bit per row, `None` until the first delete — carried beside the base (and, separately, beside the tail, since each has its own row-id space). A later delete unions into the existing mask, so it composes for free with rows already tombstoned.
+- The base (or the file) itself, and any secondary index built over it, is left completely untouched — a tombstone costs a bit per row, not a copy of the surviving data.
+- `match_pattern` deliberately does **not** consult tombstones when it computes a selection (that keeps its row positions aligned for mask-based refinement); every *read* path does — `size`, `quads`, and friends all subtract the tombstones (`live_mask`/`gather_live`) before rows reach the caller.
+- File-backed stores tombstone the same way (a file can't be rewritten on delete), and the mask is applied **inside the scan** itself — as an `ExcludeByIndex` selection, or subtracted up front from an id list — so it composes with a pushed-down filter instead of post-filtering the filter's output (which would carry no row ids left to re-align against).
+- Tombstoned rows are only reclaimed by compaction; until then they still occupy physical storage.
+
+#### Compaction
+
+`compact()` (keep the current index set) / `compact_with_indexes(indexes)` (rebuild a chosen set) are the only operations that actually rewrite data. A compaction:
+1. Reads every *live* row the store's view covers — base rows first, then tail rows, tombstones already excluded (`live_raw_quads`).
+2. Sorts them by `(s, p, o, g)`.
+3. Rebuilds a fresh base through the normal builder pipeline (a fresh `TermDictionary` under the Dictionary layout, since the tail may hold terms the old dictionary never assigned a code to), stamping `s` as sorted.
+4. Rebuilds the requested secondary indexes over the new order.
+
+The result is a store with an empty tail, no tombstones, and — because it's freshly sorted — the subject binary-search fast path restored, even if the view being compacted had lost it (e.g. a tail, or a narrowed match result). A **file-backed** store stays file-backed: the rebuilt array is written to a temp sibling file and atomically renamed over the original path, then reopened.
+
+**Auto-compaction policy**: `add_quads` is append-then-check — the append itself is policy-free, and whichever call pushes the tail past a threshold pays for folding it back into the base, amortizing the O(n log n) rebuild cost to roughly constant per appended row (the same argument as a dynamic array's growth factor). The tail is folded once it reaches:
+- **one builder chunk** — 100,000 rows — regardless of how large the base is, since the tail is the store's only unindexed, unsorted region: every query mask-scans it and every append rebuilds it, so past this size it would dominate an otherwise index-routed lookup on a large base; or
+- **a tenth of the base**, with a **4,096-row floor** so a small store isn't compacted every few appends.
+
+This applies equally to in-memory **and file-backed** stores — a file-backed store past the threshold pays for a disk write (rewriting its source file in place, as above) as part of the `add_quads` call.
 
 ---
 
@@ -215,55 +255,42 @@ Example object-only query `(?, ?, ex:alice, ?)`:
 2. Binary-search `_idx_o_val` for `2` → position 1.
 3. `_idx_o_rid[1] = 3` → row 3: *(bob, knows, alice)*.
 
-## How Datatypes are Handled
-
-Vortex-RDF ensures 100% fidelity for all [XSD datatypes](https://www.w3.org/TR/xmlschema-2/) (numeric, boolean, datetime, etc.) by leveraging [N-Triples Canonicalization](https://www.w3.org/TR/n-triples/#canonical-ntriples). Every Literal is stored using its canonical N-Triples string representation. For example, the integer `42` is stored as `"42"^^<http://www.w3.org/2001/XMLSchema#integer>`.
-
-Because RDF datatypes are highly repetitive (e.g., thousands of numbers sharing the same `XMLSchema#integer` suffix), applying e.g., **FSST compression** leads to:
-1. Identifying common datatype suffixes as **Frequent Symbols**.
-2. Replacing these long IRI strings with **1-byte codes**.
-3. Cheap reconstruction of the full string during zero-copy reads.
-
-This provides the storage efficiency of native types while maintaining the flexibility to store any arbitrary or custom RDF term.
-
-#### Towards Type Lifting
-
-The `TypedObject` layout is the first step in this direction: it already separates the literal value from its datatype and language tag into dedicated columns. Full "Type Lifting" — moving common analytical types (integers, floats, timestamps) into native Vortex columns (e.g., `PrimitiveArray`, `DateTimeArray`) to enable range queries and mathematical operations pushed down to the compressed columnar data — remains future work.
-
 ---
 
 ## Installation
 
 ### Rust
-Add to your `Cargo.toml`:
+Declare `vortex-rdf-core` as a dependency as follows:
+
 ```toml
 [dependencies]
-vortex-rdf-core = { "TODO: Publish on crates.io" }
+vortex-rdf-core = "0.1.0"
 ```
 
 The `file-io` feature (enabled by default) provides Vortex file reading/writing on top of Tokio; disable default features for WASM or IPC-only environments.
 
-For the time being you may clone this repo and compile the CLI with:
+Install the CLI with:
 
 ```bash
-cargo build --release -p vortex-rdf-cli
-# The binary will be at ./target/release/vortex-rdf-cli
+cargo install vortex-rdf-cli
 ```
 
-### WebAssembly (WASM)
-Build for JS environments using `wasm-pack`:
+### JavaScript/WebAssembly 
+
 ```bash
-cd js
-npm run build:node # for Node.js
-npm run build:web  # for the Browser
+npm install @vortex-rdf/vortex-rdf-store
 ```
-> TODO: Publish on npm
+
+See [js/README.md](js/README.md) for more details.
 
 ---
 
 ## Usage
 
 ### Rust API
+
+- **Building a Vortex file and querying it:**
+
 ```rust
 use std::fs::File;
 use oxrdf::NamedNode;
@@ -302,7 +329,7 @@ let output = File::create("filtered.nq")?;
 deserialize(filtered, output, RdfFormat::NQuads).await?;
 ```
 
-Building an in-memory store and mutating it:
+- **Building an in-memory store and mutating it**:
 
 ```rust
 // In-memory build (default configuration: UnsortedStream builder,
@@ -316,8 +343,8 @@ let array = VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuil
     quads, LayoutStrategy::Dictionary, vec![IndexType::SecondaryByReference],
 ).await?;
 
-// Mutations return derived stores and are virtual — they are never
-// persisted back into the original Vortex file.
+// Mutations return derived stores and are virtual — they are only
+// persisted back into the original Vortex file via compaction.
 
 // Add Quad: appended into an in-memory tail beside the base,
 // so the base's row ids and secondary indexes stay valid.
@@ -325,43 +352,6 @@ let mutated = store.add_quad(new_quad).await?;
 
 // Delete Quad: inverse vectorized columnar filter.
 let cleaned = mutated.delete_quad(&new_quad).await?;
-```
-
-### JavaScript / WASM
-
-```javascript
-import { VortexStore, init_panic_hook, nquads_to_vortex, vortex_to_nquads } from './pkg/vortex_rdf.js';
-
-init_panic_hook();
-
-// Convert an N-Quads string to Vortex IPC bytes and back.
-// The optional builder strategy is 'Unsorted' (default) or 'Sorted'.
-const bytes = await nquads_to_vortex(nquadsString, 'Sorted');
-const restored = await vortex_to_nquads(bytes);
-```
-
-The `VortexStore` class follows the [RDF-JS DatasetCore](https://rdf.js.org/dataset-spec/#datasetcore-interface) and [Data Model](https://rdf.js.org/data-model-spec/) shapes, with all methods returning Promises:
-
-```javascript
-// Create a store from Vortex IPC bytes or from an RDF string
-const store = await VortexStore.fromBytes(vortexBytes);
-// const store = await VortexStore.fromString(turtleString, "turtle", "Sorted");
-// const store = VortexStore.empty();
-
-console.log(`Loaded ${await store.size()} quads`);
-
-// Query using an RDF-JS match() pattern: match(subject?, predicate?, object?, graph?)
-const matches = await store.match(null, namedNode, null, null);
-
-// Iterate over results
-for (const quad of await matches.values()) {
-  console.log(quad.subject.value, quad.predicate.value, quad.object.value);
-}
-
-// Membership and mutations (virtual, in-memory)
-await store.has(someQuad);
-await store.addQuad(someQuad);
-await store.deleteQuad(otherQuad);
 ```
 
 ### Command Line Interface
@@ -393,60 +383,17 @@ vortex-rdf-cli match --input test.vortex --subject "http://example.org/s1" --out
 RUST_LOG=vortex_rdf_cli=debug,vortex_rdf_core=debug vortex-rdf-cli serialize --input data.ttl --output data.vortex
 ```
 
----
+## Development
 
-## Benchmarking with CodSpeed
+Run `./scripts/install-git-hooks.sh` once per clone to enable a `pre-push` hook
+that mirrors the Rust jobs in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) —
+`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+and both `cargo test` variants. You can also run it manually with
+`./scripts/ci-check.sh`. Skip it for one push with `git push --no-verify`.
 
-Vortex-RDF features a benchmark suite built on top of [Divan](https://github.com/nvzqz/divan) and fully integrated with [CodSpeed](https://codspeed.io) for precise, CPU-instruction-level performance tracking.
-
-The consolidated **`benchmark`** target covers the axes of:
-* Builder strategies: `SortedInMemory`, `SortedStream`, `UnsortedStream`
-* Layout strategies: `Default`, `TypedObject`, `Dictionary`
-* Secondary indexes: none, `SecondaryByReference`, `SecondaryByCopy`
-* Sources: file-backed and in-memory
-* Workloads, grouped by the operation they exercise:
-  * **`serialize`** — the write path (build + encode + write).
-  * **`match_*`** / **`match_chained`** — `match_pattern` queries across the six shapes the query router actually branches on (`S`, `P`, `O`, `PO`, `G`, `SPOG`), plus chained view refinement.
-  * **`decode_all`** / **`open_file`** / **`from_bytes`** — the read-back path: full-scan decode, lazy file open, and IPC load.
-
-Rather than the full cross product of these axes — thousands of instances, most measuring identical code paths — the suite is a **star (one-factor-at-a-time) design**: each group fixes a baseline and varies one axis at a time, adding back only the interactions that genuinely change behaviour. This keeps CodSpeed lean (~66 instances, all run in CI) without losing coverage of any distinct path. The dataset size is a single `BENCH_SIZE` constant, since simulation mode counts instructions deterministically and one representative size catches regressions in every path. See the module docs in [`core/benches/benchmark.rs`](https://github.com/vortex-rdf/vortex-rdf/blob/main/core/benches/benchmark.rs) for the full rationale.
-
-### Running Benchmarks Locally
-
-#### 1. Fast Sanity Check (Test Mode)
-Running full statistical loops can take several minutes due to heavy sampling. You can execute all benchmarks **exactly once** in test-mode to instantly verify correctness:
-```bash
-cargo test --bench benchmark
-```
-
-#### 2. Run Full Statistical Benchmarks
-To run the full Divan statistical profiling loops:
-```bash
-cargo bench --bench benchmark
-```
-
-#### 3. Filtering Benchmarks
-Divan filters on the benchmark's full path, so you can isolate a group, a config, or a query shape:
-```bash
-# Profile only the serialization (write-path) benchmarks
-cargo bench --bench benchmark -- serialize
-
-# Profile only match queries
-cargo bench --bench benchmark -- match
-
-# Profile a specific config across all its patterns
-cargo bench --bench benchmark -- match_sorted_default_bycopy_file
-```
-
-### Artifact Caching
-To keep query measurements isolated from ingestion cost, the suite builds each config's data **once** and reuses it. A thread-safe global cache holds the built in-memory arrays, the serialized `.vortex` files (under `target/bench_vortex_files`), and the IPC byte buffers, keyed by builder, layout, index, and dataset size. Store construction and materialized query inputs stay in Divan's untimed `with_inputs` setup, so each benchmark measures only its own operation and CodSpeed telemetry stays clean and noise-free. Under the star design only a handful of distinct configs are ever requested, so the cache stays naturally bounded.
-
----
-
-## References
-
-[1] Maximilian Kuschewski, David Sauerwein, Adnan Alhomssi, and Viktor Leis. 2023. BtrBlocks: Efficient Columnar Compression for Data Lakes. Proc. ACM Manag. Data, June 2023. https://doi.org/10.1145/3589263
-
-[2] Peter Boncz, Thomas Neumann, and Viktor Leis. FSST: Fast Random Access String Compression. Proc. VLDB Endow., 13(12):2649–2661, July 2020. https://doi.org/10.14778/3407790.3407851.
-
-[3] Daniel Lemire, Leonid Boytsov and Nathan Kurz. SIMD compression and the intersection of sorted integers. 2015. https://doi.org/10.1002/spe.2326
+The `js-tests` CI job (wasm-pack build + `npm test`) is *not* mirrored locally —
+the wasm32 build needs the memory tuning `ci.yml` applies (`CARGO_BUILD_JOBS=1`,
+low codegen units/opt-level) even to run reliably, and was killed under memory
+pressure locally without it. Before pushing JS/wasm changes, run it by hand
+with `(cd js && npm run build && npm test)`; otherwise rely on GitHub CI for
+that job.
