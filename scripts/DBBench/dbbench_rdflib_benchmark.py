@@ -16,6 +16,8 @@ import os
 import signal
 import multiprocessing as mp
 import traceback
+from rdflib.term import Variable
+from rdflib.plugins.sparql.processor import prepareQuery
 
 
 def split_dbbench_queries(path: Path):
@@ -294,6 +296,45 @@ def run_one_query_process_timeout(
     raise RuntimeError(msg.get("error", "unknown child-process query error"))
 
 
+def extract_single_tp_bindings(query: str):
+    """Return native N3 bindings for a SELECT query containing exactly one BGP triple."""
+    translated = prepareQuery(query)
+    triples = []
+
+    def walk(node):
+        if node is None:
+            return
+        if getattr(node, "name", None) == "BGP":
+            triples.extend(node.get("triples", []))
+        if isinstance(node, dict):
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, (list, tuple)):
+            for value in node:
+                walk(value)
+        elif hasattr(node, "items"):
+            for _, value in node.items():
+                walk(value)
+
+    walk(translated.algebra)
+    if len(triples) != 1:
+        raise ValueError(f"diagnostic mode expected one TP triple, found {len(triples)}")
+    s, p, o = triples[0]
+    return tuple(None if isinstance(value, Variable) else value.n3() for value in (s, p, o))
+
+
+def run_native_diagnostic(vortex_path: str, vortex_layout: str, query: str):
+    from vortex_rdflib.vortex_rdf_native import diagnose_match
+    subject_n3, predicate_n3, object_n3 = extract_single_tp_bindings(query)
+    return dict(diagnose_match(
+        vortex_path,
+        subject_n3,
+        predicate_n3,
+        object_n3,
+        vortex_layout,
+    ))
+
+
 def summarize(results):
     grouped = {}
 
@@ -412,6 +453,11 @@ def main():
     )
 
     parser.add_argument("--out-prefix", default="dbbench_rdflib")
+    parser.add_argument(
+        "--diagnostics-jsonl",
+        default=None,
+        help="Append optimized native-ID diagnostic records to this JSONL file; vortex + signal mode only",
+    )
     parser.add_argument("--no-silence-stdout", action="store_true")
     parser.add_argument(
         "--engines",
@@ -421,6 +467,10 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.diagnostics_jsonl and args.timeout_mode != "signal":
+        parser.error("--diagnostics-jsonl requires --timeout-mode signal")
+    if args.diagnostics_jsonl and args.engines != ["vortex"]:
+        parser.error("--diagnostics-jsonl requires exactly --engines vortex")
 
     query_root = Path(args.query_root)
     out_prefix = Path(args.out_prefix)
@@ -556,7 +606,22 @@ def main():
                             timeout_s=args.query_timeout_s,
                         )
                     row.update(out)
-
+                    if args.diagnostics_jsonl:
+                        diagnostic = run_native_diagnostic(
+                            args.vortex_path,
+                            args.vortex_layout,
+                            qrec["query"],
+                        )
+                        diagnostic.update({
+                            "query_id": qrec["query_id"],
+                            "relative_path": qrec["relative_path"],
+                            "phase": phase,
+                            "run": row["run"],
+                            "benchmark_elapsed_ms": row["elapsed_s"] * 1000.0,
+                            "benchmark_result_count": row["result_count"],
+                        })
+                        with Path(args.diagnostics_jsonl).open("a", encoding="utf-8") as diag_file:
+                            diag_file.write(json.dumps(diagnostic, sort_keys=True) + "\n")
                     if phase == "measured" and measured_run_idx == 0:
                         counts_by_engine[engine] = row["result_count"]
 

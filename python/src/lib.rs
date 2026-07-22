@@ -108,19 +108,8 @@ fn diagnose_match<'py>(
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let binding_parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
 
-    // Measure the exact legacy path currently used by VortexStore.triples().
-    let legacy_start = Instant::now();
-    let legacy_rows = PY_NATIVE_RUNTIME
-        .block_on(match_cottas_native_file_as_triples(
-            Path::new(&path),
-            subject.as_ref(),
-            predicate.as_ref(),
-            object.as_ref(),
-            None,
-        ))
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let legacy_native_ms = legacy_start.elapsed().as_secs_f64() * 1000.0;
-
+    // Measure only the optimized diagnostic path. Running the legacy path first
+    // would alter warm state and make the diagnostic timings non-causal.
     // Measure the optimized indexed path independently. The resulting N-Triples
     // bytes are retained only to expose materialization cost and output size.
     let optimized_start = Instant::now();
@@ -140,9 +129,6 @@ fn diagnose_match<'py>(
 
     let out = PyDict::new(py);
     out.set_item("binding_parse_ms", binding_parse_ms)?;
-    out.set_item("legacy_native_ms", legacy_native_ms)?;
-    out.set_item("legacy_rows", legacy_rows.len())?;
-    out.set_item("legacy_rows_data", legacy_rows)?;
     out.set_item("optimized_binding_ms", optimized_binding_ms)?;
     out.set_item("optimized_rdf_bytes", rdf_bytes.len())?;
     out.set_item("core_total_ms", diagnostics.total_ms)?;
@@ -151,6 +137,56 @@ fn diagnose_match<'py>(
         (optimized_binding_ms - diagnostics.total_ms).max(0.0),
     )?;
     out.set_item("term_lookup_ms", diagnostics.term_lookup_ms)?;
+    out.set_item("bound_term_count", diagnostics.term_to_id_stats.len())?;
+    out.set_item(
+        "term_open_ms",
+        diagnostics
+            .term_to_id_stats
+            .iter()
+            .map(|s| s.open_ms)
+            .sum::<f64>(),
+    )?;
+    out.set_item(
+        "term_can_prune_ms",
+        diagnostics
+            .term_to_id_stats
+            .iter()
+            .map(|s| s.can_prune_ms)
+            .sum::<f64>(),
+    )?;
+    out.set_item(
+        "term_scan_build_ms",
+        diagnostics
+            .term_to_id_stats
+            .iter()
+            .map(|s| s.scan_build_ms)
+            .sum::<f64>(),
+    )?;
+    out.set_item(
+        "term_read_all_ms",
+        diagnostics
+            .term_to_id_stats
+            .iter()
+            .map(|s| s.read_all_ms)
+            .sum::<f64>(),
+    )?;
+    out.set_item(
+        "term_extract_ms",
+        diagnostics
+            .term_to_id_stats
+            .iter()
+            .map(|s| s.extract_ms)
+            .sum::<f64>(),
+    )?;
+    out.set_item(
+        "term_strategies",
+        diagnostics
+            .term_to_id_stats
+            .iter()
+            .map(|s| s.strategy.as_str())
+            .collect::<Vec<_>>()
+            .join("+"),
+    )?;
     out.set_item("open_ms", diagnostics.open_ms)?;
     out.set_item("scan_build_ms", diagnostics.scan_build_ms)?;
     out.set_item("read_all_ms", diagnostics.read_all_ms)?;
@@ -169,7 +205,27 @@ fn diagnose_match<'py>(
     out.set_item("po_candidate_rows", diagnostics.po_candidate_rows)?;
     out.set_item("unique_ids_requested", diagnostics.unique_ids_requested)?;
     out.set_item("unique_ids_loaded", diagnostics.unique_ids_loaded)?;
-    out.set_item("id_to_term_strategy", diagnostics.id_to_term_stats.strategy)?;
+    out.set_item(
+        "id_to_term_strategy",
+        diagnostics.id_to_term_stats.strategy.clone(),
+    )?;
+    out.set_item(
+        "id_to_term_open_ms",
+        diagnostics.id_to_term_stats.open_files_ms,
+    )?;
+    out.set_item(
+        "id_to_term_sort_dedup_ms",
+        diagnostics.id_to_term_stats.sort_dedup_ms,
+    )?;
+    out.set_item(
+        "id_to_term_read_ms",
+        diagnostics.id_to_term_stats.blob_read_ms,
+    )?;
+    out.set_item(
+        "id_to_term_requested",
+        diagnostics.id_to_term_stats.requested_ids_unique,
+    )?;
+    out.set_item("id_to_term_loaded", diagnostics.id_to_term_stats.ids_loaded)?;
     out.set_item("access_index_strategy", diagnostics.access_index_strategy)?;
     out.set_item("access_index_lookup_ms", diagnostics.access_index_lookup_ms)?;
     out.set_item(
