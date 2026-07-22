@@ -386,10 +386,14 @@ RUST_LOG=vortex_rdf_cli=debug,vortex_rdf_core=debug vortex-rdf-cli serialize --i
 ## Development
 
 Run `./scripts/install-git-hooks.sh` once per clone to enable a `pre-push` hook
-that mirrors [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — `cargo
-fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, both
-`cargo test` variants, and (only when `js/`, `core/`, `Cargo.toml`, or
-`Cargo.lock` changed since the remote) the WASM build and `npm test`. You can
-also run it manually with `./scripts/ci-check.sh`. Skip it for one push with
-`git push --no-verify`, or force/skip the JS job with
-`VORTEX_JS_CHECK=always|never`.
+that mirrors the Rust jobs in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) —
+`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+and both `cargo test` variants. You can also run it manually with
+`./scripts/ci-check.sh`. Skip it for one push with `git push --no-verify`.
+
+The `js-tests` CI job (wasm-pack build + `npm test`) is *not* mirrored locally —
+the wasm32 build needs the memory tuning `ci.yml` applies (`CARGO_BUILD_JOBS=1`,
+low codegen units/opt-level) even to run reliably, and was killed under memory
+pressure locally without it. Before pushing JS/wasm changes, run it by hand
+with `(cd js && npm run build && npm test)`; otherwise rely on GitHub CI for
+that job.
