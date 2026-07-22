@@ -260,10 +260,15 @@ fn diagnose_term_windows<'py>(
     runs: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
     let window_sizes = window_sizes.unwrap_or_else(|| vec![256, 512, 1024, 2048]);
+    // The Python API accepts RDFLib/N3 syntax. Canonicalize through the same
+    // oxrdf parser and Display representation used by production lookup.
+    let canonical_term = parse_term(&term)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        .to_string();
     let diagnostics = PY_NATIVE_RUNTIME
         .block_on(diagnose_cottas_native_term_windows(
             Path::new(&path),
-            &term,
+            &canonical_term,
             &window_sizes,
             runs,
         ))
