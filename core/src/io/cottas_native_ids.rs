@@ -1338,6 +1338,24 @@ async fn resolve_native_pattern<D: NativeDictionaryProvider + ?Sized>(
         requested.push((value.to_string(), "g"));
     }
 
+    if requested.len() == 1 {
+        let (term, column) = &requested[0];
+        let (id, stats) = dictionary.lookup_term_id(term, Some(*column)).await?;
+        let total_lookup_ms = stats.total_ms;
+        let Some(id) = id else {
+            return Ok((None, total_lookup_ms, vec![stats]));
+        };
+        let mut resolved = ResolvedNativePattern::default();
+        match *column {
+            "s" => resolved.s = Some(id),
+            "p" => resolved.p = Some(id),
+            "o" => resolved.o = Some(id),
+            "g" => resolved.g = Some(id),
+            _ => unreachable!("only native SPOG columns are requested"),
+        }
+        return Ok((Some(resolved), total_lookup_ms, vec![stats]));
+    }
+
     let (ids, stats, total_lookup_ms) = dictionary.lookup_bound_term_ids(&requested).await?;
     if requested.iter().any(|(term, _)| !ids.contains_key(term)) {
         return Ok((None, total_lookup_ms, stats));
