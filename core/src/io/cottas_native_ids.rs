@@ -5717,6 +5717,228 @@ async fn lookup_bound_term_ids_shared_open_equalities(
     Ok((out, stats, total_ms))
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct NativeTermWindowTrial {
+    pub strategy: String,
+    pub window_rows: usize,
+    pub row_start: u64,
+    pub row_end: u64,
+    pub run: usize,
+    pub open_ms: f64,
+    pub scan_build_ms: f64,
+    pub read_all_ms: f64,
+    pub extract_ms: f64,
+    pub total_ms: f64,
+    pub result_rows: usize,
+    pub found_id: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NativeTermWindowDiagnostics {
+    pub term: String,
+    pub term_preview: String,
+    pub dictionary_rows: usize,
+    pub discovered_row: u64,
+    pub expected_id: u32,
+    pub discovery_open_ms: f64,
+    pub discovery_read_ms: f64,
+    pub discovery_extract_ms: f64,
+    pub trials: Vec<NativeTermWindowTrial>,
+}
+
+/// Diagnostic-only feasibility test for a sparse lexical term directory.
+///
+/// Discovery intentionally scans the sorted term_to_id dictionary once and is
+/// reported separately. Timed trials then compare the current full-layout
+/// equality scan with exact row windows around the discovered lexical row.
+/// This function does not alter production lookup routing or persist metadata.
+pub async fn diagnose_cottas_native_term_windows(
+    data_path: &Path,
+    term: &str,
+    window_sizes: &[usize],
+    runs: usize,
+) -> Result<NativeTermWindowDiagnostics> {
+    if runs == 0 {
+        return Err(VortexRdfError::InvalidOperation(
+            "term-window diagnostics require at least one run".into(),
+        ));
+    }
+    if window_sizes.is_empty() || window_sizes.iter().any(|size| *size == 0) {
+        return Err(VortexRdfError::InvalidOperation(
+            "term-window diagnostics require non-zero window sizes".into(),
+        ));
+    }
+
+    let path = native_dict_term_to_id_path(data_path);
+    if !path.is_file() {
+        return Err(VortexRdfError::InvalidOperation(format!(
+            "Vortex term_to_id dictionary component is missing at {:?}", path
+        )));
+    }
+
+    let discovery_open_start = Instant::now();
+    let discovery_file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let discovery_open_ms = elapsed_ms(discovery_open_start);
+    let discovery_read_start = Instant::now();
+    let dictionary = discovery_file
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_projection(vortex_array::expr::select(
+            ["term", "id"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?
+        .read_all()
+        .await
+        .map_err(VortexRdfError::from)?;
+    let discovery_read_ms = elapsed_ms(discovery_read_start);
+    let discovery_extract_start = Instant::now();
+    let terms = extract_projected_utf8_column(&dictionary, "term")?;
+    let ids = extract_projected_u32_column(&dictionary, "id")?;
+    if terms.len() != ids.len() || terms.len() != dictionary.len() {
+        return Err(VortexRdfError::Deserialization(format!(
+            "term-window discovery column mismatch: rows={}, terms={}, ids={}",
+            dictionary.len(), terms.len(), ids.len()
+        )));
+    }
+    if terms.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(VortexRdfError::Deserialization(
+            "term_to_id dictionary is not strictly lexically sorted".into(),
+        ));
+    }
+    let row = terms.binary_search_by(|candidate| candidate.as_str().cmp(term)).map_err(|_| {
+        VortexRdfError::InvalidOperation(format!(
+            "diagnostic term {:?} does not exist in the term_to_id dictionary", term
+        ))
+    })?;
+    let expected_id = ids[row];
+    let dictionary_rows = terms.len();
+    let discovery_extract_ms = elapsed_ms(discovery_extract_start);
+    drop(dictionary);
+    drop(discovery_file);
+
+    let open_start = Instant::now();
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let shared_open_ms = elapsed_ms(open_start);
+    let mut trials = Vec::with_capacity(runs.saturating_mul(window_sizes.len() + 1));
+    macro_rules! run_trial {
+        ($range:expr, $window_rows:expr, $run:expr, $open_ms:expr, $strategy:expr) => {{
+            let total_start = Instant::now();
+            let scan_start = Instant::now();
+            let scan = file.scan().map_err(VortexRdfError::from)?;
+            let scan = match $range.clone() {
+                Some(range) => scan.with_row_range(range),
+                None => scan,
+            };
+            let stream = scan
+                .with_filter(eq(col("term"), lit(term)))
+                .with_projection(vortex_array::expr::select(
+                    ["id"],
+                    vortex_array::expr::root(),
+                ))
+                .into_array_stream()
+                .map_err(VortexRdfError::from)?;
+            let scan_build_ms = elapsed_ms(scan_start);
+            let read_start = Instant::now();
+            let result = stream.read_all().await.map_err(VortexRdfError::from)?;
+            let read_all_ms = elapsed_ms(read_start);
+            if result.len() > 1 {
+                return Err(VortexRdfError::Deserialization(format!(
+                    "term-window diagnostic returned {} IDs for exact term {:?}",
+                    result.len(), term
+                )));
+            }
+            let extract_start = Instant::now();
+            let found_id = extract_first_u32_from_single_column_array(&result, "id")?;
+            let extract_ms = elapsed_ms(extract_start);
+            let (row_start, row_end) = $range
+                .as_ref()
+                .map(|range: &Range<u64>| (range.start, range.end))
+                .unwrap_or((0, 0));
+            NativeTermWindowTrial {
+                strategy: $strategy.to_string(),
+                window_rows: $window_rows,
+                row_start,
+                row_end,
+                run: $run,
+                open_ms: $open_ms,
+                scan_build_ms,
+                read_all_ms,
+                extract_ms,
+                total_ms: elapsed_ms(total_start) + $open_ms,
+                result_rows: result.len(),
+                found_id,
+            }
+        }};
+    }
+    for run in 0..runs {
+        let baseline_range: Option<Range<u64>> = None;
+        let baseline = run_trial!(
+            baseline_range,
+            dictionary_rows,
+            run,
+            if run == 0 { shared_open_ms } else { 0.0 },
+            "full-layout-equality"
+        );
+        if baseline.found_id != Some(expected_id) {
+            return Err(VortexRdfError::Deserialization(format!(
+                "full-layout diagnostic returned {:?}; expected ID {}",
+                baseline.found_id, expected_id
+            )));
+        }
+        trials.push(baseline);
+
+        for &window_rows in window_sizes {
+            let half = window_rows / 2;
+            let mut start = row.saturating_sub(half);
+            let mut end = start.saturating_add(window_rows).min(dictionary_rows);
+            start = end.saturating_sub(window_rows).min(start);
+            if !(start <= row && row < end) {
+                return Err(VortexRdfError::InvalidOperation(format!(
+                    "computed diagnostic window {}..{} does not contain row {}",
+                    start, end, row
+                )));
+            }
+            let window_range = Some(start as u64..end as u64);
+            let window = run_trial!(
+                window_range,
+                end - start,
+                run,
+                0.0,
+                "known-window-row-range"
+            );
+            if window.found_id != Some(expected_id) {
+                return Err(VortexRdfError::Deserialization(format!(
+                    "window {}..{} returned {:?}; expected ID {}",
+                    start, end, window.found_id, expected_id
+                )));
+            }
+            trials.push(window);
+        }
+    }
+
+    Ok(NativeTermWindowDiagnostics {
+        term: term.to_string(),
+        term_preview: native_term_preview(term),
+        dictionary_rows,
+        discovered_row: row as u64,
+        expected_id,
+        discovery_open_ms,
+        discovery_read_ms,
+        discovery_extract_ms,
+        trials,
+    })
+}
+
 async fn lookup_term_id_from_sidecar(data_path: &Path, term: &str) -> Result<Option<u32>> {
     let (id, _stats) = lookup_term_id_from_sidecar_with_stats(data_path, term, None).await?;
     Ok(id)
