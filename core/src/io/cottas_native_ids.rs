@@ -156,6 +156,7 @@ impl NativeIdTriple {
 enum NativeComponent {
     DictionaryVortex,
     DictionaryTermToIdVortex,
+    DictionaryTermDirectoryVortex,
     SubjectRangesVortex,
     PredicateDirectoryVortexV2,
     PredicateRangesVortexV2,
@@ -171,6 +172,7 @@ impl NativeComponent {
         match self {
             Self::DictionaryVortex => "rdf.dictionary.id-to-term.vortex",
             Self::DictionaryTermToIdVortex => "rdf.dictionary.term-to-id.vortex",
+            Self::DictionaryTermDirectoryVortex => "rdf.dictionary.term-directory.vortex-v1",
             Self::SubjectRangesVortex => "rdf.index.subject.ranges.vortex-v1",
             Self::PredicateDirectoryVortexV2 => "rdf.index.p.directory.vortex-v2",
             Self::PredicateRangesVortexV2 => "rdf.index.p.ranges.vortex-v2",
@@ -186,6 +188,7 @@ impl NativeComponent {
         match self {
             Self::DictionaryVortex => "dict.vortex",
             Self::DictionaryTermToIdVortex => "dict.term_to_id.vortex",
+            Self::DictionaryTermDirectoryVortex => "dict.term_directory.v1.vortex",
             Self::SubjectRangesVortex => "subject_ranges.v1.vortex",
             Self::PredicateDirectoryVortexV2 => "p_exact_directory.v2.vortex",
             Self::PredicateRangesVortexV2 => "p_exact_ranges.v2.vortex",
@@ -276,6 +279,10 @@ fn native_dict_path(data_path: &Path) -> PathBuf {
 
 fn native_dict_term_to_id_path(data_path: &Path) -> PathBuf {
     native_component_path(data_path, NativeComponent::DictionaryTermToIdVortex)
+}
+
+fn native_dict_term_directory_path(data_path: &Path) -> PathBuf {
+    native_component_path(data_path, NativeComponent::DictionaryTermDirectoryVortex)
 }
 
 fn quad_to_native_triple(quad: &Quad) -> NativeTriple {
@@ -5232,6 +5239,256 @@ async fn write_dictionary_lookup_sidecars_from_pair_runs(
     Ok(())
 }
 
+
+// VORTEX_RDF_SPARSE_TERM_DIRECTORY_V1
+#[derive(Clone, Debug)]
+struct NativeTermDirectoryEntry {
+    first_term: String,
+    last_term: String,
+    row_start: u64,
+    row_end: u64,
+}
+
+static NATIVE_TERM_DIRECTORY_CACHE: LazyLock<
+    Mutex<HashMap<PathBuf, Arc<[NativeTermDirectoryEntry]>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn term_directory_cache_lock()
+-> Result<std::sync::MutexGuard<'static, HashMap<PathBuf, Arc<[NativeTermDirectoryEntry]>>>> {
+    NATIVE_TERM_DIRECTORY_CACHE.lock().map_err(|_| {
+        VortexRdfError::Deserialization("term directory cache mutex was poisoned".into())
+    })
+}
+
+fn build_native_term_directory_array(
+    first: Vec<String>, last: Vec<String>, starts: Vec<u64>, ends: Vec<u64>,
+) -> Result<ArrayRef> {
+    StructArray::from_fields(&[
+        ("first_term", VarBinArray::from(first).into_array()),
+        ("last_term", VarBinArray::from(last).into_array()),
+        ("row_start", PrimitiveArray::from_iter(starts).into_array()),
+        ("row_end", PrimitiveArray::from_iter(ends).into_array()),
+    ]).map_err(VortexRdfError::Vortex).map(|a| a.into_array())
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct NativeTermDirectoryBuildStats {
+    pub data_path: String,
+    pub source_path: String,
+    pub output_path: String,
+    pub fence_rows: usize,
+    pub dictionary_rows: u64,
+    pub directory_entries: usize,
+    pub open_ms: f64,
+    pub scan_ms: f64,
+    pub write_ms: f64,
+    pub total_ms: f64,
+}
+
+/// Builds only the sparse lexical directory from the existing sorted
+/// term-to-ID Vortex component. Triples and unrelated components are untouched.
+pub async fn build_cottas_native_term_directory(
+    data_path: &Path, fence_rows: usize,
+) -> Result<NativeTermDirectoryBuildStats> {
+    let total_start = Instant::now();
+    if fence_rows == 0 {
+        return Err(VortexRdfError::InvalidOperation("fence_rows must be positive".into()));
+    }
+    let source_path = require_vortex_component(
+        data_path, NativeComponent::DictionaryTermToIdVortex, "term-to-ID dictionary",
+    )?;
+    let output_path = native_dict_term_directory_path(data_path);
+    let temporary_path = output_path.with_extension("vortex.tmp");
+    let open_start = Instant::now();
+    let file = NATIVE_FILE_SESSION.open_options().open_path(&source_path).await
+        .map_err(VortexRdfError::from)?;
+    let open_ms = elapsed_ms(open_start);
+    let scan_start = Instant::now();
+    let mut stream = file.scan().map_err(VortexRdfError::from)?
+        .with_projection(vortex_array::expr::select(["term"], vortex_array::expr::root()))
+        .into_array_stream().map_err(VortexRdfError::from)?;
+    let (mut first, mut last, mut starts, mut ends) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut rows = 0u64;
+    let mut fence_first: Option<String> = None;
+    let mut fence_last: Option<String> = None;
+    let mut fence_start = 0u64;
+    let mut fence_len = 0usize;
+    let mut previous: Option<String> = None;
+    while let Some(batch) = stream.next().await {
+        let batch = batch.map_err(VortexRdfError::from)?;
+        let terms = extract_projected_utf8_column(&batch, "term")?;
+        if terms.len() != batch.len() {
+            return Err(VortexRdfError::Deserialization("term directory source length mismatch".into()));
+        }
+        for term in terms {
+            if previous.as_ref().is_some_and(|p| p >= &term) {
+                return Err(VortexRdfError::Deserialization(format!(
+                    "term-to-ID dictionary is not strictly sorted near row {rows}"
+                )));
+            }
+            if fence_first.is_none() { fence_start = rows; fence_first = Some(term.clone()); }
+            fence_last = Some(term.clone());
+            previous = Some(term);
+            fence_len += 1;
+            rows = rows.checked_add(1).ok_or_else(|| VortexRdfError::Serialization("row overflow".into()))?;
+            if fence_len == fence_rows {
+                first.push(fence_first.take().unwrap()); last.push(fence_last.take().unwrap());
+                starts.push(fence_start); ends.push(rows); fence_len = 0;
+            }
+        }
+    }
+    if fence_len != 0 {
+        first.push(fence_first.take().unwrap()); last.push(fence_last.take().unwrap());
+        starts.push(fence_start); ends.push(rows);
+    }
+    let scan_ms = elapsed_ms(scan_start);
+    let directory_entries = first.len();
+    let array = build_native_term_directory_array(first, last, starts, ends)?;
+    let dtype = build_native_term_directory_array(Vec::new(), Vec::new(), Vec::new(), Vec::new())?.dtype().clone();
+    let arrays = ArrayStreamAdapter::new(dtype, futures::stream::iter(vec![Ok(array)]));
+    let write_start = Instant::now();
+    let mut output = tokio::fs::File::create(&temporary_path).await
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    let strategy = WriteStrategyBuilder::default()
+        .with_row_block_size(directory_entries.max(1).min(65_536))
+        .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact()).build();
+    if let Err(error) = NATIVE_FILE_SESSION.write_options().with_strategy(strategy)
+        .write(&mut output, arrays).await {
+        drop(output); let _ = std::fs::remove_file(&temporary_path);
+        return Err(VortexRdfError::from(error));
+    }
+    output.sync_all().await.map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    drop(output);
+    std::fs::rename(&temporary_path, &output_path)
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    term_directory_cache_lock()?.remove(&output_path);
+    let write_ms = elapsed_ms(write_start);
+    Ok(NativeTermDirectoryBuildStats {
+        data_path: data_path.display().to_string(), source_path: source_path.display().to_string(),
+        output_path: output_path.display().to_string(), fence_rows, dictionary_rows: rows,
+        directory_entries, open_ms, scan_ms, write_ms, total_ms: elapsed_ms(total_start),
+    })
+}
+
+async fn native_term_directory(data_path: &Path) -> Result<Arc<[NativeTermDirectoryEntry]>> {
+    let path = require_vortex_component(
+        data_path, NativeComponent::DictionaryTermDirectoryVortex, "sparse term directory",
+    )?;
+    if let Some(v) = term_directory_cache_lock()?.get(&path).cloned() { return Ok(v); }
+    let file = NATIVE_FILE_SESSION.open_options().open_path(&path).await.map_err(VortexRdfError::from)?;
+    let a = file.scan().map_err(VortexRdfError::from)?
+        .with_projection(vortex_array::expr::select(
+            ["first_term", "last_term", "row_start", "row_end"], vortex_array::expr::root(),
+        )).into_array_stream().map_err(VortexRdfError::from)?.read_all().await
+        .map_err(VortexRdfError::from)?;
+    let first = extract_projected_utf8_column(&a, "first_term")?;
+    let last = extract_projected_utf8_column(&a, "last_term")?;
+    let starts = extract_projected_u64_column(&a, "row_start")?;
+    let ends = extract_projected_u64_column(&a, "row_end")?;
+    if [first.len(), last.len(), starts.len(), ends.len()].into_iter().any(|n| n != a.len()) {
+        return Err(VortexRdfError::Deserialization("term directory column length mismatch".into()));
+    }
+    let mut entries = Vec::with_capacity(a.len());
+    for i in 0..a.len() {
+        if first[i] > last[i] || starts[i] >= ends[i] ||
+            (i > 0 && (last[i - 1] >= first[i] || ends[i - 1] != starts[i])) {
+            return Err(VortexRdfError::Deserialization(format!("invalid term directory entry {i}")));
+        }
+        entries.push(NativeTermDirectoryEntry {
+            first_term: first[i].clone(), last_term: last[i].clone(),
+            row_start: starts[i], row_end: ends[i],
+        });
+    }
+    if entries.first().is_some_and(|e| e.row_start != 0) {
+        return Err(VortexRdfError::Deserialization("term directory does not start at row zero".into()));
+    }
+    let entries: Arc<[NativeTermDirectoryEntry]> = entries.into();
+    let mut cache = term_directory_cache_lock()?;
+    Ok(cache.entry(path).or_insert_with(|| Arc::clone(&entries)).clone())
+}
+
+fn term_directory_range(entries: &[NativeTermDirectoryEntry], term: &str) -> Option<Range<u64>> {
+    let i = entries.partition_point(|e| e.last_term.as_str() < term);
+    let e = entries.get(i)?;
+    (e.first_term.as_str() <= term).then(|| e.row_start..e.row_end)
+}
+
+#[derive(Debug)]
+struct NativeTermLookupWindow { range: Range<u64>, terms: Vec<String> }
+
+fn merge_native_term_lookup_windows(mut input: Vec<NativeTermLookupWindow>) -> Vec<NativeTermLookupWindow> {
+    input.sort_by_key(|w| w.range.start);
+    let mut out: Vec<NativeTermLookupWindow> = Vec::with_capacity(input.len());
+    for mut w in input {
+        if let Some(p) = out.last_mut() {
+            if w.range.start <= p.range.end {
+                p.range.end = p.range.end.max(w.range.end); p.terms.append(&mut w.terms); continue;
+            }
+        }
+        out.push(w);
+    }
+    for w in &mut out { w.terms.sort(); w.terms.dedup(); }
+    out
+}
+
+async fn lookup_bound_term_ids_sparse_directory(
+    data_path: &Path, terms: &[(String, &'static str)],
+) -> Result<(HashMap<String, u32>, Vec<NativeTermToIdLookupStats>, f64)> {
+    let total_start = Instant::now();
+    if terms.is_empty() { return Ok((HashMap::new(), Vec::new(), elapsed_ms(total_start))); }
+    let directory = native_term_directory(data_path).await?;
+    let mut stats: Vec<_> = terms.iter().map(|(term, column)| NativeTermToIdLookupStats {
+        column: Some((*column).to_string()), term_len: term.len(), term_preview: native_term_preview(term),
+        strategy: "vortex-sparse-directory-v1".to_string(), ..Default::default()
+    }).collect();
+    let windows = merge_native_term_lookup_windows(terms.iter().filter_map(|(term, _)| {
+        term_directory_range(&directory, term).map(|range| NativeTermLookupWindow {
+            range, terms: vec![term.clone()],
+        })
+    }).collect());
+    if windows.is_empty() {
+        let ms = elapsed_ms(total_start); stats[0].total_ms = ms;
+        return Ok((HashMap::new(), stats, ms));
+    }
+    let path = require_vortex_component(
+        data_path, NativeComponent::DictionaryTermToIdVortex, "term-to-ID dictionary",
+    )?;
+    let open_start = Instant::now();
+    let file = NATIVE_FILE_SESSION.open_options().open_path(&path).await.map_err(VortexRdfError::from)?;
+    let open_ms = elapsed_ms(open_start);
+    let (mut scan_ms, mut read_ms, mut extract_ms) = (0.0, 0.0, 0.0);
+    let mut found = HashMap::with_capacity(terms.len());
+    for window in windows {
+        let expr = window.terms.iter().map(|t| eq(col("term"), lit(t.as_str()))).reduce(or).unwrap();
+        let t = Instant::now();
+        let stream = file.scan().map_err(VortexRdfError::from)?.with_row_range(window.range)
+            .with_filter(expr).with_projection(vortex_array::expr::select(["term", "id"], vortex_array::expr::root()))
+            .into_array_stream().map_err(VortexRdfError::from)?;
+        scan_ms += elapsed_ms(t);
+        let t = Instant::now();
+        let result = stream.read_all().await.map_err(VortexRdfError::from)?;
+        read_ms += elapsed_ms(t);
+        let t = Instant::now();
+        let loaded_terms = extract_projected_utf8_column(&result, "term")?;
+        let ids = extract_projected_u32_column(&result, "id")?;
+        if loaded_terms.len() != ids.len() { return Err(VortexRdfError::Deserialization("sparse lookup length mismatch".into())); }
+        for (term, id) in loaded_terms.into_iter().zip(ids) {
+            if found.insert(term.clone(), id).is_some() {
+                return Err(VortexRdfError::Deserialization(format!("duplicate sparse lookup result {term:?}")));
+            }
+        }
+        extract_ms += elapsed_ms(t);
+    }
+    let total_ms = elapsed_ms(total_start);
+    for (i, (term, _)) in terms.iter().enumerate() {
+        stats[i].found_id = found.get(term).copied();
+        stats[i].result_array_len = usize::from(stats[i].found_id.is_some());
+    }
+    stats[0].open_ms = open_ms; stats[0].scan_build_ms = scan_ms;
+    stats[0].read_all_ms = read_ms; stats[0].extract_ms = extract_ms; stats[0].total_ms = total_ms;
+    Ok((found, stats, total_ms))
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct NativeDictionaryRebuildStats {
     pub data_path: String,
@@ -5527,8 +5784,9 @@ async fn lookup_bound_term_ids_from_sidecar_with_stats(
         "shared-open-equalities" => {
             lookup_bound_term_ids_shared_open_equalities(data_path, terms).await
         }
+        "sparse-directory-v1" => lookup_bound_term_ids_sparse_directory(data_path, terms).await,
         other => Err(VortexRdfError::InvalidOperation(format!(
-            "Unsupported VORTEX_RDF_TERM_LOOKUP_STRATEGY={other:?}; expected batched-or or shared-open-equalities"
+            "Unsupported VORTEX_RDF_TERM_LOOKUP_STRATEGY={other:?}; expected batched-or, shared-open-equalities, or sparse-directory-v1"
         ))),
     }
 }
@@ -5949,6 +6207,18 @@ async fn lookup_term_id_from_sidecar_with_stats(
     term: &str,
     column: Option<&'static str>,
 ) -> Result<(Option<u32>, NativeTermToIdLookupStats)> {
+    let strategy = std::env::var("VORTEX_RDF_TERM_LOOKUP_STRATEGY")
+        .unwrap_or_else(|_| "batched-or".to_string());
+    if strategy == "sparse-directory-v1" {
+        let requested = vec![(term.to_string(), column.unwrap_or("term"))];
+        let (ids, mut stats, _) = lookup_bound_term_ids_sparse_directory(data_path, &requested).await?;
+        return Ok((ids.get(term).copied(), stats.pop().unwrap()));
+    }
+    if strategy != "batched-or" && strategy != "shared-open-equalities" {
+        return Err(VortexRdfError::InvalidOperation(format!(
+            "Unsupported VORTEX_RDF_TERM_LOOKUP_STRATEGY={strategy:?}; expected batched-or, shared-open-equalities, or sparse-directory-v1"
+        )));
+    }
     let lookup_start = Instant::now();
     let mut stats = NativeTermToIdLookupStats {
         column: column.map(|value| value.to_string()),

@@ -14,7 +14,8 @@ pub use ser::{quads_stream_to_vortex, quads_stream_to_vortex_writer, serialize};
 pub use cottas_native_ids::{
     CottasNativeConfig, CottasNativeIdsDiagnostics, NativeIdsCountMode,
     build_cottas_native_o_exact_ranges_index, build_cottas_native_po_predicate_partitions_v2,
-    build_cottas_native_subject_range_index, count_cottas_native_ids_file_with_diagnostics,
+    build_cottas_native_subject_range_index, build_cottas_native_term_directory,
+    count_cottas_native_ids_file_with_diagnostics,
     count_cottas_native_ids_file_with_diagnostics_mode, diagnose_cottas_native_term_windows,
     match_cottas_native_file, match_cottas_native_file_as_triples,
     match_cottas_native_file_as_triples_optimized, match_cottas_native_file_with_diagnostics,
