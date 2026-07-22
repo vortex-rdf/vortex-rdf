@@ -5520,6 +5520,23 @@ async fn lookup_bound_term_ids_from_sidecar_with_stats(
     data_path: &Path,
     terms: &[(String, &'static str)],
 ) -> Result<(HashMap<String, u32>, Vec<NativeTermToIdLookupStats>, f64)> {
+    let strategy = std::env::var("VORTEX_RDF_TERM_LOOKUP_STRATEGY")
+        .unwrap_or_else(|_| "batched-or".to_string());
+    match strategy.as_str() {
+        "batched-or" => lookup_bound_term_ids_batched_or(data_path, terms).await,
+        "shared-open-equalities" => {
+            lookup_bound_term_ids_shared_open_equalities(data_path, terms).await
+        }
+        other => Err(VortexRdfError::InvalidOperation(format!(
+            "Unsupported VORTEX_RDF_TERM_LOOKUP_STRATEGY={other:?}; expected batched-or or shared-open-equalities"
+        ))),
+    }
+}
+
+async fn lookup_bound_term_ids_batched_or(
+    data_path: &Path,
+    terms: &[(String, &'static str)],
+) -> Result<(HashMap<String, u32>, Vec<NativeTermToIdLookupStats>, f64)> {
     let total_start = Instant::now();
     if terms.is_empty() {
         return Ok((HashMap::new(), Vec::new(), elapsed_ms(total_start)));
@@ -5598,7 +5615,7 @@ async fn lookup_bound_term_ids_from_sidecar_with_stats(
         stats[index].found_id = out.get(term).copied();
         stats[index].result_array_len = usize::from(stats[index].found_id.is_some());
     }
-    // Record shared batch costs once so diagnostics do not multiply them by the number of terms.
+    // Shared costs are stored once so aggregate diagnostics do not multiply them.
     stats[0].open_ms = open_ms;
     stats[0].can_prune_ms = can_prune_ms;
     stats[0].scan_build_ms = scan_build_ms;
@@ -5606,6 +5623,97 @@ async fn lookup_bound_term_ids_from_sidecar_with_stats(
     stats[0].extract_ms = extract_ms;
     stats[0].can_prune = can_prune;
     stats[0].total_ms = total_ms;
+    Ok((out, stats, total_ms))
+}
+
+async fn lookup_bound_term_ids_shared_open_equalities(
+    data_path: &Path,
+    terms: &[(String, &'static str)],
+) -> Result<(HashMap<String, u32>, Vec<NativeTermToIdLookupStats>, f64)> {
+    let total_start = Instant::now();
+    if terms.is_empty() {
+        return Ok((HashMap::new(), Vec::new(), elapsed_ms(total_start)));
+    }
+
+    let path = native_dict_term_to_id_path(data_path);
+    if !path.is_file() {
+        return Err(VortexRdfError::InvalidOperation(format!(
+            "Vortex term_to_id dictionary component is missing at {:?}",
+            path
+        )));
+    }
+
+    let open_start = Instant::now();
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let open_ms = elapsed_ms(open_start);
+
+    let mut out = HashMap::with_capacity(terms.len());
+    let mut stats = Vec::with_capacity(terms.len());
+    for (index, (term, column)) in terms.iter().enumerate() {
+        let lookup_start = Instant::now();
+        let mut item = NativeTermToIdLookupStats {
+            column: Some((*column).to_string()),
+            term_len: term.len(),
+            term_preview: native_term_preview(term),
+            strategy: "vortex-shared-open-equality".to_string(),
+            ..NativeTermToIdLookupStats::default()
+        };
+        if index == 0 {
+            item.open_ms = open_ms;
+        }
+
+        let expr = eq(col("term"), lit(term.as_str()));
+        let can_prune_start = Instant::now();
+        item.can_prune = file.can_prune(&expr).ok();
+        item.can_prune_ms = elapsed_ms(can_prune_start);
+
+        let scan_start = Instant::now();
+        let stream = file
+            .scan()
+            .map_err(VortexRdfError::from)?
+            .with_filter(expr)
+            .with_projection(vortex_array::expr::select(
+                ["id"],
+                vortex_array::expr::root(),
+            ))
+            .into_array_stream()
+            .map_err(VortexRdfError::from)?;
+        item.scan_build_ms = elapsed_ms(scan_start);
+
+        let read_start = Instant::now();
+        let result = stream.read_all().await.map_err(VortexRdfError::from)?;
+        item.read_all_ms = elapsed_ms(read_start);
+        item.result_array_len = result.len();
+        if result.len() > 1 {
+            return Err(VortexRdfError::Deserialization(format!(
+                "shared-open term_to_id equality returned {} IDs for term {:?}",
+                result.len(),
+                term
+            )));
+        }
+
+        let extract_start = Instant::now();
+        let id = extract_first_u32_from_single_column_array(&result, "id")?;
+        item.extract_ms = elapsed_ms(extract_start);
+        item.found_id = id;
+        if let Some(id) = id {
+            if let Some(previous) = out.insert(term.clone(), id) {
+                if previous != id {
+                    return Err(VortexRdfError::Deserialization(format!(
+                        "shared-open term_to_id lookup returned conflicting IDs for duplicate term {term:?}"
+                    )));
+                }
+            }
+        }
+        item.total_ms = elapsed_ms(lookup_start) + if index == 0 { open_ms } else { 0.0 };
+        stats.push(item);
+    }
+
+    let total_ms = elapsed_ms(total_start);
     Ok((out, stats, total_ms))
 }
 
