@@ -3,6 +3,7 @@ use futures::{Stream, StreamExt, stream};
 use js_sys::{Object, Reflect};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use oxrdfio::RdfFormat;
+use std::cell::RefCell;
 use std::io::Cursor;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
@@ -16,7 +17,6 @@ use vortex_rdf_core::{
     BuilderStrategy, IndexType, Indexes, LayoutStrategy, SortedInMemoryBuilder,
     UnsortedStreamBuilder, VortexRdfStore as CoreStore,
 };
-use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
@@ -404,7 +404,8 @@ impl VortexRdfStore {
         // it is not dependent on the matched rows and must be built off `self`.
         let dict = self.code_path_dict();
         let inner = self.inner.clone();
-        let promise = future_to_promise(async move { match_columns(inner, dict, s, p, o, g).await });
+        let promise =
+            future_to_promise(async move { match_columns(inner, dict, s, p, o, g).await });
         make_lazy_quad_stream(&promise.into())
     }
 
@@ -867,8 +868,9 @@ type BoxedQuadStream = Box<dyn Stream<Item = CoreResult<Quad>> + Unpin + Send>;
 fn js_to_quad_stream(value: JsValue) -> Result<BoxedQuadStream, JsValue> {
     if js_sys::Array::is_array(&value) {
         let quads = js_array_to_quads(js_sys::Array::from(&value))?;
-        let stream: BoxedQuadStream =
-            Box::new(stream::iter(quads.into_iter().map(Ok::<Quad, VortexRdfError>)));
+        let stream: BoxedQuadStream = Box::new(stream::iter(
+            quads.into_iter().map(Ok::<Quad, VortexRdfError>),
+        ));
         return Ok(stream);
     }
     rdfjs_stream_to_quads(value)
