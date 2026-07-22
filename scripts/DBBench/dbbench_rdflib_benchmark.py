@@ -405,6 +405,11 @@ def main():
 
     parser.add_argument("--max-queries", type=int, default=None)
     parser.add_argument("--only-file-contains", default=None)
+    parser.add_argument(
+        "--query-id-file",
+        default=None,
+        help="Text file containing one exact query_id per line; blank lines and # comments are ignored",
+    )
 
     parser.add_argument("--out-prefix", default="dbbench_rdflib")
     parser.add_argument("--no-silence-stdout", action="store_true")
@@ -432,6 +437,17 @@ def main():
             r for r in query_records
             if args.only_file_contains in r["relative_path"]
         ]
+    if args.query_id_file:
+        selected_ids = {
+            line.strip()
+            for line in Path(args.query_id_file).read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+        known_ids = {r["query_id"] for r in query_records}
+        missing_ids = sorted(selected_ids - known_ids)
+        if missing_ids:
+            raise SystemExit("Unknown query IDs in --query-id-file:\n  " + "\n  ".join(missing_ids))
+        query_records = [r for r in query_records if r["query_id"] in selected_ids]
 
     if args.shuffle:
         rng = random.Random(args.seed)

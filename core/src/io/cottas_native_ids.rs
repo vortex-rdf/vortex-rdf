@@ -31,7 +31,7 @@ use vortex_session::VortexSession;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 use oxrdfio::{RdfFormat, RdfSerializer};
 
-use vortex::expr::{Expression, and, col, eq, lit};
+use vortex::expr::{Expression, and, col, eq, lit, or};
 use vortex_array::stream::ArrayStreamExt;
 
 static NATIVE_FILE_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
@@ -1130,6 +1130,10 @@ pub trait NativeDictionaryProvider: Send + Sync {
         column: Option<&'static str>,
     ) -> Result<(Option<u32>, NativeTermToIdLookupStats)>;
 
+    async fn lookup_bound_term_ids(
+        &self,
+        terms: &[(String, &'static str)],
+    ) -> Result<(HashMap<String, u32>, Vec<NativeTermToIdLookupStats>, f64)>;
     async fn lookup_terms_by_ids(
         &self,
         ids: &[u32],
@@ -1184,6 +1188,13 @@ impl NativeDictionaryProvider for NativeRdfProviders {
         column: Option<&'static str>,
     ) -> Result<(Option<u32>, NativeTermToIdLookupStats)> {
         lookup_term_id_from_sidecar_with_stats(&self.data_path, term, column).await
+    }
+
+    async fn lookup_bound_term_ids(
+        &self,
+        terms: &[(String, &'static str)],
+    ) -> Result<(HashMap<String, u32>, Vec<NativeTermToIdLookupStats>, f64)> {
+        lookup_bound_term_ids_from_sidecar_with_stats(&self.data_path, terms).await
     }
 
     async fn lookup_terms_by_ids(
@@ -1313,31 +1324,37 @@ async fn resolve_native_pattern<D: NativeDictionaryProvider + ?Sized>(
     f64,
     Vec<NativeTermToIdLookupStats>,
 )> {
-    let mut resolved = ResolvedNativePattern::default();
-    let mut total_lookup_ms = 0.0;
-    let mut stats_out = Vec::new();
-
-    macro_rules! resolve_bound {
-        ($value:expr, $field:ident, $column:literal) => {
-            if let Some(value) = $value {
-                let (id, stats) = dictionary
-                    .lookup_term_id(&value.to_string(), Some($column))
-                    .await?;
-                total_lookup_ms += stats.total_ms;
-                stats_out.push(stats);
-                let Some(id) = id else {
-                    return Ok((None, total_lookup_ms, stats_out));
-                };
-                resolved.$field = Some(id);
-            }
-        };
+    let mut requested = Vec::with_capacity(4);
+    if let Some(value) = subject {
+        requested.push((value.to_string(), "s"));
+    }
+    if let Some(value) = predicate {
+        requested.push((value.to_string(), "p"));
+    }
+    if let Some(value) = object {
+        requested.push((value.to_string(), "o"));
+    }
+    if let Some(value) = graph {
+        requested.push((value.to_string(), "g"));
     }
 
-    resolve_bound!(subject, s, "s");
-    resolve_bound!(predicate, p, "p");
-    resolve_bound!(object, o, "o");
-    resolve_bound!(graph, g, "g");
-    Ok((Some(resolved), total_lookup_ms, stats_out))
+    let (ids, stats, total_lookup_ms) = dictionary.lookup_bound_term_ids(&requested).await?;
+    if requested.iter().any(|(term, _)| !ids.contains_key(term)) {
+        return Ok((None, total_lookup_ms, stats));
+    }
+
+    let mut resolved = ResolvedNativePattern::default();
+    for (term, column) in requested {
+        let id = ids[&term];
+        match column {
+            "s" => resolved.s = Some(id),
+            "p" => resolved.p = Some(id),
+            "o" => resolved.o = Some(id),
+            "g" => resolved.g = Some(id),
+            _ => unreachable!("only native SPOG columns are requested"),
+        }
+    }
+    Ok((Some(resolved), total_lookup_ms, stats))
 }
 
 async fn plan_native_access<I: NativeIndexProvider + ?Sized>(
@@ -5479,6 +5496,99 @@ async fn build_native_pattern_filter_lazy_with_stats(
     );
 
     Ok((NativePatternFilter::Expr(expr), term_lookup_ms))
+}
+
+async fn lookup_bound_term_ids_from_sidecar_with_stats(
+    data_path: &Path,
+    terms: &[(String, &'static str)],
+) -> Result<(HashMap<String, u32>, Vec<NativeTermToIdLookupStats>, f64)> {
+    let total_start = Instant::now();
+    if terms.is_empty() {
+        return Ok((HashMap::new(), Vec::new(), elapsed_ms(total_start)));
+    }
+
+    let path = native_dict_term_to_id_path(data_path);
+    if !path.is_file() {
+        return Err(VortexRdfError::InvalidOperation(format!(
+            "Vortex term_to_id dictionary component is missing at {:?}",
+            path
+        )));
+    }
+
+    let mut stats: Vec<NativeTermToIdLookupStats> = terms
+        .iter()
+        .map(|(term, column)| NativeTermToIdLookupStats {
+            column: Some((*column).to_string()),
+            term_len: term.len(),
+            term_preview: native_term_preview(term),
+            strategy: "vortex-batched-term-filter".to_string(),
+            ..NativeTermToIdLookupStats::default()
+        })
+        .collect();
+
+    let open_start = Instant::now();
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let open_ms = elapsed_ms(open_start);
+    let expr = terms
+        .iter()
+        .map(|(term, _)| eq(col("term"), lit(term.as_str())))
+        .reduce(or)
+        .expect("non-empty bound-term batch");
+    let can_prune_start = Instant::now();
+    let can_prune = file.can_prune(&expr).ok();
+    let can_prune_ms = elapsed_ms(can_prune_start);
+    let scan_start = Instant::now();
+    let stream = file
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_filter(expr)
+        .with_projection(vortex_array::expr::select(
+            ["term", "id"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?;
+    let scan_build_ms = elapsed_ms(scan_start);
+    let read_start = Instant::now();
+    let result = stream.read_all().await.map_err(VortexRdfError::from)?;
+    let read_all_ms = elapsed_ms(read_start);
+    let extract_start = Instant::now();
+    let loaded_terms = extract_projected_utf8_column(&result, "term")?;
+    let loaded_ids = extract_projected_u32_column(&result, "id")?;
+    if loaded_terms.len() != loaded_ids.len() {
+        return Err(VortexRdfError::Deserialization(format!(
+            "batched term_to_id lookup returned terms={} and ids={}",
+            loaded_terms.len(),
+            loaded_ids.len()
+        )));
+    }
+    let mut out = HashMap::with_capacity(loaded_terms.len());
+    for (term, id) in loaded_terms.into_iter().zip(loaded_ids) {
+        if out.insert(term.clone(), id).is_some() {
+            return Err(VortexRdfError::Deserialization(format!(
+                "batched term_to_id lookup returned duplicate term {term:?}"
+            )));
+        }
+    }
+    let extract_ms = elapsed_ms(extract_start);
+    let total_ms = elapsed_ms(total_start);
+    for (index, (term, _)) in terms.iter().enumerate() {
+        stats[index].found_id = out.get(term).copied();
+        stats[index].result_array_len = usize::from(stats[index].found_id.is_some());
+    }
+    // Record shared batch costs once so diagnostics do not multiply them by the number of terms.
+    stats[0].open_ms = open_ms;
+    stats[0].can_prune_ms = can_prune_ms;
+    stats[0].scan_build_ms = scan_build_ms;
+    stats[0].read_all_ms = read_all_ms;
+    stats[0].extract_ms = extract_ms;
+    stats[0].can_prune = can_prune;
+    stats[0].total_ms = total_ms;
+    Ok((out, stats, total_ms))
 }
 
 async fn lookup_term_id_from_sidecar(data_path: &Path, term: &str) -> Result<Option<u32>> {
