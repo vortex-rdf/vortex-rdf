@@ -11,6 +11,7 @@ use tokio::runtime::Runtime;
 use vortex_rdf_core::common::utils::{parse_named_node, parse_subject, parse_term};
 use vortex_rdf_core::io::{
     NativeIdsCountMode, count_cottas_native_ids_file_with_diagnostics_mode,
+    diagnose_cottas_native_term_windows,
     count_cottas_native_string_file, match_cottas_native_file_as_triples,
     match_cottas_native_file_as_triples_optimized, match_cottas_native_file_with_diagnostics,
     match_cottas_native_string_file_as_triples,
@@ -250,6 +251,54 @@ fn diagnose_match<'py>(
 }
 
 #[pyfunction]
+#[pyo3(signature = (path, term, window_sizes=None, runs=5))]
+fn diagnose_term_windows<'py>(
+    py: Python<'py>,
+    path: String,
+    term: String,
+    window_sizes: Option<Vec<usize>>,
+    runs: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    let window_sizes = window_sizes.unwrap_or_else(|| vec![256, 512, 1024, 2048]);
+    let diagnostics = PY_NATIVE_RUNTIME
+        .block_on(diagnose_cottas_native_term_windows(
+            Path::new(&path),
+            &term,
+            &window_sizes,
+            runs,
+        ))
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let out = PyDict::new(py);
+    out.set_item("term", diagnostics.term)?;
+    out.set_item("term_preview", diagnostics.term_preview)?;
+    out.set_item("dictionary_rows", diagnostics.dictionary_rows)?;
+    out.set_item("discovered_row", diagnostics.discovered_row)?;
+    out.set_item("expected_id", diagnostics.expected_id)?;
+    out.set_item("discovery_open_ms", diagnostics.discovery_open_ms)?;
+    out.set_item("discovery_read_ms", diagnostics.discovery_read_ms)?;
+    out.set_item("discovery_extract_ms", diagnostics.discovery_extract_ms)?;
+    let trials = pyo3::types::PyList::empty(py);
+    for trial in diagnostics.trials {
+        let item = PyDict::new(py);
+        item.set_item("strategy", trial.strategy)?;
+        item.set_item("window_rows", trial.window_rows)?;
+        item.set_item("row_start", trial.row_start)?;
+        item.set_item("row_end", trial.row_end)?;
+        item.set_item("run", trial.run)?;
+        item.set_item("open_ms", trial.open_ms)?;
+        item.set_item("scan_build_ms", trial.scan_build_ms)?;
+        item.set_item("read_all_ms", trial.read_all_ms)?;
+        item.set_item("extract_ms", trial.extract_ms)?;
+        item.set_item("total_ms", trial.total_ms)?;
+        item.set_item("result_rows", trial.result_rows)?;
+        item.set_item("found_id", trial.found_id)?;
+        trials.append(item)?;
+    }
+    out.set_item("trials", trials)?;
+    Ok(out)
+}
+
+#[pyfunction]
 fn count_triples(path: String, layout: Option<String>) -> PyResult<usize> {
     let layout = layout.unwrap_or_else(|| "cottas-native-strings".to_string());
 
@@ -283,6 +332,7 @@ fn count_triples(path: String, layout: Option<String>) -> PyResult<usize> {
 fn vortex_rdf_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(match_triples, m)?)?;
     m.add_function(wrap_pyfunction!(diagnose_match, m)?)?;
+    m.add_function(wrap_pyfunction!(diagnose_term_windows, m)?)?;
     m.add_function(wrap_pyfunction!(count_triples, m)?)?;
     Ok(())
 }
