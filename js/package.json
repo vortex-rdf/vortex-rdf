@@ -1,7 +1,7 @@
 {
     "name": "vortex-rdf",
     "version": "0.1.0",
-    "description": "High-performance, columnar RDF serialization format",
+    "description": "High-performance, zero-copy columnar RDF serialization format",
     "type": "module",
     "main": "./entry/browser.js",
     "types": "./pkg/web/vortex_rdf.d.ts",
