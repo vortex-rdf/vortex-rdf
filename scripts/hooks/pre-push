@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Installed as the repo's pre-push hook (see scripts/install-git-hooks.sh).
+# Runs scripts/ci-check.sh before allowing a push, so local pushes fail the
+# same way GitHub Actions would. Skip once with `git push --no-verify`.
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+zero="0000000000000000000000000000000000000000"
+
+base=""
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [[ "$local_sha" == "$zero" ]] && continue # deleting a remote ref, nothing to check
+  if [[ "$remote_sha" != "$zero" ]]; then
+    base="$remote_sha"
+  fi
+done
+
+CI_CHECK_BASE="$base" exec "$repo_root/scripts/ci-check.sh"

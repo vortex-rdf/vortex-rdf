@@ -382,3 +382,14 @@ vortex-rdf-cli match --input test.vortex --subject "http://example.org/s1" --out
 # Enable debug logging (shows timing metrics)
 RUST_LOG=vortex_rdf_cli=debug,vortex_rdf_core=debug vortex-rdf-cli serialize --input data.ttl --output data.vortex
 ```
+
+## Development
+
+Run `./scripts/install-git-hooks.sh` once per clone to enable a `pre-push` hook
+that mirrors [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — `cargo
+fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, both
+`cargo test` variants, and (only when `js/`, `core/`, `Cargo.toml`, or
+`Cargo.lock` changed since the remote) the WASM build and `npm test`. You can
+also run it manually with `./scripts/ci-check.sh`. Skip it for one push with
+`git push --no-verify`, or force/skip the JS job with
+`VORTEX_JS_CHECK=always|never`.
