@@ -13,8 +13,7 @@ use vortex_rdf_core::io::{
     NativeIdsCountMode, count_cottas_native_ids_file_with_diagnostics_mode,
     count_cottas_native_string_file, diagnose_cottas_native_id_decode_strategies,
     diagnose_cottas_native_result_pipeline, diagnose_cottas_native_term_windows,
-    match_cottas_native_file_as_compact_triples,
-    match_cottas_native_file_as_triples,
+    match_cottas_native_file_as_compact_triples, match_cottas_native_file_as_triples,
     match_cottas_native_file_as_triples_optimized, match_cottas_native_file_with_diagnostics,
     match_cottas_native_string_file_as_triples,
 };
@@ -123,24 +122,45 @@ fn match_triples_compact(
 #[pyfunction]
 #[pyo3(signature = (path, subject_n3, predicate_n3, object_n3, layout=None, max_range_scans=256))]
 fn diagnose_id_decode_strategies<'py>(
-    py: Python<'py>, path: String, subject_n3: Option<String>,
-    predicate_n3: Option<String>, object_n3: Option<String>,
-    layout: Option<String>, max_range_scans: usize,
+    py: Python<'py>,
+    path: String,
+    subject_n3: Option<String>,
+    predicate_n3: Option<String>,
+    object_n3: Option<String>,
+    layout: Option<String>,
+    max_range_scans: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
     let layout = layout.unwrap_or_else(|| "cottas-native-ids".to_string());
     if !matches!(layout.as_str(), "cottas-native-ids" | "cottas-native") {
-        return Err(PyRuntimeError::new_err("ID decode diagnostics require native IDs"));
+        return Err(PyRuntimeError::new_err(
+            "ID decode diagnostics require native IDs",
+        ));
     }
-    let subject = subject_n3.as_deref().map(parse_subject).transpose()
+    let subject = subject_n3
+        .as_deref()
+        .map(parse_subject)
+        .transpose()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let predicate = predicate_n3.as_deref().map(parse_named_node).transpose()
+    let predicate = predicate_n3
+        .as_deref()
+        .map(parse_named_node)
+        .transpose()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let object = object_n3.as_deref().map(parse_term).transpose()
+    let object = object_n3
+        .as_deref()
+        .map(parse_term)
+        .transpose()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let d = PY_NATIVE_RUNTIME.block_on(diagnose_cottas_native_id_decode_strategies(
-        Path::new(&path), subject.as_ref(), predicate.as_ref(), object.as_ref(),
-        None, max_range_scans,
-    )).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let d = PY_NATIVE_RUNTIME
+        .block_on(diagnose_cottas_native_id_decode_strategies(
+            Path::new(&path),
+            subject.as_ref(),
+            predicate.as_ref(),
+            object.as_ref(),
+            None,
+            max_range_scans,
+        ))
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let out = PyDict::new(py);
     out.set_item("rows_out", d.rows_out)?;
     out.set_item("ids_only_ms", d.ids_only_ms)?;
@@ -183,18 +203,35 @@ fn diagnose_result_pipeline<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let layout = layout.unwrap_or_else(|| "cottas-native-ids".to_string());
     if !matches!(layout.as_str(), "cottas-native-ids" | "cottas-native") {
-        return Err(PyRuntimeError::new_err("pipeline diagnostics require native IDs"));
+        return Err(PyRuntimeError::new_err(
+            "pipeline diagnostics require native IDs",
+        ));
     }
-    let subject = subject_n3.as_deref().map(parse_subject).transpose()
+    let subject = subject_n3
+        .as_deref()
+        .map(parse_subject)
+        .transpose()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let predicate = predicate_n3.as_deref().map(parse_named_node).transpose()
+    let predicate = predicate_n3
+        .as_deref()
+        .map(parse_named_node)
+        .transpose()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let object = object_n3.as_deref().map(parse_term).transpose()
+    let object = object_n3
+        .as_deref()
+        .map(parse_term)
+        .transpose()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let binding_start = Instant::now();
-    let d = PY_NATIVE_RUNTIME.block_on(diagnose_cottas_native_result_pipeline(
-        Path::new(&path), subject.as_ref(), predicate.as_ref(), object.as_ref(), None,
-    )).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let d = PY_NATIVE_RUNTIME
+        .block_on(diagnose_cottas_native_result_pipeline(
+            Path::new(&path),
+            subject.as_ref(),
+            predicate.as_ref(),
+            object.as_ref(),
+            None,
+        ))
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let binding_call_ms = binding_start.elapsed().as_secs_f64() * 1000.0;
     let out = PyDict::new(py);
     out.set_item("rows_out", d.rows_out)?;
@@ -212,11 +249,17 @@ fn diagnose_result_pipeline<'py>(
     out.set_item("ids_only_ms", d.ids_only_ms)?;
     out.set_item("unique_id_collect_ms", d.unique_id_collect_ms)?;
     out.set_item("id_to_term_ms", d.id_to_term_ms)?;
-    out.set_item("compact_intern_and_row_build_ms", d.compact_intern_and_row_build_ms)?;
+    out.set_item(
+        "compact_intern_and_row_build_ms",
+        d.compact_intern_and_row_build_ms,
+    )?;
     out.set_item("compact_native_ms", d.compact_native_ms)?;
     out.set_item("total_rust_ms", d.total_rust_ms)?;
     out.set_item("binding_call_ms", binding_call_ms)?;
-    out.set_item("binding_fixed_overhead_ms", (binding_call_ms - d.total_rust_ms).max(0.0))?;
+    out.set_item(
+        "binding_fixed_overhead_ms",
+        (binding_call_ms - d.total_rust_ms).max(0.0),
+    )?;
     out.set_item("id_to_term_open_ms", d.id_to_term_stats.open_files_ms)?;
     out.set_item("id_to_term_read_ms", d.id_to_term_stats.blob_read_ms)?;
     out.set_item("id_to_term_loaded", d.id_to_term_stats.ids_loaded)?;
