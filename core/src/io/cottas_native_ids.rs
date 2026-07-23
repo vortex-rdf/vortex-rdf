@@ -405,7 +405,9 @@ fn intern_compact_term(
     terms: &mut Vec<String>,
     indexes: &mut HashMap<String, u32>,
 ) -> Result<u32> {
-    if let Some(index) = indexes.get(value) { return Ok(*index); }
+    if let Some(index) = indexes.get(value) {
+        return Ok(*index);
+    }
     let index = u32::try_from(terms.len()).map_err(|_| {
         VortexRdfError::InvalidOperation("compact query term table exceeds u32".into())
     })?;
@@ -420,29 +422,54 @@ async fn projected_native_id_rows_as_compact_triples(
     rows: &NativeProjectedIdRows,
     bound: &BoundNativeRdfTerms,
 ) -> Result<NativeCompactTripleBatch> {
-    if rows.rows == 0 { return Ok(NativeCompactTripleBatch::default()); }
+    if rows.rows == 0 {
+        return Ok(NativeCompactTripleBatch::default());
+    }
     let unique_ids = collect_unique_ids_from_projected_unbound_rows(rows, bound);
     let id_to_term = lookup_terms_by_ids_from_sidecar(data_path, &unique_ids).await?;
     let mut terms = Vec::with_capacity(id_to_term.len().saturating_add(3));
     let mut lexical_indexes = HashMap::with_capacity(terms.capacity());
     let mut id_indexes = HashMap::with_capacity(id_to_term.len());
     for id in unique_ids {
-        let value = id_to_term.get(&id).ok_or_else(|| VortexRdfError::Deserialization(
-            format!("ID {id} missing during compact reconstruction")
-        ))?;
-        id_indexes.insert(id, intern_compact_term(value, &mut terms, &mut lexical_indexes)?);
+        let value = id_to_term.get(&id).ok_or_else(|| {
+            VortexRdfError::Deserialization(format!(
+                "ID {id} missing during compact reconstruction"
+            ))
+        })?;
+        id_indexes.insert(
+            id,
+            intern_compact_term(value, &mut terms, &mut lexical_indexes)?,
+        );
     }
-    let bound_s = bound.s.as_deref().map(|v| intern_compact_term(v, &mut terms, &mut lexical_indexes)).transpose()?;
-    let bound_p = bound.p.as_deref().map(|v| intern_compact_term(v, &mut terms, &mut lexical_indexes)).transpose()?;
-    let bound_o = bound.o.as_deref().map(|v| intern_compact_term(v, &mut terms, &mut lexical_indexes)).transpose()?;
+    let bound_s = bound
+        .s
+        .as_deref()
+        .map(|v| intern_compact_term(v, &mut terms, &mut lexical_indexes))
+        .transpose()?;
+    let bound_p = bound
+        .p
+        .as_deref()
+        .map(|v| intern_compact_term(v, &mut terms, &mut lexical_indexes))
+        .transpose()?;
+    let bound_o = bound
+        .o
+        .as_deref()
+        .map(|v| intern_compact_term(v, &mut terms, &mut lexical_indexes))
+        .transpose()?;
     let resolve = |fixed: Option<u32>, id: Option<u32>, label: &str| -> Result<u32> {
-        if let Some(index) = fixed { return Ok(index); }
-        let id = id.ok_or_else(|| VortexRdfError::Deserialization(
-            format!("{label} projected ID missing for compact output")
-        ))?;
-        id_indexes.get(&id).copied().ok_or_else(|| VortexRdfError::Deserialization(
-            format!("{label} ID {id} missing from compact query dictionary")
-        ))
+        if let Some(index) = fixed {
+            return Ok(index);
+        }
+        let id = id.ok_or_else(|| {
+            VortexRdfError::Deserialization(format!(
+                "{label} projected ID missing for compact output"
+            ))
+        })?;
+        id_indexes.get(&id).copied().ok_or_else(|| {
+            VortexRdfError::Deserialization(format!(
+                "{label} ID {id} missing from compact query dictionary"
+            ))
+        })
     };
     let mut compact = Vec::with_capacity(rows.rows);
     for i in 0..rows.rows {
@@ -452,7 +479,10 @@ async fn projected_native_id_rows_as_compact_triples(
             resolve(bound_o, projected_id_at(&rows.o, &bound.o, i, "O")?, "O")?,
         ));
     }
-    Ok(NativeCompactTripleBatch { terms, rows: compact })
+    Ok(NativeCompactTripleBatch {
+        terms,
+        rows: compact,
+    })
 }
 
 /// Transfers each lexical term once and rows as indexes into that query-local table.
@@ -463,8 +493,10 @@ pub async fn match_cottas_native_file_as_compact_triples(
     object: Option<&Term>,
     graph: Option<&GraphName>,
 ) -> Result<NativeCompactTripleBatch> {
-    let planned = execute_cottas_native_match(input_path, subject, predicate, object, graph).await?;
-    projected_native_id_rows_as_compact_triples(input_path, &planned.rows, &planned.bound_terms).await
+    let planned =
+        execute_cottas_native_match(input_path, subject, predicate, object, graph).await?;
+    projected_native_id_rows_as_compact_triples(input_path, &planned.rows, &planned.bound_terms)
+        .await
 }
 
 pub async fn serialize_cottas_native_file<Dict, S>(
@@ -5313,7 +5345,6 @@ async fn write_dictionary_lookup_sidecars_from_pair_runs(
     Ok(())
 }
 
-
 // VORTEX_RDF_SPARSE_TERM_DIRECTORY_V1
 #[derive(Clone, Debug)]
 struct NativeTermDirectoryEntry {
@@ -5335,14 +5366,19 @@ fn term_directory_cache_lock()
 }
 
 fn build_native_term_directory_array(
-    first: Vec<String>, last: Vec<String>, starts: Vec<u64>, ends: Vec<u64>,
+    first: Vec<String>,
+    last: Vec<String>,
+    starts: Vec<u64>,
+    ends: Vec<u64>,
 ) -> Result<ArrayRef> {
     StructArray::from_fields(&[
         ("first_term", VarBinArray::from(first).into_array()),
         ("last_term", VarBinArray::from(last).into_array()),
         ("row_start", PrimitiveArray::from_iter(starts).into_array()),
         ("row_end", PrimitiveArray::from_iter(ends).into_array()),
-    ]).map_err(VortexRdfError::Vortex).map(|a| a.into_array())
+    ])
+    .map_err(VortexRdfError::Vortex)
+    .map(|a| a.into_array())
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -5362,26 +5398,41 @@ pub struct NativeTermDirectoryBuildStats {
 /// Builds only the sparse lexical directory from the existing sorted
 /// term-to-ID Vortex component. Triples and unrelated components are untouched.
 pub async fn build_cottas_native_term_directory(
-    data_path: &Path, fence_rows: usize,
+    data_path: &Path,
+    fence_rows: usize,
 ) -> Result<NativeTermDirectoryBuildStats> {
     let total_start = Instant::now();
     if fence_rows == 0 {
-        return Err(VortexRdfError::InvalidOperation("fence_rows must be positive".into()));
+        return Err(VortexRdfError::InvalidOperation(
+            "fence_rows must be positive".into(),
+        ));
     }
     let source_path = require_vortex_component(
-        data_path, NativeComponent::DictionaryTermToIdVortex, "term-to-ID dictionary",
+        data_path,
+        NativeComponent::DictionaryTermToIdVortex,
+        "term-to-ID dictionary",
     )?;
     let output_path = native_dict_term_directory_path(data_path);
     let temporary_path = output_path.with_extension("vortex.tmp");
     let open_start = Instant::now();
-    let file = NATIVE_FILE_SESSION.open_options().open_path(&source_path).await
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&source_path)
+        .await
         .map_err(VortexRdfError::from)?;
     let open_ms = elapsed_ms(open_start);
     let scan_start = Instant::now();
-    let mut stream = file.scan().map_err(VortexRdfError::from)?
-        .with_projection(vortex_array::expr::select(["term"], vortex_array::expr::root()))
-        .into_array_stream().map_err(VortexRdfError::from)?;
-    let (mut first, mut last, mut starts, mut ends) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut stream = file
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_projection(vortex_array::expr::select(
+            ["term"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?;
+    let (mut first, mut last, mut starts, mut ends) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut rows = 0u64;
     let mut fence_first: Option<String> = None;
     let mut fence_last: Option<String> = None;
@@ -5392,7 +5443,9 @@ pub async fn build_cottas_native_term_directory(
         let batch = batch.map_err(VortexRdfError::from)?;
         let terms = extract_projected_utf8_column(&batch, "term")?;
         if terms.len() != batch.len() {
-            return Err(VortexRdfError::Deserialization("term directory source length mismatch".into()));
+            return Err(VortexRdfError::Deserialization(
+                "term directory source length mismatch".into(),
+            ));
         }
         for term in terms {
             if previous.as_ref().is_some_and(|p| p >= &term) {
@@ -5400,85 +5453,145 @@ pub async fn build_cottas_native_term_directory(
                     "term-to-ID dictionary is not strictly sorted near row {rows}"
                 )));
             }
-            if fence_first.is_none() { fence_start = rows; fence_first = Some(term.clone()); }
+            if fence_first.is_none() {
+                fence_start = rows;
+                fence_first = Some(term.clone());
+            }
             fence_last = Some(term.clone());
             previous = Some(term);
             fence_len += 1;
-            rows = rows.checked_add(1).ok_or_else(|| VortexRdfError::Serialization("row overflow".into()))?;
+            rows = rows
+                .checked_add(1)
+                .ok_or_else(|| VortexRdfError::Serialization("row overflow".into()))?;
             if fence_len == fence_rows {
-                first.push(fence_first.take().unwrap()); last.push(fence_last.take().unwrap());
-                starts.push(fence_start); ends.push(rows); fence_len = 0;
+                first.push(fence_first.take().unwrap());
+                last.push(fence_last.take().unwrap());
+                starts.push(fence_start);
+                ends.push(rows);
+                fence_len = 0;
             }
         }
     }
     if fence_len != 0 {
-        first.push(fence_first.take().unwrap()); last.push(fence_last.take().unwrap());
-        starts.push(fence_start); ends.push(rows);
+        first.push(fence_first.take().unwrap());
+        last.push(fence_last.take().unwrap());
+        starts.push(fence_start);
+        ends.push(rows);
     }
     let scan_ms = elapsed_ms(scan_start);
     let directory_entries = first.len();
     let array = build_native_term_directory_array(first, last, starts, ends)?;
-    let dtype = build_native_term_directory_array(Vec::new(), Vec::new(), Vec::new(), Vec::new())?.dtype().clone();
+    let dtype = build_native_term_directory_array(Vec::new(), Vec::new(), Vec::new(), Vec::new())?
+        .dtype()
+        .clone();
     let arrays = ArrayStreamAdapter::new(dtype, futures::stream::iter(vec![Ok(array)]));
     let write_start = Instant::now();
-    let mut output = tokio::fs::File::create(&temporary_path).await
+    let mut output = tokio::fs::File::create(&temporary_path)
+        .await
         .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
     let strategy = WriteStrategyBuilder::default()
         .with_row_block_size(directory_entries.max(1).min(65_536))
-        .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact()).build();
-    if let Err(error) = NATIVE_FILE_SESSION.write_options().with_strategy(strategy)
-        .write(&mut output, arrays).await {
-        drop(output); let _ = std::fs::remove_file(&temporary_path);
+        .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+        .build();
+    if let Err(error) = NATIVE_FILE_SESSION
+        .write_options()
+        .with_strategy(strategy)
+        .write(&mut output, arrays)
+        .await
+    {
+        drop(output);
+        let _ = std::fs::remove_file(&temporary_path);
         return Err(VortexRdfError::from(error));
     }
-    output.sync_all().await.map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    output
+        .sync_all()
+        .await
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
     drop(output);
     std::fs::rename(&temporary_path, &output_path)
         .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
     term_directory_cache_lock()?.remove(&output_path);
     let write_ms = elapsed_ms(write_start);
     Ok(NativeTermDirectoryBuildStats {
-        data_path: data_path.display().to_string(), source_path: source_path.display().to_string(),
-        output_path: output_path.display().to_string(), fence_rows, dictionary_rows: rows,
-        directory_entries, open_ms, scan_ms, write_ms, total_ms: elapsed_ms(total_start),
+        data_path: data_path.display().to_string(),
+        source_path: source_path.display().to_string(),
+        output_path: output_path.display().to_string(),
+        fence_rows,
+        dictionary_rows: rows,
+        directory_entries,
+        open_ms,
+        scan_ms,
+        write_ms,
+        total_ms: elapsed_ms(total_start),
     })
 }
 
 async fn native_term_directory(data_path: &Path) -> Result<Arc<[NativeTermDirectoryEntry]>> {
     let path = require_vortex_component(
-        data_path, NativeComponent::DictionaryTermDirectoryVortex, "sparse term directory",
+        data_path,
+        NativeComponent::DictionaryTermDirectoryVortex,
+        "sparse term directory",
     )?;
-    if let Some(v) = term_directory_cache_lock()?.get(&path).cloned() { return Ok(v); }
-    let file = NATIVE_FILE_SESSION.open_options().open_path(&path).await.map_err(VortexRdfError::from)?;
-    let a = file.scan().map_err(VortexRdfError::from)?
+    if let Some(v) = term_directory_cache_lock()?.get(&path).cloned() {
+        return Ok(v);
+    }
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let a = file
+        .scan()
+        .map_err(VortexRdfError::from)?
         .with_projection(vortex_array::expr::select(
-            ["first_term", "last_term", "row_start", "row_end"], vortex_array::expr::root(),
-        )).into_array_stream().map_err(VortexRdfError::from)?.read_all().await
+            ["first_term", "last_term", "row_start", "row_end"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?
+        .read_all()
+        .await
         .map_err(VortexRdfError::from)?;
     let first = extract_projected_utf8_column(&a, "first_term")?;
     let last = extract_projected_utf8_column(&a, "last_term")?;
     let starts = extract_projected_u64_column(&a, "row_start")?;
     let ends = extract_projected_u64_column(&a, "row_end")?;
-    if [first.len(), last.len(), starts.len(), ends.len()].into_iter().any(|n| n != a.len()) {
-        return Err(VortexRdfError::Deserialization("term directory column length mismatch".into()));
+    if [first.len(), last.len(), starts.len(), ends.len()]
+        .into_iter()
+        .any(|n| n != a.len())
+    {
+        return Err(VortexRdfError::Deserialization(
+            "term directory column length mismatch".into(),
+        ));
     }
     let mut entries = Vec::with_capacity(a.len());
     for i in 0..a.len() {
-        if first[i] > last[i] || starts[i] >= ends[i] ||
-            (i > 0 && (last[i - 1] >= first[i] || ends[i - 1] != starts[i])) {
-            return Err(VortexRdfError::Deserialization(format!("invalid term directory entry {i}")));
+        if first[i] > last[i]
+            || starts[i] >= ends[i]
+            || (i > 0 && (last[i - 1] >= first[i] || ends[i - 1] != starts[i]))
+        {
+            return Err(VortexRdfError::Deserialization(format!(
+                "invalid term directory entry {i}"
+            )));
         }
         entries.push(NativeTermDirectoryEntry {
-            first_term: first[i].clone(), last_term: last[i].clone(),
-            row_start: starts[i], row_end: ends[i],
+            first_term: first[i].clone(),
+            last_term: last[i].clone(),
+            row_start: starts[i],
+            row_end: ends[i],
         });
     }
     if entries.first().is_some_and(|e| e.row_start != 0) {
-        return Err(VortexRdfError::Deserialization("term directory does not start at row zero".into()));
+        return Err(VortexRdfError::Deserialization(
+            "term directory does not start at row zero".into(),
+        ));
     }
     let entries: Arc<[NativeTermDirectoryEntry]> = entries.into();
     let mut cache = term_directory_cache_lock()?;
-    Ok(cache.entry(path).or_insert_with(|| Arc::clone(&entries)).clone())
+    Ok(cache
+        .entry(path)
+        .or_insert_with(|| Arc::clone(&entries))
+        .clone())
 }
 
 fn term_directory_range(entries: &[NativeTermDirectoryEntry], term: &str) -> Option<Range<u64>> {
@@ -5488,56 +5601,101 @@ fn term_directory_range(entries: &[NativeTermDirectoryEntry], term: &str) -> Opt
 }
 
 #[derive(Debug)]
-struct NativeTermLookupWindow { range: Range<u64>, terms: Vec<String> }
+struct NativeTermLookupWindow {
+    range: Range<u64>,
+    terms: Vec<String>,
+}
 
-fn merge_native_term_lookup_windows(mut input: Vec<NativeTermLookupWindow>) -> Vec<NativeTermLookupWindow> {
+fn merge_native_term_lookup_windows(
+    mut input: Vec<NativeTermLookupWindow>,
+) -> Vec<NativeTermLookupWindow> {
     input.sort_by_key(|w| w.range.start);
     let mut out: Vec<NativeTermLookupWindow> = Vec::with_capacity(input.len());
     for mut w in input {
         if let Some(p) = out.last_mut() {
             if w.range.start <= p.range.end {
-                p.range.end = p.range.end.max(w.range.end); p.terms.append(&mut w.terms); continue;
+                p.range.end = p.range.end.max(w.range.end);
+                p.terms.append(&mut w.terms);
+                continue;
             }
         }
         out.push(w);
     }
-    for w in &mut out { w.terms.sort(); w.terms.dedup(); }
+    for w in &mut out {
+        w.terms.sort();
+        w.terms.dedup();
+    }
     out
 }
 
 async fn lookup_bound_term_ids_sparse_directory(
-    data_path: &Path, terms: &[(String, &'static str)],
+    data_path: &Path,
+    terms: &[(String, &'static str)],
 ) -> Result<(HashMap<String, u32>, Vec<NativeTermToIdLookupStats>, f64)> {
     let total_start = Instant::now();
-    if terms.is_empty() { return Ok((HashMap::new(), Vec::new(), elapsed_ms(total_start))); }
+    if terms.is_empty() {
+        return Ok((HashMap::new(), Vec::new(), elapsed_ms(total_start)));
+    }
     let directory = native_term_directory(data_path).await?;
-    let mut stats: Vec<_> = terms.iter().map(|(term, column)| NativeTermToIdLookupStats {
-        column: Some((*column).to_string()), term_len: term.len(), term_preview: native_term_preview(term),
-        strategy: "vortex-sparse-directory-v1".to_string(), ..Default::default()
-    }).collect();
-    let windows = merge_native_term_lookup_windows(terms.iter().filter_map(|(term, _)| {
-        term_directory_range(&directory, term).map(|range| NativeTermLookupWindow {
-            range, terms: vec![term.clone()],
+    let mut stats: Vec<_> = terms
+        .iter()
+        .map(|(term, column)| NativeTermToIdLookupStats {
+            column: Some((*column).to_string()),
+            term_len: term.len(),
+            term_preview: native_term_preview(term),
+            strategy: "vortex-sparse-directory-v1".to_string(),
+            ..Default::default()
         })
-    }).collect());
+        .collect();
+    let windows = merge_native_term_lookup_windows(
+        terms
+            .iter()
+            .filter_map(|(term, _)| {
+                term_directory_range(&directory, term).map(|range| NativeTermLookupWindow {
+                    range,
+                    terms: vec![term.clone()],
+                })
+            })
+            .collect(),
+    );
     if windows.is_empty() {
-        let ms = elapsed_ms(total_start); stats[0].total_ms = ms;
+        let ms = elapsed_ms(total_start);
+        stats[0].total_ms = ms;
         return Ok((HashMap::new(), stats, ms));
     }
     let path = require_vortex_component(
-        data_path, NativeComponent::DictionaryTermToIdVortex, "term-to-ID dictionary",
+        data_path,
+        NativeComponent::DictionaryTermToIdVortex,
+        "term-to-ID dictionary",
     )?;
     let open_start = Instant::now();
-    let file = NATIVE_FILE_SESSION.open_options().open_path(&path).await.map_err(VortexRdfError::from)?;
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&path)
+        .await
+        .map_err(VortexRdfError::from)?;
     let open_ms = elapsed_ms(open_start);
     let (mut scan_ms, mut read_ms, mut extract_ms) = (0.0, 0.0, 0.0);
     let mut found = HashMap::with_capacity(terms.len());
     for window in windows {
-        let expr = window.terms.iter().map(|t| eq(col("term"), lit(t.as_str()))).reduce(or).unwrap();
+        let expr = window
+            .terms
+            .iter()
+            .map(|t| eq(col("term"), lit(t.as_str())))
+            .reduce(or)
+            .unwrap();
         let t = Instant::now();
-        let stream = file.scan().map_err(VortexRdfError::from)?.with_row_range(window.range)
-            .with_filter(expr).with_projection(vortex_array::expr::select(["term", "id"], vortex_array::expr::root()))
-            .into_array_stream().map_err(VortexRdfError::from)?;
+        let stream = file
+            .scan()
+            .map_err(VortexRdfError::from)?
+            .with_row_range(window.range)
+            .with_filter(expr)
+            .with_projection(vortex_array::expr::select(
+                ["term", "id"],
+                vortex_array::expr::root(),
+            ))
+            .into_array_stream()
+            .map_err(VortexRdfError::from)?;
         scan_ms += elapsed_ms(t);
         let t = Instant::now();
         let result = stream.read_all().await.map_err(VortexRdfError::from)?;
@@ -5545,10 +5703,16 @@ async fn lookup_bound_term_ids_sparse_directory(
         let t = Instant::now();
         let loaded_terms = extract_projected_utf8_column(&result, "term")?;
         let ids = extract_projected_u32_column(&result, "id")?;
-        if loaded_terms.len() != ids.len() { return Err(VortexRdfError::Deserialization("sparse lookup length mismatch".into())); }
+        if loaded_terms.len() != ids.len() {
+            return Err(VortexRdfError::Deserialization(
+                "sparse lookup length mismatch".into(),
+            ));
+        }
         for (term, id) in loaded_terms.into_iter().zip(ids) {
             if found.insert(term.clone(), id).is_some() {
-                return Err(VortexRdfError::Deserialization(format!("duplicate sparse lookup result {term:?}")));
+                return Err(VortexRdfError::Deserialization(format!(
+                    "duplicate sparse lookup result {term:?}"
+                )));
             }
         }
         extract_ms += elapsed_ms(t);
@@ -5558,8 +5722,11 @@ async fn lookup_bound_term_ids_sparse_directory(
         stats[i].found_id = found.get(term).copied();
         stats[i].result_array_len = usize::from(stats[i].found_id.is_some());
     }
-    stats[0].open_ms = open_ms; stats[0].scan_build_ms = scan_ms;
-    stats[0].read_all_ms = read_ms; stats[0].extract_ms = extract_ms; stats[0].total_ms = total_ms;
+    stats[0].open_ms = open_ms;
+    stats[0].scan_build_ms = scan_ms;
+    stats[0].read_all_ms = read_ms;
+    stats[0].extract_ms = extract_ms;
+    stats[0].total_ms = total_ms;
     Ok((found, stats, total_ms))
 }
 
@@ -6104,7 +6271,8 @@ pub async fn diagnose_cottas_native_term_windows(
     let path = native_dict_term_to_id_path(data_path);
     if !path.is_file() {
         return Err(VortexRdfError::InvalidOperation(format!(
-            "Vortex term_to_id dictionary component is missing at {:?}", path
+            "Vortex term_to_id dictionary component is missing at {:?}",
+            path
         )));
     }
 
@@ -6135,7 +6303,9 @@ pub async fn diagnose_cottas_native_term_windows(
     if terms.len() != ids.len() || terms.len() != dictionary.len() {
         return Err(VortexRdfError::Deserialization(format!(
             "term-window discovery column mismatch: rows={}, terms={}, ids={}",
-            dictionary.len(), terms.len(), ids.len()
+            dictionary.len(),
+            terms.len(),
+            ids.len()
         )));
     }
     if terms.windows(2).any(|pair| pair[0] >= pair[1]) {
@@ -6143,11 +6313,14 @@ pub async fn diagnose_cottas_native_term_windows(
             "term_to_id dictionary is not strictly lexically sorted".into(),
         ));
     }
-    let row = terms.binary_search_by(|candidate| candidate.as_str().cmp(term)).map_err(|_| {
-        VortexRdfError::InvalidOperation(format!(
-            "diagnostic term {:?} does not exist in the term_to_id dictionary", term
-        ))
-    })?;
+    let row = terms
+        .binary_search_by(|candidate| candidate.as_str().cmp(term))
+        .map_err(|_| {
+            VortexRdfError::InvalidOperation(format!(
+                "diagnostic term {:?} does not exist in the term_to_id dictionary",
+                term
+            ))
+        })?;
     let expected_id = ids[row];
     let dictionary_rows = terms.len();
     let discovery_extract_ms = elapsed_ms(discovery_extract_start);
@@ -6186,7 +6359,8 @@ pub async fn diagnose_cottas_native_term_windows(
             if result.len() > 1 {
                 return Err(VortexRdfError::Deserialization(format!(
                     "term-window diagnostic returned {} IDs for exact term {:?}",
-                    result.len(), term
+                    result.len(),
+                    term
                 )));
             }
             let extract_start = Instant::now();
@@ -6232,7 +6406,7 @@ pub async fn diagnose_cottas_native_term_windows(
         for &window_rows in window_sizes {
             let half = window_rows / 2;
             let mut start = row.saturating_sub(half);
-            let mut end = start.saturating_add(window_rows).min(dictionary_rows);
+            let end = start.saturating_add(window_rows).min(dictionary_rows);
             start = end.saturating_sub(window_rows).min(start);
             if !(start <= row && row < end) {
                 return Err(VortexRdfError::InvalidOperation(format!(
@@ -6285,7 +6459,8 @@ async fn lookup_term_id_from_sidecar_with_stats(
         .unwrap_or_else(|_| "batched-or".to_string());
     if strategy == "sparse-directory-v1" {
         let requested = vec![(term.to_string(), column.unwrap_or("term"))];
-        let (ids, mut stats, _) = lookup_bound_term_ids_sparse_directory(data_path, &requested).await?;
+        let (ids, mut stats, _) =
+            lookup_bound_term_ids_sparse_directory(data_path, &requested).await?;
         return Ok((ids.get(term).copied(), stats.pop().unwrap()));
     }
     if strategy != "batched-or" && strategy != "shared-open-equalities" {

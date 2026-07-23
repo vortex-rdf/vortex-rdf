@@ -31,8 +31,7 @@ use vortex_rdf_core::{
         CottasNativeConfig, CottasNativeStringConfig, CottasVortexCompressionProfile,
         NativeIdsCountMode, NativeStringCountMode, build_cottas_native_o_exact_ranges_index,
         build_cottas_native_po_predicate_partitions_v2, build_cottas_native_subject_range_index,
-        build_cottas_native_term_directory,
-        count_cottas_native_ids_file_with_diagnostics_mode,
+        build_cottas_native_term_directory, count_cottas_native_ids_file_with_diagnostics_mode,
         count_cottas_native_string_file_with_diagnostics_mode, load_vortex_file_ref,
         match_cottas_native_file, match_cottas_native_file_with_diagnostics,
         match_cottas_native_string_file, match_cottas_native_string_file_with_diagnostics,
@@ -803,16 +802,26 @@ async fn main() -> Result<()> {
             fence_rows,
             diagnostics_out,
         } => {
-            if !input.extension().map(|value| value == "vortex").unwrap_or(false) {
-                return Err(anyhow!("build-native-term-directory expects a .vortex input file"));
+            if !input
+                .extension()
+                .map(|value| value == "vortex")
+                .unwrap_or(false)
+            {
+                return Err(anyhow!(
+                    "build-native-term-directory expects a .vortex input file"
+                ));
             }
-            if fence_rows == 0 { return Err(anyhow!("--fence-rows must be greater than zero")); }
-            let stats = build_cottas_native_term_directory(&input, fence_rows).await
+            if fence_rows == 0 {
+                return Err(anyhow!("--fence-rows must be greater than zero"));
+            }
+            let stats = build_cottas_native_term_directory(&input, fence_rows)
+                .await
                 .context("Failed to build sparse native term directory")?;
             let json = serde_json::to_vec_pretty(&stats)
                 .context("Failed to serialize term directory diagnostics")?;
             if let Some(path) = diagnostics_out {
-                tokio::fs::write(path, &json).await
+                tokio::fs::write(path, &json)
+                    .await
                     .context("Failed to write term directory diagnostics")?;
             }
             stdout().write_all(&json)?;

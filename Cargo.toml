@@ -13,22 +13,22 @@ description = "Modern and high-performance columnar RDF serialization format"
 
 [workspace.dependencies]
 vortex-rdf-core = { path = "core" }
-vortex = { version = "0.79.0", default-features = false }
-vortex-array = { version = "0.79.0" }
-vortex-error = "0.79.0"
-vortex-ipc = "0.79.0"
-vortex-io = "0.79.0"
-vortex-session = "0.79.0"
-vortex-fsst = "0.79.0"
-vortex-mask = "0.79.0"
-vortex-file = { version = "0.79.0", features = ["tokio"] }
-vortex-scan = "0.79.0"
-vortex-layout = "0.79.0"
+vortex = { version = "0.80.0", default-features = false }
+vortex-array = { version = "0.80.0" }
+vortex-error = "0.80.0"
+vortex-ipc = "0.80.0"
+vortex-io = "0.80.0"
+vortex-session = "0.80.0"
+vortex-fsst = "0.80.0"
+vortex-mask = "0.80.0"
+vortex-file = { version = "0.80.0", features = ["tokio"] }
+vortex-scan = "0.80.0"
+vortex-layout = "0.80.0"
 async-trait = "0.1.91"
-vortex-btrblocks = "0.79.0"
-vortex-buffer = "0.79.0"
+vortex-btrblocks = "0.80.0"
+vortex-buffer = "0.80.0"
 
-tokio = { version = "1.53", features = ["sync", "macros", "rt"] }
+tokio = { version = "1.53.1", features = ["sync", "macros", "rt"] }
 futures = "0.3.33"
 
 oxrdf = "0.3.3"
@@ -37,7 +37,7 @@ itertools = "0.15.0"
 thiserror = "2.0.19"
 anyhow = "1.0.104"
 
-clap = { version = "4.6.3", features = ["derive"] }
+clap = { version = "4.6.4", features = ["derive"] }
 wasm-bindgen = "0.2.126"
 js-sys = "0.3.103"
 console_error_panic_hook = "0.1.7"
