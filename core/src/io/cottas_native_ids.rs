@@ -476,6 +476,9 @@ pub struct NativeDirectCompactTimings {
     pub unique_ids: usize,
     pub terms_out: usize,
     pub lexical_bytes: usize,
+    // VORTEX_RDF_ID_TO_TERM_ENCODING_TRACE_V1
+    pub selected_array_encoding: String,
+    pub term_column_encoding: String,
     pub unique_id_collect_ms: f64,
     pub dictionary_open_ms: f64,
     pub row_indices_build_ms: f64,
@@ -548,6 +551,7 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
     let stage = Instant::now();
     let array = stream.read_all().await.map_err(VortexRdfError::from)?;
     timings.read_all_ms = elapsed_ms(stage);
+    timings.selected_array_encoding = array.to_string();
     if array.len() != requested.len() {
         return Err(VortexRdfError::Deserialization(format!(
             "direct compact dictionary selection returned {} rows for {} requested IDs",
@@ -570,11 +574,13 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
         .execute::<PrimitiveArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)?;
     timings.id_column_execute_ms = elapsed_ms(stage);
-    let stage = Instant::now();
-    let term_column = struct_array
+    let term_field = struct_array
         .unmasked_field_by_name("term")
         .map_err(VortexRdfError::Vortex)?
-        .clone()
+        .clone();
+    timings.term_column_encoding = term_field.to_string();
+    let stage = Instant::now();
+    let term_column = term_field
         .execute::<VarBinViewArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)?;
     timings.term_column_execute_ms = elapsed_ms(stage);

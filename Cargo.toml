@@ -13,20 +13,20 @@ description = "Modern and high-performance columnar RDF serialization format"
 
 [workspace.dependencies]
 vortex-rdf-core = { path = "core" }
-vortex = { version = "0.80.0", default-features = false }
-vortex-array = { version = "0.80.0" }
-vortex-error = "0.80.0"
-vortex-ipc = "0.80.0"
-vortex-io = "0.80.0"
-vortex-session = "0.80.0"
-vortex-fsst = "0.80.0"
-vortex-mask = "0.80.0"
-vortex-file = { version = "0.80.0", features = ["tokio"] }
-vortex-scan = "0.80.0"
-vortex-layout = "0.80.0"
+vortex = { version = "0.81.0", default-features = false }
+vortex-array = { version = "0.81.0" }
+vortex-error = "0.81.0"
+vortex-ipc = "0.81.0"
+vortex-io = "0.81.0"
+vortex-session = "0.81.0"
+vortex-fsst = "0.81.0"
+vortex-mask = "0.81.0"
+vortex-file = { version = "0.81.0", features = ["tokio"] }
+vortex-scan = "0.81.0"
+vortex-layout = "0.81.0"
 async-trait = "0.1.91"
-vortex-btrblocks = "0.80.0"
-vortex-buffer = "0.80.0"
+vortex-btrblocks = "0.81.0"
+vortex-buffer = "0.81.0"
 
 tokio = { version = "1.53.1", features = ["sync", "macros", "rt"] }
 futures = "0.3.33"
