@@ -518,119 +518,129 @@ fn compact_rows_from_id_indexes(
     })
 }
 
-async fn projected_native_id_rows_as_compact_triples_direct_v1(
+// VORTEX_RDF_DIRECT_COMPACT_TIMINGS_V1
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct NativeDirectCompactTimings {
+    pub rows_out: usize,
+    pub unique_ids: usize,
+    pub terms_out: usize,
+    pub lexical_bytes: usize,
+    pub unique_id_collect_ms: f64,
+    pub dictionary_open_ms: f64,
+    pub row_indices_build_ms: f64,
+    pub scan_build_ms: f64,
+    pub read_all_ms: f64,
+    pub struct_execute_ms: f64,
+    pub id_column_execute_ms: f64,
+    pub term_column_execute_ms: f64,
+    pub lexical_extract_allocate_ms: f64,
+    pub id_index_insert_ms: f64,
+    pub bound_term_insert_ms: f64,
+    pub compact_row_build_ms: f64,
+    pub reconstruction_total_ms: f64,
+    pub total_rust_ms: f64,
+}
+
+async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
     data_path: &Path,
     rows: &NativeProjectedIdRows,
     bound: &BoundNativeRdfTerms,
-) -> Result<NativeCompactTripleBatch> {
+) -> Result<(NativeCompactTripleBatch, NativeDirectCompactTimings)> {
+    let total_start = Instant::now();
+    let mut timings = NativeDirectCompactTimings { rows_out: rows.rows, ..Default::default() };
     if rows.rows == 0 {
-        return Ok(NativeCompactTripleBatch::default());
+        timings.total_rust_ms = elapsed_ms(total_start);
+        return Ok((NativeCompactTripleBatch::default(), timings));
     }
-
+    let stage = Instant::now();
     let mut requested = collect_unique_ids_from_projected_unbound_rows(rows, bound);
-    requested.sort_unstable();
-    requested.dedup();
+    requested.sort_unstable(); requested.dedup();
+    timings.unique_id_collect_ms = elapsed_ms(stage);
+    timings.unique_ids = requested.len();
 
-    let path = require_vortex_component(
-        data_path,
-        NativeComponent::DictionaryVortex,
-        "ID-to-term dictionary",
-    )?;
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
-    let indices = Buffer::from(
-        requested
-            .iter()
-            .map(|id| u64::from(*id))
-            .collect::<Vec<_>>(),
-    );
-    let array = file
-        .scan()
-        .map_err(VortexRdfError::from)?
+    let path = require_vortex_component(data_path, NativeComponent::DictionaryVortex, "ID-to-term dictionary")?;
+    let stage = Instant::now();
+    let file = NATIVE_FILE_SESSION.open_options().open_path(&path).await.map_err(VortexRdfError::from)?;
+    timings.dictionary_open_ms = elapsed_ms(stage);
+    let stage = Instant::now();
+    let indices = Buffer::from(requested.iter().map(|id| u64::from(*id)).collect::<Vec<_>>());
+    timings.row_indices_build_ms = elapsed_ms(stage);
+    let stage = Instant::now();
+    let stream = file.scan().map_err(VortexRdfError::from)?
         .with_row_indices(indices)
-        .with_projection(vortex_array::expr::select(
-            ["id", "term"],
-            vortex_array::expr::root(),
-        ))
-        .into_array_stream()
-        .map_err(VortexRdfError::from)?
-        .read_all()
-        .await
-        .map_err(VortexRdfError::from)?;
-    if array.len() != requested.len() {
-        return Err(VortexRdfError::Deserialization(format!(
-            "direct compact dictionary selection returned {} rows for {} requested IDs",
-            array.len(),
-            requested.len()
-        )));
-    }
+        .with_projection(vortex_array::expr::select(["id", "term"], vortex_array::expr::root()))
+        .into_array_stream().map_err(VortexRdfError::from)?;
+    timings.scan_build_ms = elapsed_ms(stage);
+    let stage = Instant::now();
+    let array = stream.read_all().await.map_err(VortexRdfError::from)?;
+    timings.read_all_ms = elapsed_ms(stage);
+    if array.len() != requested.len() { return Err(VortexRdfError::Deserialization(format!(
+        "direct compact dictionary selection returned {} rows for {} requested IDs", array.len(), requested.len()))); }
 
-    // Execute both projected columns once. Each lexical value is allocated
-    // directly in the final compact term table; no HashMap<u32, String> and no
-    // second lexical HashMap<String, u32> are constructed.
     let mut ctx = NATIVE_FILE_SESSION.create_execution_ctx();
-    let struct_array = array
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let id_column = struct_array
-        .unmasked_field_by_name("id")
-        .map_err(VortexRdfError::Vortex)?
-        .clone()
-        .execute::<PrimitiveArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let term_column = struct_array
-        .unmasked_field_by_name("term")
-        .map_err(VortexRdfError::Vortex)?
-        .clone()
-        .execute::<VarBinViewArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
+    let stage = Instant::now();
+    let struct_array = array.execute::<StructArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
+    timings.struct_execute_ms = elapsed_ms(stage);
+    let stage = Instant::now();
+    let id_column = struct_array.unmasked_field_by_name("id").map_err(VortexRdfError::Vortex)?
+        .clone().execute::<PrimitiveArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
+    timings.id_column_execute_ms = elapsed_ms(stage);
+    let stage = Instant::now();
+    let term_column = struct_array.unmasked_field_by_name("term").map_err(VortexRdfError::Vortex)?
+        .clone().execute::<VarBinViewArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
+    timings.term_column_execute_ms = elapsed_ms(stage);
     let loaded_ids = id_column.as_slice::<u32>();
-    if loaded_ids.len() != requested.len() || term_column.len() != requested.len() {
-        return Err(VortexRdfError::Deserialization(format!(
-            "direct compact dictionary column mismatch: ids={}, terms={}, requested={}",
-            loaded_ids.len(),
-            term_column.len(),
-            requested.len()
-        )));
+    if loaded_ids.len()!=requested.len() || term_column.len()!=requested.len() {
+        return Err(VortexRdfError::Deserialization(format!("direct compact dictionary column mismatch: ids={}, terms={}, requested={}", loaded_ids.len(), term_column.len(), requested.len())));
     }
-
-    let mut terms = Vec::with_capacity(requested.len().saturating_add(3));
-    let mut id_indexes = HashMap::with_capacity(requested.len());
-    for (index, (&expected, &actual)) in requested.iter().zip(loaded_ids).enumerate() {
-        if expected != actual {
-            return Err(VortexRdfError::Deserialization(format!(
-                "direct compact ID invariant failed at position {index}: requested {expected}, loaded {actual}"
-            )));
-        }
-        let term_bytes = term_column.bytes_at(index);
-        let lexical = std::str::from_utf8(&term_bytes).map_err(|error| {
-            VortexRdfError::Deserialization(format!(
-                "direct compact dictionary term for ID {actual} is invalid UTF-8: {error}"
-            ))
-        })?;
-        let compact_index = u32::try_from(terms.len()).map_err(|_| {
-            VortexRdfError::InvalidOperation("compact query term table exceeds u32".into())
-        })?;
+    let mut terms=Vec::with_capacity(requested.len().saturating_add(3));
+    let mut id_indexes=HashMap::with_capacity(requested.len());
+    let mut lexical_ms=0.0; let mut insert_ms=0.0;
+    for (index,(&expected,&actual)) in requested.iter().zip(loaded_ids).enumerate() {
+        if expected!=actual { return Err(VortexRdfError::Deserialization(format!("direct compact ID invariant failed at position {index}: requested {expected}, loaded {actual}"))); }
+        let stage=Instant::now();
+        let term_bytes=term_column.bytes_at(index);
+        let lexical=std::str::from_utf8(&term_bytes).map_err(|error| VortexRdfError::Deserialization(format!("direct compact dictionary term for ID {actual} is invalid UTF-8: {error}")))?;
+        let compact_index=u32::try_from(terms.len()).map_err(|_| VortexRdfError::InvalidOperation("compact query term table exceeds u32".into()))?;
         terms.push(lexical.to_owned());
-        if id_indexes.insert(actual, compact_index).is_some() {
-            return Err(VortexRdfError::Deserialization(format!(
-                "direct compact dictionary returned duplicate ID {actual}"
-            )));
-        }
+        lexical_ms += elapsed_ms(stage);
+        let stage=Instant::now();
+        if id_indexes.insert(actual,compact_index).is_some() { return Err(VortexRdfError::Deserialization(format!("direct compact dictionary returned duplicate ID {actual}"))); }
+        insert_ms += elapsed_ms(stage);
     }
+    timings.lexical_extract_allocate_ms=lexical_ms;
+    timings.id_index_insert_ms=insert_ms;
+    timings.lexical_bytes=terms.iter().map(String::len).sum();
+    let stage=Instant::now();
+    let mut bound_indexes=HashMap::with_capacity(3);
+    let bound_s=append_bound_compact_term(bound.s.as_deref(),&mut terms,&mut bound_indexes)?;
+    let bound_p=append_bound_compact_term(bound.p.as_deref(),&mut terms,&mut bound_indexes)?;
+    let bound_o=append_bound_compact_term(bound.o.as_deref(),&mut terms,&mut bound_indexes)?;
+    timings.bound_term_insert_ms=elapsed_ms(stage);
+    let stage=Instant::now();
+    let batch=compact_rows_from_id_indexes(rows,bound,terms,id_indexes,bound_s,bound_p,bound_o)?;
+    timings.compact_row_build_ms=elapsed_ms(stage);
+    timings.terms_out=batch.terms.len();
+    timings.reconstruction_total_ms=timings.unique_id_collect_ms+timings.dictionary_open_ms+timings.row_indices_build_ms+timings.scan_build_ms+timings.read_all_ms+timings.struct_execute_ms+timings.id_column_execute_ms+timings.term_column_execute_ms+timings.lexical_extract_allocate_ms+timings.id_index_insert_ms+timings.bound_term_insert_ms+timings.compact_row_build_ms;
+    timings.total_rust_ms=elapsed_ms(total_start);
+    Ok((batch,timings))
+}
 
-    // Bound terms are at most three output values. Deduplicate only among those
-    // values, avoiding a lexical hash table over the entire decoded dictionary.
-    // A bound lexical value may duplicate a decoded unbound value; retaining that
-    // extra entry is semantically harmless and bounds the duplicate count to three.
-    let mut bound_indexes = HashMap::with_capacity(3);
-    let bound_s = append_bound_compact_term(bound.s.as_deref(), &mut terms, &mut bound_indexes)?;
-    let bound_p = append_bound_compact_term(bound.p.as_deref(), &mut terms, &mut bound_indexes)?;
-    let bound_o = append_bound_compact_term(bound.o.as_deref(), &mut terms, &mut bound_indexes)?;
-    compact_rows_from_id_indexes(rows, bound, terms, id_indexes, bound_s, bound_p, bound_o)
+async fn projected_native_id_rows_as_compact_triples_direct_v1(
+    data_path: &Path, rows: &NativeProjectedIdRows, bound: &BoundNativeRdfTerms,
+) -> Result<NativeCompactTripleBatch> {
+    projected_native_id_rows_as_compact_triples_direct_v1_impl(data_path,rows,bound).await.map(|v|v.0)
+}
+
+pub async fn diagnose_cottas_native_direct_compact(
+    input_path: &Path, subject: Option<&NamedOrBlankNode>, predicate: Option<&NamedNode>,
+    object: Option<&Term>, graph: Option<&GraphName>,
+) -> Result<NativeDirectCompactTimings> {
+    let total=Instant::now();
+    let planned=execute_cottas_native_match(input_path,subject,predicate,object,graph).await?;
+    let (_batch,mut timings)=projected_native_id_rows_as_compact_triples_direct_v1_impl(input_path,&planned.rows,&planned.bound_terms).await?;
+    timings.total_rust_ms=elapsed_ms(total);
+    Ok(timings)
 }
 
 async fn projected_native_id_rows_as_compact_triples(

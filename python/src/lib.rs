@@ -11,8 +11,9 @@ use tokio::runtime::Runtime;
 use vortex_rdf_core::common::utils::{parse_named_node, parse_subject, parse_term};
 use vortex_rdf_core::io::{
     NativeIdsCountMode, count_cottas_native_ids_file_with_diagnostics_mode,
-    count_cottas_native_string_file, diagnose_cottas_native_id_decode_strategies,
-    diagnose_cottas_native_result_pipeline, diagnose_cottas_native_term_windows,
+    count_cottas_native_string_file, diagnose_cottas_native_direct_compact,
+    diagnose_cottas_native_id_decode_strategies, diagnose_cottas_native_result_pipeline,
+    diagnose_cottas_native_term_windows,
     match_cottas_native_file_as_compact_triples, match_cottas_native_file_as_triples,
     match_cottas_native_file_as_triples_optimized, match_cottas_native_file_with_diagnostics,
     match_cottas_native_string_file_as_triples,
@@ -116,6 +117,22 @@ fn match_triples_compact(
         ))
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     Ok((batch.terms, batch.rows))
+}
+
+// VORTEX_RDF_DIRECT_COMPACT_TIMINGS_V1
+#[pyfunction]
+fn diagnose_direct_compact<'py>(py: Python<'py>, path: String, subject_n3: Option<String>, predicate_n3: Option<String>, object_n3: Option<String>, layout: Option<String>) -> PyResult<Bound<'py, PyDict>> {
+    let layout=layout.unwrap_or_else(||"cottas-native-ids".to_string());
+    if !matches!(layout.as_str(),"cottas-native-ids"|"cottas-native") { return Err(PyRuntimeError::new_err("direct compact diagnostics require native IDs")); }
+    let subject=subject_n3.as_deref().map(parse_subject).transpose().map_err(|e|PyRuntimeError::new_err(e.to_string()))?;
+    let predicate=predicate_n3.as_deref().map(parse_named_node).transpose().map_err(|e|PyRuntimeError::new_err(e.to_string()))?;
+    let object=object_n3.as_deref().map(parse_term).transpose().map_err(|e|PyRuntimeError::new_err(e.to_string()))?;
+    let d=PY_NATIVE_RUNTIME.block_on(diagnose_cottas_native_direct_compact(Path::new(&path),subject.as_ref(),predicate.as_ref(),object.as_ref(),None)).map_err(|e|PyRuntimeError::new_err(e.to_string()))?;
+    let out=PyDict::new(py);
+    macro_rules! set { ($name:literal,$value:expr)=>{out.set_item($name,$value)?}; }
+    set!("rows_out",d.rows_out); set!("unique_ids",d.unique_ids); set!("terms_out",d.terms_out); set!("lexical_bytes",d.lexical_bytes);
+    set!("unique_id_collect_ms",d.unique_id_collect_ms); set!("dictionary_open_ms",d.dictionary_open_ms); set!("row_indices_build_ms",d.row_indices_build_ms); set!("scan_build_ms",d.scan_build_ms); set!("read_all_ms",d.read_all_ms); set!("struct_execute_ms",d.struct_execute_ms); set!("id_column_execute_ms",d.id_column_execute_ms); set!("term_column_execute_ms",d.term_column_execute_ms); set!("lexical_extract_allocate_ms",d.lexical_extract_allocate_ms); set!("id_index_insert_ms",d.id_index_insert_ms); set!("bound_term_insert_ms",d.bound_term_insert_ms); set!("compact_row_build_ms",d.compact_row_build_ms); set!("reconstruction_total_ms",d.reconstruction_total_ms); set!("total_rust_ms",d.total_rust_ms);
+    Ok(out)
 }
 
 // VORTEX_RDF_ADAPTIVE_ID_TO_TERM_BENCHMARK_V1
@@ -531,6 +548,7 @@ fn vortex_rdf_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(match_triples, m)?)?;
     m.add_function(wrap_pyfunction!(match_triples_compact, m)?)?;
     m.add_function(wrap_pyfunction!(diagnose_result_pipeline, m)?)?;
+    m.add_function(wrap_pyfunction!(diagnose_direct_compact, m)?)?;
     m.add_function(wrap_pyfunction!(diagnose_id_decode_strategies, m)?)?;
     m.add_function(wrap_pyfunction!(diagnose_match, m)?)?;
     m.add_function(wrap_pyfunction!(diagnose_term_windows, m)?)?;
