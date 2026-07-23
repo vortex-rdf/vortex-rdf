@@ -18,8 +18,9 @@ use vortex_error::{VortexError, VortexResult};
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use vortex_array::VortexSessionExecute;
+use vortex_array::arrays::chunked::ChunkedArrayExt;
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::arrays::{PrimitiveArray, StructArray, VarBinArray, VarBinViewArray};
+use vortex_array::arrays::{Chunked, PrimitiveArray, StructArray, VarBinArray, VarBinViewArray};
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::{ArrayRef, IntoArray};
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
@@ -479,6 +480,7 @@ pub struct NativeDirectCompactTimings {
     // VORTEX_RDF_ID_TO_TERM_ENCODING_TRACE_V1
     pub selected_array_encoding: String,
     pub term_column_encoding: String,
+    pub term_chunks: usize,
     pub unique_id_collect_ms: f64,
     pub dictionary_open_ms: f64,
     pub row_indices_build_ms: f64,
@@ -579,50 +581,79 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
         .map_err(VortexRdfError::Vortex)?
         .clone();
     timings.term_column_encoding = term_field.to_string();
-    let stage = Instant::now();
-    let term_column = term_field
-        .execute::<VarBinViewArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    timings.term_column_execute_ms = elapsed_ms(stage);
+    // VORTEX_RDF_INCREMENTAL_CHUNKED_TERM_DECODE_V1
+    // Avoid the global Chunked<utf8> canonical builder. Canonicalize and
+    // consume each selected chunk independently while preserving row order.
+    let term_chunks = term_field.as_opt::<Chunked>().ok_or_else(|| {
+        VortexRdfError::Deserialization(format!(
+            "direct compact term selection expected Chunked UTF-8, got {}",
+            term_field
+        ))
+    })?;
+    timings.term_chunks = term_chunks.nchunks();
     let loaded_ids = id_column.as_slice::<u32>();
-    if loaded_ids.len() != requested.len() || term_column.len() != requested.len() {
+    if loaded_ids.len() != requested.len() || term_field.len() != requested.len() {
         return Err(VortexRdfError::Deserialization(format!(
             "direct compact dictionary column mismatch: ids={}, terms={}, requested={}",
             loaded_ids.len(),
-            term_column.len(),
+            term_field.len(),
             requested.len()
         )));
     }
     let mut terms = Vec::with_capacity(requested.len().saturating_add(3));
     let mut id_indexes = HashMap::with_capacity(requested.len());
+    let mut term_execute_ms = 0.0;
     let mut lexical_ms = 0.0;
     let mut insert_ms = 0.0;
-    for (index, (&expected, &actual)) in requested.iter().zip(loaded_ids).enumerate() {
-        if expected != actual {
-            return Err(VortexRdfError::Deserialization(format!(
-                "direct compact ID invariant failed at position {index}: requested {expected}, loaded {actual}"
-            )));
-        }
+    let mut index = 0usize;
+    for chunk in term_chunks.iter_chunks() {
         let stage = Instant::now();
-        let term_bytes = term_column.bytes_at(index);
-        let lexical = std::str::from_utf8(&term_bytes).map_err(|error| {
-            VortexRdfError::Deserialization(format!(
-                "direct compact dictionary term for ID {actual} is invalid UTF-8: {error}"
-            ))
-        })?;
-        let compact_index = u32::try_from(terms.len()).map_err(|_| {
-            VortexRdfError::InvalidOperation("compact query term table exceeds u32".into())
-        })?;
-        terms.push(lexical.to_owned());
-        lexical_ms += elapsed_ms(stage);
-        let stage = Instant::now();
-        if id_indexes.insert(actual, compact_index).is_some() {
-            return Err(VortexRdfError::Deserialization(format!(
-                "direct compact dictionary returned duplicate ID {actual}"
-            )));
+        let term_chunk = chunk
+            .clone()
+            .execute::<VarBinViewArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?;
+        term_execute_ms += elapsed_ms(stage);
+        for chunk_index in 0..term_chunk.len() {
+            let expected = *requested.get(index).ok_or_else(|| {
+                VortexRdfError::Deserialization(
+                    "direct compact term chunks exceeded requested IDs".into(),
+                )
+            })?;
+            let actual = loaded_ids[index];
+            if expected != actual {
+                return Err(VortexRdfError::Deserialization(format!(
+                    "direct compact ID invariant failed at position {index}: requested {expected}, loaded {actual}"
+                )));
+            }
+            let stage = Instant::now();
+            let term_bytes = term_chunk.bytes_at(chunk_index);
+            let lexical = std::str::from_utf8(&term_bytes).map_err(|error| {
+                VortexRdfError::Deserialization(format!(
+                    "direct compact dictionary term for ID {actual} is invalid UTF-8: {error}"
+                ))
+            })?;
+            let compact_index = u32::try_from(terms.len()).map_err(|_| {
+                VortexRdfError::InvalidOperation("compact query term table exceeds u32".into())
+            })?;
+            terms.push(lexical.to_owned());
+            lexical_ms += elapsed_ms(stage);
+            let stage = Instant::now();
+            if id_indexes.insert(actual, compact_index).is_some() {
+                return Err(VortexRdfError::Deserialization(format!(
+                    "direct compact dictionary returned duplicate ID {actual}"
+                )));
+            }
+            insert_ms += elapsed_ms(stage);
+            index += 1;
         }
-        insert_ms += elapsed_ms(stage);
     }
+    if index != requested.len() {
+        return Err(VortexRdfError::Deserialization(format!(
+            "direct compact term chunks returned {index} rows for {} requested IDs",
+            requested.len()
+        )));
+    }
+    timings.term_column_execute_ms = term_execute_ms;
     timings.lexical_extract_allocate_ms = lexical_ms;
     timings.id_index_insert_ms = insert_ms;
     timings.lexical_bytes = terms.iter().map(String::len).sum();

@@ -170,6 +170,7 @@ fn diagnose_direct_compact<'py>(
     // VORTEX_RDF_EXPOSE_ENCODING_TRACE_V1
     set!("selected_array_encoding", &d.selected_array_encoding);
     set!("term_column_encoding", &d.term_column_encoding);
+    set!("term_chunks", d.term_chunks);
     set!("unique_id_collect_ms", d.unique_id_collect_ms);
     set!("dictionary_open_ms", d.dictionary_open_ms);
     set!("row_indices_build_ms", d.row_indices_build_ms);
