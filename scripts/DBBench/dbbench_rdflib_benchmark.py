@@ -328,16 +328,16 @@ def extract_single_tp_bindings(query: str):
 
 def run_native_diagnostic(vortex_path: str, vortex_layout: str, query: str):
     """
-    Run the layered Rust-native result-pipeline diagnostic.
+    Run the current production direct-compact diagnostic.
 
-    This is a separate execution from graph.query(). Its timings must not be
-    added to benchmark_elapsed_ms.
+    This executes the native match and direct compact reconstruction separately
+    from the timed graph.query() benchmark.
     """
-    from vortex_rdflib.vortex_rdf_native import diagnose_result_pipeline
+    from vortex_rdflib.vortex_rdf_native import diagnose_direct_compact
 
     subject_n3, predicate_n3, object_n3 = extract_single_tp_bindings(query)
 
-    return dict(diagnose_result_pipeline(
+    return dict(diagnose_direct_compact(
         vortex_path,
         subject_n3,
         predicate_n3,
