@@ -280,11 +280,13 @@ def run_one_query_process_timeout(
         try:
             msg = queue.get_nowait()
             if msg.get("status") == "error":
-                raise RuntimeError(msg.get("error", f"child exitcode={proc.exitcode}"))
+                raise RuntimeError(
+                    msg.get("error", f"child exitcode={proc.exitcode}"))
         except Exception as e:
             if isinstance(e, RuntimeError):
                 raise
-        raise RuntimeError(f"Query child process exited with code {proc.exitcode}")
+        raise RuntimeError(
+            f"Query child process exited with code {proc.exitcode}")
 
     try:
         msg = queue.get(timeout=1.0)
@@ -318,7 +320,8 @@ def extract_single_tp_bindings(query: str):
 
     walk(translated.algebra)
     if len(triples) != 1:
-        raise ValueError(f"diagnostic mode expected one TP triple, found {len(triples)}")
+        raise ValueError(
+            f"diagnostic mode expected one TP triple, found {len(triples)}")
     s, p, o = triples[0]
     return tuple(None if isinstance(value, Variable) else value.n3() for value in (s, p, o))
 
@@ -341,7 +344,26 @@ def run_native_diagnostic(vortex_path: str, vortex_layout: str, query: str):
         object_n3,
         vortex_layout,
     ))
-    
+
+
+def run_direct_compact_diagnostic(
+    vortex_path: str,
+    vortex_layout: str,
+    query: str,
+):
+    from vortex_rdflib.vortex_rdf_native import diagnose_direct_compact
+
+    subject_n3, predicate_n3, object_n3 = extract_single_tp_bindings(query)
+
+    return dict(diagnose_direct_compact(
+        vortex_path,
+        subject_n3,
+        predicate_n3,
+        object_n3,
+        vortex_layout,
+    ))
+
+
 def run_id_decode_diagnostic(
     vortex_path: str, vortex_layout: str, query: str, max_range_scans: int,
 ):
@@ -499,9 +521,11 @@ def main():
     if args.diagnostics_jsonl and args.engines != ["vortex"]:
         parser.error("--diagnostics-jsonl requires exactly --engines vortex")
     if args.id_decode_diagnostics_jsonl and args.timeout_mode != "signal":
-        parser.error("--id-decode-diagnostics-jsonl requires --timeout-mode signal")
+        parser.error(
+            "--id-decode-diagnostics-jsonl requires --timeout-mode signal")
     if args.id_decode_diagnostics_jsonl and args.engines != ["vortex"]:
-        parser.error("--id-decode-diagnostics-jsonl requires exactly --engines vortex")
+        parser.error(
+            "--id-decode-diagnostics-jsonl requires exactly --engines vortex")
     if args.id_decode_max_range_scans < 1:
         parser.error("--id-decode-max-range-scans must be positive")
 
@@ -529,8 +553,10 @@ def main():
         known_ids = {r["query_id"] for r in query_records}
         missing_ids = sorted(selected_ids - known_ids)
         if missing_ids:
-            raise SystemExit("Unknown query IDs in --query-id-file:\n  " + "\n  ".join(missing_ids))
-        query_records = [r for r in query_records if r["query_id"] in selected_ids]
+            raise SystemExit(
+                "Unknown query IDs in --query-id-file:\n  " + "\n  ".join(missing_ids))
+        query_records = [
+            r for r in query_records if r["query_id"] in selected_ids]
 
     if args.shuffle:
         rng = random.Random(args.seed)
@@ -540,7 +566,8 @@ def main():
         query_records = query_records[:args.max_queries]
 
     print(f"Loaded {len(query_records)} individual queries")
-    print(f"Timeout mode: {args.timeout_mode}; query timeout: {args.query_timeout_s}s; kill grace: {args.timeout_kill_grace_s}s")
+    print(
+        f"Timeout mode: {args.timeout_mode}; query timeout: {args.query_timeout_s}s; kill grace: {args.timeout_kill_grace_s}s")
 
     inventory_path = out_prefix.with_suffix(".queries.json")
     inventory_path.write_text(
@@ -640,7 +667,7 @@ def main():
                         )
                     row.update(out)
                     if args.diagnostics_jsonl:
-                        diagnostic = run_native_diagnostic(
+                        diagnostic = run_direct_compact_diagnostic(
                             args.vortex_path,
                             args.vortex_layout,
                             qrec["query"],
@@ -654,7 +681,8 @@ def main():
                             "benchmark_result_count": row["result_count"],
                         })
                         with Path(args.diagnostics_jsonl).open("a", encoding="utf-8") as diag_file:
-                            diag_file.write(json.dumps(diagnostic, sort_keys=True) + "\n")
+                            diag_file.write(json.dumps(
+                                diagnostic, sort_keys=True) + "\n")
                     if args.id_decode_diagnostics_jsonl:
                         diagnostic = run_id_decode_diagnostic(
                             args.vortex_path, args.vortex_layout, qrec["query"],
@@ -669,7 +697,8 @@ def main():
                             "benchmark_result_count": row["result_count"],
                         })
                         with Path(args.id_decode_diagnostics_jsonl).open("a", encoding="utf-8") as diag_file:
-                            diag_file.write(json.dumps(diagnostic, sort_keys=True) + "\\n")
+                            diag_file.write(json.dumps(
+                                diagnostic, sort_keys=True) + "\\n")
                     if phase == "measured" and measured_run_idx == 0:
                         counts_by_engine[engine] = row["result_count"]
 
@@ -729,7 +758,8 @@ def main():
     write_csv(raw_csv, results)
 
     summary_rows = summarize(results)
-    summary_json.write_text(json.dumps(summary_rows, indent=2), encoding="utf-8")
+    summary_json.write_text(json.dumps(
+        summary_rows, indent=2), encoding="utf-8")
     write_csv(summary_csv, summary_rows)
 
     print(f"Wrote {raw_json}")
