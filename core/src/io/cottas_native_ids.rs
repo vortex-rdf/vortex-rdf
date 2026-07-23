@@ -274,6 +274,16 @@ fn require_vortex_component(
 }
 
 fn native_dict_path(data_path: &Path) -> PathBuf {
+    if let Ok(raw) = std::env::var("VORTEX_RDF_ID_TO_TERM_VORTEX_PATH") {
+        let candidate = PathBuf::from(raw);
+        if candidate.extension().is_some_and(|ext| ext == "vortex") && candidate.is_file() {
+            return candidate;
+        }
+        panic!(
+            "VORTEX_RDF_ID_TO_TERM_VORTEX_PATH must name an existing .vortex file: {:?}",
+            candidate
+        );
+    }
     native_component_path(data_path, NativeComponent::DictionaryVortex)
 }
 
@@ -400,66 +410,7 @@ pub struct NativeCompactTripleBatch {
     pub rows: Vec<(u32, u32, u32)>,
 }
 
-fn intern_compact_term(
-    value: &str,
-    terms: &mut Vec<String>,
-    indexes: &mut HashMap<String, u32>,
-) -> Result<u32> {
-    if let Some(index) = indexes.get(value) {
-        return Ok(*index);
-    }
-    let index = u32::try_from(terms.len()).map_err(|_| {
-        VortexRdfError::InvalidOperation("compact query term table exceeds u32".into())
-    })?;
-    let owned = value.to_owned();
-    terms.push(owned.clone());
-    indexes.insert(owned, index);
-    Ok(index)
-}
-
 // VORTEX_RDF_DIRECT_COMPACT_DECODER_V1
-async fn projected_native_id_rows_as_compact_triples_legacy_hashmaps(
-    data_path: &Path,
-    rows: &NativeProjectedIdRows,
-    bound: &BoundNativeRdfTerms,
-) -> Result<NativeCompactTripleBatch> {
-    if rows.rows == 0 {
-        return Ok(NativeCompactTripleBatch::default());
-    }
-    let unique_ids = collect_unique_ids_from_projected_unbound_rows(rows, bound);
-    let id_to_term = lookup_terms_by_ids_from_sidecar(data_path, &unique_ids).await?;
-    let mut terms = Vec::with_capacity(id_to_term.len().saturating_add(3));
-    let mut lexical_indexes = HashMap::with_capacity(terms.capacity());
-    let mut id_indexes = HashMap::with_capacity(id_to_term.len());
-    for id in unique_ids {
-        let value = id_to_term.get(&id).ok_or_else(|| {
-            VortexRdfError::Deserialization(format!(
-                "ID {id} missing during compact reconstruction"
-            ))
-        })?;
-        id_indexes.insert(
-            id,
-            intern_compact_term(value, &mut terms, &mut lexical_indexes)?,
-        );
-    }
-    let bound_s = bound
-        .s
-        .as_deref()
-        .map(|v| intern_compact_term(v, &mut terms, &mut lexical_indexes))
-        .transpose()?;
-    let bound_p = bound
-        .p
-        .as_deref()
-        .map(|v| intern_compact_term(v, &mut terms, &mut lexical_indexes))
-        .transpose()?;
-    let bound_o = bound
-        .o
-        .as_deref()
-        .map(|v| intern_compact_term(v, &mut terms, &mut lexical_indexes))
-        .transpose()?;
-    compact_rows_from_id_indexes(rows, bound, terms, id_indexes, bound_s, bound_p, bound_o)
-}
-
 fn append_bound_compact_term(
     value: Option<&str>,
     terms: &mut Vec<String>,
@@ -547,99 +498,182 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
     bound: &BoundNativeRdfTerms,
 ) -> Result<(NativeCompactTripleBatch, NativeDirectCompactTimings)> {
     let total_start = Instant::now();
-    let mut timings = NativeDirectCompactTimings { rows_out: rows.rows, ..Default::default() };
+    let mut timings = NativeDirectCompactTimings {
+        rows_out: rows.rows,
+        ..Default::default()
+    };
     if rows.rows == 0 {
         timings.total_rust_ms = elapsed_ms(total_start);
         return Ok((NativeCompactTripleBatch::default(), timings));
     }
     let stage = Instant::now();
     let mut requested = collect_unique_ids_from_projected_unbound_rows(rows, bound);
-    requested.sort_unstable(); requested.dedup();
+    requested.sort_unstable();
+    requested.dedup();
     timings.unique_id_collect_ms = elapsed_ms(stage);
     timings.unique_ids = requested.len();
 
-    let path = require_vortex_component(data_path, NativeComponent::DictionaryVortex, "ID-to-term dictionary")?;
+    let path = require_vortex_component(
+        data_path,
+        NativeComponent::DictionaryVortex,
+        "ID-to-term dictionary",
+    )?;
     let stage = Instant::now();
-    let file = NATIVE_FILE_SESSION.open_options().open_path(&path).await.map_err(VortexRdfError::from)?;
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&path)
+        .await
+        .map_err(VortexRdfError::from)?;
     timings.dictionary_open_ms = elapsed_ms(stage);
     let stage = Instant::now();
-    let indices = Buffer::from(requested.iter().map(|id| u64::from(*id)).collect::<Vec<_>>());
+    let indices = Buffer::from(
+        requested
+            .iter()
+            .map(|id| u64::from(*id))
+            .collect::<Vec<_>>(),
+    );
     timings.row_indices_build_ms = elapsed_ms(stage);
     let stage = Instant::now();
-    let stream = file.scan().map_err(VortexRdfError::from)?
+    let stream = file
+        .scan()
+        .map_err(VortexRdfError::from)?
         .with_row_indices(indices)
-        .with_projection(vortex_array::expr::select(["id", "term"], vortex_array::expr::root()))
-        .into_array_stream().map_err(VortexRdfError::from)?;
+        .with_projection(vortex_array::expr::select(
+            ["id", "term"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?;
     timings.scan_build_ms = elapsed_ms(stage);
     let stage = Instant::now();
     let array = stream.read_all().await.map_err(VortexRdfError::from)?;
     timings.read_all_ms = elapsed_ms(stage);
-    if array.len() != requested.len() { return Err(VortexRdfError::Deserialization(format!(
-        "direct compact dictionary selection returned {} rows for {} requested IDs", array.len(), requested.len()))); }
+    if array.len() != requested.len() {
+        return Err(VortexRdfError::Deserialization(format!(
+            "direct compact dictionary selection returned {} rows for {} requested IDs",
+            array.len(),
+            requested.len()
+        )));
+    }
 
     let mut ctx = NATIVE_FILE_SESSION.create_execution_ctx();
     let stage = Instant::now();
-    let struct_array = array.execute::<StructArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
+    let struct_array = array
+        .execute::<StructArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
     timings.struct_execute_ms = elapsed_ms(stage);
     let stage = Instant::now();
-    let id_column = struct_array.unmasked_field_by_name("id").map_err(VortexRdfError::Vortex)?
-        .clone().execute::<PrimitiveArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
+    let id_column = struct_array
+        .unmasked_field_by_name("id")
+        .map_err(VortexRdfError::Vortex)?
+        .clone()
+        .execute::<PrimitiveArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
     timings.id_column_execute_ms = elapsed_ms(stage);
     let stage = Instant::now();
-    let term_column = struct_array.unmasked_field_by_name("term").map_err(VortexRdfError::Vortex)?
-        .clone().execute::<VarBinViewArray>(&mut ctx).map_err(VortexRdfError::Vortex)?;
+    let term_column = struct_array
+        .unmasked_field_by_name("term")
+        .map_err(VortexRdfError::Vortex)?
+        .clone()
+        .execute::<VarBinViewArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
     timings.term_column_execute_ms = elapsed_ms(stage);
     let loaded_ids = id_column.as_slice::<u32>();
-    if loaded_ids.len()!=requested.len() || term_column.len()!=requested.len() {
-        return Err(VortexRdfError::Deserialization(format!("direct compact dictionary column mismatch: ids={}, terms={}, requested={}", loaded_ids.len(), term_column.len(), requested.len())));
+    if loaded_ids.len() != requested.len() || term_column.len() != requested.len() {
+        return Err(VortexRdfError::Deserialization(format!(
+            "direct compact dictionary column mismatch: ids={}, terms={}, requested={}",
+            loaded_ids.len(),
+            term_column.len(),
+            requested.len()
+        )));
     }
-    let mut terms=Vec::with_capacity(requested.len().saturating_add(3));
-    let mut id_indexes=HashMap::with_capacity(requested.len());
-    let mut lexical_ms=0.0; let mut insert_ms=0.0;
-    for (index,(&expected,&actual)) in requested.iter().zip(loaded_ids).enumerate() {
-        if expected!=actual { return Err(VortexRdfError::Deserialization(format!("direct compact ID invariant failed at position {index}: requested {expected}, loaded {actual}"))); }
-        let stage=Instant::now();
-        let term_bytes=term_column.bytes_at(index);
-        let lexical=std::str::from_utf8(&term_bytes).map_err(|error| VortexRdfError::Deserialization(format!("direct compact dictionary term for ID {actual} is invalid UTF-8: {error}")))?;
-        let compact_index=u32::try_from(terms.len()).map_err(|_| VortexRdfError::InvalidOperation("compact query term table exceeds u32".into()))?;
+    let mut terms = Vec::with_capacity(requested.len().saturating_add(3));
+    let mut id_indexes = HashMap::with_capacity(requested.len());
+    let mut lexical_ms = 0.0;
+    let mut insert_ms = 0.0;
+    for (index, (&expected, &actual)) in requested.iter().zip(loaded_ids).enumerate() {
+        if expected != actual {
+            return Err(VortexRdfError::Deserialization(format!(
+                "direct compact ID invariant failed at position {index}: requested {expected}, loaded {actual}"
+            )));
+        }
+        let stage = Instant::now();
+        let term_bytes = term_column.bytes_at(index);
+        let lexical = std::str::from_utf8(&term_bytes).map_err(|error| {
+            VortexRdfError::Deserialization(format!(
+                "direct compact dictionary term for ID {actual} is invalid UTF-8: {error}"
+            ))
+        })?;
+        let compact_index = u32::try_from(terms.len()).map_err(|_| {
+            VortexRdfError::InvalidOperation("compact query term table exceeds u32".into())
+        })?;
         terms.push(lexical.to_owned());
         lexical_ms += elapsed_ms(stage);
-        let stage=Instant::now();
-        if id_indexes.insert(actual,compact_index).is_some() { return Err(VortexRdfError::Deserialization(format!("direct compact dictionary returned duplicate ID {actual}"))); }
+        let stage = Instant::now();
+        if id_indexes.insert(actual, compact_index).is_some() {
+            return Err(VortexRdfError::Deserialization(format!(
+                "direct compact dictionary returned duplicate ID {actual}"
+            )));
+        }
         insert_ms += elapsed_ms(stage);
     }
-    timings.lexical_extract_allocate_ms=lexical_ms;
-    timings.id_index_insert_ms=insert_ms;
-    timings.lexical_bytes=terms.iter().map(String::len).sum();
-    let stage=Instant::now();
-    let mut bound_indexes=HashMap::with_capacity(3);
-    let bound_s=append_bound_compact_term(bound.s.as_deref(),&mut terms,&mut bound_indexes)?;
-    let bound_p=append_bound_compact_term(bound.p.as_deref(),&mut terms,&mut bound_indexes)?;
-    let bound_o=append_bound_compact_term(bound.o.as_deref(),&mut terms,&mut bound_indexes)?;
-    timings.bound_term_insert_ms=elapsed_ms(stage);
-    let stage=Instant::now();
-    let batch=compact_rows_from_id_indexes(rows,bound,terms,id_indexes,bound_s,bound_p,bound_o)?;
-    timings.compact_row_build_ms=elapsed_ms(stage);
-    timings.terms_out=batch.terms.len();
-    timings.reconstruction_total_ms=timings.unique_id_collect_ms+timings.dictionary_open_ms+timings.row_indices_build_ms+timings.scan_build_ms+timings.read_all_ms+timings.struct_execute_ms+timings.id_column_execute_ms+timings.term_column_execute_ms+timings.lexical_extract_allocate_ms+timings.id_index_insert_ms+timings.bound_term_insert_ms+timings.compact_row_build_ms;
-    timings.total_rust_ms=elapsed_ms(total_start);
-    Ok((batch,timings))
+    timings.lexical_extract_allocate_ms = lexical_ms;
+    timings.id_index_insert_ms = insert_ms;
+    timings.lexical_bytes = terms.iter().map(String::len).sum();
+    let stage = Instant::now();
+    let mut bound_indexes = HashMap::with_capacity(3);
+    let bound_s = append_bound_compact_term(bound.s.as_deref(), &mut terms, &mut bound_indexes)?;
+    let bound_p = append_bound_compact_term(bound.p.as_deref(), &mut terms, &mut bound_indexes)?;
+    let bound_o = append_bound_compact_term(bound.o.as_deref(), &mut terms, &mut bound_indexes)?;
+    timings.bound_term_insert_ms = elapsed_ms(stage);
+    let stage = Instant::now();
+    let batch =
+        compact_rows_from_id_indexes(rows, bound, terms, id_indexes, bound_s, bound_p, bound_o)?;
+    timings.compact_row_build_ms = elapsed_ms(stage);
+    timings.terms_out = batch.terms.len();
+    timings.reconstruction_total_ms = timings.unique_id_collect_ms
+        + timings.dictionary_open_ms
+        + timings.row_indices_build_ms
+        + timings.scan_build_ms
+        + timings.read_all_ms
+        + timings.struct_execute_ms
+        + timings.id_column_execute_ms
+        + timings.term_column_execute_ms
+        + timings.lexical_extract_allocate_ms
+        + timings.id_index_insert_ms
+        + timings.bound_term_insert_ms
+        + timings.compact_row_build_ms;
+    timings.total_rust_ms = elapsed_ms(total_start);
+    Ok((batch, timings))
 }
 
 async fn projected_native_id_rows_as_compact_triples_direct_v1(
-    data_path: &Path, rows: &NativeProjectedIdRows, bound: &BoundNativeRdfTerms,
+    data_path: &Path,
+    rows: &NativeProjectedIdRows,
+    bound: &BoundNativeRdfTerms,
 ) -> Result<NativeCompactTripleBatch> {
-    projected_native_id_rows_as_compact_triples_direct_v1_impl(data_path,rows,bound).await.map(|v|v.0)
+    projected_native_id_rows_as_compact_triples_direct_v1_impl(data_path, rows, bound)
+        .await
+        .map(|v| v.0)
 }
 
 pub async fn diagnose_cottas_native_direct_compact(
-    input_path: &Path, subject: Option<&NamedOrBlankNode>, predicate: Option<&NamedNode>,
-    object: Option<&Term>, graph: Option<&GraphName>,
+    input_path: &Path,
+    subject: Option<&NamedOrBlankNode>,
+    predicate: Option<&NamedNode>,
+    object: Option<&Term>,
+    graph: Option<&GraphName>,
 ) -> Result<NativeDirectCompactTimings> {
-    let total=Instant::now();
-    let planned=execute_cottas_native_match(input_path,subject,predicate,object,graph).await?;
-    let (_batch,mut timings)=projected_native_id_rows_as_compact_triples_direct_v1_impl(input_path,&planned.rows,&planned.bound_terms).await?;
-    timings.total_rust_ms=elapsed_ms(total);
+    let total = Instant::now();
+    let planned =
+        execute_cottas_native_match(input_path, subject, predicate, object, graph).await?;
+    let (_batch, mut timings) = projected_native_id_rows_as_compact_triples_direct_v1_impl(
+        input_path,
+        &planned.rows,
+        &planned.bound_terms,
+    )
+    .await?;
+    timings.total_rust_ms = elapsed_ms(total);
     Ok(timings)
 }
 
@@ -648,20 +682,7 @@ async fn projected_native_id_rows_as_compact_triples(
     rows: &NativeProjectedIdRows,
     bound: &BoundNativeRdfTerms,
 ) -> Result<NativeCompactTripleBatch> {
-    let strategy = std::env::var("VORTEX_RDF_COMPACT_RECONSTRUCTION_STRATEGY")
-        .unwrap_or_else(|_| "legacy-hashmaps".to_string());
-    match strategy.as_str() {
-        "legacy-hashmaps" => {
-            projected_native_id_rows_as_compact_triples_legacy_hashmaps(data_path, rows, bound)
-                .await
-        }
-        "direct-v1" => {
-            projected_native_id_rows_as_compact_triples_direct_v1(data_path, rows, bound).await
-        }
-        other => Err(VortexRdfError::InvalidOperation(format!(
-            "Unsupported VORTEX_RDF_COMPACT_RECONSTRUCTION_STRATEGY={other:?}; expected legacy-hashmaps or direct-v1"
-        ))),
-    }
+    projected_native_id_rows_as_compact_triples_direct_v1(data_path, rows, bound).await
 }
 
 /// Transfers each lexical term once and rows as indexes into that query-local table.
@@ -676,487 +697,6 @@ pub async fn match_cottas_native_file_as_compact_triples(
         execute_cottas_native_match(input_path, subject, predicate, object, graph).await?;
     projected_native_id_rows_as_compact_triples(input_path, &planned.rows, &planned.bound_terms)
         .await
-}
-
-// VORTEX_RDF_NATIVE_RESULT_PIPELINE_DIAGNOSTICS_V1
-/// Diagnostic timings for the Rust-native result path. `ids_only_ms` ends at
-/// NativeProjectedIdRows and is the closest current proxy for a DataFusion handoff.
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct NativeResultPipelineDiagnostics {
-    pub rows_out: usize,
-    pub projected_columns: usize,
-    pub projected_values: usize,
-    pub unique_ids: usize,
-    pub terms_loaded: usize,
-    pub lexical_bytes: usize,
-    pub compact_rows: usize,
-    pub term_lookup_ms: f64,
-    pub access_index_lookup_ms: f64,
-    pub open_ms: f64,
-    pub scan_build_ms: f64,
-    pub scan_read_and_id_extract_ms: f64,
-    pub ids_only_ms: f64,
-    pub unique_id_collect_ms: f64,
-    pub id_to_term_ms: f64,
-    pub compact_intern_and_row_build_ms: f64,
-    pub compact_native_ms: f64,
-    pub total_rust_ms: f64,
-    pub id_to_term_stats: NativeIdToTermLookupStats,
-    pub access_index_strategy: String,
-    pub access_execution_strategy: String,
-}
-
-pub async fn diagnose_cottas_native_result_pipeline(
-    input_path: &Path,
-    subject: Option<&NamedOrBlankNode>,
-    predicate: Option<&NamedNode>,
-    object: Option<&Term>,
-    graph: Option<&GraphName>,
-) -> Result<NativeResultPipelineDiagnostics> {
-    let total_start = Instant::now();
-    let planned =
-        execute_cottas_native_match(input_path, subject, predicate, object, graph).await?;
-    let ids_only_ms = elapsed_ms(total_start);
-    let rows = &planned.rows;
-    let projected_columns = [&rows.s, &rows.p, &rows.o, &rows.g]
-        .into_iter()
-        .filter(|column| column.is_some())
-        .count();
-    let projected_values = [&rows.s, &rows.p, &rows.o, &rows.g]
-        .into_iter()
-        .filter_map(|column| column.as_ref())
-        .map(Vec::len)
-        .sum();
-
-    let unique_start = Instant::now();
-    let unique_ids = collect_unique_ids_from_projected_unbound_rows(rows, &planned.bound_terms);
-    let unique_id_collect_ms = elapsed_ms(unique_start);
-
-    let lookup_start = Instant::now();
-    let (id_to_term, id_to_term_stats) =
-        lookup_terms_by_ids_from_sidecar_with_stats(input_path, &unique_ids).await?;
-    let id_to_term_ms = elapsed_ms(lookup_start);
-
-    let compact_start = Instant::now();
-    let mut terms = Vec::with_capacity(id_to_term.len().saturating_add(3));
-    let mut lexical_indexes = HashMap::with_capacity(terms.capacity());
-    let mut id_indexes = HashMap::with_capacity(id_to_term.len());
-    for id in &unique_ids {
-        let value = id_to_term.get(id).ok_or_else(|| {
-            VortexRdfError::Deserialization(format!(
-                "ID {id} missing during diagnostic compact reconstruction"
-            ))
-        })?;
-        id_indexes.insert(
-            *id,
-            intern_compact_term(value, &mut terms, &mut lexical_indexes)?,
-        );
-    }
-    let bound_s = planned
-        .bound_terms
-        .s
-        .as_deref()
-        .map(|v| intern_compact_term(v, &mut terms, &mut lexical_indexes))
-        .transpose()?;
-    let bound_p = planned
-        .bound_terms
-        .p
-        .as_deref()
-        .map(|v| intern_compact_term(v, &mut terms, &mut lexical_indexes))
-        .transpose()?;
-    let bound_o = planned
-        .bound_terms
-        .o
-        .as_deref()
-        .map(|v| intern_compact_term(v, &mut terms, &mut lexical_indexes))
-        .transpose()?;
-    let resolve = |fixed: Option<u32>, id: Option<u32>, label: &str| -> Result<u32> {
-        if let Some(index) = fixed {
-            return Ok(index);
-        }
-        let id = id.ok_or_else(|| {
-            VortexRdfError::Deserialization(format!(
-                "{label} projected ID missing in pipeline diagnostic"
-            ))
-        })?;
-        id_indexes.get(&id).copied().ok_or_else(|| {
-            VortexRdfError::Deserialization(format!(
-                "{label} ID {id} missing from diagnostic compact dictionary"
-            ))
-        })
-    };
-    let mut compact_rows = Vec::with_capacity(rows.rows);
-    for i in 0..rows.rows {
-        compact_rows.push((
-            resolve(
-                bound_s,
-                projected_id_at(&rows.s, &planned.bound_terms.s, i, "S")?,
-                "S",
-            )?,
-            resolve(
-                bound_p,
-                projected_id_at(&rows.p, &planned.bound_terms.p, i, "P")?,
-                "P",
-            )?,
-            resolve(
-                bound_o,
-                projected_id_at(&rows.o, &planned.bound_terms.o, i, "O")?,
-                "O",
-            )?,
-        ));
-    }
-    let compact_intern_and_row_build_ms = elapsed_ms(compact_start);
-    let lexical_bytes = terms.iter().map(String::len).sum();
-    let diagnostics = &planned.diagnostics;
-    Ok(NativeResultPipelineDiagnostics {
-        rows_out: rows.rows,
-        projected_columns,
-        projected_values,
-        unique_ids: unique_ids.len(),
-        terms_loaded: terms.len(),
-        lexical_bytes,
-        compact_rows: compact_rows.len(),
-        term_lookup_ms: diagnostics.term_lookup_ms,
-        access_index_lookup_ms: diagnostics.access_index_lookup_ms,
-        open_ms: diagnostics.open_ms,
-        scan_build_ms: diagnostics.scan_build_ms,
-        scan_read_and_id_extract_ms: diagnostics.read_all_ms,
-        ids_only_ms,
-        unique_id_collect_ms,
-        id_to_term_ms,
-        compact_intern_and_row_build_ms,
-        compact_native_ms: unique_id_collect_ms + id_to_term_ms + compact_intern_and_row_build_ms,
-        total_rust_ms: elapsed_ms(total_start),
-        id_to_term_stats,
-        access_index_strategy: diagnostics.access_index_strategy.clone(),
-        access_execution_strategy: diagnostics.access_execution_strategy.clone(),
-    })
-}
-
-// VORTEX_RDF_ADAPTIVE_ID_TO_TERM_BENCHMARK_V1
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct NativeIdDecodeStrategyTrial {
-    pub strategy: String,
-    pub status: String,
-    pub max_gap: Option<u32>,
-    pub scan_count: usize,
-    pub rows_read: u64,
-    pub terms_loaded: usize,
-    pub open_ms: f64,
-    pub read_ms: f64,
-    pub extract_filter_ms: f64,
-    pub total_ms: f64,
-    pub error: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct NativeIdDecodeStrategyDiagnostics {
-    pub rows_out: usize,
-    pub ids_only_ms: f64,
-    pub requested_ids: usize,
-    pub min_id: Option<u32>,
-    pub max_id: Option<u32>,
-    pub id_span: u64,
-    pub id_density: f64,
-    pub exact_run_count: usize,
-    pub max_range_scans: usize,
-    pub trials: Vec<NativeIdDecodeStrategyTrial>,
-}
-
-fn merge_requested_id_ranges(ids: &[u32], max_gap: u32) -> Vec<Range<u64>> {
-    let Some(&first) = ids.first() else {
-        return Vec::new();
-    };
-    let mut ranges = Vec::new();
-    let mut start = first;
-    let mut last = first;
-    for &id in &ids[1..] {
-        if id <= last.saturating_add(max_gap).saturating_add(1) {
-            last = id;
-        } else {
-            ranges.push(u64::from(start)..u64::from(last) + 1);
-            start = id;
-            last = id;
-        }
-    }
-    ranges.push(u64::from(start)..u64::from(last) + 1);
-    ranges
-}
-
-async fn decode_ids_by_ranges_for_trial(
-    data_path: &Path,
-    requested: &HashSet<u32>,
-    ranges: &[Range<u64>],
-    strategy: &str,
-    max_gap: Option<u32>,
-) -> Result<(HashMap<u32, String>, NativeIdDecodeStrategyTrial)> {
-    let total_start = Instant::now();
-    let path = require_vortex_component(
-        data_path,
-        NativeComponent::DictionaryVortex,
-        "ID-to-term dictionary",
-    )?;
-    let open_start = Instant::now();
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
-    let open_ms = elapsed_ms(open_start);
-    let mut out = HashMap::with_capacity(requested.len());
-    let mut read_ms = 0.0;
-    let mut extract_filter_ms = 0.0;
-    let mut rows_read = 0u64;
-    for range in ranges {
-        rows_read = rows_read
-            .checked_add(range.end - range.start)
-            .ok_or_else(|| {
-                VortexRdfError::InvalidOperation("diagnostic rows_read overflow".into())
-            })?;
-        let read_start = Instant::now();
-        let array = file
-            .scan()
-            .map_err(VortexRdfError::from)?
-            .with_row_range(range.clone())
-            .with_projection(vortex_array::expr::select(
-                ["id", "term"],
-                vortex_array::expr::root(),
-            ))
-            .into_array_stream()
-            .map_err(VortexRdfError::from)?
-            .read_all()
-            .await
-            .map_err(VortexRdfError::from)?;
-        read_ms += elapsed_ms(read_start);
-        let extract_start = Instant::now();
-        let ids = extract_projected_u32_column(&array, "id")?;
-        let terms = extract_projected_utf8_column(&array, "term")?;
-        if ids.len() != terms.len() || ids.len() != array.len() {
-            return Err(VortexRdfError::Deserialization(format!(
-                "{strategy} trial returned inconsistent dictionary columns"
-            )));
-        }
-        for (id, term) in ids.into_iter().zip(terms) {
-            if requested.contains(&id) && out.insert(id, term).is_some() {
-                return Err(VortexRdfError::Deserialization(format!(
-                    "{strategy} trial loaded duplicate ID {id}"
-                )));
-            }
-        }
-        extract_filter_ms += elapsed_ms(extract_start);
-    }
-    let trial = NativeIdDecodeStrategyTrial {
-        strategy: strategy.to_string(),
-        status: "ok".to_string(),
-        max_gap,
-        scan_count: ranges.len(),
-        rows_read,
-        terms_loaded: out.len(),
-        open_ms,
-        read_ms,
-        extract_filter_ms,
-        total_ms: elapsed_ms(total_start),
-        error: None,
-    };
-    Ok((out, trial))
-}
-
-fn skipped_id_decode_trial(
-    strategy: &str,
-    max_gap: Option<u32>,
-    scan_count: usize,
-    rows_read: u64,
-    reason: String,
-) -> NativeIdDecodeStrategyTrial {
-    NativeIdDecodeStrategyTrial {
-        strategy: strategy.to_string(),
-        status: "skipped".to_string(),
-        max_gap,
-        scan_count,
-        rows_read,
-        error: Some(reason),
-        ..Default::default()
-    }
-}
-
-/// Diagnostic only. It reuses the exact query-scoped ID set and validates every
-/// completed alternative against the current row-index decoder before reporting it.
-pub async fn diagnose_cottas_native_id_decode_strategies(
-    input_path: &Path,
-    subject: Option<&NamedOrBlankNode>,
-    predicate: Option<&NamedNode>,
-    object: Option<&Term>,
-    graph: Option<&GraphName>,
-    max_range_scans: usize,
-) -> Result<NativeIdDecodeStrategyDiagnostics> {
-    let ids_start = Instant::now();
-    let planned =
-        execute_cottas_native_match(input_path, subject, predicate, object, graph).await?;
-    let ids_only_ms = elapsed_ms(ids_start);
-    let mut ids =
-        collect_unique_ids_from_projected_unbound_rows(&planned.rows, &planned.bound_terms);
-    ids.sort_unstable();
-    ids.dedup();
-    let min_id = ids.first().copied();
-    let max_id = ids.last().copied();
-    let id_span = match (min_id, max_id) {
-        (Some(min), Some(max)) => u64::from(max) - u64::from(min) + 1,
-        _ => 0,
-    };
-    let id_density = if id_span == 0 {
-        0.0
-    } else {
-        ids.len() as f64 / id_span as f64
-    };
-    let exact_ranges = merge_requested_id_ranges(&ids, 0);
-    let exact_run_count = exact_ranges.len();
-    if ids.is_empty() {
-        return Ok(NativeIdDecodeStrategyDiagnostics {
-            rows_out: planned.rows.rows,
-            ids_only_ms,
-            requested_ids: 0,
-            min_id,
-            max_id,
-            id_span,
-            id_density,
-            exact_run_count,
-            max_range_scans,
-            trials: Vec::new(),
-        });
-    }
-    let requested: HashSet<u32> = ids.iter().copied().collect();
-    let baseline_start = Instant::now();
-    let (baseline, baseline_stats) =
-        lookup_terms_by_ids_from_sidecar_with_stats(input_path, &ids).await?;
-    let mut trials = vec![NativeIdDecodeStrategyTrial {
-        strategy: "row-indices-current".to_string(),
-        status: "ok".to_string(),
-        max_gap: None,
-        scan_count: 1,
-        rows_read: ids.len() as u64,
-        terms_loaded: baseline.len(),
-        open_ms: baseline_stats.open_files_ms,
-        read_ms: baseline_stats.blob_read_ms,
-        extract_filter_ms: (baseline_stats.total_ms
-            - baseline_stats.open_files_ms
-            - baseline_stats.blob_read_ms)
-            .max(0.0),
-        total_ms: elapsed_ms(baseline_start),
-        error: None,
-    }];
-    if baseline.len() != ids.len() {
-        return Err(VortexRdfError::Deserialization(format!(
-            "baseline ID decoder loaded {} of {} requested IDs",
-            baseline.len(),
-            ids.len()
-        )));
-    }
-    for max_gap in [0u32, 8, 64, 512] {
-        let ranges = merge_requested_id_ranges(&ids, max_gap);
-        let rows_read = range_rows(&ranges);
-        let strategy = format!("merged-ranges-gap-{max_gap}");
-        if ranges.len() > max_range_scans {
-            trials.push(skipped_id_decode_trial(
-                &strategy,
-                Some(max_gap),
-                ranges.len(),
-                rows_read,
-                format!("range count exceeds max_range_scans={max_range_scans}"),
-            ));
-            continue;
-        }
-        let (candidate, trial) = decode_ids_by_ranges_for_trial(
-            input_path,
-            &requested,
-            &ranges,
-            &strategy,
-            Some(max_gap),
-        )
-        .await?;
-        if candidate != baseline {
-            return Err(VortexRdfError::Deserialization(format!(
-                "{strategy} result differs from row-index baseline"
-            )));
-        }
-        trials.push(trial);
-    }
-    let bounding = u64::from(min_id.unwrap())..u64::from(max_id.unwrap()) + 1;
-    let (candidate, trial) = decode_ids_by_ranges_for_trial(
-        input_path,
-        &requested,
-        std::slice::from_ref(&bounding),
-        "bounding-range",
-        None,
-    )
-    .await?;
-    if candidate != baseline {
-        return Err(VortexRdfError::Deserialization(
-            "bounding-range result differs from row-index baseline".into(),
-        ));
-    }
-    trials.push(trial);
-    let dictionary_path = native_dict_path(input_path);
-    let open_start = Instant::now();
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&dictionary_path)
-        .await
-        .map_err(VortexRdfError::from)?;
-    let open_ms = elapsed_ms(open_start);
-    let read_start = Instant::now();
-    let array = file
-        .scan()
-        .map_err(VortexRdfError::from)?
-        .with_projection(vortex_array::expr::select(
-            ["id", "term"],
-            vortex_array::expr::root(),
-        ))
-        .into_array_stream()
-        .map_err(VortexRdfError::from)?
-        .read_all()
-        .await
-        .map_err(VortexRdfError::from)?;
-    let read_ms = elapsed_ms(read_start);
-    let extract_start = Instant::now();
-    let loaded_ids = extract_projected_u32_column(&array, "id")?;
-    let terms = extract_projected_utf8_column(&array, "term")?;
-    let mut full = HashMap::with_capacity(ids.len());
-    for (id, term) in loaded_ids.into_iter().zip(terms) {
-        if requested.contains(&id) {
-            full.insert(id, term);
-        }
-    }
-    let extract_filter_ms = elapsed_ms(extract_start);
-    if full != baseline {
-        return Err(VortexRdfError::Deserialization(
-            "full-scan result differs from row-index baseline".into(),
-        ));
-    }
-    trials.push(NativeIdDecodeStrategyTrial {
-        strategy: "full-sequential-scan".to_string(),
-        status: "ok".to_string(),
-        max_gap: None,
-        scan_count: 1,
-        rows_read: array.len() as u64,
-        terms_loaded: full.len(),
-        open_ms,
-        read_ms,
-        extract_filter_ms,
-        total_ms: open_ms + read_ms + extract_filter_ms,
-        error: None,
-    });
-    Ok(NativeIdDecodeStrategyDiagnostics {
-        rows_out: planned.rows.rows,
-        ids_only_ms,
-        requested_ids: ids.len(),
-        min_id,
-        max_id,
-        id_span,
-        id_density,
-        exact_run_count,
-        max_range_scans,
-        trials,
-    })
 }
 
 pub async fn serialize_cottas_native_file<Dict, S>(
@@ -6388,6 +5928,206 @@ async fn lookup_bound_term_ids_sparse_directory(
     stats[0].extract_ms = extract_ms;
     stats[0].total_ms = total_ms;
     Ok((found, stats, total_ms))
+}
+
+// VORTEX_RDF_ID_TO_TERM_LAYOUT_EXPERIMENTS_V1
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct NativeIdToTermRewriteStats {
+    pub source_path: String,
+    pub output_path: String,
+    pub row_group_size: usize,
+    pub compression_profile: String,
+    pub rows_read: u64,
+    pub rows_written: u64,
+    pub source_bytes: u64,
+    pub output_bytes: u64,
+    pub open_ms: f64,
+    pub write_ms: f64,
+    pub validate_ms: f64,
+    pub total_ms: f64,
+}
+
+fn store_rewritten_dictionary_row_count(shared_rows: &Mutex<u64>, rows: u64) -> VortexResult<()> {
+    let mut guard = shared_rows
+        .lock()
+        .map_err(|_| vortex_error::vortex_err!("rewrite row counter mutex was poisoned"))?;
+
+    *guard = rows;
+    Ok(())
+}
+
+/// Rewrites only the existing ID-to-term Vortex component. No triples, indexes,
+/// term-to-ID data, or non-Vortex runtime files are created.
+pub async fn rewrite_cottas_native_id_to_term_dictionary(
+    data_path: &Path,
+    output_path: &Path,
+    row_group_size: usize,
+    compression_profile: CottasVortexCompressionProfile,
+) -> Result<NativeIdToTermRewriteStats> {
+    let total_start = Instant::now();
+    if row_group_size == 0 {
+        return Err(VortexRdfError::InvalidOperation(
+            "row_group_size must be positive".into(),
+        ));
+    }
+    if output_path.extension().is_none_or(|ext| ext != "vortex") {
+        return Err(VortexRdfError::InvalidOperation(
+            "candidate output must end in .vortex".into(),
+        ));
+    }
+    let source_path = native_component_path(data_path, NativeComponent::DictionaryVortex);
+    if !source_path.is_file() {
+        return Err(VortexRdfError::InvalidOperation(format!(
+            "source ID-to-term dictionary is missing at {:?}",
+            source_path
+        )));
+    }
+    if output_path == data_path || output_path == source_path {
+        return Err(VortexRdfError::InvalidOperation(
+            "candidate output must not overwrite the artifact or production dictionary".into(),
+        ));
+    }
+    if output_path.exists() {
+        return Err(VortexRdfError::InvalidOperation(format!(
+            "candidate output already exists: {:?}",
+            output_path
+        )));
+    }
+    let temporary_path = PathBuf::from(format!("{}.tmp", output_path.display()));
+    if temporary_path.exists() {
+        return Err(VortexRdfError::InvalidOperation(format!(
+            "temporary candidate already exists: {:?}",
+            temporary_path
+        )));
+    }
+    let source_bytes = std::fs::metadata(&source_path)
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?
+        .len();
+    let open_start = Instant::now();
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&source_path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let open_ms = elapsed_ms(open_start);
+    let input = file
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_projection(vortex_array::expr::select(
+            ["id", "term"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?;
+    let shared_rows = Arc::new(Mutex::new(0u64));
+    let stream_rows = Arc::clone(&shared_rows);
+    let arrays = async_stream::try_stream! {
+            let mut input=Box::pin(input); let mut ids=Vec::with_capacity(row_group_size); let mut terms=Vec::with_capacity(row_group_size); let mut expected=0u64;
+            while let Some(batch)=input.next().await {
+                let batch=batch?;
+                let batch_ids=extract_projected_u32_column(&batch,"id").map_err(rdf_err_to_vortex_err)?;
+                let batch_terms=extract_projected_utf8_column(&batch,"term").map_err(rdf_err_to_vortex_err)?;
+                if batch_ids.len()!=batch_terms.len() || batch_ids.len()!=batch.len() { Err(vortex_error::vortex_err!("source dictionary column mismatch"))?; }
+                for (id,term) in batch_ids.into_iter().zip(batch_terms) {
+                    if u64::from(id)!=expected { Err(vortex_error::vortex_err!("source dictionary row/ID invariant failed at row {}: ID {}",expected,id))?; }
+                    ids.push(id); terms.push(term); expected+=1;
+                    if ids.len()==row_group_size { yield build_native_dictionary_array(std::mem::take(&mut ids),std::mem::take(&mut terms)).map_err(rdf_err_to_vortex_err)?; ids=Vec::with_capacity(row_group_size); terms=Vec::with_capacity(row_group_size); }
+                }
+            }
+            if !ids.is_empty() { yield build_native_dictionary_array(ids,terms).map_err(rdf_err_to_vortex_err)?; }
+    store_rewritten_dictionary_row_count(
+        stream_rows.as_ref(),
+        expected,
+    )?;
+        };
+    let dtype = empty_native_dictionary_array()?.dtype().clone();
+    let output_stream = ArrayStreamAdapter::new(dtype, arrays);
+    let strategy = match compression_profile {
+        CottasVortexCompressionProfile::Balanced => WriteStrategyBuilder::default()
+            .with_row_block_size(row_group_size)
+            .build(),
+        CottasVortexCompressionProfile::Compact => WriteStrategyBuilder::default()
+            .with_row_block_size(row_group_size)
+            .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+            .build(),
+    };
+    let write_start = Instant::now();
+    let mut output = tokio::fs::File::create(&temporary_path)
+        .await
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    if let Err(error) = NATIVE_FILE_SESSION
+        .write_options()
+        .with_strategy(strategy)
+        .write(&mut output, output_stream)
+        .await
+    {
+        drop(output);
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(VortexRdfError::from(error));
+    }
+    output
+        .sync_all()
+        .await
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    drop(output);
+    let rows_read = *shared_rows
+        .lock()
+        .map_err(|_| VortexRdfError::Serialization("rewrite row counter mutex poisoned".into()))?;
+    let write_ms = elapsed_ms(write_start);
+    let validate_start = Instant::now();
+    let candidate = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(&temporary_path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let check = candidate
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .with_projection(vortex_array::expr::select(
+            ["id"],
+            vortex_array::expr::root(),
+        ))
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?
+        .read_all()
+        .await
+        .map_err(VortexRdfError::from)?;
+    let check_ids = extract_projected_u32_column(&check, "id")?;
+    if check_ids.len() as u64 != rows_read
+        || check_ids
+            .iter()
+            .enumerate()
+            .any(|(row, id)| usize::try_from(*id).ok() != Some(row))
+    {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(VortexRdfError::Deserialization(
+            "candidate dictionary failed row/ID validation".into(),
+        ));
+    }
+    let validate_ms = elapsed_ms(validate_start);
+    std::fs::rename(&temporary_path, output_path)
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    let output_bytes = std::fs::metadata(output_path)
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?
+        .len();
+    Ok(NativeIdToTermRewriteStats {
+        source_path: source_path.display().to_string(),
+        output_path: output_path.display().to_string(),
+        row_group_size,
+        compression_profile: match compression_profile {
+            CottasVortexCompressionProfile::Balanced => "balanced",
+            CottasVortexCompressionProfile::Compact => "compact",
+        }
+        .into(),
+        rows_read,
+        rows_written: rows_read,
+        source_bytes,
+        output_bytes,
+        open_ms,
+        write_ms,
+        validate_ms,
+        total_ms: elapsed_ms(total_start),
+    })
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

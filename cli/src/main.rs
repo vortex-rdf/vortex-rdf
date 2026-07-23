@@ -35,8 +35,9 @@ use vortex_rdf_core::{
         count_cottas_native_string_file_with_diagnostics_mode, load_vortex_file_ref,
         match_cottas_native_file, match_cottas_native_file_with_diagnostics,
         match_cottas_native_string_file, match_cottas_native_string_file_with_diagnostics,
-        open_vortex_file, rebuild_cottas_native_term_dictionary, serialize,
-        serialize_cottas_native_file, serialize_cottas_native_string_file,
+        open_vortex_file, rebuild_cottas_native_term_dictionary,
+        rewrite_cottas_native_id_to_term_dictionary, serialize, serialize_cottas_native_file,
+        serialize_cottas_native_string_file,
     },
     store::layout::{
         cottas::{CottasLayout, TripleOrdering},
@@ -170,6 +171,20 @@ enum Action {
     BuildNativeObjectIndex {
         #[arg(short, long)]
         input: PathBuf,
+        #[arg(long)]
+        diagnostics_out: Option<PathBuf>,
+    },
+    /// Rewrite only the ID-to-term Vortex dictionary for row-group/compression experiments.
+    #[command(name = "rewrite-native-id-dictionary")]
+    RewriteNativeIdDictionary {
+        #[arg(short, long)]
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long)]
+        row_group_size: usize,
+        #[arg(long, value_enum)]
+        compression_profile: CompressionProfile,
         #[arg(long)]
         diagnostics_out: Option<PathBuf>,
     },
@@ -767,6 +782,32 @@ async fn main() -> Result<()> {
                 b"
 ",
             )?;
+            return Ok(());
+        }
+        Action::RewriteNativeIdDictionary {
+            input,
+            output,
+            row_group_size,
+            compression_profile,
+            diagnostics_out,
+        } => {
+            let stats = rewrite_cottas_native_id_to_term_dictionary(
+                &input,
+                &output,
+                row_group_size,
+                compression_profile.into(),
+            )
+            .await
+            .context("Failed to rewrite ID-to-term Vortex dictionary")?;
+            let json = serde_json::to_vec_pretty(&stats)
+                .context("Failed to serialize rewrite diagnostics")?;
+            if let Some(path) = diagnostics_out {
+                tokio::fs::write(path, &json)
+                    .await
+                    .context("Failed to write rewrite diagnostics")?;
+            }
+            stdout().write_all(&json)?;
+            stdout().write_all(b"\n")?;
             return Ok(());
         }
         Action::RebuildNativeTermDictionary {
