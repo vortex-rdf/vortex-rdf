@@ -499,6 +499,124 @@ pub async fn match_cottas_native_file_as_compact_triples(
         .await
 }
 
+// VORTEX_RDF_NATIVE_RESULT_PIPELINE_DIAGNOSTICS_V1
+/// Diagnostic timings for the Rust-native result path. `ids_only_ms` ends at
+/// NativeProjectedIdRows and is the closest current proxy for a DataFusion handoff.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct NativeResultPipelineDiagnostics {
+    pub rows_out: usize,
+    pub projected_columns: usize,
+    pub projected_values: usize,
+    pub unique_ids: usize,
+    pub terms_loaded: usize,
+    pub lexical_bytes: usize,
+    pub compact_rows: usize,
+    pub term_lookup_ms: f64,
+    pub access_index_lookup_ms: f64,
+    pub open_ms: f64,
+    pub scan_build_ms: f64,
+    pub scan_read_and_id_extract_ms: f64,
+    pub ids_only_ms: f64,
+    pub unique_id_collect_ms: f64,
+    pub id_to_term_ms: f64,
+    pub compact_intern_and_row_build_ms: f64,
+    pub compact_native_ms: f64,
+    pub total_rust_ms: f64,
+    pub id_to_term_stats: NativeIdToTermLookupStats,
+    pub access_index_strategy: String,
+    pub access_execution_strategy: String,
+}
+
+pub async fn diagnose_cottas_native_result_pipeline(
+    input_path: &Path,
+    subject: Option<&NamedOrBlankNode>,
+    predicate: Option<&NamedNode>,
+    object: Option<&Term>,
+    graph: Option<&GraphName>,
+) -> Result<NativeResultPipelineDiagnostics> {
+    let total_start = Instant::now();
+    let planned = execute_cottas_native_match(
+        input_path, subject, predicate, object, graph,
+    ).await?;
+    let ids_only_ms = elapsed_ms(total_start);
+    let rows = &planned.rows;
+    let projected_columns = [&rows.s, &rows.p, &rows.o, &rows.g]
+        .into_iter().filter(|column| column.is_some()).count();
+    let projected_values = [&rows.s, &rows.p, &rows.o, &rows.g]
+        .into_iter().filter_map(|column| column.as_ref()).map(Vec::len).sum();
+
+    let unique_start = Instant::now();
+    let unique_ids = collect_unique_ids_from_projected_unbound_rows(
+        rows, &planned.bound_terms,
+    );
+    let unique_id_collect_ms = elapsed_ms(unique_start);
+
+    let lookup_start = Instant::now();
+    let (id_to_term, id_to_term_stats) =
+        lookup_terms_by_ids_from_sidecar_with_stats(input_path, &unique_ids).await?;
+    let id_to_term_ms = elapsed_ms(lookup_start);
+
+    let compact_start = Instant::now();
+    let mut terms = Vec::with_capacity(id_to_term.len().saturating_add(3));
+    let mut lexical_indexes = HashMap::with_capacity(terms.capacity());
+    let mut id_indexes = HashMap::with_capacity(id_to_term.len());
+    for id in &unique_ids {
+        let value = id_to_term.get(id).ok_or_else(|| VortexRdfError::Deserialization(
+            format!("ID {id} missing during diagnostic compact reconstruction")
+        ))?;
+        id_indexes.insert(*id, intern_compact_term(value, &mut terms, &mut lexical_indexes)?);
+    }
+    let bound_s = planned.bound_terms.s.as_deref()
+        .map(|v| intern_compact_term(v, &mut terms, &mut lexical_indexes)).transpose()?;
+    let bound_p = planned.bound_terms.p.as_deref()
+        .map(|v| intern_compact_term(v, &mut terms, &mut lexical_indexes)).transpose()?;
+    let bound_o = planned.bound_terms.o.as_deref()
+        .map(|v| intern_compact_term(v, &mut terms, &mut lexical_indexes)).transpose()?;
+    let resolve = |fixed: Option<u32>, id: Option<u32>, label: &str| -> Result<u32> {
+        if let Some(index) = fixed { return Ok(index); }
+        let id = id.ok_or_else(|| VortexRdfError::Deserialization(
+            format!("{label} projected ID missing in pipeline diagnostic")
+        ))?;
+        id_indexes.get(&id).copied().ok_or_else(|| VortexRdfError::Deserialization(
+            format!("{label} ID {id} missing from diagnostic compact dictionary")
+        ))
+    };
+    let mut compact_rows = Vec::with_capacity(rows.rows);
+    for i in 0..rows.rows {
+        compact_rows.push((
+            resolve(bound_s, projected_id_at(&rows.s, &planned.bound_terms.s, i, "S")?, "S")?,
+            resolve(bound_p, projected_id_at(&rows.p, &planned.bound_terms.p, i, "P")?, "P")?,
+            resolve(bound_o, projected_id_at(&rows.o, &planned.bound_terms.o, i, "O")?, "O")?,
+        ));
+    }
+    let compact_intern_and_row_build_ms = elapsed_ms(compact_start);
+    let lexical_bytes = terms.iter().map(String::len).sum();
+    let diagnostics = &planned.diagnostics;
+    Ok(NativeResultPipelineDiagnostics {
+        rows_out: rows.rows,
+        projected_columns,
+        projected_values,
+        unique_ids: unique_ids.len(),
+        terms_loaded: terms.len(),
+        lexical_bytes,
+        compact_rows: compact_rows.len(),
+        term_lookup_ms: diagnostics.term_lookup_ms,
+        access_index_lookup_ms: diagnostics.access_index_lookup_ms,
+        open_ms: diagnostics.open_ms,
+        scan_build_ms: diagnostics.scan_build_ms,
+        scan_read_and_id_extract_ms: diagnostics.read_all_ms,
+        ids_only_ms,
+        unique_id_collect_ms,
+        id_to_term_ms,
+        compact_intern_and_row_build_ms,
+        compact_native_ms: unique_id_collect_ms + id_to_term_ms + compact_intern_and_row_build_ms,
+        total_rust_ms: elapsed_ms(total_start),
+        id_to_term_stats,
+        access_index_strategy: diagnostics.access_index_strategy.clone(),
+        access_execution_strategy: diagnostics.access_execution_strategy.clone(),
+    })
+}
+
 pub async fn serialize_cottas_native_file<Dict, S>(
     quad_stream: S,
     output_path: &Path,
