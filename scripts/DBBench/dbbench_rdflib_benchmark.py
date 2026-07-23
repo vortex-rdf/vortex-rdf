@@ -324,9 +324,17 @@ def extract_single_tp_bindings(query: str):
 
 
 def run_native_diagnostic(vortex_path: str, vortex_layout: str, query: str):
-    from vortex_rdflib.vortex_rdf_native import diagnose_match
+    """
+    Run the layered Rust-native result-pipeline diagnostic.
+
+    This is a separate execution from graph.query(). Its timings must not be
+    added to benchmark_elapsed_ms.
+    """
+    from vortex_rdflib.vortex_rdf_native import diagnose_result_pipeline
+
     subject_n3, predicate_n3, object_n3 = extract_single_tp_bindings(query)
-    return dict(diagnose_match(
+
+    return dict(diagnose_result_pipeline(
         vortex_path,
         subject_n3,
         predicate_n3,
