@@ -617,6 +617,243 @@ pub async fn diagnose_cottas_native_result_pipeline(
     })
 }
 
+// VORTEX_RDF_ADAPTIVE_ID_TO_TERM_BENCHMARK_V1
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct NativeIdDecodeStrategyTrial {
+    pub strategy: String,
+    pub status: String,
+    pub max_gap: Option<u32>,
+    pub scan_count: usize,
+    pub rows_read: u64,
+    pub terms_loaded: usize,
+    pub open_ms: f64,
+    pub read_ms: f64,
+    pub extract_filter_ms: f64,
+    pub total_ms: f64,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct NativeIdDecodeStrategyDiagnostics {
+    pub rows_out: usize,
+    pub ids_only_ms: f64,
+    pub requested_ids: usize,
+    pub min_id: Option<u32>,
+    pub max_id: Option<u32>,
+    pub id_span: u64,
+    pub id_density: f64,
+    pub exact_run_count: usize,
+    pub max_range_scans: usize,
+    pub trials: Vec<NativeIdDecodeStrategyTrial>,
+}
+
+fn merge_requested_id_ranges(ids: &[u32], max_gap: u32) -> Vec<Range<u64>> {
+    let Some(&first) = ids.first() else { return Vec::new(); };
+    let mut ranges = Vec::new();
+    let mut start = first;
+    let mut last = first;
+    for &id in &ids[1..] {
+        if id <= last.saturating_add(max_gap).saturating_add(1) {
+            last = id;
+        } else {
+            ranges.push(u64::from(start)..u64::from(last) + 1);
+            start = id;
+            last = id;
+        }
+    }
+    ranges.push(u64::from(start)..u64::from(last) + 1);
+    ranges
+}
+
+async fn decode_ids_by_ranges_for_trial(
+    data_path: &Path,
+    requested: &HashSet<u32>,
+    ranges: &[Range<u64>],
+    strategy: &str,
+    max_gap: Option<u32>,
+) -> Result<(HashMap<u32, String>, NativeIdDecodeStrategyTrial)> {
+    let total_start = Instant::now();
+    let path = require_vortex_component(
+        data_path, NativeComponent::DictionaryVortex, "ID-to-term dictionary",
+    )?;
+    let open_start = Instant::now();
+    let file = NATIVE_FILE_SESSION.open_options().open_path(&path).await
+        .map_err(VortexRdfError::from)?;
+    let open_ms = elapsed_ms(open_start);
+    let mut out = HashMap::with_capacity(requested.len());
+    let mut read_ms = 0.0;
+    let mut extract_filter_ms = 0.0;
+    let mut rows_read = 0u64;
+    for range in ranges {
+        rows_read = rows_read.checked_add(range.end - range.start).ok_or_else(||
+            VortexRdfError::InvalidOperation("diagnostic rows_read overflow".into()))?;
+        let read_start = Instant::now();
+        let array = file.scan().map_err(VortexRdfError::from)?
+            .with_row_range(range.clone())
+            .with_projection(vortex_array::expr::select(
+                ["id", "term"], vortex_array::expr::root(),
+            ))
+            .into_array_stream().map_err(VortexRdfError::from)?
+            .read_all().await.map_err(VortexRdfError::from)?;
+        read_ms += elapsed_ms(read_start);
+        let extract_start = Instant::now();
+        let ids = extract_projected_u32_column(&array, "id")?;
+        let terms = extract_projected_utf8_column(&array, "term")?;
+        if ids.len() != terms.len() || ids.len() != array.len() {
+            return Err(VortexRdfError::Deserialization(format!(
+                "{strategy} trial returned inconsistent dictionary columns"
+            )));
+        }
+        for (id, term) in ids.into_iter().zip(terms) {
+            if requested.contains(&id) && out.insert(id, term).is_some() {
+                return Err(VortexRdfError::Deserialization(format!(
+                    "{strategy} trial loaded duplicate ID {id}"
+                )));
+            }
+        }
+        extract_filter_ms += elapsed_ms(extract_start);
+    }
+    let trial = NativeIdDecodeStrategyTrial {
+        strategy: strategy.to_string(), status: "ok".to_string(), max_gap,
+        scan_count: ranges.len(), rows_read, terms_loaded: out.len(), open_ms,
+        read_ms, extract_filter_ms, total_ms: elapsed_ms(total_start), error: None,
+    };
+    Ok((out, trial))
+}
+
+fn skipped_id_decode_trial(
+    strategy: &str, max_gap: Option<u32>, scan_count: usize, rows_read: u64, reason: String,
+) -> NativeIdDecodeStrategyTrial {
+    NativeIdDecodeStrategyTrial {
+        strategy: strategy.to_string(), status: "skipped".to_string(), max_gap,
+        scan_count, rows_read, error: Some(reason), ..Default::default()
+    }
+}
+
+/// Diagnostic only. It reuses the exact query-scoped ID set and validates every
+/// completed alternative against the current row-index decoder before reporting it.
+pub async fn diagnose_cottas_native_id_decode_strategies(
+    input_path: &Path,
+    subject: Option<&NamedOrBlankNode>,
+    predicate: Option<&NamedNode>,
+    object: Option<&Term>,
+    graph: Option<&GraphName>,
+    max_range_scans: usize,
+) -> Result<NativeIdDecodeStrategyDiagnostics> {
+    let ids_start = Instant::now();
+    let planned = execute_cottas_native_match(
+        input_path, subject, predicate, object, graph,
+    ).await?;
+    let ids_only_ms = elapsed_ms(ids_start);
+    let mut ids = collect_unique_ids_from_projected_unbound_rows(
+        &planned.rows, &planned.bound_terms,
+    );
+    ids.sort_unstable();
+    ids.dedup();
+    let min_id = ids.first().copied();
+    let max_id = ids.last().copied();
+    let id_span = match (min_id, max_id) {
+        (Some(min), Some(max)) => u64::from(max) - u64::from(min) + 1,
+        _ => 0,
+    };
+    let id_density = if id_span == 0 { 0.0 } else { ids.len() as f64 / id_span as f64 };
+    let exact_ranges = merge_requested_id_ranges(&ids, 0);
+    let exact_run_count = exact_ranges.len();
+    if ids.is_empty() {
+        return Ok(NativeIdDecodeStrategyDiagnostics {
+            rows_out: planned.rows.rows, ids_only_ms, requested_ids: 0,
+            min_id, max_id, id_span, id_density, exact_run_count,
+            max_range_scans, trials: Vec::new(),
+        });
+    }
+    let requested: HashSet<u32> = ids.iter().copied().collect();
+    let baseline_start = Instant::now();
+    let (baseline, baseline_stats) =
+        lookup_terms_by_ids_from_sidecar_with_stats(input_path, &ids).await?;
+    let mut trials = vec![NativeIdDecodeStrategyTrial {
+        strategy: "row-indices-current".to_string(), status: "ok".to_string(),
+        max_gap: None, scan_count: 1, rows_read: ids.len() as u64,
+        terms_loaded: baseline.len(), open_ms: baseline_stats.open_files_ms,
+        read_ms: baseline_stats.blob_read_ms,
+        extract_filter_ms: (baseline_stats.total_ms
+            - baseline_stats.open_files_ms - baseline_stats.blob_read_ms).max(0.0),
+        total_ms: elapsed_ms(baseline_start), error: None,
+    }];
+    if baseline.len() != ids.len() {
+        return Err(VortexRdfError::Deserialization(format!(
+            "baseline ID decoder loaded {} of {} requested IDs", baseline.len(), ids.len()
+        )));
+    }
+    for max_gap in [0u32, 8, 64, 512] {
+        let ranges = merge_requested_id_ranges(&ids, max_gap);
+        let rows_read = range_rows(&ranges);
+        let strategy = format!("merged-ranges-gap-{max_gap}");
+        if ranges.len() > max_range_scans {
+            trials.push(skipped_id_decode_trial(
+                &strategy, Some(max_gap), ranges.len(), rows_read,
+                format!("range count exceeds max_range_scans={max_range_scans}"),
+            ));
+            continue;
+        }
+        let (candidate, trial) = decode_ids_by_ranges_for_trial(
+            input_path, &requested, &ranges, &strategy, Some(max_gap),
+        ).await?;
+        if candidate != baseline {
+            return Err(VortexRdfError::Deserialization(format!(
+                "{strategy} result differs from row-index baseline"
+            )));
+        }
+        trials.push(trial);
+    }
+    let bounding = u64::from(min_id.unwrap())..u64::from(max_id.unwrap()) + 1;
+    let (candidate, trial) = decode_ids_by_ranges_for_trial(
+        input_path, &requested, std::slice::from_ref(&bounding),
+        "bounding-range", None,
+    ).await?;
+    if candidate != baseline {
+        return Err(VortexRdfError::Deserialization(
+            "bounding-range result differs from row-index baseline".into(),
+        ));
+    }
+    trials.push(trial);
+    let dictionary_path = native_dict_path(input_path);
+    let open_start = Instant::now();
+    let file = NATIVE_FILE_SESSION.open_options().open_path(&dictionary_path).await
+        .map_err(VortexRdfError::from)?;
+    let open_ms = elapsed_ms(open_start);
+    let read_start = Instant::now();
+    let array = file.scan().map_err(VortexRdfError::from)?
+        .with_projection(vortex_array::expr::select(
+            ["id", "term"], vortex_array::expr::root(),
+        )).into_array_stream().map_err(VortexRdfError::from)?
+        .read_all().await.map_err(VortexRdfError::from)?;
+    let read_ms = elapsed_ms(read_start);
+    let extract_start = Instant::now();
+    let loaded_ids = extract_projected_u32_column(&array, "id")?;
+    let terms = extract_projected_utf8_column(&array, "term")?;
+    let mut full = HashMap::with_capacity(ids.len());
+    for (id, term) in loaded_ids.into_iter().zip(terms) {
+        if requested.contains(&id) { full.insert(id, term); }
+    }
+    let extract_filter_ms = elapsed_ms(extract_start);
+    if full != baseline {
+        return Err(VortexRdfError::Deserialization(
+            "full-scan result differs from row-index baseline".into(),
+        ));
+    }
+    trials.push(NativeIdDecodeStrategyTrial {
+        strategy: "full-sequential-scan".to_string(), status: "ok".to_string(),
+        max_gap: None, scan_count: 1, rows_read: array.len() as u64,
+        terms_loaded: full.len(), open_ms, read_ms, extract_filter_ms,
+        total_ms: open_ms + read_ms + extract_filter_ms, error: None,
+    });
+    Ok(NativeIdDecodeStrategyDiagnostics {
+        rows_out: planned.rows.rows, ids_only_ms, requested_ids: ids.len(),
+        min_id, max_id, id_span, id_density, exact_run_count,
+        max_range_scans, trials,
+    })
+}
+
 pub async fn serialize_cottas_native_file<Dict, S>(
     quad_stream: S,
     output_path: &Path,
