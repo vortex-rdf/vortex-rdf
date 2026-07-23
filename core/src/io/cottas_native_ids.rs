@@ -393,6 +393,80 @@ pub async fn match_cottas_native_file_as_triples_optimized(
     projected_native_id_rows_as_triples(input_path, &planned.rows, &planned.bound_terms).await
 }
 
+// VORTEX_RDF_COMPACT_PYTHON_RESULT_V1
+#[derive(Clone, Debug, Default)]
+pub struct NativeCompactTripleBatch {
+    pub terms: Vec<String>,
+    pub rows: Vec<(u32, u32, u32)>,
+}
+
+fn intern_compact_term(
+    value: &str,
+    terms: &mut Vec<String>,
+    indexes: &mut HashMap<String, u32>,
+) -> Result<u32> {
+    if let Some(index) = indexes.get(value) { return Ok(*index); }
+    let index = u32::try_from(terms.len()).map_err(|_| {
+        VortexRdfError::InvalidOperation("compact query term table exceeds u32".into())
+    })?;
+    let owned = value.to_owned();
+    terms.push(owned.clone());
+    indexes.insert(owned, index);
+    Ok(index)
+}
+
+async fn projected_native_id_rows_as_compact_triples(
+    data_path: &Path,
+    rows: &NativeProjectedIdRows,
+    bound: &BoundNativeRdfTerms,
+) -> Result<NativeCompactTripleBatch> {
+    if rows.rows == 0 { return Ok(NativeCompactTripleBatch::default()); }
+    let unique_ids = collect_unique_ids_from_projected_unbound_rows(rows, bound);
+    let id_to_term = lookup_terms_by_ids_from_sidecar(data_path, &unique_ids).await?;
+    let mut terms = Vec::with_capacity(id_to_term.len().saturating_add(3));
+    let mut lexical_indexes = HashMap::with_capacity(terms.capacity());
+    let mut id_indexes = HashMap::with_capacity(id_to_term.len());
+    for id in unique_ids {
+        let value = id_to_term.get(&id).ok_or_else(|| VortexRdfError::Deserialization(
+            format!("ID {id} missing during compact reconstruction")
+        ))?;
+        id_indexes.insert(id, intern_compact_term(value, &mut terms, &mut lexical_indexes)?);
+    }
+    let bound_s = bound.s.as_deref().map(|v| intern_compact_term(v, &mut terms, &mut lexical_indexes)).transpose()?;
+    let bound_p = bound.p.as_deref().map(|v| intern_compact_term(v, &mut terms, &mut lexical_indexes)).transpose()?;
+    let bound_o = bound.o.as_deref().map(|v| intern_compact_term(v, &mut terms, &mut lexical_indexes)).transpose()?;
+    let resolve = |fixed: Option<u32>, id: Option<u32>, label: &str| -> Result<u32> {
+        if let Some(index) = fixed { return Ok(index); }
+        let id = id.ok_or_else(|| VortexRdfError::Deserialization(
+            format!("{label} projected ID missing for compact output")
+        ))?;
+        id_indexes.get(&id).copied().ok_or_else(|| VortexRdfError::Deserialization(
+            format!("{label} ID {id} missing from compact query dictionary")
+        ))
+    };
+    let mut compact = Vec::with_capacity(rows.rows);
+    for i in 0..rows.rows {
+        compact.push((
+            resolve(bound_s, projected_id_at(&rows.s, &bound.s, i, "S")?, "S")?,
+            resolve(bound_p, projected_id_at(&rows.p, &bound.p, i, "P")?, "P")?,
+            resolve(bound_o, projected_id_at(&rows.o, &bound.o, i, "O")?, "O")?,
+        ));
+    }
+    Ok(NativeCompactTripleBatch { terms, rows: compact })
+}
+
+/// Transfers each lexical term once and rows as indexes into that query-local table.
+pub async fn match_cottas_native_file_as_compact_triples(
+    input_path: &Path,
+    subject: Option<&NamedOrBlankNode>,
+    predicate: Option<&NamedNode>,
+    object: Option<&Term>,
+    graph: Option<&GraphName>,
+) -> Result<NativeCompactTripleBatch> {
+    let planned = execute_cottas_native_match(input_path, subject, predicate, object, graph).await?;
+    projected_native_id_rows_as_compact_triples(input_path, &planned.rows, &planned.bound_terms).await
+}
+
 pub async fn serialize_cottas_native_file<Dict, S>(
     quad_stream: S,
     output_path: &Path,

@@ -6,7 +6,10 @@ from rdflib.term import BNode, Node, URIRef
 from rdflib.store import Store, NO_STORE, VALID_STORE
 from rdflib.util import from_n3
 
-from .vortex_rdf_native import match_triples, count_triples, diagnose_match
+from .vortex_rdf_native import (
+    match_triples, match_triples_compact, count_triples, diagnose_match,
+)
+# VORTEX_RDF_COMPACT_PYTHON_RESULT_V1
 
 
 def _term_debug(t):
@@ -137,14 +140,27 @@ class VortexStore(Store):
                 flush=True,
             )
 
-        triples_out = match_triples(
-            self.path,
-            s_n3,
-            p_n3,
-            o_n3,
-            self.layout,
-        )
+        if self.layout in {"cottas-native-ids", "cottas-native"}:
+            lexical_terms, indexed_rows = match_triples_compact(
+                self.path, s_n3, p_n3, o_n3, self.layout,
+            )
+            # Parse every distinct RDF lexical term once per query, including bounds.
+            parsed_terms = [self._from_n3_safe(value) for value in lexical_terms]
+            term_count = len(parsed_terms)
+            for s_idx, p_idx, o_idx in indexed_rows:
+                if s_idx >= term_count or p_idx >= term_count or o_idx >= term_count:
+                    raise ValueError(
+                        "Compact native result has an invalid term index: "
+                        f"{(s_idx, p_idx, o_idx)!r}, terms={term_count}"
+                    )
+                yield (
+                    parsed_terms[s_idx], parsed_terms[p_idx], parsed_terms[o_idx]
+                ), None
+            return
 
+        triples_out = match_triples(
+            self.path, s_n3, p_n3, o_n3, self.layout,
+        )
         for ss, pp, oo in triples_out:
             yield (
                 self._from_n3_safe(ss),
