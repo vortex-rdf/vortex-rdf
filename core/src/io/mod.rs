@@ -16,11 +16,11 @@ pub use cottas_native_ids::{
     build_cottas_native_o_exact_ranges_index, build_cottas_native_po_predicate_partitions_v2,
     build_cottas_native_subject_range_index, build_cottas_native_term_directory,
     count_cottas_native_ids_file_with_diagnostics,
-    count_cottas_native_ids_file_with_diagnostics_mode, diagnose_cottas_native_term_windows,
-    match_cottas_native_file, match_cottas_native_file_as_compact_triples,
-    match_cottas_native_file_as_triples, match_cottas_native_file_as_triples_optimized,
-    match_cottas_native_file_with_diagnostics, rebuild_cottas_native_term_dictionary,
-    serialize_cottas_native_file,
+    count_cottas_native_ids_file_with_diagnostics_mode, diagnose_cottas_native_result_pipeline,
+    diagnose_cottas_native_term_windows, match_cottas_native_file,
+    match_cottas_native_file_as_compact_triples, match_cottas_native_file_as_triples,
+    match_cottas_native_file_as_triples_optimized, match_cottas_native_file_with_diagnostics,
+    rebuild_cottas_native_term_dictionary, serialize_cottas_native_file,
 };
 
 pub use cottas_native_strings::{
