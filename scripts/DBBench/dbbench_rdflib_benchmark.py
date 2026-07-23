@@ -364,16 +364,6 @@ def run_direct_compact_diagnostic(
     ))
 
 
-def run_id_decode_diagnostic(
-    vortex_path: str, vortex_layout: str, query: str, max_range_scans: int,
-):
-    from vortex_rdflib.vortex_rdf_native import diagnose_id_decode_strategies
-    subject_n3, predicate_n3, object_n3 = extract_single_tp_bindings(query)
-    return dict(diagnose_id_decode_strategies(
-        vortex_path, subject_n3, predicate_n3, object_n3,
-        vortex_layout, max_range_scans,
-    ))
-
 
 def summarize(results):
     grouped = {}
@@ -683,22 +673,6 @@ def main():
                         with Path(args.diagnostics_jsonl).open("a", encoding="utf-8") as diag_file:
                             diag_file.write(json.dumps(
                                 diagnostic, sort_keys=True) + "\n")
-                    if args.id_decode_diagnostics_jsonl:
-                        diagnostic = run_id_decode_diagnostic(
-                            args.vortex_path, args.vortex_layout, qrec["query"],
-                            args.id_decode_max_range_scans,
-                        )
-                        diagnostic.update({
-                            "query_id": qrec["query_id"],
-                            "relative_path": qrec["relative_path"],
-                            "phase": phase,
-                            "run": row["run"],
-                            "benchmark_elapsed_ms": row["elapsed_s"] * 1000.0,
-                            "benchmark_result_count": row["result_count"],
-                        })
-                        with Path(args.id_decode_diagnostics_jsonl).open("a", encoding="utf-8") as diag_file:
-                            diag_file.write(json.dumps(
-                                diagnostic, sort_keys=True) + "\\n")
                     if phase == "measured" and measured_run_idx == 0:
                         counts_by_engine[engine] = row["result_count"]
 

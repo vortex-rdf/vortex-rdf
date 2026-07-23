@@ -7,8 +7,7 @@ from rdflib.store import Store, NO_STORE, VALID_STORE
 from rdflib.util import from_n3
 
 from .vortex_rdf_native import (
-    match_triples, match_triples_compact, count_triples, diagnose_match,
-    diagnose_result_pipeline,
+    match_triples, match_triples_compact, count_triples, diagnose_match, diagnose_direct_compact
 )
 
 
@@ -167,48 +166,6 @@ class VortexStore(Store):
                 self._from_n3_safe(pp),
                 self._from_n3_safe(oo),
             ), None
-
-    def diagnose_result_pipeline(self, triple_pattern, materialize_python=True):
-        """Layered diagnostic; normal triples() timing remains uncontaminated."""
-        if self.path is None:
-            raise ValueError("Store has no path")
-        if self.layout not in {"cottas-native-ids", "cottas-native"}:
-            raise ValueError("Pipeline diagnostics require a native-ID layout")
-        import time
-        s, p, o = triple_pattern
-        s_n3, p_n3, o_n3 = map(self._node_to_n3, (s, p, o))
-        result = dict(diagnose_result_pipeline(
-            self.path, s_n3, p_n3, o_n3, self.layout,
-        ))
-        if not materialize_python:
-            return result
-
-        call_start = time.perf_counter_ns()
-        lexical_terms, indexed_rows = match_triples_compact(
-            self.path, s_n3, p_n3, o_n3, self.layout,
-        )
-        call_end = time.perf_counter_ns()
-        parse_start = time.perf_counter_ns()
-        parsed_terms = [self._from_n3_safe(value) for value in lexical_terms]
-        parse_end = time.perf_counter_ns()
-        row_start = time.perf_counter_ns()
-        term_count = len(parsed_terms)
-        materialized = []
-        append = materialized.append
-        for s_idx, p_idx, o_idx in indexed_rows:
-            if s_idx >= term_count or p_idx >= term_count or o_idx >= term_count:
-                raise ValueError("Compact diagnostic received an invalid term index")
-            append((parsed_terms[s_idx], parsed_terms[p_idx], parsed_terms[o_idx]))
-        row_end = time.perf_counter_ns()
-        result.update({
-            "compact_python_call_ms": (call_end - call_start) / 1_000_000,
-            "python_unique_term_parse_ms": (parse_end - parse_start) / 1_000_000,
-            "python_row_materialize_ms": (row_end - row_start) / 1_000_000,
-            "python_materialized_rows": len(materialized),
-            "python_terms_received": len(lexical_terms),
-            "python_index_rows_received": len(indexed_rows),
-        })
-        return result
 
     def diagnose_triples(self, triple_pattern):
         """Return timings plus raw/unique rows for one native-ID triple pattern."""
