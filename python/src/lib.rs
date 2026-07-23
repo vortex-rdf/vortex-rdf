@@ -167,6 +167,9 @@ fn diagnose_direct_compact<'py>(
     set!("unique_ids", d.unique_ids);
     set!("terms_out", d.terms_out);
     set!("lexical_bytes", d.lexical_bytes);
+    // VORTEX_RDF_EXPOSE_ENCODING_TRACE_V1
+    set!("selected_array_encoding", &d.selected_array_encoding);
+    set!("term_column_encoding", &d.term_column_encoding);
     set!("unique_id_collect_ms", d.unique_id_collect_ms);
     set!("dictionary_open_ms", d.dictionary_open_ms);
     set!("row_indices_build_ms", d.row_indices_build_ms);

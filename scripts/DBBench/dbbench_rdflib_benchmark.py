@@ -355,15 +355,26 @@ def run_direct_compact_diagnostic(
 
     subject_n3, predicate_n3, object_n3 = extract_single_tp_bindings(query)
 
-    return dict(diagnose_direct_compact(
+    diagnostic = dict(diagnose_direct_compact(
         vortex_path,
         subject_n3,
         predicate_n3,
         object_n3,
         vortex_layout,
     ))
-
-
+    # VORTEX_RDF_REQUIRE_ENCODING_TRACE_V1
+    required = {
+        "selected_array_encoding",
+        "term_column_encoding",
+    }
+    missing = sorted(required.difference(diagnostic))
+    if missing:
+        raise RuntimeError(
+            "direct compact diagnostic is missing required encoding fields: "
+            + ", ".join(missing)
+            + "; rebuild and reinstall the current PyO3 extension"
+        )
+    return diagnostic
 
 def summarize(results):
     grouped = {}
