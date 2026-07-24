@@ -178,6 +178,21 @@ fn diagnose_direct_compact<'py>(
         "term_chunk_encoding_execute_ms",
         &d.term_chunk_encoding_execute_ms
     );
+    // VORTEX_RDF_FILTERED_SOURCE_EXECUTION_TRACE_V2
+    set!("term_filter_source_names", &d.term_filter_source_names);
+    set!("term_filter_source_chunks", &d.term_filter_source_chunks);
+    set!(
+        "term_filter_source_selected_rows",
+        &d.term_filter_source_selected_rows
+    );
+    set!(
+        "term_filter_source_input_rows",
+        &d.term_filter_source_input_rows
+    );
+    set!(
+        "term_filter_source_execute_ms",
+        &d.term_filter_source_execute_ms
+    );
     set!("unique_id_collect_ms", d.unique_id_collect_ms);
     set!("dictionary_open_ms", d.dictionary_open_ms);
     set!("row_indices_build_ms", d.row_indices_build_ms);

@@ -19,8 +19,11 @@ use vortex_error::{VortexError, VortexResult};
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::chunked::ChunkedArrayExt;
+use vortex_array::arrays::filter::FilterArrayExt;
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::arrays::{Chunked, PrimitiveArray, StructArray, VarBinArray, VarBinViewArray};
+use vortex_array::arrays::{
+    Chunked, Filter, PrimitiveArray, StructArray, VarBinArray, VarBinViewArray,
+};
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::{ArrayRef, IntoArray};
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
@@ -486,6 +489,12 @@ pub struct NativeDirectCompactTimings {
     pub term_chunk_encoding_chunks: Vec<usize>,
     pub term_chunk_encoding_rows: Vec<usize>,
     pub term_chunk_encoding_execute_ms: Vec<f64>,
+    // VORTEX_RDF_FILTERED_SOURCE_EXECUTION_TRACE_V2
+    pub term_filter_source_names: Vec<String>,
+    pub term_filter_source_chunks: Vec<usize>,
+    pub term_filter_source_selected_rows: Vec<usize>,
+    pub term_filter_source_input_rows: Vec<usize>,
+    pub term_filter_source_execute_ms: Vec<f64>,
     pub unique_id_collect_ms: f64,
     pub dictionary_open_ms: f64,
     pub row_indices_build_ms: f64,
@@ -610,6 +619,10 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
     let mut id_indexes = HashMap::with_capacity(requested.len());
     let mut term_execute_ms = 0.0;
     let mut chunk_execution_stats: BTreeMap<String, (usize, usize, f64)> = BTreeMap::new();
+    // Aggregated only for diagnose_direct_compact; the production path does not
+    // inspect Filter children or allocate source-encoding labels.
+    let mut filter_source_execution_stats: BTreeMap<String, (usize, usize, usize, f64)> =
+        BTreeMap::new();
     let mut lexical_ms = 0.0;
     let mut insert_ms = 0.0;
     let mut index = 0usize;
@@ -621,6 +634,23 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
                 .map_or(rendered.as_str(), |(name, _)| name)
                 .to_owned()
         });
+        let filter_source = if collect_chunk_execution_stats {
+            let filter = chunk.as_opt::<Filter>().ok_or_else(|| {
+                VortexRdfError::Deserialization(format!(
+                    "filtered-source trace expected a Filter chunk, got {}",
+                    chunk
+                ))
+            })?;
+            let source = filter.child();
+            let rendered = source.to_string();
+            let source_encoding = rendered
+                .split_once('(')
+                .map_or(rendered.as_str(), |(name, _)| name)
+                .to_owned();
+            Some((source_encoding, source.len()))
+        } else {
+            None
+        };
         let stage = Instant::now();
         let term_chunk = chunk
             .clone()
@@ -633,6 +663,15 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
             stats.0 += 1;
             stats.1 += term_chunk.len();
             stats.2 += chunk_execute_ms;
+        }
+        if let Some((source_encoding, input_rows)) = filter_source {
+            let stats = filter_source_execution_stats
+                .entry(source_encoding)
+                .or_default();
+            stats.0 += 1;
+            stats.1 += term_chunk.len();
+            stats.2 += input_rows;
+            stats.3 += chunk_execute_ms;
         }
         for chunk_index in 0..term_chunk.len() {
             let expected = *requested.get(index).ok_or_else(|| {
@@ -680,6 +719,14 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
         timings.term_chunk_encoding_chunks.push(chunks);
         timings.term_chunk_encoding_rows.push(rows);
         timings.term_chunk_encoding_execute_ms.push(execute_ms);
+    }
+    for (encoding, (chunks, selected_rows, input_rows, execute_ms)) in filter_source_execution_stats
+    {
+        timings.term_filter_source_names.push(encoding);
+        timings.term_filter_source_chunks.push(chunks);
+        timings.term_filter_source_selected_rows.push(selected_rows);
+        timings.term_filter_source_input_rows.push(input_rows);
+        timings.term_filter_source_execute_ms.push(execute_ms);
     }
     timings.lexical_extract_allocate_ms = lexical_ms;
     timings.id_index_insert_ms = insert_ms;
