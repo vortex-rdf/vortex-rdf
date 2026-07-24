@@ -480,6 +480,8 @@ pub struct NativeDirectCompactTimings {
     pub unique_ids: usize,
     pub terms_out: usize,
     pub lexical_bytes: usize,
+    // VORTEX_RDF_COMPACT_DICTIONARY_OVERRIDE_V1
+    pub dictionary_path: String,
     // VORTEX_RDF_ID_TO_TERM_ENCODING_TRACE_V1
     pub selected_array_encoding: String,
     pub term_column_encoding: String,
@@ -533,11 +535,15 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
     timings.unique_id_collect_ms = elapsed_ms(stage);
     timings.unique_ids = requested.len();
 
-    let path = require_vortex_component(
-        data_path,
-        NativeComponent::DictionaryVortex,
-        "ID-to-term dictionary",
-    )?;
+    // Resolve through the same override-aware path used by production ID-to-term lookup.
+    let path = native_dict_path(data_path);
+    if !path.is_file() {
+        return Err(VortexRdfError::InvalidOperation(format!(
+            "Vortex ID-to-term dictionary is missing at {:?}",
+            path
+        )));
+    }
+    timings.dictionary_path = path.display().to_string();
     let stage = Instant::now();
     let file = NATIVE_FILE_SESSION
         .open_options()
