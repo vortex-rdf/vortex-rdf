@@ -16,7 +16,7 @@ use std::time::Instant;
 use vortex::VortexSessionDefault;
 use vortex_error::{VortexError, VortexResult};
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::chunked::ChunkedArrayExt;
 use vortex_array::arrays::struct_::StructArrayExt;
@@ -481,6 +481,11 @@ pub struct NativeDirectCompactTimings {
     pub selected_array_encoding: String,
     pub term_column_encoding: String,
     pub term_chunks: usize,
+    // VORTEX_RDF_CHUNK_EXECUTION_COST_TRACE_V1
+    pub term_chunk_encoding_names: Vec<String>,
+    pub term_chunk_encoding_chunks: Vec<usize>,
+    pub term_chunk_encoding_rows: Vec<usize>,
+    pub term_chunk_encoding_execute_ms: Vec<f64>,
     pub unique_id_collect_ms: f64,
     pub dictionary_open_ms: f64,
     pub row_indices_build_ms: f64,
@@ -501,6 +506,7 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
     data_path: &Path,
     rows: &NativeProjectedIdRows,
     bound: &BoundNativeRdfTerms,
+    collect_chunk_execution_stats: bool,
 ) -> Result<(NativeCompactTripleBatch, NativeDirectCompactTimings)> {
     let total_start = Instant::now();
     let mut timings = NativeDirectCompactTimings {
@@ -603,16 +609,31 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
     let mut terms = Vec::with_capacity(requested.len().saturating_add(3));
     let mut id_indexes = HashMap::with_capacity(requested.len());
     let mut term_execute_ms = 0.0;
+    let mut chunk_execution_stats: BTreeMap<String, (usize, usize, f64)> = BTreeMap::new();
     let mut lexical_ms = 0.0;
     let mut insert_ms = 0.0;
     let mut index = 0usize;
     for chunk in term_chunks.iter_chunks() {
+        let encoding_name = collect_chunk_execution_stats.then(|| {
+            let rendered = chunk.to_string();
+            rendered
+                .split_once('(')
+                .map_or(rendered.as_str(), |(name, _)| name)
+                .to_owned()
+        });
         let stage = Instant::now();
         let term_chunk = chunk
             .clone()
             .execute::<VarBinViewArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
-        term_execute_ms += elapsed_ms(stage);
+        let chunk_execute_ms = elapsed_ms(stage);
+        term_execute_ms += chunk_execute_ms;
+        if let Some(encoding_name) = encoding_name {
+            let stats = chunk_execution_stats.entry(encoding_name).or_default();
+            stats.0 += 1;
+            stats.1 += term_chunk.len();
+            stats.2 += chunk_execute_ms;
+        }
         for chunk_index in 0..term_chunk.len() {
             let expected = *requested.get(index).ok_or_else(|| {
                 VortexRdfError::Deserialization(
@@ -654,6 +675,12 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
         )));
     }
     timings.term_column_execute_ms = term_execute_ms;
+    for (encoding, (chunks, rows, execute_ms)) in chunk_execution_stats {
+        timings.term_chunk_encoding_names.push(encoding);
+        timings.term_chunk_encoding_chunks.push(chunks);
+        timings.term_chunk_encoding_rows.push(rows);
+        timings.term_chunk_encoding_execute_ms.push(execute_ms);
+    }
     timings.lexical_extract_allocate_ms = lexical_ms;
     timings.id_index_insert_ms = insert_ms;
     timings.lexical_bytes = terms.iter().map(String::len).sum();
@@ -689,7 +716,7 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1(
     rows: &NativeProjectedIdRows,
     bound: &BoundNativeRdfTerms,
 ) -> Result<NativeCompactTripleBatch> {
-    projected_native_id_rows_as_compact_triples_direct_v1_impl(data_path, rows, bound)
+    projected_native_id_rows_as_compact_triples_direct_v1_impl(data_path, rows, bound, false)
         .await
         .map(|v| v.0)
 }
@@ -708,6 +735,7 @@ pub async fn diagnose_cottas_native_direct_compact(
         input_path,
         &planned.rows,
         &planned.bound_terms,
+        true,
     )
     .await?;
     timings.total_rust_ms = elapsed_ms(total);
