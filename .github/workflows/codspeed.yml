@@ -35,8 +35,10 @@ jobs:
           cache-target: release
           bins: cargo-codspeed
 
-      - name: Build the benchmark target(s)
-        run: cargo codspeed build
+      # Only the benchmark target is uploaded; match_lazy belongs to the
+      # dashboard workflow, so instrumenting it here would be wasted work.
+      - name: Build the benchmark target
+        run: cargo codspeed build --bench benchmark
 
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@v5
@@ -62,7 +64,9 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v7
         with:
-          node-version: 25
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: js/package-lock.json
 
       - name: Install deps and build the wasm bindings
         working-directory: js
@@ -79,5 +83,43 @@ jobs:
         uses: CodSpeedHQ/action@v5
         with:
           mode: simulation
-          run: node --import tsx --expose-gc bench/codspeed.bench.ts
+          # --no-liftoff: the plugin measures a single invocation per task, and
+          # V8's background wasm tier-up raced it — the measured run
+          # nondeterministically executed Liftoff or TurboFan code, a ~2x
+          # instruction-count swing on the build tasks at identical code.
+          # Top-tier-only compilation is deterministic; its one-time lazy
+          # compile cost is absorbed by the plugin's untimed warmup calls.
+          run: node --import tsx --expose-gc --no-liftoff bench/codspeed.bench.ts
           working-directory: js
+
+  python-benchmarks:
+    name: Run Python benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The extension is compiled fresh so the benchmark measures HEAD, the
+      # same reason the JS job rebuilds the wasm bindings.
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: python-codspeed
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Build the bindings
+        working-directory: python
+        run: uv sync
+
+      # Same CodSpeed project and mode as the other jobs (simulation =
+      # instruction counting), so the Python read paths publish alongside them.
+      - name: Run the Python benchmarks
+        uses: CodSpeedHQ/action@v5
+        with:
+          mode: simulation
+          run: uv run pytest bench/test_codspeed.py --codspeed
+          working-directory: python

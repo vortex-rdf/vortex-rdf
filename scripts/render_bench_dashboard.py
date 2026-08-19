@@ -124,9 +124,9 @@ def cpu_model():
 
 
 def default_bench_size():
-    """The fallback dataset size baked into `core/benches/benchmark.rs`'s
+    """The fallback dataset size baked into `core/benches/support/mod.rs`'s
     `bench_size()`, i.e. what a run used if it didn't override `BENCH_SIZE`."""
-    src = (REPO_ROOT / "core" / "benches" / "benchmark.rs").read_text(encoding="utf-8")
+    src = (REPO_ROOT / "core" / "benches" / "support" / "mod.rs").read_text(encoding="utf-8")
     m = re.search(r"fn bench_size.*?unwrap_or\(([\d_]+)\)", src, re.DOTALL)
     return int(m.group(1).replace("_", "")) if m else None
 
@@ -168,11 +168,35 @@ def load_js_results(path):
     return data, "", [], {}
 
 
+def load_python_results(path):
+    """Load the Python benchmark results emitted by `python/bench/run.py`.
+
+    Same dashboard shape as the JavaScript results plus `sizes`, a list of
+    `{slug, label, bytes}` giving each library's on-disk artifact -- the Python
+    comparison is between file-backed formats, so artifact size is a first-class
+    axis there rather than an afterthought. `bytes` is null for a library whose
+    store lives only in memory.
+
+    Rows may additionally carry `"unsupported": true` with a `reason`, for an
+    operation a library's API does not offer at all (see the mutation column).
+    Those rows have `median_ns: null` so the panels exclude them from the
+    column's best/ratio arithmetic.
+    """
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return (
+        data.get("results", []),
+        data.get("provenance", ""),
+        data.get("memory", []),
+        data.get("sizes", []),
+        data.get("config", {}),
+    )
+
+
 def main():
     if len(sys.argv) < 3:
         print(
             f"usage: {sys.argv[0]} <bench-output.txt> <output.html> "
-            "[--js <js-results.json>] [--bench-size <n>]",
+            "[--js <js-results.json>] [--python <py-results.json>] [--bench-size <n>]",
             file=sys.stderr,
         )
         return 1
@@ -182,6 +206,9 @@ def main():
     js_path = None
     if "--js" in sys.argv:
         js_path = sys.argv[sys.argv.index("--js") + 1]
+    py_path = None
+    if "--python" in sys.argv:
+        py_path = sys.argv[sys.argv.index("--python") + 1]
     bench_size_override = None
     if "--bench-size" in sys.argv:
         bench_size_override = int(sys.argv[sys.argv.index("--bench-size") + 1])
@@ -197,6 +224,10 @@ def main():
     if js_path:
         js_results, js_provenance, js_memory, js_config = load_js_results(js_path)
 
+    py_results, py_provenance, py_memory, py_sizes, py_config = ([], "", [], [], {})
+    if py_path:
+        py_results, py_provenance, py_memory, py_sizes, py_config = load_python_results(py_path)
+
     provenance = build_provenance(results, timer_precision, bench_size_override)
     template = template_path.read_text(encoding="utf-8")
     out = (
@@ -207,12 +238,18 @@ def main():
         .replace("__JS_PROVENANCE__", json.dumps(js_provenance))
         .replace("__JS_MEMORY_DATA__", json.dumps(js_memory))
         .replace("__JS_CONFIG_DATA__", json.dumps(js_config))
+        .replace("__PY_BENCH_DATA__", json.dumps(py_results))
+        .replace("__PY_PROVENANCE__", json.dumps(py_provenance))
+        .replace("__PY_MEMORY_DATA__", json.dumps(py_memory))
+        .replace("__PY_SIZE_DATA__", json.dumps(py_sizes))
+        .replace("__PY_CONFIG_DATA__", json.dumps(py_config))
     )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(out, encoding="utf-8")
-    print(f"parsed {len(results)} Rust + {len(js_results)} JS benchmark results "
-          f"({len(js_memory)} memory readings) -> {out_path}")
+    print(f"parsed {len(results)} Rust + {len(js_results)} JS + {len(py_results)} Python "
+          f"benchmark results ({len(js_memory) + len(py_memory)} memory readings, "
+          f"{len(py_sizes)} artifact sizes) -> {out_path}")
     return 0
 
 

@@ -1,39 +1,69 @@
-use std::ops::Range;
-use std::sync::Arc;
+//! Secondary-index vocabulary and the store's dispatch into it.
+//!
+//! This hub owns what is common to every index: the [`IndexType`] enum and
+//! its exhaustive dispatch into the per-index modules (column emission,
+//! schema detection, resolution), the resolution currency
+//! (`IndexResolution`, `IndexedComponent`, the eager/lazy `ResolvedRowIds`
+//! split and its `LazyRowIds` recipe) both backends answer in, the planners
+//! that try a store's whole index set in preference order, and the row-space
+//! helpers shared across index families.
+//!
+//! What belongs in a leaf instead: an index's column-name scheme, its sort
+//! orders, and how it probes them (`secondary_by_copy`,
+//! `secondary_by_reference`) — the hub never hardcodes a column name.
+//! Three further clusters live beside it: `serve` (reading matched quads out
+//! of an index's own columns), `components` (the persisted-child model and
+//! the slug registry), and `row_space` (the `_idx_` column-name convention),
+//! all re-exported here so callers see one `indexes::` surface.
 
-use clap::ValueEnum;
-use oxrdf::Quad;
+use std::ops::Range;
+use std::sync::{Arc, OnceLock};
+
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
-use vortex_array::dtype::{DType, FieldName, FieldNames};
+use vortex_array::dtype::DType;
 #[cfg(feature = "file-io")]
-use vortex_array::expr::{Expression, and, eq, get_item, gt_eq, lit, lt_eq, root, select};
-#[cfg(feature = "file-io")]
+use vortex_array::expr::{Expression, and, eq, get_item, lit, root, select};
 use vortex_array::scalar::Scalar;
 #[cfg(feature = "file-io")]
 use vortex_array::stream::ArrayStreamExt;
-use vortex_array::validity::Validity;
-use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
+use vortex_array::{ArrayRef, VortexSessionExecute};
 use vortex_buffer::Buffer;
-#[cfg(feature = "file-io")]
-use vortex_file::VortexFile;
-use vortex_mask::Mask;
 
 use crate::error::{Result, VortexRdfError};
-use crate::io::VORTEX_LIGHT_SESSION;
+use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout};
 
-pub mod secondary_by_copy;
-pub mod secondary_by_reference;
+pub(crate) mod components;
+pub(crate) mod row_space;
+pub(crate) mod secondary_by_copy;
+pub(crate) mod secondary_by_reference;
+pub(crate) mod serve;
+#[cfg(feature = "file-io")]
+pub(crate) mod tee;
+
+pub(crate) use components::{
+    ComponentRole, IndexComponent, KnownComponent, adopt_component_reader, indexes_from_components,
+    known_component, split_built_row_space,
+};
+#[cfg(feature = "file-io")]
+pub(crate) use components::{IndexComponentSpec, adopt_scanned_component, index_component_specs};
+#[cfg(feature = "file-io")]
+pub(crate) use row_space::primary_dtype;
+pub(crate) use row_space::strip_index_columns;
+#[cfg(feature = "file-io")]
+pub(crate) use serve::FileServePlan;
+pub(crate) use serve::InMemoryServePlan;
 
 /// A secondary index that can be embedded alongside the primary quad columns.
 ///
 /// Variant declaration order is the resolution preference order: pattern
 /// matching tries each detected index in this order and takes the first that
 /// doesn't decline (see `resolve_indexes_in_memory`).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, ValueEnum)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum IndexType {
     /// Appends two complete extra copies of the quad columns, each in its own
     /// sort order and each paired with the primary row IDs it permutes — the
@@ -49,9 +79,10 @@ pub enum IndexType {
     /// Predicate-bound patterns binary-search `_idx_posg_p`; a bound
     /// predicate **and** object prefix-search (p, o) in one probe, resolving
     /// both components; object-bound patterns binary-search `_idx_ospg_o`.
-    /// In file-backed stores the copies additionally let `quads()` stream the
-    /// matching rows from a *contiguous* run of the copy columns instead of
-    /// scattering row-id reads across the primary columns. As with
+    /// The copies additionally let reads take the matching rows from a
+    /// *contiguous* run of the copy columns — sliced or point-read in memory,
+    /// scanned from the index child on a file — instead of scattering row-id
+    /// reads across the primary columns. As with
     /// [`SecondaryByReference`](Self::SecondaryByReference), in-memory routing
     /// engages only when the lead value columns carry the `IsSorted` statistic
     /// (single-chunk builds, or the sorted builders' global emission).
@@ -78,9 +109,73 @@ pub enum IndexType {
     SecondaryByReference,
 }
 
+/// The canonical index name: kebab-case (`"secondary-by-copy"`,
+/// `"secondary-by-reference"`), the same spelling the `clap` derive exposes
+/// on the CLI — so every frontend reports one vocabulary and a value printed
+/// by one can be parsed by another.
+impl std::fmt::Display for IndexType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            IndexType::SecondaryByCopy => "secondary-by-copy",
+            IndexType::SecondaryByReference => "secondary-by-reference",
+        })
+    }
+}
+
+/// Accepts exactly the canonical kebab-case names
+/// [`Display`](std::fmt::Display) emits — `"secondary-by-copy"`,
+/// `"secondary-by-reference"` — the one vocabulary every frontend shares.
+impl std::str::FromStr for IndexType {
+    type Err = VortexRdfError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "secondary-by-copy" => Ok(IndexType::SecondaryByCopy),
+            "secondary-by-reference" => Ok(IndexType::SecondaryByReference),
+            _ => Err(VortexRdfError::Deserialization(format!(
+                "unknown index type {s:?}; expected \"secondary-by-copy\" or \
+                 \"secondary-by-reference\""
+            ))),
+        }
+    }
+}
+
+/// Every [`IndexType`], in declaration = preference order — what
+/// [`detect_indexes`] scans and what [`IndexType::preference_rank`] indexes
+/// into. Adding a variant fails to compile at that exhaustive match until the
+/// variant is listed here too.
+pub(crate) const ALL_INDEX_TYPES: [IndexType; 2] =
+    [IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
+
 impl IndexType {
+    /// This variant's position in [`ALL_INDEX_TYPES`] — the resolution
+    /// preference order, as a sort key.
+    pub(crate) const fn preference_rank(self) -> usize {
+        match self {
+            IndexType::SecondaryByCopy => 0,
+            IndexType::SecondaryByReference => 1,
+        }
+    }
+
+    /// This index's persisted-child roles — the const table every generic
+    /// loop is parameterized by: the spec push and row-space split
+    /// (`components`), schema detection ([`Self::is_present`]), the slug
+    /// registry ([`known_component`]), and the sorted-column roster
+    /// ([`globally_sorted_columns`]). The exhaustive match is the
+    /// compile-fail anchor for those loops: a new variant answers here once
+    /// and flows into all of them.
+    pub(crate) const fn component_roles(self) -> &'static [ComponentRole] {
+        match self {
+            IndexType::SecondaryByCopy => &secondary_by_copy::ROLES,
+            IndexType::SecondaryByReference => &secondary_by_reference::ROLES,
+        }
+    }
+
     /// Whether this index needs the sorted builders' global two-pass
     /// emission path so its value columns are globally sorted.
+    // Asked only by the external-sort builder, compiled out on wasm (see the
+    // module gate in `store::builders`).
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
     pub(crate) fn needs_global_sorted_emission(self) -> bool {
         match self {
             IndexType::SecondaryByCopy => true,
@@ -162,15 +257,21 @@ impl IndexType {
         }
     }
 
-    /// Whether this index's columns are present in an array/file of `dtype`.
+    /// Whether this index's columns are present in an array/file of `dtype`:
+    /// every role's source columns, all of them — a partial set (e.g. after
+    /// a lossy projection) must not count as a usable index.
     ///
-    /// The query-side counterpart of `append_columns`: each index module owns
-    /// its column-name scheme, so detection dispatches there rather than the
-    /// store probing hardcoded names.
+    /// The query-side counterpart of `append_columns`: each index module
+    /// still owns its column-name scheme — this just reads the names off its
+    /// role table rather than the store probing hardcoded ones.
     pub(crate) fn is_present(self, dtype: &DType) -> bool {
-        match self {
-            IndexType::SecondaryByCopy => secondary_by_copy::is_present(dtype),
-            IndexType::SecondaryByReference => secondary_by_reference::is_present(dtype),
+        match dtype {
+            DType::Struct(fields, _) => self.component_roles().iter().all(|role| {
+                role.source_columns
+                    .iter()
+                    .all(|name| fields.names().iter().any(|n| n.as_ref() == *name))
+            }),
+            _ => false,
         }
     }
 
@@ -185,17 +286,17 @@ impl IndexType {
     /// query-side answer from every new index variant.
     pub(crate) fn resolve_in_memory(
         self,
-        struct_arr: &StructArray,
+        components: &[IndexComponent],
         layout: &ResolvedLayout,
         pattern: QuadPattern<'_>,
         codes: &mut PatternCodes,
-    ) -> Result<IndexResolution> {
+    ) -> Result<IndexResolution<InMemoryServePlan>> {
         match self {
             IndexType::SecondaryByCopy => {
-                secondary_by_copy::resolve_in_memory(struct_arr, layout, pattern, codes)
+                secondary_by_copy::resolve_in_memory(components, layout, pattern, codes)
             }
             IndexType::SecondaryByReference => {
-                secondary_by_reference::resolve_in_memory(struct_arr, layout, pattern, codes)
+                secondary_by_reference::resolve_in_memory(components, pattern, codes)
             }
         }
     }
@@ -208,18 +309,17 @@ impl IndexType {
     #[cfg(feature = "file-io")]
     pub(crate) async fn resolve_file(
         self,
-        file: &VortexFile,
-        quad_rows: u64,
+        file: &crate::store::native_file::NativeStoreFile,
         layout: &ResolvedLayout,
         pattern: QuadPattern<'_>,
         codes: &mut PatternCodes,
-    ) -> Result<IndexResolution> {
+    ) -> Result<IndexResolution<FileServePlan>> {
         match self {
             IndexType::SecondaryByCopy => {
-                secondary_by_copy::resolve_file(file, quad_rows, layout, pattern, codes).await
+                secondary_by_copy::resolve_file(file, layout, pattern, codes).await
             }
             IndexType::SecondaryByReference => {
-                secondary_by_reference::resolve_file(file, quad_rows, layout, pattern, codes).await
+                secondary_by_reference::resolve_file(file, pattern, codes).await
             }
         }
     }
@@ -262,14 +362,17 @@ impl IndexedComponent {
 /// The outcome of asking an index to resolve a quad pattern against a backend.
 ///
 /// Both backends answer in the same currency — ascending, unique *base* row ids
-/// — so the store folds either one into a [`RowSelection`] the same way.
+/// — so the store folds either one into a [`RowSelection`] the same way. `Plan`
+/// is the backend's serve-plan type ([`InMemoryServePlan`] for in-memory
+/// resolutions, `FileServePlan` for file ones), so a resolution can only ever
+/// hand the store a plan its own backend can execute.
 ///
 /// [`RowSelection`]: crate::store::selection::RowSelection
 // `Resolved` dwarfs the dataless `Declined`, but the enum is a transient
 // per-match return value that is destructured immediately, never stored in
 // bulk — boxing its fields would buy nothing but an allocation per query.
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum IndexResolution {
+pub(crate) enum IndexResolution<Plan> {
     /// The index does not accelerate this pattern: either its shape isn't one
     /// this index covers, or (in memory) its value column isn't in a usable
     /// sorted form. The caller falls back to its non-indexed path.
@@ -278,243 +381,244 @@ pub(crate) enum IndexResolution {
     /// term is absent from the indexed column. The caller short-circuits to an
     /// empty result.
     Empty,
-    /// The index resolved `resolves`, yielding exactly `row_ids`: a non-empty,
-    /// ascending set of base row ids. The caller narrows its selection to those
-    /// ids and drops `resolves` from any residual filtering, since the ids
-    /// already satisfy it.
+    /// The index resolved `resolves`, yielding exactly `row_ids`: an
+    /// ascending, unique set of base row ids (eager, or lazily computed — see
+    /// [`ResolvedRowIds`]). The caller narrows its selection to those ids and
+    /// drops `resolves` from any residual filtering, since the ids already
+    /// satisfy it.
     ///
     /// `serve` is the optional, index-agnostic *serving plan*: when the index
     /// also holds the matched quads clustered in its own columns, it hands back
-    /// a [`ServePlan`] so the store can read them straight from there instead of
-    /// gathering the primary columns by scattered row id — a contiguous file
+    /// the backend's plan so the store can read them straight from there instead
+    /// of gathering the primary columns by scattered row id — a contiguous file
     /// scan or, for an in-memory base, a plain array slice. An index that stores
     /// only back-references (no whole quads) leaves it `None`. It is a pure
     /// optimization — `row_ids` already resolve the pattern on their own.
     Resolved {
-        row_ids: Buffer<u64>,
+        row_ids: ResolvedRowIds,
         resolves: IndexedComponent,
-        serve: Option<ServePlan>,
+        serve: Option<Plan>,
     },
 }
 
-/// An alternative physical read path an index offers for serving a resolved
-/// view's quads: read them straight from the index's own columns — where the
-/// index already clusters the matched rows into a contiguous run — instead of
-/// gathering the primary columns by scattered row id.
+/// How a resolution answers its row ids.
 ///
-/// This is the generic form of what a permutation index (whole quads in a
-/// query-friendly order, e.g. [`IndexType::SecondaryByCopy`]) can provide and a
-/// back-reference index (only `(value, row-id)` pairs, e.g.
-/// [`IndexType::SecondaryByReference`]) cannot. An index builds a plan during
-/// resolution; the store executes it without knowing which index produced it,
-/// so serving stays a uniform capability rather than one index's special case.
-///
-/// Only the *acquisition* of the matched columns differs by backend (see
-/// [`ServeSource`]): a file scan filtered to the rows, or a plain slice of an
-/// in-memory base. Both then decode through the same shared tail.
-///
-/// Correctness never depends on the plan: it reproduces exactly the rows the
-/// resolution's `row_ids` name, so any operation that can't honor it (chained
-/// matches, counting, materializing) simply ignores it and reads through the
-/// row ids. The store keeps a plan only while the resolution is a view's sole
-/// restriction — see `QuadsSource::File` / `QuadsSource::InMemory`.
-#[derive(Clone)]
-pub(crate) struct ServePlan {
-    /// The source column for each primary `(s, p, o, g)` component, in that
-    /// order — the index's own columns holding the whole quad.
-    primary_columns: [&'static str; 4],
-    /// The column giving each served row's primary row id, used to drop rows
-    /// tombstoned since construction.
-    rid_column: &'static str,
-    /// The layout the projected source columns decode through (an index that
-    /// stores whole terms decodes them as strings, or dictionary codes under
-    /// the Dictionary layout).
-    decode_layout: ResolvedLayout,
-    /// How to reach the matched rows within the index's columns — the one
-    /// backend-specific part of a serve.
-    source: ServeSource,
+/// `Eager` is a resolution that had to compute its ids to answer at all (a
+/// back-reference probe, or a copy resolution without a serving plan) and is
+/// non-empty by construction — an empty scan short-circuits to
+/// [`IndexResolution::Empty`] instead. `Lazy` rides only alongside a serve
+/// plan: the plan answers reads straight from the index's own
+/// columns, so the ids — a second pass over the same data — are deferred until
+/// a consumer actually needs the selection (a count, a chained match, a
+/// delete, a base-order gather). A lazy resolution may therefore materialize
+/// to an *empty* id set; consumers reach it through the view's pending
+/// selection, which handles that like any other narrow selection.
+pub(crate) enum ResolvedRowIds {
+    Eager(Buffer<u64>),
+    Lazy(LazyRowIds),
 }
 
-/// Where a [`ServePlan`]'s matched rows sit within the index's columns, and how
-/// to reach them.
+/// The exact base row ids of a serve-attached index resolution, computed on
+/// first need and shared across every clone of the view that carries them.
+///
+/// The serving plan makes the ids redundant for the dominant
+/// match-then-iterate flow — for a file-backed store they cost a whole extra
+/// pushed-down scan of the index child — so the resolution hands back the
+/// *recipe* instead and whichever consumer first needs the selection runs it.
+/// The result lands in a shared cell: later consumers (and view clones made
+/// before materialization) read it back for free. Two consumers racing on
+/// first need may both run the recipe, but the source is immutable so they
+/// compute identical ids; whichever stores first wins and both return the
+/// stored buffer — no lock is held across the computation.
 #[derive(Clone)]
-enum ServeSource {
-    /// In-memory base: the matched rows are the contiguous `[start, end)` run of
-    /// the index's columns in the base struct array — the run a binary search
-    /// over the sorted lead column bounded. The store slices its base by this
-    /// range directly, with no row-id gather.
-    InMemory(Range<usize>),
-    /// File-backed: the matched rows are those where every `(column, value)`
-    /// term equality holds, read by a pushed-down scan of the index's columns
-    /// (whose sort order clusters them into a contiguous, zone-prunable run).
-    #[cfg(feature = "file-io")]
-    File(Vec<(&'static str, Scalar)>),
+pub(crate) struct LazyRowIds {
+    cell: Arc<OnceLock<Buffer<u64>>>,
+    source: LazyRowIdSource,
 }
 
-impl ServePlan {
-    /// A plan serving the contiguous `range` of an in-memory base's index
-    /// columns.
-    pub(crate) fn in_memory(
-        primary_columns: [&'static str; 4],
-        rid_column: &'static str,
-        decode_layout: ResolvedLayout,
-        range: Range<usize>,
-    ) -> Self {
-        Self {
-            primary_columns,
-            rid_column,
-            decode_layout,
-            source: ServeSource::InMemory(range),
-        }
-    }
-
-    /// A plan serving a file's index columns by a pushed-down scan filtered to
-    /// the rows where every `constraints` equality holds.
+/// Where a [`LazyRowIds`]' ids come from — mirroring the serve plans'
+/// per-backend split ([`InMemoryServePlan`] / `FileServePlan`), holding
+/// exactly what the eager path would have consumed at resolution time.
+#[derive(Clone)]
+enum LazyRowIdSource {
+    /// In-memory: the rid-column slice of the component's matched run, decoded
+    /// and sorted on demand ([`sorted_row_ids`]).
+    Component(ArrayRef),
+    /// File-backed: the rid-only pushed-down scan of the index child
+    /// ([`scan_index_row_ids`]) the eager path would have run at match time.
     #[cfg(feature = "file-io")]
-    pub(crate) fn file(
-        primary_columns: [&'static str; 4],
-        rid_column: &'static str,
-        decode_layout: ResolvedLayout,
+    IndexChild {
+        reader: vortex_layout::LayoutReaderRef,
         constraints: Vec<(&'static str, Scalar)>,
+        rid_column: &'static str,
+    },
+}
+
+impl LazyRowIds {
+    /// Test-only hook: whether the ids have actually been computed — so a
+    /// test can pin that a read was answered without them.
+    #[cfg(test)]
+    pub(crate) fn debug_materialized(&self) -> bool {
+        self.cell.get().is_some()
+    }
+
+    /// Lazy ids over an in-memory component's matched rid run.
+    pub(crate) fn from_component_run(rids: ArrayRef) -> Self {
+        Self {
+            cell: Arc::new(OnceLock::new()),
+            source: LazyRowIdSource::Component(rids),
+        }
+    }
+
+    /// Lazy ids scanned from a file's index child on first need.
+    #[cfg(feature = "file-io")]
+    pub(crate) fn from_index_child_scan(
+        reader: vortex_layout::LayoutReaderRef,
+        constraints: Vec<(&'static str, Scalar)>,
+        rid_column: &'static str,
     ) -> Self {
         Self {
-            primary_columns,
-            rid_column,
-            decode_layout,
-            source: ServeSource::File(constraints),
+            cell: Arc::new(OnceLock::new()),
+            source: LazyRowIdSource::IndexChild {
+                reader,
+                constraints,
+                rid_column,
+            },
         }
     }
 
-    /// Decode an in-memory base's matched quads straight from its index columns:
-    /// slice the base to this plan's row run, then decode those columns as the
-    /// primary `(s, p, o, g)` — replacing the row-id gather over the primaries.
-    pub(crate) fn decode_in_memory(
-        &self,
-        base: &ArrayRef,
-        deleted: Option<&Mask>,
-    ) -> Vec<Result<Quad>> {
-        let range = match &self.source {
-            ServeSource::InMemory(range) => range.clone(),
+    /// How many rows the ids cover, when knowable without computing them: an
+    /// in-memory run knows its width up front (so a count on a served match
+    /// never decodes), a file child only after materialization.
+    pub(crate) fn len_if_known(&self) -> Option<usize> {
+        match &self.source {
+            LazyRowIdSource::Component(rids) => Some(rids.len()),
             #[cfg(feature = "file-io")]
-            ServeSource::File(_) => {
-                unreachable!("an in-memory view only ever carries an in-memory serve plan")
+            LazyRowIdSource::IndexChild { .. } => self.cell.get().map(Buffer::len),
+        }
+    }
+
+    /// The ids, computing (and caching) them on first call.
+    #[cfg(feature = "file-io")]
+    pub(crate) async fn materialized(&self) -> Result<Buffer<u64>> {
+        if let Some(ids) = self.cell.get() {
+            return Ok(ids.clone());
+        }
+        let ids = match &self.source {
+            LazyRowIdSource::Component(rids) => sorted_row_ids(rids.clone())?,
+            LazyRowIdSource::IndexChild {
+                reader,
+                constraints,
+                rid_column,
+            } => scan_index_row_ids(reader.clone(), constraints, rid_column).await?,
+        };
+        Ok(self.cell.get_or_init(|| ids).clone())
+    }
+
+    /// The synchronous counterpart of [`materialized`](Self::materialized),
+    /// for in-memory sources — a file child's ids take I/O, and every
+    /// consumer of a file view's selection is already async.
+    pub(crate) fn materialized_sync(&self) -> Result<Buffer<u64>> {
+        if let Some(ids) = self.cell.get() {
+            return Ok(ids.clone());
+        }
+        let ids = match &self.source {
+            LazyRowIdSource::Component(rids) => sorted_row_ids(rids.clone())?,
+            #[cfg(feature = "file-io")]
+            LazyRowIdSource::IndexChild { .. } => {
+                unreachable!("an in-memory view only ever carries component-sourced pending ids")
             }
         };
-        match base.slice(range) {
-            Ok(rows) => self.decode_columns(&rows, deleted),
-            Err(e) => vec![Err(VortexRdfError::Vortex(e))],
-        }
-    }
-
-    /// Decode the `(s, p, o, g)` quads out of a chunk of this plan's projected
-    /// index columns, dropping rows tombstoned in `deleted` via the row-id
-    /// column — the shared tail of both backends' serving.
-    pub(crate) fn decode_columns(
-        &self,
-        chunk: &ArrayRef,
-        deleted: Option<&Mask>,
-    ) -> Vec<Result<Quad>> {
-        match self.chunk_rows(chunk, deleted) {
-            Ok(rows) => self.decode_layout.decode_chunk(&rows),
-            Err(e) => vec![Err(e)],
-        }
-    }
-
-    /// [`decode_columns`](Self::decode_columns) through the layout's async
-    /// decode — for serving a store whose term dictionary is file-backed,
-    /// where each chunk's codes are resolved with a dictionary scan.
-    #[cfg(feature = "file-io")]
-    pub(crate) async fn decode_columns_async(
-        &self,
-        chunk: &ArrayRef,
-        deleted: Option<&Mask>,
-    ) -> Vec<Result<Quad>> {
-        match self.chunk_rows(chunk, deleted) {
-            Ok(rows) => self.decode_layout.decode_chunk_async(&rows).await,
-            Err(e) => vec![Err(e)],
-        }
-    }
-
-    /// A chunk's live rows as a primary-named `(s, p, o, g)` struct: relabel the
-    /// source columns, then drop any whose primary row id is tombstoned.
-    fn chunk_rows(&self, chunk: &ArrayRef, deleted: Option<&Mask>) -> Result<ArrayRef> {
-        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
-        let struct_arr = chunk
-            .clone()
-            .execute::<StructArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-        let col = |name: &'static str| {
-            struct_arr
-                .unmasked_field_by_name(name)
-                .cloned()
-                .map_err(VortexRdfError::Vortex)
-        };
-        let [s, p, o, g] = self.primary_columns;
-        let len = struct_arr.len();
-        let rows = StructArray::try_new(
-            FieldNames::from(crate::store::schema::PRIMARY_COLUMNS),
-            vec![col(s)?, col(p)?, col(o)?, col(g)?],
-            len,
-            Validity::NonNullable,
-        )
-        .map_err(VortexRdfError::Vortex)?
-        .into_array();
-
-        let Some(deleted) = deleted else {
-            return Ok(rows);
-        };
-        // Tombstones are defined over primary row ids; the rid column says which
-        // primary row each served row mirrors.
-        let rid_col = col(self.rid_column)?
-            .execute::<PrimitiveArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-        let live = Mask::from_indices(
-            len,
-            rid_col
-                .as_slice::<u32>()
-                .iter()
-                .enumerate()
-                .filter(|&(_, &rid)| !deleted.value(rid as usize))
-                .map(|(position, _)| position),
-        );
-        if live.all_true() {
-            return Ok(rows);
-        }
-        rows.filter(live).map_err(VortexRdfError::Vortex)
+        Ok(self.cell.get_or_init(|| ids).clone())
     }
 }
 
-/// File-backed serving: turning the plan's constraints into a scan.
-#[cfg(feature = "file-io")]
-impl ServePlan {
-    /// The columns to project from the file to serve these rows: the four
-    /// component sources plus the row-id column (for tombstones).
-    pub(crate) fn projection(&self) -> [&'static str; 5] {
-        let [s, p, o, g] = self.primary_columns;
-        [s, p, o, g, self.rid_column]
-    }
+/// Binary-search a component's sorted `column` for the `[lo, hi)` run of rows
+/// equal to `native`, searched `within` a row range whose slice of the column
+/// is itself sorted (the whole component, or a lead run for a prefix probe) —
+/// the probe step shared by the in-memory resolvers.
+///
+/// `None` when the column is missing or the probe can't cast to its dtype
+/// (the resolver declines and the store falls back to a mask scan); an empty
+/// range when the probed term is absent from the data.
+pub(crate) fn sorted_probe_run(
+    rows: &StructArray,
+    column: &'static str,
+    native: &Scalar,
+    within: Range<usize>,
+) -> Result<Option<Range<usize>>> {
+    use crate::store::array::search_sorted_bounds;
 
-    /// The filter selecting exactly the served rows within the index's columns
-    /// — the conjunction of this plan's term equalities.
-    pub(crate) fn filter(&self) -> Expression {
-        let constraints = match &self.source {
-            ServeSource::File(constraints) => constraints,
-            ServeSource::InMemory(_) => {
-                unreachable!("a file view only ever carries a file serve plan")
-            }
-        };
-        let mut filter: Option<Expression> = None;
-        for (column, value) in constraints {
-            let expr = eq(get_item(*column, root()), lit(value.clone()));
-            filter = Some(match filter.take() {
-                Some(f) => and(f, expr),
-                None => expr,
-            });
+    let Ok(col) = rows.unmasked_field_by_name(column) else {
+        return Ok(None);
+    };
+    let Ok(scalar) = native.cast(col.dtype()) else {
+        return Ok(None);
+    };
+    let run = col.slice(within.clone()).map_err(VortexRdfError::Vortex)?;
+    let (lo, hi) = search_sorted_bounds(&run, &scalar)?;
+    Ok(Some(within.start + lo..within.start + hi))
+}
+
+/// The row ids of a located index-child run, read point-by-point from the
+/// child's rid column through its cached chunk probes and re-sorted into
+/// base row order — the file counterpart of slicing an in-memory rid run.
+/// `Ok(None)` when the rid column's chunks decline (the caller keeps its
+/// scan); rids are unique by construction, so sorting alone suffices.
+///
+/// `rid_column` comes from the calling index — the hub names no index's
+/// columns.
+#[cfg(feature = "file-io")]
+pub(crate) async fn rid_point_reads(
+    file: &crate::store::native_file::NativeStoreFile,
+    component: &str,
+    rid_column: &str,
+    range: Range<u64>,
+) -> Result<Option<Buffer<u64>>> {
+    let Some(chunks) = file.component_column_chunks(component, rid_column) else {
+        return Ok(None);
+    };
+    let source = file.segment_source();
+    let session = file.session();
+    let mut ids = Vec::with_capacity((range.end - range.start) as usize);
+    for row in range {
+        match chunks
+            .value_at(row, &source, session)
+            .await
+            .map_err(VortexRdfError::Vortex)?
+        {
+            Some(rid) => ids.push(rid),
+            None => return Ok(None),
         }
-        // A serve plan always carries at least one constraint (the resolved
-        // lead component), so the conjunction is never empty.
-        filter.expect("a serve plan constrains at least one column")
     }
+    ids.sort_unstable();
+    Ok(Some(Buffer::from(ids)))
+}
+
+/// [`sorted_probe_run`] through a component's cached probe when its column
+/// resolves one (skipping the per-call slice + encoding-tree walk): a full
+/// search on the whole column, or a windowed search inside a lead run —
+/// window-only, exactly like the slice-then-search path. String-valued
+/// components (whose probe scalars are not integers) and probe-declined
+/// encodings fall back to the per-call search.
+pub(crate) fn component_probe_run(
+    component: &IndexComponent,
+    column: &'static str,
+    native: &Scalar,
+    within: Option<Range<usize>>,
+) -> Result<Option<Range<usize>>> {
+    if let Some(owned) = component.probe(column)
+        && let Ok(needle) = u64::try_from(native)
+    {
+        let (lo, hi) = match within {
+            None => owned.bounds(needle),
+            Some(range) => owned.bounds_in(range, needle),
+        };
+        return Ok(Some(lo..hi));
+    }
+    let rows = component.rows()?;
+    let within = within.unwrap_or(0..rows.len());
+    sorted_probe_run(rows, column, native, within)
 }
 
 /// Decode a row-id column into the ascending, unique `Buffer<u64>` every index
@@ -533,7 +637,7 @@ pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<u64>> {
     if row_id_column.is_empty() {
         return Ok(Buffer::empty());
     }
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let ids = row_id_column
         .cast(DType::Primitive(PType::U64, Nullability::NonNullable))
         .map_err(VortexRdfError::Vortex)?
@@ -541,9 +645,20 @@ pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<u64>> {
         .map_err(VortexRdfError::Vortex)?
         .into_buffer::<u64>();
 
-    let mut sorted = ids.as_slice().to_vec();
-    sorted.sort_unstable();
-    Ok(Buffer::from_iter(sorted))
+    // The freshly-executed buffer is normally uniquely owned, so the sort
+    // runs in place with no copy; a shared buffer (someone else still holds
+    // the execution's output) falls back to one copy.
+    match ids.try_into_mut() {
+        Ok(mut ids) => {
+            ids.as_mut_slice().sort_unstable();
+            Ok(ids.freeze())
+        }
+        Err(ids) => {
+            let mut sorted = ids.as_slice().to_vec();
+            sorted.sort_unstable();
+            Ok(Buffer::from(sorted))
+        }
+    }
 }
 
 /// Scan `row_id_column` for the rows where every `(value_column, probe)`
@@ -551,27 +666,26 @@ pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<u64>> {
 /// buffer (the shape vortex's `Selection::IncludeByIndex` requires) — the
 /// file-backed probe shared by the secondary indexes.
 ///
-/// Each equality is expressed as a range (`>= probe AND <= probe`): the value
-/// columns are sorted (or at least clustered per chunk), so range predicates
-/// let Vortex prune to the splits whose min/max can hold the probe without
-/// materializing the whole column. Output order is irrelevant (the ids are
-/// sorted afterwards), so the scan may run unordered.
+/// Each equality is a plain `eq`, the same encoding the serve-plan filter
+/// uses: on Vortex 0.83 a binary `Eq` falsifies against the identical zone
+/// min/max envelope as a `>= probe AND <= probe` range pair (see vortex's
+/// `stats/rewrite/builtins.rs`), while the pair evaluates two conjuncts to
+/// compute the same mask — measured, `eq` was never slower on this rid-scan
+/// path. One shared shape also keeps both paths hitting the same per-conjunct
+/// pruning caches. Output order is irrelevant (the ids are sorted
+/// afterwards), so the scan may run unordered.
 #[cfg(feature = "file-io")]
 pub(crate) async fn scan_index_row_ids(
-    file: &VortexFile,
-    quad_rows: u64,
+    reader: vortex_layout::LayoutReaderRef,
     value_constraints: &[(&'static str, Scalar)],
     row_id_column: &'static str,
 ) -> Result<Buffer<u64>> {
     let mut filter: Option<Expression> = None;
     for (column, probe) in value_constraints {
-        let bounded = and(
-            gt_eq(get_item(*column, root()), lit(probe.clone())),
-            lt_eq(get_item(*column, root()), lit(probe.clone())),
-        );
+        let expr = eq(get_item(*column, root()), lit(probe.clone()));
         filter = Some(match filter.take() {
-            Some(f) => and(f, bounded),
-            None => bounded,
+            Some(f) => and(f, expr),
+            None => expr,
         });
     }
     // Every index probes at least one value column; an empty constraint set
@@ -580,15 +694,56 @@ pub(crate) async fn scan_index_row_ids(
         return Ok(Buffer::empty());
     };
 
-    // Quad rows only: a padded file's dictionary tail carries zero sentinels
-    // in every index column, which a probe for term code 0 would match.
-    let arr = file
-        .scan()
-        .map_err(VortexRdfError::Vortex)?
-        .with_row_range(0..quad_rows)
+    read_scanned_row_ids(
+        rid_scan(reader, row_id_column).with_filter(filter),
+        row_id_column,
+    )
+    .await
+}
+
+/// The row ids of a *located* index-child run — the rows a resolver bounded
+/// by binary-searching the child's cached chunk probes — read by a rid-only
+/// scan restricted to that range. The wide-run counterpart of
+/// [`rid_point_reads`], for runs too large to read point by point.
+///
+/// The scan carries no filter: the location bounded exactly the rows the
+/// constraints select, so re-testing the value columns would only re-read and
+/// re-compare them. A resolver whose location covers only *some* of its
+/// constraints must keep [`scan_index_row_ids`], whose filter tests them all.
+#[cfg(feature = "file-io")]
+pub(crate) async fn scan_located_row_ids(
+    reader: vortex_layout::LayoutReaderRef,
+    row_id_column: &'static str,
+    range: Range<u64>,
+) -> Result<Buffer<u64>> {
+    read_scanned_row_ids(
+        rid_scan(reader, row_id_column).with_row_range(range),
+        row_id_column,
+    )
+    .await
+}
+
+/// A rid-only scan of an index child: just the row-id column, unordered
+/// (callers sort the ids anyway). Restrictions — a filter, a row range — are
+/// the caller's to add.
+#[cfg(feature = "file-io")]
+fn rid_scan(
+    reader: vortex_layout::LayoutReaderRef,
+    row_id_column: &'static str,
+) -> vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef> {
+    vortex_layout::scan::scan_builder::ScanBuilder::new(VORTEX_SESSION.clone(), reader)
         .with_projection(select([row_id_column], root()))
-        .with_filter(filter)
         .with_ordered(false)
+}
+
+/// Run a rid-only scan and decode its row-id column into the ascending,
+/// unique buffer every index resolution answers in.
+#[cfg(feature = "file-io")]
+async fn read_scanned_row_ids(
+    scan: vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>,
+    row_id_column: &'static str,
+) -> Result<Buffer<u64>> {
+    let arr = scan
         .into_array_stream()
         .map_err(VortexRdfError::Vortex)?
         .read_all()
@@ -599,7 +754,7 @@ pub(crate) async fn scan_index_row_ids(
         return Ok(Buffer::empty());
     }
 
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let struct_arr = arr
         .execute::<StructArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)?;
@@ -611,15 +766,36 @@ pub(crate) async fn scan_index_row_ids(
     )
 }
 
+/// An eager file resolution off the rid-only pushed-down scan — the shared
+/// tail of the file resolvers whenever no serving plan defers the ids (a
+/// back-reference child, or a copy resolution that couldn't build its plan):
+/// `Empty` when the scan proves the probe matches nothing.
+#[cfg(feature = "file-io")]
+pub(crate) async fn resolve_eager_from_scan(
+    reader: vortex_layout::LayoutReaderRef,
+    constraints: &[(&'static str, Scalar)],
+    rid_column: &'static str,
+    resolves: IndexedComponent,
+) -> Result<IndexResolution<FileServePlan>> {
+    let row_ids = scan_index_row_ids(reader, constraints, rid_column).await?;
+    if row_ids.is_empty() {
+        return Ok(IndexResolution::Empty);
+    }
+    Ok(IndexResolution::Resolved {
+        row_ids: ResolvedRowIds::Eager(row_ids),
+        resolves,
+        serve: None,
+    })
+}
+
 /// Index types whose columns are present in `dtype` — how a store discovers
 /// its queryable indexes from an array or file schema at construction.
 ///
-/// Iterates every `IndexType` variant via clap's derived
-/// `ValueEnum::value_variants`, so a new variant flows in here (and into the
-/// resolvers) with no store changes once its `is_present`/`resolve_*` arms
-/// exist.
+/// Iterates [`ALL_INDEX_TYPES`], so a new variant flows in here (and into the
+/// resolvers) with no store changes once it is listed there and its
+/// `component_roles`/`resolve_*` arms exist.
 pub(crate) fn detect_indexes(dtype: &DType) -> Indexes {
-    IndexType::value_variants()
+    ALL_INDEX_TYPES
         .iter()
         .copied()
         .filter(|index| index.is_present(dtype))
@@ -636,13 +812,13 @@ pub(crate) fn detect_indexes(dtype: &DType) -> Indexes {
 /// one index.
 pub(crate) fn resolve_indexes_in_memory(
     indexes: &[IndexType],
-    struct_arr: &StructArray,
+    components: &[IndexComponent],
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
-) -> Result<IndexResolution> {
+) -> Result<IndexResolution<InMemoryServePlan>> {
     for index in indexes {
-        match index.resolve_in_memory(struct_arr, layout, pattern, codes)? {
+        match index.resolve_in_memory(components, layout, pattern, codes)? {
             IndexResolution::Declined => continue,
             resolved => return Ok(resolved),
         }
@@ -660,17 +836,13 @@ pub(crate) fn resolve_indexes_in_memory(
 #[cfg(feature = "file-io")]
 pub(crate) async fn resolve_indexes_file(
     indexes: &[IndexType],
-    file: &VortexFile,
-    quad_rows: u64,
+    file: &crate::store::native_file::NativeStoreFile,
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
-) -> Result<IndexResolution> {
+) -> Result<IndexResolution<FileServePlan>> {
     for index in indexes {
-        match index
-            .resolve_file(file, quad_rows, layout, pattern, codes)
-            .await?
-        {
+        match index.resolve_file(file, layout, pattern, codes).await? {
             IndexResolution::Declined => continue,
             resolved => return Ok(resolved),
         }
@@ -682,6 +854,7 @@ pub(crate) async fn resolve_indexes_file(
 /// two-pass emission pipeline. The plural name marks the planner over the whole
 /// index set; the singular [`IndexType::needs_global_sorted_emission`] it folds
 /// over answers for one index.
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 pub(crate) fn indexes_need_global_sorted_emission(indexes: &[IndexType]) -> bool {
     unique_indexes(indexes)
         .into_iter()
@@ -696,17 +869,18 @@ pub(crate) fn indexes_need_global_sorted_emission(indexes: &[IndexType]) -> bool
 /// `vec![IndexType::SecondaryByCopy]` for the full sorted quad copies.
 pub type Indexes = Vec<IndexType>;
 
-/// The index value columns a globally sorted emission guarantees sorted —
-/// what the sorted builders (re-)stamp `IsSorted` after canonicalization,
-/// which drops per-chunk stats. Sourced from the index modules' own name
-/// accessors so the names live in exactly one place each.
-pub(crate) fn globally_sorted_columns() -> [&'static str; 4] {
-    [
-        secondary_by_reference::O_VAL_COL,
-        secondary_by_reference::P_VAL_COL,
-        secondary_by_copy::Family::Posg.lead_col(),
-        secondary_by_copy::Family::Ospg.lead_col(),
-    ]
+/// The index value columns a globally sorted emission guarantees sorted,
+/// across every index type — what the sorted builders (re-)stamp `IsSorted`
+/// after canonicalization, which drops per-chunk stats. Each role's lead
+/// sort-key column, read off the same tables the row-space split reads its
+/// sortedness provenance from, so the re-stamp and the resolution gate can
+/// never disagree about which columns matter; the fold over
+/// [`ALL_INDEX_TYPES`] × [`IndexType::component_roles`] flows a new variant
+/// in the moment it declares its roles.
+pub(crate) fn globally_sorted_columns() -> impl Iterator<Item = &'static str> {
+    ALL_INDEX_TYPES
+        .into_iter()
+        .flat_map(|index| index.component_roles().iter().map(|role| role.lead_source))
 }
 
 /// Deduplicate the requested indexes, preserving first-seen order, so a
@@ -720,118 +894,6 @@ pub(crate) fn unique_indexes(indexes: &[IndexType]) -> Vec<IndexType> {
         }
     }
     seen
-}
-
-/// Globally sorted index columns for every requested index type, built once
-/// over the complete in-memory dataset and sliced per chunk — the global
-/// counterpart of the per-chunk `IndexType::append_*` dispatch.
-pub(crate) struct GlobalIndexes {
-    by_copy: Option<secondary_by_copy::GlobalCopyArrays>,
-    by_reference: Option<secondary_by_reference::GlobalIndexArrays>,
-}
-
-impl GlobalIndexes {
-    /// Build from the dataset in final row order (term-string columns).
-    pub(crate) fn from_quads(indexes: &[IndexType], quads: &[RawQuad]) -> Self {
-        let mut by_copy = None;
-        let mut by_reference = None;
-        for idx in unique_indexes(indexes) {
-            match idx {
-                IndexType::SecondaryByCopy => {
-                    by_copy = Some(secondary_by_copy::GlobalCopyArrays::from_quads(quads));
-                }
-                IndexType::SecondaryByReference => {
-                    by_reference =
-                        Some(secondary_by_reference::GlobalIndexArrays::from_quads(quads));
-                }
-            }
-        }
-        Self {
-            by_copy,
-            by_reference,
-        }
-    }
-
-    /// Dictionary-layout variant: build from the dataset's u32 codes.
-    pub(crate) fn from_codes(indexes: &[IndexType], codes: &QuadCodes) -> Self {
-        let mut by_copy = None;
-        let mut by_reference = None;
-        for idx in unique_indexes(indexes) {
-            match idx {
-                IndexType::SecondaryByCopy => {
-                    by_copy = Some(secondary_by_copy::GlobalCopyArrays::from_codes(codes));
-                }
-                IndexType::SecondaryByReference => {
-                    by_reference =
-                        Some(secondary_by_reference::GlobalIndexArrays::from_codes(codes));
-                }
-            }
-        }
-        Self {
-            by_copy,
-            by_reference,
-        }
-    }
-
-    /// Append window `range` of every index's global order as one chunk's
-    /// index columns.
-    pub(crate) fn append_slice(
-        &self,
-        field_names: &mut Vec<Arc<str>>,
-        field_arrays: &mut Vec<ArrayRef>,
-        range: Range<usize>,
-    ) -> Result<()> {
-        if let Some(sbc) = &self.by_copy {
-            sbc.append_slice(field_names, field_arrays, range.clone())?;
-        }
-        if let Some(sbr) = &self.by_reference {
-            sbr.append_slice(field_names, field_arrays, range)?;
-        }
-        Ok(())
-    }
-}
-
-/// Project away secondary-index columns (`_idx_*`), keeping the layout's
-/// primary and intrinsic columns (e.g. `_dict_term`). Returns the array
-/// unchanged when it carries no index columns.
-pub(crate) fn strip_index_columns(arr: ArrayRef) -> Result<ArrayRef> {
-    // Figure out which field names to keep; bail out unchanged if there are
-    // no `_idx_*` columns to strip in the first place (the common case).
-    let keep: Vec<FieldName> = match arr.dtype() {
-        DType::Struct(fields, _)
-            if fields
-                .names()
-                .iter()
-                .any(|n| n.as_ref().starts_with("_idx_")) =>
-        {
-            fields
-                .names()
-                .iter()
-                .filter(|n| !n.as_ref().starts_with("_idx_"))
-                .cloned()
-                .collect()
-        }
-        _ => return Ok(arr),
-    };
-
-    // Rebuild the struct with only the kept columns.
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
-    let struct_arr = arr
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let arrays: Vec<ArrayRef> = keep
-        .iter()
-        .map(|n| {
-            struct_arr
-                .unmasked_field_by_name(n.as_ref())
-                .cloned()
-                .map_err(VortexRdfError::Vortex)
-        })
-        .collect::<Result<_>>()?;
-    let len = struct_arr.len();
-    StructArray::try_new(keep.into(), arrays, len, Validity::NonNullable)
-        .map_err(VortexRdfError::Vortex)
-        .map(|a| a.into_array())
 }
 
 #[cfg(test)]

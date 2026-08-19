@@ -16,7 +16,6 @@ categories.workspace = true
 vortex.workspace = true
 vortex-array.workspace = true
 vortex-error.workspace = true
-vortex-ipc.workspace = true
 vortex-io.workspace = true
 vortex-session.workspace = true
 vortex-fsst.workspace = true
@@ -25,6 +24,8 @@ vortex-layout.workspace = true
 vortex-file.workspace = true
 vortex-scan.workspace = true
 vortex-buffer.workspace = true
+# Encoding-aware bounds search over compressed columns (sibling workspace crate).
+vortex-encoded-search.workspace = true
 
 tokio.workspace = true
 
@@ -38,14 +39,14 @@ thiserror.workspace = true
 uuid = { version = "1", features = ["v4"] }
 rkyv = { version = "0.8.17", features = ["std", "bytecheck"] }
 serde = { version = "1.0", features = ["derive"] }
-# Decoding IPC straight off an in-memory buffer (see `io::de::array_from_ipc_bytes`)
-# needs a `bytes::Buf` whose `copy_to_bytes` is zero-copy; vortex-ipc's decoder
-# is generic over `Buf`, so we name the same crate it does.
-bytes = "1.12"
+# The native container's wire metadata (io::store_layout) is a small JSON stamp.
+serde_json = "1.0"
 
 futures.workspace = true
+async-trait.workspace = true
 log = "0.4.33"
-clap.workspace = true
+# Only for the CLI-argument derives on the strategy enums (feature `clap`).
+clap = { workspace = true, optional = true }
 web-time = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -53,13 +54,28 @@ mimalloc = { workspace = true, optional = true }
 
 [features]
 default = ["file-io"]
-file-io = ["vortex-io/tokio", "vortex/zstd", "vortex/files", "vortex-file/tokio", "tokio/fs"]
+# No `vortex/zstd`: files must decode on every target, and the wasm reader has
+# no Zstd registered — the compressor never selects it for our columns anyway.
+file-io = [
+    "vortex-io/tokio",
+    "vortex/files",
+    "vortex-file/tokio",
+    "tokio/fs",
+    "vortex-encoded-search/layout",
+]
 # Opt-in: let a binary that depends on this crate have it install mimalloc as
 # the process's global allocator, instead of picking one itself.
 mimalloc = ["dep:mimalloc"]
+# Opt-in: derive `clap::ValueEnum` on the builder/layout/index strategy enums,
+# so a CLI can take them as arguments. Off by default — the wasm and python
+# builds have no use for an argument parser.
+clap = ["dep:clap"]
 
 [dev-dependencies]
 divan = { version = "5.0.1", package = "codspeed-divan-compat" }
+# RAII temp dirs for the file-io tests: cleanup must survive a panicking
+# assertion, which hand-rolled `remove_file` tails never did.
+tempfile = "3"
 tokio = { workspace = true, features = ["time", "rt-multi-thread"] }
 
 [[bench]]

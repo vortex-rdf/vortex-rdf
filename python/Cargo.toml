@@ -29,4 +29,6 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 # the limited API in Python 3.11.
 pyo3 = { workspace = true, features = ["extension-module", "abi3-py311"] }
 oxrdf.workspace = true
-vortex-array.workspace = true
+# Only for the `Buffer<u32>` backing the zero-copy code columns; every other
+# Vortex type stays behind core's API.
+vortex-buffer.workspace = true

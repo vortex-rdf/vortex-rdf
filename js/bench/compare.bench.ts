@@ -30,22 +30,21 @@
 // plain wall-clock results and is NEVER uploaded to CodSpeed (no JS CodSpeed workflow
 // exists; this is never run via CodSpeedHQ/action). CodSpeed stays Rust-only.
 
-import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { cpus, tmpdir } from 'node:os';
-import { writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { cpus } from 'node:os';
+import { writeFileSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve, join } from 'node:path';
+import { dirname, resolve } from 'node:path';
 
 import {
     ADAPTERS, MUT_ADAPTERS, D, DQ, N_TRIPLES, N_QUADS, MUT_BATCH,
     QUERY_OPTS, HEAVY_OPTS, FULL_SCAN_OPTS, moduli, type Row,
 } from './shared.js';
+import { runWorkerProcess } from './util.js';
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
 const workerPath = resolve(here, 'compare.worker.ts');
-const tsxBin = resolve(here, '..', 'node_modules', '.bin', 'tsx');
 
 const OUT = resolve(here, process.env.BENCH_OUT ?? 'results.json');
 
@@ -67,24 +66,10 @@ interface WorkerOutput {
     failures?: { phase: string; error: string }[];
 }
 
+/** One adapter, one role, one process. A worker that cannot finish is skipped:
+ *  the remaining adapters still run and still produce their rows. */
 function runWorker(slug: string, role: 'query' | 'fullscan' | 'mutate'): WorkerOutput | null {
-    const outFile = join(tmpdir(), `vortex-bench-${slug}-${role}-${process.pid}.json`);
-    const res = spawnSync(tsxBin, ['--expose-gc', '--max-old-space-size=8192', workerPath, slug, role, outFile], {
-        stdio: 'inherit',
-        env: process.env,
-    });
-    try {
-        if (res.status !== 0) {
-            console.error(`\n[${slug}/${role}] worker exited ${res.status} — skipping; other adapters still run.`);
-            return null;
-        }
-        return JSON.parse(readFileSync(outFile, 'utf8')) as WorkerOutput;
-    } catch (e) {
-        console.error(`[${slug}/${role}] failed to read worker output:`, e);
-        return null;
-    } finally {
-        rmSync(outFile, { force: true });
-    }
+    return runWorkerProcess<WorkerOutput>(workerPath, [slug, role], `${slug}/${role}`);
 }
 
 async function main(): Promise<void> {

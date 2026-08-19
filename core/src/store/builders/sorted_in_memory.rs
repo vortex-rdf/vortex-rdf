@@ -1,12 +1,24 @@
+//! The [`SortedInMemoryBuilder`] strategy: hold the whole dataset, sort it
+//! once by (s, p, o, g), and emit chunks as windows of that single order.
+//!
+//! Holding everything at once is what earns the global sortedness stamps on
+//! `s` and on the index value columns (built through
+//! [`GlobalIndexes`] over the sorted dataset), the
+//! stamps a reader binary-searches on. The cost is O(dataset) memory; the
+//! out-of-core strategy with the same guarantee is
+//! [`sorted_stream`](super::sorted_stream). Only this file's ordering
+//! discipline lives here — the emission machinery it drives belongs to
+//! [`builders`](super).
+
 use super::{
     BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder,
     build_struct_array, build_struct_array_global, into_vortex_error, make_empty_struct,
 };
 use crate::error::Result;
 use crate::store::RawQuad;
-use crate::store::indexes::{GlobalIndexes, Indexes};
-use crate::store::layouts::dictionary::{QuadCodes, ingest_interning};
-use crate::store::layouts::term_dictionary::TermDictionary;
+use crate::store::builders::GlobalIndexes;
+use crate::store::indexes::Indexes;
+use crate::store::layouts::dictionary::{QuadCodes, TermDictionary, ingest_interning};
 use crate::store::layouts::{LayoutStrategy, dictionary};
 
 use futures::{Stream, StreamExt, stream};
@@ -37,11 +49,12 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
         // Strings per quad) ever accumulates.
         let (n, build_start, built);
         if layout == LayoutStrategy::Dictionary {
-            let (dict, codes) = ingest_interning(quad_stream).await?.finish(true)?;
+            let (dict, codes) = ingest_interning(quad_stream).await?.finish()?;
             n = codes.s.len();
             build_start = Instant::now();
             built = BuiltArray {
-                array: dictionary::build_array(&codes, &indexes, true)?,
+                array: dictionary::build_array(&codes, &indexes)?,
+                components: Vec::new(),
                 dict: Some(Arc::new(dict)),
             };
         } else {
@@ -49,7 +62,8 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
             n = quads.len();
             build_start = Instant::now();
             built = BuiltArray {
-                array: build_struct_array(&quads, layout, &indexes, n, 0, true, true)?,
+                array: build_struct_array(&quads, layout, &indexes, 0, true, true)?,
+                components: Vec::new(),
                 dict: None,
             };
         };
@@ -113,7 +127,7 @@ pub(crate) async fn build_sorted_chunk_stream(
     chunk_size: usize,
 ) -> Result<BuiltStream> {
     if layout == LayoutStrategy::Dictionary {
-        let (dict, codes) = ingest_interning(quad_stream).await?.finish(true)?;
+        let (dict, codes) = ingest_interning(quad_stream).await?.finish()?;
         return emit_dict_chunks(codes, Arc::new(dict), indexes, chunk_size);
     }
 
@@ -150,6 +164,11 @@ pub(crate) async fn build_sorted_chunk_stream(
 
     let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
     Ok(BuiltStream {
+        components: Vec::new(),
+        // Chunks slice one global emission: both the quads and the index
+        // columns concatenate back to their global sort orders.
+        components_sorted: true,
+        quads_sorted: true,
         dtype,
         chunks,
         dict: None,
@@ -191,6 +210,9 @@ fn emit_dict_chunks(
 
     let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
     Ok(BuiltStream {
+        components: Vec::new(),
+        components_sorted: true,
+        quads_sorted: true,
         dtype,
         chunks,
         dict: Some(dict),

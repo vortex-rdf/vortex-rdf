@@ -4,9 +4,7 @@
         "module": "NodeNext",
         "moduleResolution": "nodenext",
         "strict": true,
-        "declaration": true,
-        "outDir": "dist",
-        "rootDir": "test",
+        "noEmit": true,
         "lib": [
             "ESNext",
             "DOM"

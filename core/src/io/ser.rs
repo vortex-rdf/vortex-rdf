@@ -1,256 +1,246 @@
-use crate::error::{Result, VortexRdfError};
+//! The write side of the native store container.
+//!
+//! Assembles a store's parts — the primary quad table, the in-memory index
+//! components, and the term dictionary — into
+//! [`NativeComponentWrite`](crate::io::container::NativeComponentWrite)s
+//! and drives [`write_store`](crate::io::container::write_store) over
+//! them, carrying each part's sortedness provenance onto the descriptors a
+//! reader will trust. Also owns the `quads_stream_to_*` entry points, which
+//! run a builder's chunk stream straight into that writer.
+//!
+//! Reading these bytes back is [`native_file`](crate::io::native_file)'s job,
+//! and the container's own on-disk grammar is
+//! [`container`](crate::io::container)'s.
 
+use crate::error::{Result, VortexRdfError};
 use vortex_array::ArrayRef;
-use vortex_ipc::iterator::ArrayIteratorIPC;
+
+use crate::io::container::{
+    self, DICT_COMPONENT_NAME, NativeComponentWrite, ReplayableArraySource,
+    StoreComponentDescriptor, StoreComponentRole, default_child_strategy,
+};
+use crate::store::LayoutStrategy;
+use crate::store::layouts::dictionary::{TermDictionary, dict_child_chunks};
+use std::sync::Arc;
+use vortex_array::stream::ArrayStreamAdapter;
+use vortex_io::VortexWrite;
+use web_time::Instant;
 
 #[cfg(feature = "file-io")]
 use crate::error;
 #[cfg(feature = "file-io")]
-use crate::store::builders::{UnsortedStreamBuilder, VortexArrayBuilder};
+use crate::store::builders::{BuiltStream, SortedStreamBuilder, VortexArrayBuilder};
 #[cfg(feature = "file-io")]
-use crate::store::{Indexes, LayoutStrategy, RawQuad};
+use crate::store::{Indexes, RawQuad};
 #[cfg(feature = "file-io")]
-use futures::{Stream, stream};
-#[cfg(feature = "file-io")]
-#[cfg(feature = "file-io")]
-use vortex_array::expr::stats::Stat;
-#[cfg(feature = "file-io")]
-use vortex_array::stats::PRUNING_STATS;
-#[cfg(feature = "file-io")]
-use vortex_array::stream::ArrayStreamAdapter;
-#[cfg(feature = "file-io")]
-use vortex_file::WriteOptionsSessionExt;
-#[cfg(feature = "file-io")]
-use vortex_io::VortexWrite;
-#[cfg(feature = "file-io")]
-use web_time::Instant;
+use futures::Stream;
 
-#[cfg(feature = "file-io")]
-fn write_options_with_subject_stats() -> vortex_file::VortexWriteOptions {
-    let mut stats = PRUNING_STATS.to_vec();
-    if !stats.contains(&Stat::IsSorted) {
-        stats.push(Stat::IsSorted);
-    }
-    super::VORTEX_SESSION
-        .write_options()
-        .with_file_statistics(stats)
+/// The term dictionary as a native store component: the sorted term column,
+/// one chunk per held FSST window, written verbatim through the pass-through
+/// strategy as the root's required `dictionary` child (see
+/// [`container::dict_child_strategy`]).
+pub(crate) fn dict_component(dict: &TermDictionary) -> Result<NativeComponentWrite> {
+    let chunks = dict_child_chunks(dict)?;
+    let dtype = chunks[0].dtype().clone();
+    NativeComponentWrite::new(
+        StoreComponentDescriptor {
+            name: DICT_COMPONENT_NAME.into(),
+            role: StoreComponentRole::Dictionary,
+            implementation: container::DICT_IMPLEMENTATION.into(),
+            version: 1,
+            required: true,
+            sorted: true,
+            dtype,
+        },
+        Arc::new(ReplayableArraySource::try_new(chunks)?),
+        container::dict_child_strategy(),
+    )
+    .map_err(VortexRdfError::Vortex)
 }
 
-/// Serialize an already-materialized Vortex array to a Vortex file writer.
-///
-/// Prefer [`quads_stream_to_vortex_writer_with_builder`] when serializing from
-/// a quad stream: it feeds chunks to the writer as they are built instead of
-/// requiring the whole array up front.
-#[cfg(feature = "file-io")]
-pub async fn serialize<W: VortexWrite + Unpin + Send>(
-    vortex_array: ArrayRef,
+/// Serialize a store's split parts — the primary quad array, its in-memory
+/// index components, and (for the Dictionary layout) the term dictionary —
+/// as a native store file. Sortedness provenance is carried faithfully: the
+/// root records whether `s` is globally sorted (off the primary's own
+/// stamp), and each index child records its component's `sorted` flag.
+pub(crate) async fn serialize_parts<W: VortexWrite + Unpin + Send>(
+    primary: ArrayRef,
+    components: &[crate::store::indexes::IndexComponent],
+    dict: Option<&TermDictionary>,
     mut writer: W,
 ) -> Result<()> {
     let start = Instant::now();
 
-    let dtype = vortex_array.dtype().clone();
-    let vortex_stream = ArrayStreamAdapter::new(
-        dtype,
-        Box::pin(stream::once(async move { Ok(vortex_array) })),
-    );
-
-    let _summary = write_options_with_subject_stats()
-        .write(&mut writer, vortex_stream)
-        .await
-        .map_err(VortexRdfError::Vortex)?;
-
-    writer
-        .shutdown()
-        .await
-        .map_err(|e| VortexRdfError::Serialization(format!("Failed to shutdown writer: {}", e)))?;
-
-    log::debug!("[ser::serialize] Vortex writing took {:?}", start.elapsed());
-    Ok(())
-}
-
-/// Serialize a Vortex array to IPC bytes.
-pub fn write_array_to_ipc<W: std::io::Write>(vortex_array: ArrayRef, mut writer: W) -> Result<()> {
-    let ipc_iter = vortex_array
-        .to_array_iterator()
-        .into_ipc(&super::VORTEX_LIGHT_SESSION)
-        .map_err(VortexRdfError::Vortex)?;
-
-    for msg_res in ipc_iter {
-        let msg = msg_res.map_err(VortexRdfError::Vortex)?;
-        writer
-            .write_all(&msg)
-            .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    let layout = LayoutStrategy::from_dtype(primary.dtype());
+    if matches!(layout, LayoutStrategy::Dictionary) && dict.is_none() {
+        return Err(VortexRdfError::Serialization(
+            "a bare Dictionary-layout array cannot be serialized without its term \
+             dictionary"
+                .to_string(),
+        ));
     }
 
-    Ok(())
-}
+    let mut writes = Vec::with_capacity(components.len() + 1);
+    for component in components {
+        writes.push(component_write(component)?);
+    }
+    if let Some(dict) = dict {
+        writes.push(dict_component(dict)?);
+    }
 
-/// Stream quads directly into a Vortex file writer as compressed chunks.
-///
-/// The builder's [`VortexArrayBuilder::build_vortex_stream`] produces chunks
-/// lazily; the Vortex writer consumes, compresses, and flushes each chunk as
-/// it arrives. For streaming-capable builders (e.g. `UnsortedStreamBuilder`)
-/// peak memory is bounded by the chunk size instead of the dataset size.
-#[cfg(feature = "file-io")]
-pub async fn quads_stream_to_vortex_writer_with_builder<B, S, W>(
-    quads: S,
-    mut writer: W,
-    layout: LayoutStrategy,
-    indexes: Indexes,
-) -> Result<()>
-where
-    B: VortexArrayBuilder,
-    S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
-    W: VortexWrite + Unpin + Send,
-{
-    let start = Instant::now();
-
-    let built = B::build_vortex_stream(Box::new(quads), layout, indexes).await?;
-    // A Dictionary-layout stream carries its dictionary beside the chunks;
-    // writing appends it as trailing dictionary rows — the padded form — so
-    // the file stays a single self-describing artifact.
-    let (dtype, chunks) = match built.dict {
-        Some(dict) => {
-            crate::store::layouts::dictionary::pad_chunk_stream(built.dtype, built.chunks, &dict)?
-        }
-        None => (built.dtype, built.chunks),
-    };
-    let vortex_stream = ArrayStreamAdapter::new(dtype, chunks);
-
-    let _summary = write_options_with_subject_stats()
-        .write(&mut writer, vortex_stream)
-        .await
-        .map_err(VortexRdfError::Vortex)?;
-
-    writer
-        .shutdown()
-        .await
-        .map_err(|e| VortexRdfError::Serialization(format!("Failed to shutdown writer: {}", e)))?;
+    let (quads_sorted, _) = crate::store::builders::row_space_sortedness(&primary);
+    let dtype = primary.dtype().clone();
+    let stream = ArrayStreamAdapter::new(
+        dtype,
+        Box::pin(futures::stream::once(async move { Ok(primary) })),
+    );
+    container::write_store(
+        &crate::session::VORTEX_SESSION,
+        &mut writer,
+        stream,
+        default_child_strategy(),
+        quads_sorted,
+        writes,
+    )
+    .await
+    .map_err(VortexRdfError::Vortex)?;
+    // A shutdown failure is writer I/O, not an encoding problem — surface it
+    // through the `Io` variant.
+    writer.shutdown().await.map_err(VortexRdfError::Io)?;
 
     log::debug!(
-        "[ser::quads_stream_to_vortex_writer_with_builder] Streaming write took {:?}",
+        "[ser::serialize_parts] Vortex writing took {:?}",
         start.elapsed()
     );
     Ok(())
 }
 
-/// Serialize a quad stream to a Vortex file at `path`, with the Dictionary
-/// layout's term dictionary placed per `placement` — the path-based entry
-/// that can write the two-file sidecar form.
+/// An in-memory [`IndexComponent`] as a replayable native child write, its
+/// descriptor carrying the component's own sortedness provenance.
 ///
-/// [`quads_stream_to_vortex_writer_with_builder`] (writer-generic) always
-/// pads: a bare writer has no path for a companion to live beside.
+/// [`IndexComponent`]: crate::store::indexes::IndexComponent
+pub(crate) fn component_write(
+    component: &crate::store::indexes::IndexComponent,
+) -> Result<NativeComponentWrite> {
+    // Serialization is a genuine use: a deferred adoption materializes here,
+    // so the written child is byte-identical to an eagerly-adopted one's.
+    let array = component.as_array()?;
+    NativeComponentWrite::new(
+        StoreComponentDescriptor {
+            name: component.name.into(),
+            role: StoreComponentRole::Index,
+            implementation: component.implementation.into(),
+            version: 1,
+            required: false,
+            sorted: component.sorted,
+            dtype: array.dtype().clone(),
+        },
+        Arc::new(ReplayableArraySource::try_new(vec![array]).map_err(VortexRdfError::Vortex)?),
+        default_child_strategy(),
+    )
+    .map_err(VortexRdfError::Vortex)
+}
+
+/// Stream quads directly into a native store file as compressed chunks.
+///
+/// The build pipeline is the target's, not the caller's: writing a file means
+/// a filesystem exists, so the rows go through the out-of-core global sort
+/// ([`SortedStreamBuilder`]) — the one pipeline whose peak memory does not
+/// scale with the dataset. (The in-memory sort is what targets without a
+/// filesystem use; see [`SortedInMemoryBuilder`].)
+///
+/// [`SortedInMemoryBuilder`]: crate::SortedInMemoryBuilder
+///
+/// [`VortexArrayBuilder::build_vortex_stream`] produces row-space chunks
+/// lazily; the splitter tees each one into the quad child's
+/// stream and the index children's channels, and the layout writer
+/// compresses all children concurrently through one segment sink. For
+/// a build WITHOUT index children, peak memory is bounded
+/// by the chunk size instead of the dataset size. With index children the
+/// bound is looser: the sequenced segment sink assigns the quad subtree's
+/// segment ids ahead of every auxiliary child's, so a component's compressed
+/// segments accumulate in the sink until the quad table finishes writing —
+/// peak memory then includes the in-flight components' compressed size (far
+/// below the raw dataset, but not O(chunk)). The dictionary is complete
+/// before any chunk flows, and becomes the required `dictionary` child.
 #[cfg(feature = "file-io")]
-pub async fn quads_stream_to_vortex_file_with_builder<B, S>(
+pub async fn quads_stream_to_vortex_writer<S, W>(
+    quads: S,
+    writer: W,
+    layout: LayoutStrategy,
+    indexes: Indexes,
+) -> Result<()>
+where
+    S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
+    W: VortexWrite + Unpin + Send,
+{
+    let start = Instant::now();
+
+    let built = SortedStreamBuilder::build_vortex_stream(Box::new(quads), layout, indexes).await?;
+    built_stream_to_vortex_writer(built, writer).await?;
+
+    log::debug!(
+        "[ser::quads_stream_to_vortex_writer] Streaming write took {:?}",
+        start.elapsed()
+    );
+    Ok(())
+}
+
+/// Drive an already-built chunk stream into `writer` — the back half of
+/// [`quads_stream_to_vortex_writer`] (whose docs describe the
+/// whole pipeline and its memory bounds), split out so compaction can hand in
+/// a stream it built with its own spill-directory placement.
+#[cfg(feature = "file-io")]
+pub(crate) async fn built_stream_to_vortex_writer<W>(
+    built: BuiltStream,
+    mut writer: W,
+) -> Result<()>
+where
+    W: VortexWrite + Unpin + Send,
+{
+    // Builders that stream components natively hand them over here; row-space
+    // builders leave the split to the tee below (a no-op on primary dtypes).
+    let split = crate::store::indexes::tee::split_row_space(
+        built.dtype,
+        built.chunks,
+        built.components_sorted,
+    )?;
+    let mut components = split.components;
+    components.extend(built.components);
+    if let Some(dict) = &built.dict {
+        components.push(dict_component(dict)?);
+    }
+
+    container::write_store(
+        &crate::session::VORTEX_SESSION,
+        &mut writer,
+        ArrayStreamAdapter::new(split.quad_dtype, split.quad_chunks),
+        default_child_strategy(),
+        built.quads_sorted,
+        components,
+    )
+    .await
+    .map_err(VortexRdfError::Vortex)?;
+
+    // A shutdown failure is writer I/O, not an encoding problem — surface it
+    // through the `Io` variant.
+    writer.shutdown().await.map_err(VortexRdfError::Io)
+}
+
+/// Serialize a quad stream to a native store file at `path` — the path-based
+/// convenience over [`quads_stream_to_vortex_writer`].
+#[cfg(feature = "file-io")]
+pub async fn quads_stream_to_vortex_file<S>(
     quads: S,
     path: &std::path::Path,
     layout: LayoutStrategy,
     indexes: Indexes,
-    placement: crate::store::DictionaryPlacement,
 ) -> Result<()>
 where
-    B: VortexArrayBuilder,
     S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
 {
-    use crate::store::DictionaryPlacement;
-    use crate::store::layouts::term_dictionary;
-
-    let start = Instant::now();
-    let built = B::build_vortex_stream(Box::new(quads), layout, indexes).await?;
-
-    let mut writer = tokio::fs::File::create(path)
+    let writer = tokio::fs::File::create(path)
         .await
         .map_err(|e| VortexRdfError::Serialization(format!("create {:?}: {}", path, e)))?;
-
-    // Which file the dictionary goes to. `sidecar` holds it across the quads
-    // write when the companion is written after.
-    let (dtype, chunks, sidecar) = match (built.dict, placement) {
-        (Some(dict), DictionaryPlacement::Padded) => {
-            let (dtype, chunks) = crate::store::layouts::dictionary::pad_chunk_stream(
-                built.dtype,
-                built.chunks,
-                &dict,
-            )?;
-            (dtype, chunks, None)
-        }
-        (Some(dict), DictionaryPlacement::Sidecar) => (built.dtype, built.chunks, Some(dict)),
-        (None, _) => (built.dtype, built.chunks, None),
-    };
-
-    let vortex_stream = ArrayStreamAdapter::new(dtype, chunks);
-    let _summary = write_options_with_subject_stats()
-        .write(&mut writer, vortex_stream)
-        .await
-        .map_err(VortexRdfError::Vortex)?;
-    writer
-        .shutdown()
-        .await
-        .map_err(|e| VortexRdfError::Serialization(format!("Failed to shutdown writer: {}", e)))?;
-
-    if let Some(dict) = sidecar {
-        let array = term_dictionary::sidecar_dict_array(&dict)?;
-        let sidecar_path = term_dictionary::sidecar_dict_path(path);
-        let file = tokio::fs::File::create(&sidecar_path).await.map_err(|e| {
-            VortexRdfError::Serialization(format!("create {:?}: {}", sidecar_path, e))
-        })?;
-        serialize(array, file).await?;
-    }
-
-    log::debug!(
-        "[ser::quads_stream_to_vortex_file_with_builder] Streaming write ({:?}) took {:?}",
-        placement,
-        start.elapsed()
-    );
-    Ok(())
-}
-
-/// Write a store's term dictionary as the sidecar file beside `quads_path`
-/// (`data.vortex` → `data.dict.vortex`): a one-column `{_dict_term: utf8}`
-/// file whose row `i` is the term with ID `i`, kept in the encoding the
-/// dictionary is held in (FSST when compressed at the source).
-///
-/// The sidecar placement's write half: a quads file with bare code columns
-/// decodes only through this companion (see
-/// `VortexRdfStore::from_file`), so the two files must travel together.
-#[cfg(feature = "file-io")]
-pub async fn write_sidecar_dictionary(
-    snapshot: &crate::store::DictSnapshot,
-    quads_path: &std::path::Path,
-) -> Result<std::path::PathBuf> {
-    use crate::store::layouts::term_dictionary;
-    let array = term_dictionary::sidecar_dict_array(&snapshot.0)?;
-    let path = term_dictionary::sidecar_dict_path(quads_path);
-    let file = tokio::fs::File::create(&path)
-        .await
-        .map_err(|e| VortexRdfError::Serialization(format!("create {:?}: {}", path, e)))?;
-    serialize(array, file).await?;
-    Ok(path)
-}
-
-/// Serialize a stream of quads directly to a Vortex file writer using the
-/// default configuration (UnsortedStream builder, Default layout, no indexes).
-#[cfg(feature = "file-io")]
-pub async fn quads_stream_to_vortex_writer<S, W>(quads: S, writer: W) -> error::Result<()>
-where
-    S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
-    W: VortexWrite + Unpin + Send,
-{
-    quads_stream_to_vortex_writer_with_builder::<UnsortedStreamBuilder, _, _>(
-        quads,
-        writer,
-        LayoutStrategy::Default,
-        Vec::new(),
-    )
-    .await
-}
-
-/// Serialize a stream of quads to an in-memory Vortex file byte buffer.
-#[cfg(feature = "file-io")]
-pub async fn quads_stream_to_vortex<S>(quads: S) -> error::Result<Vec<u8>>
-where
-    S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
-{
-    let mut buffer = Vec::new();
-    quads_stream_to_vortex_writer(quads, &mut buffer).await?;
-    Ok(buffer)
+    quads_stream_to_vortex_writer(quads, writer, layout, indexes).await
 }

@@ -101,6 +101,7 @@
     padding: 14px 24px;
   }
   .topbar-row { display:flex; align-items:baseline; justify-content:space-between; gap:16px; flex-wrap:wrap; max-width: 1280px; margin: 0 auto; }
+  .topbar-controls { display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
   .brand { display:flex; align-items:baseline; gap:10px; }
   .brand .mark { font-weight:700; letter-spacing:0.02em; font-size:14px; text-transform:uppercase; }
   .brand .sub { color:var(--ink-2); font-size:13px; }
@@ -120,6 +121,30 @@
   }
   nav.tabs .tab:hover:not(.active) { color:var(--ink); }
   nav.tabs .tab.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+
+  /* ---- theme switch ---- */
+  /* Native radios keep the group's keyboard semantics (arrow keys, single tab
+     stop); the visible control is the label around each one. */
+  .theme-switch {
+    display:inline-flex; gap:2px; padding:2px;
+    border:1px solid var(--border-strong); border-radius:7px;
+  }
+  .theme-switch label {
+    display:inline-flex; align-items:center; justify-content:center;
+    padding:5px 8px; border-radius:5px; color:var(--ink-muted); cursor:pointer;
+  }
+  .theme-switch label:hover { color:var(--ink); }
+  .theme-switch label:has(input:checked) {
+    background:var(--surface-2); color:var(--accent);
+    box-shadow: inset 0 0 0 1px var(--border-strong);
+  }
+  .theme-switch label:has(input:focus-visible) { outline:2px solid var(--focus); outline-offset:2px; }
+  .theme-switch input { position:absolute; width:1px; height:1px; opacity:0; margin:0; }
+  .theme-switch svg { width:15px; height:15px; display:block; }
+  .sr-only {
+    position:absolute; width:1px; height:1px; padding:0; margin:-1px;
+    overflow:hidden; clip-path:inset(50%); white-space:nowrap; border:0;
+  }
   .tabpane { display:none; }
   .tabpane.active { display:block; }
   .tabpane > nav.seclinks { margin-bottom:22px; }
@@ -177,6 +202,12 @@
   .matrix-table td.num { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
   .matrix-table td.num .ratio { color:var(--ink-muted); font-size:10.5px; margin-left:5px; }
   .matrix-table td.num.best { color:var(--good); font-weight:700; }
+  /* An operation the library has no API for. Deliberately not styled like a
+     bad measurement: it is not a slow result, it is the absence of one. */
+  .matrix-table td.num.unsup {
+    color:var(--ink-muted); font-style:italic; font-size:11px;
+    font-family:inherit; font-variant-numeric:normal;
+  }
   .matrix-table tbody tr.group-break td { border-top:1px solid var(--border-strong); }
 
   /* ---- data table ---- */
@@ -216,16 +247,56 @@
   }
 </style>
 
+<script>
+  // Runs before the page body is parsed so a stored choice never paints the
+  // system theme first. An unstamped element is the "match system" state, which
+  // is what the prefers-color-scheme rules key on.
+  (function () {
+    try {
+      const stored = localStorage.getItem("vortex-bench-theme");
+      if (stored === "light" || stored === "dark") document.documentElement.dataset.theme = stored;
+    } catch (e) { /* storage blocked; the system theme applies */ }
+  })();
+</script>
+
 <header class="topbar">
   <div class="topbar-row">
     <div class="brand">
       <span class="mark mono">vortex-rdf · bench</span>
       <span class="sub">micro-benchmark results</span>
     </div>
-    <nav class="tabs" role="tablist" aria-label="Benchmark suite">
-      <button class="tab" data-tab="rust" role="tab" type="button">Rust · core</button>
-      <button class="tab" data-tab="js" role="tab" type="button">JavaScript · WASM</button>
-    </nav>
+    <div class="topbar-controls">
+      <nav class="tabs" role="tablist" aria-label="Benchmark suite">
+        <button class="tab" data-tab="rust" role="tab" type="button">Rust · core</button>
+        <button class="tab" data-tab="js" role="tab" type="button">JavaScript · WASM</button>
+        <button class="tab" data-tab="py" role="tab" type="button">Python · bindings</button>
+      </nav>
+      <div class="theme-switch" role="radiogroup" aria-label="Color theme">
+        <label title="Light">
+          <input type="radio" name="theme" value="light" />
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="4.5" />
+            <path d="M12 1.9v2.5M12 19.6v2.5M4.7 4.7l1.8 1.8M17.5 17.5l1.8 1.8M1.9 12h2.5M19.6 12h2.5M4.7 19.3l1.8-1.8M17.5 6.5l1.8-1.8" />
+          </svg>
+          <span class="sr-only">Light</span>
+        </label>
+        <label title="Match system">
+          <input type="radio" name="theme" value="auto" />
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="2.5" y="3.5" width="19" height="13" rx="2" />
+            <path d="M8.5 20.5h7M12 16.5v4" />
+          </svg>
+          <span class="sr-only">Match system</span>
+        </label>
+        <label title="Dark">
+          <input type="radio" name="theme" value="dark" />
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M20.5 14.4A8.6 8.6 0 1 1 9.6 3.5a6.8 6.8 0 0 0 10.9 10.9z" />
+          </svg>
+          <span class="sr-only">Dark</span>
+        </label>
+      </div>
+    </div>
   </div>
 </header>
 
@@ -254,7 +325,7 @@
       <span class="chan-tag mono">WRITE</span>
       <h2>Serialize — ingest &amp; encode</h2>
     </div>
-    <p class="group-desc">Building a Vortex array from 100,000 generated quads and writing it out. Baseline: sorted-stream builder, default layout, no secondary index.</p>
+    <p class="group-desc">Building a Vortex array from 100,000 generated quads and writing it out. Baseline: default layout, no secondary index.</p>
     <div class="panel-grid" id="write-panels"></div>
   </section>
 
@@ -286,17 +357,16 @@
   <section id="dict" class="group">
     <div class="group-head">
       <span class="chan-tag mono">DICT</span>
-      <h2>Dictionary — placement &amp; residency</h2>
+      <h2>Dictionary — residency</h2>
     </div>
     <p class="group-desc">
-      The Dictionary layout's term dictionary has two independent knobs. <em>Placement</em>:
-      inside the quads file as trailing rows (<span class="mono">padded</span> — the
-      self-contained default and the IPC form) or in a companion file
-      (<span class="mono">sidecar</span>). <em>Residency</em>: lifted into memory at open
+      The Dictionary layout's term dictionary rides inside the quads file as an
+      <em>embedded</em> metadata-segment blob (one self-contained file; the quad columns stay
+      bare). <em>Residency</em>: the blob is lifted into memory at open
       (<span class="mono">resident</span>) or left in the file and reached by pruned scans
-      (<span class="mono">file-backed</span>). What each placement costs a match is visible in
-      the match matrix above (the Dictionary padded vs sidecar file rows); the table below
-      shows which phase — open, cold probe, decode — the residency choice moves the cost into.
+      through a bounded reader (<span class="mono">file-backed</span>) — decided by the blob's
+      byte size. The table below shows which phase — open, cold probe, decode — the residency
+      choice moves the cost into.
     </p>
     <div class="panel-grid" id="dict-panels"></div>
   </section>
@@ -399,7 +469,7 @@
       <span class="chan-tag mono">VARIANTS</span>
       <h2>Vortex config variants</h2>
     </div>
-    <p class="group-desc">The same star design as the Rust tab, over the axes reachable from JS: builder (Unsorted / Sorted), column layout (Default / Dictionary), and secondary index (none / ByReference / ByCopy).</p>
+    <p class="group-desc">The same star design as the Rust tab, over the axes reachable from JS: column layout (Default / Dictionary) and secondary index (none / ByReference / ByCopy).</p>
     <div class="panel-grid" id="js-variant-panels"></div>
   </section>
 
@@ -444,6 +514,144 @@
 
   <footer class="prov mono" id="js-provenance"></footer>
   </div><!-- /tab-js -->
+
+  <div id="tab-py" class="tabpane">
+  <nav class="seclinks">
+    <a href="#py-overview">Overview</a>
+    <a href="#py-ingest">Build &amp; open</a>
+    <a href="#py-query">Query</a>
+    <a href="#py-mutations">Mutations</a>
+    <a href="#py-footprint">Footprint</a>
+    <a href="#py-data">Raw data</a>
+  </nav>
+
+  <section id="py-overview" class="group">
+    <p class="lede">
+      One <code>python/bench/run.py</code> run — the <code>vortex_rdf</code> bindings compared
+      against <a href="https://pypi.org/project/pyoxigraph/">pyoxigraph</a>,
+      <a href="https://pypi.org/project/pycottas/">pycottas</a>,
+      <a href="https://pypi.org/project/rdflib/">rdflib</a>, and
+      <a href="https://pypi.org/project/lightrdf/">lightrdf</a>, on the same generated dataset
+      the JavaScript tab uses (identical moduli, identical term spellings), so rows on the two
+      tabs describe the same data.
+    </p>
+    <p class="lede">
+      The shape of this comparison differs from the JavaScript one, because the libraries do.
+      Every one of them ingests from a <em>file</em>, so the workload is
+      <strong>file → store → query</strong> rather than array → store → query, and
+      <strong>Open</strong> is a first-class column: for a file-backed format it is opening the
+      artifact, while an in-memory store must re-parse the source on every process start. Two
+      libraries are read-only and one is not a store at all — those cells read
+      <span class="mono">unsupported</span>, which records an absent API, not a slow result.
+    </p>
+    <p class="lede">
+      Vortex appears once per build configuration rather than as a single row, because its
+      knobs — column layout, secondary index, and whether the store is read from the
+      file or loaded up front — move these numbers as much as the choice of library does.
+      Residency is crossed with the secondary index, so each <em>(file, memory)</em> pair
+      shares a build: the difference between the two is residency alone, and it can be read
+      with an index and without one. The in-memory indexed rows are the configurations that
+      match how pyoxigraph and rdflib hold their data.
+    </p>
+    <div class="kpi-row" id="py-kpi-row"></div>
+    <p class="lede mono" id="py-matched-rows"></p>
+    <p class="lede" id="py-count-warnings"></p>
+  </section>
+
+  <section id="py-ingest" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">BUILD</span>
+      <h2>Build &amp; open</h2>
+    </div>
+    <p class="group-desc">
+      <strong>Build</strong> is each library's idiomatic path from an N-Triples file to a
+      queryable store (<code>serialize_rdf</code>, <code>bulk_load</code>,
+      <code>rdf2cottas</code>, <code>Graph.parse</code>). <strong>Open</strong> is what a fresh
+      process pays to query an already-built artifact: a file-backed format opens it, while
+      pyoxigraph and rdflib hold their store in memory and must parse the source again — which
+      is the comparison, not a flaw. lightrdf builds nothing; its “build” is one full parse,
+      the same pass every other library must do before it can index anything.
+    </p>
+    <div class="panel-grid" id="py-ingest-panels"></div>
+  </section>
+
+  <section id="py-query" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">QUERY</span>
+      <h2>Match by pattern</h2>
+    </div>
+    <p class="group-desc">
+      Resolving each pattern and counting results:
+      <span class="mono">S</span>/<span class="mono">P</span>/<span class="mono">O</span>/<span class="mono">PO</span>/<span class="mono">SPO</span>/<span class="mono">full</span>
+      on triples, <span class="mono">G</span>/<span class="mono">SPOG</span> on named graphs.
+      Counting is the only unit all five share, and each library materializes its own natural
+      result form — Vortex builds N-Triples strings in Rust, pyoxigraph and rdflib yield term
+      objects, pycottas and lightrdf yield tuples of strings. Residency differs too: the Vortex
+      <em>(file)</em> rows and pycottas read from disk per query, while the Vortex
+      <em>(memory)</em> rows, pyoxigraph and rdflib answer from memory.
+      <strong>lightrdf is the no-index baseline</strong>: it has no store, so every pattern
+      re-parses the whole source file and costs about the same regardless of selectivity.
+    </p>
+    <div class="panel-grid" id="py-query-panels"></div>
+  </section>
+
+  <section id="py-mutations" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">MUTATE</span>
+      <h2>Add &amp; delete</h2>
+    </div>
+    <p class="group-desc">
+      Per-quad addition and deletion of a fixed batch. Only two of the five libraries can do
+      this at all: the Vortex <em>Python</em> bindings expose no mutation API (unlike the JS
+      bindings, which have <code>addQuad</code>/<code>addQuads</code>), pycottas's store raises
+      <span class="mono">“The COTTAS store is read only!”</span>, and lightrdf is a parser with
+      no store to mutate. Hover an <span class="mono">unsupported</span> cell for the reason.
+    </p>
+    <div class="panel-grid" id="py-mut-panels"></div>
+  </section>
+
+  <section id="py-footprint" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">FOOTPRINT</span>
+      <h2>Peak memory &amp; on-disk size</h2>
+    </div>
+    <p class="group-desc">
+      Each adapter runs in its own process <em>and its own virtualenv</em>, so peak RSS is the
+      kernel-tracked high-water mark (<span class="mono">VmHWM</span>) for one library alone.
+      On-disk size is the artifact the build produced; it is <span class="mono">—</span> for a
+      library that keeps its store in memory and writes no file of its own, and for lightrdf it
+      is the source N-Triples file it re-reads. Lower is better in both tables.
+    </p>
+    <div class="panel-grid" id="py-footprint-panels"></div>
+  </section>
+
+  <section id="py-data" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">DATA</span>
+      <h2>Every measured configuration</h2>
+    </div>
+    <p class="group-desc">All leaf benchmarks from this run. Click a column to sort.</p>
+    <div class="table-toolbar">
+      <input id="py-table-filter" type="text" placeholder="filter by name…" autocomplete="off" />
+      <span class="count" id="py-table-count"></span>
+    </div>
+    <div class="table-wrap">
+      <table class="data" id="py-data-table">
+        <thead><tr>
+          <th data-key="id" tabindex="0" role="button" aria-label="Sort by benchmark name">Benchmark</th>
+          <th data-key="fastest_ns" tabindex="0" role="button" aria-label="Sort by fastest">Fastest</th>
+          <th data-key="slowest_ns" tabindex="0" role="button" aria-label="Sort by slowest">Slowest</th>
+          <th data-key="median_ns" tabindex="0" role="button" aria-label="Sort by median">Median</th>
+          <th data-key="mean_ns" tabindex="0" role="button" aria-label="Sort by mean">Mean</th>
+          <th data-key="samples" tabindex="0" role="button" aria-label="Sort by sample count">Samples</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer class="prov mono" id="py-provenance"></footer>
+  </div><!-- /tab-py -->
 </main>
 
 <script>
@@ -453,6 +661,11 @@ const JS_MEMORY = __JS_MEMORY_DATA__;
 const JS_CONFIG = __JS_CONFIG_DATA__;
 const RUST_PROVENANCE = __PROVENANCE__;
 const JS_PROVENANCE = __JS_PROVENANCE__;
+const PY_DATA = __PY_BENCH_DATA__;
+const PY_MEMORY = __PY_MEMORY_DATA__;
+const PY_SIZES = __PY_SIZE_DATA__;
+const PY_CONFIG = __PY_CONFIG_DATA__;
+const PY_PROVENANCE = __PY_PROVENANCE__;
 const rustById = new Map(RUST_DATA.map(d => [d.id, d]));
 const jsById = new Map(JS_DATA.map(d => [d.id, d]));
 // Reshaped to the same {median, median_ns} shape renderMatrixPanel already
@@ -462,6 +675,27 @@ const jsMemById = new Map(JS_MEMORY.map(m => [`${m.slug}::${m.role}`, {
   median: (m.peakRssMb ?? "?") + " MB", median_ns: m.peakRssMb ?? 0,
 }]));
 
+const pyById = new Map(PY_DATA.map(d => [d.id, d]));
+const pyMemById = new Map(PY_MEMORY.map(m => [`${m.slug}::${m.role}`, {
+  median: (m.peakRssMb ?? "?") + " MB", median_ns: m.peakRssMb ?? 0,
+}]));
+// On-disk artifact size, reshaped into the same {median, median_ns} contract so
+// the size table is the same renderer as every other panel. A library that
+// writes no file keeps its row — saying "in memory" is the informative answer —
+// but carries a null size so it neither sorts to the top as the "smallest"
+// artifact nor gets a ratio against one.
+const pySizeById = new Map(PY_SIZES.map(s => [`${s.slug}::size`,
+  s.bytes == null
+    ? { median: "in memory", median_ns: null, reason: "this library writes no artifact of its own" }
+    : { median: fmtBytes(s.bytes), median_ns: s.bytes }]));
+
+function fmtBytes(n){
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`;
+  return `${(n / 1024 ** 3).toFixed(2)} GB`;
+}
+
 const RUST_PATTERNS = ["S","P","O","PO","G","SPOG"];
 const JS_PATTERNS = ["S","P","O","PO","SPO","full","G","SPOG"];
 
@@ -469,27 +703,26 @@ function get(map, id){ const r = map.get(id); if(!r) console.warn("missing bench
 function fmtRatio(a,b){ return (a/b).toFixed(2) + "×"; }
 
 // ---- panel configs (Rust tab) ----
-// Serialize: every measured builder × layout × index configuration in one
-// table, grouped (ruled rows) by the axis varied around the sorted-stream /
-// Default / no-index baseline; the last group holds the two interaction
-// configs that don't reduce to a single axis.
-function serRow(builder, layout, index, id, brk){
-  return { labels:[builder, layout, index], ids:[`serialize::${id}`], break:brk };
+// Serialize: every measured layout × index configuration in one table,
+// ordered fastest to slowest (sortByColumn) so the cost ranking reads straight
+// down the column. The rows are still declared as axis groups around the
+// Default / no-index baseline -- that is what makes each row's cost
+// attributable to one axis -- but sorting supersedes the grouping, so the
+// `break` rules those declarations carry are dropped at render time.
+function serRow(layout, index, id, brk){
+  return { labels:[layout, index], ids:[`serialize::${id}`], break:brk };
 }
 const serializePanel = {
-  title:"Serialize: builder × layout × index",
-  note:"Median time to build and write the dataset. Row groups vary one axis at a time around the sorted-stream / Default / no-index baseline; the last group is the two interaction configs.",
-  rowHeaders:["Builder","Layout","Index"], columns:["Serialize"],
+  title:"Serialize: layout × index",
+  note:"Median time to build and write the dataset, fastest first. Each configuration varies one axis around the Default / no-index baseline, except the last, which combines a layout with an index.",
+  rowHeaders:["Layout","Index"], columns:["Serialize"], sortByColumn:0,
   rows:[
-    serRow("Sorted stream","Default","none","sorted_stream_default_no_index"),
-    serRow("Sorted in-memory","Default","none","sorted_in_memory_default_no_index"),
-    serRow("Unsorted","Default","none","unsorted_default_no_index"),
-    serRow("Sorted stream","Typed-object","none","sorted_stream_typed_object_no_index", true),
-    serRow("Sorted stream","Dictionary","none","sorted_stream_dictionary_no_index"),
-    serRow("Sorted stream","Default","by-reference","sorted_stream_default_by_reference", true),
-    serRow("Sorted stream","Default","by-copy","sorted_stream_default_by_copy"),
-    serRow("Sorted stream","Dictionary","by-copy","sorted_stream_dictionary_by_copy", true),
-    serRow("Unsorted","Default","by-copy","unsorted_default_by_copy"),
+    serRow("Default","none","default_no_index"),
+    serRow("Typed-object","none","typed_object_no_index", true),
+    serRow("Dictionary","none","dictionary_no_index"),
+    serRow("Default","by-reference","default_by_reference", true),
+    serRow("Default","by-copy","default_by_copy"),
+    serRow("Dictionary","by-copy","dictionary_by_copy", true),
   ],
 };
 
@@ -538,6 +771,16 @@ function renderMatrixPanel(container, cfg, map){
       r.labels.map((l, i) => `<td class="rowh${i ? " sub" : ""}">${l}</td>`).join("") +
       r.recs.map((rec, i) => {
         if (!rec) return `<td class="num">—</td>`;
+        // A null median is a cell with no measurement to make -- an operation
+        // the library has no API for, or an artifact it never writes. It is
+        // already out of `best` (the ?? Infinity above); printing a ratio
+        // against the winner would imply it lost a race it never entered. The
+        // cell prints its own text so the reason is on the page, not just in a
+        // tooltip: "unsupported" for a missing API, "in memory" for no file.
+        if (rec.unsupported || rec.median_ns == null) {
+          const why = (rec.reason || "not supported by this library").replace(/"/g, "&quot;");
+          return `<td class="num unsup" title="${why}">${rec.median ?? "unsupported"}</td>`;
+        }
         const isBest = rec.median_ns === best[i];
         const mult = rec.median_ns / best[i];
         const multStr = mult >= 100 ? Math.round(mult).toLocaleString() : mult.toFixed(1);
@@ -555,19 +798,16 @@ function renderMatrixPanel(container, cfg, map){
 function patternIds(group, patterns){ return patterns.map(p => `${group}::${p}`); }
 
 // The consolidated match matrix: every layout × source × index variant
-// (sorted-stream builder throughout) as rows, grouped by secondary-index
-// configuration, the six routing patterns as columns. Placement (padded vs
-// sidecar) is a file-storage concept, so the Dictionary layout contributes
-// one in-memory row but two file rows per index group.
+// as rows, grouped by secondary-index
+// configuration, the six routing patterns as columns.
 const MATCH_INDEXES = [["No index","noindex"],["By reference","byref"],["By copy","bycopy"]];
 const MATCH_LAYOUTS = [
-  {labels:["Default","in-memory"],         group: ix => `match_sorted_default_${ix}_mem`},
-  {labels:["Default","file"],              group: ix => `match_sorted_default_${ix}_file`},
-  {labels:["Typed-object","in-memory"],    group: ix => `match_sorted_typedobj_${ix}_mem`},
-  {labels:["Typed-object","file"],         group: ix => `match_sorted_typedobj_${ix}_file`},
-  {labels:["Dictionary","in-memory"],      group: ix => `match_sorted_dict_${ix}_mem`},
-  {labels:["Dictionary (padded)","file"],  group: ix => `match_sorted_dict_${ix}_file`},
-  {labels:["Dictionary (sidecar)","file"], group: ix => `match_sorted_dict_${ix}_sidecar_file`},
+  {labels:["Default","in-memory"],         group: ix => `match_default_${ix}_mem`},
+  {labels:["Default","file"],              group: ix => `match_default_${ix}_file`},
+  {labels:["Typed-object","in-memory"],    group: ix => `match_typedobj_${ix}_mem`},
+  {labels:["Typed-object","file"],         group: ix => `match_typedobj_${ix}_file`},
+  {labels:["Dictionary","in-memory"],      group: ix => `match_dict_${ix}_mem`},
+  {labels:["Dictionary","file"],           group: ix => `match_dict_${ix}_file`},
 ];
 // Row set shared by the materializing and lazy match tables; the lazy bench
 // target names each group `lazy_` + its materializing twin.
@@ -581,7 +821,7 @@ function matchMatrixRows(groupPrefix){
 
 const matchMatrixPanel = {
   title:"Match matrix: index × layout × source, per pattern",
-  note:"Median <code>match_pattern</code> + materialization time; sorted-stream builder throughout. Rows are grouped by secondary-index configuration; within a group only layout and source vary. <b>Green</b> marks the fastest variant in each pattern column across all groups; the grey multiplier is the slowdown vs that column's best.",
+  note:"Median <code>match_pattern</code> + materialization time. Rows are grouped by secondary-index configuration; within a group only layout and source vary. <b>Green</b> marks the fastest variant in each pattern column across all groups; the grey multiplier is the slowdown vs that column's best.",
   wide:true, rowHeaders:["Index","Layout","Source"], columns:RUST_PATTERNS,
   rows: matchMatrixRows(""),
 };
@@ -595,7 +835,7 @@ const lazyMatchMatrixPanel = {
 
 const chainedPanel = {
   title:"Chained refinement (match P, then O)",
-  note:"Two sequential match_pattern calls on the same view — the “views narrow the same coordinate space” feature. Sorted-stream builder, Default layout, by-copy index; only the source varies.",
+  note:"Two sequential match_pattern calls on the same view — the “views narrow the same coordinate space” feature. Default layout, by-copy index; only the source varies.",
   rowHeaders:["Source"], columns:["Time"],
   rows:[
     {labels:["File"], ids:["match_chained::file"]},
@@ -605,7 +845,7 @@ const chainedPanel = {
 
 const decodeLifecyclePanel = {
   title:"Open & full decode, per layout",
-  note:"Sorted-stream builder. Open reads only the file footer (Dictionary additionally lifts its term dictionary), before any decode; decode materializes every quad back out.",
+  note:"Open reads only the file footer (Dictionary additionally lifts its term dictionary), before any decode; decode materializes every quad back out.",
   wide:true, rowHeaders:["Layout"],
   columns:["Open (file)","Decode all (file)","Decode all (in-memory)"],
   rows:[
@@ -615,19 +855,16 @@ const decodeLifecyclePanel = {
   ],
 };
 
-// What each placement costs a match lives in the match matrix (its padded vs
-// sidecar file rows); this section covers the residency axis, which has no
-// pattern dimension — it moves cost between fixed phases.
+// The residency axis has no pattern dimension — it moves cost between fixed
+// phases.
 const dictResidencyPanel = {
-  title:"Residency: cost per phase, placement × residency",
-  note:"<b>Open</b>: resident lifts the whole term column at open; file-backed reads footer metadata only (the padded extent comes from the footer's null-count statistic). <b>Cold probe</b>: four bound terms (SPOG) on a fresh store — resident binary-searches in memory; file-backed builds its fence, then evaluates one pruned split per term. <b>Decode matched</b>: match a predicate, then materialize the ~1–2k matching quads.",
-  wide:true, rowHeaders:["Placement","Residency"],
+  title:"Residency: cost per phase",
+  note:"<b>Open</b>: resident reads and lifts the embedded dictionary blob at open; file-backed reads footer metadata only. <b>Cold probe</b>: four bound terms (SPOG) on a fresh store — resident binary-searches in memory; file-backed builds its fence, then evaluates one pruned split per term. <b>Decode matched</b>: match a predicate, then materialize the ~1–2k matching quads.",
+  wide:true, rowHeaders:["Residency"],
   columns:["Open","Cold probe (SPOG)","Decode matched"],
   rows:[
-    {labels:["Padded","resident"],      slug:"padded_resident"},
-    {labels:["Padded","file-backed"],   slug:"padded_file_backed"},
-    {labels:["Sidecar","resident"],     slug:"sidecar_resident", break:true},
-    {labels:["Sidecar","file-backed"],  slug:"sidecar_file_backed"},
+    {labels:["resident"],      slug:"resident"},
+    {labels:["file-backed"],   slug:"file_backed"},
   ].map(r => ({...r, ids:[
     `dict_open::${r.slug}`,
     `dict_probe_cold::${r.slug}`,
@@ -650,8 +887,8 @@ function renderKpis(hostSel, tiles){
 // How many rows each query pattern actually matched. Selectivity is a property
 // of the dataset's term cardinality rather than a fixed dimension, so a timing
 // is only interpretable next to the number of rows it touched.
-function renderMatchedRows(matched){
-  const host = document.getElementById("js-matched-rows");
+function renderMatchedRows(matched, hostId = "js-matched-rows"){
+  const host = document.getElementById(hostId);
   if (!host) return;
   const entries = Object.entries(matched || {});
   if (!entries.length){ host.textContent = ""; return; }
@@ -733,12 +970,10 @@ function renderRust(){
   // serialize interaction effects, folded into the write section as a table
   const panel = document.createElement("div");
   panel.className = "panel";
-  panel.innerHTML = `<h3>Interaction effects</h3><p class="note">Two combinations that don't reduce to a single axis: a dictionary layout's index holds codes rather than term strings, and an unsorted builder never stamps a sortedness marker.</p>`;
+  panel.innerHTML = `<h3>Interaction effects</h3><p class="note">One combination that doesn't reduce to a single axis: a dictionary layout's index holds codes rather than term strings.</p>`;
   const irows = [
-    { name:"Dictionary + by-copy index", id:"serialize::sorted_stream_dictionary_by_copy",
-      refs:[["dictionary alone","serialize::sorted_stream_dictionary_no_index"], ["by-copy alone","serialize::sorted_stream_default_by_copy"]] },
-    { name:"Unsorted + by-copy index", id:"serialize::unsorted_default_by_copy",
-      refs:[["unsorted alone","serialize::unsorted_default_no_index"], ["by-copy alone","serialize::sorted_stream_default_by_copy"]] },
+    { name:"Dictionary + by-copy index", id:"serialize::dictionary_by_copy",
+      refs:[["dictionary alone","serialize::dictionary_no_index"], ["by-copy alone","serialize::default_by_copy"]] },
   ];
   const itable = document.createElement("table");
   itable.className = "interact-table";
@@ -800,26 +1035,22 @@ function renderRust(){
 
 // ---- JavaScript tab ----
 const JS_ADAPTERS = [
-  { slug:"vortex_unsorted_dict",       label:"Vortex Unsorted/Dict" },
-  { slug:"vortex_unsorted_default",    label:"Vortex Unsorted/Default" },
-  { slug:"vortex_sorted_dict",         label:"Vortex Sorted/Dict" },
-  { slug:"vortex_sorted_dict_byref",   label:"Vortex Sorted/Dict+ByRef" },
-  { slug:"vortex_sorted_dict_bycopy",  label:"Vortex Sorted/Dict+ByCopy" },
-  { slug:"vortex_sorted_default",      label:"Vortex Sorted/Default" },
-  { slug:"vortex_sorted_default_byref",label:"Vortex Sorted/Default+ByRef" },
-  { slug:"vortex_sorted_default_bycopy",label:"Vortex Sorted/Default+ByCopy" },
+  { slug:"vortex_dict",         label:"Vortex Dict" },
+  { slug:"vortex_dict_byref",   label:"Vortex Dict+ByRef" },
+  { slug:"vortex_dict_bycopy",  label:"Vortex Dict+ByCopy" },
+  { slug:"vortex_default",      label:"Vortex Default" },
+  { slug:"vortex_default_byref",label:"Vortex Default+ByRef" },
+  { slug:"vortex_default_bycopy",label:"Vortex Default+ByCopy" },
   { slug:"rdfstores_default",          label:"rdf-stores (default)" },
   { slug:"rdfstores_single",           label:"rdf-stores (1 index)" },
   { slug:"oxigraph",                   label:"oxigraph" },
 ];
-const JS_VORTEX = JS_ADAPTERS.slice(0, 8);
+const JS_VORTEX = JS_ADAPTERS.slice(0, 6);
 const CROSS_LIB_SERIES = [
-  { slug:"vortex_sorted_dict_byref",    label:"Vortex Sorted/Dict+ByRef" },
-  { slug:"vortex_unsorted_dict",        label:"Vortex Unsorted/Dict" },
-  { slug:"vortex_sorted_dict_bycopy",   label:"Vortex Sorted/Dict+ByCopy" },
-  { slug:"vortex_sorted_default_byref", label:"Vortex Sorted/Default+ByRef" },
-  { slug:"vortex_sorted_default_bycopy",label:"Vortex Sorted/Default+ByCopy" },
-  { slug:"vortex_unsorted_default",     label:"Vortex Unsorted/Default" },
+  { slug:"vortex_dict_byref",    label:"Vortex Dict+ByRef" },
+  { slug:"vortex_dict_bycopy",   label:"Vortex Dict+ByCopy" },
+  { slug:"vortex_default_byref", label:"Vortex Default+ByRef" },
+  { slug:"vortex_default_bycopy",label:"Vortex Default+ByCopy" },
   { slug:"rdfstores_default",           label:"rdf-stores (default)" },
   { slug:"rdfstores_single",            label:"rdf-stores (1 index)" },
   { slug:"oxigraph",                    label:"oxigraph" },
@@ -843,7 +1074,7 @@ function renderJs(){
   // Query — cross-library, per routing shape
   renderMatrixPanel(document.getElementById("js-query-panels"), {
     title:"Cross-library match, by routing shape",
-    note:"Six Vortex build variants vs rdf-stores (both index configs) vs oxigraph. Green = fastest store in each pattern column; the grey multiplier is the slowdown vs that column's best.",
+    note:"Four Vortex build variants vs rdf-stores (both index configs) vs oxigraph. Green = fastest store in each pattern column; the grey multiplier is the slowdown vs that column's best.",
     wide:true, rowHeaders:["Store"], columns:JS_PATTERNS,
     rows: CROSS_LIB_SERIES.map(a => ({ labels:[a.label], ids: patternIds(a.slug, JS_PATTERNS),
       break: a.slug === "rdfstores_default" })),
@@ -892,7 +1123,7 @@ function renderJs(){
 
   renderKpis("#js-kpi-row", [
     { label:"Libraries", value:"3", sub:"vortex · rdf-stores · oxigraph" },
-    { label:"Vortex variants", value:String(JS_VORTEX.length), sub:"builder × layout × index" },
+    { label:"Vortex variants", value:String(JS_VORTEX.length), sub:"layout × index" },
     { label:"Benchmarks", value:String(JS_DATA.length), sub:"leaf measurements" },
     { label:"Quads", value:(JS_CONFIG.triplesCount||0).toLocaleString(), sub:(JS_CONFIG.quadsCount||0).toLocaleString()+" named-graph quads" },
     // Distinct terms is the dimension this dataset exists to exercise; without
@@ -906,8 +1137,155 @@ function renderJs(){
   document.getElementById("js-provenance").textContent = JS_PROVENANCE;
 }
 
+// ---- Python tab ----
+// Mirrors python/bench/adapters.py's registry. The first Vortex entry is the
+// one that stands for Vortex in the cross-library panels; the in-memory entries
+// exist so the residency difference against pyoxigraph/rdflib is visible rather
+// than buried in a footnote, and they are crossed with the secondary index so
+// that difference can be read both with and without one.
+const PY_VORTEX = [
+  { slug:"vortex_dict",            label:"vortex-rdf Dict (file)" },
+  { slug:"vortex_dict_mem",        label:"vortex-rdf Dict (memory)" },
+  { slug:"vortex_default",         label:"vortex-rdf Default (file)" },
+  { slug:"vortex_dict_bycopy",     label:"vortex-rdf Dict+ByCopy (file)" },
+  { slug:"vortex_dict_bycopy_mem", label:"vortex-rdf Dict+ByCopy (memory)" },
+  { slug:"vortex_dict_byref",      label:"vortex-rdf Dict+ByRef (file)" },
+  { slug:"vortex_dict_byref_mem",  label:"vortex-rdf Dict+ByRef (memory)" },
+];
+// The four libraries Vortex is measured against.
+const PY_OTHER_LIBS = [
+  { slug:"pyoxigraph", label:"pyoxigraph (memory)" },
+  { slug:"pycottas",   label:"pycottas (file)" },
+  { slug:"rdflib",     label:"rdflib (memory)" },
+  { slug:"lightrdf",   label:"lightrdf (no index)" },
+];
+// Every measured configuration — what the timing and footprint panels render.
+const PY_ADAPTERS = [...PY_VORTEX, ...PY_OTHER_LIBS];
+// One row per library, for the facts that are about a library rather than a
+// build: whether it has a mutation API, and how many libraries there are.
+const PY_LIBRARIES = [{ slug:PY_VORTEX[0].slug, label:"vortex-rdf" }, ...PY_OTHER_LIBS];
+const PY_PATTERNS = ["S","P","O","PO","SPO","full","G","SPOG"];
+
+function renderPy(){
+  if (!PY_DATA.length){
+    document.getElementById("py-kpi-row").innerHTML =
+      `<div class="kpi"><span class="label">No Python results</span><span class="value">—</span><span class="sub mono">run <code>python3 python/bench/run.py</code>, then re-render with <code>--python</code></span></div>`;
+    return;
+  }
+
+  // Build & open — the two costs of getting a library queryable. Every Vortex
+  // variant is its own row here and in the panels below: the build knobs move
+  // these numbers as much as the choice of library does, so a single "vortex"
+  // row would be picking one configuration and calling it the library.
+  renderMatrixPanel(document.getElementById("py-ingest-panels"), {
+    title:"Build and open",
+    note:"Build: file → queryable store, each library's idiomatic path. Open: what a fresh process pays to query an already-built artifact — a file-backed format opens it, an in-memory store re-parses the source. Green = fastest per column.",
+    rowHeaders:["Configuration"], columns:["Build","Open"],
+    rows: PY_ADAPTERS.map(a => ({ labels:[a.label], ids:[`ingest::${a.slug}`, `open::${a.slug}`] })),
+  }, pyById);
+
+  // Query — every configuration against every routing shape.
+  renderMatrixPanel(document.getElementById("py-query-panels"), {
+    title:"Match by pattern",
+    wide:true, rowHeaders:["Configuration"], columns:PY_PATTERNS,
+    note:"Median time to resolve each pattern and count the results. lightrdf re-parses the whole file per call, so its row is flat across selectivity — that flatness is what having no index costs.",
+    rows: PY_ADAPTERS.map(a => ({ labels:[a.label], ids:patternIds(a.slug, PY_PATTERNS) })),
+  }, pyById);
+
+  // Mutations — two of the five libraries can do this at all. One row per
+  // library, not per configuration: whether an add/delete API exists is a
+  // property of the bindings, so every Vortex build reports the same absence.
+  renderMatrixPanel(document.getElementById("py-mut-panels"), {
+    title:"Add and delete a batch",
+    note:`Per-quad add and delete of ${(PY_CONFIG.mutBatch||0).toLocaleString()} quads. Hover an unsupported cell for why that library has no such API.`,
+    rowHeaders:["Library"], columns:["Add","Delete"],
+    rows: PY_LIBRARIES.map(a => ({ labels:[a.label], ids:[`add::${a.slug}`, `delete::${a.slug}`] })),
+  }, pyById);
+
+  // Footprint — peak RSS per phase, then on-disk artifact size.
+  const footHost = document.getElementById("py-footprint-panels");
+  renderMatrixPanel(footHost, {
+    title:"Query phase — peak RSS",
+    note:"Peak resident set size of each adapter's own process and virtualenv: build + open + every pattern. Smallest first.",
+    rowHeaders:["Configuration"], columns:["Peak RSS"], sortByColumn:0,
+    rows: PY_ADAPTERS.map(a => ({ labels:[a.label], ids:[`${a.slug}::query`] })),
+  }, pyMemById);
+  // Only libraries that actually mutated have a reading: a process that found
+  // the operation unsupported and exited would contribute a bare-interpreter
+  // figure, so the harness deliberately emits none. Build the rows from what
+  // exists rather than asking for rows that were never measured.
+  renderMatrixPanel(footHost, {
+    title:"Mutation phase — peak RSS",
+    note:"Add + delete in one process per library — only the libraries that can mutate appear here.",
+    rowHeaders:["Library"], columns:["Peak RSS"], sortByColumn:0,
+    rows: PY_ADAPTERS
+      .filter(a => pyMemById.has(`${a.slug}::mutate`))
+      .map(a => ({ labels:[a.label], ids:[`${a.slug}::mutate`] })),
+  }, pyMemById);
+  // A peak RSS that approached the memory the machine actually had free means
+  // that library was measured under swap pressure, so its *timings* are partly
+  // a property of this machine. Say so next to the numbers rather than letting
+  // them be read as clean measurements.
+  const availMb = PY_CONFIG.availableMemoryMb;
+  if (availMb){
+    const strained = PY_MEMORY.filter(m => m.peakRssMb != null && m.peakRssMb > availMb * 0.8);
+    if (strained.length){
+      const p = document.createElement("p");
+      p.className = "note";
+      p.innerHTML = `<strong>⚠ Measured under memory pressure:</strong> ` +
+        strained.map(m => `${m.label} peaked at ${m.peakRssMb.toLocaleString()} MB`).join("; ") +
+        `, against ${availMb.toLocaleString()} MB available when the run started. ` +
+        `Those libraries' timings include paging and should be read as an upper bound.`;
+      footHost.appendChild(p);
+    }
+  }
+
+  renderMatrixPanel(footHost, {
+    title:"On-disk artifact size",
+    note:"Bytes the build wrote. Absent for a library whose store lives only in memory; for lightrdf it is the source N-Triples file, since re-reading that file is its query path. Smallest first.",
+    rowHeaders:["Configuration"], columns:["Size"], sortByColumn:0,
+    rows: PY_ADAPTERS.map(a => ({ labels:[a.label], ids:[`${a.slug}::size`] })),
+  }, pySizeById);
+
+  const supported = PY_LIBRARIES.filter(a => {
+    const r = pyById.get(`add::${a.slug}`);
+    return r && !r.unsupported;
+  }).length;
+  renderKpis("#py-kpi-row", [
+    { label:"Libraries", value:String(PY_LIBRARIES.length), sub:"vortex · pyoxigraph · pycottas · rdflib · lightrdf" },
+    { label:"Vortex variants", value:String(PY_VORTEX.length), sub:"layout × index × residency" },
+    { label:"Benchmarks", value:String(PY_DATA.length), sub:"leaf measurements" },
+    { label:"Quads", value:(PY_CONFIG.triplesCount||0).toLocaleString(), sub:(PY_CONFIG.quadsCount||0).toLocaleString()+" named-graph quads" },
+    { label:"Distinct terms", value:(PY_CONFIG.cardinality?.triples?.terms||0).toLocaleString(),
+      sub:(PY_CONFIG.cardinality?.quads?.terms||0).toLocaleString()+" in the quads dataset" },
+    { label:"Can mutate", value:`${supported} / ${PY_LIBRARIES.length}`, sub:"libraries with an add/delete API" },
+  ]);
+  renderMatchedRows(PY_CONFIG.matchedRows, "py-matched-rows");
+
+  // The harness cross-checks every library's matched-row counts against the
+  // others; a disagreement means at least one was queried wrongly and its
+  // timings measure the wrong work. Surface that on the page rather than
+  // leaving it in the run log.
+  const warnHost = document.getElementById("py-count-warnings");
+  const warnings = PY_CONFIG.countWarnings || [];
+  if (warnings.length){
+    warnHost.innerHTML = `<strong>⚠ ${warnings.length} pattern count disagreement(s):</strong> ` +
+      warnings.map(w => `<span class="mono">${w}</span>`).join("; ") +
+      ` — timings for those patterns are not comparable across libraries.`;
+  } else {
+    warnHost.innerHTML = `<span class="mono">✓ All libraries returned identical row counts for every pattern.</span>`;
+  }
+
+  makeTable(PY_DATA, "#py-data-table", "#py-table-filter", "#py-table-count");
+  document.getElementById("py-provenance").textContent = PY_PROVENANCE;
+}
+
 // ---- tabs ----
-const panes = { rust: document.getElementById("tab-rust"), js: document.getElementById("tab-js") };
+const panes = {
+  rust: document.getElementById("tab-rust"),
+  js: document.getElementById("tab-js"),
+  py: document.getElementById("tab-py"),
+};
 const tabButtons = document.querySelectorAll(".tab");
 function showTab(name){
   if (!panes[name]) name = "rust";
@@ -924,11 +1302,29 @@ tabButtons.forEach(t => t.addEventListener("click", () => {
 }));
 window.addEventListener("hashchange", () => {
   const h = location.hash.replace("#", "");
-  if (h === "rust" || h === "js") showTab(h);
+  if (h in panes) showTab(h);
 });
 
-// ---- render both tabs (hidden panes still populate their DOM) ----
+// ---- theme switch ----
+const THEME_KEY = "vortex-bench-theme";
+const themeInputs = document.querySelectorAll(".theme-switch input");
+function applyTheme(choice){
+  if (choice === "light" || choice === "dark") document.documentElement.dataset.theme = choice;
+  else { delete document.documentElement.dataset.theme; choice = "auto"; }
+  themeInputs.forEach(i => { i.checked = i.value === choice; });
+}
+themeInputs.forEach(i => i.addEventListener("change", () => {
+  applyTheme(i.value);
+  try {
+    if (i.value === "auto") localStorage.removeItem(THEME_KEY);
+    else localStorage.setItem(THEME_KEY, i.value);
+  } catch (e) { /* storage blocked; the choice lasts for this page view */ }
+}));
+applyTheme(document.documentElement.dataset.theme || "auto");
+
+// ---- render every tab (hidden panes still populate their DOM) ----
 renderRust();
 renderJs();
-showTab(location.hash === "#js" ? "js" : "rust");
+renderPy();
+showTab(location.hash.replace("#", "") || "rust");
 </script>

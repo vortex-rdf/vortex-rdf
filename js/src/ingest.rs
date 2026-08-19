@@ -11,13 +11,15 @@ use vortex_rdf_core::store::{BuiltArray, RawQuad};
 use vortex_rdf_core::{DictionaryQuadSink, Indexes};
 use wasm_bindgen::prelude::*;
 
+use crate::error::js_err;
 use crate::terms::js_to_quad;
 
-#[wasm_bindgen(module = "/js-snippets/lazy-rdf.js")]
+#[wasm_bindgen(module = "/js-snippets/pack-quads.js")]
 extern "C" {
     /// Flatten an RDF/JS quad array into one length-prefixed byte buffer
     /// host-side, so bulk ingestion crosses the wasm boundary once instead of
-    /// ~16–20 Reflect calls per quad. Decoded by [`packed_to_quads`]. Throws
+    /// ~16–20 Reflect calls per quad. Decoded by [`packed_to_quads_into`].
+    /// Throws
     /// on a malformed quad (hence `catch`).
     #[wasm_bindgen(js_name = packQuads, catch)]
     fn pack_quads(
@@ -65,26 +67,13 @@ fn js_array_to_raw_quads(quads: js_sys::Array) -> Result<Vec<RawQuad>, JsValue> 
 /// instead of four owned Strings per quad.
 pub(crate) fn js_array_to_dictionary_array(
     quads: js_sys::Array,
-    sorted: bool,
     indexes: Indexes,
 ) -> Result<BuiltArray, JsValue> {
-    let mut sink = DictionaryQuadSink::new(sorted, indexes);
-    let total = quads.length();
-    let mut start = 0u32;
-    // `packed_to_quads_into` emits per quad; collect only unit results.
-    let mut sunk: Vec<()> = Vec::new();
-    while start < total {
-        let end = (start + PACK_CHUNK).min(total);
-        let packed = pack_quads(&quads, start, end)?;
-        packed_to_quads_into(
-            &packed.to_vec(),
-            &mut |q| sink.push(RawQuad::from_quad(&q)),
-            &mut sunk,
-        )?;
-        sunk.clear();
-        start = end;
-    }
-    sink.finish().map_err(|e| JsValue::from_str(&e.to_string()))
+    let mut sink = DictionaryQuadSink::new(indexes);
+    // `push` returns `()`, so the decode loop's collected results are a ZST
+    // vector: nothing per quad is allocated.
+    js_array_decode(&quads, |q| sink.push(RawQuad::from_quad(&q)))?;
+    sink.finish().map_err(js_err)
 }
 
 /// Mutation form: quads as `oxrdf::Quad`, which `add_quads` needs because its
@@ -118,7 +107,7 @@ fn packed_to_quads_into<T>(
             let b = *self
                 .bytes
                 .get(self.pos)
-                .ok_or_else(|| JsValue::from_str("Truncated quad buffer"))?;
+                .ok_or_else(|| js_err("Truncated quad buffer"))?;
             self.pos += 1;
             Ok(b)
         }
@@ -127,7 +116,7 @@ fn packed_to_quads_into<T>(
             let s = self
                 .bytes
                 .get(self.pos..end)
-                .ok_or_else(|| JsValue::from_str("Truncated quad buffer"))?;
+                .ok_or_else(|| js_err("Truncated quad buffer"))?;
             self.pos = end;
             Ok(u32::from_le_bytes(s.try_into().unwrap()))
         }
@@ -137,13 +126,13 @@ fn packed_to_quads_into<T>(
             let s = self
                 .bytes
                 .get(self.pos..end)
-                .ok_or_else(|| JsValue::from_str("Truncated quad buffer"))?;
+                .ok_or_else(|| js_err("Truncated quad buffer"))?;
             self.pos = end;
-            std::str::from_utf8(s).map_err(|_| JsValue::from_str("Invalid UTF-8 in quad buffer"))
+            std::str::from_utf8(s).map_err(|_| js_err("Invalid UTF-8 in quad buffer"))
         }
     }
 
-    let invalid = |i: usize| JsValue::from_str(&format!("Invalid quad object at index {}", i));
+    let invalid = |i: usize| js_err(format!("Invalid quad object at index {}", i));
     let mut cur = Cursor { bytes, pos: 0 };
     let n = cur.u32()? as usize;
     out.reserve(n);
@@ -225,7 +214,7 @@ fn rdfjs_stream_to_quads(stream_val: JsValue) -> Result<BoxedQuadStream, JsValue
         .ok()
         .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
         .ok_or_else(|| {
-            JsValue::from_str(
+            js_err(
                 "fromQuads expects an array of quads or an RDF/JS Stream \
                  (an object with an 'on' method)",
             )
@@ -259,11 +248,11 @@ fn rdfjs_stream_to_quads(stream_val: JsValue) -> Result<BoxedQuadStream, JsValue
     }) as Box<dyn FnMut()>);
 
     on.call2(&stream_val, &"data".into(), on_data.as_ref())
-        .map_err(|_| JsValue::from_str("Failed to attach a 'data' listener to the stream"))?;
+        .map_err(|_| js_err("Failed to attach a 'data' listener to the stream"))?;
     on.call2(&stream_val, &"error".into(), on_error.as_ref())
-        .map_err(|_| JsValue::from_str("Failed to attach an 'error' listener to the stream"))?;
+        .map_err(|_| js_err("Failed to attach an 'error' listener to the stream"))?;
     on.call2(&stream_val, &"end".into(), on_end.as_ref())
-        .map_err(|_| JsValue::from_str("Failed to attach an 'end' listener to the stream"))?;
+        .map_err(|_| js_err("Failed to attach an 'end' listener to the stream"))?;
 
     on_data.forget();
     on_error.forget();

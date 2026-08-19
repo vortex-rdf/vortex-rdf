@@ -12,13 +12,21 @@
         "access": "public"
     },
     "main": "./entry/browser.js",
-    "types": "./pkg/web/vortex_rdf.d.ts",
+    "types": "./entry/browser.d.ts",
     "exports": {
         ".": {
-            "types": "./pkg/web/vortex_rdf.d.ts",
-            "node": "./entry/node.js",
-            "browser": "./entry/browser.js",
-            "default": "./entry/browser.js"
+            "node": {
+                "types": "./entry/node.d.ts",
+                "default": "./entry/node.js"
+            },
+            "browser": {
+                "types": "./entry/browser.d.ts",
+                "default": "./entry/browser.js"
+            },
+            "default": {
+                "types": "./entry/browser.d.ts",
+                "default": "./entry/browser.js"
+            }
         }
     },
     "files": [
@@ -35,15 +43,16 @@
     "scripts": {
         "build:wasm": "wasm-pack build --target web --out-dir pkg/web --no-pack",
         "build:wasm:fast": "wasm-pack build --target web --out-dir pkg/web --no-pack --no-opt",
-        "build:clean-manifest": "node -e \"require('fs').rmSync('pkg/web/package.json',{force:true})\"",
-        "build": "npm run build:wasm && npm run build:clean-manifest",
-        "build:fast": "npm run build:wasm:fast && npm run build:clean-manifest",
+        "build:reset": "node -e \"require('fs').rmSync('pkg/web',{recursive:true,force:true})\"",
+        "build:clean-generated": "node -e \"const fs=require('fs');for (const f of ['pkg/web/package.json','pkg/web/.gitignore']) fs.rmSync(f,{force:true})\"",
+        "build": "npm run build:reset && npm run build:wasm && npm run build:clean-generated",
+        "build:fast": "npm run build:reset && npm run build:wasm:fast && npm run build:clean-generated",
         "prepublishOnly": "npm run build",
         "test": "vitest run",
-        "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.bench.json",
+        "typecheck": "tsc -p tsconfig.json && tsc -p bench/tsconfig.json",
         "bench": "tsx --expose-gc --max-old-space-size=8192 bench/compare.bench.ts",
         "bench:build": "npm run build && npm run bench",
-        "bench:codspeed": "tsx --expose-gc bench/codspeed.bench.ts",
+        "bench:codspeed": "node --import tsx --expose-gc --no-liftoff bench/codspeed.bench.ts",
         "bench:dict-memory": "tsx --expose-gc bench/dict-memory.bench.ts"
     },
     "keywords": [
@@ -58,12 +67,12 @@
     "license": "MIT",
     "devDependencies": {
         "@codspeed/tinybench-plugin": "^5.7.1",
-        "@types/node": "^26.1.1",
+        "@types/node": "^26.1.2",
         "oxigraph": "^0.5.9",
         "rdf-data-factory": "^2.0.2",
         "rdf-stores": "^2.2.0",
         "tinybench": "^6.1.2",
-        "tsx": "^4.23.1",
+        "tsx": "^4.23.4",
         "typescript": "^7.0.2",
         "vitest": "^4.1.10",
         "wasm-pack": "^0.15.0"

@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use web_time::{SystemTime, UNIX_EPOCH};
 
-use rkyv::api::high::{HighDeserializer, HighSerializer};
+use rkyv::api::high::{HighDeserializer, HighSerializer, to_bytes_in};
 use rkyv::rancor::Error as RkyvError;
 use rkyv::ser::allocator::ArenaHandle;
 use rkyv::util::AlignedVec;
@@ -18,19 +18,47 @@ use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 
 use crate::error::{Result, VortexRdfError};
 
-/// Create a unique temp directory under `target/` for spill files.
-pub(crate) fn make_temp_dir(prefix: &str) -> Result<PathBuf> {
+/// Environment variable overriding where spill directories are created — the
+/// escape hatch for putting out-of-core runs on a specific volume. The OS
+/// temp dir is commonly a size-capped, RAM-backed tmpfs, exactly the wrong
+/// home for runs that exist because the data outgrew memory.
+pub(crate) const SPILL_DIR_ENV: &str = "VORTEX_RDF_SPILL_DIR";
+
+/// Create a unique temp directory for spill files.
+///
+/// The parent directory is resolved in precedence order: the
+/// [`SPILL_DIR_ENV`] (`VORTEX_RDF_SPILL_DIR`) environment variable, then the
+/// caller-provided `base` (compaction passes the store file's own directory
+/// so spills share the output's volume), then [`std::env::temp_dir`]. The
+/// library must never write into the caller's working directory: a server or
+/// binding embedding this crate can run with an arbitrary — even read-only —
+/// cwd.
+///
+/// Spilling needs a real filesystem, which `wasm32-unknown-unknown` does not
+/// have, so this whole module is compiled out there (see the module gate in
+/// the `builders` hub); the wasm-reachable build paths never spill.
+pub(crate) fn make_temp_dir(prefix: &str, base: Option<&Path>) -> Result<PathBuf> {
     let id = uuid::Uuid::new_v4();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::current_dir()
-        .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?
-        .join("target")
-        .join(format!("tmp_vortex_{}_{}_{}", prefix, now, id));
-    std::fs::create_dir_all(&dir).map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
+    let parent = resolve_spill_parent(std::env::var_os(SPILL_DIR_ENV), base);
+    let dir = parent.join(format!("tmp_vortex_{}_{}_{}", prefix, now, id));
+    std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+/// The parent-directory precedence behind [`make_temp_dir`], split out so it
+/// is testable without mutating the process environment (other tests spill
+/// concurrently in this process and would race a real env override). An
+/// empty override counts as unset.
+fn resolve_spill_parent(env_override: Option<std::ffi::OsString>, base: Option<&Path>) -> PathBuf {
+    env_override
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| base.map(Path::to_path_buf))
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 /// Deletes the temporary spill directory when dropped, so spill files are
@@ -48,15 +76,20 @@ impl Drop for TempRunsGuard {
 /// Incremental rkyv writer for spilling items one at a time.
 pub(crate) struct RunWriter<T> {
     writer: BufWriter<File>,
+    /// Reused per-record serialization buffer: `rkyv::to_bytes` would
+    /// allocate a fresh `AlignedVec` per spilled record, the same allocator
+    /// churn the reused `payload` buffer on [`RunReader`] was added to kill
+    /// on the read side.
+    buf: AlignedVec,
     _marker: PhantomData<T>,
 }
 
 impl<T> RunWriter<T> {
     pub(crate) fn create(path: &Path) -> Result<Self> {
-        let file =
-            File::create(path).map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
+        let file = File::create(path)?;
         Ok(Self {
             writer: BufWriter::new(file),
+            buf: AlignedVec::new(),
             _marker: PhantomData,
         })
     }
@@ -66,8 +99,12 @@ impl<T> RunWriter<T> {
         T: Archive + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
         T::Archived: RkyvDeserialize<T, HighDeserializer<RkyvError>>,
     {
-        let bytes = rkyv::to_bytes::<RkyvError>(item)
-            .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
+        // Serialize into the held buffer (taken and put back because rkyv
+        // consumes and returns its writer by value); `clear` keeps the
+        // capacity, so steady-state pushes never touch the allocator.
+        self.buf.clear();
+        let bytes = to_bytes_in::<_, RkyvError>(item, std::mem::take(&mut self.buf))
+            .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
         let len = u32::try_from(bytes.len()).map_err(|_| {
             VortexRdfError::Serialization(format!(
                 "Spill record too large: {} bytes exceeds u32::MAX",
@@ -75,18 +112,14 @@ impl<T> RunWriter<T> {
             ))
         })?;
 
-        self.writer
-            .write_all(&len.to_le_bytes())
-            .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
-        self.writer
-            .write_all(bytes.as_ref())
-            .map_err(|e| VortexRdfError::Deserialization(e.to_string()))
+        self.writer.write_all(&len.to_le_bytes())?;
+        self.writer.write_all(bytes.as_ref())?;
+        self.buf = bytes;
+        Ok(())
     }
 
     pub(crate) fn finish(mut self) -> Result<()> {
-        self.writer
-            .flush()
-            .map_err(|e| VortexRdfError::Deserialization(e.to_string()))
+        Ok(self.writer.flush()?)
     }
 }
 
@@ -154,7 +187,7 @@ pub(crate) struct RunReader<T> {
 
 impl<T> RunReader<T> {
     pub(crate) fn new(path: &Path) -> Result<Self> {
-        let file = File::open(path).map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
+        let file = File::open(path)?;
         Ok(Self {
             reader: BufReader::new(file),
             payload: AlignedVec::new(),
@@ -168,14 +201,14 @@ impl<T> RunReader<T> {
         T::Archived: RkyvDeserialize<T, HighDeserializer<RkyvError>>,
     {
         let mut first_len_byte = [0u8; 1];
-        let n = self
-            .reader
-            .read(&mut first_len_byte)
-            .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
+        let n = self.reader.read(&mut first_len_byte)?;
         if n == 0 {
             return Ok(None);
         }
 
+        // A truncated record is a corrupt spill file — a format-level
+        // `Deserialization` failure — while any other read error is plain
+        // filesystem I/O.
         let mut len_bytes = [0u8; 4];
         len_bytes[0] = first_len_byte[0];
         self.reader.read_exact(&mut len_bytes[1..]).map_err(|e| {
@@ -184,7 +217,7 @@ impl<T> RunReader<T> {
                     "Unexpected EOF while reading spill record length".to_string(),
                 )
             } else {
-                VortexRdfError::Deserialization(e.to_string())
+                VortexRdfError::Io(e)
             }
         })?;
 
@@ -198,7 +231,7 @@ impl<T> RunReader<T> {
                     "Unexpected EOF while reading spill record payload".to_string(),
                 )
             } else {
-                VortexRdfError::Deserialization(e.to_string())
+                VortexRdfError::Io(e)
             }
         })?;
 
@@ -368,5 +401,68 @@ impl<V: Ord> Ord for PairHeapItem<V> {
 impl<V: Ord> PartialOrd for PairHeapItem<V> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spill_parent_env_override_wins() {
+        let parent = resolve_spill_parent(Some("/custom/spill".into()), Some(Path::new("/base")));
+        assert_eq!(parent, PathBuf::from("/custom/spill"));
+    }
+
+    #[test]
+    fn spill_parent_prefers_base_over_os_temp() {
+        let parent = resolve_spill_parent(None, Some(Path::new("/base")));
+        assert_eq!(parent, PathBuf::from("/base"));
+    }
+
+    #[test]
+    fn spill_parent_treats_empty_env_as_unset() {
+        let parent = resolve_spill_parent(Some("".into()), None);
+        assert_eq!(parent, std::env::temp_dir());
+    }
+
+    #[test]
+    fn make_temp_dir_honors_base_and_guard_cleans_up() {
+        // The env override outranks `base` by design, so a preset override in
+        // the test environment would (correctly) redirect this spill; only
+        // assert placement when it is absent.
+        if std::env::var_os(SPILL_DIR_ENV).is_some() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("vortex_spill_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = make_temp_dir("unit", Some(&base)).unwrap();
+        assert!(dir.starts_with(&base));
+        assert!(dir.is_dir());
+        drop(TempRunsGuard { dir: dir.clone() });
+        assert!(!dir.exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn run_roundtrip_through_reused_buffers() {
+        // Variable-length records exercise the reused write/read buffers
+        // growing and shrinking across pushes.
+        let dir = make_temp_dir("unit_roundtrip", None).unwrap();
+        let guard = TempRunsGuard { dir: dir.clone() };
+        let path = dir.join("run.bin");
+        let records: Vec<PairRecord<String>> = (0..64u32)
+            .map(|i| PairRecord {
+                value: "x".repeat((i as usize * 7) % 41),
+                rid: i,
+            })
+            .collect();
+        write_run(&path, &records).unwrap();
+        let mut reader: RunReader<PairRecord<String>> = RunReader::new(&path).unwrap();
+        for expected in &records {
+            assert_eq!(reader.next().unwrap().as_ref(), Some(expected));
+        }
+        assert!(reader.next().unwrap().is_none());
+        drop(guard);
     }
 }

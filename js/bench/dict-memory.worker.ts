@@ -31,6 +31,7 @@ import {
     reclaim, peakRssMb, rssMb, jsHeapMb, wasmHeapMb,
     type DatasetOpts,
 } from './shared.js';
+import { decodeAll } from './util.js';
 import type { VortexRdfStore } from '../entry/node.js';
 
 const [, , slugArg, nArg, subjRatioArg, objRatioArg, outFile] = process.argv;
@@ -49,21 +50,6 @@ const opts: DatasetOpts = {
 const STORES = Number(process.env.DICT_MEM_STORES ?? 4);
 /** Deletes to run before re-querying, exercising the dictionary-view rebuild. */
 const DELETES = Number(process.env.DICT_MEM_DELETES ?? 5);
-
-/** Force every term of every quad to be materialized.
- *
- * `countMatch` only takes `.length`, which for the Dictionary layout never
- * decodes a single term — so it cannot see the cost of the on-demand dictionary.
- * Reading `.value` is what makes each distinct code cross the boundary once. */
-function decodeAll(quads: readonly unknown[]): number {
-    let chars = 0;
-    for (const q of quads as { subject: { value: string }; predicate: { value: string };
-                               object: { value: string }; graph: { value: string } }[]) {
-        chars += q.subject.value.length + q.predicate.value.length
-            + q.object.value.length + q.graph.value.length;
-    }
-    return chars;
-}
 
 async function main(): Promise<void> {
     const variant = VORTEX_VARIANTS.find((v) => v.slug === slugArg);

@@ -18,7 +18,7 @@
 // ── Attribution sweep (opt-in) ───────────────────────────────────────────────
 //
 //   DICT_MEM_RATIOS=0.001,0.01,0.1,0.5,1.0 \
-//   DICT_MEM_SLUGS=vortex_sorted_dict,vortex_sorted_default \
+//   DICT_MEM_SLUGS=vortex_dict,vortex_default \
 //   npm run bench:dict-memory
 //
 // Fits per-term cost. Needs >= 2 points, and is what produced the bytes/term
@@ -48,15 +48,14 @@
 // Every config runs in its own process because wasm memory never shrinks; see
 // dict-memory.worker.ts.
 
-import { spawnSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
-import { writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve, join } from 'node:path';
+import { dirname, resolve } from 'node:path';
+
+import { runWorkerProcess } from './util.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const workerPath = resolve(here, 'dict-memory.worker.ts');
-const tsxBin = resolve(here, '..', 'node_modules', '.bin', 'tsx');
 const OUT = resolve(here, process.env.DICT_MEM_OUT ?? 'dict-memory.json');
 
 /** Rows held fixed across the sweep — only term cardinality varies.
@@ -66,9 +65,9 @@ const OUT = resolve(here, process.env.DICT_MEM_OUT ?? 'dict-memory.json');
 const N = Number(process.env.DICT_MEM_N ?? 200_000);
 
 /** Which build variants to run. Dictionary layout is the subject. Add
- *  `vortex_sorted_default` when sweeping: it has no term dictionary, so its
+ *  `vortex_default` when sweeping: it has no term dictionary, so its
  *  slope isolates everything that is *not* the dictionary. */
-const SLUGS = (process.env.DICT_MEM_SLUGS ?? 'vortex_sorted_dict').split(',');
+const SLUGS = (process.env.DICT_MEM_SLUGS ?? 'vortex_dict').split(',');
 
 /** Subject ratio per point; object ratio tracks it at half.
  *
@@ -114,26 +113,15 @@ function retainedPerStore(p: Point): number | null {
     return fit(xs, ys).slope;
 }
 
+/** One cardinality point, in its own process — wasm memory never shrinks, so a
+ *  sweep sharing a process would report every point at the high-water mark of
+ *  the largest one before it. */
 function runPoint(slug: string, subjRatio: number, objRatio: number): Point | null {
-    const outFile = join(tmpdir(), `vortex-dictmem-${slug}-${subjRatio}-${process.pid}.json`);
-    const res = spawnSync(
-        tsxBin,
-        ['--expose-gc', '--max-old-space-size=8192', workerPath,
-            slug, String(N), String(subjRatio), String(objRatio), outFile],
-        { stdio: 'inherit', env: process.env },
+    return runWorkerProcess<Point>(
+        workerPath,
+        [slug, String(N), String(subjRatio), String(objRatio)],
+        `${slug} @ ratio ${subjRatio}`,
     );
-    try {
-        if (res.status !== 0) {
-            console.error(`\n[${slug} @ ratio ${subjRatio}] worker exited ${res.status} — skipping.`);
-            return null;
-        }
-        return JSON.parse(readFileSync(outFile, 'utf8')) as Point;
-    } catch (e) {
-        console.error(`[${slug} @ ratio ${subjRatio}] failed to read output:`, e);
-        return null;
-    } finally {
-        rmSync(outFile, { force: true });
-    }
 }
 
 /** True when this run is the exact config REFERENCE was measured at, and so is
@@ -142,7 +130,7 @@ function atReferenceConfig(points: Point[]): points is [Point] {
     return points.length === 1
         && N === 200_000
         && RATIOS.length === 1 && RATIOS[0] === 1.0
-        && points[0].slug === 'vortex_sorted_dict'
+        && points[0].slug === 'vortex_dict'
         && points[0].stores === REFERENCE.stores;
 }
 

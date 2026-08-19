@@ -1,21 +1,12 @@
-use anyhow::{Context, Result, anyhow};
-use clap::{Parser, Subcommand};
-use log::{debug, info};
+use anyhow::Result;
+use clap::{Args, Parser, Subcommand};
 use oxrdfio::RdfFormat;
-use std::fs::File;
-use std::io::{Read, Write, stdin, stdout};
 use std::path::PathBuf;
-use std::time::Instant;
 
-use vortex_rdf_core::common::formats::{Format, detect_format};
-use vortex_rdf_core::common::terms::{
-    parse_graph_name, parse_named_node, parse_quads_from_reader, parse_subject, parse_term,
-};
-use vortex_rdf_core::{
-    BuilderStrategy, DictionaryPlacement, IndexType, LayoutStrategy, SortedInMemoryBuilder,
-    SortedStreamBuilder, UnsortedStreamBuilder, VortexRdfStore,
-    io::{deserialize, quads_stream_to_vortex_file_with_builder},
-};
+use vortex_rdf_core::common::formats::{format_from_name, supported_format_names};
+use vortex_rdf_core::{IndexType, LayoutStrategy};
+
+mod commands;
 
 #[derive(Parser)]
 #[command(
@@ -31,81 +22,101 @@ struct Cli {
 #[derive(Subcommand)]
 enum Action {
     /// Convert from RDF to Vortex-RDF
-    Serialize {
-        /// Column layout strategy
-        #[arg(long, value_enum, default_value = "default")]
-        layout: LayoutStrategy,
-
-        /// Secondary indexes to build (can be specified multiple times)
-        #[arg(long, value_enum)]
-        indexes: Vec<IndexType>,
-
-        /// Input file path (defaults to stdin)
-        #[arg(short, long)]
-        input: Option<PathBuf>,
-
-        /// Output file path (required)
-        #[arg(short, long)]
-        output: PathBuf,
-
-        /// RDF Format (auto-detected from file extension if not provided)
-        #[arg(short, long, value_enum)]
-        format: Option<Format>,
-
-        /// Builder strategy to use when serializing (defaults to unsorted-stream)
-        #[arg(short, long, value_enum, default_value = "unsorted-stream")]
-        builder_strategy: BuilderStrategy,
-
-        /// Where the Dictionary layout's term dictionary is written: padded
-        /// into the quads file (one self-contained file) or as a
-        /// `<stem>.dict.vortex` sidecar beside it. Ignored by other layouts.
-        #[arg(long, value_enum, default_value = "padded")]
-        dictionary_placement: DictionaryPlacement,
-    },
+    Serialize(SerializeArgs),
     /// Convert from Vortex-RDF to RDF
-    Deserialize {
-        /// Input file path (defaults to stdin)
-        #[arg(short, long)]
-        input: Option<PathBuf>,
-
-        /// Output file path (defaults to stdout)
-        #[arg(short, long)]
-        output: Option<PathBuf>,
-
-        /// RDF Format (auto-detected from file extension if not provided)
-        #[arg(short, long, value_enum)]
-        format: Option<Format>,
-    },
+    Deserialize(DeserializeArgs),
     /// Filter Vortex-RDF store by pattern
-    Match {
-        /// Input file path (required)
-        #[arg(short, long)]
-        input: PathBuf,
+    Match(MatchArgs),
+}
 
-        /// Output file path (defaults to stdout)
-        #[arg(short, long)]
-        output: Option<PathBuf>,
+#[derive(Args)]
+struct SerializeArgs {
+    /// Column layout strategy
+    #[arg(long, value_enum, default_value = "default")]
+    layout: LayoutStrategy,
 
-        /// RDF Format (auto-detected from file extension if not provided)
-        #[arg(short, long, value_enum)]
-        format: Option<Format>,
+    /// Secondary indexes to build (can be specified multiple times)
+    #[arg(long, value_enum)]
+    indexes: Vec<IndexType>,
 
-        /// Subject pattern
-        #[arg(long)]
-        subject: Option<String>,
+    /// Input file path (defaults to stdin)
+    #[arg(short, long)]
+    input: Option<PathBuf>,
 
-        /// Predicate pattern
-        #[arg(long)]
-        predicate: Option<String>,
+    /// Output file path (required)
+    #[arg(short, long)]
+    output: PathBuf,
 
-        /// Object pattern
-        #[arg(long)]
-        object: Option<String>,
+    /// RDF format name, e.g. "ttl" or "nquads" (auto-detected from the input
+    /// file extension if not provided)
+    #[arg(short, long, value_parser = parse_format)]
+    format: Option<RdfFormat>,
+}
 
-        /// Graph pattern
-        #[arg(long)]
-        graph: Option<String>,
-    },
+#[derive(Args)]
+struct DeserializeArgs {
+    /// Input file path (defaults to stdin)
+    #[arg(short, long)]
+    input: Option<PathBuf>,
+
+    /// Output file path (defaults to stdout)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// RDF format name, e.g. "ttl" or "nquads" (auto-detected from the
+    /// output file extension if not provided, falling back to N-Quads)
+    #[arg(short, long, value_parser = parse_format)]
+    format: Option<RdfFormat>,
+}
+
+#[derive(Args)]
+struct MatchArgs {
+    /// Input file path (required)
+    #[arg(short, long)]
+    input: PathBuf,
+
+    /// Output file path (defaults to stdout)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// RDF format of a non-Vortex input (auto-detected from the input file
+    /// extension if not provided; ignored for .vortex inputs)
+    #[arg(long, value_parser = parse_format)]
+    input_format: Option<RdfFormat>,
+
+    /// RDF format for the exported matches (auto-detected from the output
+    /// file extension if not provided, falling back to N-Quads)
+    #[arg(long, value_parser = parse_format)]
+    output_format: Option<RdfFormat>,
+
+    /// Subject pattern
+    #[arg(long)]
+    subject: Option<String>,
+
+    /// Predicate pattern
+    #[arg(long)]
+    predicate: Option<String>,
+
+    /// Object pattern
+    #[arg(long)]
+    object: Option<String>,
+
+    /// Graph pattern
+    #[arg(long)]
+    graph: Option<String>,
+}
+
+/// clap value parser over core's format-name table, so the CLI accepts the
+/// same spellings as every other binding ("ttl"/"turtle", "xml"/"rdfxml", …)
+/// and its rejection message quotes the same list the parser accepts.
+fn parse_format(name: &str) -> Result<RdfFormat, String> {
+    format_from_name(name).ok_or_else(|| {
+        format!(
+            "unsupported RDF format {:?} (expected one of: {})",
+            name,
+            supported_format_names().join(", ")
+        )
+    })
 }
 
 #[tokio::main]
@@ -114,194 +125,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.action {
-        Action::Serialize {
-            layout,
-            indexes,
-            input,
-            output,
-            format,
-            builder_strategy,
-            dictionary_placement,
-        } => {
-            let start = Instant::now();
-            let format = format
-                .map(RdfFormat::from)
-                .or_else(|| detect_format(&input))
-                .ok_or_else(|| {
-                    anyhow!("Could not detect RDF format. Please specify it with --format")
-                })?;
-
-            let reader: Box<dyn Read + Send> = match &input {
-                Some(p) => Box::new(File::open(p).context("Failed to open input file")?),
-                None => Box::new(stdin()),
-            };
-            let quads_stream = parse_quads_from_reader(reader, format);
-
-            // Chunks are streamed into the Vortex writer as they are built;
-            // streaming-capable builders never materialize the full dataset.
-            match builder_strategy {
-                BuilderStrategy::UnsortedStream => {
-                    quads_stream_to_vortex_file_with_builder::<UnsortedStreamBuilder, _>(
-                        quads_stream,
-                        &output,
-                        layout,
-                        indexes,
-                        dictionary_placement,
-                    )
-                    .await
-                }
-                BuilderStrategy::SortedInMemory => {
-                    quads_stream_to_vortex_file_with_builder::<SortedInMemoryBuilder, _>(
-                        quads_stream,
-                        &output,
-                        layout,
-                        indexes,
-                        dictionary_placement,
-                    )
-                    .await
-                }
-                BuilderStrategy::SortedStream => {
-                    quads_stream_to_vortex_file_with_builder::<SortedStreamBuilder, _>(
-                        quads_stream,
-                        &output,
-                        layout,
-                        indexes,
-                        dictionary_placement,
-                    )
-                    .await
-                }
-            }
-            .context("Failed to serialize to Vortex")?;
-            info!("Fully serialized to Vortex-RDF in {:?}", start.elapsed());
-        }
-
-        Action::Deserialize {
-            input,
-            output,
-            format,
-        } => {
-            let start = Instant::now();
-            let format = format
-                .map(RdfFormat::from)
-                .or_else(|| detect_format(&output))
-                .unwrap_or(RdfFormat::NQuads);
-
-            let writer: Box<dyn Write> = match &output {
-                Some(p) => Box::new(File::create(p).context("Failed to create output file")?),
-                None => Box::new(stdout()),
-            };
-
-            match &input {
-                Some(path) => {
-                    let store = VortexRdfStore::from_file(path)
-                        .await
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                    deserialize(store, writer, format)
-                        .await
-                        .context("Failed to deserialize from Vortex")?;
-                }
-                None => {
-                    let mut buffer = Vec::new();
-                    stdin()
-                        .read_to_end(&mut buffer)
-                        .context("Failed to read from stdin")?;
-                    let store = VortexRdfStore::from_bytes(&buffer)
-                        .await
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                    deserialize(store, writer, format)
-                        .await
-                        .context("Failed to deserialize from Vortex")?;
-                }
-            }
-            info!("Deserialization took {:?}", start.elapsed());
-        }
-
-        Action::Match {
-            input,
-            output,
-            format,
-            subject,
-            predicate,
-            object,
-            graph,
-        } => {
-            let start = Instant::now();
-
-            let subject_node = subject.as_deref().map(parse_subject).transpose()?;
-            let predicate_node = predicate.as_deref().map(parse_named_node).transpose()?;
-            let object_node = object.as_deref().map(parse_term).transpose()?;
-            let graph_node = graph.as_deref().map(parse_graph_name).transpose()?;
-
-            let output_format = format
-                .map(RdfFormat::from)
-                .or_else(|| detect_format(&output))
-                .unwrap_or(RdfFormat::NQuads);
-
-            let writer: Box<dyn Write> = match &output {
-                Some(p) => Box::new(File::create(p).context("Failed to create output file")?),
-                None => Box::new(stdout()),
-            };
-
-            let is_vortex = input.extension().map(|e| e == "vortex").unwrap_or(false);
-
-            if is_vortex {
-                let load_start = Instant::now();
-                let store = VortexRdfStore::from_file(&input)
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                debug!("Opened Vortex file in {:?}", load_start.elapsed());
-
-                let match_start = Instant::now();
-                let filtered = store
-                    .match_pattern(
-                        subject_node.as_ref(),
-                        predicate_node.as_ref(),
-                        object_node.as_ref(),
-                        graph_node.as_ref(),
-                    )
-                    .await
-                    .context("Failed to match pattern")?;
-                debug!("Applying match pattern took {:?}", match_start.elapsed());
-
-                deserialize(filtered, writer, output_format)
-                    .await
-                    .context("Failed to deserialize filtered results")?;
-            } else {
-                let load_start = Instant::now();
-                let input_format = format
-                    .map(RdfFormat::from)
-                    .or_else(|| detect_format(&Some(input.clone())))
-                    .ok_or_else(|| {
-                        anyhow!("Could not detect RDF format. Please specify it with --format")
-                    })?;
-
-                let reader = Box::new(File::open(&input).context("Failed to open input file")?);
-                let quads_stream = parse_quads_from_reader(reader, input_format);
-
-                let arr = VortexRdfStore::build_vortex_array(quads_stream).await?;
-                let store = VortexRdfStore::new(arr).map_err(|e| anyhow::anyhow!(e))?;
-                debug!("Vortex store built in {:?}", load_start.elapsed());
-
-                let match_start = Instant::now();
-                let filtered = store
-                    .match_pattern(
-                        subject_node.as_ref(),
-                        predicate_node.as_ref(),
-                        object_node.as_ref(),
-                        graph_node.as_ref(),
-                    )
-                    .await
-                    .context("Failed to match pattern")?;
-                debug!("Applying match pattern took {:?}", match_start.elapsed());
-
-                deserialize(filtered, writer, output_format)
-                    .await
-                    .context("Failed to deserialize filtered results")?;
-            }
-
-            info!("Full matching operation took {:?}", start.elapsed());
-        }
+        Action::Serialize(args) => commands::serialize::run(args).await,
+        Action::Deserialize(args) => commands::deserialize::run(args).await,
+        Action::Match(args) => commands::matching::run(args).await,
     }
-
-    Ok(())
 }

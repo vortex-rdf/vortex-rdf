@@ -13,6 +13,22 @@ struct RawTerm {
     datatype_iri: Option<String>,
 }
 
+thread_local! {
+    /// The RDF/JS property names, allocated as JS strings once per module
+    /// instance. `Reflect::get` takes a `JsValue` key, and building one from a
+    /// `&str` allocates a JS string on every call — four per term parsed,
+    /// which is why the pattern arguments cost more to read than to match.
+    static KEY_TERM_TYPE: JsValue = JsValue::from_str("termType");
+    static KEY_VALUE: JsValue = JsValue::from_str("value");
+    static KEY_LANGUAGE: JsValue = JsValue::from_str("language");
+    static KEY_DATATYPE: JsValue = JsValue::from_str("datatype");
+}
+
+/// One property read through a cached key.
+fn get_prop(val: &JsValue, key: &'static std::thread::LocalKey<JsValue>) -> Option<JsValue> {
+    key.with(|k| Reflect::get(val, k).ok())
+}
+
 fn js_to_term_raw(val: JsValue) -> Option<RawTerm> {
     if val.is_null() || val.is_undefined() {
         return None;
@@ -25,15 +41,20 @@ fn js_to_term_raw(val: JsValue) -> Option<RawTerm> {
             datatype_iri: None,
         });
     }
-    let term_type = Reflect::get(&val, &"termType".into()).ok()?.as_string()?;
-    let value = Reflect::get(&val, &"value".into()).ok()?.as_string()?;
-    let language = Reflect::get(&val, &"language".into())
-        .ok()
-        .and_then(|v| v.as_string());
-    let datatype_iri = Reflect::get(&val, &"datatype".into())
-        .ok()
-        .and_then(|dt| Reflect::get(&dt, &"value".into()).ok())
-        .and_then(|v| v.as_string());
+    let term_type = get_prop(&val, &KEY_TERM_TYPE)?.as_string()?;
+    let value = get_prop(&val, &KEY_VALUE)?.as_string()?;
+    // Only literals carry a language or datatype; reading them off a
+    // NamedNode/BlankNode costs three boundary crossings to learn nothing.
+    let (language, datatype_iri) = if term_type == "Literal" {
+        (
+            get_prop(&val, &KEY_LANGUAGE).and_then(|v| v.as_string()),
+            get_prop(&val, &KEY_DATATYPE)
+                .and_then(|dt| get_prop(&dt, &KEY_VALUE))
+                .and_then(|v| v.as_string()),
+        )
+    } else {
+        (None, None)
+    };
     Some(RawTerm {
         term_type,
         value,

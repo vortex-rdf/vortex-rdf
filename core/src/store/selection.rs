@@ -4,31 +4,101 @@
 //! the base data it was constructed from and narrows a `RowSelection` over
 //! it. Everything a selection names is a *base* row id, so ids stay meaningful
 //! however many times a view is refined — which is what lets secondary indexes
-//! (whose `_idx_*_rid` columns address the base rows) survive `match_pattern`,
-//! and what lets a matched view later be handed back for mutation.
+//! (whose components' `rid` columns address the base rows) survive
+//! `match_pattern`, and what lets a matched view later be handed back for
+//! mutation.
 //!
 //! Both backends select rows in this same currency. The three variants also
 //! encode an invariant the file backend needs: a range and an id list are
 //! mutually exclusive, because setting both disables vortex's exact-range
 //! planning (`attempt_split_ranges` bails when a row range is also set).
 //!
-//! [`VortexRdfStore`]: crate::store::vortex_rdf_store::VortexRdfStore
+//! A view's selection field wraps this in [`ViewSelection`], which adds one
+//! more state: *pending* — an index-served match whose exact ids are a
+//! deferred computation, run by the first consumer that needs the selection
+//! rather than at match time (serving reads never do).
+//!
+//! [`VortexRdfStore`]: crate::store::VortexRdfStore
 
-#[cfg(feature = "file-io")]
-use std::ops::BitAnd;
 use std::ops::Range;
 
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray};
 use vortex_buffer::Buffer;
-#[cfg(feature = "file-io")]
-use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_mask::{AllOr, Mask};
-#[cfg(feature = "file-io")]
-use vortex_scan::selection::Selection;
+
+use crate::store::probes::BaseProbes;
 
 use crate::error::{Result, VortexRdfError};
+use crate::store::indexes::LazyRowIds;
+
+/// A view's base-row selection, which may still be *pending*: a match served
+/// by an index left its exact ids uncomputed ([`LazyRowIds`]), because the
+/// attached serving plan answers reads without them.
+///
+/// The two variants keep the pending state impossible to overlook: every
+/// consumer either takes the serving plan (and never touches the selection)
+/// or materializes here first — there is no concrete-looking value to read
+/// out of a pending selection by mistake. A pending selection exists only
+/// alongside `serve: Some` on its view (`QuadsSource`), and only ever
+/// materializes to the id set the eager path would have produced, so
+/// laziness never changes what a view covers — only when the ids are paid
+/// for.
+#[derive(Clone)]
+pub(crate) enum ViewSelection {
+    Exact(RowSelection),
+    Pending(LazyRowIds),
+}
+
+impl ViewSelection {
+    /// The unrefined selection — every base row.
+    pub(crate) fn all() -> Self {
+        ViewSelection::Exact(RowSelection::All)
+    }
+
+    /// Whether this is the unrefined whole-base selection. A pending
+    /// selection is never `All`: it exists only on a view an index resolution
+    /// restricted.
+    pub(crate) fn is_all(&self) -> bool {
+        matches!(self, ViewSelection::Exact(RowSelection::All))
+    }
+
+    /// The concrete selection, running a pending resolution's deferred id
+    /// computation if one is still outstanding (cached for every later
+    /// consumer and every clone of the view — see [`LazyRowIds`]).
+    #[cfg(feature = "file-io")]
+    pub(crate) async fn materialized(&self) -> Result<RowSelection> {
+        match self {
+            ViewSelection::Exact(selection) => Ok(selection.clone()),
+            ViewSelection::Pending(lazy) => Ok(RowSelection::Ids(lazy.materialized().await?)),
+        }
+    }
+
+    /// The synchronous counterpart of [`materialized`](Self::materialized),
+    /// for in-memory views (whose pending ids never take I/O).
+    pub(crate) fn materialized_sync(&self) -> Result<RowSelection> {
+        match self {
+            ViewSelection::Exact(selection) => Ok(selection.clone()),
+            ViewSelection::Pending(lazy) => Ok(RowSelection::Ids(lazy.materialized_sync()?)),
+        }
+    }
+
+    /// The already-exact selection, for consumers that structurally cannot
+    /// meet a pending one: a pending selection always rides with a serve
+    /// plan, and these consumers only run on views without one.
+    pub(crate) fn expect_exact(&self) -> &RowSelection {
+        match self {
+            ViewSelection::Exact(selection) => selection,
+            ViewSelection::Pending(_) => {
+                unreachable!(
+                    "a pending selection always rides with a serve plan; consumers that \
+                     cannot honor the plan materialize the selection first"
+                )
+            }
+        }
+    }
+}
 
 /// The rows of a base array (or file) that a store view covers, as base row
 /// ids. Refinements only ever narrow a selection, never re-base it.
@@ -173,52 +243,6 @@ impl RowSelection {
         }
     }
 
-    /// Apply this selection — and any tombstones — to a file scan.
-    ///
-    /// A range and an id list reach the scan through different knobs (a row
-    /// range and a [`Selection`]), and the variants being exclusive is what
-    /// keeps them from being set together — vortex's exact-range planning
-    /// (`attempt_split_ranges`) bails out when a row range accompanies an
-    /// `IncludeByIndex` selection.
-    ///
-    /// Tombstoned rows are dropped inside the scan rather than by post-filtering
-    /// its output, so this composes with a pushed-down filter (whose output
-    /// carries no row ids to re-align against). They ride the same `Selection`
-    /// knob as an id list, so the one case where both would claim it — a sparse
-    /// `Ids` selection with deletes — is resolved by subtracting the tombstones
-    /// from the id list up front; `All`/`Range` leave that knob free for an
-    /// `ExcludeByIndex` of the (sparse) deleted rows.
-    #[cfg(feature = "file-io")]
-    pub(crate) fn restrict_scan<A: 'static + Send>(
-        &self,
-        scan: ScanBuilder<A>,
-        deleted: Option<&Mask>,
-        quad_rows: u64,
-    ) -> ScanBuilder<A> {
-        // `All` means "all quad rows", which is narrower than the file when a
-        // padded Dictionary file carries trailing dictionary rows — so it is
-        // bounded explicitly rather than left to the scan's full row range.
-        let bounded;
-        let selection = match self {
-            RowSelection::All => {
-                bounded = RowSelection::Range(0..quad_rows);
-                &bounded
-            }
-            other => other,
-        };
-        match (selection, deleted) {
-            (RowSelection::All, _) => unreachable!("All was just bounded to a Range"),
-            (RowSelection::Range(range), None) => scan.with_row_range(range.clone()),
-            (RowSelection::Range(range), Some(deleted)) => scan
-                .with_row_range(range.clone())
-                .with_selection(Selection::ExcludeByIndex(deleted_ids(deleted))),
-            (RowSelection::Ids(ids), None) => scan.with_row_indices(ids.clone()),
-            (RowSelection::Ids(ids), Some(deleted)) => {
-                scan.with_row_indices(subtract_deleted(ids, deleted))
-            }
-        }
-    }
-
     /// Narrow using a mask over *this selection's own rows* — i.e. one bit per
     /// row of `self.apply(base)`, in that order — translating those local
     /// positions back into base row ids.
@@ -259,35 +283,15 @@ fn restrict_ids(ids: Buffer<u64>, range: &Range<u64>) -> Buffer<u64> {
     ids.slice(lo..hi)
 }
 
-/// The set positions of a tombstone mask as an ascending id list — the sparse
-/// form the scan wants for an exclusion.
-#[cfg(feature = "file-io")]
-fn deleted_ids(deleted: &Mask) -> Buffer<u64> {
-    match deleted.indices() {
-        AllOr::All => Buffer::from_iter(0..deleted.len() as u64),
-        AllOr::None => Buffer::empty(),
-        AllOr::Some(indices) => Buffer::from_iter(indices.iter().map(|&i| i as u64)),
-    }
-}
-
-/// An ascending id list with the tombstoned rows removed — used when a sparse
-/// id selection and the deletions would both want the scan's selection knob.
-#[cfg(feature = "file-io")]
-fn subtract_deleted(ids: &Buffer<u64>, deleted: &Mask) -> Buffer<u64> {
-    Buffer::from_iter(
-        ids.iter()
-            .copied()
-            .filter(|&id| !deleted.value(id as usize)),
-    )
-}
-
 /// Intersection of two ascending id lists.
 fn intersect_ids(left: &[u64], right: &[u64]) -> Buffer<u64> {
     // Classic sorted-merge intersection: advance whichever side is behind,
-    // emit a value only when both sides agree on it.
+    // emit a value only when both sides agree on it. The result can hold at
+    // most the smaller list, so one up-front reservation replaces the
+    // growth-doubling reallocations.
     let mut i = 0usize;
     let mut j = 0usize;
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(left.len().min(right.len()));
     while i < left.len() && j < right.len() {
         use std::cmp::Ordering;
         match left[i].cmp(&right[j]) {
@@ -300,7 +304,7 @@ fn intersect_ids(left: &[u64], right: &[u64]) -> Buffer<u64> {
             }
         }
     }
-    Buffer::from_iter(out)
+    Buffer::from(out)
 }
 
 /// Gather the rows of `base` that `selection` covers and `deleted` has not
@@ -314,7 +318,11 @@ pub(crate) fn gather_live(
     base: &ArrayRef,
     selection: &RowSelection,
     deleted: Option<&Mask>,
+    probes: Option<&BaseProbes>,
 ) -> Result<ArrayRef> {
+    if let Some(rows) = gather_by_point_reads(base, selection, deleted, probes)? {
+        return Ok(rows);
+    }
     let rows = selection.apply(base)?;
     let Some(deleted) = deleted else {
         return Ok(rows);
@@ -326,44 +334,94 @@ pub(crate) fn gather_live(
     rows.filter(live).map_err(VortexRdfError::Vortex)
 }
 
+/// Selection size up to which a gather reads rows point-by-point through
+/// encoded search probes instead of the slice/take pipeline (see
+/// [`gather_by_point_reads`]). The pipeline's cost is fixed per column
+/// (optimizer pass, execution context, canonicalization) whatever the row
+/// count; point reads cost a fraction of a microsecond per row per column —
+/// the crossover sits in the hundreds of rows, and this stays under it.
+pub(crate) const POINT_GATHER_MAX_ROWS: usize = 256;
+
+/// Rows of a small selection, read point-by-point through encoded search
+/// probes into canonical output columns — the read-side counterpart of the
+/// match paths' encoded probing, skipping the per-column slice/canonicalize
+/// pipeline whose fixed cost dominates tiny reads on a compressed-resident
+/// base. `None` declines: a wide or `All` selection, a non-struct base, or
+/// any child (e.g. a string column) no probe resolves — the general pipeline
+/// handles those. Also serves the index serving plans, which canonicalize
+/// their small contiguous chunks through it (`Range(0..len)` over the sliced
+/// component rows).
+pub(crate) fn gather_by_point_reads(
+    base: &ArrayRef,
+    selection: &RowSelection,
+    deleted: Option<&Mask>,
+    probes: Option<&BaseProbes>,
+) -> Result<Option<ArrayRef>> {
+    use vortex_array::arrays::struct_::StructArrayExt;
+    use vortex_array::arrays::{Struct, StructArray};
+    use vortex_array::dtype::PType;
+    use vortex_encoded_search::SortedProbe;
+
+    let live: Vec<usize> = match selection {
+        RowSelection::All => return Ok(None),
+        RowSelection::Range(r) if (r.end - r.start) as usize <= POINT_GATHER_MAX_ROWS => (r.start
+            ..r.end)
+            .map(|i| i as usize)
+            .filter(|&i| deleted.is_none_or(|d| !d.value(i)))
+            .collect(),
+        RowSelection::Ids(ids) if ids.len() <= POINT_GATHER_MAX_ROWS => ids
+            .iter()
+            .map(|&i| i as usize)
+            .filter(|&i| deleted.is_none_or(|d| !d.value(i)))
+            .collect(),
+        _ => return Ok(None),
+    };
+    let Ok(struct_arr) = base.clone().try_downcast::<Struct>() else {
+        return Ok(None);
+    };
+    let names = struct_arr.names().clone();
+    let mut children = Vec::with_capacity(names.len());
+    for (idx, name) in names.iter().enumerate() {
+        let Ok(child) = struct_arr.unmasked_field_by_name(name.as_ref()) else {
+            return Ok(None);
+        };
+        // The store's cached probe first (resolution walks the encoding tree
+        // — the fixed cost this path exists to avoid); a transient base
+        // (tail, served rows) resolves per call.
+        let cached = probes.and_then(|p| p.child(base, idx));
+        let local;
+        let probe = match cached {
+            Some(owned) => owned.probe(),
+            None => {
+                let Some(resolved) = SortedProbe::resolve(child) else {
+                    return Ok(None);
+                };
+                local = resolved;
+                &local
+            }
+        };
+        let reads = live.iter().map(|&i| probe.value_at(i));
+        let gathered = match child.dtype().as_ptype() {
+            PType::U8 => PrimitiveArray::from_iter(reads.map(|v| v as u8)).into_array(),
+            PType::U16 => PrimitiveArray::from_iter(reads.map(|v| v as u16)).into_array(),
+            PType::U32 => PrimitiveArray::from_iter(reads.map(|v| v as u32)).into_array(),
+            PType::U64 => PrimitiveArray::from_iter(reads).into_array(),
+            _ => return Ok(None),
+        };
+        children.push(gathered);
+    }
+    let rows = StructArray::try_new(names, children, live.len(), Validity::NonNullable)
+        .map_err(VortexRdfError::Vortex)?
+        .into_array();
+    Ok(Some(rows))
+}
+
 /// Fold a freshly-doomed set of base rows into a store's existing tombstones,
 /// shared by both backends' delete paths.
 pub(crate) fn union_deleted(existing: Option<&Mask>, doomed: Mask) -> Mask {
     match existing {
         Some(existing) => existing | &doomed,
         None => doomed,
-    }
-}
-
-/// Split a file view's [`RowSelection`] into the two knobs the per-split filter
-/// loop understands: a [`Selection`] narrowing the mask (an id list, e.g. from a
-/// secondary index) and the row-id `bounds` it iterates. A `Range` narrows the
-/// bounds; an `Ids` list narrows the mask; `All` narrows neither.
-#[cfg(feature = "file-io")]
-pub(crate) fn split_bounds(selection: &RowSelection, row_count: u64) -> (Selection, Range<u64>) {
-    match selection {
-        RowSelection::All => (Selection::All, 0..row_count),
-        RowSelection::Range(range) => (Selection::All, range.clone()),
-        RowSelection::Ids(ids) => (Selection::IncludeByIndex(ids.clone()), 0..row_count),
-    }
-}
-
-/// The starting mask for one file split: the rows `selection` covers within
-/// `range`, minus any that `deleted` has tombstoned. Returned split-relative
-/// (one bit per row of `range`), ready for [`evaluate_filter_split`].
-#[cfg(feature = "file-io")]
-pub(crate) fn split_start_mask(
-    selection: &Selection,
-    deleted: Option<&Mask>,
-    range: &Range<u64>,
-) -> Mask {
-    let mask = selection.row_mask(range).mask().clone();
-    match deleted {
-        None => mask,
-        Some(deleted) => {
-            let live = !&deleted.slice(range.start as usize..range.end as usize);
-            mask.bitand(&live)
-        }
     }
 }
 

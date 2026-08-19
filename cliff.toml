@@ -47,6 +47,8 @@ filter_unconventional = true
 require_conventional = false
 # Map conventional types to Keep a Changelog groups. The <!-- N --> prefixes force
 # canonical ordering and are removed by `striptags` in the template.
+# These prefixes must cover every type scripts/hooks/commit-msg accepts —
+# anything uncovered silently falls into the catch-all Changed group below.
 commit_parsers = [
     { message = "^feat", group = "<!-- 0 -->Added" },
     { message = "^add", group = "<!-- 0 -->Added" },

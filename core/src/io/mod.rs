@@ -1,56 +1,16 @@
-pub mod de;
-pub mod ser;
+//! The native container codec: the `vortex-rdf.store.v1` grammar
+//! ([`container`]), the write driver over it ([`ser`]), and read-side file
+//! access ([`native_file`]). Textual RDF conversion lives in
+//! [`common`](crate::common) (parsing in `terms`, export in `export`); the
+//! opened-store runtime handle lives store-side in `store::native_file`.
 
-use std::sync::LazyLock;
-use vortex_array::scalar_fn::session::ScalarFnSession;
-use vortex_array::session::ArraySession;
-use vortex_session::VortexSession;
+pub(crate) mod container;
+pub(crate) mod native_file;
+/// Every item in `ser` is write-side native-container machinery, compiled only
+/// where a store can be written: natively behind `file-io`, and on wasm (whose
+/// bindings exchange file bytes).
+#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+pub(crate) mod ser;
 
 #[cfg(feature = "file-io")]
-use vortex_io::session::RuntimeSession;
-#[cfg(feature = "file-io")]
-use vortex_io::session::RuntimeSessionExt;
-#[cfg(feature = "file-io")]
-use vortex_layout::session::LayoutSession;
-
-/// Full session including layout and async runtime — used for file I/O.
-#[cfg(feature = "file-io")]
-pub static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-    let session = VortexSession::empty()
-        .with::<ArraySession>()
-        .with::<LayoutSession>()
-        .with::<ScalarFnSession>()
-        .with::<RuntimeSession>();
-    #[cfg(not(target_arch = "wasm32"))]
-    let session = session.with_tokio();
-    vortex_file::register_default_encodings(&session);
-    session
-});
-
-/// Minimal session for in-memory array operations and IPC.
-pub static VORTEX_LIGHT_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-    let session = VortexSession::empty()
-        .with::<ArraySession>()
-        .with::<ScalarFnSession>();
-    #[cfg(feature = "file-io")]
-    vortex_file::register_default_encodings(&session);
-    // The term dictionary is held and written FSST-compressed, so this
-    // encoding must be resolvable even in the light session — which is the
-    // only one wasm has, and which `register_default_encodings` above does not
-    // reach because `file-io` is off there.
-    #[cfg(not(feature = "file-io"))]
-    vortex_fsst::initialize(&session);
-    session
-});
-
-pub use de::{array_from_ipc_bytes, array_from_ipc_reader, deserialize};
-#[cfg(feature = "file-io")]
-pub use de::{load_vortex_file_ref, open_vortex_file};
-
-pub use ser::write_array_to_ipc;
-#[cfg(feature = "file-io")]
-pub use ser::{
-    quads_stream_to_vortex, quads_stream_to_vortex_file_with_builder,
-    quads_stream_to_vortex_writer, quads_stream_to_vortex_writer_with_builder, serialize,
-    write_sidecar_dictionary,
-};
+pub use ser::{quads_stream_to_vortex_file, quads_stream_to_vortex_writer};

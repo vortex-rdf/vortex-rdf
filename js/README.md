@@ -71,14 +71,14 @@ for await (const quad of store.match(null, myPredicate, null, null)) {
 }
 ```
 
-When you just want the matches as an array, `getQuads` is the array-returning counterpart (`async`, because resolving the match crosses the WebAssembly boundary):
+When you just want the matches as an array, `getQuads` is the array-returning counterpart (synchronous — no read path performs I/O, so there is nothing to await):
 
 ```javascript
-const quads = await store.getQuads(null, myPredicate, null, null);
+const quads = store.getQuads(null, myPredicate, null, null);
 console.log(`Found ${quads.length} results`);
 ```
 
-**Quads are lazy and zero-copy.** `match`/`getQuads` don't build eager term objects — they hand back quads backed by the store's columnar data. A term's string is decoded only when you read `.value`/`.termType`, and then interned, so iterating, counting, filtering, and `.equals` never materialize strings you don't use. Under the default `Dictionary` layout, `.equals` between terms of the same store is an **integer code compare** (no decoding at all). 
+**Quads are lazy and zero-copy.** `match`/`getQuads` don't build eager term objects — they hand back quads backed by the store's columnar data. A term's string is decoded only when you read `.value`/`.termType`, and then interned, so iterating, counting, filtering, and `.equals` never materialize strings you don't use. Under the default `dictionary` layout, `.equals` between terms of the same store is an **integer code compare** (no decoding at all). 
 
 The quads implement the RDF/JS `Quad`/`Term` interface (`.subject.value`, `.equals`, …) and interoperate with foreign RDF/JS terms via `.equals` in both directions. (They're lazy views into the producing store, so — unlike a plain data object — don't `structuredClone`
 them or rely on enumerating own properties.)
@@ -119,46 +119,63 @@ const bytes = await store.toBytes();
 
 Ingestion accepts an optional `BuildOptions` object that trades build cost against query speed and size. All fields are optional.
 
+Quads are always sorted by subject → predicate → object → graph while the columnar array is built — that global order is what gives subject lookups their binary search and what every secondary index routes against.
+
 ```javascript
 const store = await VortexRdfStore.fromString(data, 'nquads', {
-  builder: 'Sorted',                  // 'Unsorted' (default) | 'Sorted'
-  layout: 'Dictionary',               // 'Dictionary' (default) | 'Default' | 'TypedObject'
-  indexes: ['SecondaryByReference'],  // default: []
+  layout: 'dictionary',                   // 'dictionary' (default) | 'default' | 'typed-object'
+  indexes: ['secondary-by-reference'],    // default: []
 });
 ```
 
-**`builder`** — how quads are ordered while building:
-
-| Value | Build cost | Effect on queries |
-| --- | --- | --- |
-| `'Unsorted'` (default) | Cheapest; natural insertion order | Every `match` is a full column scan |
-| `'Sorted'` | Global in-memory sort by subject → predicate → object → graph | Subject lookups use a binary search |
+Core's out-of-core builder spills sorted runs to disk — a filesystem WebAssembly does not have — so the wasm build always sorts in memory and takes no builder option.
 
 **`layout`** — how terms are encoded into columns:
 
 | Value | Notes |
 | --- | --- |
-| `'Dictionary'` (default) | Terms replaced by codes into a sorted term dictionary. Most compact and fastest to query; backs the integer `.equals` fast path on lazy quads; added quads live in an in-memory string tail until serialized |
-| `'Default'` | All four terms as N-Triples strings |
-| `'TypedObject'` | Object split into kind/value/datatype/language columns |
+| `'dictionary'` (default) | Terms replaced by codes into a sorted term dictionary. Most compact and fastest to query; backs the integer `.equals` fast path on lazy quads; added quads live in an in-memory string tail until serialized |
+| `'default'` | All four terms as N-Triples strings |
+| `'typed-object'` | Object split into kind/value/datatype/language columns |
 
 **`indexes`** 
 
-- `'SecondaryByReference'` adds sorted predicate/object columns plus row-id back-references, so predicate-only and object-only patterns use a binary search instead of a full scan. 
-- `'SecondaryByCopy'` embeds two complete extra copies of the quad columns — one sorted by `(p, o, s, g)`, one by `(o, s, p, g)` — giving predicate- and object-bound patterns (including combined predicate+object lookups, resolved in one prefix search) the same sorted access path subjects have, at roughly 2× the storage. Both cost extra space and are only effective alongside `builder: 'Sorted'`.
+- `'secondary-by-reference'` adds sorted predicate/object columns plus row-id back-references, so predicate-only and object-only patterns use a binary search instead of a full scan. 
+- `'secondary-by-copy'` embeds two complete extra copies of the quad columns — one sorted by `(p, o, s, g)`, one by `(o, s, p, g)` — giving predicate- and object-bound patterns (including combined predicate+object lookups, resolved in one prefix search) the same sorted access path subjects have, at roughly 2× the storage. Both cost extra space.
 
-A good query-optimized configuration is 
+The default `{ layout: 'dictionary' }` already gives compact, code-based lazy reads and a binary-searchable subject column. Adding an index on top is what a predicate- or object-heavy workload wants:
 
 ```javascript
 { 
-    builder: 'Sorted', 
-    layout: 'Dictionary', 
-    indexes: ['SecondaryByReference'] 
+    layout: 'dictionary', 
+    indexes: ['secondary-by-reference'] 
 };
 ```
 
+### Term codes (low-level)
 
-The default `{ builder: 'Unsorted', layout: 'Dictionary' }` already gives compact, code-based lazy reads and is cheap to build.
+Under the default `dictionary` layout, terms are stored as `u32` codes into a sorted term dictionary. `termDict()` is the one door to code↔term translation: it returns an immutable `TermDict` handle, or `undefined` when the store's rows aren't code-addressable (a non-dictionary layout, or added quads pending in the in-memory tail):
+
+```javascript
+const dict = store.termDict();   // TermDict | undefined
+if (dict) {
+  const code = dict.encode('<http://schema.org/name>');  // number | undefined
+  console.log(dict.decode(code));                        // '<http://schema.org/name>'
+}
+```
+
+`decode`/`encode` speak N-Triples term strings — `<iri>`, `_:blank`, `"lit"@lang`, `"lit"^^<dt>`, and `''` for the default graph. The handle is a snapshot: it keeps decoding correctly after the store is mutated, because it retains the dictionary its codes address. It is a wasm-side handle — call `free()` when done (also wired to `Symbol.dispose`, so `using` disposes it automatically).
+
+`matchCodes` is its pattern-matching counterpart: it resolves a pattern to the matched rows' raw term codes — four columnar `Uint32Array`s plus a `length` — without materializing any term strings, and returns `null` under the same conditions `termDict()` returns `undefined`:
+
+```javascript
+const cols = store.matchCodes(null, myPredicate, null, null);
+if (cols) {
+  console.log(cols.length, dict.decode(cols.o[0]));
+}
+```
+
+`matchCodes` is a prototype read path; `match`/`getQuads` are the supported way to read quads.
 
 ### Helper functions
 
@@ -167,7 +184,7 @@ For one-shot conversions without holding a store:
 ```javascript
 import { rdf_to_vortex, vortex_to_rdf } from '@vortex-rdf/vortex-rdf-store';
 
-const bytes = await rdf_to_vortex(turtleText, 'turtle', { builder: 'Sorted' });
+const bytes = await rdf_to_vortex(turtleText, 'turtle', { layout: 'dictionary' });
 const text  = await vortex_to_rdf(bytes, 'nquads');
 
 // N-Quads is just another format
@@ -185,12 +202,12 @@ import { DataFactory } from 'rdf-data-factory';
 
 const df = new DataFactory();
 
-const options: BuildOptions = { builder: 'Sorted', layout: 'Dictionary' };
+const options: BuildOptions = { layout: 'dictionary' };
 const store = await VortexRdfStore.fromString(data, 'nquads', options);
 
-console.log(store.layout()); // 'Dictionary'
+console.log(store.layout()); // 'dictionary'
 
-const quads = await store.getQuads(null, df.namedNode('http://schema.org/name'), null, null);
+const quads = store.getQuads(null, df.namedNode('http://schema.org/name'), null, null);
 for (const quad of quads) {
   console.log(quad.subject.value);
 }
@@ -230,7 +247,7 @@ Three surfaces, kept separate because they answer different questions and are tr
 
 **`npm run bench`** runs each store — the Vortex build variants, [rdf-stores.js](https://github.com/rubensworks/rdf-stores.js), and [oxigraph](https://github.com/oxigraph/oxigraph) — through the same query, mutation, and serialization workload, one adapter per child process so peak RSS is attributable and no store's garbage taints another's timings. It is wall-clock, so it is only as stable as the machine it runs on; it is deliberately **not** uploaded to CodSpeed. `scripts/render_bench_dashboard.py` turns its `results.json` plus a `cargo bench --bench benchmark` run into `public/index.html`.
 
-The dataset is generated by `genDataset` in [bench/shared.ts](bench/shared.ts), with term cardinality as an explicit knob — real RDF has terms scaling with rows, and a generator that draws millions of quads from a handful of IRIs makes every store's term handling invisible. Tunable by env var:
+The dataset is generated by `genDataset` in [bench/datasets.ts](bench/datasets.ts), with term cardinality as an explicit knob — real RDF has terms scaling with rows, and a generator that draws millions of quads from a handful of IRIs makes every store's term handling invisible. Tunable by env var:
 
 | Var | Default | Meaning |
 | --- | --- | --- |

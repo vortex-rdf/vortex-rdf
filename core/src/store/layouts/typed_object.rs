@@ -11,14 +11,21 @@ use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
-use crate::common::array::{StrColReader, make_nullable_string_array, make_string_array};
 use crate::common::terms::{get_as_term, parse_graph_name, parse_named_node, parse_subject};
 use crate::error::{Result, VortexRdfError};
-use crate::io::VORTEX_LIGHT_SESSION;
+use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
-use crate::store::schema::{
-    COL_G, COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE, COL_P, COL_S,
-};
+use crate::store::array::{StrColReader, make_nullable_string_array, make_string_array};
+use crate::store::schema::{COL_G, COL_P, COL_S};
+
+/// The term kind tag — its presence in a schema is what marks the layout.
+pub(crate) const COL_O_KIND: &str = "o_kind";
+/// The object's lexical value: IRI string, blank node id, or literal value.
+pub(crate) const COL_O_VALUE: &str = "o_value";
+/// The literal datatype IRI — null unless the object is a typed literal.
+pub(crate) const COL_O_DATATYPE: &str = "o_datatype";
+/// The literal language tag — null unless the object is a language literal.
+pub(crate) const COL_O_LANG: &str = "o_lang";
 
 /// Field names of the primary columns:
 /// `s`, `p`, `o_kind`, `o_value`, `o_datatype`, `o_lang`, `g`.
@@ -129,7 +136,7 @@ fn compose_object(
 /// holds the full object term, which under this layout has to be recomposed
 /// from `o_kind`/`o_value`/`o_datatype`/`o_lang`.
 pub(crate) fn object_terms(struct_arr: &StructArray) -> Result<Vec<String>> {
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
 
     let kind_col = struct_arr
         .unmasked_field_by_name(COL_O_KIND)
@@ -183,7 +190,7 @@ pub(crate) fn object_terms(struct_arr: &StructArray) -> Result<Vec<String>> {
 
 /// Decode a StructArray chunk with typed object sub-columns into Quads.
 pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
 
     let struct_arr = match chunk.clone().execute::<StructArray>(&mut ctx) {
         Ok(a) => a,

@@ -1,0 +1,40 @@
+[package]
+name = "vortex-encoded-search"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bounds search and point access over compressed Vortex arrays without decoding"
+keywords = ["vortex", "columnar", "binary-search", "compression"]
+categories = ["encoding", "data-structures"]
+
+[dependencies]
+self_cell = { workspace = true }
+vortex-array = { workspace = true }
+vortex-buffer = { workspace = true }
+vortex-error = { workspace = true }
+vortex-fastlanes = { workspace = true }
+vortex-runend = { workspace = true }
+vortex-sequence = { workspace = true }
+vortex-layout = { workspace = true, optional = true }
+vortex-session = { workspace = true, optional = true }
+
+[features]
+default = []
+layout = ["dep:vortex-layout", "dep:vortex-session"]
+
+[dev-dependencies]
+divan = { package = "codspeed-divan-compat", version = "5.0.1" }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+vortex-btrblocks = { workspace = true }
+vortex-file = { workspace = true }
+vortex-io = { workspace = true, features = ["tokio"] }
+vortex-layout = { workspace = true }
+vortex-session = { workspace = true }
+
+[[bench]]
+name = "probe"
+harness = false

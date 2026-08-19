@@ -9,15 +9,14 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use futures::StreamExt;
-use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
+use futures::{Stream, StreamExt, stream};
+use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use tokio::runtime::Runtime;
 
-use vortex_rdf_core::common::testing::generate_rdf_data_stream;
+use vortex_rdf_core::error::Result;
 use vortex_rdf_core::store::RawQuad;
 use vortex_rdf_core::{
-    DictionaryPlacement, IndexType, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder,
-    UnsortedStreamBuilder, VortexRdfStore, io,
+    BuiltArray, IndexType, LayoutStrategy, SortedStreamBuilder, VortexArrayBuilder, VortexRdfStore,
 };
 
 /// Single dataset size for the whole suite. In simulation mode CodSpeed counts
@@ -46,23 +45,6 @@ pub fn rt() -> &'static Runtime {
 }
 
 // ── configuration axes ──────────────────────────────────────────────────────
-
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-pub enum Builder {
-    Unsorted,
-    SortedInMemory,
-    SortedStream,
-}
-
-impl Builder {
-    pub fn short(self) -> &'static str {
-        match self {
-            Self::Unsorted => "unsorted",
-            Self::SortedInMemory => "sorted_in_memory",
-            Self::SortedStream => "sorted_stream",
-        }
-    }
-}
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Layout {
@@ -122,6 +104,10 @@ impl Index {
 pub enum Source {
     File,
     InMemory,
+    /// Lean adoption: `from_bytes` over the serialized store, keeping the
+    /// base wire-encoded and the index components deferred — the shape js
+    /// `fromBytes` and python `from_bytes` hand out.
+    Bytes,
 }
 
 impl Source {
@@ -129,6 +115,7 @@ impl Source {
         match self {
             Self::File => "file",
             Self::InMemory => "in_memory",
+            Self::Bytes => "from_bytes",
         }
     }
 }
@@ -154,151 +141,107 @@ pub fn materialize_quads(size: usize) -> Vec<RawQuad> {
     })
 }
 
-/// Build the in-memory store for a config, dispatching the generic builder on
-/// the runtime `Builder` enum. A store rather than a bare array: under the
-/// Dictionary layout the array holds only u32 codes, and the term dictionary
-/// travels beside it in the builder's `BuiltArray` — `from_built` is the one
-/// constructor that accepts that pair.
-pub fn build_store(builder: Builder, layout: Layout, index: Index, size: usize) -> VortexRdfStore {
+/// Run a config's ingest to the builder's `BuiltArray`: the quad array plus
+/// whatever travels beside it — under the Dictionary layout the array holds
+/// only u32 codes and the term dictionary rides alongside; `from_built` is
+/// the one constructor that accepts that pair.
+fn build_built(layout: Layout, index: Index, size: usize) -> BuiltArray {
     rt().block_on(async move {
-        let stream = generate_rdf_data_stream(size);
-        let strategy = layout.strategy();
-        let indexes = index.types();
-        match builder {
-            Builder::Unsorted => {
-                VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
-                    stream, strategy, indexes,
-                )
-                .await
-            }
-            Builder::SortedInMemory => {
-                VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
-                    stream, strategy, indexes,
-                )
-                .await
-            }
-            Builder::SortedStream => {
-                VortexRdfStore::build_vortex_array_with_builder::<SortedStreamBuilder>(
-                    stream, strategy, indexes,
-                )
-                .await
-            }
-        }
-        .and_then(VortexRdfStore::from_built)
-        .expect("failed to build vortex store")
+        SortedStreamBuilder::build_vortex_array(
+            Box::new(generate_rdf_data_stream(size)),
+            layout.strategy(),
+            index.types(),
+        )
+        .await
+        .expect("failed to build vortex array")
     })
 }
 
-pub type CacheKey = (Builder, Layout, Index, usize);
+pub type CacheKey = (Layout, Index, usize);
 
-/// Cache of built in-memory stores (cheaply cloneable: Arc-shared internals).
-/// Under the star design only a handful of distinct configs are ever
+/// Cache of ingest products (`BuiltArray`, cheaply cloneable: Arc-shared
+/// buffers). Only the expensive ingest is cached — stores are rebuilt per
+/// handout, see [`cached_store`]. Only a handful of distinct configs are ever
 /// requested, so this stays naturally bounded (unlike the old full-factorial
 /// cache, which held every combination for the process lifetime).
-static STORE_CACHE: OnceLock<Mutex<HashMap<CacheKey, VortexRdfStore>>> = OnceLock::new();
+static BUILT_CACHE: OnceLock<Mutex<HashMap<CacheKey, BuiltArray>>> = OnceLock::new();
 static FILE_CACHE: OnceLock<Mutex<HashMap<CacheKey, PathBuf>>> = OnceLock::new();
 
-pub fn cached_store(builder: Builder, layout: Layout, index: Index, size: usize) -> VortexRdfStore {
-    let cache = STORE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (builder, layout, index, size);
-    if let Some(store) = cache.lock().unwrap().get(&key) {
-        return store.clone();
+fn cached_built(layout: Layout, index: Index, size: usize) -> BuiltArray {
+    let cache = BUILT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (layout, index, size);
+    if let Some(built) = cache.lock().unwrap().get(&key) {
+        return built.clone();
     }
-    let store = build_store(builder, layout, index, size);
-    cache.lock().unwrap().insert(key, store.clone());
-    store
+    let built = build_built(layout, index, size);
+    cache.lock().unwrap().insert(key, built.clone());
+    built
 }
 
-pub fn cached_file(builder: Builder, layout: Layout, index: Index, size: usize) -> PathBuf {
+/// A FRESH store over a config's cached ingest product: `from_built` re-runs
+/// component adoption and store construction every call, so no store-level
+/// state is shared between the stores this returns. Handing out clones of one
+/// cached store instead already produced a documented phantom regression
+/// under CodSpeed's single-measured-invocation model (the file bench warming
+/// the shared store shifted the in-memory match baselines) — tasks must start
+/// cold and order-independent. Known residual: the immutable Arc'd buffers —
+/// and vortex's interior-mutable per-array stats riding on them — remain
+/// shared with the cache. That was the incident's actual channel (the writer
+/// computing file stats on the shared array); today's writer repartitions
+/// into copies, but any stat a read lazily computes still lands on the shared
+/// array. Closing that too would take a deep copy per handout.
+pub fn cached_store(layout: Layout, index: Index, size: usize) -> VortexRdfStore {
+    VortexRdfStore::from_built(cached_built(layout, index, size))
+        .expect("failed to build vortex store")
+}
+
+pub fn cached_file(layout: Layout, index: Index, size: usize) -> PathBuf {
     let cache = FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (builder, layout, index, size);
+    let key = (layout, index, size);
     if let Some(path) = cache.lock().unwrap().get(&key) {
         return path.clone();
     }
-    let store = cached_store(builder, layout, index, size);
+    let store = cached_store(layout, index, size);
     let dir = PathBuf::from("target/bench_vortex_files");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!(
-        "{}_{}_{}_{}.vortex",
-        builder.short(),
+        "{}_{}_{}.vortex",
         layout.short(),
         index.short(),
         size
     ));
     rt().block_on(async {
-        let arr = store
-            .to_serializable_array()
-            .await
-            .expect("serializable array");
-        let writer = tokio::fs::File::create(&path).await.expect("create file");
-        io::serialize(arr, writer).await.expect("serialize file");
+        let bytes = store.to_bytes().await.expect("serialize store");
+        std::fs::write(&path, bytes).expect("write file");
     });
     cache.lock().unwrap().insert(key, path.clone());
     path
 }
 
 /// Construct a store over a config's data, from the requested source. Both are
-/// untimed: `from_file` reads the footer only, and the in-memory arm clones a
-/// cached (Arc-shared) store.
-pub fn make_store(
-    source: Source,
-    builder: Builder,
-    layout: Layout,
-    index: Index,
-    size: usize,
-) -> VortexRdfStore {
+/// untimed: `from_file` reads the footer only, and the in-memory arm rebuilds
+/// a fresh store from the cached ingest product (see [`cached_store`]).
+pub fn make_store(source: Source, layout: Layout, index: Index, size: usize) -> VortexRdfStore {
     match source {
         Source::File => {
-            let path = cached_file(builder, layout, index, size);
+            let path = cached_file(layout, index, size);
             rt().block_on(async {
                 VortexRdfStore::from_file(path)
                     .await
                     .expect("open file store")
             })
         }
-        Source::InMemory => cached_store(builder, layout, index, size),
+        Source::InMemory => cached_store(layout, index, size),
+        Source::Bytes => {
+            let path = cached_file(layout, index, size);
+            let bytes = std::fs::read(path).expect("read serialized store");
+            rt().block_on(async {
+                VortexRdfStore::from_bytes_owned(bytes)
+                    .await
+                    .expect("adopt bytes store")
+            })
+        }
     }
-}
-
-type DictIndexedFileKey = (DictionaryPlacement, Index, usize);
-static DICT_INDEXED_FILE_CACHE: OnceLock<Mutex<HashMap<DictIndexedFileKey, PathBuf>>> =
-    OnceLock::new();
-
-/// Like `cached_dict_file`, but with a secondary index — the files behind
-/// the placement rows of the match matrix benches.
-pub fn cached_dict_indexed_file(
-    placement: DictionaryPlacement,
-    index: Index,
-    size: usize,
-) -> PathBuf {
-    let cache = DICT_INDEXED_FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (placement, index, size);
-    if let Some(path) = cache.lock().unwrap().get(&key) {
-        return path.clone();
-    }
-    let dir = PathBuf::from("target/bench_vortex_files");
-    std::fs::create_dir_all(&dir).unwrap();
-    let placement_name = match placement {
-        DictionaryPlacement::Padded => "padded",
-        DictionaryPlacement::Sidecar => "sidecar",
-    };
-    let path = dir.join(format!(
-        "dict_{placement_name}_{}_{size}.vortex",
-        index.short()
-    ));
-    rt().block_on(async {
-        io::quads_stream_to_vortex_file_with_builder::<SortedStreamBuilder, _>(
-            generate_rdf_data_stream(size),
-            &path,
-            LayoutStrategy::Dictionary,
-            index.types(),
-            placement,
-        )
-        .await
-        .expect("write indexed dictionary bench file");
-    });
-    cache.lock().unwrap().insert(key, path.clone());
-    path
 }
 
 // ── match patterns ──────────────────────────────────────────────────────────
@@ -351,4 +294,90 @@ pub fn terms_for(
         Pattern::G => (None, None, None, Some(g())),
         Pattern::SPOG => (Some(s()), Some(p()), Some(o()), Some(g())),
     }
+}
+
+/// Generate a stream of mock RDF quads for the bench targets.
+/// Triples are evenly distributed across 10 named graphs.
+pub fn generate_rdf_data_stream(size: usize) -> impl Stream<Item = Result<RawQuad>> {
+    const EX: &str = "http://example.org/";
+    const NUM_GRAPHS: u64 = 10;
+
+    stream::iter((0..size).map(|i| {
+        let subject =
+            NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!("{}subject/{}", EX, i)));
+        let predicate = NamedNode::new_unchecked(format!("{}predicate/{}", EX, i % 100));
+        let object = Term::NamedNode(NamedNode::new_unchecked(format!("{}object/{}", EX, i % 50)));
+        let graph = GraphName::NamedNode(NamedNode::new_unchecked(format!(
+            "{}graph/{}",
+            EX,
+            (i as u64) % NUM_GRAPHS
+        )));
+
+        Ok(RawQuad::from_quad(&Quad::new(
+            subject, predicate, object, graph,
+        )))
+    }))
+}
+
+/// Like [`generate_rdf_data_stream`], but with literal objects — plain,
+/// language-tagged, typed, and escape-bearing (quotes, backslashes, newlines,
+/// and `"@`/`^^` lookalikes inside the value). The star dataset above is
+/// named-node-only, so this is what lets a benchmark reach the literal
+/// escape/unescape paths at all.
+pub fn generate_literal_rdf_data_stream(size: usize) -> impl Stream<Item = Result<RawQuad>> {
+    const EX: &str = "http://example.org/";
+
+    stream::iter((0..size).map(|i| {
+        let subject =
+            NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!("{}subject/{}", EX, i)));
+        let predicate = NamedNode::new_unchecked(format!("{}predicate/{}", EX, i % 100));
+        let object = Term::Literal(match i % 4 {
+            0 => Literal::new_simple_literal(format!("plain value {}", i % 50)),
+            1 => Literal::new_language_tagged_literal_unchecked(
+                format!("tagged value {}", i % 50),
+                "en",
+            ),
+            2 => Literal::new_typed_literal(
+                format!("{}", i % 50),
+                NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer"),
+            ),
+            _ => Literal::new_simple_literal(format!(
+                "say \"hi\"@home ^^ line\nbreak back\\slash {}",
+                i % 50
+            )),
+        });
+
+        Ok(RawQuad::from_quad(&Quad::new(
+            subject,
+            predicate,
+            object,
+            GraphName::DefaultGraph,
+        )))
+    }))
+}
+
+/// The literal-bearing store for `decode_all_literals`: Dictionary layout, no
+/// index — the config whose full decode term-decodes every row. Cached and
+/// handed out like the star stores: only the ingest product is cached, and
+/// each call rebuilds a fresh store from it (see
+/// [`cached_store`] for why shared clones are a contamination hazard).
+pub fn cached_literal_store(size: usize) -> VortexRdfStore {
+    static CACHE: OnceLock<Mutex<HashMap<usize, BuiltArray>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let built = if let Some(built) = cache.lock().unwrap().get(&size) {
+        built.clone()
+    } else {
+        let built = rt().block_on(async move {
+            SortedStreamBuilder::build_vortex_array(
+                Box::new(generate_literal_rdf_data_stream(size)),
+                LayoutStrategy::Dictionary,
+                Vec::new(),
+            )
+            .await
+            .expect("failed to build literal array")
+        });
+        cache.lock().unwrap().insert(size, built.clone());
+        built
+    };
+    VortexRdfStore::from_built(built).expect("failed to build literal store")
 }

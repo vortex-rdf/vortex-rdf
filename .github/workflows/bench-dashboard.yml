@@ -44,7 +44,9 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v7
         with:
-          node-version: 25
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: js/package-lock.json
 
       # Build the wasm bindings and run the JavaScript comparative benchmark
       # (VortexRdfStore variants vs rdf-stores.js vs oxigraph). Wall-clock via
@@ -61,8 +63,35 @@ jobs:
           npm run build
           npm run bench
 
+      # The Python comparative benchmark (vortex_rdf vs pyoxigraph, pycottas,
+      # rdflib, lightrdf). run.py provisions one uv virtualenv per library --
+      # they cannot share one, since pycottas hard-pins an older pyoxigraph
+      # than the version we want to measure. Wall-clock; not uploaded to
+      # CodSpeed, same as the JS comparative bench.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Build Python bindings + run Python comparative benchmark
+        working-directory: python
+        env:
+          BENCH_DIM: 128
+          BENCH_DIM_QUADS: 32
+          MUT_BATCH: 10000
+        run: |
+          uv venv .venv --python 3.13
+          uv pip install --python .venv/bin/python maturin
+          # `maturin develop` requires an active virtualenv, and it is what puts
+          # the compiled `_native.abi3.so` inside python/vortex_rdf/ — which is
+          # all the bench needs, since run.py reaches the bindings via
+          # PYTHONPATH rather than installing them into each adapter's venv.
+          VIRTUAL_ENV="$PWD/.venv" .venv/bin/maturin develop --release
+          python3 bench/run.py
+
       - name: Render dashboard
-        run: python3 scripts/render_bench_dashboard.py bench_output.txt public/index.html --js js/bench/results.json
+        run: |
+          python3 scripts/render_bench_dashboard.py bench_output.txt public/index.html \
+            --js js/bench/results.json \
+            --python python/bench/results.json
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5

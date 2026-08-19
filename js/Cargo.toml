@@ -2,6 +2,7 @@
 name = "vortex-rdf"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,34 +13,44 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-# wasm-opt's default `-O` costs ~13min on this module and buys nothing we want:
-# LLVM at opt-level=3 has already done the real optimization, so `-O` only shrinks
-# the file. Measured on the 0.83 vortex tree (14.7MB wasm-bindgen output):
+# wasm-opt's default `-O` costs many minutes on this module and buys nothing we
+# want: LLVM at opt-level=3 has already done the real optimization, so `-O` only
+# shrinks the file. -O1 builds ~20x faster, gzips comparably (what npm and CDNs
+# actually ship), and is indistinguishable at runtime.
 #
-#   level      wasm-opt   raw       gzip      fromQuads/match   WebAssembly.compile
-#   -O (=-O2)  13m20s     11.34MB   2.58MB    274ms / 68.2ms    14.3ms
-#   -O1           42s     12.22MB   2.46MB    267ms / 66.3ms    13.3ms
-#
-# -O1 is 19x faster to build, gzips *smaller* (what npm and CDNs actually ship),
-# and is indistinguishable at runtime. The only regression is raw uncompressed
-# size, which nothing measurably depends on.
+# Size history (raw / gzip after -O1): 12.22MB / 2.46MB on the 0.83 vortex tree
+# with the IPC byte format; 24.5MB / 4.7MB after the embedded-store format made
+# `toBytes`/`fromBytes` real Vortex files — the file writer's compression
+# pipeline (btrblocks + every registered encoding) is now reachable from wasm
+# and can no longer be dead-stripped. If the bundle ever matters more than
+# writer parity, a wasm-only lighter write strategy is the lever.
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ['-O1']
 
 [dependencies]
-vortex-rdf-core = { path = "../core", default-features = false }
 wasm-bindgen.workspace = true
 wasm-bindgen-futures = "0.4.76"
 js-sys.workspace = true
 futures.workspace = true
 console_error_panic_hook.workspace = true
+# Never referenced from this crate's sources: both entries exist to turn on the
+# `wasm_js` backend, which has no default on wasm32 and so must be enabled by a
+# crate in the graph. Two majors because two sets of transitive dependents want
+# different ones -- 0.3 through rand_core 0.9 (oxrdf, vortex-onpair), 0.4
+# through rand 0.10 (vortex-array) and codspeed.
 getrandom = { version = "0.3.4", features = ["wasm_js"] }
 getrandom_04 = { package = "getrandom", version = "0.4.3", features = ["wasm_js"] }
 oxrdf.workspace = true
 oxrdfio.workspace = true
-vortex-array.workspace = true
-vortex.workspace = true
 
-[dependencies.web-sys]
-version = "0.3.103"
-features = ["console"]
+# The core dependency is target-conditional so that the crate builds on both
+# targets it is checked against. WebAssembly has no filesystem, so the wasm
+# build takes core without its default `file-io` feature; the host build takes
+# the default features, under which core's serialization surface
+# (`to_bytes`/`from_bytes`) — which these bindings call unconditionally — is
+# compiled in.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+vortex-rdf-core = { path = "../core", default-features = false }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+vortex-rdf-core = { path = "../core" }

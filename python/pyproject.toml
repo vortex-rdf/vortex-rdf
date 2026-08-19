@@ -4,7 +4,9 @@ build-backend = "maturin"
 
 [project]
 name = "vortex-rdf"
-version = "0.5.0"
+# Inherited from Cargo.toml by maturin: the crate takes the workspace version,
+# so the release version has one declaration site on the Rust side.
+dynamic = ["version"]
 description = "Python bindings for Vortex-RDF, a high-performance columnar RDF store format"
 readme = "README.md"
 license = "MIT"
@@ -23,7 +25,9 @@ classifiers = [
 dependencies = []
 
 [dependency-groups]
-dev = ["pytest>=8", "maturin>=1.8,<2"]
+# pytest-codspeed instruments bench/test_codspeed.py; it is a dev
+# dependency rather than a bench extra so `uv sync` alone can run it.
+dev = ["pytest>=8", "maturin>=1.8,<2", "pytest-codspeed>=4"]
 
 [project.urls]
 Repository = "https://github.com/vortex-rdf/vortex-rdf"
@@ -37,11 +41,13 @@ python-source = "."
 
 [tool.uv]
 # The extension must be rebuilt when the Rust sources change — the binding
-# crate's own and the core crate's it wraps (a path dependency).
+# crate's own and the core crate's it wraps (a path dependency). The workspace
+# manifest is a key too: it carries the version this package inherits.
 cache-keys = [
   { file = "pyproject.toml" },
   { file = "Cargo.toml" },
   { file = "src/**/*.rs" },
+  { file = "../Cargo.toml" },
   { file = "../core/Cargo.toml" },
   { file = "../core/src/**/*.rs" },
 ]

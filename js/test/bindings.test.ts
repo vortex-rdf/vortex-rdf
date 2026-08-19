@@ -27,29 +27,27 @@ const NQUADS = [
     '<http://example.org/s4> <http://example.org/p4> "hola"@es .',
 ].join('\n') + '\n';
 
-/** Every build variant reachable from JS. */
+/** Every build variant reachable from JS, in the canonical kebab-case
+ *  vocabulary — the only spellings accepted, and what `layout()` reports. */
 const VARIANTS: { name: string; options: BuildOptions }[] = [
-    { name: 'Unsorted/Default', options: { builder: 'Unsorted', layout: 'Default' } },
-    { name: 'Unsorted/TypedObject', options: { builder: 'Unsorted', layout: 'TypedObject' } },
-    { name: 'Unsorted/Dictionary', options: { builder: 'Unsorted', layout: 'Dictionary' } },
-    { name: 'Sorted/Default', options: { builder: 'Sorted', layout: 'Default' } },
-    { name: 'Sorted/TypedObject', options: { builder: 'Sorted', layout: 'TypedObject' } },
-    { name: 'Sorted/Dictionary', options: { builder: 'Sorted', layout: 'Dictionary' } },
+    { name: 'Default', options: { layout: 'default' } },
+    { name: 'TypedObject', options: { layout: 'typed-object' } },
+    { name: 'Dictionary', options: { layout: 'dictionary' } },
     {
-        name: 'Sorted/Default+index',
-        options: { builder: 'Sorted', layout: 'Default', indexes: ['SecondaryByReference'] },
+        name: 'Default+index',
+        options: { layout: 'default', indexes: ['secondary-by-reference'] },
     },
     {
-        name: 'Sorted/Dictionary+index',
-        options: { builder: 'Sorted', layout: 'Dictionary', indexes: ['SecondaryByReference'] },
+        name: 'Dictionary+index',
+        options: { layout: 'dictionary', indexes: ['secondary-by-reference'] },
     },
     {
-        name: 'Sorted/Default+copy-index',
-        options: { builder: 'Sorted', layout: 'Default', indexes: ['SecondaryByCopy'] },
+        name: 'Default+copy-index',
+        options: { layout: 'default', indexes: ['secondary-by-copy'] },
     },
     {
-        name: 'Sorted/Dictionary+copy-index',
-        options: { builder: 'Sorted', layout: 'Dictionary', indexes: ['SecondaryByCopy'] },
+        name: 'Dictionary+copy-index',
+        options: { layout: 'dictionary', indexes: ['secondary-by-copy'] },
     },
 ];
 
@@ -65,7 +63,7 @@ describe('build variants', () => {
             test('matches every quad-position pattern', async () => {
                 const store = await VortexRdfStore.fromString(NQUADS, 'nquads', options);
                 const count = (s: Term | null, p: Term | null, o: Term | null, g: Term | null) =>
-                    store.getQuads(s, p, o, g).then((qs: Quad[]) => qs.length);
+                    store.getQuads(s, p, o, g).length;
 
                 // Subject-only: exercises the sorted binary-search path.
                 expect(await count(df.namedNode('http://example.org/s1'), null, null, null)).toBe(2);
@@ -245,9 +243,8 @@ describe('RDF format support', () => {
 describe('free functions', () => {
     test('rdf_to_vortex / vortex_to_rdf round-trip with options', async () => {
         const bytes = await rdf_to_vortex(NQUADS, 'nquads', {
-            builder: 'Sorted',
-            layout: 'Dictionary',
-            indexes: ['SecondaryByReference'],
+            layout: 'dictionary',
+            indexes: ['secondary-by-reference'],
         });
         expect(bytes).toBeInstanceOf(Uint8Array);
 
@@ -262,9 +259,9 @@ describe('free functions', () => {
     });
 
     test('rdf_to_vortex accepts a BuildOptions object', async () => {
-        const bytes = await rdf_to_vortex(NQUADS, 'nquads', { builder: 'Sorted', layout: 'Dictionary' });
+        const bytes = await rdf_to_vortex(NQUADS, 'nquads', { layout: 'dictionary' });
         const store = await VortexRdfStore.fromBytes(bytes);
-        expect(store.layout()).toBe('Dictionary');
+        expect(store.layout()).toBe('dictionary');
         expect(await store.size()).toBe(6);
     });
 });
@@ -275,7 +272,7 @@ describe('lazy terms outliving a dictionary rebuild', () => {
     // *fresh* dictionary, renumbering every term, so lazy quads that decoded
     // against the live store would silently resolve old codes to other terms.
     // They must decode against the snapshot taken when they were produced.
-    const dictOpts: BuildOptions = { builder: 'Sorted', layout: 'Dictionary' };
+    const dictOpts: BuildOptions = { layout: 'dictionary' };
     const PROBE = '<http://example.org/s3>';
 
     /** Enough quads to cross the auto-compaction floor, all sorting *before*
@@ -299,14 +296,14 @@ describe('lazy terms outliving a dictionary rebuild', () => {
         const held = await store.getQuads(null, df.namedNode('http://example.org/p3'), null, null);
         expect(held.length).toBe(1);
 
-        const codeBefore = store.encodeTerm(PROBE);
+        const codeBefore = store.termDict()!.encode(PROBE);
         await store.addQuads(compactionTrigger());
         // Preconditions, so this cannot pass vacuously if compaction stops
         // firing: the term was renumbered, and its old code now names a
         // *different* term — which is precisely what a lazy quad decoding
         // against the live store would hand back.
-        expect(store.encodeTerm(PROBE)).not.toBe(codeBefore);
-        expect(store.decodeTerm(codeBefore!)).not.toBe(PROBE);
+        expect(store.termDict()!.encode(PROBE)).not.toBe(codeBefore);
+        expect(store.termDict()!.decode(codeBefore!)).not.toBe(PROBE);
 
         expect(held[0].subject.value).toBe('http://example.org/s3');
         expect(held[0].predicate.value).toBe('http://example.org/p3');
@@ -320,9 +317,9 @@ describe('lazy terms outliving a dictionary rebuild', () => {
         const held = await collect(store.match(null, df.namedNode('http://example.org/p4'), null, null));
         expect(held.length).toBe(1);
 
-        const codeBefore = store.encodeTerm(PROBE);
+        const codeBefore = store.termDict()!.encode(PROBE);
         await store.addQuads(compactionTrigger());
-        expect(store.encodeTerm(PROBE)).not.toBe(codeBefore);
+        expect(store.termDict()!.encode(PROBE)).not.toBe(codeBefore);
 
         expect(held[0].subject.value).toBe('http://example.org/s4');
         expect(held[0].object.value).toBe('hola');
@@ -341,19 +338,23 @@ describe('lazy terms outliving a dictionary rebuild', () => {
 });
 
 describe('option validation', () => {
-    test('rejects an unknown builder', async () => {
-        await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { builder: 'Nope' as any })).rejects
-            .toThrow(/Unknown builder strategy/);
-    });
-
     test('rejects an unknown layout', async () => {
         await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'Nope' as any })).rejects
-            .toThrow(/Unknown layout strategy/);
+            .toThrow(/unknown layout strategy/);
     });
 
     test('rejects an unknown index', async () => {
         await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { indexes: ['Nope'] as any })).rejects
-            .toThrow(/Unknown index type/);
+            .toThrow(/unknown index type/);
+    });
+
+    test('rejects retired spellings, naming the canonical vocabulary', async () => {
+        // Parsing is strict kebab-case: the old PascalCase inputs error, and
+        // the message lists the canonical names.
+        await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'Dictionary' as any })).rejects
+            .toThrow(/unknown layout strategy "Dictionary".*"dictionary"/);
+        await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { indexes: ['SecondaryByCopy'] as any })).rejects
+            .toThrow(/unknown index type "SecondaryByCopy".*"secondary-by-copy"/);
     });
 
     test('rejects a non-array indexes option', async () => {
@@ -366,14 +367,9 @@ describe('option validation', () => {
             .toThrow(/must be a string/);
     });
 
-    test('SortedStream stays unavailable in WASM', async () => {
-        await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { builder: 'SortedStream' as any }))
-            .rejects.toThrow(/Unknown builder strategy/);
-    });
-
-    test('defaults to Unsorted/Dictionary when options are omitted', async () => {
+    test('defaults to the Dictionary layout when options are omitted', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
-        expect(store.layout()).toBe('Dictionary');
+        expect(store.layout()).toBe('dictionary');
         expect(await store.size()).toBe(6);
     });
 });
@@ -415,9 +411,9 @@ describe('multi-chunk payloads', () => {
 }, 120_000);
 
 describe('match / getQuads across layouts', () => {
-    for (const layout of ['Default', 'TypedObject', 'Dictionary'] as const) {
+    for (const layout of ['default', 'typed-object', 'dictionary'] as const) {
         test(`${layout}: getQuads returns correctly-decoded terms`, async () => {
-            const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { builder: 'Sorted', layout });
+            const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout });
             const quads = await store.getQuads(null, df.namedNode('http://example.org/p1'), null, null);
             expect(quads.length).toBe(3);
 
@@ -431,11 +427,11 @@ describe('match / getQuads across layouts', () => {
         });
 
         test(`${layout}: a matched subset round-trips through fromQuads → bytes`, async () => {
-            const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { builder: 'Sorted', layout });
+            const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout });
             const quads = await store.getQuads(null, df.namedNode('http://example.org/p1'), null, null);
 
             // Rebuild a standalone store from the matched quads and round-trip it.
-            const derived = await VortexRdfStore.fromQuads(quads, { builder: 'Sorted', layout });
+            const derived = await VortexRdfStore.fromQuads(quads, { layout });
             const restored = await VortexRdfStore.fromBytes(await derived.toBytes());
             expect(await restored.size()).toBe(3);
 
@@ -502,7 +498,7 @@ describe('lazy terms', () => {
     });
 
     test('Default layout: .equals falls back to value/termType compare', async () => {
-        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'Default' });
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'default' });
         const a = await store.getQuads(null, df.namedNode('http://example.org/p1'), null, null);
         // <o1> appears twice under p1 — equal by value even without codes.
         const o1s = a.filter((q: Quad) => q.object.value === 'http://example.org/o1');
@@ -514,7 +510,7 @@ describe('lazy terms', () => {
 
 describe('adding quads', () => {
     test('Dictionary layout supports addQuad via the string tail', async () => {
-        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'Dictionary' });
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
         // Every term here is absent from the dictionary built at load time;
         // the quad lands in the string tail and must still be found by match.
         const quad = df.quad(
@@ -544,7 +540,7 @@ describe('adding quads', () => {
     });
 
     test('Default layout supports addQuad', async () => {
-        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'Default' });
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'default' });
         const quad = df.quad(
             df.namedNode('http://example.org/s9'),
             df.namedNode('http://example.org/p9'),
@@ -584,3 +580,56 @@ describe('adding quads', () => {
         expect(await store.has(fresh)).toBe(true);
     });
 });
+
+describe('empty store + delete', () => {
+    test('empty() builds a store of size 0', async () => {
+        const store = VortexRdfStore.empty();
+        expect(await store.size()).toBe(0);
+    });
+
+    test('deleteQuad drops a quad added to an empty store', async () => {
+        const store = VortexRdfStore.empty();
+        const quad = df.quad(
+            df.namedNode('http://example.org/s'),
+            df.namedNode('http://example.org/p'),
+            df.literal('hello'),
+        );
+
+        await store.addQuad(quad);
+        expect(await store.size()).toBe(1);
+        expect(await store.has(quad)).toBe(true);
+
+        await store.deleteQuad(quad);
+        expect(await store.size()).toBe(0);
+    });
+});
+
+describe('duck-typed quads', () => {
+    // Deliberately not a real Quad instance (no `.equals`): the store accepts any
+    // structurally-shaped value, reading only the four term fields.
+    const structural = {
+        subject: { termType: 'NamedNode' as const, value: 'http://example.org/s' },
+        predicate: { termType: 'NamedNode' as const, value: 'http://example.org/p' },
+        object: { termType: 'Literal' as const, value: 'hello' },
+        graph: { termType: 'DefaultGraph' as const, value: '' },
+    } as unknown as Quad;
+
+    test('addQuad / has / deleteQuad accept a non-Quad with the right fields', async () => {
+        const store = VortexRdfStore.empty();
+
+        await store.addQuad(structural);
+        expect(await store.size()).toBe(1);
+        expect(await store.has(structural)).toBe(true);
+
+        await store.deleteQuad(structural);
+        expect(await store.size()).toBe(0);
+    });
+});
+
+describe('getQuads without a pattern', () => {
+    test('zero arguments returns every quad', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
+        expect((await store.getQuads()).length).toBe(6);
+    });
+});
+
