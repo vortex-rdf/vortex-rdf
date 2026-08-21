@@ -25,7 +25,7 @@ vortex-error = "0.83.0"
 vortex-ipc = "0.83.0"
 vortex-io = "0.83.0"
 vortex-session = "0.83.0"
-vortex-fsst = "0.83.0"
+vortex-fsst = "0.85.0"
 vortex-mask = "0.83.0"
 vortex-file = { version = "0.83.0" }
 vortex-scan = "0.83.0"
