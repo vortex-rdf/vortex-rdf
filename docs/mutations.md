@@ -74,7 +74,7 @@ flowchart TD
 - **Set semantics.** A quad equal to one already in the store, or to an
   earlier quad of the batch, is skipped: an in-batch `HashSet` catches the
   latter, and each remaining quad is checked with
-  [`contains`](../core/src/store/matching.rs#L776) — one fully bound
+  [`contains`](../core/src/store/matching.rs#L789) — one fully bound
   `match_pattern` over base and tail ([matching.md §9](matching.md#9-the-tail)).
 - **Accretion.** Each batch joins the tail as one more chunk of a chunked
   accumulator; the accreted chunks are folded into the flat first chunk
@@ -92,17 +92,17 @@ flowchart TD
   selections are `All`.
 - **Every layout, Dictionary included.** An appended term has no code in the
   base's frozen sorted dictionary, so under the Dictionary layout the tail
-  stores Default-layout N-Triples strings ([`tail_layout`](../core/src/store/mod.rs#L366));
+  stores Default-layout N-Triples strings ([`tail_layout`](../core/src/store/mod.rs#L368));
   under the other layouts it uses the store's own columns. Patterns probe the
   base by code and the tail by string, and a query that touches both unions
   the results.
-- **Matching.** [`match_pattern`](../core/src/store/matching.rs#L52) runs the
+- **Matching.** [`match_pattern`](../core/src/store/matching.rs#L53) runs the
   base's normal routing (prefix probe / index / scan) and, independently, a
-  mask scan over the tail ([`match_tail`](../core/src/store/matching.rs#L78)),
+  mask scan over the tail ([`match_tail`](../core/src/store/matching.rs#L67)),
   then unions the two. A base short-circuit (a term with no code in the
   dictionary) never skips the tail, since that term may exist in the tail's
   plain strings.
-- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L384) is the number
+- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L386) is the number
   of physical tail rows — the store's only unindexed, unsorted region, and the
   number to watch when tuning compaction.
 
@@ -143,7 +143,7 @@ flowchart TD
 - **The contract.** `match_pattern` deliberately does **not** subtract
   tombstones when it computes a selection (keeping its row positions aligned
   for mask-based refinement); every *read* path does.
-  [`RowSelection::live_mask`](../core/src/store/selection.rs#L238) answers
+  [`RowSelection::live_mask`](../core/src/store/selection.rs#L188) answers
   "which of this selection's own rows are not tombstoned", and the in-memory
   reads all go through [`gather_live`](../core/src/store/scan/gather.rs#L22)
   — the single place a view becomes rows — so applying the mask cannot be
@@ -254,15 +254,15 @@ store past the threshold rewrites its source file, as above, as part of the
 ## 6. Ownership and `owned()`
 
 Only a store that owns its rows may be mutated
-([`is_owner`](../core/src/store/mod.rs#L417),
-[`ensure_owner`](../core/src/store/mod.rs#L429)): its base selection is
+([`is_owner`](../core/src/store/mod.rs#L419),
+[`ensure_owner`](../core/src/store/mod.rs#L431)): its base selection is
 `All`, it has no pending file filter, and its tail selection (if any) is
 `All`. A view derived from `match_pattern` is a window onto a base it shares,
 so mutating it would either silently drop the rows outside the view or write
 through to data it does not own; a view that happens to select everything (an
 unconstrained match) counts as an owner.
 
-[`owned`](../core/src/store/mod.rs#L400) turns any store into one that can be
+[`owned`](../core/src/store/mod.rs#L402) turns any store into one that can be
 mutated: an owner comes back as a cheap clone (tombstones and indexes kept), a
 narrowed view is compacted with its declared indexes into an independent
 store. Mutating a match result therefore goes `view.owned().await?` first, or

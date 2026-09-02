@@ -54,6 +54,24 @@ dictionary.encode("<http://xmlns.com/foaf/0.1/name>")  # code for a term, or Non
 
 Consumers can join, count, and de-duplicate entirely in code space and decode each distinct term once, never materializing a term string for a row they discard.
 
+### Pushdown primitives
+
+A query layer narrows a match inside the store rather than over gathered rows:
+
+```python
+store.match_codes_many([(None, p, None, None), (s, None, None, None)])   # one call, one GIL release
+store.count_quads_many([...])                                            # the counts, in order
+store.count_quads(p=p, limit=1)                                          # an ASK: reads one row
+store.match_codes(p=p, limit=10, offset=20)                              # a window, in match order
+
+lo, hi = dictionary.prefix_range("<http://ex.org/")                     # codes of an IRI namespace
+store.match_codes(p=p, keep={"s": range(lo, hi)})                        # rows whose subject is in it
+holds, unknown = dictionary.filter_codes("num_gt", "40")                 # a FILTER, decided per term
+store.match_codes(p=p, keep={"o": holds})                                # rows it holds for
+```
+
+`keep` restricts a position by term code before any row is gathered — a `range` of codes (what `prefix_range` yields, or `lower_bound` bounds) or a set of codes in any form `decode_many` accepts — and composes with `limit`/`offset`. `filter_codes(kind, arg)` evaluates one predicate over the whole dictionary once (memoized) and returns the codes it definitely holds for and the codes it cannot decide, which the caller resolves itself; kinds are `is_literal`, `is_iri`, `is_blank`, `datatype`, `lang`, `lang_matches`, `str_prefix` and `num_lt`/`num_le`/`num_gt`/`num_ge`/`num_eq`/`num_ne`, under the rules a SPARQL engine over rdflib applies. `encode` resolves a term in its canonical N-Triples form when the given spelling misses (`"x"^^xsd:string` is `"x"`), and `encode_many` batches it.
+
 ## Arrow interface
 
 Every matched view, code column and dictionary speaks the [Arrow PyCapsule interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html), so pyarrow, polars, DuckDB, DataFusion or any other Arrow-native engine consumes them directly — the package itself depends on none of them:

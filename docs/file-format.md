@@ -225,13 +225,13 @@ are bare codes and cannot be decoded without it.
 | `name` / `role` | `dictionary` / `dictionary` |
 | `implementation` / `version` | `sorted-terms-fsst-v1` / 1 |
 | `required` / `sorted` | `true` / `true` |
-| schema | one column, [`_dict_term`](../core/src/store/layouts/dictionary/term_dict.rs#L43): non-nullable `Utf8` |
+| schema | one column, [`_dict_term`](../core/src/store/layouts/dictionary/term_dict.rs#L47): non-nullable `Utf8` |
 | contents | every distinct term of the dataset — subjects, predicates, objects, graph names and the default graph's `""` in one namespace — sorted, each once |
 | codes | implicit: the term at row *i* has code *i* |
 | size limit | at most `i32::MAX` terms |
 
 The column is FSST-compressed **at the source**, in independent windows of
-65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/term_dict.rs#L51))
+65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/term_dict.rs#L55))
 that share one symbol table trained on the whole column. The child is written
 through a pass-through strategy ([`dict_child_strategy`](../core/src/io/container/write.rs#L191))
 rather than the default pipeline: a Struct over a Chunked layout of Flat

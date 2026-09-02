@@ -90,33 +90,33 @@ tail rows store their terms as strings, and the terms appended have no code
 in the frozen dictionary ([mutations.md §2](mutations.md#2-additions-the-append-tail)).
 Such a view rejects `codes` and `terms` with an error — export `strings`,
 or compact first — exactly the gate
-[`code_read_snapshot`](../core/src/store/mod.rs#L494) applies to the
+[`code_read_snapshot`](../core/src/store/mod.rs#L496) applies to the
 code-column readers.
 
 ### 2.3 The dictionary as an Arrow array
 
-[`DictSnapshot::to_arrow`](../core/src/store/layouts/dictionary/term_dict.rs#L757)
+[`DictSnapshot::to_arrow`](../core/src/store/layouts/dictionary/term_dict.rs#L834)
 returns the whole term dictionary as one `string_view` array whose element
 `i` is the term of code `i`: a code → term lookup table, and the values
 array every `terms` batch is keyed over. It is built on first use and
 cached on the dictionary
-([`arrow_values`](../core/src/store/layouts/dictionary/term_dict.rs#L161)),
+([`arrow_values`](../core/src/store/layouts/dictionary/term_dict.rs#L162)),
 so every export of a store shares one `Arc`. Canonical (plaintext) chunks
 convert buffer-sharing; FSST-compressed chunks decompress once, a cost
 bounded by the dictionary's size, never by a result's
 ([§3.4](#34-the-dictionary-values)).
 
 Two bounds expose the lexicographic-rank structure of the code space to a
-planner. [`lower_bound`](../core/src/store/layouts/dictionary/term_dict.rs#L765)
+planner. [`lower_bound`](../core/src/store/layouts/dictionary/term_dict.rs#L840)
 is the first code whose term is byte-wise `>=` a string, so
 `lower_bound(a)..lower_bound(b)` is exactly the codes of the terms in
-`a..b`; [`prefix_range`](../core/src/store/layouts/dictionary/term_dict.rs#L774)
+`a..b`; [`prefix_range`](../core/src/store/layouts/dictionary/term_dict.rs#L851)
 is the half-open code range of the terms spelled with a prefix — an IRI
 namespace is the prefix `<http://…/`, and because N-Triples kinds partition
 the space by first byte (`"` literals, `<` IRIs, `_` blank nodes), kind
 bounds are prefix ranges too. Both are a binary search through the
 dictionary cursor
-([`lower_bound_bytes`](../core/src/store/layouts/dictionary/term_dict.rs#L440)),
+([`lower_bound_bytes`](../core/src/store/layouts/dictionary/term_dict.rs#L452)),
 the same probe the exact `encode` runs.
 
 ---
@@ -214,7 +214,7 @@ key is in range, a linear pass over the codes and no copy.
 
 ### 3.4 The dictionary values
 
-[`arrow_values`](../core/src/store/layouts/dictionary/term_dict.rs#L459)
+[`arrow_values`](../core/src/store/layouts/dictionary/term_dict.rs#L471)
 turns the term column into one canonical `VarBinViewArray` — a single
 canonical chunk is used as it is; an FSST chunk, or a chunked column, is
 executed to canonical once through the Vortex session (chunks concatenated
@@ -248,7 +248,7 @@ pa.array(store.match_codes()[0])                                      # a code c
 pa.array(store.term_dict())                                           # the dictionary
 ```
 
-[`match_arrow`](../python/src/store.rs#L398) resolves the pattern and
+[`match_arrow`](../python/src/store.rs#L559) resolves the pattern and
 builds the core batch stream off the GIL, then wraps it in an
 [`ArrowQuadStream`](../python/src/arrow.rs#L110). Its
 [`__arrow_c_schema__`](../python/src/arrow.rs#L136) can be read any number
@@ -261,10 +261,10 @@ The reader holds no Python state, so it runs wherever the consumer calls it
 from — pyarrow, for one, releases the GIL around `read_next_batch` — and
 batches are produced as they are pulled, never ahead of the consumer.
 
-A code column's [`__arrow_c_array__`](../python/src/codes.rs#L205) wraps
+A code column's [`__arrow_c_array__`](../python/src/codes.rs#L198) wraps
 the column's `u32` buffer as a `UInt32Array` — the same memory the buffer
 protocol exposes — and the dictionary's
-[`__arrow_c_array__`](../python/src/codes.rs#L171) hands out the cached
+[`__arrow_c_array__`](../python/src/codes.rs#L198) hands out the cached
 values array of [§2.3](#23-the-dictionary-as-an-arrow-array). Both go
 through [`array_capsules`](../python/src/arrow.rs#L74): the array's
 `ArrayData` is exported with arrow-rs's `to_ffi`, which shares the buffers

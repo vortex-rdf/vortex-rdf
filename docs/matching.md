@@ -215,7 +215,7 @@ flowchart LR
 
 ## 6. The in-memory path
 
-[`match_base_in_memory`](../core/src/store/matching.rs#L191) runs four stages
+[`match_base_in_memory`](../core/src/store/matching.rs#L204) runs four stages
 over the base `StructArray`. Each one asks the same two questions — *can I answer
 part of this pattern cheaply?* and *which rows survive?* — narrowing the shared
 `RowSelection` and clearing whatever pattern components it answered, so the next
@@ -223,7 +223,7 @@ stage only sees what is left.
 
 Only the *struct* is canonical. Its columns stay in the compressed encodings
 every in-memory construction gives them
-([`compress_built_parts`](../core/src/store/mod.rs#L155)), and the stages below
+([`compress_built_parts`](../core/src/store/mod.rs#L157)), and the stages below
 search them in place through the cached encoded-search probes. No stage
 decompresses a column; a match decodes nothing but the rows a mask scan has to
 compare ([§6.3](#63-residual-column-filtering)).
@@ -261,7 +261,7 @@ Each stage in the code, and where the details are below:
 | Prelude | [`matching.rs:213-242`](../core/src/store/matching.rs#L213-L242) | — |
 | 1 · prefix probe | [`matching.rs:244-327`](../core/src/store/matching.rs#L244-L327), [`search_sorted_bounds`](../core/src/store/array.rs#L178) | [§6.1](#61-prefix-probe) |
 | 2 · secondary-index routing | [`matching.rs:329-399`](../core/src/store/matching.rs#L329-L399), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L485) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`matching.rs:401-442`](../core/src/store/matching.rs#L401-L442), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L184), [`mask_for`](../core/src/store/matching.rs#L735) | [§6.3](#63-residual-column-filtering) |
+| 3 · residual column filtering | [`matching.rs:401-442`](../core/src/store/matching.rs#L401-L442), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L184), [`mask_for`](../core/src/store/matching.rs#L748) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`matching.rs:444-458`](../core/src/store/matching.rs#L444-L458) | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
@@ -481,7 +481,7 @@ longer starts `All` ([§11](#11-chained-matches)).
 
 ## 7. The file path
 
-[`match_base_file`](../core/src/store/matching.rs#L485) composes the same
+[`match_base_file`](../core/src/store/matching.rs#L498) composes the same
 restrictions as the in-memory path, but **nothing is read**: each stage decides
 what the *next* scan will do, and the result is a filter expression plus a row
 selection.
@@ -1080,10 +1080,125 @@ unrestricted ([§11](#11-chained-matches)).
 
 ---
 
-## 16. Source map
+## 16. Narrowing beyond a pattern
+
+A pattern is not the only restriction a query layer wants inside the store.
+Four more primitives narrow a view — or a batch of them — before any row is
+gathered, so what a `LIMIT`, an `ASK`, a `FILTER` or a `VALUES` would discard
+never crosses a decode or a binding boundary. All of them yield ordinary
+views: they compose with each other, with a later `match_pattern`, and with
+every read path of [§12](#12-what-the-derived-view-costs-at-read-time).
+
+### 16.1 Batches
+
+[`match_pattern_many`](../core/src/store/matching.rs#L79) matches a slice of
+patterns in one call and hands back their views in input order. The matches
+run concurrently (`try_join_all`), so on a file the pattern scans overlap
+instead of queueing; an in-memory match simply runs to completion when
+polled. The bindings expose it as `match_codes_many` / `count_quads_many`
+([`match_codes_many`](../python/src/store.rs#L517)): every pattern of the
+batch is parsed before anything is evaluated, and one GIL release covers the
+whole batch — the shape a join probe loop (one probe per left-hand row)
+needs.
+
+### 16.2 Windows
+
+[`window`](../core/src/store/pushdown.rs#L65) is `LIMIT`/`OFFSET`: the view
+over `limit` rows after the first `offset`, in the order every read yields
+them — live base rows in base order, then the tail's. It folds into an exact
+row selection ([`RowSelection::window`](../core/src/store/selection.rs#L198)):
+a contiguous selection without tombstones stays a range, anything else
+becomes the id list of exactly the rows kept, tombstones skipped while
+counting. Nothing outside the window is read afterwards. The tail takes the
+remainder — whatever of the offset and the limit the base's live rows left.
+
+A file view still carrying a pushed-down filter is the one case where the
+selection alone does not know its rows: the window first resolves the filter
+to row ids with one evaluation of the filter over the selection
+([`matching_file_rows`](../core/src/store/scan/file_scan.rs#L300), no column
+projected), then windows those ids and drops the filter. Serve plans are
+dropped too: a window is a narrowing, and a plan's contiguous run would
+over-cover it.
+
+[`size_capped`](../core/src/store/pushdown.rs#L160) is `window(0, n).size()`
+— `size_capped(1)` is an `ASK` that reads one row.
+
+### 16.3 Keeps
+
+[`keep`](../core/src/store/pushdown.rs#L174) restricts one column by term
+code: the rows whose code lies in a [`Keep`](../core/src/store/pushdown.rs#L25)
+— a sorted code set, or a half-open code range. Codes are lexicographic ranks
+([file-format.md §5](file-format.md#5-the-dictionary-child)), so a range is
+what a term prefix maps to: `prefix_range("<http://ex.org/")` is every IRI of
+that namespace, and the N-Triples kinds are three fixed ranges (`"`, `<`,
+`_:`). A set is what a dictionary predicate scan yields ([§16.4](#164-term-predicates))
+or what a `VALUES` list encodes to.
+
+In memory the column's canonical `u32` codes are tested directly over the
+selected rows, yielding exact ids — the same loop shape as the typed
+residual filter of [§7](#7-stage-3-the-residual-filter). On a file a range
+becomes a pushed-down filter (`col >= lo AND col < hi`, ANDed onto whatever
+the view carried, so the scan prunes by it) and a set is resolved to row ids
+by one ordered scan projecting only that column
+([`file_column_ids`](../core/src/store/pushdown.rs#L279)); tombstones and the
+view's own filter stay with the reads. Keeps need every row to be
+code-addressable: they apply to the Dictionary layout only, and a view with
+an append tail (whose terms have no codes) is rejected — compact first.
+
+### 16.4 Term predicates
+
+A `FILTER` over one variable is decided term by term, and a dictionary
+holds each term once. [`DictSnapshot::filter_codes`](../core/src/store/layouts/dictionary/term_dict.rs#L812)
+evaluates a [`TermPredicate`](../core/src/store/layouts/dictionary/predicates.rs#L69)
+over the whole dictionary in one pass — memoized per predicate for the
+dictionary's lifetime ([`filter_codes`](../core/src/store/layouts/dictionary/term_dict.rs#L502))
+— and returns two ascending code sets: the codes the predicate definitely
+holds for, and the codes it cannot decide. Every other code is definitely
+false. The true set feeds `keep`; the undecided set is what the caller
+evaluates itself, with the full SPARQL machinery.
+
+The predicates ([`parse`](../core/src/store/layouts/dictionary/predicates.rs#L97),
+[`eval`](../core/src/store/layouts/dictionary/predicates.rs#L128)) are the
+single-variable conjuncts a SPARQL engine over rdflib pushes down, under its
+own rules: `isLiteral`/`isIRI`/`isBlank`; `datatype(?x) = <iri>` (a plain
+literal is `xsd:string`, a tagged one `rdf:langString`; a non-literal is an
+error, hence undecided); `lang(?x) = "tag"` and `langMatches`; `strStarts(str(?x), …)`
+over IRIs, blank labels and string-like literals (other datatypes carry a
+normalized lexical form rdflib owns, hence undecided); and the six numeric
+comparisons with a constant
+([`num_verdict`](../core/src/store/layouts/dictionary/predicates.rs#L465)):
+numeric literals compare by value under their datatype's bounds, literals of
+different datatypes order by datatype IRI (so every `xsd:string` literal
+sorts above an `xsd:integer`), a non-literal is unequal under `=`/`!=` and
+an error under the orderings, and a NaN against a decimal, or a float against
+a fractional decimal, is undecided. The [`Verdict`](../core/src/store/layouts/dictionary/predicates.rs#L33)
+is conservative by construction: anything this evaluator cannot settle
+exactly is handed back rather than guessed.
+
+Beside it, `encode` became spelling-tolerant
+([`encode_tolerant`](../core/src/store/layouts/dictionary/term_dict.rs#L535)):
+an exact lookup first, then the term's canonical N-Triples form (an
+`xsd:string`-typed literal is a plain one), so a caller's own rendering of a
+term still resolves; `encode_many` batches it.
+
+### 16.5 In the bindings
+
+Python: `match_codes(..., keep=, limit=, offset=)`
+([`parse_keep`](../python/src/store.rs#L55): a `range` is a code range,
+anything `decode_many` accepts is a code set), `count_quads(..., limit=)`,
+`match_codes_many`, `count_quads_many`, and on `TermDict`: `lower_bound`,
+`prefix_range`, [`filter_codes`](../python/src/codes.rs#L154) (two
+zero-copy code columns), `encode_many`. The wasm bindings expose none of
+these yet.
+
+---
+
+## 17. Source map
 
 | Concern | File |
 |---|---|
+| Batches, windows, keeps (`window`, `size_capped`, `keep`, `Keep`) | [`core/src/store/pushdown.rs`](../core/src/store/pushdown.rs), [`core/src/store/matching.rs`](../core/src/store/matching.rs) |
+| Term predicates and their verdicts | [`core/src/store/layouts/dictionary/predicates.rs`](../core/src/store/layouts/dictionary/predicates.rs) |
 | `match_pattern`, `match_base`, both backends, `match_tail`, `mask_for`, `contains` | [`core/src/store/matching.rs`](../core/src/store/matching.rs) |
 | Layouts, `QuadPattern`, `PatternCodes`, `Constraints`, `prepare_pattern` | [`core/src/store/layouts/mod.rs`](../core/src/store/layouts/mod.rs) |
 | Dictionary residency and the async prelude | [`core/src/store/layouts/dictionary/access.rs`](../core/src/store/layouts/dictionary/access.rs) |
