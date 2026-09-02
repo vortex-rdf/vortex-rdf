@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased](https://github.com/vortex-rdf/vortex-rdf/compare/v0.10.0...HEAD)
+
+### Added
+
+- Add VortexRdfStore::from_quads (core) ([`7acfea1`](https://github.com/vortex-rdf/vortex-rdf/commit/7acfea1508b948a31a2b9f0c374079c4bba78aff) by @julianrojas87)
+- Add the Arrow schema vocabulary for quad batches (core) ([`8a1cbc0`](https://github.com/vortex-rdf/vortex-rdf/commit/8a1cbc049e556282927aba6c1ff6f69dcf1f0ce3) by julianrojas87)
+- Export the term dictionary to Arrow, with code bounds (core) ([`b11fc99`](https://github.com/vortex-rdf/vortex-rdf/commit/b11fc99705fdb34a759deaa127ca328ca68ebefc) by julianrojas87)
+- Export a matched view as Arrow record batches (core) ([`84388f0`](https://github.com/vortex-rdf/vortex-rdf/commit/84388f00d2fcefe532ef99a06a28d81e3576f2a3) by julianrojas87)
+- Serve code batches off the cached code columns (core) ([`a7c4ee6`](https://github.com/vortex-rdf/vortex-rdf/commit/a7c4ee65f2e2ac611d79767bfb58eb9d6875dd01) by julianrojas87)
+- Expose the Arrow PyCapsule interface (python) ([`e439b2c`](https://github.com/vortex-rdf/vortex-rdf/commit/e439b2c6b2e71736fe82dac6aab48af2c0c7b9a2) by julianrojas87)
+- Export a match as Arrow IPC bytes (js) ([`4b64216`](https://github.com/vortex-rdf/vortex-rdf/commit/4b642169251d70ce10fb729ed3032775a9d6b86b) by julianrojas87)
+- Batch matches, row windows and keep constraints (core) ([`088e702`](https://github.com/vortex-rdf/vortex-rdf/commit/088e70290c70f2dbc28a3d88dcc9962f198ef1ae) by julianrojas87)
+- Dictionary term predicates and tolerant encoding (core) ([`2065da2`](https://github.com/vortex-rdf/vortex-rdf/commit/2065da20fa00e9ba511858bfeb8df9a7cf00dc73) by julianrojas87)
+- The pushdown primitives (python) ([`3bbf86e`](https://github.com/vortex-rdf/vortex-rdf/commit/3bbf86e185c355584d74f41fd0c49b6826f69bd5) by julianrojas87)
+
+### Fixed
+
+- Survive a restored venv whose interpreter is gone (bench) ([`9a9d424`](https://github.com/vortex-rdf/vortex-rdf/commit/9a9d424288d3e000cc6bdc8357a946b9be47b206) by @julianrojas87)
+
 ## [0.10.0](https://github.com/vortex-rdf/vortex-rdf/compare/v0.5.0...v0.10.0) - 2026-08-26
 
 ### Added
