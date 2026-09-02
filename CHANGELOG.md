@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Canonical built bases, live canonical cache for encoded ones (core) ([`43feb94`](https://github.com/vortex-rdf/vortex-rdf/commit/43feb9405a001a105200064fbf92e9d9b8caaccb) by julianrojas87)
 - One Arrow read per binding; drop the duplicate code-column reads ([`7cd92e2`](https://github.com/vortex-rdf/vortex-rdf/commit/7cd92e2d310124bf6387fe439089ea2a7155368d) by julianrojas87)
 
+### Changed
+
+- Move the Arrow vocabulary under store (core) ([`18acd8d`](https://github.com/vortex-rdf/vortex-rdf/commit/18acd8d2975b7633e987544c6432a2caed9db3f6) by julianrojas87)
+
 ### Fixed
 
 - Survive a restored venv whose interpreter is gone (bench) ([`9a9d424`](https://github.com/vortex-rdf/vortex-rdf/commit/9a9d424288d3e000cc6bdc8357a946b9be47b206) by @julianrojas87)
