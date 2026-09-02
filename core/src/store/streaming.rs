@@ -64,7 +64,7 @@ impl VortexRdfStore {
     /// scan error arrives as a one-element `vec![Err(..)]`.
     pub fn shared_quad_chunks(
         &self,
-    ) -> Result<Box<dyn Stream<Item = Vec<Result<SharedQuad>>> + Unpin + Send + '_>> {
+    ) -> Result<Box<dyn Stream<Item = Vec<Result<SharedQuad>>> + Unpin + Send + 'static>> {
         self.decoded_chunks::<SharedQuad>()
     }
 
@@ -86,10 +86,12 @@ impl VortexRdfStore {
     /// is one decoded chunk (a scan split, the in-memory base, or the tail),
     /// so consumers that want whole batches can take them without paying
     /// per-quad stream overhead. A chunk-level scan error arrives as a
-    /// one-element `vec![Err(..)]`.
+    /// one-element `vec![Err(..)]`. The stream owns everything it reads
+    /// (decoded rows, or a scan over the file handle), so it outlives the
+    /// store handle it was taken from.
     fn decoded_chunks<T: ChunkDecode>(
         &self,
-    ) -> Result<Box<dyn Stream<Item = Vec<Result<T>>> + Unpin + Send + '_>> {
+    ) -> Result<Box<dyn Stream<Item = Vec<Result<T>>> + Unpin + Send + 'static>> {
         let layout = self.layout.clone();
         // Tail rows are in memory and few: decode them eagerly, to be appended
         // after whatever the base yields.

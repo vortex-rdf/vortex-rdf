@@ -1,20 +1,28 @@
-//! The Arrow face of a store: the record-batch schema of a matched view.
+//! The Arrow face of a store: the record-batch schema of a matched view and
+//! the batch stream that carries it.
 //!
 //! Everything Arrow-consumer-facing speaks through here: the schema a quad
 //! batch carries ([`quad_schema`]), the way term columns are encoded in it
-//! ([`TermEncoding`]), and the column-selection currency ([`QuadColumn`]).
-//! The batches themselves are produced by the store's export methods, which
-//! convert each Vortex chunk through the session's `ArrowSession`
-//! (registered in [`crate::session`]).
+//! ([`TermEncoding`]), the column-selection currency ([`QuadColumn`]), and
+//! the stream type the export hands out ([`QuadBatches`]). The batches
+//! themselves come from
+//! [`VortexRdfStore::to_record_batches`](crate::store::VortexRdfStore::to_record_batches),
+//! which converts each Vortex chunk through vortex-arrow's buffer-sharing
+//! kernels (the `ArrowSession` registered in [`crate::session`]).
 //!
 //! The column names and their order are the store's own serialized contract
 //! ([`schema::PRIMARY_COLUMNS`](crate::store::schema)); the Arrow schema
 //! restates them, it does not define them.
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_array::RecordBatch;
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+use futures::stream::BoxStream;
+use futures::{Stream, StreamExt};
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::LayoutStrategy;
@@ -157,6 +165,76 @@ pub fn quad_schema(layout: LayoutStrategy, encoding: TermEncoding) -> Result<Sch
         (META_DEFAULT_GRAPH.to_string(), String::new()),
     ]);
     Ok(Arc::new(Schema::new_with_metadata(fields, metadata)))
+}
+
+/// `full` restricted to `columns`, in the caller's order, metadata kept.
+///
+/// # Errors
+///
+/// An empty projection, or a column named twice.
+pub(crate) fn projected_schema(full: &Schema, columns: &[QuadColumn]) -> Result<SchemaRef> {
+    if columns.is_empty() {
+        return Err(VortexRdfError::InvalidOperation(
+            "a projection must keep at least one column".to_string(),
+        ));
+    }
+    let mut seen = [false; 4];
+    let mut fields = Vec::with_capacity(columns.len());
+    for &column in columns {
+        if std::mem::replace(&mut seen[column.index()], true) {
+            return Err(VortexRdfError::InvalidOperation(format!(
+                "column {:?} repeated in the projection",
+                column.name()
+            )));
+        }
+        fields.push(full.field(column.index()).clone());
+    }
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        full.metadata().clone(),
+    )))
+}
+
+/// An Arrow-side failure, carried as the Vortex error it converts to.
+pub(crate) fn arrow_err(err: ArrowError) -> VortexRdfError {
+    VortexRdfError::Vortex(err.into())
+}
+
+/// The record batches of one export: a `Stream` of batches that all carry
+/// [`schema`](Self::schema) — one batch per decode chunk, empty chunks
+/// skipped — owning everything it reads from, so it outlives the store
+/// handle it was taken from.
+pub struct QuadBatches {
+    schema: SchemaRef,
+    inner: BoxStream<'static, Result<RecordBatch>>,
+}
+
+impl QuadBatches {
+    pub(crate) fn new(schema: SchemaRef, inner: BoxStream<'static, Result<RecordBatch>>) -> Self {
+        Self { schema, inner }
+    }
+
+    /// The schema every batch of this stream carries (available before the
+    /// first batch, and for a stream that yields none).
+    pub fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+impl Stream for QuadBatches {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.poll_next_unpin(cx)
+    }
+}
+
+impl std::fmt::Debug for QuadBatches {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuadBatches")
+            .field("schema", &self.schema)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

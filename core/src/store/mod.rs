@@ -13,6 +13,7 @@ pub(crate) mod selection;
 pub(crate) mod source;
 
 // [`VortexRdfStore`]'s impl clusters — the struct itself is defined below.
+mod batches;
 mod compaction;
 mod export;
 mod matching;

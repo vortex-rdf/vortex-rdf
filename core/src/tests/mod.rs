@@ -11,6 +11,7 @@ use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use std::sync::OnceLock;
 
 mod adoption;
+mod arrow;
 mod builders;
 mod dictionary;
 #[cfg(feature = "file-io")]

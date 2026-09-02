@@ -400,7 +400,29 @@ impl VortexRdfStore {
         selection: &RowSelection,
         deleted: Option<&Mask>,
     ) -> Result<ScanBuilder<ArrayRef>> {
-        let proj = self.layout.strategy().primary_column_names();
+        self.restricted_file_scan_projected(
+            file,
+            filter,
+            selection,
+            deleted,
+            self.layout.strategy().primary_column_names(),
+        )
+    }
+
+    /// [`restricted_file_scan`](Self::restricted_file_scan) reading only
+    /// `columns` — a subset of the primary columns, in the caller's order —
+    /// so a consumer that needs fewer columns never decodes the rest.
+    #[cfg(feature = "file-io")]
+    pub(super) fn restricted_file_scan_projected(
+        &self,
+        file: &crate::store::native_file::NativeStoreFile,
+        filter: Option<&Expression>,
+        selection: &RowSelection,
+        deleted: Option<&Mask>,
+        columns: &[&str],
+    ) -> Result<ScanBuilder<ArrayRef>> {
+        let proj: Vec<vortex_array::dtype::FieldName> =
+            columns.iter().map(|c| vortex_array::dtype::FieldName::from(*c)).collect();
         let mut scan = file.scan().map_err(VortexRdfError::Vortex)?;
         // The scan's scope (the quad-source root dtype) is what filters and
         // projections bind against — read it before the projection replaces
