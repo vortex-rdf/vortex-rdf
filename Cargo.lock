@@ -4168,7 +4168,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-rdf"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "arrow-ipc",
  "console_error_panic_hook",
@@ -4185,7 +4185,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-rdf-cli"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4198,7 +4198,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-rdf-core"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4239,7 +4239,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-rdf-encoded-search"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "codspeed-divan-compat",
  "futures",
@@ -4260,7 +4260,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-rdf-python"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
