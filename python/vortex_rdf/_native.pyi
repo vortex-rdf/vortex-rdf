@@ -1,13 +1,17 @@
 """Type stubs for the private native extension module."""
 
 import os
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import List, Mapping, Optional, Sequence, Tuple, Union
 
 __version__: str
 
 # Path arguments are `PathBuf` on the Rust side, so any `os.PathLike[str]` is
 # accepted alongside `str`.
 _StrPath = Union[str, "os.PathLike[str]"]
+# Term codes in any form `TermDict.decode_many` accepts.
+_Codes = Union[Sequence[int], memoryview, bytes, bytearray, "U32Column"]
+# A quad pattern as four optional N-Triples term strings.
+_Pattern = Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]
 
 class VortexRdfError(Exception):
     """Raised when a Vortex-RDF store operation fails."""
@@ -18,8 +22,32 @@ class TermDict:
         this dictionary's range."""
         ...
     def encode(self, term: str) -> Optional[int]:
-        """The code of the N-Triples term `term`, or None when the dictionary
-        does not hold it; the inverse of `decode`."""
+        """The code of the term `term`, or None when the dictionary does not
+        hold it; the inverse of `decode`. Looked up as spelled, then in its
+        canonical N-Triples form (an ``xsd:string``-typed literal is a plain
+        one, escapes normalize)."""
+        ...
+    def encode_many(self, terms: Sequence[str]) -> List[Optional[int]]:
+        """`encode` for many terms in one GIL-released call, in input order."""
+        ...
+    def lower_bound(self, term: str) -> int:
+        """The first code whose term is ``>= term`` in byte order (``len(self)``
+        when every term is smaller): ``lower_bound(a)..lower_bound(b)`` is
+        exactly the codes of the terms in ``a..b``."""
+        ...
+    def prefix_range(self, prefix: str) -> Tuple[int, int]:
+        """The half-open code range ``(lo, hi)`` of the terms whose N-Triples
+        spelling starts with ``prefix`` — an IRI namespace as ``"<http://…/"``,
+        a kind as its first byte. Pass it as ``range(lo, hi)`` to
+        ``match_codes(keep=...)``."""
+        ...
+    def filter_codes(self, kind: str, arg: str) -> Tuple[U32Column, U32Column]:
+        """The codes for which the term predicate ``kind`` with argument
+        ``arg`` is definitely true, and the codes it cannot decide — two
+        ascending code columns; the rest are definitely false. Kinds:
+        ``is_literal``, ``is_iri``, ``is_blank``, ``datatype``, ``lang``,
+        ``lang_matches``, ``str_prefix``, ``num_lt``/``num_le``/``num_gt``/
+        ``num_ge``/``num_eq``/``num_ne``. Memoized per predicate."""
         ...
     def decode_many(
         self,
@@ -97,7 +125,33 @@ class VortexRdfStore:
         p: Optional[str] = None,
         o: Optional[str] = None,
         g: Optional[str] = None,
-    ) -> Optional[Tuple[U32Column, U32Column, U32Column, U32Column]]: ...
+        *,
+        keep: Optional[Mapping[str, Union[range, _Codes]]] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> Optional[Tuple[U32Column, U32Column, U32Column, U32Column]]:
+        """The matching rows as zero-copy code columns, or None when the
+        code path does not apply.
+
+        ``keep`` restricts positions by code before any row is gathered: a
+        mapping from column name (``"s"``, ``"p"``, ``"o"``, ``"g"``) to a
+        ``range`` of codes (what ``TermDict.prefix_range`` yields) or to a
+        set of codes in any form ``TermDict.decode_many`` accepts.
+        ``limit``/``offset`` window the rows in match order, after ``keep``."""
+        ...
+    def match_codes_many(
+        self,
+        patterns: Sequence[_Pattern],
+    ) -> List[Optional[Tuple[U32Column, U32Column, U32Column, U32Column]]]:
+        """``match_codes`` for a batch of ``(s, p, o, g)`` patterns: every
+        pattern is parsed first (a malformed one raises ``ValueError`` before
+        anything is evaluated), the matches run concurrently under one GIL
+        release, one result per pattern in input order."""
+        ...
+    def count_quads_many(self, patterns: Sequence[_Pattern]) -> List[int]:
+        """``count_quads`` for a batch of ``(s, p, o, g)`` patterns, evaluated
+        like ``match_codes_many``."""
+        ...
     def get_quads(
         self,
         s: Optional[str] = None,
@@ -114,9 +168,12 @@ class VortexRdfStore:
         p: Optional[str] = None,
         o: Optional[str] = None,
         g: Optional[str] = None,
+        *,
+        limit: Optional[int] = None,
     ) -> int:
         """Number of quads matching the pattern, counted from the row
-        selection; no term is materialized."""
+        selection; no term is materialized. With ``limit`` the count stops
+        there (``limit=1`` is an existence test reading one row)."""
         ...
     def match_columns(
         self,

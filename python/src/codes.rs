@@ -12,10 +12,10 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyString, PyTuple};
 use vortex_buffer::Buffer;
-use vortex_rdf_core::DictSnapshot;
+use vortex_rdf_core::{DictSnapshot, TermPredicate};
 
 use crate::arrow::array_capsules;
-use crate::store_err;
+use crate::{parse_err, store_err};
 
 /// Buckets in the decode-sharing cache (see [`TermDict::decode_slice`]).
 /// A power of two, so the bucket index is a mask rather than a division; 256
@@ -106,11 +106,57 @@ impl TermDict {
         self.snapshot.decode(code)
     }
 
-    /// The code of the N-Triples term string `term`, or `None` when this
-    /// dictionary does not hold the term. The inverse of
-    /// [`decode`](Self::decode).
+    /// The code of the term string `term`, or `None` when this dictionary
+    /// does not hold the term. The inverse of [`decode`](Self::decode):
+    /// looked up as spelled, then — on a miss — in its canonical N-Triples
+    /// form (an `xsd:string`-typed literal is a plain one, escapes
+    /// normalize), so a caller's own rendering of a term still resolves.
     fn encode(&self, term: &str) -> Option<u32> {
         self.snapshot.encode(term)
+    }
+
+    /// [`encode`](Self::encode) for many terms in one GIL-released call, in
+    /// input order.
+    fn encode_many(&self, py: Python<'_>, terms: Vec<String>) -> Vec<Option<u32>> {
+        py.detach(|| {
+            let terms: Vec<&str> = terms.iter().map(String::as_str).collect();
+            self.snapshot.encode_many(&terms)
+        })
+    }
+
+    /// The first code whose term is `>= term` in byte order (`len(self)`
+    /// when every term is smaller): codes are lexicographic ranks, so
+    /// `lower_bound(a)..lower_bound(b)` is exactly the codes of the terms in
+    /// `a..b`.
+    fn lower_bound(&self, term: &str) -> u32 {
+        self.snapshot.lower_bound(term)
+    }
+
+    /// The half-open code range `(lo, hi)` of the terms whose N-Triples
+    /// spelling starts with `prefix` — an IRI namespace as `"<http://…/"`,
+    /// a kind as its first byte (`'"'` literals, `"<"` IRIs, `"_:"` blank
+    /// nodes). Pass it as `range(lo, hi)` to `match_codes(keep=...)`.
+    fn prefix_range(&self, prefix: &str) -> (u32, u32) {
+        self.snapshot.prefix_range(prefix)
+    }
+
+    /// The codes for which the term predicate `kind` with argument `arg` is
+    /// definitely true, and the codes it cannot decide (the caller resolves
+    /// those itself) — two ascending code columns; the remaining codes are
+    /// definitely false. Kinds: `is_literal`, `is_iri`, `is_blank`
+    /// (`arg` ignored), `datatype` (an IRI), `lang` (a tag, `""` for
+    /// untagged), `lang_matches` (a language range), `str_prefix` (a
+    /// string), `num_lt`/`num_le`/`num_gt`/`num_ge`/`num_eq`/`num_ne` (a
+    /// numeric constant: an N-Triples literal spelling, or a bare number
+    /// typed by its syntax). One pass over the dictionary per predicate,
+    /// memoized for the dictionary's lifetime. A bad `kind` or `arg`
+    /// raises `ValueError`.
+    fn filter_codes(&self, py: Python<'_>, kind: &str, arg: &str) -> PyResult<(U32Column, U32Column)> {
+        let predicate = TermPredicate::parse(kind, arg).map_err(parse_err)?;
+        let (holds, unknown) = py
+            .detach(|| self.snapshot.filter_codes(&predicate))
+            .map_err(store_err)?;
+        Ok((U32Column { codes: holds }, U32Column { codes: unknown }))
     }
 
     /// Decode a batch of codes in one call, releasing the GIL for the whole
@@ -131,26 +177,7 @@ impl TermDict {
         py: Python<'_>,
         codes: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<Option<Py<PyString>>>> {
-        if let Ok(buf) = PyBuffer::<u32>::get(codes) {
-            return Ok(self.decode_slice(py, &buf.to_vec(py)?));
-        }
-        if let Ok(buf) = PyBuffer::<u8>::get(codes) {
-            let bytes = buf.to_vec(py)?;
-            if !bytes.len().is_multiple_of(4) {
-                return Err(PyValueError::new_err(format!(
-                    "byte buffer of {} bytes is not a whole number of u32 codes",
-                    bytes.len()
-                )));
-            }
-            let codes: Vec<u32> = bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|b| u32::from_ne_bytes(*b))
-                .collect();
-            return Ok(self.decode_slice(py, &codes));
-        }
-        Ok(self.decode_slice(py, &codes.extract::<Vec<u32>>()?))
+        Ok(self.decode_slice(py, &codes_from_py(py, codes)?))
     }
 
     fn __len__(&self) -> usize {
@@ -177,6 +204,33 @@ impl TermDict {
         let values = self.snapshot.to_arrow().map_err(store_err)?;
         array_capsules(py, values.as_ref())
     }
+}
+
+/// Term codes out of any Python value that carries them: a u32 buffer
+/// (`memoryview(col).cast("I")`, `array("I", ...)`, a `uint32` NumPy array),
+/// read in one bulk copy; a byte-typed buffer — the raw view a
+/// [`U32Column`] exports — reinterpreted as native-endian u32s; or any
+/// other sequence of ints, one `PyLong` extraction per code.
+pub(crate) fn codes_from_py(py: Python<'_>, codes: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
+    if let Ok(buf) = PyBuffer::<u32>::get(codes) {
+        return buf.to_vec(py);
+    }
+    if let Ok(buf) = PyBuffer::<u8>::get(codes) {
+        let bytes = buf.to_vec(py)?;
+        if !bytes.len().is_multiple_of(4) {
+            return Err(PyValueError::new_err(format!(
+                "byte buffer of {} bytes is not a whole number of u32 codes",
+                bytes.len()
+            )));
+        }
+        return Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_ne_bytes(*b))
+            .collect());
+    }
+    codes.extract::<Vec<u32>>()
 }
 
 /// One matched term-code column, exposed to Python zero-copy through the

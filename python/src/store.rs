@@ -2,21 +2,89 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use pyo3::exceptions::PyFileNotFoundError;
+use futures::future::try_join_all;
+use pyo3::exceptions::{PyFileNotFoundError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyString};
+use pyo3::types::{PyBytes, PyRange, PyRangeMethods, PyString};
 use vortex_buffer::Buffer;
 use vortex_rdf_core::common::terms::{Pattern, parse_pattern_checked};
 use vortex_rdf_core::{
-    QuadColumn, TermEncoding, VortexRdfError as CoreError, VortexRdfStore as CoreStore,
+    Keep, QuadColumn, TermEncoding, VortexRdfError as CoreError, VortexRdfStore as CoreStore,
 };
 
 use crate::arrow::ArrowQuadStream;
-use crate::codes::{TermDict, U32Column};
+use crate::codes::{TermDict, U32Column, codes_from_py};
 use crate::{RUNTIME, VortexRdfError, parse_err, store_err};
 
 /// `(s, p, o, g)` code columns as returned by [`VortexRdfStore::match_codes`].
 type CodeColumns = (U32Column, U32Column, U32Column, U32Column);
+
+/// A pattern as Python spells it: four optional N-Triples term strings.
+type PyPattern = (Option<String>, Option<String>, Option<String>, Option<String>);
+
+/// The restrictions a code read applies after its pattern: `keep` constraints
+/// in column order, then a row window.
+#[derive(Default)]
+struct ReadOptions {
+    keep: Vec<(QuadColumn, Keep)>,
+    limit: Option<usize>,
+    offset: usize,
+}
+
+impl ReadOptions {
+    fn windowed(&self) -> bool {
+        self.limit.is_some() || self.offset > 0
+    }
+}
+
+/// Every pattern of a batch parsed up front, so a malformed one raises
+/// `ValueError` before anything is evaluated.
+fn parse_patterns(patterns: &[PyPattern]) -> PyResult<Vec<Pattern>> {
+    patterns
+        .iter()
+        .map(|(s, p, o, g)| {
+            parse_pattern_checked(s.as_deref(), p.as_deref(), o.as_deref(), g.as_deref())
+                .map_err(parse_err)
+        })
+        .collect()
+}
+
+/// The `keep` argument — a mapping from column name to a `range` (a code
+/// range) or to codes in any form `decode_many` accepts (a code set) — as
+/// core constraints, in column order.
+fn parse_keep(
+    py: Python<'_>,
+    keep: Option<HashMap<String, Bound<'_, PyAny>>>,
+) -> PyResult<Vec<(QuadColumn, Keep)>> {
+    let Some(keep) = keep else {
+        return Ok(Vec::new());
+    };
+    let mut constraints = Vec::with_capacity(keep.len());
+    for (name, value) in keep {
+        let column: QuadColumn = name.parse().map_err(parse_err)?;
+        let keep = match value.cast::<PyRange>() {
+            Ok(range) => {
+                if range.step()? != 1 {
+                    return Err(PyValueError::new_err(format!(
+                        "keep range for column {name:?} must have step 1"
+                    )));
+                }
+                let bound = |v: isize| {
+                    u32::try_from(v).map_err(|_| {
+                        PyValueError::new_err(format!(
+                            "keep range for column {name:?} is outside the u32 code space"
+                        ))
+                    })
+                };
+                Keep::range(bound(range.start()?)?, bound(range.stop()?)?)
+            }
+            Err(_) => Keep::set(codes_from_py(py, &value)?),
+        };
+        constraints.push((column, keep));
+    }
+    constraints.sort_by_key(|(column, _)| column.index());
+    Ok(constraints)
+}
 
 /// One row of [`VortexRdfStore::get_quads`]: subject, predicate, object, graph.
 /// Held as `Py<PyString>` so a term repeated down a column is one Python object
@@ -31,6 +99,16 @@ type StringColumns = (
     Vec<Py<PyString>>,
     Vec<Py<PyString>>,
 );
+
+/// The gathered code buffers as the columns Python receives.
+fn code_columns([s, p, o, g]: [Buffer<u32>; 4]) -> CodeColumns {
+    (
+        U32Column { codes: s },
+        U32Column { codes: p },
+        U32Column { codes: o },
+        U32Column { codes: g },
+    )
+}
 
 /// Unwrap decoded columns, raising `VortexRdfError` on anything that cannot
 /// be a valid result.
@@ -88,15 +166,36 @@ impl VortexRdfStore {
             .await
     }
 
+    /// The view matching `pattern`, narrowed by `options` — its `keep`
+    /// constraints, then its row window.
+    async fn matched_with(&self, pattern: &Pattern, options: &ReadOptions) -> Result<CoreStore, CoreError> {
+        let mut view = self.matched(pattern).await?;
+        for (column, keep) in &options.keep {
+            view = view.keep(*column, keep).await?;
+        }
+        if options.windowed() {
+            view = view
+                .window(options.offset, options.limit.unwrap_or(usize::MAX))
+                .await?;
+        }
+        Ok(view)
+    }
+
     /// The matched rows as `(s, p, o, g)` term-code columns, gathered off the
     /// GIL, or `None` when the match declines the code path.
     fn matched_code_columns(
         &self,
         py: Python<'_>,
         pattern: &Pattern,
+        options: &ReadOptions,
     ) -> PyResult<Option<[Buffer<u32>; 4]>> {
         py.detach(|| -> Result<_, CoreError> {
-            RUNTIME.block_on(async { self.matched(pattern).await?.code_columns_gathered().await })
+            RUNTIME.block_on(async {
+                self.matched_with(pattern, options)
+                    .await?
+                    .code_columns_gathered()
+                    .await
+            })
         })
         .map_err(store_err)
     }
@@ -115,7 +214,7 @@ impl VortexRdfStore {
         if let Some(snapshot) = self.store.code_read_snapshot() {
             // `code_read_snapshot` reports only that the path can apply; the
             // match itself still decides, so fall through when it declines.
-            if let Some(codes) = self.matched_code_columns(py, pattern)? {
+            if let Some(codes) = self.matched_code_columns(py, pattern, &ReadOptions::default())? {
                 let dict = TermDict { snapshot };
                 let decoded = std::array::from_fn(|i| dict.decode_slice(py, codes[i].as_slice()));
                 return resolve_columns(decoded);
@@ -296,8 +395,10 @@ impl VortexRdfStore {
     }
 
     /// Number of quads matching a pattern, counted from the match's row
-    /// selection alone -- no term is materialized into Python.
-    #[pyo3(signature = (s=None, p=None, o=None, g=None))]
+    /// selection alone -- no term is materialized into Python. With `limit`
+    /// the count stops there: `count_quads(..., limit=1)` is an existence
+    /// test that reads no further than its first row.
+    #[pyo3(signature = (s=None, p=None, o=None, g=None, *, limit=None))]
     fn count_quads(
         &self,
         py: Python<'_>,
@@ -305,10 +406,32 @@ impl VortexRdfStore {
         p: Option<&str>,
         o: Option<&str>,
         g: Option<&str>,
+        limit: Option<usize>,
     ) -> PyResult<usize> {
         let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
         py.detach(|| -> Result<usize, CoreError> {
-            RUNTIME.block_on(async { self.matched(&pattern).await?.size().await })
+            RUNTIME.block_on(async {
+                let view = self.matched(&pattern).await?;
+                match limit {
+                    Some(limit) => view.size_capped(limit).await,
+                    None => view.size().await,
+                }
+            })
+        })
+        .map_err(store_err)
+    }
+
+    /// `count_quads` for a batch of `(s, p, o, g)` patterns in one call:
+    /// every pattern is parsed first (a malformed one raises `ValueError`
+    /// before anything is evaluated), the matches run concurrently under one
+    /// GIL release, and the counts come back in input order.
+    fn count_quads_many(&self, py: Python<'_>, patterns: Vec<PyPattern>) -> PyResult<Vec<usize>> {
+        let patterns = parse_patterns(&patterns)?;
+        py.detach(|| -> Result<Vec<usize>, CoreError> {
+            RUNTIME.block_on(async {
+                let views = self.store.match_pattern_many(&patterns).await?;
+                try_join_all(views.iter().map(|view| view.size())).await
+            })
         })
         .map_err(store_err)
     }
@@ -352,7 +475,16 @@ impl VortexRdfStore {
     /// `None` when the code path does not apply (see `term_dict`). Callers
     /// fall back to [`Self::get_quads`] or [`Self::match_columns`], which
     /// resolve terms on every layout.
-    #[pyo3(signature = (s=None, p=None, o=None, g=None))]
+    ///
+    /// `keep` restricts positions by code before any row is gathered: a
+    /// mapping from column name (`"s"`, `"p"`, `"o"`, `"g"`) to a `range`
+    /// of codes (what `TermDict.prefix_range` yields) or to a set of codes
+    /// in any form `TermDict.decode_many` accepts. `limit`/`offset` window
+    /// the rows in match order, after `keep`.
+    #[pyo3(signature = (s=None, p=None, o=None, g=None, *, keep=None, limit=None, offset=0))]
+    // The parameter list is the Python signature: four pattern positions plus
+    // the three keyword options.
+    #[allow(clippy::too_many_arguments)]
     fn match_codes(
         &self,
         py: Python<'_>,
@@ -360,20 +492,49 @@ impl VortexRdfStore {
         p: Option<&str>,
         o: Option<&str>,
         g: Option<&str>,
+        keep: Option<HashMap<String, Bound<'_, PyAny>>>,
+        limit: Option<usize>,
+        offset: usize,
     ) -> PyResult<Option<CodeColumns>> {
         let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
+        let options = ReadOptions {
+            keep: parse_keep(py, keep)?,
+            limit,
+            offset,
+        };
         if self.store.code_read_snapshot().is_none() {
             return Ok(None);
         }
-        let columns = self.matched_code_columns(py, &pattern)?;
-        Ok(columns.map(|[s, p, o, g]| {
-            (
-                U32Column { codes: s },
-                U32Column { codes: p },
-                U32Column { codes: o },
-                U32Column { codes: g },
-            )
-        }))
+        let columns = self.matched_code_columns(py, &pattern, &options)?;
+        Ok(columns.map(code_columns))
+    }
+
+    /// `match_codes` for a batch of `(s, p, o, g)` patterns in one call —
+    /// every pattern parsed first (a malformed one raises `ValueError`
+    /// before anything is evaluated), the matches run concurrently under one
+    /// GIL release, one result per pattern in input order. `None` for every
+    /// pattern when the code path does not apply (see `term_dict`).
+    fn match_codes_many(
+        &self,
+        py: Python<'_>,
+        patterns: Vec<PyPattern>,
+    ) -> PyResult<Vec<Option<CodeColumns>>> {
+        let patterns = parse_patterns(&patterns)?;
+        if self.store.code_read_snapshot().is_none() {
+            return Ok(patterns.iter().map(|_| None).collect());
+        }
+        let columns = py
+            .detach(|| -> Result<_, CoreError> {
+                RUNTIME.block_on(async {
+                    let views = self.store.match_pattern_many(&patterns).await?;
+                    try_join_all(views.iter().map(|view| view.code_columns_gathered())).await
+                })
+            })
+            .map_err(store_err)?;
+        Ok(columns
+            .into_iter()
+            .map(|columns| columns.map(code_columns))
+            .collect())
     }
 
     /// Match a pattern and hand the rows to any Arrow consumer as a stream of
