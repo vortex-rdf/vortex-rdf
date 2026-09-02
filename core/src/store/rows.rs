@@ -23,7 +23,6 @@ use vortex_buffer::Buffer;
 use vortex_array::expr::{Expression, root, select};
 #[cfg(feature = "file-io")]
 use vortex_layout::scan::scan_builder::ScanBuilder;
-#[cfg(feature = "file-io")]
 use vortex_mask::Mask;
 
 use super::VortexRdfStore;
@@ -175,26 +174,15 @@ impl VortexRdfStore {
 
     /// The rows this view selects, as four `u32` term-code columns (`s`, `p`,
     /// `o`, `g`) — read off the answering index's own columns when the view
-    /// carries a serve plan that covers them, else gathered directly from the
-    /// base's canonical primitive slices.
+    /// carries a serve plan that covers them, else off the base's canonical
+    /// columns (see [`select_codes`]).
     ///
-    /// `None` whenever codes cannot be served both cheaply and correctly:
-    /// a non-Dictionary layout, a non-empty append tail (its strings are not
-    /// in the cached dictionary), a file-backed source, or base columns not
-    /// reachable as canonical non-nullable u32 primitives (e.g. chunked or
-    /// wire-compressed). Callers fall back to `selected_rows`.
-    ///
-    /// A builder-compressed column behind a `vortex.shared` wrapper still
-    /// qualifies: its canonical primitive is materialized once into the
-    /// wrapper's one-way cache (`shared_u32_primitive`) and shared zero-copy
-    /// by every later call and every view over the base — the payload path
-    /// pays a first-touch decode instead of losing the buffer-sharing fast
-    /// path.
-    ///
-    /// Serving codes off the base's buffers skips the slice-gather-canonicalize
-    /// pipeline that [`code_columns_gathered`](Self::code_columns_gathered) —
-    /// the bindings' entry point — otherwise runs; that method tries this fast
-    /// path first.
+    /// `None` whenever codes cannot be served this way: a non-Dictionary
+    /// layout, a non-empty append tail (its strings are not in the cached
+    /// dictionary), a file-backed source, or base columns that are not
+    /// canonical non-nullable u32 primitives — the wire encodings an adopted
+    /// base keeps, which [`code_columns_shared`](Self::code_columns_shared)
+    /// serves through the live canonical cache.
     pub(crate) fn code_columns(&self) -> Option<[Buffer<u32>; 4]> {
         use vortex_array::arrays::Struct;
         if self.layout.strategy() != LayoutStrategy::Dictionary || self.tail_len() != 0 {
@@ -222,79 +210,92 @@ impl VortexRdfStore {
             return Some(columns);
         }
         let struct_arr = base.clone().try_downcast::<Struct>().ok()?;
-        let mut prims: Vec<PrimitiveArray> = Vec::with_capacity(4);
+        let mut columns: Vec<Buffer<u32>> = Vec::with_capacity(4);
         for name in schema::PRIMARY_COLUMNS {
             let col = struct_arr.unmasked_field_by_name(name).ok()?;
-            prims.push(crate::store::array::shared_u32_primitive(col)?);
+            columns.push(crate::store::array::canonical_u32(col)?.into_buffer::<u32>());
         }
         // No plan (or a plan that declined): codes are gathered by row id, so
         // a served match's pending selection materializes here (the in-memory
         // decode+sort it deferred at match time).
         let selection = selection.materialized().ok()?;
-        // Contiguous, tombstone-free selections share the base's buffers
-        // zero-copy (a `Buffer` slice is a refcount bump); a tombstone-free id
-        // list is a branch-free gather; only tombstoned views pay a
-        // per-element liveness test.
-        let column = |prim: &PrimitiveArray| -> Buffer<u32> {
-            match (&selection, deleted) {
-                (RowSelection::All, None) => prim.clone().into_buffer::<u32>(),
-                (RowSelection::Range(r), None) => prim
-                    .clone()
-                    .into_buffer::<u32>()
-                    .slice(r.start as usize..r.end as usize),
-                // An index-resolved match without deletes — the bindings'
-                // common payload shape.
-                (RowSelection::Ids(ids), None) => {
-                    let slice = prim.as_slice::<u32>();
-                    Buffer::from_iter(ids.iter().map(|&i| slice[i as usize]))
-                }
-                (selection, Some(deleted)) => {
-                    let slice = prim.as_slice::<u32>();
-                    let live = |i: usize| !deleted.value(i);
-                    match selection {
-                        RowSelection::All => Buffer::from_iter(
-                            (0..base.len()).filter(|&i| live(i)).map(|i| slice[i]),
-                        ),
-                        RowSelection::Range(r) => Buffer::from_iter(
-                            (r.start as usize..r.end as usize)
-                                .filter(|&i| live(i))
-                                .map(|i| slice[i]),
-                        ),
-                        RowSelection::Ids(ids) => Buffer::from_iter(
-                            ids.iter()
-                                .map(|&i| i as usize)
-                                .filter(|&i| live(i))
-                                .map(|i| slice[i]),
-                        ),
-                    }
-                }
-            }
+        Some(select_codes(&columns, &selection, deleted.as_ref()))
+    }
+
+    /// [`code_columns`](Self::code_columns), extended to an encoded base
+    /// through its live canonical cache
+    /// ([`LiveCanonical`](crate::store::canonical::LiveCanonical)): a
+    /// contiguous, tombstone-free selection wider than a point read decodes
+    /// each column once — shared with every holder alive, freed with the
+    /// last — and hands out slices of it; an id list or a tombstoned view
+    /// gathers from the decoded columns only while some holder keeps them
+    /// alive.
+    ///
+    /// `None` leaves the rest to the gather pipeline: point-sized selections
+    /// (point reads through the probes) and gathers over columns nobody
+    /// holds (a `take` over the encoded base) — neither decodes a whole
+    /// column for a few rows.
+    pub(crate) fn code_columns_shared(&self) -> Result<Option<[Buffer<u32>; 4]>> {
+        if let Some(columns) = self.code_columns() {
+            return Ok(Some(columns));
+        }
+        if self.layout.strategy() != LayoutStrategy::Dictionary || self.tail_len() != 0 {
+            return Ok(None);
+        }
+        #[allow(irrefutable_let_patterns)]
+        let QuadsSource::InMemory {
+            base,
+            selection,
+            deleted,
+            canonical,
+            ..
+        } = &self.quads
+        else {
+            return Ok(None);
         };
-        Some([
-            column(&prims[0]),
-            column(&prims[1]),
-            column(&prims[2]),
-            column(&prims[3]),
-        ])
+        let selection = selection.materialized()?;
+        if selection.is_point_sized() {
+            return Ok(None);
+        }
+        let contiguous =
+            matches!(selection, RowSelection::All | RowSelection::Range(_)) && deleted.is_none();
+        let struct_arr = crate::store::array::into_struct_array(base.clone())?;
+        let mut columns: Vec<Buffer<u32>> = Vec::with_capacity(4);
+        for (idx, name) in schema::PRIMARY_COLUMNS.iter().enumerate() {
+            let column = if contiguous {
+                let col = struct_arr
+                    .unmasked_field_by_name(name)
+                    .map_err(VortexRdfError::Vortex)?;
+                canonical.column(idx, col)?
+            } else {
+                let Some(column) = canonical.column_if_alive(idx) else {
+                    return Ok(None);
+                };
+                column
+            };
+            columns.push(column);
+        }
+        Ok(Some(select_codes(&columns, &selection, deleted.as_ref())))
     }
 
     /// The rows this view selects as four `u32` term-code columns, gathering
-    /// them when `code_columns`' zero-copy fast path
-    /// does not apply.
+    /// them when neither [`code_columns`](Self::code_columns) nor the live
+    /// canonical cache ([`code_columns_shared`](Self::code_columns_shared))
+    /// applies.
     ///
-    /// The fallback is the full read pipeline —
-    /// `selected_rows`, canonicalize, then one
-    /// primitive column per role — so a file-backed store, a narrowed view
-    /// whose base columns are chunked, or any other non-canonical shape still
-    /// answers codes. Only the cases where codes are not the store's
-    /// vocabulary at all yield `None`: a non-Dictionary layout, or a non-empty
-    /// append tail (whose terms are absent from the cached dictionary, so its
-    /// codes would address a different one).
+    /// The fallback is the full read pipeline — `selected_rows` (point reads
+    /// through the probes for a point-sized selection, a `take` over the base
+    /// otherwise), canonicalize, then one primitive column per role — so a
+    /// file-backed store, a narrow view over an encoded base, or any other
+    /// shape still answers codes. Only the cases where codes are not the
+    /// store's vocabulary at all yield `None`: a non-Dictionary layout, or a
+    /// non-empty append tail (whose terms are absent from the cached
+    /// dictionary, so its codes would address a different one).
     ///
     /// This is the payload path behind the bindings' code-column reads; they
     /// call it instead of re-implementing the gather.
     pub async fn code_columns_gathered(&self) -> Result<Option<[Buffer<u32>; 4]>> {
-        if let Some(columns) = self.code_columns() {
+        if let Some(columns) = self.code_columns_shared()? {
             return Ok(Some(columns));
         }
         if self.layout.strategy() != LayoutStrategy::Dictionary || self.tail_len() != 0 {
@@ -473,4 +474,52 @@ impl VortexRdfStore {
         let base = self.base_selected_rows().await?;
         Ok(self.merged_raw_quads(&base).await?.0)
     }
+}
+
+/// The codes `selection` picks out of four canonical columns, tombstones
+/// dropped: a contiguous, tombstone-free selection is a slice of each column
+/// (a refcount bump — the buffers stay shared with whoever holds the
+/// columns), a tombstone-free id list is a branch-free gather, and only
+/// tombstoned views pay a per-element liveness test.
+fn select_codes(
+    columns: &[Buffer<u32>],
+    selection: &RowSelection,
+    deleted: Option<&Mask>,
+) -> [Buffer<u32>; 4] {
+    let column = |column: &Buffer<u32>| -> Buffer<u32> {
+        match (selection, deleted) {
+            (RowSelection::All, None) => column.clone(),
+            (RowSelection::Range(r), None) => column.slice(r.start as usize..r.end as usize),
+            (RowSelection::Ids(ids), None) => {
+                let slice = column.as_slice();
+                Buffer::from_iter(ids.iter().map(|&i| slice[i as usize]))
+            }
+            (selection, Some(deleted)) => {
+                let slice = column.as_slice();
+                let live = |i: usize| !deleted.value(i);
+                match selection {
+                    RowSelection::All => Buffer::from_iter(
+                        (0..slice.len()).filter(|&i| live(i)).map(|i| slice[i]),
+                    ),
+                    RowSelection::Range(r) => Buffer::from_iter(
+                        (r.start as usize..r.end as usize)
+                            .filter(|&i| live(i))
+                            .map(|i| slice[i]),
+                    ),
+                    RowSelection::Ids(ids) => Buffer::from_iter(
+                        ids.iter()
+                            .map(|&i| i as usize)
+                            .filter(|&i| live(i))
+                            .map(|i| slice[i]),
+                    ),
+                }
+            }
+        }
+    };
+    [
+        column(&columns[0]),
+        column(&columns[1]),
+        column(&columns[2]),
+        column(&columns[3]),
+    ]
 }

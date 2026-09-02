@@ -153,7 +153,7 @@ impl VortexRdfStore {
         let layout = super::resolved_layout(dict, base.dtype())?;
         // Compress like every other construction — a compacted store carries
         // the same resident form a freshly built one does.
-        let (base, components) = super::compress_built_parts(base, components)?;
+        let (base, components) = super::resident_built_parts(base, components)?;
         Self::assemble_resident(base, components, layout)
     }
 

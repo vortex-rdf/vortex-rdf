@@ -10,6 +10,7 @@ use vortex_mask::Mask;
 
 use crate::error::Result;
 use crate::store::indexes::{InMemoryServePlan, IndexComponent};
+use crate::store::canonical::LiveCanonical;
 use crate::store::probes::StructProbes;
 use crate::store::scan::gather::gather_live;
 use crate::store::selection::{RowSelection, ViewSelection};
@@ -58,6 +59,12 @@ pub(crate) enum QuadsSource {
         /// carried wherever `base` carries, and a fresh base takes a fresh
         /// cache.
         probes: Arc<StructProbes>,
+        /// The live canonical form of `base`'s code columns, for the code
+        /// reads an encoded (adopted) base cannot serve zero-copy: decoded
+        /// per column on demand, shared by every holder alive, freed with the
+        /// last (see [`LiveCanonical`]). Shared by views like `probes`; a
+        /// built base's canonical columns never need it.
+        canonical: Arc<LiveCanonical>,
         /// The index's plan for reading this view's rows from its own
         /// columns, present only while the selection is exactly the run the
         /// plan covers (any narrowing drops it, materializing a `Pending`

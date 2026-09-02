@@ -2,6 +2,7 @@
 // here (or at the crate root), so each has exactly one canonical public path.
 pub(crate) mod array;
 pub(crate) mod builders;
+pub(crate) mod canonical;
 pub(crate) mod indexes;
 pub(crate) mod layouts;
 #[cfg(feature = "file-io")]
@@ -146,19 +147,20 @@ fn resolved_layout(
     }
 }
 
-/// The compressed-resident form every in-memory construction produces: the
-/// base's u32 code columns and each component's integer children are
-/// re-encoded into probe-supported encodings (see
+/// The resident form every in-memory construction produces: the base's
+/// integer children as flat canonical primitives (see
+/// [`with_canonical_int_children`](array::with_canonical_int_children)), so
+/// every code read serves them zero-copy, and each component's integer
+/// children re-encoded into probe-supported encodings (see
 /// [`with_compressed_int_children`](array::with_compressed_int_children)),
-/// with the base additionally payload-wrapped so the code-column read path
-/// keeps its zero-copy fast path. Shared by the builder adoption
+/// which nothing ever reads as a payload. Shared by the builder adoption
 /// (`from_built`) and compaction's rebuild (`from_raw_quads`) — the two
-/// places canonical built columns become a store.
-fn compress_built_parts(
+/// places built columns become a store.
+fn resident_built_parts(
     base: ArrayRef,
     components: Vec<IndexComponent>,
 ) -> Result<(ArrayRef, Vec<IndexComponent>)> {
-    let base = array::with_compressed_int_children(base, true)?;
+    let base = array::with_canonical_int_children(base)?;
     let components = components
         .into_iter()
         .map(IndexComponent::into_compressed)
@@ -211,7 +213,10 @@ impl VortexRdfStore {
     /// the probe's supported set are decoded to canonical primitives (see
     /// `with_searchable_int_children`);
     /// every index component is materialized into the same resident form, so
-    /// its sorted probes bind directly too.
+    /// its sorted probes bind directly too. Code reads over the encoded
+    /// columns go through the base's live canonical cache
+    /// ([`LiveCanonical`](canonical::LiveCanonical)): decoded on demand,
+    /// shared while held, freed with the last holder.
     ///
     /// The array's statistics are trusted as provenance: an `IsSorted` stamp
     /// on its `s` column asserts the rows are in global `(s, p, o, g)` order —
@@ -235,7 +240,7 @@ impl VortexRdfStore {
     /// re-derived or split out of the rows.
     pub fn from_built(built: BuiltArray) -> Result<Self> {
         let layout = resolved_layout(built.dict, built.array.dtype())?;
-        let (base, components) = compress_built_parts(built.array, built.components)?;
+        let (base, components) = resident_built_parts(built.array, built.components)?;
         Self::assemble_resident(base, components, layout)
     }
 
@@ -243,8 +248,9 @@ impl VortexRdfStore {
     /// components — the shared tail of every in-memory construction path.
     ///
     /// Callers own the resident form of what they pass: construction sites
-    /// compress first ([`compress_built_parts`]), the adoption site keeps
-    /// wire encodings selectively
+    /// hold the base canonical and compress the components
+    /// ([`resident_built_parts`]), the adoption site keeps wire encodings
+    /// selectively
     /// ([`with_searchable_int_children`](array::with_searchable_int_children));
     /// this assembler transforms nothing.
     fn assemble_resident(
@@ -272,6 +278,7 @@ impl VortexRdfStore {
                 components,
                 deleted: None,
                 probes: store_probes,
+                canonical: canonical::LiveCanonical::new(),
                 serve: None,
             },
             tail: None,
@@ -302,6 +309,7 @@ impl VortexRdfStore {
                 components: Arc::from(Vec::new()),
                 deleted: None,
                 probes: probes::StructProbes::new(),
+                canonical: canonical::LiveCanonical::new(),
                 serve: None,
             },
             tail: None,
@@ -322,6 +330,7 @@ impl VortexRdfStore {
                 base,
                 deleted,
                 probes,
+                canonical,
                 ..
             } => QuadsSource::InMemory {
                 base: base.clone(),
@@ -329,6 +338,7 @@ impl VortexRdfStore {
                 components: Arc::from(Vec::new()),
                 deleted: deleted.clone(),
                 probes: Arc::clone(probes),
+                canonical: Arc::clone(canonical),
                 serve: None,
             },
             #[cfg(feature = "file-io")]

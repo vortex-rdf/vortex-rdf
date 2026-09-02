@@ -357,13 +357,13 @@ impl IndexComponent {
     /// probe-supported encodings — the construction-side counterpart of
     /// [`into_searchable`](Self::into_searchable): a builder's canonical
     /// emission compresses here (see
-    /// [`array::with_compressed_int_children`]), without the base's payload
-    /// wrapper (components never serve code columns). The sorted probes bind
-    /// the compressed columns directly.
+    /// [`array::with_compressed_int_children`]). Components never serve code
+    /// columns, so nothing ever needs their canonical form back; the sorted
+    /// probes bind the compressed columns directly.
     ///
     /// [`array::with_compressed_int_children`]: crate::store::array::with_compressed_int_children
     pub(crate) fn into_compressed(self) -> Result<Self> {
-        self.rebuilt(|rows| crate::store::array::with_compressed_int_children(rows, false))
+        self.rebuilt(crate::store::array::with_compressed_int_children)
     }
 
     /// The cached encoded-search probe over the component's `column`, or

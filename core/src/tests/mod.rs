@@ -28,6 +28,7 @@ mod matching;
 mod mutation;
 mod names;
 mod primitives;
+mod resident;
 mod roundtrip;
 #[cfg(feature = "file-io")]
 mod serialization;

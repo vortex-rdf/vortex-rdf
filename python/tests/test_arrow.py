@@ -167,3 +167,19 @@ def test_duckdb_consumes_the_stream(vortex_files):
     store = VortexRdfStore(vortex_files["dictionary"])
     quads = store.match_arrow(encoding="strings")  # noqa: F841 -- read by name below
     assert duckdb.sql("select count(*) from quads").fetchone()[0] == 5
+
+
+def test_in_memory_store_shares_one_decoded_form_while_held(vortex_files):
+    """An adopted (``in_memory=True``) store keeps the file's encodings; wide
+    code reads decode each column into a canonical form that every result
+    alive shares, so two whole-store reads and a ``codes`` export hand out
+    the same buffers while any of them is held."""
+    store = VortexRdfStore(vortex_files["dictionary"], in_memory=True)
+    first = store.match_codes()
+    second = store.match_codes()
+    for a, b in zip(first, second):
+        assert _address(a) == _address(b)
+    table = _table(store.match_arrow())
+    for column, held in zip(table.columns, first):
+        assert column.num_chunks == 1
+        assert column.chunk(0).buffers()[1].address == _address(held)

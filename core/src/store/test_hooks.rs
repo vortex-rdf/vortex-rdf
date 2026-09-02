@@ -14,7 +14,8 @@ use crate::store::array;
 #[cfg(feature = "file-io")]
 use crate::store::layouts::QuadPattern;
 #[cfg(feature = "file-io")]
-use crate::store::layouts::{DictAccess, ResolvedLayout};
+use crate::store::layouts::DictAccess;
+use crate::store::layouts::ResolvedLayout;
 use crate::store::selection::{RowSelection, ViewSelection};
 use crate::store::{QuadsSource, VortexRdfStore};
 
@@ -256,4 +257,28 @@ fn debug_sorted_children_probe_resolvable(struct_arr: &StructArray) -> bool {
         !array::column_is_sorted(child)
             || vortex_rdf_encoded_search::SortedProbe::resolve(child).is_some()
     })
+}
+
+impl VortexRdfStore {
+    /// Whether some reader currently holds the live canonical form of
+    /// in-memory base column `idx` (in `PRIMARY_COLUMNS` order); `None` for
+    /// a file-backed store.
+    pub(crate) fn debug_live_canonical_alive(&self, idx: usize) -> Option<bool> {
+        match &self.quads {
+            QuadsSource::InMemory { canonical, .. } => Some(canonical.is_alive(idx)),
+            #[cfg(feature = "file-io")]
+            QuadsSource::File { .. } => None,
+        }
+    }
+
+    /// Whether some consumer currently holds the resident dictionary's Arrow
+    /// values array; `None` without a resident dictionary.
+    pub(crate) fn debug_dict_arrow_values_alive(&self) -> Option<bool> {
+        match &self.layout {
+            ResolvedLayout::Dictionary(access) => {
+                Some(access.resident()?.debug_arrow_values_alive())
+            }
+            _ => None,
+        }
+    }
 }

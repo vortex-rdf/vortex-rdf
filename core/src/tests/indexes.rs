@@ -816,13 +816,13 @@ async fn test_in_memory_copy_index_serving() {
 
 // ─── Resident form and code reads over indexes ─────────────────────────
 
-/// A built store's resident form: construction compresses the base's code
-/// columns and every component's integer children into probe-supported
-/// encodings — no canonical primitives are retained — while every sorted
-/// column still binds an encoded search probe, and the payload path still
-/// serves codes (through the base's `vortex.shared` wrappers).
+/// A built store's resident form: the base's code columns are flat
+/// canonical primitives — served zero-copy by every code read, and still
+/// binding an encoded search probe — while every component's integer
+/// children are compressed into probe-supported encodings, the columns
+/// nothing ever reads as a payload.
 #[tokio::test]
-async fn test_built_store_compresses_resident_form() {
+async fn test_built_store_resident_form() {
     let quads = modular_quads(200, 4, 8);
     let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(quads.clone()),
@@ -834,23 +834,23 @@ async fn test_built_store_compresses_resident_form() {
     let store = VortexRdfStore::from_built(arr).unwrap();
 
     assert!(
-        !store.debug_base_int_children_canonical(),
-        "construction must retain compressed code columns, not canonical primitives"
+        store.debug_base_int_children_canonical(),
+        "construction must hold the base's code columns as canonical primitives"
     );
     assert!(
         store.debug_base_probe_resolvable(),
-        "every sorted column of the compressed base must bind an encoded search probe"
+        "every sorted column of the canonical base must bind an encoded search probe"
     );
     for name in ["index:posg", "index:ospg"] {
         assert_eq!(
             store.debug_index_component_int_children_canonical(name),
             Some(false),
-            "{name}: component children must stay compressed too"
+            "{name}: component children must be compressed"
         );
     }
 
-    // The payload path still answers: codes decode to exactly the matched
-    // quads (first touch materializes the shared canonical, then zero-copy).
+    // The payload path answers off the canonical columns: codes decode to
+    // exactly the matched quads, and no live canonical form is ever made.
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     let matched = store
         .match_pattern(None, Some(&p1), None, None)
@@ -858,7 +858,10 @@ async fn test_built_store_compresses_resident_form() {
         .unwrap();
     let cols = matched
         .code_columns()
-        .expect("compressed base still serves codes through its shared wrappers");
+        .expect("a canonical base serves codes without a decode");
+    for idx in 0..4 {
+        assert_eq!(matched.debug_live_canonical_alive(idx), Some(false));
+    }
     let dict = matched.code_read_snapshot().unwrap();
     let mut got: Vec<String> = (0..cols[0].len())
         .map(|i| {

@@ -98,10 +98,11 @@ impl VortexRdfStore {
                     .to_string(),
             ));
         }
-        // An in-memory view whose codes `code_columns` serves hands out those
-        // very buffers (the canonical form it caches behind a wrapped base);
+        // An in-memory view whose codes `code_columns_shared` serves hands
+        // out those very buffers — a built base's canonical columns, or an
+        // adopted base's live canonical form, shared with every holder alive;
         // anything else reads the primary chunks.
-        let batches: BoxStream<'static, Result<RecordBatch>> = match self.code_columns() {
+        let batches: BoxStream<'static, Result<RecordBatch>> = match self.code_columns_shared()? {
             Some(buffers) => {
                 let batch = code_buffers_to_batch(&buffers, &schema, &columns, values.as_ref())?;
                 stream::once(future::ready(Ok(batch))).boxed()

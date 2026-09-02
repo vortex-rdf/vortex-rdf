@@ -12,6 +12,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+bytes = "1.12"
 vortex.workspace = true
 vortex-array.workspace = true
 vortex-error.workspace = true
@@ -27,6 +28,7 @@ vortex-buffer.workspace = true
 vortex-arrow.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
+arrow-buffer.workspace = true
 # Encoding-aware bounds search over compressed columns (sibling workspace crate).
 vortex-rdf-encoded-search.workspace = true
 

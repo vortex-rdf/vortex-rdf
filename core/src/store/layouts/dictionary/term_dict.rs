@@ -11,8 +11,8 @@
 //! [`LayoutStrategy::Dictionary`]: crate::store::layouts::LayoutStrategy::Dictionary
 
 use crate::debug;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
 use super::predicates::{TermPredicate, Verdict};
@@ -158,19 +158,105 @@ pub(crate) struct TermDictionary {
     terms: TermStore,
     /// Memo for [`encode`](Self::encode); see [`ProbeCache`].
     probes: ProbeCache,
-    /// The whole term column as one Arrow `StringViewArray`, built on first
-    /// use by [`arrow_values`](Self::arrow_values) and shared by every later
-    /// caller (an Arrow dictionary array needs a single values array, so the
-    /// batch export attaches this one to every batch of a stream).
-    arrow_values: OnceLock<ArrowArrayRef>,
-    /// Memo for [`filter_codes`](Self::filter_codes): each predicate's
-    /// verdict sets, keyed by the predicate's canonical spelling.
-    predicates: Mutex<HashMap<String, VerdictSets>>,
+    /// The whole term column as the buffers of one Arrow `StringViewArray`,
+    /// built by [`arrow_values`](Self::arrow_values) and held weakly: every
+    /// array handed out holds the memory through its buffers (an Arrow
+    /// dictionary array needs a single values array, so the batch export
+    /// attaches one to every batch of a stream), and it is freed with the
+    /// last holder — in Rust or across the C Data Interface alike.
+    arrow_values: Mutex<Option<Weak<ArrowValuesOwner>>>,
+    /// Memo for [`filter_codes`](Self::filter_codes): the verdict sets of
+    /// the most recently asked predicates, keyed by canonical spelling.
+    predicates: Mutex<PredicateMemo>,
 }
 
 /// A predicate's verdict over a dictionary: the codes it holds for and the
 /// codes it leaves undecided, both ascending.
 type VerdictSets = Arc<(Buffer<u32>, Buffer<u32>)>;
+
+/// The decoded term column behind [`arrow_values`](TermDictionary::arrow_values):
+/// the buffers a `StringViewArray` is built from. Every array handed out
+/// holds this owner through its buffers' allocation, so the dictionary's
+/// weak reference tracks the memory itself — alive for as long as any
+/// consumer, in Rust or across the C Data Interface, holds a buffer of it,
+/// and not a moment longer.
+struct ArrowValuesOwner {
+    views: arrow_buffer::ScalarBuffer<u128>,
+    data: Arc<[arrow_buffer::Buffer]>,
+    nulls: Option<arrow_buffer::NullBuffer>,
+}
+
+impl ArrowValuesOwner {
+    fn from_array(array: arrow_array::StringViewArray) -> Arc<Self> {
+        let (views, data, nulls) = array.into_parts();
+        Arc::new(Self { views, data, nulls })
+    }
+
+    /// A `StringViewArray` over this owner's memory, each of whose buffers
+    /// keeps the owner alive.
+    fn array(self: &Arc<Self>) -> ArrowArrayRef {
+        use arrow_buffer::{BooleanBuffer, Buffer as ArrowBuffer, NullBuffer, ScalarBuffer};
+        use std::ptr::NonNull;
+        let held = |buffer: &ArrowBuffer| -> ArrowBuffer {
+            let owner: Arc<dyn arrow_buffer::alloc::Allocation> = Arc::<Self>::clone(self);
+            // SAFETY: the bytes are owned by `self`, which the new buffer's
+            // allocation keeps alive for as long as the buffer or any clone
+            // of it exists; an Arrow buffer's pointer is never null.
+            unsafe {
+                ArrowBuffer::from_custom_allocation(
+                    NonNull::new_unchecked(buffer.as_ptr().cast_mut()),
+                    buffer.len(),
+                    owner,
+                )
+            }
+        };
+        let views = ScalarBuffer::<u128>::new(held(self.views.inner()), 0, self.views.len());
+        let data: Vec<ArrowBuffer> = self.data.iter().map(held).collect();
+        let nulls = self.nulls.as_ref().map(|nulls| {
+            let bits = nulls.inner();
+            NullBuffer::new(BooleanBuffer::new(held(bits.inner()), bits.offset(), bits.len()))
+        });
+        // SAFETY: the parts are those of a `StringViewArray` validated when it
+        // was built; only the buffers' ownership changed.
+        Arc::new(unsafe { arrow_array::StringViewArray::new_unchecked(views, data, nulls) })
+    }
+}
+
+/// Predicates [`filter_codes`](TermDictionary::filter_codes) keeps verdict
+/// sets for at once; past it the oldest entry is dropped. Sized for the
+/// FILTERs of the queries in flight, not for every constant ever asked: an
+/// entry can hold up to two codes per dictionary term.
+const PREDICATE_MEMO_SLOTS: usize = 32;
+
+/// A bounded, insertion-ordered memo of predicate verdict sets.
+#[derive(Default)]
+struct PredicateMemo {
+    sets: HashMap<String, VerdictSets>,
+    order: VecDeque<String>,
+}
+
+impl PredicateMemo {
+    fn get(&self, key: &str) -> Option<VerdictSets> {
+        self.sets.get(key).map(Arc::clone)
+    }
+
+    /// Memoize `sets` under `key`, dropping the oldest entry past the cap.
+    /// Returns the memoized sets: an entry a racing caller inserted first
+    /// wins.
+    fn insert(&mut self, key: String, sets: VerdictSets) -> VerdictSets {
+        if let Some(existing) = self.sets.get(&key) {
+            return Arc::clone(existing);
+        }
+        while self.order.len() >= PREDICATE_MEMO_SLOTS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.sets.remove(&oldest);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.sets.insert(key, Arc::clone(&sets));
+        sets
+    }
+}
 
 impl TermDictionary {
     /// Wrap the held terms, with an empty lookup memo.
@@ -178,8 +264,8 @@ impl TermDictionary {
         Self {
             terms,
             probes: ProbeCache::new(),
-            arrow_values: OnceLock::new(),
-            predicates: Mutex::new(HashMap::new()),
+            arrow_values: Mutex::new(None),
+            predicates: Mutex::new(PredicateMemo::default()),
         }
     }
 
@@ -463,14 +549,21 @@ impl TermDictionary {
         lo as u32
     }
 
-    /// The whole term column as one Arrow `StringViewArray`, cached on first
-    /// use.
+    /// The whole term column as one Arrow `StringViewArray`, over memory
+    /// shared with every holder alive and rebuilt after the last drops (see
+    /// [`ArrowValuesOwner`]).
     ///
     /// Canonical chunks convert buffer-sharing; FSST chunks decompress — once
-    /// per dictionary, bounded by the dictionary's size, never by a result's.
+    /// per set of concurrent holders, bounded by the dictionary's size, never
+    /// by a result's.
     pub(crate) fn arrow_values(&self) -> Result<ArrowArrayRef> {
-        if let Some(values) = self.arrow_values.get() {
-            return Ok(values.clone());
+        use arrow_array::cast::AsArray as _;
+        let mut slot = self
+            .arrow_values
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(owner) = slot.as_ref().and_then(Weak::upgrade) {
+            return Ok(owner.array());
         }
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let canonical = match &self.terms {
@@ -491,14 +584,30 @@ impl TermDictionary {
         };
         let values = canonical_varbinview_to_arrow::<StringViewType>(&canonical, &mut ctx)
             .map_err(VortexRdfError::Vortex)?;
-        // A racing first call built its own copy; either one may win the slot.
-        Ok(self.arrow_values.get_or_init(|| values).clone())
+        let Some(values) = values.as_string_view_opt() else {
+            return Err(VortexRdfError::InvalidOperation(
+                "the term column did not convert to an Arrow string_view array".to_string(),
+            ));
+        };
+        let owner = ArrowValuesOwner::from_array(values.clone());
+        *slot = Some(Arc::downgrade(&owner));
+        Ok(owner.array())
+    }
+
+    /// Whether some holder currently keeps the Arrow values array alive.
+    #[cfg(test)]
+    pub(crate) fn debug_arrow_values_alive(&self) -> bool {
+        self.arrow_values
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|owner| owner.strong_count() > 0)
     }
 
     /// The codes whose terms `predicate` decides true, and those it cannot
     /// decide (see [`Verdict`]), both ascending — one pass over the term
-    /// column on first use, memoized per predicate for the dictionary's
-    /// lifetime.
+    /// column, memoized for the last [`PREDICATE_MEMO_SLOTS`] predicates
+    /// asked.
     pub(crate) fn filter_codes(&self, predicate: &TermPredicate) -> Result<VerdictSets> {
         let key = predicate.to_string();
         if let Some(cached) = self
@@ -507,7 +616,7 @@ impl TermDictionary {
             .unwrap_or_else(PoisonError::into_inner)
             .get(&key)
         {
-            return Ok(Arc::clone(cached));
+            return Ok(cached);
         }
         let mut cursor = self.cursor();
         let (mut holds, mut unknown) = (Vec::new(), Vec::new());
@@ -519,13 +628,11 @@ impl TermDictionary {
             }
         }
         let sets = Arc::new((Buffer::from_iter(holds), Buffer::from_iter(unknown)));
-        Ok(Arc::clone(
-            self.predicates
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .entry(key)
-                .or_insert(sets),
-        ))
+        Ok(self
+            .predicates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key, sets))
     }
 
     /// [`encode`](Self::encode), then — on a miss — the same lookup with the
@@ -1103,8 +1210,9 @@ mod tests {
     }
 
     /// The Arrow values array is the decode table verbatim — for a canonical
-    /// single-chunk dictionary, a windowed FSST one, and the empty one — and
-    /// the second call returns the cached array, not a rebuild.
+    /// single-chunk dictionary, a windowed FSST one, and the empty one. While
+    /// one is held every call returns that same array; it is freed with its
+    /// last holder and rebuilt on demand.
     #[test]
     fn arrow_values_match_decode() {
         use arrow_array::Array as _;
@@ -1129,7 +1237,16 @@ mod tests {
                 assert_eq!(d.encode(strings.value(code as usize)), Some(code));
             }
             let again = d.arrow_values().unwrap();
-            assert!(Arc::ptr_eq(&values, &again), "second call must be cached");
+            assert_eq!(
+                strings.views().as_ptr(),
+                again.as_string_view().views().as_ptr(),
+                "a held array shares its buffers"
+            );
+            assert!(d.debug_arrow_values_alive());
+            drop(values);
+            drop(again);
+            assert!(!d.debug_arrow_values_alive(), "freed with the last holder");
+            assert_eq!(d.arrow_values().unwrap().len(), d.len(), "rebuilt on demand");
         }
 
         assert_eq!(TermDictionary::empty().arrow_values().unwrap().len(), 0);

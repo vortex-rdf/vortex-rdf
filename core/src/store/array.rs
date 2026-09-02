@@ -204,27 +204,14 @@ pub(crate) fn search_sorted_bounds(
     Ok((index_of(lo), index_of(hi)))
 }
 
-/// Keep a base struct's integer children (the Dictionary layout's term
-/// codes, TypedObject's kind column) in their compressed form wherever the
-/// match fast paths can bind them, decoding only the remainder to canonical
-/// primitives — preserving each child's `IsSorted` stamp across any
-/// re-encoding.
-///
-/// The per-row match fast paths — [`search_sorted_bounds`]' probes and the
-/// typed residual loops — bind canonical primitives and any encoding an
-/// encoded search probe resolves, so those children stay compressed at
-/// adoption. A child outside the probe's supported set (e.g. dictionary
-/// encoding) would pay a per-call fallback through the generic per-scalar
-/// kernel on every match; decoding it once here keeps every fast path fast
-/// for the store's lifetime. String children keep their encoded form: their
-/// canonical `VarBinView` costs real memory, and the mask scan handles them
-/// at selection cost. Serialization re-compresses every child through the
-/// default write strategy, so the wire format is unaffected.
+/// Decode the non-nullable integer children of a base struct that `decode`
+/// selects into canonical primitives, keeping every other child as it is and
+/// carrying each child's `IsSorted` stamp across the re-encoding.
 ///
 /// A nullable struct passes through untouched — the base schema is
 /// non-nullable, and rebuilding a struct with validity is not this helper's
 /// business.
-pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
+fn decode_int_children(rows: ArrayRef, decode: impl Fn(&ArrayRef) -> bool) -> Result<ArrayRef> {
     use vortex_array::arrays::struct_::StructArrayExt;
     use vortex_array::arrays::{PrimitiveArray, StructArray};
     use vortex_array::validity::Validity;
@@ -243,10 +230,7 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
         let child = struct_arr
             .unmasked_field_by_name(name.as_ref())
             .map_err(VortexRdfError::Vortex)?;
-        let decode = child.dtype().is_int()
-            && !child.dtype().is_nullable()
-            && vortex_rdf_encoded_search::SortedProbe::resolve(child).is_none();
-        if !decode {
+        if !(child.dtype().is_int() && !child.dtype().is_nullable() && decode(child)) {
             children.push(child.clone());
             continue;
         }
@@ -273,10 +257,42 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
     )
 }
 
-/// Compress a built struct's u32 code columns into probe-supported
-/// encodings, in place of the canonical primitives the builders emit —
-/// the construction half of the store's compressed-resident form (the
-/// adoption half is [`with_searchable_int_children`]).
+/// Keep an adopted base struct's integer children (the Dictionary layout's
+/// term codes, TypedObject's kind column) in the encodings they arrived in
+/// wherever the match fast paths can bind them, decoding only the remainder
+/// to canonical primitives.
+///
+/// The per-row match fast paths — [`search_sorted_bounds`]' probes and the
+/// typed residual loops — bind canonical primitives and any encoding an
+/// encoded search probe resolves, so those children stay encoded at
+/// adoption. A child outside the probe's supported set (e.g. dictionary
+/// encoding) would pay a per-call fallback through the generic per-scalar
+/// kernel on every match; decoding it once here keeps every fast path fast
+/// for the store's lifetime. String children keep their encoded form: their
+/// canonical `VarBinView` costs real memory, and the mask scan handles them
+/// at selection cost. Serialization re-compresses every child through the
+/// default write strategy, so the wire format is unaffected.
+///
+/// Code reads over the encoded children go through the base's live
+/// canonical cache ([`LiveCanonical`](crate::store::canonical::LiveCanonical)).
+pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
+    decode_int_children(rows, |child| {
+        vortex_rdf_encoded_search::SortedProbe::resolve(child).is_none()
+    })
+}
+
+/// Hold a built base struct's integer children as flat canonical primitives.
+/// The builders assemble anything over `DEFAULT_CHUNK_ROWS` rows into a
+/// `ChunkedArray`, and the code-column read path serves a primary column
+/// zero-copy only as one contiguous canonical buffer
+/// ([`canonical_u32`]); already-canonical children pass through.
+pub(crate) fn with_canonical_int_children(rows: ArrayRef) -> Result<ArrayRef> {
+    use vortex_array::arrays::Primitive;
+    decode_int_children(rows, |child| !child.is::<Primitive>())
+}
+
+/// Compress a built index component's u32 code columns into probe-supported
+/// encodings, in place of the canonical primitives the builders emit.
 ///
 /// Every encoding chosen here is one an encoded search probe resolves, so
 /// the match fast paths keep binding the column; the choice is made from
@@ -288,16 +304,13 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
 /// `DEFAULT_CHUNK_ROWS` rows into a `ChunkedArray`, so without that every
 /// build past one chunk would keep the canonical form.
 ///
-/// `payload_lazy` wraps each compressed column in a `vortex.shared` lazy
-/// wrapper: the match fast paths probe the compressed source through the
-/// wrapper, while the code-column payload path materializes the canonical
-/// primitive once into the wrapper's cache (`shared_u32_primitive`) and is
-/// zero-copy on every later call. Pass it for the primary base — the only
-/// array the payload path reads; components never serve payloads and skip
-/// the wrapper.
-pub(crate) fn with_compressed_int_children(rows: ArrayRef, payload_lazy: bool) -> Result<ArrayRef> {
+/// Components are the columns nothing ever reads as a payload: serve plans
+/// point-read them through the probes, so the compressed form costs no read
+/// path anything. The primary base is held canonical instead
+/// ([`with_canonical_int_children`]).
+pub(crate) fn with_compressed_int_children(rows: ArrayRef) -> Result<ArrayRef> {
     use vortex_array::arrays::struct_::StructArrayExt;
-    use vortex_array::arrays::{Primitive, SharedArray, StructArray};
+    use vortex_array::arrays::StructArray;
     use vortex_array::validity::Validity;
 
     if rows.dtype().is_nullable() {
@@ -314,13 +327,10 @@ pub(crate) fn with_compressed_int_children(rows: ArrayRef, payload_lazy: bool) -
             .unmasked_field_by_name(name.as_ref())
             .map_err(VortexRdfError::Vortex)?;
         let sorted = column_is_sorted(child);
-        let Some(mut encoded) = compress_u32_child(child, sorted, &mut ctx)? else {
+        let Some(encoded) = compress_u32_child(child, sorted, &mut ctx)? else {
             children.push(child.clone());
             continue;
         };
-        if payload_lazy && !encoded.is::<Primitive>() {
-            encoded = SharedArray::new(encoded).into_array();
-        }
         if sorted {
             stamp_is_sorted(&encoded);
         }
@@ -334,61 +344,12 @@ pub(crate) fn with_compressed_int_children(rows: ArrayRef, payload_lazy: bool) -
     )
 }
 
-/// A base child as a canonical non-nullable u32 primitive, zero-copy where
-/// one exists: a canonical column directly, a `vortex.shared` wrapper via its
-/// one-way cache — the first call decodes the compressed source into the
-/// cache, every later call is a refcount bump shared by all views over the
-/// base. `None` for any other encoding (callers fall back to the gather
-/// pipeline).
-///
-/// Decoding into the cache is one pass over the whole column, so callers that
-/// only read a few rows take [`cached_u32_primitive`] instead.
-pub(crate) fn shared_u32_primitive(
-    child: &ArrayRef,
-) -> Option<vortex_array::arrays::PrimitiveArray> {
-    use vortex_array::Canonical;
-    use vortex_array::arrays::shared::SharedArrayExt as _;
-    use vortex_array::arrays::{Primitive, PrimitiveArray, Shared};
-
-    if let Some(prim) = canonical_u32(child) {
-        return Some(prim);
-    }
-    let shared = child.as_opt::<Shared>()?;
-    let cached = shared
-        .get_or_compute(|source| {
-            let mut ctx = VORTEX_SESSION.create_execution_ctx();
-            source
-                .clone()
-                .execute::<PrimitiveArray>(&mut ctx)
-                .map(Canonical::Primitive)
-        })
-        .ok()?;
-    let prim = cached.try_downcast::<Primitive>().ok()?;
-    (prim.ptype() == vortex_array::dtype::PType::U32).then_some(prim)
-}
-
-/// The non-decoding half of [`shared_u32_primitive`]: a base child's canonical
-/// non-nullable u32 primitive when one already exists — the column itself, or
-/// a `vortex.shared` wrapper whose one-way cache some earlier read already
-/// filled. `None` when producing one would mean decoding the compressed
-/// source, so a caller reading a handful of rows can prefer per-row point
-/// reads over a whole-column pass.
-pub(crate) fn cached_u32_primitive(
-    child: &ArrayRef,
-) -> Option<vortex_array::arrays::PrimitiveArray> {
-    use vortex_array::arrays::Shared;
-    use vortex_array::arrays::shared::SharedArrayExt as _;
-
-    if let Some(prim) = canonical_u32(child) {
-        return Some(prim);
-    }
-    let shared = child.as_opt::<Shared>()?;
-    canonical_u32(shared.current_array_ref())
-}
-
-/// A non-nullable canonical u32 primitive, or `None` for anything else — the
-/// shape both `*_u32_primitive` accessors hand back.
-fn canonical_u32(arr: &ArrayRef) -> Option<vortex_array::arrays::PrimitiveArray> {
+/// A base child as a canonical non-nullable u32 primitive when it is one —
+/// the form a built base's code columns are held in, which every code read
+/// serves zero-copy — and `None` for any other encoding (an adopted base's
+/// wire encodings; callers decode through the base's live canonical cache
+/// or gather).
+pub(crate) fn canonical_u32(arr: &ArrayRef) -> Option<vortex_array::arrays::PrimitiveArray> {
     use vortex_array::arrays::Primitive;
 
     if !arr.dtype().is_unsigned_int() || arr.dtype().is_nullable() {

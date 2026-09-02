@@ -4201,8 +4201,10 @@ name = "vortex-rdf-core"
 version = "0.11.0"
 dependencies = [
  "arrow-array",
+ "arrow-buffer",
  "arrow-schema",
  "async-trait",
+ "bytes",
  "clap",
  "codspeed-divan-compat",
  "futures",

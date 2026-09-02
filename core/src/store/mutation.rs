@@ -187,6 +187,7 @@ impl VortexRdfStore {
                     components,
                     deleted,
                     probes,
+                    canonical,
                     ..
                 },
                 QuadsSource::InMemory {
@@ -209,6 +210,7 @@ impl VortexRdfStore {
                         components: Arc::clone(components),
                         deleted: Some(union_deleted(deleted.as_ref(), doomed)),
                         probes: Arc::clone(probes),
+                        canonical: Arc::clone(canonical),
                         serve: None,
                     },
                     tail,

@@ -218,6 +218,7 @@ impl VortexRdfStore {
             components,
             deleted,
             probes,
+            canonical,
             ..
         } = &self.quads
         else {
@@ -485,6 +486,7 @@ impl VortexRdfStore {
                 components: Arc::clone(components),
                 deleted: deleted.clone(),
                 probes: Arc::clone(probes),
+                canonical: Arc::clone(canonical),
                 serve,
             },
             tail: self.tail.clone(),

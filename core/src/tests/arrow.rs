@@ -102,9 +102,9 @@ async fn store(quads: Vec<Quad>, layout: LayoutStrategy) -> VortexRdfStore {
 
 /// A full in-memory Dictionary store exports its code columns as the very
 /// buffers `code_columns` serves: the same values, at the same addresses.
-/// A store adopted from bytes keeps its base wire-encoded, so no reader can
-/// share a canonical buffer there; its export still equals the gathered
-/// codes.
+/// A store adopted from bytes keeps its base wire-encoded; its export shares
+/// the live canonical form with every code read holding it, so while the
+/// gathered columns are held the batch's columns are those same buffers.
 #[tokio::test]
 async fn codes_share_the_base_buffers_of_a_full_dictionary_store() {
     let built = store(modular_quads(50, 5, 7), LayoutStrategy::Dictionary).await;
@@ -131,9 +131,20 @@ async fn codes_share_the_base_buffers_of_a_full_dictionary_store() {
         .unwrap();
     let gathered = adopted.code_columns_gathered().await.unwrap().unwrap();
     let (_, adopted_batches) = batches(&adopted, TermEncoding::Codes, None).await;
-    let columns = code_columns_of(&adopted_batches);
+    assert_eq!(adopted_batches.len(), 1);
     for (i, buffer) in gathered.iter().enumerate() {
-        assert_eq!(columns[i], buffer.as_slice(), "adopted: column {i}");
+        let column = adopted_batches[0].column(i).as_primitive::<UInt32Type>();
+        assert_eq!(column.values().as_ref(), buffer.as_slice(), "adopted: column {i}");
+        assert_eq!(
+            column.values().as_ptr(),
+            buffer.as_slice().as_ptr(),
+            "adopted: column {i} must share the live canonical form"
+        );
+    }
+    drop(gathered);
+    drop(adopted_batches);
+    for idx in 0..4 {
+        assert_eq!(adopted.debug_live_canonical_alive(idx), Some(false));
     }
 }
 
@@ -164,9 +175,10 @@ async fn codes_and_terms_agree_with_the_gathered_codes_of_a_view() {
         for (i, column) in batch.columns().iter().enumerate() {
             let dictionary = column.as_dictionary::<UInt32Type>();
             assert_eq!(dictionary.keys().values().as_ref(), expected[i].as_slice());
-            assert!(
-                Arc::ptr_eq(dictionary.values(), &values),
-                "column {i} must share the dictionary's values array"
+            assert_eq!(
+                dictionary.values().as_string_view().views().as_ptr(),
+                values.as_string_view().views().as_ptr(),
+                "column {i} must share the dictionary's values buffers"
             );
         }
     }

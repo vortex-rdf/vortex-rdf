@@ -6,15 +6,18 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "file-io")]
+use vortex_array::VortexSessionExecute;
+#[cfg(feature = "file-io")]
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::VortexSessionExecute;
 use vortex_buffer::Buffer;
 
 use crate::arrow::QuadColumn;
 use crate::error::{Result, VortexRdfError};
+#[cfg(feature = "file-io")]
 use crate::session::VORTEX_SESSION;
-use crate::store::array::{into_struct_array, shared_u32_primitive};
+use crate::store::array::{canonical_u32, into_struct_array};
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_scan;
 use crate::store::selection::{RowSelection, ViewSelection};
@@ -70,6 +73,7 @@ impl VortexRdfStore {
                 components,
                 deleted,
                 probes,
+                canonical,
                 ..
             } => {
                 let selection = selection.materialized()?;
@@ -82,6 +86,7 @@ impl VortexRdfStore {
                         components: Arc::clone(components),
                         deleted: deleted.clone(),
                         probes: Arc::clone(probes),
+                        canonical: Arc::clone(canonical),
                         serve: None,
                     },
                     taken,
@@ -192,6 +197,7 @@ impl VortexRdfStore {
                 components,
                 deleted,
                 probes,
+                canonical,
                 ..
             } => {
                 let selection = selection.materialized()?;
@@ -199,14 +205,15 @@ impl VortexRdfStore {
                 let col = struct_arr
                     .unmasked_field_by_name(column.name())
                     .map_err(VortexRdfError::Vortex)?;
-                let codes = match shared_u32_primitive(col) {
-                    Some(prim) => prim,
-                    None => col
-                        .clone()
-                        .execute::<PrimitiveArray>(&mut VORTEX_SESSION.create_execution_ctx())
-                        .map_err(VortexRdfError::Vortex)?,
+                // A canonical column (a built base) binds directly; an
+                // encoded one reads through the live canonical cache —
+                // shared with any holder alive, and gone again with this
+                // scan when there is none.
+                let codes = match canonical_u32(col) {
+                    Some(prim) => prim.into_buffer::<u32>(),
+                    None => canonical.column(column.index(), col)?,
                 };
-                let codes = codes.as_slice::<u32>();
+                let codes = codes.as_slice();
                 let admits = |id: &u64| keep.contains(codes[*id as usize]);
                 let ids: Vec<u64> = match &selection {
                     RowSelection::All => (0..base.len() as u64).filter(admits).collect(),
@@ -219,6 +226,7 @@ impl VortexRdfStore {
                     components: Arc::clone(components),
                     deleted: deleted.clone(),
                     probes: Arc::clone(probes),
+                    canonical: Arc::clone(canonical),
                     serve: None,
                 }
             }
