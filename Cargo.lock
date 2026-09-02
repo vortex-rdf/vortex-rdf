@@ -4185,6 +4185,8 @@ dependencies = [
 name = "vortex-rdf-core"
 version = "0.10.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
  "async-trait",
  "clap",
  "codspeed-divan-compat",
@@ -4205,6 +4207,7 @@ dependencies = [
  "uuid",
  "vortex",
  "vortex-array",
+ "vortex-arrow",
  "vortex-buffer",
  "vortex-edition",
  "vortex-error",

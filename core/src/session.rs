@@ -33,6 +33,9 @@ pub(crate) static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     let session = session.with_handle(vortex_io::runtime::wasm::WasmRuntime::handle());
     vortex_file::register_default_encodings(&session);
+    // Arrow conversion registry (`session.arrow()`), used by the batch export
+    // in `crate::arrow`; registering eagerly keeps session setup in one place.
+    vortex_arrow::initialize(&session);
     crate::io::container::register(&session);
     enable_store_edition(&session);
     session

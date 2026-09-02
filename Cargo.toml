@@ -36,6 +36,11 @@ vortex-file = { version = "0.85.0" }
 vortex-scan = "0.85.0"
 vortex-layout = "0.85.0"
 vortex-buffer = "0.85.0"
+vortex-arrow = "0.85.0"
+# The arrow-rs majors vortex-arrow 0.85 itself requires: the graph must only
+# ever resolve one arrow-rs version (`cargo tree -i arrow-array`).
+arrow-array = "58.3"
+arrow-schema = "58.3"
 self_cell = "1.2"
 divan = { package = "codspeed-divan-compat", version = "5.0.1" }
 

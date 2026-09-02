@@ -43,6 +43,7 @@
 //! });
 //! ```
 
+pub mod arrow;
 pub mod common;
 pub mod debug;
 pub mod error;
@@ -51,6 +52,7 @@ mod session;
 /// The quad store: builders, layouts, indexes, matching and mutation.
 pub mod store;
 
+pub use arrow::{QuadColumn, TermEncoding};
 pub use error::{Result, VortexRdfError};
 
 pub use store::{
