@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Batch matches, row windows and keep constraints (core) ([`088e702`](https://github.com/vortex-rdf/vortex-rdf/commit/088e70290c70f2dbc28a3d88dcc9962f198ef1ae) by julianrojas87)
 - Dictionary term predicates and tolerant encoding (core) ([`2065da2`](https://github.com/vortex-rdf/vortex-rdf/commit/2065da20fa00e9ba511858bfeb8df9a7cf00dc73) by julianrojas87)
 - The pushdown primitives (python) ([`3bbf86e`](https://github.com/vortex-rdf/vortex-rdf/commit/3bbf86e185c355584d74f41fd0c49b6826f69bd5) by julianrojas87)
+- Canonical built bases, live canonical cache for encoded ones (core) ([`43feb94`](https://github.com/vortex-rdf/vortex-rdf/commit/43feb9405a001a105200064fbf92e9d9b8caaccb) by julianrojas87)
 
 ### Fixed
 
