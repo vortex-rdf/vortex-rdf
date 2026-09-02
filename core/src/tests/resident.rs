@@ -3,7 +3,7 @@
 //! values — what each decodes, what it shares, and when it is freed.
 
 use super::*;
-use crate::arrow::{QuadColumn, TermEncoding};
+use crate::store::{QuadColumn, TermEncoding};
 use crate::store::Keep;
 use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;

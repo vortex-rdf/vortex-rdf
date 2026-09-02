@@ -43,7 +43,6 @@
 //! });
 //! ```
 
-pub mod arrow;
 pub mod common;
 pub mod debug;
 pub mod error;
@@ -52,13 +51,14 @@ mod session;
 /// The quad store: builders, layouts, indexes, matching and mutation.
 pub mod store;
 
-pub use arrow::{QuadColumn, TermEncoding};
 pub use error::{Result, VortexRdfError};
 
 pub use store::{
     BuiltArray, BuiltStream, ChunkStream, DictSnapshot, DictionaryQuadSink, IndexType, Indexes,
-    Keep, LayoutStrategy, NumOp, RawQuad, SharedQuad, SortedInMemoryBuilder, StoreParts,
-    TermPredicate, Verdict, VortexArrayBuilder, VortexRdfStore, export_rdf,
+    Keep, LayoutStrategy, META_DEFAULT_GRAPH, META_LAYOUT, META_TERM_ENCODING, META_VERSION,
+    NumOp, QuadBatches, QuadColumn, RawQuad, SharedQuad, SortedInMemoryBuilder, StoreParts,
+    TermEncoding, TermPredicate, Verdict, VortexArrayBuilder, VortexRdfStore, export_rdf,
+    quad_schema,
 };
 // Compiled out on wasm along with the rest of the sorted-stream builder's
 // out-of-core merge (see the module gate in `store::builders`).

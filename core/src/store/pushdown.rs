@@ -13,7 +13,7 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_buffer::Buffer;
 
-use crate::arrow::QuadColumn;
+use crate::store::arrow::QuadColumn;
 use crate::error::{Result, VortexRdfError};
 #[cfg(feature = "file-io")]
 use crate::session::VORTEX_SESSION;

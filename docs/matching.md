@@ -223,7 +223,7 @@ stage only sees what is left.
 
 A built base's code columns are flat canonical primitives; an adopted base
 keeps the encodings its file was written with
-([`resident_built_parts`](../core/src/store/mod.rs#L159),
+([`resident_built_parts`](../core/src/store/mod.rs#L164),
 [`with_searchable_int_children`](../core/src/store/array.rs#L278)). The stages
 below search either form in place — slice compares on canonical columns, the
 cached encoded-search probes on encoded ones. No stage decodes a column; a

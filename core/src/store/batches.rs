@@ -25,7 +25,9 @@ use vortex_array::{ArrayRef, VortexSessionExecute};
 use vortex_arrow::primitive::canonical_primitive_to_arrow;
 use vortex_buffer::Buffer;
 
-use crate::arrow::{QuadBatches, QuadColumn, TermEncoding, arrow_err, projected_schema, quad_schema};
+use crate::store::arrow::{
+    QuadBatches, QuadColumn, TermEncoding, arrow_err, projected_schema, quad_schema,
+};
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::array::field_as;

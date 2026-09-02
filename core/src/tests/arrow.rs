@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::arrow::{META_TERM_ENCODING, QuadColumn, TermEncoding};
+use crate::store::{META_TERM_ENCODING, QuadColumn, TermEncoding};
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt32Type;
 use arrow_array::{Array, RecordBatch};

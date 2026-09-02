@@ -3,7 +3,7 @@
 //! against the plain match it must agree with.
 
 use super::*;
-use crate::arrow::QuadColumn;
+use crate::store::QuadColumn;
 use crate::common::terms::Pattern;
 use crate::store::Keep;
 

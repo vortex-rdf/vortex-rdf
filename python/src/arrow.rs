@@ -24,7 +24,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyTuple};
 use vortex_rdf_core::TermEncoding;
-use vortex_rdf_core::arrow::QuadBatches;
+use vortex_rdf_core::QuadBatches;
 
 use crate::{RUNTIME, VortexRdfError};
 

@@ -1,6 +1,7 @@
 // The submodules are crate-private: every public item below is re-exported
 // here (or at the crate root), so each has exactly one canonical public path.
 pub(crate) mod array;
+pub(crate) mod arrow;
 pub(crate) mod builders;
 pub(crate) mod canonical;
 pub(crate) mod indexes;
@@ -27,6 +28,10 @@ mod streaming;
 #[cfg(test)]
 pub(crate) mod test_hooks;
 
+pub use arrow::{
+    META_DEFAULT_GRAPH, META_LAYOUT, META_TERM_ENCODING, META_VERSION, QuadBatches, QuadColumn,
+    TermEncoding, quad_schema,
+};
 pub use builders::{
     BuiltArray, BuiltStream, ChunkStream, SortedInMemoryBuilder, VortexArrayBuilder,
 };
