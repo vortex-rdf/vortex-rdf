@@ -34,16 +34,44 @@ class TermDict:
         ...
     def __len__(self) -> int: ...
     def __repr__(self) -> str: ...
+    def __arrow_c_array__(self, requested_schema: object = None) -> Tuple[object, object]:
+        """The Arrow PyCapsule interface: the whole dictionary as a
+        ``string_view`` array whose element ``i`` is the term of code ``i``
+        (``pyarrow.array(dictionary)``). ``requested_schema`` is not applied."""
+        ...
 
 class U32Column:
     """Read-only u32 column; supports the buffer protocol
-    (``memoryview(col).cast("I")`` is a zero-copy view)."""
+    (``memoryview(col).cast("I")`` is a zero-copy view) and the Arrow
+    PyCapsule interface (``pyarrow.array(col)`` shares the same memory)."""
 
     def __len__(self) -> int: ...
     def __repr__(self) -> str: ...
     # The buffer protocol is implemented natively (`__getbuffer__`);
     # `__buffer__` is the Python 3.12+ spelling `memoryview()` reports for it.
     def __buffer__(self, flags: int, /) -> memoryview: ...
+    def __arrow_c_array__(self, requested_schema: object = None) -> Tuple[object, object]:
+        """The column as a zero-copy ``uint32`` Arrow array; ``requested_schema``
+        is not applied."""
+        ...
+
+class ArrowQuadStream:
+    """The record batches of one `VortexRdfStore.match_arrow` call, handed to
+    an Arrow consumer through the PyCapsule interface — consumable once
+    (``pyarrow.RecordBatchReader.from_stream(stream)``, ``polars.DataFrame(stream)``,
+    a DuckDB query over it); the schema is readable any number of times
+    (``pyarrow.schema(stream)``)."""
+
+    @property
+    def encoding(self) -> str:
+        """The term encoding of the batches: "codes", "terms" or "strings"."""
+        ...
+    def __arrow_c_schema__(self) -> object: ...
+    def __arrow_c_stream__(self, requested_schema: object = None) -> object:
+        """The batches as an ``arrow_array_stream`` capsule; a second call
+        raises ``ValueError``. ``requested_schema`` is not applied."""
+        ...
+    def __repr__(self) -> str: ...
 
 class VortexRdfStore:
     def __init__(
@@ -98,6 +126,25 @@ class VortexRdfStore:
         g: Optional[str] = None,
     ) -> Tuple[List[str], List[str], List[str], List[str]]:
         """The same rows as `get_quads`, as four parallel columns."""
+        ...
+    def match_arrow(
+        self,
+        s: Optional[str] = None,
+        p: Optional[str] = None,
+        o: Optional[str] = None,
+        g: Optional[str] = None,
+        *,
+        encoding: str = "codes",
+        projection: Optional[Sequence[str]] = None,
+    ) -> ArrowQuadStream:
+        """The matching rows as a stream of Arrow record batches (columns
+        ``s``, ``p``, ``o``, ``g``, or the ``projection`` subset in that order).
+
+        ``encoding`` is ``"codes"`` (``uint32`` term codes sharing the store's
+        buffers), ``"terms"`` (the codes as dictionary keys over the whole term
+        dictionary) or ``"strings"`` (``string_view`` N-Triples strings, the
+        one encoding every layout serves). Codes and terms need the
+        Dictionary layout; the TypedObject layout has no Arrow export."""
         ...
 
 def serialize_rdf(

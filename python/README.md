@@ -54,6 +54,24 @@ dictionary.encode("<http://xmlns.com/foaf/0.1/name>")  # code for a term, or Non
 
 Consumers can join, count, and de-duplicate entirely in code space and decode each distinct term once, never materializing a term string for a row they discard.
 
+## Arrow interface
+
+Every matched view, code column and dictionary speaks the [Arrow PyCapsule interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html), so pyarrow, polars, DuckDB, DataFusion or any other Arrow-native engine consumes them directly — the package itself depends on none of them:
+
+```python
+import pyarrow as pa, polars as pl
+
+stream = store.match_arrow(p="<http://xmlns.com/foaf/0.1/name>")   # ArrowQuadStream
+pa.schema(stream)                                    # s, p, o, g — uint32 term codes
+table = pa.RecordBatchReader.from_stream(stream).read_all()
+frame = pl.DataFrame(store.match_arrow(encoding="terms"))    # strings backed by codes
+
+pa.array(store.match_codes()[0])                     # a code column, zero-copy
+pa.array(store.term_dict())                          # the dictionary: element i = term of code i
+```
+
+`match_arrow` streams one record batch per decode chunk (the whole store in memory, each scan split of a file), pulled as the consumer reads. `encoding="codes"` (the default) hands out `uint32` term codes sharing the store's buffers — join, filter and aggregate in code space, then decode the survivors through `term_dict()` or the dictionary array; `encoding="terms"` wraps the same codes as an Arrow dictionary over the whole term dictionary, so engines see strings while carrying codes; `encoding="strings"` materializes `string_view` N-Triples strings and is the one encoding every layout serves. `projection=["o", "s"]` restricts and orders the columns (a file scan then reads only those). A stream is consumed once; its schema can be read any number of times.
+
 ## Build options
 
 ```python

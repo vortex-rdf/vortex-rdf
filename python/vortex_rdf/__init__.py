@@ -6,6 +6,7 @@ rdflib Store on top of these bindings.
 """
 
 from ._native import (
+    ArrowQuadStream,
     TermDict,
     U32Column,
     VortexRdfError,
@@ -15,6 +16,7 @@ from ._native import (
 )
 
 __all__ = [
+    "ArrowQuadStream",
     "TermDict",
     "U32Column",
     "VortexRdfError",

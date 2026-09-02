@@ -7,8 +7,11 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use vortex_buffer::Buffer;
 use vortex_rdf_core::common::terms::{Pattern, parse_pattern_checked};
-use vortex_rdf_core::{VortexRdfError as CoreError, VortexRdfStore as CoreStore};
+use vortex_rdf_core::{
+    QuadColumn, TermEncoding, VortexRdfError as CoreError, VortexRdfStore as CoreStore,
+};
 
+use crate::arrow::ArrowQuadStream;
 use crate::codes::{TermDict, U32Column};
 use crate::{RUNTIME, VortexRdfError, parse_err, store_err};
 
@@ -371,5 +374,53 @@ impl VortexRdfStore {
                 U32Column { codes: g },
             )
         }))
+    }
+
+    /// Match a pattern and hand the rows to any Arrow consumer as a stream of
+    /// record batches (the Arrow PyCapsule interface: pass the result to
+    /// `pyarrow.RecordBatchReader.from_stream`, `polars.DataFrame`, or a
+    /// DuckDB query). One batch per decode chunk, columns `s`, `p`, `o`, `g`
+    /// — or the `projection` subset, in the given order.
+    ///
+    /// `encoding` selects the cell type: `"codes"` (`uint32` term codes,
+    /// sharing the store's buffers; decode through [`Self::term_dict`] or
+    /// join in code space), `"terms"` (the same codes as dictionary keys
+    /// over the whole term dictionary, so consumers see strings and carry
+    /// codes), or `"strings"` (`string_view` N-Triples strings — the one
+    /// encoding every layout serves). Codes and terms need the Dictionary
+    /// layout; the TypedObject layout has no Arrow export. Batches are
+    /// produced as the consumer pulls them, off the GIL wherever the
+    /// consumer releases it.
+    #[pyo3(signature = (s=None, p=None, o=None, g=None, *, encoding="codes", projection=None))]
+    // The parameter list is the Python signature: four pattern positions plus
+    // the two keyword options.
+    #[allow(clippy::too_many_arguments)]
+    fn match_arrow(
+        &self,
+        py: Python<'_>,
+        s: Option<&str>,
+        p: Option<&str>,
+        o: Option<&str>,
+        g: Option<&str>,
+        encoding: &str,
+        projection: Option<Vec<String>>,
+    ) -> PyResult<ArrowQuadStream> {
+        let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
+        let encoding: TermEncoding = encoding.parse().map_err(parse_err)?;
+        let projection: Option<Vec<QuadColumn>> = projection
+            .map(|names| names.iter().map(|name| name.parse()).collect())
+            .transpose()
+            .map_err(parse_err)?;
+        let batches = py
+            .detach(|| -> Result<_, CoreError> {
+                RUNTIME.block_on(async {
+                    self.matched(&pattern)
+                        .await?
+                        .to_record_batches(encoding, projection.as_deref())
+                        .await
+                })
+            })
+            .map_err(store_err)?;
+        Ok(ArrowQuadStream::new(batches, encoding))
     }
 }

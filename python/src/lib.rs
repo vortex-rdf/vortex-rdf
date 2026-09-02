@@ -6,6 +6,7 @@
 //! Unlike the wasm bindings, this crate keeps core's `file-io` feature on:
 //! stores are opened lazily from `.vortex` files and queried in place.
 
+mod arrow;
 mod codes;
 mod serialize;
 mod store;
@@ -52,6 +53,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<store::VortexRdfStore>()?;
     m.add_class::<codes::TermDict>()?;
     m.add_class::<codes::U32Column>()?;
+    m.add_class::<arrow::ArrowQuadStream>()?;
     m.add_function(wrap_pyfunction!(serialize::serialize_rdf, m)?)?;
     m.add("VortexRdfError", m.py().get_type::<VortexRdfError>())?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;

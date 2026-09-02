@@ -59,14 +59,20 @@ def test_version_matches_distribution():
     assert vortex_rdf.__version__ == importlib.metadata.version("vortex-rdf")
 
 
+_ARROW_PROTOCOL = ("__arrow_c_schema__", "__arrow_c_array__", "__arrow_c_stream__")
+
+
 def _runtime_methods(cls):
     names = _public(dir(cls)) | {"__len__", "__repr__"}
     if sys.version_info >= (3, 12):
         names |= {n for n in ("__buffer__",) if hasattr(cls, n)}
+    names |= {n for n in _ARROW_PROTOCOL if hasattr(cls, n)}
     return names
 
 
-@pytest.mark.parametrize("name", ["VortexRdfStore", "TermDict", "U32Column"])
+@pytest.mark.parametrize(
+    "name", ["VortexRdfStore", "TermDict", "U32Column", "ArrowQuadStream"]
+)
 def test_stub_class_methods_match_runtime(name):
     stub_methods = _stub_classes(_stub_tree())[name]
     cls = getattr(_native, name)

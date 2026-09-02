@@ -4247,6 +4247,9 @@ dependencies = [
 name = "vortex-rdf-python"
 version = "0.10.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "futures",
  "pyo3",
  "tokio",
  "vortex-buffer",

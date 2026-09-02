@@ -24,3 +24,8 @@ vortex-rdf-core = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 pyo3 = { workspace = true, features = ["extension-module", "abi3-py311"] }
 vortex-buffer.workspace = true
+# The Arrow C Data Interface structs behind the PyCapsule protocol, at the one
+# arrow-rs version the workspace pins.
+arrow-array = { workspace = true, features = ["ffi"] }
+arrow-schema.workspace = true
+futures.workspace = true

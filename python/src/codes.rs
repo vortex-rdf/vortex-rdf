@@ -5,13 +5,17 @@
 
 use std::os::raw::{c_int, c_void};
 
+use arrow_array::UInt32Array;
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PySystemError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::PyString;
+use pyo3::types::{PyString, PyTuple};
 use vortex_buffer::Buffer;
 use vortex_rdf_core::DictSnapshot;
+
+use crate::arrow::array_capsules;
+use crate::store_err;
 
 /// Buckets in the decode-sharing cache (see [`TermDict::decode_slice`]).
 /// A power of two, so the bucket index is a mask rather than a division; 256
@@ -156,6 +160,23 @@ impl TermDict {
     fn __repr__(&self) -> String {
         format!("TermDict(len={})", self.snapshot.len())
     }
+
+    /// The Arrow PyCapsule interface: the whole dictionary as a `string_view`
+    /// array whose element `i` is the term of code `i` — a code → term
+    /// lookup table for `pyarrow.array(dictionary)`, `polars.Series(dictionary)`
+    /// and friends. Built once per dictionary and shared by every export.
+    /// `requested_schema` is accepted for protocol conformance and not
+    /// applied.
+    #[pyo3(signature = (requested_schema=None))]
+    fn __arrow_c_array__<'py>(
+        &self,
+        py: Python<'py>,
+        requested_schema: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let _ = requested_schema;
+        let values = self.snapshot.to_arrow().map_err(store_err)?;
+        array_capsules(py, values.as_ref())
+    }
 }
 
 /// One matched term-code column, exposed to Python zero-copy through the
@@ -174,6 +195,21 @@ impl U32Column {
 
     fn __repr__(&self) -> String {
         format!("U32Column(len={})", self.codes.len())
+    }
+
+    /// The Arrow PyCapsule interface: the column as a `uint32` array sharing
+    /// this column's buffer — `pyarrow.array(col)`, `polars.Series(col)`
+    /// view the same memory the buffer protocol exposes. `requested_schema`
+    /// is accepted for protocol conformance and not applied.
+    #[pyo3(signature = (requested_schema=None))]
+    fn __arrow_c_array__<'py>(
+        &self,
+        py: Python<'py>,
+        requested_schema: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let _ = requested_schema;
+        let array = UInt32Array::new(self.codes.clone().into_arrow_scalar_buffer(), None);
+        array_capsules(py, &array)
     }
 
     /// Fills `view` over the raw u32 data; the exported buffer holds a
