@@ -1,7 +1,8 @@
-//! The Dictionary-layout code path: matched rows as zero-copy `u32` term-code
-//! columns plus a dictionary handle, mirroring the JS bindings' lazy payload
-//! (`js/src/store.rs::match_payload`). Python decodes each distinct code once
-//! and never materializes per-occurrence term strings.
+//! The Dictionary-layout code vocabulary: a dictionary handle that decodes
+//! and encodes term codes, and the zero-copy `u32` code columns the
+//! dictionary's predicates yield. Codes arrive from the Arrow export
+//! (`match_arrow`); Python decodes each distinct code once and never
+//! materializes per-occurrence term strings.
 
 use std::os::raw::{c_int, c_void};
 
@@ -10,7 +11,7 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PySystemError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyString, PyTuple};
+use pyo3::types::{PyCapsule, PyCapsuleMethods, PyString, PyTuple};
 use vortex_buffer::Buffer;
 use vortex_rdf_core::{DictSnapshot, TermPredicate};
 
@@ -135,7 +136,7 @@ impl TermDict {
     /// The half-open code range `(lo, hi)` of the terms whose N-Triples
     /// spelling starts with `prefix` — an IRI namespace as `"<http://…/"`,
     /// a kind as its first byte (`'"'` literals, `"<"` IRIs, `"_:"` blank
-    /// nodes). Pass it as `range(lo, hi)` to `match_codes(keep=...)`.
+    /// nodes). Pass it as `range(lo, hi)` to `match_arrow(keep=...)`.
     fn prefix_range(&self, prefix: &str) -> (u32, u32) {
         self.snapshot.prefix_range(prefix)
     }
@@ -163,12 +164,13 @@ impl TermDict {
     /// batch.
     ///
     /// `codes` is preferably a u32 buffer (`memoryview(col).cast("I")`,
-    /// `array("I", ...)`, a `uint32` NumPy array), read in one bulk copy
-    /// with no per-element Python-int conversion. A byte-typed buffer — the
-    /// raw view a [`U32Column`] itself exports — is reinterpreted as
-    /// native-endian u32s, so a column from `match_codes` passes directly.
-    /// Any other sequence of ints still works, at one `PyLong` extraction
-    /// per code.
+    /// `array("I", ...)`, a `uint32` NumPy array) or a `uint32` Arrow array
+    /// (anything with `__arrow_c_array__`: a `pyarrow.Array`, a code column
+    /// out of `match_arrow`), read in one bulk copy with no per-element
+    /// Python-int conversion. A byte-typed buffer — the raw view a
+    /// [`U32Column`] itself exports — is reinterpreted as native-endian u32s,
+    /// so a column from `filter_codes` passes directly. Any other sequence
+    /// of ints still works, at one `PyLong` extraction per code.
     ///
     /// A repeated code yields the *same* Python string object; see
     /// [`decode_slice`](Self::decode_slice).
@@ -209,8 +211,9 @@ impl TermDict {
 /// Term codes out of any Python value that carries them: a u32 buffer
 /// (`memoryview(col).cast("I")`, `array("I", ...)`, a `uint32` NumPy array),
 /// read in one bulk copy; a byte-typed buffer — the raw view a
-/// [`U32Column`] exports — reinterpreted as native-endian u32s; or any
-/// other sequence of ints, one `PyLong` extraction per code.
+/// [`U32Column`] exports — reinterpreted as native-endian u32s; a `uint32`
+/// Arrow array through the PyCapsule interface ([`codes_from_arrow`]); or
+/// any other sequence of ints, one `PyLong` extraction per code.
 pub(crate) fn codes_from_py(py: Python<'_>, codes: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
     if let Ok(buf) = PyBuffer::<u32>::get(codes) {
         return buf.to_vec(py);
@@ -230,12 +233,58 @@ pub(crate) fn codes_from_py(py: Python<'_>, codes: &Bound<'_, PyAny>) -> PyResul
             .map(|b| u32::from_ne_bytes(*b))
             .collect());
     }
+    if codes.hasattr("__arrow_c_array__")? {
+        return codes_from_arrow(codes);
+    }
     codes.extract::<Vec<u32>>()
 }
 
-/// One matched term-code column, exposed to Python zero-copy through the
-/// buffer protocol: `memoryview(col).cast("I")` views the Rust memory
-/// directly. The column is read-only and owns (refcounts) its backing buffer.
+/// Term codes out of an object speaking the Arrow PyCapsule interface — a
+/// `pyarrow.Array`, a polars `Series.to_arrow()`, a code column read back
+/// out of `match_arrow`. The array must be a non-nullable `uint32`, the
+/// type every code column of this package exports; it is read in one bulk
+/// copy and the producer's buffers are released right after.
+fn codes_from_arrow(codes: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
+    use arrow_array::ffi::{FFI_ArrowArray, from_ffi};
+    use arrow_schema::DataType;
+    use arrow_schema::ffi::FFI_ArrowSchema;
+
+    let capsules = codes.call_method0("__arrow_c_array__")?;
+    let (schema, array): (Bound<'_, PyCapsule>, Bound<'_, PyCapsule>) = capsules.extract()?;
+    let schema_ptr = schema.pointer_checked(Some(c"arrow_schema"))?;
+    let array_ptr = array.pointer_checked(Some(c"arrow_array"))?;
+    // SAFETY: the capsules hold what the protocol promises — pointers to C
+    // Data Interface structs the producer owns until a consumer moves them
+    // out. `from_raw` moves each struct out, leaving a released one behind,
+    // so the capsules' own destructors become no-ops and this side owns the
+    // buffers until `data` drops.
+    let (schema, array) = unsafe {
+        (
+            FFI_ArrowSchema::from_raw(schema_ptr.as_ptr().cast()),
+            FFI_ArrowArray::from_raw(array_ptr.as_ptr().cast()),
+        )
+    };
+    // SAFETY: `array` and `schema` describe one array the producer exported
+    // through the protocol; both were moved out above and are consumed here.
+    let data = unsafe { from_ffi(array, &schema) }.map_err(|e| PyValueError::new_err(e.to_string()))?;
+    if data.data_type() != &DataType::UInt32 {
+        return Err(PyValueError::new_err(format!(
+            "expected a uint32 Arrow array of term codes, got {}",
+            data.data_type()
+        )));
+    }
+    if data.null_count() > 0 {
+        return Err(PyValueError::new_err(
+            "an Arrow array of term codes must have no nulls".to_string(),
+        ));
+    }
+    Ok(UInt32Array::from(data).values().to_vec())
+}
+
+/// A column of term codes — the sets a dictionary predicate yields — exposed
+/// to Python zero-copy through the buffer protocol (`memoryview(col).cast("I")`
+/// views the Rust memory directly) and the Arrow PyCapsule interface. The
+/// column is read-only and owns (refcounts) its backing buffer.
 #[pyclass(frozen, module = "vortex_rdf._native")]
 pub struct U32Column {
     pub(crate) codes: Buffer<u32>,

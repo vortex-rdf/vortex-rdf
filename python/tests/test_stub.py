@@ -25,12 +25,14 @@ def _stub_tree():
 
 
 def _stub_classes(tree):
+    """The stub's public classes and their methods; a private class is a
+    typing helper (a `Protocol`), not a runtime name."""
     return {
         node.name: {
             item.name for item in node.body if isinstance(item, ast.FunctionDef)
         }
         for node in tree.body
-        if isinstance(node, ast.ClassDef)
+        if isinstance(node, ast.ClassDef) and not node.name.startswith("_")
     }
 
 
@@ -122,7 +124,7 @@ def _text_signature_pairs():
     for node in tree.body:
         if isinstance(node, ast.FunctionDef):
             pairs.append((node.name, node, getattr(_native, node.name)))
-        elif isinstance(node, ast.ClassDef):
+        elif isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
             cls = getattr(_native, node.name)
             for item in node.body:
                 if not isinstance(item, ast.FunctionDef):

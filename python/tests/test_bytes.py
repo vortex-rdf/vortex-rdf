@@ -16,7 +16,6 @@ def test_bytes_round_trip(vortex_files, layout):
     assert sorted(clone.get_quads()) == sorted(store.get_quads())
     assert sorted(clone.get_quads(p=NAME)) == sorted(store.get_quads(p=NAME))
     assert (clone.term_dict() is not None) == (layout == "dictionary")
-    assert (clone.match_codes() is not None) == (layout == "dictionary")
     assert repr(clone) == f'VortexRdfStore(layout="{layout}")'
 
 

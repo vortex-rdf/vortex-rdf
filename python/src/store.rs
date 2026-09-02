@@ -13,11 +13,8 @@ use vortex_rdf_core::{
 };
 
 use crate::arrow::ArrowQuadStream;
-use crate::codes::{TermDict, U32Column, codes_from_py};
+use crate::codes::{TermDict, codes_from_py};
 use crate::{RUNTIME, VortexRdfError, parse_err, store_err};
-
-/// `(s, p, o, g)` code columns as returned by [`VortexRdfStore::match_codes`].
-type CodeColumns = (U32Column, U32Column, U32Column, U32Column);
 
 /// A pattern as Python spells it: four optional N-Triples term strings.
 type PyPattern = (Option<String>, Option<String>, Option<String>, Option<String>);
@@ -35,6 +32,25 @@ impl ReadOptions {
     fn windowed(&self) -> bool {
         self.limit.is_some() || self.offset > 0
     }
+}
+
+/// The `encoding`/`projection` options of an Arrow export, parsed by core's
+/// own `FromStr` impls so an error reads the same from every frontend.
+struct Export {
+    encoding: TermEncoding,
+    projection: Option<Vec<QuadColumn>>,
+}
+
+fn parse_export(encoding: &str, projection: Option<Vec<String>>) -> PyResult<Export> {
+    let encoding: TermEncoding = encoding.parse().map_err(parse_err)?;
+    let projection: Option<Vec<QuadColumn>> = projection
+        .map(|names| names.iter().map(|name| name.parse()).collect())
+        .transpose()
+        .map_err(parse_err)?;
+    Ok(Export {
+        encoding,
+        projection,
+    })
 }
 
 /// Every pattern of a batch parsed up front, so a malformed one raises
@@ -90,25 +106,6 @@ fn parse_keep(
 /// Held as `Py<PyString>` so a term repeated down a column is one Python object
 /// shared by every row that uses it.
 type PyQuad = (Py<PyString>, Py<PyString>, Py<PyString>, Py<PyString>);
-
-/// `(subjects, predicates, objects, graphs)` as returned by
-/// [`VortexRdfStore::match_columns`].
-type StringColumns = (
-    Vec<Py<PyString>>,
-    Vec<Py<PyString>>,
-    Vec<Py<PyString>>,
-    Vec<Py<PyString>>,
-);
-
-/// The gathered code buffers as the columns Python receives.
-fn code_columns([s, p, o, g]: [Buffer<u32>; 4]) -> CodeColumns {
-    (
-        U32Column { codes: s },
-        U32Column { codes: p },
-        U32Column { codes: o },
-        U32Column { codes: g },
-    )
-}
 
 /// Unwrap decoded columns, raising `VortexRdfError` on anything that cannot
 /// be a valid result.
@@ -204,8 +201,7 @@ impl VortexRdfStore {
     /// subject-predicate-object-graph order. The default graph is the empty
     /// string, the spelling `parse_pattern_checked` accepts for it.
     ///
-    /// Backs both [`Self::get_quads`] and [`Self::match_columns`], so the two
-    /// resolve a pattern the same way.
+    /// Backs [`Self::get_quads`].
     fn matched_columns(
         &self,
         py: Python<'_>,
@@ -436,105 +432,15 @@ impl VortexRdfStore {
         .map_err(store_err)
     }
 
-    /// Match a pattern and return the matching quads as four parallel columns
-    /// of N-Triples strings — `(subjects, predicates, objects, graphs)`, each
-    /// as long as the result.
-    ///
-    /// The column-oriented counterpart of [`Self::get_quads`], for callers that
-    /// work a position at a time (filtering on objects, collecting distinct
-    /// subjects) and would otherwise build a tuple per row to take it apart
-    /// again. Unlike [`Self::match_codes`] it is available on every layout,
-    /// falling back to the shared-term rows when the code path does not apply.
-    #[pyo3(signature = (s=None, p=None, o=None, g=None))]
-    fn match_columns(
-        &self,
-        py: Python<'_>,
-        s: Option<&str>,
-        p: Option<&str>,
-        o: Option<&str>,
-        g: Option<&str>,
-    ) -> PyResult<StringColumns> {
-        let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
-        let [subjects, predicates, objects, graphs] = self.matched_columns(py, &pattern)?;
-        Ok((subjects, predicates, objects, graphs))
-    }
-
     /// The store's term dictionary, or `None` when the code path does not
     /// apply: a non-Dictionary layout, a non-resident (file-backed)
     /// dictionary, or an append tail whose quads are not in the cached
-    /// dictionary. Pair with [`Self::match_codes`]; decode each distinct
+    /// dictionary. Pair with [`Self::match_arrow`]; decode each distinct
     /// code once, caching on the Python side.
     fn term_dict(&self) -> Option<TermDict> {
         self.store
             .code_read_snapshot()
             .map(|snapshot| TermDict { snapshot })
-    }
-
-    /// Match a pattern and return the rows as four zero-copy `u32` term-code
-    /// columns `(s, p, o, g)` decodable through [`Self::term_dict`], or
-    /// `None` when the code path does not apply (see `term_dict`). Callers
-    /// fall back to [`Self::get_quads`] or [`Self::match_columns`], which
-    /// resolve terms on every layout.
-    ///
-    /// `keep` restricts positions by code before any row is gathered: a
-    /// mapping from column name (`"s"`, `"p"`, `"o"`, `"g"`) to a `range`
-    /// of codes (what `TermDict.prefix_range` yields) or to a set of codes
-    /// in any form `TermDict.decode_many` accepts. `limit`/`offset` window
-    /// the rows in match order, after `keep`.
-    #[pyo3(signature = (s=None, p=None, o=None, g=None, *, keep=None, limit=None, offset=0))]
-    // The parameter list is the Python signature: four pattern positions plus
-    // the three keyword options.
-    #[allow(clippy::too_many_arguments)]
-    fn match_codes(
-        &self,
-        py: Python<'_>,
-        s: Option<&str>,
-        p: Option<&str>,
-        o: Option<&str>,
-        g: Option<&str>,
-        keep: Option<HashMap<String, Bound<'_, PyAny>>>,
-        limit: Option<usize>,
-        offset: usize,
-    ) -> PyResult<Option<CodeColumns>> {
-        let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
-        let options = ReadOptions {
-            keep: parse_keep(py, keep)?,
-            limit,
-            offset,
-        };
-        if self.store.code_read_snapshot().is_none() {
-            return Ok(None);
-        }
-        let columns = self.matched_code_columns(py, &pattern, &options)?;
-        Ok(columns.map(code_columns))
-    }
-
-    /// `match_codes` for a batch of `(s, p, o, g)` patterns in one call —
-    /// every pattern parsed first (a malformed one raises `ValueError`
-    /// before anything is evaluated), the matches run concurrently under one
-    /// GIL release, one result per pattern in input order. `None` for every
-    /// pattern when the code path does not apply (see `term_dict`).
-    fn match_codes_many(
-        &self,
-        py: Python<'_>,
-        patterns: Vec<PyPattern>,
-    ) -> PyResult<Vec<Option<CodeColumns>>> {
-        let patterns = parse_patterns(&patterns)?;
-        if self.store.code_read_snapshot().is_none() {
-            return Ok(patterns.iter().map(|_| None).collect());
-        }
-        let columns = py
-            .detach(|| -> Result<_, CoreError> {
-                RUNTIME.block_on(async {
-                    let views = self.store.match_pattern_many(&patterns).await?;
-                    try_join_all(views.iter().map(|view| view.code_columns_gathered())).await
-                })
-            })
-            .map_err(store_err)?;
-        Ok(columns
-            .into_iter()
-            .map(|columns| columns.map(code_columns))
-            .collect())
     }
 
     /// Match a pattern and hand the rows to any Arrow consumer as a stream of
@@ -549,12 +455,18 @@ impl VortexRdfStore {
     /// over the whole term dictionary, so consumers see strings and carry
     /// codes), or `"strings"` (`string_view` N-Triples strings — the one
     /// encoding every layout serves). Codes and terms need the Dictionary
-    /// layout; the TypedObject layout has no Arrow export. Batches are
-    /// produced as the consumer pulls them, off the GIL wherever the
-    /// consumer releases it.
-    #[pyo3(signature = (s=None, p=None, o=None, g=None, *, encoding="codes", projection=None))]
+    /// layout; the TypedObject layout has no Arrow export.
+    ///
+    /// `keep` restricts positions by term code before any row is gathered:
+    /// a mapping from column name (`"s"`, `"p"`, `"o"`, `"g"`) to a `range`
+    /// of codes (what `TermDict.prefix_range` yields) or to a set of codes
+    /// in any form `TermDict.decode_many` accepts — a `U32Column`, a
+    /// `uint32` Arrow array, a buffer, a sequence of ints. `limit`/`offset`
+    /// window the rows in match order, after `keep`. Batches are produced as
+    /// the consumer pulls them, off the GIL wherever the consumer releases it.
+    #[pyo3(signature = (s=None, p=None, o=None, g=None, *, encoding="codes", projection=None, keep=None, limit=None, offset=0))]
     // The parameter list is the Python signature: four pattern positions plus
-    // the two keyword options.
+    // the keyword options.
     #[allow(clippy::too_many_arguments)]
     fn match_arrow(
         &self,
@@ -565,23 +477,59 @@ impl VortexRdfStore {
         g: Option<&str>,
         encoding: &str,
         projection: Option<Vec<String>>,
+        keep: Option<HashMap<String, Bound<'_, PyAny>>>,
+        limit: Option<usize>,
+        offset: usize,
     ) -> PyResult<ArrowQuadStream> {
         let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
-        let encoding: TermEncoding = encoding.parse().map_err(parse_err)?;
-        let projection: Option<Vec<QuadColumn>> = projection
-            .map(|names| names.iter().map(|name| name.parse()).collect())
-            .transpose()
-            .map_err(parse_err)?;
+        let export = parse_export(encoding, projection)?;
+        let options = ReadOptions {
+            keep: parse_keep(py, keep)?,
+            limit,
+            offset,
+        };
         let batches = py
             .detach(|| -> Result<_, CoreError> {
                 RUNTIME.block_on(async {
-                    self.matched(&pattern)
+                    self.matched_with(&pattern, &options)
                         .await?
-                        .to_record_batches(encoding, projection.as_deref())
+                        .to_record_batches(export.encoding, export.projection.as_deref())
                         .await
                 })
             })
             .map_err(store_err)?;
-        Ok(ArrowQuadStream::new(batches, encoding))
+        Ok(ArrowQuadStream::new(batches, export.encoding))
+    }
+
+    /// `match_arrow` for a batch of `(s, p, o, g)` patterns in one call —
+    /// every pattern parsed first (a malformed one raises `ValueError`
+    /// before anything is evaluated), the matches run concurrently under one
+    /// GIL release, one stream per pattern in input order, all under the
+    /// same `encoding` and `projection`.
+    #[pyo3(signature = (patterns, *, encoding="codes", projection=None))]
+    fn match_arrow_many(
+        &self,
+        py: Python<'_>,
+        patterns: Vec<PyPattern>,
+        encoding: &str,
+        projection: Option<Vec<String>>,
+    ) -> PyResult<Vec<ArrowQuadStream>> {
+        let patterns = parse_patterns(&patterns)?;
+        let export = parse_export(encoding, projection)?;
+        let streams = py
+            .detach(|| -> Result<_, CoreError> {
+                RUNTIME.block_on(async {
+                    let views = self.store.match_pattern_many(&patterns).await?;
+                    try_join_all(views.iter().map(|view| {
+                        view.to_record_batches(export.encoding, export.projection.as_deref())
+                    }))
+                    .await
+                })
+            })
+            .map_err(store_err)?;
+        Ok(streams
+            .into_iter()
+            .map(|batches| ArrowQuadStream::new(batches, export.encoding))
+            .collect())
     }
 }

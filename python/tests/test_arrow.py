@@ -34,9 +34,14 @@ def _cells(table, dictionary=None):
     return cells
 
 
+def _transposed(rows):
+    """Four column lists out of `get_quads` rows (four empty ones for none)."""
+    return [list(column) for column in zip(*rows)] if rows else [[], [], [], []]
+
+
 def test_u32_column_exports_the_same_memory_as_its_buffer(vortex_files):
     store = VortexRdfStore(vortex_files["dictionary"])
-    for column in store.match_codes():
+    for column in store.term_dict().filter_codes("is_iri", ""):
         array = pa.array(column)
         assert array.type == pa.uint32()
         assert array.null_count == 0
@@ -59,9 +64,9 @@ def test_term_dict_exports_the_decode_table(vortex_files):
 
 @pytest.mark.parametrize("in_memory", [False, True])
 @pytest.mark.parametrize("encoding", ENCODINGS)
-def test_match_arrow_rows_are_match_columns(vortex_files, encoding, in_memory):
+def test_match_arrow_rows_are_get_quads(vortex_files, encoding, in_memory):
     """File-backed stores export through the scan, in-memory ones off the
-    adopted base; both agree with `match_columns` on every encoding."""
+    adopted base; both agree with `get_quads` on every encoding."""
     store = VortexRdfStore(vortex_files["dictionary"], in_memory=in_memory)
     dictionary = store.term_dict()
     for pattern in PATTERNS:
@@ -84,8 +89,7 @@ def test_match_arrow_rows_are_match_columns(vortex_files, encoding, in_memory):
         }[encoding]
         assert all(field.type == expected_type for field in table.schema), pattern
         assert all(not field.nullable for field in table.schema)
-        expected = [list(column) for column in store.match_columns(**pattern)]
-        assert _cells(table, dictionary) == expected, pattern
+        assert _cells(table, dictionary) == _transposed(store.get_quads(**pattern)), pattern
 
 
 def test_terms_share_one_dictionary_across_columns_and_batches(vortex_files):
@@ -113,8 +117,8 @@ def test_projection_picks_columns_in_order(vortex_files):
     for encoding in ENCODINGS:
         table = _table(store.match_arrow(p=NAME, encoding=encoding, projection=["o", "s"]))
         assert table.schema.names == ["o", "s"]
-        subjects, _, objects, _ = store.match_columns(p=NAME)
-        assert _cells(table, store.term_dict()) == [list(objects), list(subjects)]
+        subjects, _, objects, _ = _transposed(store.get_quads(p=NAME))
+        assert _cells(table, store.term_dict()) == [objects, subjects]
     with pytest.raises(ValueError):
         store.match_arrow(projection=["subject"])
     with pytest.raises(VortexRdfError):
@@ -133,7 +137,7 @@ def test_encodings_per_layout(vortex_files, layout):
                 store.match_arrow(encoding=encoding)
         return
     strings = _table(store.match_arrow(encoding="strings"))
-    assert _cells(strings) == [list(column) for column in store.match_columns()]
+    assert _cells(strings) == _transposed(store.get_quads())
     if layout == "default":
         for encoding in ("codes", "terms"):
             with pytest.raises(VortexRdfError):
@@ -158,7 +162,7 @@ def test_polars_consumes_the_stream(vortex_files):
     assert codes.dtypes == [pl.UInt32] * 4
     dictionary = store.term_dict()
     assert sorted(dictionary.decode(code) for code in codes["s"]) == sorted(
-        store.match_columns(p=NAME)[0]
+        _transposed(store.get_quads(p=NAME))[0]
     )
 
 
@@ -175,11 +179,9 @@ def test_in_memory_store_shares_one_decoded_form_while_held(vortex_files):
     alive shares, so two whole-store reads and a ``codes`` export hand out
     the same buffers while any of them is held."""
     store = VortexRdfStore(vortex_files["dictionary"], in_memory=True)
-    first = store.match_codes()
-    second = store.match_codes()
-    for a, b in zip(first, second):
-        assert _address(a) == _address(b)
-    table = _table(store.match_arrow())
-    for column, held in zip(table.columns, first):
-        assert column.num_chunks == 1
-        assert column.chunk(0).buffers()[1].address == _address(held)
+    first = _table(store.match_arrow())
+    second = _table(store.match_arrow(projection=["o", "s"]))
+    address = lambda table, name: table.column(name).chunk(0).buffers()[1].address  # noqa: E731
+    for name in ["s", "o"]:
+        assert first.column(name).num_chunks == 1
+        assert address(first, name) == address(second, name)

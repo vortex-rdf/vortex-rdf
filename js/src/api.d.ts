@@ -84,7 +84,7 @@ export interface ArrowOptions {
  * synchronous read family, throws) with an `Error`.
  *
  * Only the pattern-read family — `match`, `getQuads`, `countQuads`,
- * `matchCodes` — is synchronous; `size` and `has` return promises like the
+ * `matchArrowIPC` — is synchronous; `size` and `has` return promises like the
  * builders and mutations.
  *
  * A pattern position is a wildcard when it is `null`/`undefined` or an RDF/JS
@@ -146,14 +146,6 @@ export class VortexRdfStore {
      * selection alone, no term string materialized.
      */
     countQuads(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null): number;
-    /**
-     * Low-level. Resolve a pattern to the matched rows' raw u32 term codes —
-     * `{ s, p, o, g }` as `Uint32Array`s plus `length` — with no term strings
-     * materialized. `null` unless the store's rows are code-addressable
-     * (Dictionary layout, no pending appends, resident dictionary); decode
-     * codes through `termDict()`.
-     */
-    matchCodes(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null): { s: Uint32Array; p: Uint32Array; o: Uint32Array; g: Uint32Array; length: number } | null;
     /**
      * Low-level. The quads matching a pattern as an Arrow IPC stream — the
      * bytes `tableFromIPC` (apache-arrow), DuckDB-WASM, Arquero or Perspective

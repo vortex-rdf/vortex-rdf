@@ -1,4 +1,5 @@
 import { describe, test, expect } from 'vitest';
+import { tableFromIPC } from 'apache-arrow';
 import { DataFactory } from 'rdf-data-factory';
 import { Readable } from 'node:stream';
 import type { Quad, Term, Literal, Stream } from '@rdfjs/types';
@@ -653,58 +654,56 @@ describe('indexes()', () => {
     });
 });
 
-describe('matchCodes / termDict gates', () => {
+describe('matchArrowIPC codes / termDict gates', () => {
     const p1 = df.namedNode('http://example.org/p1');
+    const column = (bytes: Uint8Array, name: string): number[] => [...tableFromIPC(bytes).getChild(name)!];
 
     test('Dictionary: codes agree with getQuads and decode through termDict', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
         const dict = store.termDict()!;
         expect(dict).toBeDefined();
 
-        const cols = store.matchCodes(null, p1, null, null)!;
-        expect(cols).not.toBeNull();
-        expect(cols.length).toBe(3);
-        for (const col of [cols.s, cols.p, cols.o, cols.g]) {
-            expect(col).toBeInstanceOf(Uint32Array);
-            expect(col.length).toBe(3);
-        }
+        const bytes = store.matchArrowIPC(null, p1, null, null);
+        const table = tableFromIPC(bytes);
+        expect(table.numRows).toBe(3);
         const quads = store.getQuads(null, p1, null, null);
         const iri = (t: Term) => `<${t.value}>`;
-        expect([...cols.s].map((c) => dict.decode(c)).sort())
+        expect(column(bytes, 's').map((c) => dict.decode(c)).sort())
             .toEqual(quads.map((q: Quad) => iri(q.subject)).sort());
-        expect([...cols.o].map((c) => dict.decode(c)).sort())
+        expect(column(bytes, 'o').map((c) => dict.decode(c)).sort())
             .toEqual(quads.map((q: Quad) => iri(q.object)).sort());
 
-        const full = store.matchCodes(
+        const full = store.matchArrowIPC(
             df.namedNode('http://example.org/s2'),
             p1,
             df.namedNode('http://example.org/o2'),
             df.namedNode('http://example.org/g1'),
-        )!;
-        expect(full.length).toBe(1);
-        expect(dict.decode(full.g[0])).toBe('<http://example.org/g1>');
+        );
+        expect(tableFromIPC(full).numRows).toBe(1);
+        expect(dict.decode(column(full, 'g')[0])).toBe('<http://example.org/g1>');
     });
 
     for (const layout of ['default', 'typed-object'] as const) {
-        test(`${layout}: matchCodes is null and termDict undefined`, async () => {
+        test(`${layout}: codes throw and termDict is undefined`, async () => {
             const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout });
-            expect(store.matchCodes(null, p1, null, null)).toBeNull();
+            expect(() => store.matchArrowIPC(null, p1, null, null)).toThrow();
             expect(store.termDict()).toBeUndefined();
         });
     }
 
     test('a pending append closes the code path', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
-        expect(store.matchCodes(null, p1, null, null)).not.toBeNull();
+        expect(tableFromIPC(store.matchArrowIPC(null, p1, null, null)).numRows).toBe(3);
         await store.addQuad(df.quad(
             df.namedNode('http://example.org/s9'),
             df.namedNode('http://example.org/p9'),
             df.literal('new'),
         ));
-        expect(store.matchCodes(null, p1, null, null)).toBeNull();
+        expect(() => store.matchArrowIPC(null, p1, null, null)).toThrow(/compact/);
         expect(store.termDict()).toBeUndefined();
-        // The term path still answers.
+        // The term paths still answer.
         expect(store.getQuads(null, p1, null, null).length).toBe(3);
+        expect(tableFromIPC(store.matchArrowIPC(null, p1, null, null, { encoding: 'strings' })).numRows).toBe(3);
     });
 
     test('TermDict edges: out-of-range decode and unknown encode are undefined', async () => {
@@ -894,7 +893,7 @@ describe('term validation and malformed input', () => {
         expect(() => store.countQuads(null, null, { termType: 'Nope', value: '' } as unknown as Term, null))
             .toThrow(/Invalid object term/);
         expect(() => store.match(null, null, null, df.literal('g'))).toThrow(/Invalid graph term/);
-        expect(() => store.matchCodes(null, null, null, df.literal('g'))).toThrow(/Invalid graph term/);
+        expect(() => store.matchArrowIPC(null, null, null, df.literal('g'))).toThrow(/Invalid graph term/);
         expect(() => store.countQuads(df.namedNode('not an iri'), null, null, null)).toThrow(Error);
     });
 

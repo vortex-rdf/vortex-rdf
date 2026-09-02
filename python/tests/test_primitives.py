@@ -1,7 +1,9 @@
 """The pushdown primitives: batch matches and counts, `keep` code
 constraints, and `limit`/`offset` windows — each against the plain calls it
-must agree with."""
+must agree with. Codes travel through the Arrow surface (`match_arrow`), read
+back here with pyarrow."""
 
+import pyarrow as pa
 import pytest
 
 from vortex_rdf import VortexRdfError, VortexRdfStore
@@ -19,41 +21,58 @@ PATTERNS = [
 ]
 
 
+def _columns(stream):
+    """A stream's columns as Python lists, in schema order."""
+    table = pa.RecordBatchReader.from_stream(stream).read_all()
+    return [column.to_pylist() for column in table.columns]
+
+
+def _codes(store, *pattern, **options):
+    return _columns(store.match_arrow(*pattern, **options))
+
+
 def _rows(columns):
-    return sorted(zip(*(memoryview(c).cast("I").tolist() for c in columns)))
+    return sorted(zip(*columns))
 
 
 def _decoded(store, columns):
     dictionary = store.term_dict()
-    return sorted(tuple(dictionary.decode(c) for c in row) for row in zip(*(memoryview(c).cast("I").tolist() for c in columns)))
+    return sorted(tuple(dictionary.decode(c) for c in row) for row in zip(*columns))
 
 
 @pytest.mark.parametrize("in_memory", [False, True])
 def test_batch_calls_agree_with_singles(vortex_files, in_memory):
     store = VortexRdfStore(vortex_files["dictionary"], in_memory=in_memory)
-    many = store.match_codes_many(PATTERNS)
+    many = store.match_arrow_many(PATTERNS)
     counts = store.count_quads_many(PATTERNS)
     assert len(many) == len(counts) == len(PATTERNS)
-    for pattern, columns, count in zip(PATTERNS, many, counts):
-        single = store.match_codes(*pattern)
-        assert _rows(columns) == _rows(single), pattern
+    for pattern, stream, count in zip(PATTERNS, many, counts):
+        assert stream.encoding == "codes"
+        columns = _columns(stream)
+        assert _rows(columns) == _rows(_codes(store, *pattern)), pattern
         assert count == store.count_quads(*pattern) == len(_rows(columns)), pattern
-    assert store.match_codes_many([]) == [] and store.count_quads_many([]) == []
+    assert store.match_arrow_many([]) == [] and store.count_quads_many([]) == []
+    projected = store.match_arrow_many(PATTERNS[:2], encoding="strings", projection=["o"])
+    assert [pa.schema(stream).names for stream in projected] == [["o"], ["o"]]
 
 
 def test_batch_calls_parse_every_pattern_first(vortex_files):
     store = VortexRdfStore(vortex_files["dictionary"])
     with pytest.raises(ValueError):
-        store.match_codes_many([(None, None, None, None), (None, "not a term", None, None)])
+        store.match_arrow_many([(None, None, None, None), (None, "not a term", None, None)])
     with pytest.raises(ValueError):
         store.count_quads_many([("<http://ex.org/x>", None, None, None), (None, None, "bad", None)])
 
 
 @pytest.mark.parametrize("layout", ["default", "typed-object"])
-def test_batch_codes_decline_without_the_code_path(vortex_files, layout):
+def test_batch_codes_raise_without_the_code_path(vortex_files, layout):
     store = VortexRdfStore(vortex_files[layout])
-    assert store.match_codes_many(PATTERNS) == [None] * len(PATTERNS)
+    with pytest.raises(VortexRdfError):
+        store.match_arrow_many(PATTERNS)
     assert store.count_quads_many(PATTERNS) == [store.count_quads(*p) for p in PATTERNS]
+    if layout == "default":
+        strings = store.match_arrow_many(PATTERNS, encoding="strings")
+        assert [len(_columns(s)[0]) for s in strings] == store.count_quads_many(PATTERNS)
 
 
 def test_count_limit_caps(vortex_files, layout):
@@ -68,58 +87,66 @@ def test_count_limit_caps(vortex_files, layout):
 def test_limit_and_offset_window_the_rows(vortex_files):
     store = VortexRdfStore(vortex_files["dictionary"])
     for pattern in PATTERNS:
-        full = _rows(store.match_codes(*pattern)) if store.match_codes(*pattern) else []
-        ordered = list(zip(*(memoryview(c).cast("I").tolist() for c in store.match_codes(*pattern))))
+        ordered = list(zip(*_codes(store, *pattern)))
         n = len(ordered)
         for offset, limit in [(0, 1), (0, 2), (1, 2), (2, 10), (n, 1), (0, 0)]:
-            windowed = store.match_codes(*pattern, limit=limit, offset=offset)
-            got = list(zip(*(memoryview(c).cast("I").tolist() for c in windowed)))
+            got = list(zip(*_codes(store, *pattern, limit=limit, offset=offset)))
             assert got == ordered[offset : offset + limit], (pattern, offset, limit)
-        assert sorted(zip(*(memoryview(c).cast("I").tolist() for c in store.match_codes(*pattern, offset=1)))) == sorted(ordered[1:]), pattern
-        assert full == sorted(ordered)
+        assert _rows(_codes(store, *pattern, offset=1)) == sorted(ordered[1:]), pattern
+    # A window needs no codes: every string-capable layout serves one.
+    plain = VortexRdfStore(vortex_files["default"])
+    assert len(_columns(plain.match_arrow(encoding="strings", limit=2, offset=1))[0]) == 2
 
 
 def test_keep_restricts_by_set_and_range(vortex_files):
     store = VortexRdfStore(vortex_files["dictionary"])
     dictionary = store.term_dict()
-    everything = _decoded(store, store.match_codes())
+    everything = _decoded(store, _codes(store))
 
     bob_code = dictionary.encode(BOB)
-    kept = store.match_codes(keep={"s": [bob_code]})
+    kept = _codes(store, keep={"s": [bob_code]})
     assert _decoded(store, kept) == [row for row in everything if row[0] == BOB]
-    as_column = store.match_codes(keep={"s": store.match_codes(s=BOB)[0]})
-    assert _rows(as_column) == _rows(kept)
+    # A code set straight out of the Arrow surface: a uint32 pyarrow array.
+    as_arrow = _codes(store, keep={"s": pa.array(_codes(store, BOB)[0], pa.uint32())})
+    assert _rows(as_arrow) == _rows(kept)
 
     lo, hi = dictionary.prefix_range("<http://ex.org/")
-    kept = store.match_codes(keep={"o": range(lo, hi)})
+    kept = _codes(store, keep={"o": range(lo, hi)})
     assert _decoded(store, kept) == [row for row in everything if row[2].startswith("<http://ex.org/")]
 
-    kept = store.match_codes(p=NAME, keep={"s": range(lo, hi), "o": [dictionary.encode('"Bob"@en')]})
+    kept = _codes(store, p=NAME, keep={"s": range(lo, hi), "o": [dictionary.encode('"Bob"@en')]})
     assert _decoded(store, kept) == [(BOB, NAME, '"Bob"@en', "")]
 
-    assert _rows(store.match_codes(keep={"o": []})) == []
-    assert _rows(store.match_codes(keep={"o": range(0, 0)})) == []
-    windowed = store.match_codes(keep={"o": range(lo, hi)}, limit=1)
-    assert len(_rows(windowed)) == 1
+    assert _rows(_codes(store, keep={"o": []})) == []
+    assert _rows(_codes(store, keep={"o": range(0, 0)})) == []
+    assert len(_rows(_codes(store, keep={"o": range(lo, hi)}, limit=1))) == 1
+    # keep composes with every encoding and projection.
+    terms = _columns(store.match_arrow(encoding="terms", projection=["o"], keep={"s": [bob_code]}))
+    assert terms == [[row[2] for row in everything if row[0] == BOB]]
 
 
 def test_keep_rejects_bad_arguments(vortex_files):
     store = VortexRdfStore(vortex_files["dictionary"])
     with pytest.raises(ValueError):
-        store.match_codes(keep={"subject": [1]})
+        store.match_arrow(keep={"subject": [1]})
     with pytest.raises(ValueError):
-        store.match_codes(keep={"s": range(0, 10, 2)})
+        store.match_arrow(keep={"s": range(0, 10, 2)})
     with pytest.raises(ValueError):
-        store.match_codes(keep={"s": range(-1, 10)})
+        store.match_arrow(keep={"s": range(-1, 10)})
     with pytest.raises((ValueError, TypeError)):
-        store.match_codes(keep={"s": ["x"]})
+        store.match_arrow(keep={"s": ["x"]})
+    with pytest.raises(ValueError, match="uint32"):
+        store.match_arrow(keep={"s": pa.array([1], pa.int64())})
+    with pytest.raises(ValueError, match="nulls"):
+        store.match_arrow(keep={"s": pa.array([1, None], pa.uint32())})
 
 
-def test_keep_declines_off_the_code_path(vortex_files):
-    """`keep` rides the code path, so it declines like `match_codes` does;
-    a window needs no codes and works on every layout."""
+def test_keep_needs_the_code_path(vortex_files):
+    """`keep` constrains term codes, so a layout without them raises; a
+    window needs no codes and works on every string-capable layout."""
     plain = VortexRdfStore(vortex_files["default"])
-    assert plain.match_codes(keep={"s": [1]}) is None
+    with pytest.raises(VortexRdfError):
+        plain.match_arrow(encoding="strings", keep={"s": [1]})
     assert plain.count_quads(limit=1) == 1
     with pytest.raises(VortexRdfError):
         # A tailless dictionary store with codes, but a column that holds
@@ -198,12 +225,14 @@ def test_filter_codes_feed_keep(vortex_files):
     store = VortexRdfStore(vortex_files["dictionary"])
     dictionary = store.term_dict()
     holds, unknown = dictionary.filter_codes("num_gt", "40")
-    kept = store.match_codes(keep={"o": holds})
+    kept = _codes(store, keep={"o": holds})
     assert _decoded(store, kept) == [
-        row for row in _decoded(store, store.match_codes())
+        row for row in _decoded(store, _codes(store))
         if row[2] in {AGE, '"Alice"', '"Anon"', '"Bob"@en'}
     ]
     assert len(memoryview(unknown)) > 0
+    # The same set through its Arrow face.
+    assert _rows(_codes(store, keep={"o": pa.array(holds)})) == _rows(kept)
 
 
 def test_encode_is_spelling_tolerant(vortex_files):

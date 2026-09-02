@@ -29,10 +29,46 @@ function cells(table: Table, name: string): unknown[] {
     return [...vector!];
 }
 
+type AnyTerm = { termType: string; value: string; language?: string; datatype?: { value: string } };
+
+/** A term's N-Triples spelling — the dictionary's vocabulary. */
+function nt(term: AnyTerm): string {
+    switch (term.termType) {
+        case 'NamedNode': return `<${term.value}>`;
+        case 'BlankNode': return `_:${term.value}`;
+        case 'DefaultGraph': return '';
+        case 'Literal':
+            if (term.language) return `"${term.value}"@${term.language}`;
+            if (term.datatype && term.datatype.value !== 'http://www.w3.org/2001/XMLSchema#string') {
+                return `"${term.value}"^^<${term.datatype.value}>`;
+            }
+            return `"${term.value}"`;
+        default: throw new Error(`unexpected term type ${term.termType}`);
+    }
+}
+
+/** The quads' terms per column, spelled as N-Triples. */
+function spellings(quads: { subject: AnyTerm; predicate: AnyTerm; object: AnyTerm; graph: AnyTerm }[]) {
+    return {
+        s: quads.map((q) => nt(q.subject)),
+        p: quads.map((q) => nt(q.predicate)),
+        o: quads.map((q) => nt(q.object)),
+        g: quads.map((q) => nt(q.graph)),
+    };
+}
+
+/** The quads' term codes per column, through the dictionary. */
+function codesOf(store: VortexRdfStore, quads: Parameters<typeof spellings>[0]) {
+    const dict = store.termDict()!;
+    const terms = spellings(quads);
+    const encode = (column: string[]) => column.map((term) => dict.encode(term)!);
+    return { s: encode(terms.s), p: encode(terms.p), o: encode(terms.o), g: encode(terms.g) };
+}
+
 describe('matchArrowIPC', () => {
-    test('codes are the matchCodes columns, under the quad schema', async () => {
+    test('codes are the quads\' dictionary codes, under the quad schema', async () => {
         const store = await build({ layout: 'dictionary' });
-        const codes = store.matchCodes(null, p1, null, null)!;
+        const codes = codesOf(store, store.getQuads(null, p1, null, null));
         const table = tableFromIPC(store.matchArrowIPC(null, p1, null, null));
 
         expect(table.schema.fields.map((f) => f.name)).toEqual([...COLUMNS]);
@@ -50,7 +86,7 @@ describe('matchArrowIPC', () => {
     test('terms are strings carried as dictionary keys over the term dictionary', async () => {
         const store = await build({ layout: 'dictionary' });
         const dict = store.termDict()!;
-        const codes = store.matchCodes(null, null, null, null)!;
+        const codes = codesOf(store, store.getQuads(null, null, null, null));
         const table = tableFromIPC(store.matchArrowIPC(null, null, null, null, { encoding: 'terms' }));
 
         expect(table.schema.metadata.get('vortex_rdf.term_encoding')).toBe('terms');
@@ -65,7 +101,7 @@ describe('matchArrowIPC', () => {
         const reference = await build({ layout: 'dictionary' });
         const dict = reference.termDict()!;
         const expected = Object.fromEntries(
-            COLUMNS.map((name) => [name, Array.from(reference.matchCodes(null, null, null, null)![name], (c) => dict.decode(c))]),
+            COLUMNS.map((name) => [name, Array.from(codesOf(reference, reference.getQuads(null, null, null, null))[name], (c) => dict.decode(c))]),
         );
         for (const layout of ['default', 'dictionary'] as const) {
             const store = await build({ layout });
@@ -87,7 +123,7 @@ describe('matchArrowIPC', () => {
 
     test('a projection picks columns in order', async () => {
         const store = await build({ layout: 'dictionary' });
-        const codes = store.matchCodes(null, p1, null, null)!;
+        const codes = codesOf(store, store.getQuads(null, p1, null, null));
         const table = tableFromIPC(store.matchArrowIPC(null, p1, null, null, { projection: ['o', 's'] }));
         expect(table.schema.fields.map((f) => f.name)).toEqual(['o', 's']);
         expect(cells(table, 'o')).toEqual(Array.from(codes.o));

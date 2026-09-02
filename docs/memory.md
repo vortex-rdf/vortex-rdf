@@ -143,9 +143,9 @@ reopens the file and starts afresh.
 
 ## 4. Keeping memory bounded
 
-- **Hold results only as long as they are needed.** On an adopted base, a
-  `match_codes` result, an Arrow `codes` batch, or a polars frame built
-  from either is what keeps the canonical form of the columns alive; on
+- **Hold results only as long as they are needed.** On an adopted base, an
+  Arrow `codes` batch, or a polars frame built from one, is what keeps the
+  canonical form of the columns alive; on
   any base, a `terms` batch or an exported dictionary is what keeps the
   Arrow values alive. Two consumers alive at the same time share one copy;
   the memory returns with the last of them.

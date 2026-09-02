@@ -22,7 +22,8 @@ Where the two suites cannot correspond:
   makes it the analogue of the JS suite's `build::fromString_nquads` as much as
   of its `fromQuads` variants, and the two are not comparable in absolute
   terms — only against themselves over time.
-* `match_columns` is a Python-only read path and has no JavaScript row.
+* `match_arrow` reads the codes back through pyarrow, the boundary a query
+  layer crosses; JavaScript's `readpath::matchArrowIPC` is the IPC twin.
 
 Run locally (after `maturin develop`):
     uv run pytest bench/test_codspeed.py --codspeed
@@ -36,6 +37,7 @@ import sys
 from array import array
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -248,20 +250,31 @@ def test_open(benchmark, store_paths, variant):
 
 
 @pytest.mark.benchmark
-@pytest.mark.parametrize("op", ["get_quads", "match_codes", "match_columns"])
+@pytest.mark.parametrize("op", ["get_quads", "match_arrow"])
 def test_readpath(benchmark, stores, op):
     """The read entry points on the unindexed store for one selective pattern
     (S), isolating the boundary cost each carries.
 
-    `match_codes` is the lazy one — u32 columns, no term strings — so it is the
-    Python analogue of the JS suite's `readpath::matchCodes`. The other two
-    materialize terms, which in JS is `readpath::getQuads_decoded`; the
-    bindings have no lazy quad object, so there is no undecoded `get_quads`.
+    `match_arrow` is the lazy one — u32 code columns read back through
+    pyarrow, no term strings — the Python analogue of the JS suite's
+    `readpath::matchArrowIPC`. `get_quads` materializes terms, which in JS is
+    `readpath::getQuads_decoded`; the bindings have no lazy quad object, so
+    there is no undecoded `get_quads`.
     """
     store = stores["triples::dict"]
     p = TRIPLE_PATTERNS[0]  # S
-    call = getattr(store, op)
-    benchmark(lambda: call(p.s, p.p, p.o, p.g))
+    if op == "get_quads":
+        benchmark(lambda: store.get_quads(p.s, p.p, p.o, p.g))
+    else:
+        benchmark(
+            lambda: pa.RecordBatchReader.from_stream(store.match_arrow(p.s, p.p, p.o, p.g)).read_all()
+        )
+
+
+def _code_columns(store, s, p, o, g):
+    """The matched rows' code columns as `array("I")` buffers."""
+    table = pa.RecordBatchReader.from_stream(store.match_arrow(s, p, o, g)).read_all()
+    return [array("I", column.to_pylist()) for column in table.columns]
 
 
 @pytest.mark.benchmark
@@ -351,17 +364,14 @@ def test_decode_many(benchmark, stores, shape):
     store = stores["realistic"]
     dictionary = store.term_dict()
     p = next(x for x in dataset_probes(DIM**3)["triples"] if x.name == "P")
-    columns = store.match_codes(p.s, p.p, p.o, p.g)
-    codes = array("I", memoryview(columns[1 if shape == "constant" else 0]).cast("I"))
+    codes = _code_columns(store, p.s, p.p, p.o, p.g)[1 if shape == "constant" else 0]
     _assert_shape(shape, codes)
     benchmark(lambda: dictionary.decode_many(codes))
 
 
 @pytest.mark.benchmark
 def test_decode_many_scattered(benchmark, scattered_store):
-    codes = array(
-        "I", memoryview(scattered_store.match_codes(None, RDF_TYPE, None, None)[2]).cast("I")
-    )
+    codes = _code_columns(scattered_store, None, RDF_TYPE, None, None)[2]
     _assert_shape("scattered", codes)
     benchmark(lambda: scattered_store.term_dict().decode_many(codes))
 

@@ -32,45 +32,9 @@ store.layout()                                               # "dictionary" | "d
 store.indexes()                                              # e.g. ["secondary-by-reference"]
 store.count_quads(p="<http://xmlns.com/foaf/0.1/name>")      # int
 store.get_quads(p="<http://xmlns.com/foaf/0.1/name>")        # [(s, p, o, g), ...]
-store.match_columns(p="<http://xmlns.com/foaf/0.1/name>")    # (subjects, predicates, objects, graphs)
 ```
 
-`get_quads` returns whole quads; `match_columns` returns the same rows transposed into four parallel columns, for callers that work a position at a time. Both are served from the term-code columns whenever the store can (Dictionary layout, resident dictionary) and from the matched quads otherwise; results are identical. On the code path a term that repeats down a column is one shared Python string, so a caller converting terms into its own representation can rely on the cached string it is handed.
-
-## Term codes (low-level)
-
-For Dictionary-layout stores, `match_codes` returns the matched rows as four **zero-copy** `u32` term-code columns — `memoryview(col).cast("I")` views the Rust memory directly — decodable through a `term_dict()` handle:
-
-```python
-cols = store.match_codes(p="<http://xmlns.com/foaf/0.1/name>")  # (s, p, o, g) or None
-dictionary = store.term_dict()                                    # TermDict or None
-subjects = memoryview(cols[0]).cast("I")
-dictionary.decode(subjects[0])                       # N-Triples string for that code
-dictionary.decode_many(cols[0])                      # bulk-decode a whole column
-dictionary.encode("<http://xmlns.com/foaf/0.1/name>")  # code for a term, or None
-```
-
-`decode_many` decodes a batch in one GIL-released call. Buffer-protocol inputs — a column straight from `match_codes`, an `array("I", ...)`, a `uint32` NumPy array — are read in a single bulk copy with no per-element int conversion; any sequence of ints works too. `encode` is the inverse of `decode`. Both `term_dict()` and `match_codes` return `None` when the code path does not apply (a non-Dictionary layout, or a dictionary left file-backed by the residency budget).
-
-Consumers can join, count, and de-duplicate entirely in code space and decode each distinct term once, never materializing a term string for a row they discard.
-
-### Pushdown primitives
-
-A query layer narrows a match inside the store rather than over gathered rows:
-
-```python
-store.match_codes_many([(None, p, None, None), (s, None, None, None)])   # one call, one GIL release
-store.count_quads_many([...])                                            # the counts, in order
-store.count_quads(p=p, limit=1)                                          # an ASK: reads one row
-store.match_codes(p=p, limit=10, offset=20)                              # a window, in match order
-
-lo, hi = dictionary.prefix_range("<http://ex.org/")                     # codes of an IRI namespace
-store.match_codes(p=p, keep={"s": range(lo, hi)})                        # rows whose subject is in it
-holds, unknown = dictionary.filter_codes("num_gt", "40")                 # a FILTER, decided per term
-store.match_codes(p=p, keep={"o": holds})                                # rows it holds for
-```
-
-`keep` restricts a position by term code before any row is gathered — a `range` of codes (what `prefix_range` yields, or `lower_bound` bounds) or a set of codes in any form `decode_many` accepts — and composes with `limit`/`offset`. `filter_codes(kind, arg)` evaluates one predicate over the whole dictionary once (memoized) and returns the codes it definitely holds for and the codes it cannot decide, which the caller resolves itself; kinds are `is_literal`, `is_iri`, `is_blank`, `datatype`, `lang`, `lang_matches`, `str_prefix` and `num_lt`/`num_le`/`num_gt`/`num_ge`/`num_eq`/`num_ne`, under the rules a SPARQL engine over rdflib applies. `encode` resolves a term in its canonical N-Triples form when the given spelling misses (`"x"^^xsd:string` is `"x"`), and `encode_many` batches it.
+`get_quads` is the library-shaped read: whole quads as Python strings, served from the term-code columns whenever the store can (Dictionary layout, resident dictionary) and from the matched quads otherwise. On the code path a term that repeats down a column is one shared Python string, so a caller converting terms into its own representation can rely on the cached string it is handed. Everything a query planner or executor needs goes through the Arrow interface below.
 
 ## Arrow interface
 
@@ -84,11 +48,43 @@ pa.schema(stream)                                    # s, p, o, g — uint32 ter
 table = pa.RecordBatchReader.from_stream(stream).read_all()
 frame = pl.DataFrame(store.match_arrow(encoding="terms"))    # strings backed by codes
 
-pa.array(store.match_codes()[0])                     # a code column, zero-copy
 pa.array(store.term_dict())                          # the dictionary: element i = term of code i
 ```
 
 `match_arrow` streams one record batch per decode chunk (the whole store in memory, each scan split of a file), pulled as the consumer reads. `encoding="codes"` (the default) hands out `uint32` term codes sharing the store's buffers — join, filter and aggregate in code space, then decode the survivors through `term_dict()` or the dictionary array; `encoding="terms"` wraps the same codes as an Arrow dictionary over the whole term dictionary, so engines see strings while carrying codes; `encoding="strings"` materializes `string_view` N-Triples strings and is the one encoding every layout serves. `projection=["o", "s"]` restricts and orders the columns (a file scan then reads only those). A stream is consumed once; its schema can be read any number of times.
+
+### Term codes
+
+For Dictionary-layout stores, the `codes` encoding is the store's own vocabulary: `uint32` ranks into one sorted term dictionary, decodable through a `term_dict()` handle:
+
+```python
+codes = pa.RecordBatchReader.from_stream(store.match_arrow(p=p)).read_all()
+dictionary = store.term_dict()                       # TermDict or None
+dictionary.decode(codes["s"][0].as_py())             # N-Triples string for that code
+dictionary.decode_many(codes["s"].combine_chunks())  # bulk-decode a whole column
+dictionary.encode("<http://xmlns.com/foaf/0.1/name>")  # code for a term, or None
+```
+
+`decode_many` decodes a batch in one GIL-released call — point decodes, so decoding a few codes never decompresses the whole dictionary the way `pa.array(store.term_dict())` does. It takes a `uint32` Arrow array (anything with `__arrow_c_array__`), a buffer (`array("I", ...)`, a `uint32` NumPy array, a `U32Column`), or any sequence of ints, and a repeated code yields one shared Python string. `encode` is the inverse of `decode`. `term_dict()` returns `None` when the code path does not apply (a non-Dictionary layout, or a dictionary left file-backed by the residency budget); `match_arrow(encoding="codes")` raises on a layout without codes.
+
+### Pushdown primitives
+
+A query layer narrows a match inside the store rather than over gathered rows:
+
+```python
+store.match_arrow_many([(None, p, None, None), (s, None, None, None)])   # one call, one GIL release
+store.count_quads_many([...])                                            # the counts, in order
+store.count_quads(p=p, limit=1)                                          # an ASK: reads one row
+store.match_arrow(p=p, limit=10, offset=20)                              # a window, in match order
+
+lo, hi = dictionary.prefix_range("<http://ex.org/")                     # codes of an IRI namespace
+store.match_arrow(p=p, keep={"s": range(lo, hi)})                        # rows whose subject is in it
+holds, unknown = dictionary.filter_codes("num_gt", "40")                 # a FILTER, decided per term
+store.match_arrow(p=p, keep={"o": holds})                                # rows it holds for
+store.match_arrow(p=p, keep={"o": pa.array(holds)})                      # the same set, as an Arrow array
+```
+
+`keep` restricts a position by term code before any row is gathered — a `range` of codes (what `prefix_range` yields, or `lower_bound` bounds) or a set of codes in any form `decode_many` accepts — and composes with `encoding`, `projection`, `limit` and `offset`. `filter_codes(kind, arg)` evaluates one predicate over the whole dictionary once (memoized) and returns the codes it definitely holds for and the codes it cannot decide, as two zero-copy `U32Column`s (Arrow-exportable, `pa.array(holds)`), which the caller resolves itself; kinds are `is_literal`, `is_iri`, `is_blank`, `datatype`, `lang`, `lang_matches`, `str_prefix` and `num_lt`/`num_le`/`num_gt`/`num_ge`/`num_eq`/`num_ne`, under the rules a SPARQL engine over rdflib applies. `encode` resolves a term in its canonical N-Triples form when the given spelling misses (`"x"^^xsd:string` is `"x"`), and `encode_many` batches it.
 
 ## Build options
 
@@ -102,7 +98,7 @@ Every option after the two paths is keyword-only. `format` is an RDF format name
 
 | Value | Notes |
 | --- | --- |
-| `"dictionary"` (default) | Terms replaced by codes into a sorted term dictionary. Most compact and fastest to query; backs `match_codes`/`term_dict` |
+| `"dictionary"` (default) | Terms replaced by codes into a sorted term dictionary. Most compact and fastest to query; backs the `codes` and `terms` encodings and `term_dict` |
 | `"default"` | All four terms as N-Triples strings |
 | `"typed-object"` | Object split into kind/value/datatype/language columns |
 
@@ -115,9 +111,9 @@ Every option after the two paths is keyword-only. `format` is an RDF format name
 
 ## Bytes & files
 
-The default open is lazy and file-backed. `VortexRdfStore(path, in_memory=True)` loads the store into memory once, so each subsequent match skips the per-call file-scan pipeline. Such a store keeps the file's column encodings: a wide `match_codes`/`match_arrow` read decodes a column into a canonical form that every result alive shares and that is freed with the last of them, so memory follows what you hold, not what you have read (see [docs/memory.md](../docs/memory.md)).
+The default open is lazy and file-backed. `VortexRdfStore(path, in_memory=True)` loads the store into memory once, so each subsequent match skips the per-call file-scan pipeline. Such a store keeps the file's column encodings: a wide `match_arrow` read decodes a column into a canonical form that every result alive shares and that is freed with the last of them, so memory follows what you hold, not what you have read (see [docs/memory.md](../docs/memory.md)).
 
-For Dictionary-layout files the term dictionary is lifted into memory when its compressed size in the file fits the residency budget — 512 MiB by default, overridable process-wide with `VORTEX_RDF_DICT_MAX_RESIDENT_BYTES`. `VortexRdfStore(path, max_resident_bytes=n)` sets the budget for that open (the environment variable is ignored for it). A dictionary left file-backed is point-read through its chunk leaves; `term_dict()` and `match_codes` then return `None` and the string reads fall back to the matched quads.
+For Dictionary-layout files the term dictionary is lifted into memory when its compressed size in the file fits the residency budget — 512 MiB by default, overridable process-wide with `VORTEX_RDF_DICT_MAX_RESIDENT_BYTES`. `VortexRdfStore(path, max_resident_bytes=n)` sets the budget for that open (the environment variable is ignored for it). A dictionary left file-backed is point-read through its chunk leaves; `term_dict()` then returns `None` and `get_quads` falls back to the matched quads; `match_arrow` still exports the codes, only decoding them needs the resident dictionary.
 
 Stores also round-trip through bytes: `store.to_bytes()` serializes to the native container (the same exchange format as the `.vortex` file, the CLI and the JS bindings), and `VortexRdfStore.from_bytes(data)` opens such a buffer — `bytes` or `bytearray` — as a fully in-memory store.
 

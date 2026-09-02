@@ -1098,11 +1098,11 @@ every read path of [§12](#12-what-the-derived-view-costs-at-read-time).
 patterns in one call and hands back their views in input order. The matches
 run concurrently (`try_join_all`), so on a file the pattern scans overlap
 instead of queueing; an in-memory match simply runs to completion when
-polled. The bindings expose it as `match_codes_many` / `count_quads_many`
-([`match_codes_many`](../python/src/store.rs#L517)): every pattern of the
-batch is parsed before anything is evaluated, and one GIL release covers the
-whole batch — the shape a join probe loop (one probe per left-hand row)
-needs.
+polled. The bindings expose it as `match_arrow_many` / `count_quads_many`
+([`match_arrow_many`](../python/src/store.rs#L510)): every pattern of the
+batch is parsed before anything is evaluated, one GIL release covers the
+whole batch, and each pattern comes back as its own Arrow stream — the
+shape a join probe loop (one probe per left-hand row) needs.
 
 ### 16.2 Windows
 
@@ -1186,13 +1186,15 @@ term still resolves; `encode_many` batches it.
 
 ### 16.5 In the bindings
 
-Python: `match_codes(..., keep=, limit=, offset=)`
-([`parse_keep`](../python/src/store.rs#L55): a `range` is a code range,
-anything `decode_many` accepts is a code set), `count_quads(..., limit=)`,
-`match_codes_many`, `count_quads_many`, and on `TermDict`: `lower_bound`,
-`prefix_range`, [`filter_codes`](../python/src/codes.rs#L154) (two
-zero-copy code columns), `encode_many`. The wasm bindings expose none of
-these yet.
+Python: `match_arrow(..., keep=, limit=, offset=)`
+([`parse_keep`](../python/src/store.rs#L71): a `range` is a code range,
+anything `decode_many` accepts — a `uint32` Arrow array included — is a
+code set), `count_quads(..., limit=)`, `match_arrow_many`,
+`count_quads_many`, and on `TermDict`: `lower_bound`, `prefix_range`,
+[`filter_codes`](../python/src/codes.rs#L155) (two zero-copy,
+Arrow-exportable code columns), `encode_many`. Every engine-facing read
+is the Arrow stream; there is no separate code-column read. The wasm
+bindings expose none of the narrowing options yet.
 
 ---
 

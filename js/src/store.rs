@@ -327,35 +327,6 @@ impl VortexRdfStore {
         })?
     }
 
-    /// Low-level: resolve a pattern to the matched rows' raw `u32` term codes —
-    /// `{ s, p, o, g }` as `Uint32Array`s plus `length` — with no term strings
-    /// materialized. `null` unless the store's rows are code-addressable
-    /// (Dictionary layout, no pending appends, resident dictionary); decode
-    /// codes through [`termDict`](Self::term_dict).
-    #[wasm_bindgen(js_name = matchCodes, skip_typescript)]
-    pub fn match_codes(
-        &self,
-        subject: JsValue,
-        predicate: JsValue,
-        object: JsValue,
-        graph: JsValue,
-    ) -> Result<JsValue, JsValue> {
-        // Same gate as `code_path_dict`: without a code-read snapshot the codes
-        // would not resolve via `termDict`.
-        if self.inner.code_read_snapshot().is_none() {
-            return Ok(JsValue::NULL);
-        }
-        let pattern = JsPattern::parse(subject, predicate, object, graph)?;
-        let matched = resolve_now(pattern.matched(&self.inner))??;
-
-        let result = Object::new();
-        let Some(n) = resolve_now(set_code_columns(&result, &matched))?? else {
-            return Ok(JsValue::NULL);
-        };
-        Reflect::set(&result, &"length".into(), &JsValue::from_f64(n as f64))?;
-        Ok(result.into())
-    }
-
     /// Low-level: the quads matching a pattern as an Arrow IPC stream
     /// (`Uint8Array`) — the bytes `apache-arrow`'s `tableFromIPC`,
     /// DuckDB-WASM, Arquero or Perspective read. One record batch per decode
@@ -363,9 +334,9 @@ impl VortexRdfStore {
     /// `options.projection` in that order; `options.encoding` selects the
     /// cell type (`codes` u32 term codes, `terms` the codes as dictionary
     /// keys over the whole term dictionary, `strings` N-Triples strings).
-    /// The bytes are a copy out of wasm memory, as every `Uint32Array`
-    /// [`matchCodes`](Self::match_codes) hands out is. Throws on an invalid
-    /// pattern term or option, and on an encoding the layout cannot serve.
+    /// The bytes are a copy out of wasm memory, as the `Uint32Array`s of the
+    /// lazy quad payload are. Throws on an invalid pattern term or option,
+    /// and on an encoding the layout cannot serve.
     #[wasm_bindgen(js_name = matchArrowIPC, skip_typescript)]
     pub fn match_arrow_ipc(
         &self,

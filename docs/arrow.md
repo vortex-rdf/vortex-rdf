@@ -173,13 +173,13 @@ a built base's canonical `u32` columns, a served match reading the
 answering index's own columns, or an adopted base's live canonical form —
 the batch is built straight from the four buffers it returns
 ([`code_buffers_to_batch`](../core/src/store/batches.rs#L177)). This is
-the path the bindings' `match_codes` / `matchCodes` already take, so the
-Arrow export and the code-column readers hand out the same memory. A
+the path the bindings' `match_arrow` / `matchArrowIPC` take — their one
+engine-facing read — so every consumer of a view hands out the same memory. A
 store *adopted* from bytes or a file keeps its base wire-encoded
 ([serialization.md](serialization.md)): a contiguous wide read decodes
 each column once into a form every holder shares and the last holder
-frees, so an export and a `match_codes` result alive at the same time are
-the same buffers ([memory.md](memory.md)); a point-sized or scattered
+frees, so two exports alive at the same time are the same buffers
+([memory.md](memory.md)); a point-sized or scattered
 selection over an adopted base is gathered instead, one allocation per
 call.
 
@@ -207,14 +207,14 @@ key is in range, a linear pass over the codes and no copy.
 | Step | Copies | Notes |
 |---|---|---|
 | served `u32` buffers → `UInt32Array` | no | Arrow's buffer refcounts the vortex buffer |
-| adopted base, contiguous wide read | once per set of concurrent holders | the live canonical form: shared with every `match_codes` result alive, freed with the last ([memory.md](memory.md)) |
+| adopted base, contiguous wide read | once per set of concurrent holders | the live canonical form: shared with every export alive, freed with the last ([memory.md](memory.md)) |
 | file scan chunk → `UInt32Array` | no, after the scan's own decode | the scan materializes each split once |
 | `terms` key wrap | no | one shared values `Arc` per stream |
 | dictionary values, canonical chunks | no | `string_view` over the dictionary's own buffers |
 | dictionary values, FSST chunks | once per set of concurrent holders | decompressed on first use, held weakly, freed with the last holder |
 | `strings` cells | yes, every cell | the string materialization itself |
 | Python capsule export | no | the C Data Interface hands out the same buffers |
-| JavaScript IPC bytes | yes, the whole result | one copy out of wasm memory, like `matchCodes` |
+| JavaScript IPC bytes | yes, the whole result | one copy out of wasm memory, like the lazy quad payload |
 
 ### 3.4 The dictionary values
 
@@ -249,11 +249,11 @@ stream = store.match_arrow(p="<http://xmlns.com/foaf/0.1/name>")     # ArrowQuad
 pa.schema(stream)                                                     # s, p, o, g: uint32
 table = pa.RecordBatchReader.from_stream(stream).read_all()
 frame = pl.DataFrame(store.match_arrow(encoding="terms", projection=["s", "o"]))
-pa.array(store.match_codes()[0])                                      # a code column, zero-copy
+pa.array(store.term_dict().filter_codes("is_iri", "")[0])             # a code set, zero-copy
 pa.array(store.term_dict())                                           # the dictionary
 ```
 
-[`match_arrow`](../python/src/store.rs#L559) resolves the pattern and
+[`match_arrow`](../python/src/store.rs#L471) resolves the pattern and
 builds the core batch stream off the GIL, then wraps it in an
 [`ArrowQuadStream`](../python/src/arrow.rs#L110). Its
 [`__arrow_c_schema__`](../python/src/arrow.rs#L136) can be read any number
@@ -266,10 +266,10 @@ The reader holds no Python state, so it runs wherever the consumer calls it
 from — pyarrow, for one, releases the GIL around `read_next_batch` — and
 batches are produced as they are pulled, never ahead of the consumer.
 
-A code column's [`__arrow_c_array__`](../python/src/codes.rs#L198) wraps
+A code set's [`__arrow_c_array__`](../python/src/codes.rs#L200) wraps
 the column's `u32` buffer as a `UInt32Array` — the same memory the buffer
 protocol exposes — and the dictionary's
-[`__arrow_c_array__`](../python/src/codes.rs#L198) hands out the cached
+[`__arrow_c_array__`](../python/src/codes.rs#L200) hands out the cached
 values array of [§2.3](#23-the-dictionary-as-an-arrow-array). Both go
 through [`array_capsules`](../python/src/arrow.rs#L74): the array's
 `ArrayData` is exported with arrow-rs's `to_ffi`, which shares the buffers
@@ -298,7 +298,7 @@ and the Arrow ecosystem there — `apache-arrow`'s `tableFromIPC`,
 DuckDB-WASM, Arquero, Perspective — consumes the
 [IPC streaming format](https://arrow.apache.org/docs/format/Columnar.html#ipc-streaming-format).
 So the wasm bindings export exactly that:
-[`matchArrowIPC`](../js/src/store.rs#L369) resolves the pattern, drives
+[`matchArrowIPC`](../js/src/store.rs#L340) resolves the pattern, drives
 the core batch stream to completion (no wasm read path performs I/O, so
 the stream is already resolved and nothing suspends) and writes the
 schema and every batch through arrow-ipc's `StreamWriter` into one
@@ -317,9 +317,9 @@ batches and the record batches carry only `u32` keys, so the shared
 dictionary crosses the boundary once per column rather than once per
 batch.
 
-The bytes are one copy out of wasm memory — the same choice `matchCodes`
-makes with its `Uint32Array`s
-([`set_code_columns`](../js/src/store.rs#L489)), because a view into wasm
+The bytes are one copy out of wasm memory — the same choice the lazy quad
+payload makes with its `Uint32Array`s
+([`set_code_columns`](../js/src/store.rs#L460)), because a view into wasm
 linear memory is detached the moment the memory grows. A zero-copy path (`arrow-js-ffi` reading C Data Interface structs
 out of wasm memory) would need explicit release handles and memory-growth
 discipline on the consumer's side, and is not part of this surface.
@@ -331,5 +331,5 @@ discipline on the consumer's side, and is not part of this surface.
 | Surface | Tests |
 |---|---|
 | core | [tests/arrow.rs](../core/src/tests/arrow.rs): buffer sharing on a built store, codes/terms/strings against the code and shared-quad readers (in memory and file-backed), tail and tombstone equivalence, projection, rejected combinations; [arrow/mod.rs](../core/src/arrow/mod.rs) schema tests; [term_dict.rs](../core/src/store/layouts/dictionary/term_dict.rs) dictionary values and bounds |
-| Python | [tests/test_arrow.py](../python/tests/test_arrow.py): capsule round-trips into pyarrow and polars, buffer-address equality for code columns, stream-versus-`match_columns` equality on file-backed and in-memory stores, one shared dictionary across columns and batches, consume-once semantics, projection, per-layout rejection |
-| JavaScript | [test/arrow.test.ts](../js/test/arrow.test.ts): IPC tables against `matchCodes` and `termDict`, schema metadata, string-view and dictionary column types, projection, rejected options and layouts |
+| Python | [tests/test_arrow.py](../python/tests/test_arrow.py): capsule round-trips into pyarrow and polars, buffer-address equality for code sets, stream-versus-`get_quads` equality on file-backed and in-memory stores, one shared dictionary across columns and batches, consume-once semantics, projection, per-layout rejection; [tests/test_primitives.py](../python/tests/test_primitives.py): `keep`, windows and batches through the stream, Arrow arrays as code sets |
+| JavaScript | [test/arrow.test.ts](../js/test/arrow.test.ts): IPC tables against `getQuads` and `termDict`, schema metadata, string-view and dictionary column types, projection, rejected options and layouts |

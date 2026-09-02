@@ -1,15 +1,22 @@
 """Type stubs for the private native extension module."""
 
 import os
-from typing import List, Mapping, Optional, Sequence, Tuple, Union
+from typing import List, Mapping, Optional, Protocol, Sequence, Tuple, Union
 
 __version__: str
 
 # Path arguments are `PathBuf` on the Rust side, so any `os.PathLike[str]` is
 # accepted alongside `str`.
 _StrPath = Union[str, "os.PathLike[str]"]
-# Term codes in any form `TermDict.decode_many` accepts.
-_Codes = Union[Sequence[int], memoryview, bytes, bytearray, "U32Column"]
+class _ArrowArray(Protocol):
+    """Anything speaking the Arrow PyCapsule array interface — a
+    `pyarrow.Array`, a code column read back out of `match_arrow`."""
+
+    def __arrow_c_array__(self, requested_schema: object = None) -> Tuple[object, object]: ...
+
+# Term codes in any form `TermDict.decode_many` accepts: a u32 buffer, a
+# `uint32` Arrow array, or a sequence of ints.
+_Codes = Union[Sequence[int], memoryview, bytes, bytearray, "U32Column", _ArrowArray]
 # A quad pattern as four optional N-Triples term strings.
 _Pattern = Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]
 
@@ -39,7 +46,7 @@ class TermDict:
         """The half-open code range ``(lo, hi)`` of the terms whose N-Triples
         spelling starts with ``prefix`` — an IRI namespace as ``"<http://…/"``,
         a kind as its first byte. Pass it as ``range(lo, hi)`` to
-        ``match_codes(keep=...)``."""
+        ``match_arrow(keep=...)``."""
         ...
     def filter_codes(self, kind: str, arg: str) -> Tuple[U32Column, U32Column]:
         """The codes for which the term predicate ``kind`` with argument
@@ -119,38 +126,9 @@ class VortexRdfStore:
     def __len__(self) -> int: ...
     def __repr__(self) -> str: ...
     def term_dict(self) -> Optional[TermDict]: ...
-    def match_codes(
-        self,
-        s: Optional[str] = None,
-        p: Optional[str] = None,
-        o: Optional[str] = None,
-        g: Optional[str] = None,
-        *,
-        keep: Optional[Mapping[str, Union[range, _Codes]]] = None,
-        limit: Optional[int] = None,
-        offset: int = 0,
-    ) -> Optional[Tuple[U32Column, U32Column, U32Column, U32Column]]:
-        """The matching rows as zero-copy code columns, or None when the
-        code path does not apply.
-
-        ``keep`` restricts positions by code before any row is gathered: a
-        mapping from column name (``"s"``, ``"p"``, ``"o"``, ``"g"``) to a
-        ``range`` of codes (what ``TermDict.prefix_range`` yields) or to a
-        set of codes in any form ``TermDict.decode_many`` accepts.
-        ``limit``/``offset`` window the rows in match order, after ``keep``."""
-        ...
-    def match_codes_many(
-        self,
-        patterns: Sequence[_Pattern],
-    ) -> List[Optional[Tuple[U32Column, U32Column, U32Column, U32Column]]]:
-        """``match_codes`` for a batch of ``(s, p, o, g)`` patterns: every
-        pattern is parsed first (a malformed one raises ``ValueError`` before
-        anything is evaluated), the matches run concurrently under one GIL
-        release, one result per pattern in input order."""
-        ...
     def count_quads_many(self, patterns: Sequence[_Pattern]) -> List[int]:
         """``count_quads`` for a batch of ``(s, p, o, g)`` patterns, evaluated
-        like ``match_codes_many``."""
+        like ``match_arrow_many``."""
         ...
     def get_quads(
         self,
@@ -175,15 +153,6 @@ class VortexRdfStore:
         selection; no term is materialized. With ``limit`` the count stops
         there (``limit=1`` is an existence test reading one row)."""
         ...
-    def match_columns(
-        self,
-        s: Optional[str] = None,
-        p: Optional[str] = None,
-        o: Optional[str] = None,
-        g: Optional[str] = None,
-    ) -> Tuple[List[str], List[str], List[str], List[str]]:
-        """The same rows as `get_quads`, as four parallel columns."""
-        ...
     def match_arrow(
         self,
         s: Optional[str] = None,
@@ -193,6 +162,9 @@ class VortexRdfStore:
         *,
         encoding: str = "codes",
         projection: Optional[Sequence[str]] = None,
+        keep: Optional[Mapping[str, Union[range, _Codes]]] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
     ) -> ArrowQuadStream:
         """The matching rows as a stream of Arrow record batches (columns
         ``s``, ``p``, ``o``, ``g``, or the ``projection`` subset in that order).
@@ -201,7 +173,27 @@ class VortexRdfStore:
         buffers), ``"terms"`` (the codes as dictionary keys over the whole term
         dictionary) or ``"strings"`` (``string_view`` N-Triples strings, the
         one encoding every layout serves). Codes and terms need the
-        Dictionary layout; the TypedObject layout has no Arrow export."""
+        Dictionary layout; the TypedObject layout has no Arrow export.
+
+        ``keep`` restricts positions by code before any row is gathered: a
+        mapping from column name (``"s"``, ``"p"``, ``"o"``, ``"g"``) to a
+        ``range`` of codes (what ``TermDict.prefix_range`` yields) or to a
+        set of codes in any form ``TermDict.decode_many`` accepts, a
+        ``uint32`` Arrow array included. ``limit``/``offset`` window the rows
+        in match order, after ``keep``."""
+        ...
+    def match_arrow_many(
+        self,
+        patterns: Sequence[_Pattern],
+        *,
+        encoding: str = "codes",
+        projection: Optional[Sequence[str]] = None,
+    ) -> List[ArrowQuadStream]:
+        """``match_arrow`` for a batch of ``(s, p, o, g)`` patterns: every
+        pattern is parsed first (a malformed one raises ``ValueError`` before
+        anything is evaluated), the matches run concurrently under one GIL
+        release, one stream per pattern in input order, all under the same
+        ``encoding`` and ``projection``."""
         ...
 
 def serialize_rdf(

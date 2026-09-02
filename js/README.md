@@ -131,16 +131,7 @@ if (dict) {
 
 `decode`/`encode` speak N-Triples term strings — `<iri>`, `_:blank`, `"lit"@lang`, `"lit"^^<dt>`, and `''` for the default graph. The handle is a snapshot: it keeps decoding correctly after the store is mutated, because it retains the dictionary its codes address. It is a wasm-side handle — call `free()` when done (also wired to `Symbol.dispose`, so `using` disposes it automatically).
 
-`matchCodes` is its pattern-matching counterpart: it resolves a pattern to the matched rows' raw term codes — four columnar `Uint32Array`s `{ s, p, o, g }` plus a `length` — without materializing any term strings, and returns `null` under the same conditions `termDict()` returns `undefined`:
-
-```javascript
-const cols = store.matchCodes(null, myPredicate, null, null);
-if (cols) {
-  console.log(cols.length, dict.decode(cols.o[0]));
-}
-```
-
-`match`/`getQuads` are the supported way to read quads; `matchCodes` is the low-level path for callers that join, count and de-duplicate in code space and decode each distinct term once.
+`match`/`getQuads` are the way to read quads; the codes themselves come out of the [Arrow interface](#arrow-interface) below (`encoding: 'codes'`), for callers that join, count and de-duplicate in code space and decode each distinct term once.
 
 ## Arrow interface
 
@@ -155,7 +146,7 @@ const terms = tableFromIPC(store.matchArrowIPC(null, null, null, null, { encodin
 terms.getChild('o')?.get(0);                             // an N-Triples string, carried as a dictionary key
 ```
 
-One record batch per decode chunk. `encoding: 'codes'` (the default) ships `uint32` term codes — join, filter and aggregate in code space, then decode the survivors through `termDict()`; `'terms'` wraps the same codes as an Arrow dictionary over the whole term dictionary, so engines see strings while carrying codes; `'strings'` materializes `string_view` N-Triples strings and is the one encoding every layout serves. `projection: ['o', 's']` restricts and orders the columns. The bytes are a copy out of wasm memory, like the `Uint32Array`s `matchCodes` returns.
+One record batch per decode chunk. `encoding: 'codes'` (the default) ships `uint32` term codes — join, filter and aggregate in code space, then decode the survivors through `termDict()`; `'terms'` wraps the same codes as an Arrow dictionary over the whole term dictionary, so engines see strings while carrying codes; `'strings'` materializes `string_view` N-Triples strings and is the one encoding every layout serves. `projection: ['o', 's']` restricts and orders the columns. The bytes are a copy out of wasm memory. This is the one engine-facing read surface of the bindings: a query planner or executor over a store consumes it, on this and every other language binding.
 
 ## Build options
 

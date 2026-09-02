@@ -388,7 +388,7 @@ store's resident form
   ([`with_canonical_int_children`](../core/src/store/array.rs#L289)): the
   builders assemble anything over `DEFAULT_CHUNK_ROWS` rows as a
   `ChunkedArray`, and one contiguous buffer per column is what lets every
-  code read — `match_codes`, the Arrow `codes` export — hand out slices of
+  code read — the Arrow `codes` export, `get_quads` — hand out slices of
   the base without a decode; the `IsSorted` stamps carry across;
 - every non-nullable `u32` child of each index component is re-encoded from
   the bounds the build already knows — `Constant` for a single-valued
