@@ -180,6 +180,77 @@ impl RowSelection {
         }
     }
 
+    /// How many of this selection's rows are live — its rows minus the
+    /// `deleted` tombstones among them.
+    pub(crate) fn live_count(&self, deleted: Option<&Mask>, base_len: usize) -> usize {
+        match deleted {
+            None => self.len(base_len),
+            Some(deleted) => self.live_mask(deleted, base_len).true_count(),
+        }
+    }
+
+    /// The `limit` live rows after the first `offset` live ones, in this
+    /// selection's (ascending base) order with the `deleted` tombstones
+    /// skipped, as a selection of their own — and how many rows it holds
+    /// (fewer than `limit` when the selection runs out). Without tombstones
+    /// a range stays a range; with them, or over an id list, the window is
+    /// an id list.
+    pub(crate) fn window(
+        &self,
+        deleted: Option<&Mask>,
+        base_len: usize,
+        offset: usize,
+        limit: usize,
+    ) -> (RowSelection, usize) {
+        if limit == 0 {
+            return (RowSelection::empty(), 0);
+        }
+        let contiguous: Option<Range<usize>> = match self {
+            RowSelection::All => Some(0..base_len),
+            RowSelection::Range(range) => Some(clamped(range, base_len)),
+            RowSelection::Ids(_) => None,
+        };
+        match (contiguous, deleted) {
+            (Some(range), None) => {
+                let start = range.start + offset.min(range.len());
+                let end = start.saturating_add(limit).min(range.end);
+                (RowSelection::Range(start as u64..end as u64), end - start)
+            }
+            (None, None) => {
+                let RowSelection::Ids(ids) = self else {
+                    unreachable!("a non-contiguous selection is an id list");
+                };
+                let start = offset.min(ids.len());
+                let end = start.saturating_add(limit).min(ids.len());
+                (RowSelection::Ids(ids.slice(start..end)), end - start)
+            }
+            (Some(range), Some(deleted)) => {
+                let ids: Vec<u64> = range
+                    .filter(|&id| !deleted.value(id))
+                    .skip(offset)
+                    .take(limit)
+                    .map(|id| id as u64)
+                    .collect();
+                let taken = ids.len();
+                (RowSelection::Ids(Buffer::from_iter(ids)), taken)
+            }
+            (None, Some(deleted)) => {
+                let RowSelection::Ids(ids) = self else {
+                    unreachable!("a non-contiguous selection is an id list");
+                };
+                let ids: Vec<u64> = ids
+                    .iter()
+                    .copied()
+                    .filter(|&id| !deleted.value(id as usize))
+                    .skip(offset)
+                    .take(limit)
+                    .collect();
+                let taken = ids.len();
+                (RowSelection::Ids(Buffer::from_iter(ids)), taken)
+            }
+        }
+    }
+
     /// Whether this selection is small enough for the point-read paths
     /// (at most [`POINT_GATHER_MAX_ROWS`] rows). `All` never is.
     pub(crate) fn is_point_sized(&self) -> bool {

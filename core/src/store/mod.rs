@@ -19,6 +19,7 @@ mod export;
 mod matching;
 mod mutation;
 mod open;
+mod pushdown;
 mod rows;
 mod serialize;
 mod streaming;
@@ -36,6 +37,7 @@ pub use builders::SortedStreamBuilder;
 pub use indexes::{IndexType, Indexes};
 pub use layouts::LayoutStrategy;
 pub use layouts::dictionary::DictSnapshot;
+pub use pushdown::Keep;
 pub use layouts::dictionary::DictionaryQuadSink;
 // `RawQuad` lives in `common` (it is pure RDF text — see that module's
 // charter); this re-export makes `store::RawQuad` the path builder consumers
