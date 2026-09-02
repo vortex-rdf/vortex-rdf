@@ -44,6 +44,7 @@ pub(crate) mod access;
 #[cfg(feature = "file-io")]
 pub(crate) mod file_backed;
 pub(crate) mod ingest;
+pub(crate) mod predicates;
 pub(crate) mod term_dict;
 
 #[cfg(feature = "file-io")]
@@ -54,6 +55,7 @@ pub use self::ingest::DictionaryQuadSink;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) use self::ingest::{TermCodeMap, TermDictionaryBuilder};
 use self::term_dict::DictCursor;
+pub use self::predicates::{NumOp, TermPredicate, Verdict};
 pub use self::term_dict::DictSnapshot;
 pub(crate) use self::term_dict::TermDictionary;
 

@@ -36,7 +36,7 @@ pub use export::export_rdf;
 pub use builders::SortedStreamBuilder;
 pub use indexes::{IndexType, Indexes};
 pub use layouts::LayoutStrategy;
-pub use layouts::dictionary::DictSnapshot;
+pub use layouts::dictionary::{DictSnapshot, NumOp, TermPredicate, Verdict};
 pub use pushdown::Keep;
 pub use layouts::dictionary::DictionaryQuadSink;
 // `RawQuad` lives in `common` (it is pure RDF text — see that module's

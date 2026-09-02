@@ -11,14 +11,18 @@
 //! [`LayoutStrategy::Dictionary`]: crate::store::layouts::LayoutStrategy::Dictionary
 
 use crate::debug;
-use std::collections::HashSet;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
+
+use super::predicates::{TermPredicate, Verdict};
+use crate::common::terms::parse_term;
 
 use arrow_array::ArrayRef as ArrowArrayRef;
 use arrow_array::types::StringViewType;
 use vortex_array::arrays::ChunkedArray;
 use vortex_arrow::byte_view::canonical_varbinview_to_arrow;
+use vortex_buffer::Buffer;
 
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
@@ -159,7 +163,14 @@ pub(crate) struct TermDictionary {
     /// caller (an Arrow dictionary array needs a single values array, so the
     /// batch export attaches this one to every batch of a stream).
     arrow_values: OnceLock<ArrowArrayRef>,
+    /// Memo for [`filter_codes`](Self::filter_codes): each predicate's
+    /// verdict sets, keyed by the predicate's canonical spelling.
+    predicates: Mutex<HashMap<String, VerdictSets>>,
 }
+
+/// A predicate's verdict over a dictionary: the codes it holds for and the
+/// codes it leaves undecided, both ascending.
+type VerdictSets = Arc<(Buffer<u32>, Buffer<u32>)>;
 
 impl TermDictionary {
     /// Wrap the held terms, with an empty lookup memo.
@@ -168,6 +179,7 @@ impl TermDictionary {
             terms,
             probes: ProbeCache::new(),
             arrow_values: OnceLock::new(),
+            predicates: Mutex::new(HashMap::new()),
         }
     }
 
@@ -482,6 +494,54 @@ impl TermDictionary {
         // A racing first call built its own copy; either one may win the slot.
         Ok(self.arrow_values.get_or_init(|| values).clone())
     }
+
+    /// The codes whose terms `predicate` decides true, and those it cannot
+    /// decide (see [`Verdict`]), both ascending — one pass over the term
+    /// column on first use, memoized per predicate for the dictionary's
+    /// lifetime.
+    pub(crate) fn filter_codes(&self, predicate: &TermPredicate) -> Result<VerdictSets> {
+        let key = predicate.to_string();
+        if let Some(cached) = self
+            .predicates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+        {
+            return Ok(Arc::clone(cached));
+        }
+        let mut cursor = self.cursor();
+        let (mut holds, mut unknown) = (Vec::new(), Vec::new());
+        for code in 0..self.len() {
+            match predicate.eval(cursor.str_at(code)?) {
+                Verdict::True => holds.push(code as u32),
+                Verdict::Unknown => unknown.push(code as u32),
+                Verdict::False => {}
+            }
+        }
+        let sets = Arc::new((Buffer::from_iter(holds), Buffer::from_iter(unknown)));
+        Ok(Arc::clone(
+            self.predicates
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(key)
+                .or_insert(sets),
+        ))
+    }
+
+    /// [`encode`](Self::encode), then — on a miss — the same lookup with the
+    /// term's spelling canonicalized through the term parser (an
+    /// `xsd:string`-typed literal is a plain one, escapes normalize), so a
+    /// caller's own rendering of a term still finds it.
+    pub(crate) fn encode_tolerant(&self, term: &str) -> Option<u32> {
+        if let Some(code) = self.encode(term) {
+            return Some(code);
+        }
+        let canonical = parse_term(term)?.to_string();
+        if canonical == term {
+            return None;
+        }
+        self.encode(&canonical)
+    }
 }
 
 /// Slots in a dictionary's [`ProbeCache`]. A power of two: the slot index is
@@ -729,12 +789,29 @@ impl DictSnapshot {
         self.0.decode(code)
     }
 
-    /// Encode an N-Triples term string to its code (its position in the
-    /// sorted dictionary), or `None` when this dictionary does not hold the
-    /// term. The inverse of [`decode`](Self::decode); a binary search over
-    /// the dictionary.
+    /// Encode a term string to its code (its position in the sorted
+    /// dictionary), or `None` when this dictionary does not hold the term.
+    /// The inverse of [`decode`](Self::decode): a binary search for the
+    /// spelling as given, then — on a miss — for its canonical N-Triples
+    /// form (an `xsd:string`-typed literal is a plain one, escapes
+    /// normalize), so a caller's own rendering of a term still resolves.
     pub fn encode(&self, term: &str) -> Option<u32> {
-        self.0.encode(term)
+        self.0.encode_tolerant(term)
+    }
+
+    /// [`encode`](Self::encode) for many terms in one call, in input order.
+    pub fn encode_many(&self, terms: &[&str]) -> Vec<Option<u32>> {
+        terms.iter().map(|term| self.encode(term)).collect()
+    }
+
+    /// The codes whose terms `predicate` decides true, and those outside the
+    /// domain it decides exactly (the caller evaluates these itself), both
+    /// ascending. One pass over the dictionary on the first call for a
+    /// predicate, memoized for the dictionary's lifetime; the remaining codes
+    /// are the ones the predicate decides false.
+    pub fn filter_codes(&self, predicate: &TermPredicate) -> Result<(Buffer<u32>, Buffer<u32>)> {
+        let sets = self.0.filter_codes(predicate)?;
+        Ok((sets.0.clone(), sets.1.clone()))
     }
 
     /// Number of terms in the dictionary.

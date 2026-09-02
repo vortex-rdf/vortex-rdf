@@ -231,6 +231,68 @@ async fn windows_and_keeps_agree_on_a_file() {
     }
 }
 
+/// The dictionary's predicate scan partitions its terms as the predicate
+/// rules say, feeds `keep`, and memoizes; `encode` resolves a canonical
+/// spelling on a miss.
+#[tokio::test]
+async fn filter_codes_partition_the_dictionary() {
+    use crate::store::TermPredicate;
+    let xsd_int = NamedNode::new("http://www.w3.org/2001/XMLSchema#integer").unwrap();
+    let s = |i: usize| NamedOrBlankNode::NamedNode(NamedNode::new(format!("http://example.org/s{i}")).unwrap());
+    let p = predicate(0);
+    let quads = vec![
+        Quad::new(s(0), p.clone(), Term::Literal(Literal::new_typed_literal("42", xsd_int.clone())), GraphName::DefaultGraph),
+        Quad::new(s(1), p.clone(), Term::Literal(Literal::new_typed_literal("7", xsd_int)), GraphName::DefaultGraph),
+        Quad::new(s(2), p.clone(), Term::Literal(Literal::new_language_tagged_literal("Bob", "en").unwrap()), GraphName::DefaultGraph),
+        Quad::new(s(3), p.clone(), Term::Literal(Literal::new_simple_literal("Alice")), GraphName::DefaultGraph),
+        Quad::new(s(4), p.clone(), Term::NamedNode(NamedNode::new("http://example.org/o").unwrap()), GraphName::DefaultGraph),
+        Quad::new(NamedOrBlankNode::BlankNode(oxrdf::BlankNode::new("b0").unwrap()), p, Term::Literal(Literal::new_simple_literal("Anon")), GraphName::DefaultGraph),
+    ];
+    let store = VortexRdfStore::from_quads(quad_stream(quads.clone()), LayoutStrategy::Dictionary, vec![])
+        .await
+        .unwrap();
+    let dict = store.code_read_snapshot().unwrap();
+    let terms: Vec<String> = (0..dict.len() as u32).map(|c| dict.decode(c).unwrap()).collect();
+    let spelled = |codes: &vortex_buffer::Buffer<u32>| -> Vec<&str> {
+        codes.iter().map(|&c| terms[c as usize].as_str()).collect()
+    };
+    let check = |kind: &str, arg: &str, holds: &[&str], unknown: &[&str]| {
+        let predicate = TermPredicate::parse(kind, arg).unwrap();
+        let (got_holds, got_unknown) = dict.filter_codes(&predicate).unwrap();
+        assert_eq!(spelled(&got_holds), holds, "{kind}({arg}) holds");
+        assert_eq!(spelled(&got_unknown), unknown, "{kind}({arg}) unknown");
+    };
+    let int = |v: &str| format!("\"{v}\"^^<http://www.w3.org/2001/XMLSchema#integer>");
+    let (forty_two, seven) = (int("42"), int("7"));
+    // Codes are byte-order ranks: "" < '"' literals (digits before letters)
+    // < '<' IRIs < '_:' blanks.
+    check("is_literal", "", &[&forty_two, &seven, "\"Alice\"", "\"Anon\"", "\"Bob\"@en"], &[""]);
+    check("num_gt", "10", &[&forty_two, "\"Alice\"", "\"Anon\"", "\"Bob\"@en"], &["", "<http://example.org/o>", "<http://example.org/p0>", "<http://example.org/s0>", "<http://example.org/s1>", "<http://example.org/s2>", "<http://example.org/s3>", "<http://example.org/s4>", "_:b0"]);
+    check("num_eq", "7", &[&seven], &[""]);
+    check("lang_matches", "en", &["\"Bob\"@en"], &["", "<http://example.org/o>", "<http://example.org/p0>", "<http://example.org/s0>", "<http://example.org/s1>", "<http://example.org/s2>", "<http://example.org/s3>", "<http://example.org/s4>", "_:b0"]);
+    check("str_prefix", "http://example.org/s", &["<http://example.org/s0>", "<http://example.org/s1>", "<http://example.org/s2>", "<http://example.org/s3>", "<http://example.org/s4>"], &["", &forty_two, &seven]);
+
+    // The sets feed `keep`: the rows whose object the predicate holds for,
+    // in base (subject) order.
+    let (holds, _) = dict.filter_codes(&TermPredicate::parse("num_gt", "10").unwrap()).unwrap();
+    let kept = store.keep(QuadColumn::O, &Keep::Set(holds)).await.unwrap();
+    let objects: Vec<String> = kept.quads_vec().await.unwrap().iter().map(|q| q.object.to_string()).collect();
+    assert_eq!(objects, [&forty_two, "\"Bob\"@en", "\"Alice\"", "\"Anon\""].map(String::from));
+
+    // Memoized: the second call hands back the same buffers.
+    let predicate = TermPredicate::parse("is_literal", "").unwrap();
+    let first = dict.filter_codes(&predicate).unwrap();
+    let second = dict.filter_codes(&predicate).unwrap();
+    assert_eq!(first.0.as_slice().as_ptr(), second.0.as_slice().as_ptr());
+
+    // A tolerant encode: the xsd:string spelling of a plain literal.
+    let alice = dict.encode("\"Alice\"").unwrap();
+    assert_eq!(dict.encode("\"Alice\"^^<http://www.w3.org/2001/XMLSchema#string>"), Some(alice));
+    assert_eq!(dict.encode("\"nope\""), None);
+    assert_eq!(dict.encode("not a term"), None);
+    assert_eq!(dict.encode_many(&["\"Alice\"", "not a term", "_:b0"]), vec![Some(alice), None, dict.encode("_:b0")]);
+}
+
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn match_pattern_many_equals_the_singles_on_a_file() {
