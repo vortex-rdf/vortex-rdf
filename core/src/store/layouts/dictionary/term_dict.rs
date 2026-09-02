@@ -12,8 +12,13 @@
 
 use crate::debug;
 use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
+
+use arrow_array::ArrayRef as ArrowArrayRef;
+use arrow_array::types::StringViewType;
+use vortex_array::arrays::ChunkedArray;
+use vortex_arrow::byte_view::canonical_varbinview_to_arrow;
 
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
@@ -105,7 +110,6 @@ impl TermChunk {
     }
 
     /// The held column as an array, in its stored encoding.
-    #[cfg(any(feature = "file-io", target_arch = "wasm32", test))]
     fn array(&self) -> ArrayRef {
         match self {
             TermChunk::Canonical(a) => a.clone().into_array(),
@@ -150,6 +154,11 @@ pub(crate) struct TermDictionary {
     terms: TermStore,
     /// Memo for [`encode`](Self::encode); see [`ProbeCache`].
     probes: ProbeCache,
+    /// The whole term column as one Arrow `StringViewArray`, built on first
+    /// use by [`arrow_values`](Self::arrow_values) and shared by every later
+    /// caller (an Arrow dictionary array needs a single values array, so the
+    /// batch export attaches this one to every batch of a stream).
+    arrow_values: OnceLock<ArrowArrayRef>,
 }
 
 impl TermDictionary {
@@ -158,6 +167,7 @@ impl TermDictionary {
         Self {
             terms,
             probes: ProbeCache::new(),
+            arrow_values: OnceLock::new(),
         }
     }
 
@@ -421,6 +431,56 @@ impl TermDictionary {
             }
         }
         None
+    }
+
+    /// The first code whose term is byte-wise `>= needle` (`len()` when every
+    /// term is smaller) — the partition-point twin of
+    /// [`search`](Self::search), over raw bytes so a prefix successor that is
+    /// not valid UTF-8 can still be probed.
+    fn lower_bound_bytes(&self, needle: &[u8]) -> u32 {
+        let mut cursor = self.cursor();
+        let (mut lo, mut hi) = (0usize, self.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if cursor.bytes_at(mid) < needle {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo as u32
+    }
+
+    /// The whole term column as one Arrow `StringViewArray`, cached on first
+    /// use.
+    ///
+    /// Canonical chunks convert buffer-sharing; FSST chunks decompress — once
+    /// per dictionary, bounded by the dictionary's size, never by a result's.
+    pub(crate) fn arrow_values(&self) -> Result<ArrowArrayRef> {
+        if let Some(values) = self.arrow_values.get() {
+            return Ok(values.clone());
+        }
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        let canonical = match &self.terms {
+            TermStore::Single(TermChunk::Canonical(plain)) => plain.clone(),
+            TermStore::Single(chunk) => chunk
+                .array()
+                .execute::<VarBinViewArray>(&mut ctx)
+                .map_err(VortexRdfError::Vortex)?,
+            TermStore::Chunked(chunked) => {
+                let chunks: Vec<ArrayRef> = chunked.chunks.iter().map(TermChunk::array).collect();
+                let dtype = chunks[0].dtype().clone();
+                ChunkedArray::try_new(chunks, dtype)
+                    .map_err(VortexRdfError::Vortex)?
+                    .into_array()
+                    .execute::<VarBinViewArray>(&mut ctx)
+                    .map_err(VortexRdfError::Vortex)?
+            }
+        };
+        let values = canonical_varbinview_to_arrow::<StringViewType>(&canonical, &mut ctx)
+            .map_err(VortexRdfError::Vortex)?;
+        // A racing first call built its own copy; either one may win the slot.
+        Ok(self.arrow_values.get_or_init(|| values).clone())
     }
 }
 
@@ -686,6 +746,49 @@ impl DictSnapshot {
     pub fn is_empty(&self) -> bool {
         self.0.len() == 0
     }
+
+    /// The whole dictionary as one Arrow `StringViewArray`: element `i` is
+    /// the N-Triples term of code `i`, so it is both a code → term lookup
+    /// table and the values array of the batch export's `terms` encoding.
+    ///
+    /// Built on first use and cached for the dictionary's lifetime: canonical
+    /// chunks convert buffer-sharing, FSST-compressed chunks decompress once
+    /// (a cost bounded by the dictionary's size, not by any result's).
+    pub fn to_arrow(&self) -> Result<ArrowArrayRef> {
+        self.0.arrow_values()
+    }
+
+    /// The first code whose term is `>= term` in byte order ([`len`](Self::len)
+    /// when every term is smaller). Because codes are lexicographic ranks,
+    /// `lower_bound(a)..lower_bound(b)` is exactly the codes of the terms in
+    /// `a..b`.
+    pub fn lower_bound(&self, term: &str) -> u32 {
+        self.0.lower_bound_bytes(term.as_bytes())
+    }
+
+    /// The half-open code range `[lo, hi)` of the terms whose N-Triples
+    /// spelling starts with `prefix` (byte-wise). An IRI namespace is the
+    /// prefix `"<http://…/"`, and the N-Triples kinds partition the space by
+    /// first byte (`"` literals, `<` IRIs, `_` blank nodes), so kind bounds
+    /// are prefix ranges too. Empty prefix ⇒ the full range.
+    pub fn prefix_range(&self, prefix: &str) -> (u32, u32) {
+        let lo = self.0.lower_bound_bytes(prefix.as_bytes());
+        // The successor of the prefix in byte order: strip trailing 0xFF
+        // bytes, then increment the last remaining one. All-0xFF (or empty)
+        // has no successor — every term from `lo` on matches.
+        let mut successor = prefix.as_bytes().to_vec();
+        while successor.last() == Some(&0xFF) {
+            successor.pop();
+        }
+        let hi = match successor.last_mut() {
+            Some(last) => {
+                *last += 1;
+                self.0.lower_bound_bytes(&successor)
+            }
+            None => self.0.len() as u32,
+        };
+        (lo, hi)
+    }
 }
 
 impl TermDictionary {
@@ -920,5 +1023,76 @@ mod tests {
         }
         assert_eq!(chunked.encode("<http://absent>"), None);
         assert_eq!(chunked.decode(300), None);
+    }
+
+    /// The Arrow values array is the decode table verbatim — for a canonical
+    /// single-chunk dictionary, a windowed FSST one, and the empty one — and
+    /// the second call returns the cached array, not a rebuild.
+    #[test]
+    fn arrow_values_match_decode() {
+        use arrow_array::Array as _;
+        use arrow_array::cast::AsArray;
+
+        let terms: Vec<String> = (0..300)
+            .map(|i| format!("<http://example.org/arrow/{i:04}>"))
+            .collect();
+        let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
+        let canonical = {
+            let mut ctx = VORTEX_SESSION.create_execution_ctx();
+            TermDictionary::from_term_chunks(vec![plain.clone().into_array()], &mut ctx).unwrap()
+        };
+        let windowed = TermDictionary::compress_windowed(plain, 64).unwrap();
+
+        for d in [&canonical, &windowed] {
+            let values = d.arrow_values().unwrap();
+            let strings = values.as_string_view();
+            assert_eq!(strings.len(), d.len());
+            for code in 0..d.len() as u32 {
+                assert_eq!(strings.value(code as usize), d.decode(code).unwrap());
+                assert_eq!(d.encode(strings.value(code as usize)), Some(code));
+            }
+            let again = d.arrow_values().unwrap();
+            assert!(Arc::ptr_eq(&values, &again), "second call must be cached");
+        }
+
+        assert_eq!(TermDictionary::empty().arrow_values().unwrap().len(), 0);
+    }
+
+    /// `lower_bound` is the partition point over the sorted terms, and
+    /// `prefix_range` brackets exactly the terms spelled with the prefix —
+    /// including at the byte-successor edge and for absent prefixes.
+    #[test]
+    fn bounds_bracket_the_sorted_terms() {
+        let terms: Vec<String> = (0..40)
+            .map(|i| format!("<http://a.example/{i:02}>"))
+            .chain((0..40).map(|i| format!("<http://b.example/{i:02}>")))
+            .chain((0..20).map(|i| format!("\"literal {i:02}\"")))
+            .chain((0..10).map(|i| format!("_:blank{i}")))
+            .collect();
+        let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+        let snapshot = DictSnapshot(Arc::new(dict(&refs)));
+
+        let mut sorted = refs.clone();
+        sorted.sort_unstable();
+        for probe in ["", "<http://a.example/", "<http://b.example/2", "\"literal", "_:", "~past"] {
+            let expected = sorted.partition_point(|t| *t < probe) as u32;
+            assert_eq!(snapshot.lower_bound(probe), expected, "{probe:?}");
+        }
+
+        for prefix in ["<http://a.example/", "<http://b.example/", "\"", "<", "_:", ""] {
+            let (lo, hi) = snapshot.prefix_range(prefix);
+            let expected: Vec<u32> = (0..snapshot.len() as u32)
+                .filter(|&c| snapshot.decode(c).unwrap().starts_with(prefix))
+                .collect();
+            assert_eq!((lo..hi).collect::<Vec<_>>(), expected, "{prefix:?}");
+        }
+        assert_eq!(snapshot.prefix_range("<http://c."), {
+            let lo = snapshot.lower_bound("<http://c.");
+            (lo, lo)
+        });
+        // A prefix byte-wise above every term yields the empty range at the end.
+        let (lo, hi) = snapshot.prefix_range("\u{FF}");
+        assert_eq!(lo, snapshot.len() as u32);
+        assert_eq!(hi, snapshot.len() as u32);
     }
 }
