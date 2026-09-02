@@ -69,6 +69,7 @@
     "devDependencies": {
         "@codspeed/tinybench-plugin": "^5.7.1",
         "@types/node": "^26.1.2",
+        "apache-arrow": "^21.2.0",
         "oxigraph": "^0.5.9",
         "rdf-data-factory": "^2.0.2",
         "rdf-stores": "^2.2.0",

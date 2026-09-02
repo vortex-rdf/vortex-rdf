@@ -9,8 +9,11 @@ export {
     deserializeRdf,
 } from '../pkg/web/vortex_rdf.js';
 export type {
+    ArrowOptions,
     BuildOptions,
     LayoutStrategy,
     IndexType,
+    QuadColumn,
     RdfFormatName,
+    TermEncoding,
 } from '../pkg/web/vortex_rdf.js';

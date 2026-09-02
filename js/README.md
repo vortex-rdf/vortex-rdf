@@ -142,6 +142,21 @@ if (cols) {
 
 `match`/`getQuads` are the supported way to read quads; `matchCodes` is the low-level path for callers that join, count and de-duplicate in code space and decode each distinct term once.
 
+## Arrow interface
+
+`matchArrowIPC` hands a match to any Arrow consumer as an [Arrow IPC stream](https://arrow.apache.org/docs/format/Columnar.html#ipc-streaming-format) — the bytes `apache-arrow`'s `tableFromIPC`, DuckDB-WASM, Arquero or Perspective read:
+
+```javascript
+import { tableFromIPC } from 'apache-arrow';
+
+const table = tableFromIPC(store.matchArrowIPC(null, myPredicate, null, null));
+table.schema.fields.map((f) => f.name);                  // ['s', 'p', 'o', 'g'] — uint32 term codes
+const terms = tableFromIPC(store.matchArrowIPC(null, null, null, null, { encoding: 'terms' }));
+terms.getChild('o')?.get(0);                             // an N-Triples string, carried as a dictionary key
+```
+
+One record batch per decode chunk. `encoding: 'codes'` (the default) ships `uint32` term codes — join, filter and aggregate in code space, then decode the survivors through `termDict()`; `'terms'` wraps the same codes as an Arrow dictionary over the whole term dictionary, so engines see strings while carrying codes; `'strings'` materializes `string_view` N-Triples strings and is the one encoding every layout serves. `projection: ['o', 's']` restricts and orders the columns. The bytes are a copy out of wasm memory, like the `Uint32Array`s `matchCodes` returns.
+
 ## Build options
 
 `fromString`, `fromQuads` and `serializeRdf` accept an optional `BuildOptions` object; every field is optional. Quads are always sorted by subject → predicate → object → graph while the columnar array is built — that global order is what gives subject lookups their binary search and what every secondary index routes against. The wasm build sorts in memory (WebAssembly has no filesystem for an out-of-core builder) and takes no builder option.

@@ -54,6 +54,32 @@ export interface BuildOptions {
 }
 
 /**
+ * How term cells are typed in an Arrow export (`matchArrowIPC`).
+ * - 'codes': `uint32` term codes, decodable through `termDict()` — the
+ *   cheapest to ship and to join on. Dictionary layout only.
+ * - 'terms': the same codes as dictionary keys over the whole term dictionary
+ *   (`dictionary<uint32, string_view>`), so readers see strings and carry
+ *   codes. Dictionary layout only.
+ * - 'strings': `string_view` N-Triples strings — the one encoding every
+ *   layout serves.
+ */
+export type TermEncoding = 'codes' | 'terms' | 'strings';
+
+/** One of the four quad columns, by its serialized name. */
+export type QuadColumn = 's' | 'p' | 'o' | 'g';
+
+/** Options of `matchArrowIPC`. Any omitted field keeps its default. */
+export interface ArrowOptions {
+    /** @default 'codes' */
+    encoding?: TermEncoding;
+    /**
+     * The columns to ship, in this order; all four in `s, p, o, g` order
+     * when omitted. Must be non-empty and name each column at most once.
+     */
+    projection?: QuadColumn[];
+}
+
+/**
  * A wasm-side store handle. Every method that fails rejects (or, for the
  * synchronous read family, throws) with an `Error`.
  *
@@ -128,6 +154,20 @@ export class VortexRdfStore {
      * codes through `termDict()`.
      */
     matchCodes(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null): { s: Uint32Array; p: Uint32Array; o: Uint32Array; g: Uint32Array; length: number } | null;
+    /**
+     * Low-level. The quads matching a pattern as an Arrow IPC stream — the
+     * bytes `tableFromIPC` (apache-arrow), DuckDB-WASM, Arquero or Perspective
+     * read. One record batch per decode chunk; columns `s`, `p`, `o`, `g`
+     * (or `options.projection`, in that order), typed per
+     * `options.encoding` (default `'codes'`; see `TermEncoding`). The schema
+     * carries `vortex_rdf.layout`, `vortex_rdf.term_encoding`,
+     * `vortex_rdf.version` and `vortex_rdf.default_graph` (`''`) metadata.
+     * Returns synchronously; the bytes are a copy out of wasm memory. Throws
+     * on an invalid pattern term or option, and on an encoding the store's
+     * layout cannot serve (`'codes'`/`'terms'` need the Dictionary layout; the
+     * TypedObject layout has no Arrow export).
+     */
+    matchArrowIPC(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null, options?: ArrowOptions): Uint8Array;
     /**
      * Low-level. An immutable handle on this store's term dictionary — the one
      * door to code↔term translation. `undefined` unless the store's rows are

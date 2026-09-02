@@ -4,6 +4,7 @@
 use std::cell::RefCell;
 use std::io::Cursor;
 
+use arrow_ipc::writer::StreamWriter;
 use futures::StreamExt;
 use js_sys::{Object, Reflect};
 use vortex_rdf_core::common::terms::parse_quads_from_reader;
@@ -15,7 +16,7 @@ use wasm_bindgen_futures::future_to_promise;
 
 use crate::error::{js_err, js_err_ctx};
 use crate::ingest::{js_array_to_dictionary_array, js_array_to_quads, js_to_quad_stream};
-use crate::options::{build_array, parse_build_options, parse_format};
+use crate::options::{build_array, parse_arrow_options, parse_build_options, parse_format};
 use crate::terms::{JsPattern, js_to_quad};
 
 #[wasm_bindgen(module = "/js-snippets/lazy-rdf.js")]
@@ -353,6 +354,42 @@ impl VortexRdfStore {
         };
         Reflect::set(&result, &"length".into(), &JsValue::from_f64(n as f64))?;
         Ok(result.into())
+    }
+
+    /// Low-level: the quads matching a pattern as an Arrow IPC stream
+    /// (`Uint8Array`) — the bytes `apache-arrow`'s `tableFromIPC`,
+    /// DuckDB-WASM, Arquero or Perspective read. One record batch per decode
+    /// chunk over core's quad schema: columns `s`, `p`, `o`, `g`, or
+    /// `options.projection` in that order; `options.encoding` selects the
+    /// cell type (`codes` u32 term codes, `terms` the codes as dictionary
+    /// keys over the whole term dictionary, `strings` N-Triples strings).
+    /// The bytes are a copy out of wasm memory, as every `Uint32Array`
+    /// [`matchCodes`](Self::match_codes) hands out is. Throws on an invalid
+    /// pattern term or option, and on an encoding the layout cannot serve.
+    #[wasm_bindgen(js_name = matchArrowIPC, skip_typescript)]
+    pub fn match_arrow_ipc(
+        &self,
+        subject: JsValue,
+        predicate: JsValue,
+        object: JsValue,
+        graph: JsValue,
+        options: JsValue,
+    ) -> Result<Vec<u8>, JsValue> {
+        let pattern = JsPattern::parse(subject, predicate, object, graph)?;
+        let (encoding, projection) = parse_arrow_options(options)?;
+        resolve_now(async move {
+            let matched = pattern.matched(&self.inner).await?;
+            let mut batches = matched
+                .to_record_batches(encoding, projection.as_deref())
+                .await
+                .map_err(js_err)?;
+            let mut writer = StreamWriter::try_new(Vec::new(), &batches.schema()).map_err(js_err)?;
+            while let Some(batch) = batches.next().await {
+                writer.write(&batch.map_err(js_err)?).map_err(js_err)?;
+            }
+            writer.finish().map_err(js_err)?;
+            writer.into_inner().map_err(js_err)
+        })?
     }
 
     /// Low-level: an immutable [`TermDict`] handle on this store's term

@@ -7,8 +7,8 @@ use js_sys::Reflect;
 use oxrdfio::RdfFormat;
 use vortex_rdf_core::common::formats::{format_from_name, supported_format_names};
 use vortex_rdf_core::{
-    BuiltArray, IndexType, Indexes, LayoutStrategy, RawQuad, Result as CoreResult,
-    SortedInMemoryBuilder, VortexArrayBuilder,
+    BuiltArray, IndexType, Indexes, LayoutStrategy, QuadColumn, RawQuad, Result as CoreResult,
+    SortedInMemoryBuilder, TermEncoding, VortexArrayBuilder,
 };
 use wasm_bindgen::prelude::*;
 
@@ -83,6 +83,39 @@ pub(crate) fn parse_build_options(options: JsValue) -> Result<BuildConfig, JsVal
             .collect::<Result<Indexes, JsValue>>()?;
     }
     Ok(config)
+}
+
+/// Resolve the optional JS `ArrowOptions` object behind `matchArrowIPC`:
+/// `encoding` (a term-encoding name, default `codes`) and `projection` (quad
+/// column names in the order to ship them, default all four). Accepts
+/// `undefined`/`null` for the defaults; the vocabularies are core's
+/// `FromStr` impls, so parse failures carry core's messages.
+pub(crate) fn parse_arrow_options(
+    options: JsValue,
+) -> Result<(TermEncoding, Option<Vec<QuadColumn>>), JsValue> {
+    if options.is_null() || options.is_undefined() {
+        return Ok((TermEncoding::Codes, None));
+    }
+    let encoding = match get_string_option(&options, "encoding")? {
+        Some(name) => name.parse().map_err(js_err)?,
+        None => TermEncoding::Codes,
+    };
+    let projection = Reflect::get(&options, &"projection".into())
+        .map_err(|_| js_err("Could not read the 'projection' option"))?;
+    if projection.is_null() || projection.is_undefined() {
+        return Ok((encoding, None));
+    }
+    if !js_sys::Array::is_array(&projection) {
+        return Err(js_err("Option 'projection' must be an array"));
+    }
+    let columns = js_sys::Array::from(&projection)
+        .iter()
+        .map(|value| match value.as_string() {
+            Some(name) => name.parse::<QuadColumn>().map_err(js_err),
+            None => Err(js_err("Option 'projection' must contain strings")),
+        })
+        .collect::<Result<Vec<_>, JsValue>>()?;
+    Ok((encoding, Some(columns)))
 }
 
 /// Read an optional string field, erroring if present but not a string.
