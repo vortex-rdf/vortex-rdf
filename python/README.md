@@ -115,7 +115,7 @@ Every option after the two paths is keyword-only. `format` is an RDF format name
 
 ## Bytes & files
 
-The default open is lazy and file-backed. `VortexRdfStore(path, in_memory=True)` loads the store into memory once, so each subsequent match skips the per-call file-scan pipeline.
+The default open is lazy and file-backed. `VortexRdfStore(path, in_memory=True)` loads the store into memory once, so each subsequent match skips the per-call file-scan pipeline. Such a store keeps the file's column encodings: a wide `match_codes`/`match_arrow` read decodes a column into a canonical form that every result alive shares and that is freed with the last of them, so memory follows what you hold, not what you have read (see [docs/memory.md](../docs/memory.md)).
 
 For Dictionary-layout files the term dictionary is lifted into memory when its compressed size in the file fits the residency budget — 512 MiB by default, overridable process-wide with `VORTEX_RDF_DICT_MAX_RESIDENT_BYTES`. `VortexRdfStore(path, max_resident_bytes=n)` sets the budget for that open (the environment variable is ignored for it). A dictionary left file-backed is point-read through its chunk leaves; `term_dict()` and `match_codes` then return `None` and the string reads fall back to the matched quads.
 

@@ -197,7 +197,7 @@ later stages see an empty selection and skip.
 ## 5. Stage C — backend dispatch
 
 Here it is decided **where the base rows live**. `match_base` reads
-the store's [`QuadsSource`](../core/src/store/source.rs#L35) and hands the prelude's witness to the matching backend. `InMemory` holds the
+the store's [`QuadsSource`](../core/src/store/source.rs#L36) and hands the prelude's witness to the matching backend. `InMemory` holds the
 base array (and any index components) resident (i.e., loaded into RAM), so its stages narrow a
 `RowSelection` directly and run synchronously. `File` leaves the rows on disk,
 so its stages can only *define* a filter and a selection for the next scan
@@ -221,12 +221,15 @@ part of this pattern cheaply?* and *which rows survive?* — narrowing the share
 `RowSelection` and clearing whatever pattern components it answered, so the next
 stage only sees what is left.
 
-Only the *struct* is canonical. Its columns stay in the compressed encodings
-every in-memory construction gives them
-([`compress_built_parts`](../core/src/store/mod.rs#L157)), and the stages below
-search them in place through the cached encoded-search probes. No stage
-decompresses a column; a match decodes nothing but the rows a mask scan has to
-compare ([§6.3](#63-residual-column-filtering)).
+A built base's code columns are flat canonical primitives; an adopted base
+keeps the encodings its file was written with
+([`resident_built_parts`](../core/src/store/mod.rs#L159),
+[`with_searchable_int_children`](../core/src/store/array.rs#L278)). The stages
+below search either form in place — slice compares on canonical columns, the
+cached encoded-search probes on encoded ones. No stage decodes a column; a
+match decodes nothing but the rows a mask scan has to compare
+([§6.3](#63-residual-column-filtering)). What each form holds resident, and
+every cache a store keeps, is in [memory.md](memory.md).
 
 ```mermaid
 flowchart TD
@@ -261,7 +264,7 @@ Each stage in the code, and where the details are below:
 | Prelude | [`matching.rs:213-242`](../core/src/store/matching.rs#L213-L242) | — |
 | 1 · prefix probe | [`matching.rs:244-327`](../core/src/store/matching.rs#L244-L327), [`search_sorted_bounds`](../core/src/store/array.rs#L178) | [§6.1](#61-prefix-probe) |
 | 2 · secondary-index routing | [`matching.rs:329-399`](../core/src/store/matching.rs#L329-L399), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L485) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`matching.rs:401-442`](../core/src/store/matching.rs#L401-L442), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L184), [`mask_for`](../core/src/store/matching.rs#L748) | [§6.3](#63-residual-column-filtering) |
+| 3 · residual column filtering | [`matching.rs:401-442`](../core/src/store/matching.rs#L401-L442), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L175), [`mask_for`](../core/src/store/matching.rs#L750) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`matching.rs:444-458`](../core/src/store/matching.rs#L444-L458) | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
@@ -481,7 +484,7 @@ longer starts `All` ([§11](#11-chained-matches)).
 
 ## 7. The file path
 
-[`match_base_file`](../core/src/store/matching.rs#L498) composes the same
+[`match_base_file`](../core/src/store/matching.rs#L500) composes the same
 restrictions as the in-memory path, but **nothing is read**: each stage decides
 what the *next* scan will do, and the result is a filter expression plus a row
 selection.
@@ -1103,7 +1106,7 @@ needs.
 
 ### 16.2 Windows
 
-[`window`](../core/src/store/pushdown.rs#L65) is `LIMIT`/`OFFSET`: the view
+[`window`](../core/src/store/pushdown.rs#L68) is `LIMIT`/`OFFSET`: the view
 over `limit` rows after the first `offset`, in the order every read yields
 them — live base rows in base order, then the tail's. It folds into an exact
 row selection ([`RowSelection::window`](../core/src/store/selection.rs#L198)):
@@ -1120,13 +1123,13 @@ projected), then windows those ids and drops the filter. Serve plans are
 dropped too: a window is a narrowing, and a plan's contiguous run would
 over-cover it.
 
-[`size_capped`](../core/src/store/pushdown.rs#L160) is `window(0, n).size()`
+[`size_capped`](../core/src/store/pushdown.rs#L165) is `window(0, n).size()`
 — `size_capped(1)` is an `ASK` that reads one row.
 
 ### 16.3 Keeps
 
-[`keep`](../core/src/store/pushdown.rs#L174) restricts one column by term
-code: the rows whose code lies in a [`Keep`](../core/src/store/pushdown.rs#L25)
+[`keep`](../core/src/store/pushdown.rs#L179) restricts one column by term
+code: the rows whose code lies in a [`Keep`](../core/src/store/pushdown.rs#L28)
 — a sorted code set, or a half-open code range. Codes are lexicographic ranks
 ([file-format.md §5](file-format.md#5-the-dictionary-child)), so a range is
 what a term prefix maps to: `prefix_range("<http://ex.org/")` is every IRI of
@@ -1140,7 +1143,7 @@ residual filter of [§7](#7-stage-3-the-residual-filter). On a file a range
 becomes a pushed-down filter (`col >= lo AND col < hi`, ANDed onto whatever
 the view carried, so the scan prunes by it) and a set is resolved to row ids
 by one ordered scan projecting only that column
-([`file_column_ids`](../core/src/store/pushdown.rs#L279)); tombstones and the
+([`file_column_ids`](../core/src/store/pushdown.rs#L287)); tombstones and the
 view's own filter stay with the reads. Keeps need every row to be
 code-addressable: they apply to the Dictionary layout only, and a view with
 an append tail (whose terms have no codes) is rejected — compact first.
@@ -1148,10 +1151,10 @@ an append tail (whose terms have no codes) is rejected — compact first.
 ### 16.4 Term predicates
 
 A `FILTER` over one variable is decided term by term, and a dictionary
-holds each term once. [`DictSnapshot::filter_codes`](../core/src/store/layouts/dictionary/term_dict.rs#L812)
+holds each term once. [`DictSnapshot::filter_codes`](../core/src/store/layouts/dictionary/term_dict.rs#L919)
 evaluates a [`TermPredicate`](../core/src/store/layouts/dictionary/predicates.rs#L69)
 over the whole dictionary in one pass — memoized per predicate for the
-dictionary's lifetime ([`filter_codes`](../core/src/store/layouts/dictionary/term_dict.rs#L502))
+dictionary's lifetime ([`filter_codes`](../core/src/store/layouts/dictionary/term_dict.rs#L611))
 — and returns two ascending code sets: the codes the predicate definitely
 holds for, and the codes it cannot decide. Every other code is definitely
 false. The true set feeds `keep`; the undecided set is what the caller
@@ -1176,7 +1179,7 @@ is conservative by construction: anything this evaluator cannot settle
 exactly is handed back rather than guessed.
 
 Beside it, `encode` became spelling-tolerant
-([`encode_tolerant`](../core/src/store/layouts/dictionary/term_dict.rs#L535)):
+([`encode_tolerant`](../core/src/store/layouts/dictionary/term_dict.rs#L642)):
 an exact lookup first, then the term's canonical N-Triples form (an
 `xsd:string`-typed literal is a plain one), so a caller's own rendering of a
 term still resolves; `encode_many` batches it.

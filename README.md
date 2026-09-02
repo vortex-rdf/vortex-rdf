@@ -142,6 +142,7 @@ for await (const quad of store.match(null, 'http://ex/p', null, null)) {
 | [docs/serialization.md](docs/serialization.md) | how a store is built and written: both sort pipelines, columns per layout, index builds |
 | [docs/mutations.md](docs/mutations.md) | the merge-on-read model: tail, tombstones, compaction and auto-compaction |
 | [docs/arrow.md](docs/arrow.md) | the Arrow interface: quad batches per encoding, the dictionary export, the Python PyCapsule and JavaScript IPC surfaces |
+| [docs/memory.md](docs/memory.md) | what a store holds resident in each form, and every cache and memo it keeps: what fills it, its bound, when it is freed |
 | [js/README.md](js/README.md) | the JavaScript/WebAssembly bindings |
 | [python/README.md](python/README.md) | the Python bindings |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | git hooks, the local CI mirror, doc-anchor checks, changelog generation |

@@ -405,11 +405,11 @@ trees.
 ## 9. The in-memory twin
 
 A store in memory holds the same three pieces the file does, in the forms the
-read paths are written against ([`QuadsSource`](../core/src/store/source.rs#L35)):
+read paths are written against ([`QuadsSource`](../core/src/store/source.rs#L36)):
 
 | In the file | In memory |
 |---|---|
-| `quad-source` child | `base: ArrayRef` — one struct, columns in the *compressed-resident* form: each `u32` column `Constant`, `RunEnd` or bit-packed, behind a `vortex.shared` wrapper whose cache holds the decoded primitive once a bulk read needs it |
+| `quad-source` child | `base: ArrayRef` — one struct; built in this process, its `u32` columns are flat canonical primitives; adopted from bytes or a file, they keep the writer's encodings, and a bulk code read goes through the base's live canonical cache ([memory.md](memory.md)) |
 | `quads_sorted` | the `IsSorted` stamp on the `s` column |
 | `index:*` children | `components: Arc<[IndexComponent]>` — the same rows under the same column names, with the descriptor's `sorted` flag; adopted from bytes they stay deferred until first use |
 | `dictionary` child | `ResolvedLayout::Dictionary(DictAccess::Resident \| FileBacked)` |
@@ -491,5 +491,5 @@ open rather than being read around.
 | Index children: schemas, sort orders, registry, adoption | [`core/src/store/indexes/secondary_by_copy.rs`](../core/src/store/indexes/secondary_by_copy.rs), [`secondary_by_reference.rs`](../core/src/store/indexes/secondary_by_reference.rs), [`components.rs`](../core/src/store/indexes/components.rs) |
 | Chunk probes over wire-encoded leaves | [`encoded-search/src/layout.rs`](../encoded-search/src/layout.rs), [`lib.rs`](../encoded-search/src/lib.rs) |
 | Locating and point-reading index runs on file | [`core/src/store/indexes/row_ids.rs`](../core/src/store/indexes/row_ids.rs), [`scan/gather.rs`](../core/src/store/scan/gather.rs) |
-| In-memory forms: compressed-resident columns, probes, view state | [`core/src/store/array.rs`](../core/src/store/array.rs), [`probes.rs`](../core/src/store/probes.rs), [`source.rs`](../core/src/store/source.rs) |
+| In-memory forms: canonical and encoded columns, probes, the live canonical cache, view state | [`core/src/store/array.rs`](../core/src/store/array.rs), [`canonical.rs`](../core/src/store/canonical.rs), [`probes.rs`](../core/src/store/probes.rs), [`source.rs`](../core/src/store/source.rs) |
 | Session: registered encodings and zone aggregates | [`core/src/session.rs`](../core/src/session.rs) |
