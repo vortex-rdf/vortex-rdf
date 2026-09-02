@@ -15,7 +15,7 @@ use std::sync::Arc;
 use arrow_array::builder::StringViewBuilder;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt32Type;
-use arrow_array::{ArrayRef as ArrowArrayRef, DictionaryArray, RecordBatch};
+use arrow_array::{ArrayRef as ArrowArrayRef, DictionaryArray, RecordBatch, UInt32Array};
 use arrow_schema::SchemaRef;
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt, future, stream};
@@ -23,6 +23,7 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::StructArray;
 use vortex_array::{ArrayRef, VortexSessionExecute};
 use vortex_arrow::primitive::canonical_primitive_to_arrow;
+use vortex_buffer::Buffer;
 
 use crate::arrow::{QuadBatches, QuadColumn, TermEncoding, arrow_err, projected_schema, quad_schema};
 use crate::error::{Result, VortexRdfError};
@@ -97,11 +98,25 @@ impl VortexRdfStore {
                     .to_string(),
             ));
         }
-        let names: Vec<&'static str> = columns.iter().map(|c| c.name()).collect();
-        let chunks = self.primary_chunks(&names).await?;
-        let batch_schema = schema.clone();
-        let batches = chunks
-            .map(move |chunk| code_chunk_to_batch(&chunk?, &batch_schema, &columns, values.as_ref()));
+        // An in-memory view whose codes `code_columns` serves hands out those
+        // very buffers (the canonical form it caches behind a wrapped base);
+        // anything else reads the primary chunks.
+        let batches: BoxStream<'static, Result<RecordBatch>> = match self.code_columns() {
+            Some(buffers) => {
+                let batch = code_buffers_to_batch(&buffers, &schema, &columns, values.as_ref())?;
+                stream::once(future::ready(Ok(batch))).boxed()
+            }
+            None => {
+                let names: Vec<&'static str> = columns.iter().map(|c| c.name()).collect();
+                let chunks = self.primary_chunks(&names).await?;
+                let batch_schema = schema.clone();
+                chunks
+                    .map(move |chunk| {
+                        code_chunk_to_batch(&chunk?, &batch_schema, &columns, values.as_ref())
+                    })
+                    .boxed()
+            }
+        };
         Ok(QuadBatches::new(schema, non_empty(batches)))
     }
 
@@ -155,6 +170,26 @@ impl VortexRdfStore {
     }
 }
 
+/// The four served code buffers as a record batch over `schema`'s columns,
+/// each an Arrow `UInt32` array sharing the buffer, or those keys over
+/// `values` as a dictionary array.
+fn code_buffers_to_batch(
+    buffers: &[Buffer<u32>; 4],
+    schema: &SchemaRef,
+    columns: &[QuadColumn],
+    values: Option<&ArrowArrayRef>,
+) -> Result<RecordBatch> {
+    let arrays = columns
+        .iter()
+        .map(|column| {
+            let buffer = buffers[column.index()].clone();
+            let keys: ArrowArrayRef = Arc::new(UInt32Array::new(buffer.into_arrow_scalar_buffer(), None));
+            keyed(keys, values)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new(schema.clone(), arrays).map_err(arrow_err)
+}
+
 /// One `u32` primary-column chunk as a record batch over `schema`'s columns,
 /// each column an Arrow `UInt32` array sharing the chunk's buffer, or those
 /// keys over `values` as a dictionary array.
@@ -174,18 +209,23 @@ fn code_chunk_to_batch(
         let codes = field_as::<PrimitiveArray>(&rows, column.name(), &mut ctx)?;
         let keys = canonical_primitive_to_arrow::<UInt32Type>(codes, &mut ctx)
             .map_err(VortexRdfError::Vortex)?;
-        arrays.push(match values {
-            None => keys,
-            Some(values) => Arc::new(
-                DictionaryArray::<UInt32Type>::try_new(
-                    keys.as_primitive::<UInt32Type>().clone(),
-                    values.clone(),
-                )
-                .map_err(arrow_err)?,
-            ),
-        });
+        arrays.push(keyed(keys, values)?);
     }
     RecordBatch::try_new(schema.clone(), arrays).map_err(arrow_err)
+}
+
+/// `keys` as they are, or as dictionary keys over `values`.
+fn keyed(keys: ArrowArrayRef, values: Option<&ArrowArrayRef>) -> Result<ArrowArrayRef> {
+    match values {
+        None => Ok(keys),
+        Some(values) => Ok(Arc::new(
+            DictionaryArray::<UInt32Type>::try_new(
+                keys.as_primitive::<UInt32Type>().clone(),
+                values.clone(),
+            )
+            .map_err(arrow_err)?,
+        )),
+    }
 }
 
 /// One decoded chunk as a record batch of `Utf8View` columns.

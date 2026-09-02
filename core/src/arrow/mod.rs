@@ -124,6 +124,30 @@ impl QuadColumn {
     }
 }
 
+/// The column's serialized name — the spelling [`FromStr`](std::str::FromStr)
+/// accepts, so projections cross every frontend as plain names.
+impl std::fmt::Display for QuadColumn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Accepts exactly the serialized column names `"s"`, `"p"`, `"o"`, `"g"`.
+impl std::str::FromStr for QuadColumn {
+    type Err = VortexRdfError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        QuadColumn::ALL
+            .into_iter()
+            .find(|column| column.name() == s)
+            .ok_or_else(|| {
+                VortexRdfError::InvalidOperation(format!(
+                    "unknown quad column {s:?}; expected \"s\", \"p\", \"o\" or \"g\""
+                ))
+            })
+    }
+}
+
 /// The Arrow schema of a quad record batch under `layout` × `encoding`:
 /// the four non-nullable primary columns (`s`, `p`, `o`, `g`), each typed per
 /// [`TermEncoding`], plus the `vortex_rdf.*` metadata entries.
@@ -300,6 +324,8 @@ mod tests {
         assert_eq!(QuadColumn::ALL.map(QuadColumn::name), PRIMARY_COLUMNS);
         for (i, column) in QuadColumn::ALL.into_iter().enumerate() {
             assert_eq!(column.index(), i);
+            assert_eq!(column.to_string().parse::<QuadColumn>().unwrap(), column);
         }
+        assert!("S".parse::<QuadColumn>().is_err());
     }
 }

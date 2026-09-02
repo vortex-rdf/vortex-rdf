@@ -100,18 +100,21 @@ async fn store(quads: Vec<Quad>, layout: LayoutStrategy) -> VortexRdfStore {
         .unwrap()
 }
 
-/// A full in-memory Dictionary store exports its code columns as the base's
-/// own buffers: the same values, at the same addresses.
+/// A full in-memory Dictionary store exports its code columns as the very
+/// buffers `code_columns` serves: the same values, at the same addresses.
+/// A store adopted from bytes keeps its base wire-encoded, so no reader can
+/// share a canonical buffer there; its export still equals the gathered
+/// codes.
 #[tokio::test]
 async fn codes_share_the_base_buffers_of_a_full_dictionary_store() {
-    let store = store(modular_quads(50, 5, 7), LayoutStrategy::Dictionary).await;
-    let expected = store
+    let built = store(modular_quads(50, 5, 7), LayoutStrategy::Dictionary).await;
+    let expected = built
         .code_columns()
-        .expect("a full in-memory dictionary store serves its codes");
-    let (schema, batches) = batches(&store, TermEncoding::Codes, None).await;
+        .expect("a full built dictionary store serves its codes");
+    let (schema, built_batches) = batches(&built, TermEncoding::Codes, None).await;
     assert_eq!(schema.metadata()[META_TERM_ENCODING], "codes");
-    assert_eq!(batches.len(), 1);
-    let batch = &batches[0];
+    assert_eq!(built_batches.len(), 1);
+    let batch = &built_batches[0];
     assert_eq!(batch.num_rows(), 50);
     for (i, buffer) in expected.iter().enumerate() {
         let column = batch.column(i).as_primitive::<UInt32Type>();
@@ -119,8 +122,18 @@ async fn codes_share_the_base_buffers_of_a_full_dictionary_store() {
         assert_eq!(
             column.values().as_ptr(),
             buffer.as_slice().as_ptr(),
-            "column {i} must share the base buffer"
+            "column {i} must share the served buffer"
         );
+    }
+
+    let adopted = VortexRdfStore::from_bytes_owned(built.to_bytes().await.unwrap())
+        .await
+        .unwrap();
+    let gathered = adopted.code_columns_gathered().await.unwrap().unwrap();
+    let (_, adopted_batches) = batches(&adopted, TermEncoding::Codes, None).await;
+    let columns = code_columns_of(&adopted_batches);
+    for (i, buffer) in gathered.iter().enumerate() {
+        assert_eq!(columns[i], buffer.as_slice(), "adopted: column {i}");
     }
 }
 
