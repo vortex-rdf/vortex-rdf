@@ -21,7 +21,7 @@ is fixed by its provenance:
 | Form | Comes from | The base | Index components | Dictionary |
 |---|---|---|---|---|
 | **Built** | [`from_quads`](../core/src/store/mod.rs#L195), [`from_built`](../core/src/store/mod.rs#L257), compaction's rebuild ([`from_raw_quads`](../core/src/store/compaction.rs#L146)) | one struct whose `u32` code columns are flat canonical primitives ([`with_canonical_int_children`](../core/src/store/array.rs#L289)) | compressed into probe-supported encodings — `Constant`, `RunEnd`, bit-packed ([`with_compressed_int_children`](../core/src/store/array.rs#L311)) | one canonical `string_view` column, as the builder froze it ([`from_sorted_column`](../core/src/store/layouts/dictionary/term_dict.rs#L350)); FSST windows are made at write ([`fsst_windows`](../core/src/store/layouts/dictionary/term_dict.rs#L452)) |
-| **Adopted** | [`from_bytes`](../core/src/store/open.rs#L264), [`from_parts`](../core/src/store/mod.rs#L234) — the bindings' `in_memory=True` / `fromBytes` | the writer's own encodings, as refcounted views into the file bytes ([`with_searchable_int_children`](../core/src/store/array.rs#L278)) | `from_parts`: the writer's encodings, made probeable ([`into_searchable`](../core/src/store/indexes/components.rs#L352)); `from_bytes`: deferred, un-executed until first use | as written — FSST chunks inside the bytes, anything else canonicalized — or, with `dictionary='plaintext'`, decoded once into one canonical column ([`DictForm`](../core/src/store/layouts/dictionary/term_dict.rs#L88)) |
+| **Adopted** | [`from_bytes`](../core/src/store/open.rs#L264), [`from_parts`](../core/src/store/mod.rs#L234) — the bindings' `in_memory=True` / `fromBytes` | the writer's own encodings, as refcounted views into the file bytes ([`with_searchable_int_children`](../core/src/store/array.rs#L278)) | `from_parts`: the writer's encodings, made probeable ([`into_searchable`](../core/src/store/indexes/components.rs#L352)); `from_bytes`: deferred, un-executed until first use | decoded once into one canonical column — the bindings' default, `dictionary='plaintext'` — or, as written, the FSST chunks inside the bytes, anything else canonicalized ([`DictForm`](../core/src/store/layouts/dictionary/term_dict.rs#L88)) |
 | **File-backed** | [`from_file`](../core/src/store/open.rs#L132) | nothing resident — every read scans the file and is transient (the file is opened with no decoded-data cache) | on disk, resolved through pushed-down scans and cached chunk probes | resident, or left in the file and point-read by leaf when it outweighs the residency budget |
 
 The rule behind the split is provenance, not policy. Where the store makes
@@ -37,9 +37,10 @@ The dictionary follows the same rule with one difference: nothing binds a
 compressed dictionary at the speed of a plaintext one. Every probe, every
 decode, every predicate pass and every `terms` export reads it, and an FSST
 chunk decodes on each of those reads, so a built dictionary is held as the
-canonical column the builder froze, and an adopted store may ask for the
-same form up front (`dictionary='plaintext'`) instead of keeping the file's
-FSST chunks and decoding on demand.
+canonical column the builder froze, and the bindings' in-memory opens
+decode an adopted dictionary into the same form up front by default
+(`dictionary='plaintext'`); `'as-written'` keeps the file's FSST chunks and
+decodes on demand, the lean load.
 
 ### 1.1 Measured
 

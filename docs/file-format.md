@@ -252,10 +252,10 @@ sum, no I/O) with a budget:
 - **Resident** (within budget): one scan of the child lifts it into memory,
   keeping every window FSST-compressed. Term → code is a binary search that
   decodes one term per step (FSST is not order-preserving, so the search
-  cannot run on the compressed bytes); code → term is a positional read. An
-  in-memory open (`from_bytes`, the bindings' `in_memory=True`) may instead
-  decode the column once into one canonical chunk that every read then uses
-  in place ([`DictForm`](../core/src/store/layouts/dictionary/term_dict.rs#L88),
+  cannot run on the compressed bytes); code → term is a positional read. The
+  bindings' in-memory opens (`fromBytes`, `in_memory=True`, `from_bytes`)
+  instead decode the column once, by default, into one canonical chunk that
+  every read then uses in place ([`DictForm`](../core/src/store/layouts/dictionary/term_dict.rs#L88),
   `dictionary='plaintext'`).
 - **File-backed** (over budget): the terms stay in the file.
   [`TermChunks`](../core/src/store/layouts/dictionary/file_backed.rs#L46)
@@ -397,7 +397,7 @@ The pattern `(? ? ex:alice ?)` becomes: code of `<http://example.org/alice>`
 | `from_file` | the file tail: postscript, footer, dtype, layout tree with its JSON inventory. Every descriptor is classified; an unknown required one fails here. Under `Dictionary`, the residency decision runs ([§5](#5-the-dictionary-child)) — a dictionary within budget is the one thing scanned at open. Index children are not touched. |
 | a query | the zone-map tables the filter needs, the chunk leaves a probe bisects, then the leaves of the rows the scan finally decodes — or, on a served match, the index child's own run |
 | `size()` on a pending filter | statistics and filter masks only; no row is projected |
-| `from_bytes` / `fromBytes` | everything: the quad table is scanned into memory, the subject stamp is restored from `quads_sorted`, the dictionary is lifted (as written — still FSST — or decoded once to one canonical column with `dictionary='plaintext'`), and each index child is adopted by its reader with nothing read — it is scanned and canonicalized on its first use |
+| `from_bytes` / `fromBytes` | everything: the quad table is scanned into memory, the subject stamp is restored from `quads_sorted`, the dictionary is lifted (decoded once to one canonical column by default in the bindings, `dictionary='plaintext'`; as written — still FSST — on request, and in the Rust `from_bytes`), and each index child is adopted by its reader with nothing read — it is scanned and canonicalized on its first use |
 
 The opened handle ([`NativeStoreFile`](../core/src/store/native_file.rs#L30))
 keeps what repeated queries reuse: the layout reader tree (so zone-map tables
