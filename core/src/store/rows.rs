@@ -422,8 +422,10 @@ impl VortexRdfStore {
         deleted: Option<&Mask>,
         columns: &[&str],
     ) -> Result<ScanBuilder<ArrayRef>> {
-        let proj: Vec<vortex_array::dtype::FieldName> =
-            columns.iter().map(|c| vortex_array::dtype::FieldName::from(*c)).collect();
+        let proj: Vec<vortex_array::dtype::FieldName> = columns
+            .iter()
+            .map(|c| vortex_array::dtype::FieldName::from(*c))
+            .collect();
         let mut scan = file.scan().map_err(VortexRdfError::Vortex)?;
         // The scan's scope (the quad-source root dtype) is what filters and
         // projections bind against — read it before the projection replaces
@@ -498,9 +500,9 @@ fn select_codes(
                 let slice = column.as_slice();
                 let live = |i: usize| !deleted.value(i);
                 match selection {
-                    RowSelection::All => Buffer::from_iter(
-                        (0..slice.len()).filter(|&i| live(i)).map(|i| slice[i]),
-                    ),
+                    RowSelection::All => {
+                        Buffer::from_iter((0..slice.len()).filter(|&i| live(i)).map(|i| slice[i]))
+                    }
                     RowSelection::Range(r) => Buffer::from_iter(
                         (r.start as usize..r.end as usize)
                             .filter(|&i| live(i))

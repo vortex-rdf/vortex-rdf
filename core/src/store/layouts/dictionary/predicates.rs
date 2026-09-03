@@ -184,7 +184,11 @@ impl fmt::Display for TermPredicate {
             TermPredicate::LangMatches(range) => write!(f, "lang_matches({range:?})"),
             TermPredicate::StrPrefix(prefix) => write!(f, "str_prefix({prefix:?})"),
             TermPredicate::Num(op, constant) => {
-                write!(f, "num_{op:?}(\"{}\"^^<{}>)", constant.lex, constant.datatype)
+                write!(
+                    f,
+                    "num_{op:?}(\"{}\"^^<{}>)",
+                    constant.lex, constant.datatype
+                )
             }
         }
     }
@@ -411,7 +415,9 @@ fn parse_int(s: &str) -> Option<i128> {
     for byte in digits.bytes() {
         match byte {
             b'0'..=b'9' => {
-                value = value.checked_mul(10)?.checked_add(i128::from(byte - b'0'))?;
+                value = value
+                    .checked_mul(10)?
+                    .checked_add(i128::from(byte - b'0'))?;
                 previous_digit = true;
             }
             b'_' if previous_digit => previous_digit = false,
@@ -443,7 +449,11 @@ fn parse_decimal(s: &str) -> Option<Num> {
     let mut unscaled: i128 = 0;
     for byte in int_part.bytes().chain(frac_part.bytes()) {
         match byte {
-            b'0'..=b'9' => unscaled = unscaled.checked_mul(10)?.checked_add(i128::from(byte - b'0'))?,
+            b'0'..=b'9' => {
+                unscaled = unscaled
+                    .checked_mul(10)?
+                    .checked_add(i128::from(byte - b'0'))?
+            }
             _ => return None,
         }
     }
@@ -539,7 +549,11 @@ fn num_verdict(op: NumOp, constant: &NumConst, view: &View<'_>) -> Verdict {
 /// The reference `langMatches` range check: lowercase subtags, `*`
 /// matching any, the range no longer than the tag.
 fn lang_range_check(range: &str, lang: &str) -> bool {
-    let range: Vec<String> = range.to_lowercase().split('-').map(str::to_string).collect();
+    let range: Vec<String> = range
+        .to_lowercase()
+        .split('-')
+        .map(str::to_string)
+        .collect();
     let lang: Vec<String> = lang.to_lowercase().split('-').map(str::to_string).collect();
     let matches = |r: &str, l: &str| r == "*" || r == l;
     if !matches(&range[0], &lang[0]) || range.len() > lang.len() {
@@ -656,7 +670,10 @@ mod tests {
         assert_eq!(dt.eval("\"x\""), Verdict::True);
         assert_eq!(dt.eval(&format!("\"1\"^^<{INT}>")), Verdict::False);
         assert_eq!(dt.eval("\"x\"@en"), Verdict::False);
-        assert_eq!(pred("datatype", RDF_LANG_STRING).eval("\"x\"@en"), Verdict::True);
+        assert_eq!(
+            pred("datatype", RDF_LANG_STRING).eval("\"x\"@en"),
+            Verdict::True
+        );
         assert_eq!(dt.eval("<http://x>"), Verdict::Unknown);
 
         let lang = pred("lang", "en");
@@ -673,7 +690,10 @@ mod tests {
         assert_eq!(matches.eval("\"x\""), Verdict::False);
         assert_eq!(pred("lang_matches", "*").eval("\"x\"@fr"), Verdict::True);
         assert_eq!(pred("lang_matches", "*").eval("\"x\""), Verdict::False);
-        assert_eq!(pred("lang_matches", "en-gb-x").eval("\"x\"@en-GB"), Verdict::False);
+        assert_eq!(
+            pred("lang_matches", "en-gb-x").eval("\"x\"@en-GB"),
+            Verdict::False
+        );
         assert_eq!(matches.eval("<http://x>"), Verdict::Unknown);
 
         let prefix = pred("str_prefix", "http://ex.org/");
@@ -683,8 +703,14 @@ mod tests {
         assert_eq!(pred("str_prefix", "A").eval("\"Alice\""), Verdict::True);
         assert_eq!(pred("str_prefix", "A").eval("\"Alice\"@en"), Verdict::True);
         assert_eq!(pred("str_prefix", "A").eval("\"alice\""), Verdict::False);
-        assert_eq!(pred("str_prefix", "a\"b").eval("\"a\\\"bc\""), Verdict::True);
-        assert_eq!(pred("str_prefix", "4").eval(&format!("\"42\"^^<{INT}>")), Verdict::Unknown);
+        assert_eq!(
+            pred("str_prefix", "a\"b").eval("\"a\\\"bc\""),
+            Verdict::True
+        );
+        assert_eq!(
+            pred("str_prefix", "4").eval(&format!("\"42\"^^<{INT}>")),
+            Verdict::Unknown
+        );
     }
 
     #[test]
@@ -692,9 +718,18 @@ mod tests {
         let gt40 = pred("num_gt", "40");
         assert_eq!(gt40.eval(&format!("\"42\"^^<{INT}>")), Verdict::True);
         assert_eq!(gt40.eval(&format!("\"40\"^^<{INT}>")), Verdict::False);
-        assert_eq!(gt40.eval("\"41.5\"^^<http://www.w3.org/2001/XMLSchema#decimal>"), Verdict::True);
-        assert_eq!(gt40.eval("\"4e1\"^^<http://www.w3.org/2001/XMLSchema#double>"), Verdict::False);
-        assert_eq!(gt40.eval("\"NaN\"^^<http://www.w3.org/2001/XMLSchema#double>"), Verdict::False);
+        assert_eq!(
+            gt40.eval("\"41.5\"^^<http://www.w3.org/2001/XMLSchema#decimal>"),
+            Verdict::True
+        );
+        assert_eq!(
+            gt40.eval("\"4e1\"^^<http://www.w3.org/2001/XMLSchema#double>"),
+            Verdict::False
+        );
+        assert_eq!(
+            gt40.eval("\"NaN\"^^<http://www.w3.org/2001/XMLSchema#double>"),
+            Verdict::False
+        );
         // A different datatype orders by its IRI: xsd:string > xsd:integer.
         assert_eq!(gt40.eval("\"Alice\""), Verdict::True);
         assert_eq!(pred("num_lt", "40").eval("\"Alice\""), Verdict::False);
@@ -702,25 +737,40 @@ mod tests {
         assert_eq!(gt40.eval(&format!("\"forty\"^^<{INT}>")), Verdict::Unknown);
         // Out of the datatype's bounds: not a numeric value; same datatype as
         // an integer constant? No — xsd:byte orders below xsd:integer.
-        assert_eq!(gt40.eval("\"300\"^^<http://www.w3.org/2001/XMLSchema#byte>"), Verdict::False);
+        assert_eq!(
+            gt40.eval("\"300\"^^<http://www.w3.org/2001/XMLSchema#byte>"),
+            Verdict::False
+        );
         assert_eq!(gt40.eval("<http://x>"), Verdict::Unknown);
 
         let eq42 = pred("num_eq", &format!("\"42\"^^<{INT}>"));
         assert_eq!(eq42.eval(&format!("\"42\"^^<{INT}>")), Verdict::True);
         assert_eq!(eq42.eval(&format!("\"042\"^^<{INT}>")), Verdict::True);
-        assert_eq!(eq42.eval("\"42.0\"^^<http://www.w3.org/2001/XMLSchema#decimal>"), Verdict::True);
+        assert_eq!(
+            eq42.eval("\"42.0\"^^<http://www.w3.org/2001/XMLSchema#decimal>"),
+            Verdict::True
+        );
         assert_eq!(eq42.eval("\"42\""), Verdict::False);
         assert_eq!(eq42.eval("\"42\"@en"), Verdict::False);
         assert_eq!(eq42.eval("<http://x>"), Verdict::False);
         assert_eq!(pred("num_ne", "42").eval("<http://x>"), Verdict::True);
-        assert_eq!(eq42.eval(&format!("\"forty-two\"^^<{INT}>")), Verdict::Unknown);
+        assert_eq!(
+            eq42.eval(&format!("\"forty-two\"^^<{INT}>")),
+            Verdict::Unknown
+        );
 
         let le = pred("num_le", "1.5");
         assert_eq!(le.eval(&format!("\"1\"^^<{INT}>")), Verdict::True);
         assert_eq!(le.eval(&format!("\"2\"^^<{INT}>")), Verdict::False);
-        assert_eq!(pred("num_ge", "1.5").eval("\"1.5\"^^<http://www.w3.org/2001/XMLSchema#decimal>"), Verdict::True);
+        assert_eq!(
+            pred("num_ge", "1.5").eval("\"1.5\"^^<http://www.w3.org/2001/XMLSchema#decimal>"),
+            Verdict::True
+        );
         // A float against a fractional decimal is not decided exactly here.
-        assert_eq!(pred("num_lt", "0.1").eval("\"0.1\"^^<http://www.w3.org/2001/XMLSchema#double>"), Verdict::Unknown);
+        assert_eq!(
+            pred("num_lt", "0.1").eval("\"0.1\"^^<http://www.w3.org/2001/XMLSchema#double>"),
+            Verdict::Unknown
+        );
         assert!(TermPredicate::parse("num_gt", "forty").is_err());
         assert!(TermPredicate::parse("is_prime", "").is_err());
     }

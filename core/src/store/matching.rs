@@ -77,9 +77,11 @@ impl VortexRdfStore {
     /// in-memory match simply runs to completion when polled. A failing
     /// pattern fails the whole call.
     pub async fn match_pattern_many(&self, patterns: &[Pattern]) -> Result<Vec<Self>> {
-        futures::future::try_join_all(patterns.iter().map(|(s, p, o, g)| {
-            self.match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
-        }))
+        futures::future::try_join_all(
+            patterns.iter().map(|(s, p, o, g)| {
+                self.match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+            }),
+        )
         .await
     }
 

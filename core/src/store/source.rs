@@ -9,8 +9,8 @@ use vortex_array::ArrayRef;
 use vortex_mask::Mask;
 
 use crate::error::Result;
-use crate::store::indexes::{InMemoryServePlan, IndexComponent};
 use crate::store::canonical::LiveCanonical;
+use crate::store::indexes::{InMemoryServePlan, IndexComponent};
 use crate::store::probes::StructProbes;
 use crate::store::scan::gather::gather_live;
 use crate::store::selection::{RowSelection, ViewSelection};

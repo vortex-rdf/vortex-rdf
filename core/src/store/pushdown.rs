@@ -13,11 +13,11 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_buffer::Buffer;
 
-use crate::store::arrow::QuadColumn;
 use crate::error::{Result, VortexRdfError};
 #[cfg(feature = "file-io")]
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{canonical_u32, into_struct_array};
+use crate::store::arrow::QuadColumn;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_scan;
 use crate::store::selection::{RowSelection, ViewSelection};
@@ -147,9 +147,12 @@ impl VortexRdfStore {
             } else {
                 (offset - base_live, limit)
             };
-            let (window, _) =
-                tail.selection
-                    .window(tail.deleted.as_ref(), tail.rows.len(), tail_offset, tail_limit);
+            let (window, _) = tail.selection.window(
+                tail.deleted.as_ref(),
+                tail.rows.len(),
+                tail_offset,
+                tail_limit,
+            );
             tail.with_selection(window)
         });
         Ok(Self {
@@ -255,9 +258,7 @@ impl VortexRdfStore {
                         (Some(filter), selection)
                     }
                     Keep::Set(_) => {
-                        let ids = self
-                            .file_column_ids(file, &selection, column, keep)
-                            .await?;
+                        let ids = self.file_column_ids(file, &selection, column, keep).await?;
                         (filter.clone(), ids_selection(ids))
                     }
                 };

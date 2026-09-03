@@ -185,7 +185,10 @@ pub fn quad_schema(layout: LayoutStrategy, encoding: TermEncoding) -> Result<Sch
     let metadata = HashMap::from([
         (META_LAYOUT.to_string(), layout.to_string()),
         (META_TERM_ENCODING.to_string(), encoding.to_string()),
-        (META_VERSION.to_string(), env!("CARGO_PKG_VERSION").to_string()),
+        (
+            META_VERSION.to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ),
         (META_DEFAULT_GRAPH.to_string(), String::new()),
     ]);
     Ok(Arc::new(Schema::new_with_metadata(fields, metadata)))
@@ -303,7 +306,11 @@ mod tests {
 
     #[test]
     fn unservable_combinations_error() {
-        for encoding in [TermEncoding::Codes, TermEncoding::Terms, TermEncoding::Strings] {
+        for encoding in [
+            TermEncoding::Codes,
+            TermEncoding::Terms,
+            TermEncoding::Strings,
+        ] {
             assert!(quad_schema(LayoutStrategy::TypedObject, encoding).is_err());
         }
         for encoding in [TermEncoding::Codes, TermEncoding::Terms] {
@@ -313,8 +320,15 @@ mod tests {
 
     #[test]
     fn canonical_names_round_trip() {
-        for encoding in [TermEncoding::Codes, TermEncoding::Terms, TermEncoding::Strings] {
-            assert_eq!(encoding.to_string().parse::<TermEncoding>().unwrap(), encoding);
+        for encoding in [
+            TermEncoding::Codes,
+            TermEncoding::Terms,
+            TermEncoding::Strings,
+        ] {
+            assert_eq!(
+                encoding.to_string().parse::<TermEncoding>().unwrap(),
+                encoding
+            );
         }
         assert!("Codes".parse::<TermEncoding>().is_err());
     }

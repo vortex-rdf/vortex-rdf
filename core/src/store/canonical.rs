@@ -49,7 +49,9 @@ impl LiveCanonical {
     /// currently alive, else decoded from `col` now. The returned buffer, and
     /// every slice taken from it, keeps the decoded column alive.
     pub(crate) fn column(&self, idx: usize, col: &ArrayRef) -> Result<Buffer<u32>> {
-        let mut slot = self.slots[idx].lock().unwrap_or_else(PoisonError::into_inner);
+        let mut slot = self.slots[idx]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(owner) = slot.upgrade() {
             return Ok(Self::handle(owner));
         }
@@ -73,14 +75,18 @@ impl LiveCanonical {
     /// Column `idx`'s canonical buffer only if some holder keeps it alive;
     /// never decodes.
     pub(crate) fn column_if_alive(&self, idx: usize) -> Option<Buffer<u32>> {
-        let slot = self.slots[idx].lock().unwrap_or_else(PoisonError::into_inner);
+        let slot = self.slots[idx]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         slot.upgrade().map(Self::handle)
     }
 
     /// Whether column `idx`'s decoded form is currently held by some reader.
     #[cfg(test)]
     pub(crate) fn is_alive(&self, idx: usize) -> bool {
-        let slot = self.slots[idx].lock().unwrap_or_else(PoisonError::into_inner);
+        let slot = self.slots[idx]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         slot.strong_count() > 0
     }
 

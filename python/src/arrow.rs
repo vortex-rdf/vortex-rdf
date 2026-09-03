@@ -23,8 +23,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyTuple};
-use vortex_rdf_core::TermEncoding;
 use vortex_rdf_core::QuadBatches;
+use vortex_rdf_core::TermEncoding;
 
 use crate::{RUNTIME, VortexRdfError};
 
@@ -53,7 +53,11 @@ unsafe extern "C" fn release_capsule<T>(capsule: *mut ffi::PyObject) {
 
 /// A capsule named `name` whose pointer is the address of a boxed `value`,
 /// freed (and its `release` run, if still set) when the capsule dies.
-fn capsule<'py, T>(py: Python<'py>, value: T, name: &'static CStr) -> PyResult<Bound<'py, PyCapsule>> {
+fn capsule<'py, T>(
+    py: Python<'py>,
+    value: T,
+    name: &'static CStr,
+) -> PyResult<Bound<'py, PyCapsule>> {
     let pointer = NonNull::from(Box::leak(Box::new(value))).cast::<c_void>();
     // SAFETY: the pointer is a live leaked box that `release_capsule::<T>`
     // reclaims exactly once, at the capsule's finalization.
@@ -71,7 +75,10 @@ fn capsule<'py, T>(py: Python<'py>, value: T, name: &'static CStr) -> PyResult<B
 
 /// `array` as the `(schema, array)` capsule pair `__arrow_c_array__` returns:
 /// the C Data Interface export of the array, sharing its buffers.
-pub(crate) fn array_capsules<'py>(py: Python<'py>, array: &dyn Array) -> PyResult<Bound<'py, PyTuple>> {
+pub(crate) fn array_capsules<'py>(
+    py: Python<'py>,
+    array: &dyn Array,
+) -> PyResult<Bound<'py, PyTuple>> {
     let (ffi_array, ffi_schema) = to_ffi(&array.to_data()).map_err(arrow_err)?;
     let schema = capsule(py, ffi_schema, SCHEMA_CAPSULE)?;
     let array = capsule(py, ffi_array, ARRAY_CAPSULE)?;
@@ -163,7 +170,11 @@ impl ArrowQuadStream {
             schema: self.schema.clone(),
             batches,
         };
-        capsule(py, FFI_ArrowArrayStream::new(Box::new(reader)), STREAM_CAPSULE)
+        capsule(
+            py,
+            FFI_ArrowArrayStream::new(Box::new(reader)),
+            STREAM_CAPSULE,
+        )
     }
 
     fn __repr__(&self) -> String {

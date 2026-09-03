@@ -152,7 +152,12 @@ impl TermDict {
     /// typed by its syntax). One pass over the dictionary per predicate,
     /// memoized for the dictionary's lifetime. A bad `kind` or `arg`
     /// raises `ValueError`.
-    fn filter_codes(&self, py: Python<'_>, kind: &str, arg: &str) -> PyResult<(U32Column, U32Column)> {
+    fn filter_codes(
+        &self,
+        py: Python<'_>,
+        kind: &str,
+        arg: &str,
+    ) -> PyResult<(U32Column, U32Column)> {
         let predicate = TermPredicate::parse(kind, arg).map_err(parse_err)?;
         let (holds, unknown) = py
             .detach(|| self.snapshot.filter_codes(&predicate))
@@ -266,7 +271,8 @@ fn codes_from_arrow(codes: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
     };
     // SAFETY: `array` and `schema` describe one array the producer exported
     // through the protocol; both were moved out above and are consumed here.
-    let data = unsafe { from_ffi(array, &schema) }.map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let data =
+        unsafe { from_ffi(array, &schema) }.map_err(|e| PyValueError::new_err(e.to_string()))?;
     if data.data_type() != &DataType::UInt32 {
         return Err(PyValueError::new_err(format!(
             "expected a uint32 Arrow array of term codes, got {}",

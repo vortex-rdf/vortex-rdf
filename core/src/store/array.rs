@@ -309,8 +309,8 @@ pub(crate) fn with_canonical_int_children(rows: ArrayRef) -> Result<ArrayRef> {
 /// path anything. The primary base is held canonical instead
 /// ([`with_canonical_int_children`]).
 pub(crate) fn with_compressed_int_children(rows: ArrayRef) -> Result<ArrayRef> {
-    use vortex_array::arrays::struct_::StructArrayExt;
     use vortex_array::arrays::StructArray;
+    use vortex_array::arrays::struct_::StructArrayExt;
     use vortex_array::validity::Validity;
 
     if rows.dtype().is_nullable() {

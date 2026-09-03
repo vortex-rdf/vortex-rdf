@@ -25,12 +25,12 @@ use vortex_array::{ArrayRef, VortexSessionExecute};
 use vortex_arrow::primitive::canonical_primitive_to_arrow;
 use vortex_buffer::Buffer;
 
-use crate::store::arrow::{
-    QuadBatches, QuadColumn, TermEncoding, arrow_err, projected_schema, quad_schema,
-};
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::array::field_as;
+use crate::store::arrow::{
+    QuadBatches, QuadColumn, TermEncoding, arrow_err, projected_schema, quad_schema,
+};
 use crate::store::layouts::ResolvedLayout;
 use crate::store::{QuadsSource, SharedQuad, VortexRdfStore};
 
@@ -167,7 +167,9 @@ impl VortexRdfStore {
                     columns,
                 )?;
                 let chunks = scan.into_stream().map_err(VortexRdfError::Vortex)?;
-                Ok(chunks.map(|chunk| chunk.map_err(VortexRdfError::Vortex)).boxed())
+                Ok(chunks
+                    .map(|chunk| chunk.map_err(VortexRdfError::Vortex))
+                    .boxed())
             }
         }
     }
@@ -186,7 +188,8 @@ fn code_buffers_to_batch(
         .iter()
         .map(|column| {
             let buffer = buffers[column.index()].clone();
-            let keys: ArrowArrayRef = Arc::new(UInt32Array::new(buffer.into_arrow_scalar_buffer(), None));
+            let keys: ArrowArrayRef =
+                Arc::new(UInt32Array::new(buffer.into_arrow_scalar_buffer(), None));
             keyed(keys, values)
         })
         .collect::<Result<Vec<_>>>()?;
