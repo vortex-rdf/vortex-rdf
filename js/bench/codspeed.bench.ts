@@ -26,7 +26,7 @@ import { Bench, type BenchOptions } from 'tinybench';
 import { withCodSpeed } from '@codspeed/tinybench-plugin';
 import type { Quad } from '@rdfjs/types';
 
-import { VortexRdfStore, type BuildOptions } from '@vortex-rdf/vortex-rdf-store';
+import { VortexRdfStore, type BuildOptions } from '@vortex-rdf/vortex-rdf-store/arrow';
 // Only the pure bench modules are importable here — ./util.js and
 // ./datasets.js, the two with no store library behind them (see their purity
 // contracts); shared.ts loads oxigraph and rdf-stores at module scope, which
@@ -234,9 +234,10 @@ async function benchQuery(triples: Quad[], quads: Quad[]): Promise<void> {
 
 /** readpath::<variant> — the read entry points on the default store for one
  * selective pattern (S), isolating the boundary cost each carries: getQuads
- * (materialized array), match (lazy stream drain), matchArrowIPC (u32 code
- * columns as Arrow IPC bytes, no term strings). Directly supports read-path
- * tuning.
+ * (materialized array), match (lazy stream drain), matchArrow (u32 code
+ * columns as an Arrow table — zero-copy views under the resizable-buffer
+ * flag the runner passes, then freed — and its `toTable()` copy). Directly
+ * supports read-path tuning.
  *
  * The `_decoded` variants additionally read every term's `.value`. They are the
  * only benchmarks in this file that exercise term decoding at all — the others
@@ -256,7 +257,12 @@ async function benchReadPath(triples: Quad[], realistic: Quad[]): Promise<void> 
     await runGroup(READ_OPTS, (b) => {
         b.add('readpath::getQuads', async () => { await store.getQuads(p.s, p.p, p.o, p.g); });
         b.add('readpath::match_stream', async () => { await drain(store.match(p.s, p.p, p.o, p.g)); });
-        b.add('readpath::matchArrowIPC', async () => { store.matchArrowIPC(p.s, p.p, p.o, p.g); });
+        b.add('readpath::matchArrow', async () => { store.matchArrow(p.s, p.p, p.o, p.g).free(); });
+        b.add('readpath::matchArrow_toTable', async () => {
+            const view = store.matchArrow(p.s, p.p, p.o, p.g);
+            view.toTable();
+            view.free();
+        });
         b.add('readpath::getQuads_decoded', async () => {
             decodeAll(await store.getQuads(p.s, p.p, p.o, p.g));
         });

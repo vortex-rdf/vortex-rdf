@@ -6,11 +6,10 @@
 // an adopted store's footprint); the counting-allocator example
 // `core/examples/dict_memory.rs` gives the exact bytes.
 //
-//   BENCH_SIZE=262144 node --import tsx --expose-gc bench/dict-form.bench.ts
+//   BENCH_SIZE=262144 node --import tsx --expose-gc --experimental-wasm-rab-integration bench/dict-form.bench.ts
 import { Bench } from 'tinybench';
-import { tableFromIPC } from 'apache-arrow';
 
-import { VortexRdfStore, type DictForm } from '@vortex-rdf/vortex-rdf-store';
+import { VortexRdfStore, type DictForm } from '@vortex-rdf/vortex-rdf-store/arrow';
 import { FULL_SCAN_PATTERN, datasetProbes, genDataset, moduli, subjectTerm, type Pat } from './datasets.js';
 import { decodeAll, fmtNs } from './util.js';
 
@@ -58,11 +57,11 @@ for (const form of FORMS) {
     bench.add('getQuads S + decode', () => { decodeAll(store.getQuads(...args(S))); });
     bench.add('getQuads P + decode', () => { decodeAll(store.getQuads(...args(P))); });
     bench.add('getQuads full + decode', () => { decodeAll(store.getQuads(...args(FULL_SCAN_PATTERN))); });
-    bench.add('matchArrowIPC codes, full', () => {
-        tableFromIPC(store.matchArrowIPC(...args(FULL_SCAN_PATTERN), { encoding: 'codes' })).numRows;
+    bench.add('matchArrow codes, full', () => {
+        store.matchArrow(...args(FULL_SCAN_PATTERN), { encoding: 'codes' }).free();
     });
-    bench.add('matchArrowIPC terms, full', () => {
-        tableFromIPC(store.matchArrowIPC(...args(FULL_SCAN_PATTERN), { encoding: 'terms' })).numRows;
+    bench.add('matchArrow terms, full', () => {
+        store.matchArrow(...args(FULL_SCAN_PATTERN), { encoding: 'terms' }).free();
     });
     await bench.run();
     for (const task of bench.tasks) {

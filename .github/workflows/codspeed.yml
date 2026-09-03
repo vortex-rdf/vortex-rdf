@@ -109,7 +109,10 @@ jobs:
           # instruction-count swing on the build tasks at identical code.
           # Top-tier-only compilation is deterministic; its one-time lazy
           # compile cost is absorbed by the plugin's untimed warmup calls.
-          run: node --import tsx --expose-gc --no-liftoff bench/codspeed.bench.ts
+          # --experimental-wasm-rab-integration: resizable wasm buffers, so
+          # the readpath::matchArrow tasks measure the zero-copy path (the
+          # one browsers run) rather than the parse-time copy fallback.
+          run: node --import tsx --expose-gc --no-liftoff --experimental-wasm-rab-integration bench/codspeed.bench.ts
           working-directory: js
 
   python-benchmarks:

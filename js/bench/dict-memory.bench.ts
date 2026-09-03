@@ -85,8 +85,14 @@ const RATIOS = (process.env.DICT_MEM_RATIOS ?? '1.0').split(',').map(Number);
  *
  *  retainedPerStoreMb is a 4-point slope fit and carries ±2-3 MB of
  *  fragmentation noise between runs with identical store content; the
- *  high-water figures are the stable ones. */
-const REFERENCE = { retainedPerStoreMb: 15.0, firstStoreMb: 51, lastStoreMb: 97, stores: 4 };
+ *  high-water figures are the stable ones.
+ *
+ *  Measured 2026-09-04, when a built store started holding its dictionary as
+ *  one canonical `string_view` column (FSST applied at write only): 300,037
+ *  terms at ~36 B more per term than the FSST form — the retained figure was
+ *  15.0 MB per store and 97 MB at four stores before. The first-store figure
+ *  is the build transient's high-water mark and did not move. */
+const REFERENCE = { retainedPerStoreMb: 25.8, firstStoreMb: 51, lastStoreMb: 129, stores: 4 };
 
 /** Retained MB per store: the slope of linear memory against live store count. */
 function retainedPerStore(p: Point): number | null {

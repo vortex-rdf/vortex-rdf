@@ -23,7 +23,7 @@ Where the two suites cannot correspond:
   of its `fromQuads` variants, and the two are not comparable in absolute
   terms — only against themselves over time.
 * `match_arrow` reads the codes back through pyarrow, the boundary a query
-  layer crosses; JavaScript's `readpath::matchArrowIPC` is the IPC twin.
+  layer crosses; JavaScript's `readpath::matchArrow` is the zero-copy twin.
 
 Run locally (after `maturin develop`):
     uv run pytest bench/test_codspeed.py --codspeed
@@ -257,7 +257,7 @@ def test_readpath(benchmark, stores, op):
 
     `match_arrow` is the lazy one — u32 code columns read back through
     pyarrow, no term strings — the Python analogue of the JS suite's
-    `readpath::matchArrowIPC`. `get_quads` materializes terms, which in JS is
+    `readpath::matchArrow`. `get_quads` materializes terms, which in JS is
     `readpath::getQuads_decoded`; the bindings have no lazy quad object, so
     there is no undecoded `get_quads`.
     """
