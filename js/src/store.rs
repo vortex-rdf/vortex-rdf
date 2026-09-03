@@ -16,7 +16,9 @@ use wasm_bindgen_futures::future_to_promise;
 
 use crate::error::{js_err, js_err_ctx};
 use crate::ingest::{js_array_to_dictionary_array, js_array_to_quads, js_to_quad_stream};
-use crate::options::{build_array, parse_arrow_options, parse_build_options, parse_format};
+use crate::options::{
+    build_array, parse_arrow_options, parse_build_options, parse_format, parse_open_options,
+};
 use crate::terms::{JsPattern, js_to_quad};
 
 #[wasm_bindgen(module = "/js-snippets/lazy-rdf.js")]
@@ -125,10 +127,14 @@ impl VortexRdfStore {
     }
 
     /// Takes ownership of the buffer wasm-bindgen marshalled from the caller's
-    /// `Uint8Array`, so the load holds a single copy of the bytes.
+    /// `Uint8Array`, so the load holds a single copy of the bytes. `options`
+    /// (`OpenOptions`) picks the resident form of the term dictionary.
     #[wasm_bindgen(js_name = fromBytes, skip_typescript)]
-    pub async fn from_bytes(bytes: Vec<u8>) -> Result<VortexRdfStore, JsValue> {
-        let inner = CoreStore::from_bytes_owned(bytes).await.map_err(js_err)?;
+    pub async fn from_bytes(bytes: Vec<u8>, options: JsValue) -> Result<VortexRdfStore, JsValue> {
+        let form = parse_open_options(options)?;
+        let inner = CoreStore::from_bytes_owned_as(bytes, form)
+            .await
+            .map_err(js_err)?;
         Ok(VortexRdfStore::wrap(inner))
     }
 
@@ -354,7 +360,8 @@ impl VortexRdfStore {
                 .to_record_batches(encoding, projection.as_deref())
                 .await
                 .map_err(js_err)?;
-            let mut writer = StreamWriter::try_new(Vec::new(), &batches.schema()).map_err(js_err)?;
+            let mut writer =
+                StreamWriter::try_new(Vec::new(), &batches.schema()).map_err(js_err)?;
             while let Some(batch) = batches.next().await {
                 writer.write(&batch.map_err(js_err)?).map_err(js_err)?;
             }

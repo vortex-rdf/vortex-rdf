@@ -11,8 +11,10 @@ export {
 export type {
     ArrowOptions,
     BuildOptions,
+    DictForm,
     LayoutStrategy,
     IndexType,
+    OpenOptions,
     QuadColumn,
     RdfFormatName,
     TermEncoding,

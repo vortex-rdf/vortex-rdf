@@ -110,6 +110,21 @@ describe('build variants', () => {
                 expect(lang.length).toBe(1);
             });
 
+            test('fromBytes takes a dictionary form and validates it', async () => {
+                const store = await VortexRdfStore.fromString(NQUADS, 'nquads', options);
+                const bytes = await store.toBytes();
+                for (const dictionary of ['as-written', 'plaintext'] as const) {
+                    const restored = await VortexRdfStore.fromBytes(bytes, { dictionary });
+                    expect(await restored.size()).toBe(6);
+                    expect(restored.getQuads(null, null, null, null).length).toBe(6);
+                    restored.free();
+                }
+                await expect(
+                    VortexRdfStore.fromBytes(bytes, { dictionary: 'fsst' } as never),
+                ).rejects.toThrow(/dictionary form/);
+                store.free();
+            });
+
             test('toBytes/fromBytes preserves the store', async () => {
                 const store = await VortexRdfStore.fromString(NQUADS, 'nquads', options);
                 const bytes = await store.toBytes();

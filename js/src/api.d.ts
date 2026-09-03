@@ -80,6 +80,23 @@ export interface ArrowOptions {
 }
 
 /**
+ * The resident form of the term dictionary of a store opened from bytes
+ * (a store built from quads always holds its dictionary plaintext).
+ * - 'as-written': the file's own FSST chunks, decoded one term per read —
+ *   the smallest footprint.
+ * - 'plaintext': the column decoded once into one canonical form that every
+ *   probe, decode and `terms` export then reads in place, at roughly three
+ *   times the compressed size.
+ */
+export type DictForm = 'as-written' | 'plaintext';
+
+/** Options of `fromBytes`. Any omitted field keeps its default. */
+export interface OpenOptions {
+    /** @default 'as-written' */
+    dictionary?: DictForm;
+}
+
+/**
  * A wasm-side store handle. Every method that fails rejects (or, for the
  * synchronous read family, throws) with an `Error`.
  *
@@ -94,7 +111,7 @@ export interface ArrowOptions {
  */
 export class VortexRdfStore {
     static empty(): VortexRdfStore;
-    static fromBytes(bytes: Uint8Array): Promise<VortexRdfStore>;
+    static fromBytes(bytes: Uint8Array, options?: OpenOptions): Promise<VortexRdfStore>;
     static fromString(input: string, format: RdfFormatName, options?: BuildOptions): Promise<VortexRdfStore>;
     /** `quads` may be an array, or an RDF/JS `Stream<Quad>` (a Node-style event emitter). */
     static fromQuads(quads: Quad[] | Stream<Quad>, options?: BuildOptions): Promise<VortexRdfStore>;
