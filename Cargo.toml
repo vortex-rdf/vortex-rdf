@@ -42,7 +42,6 @@ vortex-arrow = "0.85.0"
 arrow-array = "58.3"
 arrow-schema = "58.3"
 arrow-buffer = "58.3"
-arrow-ipc = "58.3"
 self_cell = "1.2"
 divan = { package = "codspeed-divan-compat", version = "5.0.1" }
 

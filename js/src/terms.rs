@@ -139,7 +139,7 @@ pub(crate) fn js_to_quad(val: JsValue) -> Option<Quad> {
 }
 
 /// A four-position match pattern parsed from the JS arguments of `match`,
-/// `getQuads`, `countQuads` and `matchArrowIPC`: `None` is a wildcard.
+/// `getQuads`, `countQuads` and `matchArrowFFI`: `None` is a wildcard.
 pub(crate) struct JsPattern {
     pub s: Option<NamedOrBlankNode>,
     pub p: Option<NamedNode>,

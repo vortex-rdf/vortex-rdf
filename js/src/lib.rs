@@ -12,15 +12,18 @@ mod options;
 mod store;
 mod terms;
 
-pub use store::{TermDict, VortexRdfStore};
+pub use store::{ArrowFFI, TermDict, VortexRdfStore};
 
 /// The hand-written TypeScript surface of this crate (the Rust items carry
 /// `skip_typescript`), kept in its own file for real TS tooling.
 #[wasm_bindgen(typescript_custom_section)]
 const TS_APPEND_CONTENT: &'static str = include_str!("api.d.ts");
 
-#[wasm_bindgen]
-pub fn init_panic_hook() {
+/// Runs once as the module is instantiated (the generated `init` calls it):
+/// a Rust panic then reports its message through `console.error` instead of
+/// surfacing as an opaque `unreachable` trap.
+#[wasm_bindgen(start)]
+fn start() {
     console_error_panic_hook::set_once();
 }
 

@@ -54,7 +54,7 @@ export interface BuildOptions {
 }
 
 /**
- * How term cells are typed in an Arrow export (`matchArrowIPC`).
+ * How term cells are typed in an Arrow export (`matchArrow`, `matchArrowFFI`).
  * - 'codes': `uint32` term codes, decodable through `termDict()` — the
  *   cheapest to ship and to join on. Dictionary layout only.
  * - 'terms': the same codes as dictionary keys over the whole term dictionary
@@ -68,7 +68,17 @@ export type TermEncoding = 'codes' | 'terms' | 'strings';
 /** One of the four quad columns, by its serialized name. */
 export type QuadColumn = 's' | 'p' | 'o' | 'g';
 
-/** Options of `matchArrowIPC`. Any omitted field keeps its default. */
+/** A half-open range of term codes, `lo` inclusive to `hi` exclusive. */
+export interface CodeRange {
+    lo: number;
+    hi: number;
+}
+
+/**
+ * Options of `matchArrow` / `matchArrowFFI`. Any omitted field keeps its
+ * default. `keep`, `offset` and `limit` narrow the match inside the store,
+ * before any row is gathered — the pushdown a query layer applies.
+ */
 export interface ArrowOptions {
     /** @default 'codes' */
     encoding?: TermEncoding;
@@ -77,6 +87,17 @@ export interface ArrowOptions {
      * when omitted. Must be non-empty and name each column at most once.
      */
     projection?: QuadColumn[];
+    /**
+     * Per-column term-code constraints: a code set (a `Uint32Array` — an
+     * Arrow code column's `toArray()` — or an array of codes, in any order)
+     * or a `CodeRange`. A row survives when every constrained column's code
+     * is kept. Dictionary layout only: the codes are the store's own.
+     */
+    keep?: Partial<Record<QuadColumn, Uint32Array | number[] | CodeRange>>;
+    /** Skip this many rows, in match order, after `keep`. @default 0 */
+    offset?: number;
+    /** Ship at most this many rows, in match order, after `offset`. */
+    limit?: number;
 }
 
 /**
@@ -101,8 +122,8 @@ export interface OpenOptions {
  * synchronous read family, throws) with an `Error`.
  *
  * Only the pattern-read family — `match`, `getQuads`, `countQuads`,
- * `matchArrowIPC` — is synchronous; `size` and `has` return promises like the
- * builders and mutations.
+ * `matchArrowFFI` (and the `/arrow` entry's `matchArrow`) — is synchronous;
+ * `size` and `has` return promises like the builders and mutations.
  *
  * A pattern position is a wildcard when it is `null`/`undefined` or an RDF/JS
  * `Variable` term; a bare string is read as a NamedNode IRI; any other value
@@ -164,19 +185,23 @@ export class VortexRdfStore {
      */
     countQuads(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null): number;
     /**
-     * Low-level. The quads matching a pattern as an Arrow IPC stream — the
-     * bytes `tableFromIPC` (apache-arrow), DuckDB-WASM, Arquero or Perspective
-     * read. One record batch per decode chunk; columns `s`, `p`, `o`, `g`
-     * (or `options.projection`, in that order), typed per
-     * `options.encoding` (default `'codes'`; see `TermEncoding`). The schema
+     * Low-level. The quads matching a pattern as Arrow C Data Interface
+     * structs in wasm memory, owned by the returned `ArrowFFI` handle: the
+     * schema and one struct array per record batch, at the addresses the
+     * handle reports, which `@vortex-rdf/arrow-js-ffi`'s `parseTable` reads
+     * out of the module's memory. Prefer `matchArrow` (the `/arrow` entry),
+     * which is this call with the parse and the lifetime handled. Columns
+     * `s`, `p`, `o`, `g` (or `options.projection`, in that order), typed per
+     * `options.encoding` (default `'codes'`; see `TermEncoding`); the schema
      * carries `vortex_rdf.layout`, `vortex_rdf.term_encoding`,
      * `vortex_rdf.version` and `vortex_rdf.default_graph` (`''`) metadata.
-     * Returns synchronously; the bytes are a copy out of wasm memory. Throws
-     * on an invalid pattern term or option, and on an encoding the store's
-     * layout cannot serve (`'codes'`/`'terms'` need the Dictionary layout; the
-     * TypedObject layout has no Arrow export).
+     * `options.keep`, `offset` and `limit` narrow the match inside the store.
+     * Returns synchronously. Throws on an invalid pattern term or option, on
+     * an encoding the store's layout cannot serve (`'codes'`/`'terms'` and
+     * `keep` need the Dictionary layout; the TypedObject layout has no Arrow
+     * export), and on `'codes'`/`'terms'` while appended quads are pending.
      */
-    matchArrowIPC(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null, options?: ArrowOptions): Uint8Array;
+    matchArrowFFI(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null, options?: ArrowOptions): ArrowFFI;
     /**
      * Low-level. An immutable handle on this store's term dictionary — the one
      * door to code↔term translation. `undefined` unless the store's rows are
@@ -200,9 +225,36 @@ export class VortexRdfStore {
 export class TermDict {
     /** Decode a term code, or `undefined` when it is out of range. */
     decode(code: number): string | undefined;
+    /**
+     * Decode many codes in one call: one entry per code, in order,
+     * `undefined` where a code is out of range. A `Uint32Array` (an Arrow
+     * code column's `toArray()`) or a plain array of numbers.
+     */
+    decodeMany(codes: Uint32Array | number[]): (string | undefined)[];
     /** Encode an N-Triples term string to its code (inverse of `decode`), or `undefined` when the term is absent. */
     encode(term: string): number | undefined;
     /** Release the wasm-side handle (also invoked by `Symbol.dispose`). */
+    free(): void;
+    [Symbol.dispose](): void;
+}
+
+/**
+ * The C Data Interface structs of one `matchArrowFFI` export, at stable
+ * addresses in wasm memory until `free()`. Freeing runs the structs' release
+ * callbacks, which is what returns the exported buffers to the wasm allocator:
+ * a consumer reading views into them (`parseTable(memory.buffer, …, false)`)
+ * frees only when done reading; a consumer that copied frees at once. Views
+ * into wasm memory survive its growth only once
+ * `WebAssembly.Memory.prototype.toResizableBuffer()` has been called on the
+ * module's memory (the `/arrow` entry does that where the runtime has it);
+ * otherwise every view dies, silently, on the next growth.
+ */
+export class ArrowFFI {
+    /** The address of the `ArrowSchema` struct. */
+    schemaPtr(): number;
+    /** The addresses of the `ArrowArray` structs, one per record batch, in order. */
+    arrayPtrs(): Uint32Array;
+    /** Release the structs and the buffers they export (also invoked by `Symbol.dispose`). */
     free(): void;
     [Symbol.dispose](): void;
 }

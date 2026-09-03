@@ -88,7 +88,7 @@ elif command -v rustup >/dev/null 2>&1 &&
   warn "js: skipping js-tests — run \`rustup target add wasm32-unknown-unknown\`."
   skipped+=("js-tests (no wasm32 target)")
 else
-  info "npm run build:fast && npm run typecheck && npm test (js)"
+  info "npm run build:fast && npm run typecheck && npm test && npm run test:zero-copy (js)"
   (
     cd js
     export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
@@ -97,6 +97,9 @@ else
     # pkg/web/vortex_rdf.d.ts.
     npm run typecheck
     npm test
+    # The suite again with V8's resizable wasm buffers on: the /arrow
+    # entry's zero-copy path.
+    npm run test:zero-copy
   )
   passed+=(js-tests)
 fi

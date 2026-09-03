@@ -4,13 +4,13 @@
 // here even though it works for a real browser or bundler.
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import init, { init_panic_hook } from '../pkg/web/vortex_rdf.js';
+import init from '../pkg/web/vortex_rdf.js';
 
 const wasmPath = fileURLToPath(new URL('../pkg/web/vortex_rdf_bg.wasm', import.meta.url));
 await init({ module_or_path: await readFile(wasmPath) });
-init_panic_hook();
 
 export {
+    ArrowFFI,
     TermDict,
     VortexRdfStore,
     serializeRdf,

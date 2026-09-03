@@ -3,6 +3,7 @@
 // `init`/`initSync` (each entry calls init for the caller). Kept in sync with
 // the re-exports in entry/node.js and entry/browser.js.
 export {
+    ArrowFFI,
     TermDict,
     VortexRdfStore,
     serializeRdf,
@@ -11,6 +12,7 @@ export {
 export type {
     ArrowOptions,
     BuildOptions,
+    CodeRange,
     DictForm,
     LayoutStrategy,
     IndexType,

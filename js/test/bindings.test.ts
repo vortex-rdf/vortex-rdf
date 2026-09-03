@@ -1,9 +1,9 @@
 import { describe, test, expect } from 'vitest';
-import { tableFromIPC } from 'apache-arrow';
 import { DataFactory } from 'rdf-data-factory';
 import { Readable } from 'node:stream';
 import type { Quad, Term, Literal, Stream } from '@rdfjs/types';
 import {
+    ArrowFFI,
     TermDict,
     VortexRdfStore,
     serializeRdf,
@@ -669,58 +669,10 @@ describe('indexes()', () => {
     });
 });
 
-describe('matchArrowIPC codes / termDict gates', () => {
-    const p1 = df.namedNode('http://example.org/p1');
-    const column = (bytes: Uint8Array, name: string): number[] => [...tableFromIPC(bytes).getChild(name)!];
-
-    test('Dictionary: codes agree with getQuads and decode through termDict', async () => {
-        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
-        const dict = store.termDict()!;
-        expect(dict).toBeDefined();
-
-        const bytes = store.matchArrowIPC(null, p1, null, null);
-        const table = tableFromIPC(bytes);
-        expect(table.numRows).toBe(3);
-        const quads = store.getQuads(null, p1, null, null);
-        const iri = (t: Term) => `<${t.value}>`;
-        expect(column(bytes, 's').map((c) => dict.decode(c)).sort())
-            .toEqual(quads.map((q: Quad) => iri(q.subject)).sort());
-        expect(column(bytes, 'o').map((c) => dict.decode(c)).sort())
-            .toEqual(quads.map((q: Quad) => iri(q.object)).sort());
-
-        const full = store.matchArrowIPC(
-            df.namedNode('http://example.org/s2'),
-            p1,
-            df.namedNode('http://example.org/o2'),
-            df.namedNode('http://example.org/g1'),
-        );
-        expect(tableFromIPC(full).numRows).toBe(1);
-        expect(dict.decode(column(full, 'g')[0])).toBe('<http://example.org/g1>');
-    });
-
-    for (const layout of ['default', 'typed-object'] as const) {
-        test(`${layout}: codes throw and termDict is undefined`, async () => {
-            const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout });
-            expect(() => store.matchArrowIPC(null, p1, null, null)).toThrow();
-            expect(store.termDict()).toBeUndefined();
-        });
-    }
-
-    test('a pending append closes the code path', async () => {
-        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
-        expect(tableFromIPC(store.matchArrowIPC(null, p1, null, null)).numRows).toBe(3);
-        await store.addQuad(df.quad(
-            df.namedNode('http://example.org/s9'),
-            df.namedNode('http://example.org/p9'),
-            df.literal('new'),
-        ));
-        expect(() => store.matchArrowIPC(null, p1, null, null)).toThrow(/compact/);
-        expect(store.termDict()).toBeUndefined();
-        // The term paths still answer.
-        expect(store.getQuads(null, p1, null, null).length).toBe(3);
-        expect(tableFromIPC(store.matchArrowIPC(null, p1, null, null, { encoding: 'strings' })).numRows).toBe(3);
-    });
-
+describe('termDict', () => {
+    // The code path behind the Arrow surface (codes agreeing with getQuads,
+    // the layouts and the pending-append gate) is asserted in arrow.test.ts,
+    // against the /arrow entry.
     test('TermDict edges: out-of-range decode and unknown encode are undefined', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
         const dict = store.termDict()!;
@@ -908,7 +860,7 @@ describe('term validation and malformed input', () => {
         expect(() => store.countQuads(null, null, { termType: 'Nope', value: '' } as unknown as Term, null))
             .toThrow(/Invalid object term/);
         expect(() => store.match(null, null, null, df.literal('g'))).toThrow(/Invalid graph term/);
-        expect(() => store.matchArrowIPC(null, null, null, df.literal('g'))).toThrow(/Invalid graph term/);
+        expect(() => store.matchArrowFFI(null, null, null, df.literal('g'))).toThrow(/Invalid graph term/);
         expect(() => store.countQuads(df.namedNode('not an iri'), null, null, null)).toThrow(Error);
     });
 
@@ -939,10 +891,23 @@ describe('disposal', () => {
         expect(() => dict.decode(0)).toThrow();
     });
 
-    test('Symbol.dispose is free on both handles', () => {
-        expect(typeof VortexRdfStore.prototype[Symbol.dispose]).toBe('function');
-        expect(VortexRdfStore.prototype[Symbol.dispose]).toBe(VortexRdfStore.prototype.free);
-        expect(typeof TermDict.prototype[Symbol.dispose]).toBe('function');
-        expect(TermDict.prototype[Symbol.dispose]).toBe(TermDict.prototype.free);
+    test('Symbol.dispose is free on every handle', () => {
+        for (const handle of [VortexRdfStore, TermDict, ArrowFFI]) {
+            expect(typeof handle.prototype[Symbol.dispose]).toBe('function');
+            expect(handle.prototype[Symbol.dispose]).toBe(handle.prototype.free);
+        }
+    });
+
+    test('an ArrowFFI handle reports its structs and frees once', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
+        const handle = store.matchArrowFFI(null, null, null, null);
+        expect(handle).toBeInstanceOf(ArrowFFI);
+        expect(handle.schemaPtr()).toBeGreaterThan(0);
+        const ptrs = handle.arrayPtrs();
+        expect(ptrs).toBeInstanceOf(Uint32Array);
+        expect(ptrs.length).toBe(1);
+        expect(ptrs[0]).toBeGreaterThan(0);
+        handle.free();
+        expect(() => handle.schemaPtr()).toThrow();
     });
 });

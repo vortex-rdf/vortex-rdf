@@ -27,7 +27,7 @@ describe('api.d.ts covers the wasm exports', () => {
     const generated = read('../pkg/web/vortex_rdf.d.ts');
     const api = read('../src/api.d.ts');
 
-    for (const [prefix, className] of [['vortexrdfstore', 'VortexRdfStore'], ['termdict', 'TermDict']] as const) {
+    for (const [prefix, className] of [['vortexrdfstore', 'VortexRdfStore'], ['termdict', 'TermDict'], ['arrowffi', 'ArrowFFI']] as const) {
         test(className, () => {
             const exported = wasmMethods(generated, prefix);
             expect(exported.length).toBeGreaterThan(0);
@@ -58,5 +58,21 @@ describe('the entries re-export the same names', () => {
         expect(node.length).toBeGreaterThan(0);
         expect(browser).toEqual(node);
         expect(types).toEqual(node);
+    });
+});
+
+// The two /arrow entries wrap their base entry the same way: re-export all of
+// it, add MatchView, and install matchArrow off the same module.
+describe('the /arrow entries agree', () => {
+    test('entry/arrow.node.js and entry/arrow.browser.js differ only in their base entry', () => {
+        const node = read('../entry/arrow.node.js');
+        const browser = read('../entry/arrow.browser.js');
+        expect(node).toContain("export * from './node.js';");
+        expect(browser).toContain("export * from './browser.js';");
+        for (const source of [node, browser]) {
+            expect(source).toContain('export { MatchView };');
+            expect(source).toContain('attachMatchArrow(VortexRdfStore, memory, enableZeroCopy(memory));');
+        }
+        expect(read('../entry/arrow.d.ts')).toContain("export * from './types.js';");
     });
 });

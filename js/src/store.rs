@@ -4,7 +4,9 @@
 use std::cell::RefCell;
 use std::io::Cursor;
 
-use arrow_ipc::writer::StreamWriter;
+use arrow_array::ffi::FFI_ArrowArray;
+use arrow_array::{Array as _, RecordBatch, StructArray};
+use arrow_schema::ffi::FFI_ArrowSchema;
 use futures::StreamExt;
 use js_sys::{Object, Reflect};
 use vortex_rdf_core::common::terms::parse_quads_from_reader;
@@ -108,6 +110,19 @@ impl TermDict {
     #[wasm_bindgen(js_name = decode)]
     pub fn decode(&self, code: u32) -> Option<String> {
         self.snapshot.decode(code)
+    }
+
+    /// Decode many term codes in one call — one array entry per code, in
+    /// order, `undefined` where a code is out of range. One boundary crossing
+    /// and one dictionary cursor for the whole batch; a `Uint32Array` (an Arrow
+    /// code column's `toArray()`) or a plain array of numbers.
+    #[wasm_bindgen(js_name = decodeMany)]
+    pub fn decode_many(&self, codes: &[u32]) -> js_sys::Array {
+        self.snapshot
+            .decode_many(codes)
+            .into_iter()
+            .map(|term| term.map_or(JsValue::UNDEFINED, JsValue::from))
+            .collect()
     }
 
     /// Encode an N-Triples term string to its code (inverse of
@@ -333,40 +348,54 @@ impl VortexRdfStore {
         })?
     }
 
-    /// Low-level: the quads matching a pattern as an Arrow IPC stream
-    /// (`Uint8Array`) — the bytes `apache-arrow`'s `tableFromIPC`,
-    /// DuckDB-WASM, Arquero or Perspective read. One record batch per decode
-    /// chunk over core's quad schema: columns `s`, `p`, `o`, `g`, or
-    /// `options.projection` in that order; `options.encoding` selects the
-    /// cell type (`codes` u32 term codes, `terms` the codes as dictionary
-    /// keys over the whole term dictionary, `strings` N-Triples strings).
-    /// The bytes are a copy out of wasm memory, as the `Uint32Array`s of the
-    /// lazy quad payload are. Throws on an invalid pattern term or option,
-    /// and on an encoding the layout cannot serve.
-    #[wasm_bindgen(js_name = matchArrowIPC, skip_typescript)]
-    pub fn match_arrow_ipc(
+    /// Low-level: the quads matching a pattern as Arrow C Data Interface
+    /// structs in wasm memory — the `ArrowSchema` of the batches and one
+    /// `ArrowArray` (a struct array) per batch, owned by the returned
+    /// [`ArrowFFI`] handle until its `free()`. `@vortex-rdf/arrow-js-ffi`'s
+    /// `parseTable` reads them out of the module's memory as views or as a
+    /// copy; `matchArrow` of the package's `/arrow` entry is that call with
+    /// the lifetime handled. Columns `s`, `p`, `o`, `g`, or
+    /// `options.projection` in that order, typed per `options.encoding`
+    /// (`codes` u32 term codes, `terms` the codes as dictionary keys over the
+    /// whole term dictionary, `strings` N-Triples strings); `options.keep`,
+    /// `offset` and `limit` narrow the match inside the store before any row
+    /// is gathered. Throws on an invalid pattern term or option, and on an
+    /// encoding or constraint the layout cannot serve.
+    #[wasm_bindgen(js_name = matchArrowFFI, skip_typescript)]
+    pub fn match_arrow_ffi(
         &self,
         subject: JsValue,
         predicate: JsValue,
         object: JsValue,
         graph: JsValue,
         options: JsValue,
-    ) -> Result<Vec<u8>, JsValue> {
+    ) -> Result<ArrowFFI, JsValue> {
         let pattern = JsPattern::parse(subject, predicate, object, graph)?;
-        let (encoding, projection) = parse_arrow_options(options)?;
+        let read = parse_arrow_options(options)?;
         resolve_now(async move {
-            let matched = pattern.matched(&self.inner).await?;
-            let mut batches = matched
-                .to_record_batches(encoding, projection.as_deref())
+            let mut matched = pattern.matched(&self.inner).await?;
+            for (column, keep) in &read.keep {
+                matched = matched.keep(*column, keep).await.map_err(js_err)?;
+            }
+            if read.windowed() {
+                matched = matched
+                    .window(read.offset, read.limit.unwrap_or(usize::MAX))
+                    .await
+                    .map_err(js_err)?;
+            }
+            let mut stream = matched
+                .to_record_batches(read.encoding, read.projection.as_deref())
                 .await
                 .map_err(js_err)?;
-            let mut writer =
-                StreamWriter::try_new(Vec::new(), &batches.schema()).map_err(js_err)?;
-            while let Some(batch) = batches.next().await {
-                writer.write(&batch.map_err(js_err)?).map_err(js_err)?;
+            let schema = stream.schema();
+            let mut batches = Vec::new();
+            while let Some(batch) = stream.next().await {
+                batches.push(batch.map_err(js_err)?);
             }
-            writer.finish().map_err(js_err)?;
-            writer.into_inner().map_err(js_err)
+            if batches.is_empty() {
+                batches.push(RecordBatch::new_empty(schema.clone()));
+            }
+            ArrowFFI::export(&schema, batches)
         })?
     }
 
@@ -488,4 +517,51 @@ fn term_column(offsets: &[u32], bytes: &[u8]) -> JsValue {
     Reflect::set(&obj, &"offsets".into(), &offs).unwrap();
     Reflect::set(&obj, &"bytes".into(), &bys).unwrap();
     obj.into()
+}
+
+// ─── ArrowFFI ───────────────────────────────────────────────────────────────────
+
+/// The C Data Interface structs of one Arrow export, at stable addresses in
+/// wasm memory for as long as the handle lives: the `ArrowSchema` of the
+/// batches (a struct field carrying the quad schema's metadata) and one
+/// `ArrowArray` per batch. The addresses are stable because the handle itself
+/// is heap-allocated (wasm-bindgen boxes it behind the pointer JS holds) and
+/// `arrays` is never resized after construction. Dropping the handle runs the
+/// structs' release callbacks, which is what frees the exported buffers — so
+/// a consumer holding views into them calls `free()` only once it is done
+/// reading.
+#[wasm_bindgen(skip_typescript)]
+pub struct ArrowFFI {
+    schema: FFI_ArrowSchema,
+    arrays: Vec<FFI_ArrowArray>,
+}
+
+impl ArrowFFI {
+    /// Export `batches`, all of `schema`, as one struct array each.
+    fn export(schema: &arrow_schema::Schema, batches: Vec<RecordBatch>) -> Result<Self, JsValue> {
+        let schema = FFI_ArrowSchema::try_from(schema).map_err(js_err)?;
+        let arrays = batches
+            .into_iter()
+            .map(|batch| FFI_ArrowArray::new(&StructArray::from(batch).to_data()))
+            .collect();
+        Ok(Self { schema, arrays })
+    }
+}
+
+#[wasm_bindgen]
+impl ArrowFFI {
+    /// The address of the `ArrowSchema` struct in wasm memory.
+    #[wasm_bindgen(js_name = schemaPtr)]
+    pub fn schema_ptr(&self) -> u32 {
+        &self.schema as *const FFI_ArrowSchema as u32
+    }
+
+    /// The addresses of the `ArrowArray` structs, one per batch, in order.
+    #[wasm_bindgen(js_name = arrayPtrs)]
+    pub fn array_ptrs(&self) -> Vec<u32> {
+        self.arrays
+            .iter()
+            .map(|array| array as *const FFI_ArrowArray as u32)
+            .collect()
+    }
 }

@@ -6,5 +6,12 @@
 # `cfg(target_arch = "x86_64" | "aarch64")` and never build for wasm; on wasm the
 # win is generic auto-vectorization only. Scoped to wasm32, so native (CLI, tests,
 # benches) builds are unaffected. simd128 is baseline in modern browsers and Node 16+.
+#
+# --max-memory declares a maximum on the module's memory (4 GiB, the wasm32
+# ceiling: a reservation of address space, not an allocation). A declared
+# maximum is what `WebAssembly.Memory.prototype.toResizableBuffer()` requires,
+# and that call is what lets the JS bindings' Arrow views survive memory
+# growth (js/entry/match-view.js). Without it the linker leaves the maximum
+# open and every view into the module's memory dies on the next growth.
 [target.wasm32-unknown-unknown]
-rustflags = ["-C", "target-feature=+simd128"]
+rustflags = ["-C", "target-feature=+simd128", "-C", "link-arg=--max-memory=4294967296"]

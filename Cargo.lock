@@ -196,20 +196,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arrow-ipc"
-version = "58.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29a908a11fcfb3fb2f6730f4ac15e367bc644e419155e96238f68cf3adde572b"
-dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-data",
- "arrow-schema",
- "arrow-select",
- "flatbuffers",
-]
-
-[[package]]
 name = "arrow-ord"
 version = "58.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4170,7 +4156,8 @@ dependencies = [
 name = "vortex-rdf"
 version = "0.11.0"
 dependencies = [
- "arrow-ipc",
+ "arrow-array",
+ "arrow-schema",
  "console_error_panic_hook",
  "futures",
  "getrandom 0.3.4",

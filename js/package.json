@@ -27,12 +27,30 @@
                 "types": "./entry/types.d.ts",
                 "default": "./entry/browser.js"
             }
+        },
+        "./arrow": {
+            "node": {
+                "types": "./entry/arrow.d.ts",
+                "default": "./entry/arrow.node.js"
+            },
+            "browser": {
+                "types": "./entry/arrow.d.ts",
+                "default": "./entry/arrow.browser.js"
+            },
+            "default": {
+                "types": "./entry/arrow.d.ts",
+                "default": "./entry/arrow.browser.js"
+            }
         }
     },
     "files": [
         "entry/node.js",
         "entry/browser.js",
         "entry/types.d.ts",
+        "entry/arrow.node.js",
+        "entry/arrow.browser.js",
+        "entry/arrow.d.ts",
+        "entry/match-view.js",
         "pkg/web/vortex_rdf.js",
         "pkg/web/vortex_rdf.d.ts",
         "pkg/web/vortex_rdf_bg.wasm",
@@ -50,12 +68,14 @@
         "build:fast": "npm run build:reset && npm run build:wasm:fast && npm run build:clean-generated",
         "prepublishOnly": "npm run build",
         "test": "vitest run",
+        "test:zero-copy": "vitest run --config vitest.zero-copy.config.ts",
         "typecheck": "tsc -p tsconfig.json && tsc -p bench/tsconfig.json",
         "bench": "tsx --expose-gc --max-old-space-size=8192 bench/compare.bench.ts",
         "bench:build": "npm run build && npm run bench",
-        "bench:codspeed": "node --import tsx --expose-gc --no-liftoff bench/codspeed.bench.ts",
+        "bench:codspeed": "node --import tsx --expose-gc --no-liftoff --experimental-wasm-rab-integration bench/codspeed.bench.ts",
         "bench:dict-memory": "tsx --expose-gc bench/dict-memory.bench.ts",
-        "bench:dict-form": "node --import tsx --expose-gc --max-old-space-size=8192 bench/dict-form.bench.ts"
+        "bench:dict-form": "node --import tsx --expose-gc --max-old-space-size=8192 --experimental-wasm-rab-integration bench/dict-form.bench.ts",
+        "bench:arrow": "node --import tsx --expose-gc --max-old-space-size=8192 --experimental-wasm-rab-integration bench/arrow.bench.ts"
     },
     "keywords": [
         "rdf",
@@ -70,6 +90,7 @@
     "devDependencies": {
         "@codspeed/tinybench-plugin": "^5.7.1",
         "@types/node": "^26.1.2",
+        "@vortex-rdf/arrow-js-ffi": "^0.5.0",
         "apache-arrow": "^21.2.0",
         "oxigraph": "^0.5.9",
         "rdf-data-factory": "^2.0.2",
@@ -79,6 +100,18 @@
         "typescript": "^7.0.2",
         "vitest": "^4.1.10",
         "wasm-pack": "^0.15.0"
+    },
+    "peerDependencies": {
+        "@vortex-rdf/arrow-js-ffi": "^0.5.0",
+        "apache-arrow": ">=21.2.0"
+    },
+    "peerDependenciesMeta": {
+        "@vortex-rdf/arrow-js-ffi": {
+            "optional": true
+        },
+        "apache-arrow": {
+            "optional": true
+        }
     },
     "dependencies": {
         "@rdfjs/types": "^2.0.1"

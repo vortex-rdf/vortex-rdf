@@ -147,3 +147,9 @@ jobs:
       - name: Run tests
         working-directory: js
         run: npm test
+      # The suite again with V8's resizable wasm buffers on (Node 24.5+ has
+      # the flag): the /arrow entry's zero-copy path, which the plain run
+      # cannot reach. Both must pass.
+      - name: Run tests with zero-copy Arrow views
+        working-directory: js
+        run: npm run test:zero-copy
