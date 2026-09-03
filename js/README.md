@@ -131,22 +131,40 @@ if (dict) {
 
 `decode`/`encode` speak N-Triples term strings — `<iri>`, `_:blank`, `"lit"@lang`, `"lit"^^<dt>`, and `''` for the default graph. The handle is a snapshot: it keeps decoding correctly after the store is mutated, because it retains the dictionary its codes address. It is a wasm-side handle — call `free()` when done (also wired to `Symbol.dispose`, so `using` disposes it automatically).
 
+`decodeMany(codes)` decodes a whole batch — a `Uint32Array` (an Arrow code column's `toArray()`) or an array of numbers — in one crossing, `undefined` where a code is out of range.
+
 `match`/`getQuads` are the way to read quads; the codes themselves come out of the [Arrow interface](#arrow-interface) below (`encoding: 'codes'`), for callers that join, count and de-duplicate in code space and decode each distinct term once.
 
 ## Arrow interface
 
-`matchArrowIPC` hands a match to any Arrow consumer as an [Arrow IPC stream](https://arrow.apache.org/docs/format/Columnar.html#ipc-streaming-format) — the bytes `apache-arrow`'s `tableFromIPC`, DuckDB-WASM, Arquero or Perspective read:
+The `/arrow` entry hands a match to any Arrow consumer as an Arrow JS `Table` — [apache-arrow](https://www.npmjs.com/package/apache-arrow) vectors that DuckDB-WASM, Arquero, Perspective and your own code read — **without copying it out of wasm memory** where the runtime allows, and with one copy at parse time everywhere else:
 
 ```javascript
-import { tableFromIPC } from 'apache-arrow';
+import { VortexRdfStore } from '@vortex-rdf/vortex-rdf-store/arrow';
 
-const table = tableFromIPC(store.matchArrowIPC(null, myPredicate, null, null));
-table.schema.fields.map((f) => f.name);                  // ['s', 'p', 'o', 'g'] — uint32 term codes
-const terms = tableFromIPC(store.matchArrowIPC(null, null, null, null, { encoding: 'terms' }));
-terms.getChild('o')?.get(0);                             // an N-Triples string, carried as a dictionary key
+using view = store.matchArrow(null, myPredicate, null, null);
+view.table.schema.fields.map((f) => f.name);             // ['s', 'p', 'o', 'g'] — uint32 term codes
+view.table.getChild('s').toArray();                      // a Uint32Array over the store's own memory
+const terms = store.matchArrow(null, null, null, null, { encoding: 'terms' });
+terms.table.getChild('o').get(0);                        // an N-Triples string, carried as a dictionary key
+const mine = terms.toTable();                            // a JS-owned copy, safe to keep
+terms.free();
 ```
 
-One record batch per decode chunk. `encoding: 'codes'` (the default) ships `uint32` term codes — join, filter and aggregate in code space, then decode the survivors through `termDict()`; `'terms'` wraps the same codes as an Arrow dictionary over the whole term dictionary, so engines see strings while carrying codes; `'strings'` materializes `string_view` N-Triples strings and is the one encoding every layout serves. `projection: ['o', 's']` restricts and orders the columns. The bytes are a copy out of wasm memory. This is the one engine-facing read surface of the bindings: a query planner or executor over a store consumes it, on this and every other language binding.
+`matchArrow` returns a `MatchView`: `table` is the match, one record batch per decode chunk; `encoding: 'codes'` (the default) ships `uint32` term codes — join, filter and aggregate in code space, then decode the survivors through `termDict()`; `'terms'` wraps the same codes as an Arrow dictionary over the whole term dictionary, so engines see strings while carrying codes; `'strings'` materializes `string_view` N-Triples strings and is the one encoding every layout serves. `projection: ['o', 's']` restricts and orders the columns. This is the one engine-facing read surface of the bindings: a query planner or executor over a store consumes it, on this and every other language binding.
+
+**Pushdown.** `keep` constrains columns by term code inside the store, before any row is gathered — a code set (a `Uint32Array`, such as a code column's `toArray()`, or an array of codes) or a half-open code range `{ lo, hi }` (the dictionary is sorted, so the terms sharing a prefix are one range) — and `offset`/`limit` window the rows in match order after it:
+
+```javascript
+const subjects = store.matchArrow(null, myPredicate, null, null).table.getChild('s').toArray();
+store.matchArrow(null, null, null, null, { keep: { s: subjects }, limit: 100, offset: 200 });
+```
+
+**Zero-copy, and when it is not.** A view into wasm memory is only safe if the memory cannot move under it, and wasm memory moves when it grows. On a runtime with resizable wasm buffers (`WebAssembly.Memory.prototype.toResizableBuffer`: Chrome 144, Firefox 145, Safari 26.2, Node 24.5+ with `--experimental-wasm-rab-integration`) the entry makes growth happen in place and the views stay valid; `view.zeroCopy` is then `true`, and the wasm-side buffers live until `view.free()` (also `Symbol.dispose`, so `using` frees at scope exit). Read, or `toTable()` a JS-owned copy to keep, then free — a vector read after `free()` reads recycled memory. Elsewhere `zeroCopy` is `false`: the parse copied, the wasm side is already released, and the same code runs unchanged. For a store hosted in a Web Worker, `toIPC()` gives Arrow IPC stream bytes to `postMessage` across (`tableFromIPC` reads them back).
+
+The entry's Arrow dependencies — [`@vortex-rdf/arrow-js-ffi`](https://www.npmjs.com/package/@vortex-rdf/arrow-js-ffi) and `apache-arrow` (21.2 or later, for `string_view`) — are optional peers: install them if you import the `/arrow` subpath; the main entry never references them.
+
+`matchArrowFFI` is the low-level call underneath: the same match as C Data Interface structs in wasm memory, owned by an `ArrowFFI` handle whose `schemaPtr()`/`arrayPtrs()` any C-Data-Interface reader takes.
 
 ## Build options
 
@@ -216,9 +234,10 @@ for (const quad of store.getQuads(null, df.namedNode('http://schema.org/name'), 
 The package is built with [wasm-pack](https://rustwasm.github.io/wasm-pack/) targeting `web`; one build (`pkg/web/`) backs both environments. `entry/node.js` and `entry/browser.js` are small hand-written wrappers that differ only in how they supply the `.wasm` bytes to the generated `init()`, and `package.json`'s `exports` map picks one per environment.
 
 ```bash
-npm run build       # wasm-pack build into pkg/web/ (build:fast skips wasm-opt)
-npm test            # vitest suite (requires a build)
-npm run typecheck   # tsc over the tests and benchmarks, against the published API
+npm run build           # wasm-pack build into pkg/web/ (build:fast skips wasm-opt)
+npm test                # vitest suite (requires a build); the Arrow views copy at parse time here
+npm run test:zero-copy  # the suite again under --experimental-wasm-rab-integration: zero-copy views
+npm run typecheck       # tsc over the tests and benchmarks, against the published API
 ```
 
 Benchmarks live in [bench/](bench/README.md).

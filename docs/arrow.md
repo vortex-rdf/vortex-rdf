@@ -4,7 +4,7 @@ This document describes how a store hands its data to Apache Arrow
 consumers: what an exported record batch looks like, how each cell encoding
 is produced from the store's own columns, what is and is not copied along
 the way, and how the two bindings surface it — the Python PyCapsule
-protocol and the JavaScript IPC bytes. How the rows themselves are resolved
+protocol and the JavaScript zero-copy views. How the rows themselves are resolved
 is [matching.md](matching.md); where the term dictionary comes from is
 [file-format.md](file-format.md); how appended rows (the tail) and deletes
 enter a view is [mutations.md](mutations.md).
@@ -98,14 +98,13 @@ code-column readers.
 [`DictSnapshot::to_arrow`](../core/src/store/layouts/dictionary/term_dict.rs#L1075)
 returns the whole term dictionary as one `string_view` array whose element
 `i` is the term of code `i`: a code → term lookup table, and the values
-array every `terms` batch is keyed over. It is built on first use and
-held weakly on the dictionary
-([`arrow_values`](../core/src/store/layouts/dictionary/term_dict.rs#L682)):
-every export alive at the same time shares one `Arc`, and the array is
-freed with its last holder. Canonical (plaintext) chunks convert
-buffer-sharing; FSST-compressed chunks decompress once per set of
-concurrent holders, a cost bounded by the dictionary's size, never by a
-result's ([§3.4](#34-the-dictionary-values)).
+array every `terms` batch is keyed over. For a canonical dictionary — every
+built one, and an adopted one opened in the plaintext form — it is the
+dictionary's own buffers, converted on every call with nothing cached
+([`arrow_values`](../core/src/store/layouts/dictionary/term_dict.rs#L682));
+an as-written adopted dictionary decompresses its FSST chunks once per set
+of concurrent holders and holds the result weakly, a cost bounded by the
+dictionary's size, never by a result's ([§3.4](#34-the-dictionary-values)).
 
 Two bounds expose the lexicographic-rank structure of the code space to a
 planner. [`lower_bound`](../core/src/store/layouts/dictionary/term_dict.rs#L1083)
@@ -173,7 +172,7 @@ a built base's canonical `u32` columns, a served match reading the
 answering index's own columns, or an adopted base's live canonical form —
 the batch is built straight from the four buffers it returns
 ([`code_buffers_to_batch`](../core/src/store/batches.rs#L181)). This is
-the path the bindings' `match_arrow` / `matchArrowIPC` take — their one
+the path the bindings' `match_arrow` / `matchArrow` take — their one
 engine-facing read — so every consumer of a view hands out the same memory. A
 store *adopted* from bytes or a file keeps its base wire-encoded
 ([serialization.md](serialization.md)): a contiguous wide read decodes
@@ -214,7 +213,9 @@ key is in range, a linear pass over the codes and no copy.
 | dictionary values, FSST chunks (adopted as written) | once per set of concurrent holders | decompressed on first use, held weakly, freed with the last holder |
 | `strings` cells | yes, every cell | the string materialization itself |
 | Python capsule export | no | the C Data Interface hands out the same buffers |
-| JavaScript IPC bytes | yes, the whole result | one copy out of wasm memory, like the lazy quad payload |
+| JavaScript view (`matchArrow` on a runtime with resizable wasm buffers) | no | the Arrow JS `Table` reads the module's memory in place; the `ArrowFFI` handle keeps it alive until `free()` |
+| JavaScript parse-time copy (every other runtime) | once, the whole result | `terms` copies the dictionary once per projected column |
+| JavaScript `toTable()` / `toIPC()` | once, by request | a JS-owned copy to hold past `free()`, or IPC bytes to transfer to a Worker |
 
 ### 3.4 The dictionary values
 
@@ -292,38 +293,102 @@ The `pyarrow`/`polars` packages appear only as test dependencies
 
 ---
 
-## 5. JavaScript: Arrow IPC bytes
+## 5. JavaScript: zero-copy views over wasm memory
 
-JavaScript has no C Data Interface counterpart of the capsule protocol,
-and the Arrow ecosystem there — `apache-arrow`'s `tableFromIPC`,
-DuckDB-WASM, Arquero, Perspective — consumes the
-[IPC streaming format](https://arrow.apache.org/docs/format/Columnar.html#ipc-streaming-format).
-So the wasm bindings export exactly that:
-[`matchArrowIPC`](../js/src/store.rs#L346) resolves the pattern, drives
-the core batch stream to completion (no wasm read path performs I/O, so
-the stream is already resolved and nothing suspends) and writes the
-schema and every batch through arrow-ipc's `StreamWriter` into one
-`Uint8Array`.
+JavaScript has no capsule protocol, but the C Data Interface itself needs
+nothing more than memory both sides can address — and wasm linear memory
+is exactly that. [`matchArrowFFI`](../js/src/store.rs#L364) resolves the
+pattern, applies the `keep` constraints and the row window, drives the
+core batch stream to completion (no wasm read path performs I/O, so the
+stream is already resolved and nothing suspends) and exports the result as
+C Data Interface structs ([`ArrowFFI::export`](../js/src/store.rs#L541)):
+the `ArrowSchema` of the batches, a struct field carrying the quad schema's
+metadata, and one `ArrowArray` — a struct array — per batch. The returned
+`ArrowFFI` handle owns them and reports their addresses (`schemaPtr()`,
+`arrayPtrs()`); dropping it runs the release callbacks, which is what frees
+the exported buffers. `@vortex-rdf/arrow-js-ffi` (a fork of `arrow-js-ffi`
+that also parses the `Utf8View`/`BinaryView` layout, so `string_view`
+columns and dictionary values cross as they are) reads them into an Arrow
+JS `Table`, either as views over the module's memory or as a copy.
+
+The `/arrow` entry of the package packages that call with its lifetime:
+importing `@vortex-rdf/vortex-rdf-store/arrow` installs
+[`matchArrow`](../js/entry/match-view.js#L101) on the store class and
+exports the [`MatchView`](../js/entry/match-view.js#L39) it returns. The
+main entry never references `@vortex-rdf/arrow-js-ffi` or `apache-arrow`
+(both optional peer dependencies), so a consumer that does not import the
+subpath needs neither installed.
 
 ```javascript
-const table = tableFromIPC(store.matchArrowIPC(null, myPredicate, null, null));
-const terms = tableFromIPC(store.matchArrowIPC(null, null, null, null, { encoding: 'terms' }));
+import { VortexRdfStore } from '@vortex-rdf/vortex-rdf-store/arrow';
+
+using view = store.matchArrow(null, myPredicate, null, null);
+view.table.getChild('s');                                   // an Arrow JS Vector of uint32 codes
+const terms = store.matchArrow(null, null, null, null, { encoding: 'terms' });
+const kept = terms.toTable();                               // a JS-owned copy, to hold past free()
+terms.free();
 ```
 
-The options object ([`parse_arrow_options`](../js/src/options.rs#L112))
-carries the same `encoding` and `projection` vocabulary as core, parsed by
-core's own `FromStr` impls so an error message reads the same from every
-frontend. Under `terms` the dictionary is written as IPC dictionary
-batches and the record batches carry only `u32` keys, so the shared
-dictionary crosses the boundary once per column rather than once per
-batch.
+**Views and memory growth.** A typed array over `WebAssembly.Memory.buffer`
+is a view into the module's memory, and that buffer is detached the moment
+the memory grows: every such view then reads as empty, silently. A
+resizable buffer removes the hazard —
+`WebAssembly.Memory.prototype.toResizableBuffer()` (Chrome 144, Firefox 145,
+Safari 26.2; Node 24.5+ behind `--experimental-wasm-rab-integration`) makes
+growth happen in place, the buffer keeps its identity and fixed-length views
+created before a `grow` stay valid. It requires the module to declare a
+memory maximum, which the build sets to the wasm32 ceiling
+([`.cargo/config.toml`](../.cargo/config.toml): 4 GiB, a reservation of
+address space, not an allocation). The entry calls it once at load
+([`enableZeroCopy`](../js/entry/match-view.js#L20)); where the call is
+missing or throws, every parse copies instead and `view.zeroCopy` is
+`false` — the same API, one copy at parse time.
 
-The bytes are one copy out of wasm memory — the same choice the lazy quad
-payload makes with its `Uint32Array`s
-([`set_code_columns`](../js/src/store.rs#L467)), because a view into wasm
-linear memory is detached the moment the memory grows. A zero-copy path (`arrow-js-ffi` reading C Data Interface structs
-out of wasm memory) would need explicit release handles and memory-growth
-discipline on the consumer's side, and is not part of this surface.
+**Lifetime.** Under zero-copy the `ArrowFFI` handle keeps the exported
+buffers alive until the view's `free()` (also `Symbol.dispose`, so a `using`
+declaration frees at scope exit); a vector or typed array read after that
+reads recycled memory, so hold nothing past `free()`, or take
+[`toTable()`](../js/entry/match-view.js#L68) — a deep copy the parse makes
+out of wasm memory — first. The copy is also what `structuredClone` and a
+Worker transfer accept: a wasm memory buffer is not transferable. Under the
+fallback the wasm side is freed as soon as the parse has copied, and
+`free()` only drops the table. A forgotten handle is reclaimed by
+wasm-bindgen's `FinalizationRegistry` when its wrapper is collected.
+
+**Worker topology.** Views exist only in the thread that hosts the module.
+For a store hosted in a Web Worker, [`toIPC()`](../js/entry/match-view.js#L80)
+serializes the table (apache-arrow's `tableToIPC`, on the JS side) into
+Arrow IPC stream bytes — `postMessage(bytes, [bytes.buffer])`, then
+`tableFromIPC` on the other side parses them without another copy. Under
+`terms` each column carries its own dictionary batch. Freeing the previous
+view before running the next query is the discipline a long-lived worker
+keeps.
+
+**Pushdown.** The options object
+([`parse_arrow_options`](../js/src/options.rs#L146)) carries core's
+`encoding` and `projection` vocabulary, parsed by core's own `FromStr` impls
+so an error message reads the same from every frontend, plus the narrowing
+Python's `match_arrow` takes: `keep` (per column, a `Uint32Array` or array
+of codes as a code set, `{lo, hi}` as a half-open code range —
+[`parse_keep`](../js/src/options.rs#L181)) applied through core's
+[`keep`](../core/src/store/pushdown.rs#L182), then `offset`/`limit` through
+[`window`](../core/src/store/pushdown.rs#L68), before any row is gathered.
+`TermDict.decodeMany` ([`decode_many`](../js/src/store.rs#L120)) decodes a
+code column back in one crossing.
+
+**Why not an FSST-aware export.** The dictionary's values reach JS as one
+`string_view` array over the dictionary's own buffers because a built
+dictionary is canonical and an adopted one is decoded once at `fromBytes`
+(the plaintext form, [memory.md §1.1](memory.md#11-measured)).
+The alternative — handing the FSST chunks across as they are — has no
+Arrow representation: vortex-arrow converts FSST only by canonicalizing,
+arrow-rs's canonical extension types cover nothing like it, and an
+extension type would cross the C Data Interface as field metadata that
+Arrow JS 21.2 does not interpret, readable by this package alone and never
+by DuckDB-WASM, Arquero or Perspective. A JS FSST decoder would serve only
+the as-written form through the package's own lazy dictionary, at no gain
+over the wasm bulk decode. So FSST stays a wire and as-written resident
+encoding, and the Arrow surface hands out plaintext views.
 
 ---
 
@@ -333,4 +398,4 @@ discipline on the consumer's side, and is not part of this surface.
 |---|---|
 | core | [tests/arrow.rs](../core/src/tests/arrow.rs): buffer sharing on a built store, codes/terms/strings against the code and shared-quad readers (in memory and file-backed), tail and tombstone equivalence, projection, rejected combinations; [arrow/mod.rs](../core/src/store/arrow.rs) schema tests; [term_dict.rs](../core/src/store/layouts/dictionary/term_dict.rs) dictionary values and bounds |
 | Python | [tests/test_arrow.py](../python/tests/test_arrow.py): capsule round-trips into pyarrow and polars, buffer-address equality for code sets, stream-versus-`get_quads` equality on file-backed and in-memory stores, one shared dictionary across columns and batches, consume-once semantics, projection, per-layout rejection; [tests/test_primitives.py](../python/tests/test_primitives.py): `keep`, windows and batches through the stream, Arrow arrays as code sets |
-| JavaScript | [test/arrow.test.ts](../js/test/arrow.test.ts): IPC tables against `getQuads` and `termDict`, schema metadata, string-view and dictionary column types, projection, rejected options and layouts |
+| JavaScript | [test/arrow.test.ts](../js/test/arrow.test.ts): `matchArrow` tables against `getQuads` and `termDict`, schema metadata, string-view and dictionary column types, projection, rejected options and layouts; the `MatchView` lifetime (zero-copy against the module's memory, views surviving growth, `toTable()`, `toIPC()`, `free()`, a Worker transfer); `keep`/`offset`/`limit` against the plain match; `decodeMany`. Run twice: `npm test` covers the parse-time copy, `npm run test:zero-copy` the views ([vitest.zero-copy.config.ts](../js/vitest.zero-copy.config.ts)) |
