@@ -9,96 +9,115 @@
 //! BENCH_SIZE=1048576 cargo run --release --example dict_memory
 //! ```
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+// The crate's `mimalloc` feature installs its own global allocator, which
+// this one would collide with; the workspace's CLI enables it, so a
+// workspace-wide build compiles the example without the measurement.
+#[cfg(feature = "mimalloc")]
+fn main() {
+    eprintln!("dict_memory counts through the system allocator: build without --features mimalloc");
+    std::process::exit(2);
+}
 
-use futures::stream;
-use vortex_rdf_core::{DictForm, LayoutStrategy, RawQuad, VortexRdfStore};
+#[cfg(not(feature = "mimalloc"))]
+fn main() {
+    counting::main();
+}
 
+#[cfg(not(feature = "mimalloc"))]
 #[allow(dead_code)]
 #[path = "../benches/support/dataset.rs"]
 mod dataset;
 
-/// Live heap bytes, kept by every allocation and release.
-static LIVE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(feature = "mimalloc"))]
+mod counting {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
-struct Counting;
+    use futures::stream;
+    use vortex_rdf_core::{DictForm, LayoutStrategy, RawQuad, VortexRdfStore};
 
-// SAFETY: every call forwards to `System` unchanged; only the counter is
-// added on top.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let p = unsafe { System.alloc(layout) };
-        if !p.is_null() {
-            LIVE.fetch_add(layout.size(), Ordering::Relaxed);
+    use super::dataset;
+
+    /// Live heap bytes, kept by every allocation and release.
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+    struct Counting;
+
+    // SAFETY: every call forwards to `System` unchanged; only the counter is
+    // added on top.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let p = unsafe { System.alloc(layout) };
+            if !p.is_null() {
+                LIVE.fetch_add(layout.size(), Ordering::Relaxed);
+            }
+            p
         }
-        p
-    }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let p = unsafe { System.realloc(ptr, layout, new_size) };
-        if !p.is_null() {
-            LIVE.fetch_add(new_size, Ordering::Relaxed);
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
             LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+            unsafe { System.dealloc(ptr, layout) }
         }
-        p
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let p = unsafe { System.realloc(ptr, layout, new_size) };
+            if !p.is_null() {
+                LIVE.fetch_add(new_size, Ordering::Relaxed);
+                LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+            }
+            p
+        }
     }
-}
 
-#[global_allocator]
-static ALLOC: Counting = Counting;
+    #[global_allocator]
+    static ALLOC: Counting = Counting;
 
-fn live() -> usize {
-    LIVE.load(Ordering::Relaxed)
-}
-
-fn mib(bytes: usize) -> String {
-    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
-}
-
-fn delta(from: usize) -> String {
-    let now = live();
-    if now >= from {
-        format!("+{}", mib(now - from))
-    } else {
-        format!("-{}", mib(from - now))
+    fn live() -> usize {
+        LIVE.load(Ordering::Relaxed)
     }
-}
 
-fn secs(d: Duration) -> String {
-    if d.as_secs_f64() >= 1.0 {
-        format!("{:.2} s", d.as_secs_f64())
-    } else {
-        format!("{:.1} ms", d.as_secs_f64() * 1e3)
+    fn mib(bytes: usize) -> String {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
     }
-}
 
-/// The dictionary's Arrow values held, then dropped: what each costs on top
-/// of the store.
-fn arrow_values_cost(store: &VortexRdfStore) -> (String, String) {
-    let dict = store
-        .code_read_snapshot()
-        .expect("a resident dictionary store is code-readable");
-    let before = live();
-    let values = dict.to_arrow().expect("to_arrow");
-    let held = delta(before);
-    drop(values);
-    (held, delta(before))
-}
+    fn delta(from: usize) -> String {
+        let now = live();
+        if now >= from {
+            format!("+{}", mib(now - from))
+        } else {
+            format!("-{}", mib(from - now))
+        }
+    }
 
-fn main() {
-    let n: usize = std::env::var("BENCH_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(262_144);
-    let rt = tokio::runtime::Runtime::new().expect("runtime");
-    rt.block_on(async move {
+    fn secs(d: Duration) -> String {
+        if d.as_secs_f64() >= 1.0 {
+            format!("{:.2} s", d.as_secs_f64())
+        } else {
+            format!("{:.1} ms", d.as_secs_f64() * 1e3)
+        }
+    }
+
+    /// The dictionary's Arrow values held, then dropped: what each costs on top
+    /// of the store.
+    fn arrow_values_cost(store: &VortexRdfStore) -> (String, String) {
+        let dict = store
+            .code_read_snapshot()
+            .expect("a resident dictionary store is code-readable");
+        let before = live();
+        let values = dict.to_arrow().expect("to_arrow");
+        let held = delta(before);
+        drop(values);
+        (held, delta(before))
+    }
+
+    pub(super) fn main() {
+        let n: usize = std::env::var("BENCH_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(262_144);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async move {
         let m = dataset::moduli(n, dataset::WANT_GRAPHS);
         // Built: the quads are consumed by the build and freed with it, so
         // what is left above the baseline taken before them is the store.
@@ -148,4 +167,5 @@ fn main() {
         println!("columns: form | construction | retained | to_arrow held | after drop");
         drop(built);
     });
+    }
 }
