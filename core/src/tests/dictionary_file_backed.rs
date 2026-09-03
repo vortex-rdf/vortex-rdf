@@ -580,9 +580,9 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
 
 // ─── Dictionary child round-trips ──────────────────────────────────────
 
-/// The term column stays FSST-encoded through a to_bytes/from_bytes round
-/// trip — read back compressed, not canonicalized on open — and the terms
-/// still resolve through the compressed form.
+/// Written FSST and adopted as written, the term column comes back
+/// compressed — not canonicalized on open — and the terms still resolve
+/// through the compressed form.
 #[tokio::test]
 async fn test_dictionary_terms_stay_fsst_through_bytes() {
     let arr = build_array::<SortedInMemoryBuilder>(
@@ -595,7 +595,9 @@ async fn test_dictionary_terms_stay_fsst_through_bytes() {
     let store = VortexRdfStore::from_built(arr).unwrap();
 
     let bytes = store.to_bytes().await.unwrap();
-    let reread = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+    let reread = VortexRdfStore::from_bytes_owned_as(bytes, crate::store::DictForm::AsWritten)
+        .await
+        .unwrap();
     assert_dictionary_terms_fsst(&reread, "reread");
 
     // And the terms still resolve, through the compressed representation.
@@ -606,6 +608,44 @@ async fn test_dictionary_terms_stay_fsst_through_bytes() {
         .await
         .unwrap();
     assert_eq!(matched.size().await.unwrap(), 125);
+}
+
+/// The same bytes adopted in the plaintext form decode into one canonical
+/// chunk that answers exactly like the store they were written from.
+#[tokio::test]
+async fn test_plaintext_adoption_is_one_canonical_chunk() {
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(fsst_dictionary_quads()),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await
+    .unwrap();
+    let store = VortexRdfStore::from_built(arr).unwrap();
+
+    let bytes = store.to_bytes().await.unwrap();
+    let plaintext = VortexRdfStore::from_bytes_owned_as(bytes, crate::store::DictForm::Plaintext)
+        .await
+        .unwrap();
+    assert_dictionary_canonical(&plaintext, "plaintext");
+
+    assert_eq!(plaintext.size().await.unwrap(), 2_000);
+    let p = NamedNode::new("http://example.org/predicate/3").unwrap();
+    let matched = plaintext
+        .match_pattern(None, Some(&p), None, None)
+        .await
+        .unwrap();
+    assert_eq!(matched.size().await.unwrap(), 125);
+
+    let built = store.code_read_snapshot().unwrap();
+    let dict = plaintext.code_read_snapshot().unwrap();
+    assert_eq!(dict.len(), built.len());
+    for code in (0..dict.len() as u32).step_by(97) {
+        let term = built.decode(code).unwrap();
+        assert_eq!(dict.decode(code).as_deref(), Some(term.as_str()));
+        assert_eq!(dict.encode(&term), Some(code), "{term}");
+    }
+    assert_eq!(dict.encode("\u{10FFFF}"), None);
 }
 
 /// The native container end to end through the path-based writer: one
@@ -675,6 +715,19 @@ async fn test_large_dictionary_child_lift_keeps_fsst() {
     let (dict, _code_map) = builder.finish().unwrap();
     let len = dict.len() as u64;
 
+    // As built, one canonical chunk; the FSST windows are made at write,
+    // one per 64 Ki terms.
+    let built_chunks = dict.term_chunks();
+    assert_eq!(built_chunks.len(), 1);
+    assert_eq!(
+        built_chunks[0].encoding_id().to_string(),
+        "vortex.varbinview"
+    );
+    assert_eq!(
+        dict.child_chunks().unwrap().len(),
+        (len as usize).div_ceil(65_536)
+    );
+
     let bytes = write_dict_only_store(&dict).await;
     assert!(bytes.len() > 1 << 20, "file too small to force chunking");
 
@@ -698,7 +751,9 @@ async fn test_large_dictionary_child_lift_keeps_fsst() {
             &Default::default(),
         )
         .unwrap();
-    let lifted = TermDictionary::from_child_reader(reader).await.unwrap();
+    let lifted = TermDictionary::from_child_reader(reader, crate::store::DictForm::AsWritten)
+        .await
+        .unwrap();
 
     // Multi-chunk, and every chunk still FSST.
     let chunks = lifted.term_chunks();

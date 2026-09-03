@@ -215,9 +215,11 @@ impl VortexRdfStore {
                 let access = match file_backed {
                     Some(dict) => DictAccess::FileBacked(dict),
                     // One full scan of the dictionary child — chunks keep
-                    // their FSST.
+                    // their FSST: a file-backed store is memory-bounded by
+                    // design, and its resident dictionary follows.
                     None => DictAccess::Resident(Arc::new(
-                        TermDictionary::from_child_reader(reader).await?,
+                        TermDictionary::from_child_reader(reader, super::DictForm::AsWritten)
+                            .await?,
                     )),
                 };
                 ResolvedLayout::Dictionary(access)
@@ -270,8 +272,21 @@ impl VortexRdfStore {
     /// [`from_bytes`](Self::from_bytes) taking ownership of the buffer: the
     /// file machinery slices it refcounted, so no copy is made. Use it
     /// whenever the caller already owns the bytes; `from_bytes` copies a
-    /// borrowed slice into one.
+    /// borrowed slice into one. The dictionary is adopted as written (see
+    /// [`from_bytes_owned_as`](Self::from_bytes_owned_as)).
     pub async fn from_bytes_owned(bytes: impl Into<vortex_buffer::ByteBuffer>) -> Result<Self> {
+        Self::from_bytes_owned_as(bytes, super::DictForm::AsWritten).await
+    }
+
+    /// [`from_bytes_owned`](Self::from_bytes_owned) with the dictionary
+    /// held in `form` (see [`DictForm`](super::DictForm)): its chunks as
+    /// written — FSST windows inside the bytes, decoded one term per read —
+    /// or decoded whole, once, into one canonical column that every probe,
+    /// decode and Arrow export then reads in place.
+    pub async fn from_bytes_owned_as(
+        bytes: impl Into<vortex_buffer::ByteBuffer>,
+        form: super::DictForm,
+    ) -> Result<Self> {
         let file = VORTEX_SESSION
             .open_options()
             .open_buffer(bytes.into())
@@ -311,7 +326,9 @@ impl VortexRdfStore {
                 .map_err(VortexRdfError::Vortex)?;
             match kind {
                 ComponentKind::Dict => {
-                    dict = Some(Arc::new(TermDictionary::from_child_reader(reader).await?));
+                    dict = Some(Arc::new(
+                        TermDictionary::from_child_reader(reader, form).await?,
+                    ));
                 }
                 ComponentKind::Index(known) => {
                     // Adopted by reader, nothing read: the roster row comes

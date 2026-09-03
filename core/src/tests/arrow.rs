@@ -2,6 +2,7 @@
 //! equivalence with the quad streams, projection, and the file-backed
 //! chunk pipeline.
 
+#[cfg(feature = "file-io")]
 use std::sync::Arc;
 
 use super::*;
@@ -17,10 +18,7 @@ async fn batches(
     encoding: TermEncoding,
     projection: Option<&[QuadColumn]>,
 ) -> (SchemaRef, Vec<RecordBatch>) {
-    let stream = store
-        .to_record_batches(encoding, projection)
-        .await
-        .unwrap();
+    let stream = store.to_record_batches(encoding, projection).await.unwrap();
     let schema = stream.schema();
     let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
     for batch in &batches {
@@ -78,7 +76,14 @@ fn batch_rows(batches: &[RecordBatch], dict: Option<&DictSnapshot>) -> Vec<Vec<S
 fn shared_rows(quads: &[SharedQuad]) -> Vec<Vec<String>> {
     quads
         .iter()
-        .map(|q| vec![q.s.to_string(), q.p.to_string(), q.o.to_string(), q.g.to_string()])
+        .map(|q| {
+            vec![
+                q.s.to_string(),
+                q.p.to_string(),
+                q.o.to_string(),
+                q.g.to_string(),
+            ]
+        })
         .collect()
 }
 
@@ -105,6 +110,7 @@ async fn store(quads: Vec<Quad>, layout: LayoutStrategy) -> VortexRdfStore {
 /// A store adopted from bytes keeps its base wire-encoded; its export shares
 /// the live canonical form with every code read holding it, so while the
 /// gathered columns are held the batch's columns are those same buffers.
+#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn codes_share_the_base_buffers_of_a_full_dictionary_store() {
     let built = store(modular_quads(50, 5, 7), LayoutStrategy::Dictionary).await;
@@ -134,7 +140,11 @@ async fn codes_share_the_base_buffers_of_a_full_dictionary_store() {
     assert_eq!(adopted_batches.len(), 1);
     for (i, buffer) in gathered.iter().enumerate() {
         let column = adopted_batches[0].column(i).as_primitive::<UInt32Type>();
-        assert_eq!(column.values().as_ref(), buffer.as_slice(), "adopted: column {i}");
+        assert_eq!(
+            column.values().as_ref(),
+            buffer.as_slice(),
+            "adopted: column {i}"
+        );
         assert_eq!(
             column.values().as_ptr(),
             buffer.as_slice().as_ptr(),
@@ -246,10 +256,18 @@ async fn projection_picks_columns_in_order() {
     let store = store(dictionary_test_quads(), LayoutStrategy::Dictionary).await;
     let dict = store.code_read_snapshot().unwrap();
     let projection = [QuadColumn::O, QuadColumn::S];
-    for encoding in [TermEncoding::Codes, TermEncoding::Terms, TermEncoding::Strings] {
+    for encoding in [
+        TermEncoding::Codes,
+        TermEncoding::Terms,
+        TermEncoding::Strings,
+    ] {
         let (schema, projected) = batches(&store, encoding, Some(&projection)).await;
         assert_eq!(
-            schema.fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+            schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
             ["o", "s"],
             "{encoding}"
         );
@@ -280,7 +298,11 @@ async fn projection_picks_columns_in_order() {
 #[tokio::test]
 async fn unsupported_layouts_and_encodings_are_rejected() {
     let typed = store(modular_quads(5, 2, 2), LayoutStrategy::TypedObject).await;
-    for encoding in [TermEncoding::Codes, TermEncoding::Terms, TermEncoding::Strings] {
+    for encoding in [
+        TermEncoding::Codes,
+        TermEncoding::Terms,
+        TermEncoding::Strings,
+    ] {
         assert!(typed.to_record_batches(encoding, None).await.is_err());
     }
     let default = store(modular_quads(5, 2, 2), LayoutStrategy::Default).await;
@@ -323,7 +345,9 @@ async fn file_backed_export_agrees_with_the_readers() {
                 let shared_values = column.as_dictionary::<UInt32Type>().values();
                 match &values {
                     None => values = Some(shared_values.clone()),
-                    Some(first) => assert!(Arc::ptr_eq(first, shared_values), "{tag}: one values array"),
+                    Some(first) => {
+                        assert!(Arc::ptr_eq(first, shared_values), "{tag}: one values array")
+                    }
                 }
             }
         }
@@ -334,7 +358,11 @@ async fn file_backed_export_agrees_with_the_readers() {
         let projection = [QuadColumn::P, QuadColumn::G];
         let (schema, projected) = batches(target, TermEncoding::Codes, Some(&projection)).await;
         assert_eq!(
-            schema.fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+            schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
             ["p", "g"]
         );
         let columns = code_columns_of(&projected);

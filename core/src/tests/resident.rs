@@ -3,10 +3,12 @@
 //! values — what each decodes, what it shares, and when it is freed.
 
 use super::*;
-use crate::store::{QuadColumn, TermEncoding};
-use crate::store::Keep;
+use crate::store::TermEncoding;
+#[cfg(feature = "file-io")]
+use crate::store::{Keep, QuadColumn};
 use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
+use arrow_array::types::UInt32Type;
 
 /// `n` quads over `subjects` subjects, each subject holding a run of
 /// `n / subjects` consecutive rows — wide enough that a subject's range
@@ -31,6 +33,7 @@ async fn built(quads: Vec<Quad>) -> VortexRdfStore {
         .unwrap()
 }
 
+#[cfg(feature = "file-io")]
 async fn adopted(store: &VortexRdfStore) -> VortexRdfStore {
     VortexRdfStore::from_bytes_owned(store.to_bytes().await.unwrap())
         .await
@@ -68,6 +71,7 @@ async fn built_base_serves_codes_without_the_live_cache() {
 /// Over an adopted base, contiguous wide reads decode each column once into
 /// the live canonical form, share it with every holder, and free it with
 /// the last; a subject range is a slice of the same buffers.
+#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn adopted_contiguous_reads_share_the_live_canonical_and_free_it() {
     let store = adopted(&built(wide_subject_quads(1000, 2)).await).await;
@@ -81,7 +85,11 @@ async fn adopted_contiguous_reads_share_the_live_canonical_and_free_it() {
     assert_live(&store, true);
     let b = store.code_columns_gathered().await.unwrap().unwrap();
     for idx in 0..4 {
-        assert_eq!(a[idx].as_ptr(), b[idx].as_ptr(), "column {idx} is shared while held");
+        assert_eq!(
+            a[idx].as_ptr(),
+            b[idx].as_ptr(),
+            "column {idx} is shared while held"
+        );
     }
 
     let s1 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s001").unwrap());
@@ -120,6 +128,7 @@ async fn adopted_contiguous_reads_share_the_live_canonical_and_free_it() {
 
 /// A point-sized selection over an adopted base reads point by point through
 /// the probes and never decodes a column.
+#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn adopted_point_reads_never_decode_a_column() {
     let store = adopted(&built(modular_quads(50, 5, 7)).await).await;
@@ -141,6 +150,7 @@ async fn adopted_point_reads_never_decode_a_column() {
 /// An id-list selection gathers from the live columns only while someone
 /// holds them; on its own it takes from the encoded base and leaves the
 /// cache empty.
+#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn adopted_id_reads_use_the_live_columns_only_while_held() {
     let store = adopted(&built(wide_subject_quads(1200, 2)).await).await;
@@ -157,19 +167,65 @@ async fn adopted_id_reads_use_the_live_columns_only_while_held() {
     assert_live(&store, true);
     let shared = view.code_columns_gathered().await.unwrap().unwrap();
     for idx in 0..4 {
-        assert_eq!(shared[idx].as_slice(), alone[idx].as_slice(), "column {idx}");
+        assert_eq!(
+            shared[idx].as_slice(),
+            alone[idx].as_slice(),
+            "column {idx}"
+        );
     }
     drop(held);
     drop(shared);
     assert_live(&store, false);
 }
 
-/// The dictionary's Arrow values array is shared by every holder and freed
-/// with the last: a `terms` export keeps it alive exactly as long as its
-/// batches live.
+/// A built dictionary is one canonical column that hands out its own
+/// buffers: every `to_arrow` and every `terms` batch shares the dictionary's
+/// views, and nothing is decoded or cached.
 #[tokio::test]
-async fn dictionary_arrow_values_are_freed_with_the_last_holder() {
+async fn built_dictionary_exports_its_own_buffers() {
     let store = built(modular_quads(60, 4, 9)).await;
+    let own = store
+        .debug_dict_views_ptr()
+        .expect("a built dictionary is canonical");
+    let dict = store.code_read_snapshot().unwrap();
+    let values = dict.to_arrow().unwrap();
+    assert_eq!(
+        values.as_string_view().views().as_ptr() as usize,
+        own,
+        "the Arrow values are the dictionary's own views"
+    );
+    assert_eq!(
+        store.debug_dict_arrow_values_alive(),
+        Some(false),
+        "nothing to cache"
+    );
+    let batches: Vec<RecordBatch> = store
+        .to_record_batches(TermEncoding::Terms, None)
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let column = batches[0].column(0).as_dictionary::<UInt32Type>();
+    assert_eq!(
+        column.values().as_string_view().views().as_ptr() as usize,
+        own,
+        "a terms batch carries the dictionary itself"
+    );
+    assert_eq!(store.debug_dict_arrow_values_alive(), Some(false));
+}
+
+/// An adopted dictionary held as written decodes its Arrow values into
+/// memory shared by every holder and freed with the last: a `terms` export
+/// keeps it alive exactly as long as its batches live.
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn adopted_dictionary_arrow_values_are_freed_with_the_last_holder() {
+    let store = adopted(&built(modular_quads(60, 4, 9)).await).await;
+    assert!(
+        store.debug_dict_views_ptr().is_none(),
+        "adopted as written, the dictionary is its FSST chunks"
+    );
     assert_eq!(store.debug_dict_arrow_values_alive(), Some(false));
     let dict = store.code_read_snapshot().unwrap();
     let values = dict.to_arrow().unwrap();
@@ -197,6 +253,7 @@ async fn dictionary_arrow_values_are_freed_with_the_last_holder() {
 
 /// `keep` over an adopted base reads its column through the live cache and
 /// leaves no decoded column behind.
+#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn keep_on_an_adopted_base_leaves_no_decoded_column_behind() {
     let base = built(wide_subject_quads(600, 2)).await;

@@ -364,11 +364,12 @@ async fn test_dictionary_empty_dataset() {
     assert!(decoded.is_empty());
 }
 
-/// Every chunk of the term column a build holds is FSST-encoded. The
-/// assertion is on the encoding id because a fall back to plaintext decodes
-/// identically and would otherwise go unnoticed.
+/// A built dictionary is one canonical chunk: the plaintext column as the
+/// builder froze it, compressed only when written. The assertion is on the
+/// encoding id because a compressed form decodes identically and would
+/// otherwise go unnoticed.
 #[tokio::test]
-async fn test_built_dictionary_terms_are_fsst() {
+async fn test_built_dictionary_is_one_canonical_chunk() {
     let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(fsst_dictionary_quads()),
         LayoutStrategy::Dictionary,
@@ -377,7 +378,7 @@ async fn test_built_dictionary_terms_are_fsst() {
     .await
     .unwrap();
     let store = VortexRdfStore::from_built(arr).unwrap();
-    assert_dictionary_terms_fsst(&store, "built");
+    assert_dictionary_canonical(&store, "built");
 }
 
 /// `code_read_snapshot` is the one "codes are decodable" gate the frontends

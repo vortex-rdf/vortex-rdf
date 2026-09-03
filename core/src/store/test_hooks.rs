@@ -12,9 +12,9 @@ use vortex_array::arrays::StructArray;
 use crate::error::Result;
 use crate::store::array;
 #[cfg(feature = "file-io")]
-use crate::store::layouts::QuadPattern;
-#[cfg(feature = "file-io")]
 use crate::store::layouts::DictAccess;
+#[cfg(feature = "file-io")]
+use crate::store::layouts::QuadPattern;
 use crate::store::layouts::ResolvedLayout;
 use crate::store::selection::{RowSelection, ViewSelection};
 use crate::store::{QuadsSource, VortexRdfStore};
@@ -271,13 +271,23 @@ impl VortexRdfStore {
         }
     }
 
-    /// Whether some consumer currently holds the resident dictionary's Arrow
-    /// values array; `None` without a resident dictionary.
+    /// Whether some consumer currently holds a decoded Arrow values array of
+    /// the resident dictionary; `None` without a resident dictionary.
     pub(crate) fn debug_dict_arrow_values_alive(&self) -> Option<bool> {
         match &self.layout {
             ResolvedLayout::Dictionary(access) => {
                 Some(access.resident()?.debug_arrow_values_alive())
             }
+            _ => None,
+        }
+    }
+
+    /// The address of the resident dictionary's own views buffer when it is
+    /// one canonical chunk — what a zero-copy Arrow export must share;
+    /// `None` for any other form.
+    pub(crate) fn debug_dict_views_ptr(&self) -> Option<usize> {
+        match &self.layout {
+            ResolvedLayout::Dictionary(access) => access.resident()?.debug_views_ptr(),
             _ => None,
         }
     }

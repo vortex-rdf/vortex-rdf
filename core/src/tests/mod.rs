@@ -404,8 +404,8 @@ fn term_kind_quads() -> Vec<Quad> {
     ]
 }
 
-/// 2,000 quads with ~4,000 distinct terms: enough for the dictionary to be
-/// FSST-compressed as built.
+/// 2,000 quads with ~4,000 distinct terms: enough for a real FSST window
+/// when the dictionary is written, and several probe steps per lookup.
 fn fsst_dictionary_quads() -> Vec<Quad> {
     (0..2_000)
         .map(|i| {
@@ -420,6 +420,7 @@ fn fsst_dictionary_quads() -> Vec<Quad> {
 }
 
 /// Every chunk of `store`'s held term column is FSST-encoded.
+#[cfg(feature = "file-io")]
 fn assert_dictionary_terms_fsst(store: &VortexRdfStore, when: &str) {
     let dict = store.dictionary_snapshot().unwrap().0;
     for chunk in dict.term_chunks() {
@@ -429,6 +430,18 @@ fn assert_dictionary_terms_fsst(store: &VortexRdfStore, when: &str) {
             "{when}: dictionary chunk not FSST"
         );
     }
+}
+
+/// `store`'s held term column is one canonical (plaintext) chunk.
+fn assert_dictionary_canonical(store: &VortexRdfStore, when: &str) {
+    let dict = store.dictionary_snapshot().unwrap().0;
+    let chunks = dict.term_chunks();
+    assert_eq!(chunks.len(), 1, "{when}: dictionary not one chunk");
+    assert_eq!(
+        chunks[0].encoding_id().to_string(),
+        "vortex.varbinview",
+        "{when}: dictionary chunk not canonical"
+    );
 }
 
 /// Quads as `(s, p, o, g)` N-Triples tuples, the default graph as `""` —

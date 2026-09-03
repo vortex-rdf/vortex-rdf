@@ -54,10 +54,10 @@ pub use self::ingest::DictionaryQuadSink;
 // wasm32-unknown-unknown.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) use self::ingest::{TermCodeMap, TermDictionaryBuilder};
-use self::term_dict::DictCursor;
 pub use self::predicates::{NumOp, TermPredicate, Verdict};
-pub use self::term_dict::DictSnapshot;
+use self::term_dict::DictCursor;
 pub(crate) use self::term_dict::TermDictionary;
+pub use self::term_dict::{DictForm, DictSnapshot};
 
 /// The primary columns: `s`, `p`, `o`, `g` (all u32 codes).
 pub(crate) const COLUMNS: &[&str] = &PRIMARY_COLUMNS;
@@ -300,7 +300,8 @@ const MEMO_MIN_ROWS: usize = 16;
 ///
 /// Codes repeat heavily down a column — a predicate or graph name recurs on
 /// nearly every row — and each repeat would otherwise pay the dictionary read
-/// (an FSST decompress) *and* the term parse again. Direct-mapped: a miss
+/// (a view lookup on a canonical dictionary, an FSST decompress on one
+/// adopted as written) *and* the term parse again. Direct-mapped: a miss
 /// costs one compare and one overwrite, and the memory is fixed whatever the
 /// column's cardinality, so a high-cardinality column like subjects cannot
 /// accumulate entries it never reads again.
@@ -397,7 +398,7 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Resul
 /// code's term at most once (see [`TermMemo`]) — the [`raw_quads`]
 /// reconstruction path, where a predicate or graph column repeats a handful
 /// of codes over every row and each repeat would otherwise pay the dictionary
-/// read (an FSST decompress) again.
+/// read and the term parse again.
 ///
 /// [`raw_quads`]: crate::store::layouts::ResolvedLayout::raw_quads
 pub(super) fn decode_code_column<T: Clone + for<'a> From<&'a str>>(

@@ -42,9 +42,9 @@ pub use export::export_rdf;
 pub use builders::SortedStreamBuilder;
 pub use indexes::{IndexType, Indexes};
 pub use layouts::LayoutStrategy;
-pub use layouts::dictionary::{DictSnapshot, NumOp, TermPredicate, Verdict};
-pub use pushdown::Keep;
 pub use layouts::dictionary::DictionaryQuadSink;
+pub use layouts::dictionary::{DictForm, DictSnapshot, NumOp, TermPredicate, Verdict};
+pub use pushdown::Keep;
 // `RawQuad` lives in `common` (it is pure RDF text — see that module's
 // charter); this re-export makes `store::RawQuad` the path builder consumers
 // use.
@@ -228,8 +228,19 @@ impl VortexRdfStore {
     /// the order every builder of this crate produces — and the match fast
     /// paths search every bound role on that basis. Rows sorted by subject
     /// alone must not carry it.
+    ///
+    /// The dictionary is adopted as it arrived (see
+    /// [`from_parts_as`](Self::from_parts_as)).
     pub fn from_parts(parts: StoreParts) -> Result<Self> {
-        let layout = resolved_layout(parts.dict, parts.array.dtype())?;
+        Self::from_parts_as(parts, DictForm::AsWritten)
+    }
+
+    /// [`from_parts`](Self::from_parts) with the dictionary held in `form`
+    /// (see [`DictForm`]): as it arrived — FSST chunks when the parts came
+    /// out of a file — or decoded whole, once, into one canonical column.
+    pub fn from_parts_as(parts: StoreParts, form: DictForm) -> Result<Self> {
+        let dict = parts.dict.map(|dict| dict.into_form(form)).transpose()?;
+        let layout = resolved_layout(dict, parts.array.dtype())?;
         let base = array::with_searchable_int_children(parts.array)?;
         let components = parts
             .components

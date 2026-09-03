@@ -361,7 +361,11 @@ impl FileBackedDict {
     ///
     /// [`DictAccess::ensure_resident`]: super::access::DictAccess::ensure_resident
     pub(crate) async fn lift_resident(&self) -> Result<TermDictionary> {
-        TermDictionary::from_child_reader(self.reader.clone()).await
+        TermDictionary::from_child_reader(
+            self.reader.clone(),
+            super::term_dict::DictForm::AsWritten,
+        )
+        .await
     }
 }
 
