@@ -74,7 +74,7 @@ flowchart TD
 - **Set semantics.** A quad equal to one already in the store, or to an
   earlier quad of the batch, is skipped: an in-batch `HashSet` catches the
   latter, and each remaining quad is checked with
-  [`contains`](../core/src/store/matching.rs#L791) — one fully bound
+  [`contains`](../core/src/store/matching.rs#L793) — one fully bound
   `match_pattern` over base and tail ([matching.md §9](matching.md#9-the-tail)).
 - **Accretion.** Each batch joins the tail as one more chunk of a chunked
   accumulator; the accreted chunks are folded into the flat first chunk
@@ -92,7 +92,7 @@ flowchart TD
   selections are `All`.
 - **Every layout, Dictionary included.** An appended term has no code in the
   base's frozen sorted dictionary, so under the Dictionary layout the tail
-  stores Default-layout N-Triples strings ([`tail_layout`](../core/src/store/mod.rs#L383));
+  stores Default-layout N-Triples strings ([`tail_layout`](../core/src/store/mod.rs#L394));
   under the other layouts it uses the store's own columns. Patterns probe the
   base by code and the tail by string, and a query that touches both unions
   the results.
@@ -102,7 +102,7 @@ flowchart TD
   then unions the two. A base short-circuit (a term with no code in the
   dictionary) never skips the tail, since that term may exist in the tail's
   plain strings.
-- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L401) is the number
+- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L412) is the number
   of physical tail rows — the store's only unindexed, unsorted region, and the
   number to watch when tuning compaction.
 
@@ -173,7 +173,7 @@ flowchart TD
 | `compact()` | every live row, base first | every live tail row, then re-sorted with the base |
 
 The rows a rebuild or compaction starts from come from
-[`live_raw_quads`](../core/src/store/rows.rs#L473): base rows first (in view
+[`live_raw_quads`](../core/src/store/rows.rs#L475): base rows first (in view
 order), then tail rows, tombstones already excluded.
 
 ---
@@ -255,15 +255,15 @@ store past the threshold rewrites its source file, as above, as part of the
 ## 6. Ownership and `owned()`
 
 Only a store that owns its rows may be mutated
-([`is_owner`](../core/src/store/mod.rs#L434),
-[`ensure_owner`](../core/src/store/mod.rs#L446)): its base selection is
+([`is_owner`](../core/src/store/mod.rs#L445),
+[`ensure_owner`](../core/src/store/mod.rs#L457)): its base selection is
 `All`, it has no pending file filter, and its tail selection (if any) is
 `All`. A view derived from `match_pattern` is a window onto a base it shares,
 so mutating it would either silently drop the rows outside the view or write
 through to data it does not own; a view that happens to select everything (an
 unconstrained match) counts as an owner.
 
-[`owned`](../core/src/store/mod.rs#L417) turns any store into one that can be
+[`owned`](../core/src/store/mod.rs#L428) turns any store into one that can be
 mutated: an owner comes back as a cheap clone (tombstones and indexes kept), a
 narrowed view is compacted with its declared indexes into an independent
 store. Mutating a match result therefore goes `view.owned().await?` first, or

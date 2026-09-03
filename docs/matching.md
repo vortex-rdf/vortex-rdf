@@ -215,7 +215,7 @@ flowchart LR
 
 ## 6. The in-memory path
 
-[`match_base_in_memory`](../core/src/store/matching.rs#L204) runs four stages
+[`match_base_in_memory`](../core/src/store/matching.rs#L206) runs four stages
 over the base `StructArray`. Each one asks the same two questions — *can I answer
 part of this pattern cheaply?* and *which rows survive?* — narrowing the shared
 `RowSelection` and clearing whatever pattern components it answered, so the next
@@ -264,7 +264,7 @@ Each stage in the code, and where the details are below:
 | Prelude | [`matching.rs:213-242`](../core/src/store/matching.rs#L213-L242) | — |
 | 1 · prefix probe | [`matching.rs:244-327`](../core/src/store/matching.rs#L244-L327), [`search_sorted_bounds`](../core/src/store/array.rs#L178) | [§6.1](#61-prefix-probe) |
 | 2 · secondary-index routing | [`matching.rs:329-399`](../core/src/store/matching.rs#L329-L399), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L485) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`matching.rs:401-442`](../core/src/store/matching.rs#L401-L442), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L175), [`mask_for`](../core/src/store/matching.rs#L750) | [§6.3](#63-residual-column-filtering) |
+| 3 · residual column filtering | [`matching.rs:401-442`](../core/src/store/matching.rs#L401-L442), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L175), [`mask_for`](../core/src/store/matching.rs#L752) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`matching.rs:444-458`](../core/src/store/matching.rs#L444-L458) | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
@@ -484,7 +484,7 @@ longer starts `All` ([§11](#11-chained-matches)).
 
 ## 7. The file path
 
-[`match_base_file`](../core/src/store/matching.rs#L500) composes the same
+[`match_base_file`](../core/src/store/matching.rs#L502) composes the same
 restrictions as the in-memory path, but **nothing is read**: each stage decides
 what the *next* scan will do, and the result is a filter expression plus a row
 selection.
@@ -1099,7 +1099,7 @@ patterns in one call and hands back their views in input order. The matches
 run concurrently (`try_join_all`), so on a file the pattern scans overlap
 instead of queueing; an in-memory match simply runs to completion when
 polled. The bindings expose it as `match_arrow_many` / `count_quads_many`
-([`match_arrow_many`](../python/src/store.rs#L510)): every pattern of the
+([`match_arrow_many`](../python/src/store.rs#L548)): every pattern of the
 batch is parsed before anything is evaluated, one GIL release covers the
 whole batch, and each pattern comes back as its own Arrow stream — the
 shape a join probe loop (one probe per left-hand row) needs.
@@ -1123,12 +1123,12 @@ projected), then windows those ids and drops the filter. Serve plans are
 dropped too: a window is a narrowing, and a plan's contiguous run would
 over-cover it.
 
-[`size_capped`](../core/src/store/pushdown.rs#L165) is `window(0, n).size()`
+[`size_capped`](../core/src/store/pushdown.rs#L168) is `window(0, n).size()`
 — `size_capped(1)` is an `ASK` that reads one row.
 
 ### 16.3 Keeps
 
-[`keep`](../core/src/store/pushdown.rs#L179) restricts one column by term
+[`keep`](../core/src/store/pushdown.rs#L182) restricts one column by term
 code: the rows whose code lies in a [`Keep`](../core/src/store/pushdown.rs#L28)
 — a sorted code set, or a half-open code range. Codes are lexicographic ranks
 ([file-format.md §5](file-format.md#5-the-dictionary-child)), so a range is
@@ -1143,7 +1143,7 @@ residual filter of [§7](#7-stage-3-the-residual-filter). On a file a range
 becomes a pushed-down filter (`col >= lo AND col < hi`, ANDed onto whatever
 the view carried, so the scan prunes by it) and a set is resolved to row ids
 by one ordered scan projecting only that column
-([`file_column_ids`](../core/src/store/pushdown.rs#L287)); tombstones and the
+([`file_column_ids`](../core/src/store/pushdown.rs#L288)); tombstones and the
 view's own filter stay with the reads. Keeps need every row to be
 code-addressable: they apply to the Dictionary layout only, and a view with
 an append tail (whose terms have no codes) is rejected — compact first.
@@ -1151,10 +1151,10 @@ an append tail (whose terms have no codes) is rejected — compact first.
 ### 16.4 Term predicates
 
 A `FILTER` over one variable is decided term by term, and a dictionary
-holds each term once. [`DictSnapshot::filter_codes`](../core/src/store/layouts/dictionary/term_dict.rs#L919)
+holds each term once. [`DictSnapshot::filter_codes`](../core/src/store/layouts/dictionary/term_dict.rs#L1051)
 evaluates a [`TermPredicate`](../core/src/store/layouts/dictionary/predicates.rs#L69)
 over the whole dictionary in one pass — memoized per predicate for the
-dictionary's lifetime ([`filter_codes`](../core/src/store/layouts/dictionary/term_dict.rs#L611))
+dictionary's lifetime ([`filter_codes`](../core/src/store/layouts/dictionary/term_dict.rs#L736))
 — and returns two ascending code sets: the codes the predicate definitely
 holds for, and the codes it cannot decide. Every other code is definitely
 false. The true set feeds `keep`; the undecided set is what the caller
@@ -1169,7 +1169,7 @@ error, hence undecided); `lang(?x) = "tag"` and `langMatches`; `strStarts(str(?x
 over IRIs, blank labels and string-like literals (other datatypes carry a
 normalized lexical form rdflib owns, hence undecided); and the six numeric
 comparisons with a constant
-([`num_verdict`](../core/src/store/layouts/dictionary/predicates.rs#L465)):
+([`num_verdict`](../core/src/store/layouts/dictionary/predicates.rs#L475)):
 numeric literals compare by value under their datatype's bounds, literals of
 different datatypes order by datatype IRI (so every `xsd:string` literal
 sorts above an `xsd:integer`), a non-literal is unequal under `=`/`!=` and
@@ -1179,7 +1179,7 @@ is conservative by construction: anything this evaluator cannot settle
 exactly is handed back rather than guessed.
 
 Beside it, `encode` became spelling-tolerant
-([`encode_tolerant`](../core/src/store/layouts/dictionary/term_dict.rs#L642)):
+([`encode_tolerant`](../core/src/store/layouts/dictionary/term_dict.rs#L767)):
 an exact lookup first, then the term's canonical N-Triples form (an
 `xsd:string`-typed literal is a plain one), so a caller's own rendering of a
 term still resolves; `encode_many` batches it.
@@ -1187,7 +1187,7 @@ term still resolves; `encode_many` batches it.
 ### 16.5 In the bindings
 
 Python: `match_arrow(..., keep=, limit=, offset=)`
-([`parse_keep`](../python/src/store.rs#L71): a `range` is a code range,
+([`parse_keep`](../python/src/store.rs#L77): a `range` is a code range,
 anything `decode_many` accepts — a `uint32` Arrow array included — is a
 code set), `count_quads(..., limit=)`, `match_arrow_many`,
 `count_quads_many`, and on `TermDict`: `lower_bound`, `prefix_range`,

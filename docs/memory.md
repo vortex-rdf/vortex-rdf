@@ -20,8 +20,8 @@ is fixed by its provenance:
 
 | Form | Comes from | The base | Index components | Dictionary |
 |---|---|---|---|---|
-| **Built** | [`from_quads`](../core/src/store/mod.rs#L195), [`from_built`](../core/src/store/mod.rs#L246), compaction's rebuild ([`from_raw_quads`](../core/src/store/compaction.rs#L146)) | one struct whose `u32` code columns are flat canonical primitives ([`with_canonical_int_children`](../core/src/store/array.rs#L289)) | compressed into probe-supported encodings — `Constant`, `RunEnd`, bit-packed ([`with_compressed_int_children`](../core/src/store/array.rs#L311)) | FSST windows ([`compress`](../core/src/store/layouts/dictionary/term_dict.rs#L352)) |
-| **Adopted** | [`from_bytes`](../core/src/store/open.rs#L262), [`from_parts`](../core/src/store/mod.rs#L231) — the bindings' `in_memory=True` / `fromBytes` | the writer's own encodings, as refcounted views into the file bytes ([`with_searchable_int_children`](../core/src/store/array.rs#L278)) | `from_parts`: the writer's encodings, made probeable ([`into_searchable`](../core/src/store/indexes/components.rs#L352)); `from_bytes`: deferred, un-executed until first use | lifted resident: FSST chunks as written, anything else canonicalized |
+| **Built** | [`from_quads`](../core/src/store/mod.rs#L195), [`from_built`](../core/src/store/mod.rs#L257), compaction's rebuild ([`from_raw_quads`](../core/src/store/compaction.rs#L146)) | one struct whose `u32` code columns are flat canonical primitives ([`with_canonical_int_children`](../core/src/store/array.rs#L289)) | compressed into probe-supported encodings — `Constant`, `RunEnd`, bit-packed ([`with_compressed_int_children`](../core/src/store/array.rs#L311)) | one canonical `string_view` column, as the builder froze it ([`from_sorted_column`](../core/src/store/layouts/dictionary/term_dict.rs#L350)); FSST windows are made at write ([`fsst_windows`](../core/src/store/layouts/dictionary/term_dict.rs#L452)) |
+| **Adopted** | [`from_bytes`](../core/src/store/open.rs#L264), [`from_parts`](../core/src/store/mod.rs#L234) — the bindings' `in_memory=True` / `fromBytes` | the writer's own encodings, as refcounted views into the file bytes ([`with_searchable_int_children`](../core/src/store/array.rs#L278)) | `from_parts`: the writer's encodings, made probeable ([`into_searchable`](../core/src/store/indexes/components.rs#L352)); `from_bytes`: deferred, un-executed until first use | as written — FSST chunks inside the bytes, anything else canonicalized — or, with `dictionary='plaintext'`, decoded once into one canonical column ([`DictForm`](../core/src/store/layouts/dictionary/term_dict.rs#L88)) |
 | **File-backed** | [`from_file`](../core/src/store/open.rs#L132) | nothing resident — every read scans the file and is transient (the file is opened with no decoded-data cache) | on disk, resolved through pushed-down scans and cached chunk probes | resident, or left in the file and point-read by leaf when it outweighs the residency budget |
 
 The rule behind the split is provenance, not policy. Where the store makes
@@ -33,11 +33,22 @@ the match paths bind either form through the encoded-search probes at the
 same speed. Index components are compressed in every form: nothing ever
 reads them as a payload, only the probes touch them.
 
+The dictionary follows the same rule with one difference: nothing binds a
+compressed dictionary at the speed of a plaintext one. Every probe, every
+decode, every predicate pass and every `terms` export reads it, and an FSST
+chunk decodes on each of those reads, so a built dictionary is held as the
+canonical column the builder froze, and an adopted store may ask for the
+same form up front (`dictionary='plaintext'`) instead of keeping the file's
+FSST chunks and decoding on demand.
+
 ### 1.1 Measured
 
 1,048,576 quads of the comparative benchmark dataset (629,199 distinct
 terms), Dictionary layout, no index, exact heap bytes from a counting
-allocator, one process, 2026-09-02:
+allocator, one process, 2026-09-02 — measured while a built dictionary was
+still FSST windows; the canonical built dictionary and the plaintext
+adoption form are measured in the adoption experiment that follows this
+table's refresh:
 
 | | Built | Adopted from bytes |
 |---|---|---|
@@ -107,9 +118,9 @@ that builds a new base starts with empty caches.
 
 | Slot | Holds | Filled by | Bound | Lifetime |
 |---|---|---|---|---|
-| [`ProbeCache`](../core/src/store/layouts/dictionary/term_dict.rs#L669) | term → code lookups, absence included, direct-mapped | every `encode` (a bound pattern term, `encode_many`) | [`PROBE_CACHE_SLOTS`](../core/src/store/layouts/dictionary/term_dict.rs#L659) = 256 entries, overwritten on collision | the dictionary |
-| [`arrow_values`](../core/src/store/layouts/dictionary/term_dict.rs#L167) | the whole term column as the buffers of one Arrow `string_view` array ([`ArrowValuesOwner`](../core/src/store/layouts/dictionary/term_dict.rs#L183)) | `to_arrow`, `__arrow_c_array__` on a term dictionary, every `terms` export | 16 B/term of views plus the term bytes (68 B/term measured), only while some array over it is held — a `terms` batch, a pyarrow array, a polars frame | freed with the last holder; rebuilt on the next use. Zero-copy for a canonical (plaintext) dictionary, a decompression for an FSST one |
-| [`PredicateMemo`](../core/src/store/layouts/dictionary/term_dict.rs#L233) | per term predicate, the codes it holds for and the codes it cannot decide ([`filter_codes`](../core/src/store/layouts/dictionary/term_dict.rs#L611)) | each distinct predicate asked | [`PREDICATE_MEMO_SLOTS`](../core/src/store/layouts/dictionary/term_dict.rs#L229) = 32 entries, oldest dropped first; an entry is at most 8 B per term | the dictionary |
+| [`ProbeCache`](../core/src/store/layouts/dictionary/term_dict.rs#L794) | term → code lookups, absence included, direct-mapped | every `encode` (a bound pattern term, `encode_many`) | [`PROBE_CACHE_SLOTS`](../core/src/store/layouts/dictionary/term_dict.rs#L784) = 256 entries, overwritten on collision | the dictionary |
+| [`arrow_values`](../core/src/store/layouts/dictionary/term_dict.rs#L219) | for an FSST dictionary (adopted as written) the decoded term column as the buffers of one Arrow `string_view` array ([`ArrowValuesOwner`](../core/src/store/layouts/dictionary/term_dict.rs#L183]); a canonical dictionary — every built one, an adopted one in the plaintext form — hands out its own buffers and caches nothing | `to_arrow`, `__arrow_c_array__` on a term dictionary, every `terms` export | 16 B/term of views plus the term bytes (68 B/term measured), only while some array over it is held — a `terms` batch, a pyarrow array, a polars frame | freed with the last holder; rebuilt on the next use |
+| [`PredicateMemo`](../core/src/store/layouts/dictionary/term_dict.rs#L289) | per term predicate, the codes it holds for and the codes it cannot decide ([`filter_codes`](../core/src/store/layouts/dictionary/term_dict.rs#L736)) | each distinct predicate asked | [`PREDICATE_MEMO_SLOTS`](../core/src/store/layouts/dictionary/term_dict.rs#L285) = 32 entries, oldest dropped first; an entry is at most 8 B per term | the dictionary |
 | `DictSnapshot` handles (Python `term_dict()`, JS `termDict()`) | an `Arc` to the dictionary | the caller | — | keep the whole dictionary alive after the store is dropped |
 
 ### 3.5 The file-backed dictionary
@@ -145,10 +156,11 @@ reopens the file and starts afresh.
 
 - **Hold results only as long as they are needed.** On an adopted base, an
   Arrow `codes` batch, or a polars frame built from one, is what keeps the
-  canonical form of the columns alive; on
-  any base, a `terms` batch or an exported dictionary is what keeps the
-  Arrow values alive. Two consumers alive at the same time share one copy;
-  the memory returns with the last of them.
+  canonical form of the columns alive; on a dictionary adopted as written,
+  a `terms` batch or an exported dictionary is what keeps the decoded Arrow
+  values alive (a canonical dictionary exports its own buffers and holds
+  nothing extra). Two consumers alive at the same time share one copy; the
+  memory returns with the last of them.
 - **Point reads never decode a column**, on any form: a selection of at
   most 256 rows is read point by point through the probes.
 - **Scattered reads allocate their own result**, a `take` over the base;
@@ -170,7 +182,7 @@ reopens the file and starts afresh.
 
 | Concern | Where |
 |---|---|
-| The resident forms: canonical base, compressed components, encoded adoption | [`core/src/store/array.rs`](../core/src/store/array.rs), [`mod.rs`](../core/src/store/mod.rs) ([`resident_built_parts`](../core/src/store/mod.rs#L164), [`from_parts`](../core/src/store/mod.rs#L231)) |
+| The resident forms: canonical base, compressed components, encoded adoption | [`core/src/store/array.rs`](../core/src/store/array.rs), [`mod.rs`](../core/src/store/mod.rs) ([`resident_built_parts`](../core/src/store/mod.rs#L164), [`from_parts`](../core/src/store/mod.rs#L234)) |
 | The live canonical form of an encoded base | [`core/src/store/canonical.rs`](../core/src/store/canonical.rs), [`rows.rs`](../core/src/store/rows.rs) ([`code_columns`](../core/src/store/rows.rs#L186), [`code_columns_shared`](../core/src/store/rows.rs#L238), [`code_columns_gathered`](../core/src/store/rows.rs#L297)) |
 | Point reads and gathers | [`core/src/store/scan/gather.rs`](../core/src/store/scan/gather.rs) ([`gather_by_point_reads`](../core/src/store/scan/gather.rs#L51)) |
 | Probes | [`core/src/store/probes.rs`](../core/src/store/probes.rs), [`encoded-search/src/node.rs`](../encoded-search/src/node.rs) |

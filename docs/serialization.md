@@ -52,9 +52,9 @@ A builder hands these back in one of two shapes
 |---|---|---|---|
 | CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`main.rs`](../cli/src/main.rs#L36)) | out-of-core | file |
 | Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/ser.rs#L155) / [`quads_stream_to_vortex_writer`](../core/src/io/ser.rs#L95) | out-of-core | file / any `VortexWrite` |
-| Rust | [`VortexRdfStore::from_quads`](../core/src/store/mod.rs#L195), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L50) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L36) then [`VortexRdfStore::from_built`](../core/src/store/mod.rs#L246) to name the builder | either | in-memory store |
+| Rust | [`VortexRdfStore::from_quads`](../core/src/store/mod.rs#L195), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L50) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L36) then [`VortexRdfStore::from_built`](../core/src/store/mod.rs#L257) to name the builder | either | in-memory store |
 | Rust | [`VortexRdfStore::to_bytes`](../core/src/store/serialize.rs#L146) | — (re-serializes a store) | bytes |
-| Rust | [`to_serializable_parts`](../core/src/store/serialize.rs#L125) → [`from_parts`](../core/src/store/mod.rs#L231) | — | in-memory round trip |
+| Rust | [`to_serializable_parts`](../core/src/store/serialize.rs#L125) → [`from_parts`](../core/src/store/mod.rs#L234) | — | in-memory round trip |
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize.rs`](../python/src/serialize.rs#L33)) | out-of-core | file |
 | Python | `VortexRdfStore(path, in_memory=True)` | — (opens, then lifts through `to_serializable_parts` → `from_parts`) | in-memory store |
 | Python | `store.to_bytes()` / `VortexRdfStore.from_bytes(data)` | — | bytes |
@@ -139,7 +139,7 @@ flowchart TD
 
     L -- "Dictionary" --> B1["InterningQuadBuilder::push per quad:<br/>intern 4 terms → provisional codes, keep four u32 codes"]
     B1 --> B2["finish: sort the distinct terms,<br/>rank_of[provisional] = sorted position"]
-    B2 --> B3["freeze the sorted column → TermDictionary<br/>(FSST-compressed in 65,536-term windows)"]
+    B2 --> B3["freeze the sorted column → TermDictionary<br/>(one canonical column; FSST windows at write)"]
     B2 --> B4["remap every quad's codes to ranks,<br/>sort the 16-byte rows"]
     B4 --> B5["build_array(codes): four u32 columns,<br/>s stamped IsSorted"]
     B4 --> B6["build the index components<br/>from the ranked code rows"]
@@ -276,16 +276,18 @@ Every layout puts `s` first and stamps it when the rows are sorted.
 is the sorted set of every distinct term of the dataset — subjects, predicates,
 objects and graph names in one namespace, the default graph's `""` included. A
 term's code is its position, so code order equals string order and a bound
-term resolves to its code by binary search. The frozen column is
-FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/term_dict.rs#L352)):
+term resolves to its code by binary search. The frozen column is held as it
+is — one canonical chunk every probe and decode reads in place
+([`from_sorted_column`](../core/src/store/layouts/dictionary/term_dict.rs#L350)) —
+and FSST-compressed at write ([`fsst_windows`](../core/src/store/layouts/dictionary/term_dict.rs#L452)):
 one symbol table is trained on the whole column and the terms are compressed in
-independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/term_dict.rs#L55)
+independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/term_dict.rs#L59)
 (65,536) terms, each window a self-contained FSST array. The term count must
 fit an `i32`.
 
 Which pipeline built the dictionary decides how its term→code map is held during
 encoding: borrowed from the live quads in memory
-([`from_quads_with_map`](../core/src/store/layouts/dictionary/term_dict.rs#L438)),
+([`from_quads_with_map`](../core/src/store/layouts/dictionary/term_dict.rs#L542)),
 owned when the quads were spilled and cannot be borrowed from
 ([`TermDictionaryBuilder::finish`](../core/src/store/layouts/dictionary/ingest.rs#L64)).
 Either way the map exists only for the build; stores keep the columnar
@@ -355,10 +357,11 @@ flowchart TD
 - **Index children** take exactly the same strategy, so their encoding is what a
   plain table write produces.
 - **The dictionary** takes [`dict_child_strategy`](../core/src/io/container/write.rs#L191):
-  its chunks are already FSST-compressed windows, so they are written verbatim
-  as one flat leaf each under a chunked node — no sampling, no re-encoding —
-  and the window boundaries become the leaves a file-backed dictionary later
-  point-reads.
+  its chunks are FSST-compressed windows — made here from a canonical
+  dictionary ([`child_chunks`](../core/src/store/layouts/dictionary/term_dict.rs#L1191)),
+  or passed through as they were adopted — written verbatim as one flat leaf
+  each under a chunked node — no sampling, no re-encoding — and the window
+  boundaries become the leaves a file-backed dictionary later point-reads.
 - **Ordering.** The quad stream owns the first sequence subtree and each
   component an ordered sibling subtree, so the quad table's segments land ahead
   of every component's, in inventory order; the descriptors and `quads_sorted`
@@ -380,7 +383,7 @@ container.
 ## 10. Adopting a build in memory
 
 A build that is queried in place, without a file, skips the writer:
-[`from_built`](../core/src/store/mod.rs#L246) turns a `BuiltArray` into the
+[`from_built`](../core/src/store/mod.rs#L257) turns a `BuiltArray` into the
 store's resident form
 ([`resident_built_parts`](../core/src/store/mod.rs#L164)):
 
@@ -404,7 +407,7 @@ store's resident form
 What each form holds resident, and every cache a store keeps, is in
 [memory.md](memory.md).
 
-The other in-memory constructor, [`from_parts`](../core/src/store/mod.rs#L231),
+The other in-memory constructor, [`from_parts`](../core/src/store/mod.rs#L234),
 adopts a store's split parts (the bindings' round trip): it keeps each integer
 child's existing encoding wherever a probe binds it and decodes only the ones
 that decline. Opening serialized bytes in memory is

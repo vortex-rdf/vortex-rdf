@@ -67,7 +67,7 @@ The schema metadata names the producer
 (`""`).
 
 A **projection** — a list of [`QuadColumn`](../core/src/store/arrow.rs#L96)s
-— restricts and orders the columns ([`projected_schema`](../core/src/store/arrow.rs#L199)
+— restricts and orders the columns ([`projected_schema`](../core/src/store/arrow.rs#L202)
 keeps the metadata); it must be non-empty and name each column once. A
 triple pattern rarely needs all four positions, and a file scan reads only
 the projected columns ([§3.2](#32-code-batches)).
@@ -76,7 +76,7 @@ the projected columns ([§3.2](#32-code-batches)).
 
 [`to_record_batches`](../core/src/store/batches.rs#L58) is the one entry
 point: it takes an encoding and an optional projection and returns a
-[`QuadBatches`](../core/src/store/arrow.rs#L231) — a `Stream` of
+[`QuadBatches`](../core/src/store/arrow.rs#L234) — a `Stream` of
 `RecordBatch`es that all carry the schema `QuadBatches::schema()` reports,
 one batch per decode chunk (the whole in-memory base, or each scan split
 of a file), empty chunks skipped. The stream owns everything it reads —
@@ -90,17 +90,17 @@ tail rows store their terms as strings, and the terms appended have no code
 in the frozen dictionary ([mutations.md §2](mutations.md#2-additions-the-append-tail)).
 Such a view rejects `codes` and `terms` with an error — export `strings`,
 or compact first — exactly the gate
-[`code_read_snapshot`](../core/src/store/mod.rs#L511) applies to the
+[`code_read_snapshot`](../core/src/store/mod.rs#L522) applies to the
 code-column readers.
 
 ### 2.3 The dictionary as an Arrow array
 
-[`DictSnapshot::to_arrow`](../core/src/store/layouts/dictionary/term_dict.rs#L941)
+[`DictSnapshot::to_arrow`](../core/src/store/layouts/dictionary/term_dict.rs#L1075)
 returns the whole term dictionary as one `string_view` array whose element
 `i` is the term of code `i`: a code → term lookup table, and the values
 array every `terms` batch is keyed over. It is built on first use and
 held weakly on the dictionary
-([`arrow_values`](../core/src/store/layouts/dictionary/term_dict.rs#L559)):
+([`arrow_values`](../core/src/store/layouts/dictionary/term_dict.rs#L682)):
 every export alive at the same time shares one `Arc`, and the array is
 freed with its last holder. Canonical (plaintext) chunks convert
 buffer-sharing; FSST-compressed chunks decompress once per set of
@@ -108,16 +108,16 @@ concurrent holders, a cost bounded by the dictionary's size, never by a
 result's ([§3.4](#34-the-dictionary-values)).
 
 Two bounds expose the lexicographic-rank structure of the code space to a
-planner. [`lower_bound`](../core/src/store/layouts/dictionary/term_dict.rs#L949)
+planner. [`lower_bound`](../core/src/store/layouts/dictionary/term_dict.rs#L1083)
 is the first code whose term is byte-wise `>=` a string, so
 `lower_bound(a)..lower_bound(b)` is exactly the codes of the terms in
-`a..b`; [`prefix_range`](../core/src/store/layouts/dictionary/term_dict.rs#L958)
+`a..b`; [`prefix_range`](../core/src/store/layouts/dictionary/term_dict.rs#L1092)
 is the half-open code range of the terms spelled with a prefix — an IRI
 namespace is the prefix `<http://…/`, and because N-Triples kinds partition
 the space by first byte (`"` literals, `<` IRIs, `_` blank nodes), kind
 bounds are prefix ranges too. Both are a binary search through the
 dictionary cursor
-([`lower_bound_bytes`](../core/src/store/layouts/dictionary/term_dict.rs#L538)),
+([`lower_bound_bytes`](../core/src/store/layouts/dictionary/term_dict.rs#L660)),
 the same probe the exact `encode` runs.
 
 ---
@@ -160,7 +160,7 @@ existing shared-term decode stream,
 `quads_vec`, which already applies serve plans, drops tombstones, decodes
 each distinct term of a chunk once and appends the tail — and builds a
 `string_view` column per projected position from each decoded chunk
-([`shared_chunk_to_batch`](../core/src/store/batches.rs#L235)). That is a
+([`shared_chunk_to_batch`](../core/src/store/batches.rs#L238)). That is a
 copy of every cell's bytes, the price of materializing strings at all.
 
 ### 3.2 Code batches
@@ -172,7 +172,7 @@ Two sources feed the code pipeline, chosen per view.
 a built base's canonical `u32` columns, a served match reading the
 answering index's own columns, or an adopted base's live canonical form —
 the batch is built straight from the four buffers it returns
-([`code_buffers_to_batch`](../core/src/store/batches.rs#L179)). This is
+([`code_buffers_to_batch`](../core/src/store/batches.rs#L181)). This is
 the path the bindings' `match_arrow` / `matchArrowIPC` take — their one
 engine-facing read — so every consumer of a view hands out the same memory. A
 store *adopted* from bytes or a file keeps its base wire-encoded
@@ -195,7 +195,7 @@ only the projected columns are decoded off the file. A served match's
 pending selection materializes first, as it does for every base-order
 read. Each chunk's columns then convert through vortex-arrow's
 buffer-sharing primitive kernel
-([`code_chunk_to_batch`](../core/src/store/batches.rs#L199)): the Arrow
+([`code_chunk_to_batch`](../core/src/store/batches.rs#L202)): the Arrow
 `UInt32Array` wraps the chunk's own buffer.
 
 For `terms`, each column's keys are wrapped over the dictionary's values
@@ -210,23 +210,24 @@ key is in range, a linear pass over the codes and no copy.
 | adopted base, contiguous wide read | once per set of concurrent holders | the live canonical form: shared with every export alive, freed with the last ([memory.md](memory.md)) |
 | file scan chunk → `UInt32Array` | no, after the scan's own decode | the scan materializes each split once |
 | `terms` key wrap | no | one shared values `Arc` per stream |
-| dictionary values, canonical chunks | no | `string_view` over the dictionary's own buffers |
-| dictionary values, FSST chunks | once per set of concurrent holders | decompressed on first use, held weakly, freed with the last holder |
+| dictionary values, canonical dictionary (every built one, an adopted one in the plaintext form) | no | `string_view` over the dictionary's own buffers, nothing cached |
+| dictionary values, FSST chunks (adopted as written) | once per set of concurrent holders | decompressed on first use, held weakly, freed with the last holder |
 | `strings` cells | yes, every cell | the string materialization itself |
 | Python capsule export | no | the C Data Interface hands out the same buffers |
 | JavaScript IPC bytes | yes, the whole result | one copy out of wasm memory, like the lazy quad payload |
 
 ### 3.4 The dictionary values
 
-[`arrow_values`](../core/src/store/layouts/dictionary/term_dict.rs#L559)
-turns the term column into one canonical `VarBinViewArray` — a single
-canonical chunk is used as it is; an FSST chunk, or a chunked column, is
-executed to canonical once through the Vortex session (chunks concatenated
-as a `ChunkedArray`) — and converts it with vortex-arrow's canonical
-byte-view kernel, which shares the views and data buffers. The result is
-held by a weak reference on the dictionary: callers that arrive while some
-holder is alive share it, and after the last holder drops the next call
-rebuilds it.
+[`arrow_values`](../core/src/store/layouts/dictionary/term_dict.rs#L682)
+converts the term column with vortex-arrow's canonical byte-view kernel,
+which shares the views and data buffers. A canonical dictionary — every
+built one, and an adopted one opened in the plaintext form — is converted
+as it is, on every call, with nothing cached: the Arrow array is the
+dictionary's own memory. An FSST dictionary (adopted as written) is first
+executed to canonical through the Vortex session (its chunks concatenated
+as a `ChunkedArray`), and that decoded column is held by a weak reference
+on the dictionary: callers that arrive while some holder is alive share it,
+and after the last holder drops the next call rebuilds it.
 
 The conversion registry those kernels belong to, the `ArrowSession`, is
 registered on the crate's one Vortex session at startup
@@ -253,25 +254,25 @@ pa.array(store.term_dict().filter_codes("is_iri", "")[0])             # a code s
 pa.array(store.term_dict())                                           # the dictionary
 ```
 
-[`match_arrow`](../python/src/store.rs#L471) resolves the pattern and
+[`match_arrow`](../python/src/store.rs#L509) resolves the pattern and
 builds the core batch stream off the GIL, then wraps it in an
-[`ArrowQuadStream`](../python/src/arrow.rs#L110). Its
-[`__arrow_c_schema__`](../python/src/arrow.rs#L136) can be read any number
-of times; [`__arrow_c_stream__`](../python/src/arrow.rs#L146) takes the
+[`ArrowQuadStream`](../python/src/arrow.rs#L117). Its
+[`__arrow_c_schema__`](../python/src/arrow.rs#L143) can be read any number
+of times; [`__arrow_c_stream__`](../python/src/arrow.rs#L153) takes the
 stream out of the object once (a second call raises `ValueError`) and
 exports it as an `FFI_ArrowArrayStream` over a
-[`BlockingReader`](../python/src/arrow.rs#L84): each `get_next` the
+[`BlockingReader`](../python/src/arrow.rs#L91): each `get_next` the
 consumer issues blocks on the next batch on the bindings' tokio runtime.
 The reader holds no Python state, so it runs wherever the consumer calls it
 from — pyarrow, for one, releases the GIL around `read_next_batch` — and
 batches are produced as they are pulled, never ahead of the consumer.
 
-A code set's [`__arrow_c_array__`](../python/src/codes.rs#L200) wraps
+A code set's [`__arrow_c_array__`](../python/src/codes.rs#L205) wraps
 the column's `u32` buffer as a `UInt32Array` — the same memory the buffer
 protocol exposes — and the dictionary's
-[`__arrow_c_array__`](../python/src/codes.rs#L200) hands out the cached
+[`__arrow_c_array__`](../python/src/codes.rs#L205) hands out the cached
 values array of [§2.3](#23-the-dictionary-as-an-arrow-array). Both go
-through [`array_capsules`](../python/src/arrow.rs#L74): the array's
+through [`array_capsules`](../python/src/arrow.rs#L78): the array's
 `ArrayData` is exported with arrow-rs's `to_ffi`, which shares the buffers
 and keeps them alive from the struct's private data until `release`.
 
@@ -298,7 +299,7 @@ and the Arrow ecosystem there — `apache-arrow`'s `tableFromIPC`,
 DuckDB-WASM, Arquero, Perspective — consumes the
 [IPC streaming format](https://arrow.apache.org/docs/format/Columnar.html#ipc-streaming-format).
 So the wasm bindings export exactly that:
-[`matchArrowIPC`](../js/src/store.rs#L340) resolves the pattern, drives
+[`matchArrowIPC`](../js/src/store.rs#L346) resolves the pattern, drives
 the core batch stream to completion (no wasm read path performs I/O, so
 the stream is already resolved and nothing suspends) and writes the
 schema and every batch through arrow-ipc's `StreamWriter` into one
@@ -309,7 +310,7 @@ const table = tableFromIPC(store.matchArrowIPC(null, myPredicate, null, null));
 const terms = tableFromIPC(store.matchArrowIPC(null, null, null, null, { encoding: 'terms' }));
 ```
 
-The options object ([`parse_arrow_options`](../js/src/options.rs#L93))
+The options object ([`parse_arrow_options`](../js/src/options.rs#L112))
 carries the same `encoding` and `projection` vocabulary as core, parsed by
 core's own `FromStr` impls so an error message reads the same from every
 frontend. Under `terms` the dictionary is written as IPC dictionary
@@ -319,7 +320,7 @@ batch.
 
 The bytes are one copy out of wasm memory — the same choice the lazy quad
 payload makes with its `Uint32Array`s
-([`set_code_columns`](../js/src/store.rs#L460)), because a view into wasm
+([`set_code_columns`](../js/src/store.rs#L467)), because a view into wasm
 linear memory is detached the moment the memory grows. A zero-copy path (`arrow-js-ffi` reading C Data Interface structs
 out of wasm memory) would need explicit release handles and memory-growth
 discipline on the consumer's side, and is not part of this surface.
