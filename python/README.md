@@ -117,7 +117,7 @@ For Dictionary-layout files the term dictionary is lifted into memory when its c
 
 Stores also round-trip through bytes: `store.to_bytes()` serializes to the native container (the same exchange format as the `.vortex` file, the CLI and the JS bindings), and `VortexRdfStore.from_bytes(data)` opens such a buffer — `bytes` or `bytearray` — as a fully in-memory store.
 
-An in-memory store's term dictionary has two resident forms, picked by `dictionary=` on `VortexRdfStore(path, in_memory=True, dictionary=...)` and `from_bytes(data, dictionary=...)`: `"as-written"` (the default) keeps the file's FSST chunks and decodes one term per read; `"plaintext"` decodes the column once into one canonical form that every probe, decode and `terms` export then reads in place, at roughly three times the dictionary's compressed size. A store built from quads always holds its dictionary plaintext.
+An in-memory store's term dictionary has two resident forms, picked by `dictionary=` on `VortexRdfStore(path, in_memory=True, dictionary=...)` and `from_bytes(data, dictionary=...)`: `"plaintext"` (the default) decodes the column once into one canonical form that every probe, decode and `terms` export then reads in place; `"as-written"` keeps the file's FSST chunks, a third of that size, and decodes one term per read — the lean load for a store opened, queried a few times and dropped. A store built from quads always holds its dictionary plaintext.
 
 ## Development
 

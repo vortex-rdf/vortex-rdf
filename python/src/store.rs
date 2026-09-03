@@ -260,12 +260,12 @@ impl VortexRdfStore {
 
 /// The resident form of an adopted store's term dictionary when the caller
 /// names none (see [`parse_dict_form`]).
-const DEFAULT_DICT_FORM: DictForm = DictForm::AsWritten;
+const DEFAULT_DICT_FORM: DictForm = DictForm::Plaintext;
 
-/// The `dictionary=` argument resolved through core's names: `"as-written"`
-/// keeps the file's chunks (FSST, decoded one term per read), `"plaintext"`
-/// decodes the column once into one canonical form; `None` is the binding's
-/// default.
+/// The `dictionary=` argument resolved through core's names: `"plaintext"`
+/// decodes the column once into one canonical form, `"as-written"` keeps
+/// the file's chunks (FSST, decoded one term per read); `None` is the
+/// binding's default, plaintext.
 fn parse_dict_form(name: Option<&str>) -> PyResult<DictForm> {
     match name {
         None => Ok(DEFAULT_DICT_FORM),

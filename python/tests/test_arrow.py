@@ -187,6 +187,15 @@ def test_plaintext_dictionary_exports_its_own_buffers(vortex_files):
         assert terms.column(name).chunk(0).dictionary.buffers()[1].address == first.buffers()[1].address
 
 
+def test_in_memory_dictionary_is_plaintext_by_default(vortex_files):
+    """Without ``dictionary=`` an in-memory open and ``from_bytes`` hold the
+    dictionary plaintext: every export is the dictionary's own buffers."""
+    path = vortex_files["dictionary"]
+    for store in (VortexRdfStore(path, in_memory=True), VortexRdfStore.from_bytes(VortexRdfStore(path).to_bytes())):
+        dictionary = store.term_dict()
+        assert pa.array(dictionary).buffers()[1].address == pa.array(dictionary).buffers()[1].address
+
+
 def test_in_memory_store_shares_one_decoded_form_while_held(vortex_files):
     """An adopted (``in_memory=True``) store keeps the file's encodings; wide
     code reads decode each column into a canonical form that every result

@@ -117,12 +117,12 @@ class VortexRdfStore:
         dictionary: Optional[str] = None,
     ) -> None:
         """Open ``path``: file-backed and lazy by default, wholly in memory
-        with ``in_memory=True``. ``dictionary`` — ``"as-written"`` or
-        ``"plaintext"`` — picks the resident form of an in-memory store's
-        term dictionary: the file's own FSST chunks, decoded one term per
-        read, or the column decoded once into one canonical form that every
-        probe, decode and Arrow export then reads in place. Only with
-        ``in_memory=True``; ``ValueError`` otherwise."""
+        with ``in_memory=True``. ``dictionary`` — ``"plaintext"`` (the default)
+        or ``"as-written"`` — picks the resident form of an in-memory store's
+        term dictionary: the column decoded once into one canonical form that
+        every probe, decode and Arrow export then reads in place, or the
+        file's own FSST chunks (a third of the size), decoded one term per
+        read. Only with ``in_memory=True``; ``ValueError`` otherwise."""
         ...
     @staticmethod
     def from_bytes(data: bytes, dictionary: Optional[str] = None) -> "VortexRdfStore":
