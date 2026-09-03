@@ -45,26 +45,29 @@ FSST chunks and decoding on demand.
 
 1,048,576 quads of the comparative benchmark dataset (629,199 distinct
 terms), Dictionary layout, no index, exact heap bytes from a counting
-allocator, one process, 2026-09-02 — measured while a built dictionary was
-still FSST windows; the canonical built dictionary and the plaintext
-adoption form are measured in the adoption experiment that follows this
-table's refresh:
+allocator ([`dict_memory`](../core/examples/dict_memory.rs)), one process,
+2026-09-03 (the code-read rows: 2026-09-02, unchanged by the dictionary):
 
-| | Built | Adopted from bytes |
-|---|---|---|
-| retained after construction | 34.6 MiB | 19.5 MiB — 16.9 MiB of file bytes, 2.6 MiB of probes and dictionary state |
-| of which the base's code columns | 16.0 MiB canonical (16 B/row) | 4.5 MiB in the writer's encodings, inside the bytes |
-| of which the dictionary | 12.9 MiB FSST (21.5 B/term) | the same chunks, inside the bytes |
-| construction | 2.2 s (sort, intern, compress the dictionary) | 1.1 ms |
-| whole-store code read | 6 µs, retains nothing | 2.3 ms; +16.0 MiB while the result is held, +0 after it is dropped |
-| a second whole-store read while the first is held | 6 µs | 1.6 µs, +0 (shares the first) |
-| the dictionary as an Arrow array | +40.7 MiB while held (68 B/term), +0 after | the same |
+| | Built | Adopted as written | Adopted plaintext |
+|---|---|---|---|
+| retained after construction | 57.7 MiB | 19.5 MiB — 16.9 MiB of file bytes, 2.6 MiB of probes and dictionary state | 57.7 MiB — the same 19.5 MiB plus the decoded column |
+| of which the base's code columns | 16.0 MiB canonical (16 B/row) | 4.5 MiB in the writer's encodings, inside the bytes | the same |
+| of which the dictionary | 38.2 MiB canonical (64 B/term: 16 B of view, 48 B of term bytes) | 12.9 MiB FSST (21.5 B/term), inside the bytes | 38.2 MiB canonical, plus the 12.9 MiB of FSST chunks left inside the bytes, which nothing reads any more |
+| construction | 2.3 s (sort, intern) | 3.0 ms | 14.0 ms (the 3.0 ms lift plus one bulk decode) |
+| whole-store code read | 6 µs, retains nothing | 2.3 ms; +16.0 MiB while the result is held, +0 after it is dropped | the same |
+| a second whole-store read while the first is held | 6 µs | 1.6 µs, +0 (shares the first) | the same |
+| the dictionary as an Arrow array | +0: its own buffers | +40.7 MiB while held (68 B/term), +0 after | +0: its own buffers |
 
-The two forms differ by the canonical copy of the code columns: a built
-store carries it always, an adopted store only while some reader holds it.
-On the pushdown and Arrow workloads every store is read wide, so the built
-form's constant 16 B/row is the cheaper steady state; an adopted store
-that is opened, queried and dropped never pays it at all.
+The forms differ by what is held canonical. A built store carries the
+canonical copy of its code columns always, an adopted store only while some
+reader holds it; a canonical dictionary is 25 MiB more than its FSST
+chunks, and buys the `terms` export, every probe, decode and predicate pass
+a read in place — so a store that exports terms at all is smaller with it
+(57.7 MiB steady, against 19.5 + 40.7 MiB while an as-written store's
+export is held), and a store read only through codes is 38 MiB larger. On
+the pushdown and Arrow workloads every store is read wide, so the built
+form's constant 16 B/row is the cheaper steady state; an adopted store that
+is opened, queried and dropped never pays it at all.
 
 ## 2. What a read leaves behind
 
