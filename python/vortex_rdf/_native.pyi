@@ -114,9 +114,21 @@ class VortexRdfStore:
         path: _StrPath,
         max_resident_bytes: Optional[int] = None,
         in_memory: bool = False,
-    ) -> None: ...
+        dictionary: Optional[str] = None,
+    ) -> None:
+        """Open ``path``: file-backed and lazy by default, wholly in memory
+        with ``in_memory=True``. ``dictionary`` — ``"as-written"`` or
+        ``"plaintext"`` — picks the resident form of an in-memory store's
+        term dictionary: the file's own FSST chunks, decoded one term per
+        read, or the column decoded once into one canonical form that every
+        probe, decode and Arrow export then reads in place. Only with
+        ``in_memory=True``; ``ValueError`` otherwise."""
+        ...
     @staticmethod
-    def from_bytes(data: bytes) -> "VortexRdfStore": ...
+    def from_bytes(data: bytes, dictionary: Optional[str] = None) -> "VortexRdfStore":
+        """Open native-container bytes as an in-memory store; ``dictionary``
+        as for ``__init__``."""
+        ...
     def to_bytes(self) -> bytes: ...
     def layout(self) -> str: ...
     def indexes(self) -> List[str]:

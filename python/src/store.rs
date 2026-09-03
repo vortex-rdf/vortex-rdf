@@ -9,7 +9,8 @@ use pyo3::types::{PyBytes, PyRange, PyRangeMethods, PyString};
 use vortex_buffer::Buffer;
 use vortex_rdf_core::common::terms::{Pattern, parse_pattern_checked};
 use vortex_rdf_core::{
-    Keep, QuadColumn, TermEncoding, VortexRdfError as CoreError, VortexRdfStore as CoreStore,
+    DictForm, Keep, QuadColumn, TermEncoding, VortexRdfError as CoreError,
+    VortexRdfStore as CoreStore,
 };
 
 use crate::arrow::ArrowQuadStream;
@@ -17,7 +18,12 @@ use crate::codes::{TermDict, codes_from_py};
 use crate::{RUNTIME, VortexRdfError, parse_err, store_err};
 
 /// A pattern as Python spells it: four optional N-Triples term strings.
-type PyPattern = (Option<String>, Option<String>, Option<String>, Option<String>);
+type PyPattern = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 /// The restrictions a code read applies after its pattern: `keep` constraints
 /// in column order, then a row window.
@@ -165,7 +171,11 @@ impl VortexRdfStore {
 
     /// The view matching `pattern`, narrowed by `options` — its `keep`
     /// constraints, then its row window.
-    async fn matched_with(&self, pattern: &Pattern, options: &ReadOptions) -> Result<CoreStore, CoreError> {
+    async fn matched_with(
+        &self,
+        pattern: &Pattern,
+        options: &ReadOptions,
+    ) -> Result<CoreStore, CoreError> {
         let mut view = self.matched(pattern).await?;
         for (column, keep) in &options.keep {
             view = view.keep(*column, keep).await?;
@@ -248,6 +258,21 @@ impl VortexRdfStore {
     }
 }
 
+/// The resident form of an adopted store's term dictionary when the caller
+/// names none (see [`parse_dict_form`]).
+const DEFAULT_DICT_FORM: DictForm = DictForm::AsWritten;
+
+/// The `dictionary=` argument resolved through core's names: `"as-written"`
+/// keeps the file's chunks (FSST, decoded one term per read), `"plaintext"`
+/// decodes the column once into one canonical form; `None` is the binding's
+/// default.
+fn parse_dict_form(name: Option<&str>) -> PyResult<DictForm> {
+    match name {
+        None => Ok(DEFAULT_DICT_FORM),
+        Some(name) => name.parse().map_err(parse_err),
+    }
+}
+
 #[pymethods]
 impl VortexRdfStore {
     /// Open `path`. By default the store stays file-backed and lazy (only the
@@ -257,14 +282,17 @@ impl VortexRdfStore {
     /// every subsequent match skips the per-call file-scan pipeline.
     /// `max_resident_bytes` overrides the Dictionary layout's
     /// term-dictionary residency budget (the dictionary child's compressed
-    /// size in bytes).
+    /// size in bytes). `dictionary` picks the resident form of an in-memory
+    /// store's term dictionary (see [`parse_dict_form`]) and applies to
+    /// `in_memory=True` only.
     #[new]
-    #[pyo3(signature = (path, max_resident_bytes=None, in_memory=false))]
+    #[pyo3(signature = (path, max_resident_bytes=None, in_memory=false, dictionary=None))]
     fn new(
         py: Python<'_>,
         path: PathBuf,
         max_resident_bytes: Option<u64>,
         in_memory: bool,
+        dictionary: Option<&str>,
     ) -> PyResult<Self> {
         // Core reports a missing path as `VortexRdfError::Vortex`, not `Io`,
         // so the `FileNotFoundError` contract is honoured here.
@@ -274,6 +302,13 @@ impl VortexRdfStore {
                 path.display()
             )));
         }
+        if dictionary.is_some() && !in_memory {
+            return Err(PyValueError::new_err(
+                "dictionary= picks the resident form of an in-memory store; \
+                 a file-backed open keeps the file's own form (use in_memory=True)",
+            ));
+        }
+        let form = parse_dict_form(dictionary)?;
         let store = py
             .detach(|| {
                 RUNTIME.block_on(async {
@@ -287,7 +322,7 @@ impl VortexRdfStore {
                         // codes address, exactly what `from_parts`
                         // reconstructs a store from.
                         let parts = store.to_serializable_parts().await?;
-                        CoreStore::from_parts(parts)
+                        CoreStore::from_parts_as(parts, form)
                     } else {
                         Ok(store)
                     }
@@ -304,11 +339,14 @@ impl VortexRdfStore {
     /// the JS bindings' `toBytes`, or reading a `.vortex` file into memory
     /// produces. The whole store lives in memory. `data` should be `bytes`
     /// (or `bytearray`), copied in one memcpy; any other int sequence is
-    /// accepted but extracted element by element.
+    /// accepted but extracted element by element. `dictionary` picks the
+    /// resident form of the term dictionary (see [`parse_dict_form`]).
     #[staticmethod]
-    fn from_bytes(py: Python<'_>, data: Vec<u8>) -> PyResult<Self> {
+    #[pyo3(signature = (data, dictionary=None))]
+    fn from_bytes(py: Python<'_>, data: Vec<u8>, dictionary: Option<&str>) -> PyResult<Self> {
+        let form = parse_dict_form(dictionary)?;
         let store = py
-            .detach(|| RUNTIME.block_on(CoreStore::from_bytes_owned(data)))
+            .detach(|| RUNTIME.block_on(CoreStore::from_bytes_owned_as(data, form)))
             .map_err(store_err)?;
         Ok(Self { store, path: None })
     }

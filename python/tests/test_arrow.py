@@ -173,6 +173,20 @@ def test_duckdb_consumes_the_stream(vortex_files):
     assert duckdb.sql("select count(*) from quads").fetchone()[0] == 5
 
 
+def test_plaintext_dictionary_exports_its_own_buffers(vortex_files):
+    """A plaintext resident dictionary hands out its own memory: two exports
+    of the term dictionary, and the values of a ``terms`` export, share one
+    views buffer, with nothing decoded per call."""
+    store = VortexRdfStore(vortex_files["dictionary"], in_memory=True, dictionary="plaintext")
+    dictionary = store.term_dict()
+    first = pa.array(dictionary)
+    second = pa.array(dictionary)
+    assert first.buffers()[1].address == second.buffers()[1].address
+    terms = _table(store.match_arrow(encoding="terms"))
+    for name in COLUMNS:
+        assert terms.column(name).chunk(0).dictionary.buffers()[1].address == first.buffers()[1].address
+
+
 def test_in_memory_store_shares_one_decoded_form_while_held(vortex_files):
     """An adopted (``in_memory=True``) store keeps the file's encodings; wide
     code reads decode each column into a canonical form that every result

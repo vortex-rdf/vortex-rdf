@@ -149,6 +149,35 @@ def test_in_memory_dictionary_keeps_code_path(vortex_files):
     assert len(_codes(store, p=NAME)[0]) == 3
 
 
+def _terms(dictionary):
+    return [dictionary.decode(code) for code in range(len(dictionary))]
+
+
+@pytest.mark.parametrize("dictionary", [None, "as-written", "plaintext"])
+def test_dictionary_forms_answer_alike(vortex_files, dictionary):
+    """Whichever resident form the dictionary takes, an in-memory open and
+    ``from_bytes`` answer exactly like the file-backed store."""
+    file_backed = VortexRdfStore(vortex_files["dictionary"])
+    opened = VortexRdfStore(vortex_files["dictionary"], in_memory=True, dictionary=dictionary)
+    adopted = VortexRdfStore.from_bytes(file_backed.to_bytes(), dictionary=dictionary)
+    for store in (opened, adopted):
+        assert store.term_dict() is not None
+        assert _terms(store.term_dict()) == _terms(file_backed.term_dict())
+        for pattern in PATTERNS:
+            assert sorted(store.get_quads(**pattern)) == sorted(file_backed.get_quads(**pattern))
+            assert _codes(store, **pattern) == _codes(file_backed, **pattern)
+
+
+def test_dictionary_form_is_validated(vortex_files):
+    with pytest.raises(ValueError):
+        VortexRdfStore(vortex_files["dictionary"], dictionary="plaintext")
+    with pytest.raises(ValueError):
+        VortexRdfStore(vortex_files["dictionary"], in_memory=True, dictionary="compressed")
+    data = VortexRdfStore(vortex_files["dictionary"]).to_bytes()
+    with pytest.raises(ValueError):
+        VortexRdfStore.from_bytes(data, dictionary="fsst")
+
+
 def _assert_file_backed_dictionary(fallback, resident):
     assert fallback.layout() == "dictionary"
     assert fallback.term_dict() is None
