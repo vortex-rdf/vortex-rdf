@@ -190,7 +190,7 @@ const nquads = await deserializeRdf(vortex, 'nquads');
 
 `toBytes` writes the same exchange format the CLI and the Python bindings read, so a buffer can be written to disk as a `.vortex` file or handed across bindings.
 
-`fromBytes(bytes, { dictionary })` picks the resident form of the term dictionary: `'as-written'` (the default) keeps the file's FSST chunks and decodes one term per read; `'plaintext'` decodes the column once into one canonical form that every probe, decode and `terms` export then reads in place, at roughly three times the compressed size. A store built from quads or text always holds its dictionary plaintext.
+`fromBytes(bytes, { dictionary })` picks the resident form of the term dictionary: `'plaintext'` (the default) decodes the column once into one canonical form that every probe, decode and `terms` export then reads in place — what a store built from quads or text holds too; `'as-written'` keeps the file's FSST chunks, a third of that size, and decodes one term per read, the lean load for a store opened, queried a few times and dropped.
 
 A `VortexRdfStore` is a wasm-side handle: call `free()` when you are done with it, or declare it with `using` (`free` is wired to `Symbol.dispose`); an unfreed store is reclaimed only when its JS wrapper is garbage-collected.
 

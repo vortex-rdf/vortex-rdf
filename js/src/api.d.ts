@@ -82,17 +82,17 @@ export interface ArrowOptions {
 /**
  * The resident form of the term dictionary of a store opened from bytes
  * (a store built from quads always holds its dictionary plaintext).
- * - 'as-written': the file's own FSST chunks, decoded one term per read —
- *   the smallest footprint.
- * - 'plaintext': the column decoded once into one canonical form that every
- *   probe, decode and `terms` export then reads in place, at roughly three
- *   times the compressed size.
+ * - 'plaintext' (the default): the column decoded once into one canonical
+ *   form that every probe, decode and `terms` export then reads in place.
+ * - 'as-written': the file's own FSST chunks, a third of that size, decoded
+ *   one term per read — the lean load for a store opened, queried a few
+ *   times and dropped.
  */
-export type DictForm = 'as-written' | 'plaintext';
+export type DictForm = 'plaintext' | 'as-written';
 
 /** Options of `fromBytes`. Any omitted field keeps its default. */
 export interface OpenOptions {
-    /** @default 'as-written' */
+    /** @default 'plaintext' */
     dictionary?: DictForm;
 }
 

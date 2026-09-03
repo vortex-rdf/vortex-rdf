@@ -87,13 +87,13 @@ pub(crate) fn parse_build_options(options: JsValue) -> Result<BuildConfig, JsVal
 
 /// The resident form of an adopted store's term dictionary when the caller
 /// names none.
-const DEFAULT_DICT_FORM: DictForm = DictForm::AsWritten;
+const DEFAULT_DICT_FORM: DictForm = DictForm::Plaintext;
 
 /// Resolve the optional JS `OpenOptions` object behind `fromBytes`:
-/// `dictionary` (a dictionary-form name — `as-written` keeps the file's
-/// FSST chunks, `plaintext` decodes the column once into one canonical
-/// form). Accepts `undefined`/`null` for the default; the vocabulary is
-/// core's `FromStr`, so parse failures carry core's messages.
+/// `dictionary` (a dictionary-form name — `plaintext`, the default, decodes
+/// the column once into one canonical form; `as-written` keeps the file's
+/// FSST chunks). Accepts `undefined`/`null` for the default; the vocabulary
+/// is core's `FromStr`, so parse failures carry core's messages.
 pub(crate) fn parse_open_options(options: JsValue) -> Result<DictForm, JsValue> {
     if options.is_null() || options.is_undefined() {
         return Ok(DEFAULT_DICT_FORM);
