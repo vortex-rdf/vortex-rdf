@@ -66,10 +66,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use futures::stream;
+use arrow_array::RecordBatch;
+use futures::{TryStreamExt, stream};
 use oxrdf::{NamedNode, NamedOrBlankNode};
 
-use vortex_rdf_core::{LayoutStrategy, VortexRdfError, VortexRdfStore, io};
+use vortex_rdf_core::{
+    DictForm, LayoutStrategy, TermEncoding, TermPredicate, VortexRdfError, VortexRdfStore, io,
+};
 
 // The module is shared with `match_lazy.rs` and compiled per-target; items
 // only the other target uses are dead here by design.
@@ -546,6 +549,229 @@ fn dict_decode_matched(bencher: divan::Bencher, residency: &DictResidency) {
             black_box(quads.len())
         })
     });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Group 4b — DICTIONARY ADOPTION FORM (as written vs plaintext)
+//
+// A store adopted from bytes (`from_bytes_owned_as` — what js `fromBytes` and
+// python `from_bytes` / `in_memory=True` hand out) holds its term dictionary
+// either as the file's FSST chunks, decoded one term per read, or decoded
+// once into one canonical column read in place. The axis moves cost between
+// adoption and every later dictionary read: probes, decodes, predicate passes
+// and the `terms` export. The `dict_built_*` cells are the reference a built
+// store sets, whose dictionary is always canonical.
+// ══════════════════════════════════════════════════════════════════════════
+
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+enum DictAdoption {
+    AsWritten,
+    Plaintext,
+}
+
+impl DictAdoption {
+    fn form(self) -> DictForm {
+        match self {
+            Self::AsWritten => DictForm::AsWritten,
+            Self::Plaintext => DictForm::Plaintext,
+        }
+    }
+
+    fn short(self) -> &'static str {
+        match self {
+            Self::AsWritten => "as_written",
+            Self::Plaintext => "plaintext",
+        }
+    }
+}
+
+impl fmt::Debug for DictAdoption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.short())
+    }
+}
+
+const DICT_ADOPTIONS: &[DictAdoption] = &[DictAdoption::AsWritten, DictAdoption::Plaintext];
+
+/// The bytes every adoption cell adopts: the `to_bytes` of the built
+/// Dictionary store (no index) — the artifact js `fromBytes` and python
+/// `from_bytes` open.
+fn dict_bytes(size: usize) -> Vec<u8> {
+    Vec::clone(&cached_bytes(Layout::Dictionary, Index::None, size))
+}
+
+fn adopted_dict_store(adoption: DictAdoption, size: usize) -> VortexRdfStore {
+    // The cache fills through the runtime, so take the bytes before entering it.
+    let bytes = dict_bytes(size);
+    rt().block_on(async {
+        VortexRdfStore::from_bytes_owned_as(bytes, adoption.form())
+            .await
+            .expect("adopt dictionary store")
+    })
+}
+
+fn built_dict_store(size: usize) -> VortexRdfStore {
+    cached_store(Layout::Dictionary, Index::None, size)
+}
+
+/// The predicate the filter cells evaluate: a namespace prefix, which every
+/// term is decided for, so the pass reads the whole column.
+fn subject_prefix_predicate() -> TermPredicate {
+    TermPredicate::parse("str_prefix", "http://data.example.org/subject/").expect("predicate")
+}
+
+/// Term → code probes that always miss the memo — a different subject every
+/// iteration, as [`dict_probe_distinct`] — on `store`.
+fn probe_distinct(bencher: divan::Bencher, store: &VortexRdfStore) {
+    let subjects = bench_moduli().n_subj;
+    let next = AtomicUsize::new(0);
+    bencher
+        .with_inputs(|| {
+            let i = next.fetch_add(1, Ordering::Relaxed) % subjects;
+            NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(dataset::subject_iri(i)))
+        })
+        .bench_refs(|s| {
+            rt().block_on(async {
+                let matched = store
+                    .match_pattern(Some(s), None, None, None)
+                    .await
+                    .expect("match S");
+                black_box(matched)
+            })
+        });
+}
+
+/// Match `pattern` on `store` and decode every matched quad, the bound terms
+/// memoized after the first iteration so the decode is what is priced.
+fn decode_pattern(bencher: divan::Bencher, store: &VortexRdfStore, pattern: Pattern) {
+    let (s, p, o, g) = terms_for(pattern);
+    bencher.bench(|| {
+        rt().block_on(async {
+            let matched = store
+                .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+                .await
+                .expect("match");
+            let quads = matched.quads_vec().await.expect("decode");
+            black_box(quads.len())
+        })
+    });
+}
+
+/// The whole store as `terms` batches: the cold Arrow values — a view of
+/// the dictionary itself when it is canonical, a decode of every FSST window
+/// when it is held as written.
+fn terms_export(bencher: divan::Bencher, open: impl Fn() -> VortexRdfStore + Sync) {
+    bencher.with_inputs(open).bench_refs(|store| {
+        rt().block_on(async {
+            let batches: Vec<RecordBatch> = store
+                .to_record_batches(TermEncoding::Terms, None)
+                .await
+                .expect("export terms")
+                .try_collect()
+                .await
+                .expect("collect terms");
+            black_box(batches.iter().map(RecordBatch::num_rows).sum::<usize>())
+        })
+    });
+}
+
+/// One whole-column predicate pass on a store opened fresh per sample, so the
+/// memo never answers: the cost of reading every term once.
+fn filter_codes_pass(bencher: divan::Bencher, open: impl Fn() -> VortexRdfStore + Sync) {
+    let predicate = subject_prefix_predicate();
+    bencher.with_inputs(open).bench_refs(|store| {
+        let dict = store
+            .code_read_snapshot()
+            .expect("a resident dictionary store is code-readable");
+        let (holds, unknown) = dict.filter_codes(&predicate).expect("filter codes");
+        black_box(holds.len() + unknown.len())
+    });
+}
+
+/// Adoption across the form axis: as written pays the chunk lift, plaintext
+/// also the whole-column decode.
+#[divan::bench(args = DICT_ADOPTIONS, sample_count = HEAVY_SAMPLES)]
+fn dict_adopt_open(bencher: divan::Bencher, adoption: &DictAdoption) {
+    let form = adoption.form();
+    bencher
+        .with_inputs(|| dict_bytes(bench_size()))
+        .bench_values(|bytes| {
+            rt().block_on(async {
+                let store = VortexRdfStore::from_bytes_owned_as(bytes, form)
+                    .await
+                    .expect("adopt");
+                black_box(store.layout())
+            })
+        });
+}
+
+/// A warm binary search per form: view compares on plaintext, one FSST
+/// decode per step as written.
+#[divan::bench(args = DICT_ADOPTIONS, sample_count = QUERY_SAMPLES)]
+fn dict_adopt_probe_distinct(bencher: divan::Bencher, adoption: &DictAdoption) {
+    let store = adopted_dict_store(*adoption, bench_size());
+    probe_distinct(bencher, &store);
+}
+
+/// A point result decoded per form (see [`dict_decode_point`]).
+#[divan::bench(args = DICT_ADOPTIONS, sample_count = QUERY_SAMPLES)]
+fn dict_adopt_decode_point(bencher: divan::Bencher, adoption: &DictAdoption) {
+    let store = adopted_dict_store(*adoption, bench_size());
+    decode_pattern(bencher, &store, Pattern::S);
+}
+
+/// A wide matched subset decoded per form (see [`dict_decode_matched`]).
+#[divan::bench(args = DICT_ADOPTIONS, sample_count = QUERY_SAMPLES)]
+fn dict_adopt_decode_matched(bencher: divan::Bencher, adoption: &DictAdoption) {
+    let store = adopted_dict_store(*adoption, bench_size());
+    decode_pattern(bencher, &store, Pattern::P);
+}
+
+/// Every quad decoded per form: the whole store through the dictionary.
+#[divan::bench(args = DICT_ADOPTIONS, sample_count = HEAVY_SAMPLES)]
+fn dict_adopt_decode_full(bencher: divan::Bencher, adoption: &DictAdoption) {
+    let store = adopted_dict_store(*adoption, bench_size());
+    bencher.bench(|| {
+        rt().block_on(async {
+            let quads = store.quads_vec().await.expect("decode all");
+            black_box(quads.len())
+        })
+    });
+}
+
+#[divan::bench(args = DICT_ADOPTIONS, sample_count = QUERY_SAMPLES)]
+fn dict_adopt_filter_codes(bencher: divan::Bencher, adoption: &DictAdoption) {
+    let adoption = *adoption;
+    filter_codes_pass(bencher, || adopted_dict_store(adoption, bench_size()));
+}
+
+#[divan::bench(args = DICT_ADOPTIONS, sample_count = QUERY_SAMPLES)]
+fn dict_adopt_terms_export(bencher: divan::Bencher, adoption: &DictAdoption) {
+    let adoption = *adoption;
+    terms_export(bencher, || adopted_dict_store(adoption, bench_size()));
+}
+
+/// The built store's reference for [`dict_adopt_probe_distinct`].
+#[divan::bench(sample_count = QUERY_SAMPLES)]
+fn dict_built_probe_distinct(bencher: divan::Bencher) {
+    let store = built_dict_store(bench_size());
+    probe_distinct(bencher, &store);
+}
+
+/// The built store's reference for [`dict_adopt_decode_matched`].
+#[divan::bench(sample_count = QUERY_SAMPLES)]
+fn dict_built_decode_matched(bencher: divan::Bencher) {
+    let store = built_dict_store(bench_size());
+    decode_pattern(bencher, &store, Pattern::P);
+}
+
+/// The built store's reference for [`dict_adopt_terms_export`]. There is no
+/// built reference for the filter pass: every built store of a size shares
+/// one dictionary, whose predicate memo would answer from the second sample
+/// on, and the `plaintext` arm already prices a canonical dictionary cold.
+#[divan::bench(sample_count = QUERY_SAMPLES)]
+fn dict_built_terms_export(bencher: divan::Bencher) {
+    terms_export(bencher, || built_dict_store(bench_size()));
 }
 
 // ══════════════════════════════════════════════════════════════════════════

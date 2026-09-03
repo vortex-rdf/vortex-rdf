@@ -102,3 +102,7 @@ required-features = ["file-io"]
 [[test]]
 name = "bench_dataset"
 required-features = ["file-io"]
+
+[[example]]
+name = "dict_memory"
+required-features = ["file-io"]
