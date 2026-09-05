@@ -47,8 +47,12 @@ use vortex_mask::Mask;
 
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
+use crate::store::array::{canonical_u32, into_struct_array};
+use crate::store::arrow::QuadColumn;
+use crate::store::indexes::IndexComponent;
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 use crate::store::scan::gather::primitive_from_u64_reads;
+use crate::store::view::canonical::{LiveCanonical, decode_u32};
 use crate::store::view::selection::point_sized;
 
 /// The decode tail shared by both backend-typed serve plans: which of the
@@ -252,34 +256,43 @@ pub(crate) struct InMemoryServePlan {
     /// point-by-point at its global positions instead of slicing (a slice's
     /// probe would be re-resolved per call).
     probes: Arc<crate::store::view::probes::StructProbes>,
+    /// The component's live canonical cache, which a wide run's code read
+    /// slices (see [`code_columns`](Self::code_columns)).
+    canonical: Arc<LiveCanonical>,
 }
 
+/// The fraction of its component a served run must cover for a wide code
+/// read to decode the whole column into the component's live canonical cache
+/// rather than the run alone: below it the run's own decode is the cheaper
+/// read, and the cache stays cold unless some holder already keeps the column
+/// alive.
+pub(crate) const CACHE_RUN_FRACTION: usize = 32;
+
 impl InMemoryServePlan {
-    /// A plan serving the contiguous `range` of an in-memory index
-    /// component's rows.
+    /// A plan serving the contiguous `range` of `component`'s rows.
     pub(crate) fn new(
         primary_columns: [&'static str; 4],
         rid_column: &'static str,
         decode_layout: ResolvedLayout,
-        array: ArrayRef,
+        component: &IndexComponent,
         range: Range<usize>,
-        probes: Arc<crate::store::view::probes::StructProbes>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
             decode: ServeDecode {
                 primary_columns,
                 rid_column,
                 decode_layout,
             },
-            array,
+            array: component.rows()?.clone().into_array(),
             range,
-            probes,
-        }
+            probes: component.probes_arc(),
+            canonical: component.canonical_arc(),
+        })
     }
 
-    /// The served rows' four `u32` term codes, read straight off the index
-    /// component's own columns — the code-payload counterpart of
-    /// [`decode`](Self::decode).
+    /// The served rows' `u32` term codes for `columns`, in that order, read
+    /// straight off the index component's own columns — the code-payload
+    /// counterpart of [`decode`](Self::decode).
     ///
     /// A permutation index under the Dictionary layout already holds this
     /// view's codes, contiguously, in its own order; reading them here
@@ -287,34 +300,107 @@ impl InMemoryServePlan {
     /// primary columns at each one. Rows come back in the index's order, as
     /// [`decode`](Self::decode) already serves them.
     ///
-    /// `None` declines to the caller's gather path: a run wider than
-    /// [`POINT_GATHER_MAX_ROWS`], a non-Dictionary decode layout (the columns
-    /// hold terms, not codes), or any column whose encoding resolves no
-    /// probe.
+    /// A point-sized run reads each code through the component's cached
+    /// probes, decoding no column. A wider run slices each column's canonical
+    /// form — the column itself when it is canonical, else the component's
+    /// live canonical cache: decoded once, shared with every holder alive and
+    /// freed with the last, filled when the run covers at least
+    /// 1/[`CACHE_RUN_FRACTION`] of the component or a holder already keeps
+    /// the column alive; a narrower cold run decodes the run alone.
+    /// Tombstoned rows are dropped through the rid column.
     ///
-    /// [`POINT_GATHER_MAX_ROWS`]: crate::store::view::selection::POINT_GATHER_MAX_ROWS
-    pub(crate) fn code_columns(&self, deleted: Option<&Mask>) -> Option<[Buffer<u32>; 4]> {
+    /// `Ok(None)` declines to the caller's gather path: a non-Dictionary
+    /// decode layout (the columns hold terms, not codes), or a point-sized
+    /// run over a column whose encoding resolves no probe.
+    pub(crate) fn code_columns(
+        &self,
+        columns: &[QuadColumn],
+        deleted: Option<&Mask>,
+    ) -> Result<Option<Vec<Buffer<u32>>>> {
         if !matches!(self.decode.decode_layout, ResolvedLayout::Dictionary(_)) {
-            return None;
+            return Ok(None);
         }
-        let live = self
-            .decode
-            .live_positions(&self.array, &self.range, &self.probes, deleted)?;
-        let mut columns = Vec::with_capacity(4);
-        for name in self.decode.primary_columns {
-            let probe = self.probes.by_name(&self.array, name)?;
-            columns.push(match &live {
-                None => Buffer::from_iter(self.range.clone().map(|pos| probe.value_at(pos) as u32)),
-                Some(live) => Buffer::from_iter(live.iter().map(|&pos| probe.value_at(pos) as u32)),
+        let names = columns
+            .iter()
+            .map(|column| self.decode.primary_columns[column.index()]);
+        if point_sized(self.range.len() as u64) {
+            let Some(live) =
+                self.decode
+                    .live_positions(&self.array, &self.range, &self.probes, deleted)
+            else {
+                return Ok(None);
+            };
+            let mut out = Vec::with_capacity(columns.len());
+            for name in names {
+                let Some(probe) = self.probes.by_name(&self.array, name) else {
+                    return Ok(None);
+                };
+                out.push(match &live {
+                    None => {
+                        Buffer::from_iter(self.range.clone().map(|pos| probe.value_at(pos) as u32))
+                    }
+                    Some(live) => {
+                        Buffer::from_iter(live.iter().map(|&pos| probe.value_at(pos) as u32))
+                    }
+                });
+            }
+            return Ok(Some(out));
+        }
+        let struct_arr = into_struct_array(self.array.clone())?;
+        let child = |name: &str| {
+            struct_arr
+                .unmasked_field_by_name(name)
+                .map_err(VortexRdfError::Vortex)
+        };
+        let live = match deleted {
+            None => None,
+            Some(deleted) => {
+                let rids = decode_u32(&self.run_of(child(self.decode.rid_column)?)?, "rid")?;
+                Some(
+                    rids.as_slice()
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, &rid)| !deleted.value(rid as usize))
+                        .map(|(pos, _)| pos)
+                        .collect::<Vec<usize>>(),
+                )
+            }
+        };
+        let mut out = Vec::with_capacity(columns.len());
+        for (column, name) in columns.iter().zip(names) {
+            let col = child(name)?;
+            let codes = match canonical_u32(col) {
+                Some(prim) => prim.into_buffer::<u32>().slice(self.range.clone()),
+                None => match self.cached_column(column.index(), col)? {
+                    Some(column) => column.slice(self.range.clone()),
+                    None => decode_u32(&self.run_of(col)?, name)?,
+                },
+            };
+            out.push(match &live {
+                None => codes,
+                Some(live) => Buffer::from_iter(live.iter().map(|&pos| codes.as_slice()[pos])),
             });
         }
-        let mut columns = columns.into_iter();
-        Some([
-            columns.next()?,
-            columns.next()?,
-            columns.next()?,
-            columns.next()?,
-        ])
+        Ok(Some(out))
+    }
+
+    /// `col` restricted to the served run.
+    fn run_of(&self, col: &ArrayRef) -> Result<ArrayRef> {
+        col.slice(self.range.clone())
+            .map_err(VortexRdfError::Vortex)
+    }
+
+    /// The component's live canonical form of column `idx`, when a served
+    /// read should go through it: already held by someone, or worth filling
+    /// for a run this wide. `None` leaves the read to a decode of the run.
+    fn cached_column(&self, idx: usize, col: &ArrayRef) -> Result<Option<Buffer<u32>>> {
+        if let Some(column) = self.canonical.column_if_alive(idx) {
+            return Ok(Some(column));
+        }
+        if self.range.len().saturating_mul(CACHE_RUN_FRACTION) >= self.array.len() {
+            return self.canonical.column(idx, col).map(Some);
+        }
+        Ok(None)
     }
 
     /// Decode the matched rows straight from the index component's rows:
@@ -554,6 +640,13 @@ impl FileServePlan {
         deleted: Option<&Mask>,
     ) -> Vec<Result<T>> {
         self.decode.decode_columns_async(chunk, deleted).await
+    }
+
+    /// A chunk of this plan's projected index columns as `(s, p, o, g)` rows
+    /// with the rows tombstoned in `deleted` dropped — the code export's
+    /// per-chunk step, ahead of the Arrow conversion.
+    pub(crate) fn served_rows(&self, chunk: &ArrayRef, deleted: Option<&Mask>) -> Result<ArrayRef> {
+        self.decode.chunk_rows(chunk, deleted)
     }
 }
 

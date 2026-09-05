@@ -141,7 +141,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 | `components[i]` | describes child `i + 1` ([`StoreComponentDescriptor`](../core/src/io/container/wire.rs#L107)) |
 | `name` | the child's identity; non-empty, unique, never `quad-source` |
 | `role` | `dictionary`, `index`, `change-set` (reserved for future delta components) or `other` |
-| `implementation` | the slug a reader interprets the columns through — the key of the [known-component registry](../core/src/store/indexes/components.rs#L62) |
+| `implementation` | the slug a reader interprets the columns through — the key of the [known-component registry](../core/src/store/indexes/components.rs#L63) |
 | `version` | the implementation's version, positive |
 | `required` | a reader that cannot interpret a required component **must fail the open**; an unknown optional component is skipped |
 | `sorted` | the writer's provenance that the sort-key columns are *globally* sorted — a reader may binary-search the child only when this is set; absent means false |
@@ -293,7 +293,7 @@ Shared rules:
   resolved through an index compose with row selections, tombstones and
   further matches without renumbering anything ([matching.md §1](matching.md#1-what-a-match-produces)).
 - **One row per quad.** A child whose row count differs from the quad table's
-  fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L75)).
+  fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L76)).
 - **A bound graph is never a sort key**, and neither index answers a
   bound-subject pattern — the sorted quad table is the better path there.
 

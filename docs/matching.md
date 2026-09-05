@@ -698,7 +698,10 @@ point-read now (`Eager`) while the plan still serves the quads.
 deferred rid-only scan of that run and reads stream the run through the plan
 — a scan of exactly that row range, no filter, split by row count so that its
 decode runs on many of the runtime's workers rather than inside the single
-leaf-chunk split the child's own layout would make of the run.
+leaf-chunk split the child's own layout would make of the run. In memory the
+same run's code read is a slice of the component's live canonical form
+([memory.md §3.7](memory.md#37-index-components)), so two exports of it are
+the same buffers.
 
 **Cost.** Locating a run is a few microseconds on either backend (in memory
 `P` 2.0 µs, `O` 2.5 µs, `PO` 2.8 µs; on file 3.3–9.5 µs). Reading through the
@@ -746,7 +749,7 @@ size: `{val, rid}` pairs are a fraction of a second sorted copy of every quad.
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_scan.rs#L486) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/serve.rs#L521)); unlocated: the pushed-down projected+filtered scan of the index child |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_scan.rs#L486) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/serve.rs#L607)); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
 | Dropped when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
 | Tombstones | applied through the plan's `rid` column | applied through the plan's `rid` column |
@@ -894,7 +897,7 @@ The match's decisions show up here
 | `quads()` / `quads_vec()` | decode the plan's run (in memory: slice or point reads; file: point reads ≤ 256 rows, else a range scan of the located run (`located_run_scan`); a projected+filtered scan of the child only when the run was not located) — the pending ids are never touched | gather the selection from the primaries, or run the restricted file scan |
 | `shared_quads_vec()` / `shared_quad_chunks()` | as `quads()`, through the plan's shared-term decode twins — one `Arc<str>` per distinct term of a chunk, handed to every row repeating it | the same gather or restricted scan, decoded to shared terms |
 | `size()` | in memory a lazy component run knows its width without decoding; on file a located plan's run width answers outright when no filter or tombstones apply, otherwise the ids materialize (then filter masks are counted if a filter is pending) | selection length, or `count_matching_rows` over the filter |
-| `code_columns()` / `code_columns_gathered()` | read the four `u32` columns straight off the index's own columns | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views) |
+| `code_columns()` / `code_columns_gathered()` / the `codes` export | read the projected `u32` columns straight off the index's own columns — point reads through the probes for a small run, a slice of the component's live canonical form for a wide one, the plan's child scan on file — the pending ids never touched | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views) |
 | `raw_quad_chunks()` | plan deliberately ignored (it reorders rows; the N-Triples export is order-insignificant) | restricted scan in base row order |
 
 `LazyRowIds` caches into a shared `OnceLock`, so the first consumer that needs

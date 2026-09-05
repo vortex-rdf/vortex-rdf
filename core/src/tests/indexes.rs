@@ -3,6 +3,7 @@
 //! family's serving path.
 
 use super::*;
+use crate::store::{QuadColumn, TermEncoding};
 
 // ─── Secondary index behavior ──────────────────────────────────────────
 
@@ -857,7 +858,8 @@ async fn test_built_store_resident_form() {
         .await
         .unwrap();
     let cols = matched
-        .code_columns()
+        .code_columns(&QuadColumn::ALL)
+        .unwrap()
         .expect("a canonical base serves codes without a decode");
     for idx in 0..4 {
         assert_eq!(matched.debug_live_canonical_alive(idx), Some(false));
@@ -909,7 +911,8 @@ async fn test_code_columns_serves_from_the_answering_index() {
     assert!(matched.debug_selection_pending());
 
     let cols = matched
-        .code_columns()
+        .code_columns(&QuadColumn::ALL)
+        .unwrap()
         .expect("an in-memory Dictionary view answers codes");
     assert_eq!(
         matched.debug_row_ids_materialized(),
@@ -936,4 +939,168 @@ async fn test_code_columns_serves_from_the_answering_index() {
         .collect();
     want.sort();
     assert_eq!(got, want);
+}
+
+/// A served run wider than a point read exports its codes as slices of the
+/// component's live canonical form: two exports of one match are the same
+/// buffers, a projection decodes only its columns, the form is freed with
+/// the last batch, the row ids stay unmaterialized — and a run under 1/32 of
+/// the component decodes itself, leaving the cache cold. Tombstones filter
+/// the run through its rid column.
+#[tokio::test]
+async fn test_wide_served_run_exports_slices_of_the_component() {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::UInt32Type;
+    use futures::TryStreamExt;
+
+    async fn export(
+        view: &VortexRdfStore,
+        projection: Option<&[QuadColumn]>,
+    ) -> Vec<arrow_array::RecordBatch> {
+        view.to_record_batches(TermEncoding::Codes, projection)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap()
+    }
+    fn ptr(batch: &arrow_array::RecordBatch, column: usize) -> *const u32 {
+        batch
+            .column(column)
+            .as_primitive::<UInt32Type>()
+            .values()
+            .as_ptr()
+    }
+    let spelled = |view: &VortexRdfStore, batches: &[arrow_array::RecordBatch]| -> Vec<String> {
+        let dict = view.code_read_snapshot().unwrap();
+        let dict = &dict;
+        let mut rows: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                (0..batch.num_rows()).map(move |i| {
+                    (0..3)
+                        .map(|c| {
+                            dict.decode(batch.column(c).as_primitive::<UInt32Type>().value(i))
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    let expected = |quads: &[Quad], p: usize, skip: Option<&Quad>| -> Vec<String> {
+        let mut want: Vec<String> = quads
+            .iter()
+            .filter(|q| q.predicate.as_str() == format!("http://example.org/p{p}"))
+            .filter(|q| skip != Some(q))
+            .map(|q| format!("{} {} {}", q.subject, q.predicate, q.object))
+            .collect();
+        want.sort();
+        want
+    };
+
+    // 3,000 rows, three predicates: a 1,000-row run, a third of the component.
+    let quads = graph_modular_quads(3000, 4, 3, 5, &[GraphName::DefaultGraph]);
+    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let store = VortexRdfStore::from_quads(
+        quad_stream(quads.clone()),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    let matched = store
+        .match_pattern(None, Some(&p0), None, None)
+        .await
+        .unwrap();
+    assert!(matched.debug_selection_pending());
+    let posg = "index:posg";
+    for idx in 0..4 {
+        assert_eq!(
+            matched.debug_component_canonical_alive(posg, idx),
+            Some(false)
+        );
+    }
+
+    let first = export(&matched, None).await;
+    let second = export(&matched, None).await;
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].num_rows(), 1000);
+    for column in 0..4 {
+        assert_eq!(
+            ptr(&first[0], column),
+            ptr(&second[0], column),
+            "column {column}: both exports slice the component's one live form"
+        );
+        assert_eq!(
+            matched.debug_component_canonical_alive(posg, column),
+            Some(true)
+        );
+    }
+    assert_eq!(
+        matched.debug_row_ids_materialized(),
+        Some(false),
+        "a served export never materializes the resolution's row ids"
+    );
+    assert_eq!(spelled(&matched, &first), expected(&quads, 0, None));
+    drop(first);
+    drop(second);
+    for idx in 0..4 {
+        assert_eq!(
+            matched.debug_component_canonical_alive(posg, idx),
+            Some(false),
+            "column {idx} is freed with the last batch"
+        );
+    }
+
+    // A projection decodes only the columns it names.
+    let projected = export(&matched, Some(&[QuadColumn::S, QuadColumn::O])).await;
+    assert_eq!(projected[0].num_columns(), 2);
+    for (idx, alive) in [(0, true), (1, false), (2, true), (3, false)] {
+        assert_eq!(
+            matched.debug_component_canonical_alive(posg, idx),
+            Some(alive)
+        );
+    }
+    drop(projected);
+
+    // Tombstones: the run is filtered through its rid column.
+    let store = store.delete_quad(&quads[0]).await.unwrap();
+    let matched = store
+        .match_pattern(None, Some(&p0), None, None)
+        .await
+        .unwrap();
+    let live = export(&matched, None).await;
+    assert_eq!(live.iter().map(|b| b.num_rows()).sum::<usize>(), 999);
+    assert_eq!(
+        spelled(&matched, &live),
+        expected(&quads, 0, Some(&quads[0]))
+    );
+
+    // A run under 1/32 of the component decodes itself; the cache stays cold.
+    let quads = graph_modular_quads(40_000, 5, 100, 7, &[GraphName::DefaultGraph]);
+    let store = VortexRdfStore::from_quads(
+        quad_stream(quads.clone()),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    let p7 = NamedNode::new("http://example.org/p7").unwrap();
+    let matched = store
+        .match_pattern(None, Some(&p7), None, None)
+        .await
+        .unwrap();
+    let narrow = export(&matched, None).await;
+    assert_eq!(narrow[0].num_rows(), 400);
+    for idx in 0..4 {
+        assert_eq!(
+            matched.debug_component_canonical_alive(posg, idx),
+            Some(false)
+        );
+    }
+    assert_eq!(spelled(&matched, &narrow), expected(&quads, 7, None));
 }

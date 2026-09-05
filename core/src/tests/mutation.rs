@@ -2,6 +2,7 @@
 //! auto-compaction thresholds, and the owner-only rule for views.
 
 use super::*;
+use crate::store::QuadColumn;
 
 // ─── Mutation ──────────────────────────────────────────────────────────
 
@@ -515,9 +516,13 @@ async fn test_code_columns_skips_tombstoned_rows_in_memory() {
         ("row ids", &by_predicate, &dict, 3),
         ("served, tombstoned", &served, &served_dict, 3),
     ] {
-        let [s, p, o, g] = view
-            .code_columns()
-            .unwrap_or_else(|| panic!("{tag}: the in-memory fast path must serve codes"));
+        let [s, p, o, g] = <[_; 4]>::try_from(
+            view.code_columns(&QuadColumn::ALL)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{tag}: the in-memory fast path must serve codes")),
+        )
+        .ok()
+        .unwrap();
         assert_eq!(s.len(), live, "{tag}");
         let decoded: Vec<(String, String, String, String)> = (0..s.len())
             .map(|i| {

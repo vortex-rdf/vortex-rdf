@@ -271,6 +271,20 @@ impl VortexRdfStore {
         }
     }
 
+    /// Whether some reader currently holds the live canonical form of column
+    /// `idx` of the in-memory index component `name`; `None` without that
+    /// component in memory.
+    pub(crate) fn debug_component_canonical_alive(&self, name: &str, idx: usize) -> Option<bool> {
+        match &self.quads {
+            QuadsSource::InMemory { components, .. } => components
+                .iter()
+                .find(|component| component.name == name)
+                .map(|component| component.debug_canonical_alive(idx)),
+            #[cfg(feature = "file-io")]
+            QuadsSource::File { .. } => None,
+        }
+    }
+
     /// Whether some consumer currently holds a decoded Arrow values array of
     /// the resident dictionary; `None` without a resident dictionary.
     pub(crate) fn debug_dict_arrow_values_alive(&self) -> Option<bool> {

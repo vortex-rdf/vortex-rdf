@@ -26,6 +26,7 @@ use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_mask::Mask;
 
 use crate::store::VortexRdfStore;
+use crate::store::arrow::QuadColumn;
 
 impl VortexRdfStore {
     /// Number of quads in the store.
@@ -172,21 +173,26 @@ impl VortexRdfStore {
         }
     }
 
-    /// The rows this view selects, as four `u32` term-code columns (`s`, `p`,
-    /// `o`, `g`) — read off the answering index's own columns when the view
-    /// carries a serve plan that covers them, else off the base's canonical
-    /// columns (see [`select_codes`]).
+    /// The `u32` code columns named by `columns`, in that order, for the
+    /// rows this in-memory view covers, sharing the store's own memory: a
+    /// served run straight off the answering index's columns
+    /// ([`InMemoryServePlan::code_columns`]), else the base's canonical
+    /// columns — the whole column, or a slice of it for a contiguous
+    /// selection; a scattered selection gathers, and tombstones filter.
     ///
-    /// `None` whenever codes cannot be served this way: a non-Dictionary
+    /// `Ok(None)` whenever codes cannot be served this way: a non-Dictionary
     /// layout, a non-empty append tail (its strings are not in the cached
-    /// dictionary), a file-backed source, or base columns that are not
-    /// canonical non-nullable u32 primitives — the wire encodings an adopted
-    /// base keeps, which [`code_columns_shared`](Self::code_columns_shared)
-    /// serves through the live canonical cache.
-    pub(crate) fn code_columns(&self) -> Option<[Buffer<u32>; 4]> {
+    /// dictionary), a file-backed source, a served run declining to the
+    /// gather path, or base columns that are not canonical non-nullable u32
+    /// primitives — the wire encodings an adopted base keeps, which
+    /// [`code_columns_shared`](Self::code_columns_shared) serves through the
+    /// live canonical cache.
+    ///
+    /// [`InMemoryServePlan::code_columns`]: crate::store::indexes::InMemoryServePlan::code_columns
+    pub(crate) fn code_columns(&self, columns: &[QuadColumn]) -> Result<Option<Vec<Buffer<u32>>>> {
         use vortex_array::arrays::Struct;
         if self.layout.strategy() != LayoutStrategy::Dictionary || self.tail_len() != 0 {
-            return None;
+            return Ok(None);
         }
         // Without `file-io`, InMemory is the only variant.
         #[allow(irrefutable_let_patterns)]
@@ -198,28 +204,31 @@ impl VortexRdfStore {
             ..
         } = &self.quads
         else {
-            return None;
+            return Ok(None);
         };
-        // Served fast path: the answering index's own columns already hold
-        // this view's codes as one contiguous run, so reading them there
-        // costs neither the row-id materialization this view deferred at
-        // match time nor a scattered gather over the primaries.
         if let Some(plan) = serve
-            && let Some(columns) = plan.code_columns(deleted.as_ref())
+            && let Some(columns) = plan.code_columns(columns, deleted.as_ref())?
         {
-            return Some(columns);
+            return Ok(Some(columns));
         }
-        let struct_arr = base.clone().try_downcast::<Struct>().ok()?;
-        let mut columns: Vec<Buffer<u32>> = Vec::with_capacity(4);
-        for name in schema::PRIMARY_COLUMNS {
-            let col = struct_arr.unmasked_field_by_name(name).ok()?;
-            columns.push(crate::store::array::canonical_u32(col)?.into_buffer::<u32>());
+        let Ok(struct_arr) = base.clone().try_downcast::<Struct>() else {
+            return Ok(None);
+        };
+        let mut full: Vec<Buffer<u32>> = Vec::with_capacity(columns.len());
+        for column in columns {
+            let Ok(col) = struct_arr.unmasked_field_by_name(column.name()) else {
+                return Ok(None);
+            };
+            let Some(prim) = crate::store::array::canonical_u32(col) else {
+                return Ok(None);
+            };
+            full.push(prim.into_buffer::<u32>());
         }
         // No plan (or a plan that declined): codes are gathered by row id, so
         // a served match's pending selection materializes here (the in-memory
         // decode+sort it deferred at match time).
-        let selection = selection.materialized().ok()?;
-        Some(select_codes(&columns, &selection, deleted.as_ref()))
+        let selection = selection.materialized()?;
+        Ok(Some(select_codes(&full, &selection, deleted.as_ref())))
     }
 
     /// [`code_columns`](Self::code_columns), extended to an encoded base
@@ -235,8 +244,11 @@ impl VortexRdfStore {
     /// (point reads through the probes) and gathers over columns nobody
     /// holds (a `take` over the encoded base) — neither decodes a whole
     /// column for a few rows.
-    pub(crate) fn code_columns_shared(&self) -> Result<Option<[Buffer<u32>; 4]>> {
-        if let Some(columns) = self.code_columns() {
+    pub(crate) fn code_columns_shared(
+        &self,
+        columns: &[QuadColumn],
+    ) -> Result<Option<Vec<Buffer<u32>>>> {
+        if let Some(columns) = self.code_columns(columns)? {
             return Ok(Some(columns));
         }
         if self.layout.strategy() != LayoutStrategy::Dictionary || self.tail_len() != 0 {
@@ -260,22 +272,22 @@ impl VortexRdfStore {
         let contiguous =
             matches!(selection, RowSelection::All | RowSelection::Range(_)) && deleted.is_none();
         let struct_arr = crate::store::array::into_struct_array(base.clone())?;
-        let mut columns: Vec<Buffer<u32>> = Vec::with_capacity(4);
-        for (idx, name) in schema::PRIMARY_COLUMNS.iter().enumerate() {
+        let mut full: Vec<Buffer<u32>> = Vec::with_capacity(columns.len());
+        for column in columns {
             let column = if contiguous {
                 let col = struct_arr
-                    .unmasked_field_by_name(name)
+                    .unmasked_field_by_name(column.name())
                     .map_err(VortexRdfError::Vortex)?;
-                canonical.column(idx, col)?
+                canonical.column(column.index(), col)?
             } else {
-                let Some(column) = canonical.column_if_alive(idx) else {
+                let Some(column) = canonical.column_if_alive(column.index()) else {
                     return Ok(None);
                 };
                 column
             };
-            columns.push(column);
+            full.push(column);
         }
-        Ok(Some(select_codes(&columns, &selection, deleted.as_ref())))
+        Ok(Some(select_codes(&full, &selection, deleted.as_ref())))
     }
 
     /// The rows this view selects as four `u32` term-code columns, gathering
@@ -295,8 +307,10 @@ impl VortexRdfStore {
     /// This is the payload path behind the bindings' code-column reads; they
     /// call it instead of re-implementing the gather.
     pub async fn code_columns_gathered(&self) -> Result<Option<[Buffer<u32>; 4]>> {
-        if let Some(columns) = self.code_columns_shared()? {
-            return Ok(Some(columns));
+        if let Some(columns) = self.code_columns_shared(&QuadColumn::ALL)? {
+            let [s, p, o, g] = <[Buffer<u32>; 4]>::try_from(columns)
+                .unwrap_or_else(|_| unreachable!("four columns were projected"));
+            return Ok(Some([s, p, o, g]));
         }
         if self.layout.strategy() != LayoutStrategy::Dictionary || self.tail_len() != 0 {
             return Ok(None);
@@ -487,7 +501,7 @@ fn select_codes(
     columns: &[Buffer<u32>],
     selection: &RowSelection,
     deleted: Option<&Mask>,
-) -> [Buffer<u32>; 4] {
+) -> Vec<Buffer<u32>> {
     let column = |column: &Buffer<u32>| -> Buffer<u32> {
         match (selection, deleted) {
             (RowSelection::All, None) => column.clone(),
@@ -518,10 +532,5 @@ fn select_codes(
             }
         }
     };
-    [
-        column(&columns[0]),
-        column(&columns[1]),
-        column(&columns[2]),
-        column(&columns[3]),
-    ]
+    columns.iter().map(column).collect()
 }

@@ -56,7 +56,10 @@ fn assert_live(store: &VortexRdfStore, alive: bool) {
 async fn built_base_serves_codes_without_the_live_cache() {
     let store = built(wide_subject_quads(1000, 2)).await;
     assert!(store.debug_base_int_children_canonical());
-    let direct = store.code_columns().expect("canonical columns serve codes");
+    let direct = store
+        .code_columns(&QuadColumn::ALL)
+        .unwrap()
+        .expect("canonical columns serve codes");
     let gathered = store.code_columns_gathered().await.unwrap().unwrap();
     for idx in 0..4 {
         assert_eq!(

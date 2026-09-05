@@ -33,6 +33,8 @@ use crate::store::arrow::{
 };
 use crate::store::layouts::ResolvedLayout;
 use crate::store::{QuadsSource, SharedQuad, VortexRdfStore};
+#[cfg(feature = "file-io")]
+use crate::store::{scan::file_scan, view::selection::point_sized};
 
 impl VortexRdfStore {
     /// The rows this view covers as Arrow record batches — one per decode
@@ -104,22 +106,23 @@ impl VortexRdfStore {
         // out those very buffers — a built base's canonical columns, or an
         // adopted base's live canonical form, shared with every holder alive;
         // anything else reads the primary chunks.
-        let batches: BoxStream<'static, Result<RecordBatch>> = match self.code_columns_shared()? {
-            Some(buffers) => {
-                let batch = code_buffers_to_batch(&buffers, &schema, &columns, values.as_ref())?;
-                stream::once(future::ready(Ok(batch))).boxed()
-            }
-            None => {
-                let names: Vec<&'static str> = columns.iter().map(|c| c.name()).collect();
-                let chunks = self.primary_chunks(&names).await?;
-                let batch_schema = schema.clone();
-                chunks
-                    .map(move |chunk| {
-                        code_chunk_to_batch(&chunk?, &batch_schema, &columns, values.as_ref())
-                    })
-                    .boxed()
-            }
-        };
+        let batches: BoxStream<'static, Result<RecordBatch>> =
+            match self.code_columns_shared(&columns)? {
+                Some(buffers) => {
+                    let batch = code_buffers_to_batch(&buffers, &schema, values.as_ref())?;
+                    stream::once(future::ready(Ok(batch))).boxed()
+                }
+                None => {
+                    let names: Vec<&'static str> = columns.iter().map(|c| c.name()).collect();
+                    let chunks = self.primary_chunks(&names).await?;
+                    let batch_schema = schema.clone();
+                    chunks
+                        .map(move |chunk| {
+                            code_chunk_to_batch(&chunk?, &batch_schema, &columns, values.as_ref())
+                        })
+                        .boxed()
+                }
+            };
         Ok(QuadBatches::new(schema, non_empty(batches)))
     }
 
@@ -154,9 +157,50 @@ impl VortexRdfStore {
                 filter,
                 selection,
                 deleted,
+                serve,
                 ..
             } => {
-                // Base row order needs the exact ids: a served match's
+                // A served view reads the index child through its plan — a
+                // point read of a small located run, a range scan of a wide
+                // one, the pushed-down filter scan otherwise — in the index's
+                // order, its pending selection untouched; every chunk comes
+                // back as `(s, p, o, g)` rows with the tombstoned ones dropped.
+                if let Some(plan) = serve {
+                    let plan = plan.clone();
+                    let deleted = deleted.clone();
+                    if let Some(range) = plan.row_range()
+                        && point_sized(range.end - range.start)
+                    {
+                        let scan = plan.projected_filtered_scan()?;
+                        let file = Arc::clone(file);
+                        let chunk = async move {
+                            let projection = plan.projection();
+                            let point = file_scan::component_point_chunk(
+                                &file,
+                                plan.component(),
+                                &projection,
+                                range,
+                            );
+                            let rows = file_scan::point_rows_or_scan(point, scan).await?;
+                            plan.served_rows(&rows, deleted.as_ref())
+                        };
+                        return Ok(stream::once(chunk).boxed());
+                    }
+                    let scan = match plan.located_run_scan()? {
+                        Some(scan) => scan,
+                        None => plan.projected_filtered_scan()?,
+                    };
+                    let chunks = scan.into_stream().map_err(VortexRdfError::Vortex)?;
+                    return Ok(chunks
+                        .map(move |chunk| {
+                            plan.served_rows(
+                                &chunk.map_err(VortexRdfError::Vortex)?,
+                                deleted.as_ref(),
+                            )
+                        })
+                        .boxed());
+                }
+                // Base row order needs the exact ids: an unserved match's
                 // pending selection materializes here.
                 let selection = selection.materialized_async().await?;
                 let scan = self.restricted_file_scan_projected(
@@ -175,21 +219,21 @@ impl VortexRdfStore {
     }
 }
 
-/// The four served code buffers as a record batch over `schema`'s columns,
-/// each an Arrow `UInt32` array sharing the buffer, or those keys over
-/// `values` as a dictionary array.
+/// The served code buffers, one per column of `schema` in its order, as a
+/// record batch: each an Arrow `UInt32` array sharing the buffer, or those
+/// keys over `values` as a dictionary array.
 fn code_buffers_to_batch(
-    buffers: &[Buffer<u32>; 4],
+    buffers: &[Buffer<u32>],
     schema: &SchemaRef,
-    columns: &[QuadColumn],
     values: Option<&ArrowArrayRef>,
 ) -> Result<RecordBatch> {
-    let arrays = columns
+    let arrays = buffers
         .iter()
-        .map(|column| {
-            let buffer = buffers[column.index()].clone();
-            let keys: ArrowArrayRef =
-                Arc::new(UInt32Array::new(buffer.into_arrow_scalar_buffer(), None));
+        .map(|buffer| {
+            let keys: ArrowArrayRef = Arc::new(UInt32Array::new(
+                buffer.clone().into_arrow_scalar_buffer(),
+                None,
+            ));
             keyed(keys, values)
         })
         .collect::<Result<Vec<_>>>()?;

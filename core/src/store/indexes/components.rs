@@ -26,6 +26,7 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::array::into_struct_array;
+use crate::store::view::canonical::LiveCanonical;
 
 use super::{ALL_INDEX_TYPES, IndexType, Indexes};
 
@@ -150,6 +151,7 @@ fn adopt_deferred(
         })),
         sorted,
         probes: crate::store::view::probes::StructProbes::new(),
+        canonical: LiveCanonical::new(),
     })
 }
 
@@ -186,6 +188,14 @@ pub(crate) struct IndexComponent {
     /// so the cache's array-identity guard holds for the component's
     /// lifetime; [`rebuilt`](Self::rebuilt) takes a fresh cache.
     probes: Arc<crate::store::view::probes::StructProbes>,
+    /// The live canonical form of the component's `u32` columns, for the
+    /// served code reads that hand out slices of them
+    /// ([`InMemoryServePlan::code_columns`]): decoded on demand, shared by
+    /// every holder alive, freed with the last. Fresh per
+    /// [`rebuilt`](Self::rebuilt), like the probes.
+    ///
+    /// [`InMemoryServePlan::code_columns`]: super::InMemoryServePlan::code_columns
+    canonical: Arc<LiveCanonical>,
 }
 
 /// How an [`IndexComponent`] holds its rows.
@@ -236,6 +246,7 @@ impl IndexComponent {
             rows: ComponentRows::Built(array),
             sorted,
             probes: crate::store::view::probes::StructProbes::new(),
+            canonical: LiveCanonical::new(),
         }
     }
 
@@ -336,6 +347,7 @@ impl IndexComponent {
         Ok(Self {
             rows: ComponentRows::Built(array),
             probes: crate::store::view::probes::StructProbes::new(),
+            canonical: LiveCanonical::new(),
             ..self
         })
     }
@@ -357,9 +369,10 @@ impl IndexComponent {
     /// probe-supported encodings — the construction-side counterpart of
     /// [`into_searchable`](Self::into_searchable): a builder's canonical
     /// emission compresses here (see
-    /// [`array::with_compressed_int_children`]). Components never serve code
-    /// columns, so nothing ever needs their canonical form back; the sorted
-    /// probes bind the compressed columns directly.
+    /// [`array::with_compressed_int_children`]). The sorted probes bind the
+    /// compressed columns directly; a served code read decodes a column back
+    /// through the component's live canonical cache
+    /// ([`canonical_arc`](Self::canonical_arc)).
     ///
     /// [`array::with_compressed_int_children`]: crate::store::array::with_compressed_int_children
     pub(crate) fn into_compressed(self) -> Result<Self> {
@@ -383,6 +396,18 @@ impl IndexComponent {
     /// this reference.
     pub(crate) fn probes_arc(&self) -> Arc<crate::store::view::probes::StructProbes> {
         Arc::clone(&self.probes)
+    }
+
+    /// The component's live canonical cache, for a serve plan that outlives
+    /// this reference.
+    pub(crate) fn canonical_arc(&self) -> Arc<LiveCanonical> {
+        Arc::clone(&self.canonical)
+    }
+
+    /// Whether some reader holds the live canonical form of column `idx`.
+    #[cfg(test)]
+    pub(crate) fn debug_canonical_alive(&self, idx: usize) -> bool {
+        self.canonical.is_alive(idx)
     }
 
     /// Resolve this component's probes at construction, ahead of the first

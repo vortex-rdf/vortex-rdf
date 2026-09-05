@@ -147,7 +147,7 @@ flowchart TD
   "which of this selection's own rows are not tombstoned", and the in-memory
   reads all go through [`gather_live`](../core/src/store/scan/gather.rs#L22)
   — the single place a view becomes rows — so applying the mask cannot be
-  forgotten by one of them. [`size`](../core/src/store/read/rows.rs#L37) counts
+  forgotten by one of them. [`size`](../core/src/store/read/rows.rs#L38) counts
   the live bits without gathering; the tail applies its own mask through
   [`Tail::live_rows`](../core/src/store/view/source.rs#L179).
 - **File-backed stores** tombstone the same way (a file cannot be rewritten
@@ -173,7 +173,7 @@ flowchart TD
 | `compact()` | every live row, base first | every live tail row, then re-sorted with the base |
 
 The rows a rebuild or compaction starts from come from
-[`live_raw_quads`](../core/src/store/read/rows.rs#L475): base rows first (in view
+[`live_raw_quads`](../core/src/store/read/rows.rs#L489): base rows first (in view
 order), then tail rows, tombstones already excluded.
 
 ---

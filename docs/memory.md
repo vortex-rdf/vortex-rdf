@@ -21,7 +21,7 @@ is fixed by its provenance:
 | Form | Comes from | The base | Index components | Dictionary |
 |---|---|---|---|---|
 | **Built** | [`from_quads`](../core/src/store/mod.rs#L185), [`from_built`](../core/src/store/mod.rs#L247), compaction's rebuild ([`from_raw_quads`](../core/src/store/mutation/compaction.rs#L146)) | one struct whose `u32` code columns are flat canonical primitives ([`with_canonical_int_children`](../core/src/store/array.rs#L289)) | compressed into probe-supported encodings — `Constant`, `RunEnd`, bit-packed ([`with_compressed_int_children`](../core/src/store/array.rs#L311)) | one canonical `string_view` column, as the builder froze it ([`from_sorted_column`](../core/src/store/layouts/dictionary/term_dict.rs#L350)); FSST windows are made at write ([`fsst_windows`](../core/src/store/layouts/dictionary/term_dict.rs#L452)) |
-| **Adopted** | [`from_bytes`](../core/src/store/persist/open.rs#L265), [`from_parts`](../core/src/store/mod.rs#L224) — the bindings' `in_memory=True` / `fromBytes` | the writer's own encodings, as refcounted views into the file bytes ([`with_searchable_int_children`](../core/src/store/array.rs#L278)) | `from_parts`: the writer's encodings, made probeable ([`into_searchable`](../core/src/store/indexes/components.rs#L352)); `from_bytes`: deferred, un-executed until first use | decoded once into one canonical column — the bindings' default, `dictionary='plaintext'` — or, as written, the FSST chunks inside the bytes, anything else canonicalized ([`DictForm`](../core/src/store/layouts/dictionary/term_dict.rs#L88)) |
+| **Adopted** | [`from_bytes`](../core/src/store/persist/open.rs#L265), [`from_parts`](../core/src/store/mod.rs#L224) — the bindings' `in_memory=True` / `fromBytes` | the writer's own encodings, as refcounted views into the file bytes ([`with_searchable_int_children`](../core/src/store/array.rs#L278)) | `from_parts`: the writer's encodings, made probeable ([`into_searchable`](../core/src/store/indexes/components.rs#L364)); `from_bytes`: deferred, un-executed until first use | decoded once into one canonical column — the bindings' default, `dictionary='plaintext'` — or, as written, the FSST chunks inside the bytes, anything else canonicalized ([`DictForm`](../core/src/store/layouts/dictionary/term_dict.rs#L88)) |
 | **File-backed** | [`from_file`](../core/src/store/persist/open.rs#L130) | nothing resident — every read scans the file and is transient (the file is opened with no decoded-data cache) | on disk, resolved through pushed-down scans and cached chunk probes | resident, or left in the file and point-read by leaf when it outweighs the residency budget |
 
 The rule behind the split is provenance, not policy. Where the store makes
@@ -30,8 +30,10 @@ read hands out zero-copy. Where the columns arrive already encoded — inside
 bytes the store holds anyway, or inside a file — they stay encoded, because
 decoding them would add a copy of every column on top of the bytes, and
 the match paths bind either form through the encoded-search probes at the
-same speed. Index components are compressed in every form: nothing ever
-reads them as a payload, only the probes touch them.
+same speed. Index components are compressed in every form: the probes bind
+them as they are, and the one read that wants a component's columns as a
+payload — the code export of a served run — decodes them into the
+component's own live canonical cache ([§3.7](#37-index-components)).
 
 The dictionary follows the same rule with one difference: nothing binds a
 compressed dictionary at the speed of a plaintext one. Every probe, every
@@ -108,7 +110,7 @@ that builds a new base starts with empty caches.
 | Slot | Holds | Filled by | Bound | Lifetime |
 |---|---|---|---|---|
 | [`StructProbes`](../core/src/store/view/probes.rs#L19) | one resolved encoded-search probe per base column — the walk of the column's encoding tree, and per chunk the memoized first and last values ([`Chunk`](../encoded-search/src/node.rs#L72)) | construction ([`warm`](../core/src/store/view/probes.rs#L43)); the chunk extremes on the first bounds search that touches them | a few words per column and per chunk | the base; a fresh base takes a fresh cache |
-| [`LiveCanonical`](../core/src/store/view/canonical.rs#L25) | the canonical `u32` form of an encoded base's code columns, one weak slot per column | a contiguous wide code read, or `keep`, over an adopted base ([`code_columns_shared`](../core/src/store/read/rows.rs#L238)) | 4 B/row per column, and only while some reader holds a buffer of it — every buffer handed out, and every slice of one, holds the decoded column; it is freed with the last of them, in Rust or across the C Data Interface alike | what its holders decide; never the base's. A built base never fills it |
+| [`LiveCanonical`](../core/src/store/view/canonical.rs#L25) | the canonical `u32` form of an encoded base's code columns, one weak slot per column | a contiguous wide code read, or `keep`, over an adopted base ([`code_columns_shared`](../core/src/store/read/rows.rs#L247)) | 4 B/row per column, and only while some reader holds a buffer of it — every buffer handed out, and every slice of one, holds the decoded column; it is freed with the last of them, in Rust or across the C Data Interface alike | what its holders decide; never the base's. A built base never fills it |
 | tombstones (`deleted`) | one bit per base row | the first delete | 1 bit/row | the base, until compaction |
 
 ### 3.3 Views
@@ -116,7 +118,7 @@ that builds a new base starts with empty caches.
 | Slot | Holds | Filled by | Bound | Lifetime |
 |---|---|---|---|---|
 | [`LazyRowIds`](../core/src/store/indexes/mod.rs#L313) (a [`ViewSelection::Pending`](../core/src/store/view/selection.rs#L49)) | the exact base row ids of an index-served match | the first consumer that needs exact ids — a base-order read, a count under tombstones, a chained match, a delete; never by iterating the served rows | 8 B per matched row | the view and its clones |
-| [`FileServePlan::bound`](../core/src/store/indexes/serve.rs#L370) | the plan's bound projection and filter | the first read through the plan | two expression trees | the view |
+| [`FileServePlan::bound`](../core/src/store/indexes/serve.rs#L456) | the plan's bound projection and filter | the first read through the plan | two expression trees | the view |
 
 ### 3.4 The dictionary
 
@@ -153,8 +155,9 @@ reopens the file and starts afresh.
 
 | Slot | Holds | Filled by | Bound | Lifetime |
 |---|---|---|---|---|
-| [`DeferredRows`](../core/src/store/indexes/components.rs#L206) | the rows of a component adopted un-executed by `from_bytes`, in searchable form | the first query routed to that index | the component's size: a full quad copy for `secondary-by-copy`, `{val, rid}` pairs for `secondary-by-reference` | the store |
+| [`DeferredRows`](../core/src/store/indexes/components.rs#L216) | the rows of a component adopted un-executed by `from_bytes`, in searchable form | the first query routed to that index | the component's size: a full quad copy for `secondary-by-copy`, `{val, rid}` pairs for `secondary-by-reference` | the store |
 | a component's [`StructProbes`](../core/src/store/view/probes.rs#L19) | as [§3.2](#32-the-in-memory-base), over the component's columns | construction, or the deferred materialization | a few words per column and chunk | the store |
+| a component's [`LiveCanonical`](../core/src/store/view/canonical.rs#L25) | the canonical `u32` form of the component's code columns, one weak slot per column | a served run's code export wider than a point read, when the run covers at least 1/32 of the component or a holder already keeps the column alive | 4 B/row per projected column, and only while some batch holds it | what its holders decide; never the store's |
 
 ## 4. Keeping memory bounded
 
@@ -187,7 +190,7 @@ reopens the file and starts afresh.
 | Concern | Where |
 |---|---|
 | The resident forms: canonical base, compressed components, encoded adoption | [`core/src/store/array.rs`](../core/src/store/array.rs), [`mod.rs`](../core/src/store/mod.rs) ([`resident_built_parts`](../core/src/store/mod.rs#L154), [`from_parts`](../core/src/store/mod.rs#L224)) |
-| The live canonical form of an encoded base | [`core/src/store/view/canonical.rs`](../core/src/store/view/canonical.rs), [`rows.rs`](../core/src/store/read/rows.rs) ([`code_columns`](../core/src/store/read/rows.rs#L186), [`code_columns_shared`](../core/src/store/read/rows.rs#L238), [`code_columns_gathered`](../core/src/store/read/rows.rs#L297)) |
+| The live canonical form of an encoded base | [`core/src/store/view/canonical.rs`](../core/src/store/view/canonical.rs), [`rows.rs`](../core/src/store/read/rows.rs) ([`code_columns`](../core/src/store/read/rows.rs#L192), [`code_columns_shared`](../core/src/store/read/rows.rs#L247), [`code_columns_gathered`](../core/src/store/read/rows.rs#L309)) |
 | Point reads and gathers | [`core/src/store/scan/gather.rs`](../core/src/store/scan/gather.rs) ([`gather_by_point_reads`](../core/src/store/scan/gather.rs#L51)) |
 | Probes | [`core/src/store/view/probes.rs`](../core/src/store/view/probes.rs), [`encoded-search/src/node.rs`](../encoded-search/src/node.rs) |
 | Deferred row ids and serve plans | [`core/src/store/indexes/mod.rs`](../core/src/store/indexes/mod.rs), [`serve.rs`](../core/src/store/indexes/serve.rs), [`selection.rs`](../core/src/store/view/selection.rs) |

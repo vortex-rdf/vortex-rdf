@@ -299,7 +299,7 @@ dictionary alone.
 
 Indexes never ride inside the quad rows: a builder emits primary-only rows plus
 one *component* per requested family, and that is the only form index data ever
-takes — in memory as an [`IndexComponent`](../core/src/store/indexes/components.rs#L166),
+takes — in memory as an [`IndexComponent`](../core/src/store/indexes/components.rs#L168),
 in a file as an auxiliary child.
 
 | Index | Children | Columns | Sorted by |

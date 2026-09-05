@@ -74,7 +74,7 @@ the projected columns ([§3.2](#32-code-batches)).
 
 ### 2.2 The batch stream
 
-[`to_record_batches`](../core/src/store/arrow/batches.rs#L58) is the one entry
+[`to_record_batches`](../core/src/store/arrow/batches.rs#L60) is the one entry
 point: it takes an encoding and an optional projection and returns a
 [`QuadBatches`](../core/src/store/arrow/mod.rs#L236) — a `Stream` of
 `RecordBatch`es that all carry the schema `QuadBatches::schema()` reports,
@@ -129,7 +129,7 @@ flowchart TD
     E -- "codes / terms" --> G{"tail empty?"}
     G -- "no" --> X["error: export strings or compact"]
     G -- "yes" --> C{"code_columns_shared()<br/>serves the view?"}
-    C -- "yes (canonical base, served run,<br/>or live canonical form)" --> B1["one batch over the<br/>served u32 buffers"]
+    C -- "yes (canonical base, a served run's<br/>slice, or a live canonical form)" --> B1["one batch over the<br/>served u32 buffers"]
     C -- "no" --> P["primary_chunks:<br/>in-memory base rows, or<br/>projected file scan splits"]
     P --> B2["u32 struct chunk →<br/>UInt32 arrays, buffer-sharing"]
     B1 --> T{"terms?"}
@@ -144,12 +144,12 @@ flowchart TD
 The two code-typed encodings and the string encoding take different
 routes, because their inputs are different things.
 
-`codes` and `terms` ([`code_batches`](../core/src/store/arrow/batches.rs#L90))
+`codes` and `terms` ([`code_batches`](../core/src/store/arrow/batches.rs#L92))
 want the primary columns exactly as the Dictionary layout stores them:
 `u32` code columns. Nothing is decoded; the work is finding the right rows
 and converting each column's buffer.
 
-`strings` ([`string_batches`](../core/src/store/arrow/batches.rs#L127)) wants
+`strings` ([`string_batches`](../core/src/store/arrow/batches.rs#L130)) wants
 N-Triples spellings, which under the Dictionary layout means resolving
 codes through the dictionary and under the Default layout means the stored
 strings themselves. Rather than a third decode path, it rides the store's
@@ -159,7 +159,7 @@ existing shared-term decode stream,
 `quads_vec`, which already applies serve plans, drops tombstones, decodes
 each distinct term of a chunk once and appends the tail — and builds a
 `string_view` column per projected position from each decoded chunk
-([`shared_chunk_to_batch`](../core/src/store/arrow/batches.rs#L238)). That is a
+([`shared_chunk_to_batch`](../core/src/store/arrow/batches.rs#L282)). That is a
 copy of every cell's bytes, the price of materializing strings at all.
 
 ### 3.2 Code batches
@@ -167,14 +167,15 @@ copy of every cell's bytes, the price of materializing strings at all.
 Two sources feed the code pipeline, chosen per view.
 
 **Served buffers.** When
-[`code_columns_shared`](../core/src/store/read/rows.rs#L238) serves the view —
-a built base's canonical `u32` columns, a served match reading the
-answering index's own columns, or an adopted base's live canonical form —
-the batch is built straight from the four buffers it returns
-([`code_buffers_to_batch`](../core/src/store/arrow/batches.rs#L181)). This is
-the path the bindings' `match_arrow` / `matchArrow` take — their one
-engine-facing read — so every consumer of a view hands out the same memory. A
-store *adopted* from bytes or a file keeps its base wire-encoded
+[`code_columns_shared`](../core/src/store/read/rows.rs#L247) serves the view —
+a built base's canonical `u32` columns, a served match reading the answering
+index's own columns, or an adopted base's live canonical form — the batch is
+built straight from the projected buffers it returns
+([`code_buffers_to_batch`](../core/src/store/arrow/batches.rs#L225)), and only
+those: a projection decodes nothing it leaves out. This is the path the
+bindings' `match_arrow` / `matchArrow` take — their one engine-facing read —
+so every consumer of a view hands out the same memory. A store *adopted* from
+bytes or a file keeps its base wire-encoded
 ([serialization.md](serialization.md)): a contiguous wide read decodes
 each column once into a form every holder shares and the last holder
 frees, so two exports alive at the same time are the same buffers
@@ -182,19 +183,34 @@ frees, so two exports alive at the same time are the same buffers
 selection over an adopted base is gathered instead, one allocation per
 call.
 
+A *served* match — a predicate- or object-bound pattern a by-copy index
+answered — is a contiguous run of that index's own columns, which hold every
+quad in the family's order. A point-sized run (up to 256 rows) is read code
+by code through the component's cached probes; a wider one is a slice of
+the component's canonical form
+([`InMemoryServePlan::code_columns`](../core/src/store/indexes/serve.rs#L315)).
+Components are held compressed ([memory.md §1](memory.md#1-the-three-forms)),
+so that form is the component's live canonical cache: each column decoded
+once, shared by every holder alive, freed with the last — filled when the
+run covers at least 1/32 of the component or a holder already keeps the
+column alive, a narrower cold run decoding only itself. Rows come out in
+the index's order, not the base's. On a file the same match reads the index
+child through the plan's scan — a point read of a small located run, a
+range scan of a wide one — and never materializes the match's row ids.
+
 **Primary chunks.** Otherwise
-[`primary_chunks`](../core/src/store/arrow/batches.rs#L142) streams the base's
+[`primary_chunks`](../core/src/store/arrow/batches.rs#L145) streams the base's
 primary columns as encoded chunks in base row order, the view's selection
 applied and tombstones excluded: one chunk for an in-memory base (the
 array itself when the view covers all of it), and for a file one chunk per
 scan split of the restricted scan every unserved file read starts from —
 here in its projected form,
-[`restricted_file_scan_projected`](../core/src/store/read/rows.rs#L417), so
+[`restricted_file_scan_projected`](../core/src/store/read/rows.rs#L431), so
 only the projected columns are decoded off the file. A served match's
 pending selection materializes first, as it does for every base-order
 read. Each chunk's columns then convert through vortex-arrow's
 buffer-sharing primitive kernel
-([`code_chunk_to_batch`](../core/src/store/arrow/batches.rs#L202)): the Arrow
+([`code_chunk_to_batch`](../core/src/store/arrow/batches.rs#L246)): the Arrow
 `UInt32Array` wraps the chunk's own buffer.
 
 For `terms`, each column's keys are wrapped over the dictionary's values
@@ -207,6 +223,7 @@ key is in range, a linear pass over the codes and no copy.
 |---|---|---|
 | served `u32` buffers → `UInt32Array` | no | Arrow's buffer refcounts the vortex buffer |
 | adopted base, contiguous wide read | once per set of concurrent holders | the live canonical form: shared with every export alive, freed with the last ([memory.md](memory.md)) |
+| served run of a by-copy index, wider than a point read | once per set of concurrent holders, or once for the run | the component's live canonical form, sliced; a cold run under 1/32 of the component decodes itself instead |
 | file scan chunk → `UInt32Array` | no, after the scan's own decode | the scan materializes each split once |
 | `terms` key wrap | no | one shared values `Arc` per stream |
 | dictionary values, canonical dictionary (every built one, an adopted one in the plaintext form) | no | `string_view` over the dictionary's own buffers, nothing cached |

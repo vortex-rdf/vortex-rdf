@@ -302,10 +302,9 @@ pub(crate) fn resolve_in_memory(
             CHILD_PRIMARY,
             COL_RID,
             copy_decode_layout(layout),
-            rows.clone().into_array(),
+            component,
             run,
-            component.probes_arc(),
-        )),
+        )?),
     })
 }
 

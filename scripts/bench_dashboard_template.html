@@ -1014,7 +1014,7 @@ const ARROW_ACCESS_MODES = ["quads", "arrow strings", "arrow codes"];
 
 const arrowAccessPanel = {
   title:"Data access: quads or Arrow, per pattern",
-  note:"One resolved view, three ways to read it. <b>quads</b> is the matrix's own <code>match_warm_dict_noindex_*</code> cell — <code>match_pattern</code> then <code>quads_vec</code>, one quad per row. <b>arrow strings</b> exports that same view as <code>string_view</code> columns, which decodes the same terms; <b>arrow codes</b> exports the <code>u32</code> code columns a query engine joins on and decodes none, so it is the interface's point rather than a like-for-like with the other two. All warm, Dictionary layout, no secondary index — nothing varies but the way out. <span class=\"best-key\">Green</span> marks the faster source in each leaf column.",
+  note:"One resolved view, three ways to read it. <b>quads</b> is the matrix's own <code>match_warm_dict_noindex_*</code> cell — <code>match_pattern</code> then <code>quads_vec</code>, one quad per row. <b>arrow strings</b> exports that same view as <code>string_view</code> columns, which decodes the same terms; <b>arrow codes</b> exports the <code>u32</code> code columns a query engine joins on and decodes none, so it is the interface's point rather than a like-for-like with the other two. All warm, Dictionary layout; the first two rows carry no secondary index, the last two a by-copy index, whose served runs the code export slices — nothing else varies but the way out. <span class=\"best-key\">Green</span> marks the faster source in each leaf column.",
   wide:true, rowHeaders:["Layout","Source"],
   columns:RUST_PATTERNS, subColumns:ARROW_ACCESS_MODES,
   rows:[
@@ -1026,6 +1026,14 @@ const arrowAccessPanel = {
       `match_warm_dict_noindex_file::${p}`,
       `arrow_strings_dict_file::${p}`,
       `arrow_codes_dict_file::${p}`])},
+    {labels:["Dictionary · by-copy","in-memory"], ids: RUST_PATTERNS.flatMap(p => [
+      `match_warm_dict_bycopy_mem::${p}`,
+      `arrow_strings_dict_bycopy_mem::${p}`,
+      `arrow_codes_dict_bycopy_mem::${p}`]), break:true},
+    {labels:["Dictionary · by-copy","file"], ids: RUST_PATTERNS.flatMap(p => [
+      `match_warm_dict_bycopy_file::${p}`,
+      `arrow_strings_dict_bycopy_file::${p}`,
+      `arrow_codes_dict_bycopy_file::${p}`])},
   ],
 };
 

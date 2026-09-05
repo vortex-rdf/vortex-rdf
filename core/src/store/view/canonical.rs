@@ -26,6 +26,23 @@ pub(crate) struct LiveCanonical {
     slots: [Mutex<Weak<Buffer<u32>>>; schema::PRIMARY_COLUMNS.len()],
 }
 
+/// Decode code column `name` (any encoding) to its canonical `u32` buffer —
+/// one allocation of the column, or of the slice the caller passed.
+pub(crate) fn decode_u32(col: &ArrayRef, name: &str) -> Result<Buffer<u32>> {
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
+    let prim = col
+        .clone()
+        .execute::<PrimitiveArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+    if prim.ptype() != vortex_array::dtype::PType::U32 {
+        return Err(VortexRdfError::InvalidOperation(format!(
+            "code column {name} is {}, not u32",
+            prim.ptype()
+        )));
+    }
+    Ok(prim.into_buffer::<u32>())
+}
+
 /// The owner a handed-out buffer keeps alive: the decoded column behind an
 /// `Arc`, exposed as bytes for `Bytes::from_owner`.
 struct Held(Arc<Buffer<u32>>);
@@ -55,19 +72,7 @@ impl LiveCanonical {
         if let Some(owner) = slot.upgrade() {
             return Ok(Self::handle(owner));
         }
-        let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let prim = col
-            .clone()
-            .execute::<PrimitiveArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-        if prim.ptype() != vortex_array::dtype::PType::U32 {
-            return Err(VortexRdfError::InvalidOperation(format!(
-                "code column {} is {}, not u32",
-                schema::PRIMARY_COLUMNS[idx],
-                prim.ptype()
-            )));
-        }
-        let owner = Arc::new(prim.into_buffer::<u32>());
+        let owner = Arc::new(decode_u32(col, schema::PRIMARY_COLUMNS[idx])?);
         *slot = Arc::downgrade(&owner);
         Ok(Self::handle(owner))
     }

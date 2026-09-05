@@ -7,7 +7,7 @@ import pyarrow as pa
 import pytest
 
 import vortex_rdf
-from vortex_rdf import ArrowQuadStream, VortexRdfError, VortexRdfStore
+from vortex_rdf import ArrowQuadStream, VortexRdfError, VortexRdfStore, serialize_rdf
 
 NAME = "<http://xmlns.com/foaf/0.1/name>"
 PATTERNS = ({}, {"p": NAME}, {"s": "<http://ex.org/bob>"}, {"o": '"Bob"@en'})
@@ -206,5 +206,29 @@ def test_in_memory_store_shares_one_decoded_form_while_held(vortex_files):
     second = _table(store.match_arrow(projection=["o", "s"]))
     address = lambda table, name: table.column(name).chunk(0).buffers()[1].address  # noqa: E731
     for name in ["s", "o"]:
+        assert first.column(name).num_chunks == 1
+        assert address(first, name) == address(second, name)
+
+
+def test_served_runs_share_the_index_columns_across_exports(tmp_path):
+    """A predicate-bound match a by-copy index answers is a run of that
+    index's own columns. Wider than a point read, its ``codes`` export is a
+    slice of the component's live canonical form, so two exports of one
+    pattern hand out the same buffers — with nothing held in between."""
+    src = tmp_path / "wide.nt"
+    src.write_text(
+        "".join(
+            f"<http://ex/s{i}> <http://ex/p{i % 3}> <http://ex/o{i % 50}> .\n"
+            for i in range(3000)
+        )
+    )
+    out = tmp_path / "wide.vortex"
+    serialize_rdf(src, out, layout="dictionary", indexes=["secondary-by-copy"])
+    store = VortexRdfStore(out, in_memory=True)
+    address = lambda table, name: table.column(name).chunk(0).buffers()[1].address  # noqa: E731
+    first = _table(store.match_arrow(p="<http://ex/p1>"))
+    second = _table(store.match_arrow(p="<http://ex/p1>"))
+    assert first.num_rows == 1000
+    for name in ["s", "p", "o", "g"]:
         assert first.column(name).num_chunks == 1
         assert address(first, name) == address(second, name)

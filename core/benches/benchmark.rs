@@ -259,6 +259,58 @@ fn arrow_codes_dict_mem(bencher: divan::Bencher, pattern: &Pattern) {
     );
 }
 
+// The same two encodings over a by-copy index: a predicate- or object-bound
+// match is a served run there, which the code export hands out as a slice of
+// the component's canonical form — the matrix's `match_warm_dict_bycopy_*`
+// cell is the quad baseline.
+#[divan::bench(args = PATTERNS, sample_count = QUERY_SAMPLES)]
+fn arrow_strings_dict_bycopy_mem(bencher: divan::Bencher, pattern: &Pattern) {
+    run_match_arrow(
+        bencher,
+        Layout::Dictionary,
+        Index::ByCopy,
+        Source::InMemory,
+        *pattern,
+        TermEncoding::Strings,
+    );
+}
+
+#[divan::bench(args = PATTERNS, sample_count = QUERY_SAMPLES)]
+fn arrow_codes_dict_bycopy_mem(bencher: divan::Bencher, pattern: &Pattern) {
+    run_match_arrow(
+        bencher,
+        Layout::Dictionary,
+        Index::ByCopy,
+        Source::InMemory,
+        *pattern,
+        TermEncoding::Codes,
+    );
+}
+
+#[divan::bench(args = PATTERNS, sample_count = QUERY_SAMPLES)]
+fn arrow_strings_dict_bycopy_file(bencher: divan::Bencher, pattern: &Pattern) {
+    run_match_arrow(
+        bencher,
+        Layout::Dictionary,
+        Index::ByCopy,
+        Source::File,
+        *pattern,
+        TermEncoding::Strings,
+    );
+}
+
+#[divan::bench(args = PATTERNS, sample_count = QUERY_SAMPLES)]
+fn arrow_codes_dict_bycopy_file(bencher: divan::Bencher, pattern: &Pattern) {
+    run_match_arrow(
+        bencher,
+        Layout::Dictionary,
+        Index::ByCopy,
+        Source::File,
+        *pattern,
+        TermEncoding::Codes,
+    );
+}
+
 #[divan::bench(args = PATTERNS, sample_count = QUERY_SAMPLES)]
 fn arrow_strings_dict_file(bencher: divan::Bencher, pattern: &Pattern) {
     run_match_arrow(

@@ -115,7 +115,8 @@ async fn store(quads: Vec<Quad>, layout: LayoutStrategy) -> VortexRdfStore {
 async fn codes_share_the_base_buffers_of_a_full_dictionary_store() {
     let built = store(modular_quads(50, 5, 7), LayoutStrategy::Dictionary).await;
     let expected = built
-        .code_columns()
+        .code_columns(&QuadColumn::ALL)
+        .unwrap()
         .expect("a full built dictionary store serves its codes");
     let (schema, built_batches) = batches(&built, TermEncoding::Codes, None).await;
     assert_eq!(schema.metadata()[META_TERM_ENCODING], "codes");
@@ -368,5 +369,74 @@ async fn file_backed_export_agrees_with_the_readers() {
         let columns = code_columns_of(&projected);
         assert_eq!(columns[0], expected[1].as_slice(), "{tag}: projected p");
         assert_eq!(columns[1], expected[3].as_slice(), "{tag}: projected g");
+    }
+}
+
+/// A served match exports every encoding through its plan: `codes`, `terms`
+/// and `strings` carry the same rows in the same (index) order as the quad
+/// stream, in memory and on file, and none materializes the match's row ids.
+#[tokio::test]
+async fn served_views_export_every_encoding_in_the_index_order() {
+    let quads = modular_quads(1200, 3, 5);
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let in_memory = VortexRdfStore::from_quads(
+        quad_stream(quads.clone()),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    #[cfg(feature = "file-io")]
+    let (_dir, path) = write_store_file(
+        quads.clone(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    #[cfg(feature = "file-io")]
+    let on_file = Some(VortexRdfStore::from_file(&path).await.unwrap());
+    #[cfg(not(feature = "file-io"))]
+    let on_file: Option<VortexRdfStore> = None;
+    for store in [Some(in_memory), on_file].into_iter().flatten() {
+        let view = store
+            .match_pattern(None, Some(&p1), None, None)
+            .await
+            .unwrap();
+        let dict = view.code_read_snapshot().unwrap();
+        let quads: Vec<String> = view
+            .quads_vec()
+            .await
+            .unwrap()
+            .iter()
+            .map(|q| format!("{} {} {}", q.subject, q.predicate, q.object))
+            .collect();
+        assert_eq!(quads.len(), 400);
+        for encoding in [
+            TermEncoding::Codes,
+            TermEncoding::Terms,
+            TermEncoding::Strings,
+        ] {
+            let (_, batches) = batches(&view, encoding, None).await;
+            let rows: Vec<String> = batches
+                .iter()
+                .flat_map(|batch| {
+                    let columns: Vec<Vec<String>> = (0..3)
+                        .map(|c| column_strings(batch.column(c), Some(&dict)))
+                        .collect();
+                    (0..batch.num_rows())
+                        .map(|i| format!("{} {} {}", columns[0][i], columns[1][i], columns[2][i]))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(
+                rows, quads,
+                "{encoding}: the plan's order, on every encoding"
+            );
+        }
+        assert_ne!(
+            view.debug_row_ids_materialized(),
+            Some(true),
+            "served exports never materialize the match's row ids"
+        );
     }
 }
