@@ -392,7 +392,20 @@ encoding, and the Arrow surface hands out plaintext views.
 
 ---
 
-## 6. Test map
+## 6. Where it is measured
+
+| Surface | Cells |
+|---|---|
+| Rust internals | [benchmark.rs](../core/benches/benchmark.rs): `arrow_{strings,codes}_dict_{mem,file}` per pattern — the `match_warm_dict_noindex_*` matrix cell beside each is the quad-API baseline for the same view; `terms_export`, `dict_built_terms_export` and `dict_adopt_terms_export` price the whole-store `terms` export per dictionary form |
+| JavaScript | [compare.worker.ts](../js/bench/compare.worker.ts)'s `arrow` role: `<slug>::<pattern>::arrow` and `::arrow_codes` against the `<slug>::<pattern>` quad cell, in a process of its own under the resizable-buffer flag; [arrow.bench.ts](../js/bench/arrow.bench.ts) prices the surface per consumer step (view, `toTable()`, `toIPC()`, the reads on top); [codspeed.bench.ts](../js/bench/codspeed.bench.ts) carries `readpath::matchArrow` |
+| Python | [worker.py](../python/bench/worker.py)'s `arrow` role: the same two ids against the `get_quads` cell, in a process of its own so pyarrow's footprint stays out of the memory panel; [test_codspeed.py](../python/bench/test_codspeed.py) carries `match_arrow` |
+
+All three reach the [dashboard](https://vortex-rdf.github.io/vortex-rdf/)'s
+"Data access — quads or Arrow" panel, one per tab.
+
+---
+
+## 7. Test map
 
 | Surface | Tests |
 |---|---|

@@ -222,6 +222,67 @@ fn match_chained(bencher: divan::Bencher, source: &Source) {
         });
 }
 
+// ── the same matched rows, handed out as Arrow ──────────────────────────────
+//
+// One matched view, two ways to read it: `match_warm_dict_noindex_{mem,file}`
+// above builds a quad per row, the four cells below export the same view as
+// record batches. Same layout, same index, same probes, same warm regime, so a
+// column here divided by the matrix column beside it is what the Arrow surface
+// is worth to a consumer that wants columns.
+//
+// `strings` decodes every term, which is the work `quads_vec` does — the
+// like-for-like comparison. `codes` hands out the `u32` columns an engine
+// joins on without touching the dictionary at all, which is why the interface
+// exists. Both are Dictionary-only: no other layout has a code column.
+
+#[divan::bench(args = PATTERNS, sample_count = QUERY_SAMPLES)]
+fn arrow_strings_dict_mem(bencher: divan::Bencher, pattern: &Pattern) {
+    run_match_arrow(
+        bencher,
+        Layout::Dictionary,
+        Index::None,
+        Source::InMemory,
+        *pattern,
+        TermEncoding::Strings,
+    );
+}
+
+#[divan::bench(args = PATTERNS, sample_count = QUERY_SAMPLES)]
+fn arrow_codes_dict_mem(bencher: divan::Bencher, pattern: &Pattern) {
+    run_match_arrow(
+        bencher,
+        Layout::Dictionary,
+        Index::None,
+        Source::InMemory,
+        *pattern,
+        TermEncoding::Codes,
+    );
+}
+
+#[divan::bench(args = PATTERNS, sample_count = QUERY_SAMPLES)]
+fn arrow_strings_dict_file(bencher: divan::Bencher, pattern: &Pattern) {
+    run_match_arrow(
+        bencher,
+        Layout::Dictionary,
+        Index::None,
+        Source::File,
+        *pattern,
+        TermEncoding::Strings,
+    );
+}
+
+#[divan::bench(args = PATTERNS, sample_count = QUERY_SAMPLES)]
+fn arrow_codes_dict_file(bencher: divan::Bencher, pattern: &Pattern) {
+    run_match_arrow(
+        bencher,
+        Layout::Dictionary,
+        Index::None,
+        Source::File,
+        *pattern,
+        TermEncoding::Codes,
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // Group 3 — DECODE / LOAD (read-back path)
 //

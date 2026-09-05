@@ -10,11 +10,12 @@ use std::hash::Hash;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use futures::{Stream, StreamExt, stream};
+use arrow_array::RecordBatch;
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 
 use vortex_rdf_core::{
-    BuiltArray, IndexType, LayoutStrategy, RawQuad, Result, SortedStreamBuilder,
+    BuiltArray, IndexType, LayoutStrategy, RawQuad, Result, SortedStreamBuilder, TermEncoding,
     VortexArrayBuilder, VortexRdfStore,
 };
 
@@ -350,6 +351,54 @@ pub fn run_match(
             }
         }
     }
+}
+
+/// One Arrow access cell: `match_pattern` for `pattern`, then the matched view
+/// exported as record batches under `encoding`. The warm twin of [`run_match`]
+/// — same store config, same probe, same priming and selectivity check — so a
+/// cell here and the `match_warm_*` cell beside it differ only in how the
+/// matched rows are handed out: per-row quads there, columnar batches here.
+///
+/// The batches are collected and returned from the timed closure, so the
+/// measurement covers producing them and not their drop, exactly as
+/// `quads_vec` is measured. Under `Strings` that production decodes every
+/// term, which is the same work `quads_vec` does; under `Codes` it hands out
+/// the `u32` columns a query engine joins on, which is the point of the
+/// comparison.
+pub fn run_match_arrow(
+    bencher: divan::Bencher,
+    layout: Layout,
+    index: Index,
+    source: Source,
+    pattern: Pattern,
+    encoding: TermEncoding,
+) {
+    let (s, p, o, g) = terms_for(pattern);
+    let export = |store: &VortexRdfStore| {
+        rt().block_on(async {
+            let view = store
+                .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+                .await
+                .expect("match_pattern failed");
+            let batches: Vec<RecordBatch> = view
+                .to_record_batches(encoding, None)
+                .await
+                .expect("export batches")
+                .try_collect()
+                .await
+                .expect("collect batches");
+            batches
+        })
+    };
+    let store = make_store(source, layout, index, bench_size());
+    let primed = export(&store);
+    bench_moduli().assert_matched(
+        bench_size(),
+        pattern,
+        primed.iter().map(RecordBatch::num_rows).sum(),
+    );
+    drop(primed);
+    bencher.bench(|| export(&store));
 }
 
 /// The layout × index × source match matrix in both cache regimes: one

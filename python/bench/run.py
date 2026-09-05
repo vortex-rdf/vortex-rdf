@@ -14,7 +14,10 @@ against. Each venv is provisioned once and reused.
 
 The Vortex bindings are not installed into their venv -- the compiled extension
 is abi3 and `python/vortex_rdf/` is a plain package directory, so putting it on
-PYTHONPATH is enough and avoids a maturin build per run.
+PYTHONPATH is enough and avoids a maturin build per run. That venv does carry
+pyarrow, for the `arrow` role alone: the libraries that export Arrow answer the
+same probes a second time through it, in a process of their own so pyarrow's
+import never enters another role's peak-RSS reading.
 
 Every adapter counts every query pattern before timing it; a disagreement
 between libraries is recorded under `config.countWarnings` in `results.json`.
@@ -37,7 +40,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from adapters import ALL_SLUGS, VENV_FOR  # noqa: E402
+from adapters import ALL_SLUGS, ARROW_SLUGS, VENV_FOR  # noqa: E402
 from datasets import dataset_opts, moduli, write_dataset  # noqa: E402
 
 BENCH_DIR = Path(__file__).resolve().parent
@@ -57,9 +60,12 @@ GRAPHS = int(os.environ.get("BENCH_GRAPHS_QUADS", 8))
 MUT_BATCH = int(os.environ.get("MUT_BATCH", 10_000))
 PYTHON_VERSION = os.environ.get("BENCH_PYTHON", "3.13")
 
-#: Package set per virtualenv. Vortex needs none -- it rides on PYTHONPATH.
+#: Package set per virtualenv. The bindings themselves ride on PYTHONPATH, so
+#: the vortex venv carries only what a *consumer* of the Arrow export needs:
+#: pyarrow, imported by the Arrow role alone (`worker.py`'s `run_arrow`, in its
+#: own process, so its footprint never enters the memory panel).
 VENV_PACKAGES = {
-    "vortex": [],
+    "vortex": ["pyarrow"],
     "pyoxigraph": ["pyoxigraph"],
     "pycottas": ["pycottas"],
     "rdflib": ["rdflib"],
@@ -72,20 +78,24 @@ def log(msg: str) -> None:
 
 
 def provision(name: str) -> Path:
-    """Create the virtualenv for `name` if absent; return its interpreter."""
+    """Create the virtualenv for `name` if absent, and make sure it holds the
+    packages it is declared to hold; return its interpreter."""
     venv = VENV_ROOT / name
     python = venv / "bin" / "python"
-    if python.exists():
-        return python
-    log(f"provisioning venv: {name}")
-    # `bin/python` is an absolute symlink to a uv-managed interpreter that
-    # lives outside this tree, so a restored cache can bring the venv back
-    # with that link dangling — and the check above follows symlinks, so it
-    # reads as absent. Let uv replace the directory rather than refuse it.
-    cmd = ["uv", "venv", str(venv), "--python", PYTHON_VERSION, "-q"]
-    if venv.exists():
-        cmd.append("--clear")
-    subprocess.run(cmd, check=True, cwd=REPO_ROOT)
+    if not python.exists():
+        log(f"provisioning venv: {name}")
+        # `bin/python` is an absolute symlink to a uv-managed interpreter that
+        # lives outside this tree, so a restored cache can bring the venv back
+        # with that link dangling — and the check above follows symlinks, so it
+        # reads as absent. Let uv replace the directory rather than refuse it.
+        cmd = ["uv", "venv", str(venv), "--python", PYTHON_VERSION, "-q"]
+        if venv.exists():
+            cmd.append("--clear")
+        subprocess.run(cmd, check=True, cwd=REPO_ROOT)
+    # Unconditionally, not only on creation: a venv provisioned by an earlier
+    # run predates any package added to VENV_PACKAGES since, and the check
+    # above would hand it back missing one. uv resolves an already-satisfied
+    # set in well under a second.
     pkgs = VENV_PACKAGES[name]
     if pkgs:
         subprocess.run(
@@ -230,6 +240,16 @@ def main() -> int:
         sizes.append(
             {"slug": slug, "label": res["label"], "bytes": res.get("artifact_bytes")}
         )
+
+    # The Arrow read of the same probes, for the libraries that export any.
+    # Its own process per adapter: pyarrow's import alone is tens of megabytes
+    # of RSS, and the query role above is where this library's peak-memory
+    # figure comes from.
+    for slug in ARROW_SLUGS:
+        res = run_worker(slug, "arrow", triples, quads)
+        if not res:
+            continue
+        rows.extend(res["rows"])
 
     # Every adapter, including the ones that cannot mutate: a worker that finds
     # the operation unsupported exits before building anything, so the sweep is

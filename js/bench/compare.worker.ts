@@ -11,12 +11,13 @@ import {
     genDataset, genFresh, genDatasetPrefix, datasetProbes, moduli,
     FULL_SCAN_PATTERN, QUERY_OPTS, COLD_QUERY_OPTS, HEAVY_OPTS, FULL_SCAN_OPTS,
     reclaim, collect, unsupportedRow, peakRssMb, rssMb, jsHeapMb, wasmHeapMb,
+    installArrow,
     type Row, type Pat, type StoreAdapter, type WorkerOutput,
 } from './shared.js';
 
 const [, , slug, role, outFile] = process.argv;
 if (!slug || !role || !outFile) {
-    console.error('usage: compare.worker.ts <slug> <query|querycold|fullscan|mutate> <out-file>');
+    console.error('usage: compare.worker.ts <slug> <query|querycold|fullscan|arrow|mutate> <out-file>');
     process.exit(1);
 }
 
@@ -376,6 +377,69 @@ async function runFullScan(a: StoreAdapter): Promise<Row[]> {
     return rows;
 }
 
+/**
+ * The Arrow read of the same probes, in its own process.
+ *
+ * Two encodings against one baseline: `::arrow` exports the matched rows as
+ * `string_view` columns and reads all four terms of every row — the same
+ * values `::<pattern>` reads out of quads, so the pair is what the Arrow
+ * surface is worth for the same delivered data. `::arrow_codes` exports the
+ * `u32` code columns and reads their typed arrays, decoding no term at all:
+ * not a like-for-like of the other two, but the currency a query engine joins
+ * on, and the reason the interface exists.
+ *
+ * Its own process for two reasons. `apache-arrow` and the FFI parser are
+ * multi-megabyte module graphs, and the zero-copy flag this role is spawned
+ * with changes how the module's memory behaves — loading either into the query
+ * worker would move every memory reading and every timing on the page. Only
+ * the adapters with `arrowMatch` are ever spawned for it.
+ */
+async function runArrow(a: StoreAdapter): Promise<Row[]> {
+    const rows: Row[] = [];
+    if (!a.arrowMatch) return rows;
+    const zeroCopy = await installArrow();
+    console.log(`[${a.label}] arrow… (zeroCopy=${zeroCopy})`);
+
+    const h: unknown = await a.build(genDataset(N_TRIPLES, datasetOptsFor(a)));
+    const pats = [...probesFor(a), FULL_SCAN_PATTERN];
+    const costMs: Record<string, number> = {};
+    // The same pre-pass the other roles run: every probe answered once, its
+    // row count checked against the count path (a disagreement means the Arrow
+    // export resolved something else, which would time the wrong work), and
+    // its cost picking the repetition plan.
+    for (const p of pats) {
+        try {
+            const t0 = performance.now();
+            const n = a.arrowMatch(h, p, 'strings');
+            costMs[p.name] = performance.now() - t0;
+            const want = await a.countOnly(h, p);
+            if (n !== want) throw new Error(`arrow rows disagree: ${n} vs ${want}`);
+            const codes = a.arrowMatch(h, p, 'codes');
+            if (codes !== want) throw new Error(`arrow codes rows disagree: ${codes} vs ${want}`);
+        } catch (e) {
+            const error = e instanceof Error ? e.message : String(e);
+            console.error(`  !! arrow '${p.name}' failed: ${error}`);
+            failures.push({ phase: `arrow:${p.name}`, error });
+            delete costMs[p.name];
+        }
+    }
+    const ok = pats.filter((p) => costMs[p.name] !== undefined);
+    const { fast, slow } = splitBySpeed(ok, costMs);
+    for (const [phase, group, opts] of [
+        ['arrow', fast, QUERY_OPTS], ['arrow_slow', slow, ONE_SHOT],
+    ] as const) {
+        if (!group.length) continue;
+        await bench(phase, rows, opts, (b) => {
+            for (const p of group) {
+                b.add(`${a.slug}::${p.name}::arrow`, () => { a.arrowMatch!(h, p, 'strings'); });
+                b.add(`${a.slug}::${p.name}::arrow_codes`, () => { a.arrowMatch!(h, p, 'codes'); });
+            }
+        }, 'warm');
+    }
+    reclaim(a, h);
+    return rows;
+}
+
 async function runMutate(a: StoreAdapter): Promise<Row[]> {
     const rows: Row[] = [];
     const fresh = genFresh(MUT_BATCH);
@@ -420,7 +484,8 @@ async function main(): Promise<void> {
     const rows = role === 'query' ? await runQuery(a)
         : role === 'querycold' ? await runQueryCold(a)
             : role === 'fullscan' ? await runFullScan(a)
-                : await runMutate(a);
+                : role === 'arrow' ? await runArrow(a)
+                    : await runMutate(a);
     const out: WorkerOutput = {
         rows,
         peakRssMb: peakRssMb(),

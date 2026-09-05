@@ -64,8 +64,19 @@ interface MemoryRow {
  *  the remaining adapters still run and still produce their rows. The caller
  *  records a failure for a null return, so the missing rows stay attributed on
  *  the page as failures, not as benchmarks nobody ran. */
-function runWorker(slug: string, role: 'query' | 'querycold' | 'fullscan' | 'mutate'): WorkerOutput | null {
-    return runWorkerProcess<WorkerOutput>(workerPath, [slug, role], `${slug}/${role}`);
+/** Views over wasm memory need the module's buffer to grow in place, which
+ *  Node keeps behind this flag (24.5+). Without it every Arrow parse copies
+ *  instead — the same API, a slower cell — so the Arrow role asks for it, and
+ *  the worker prints which it got. It is passed to that role alone: it changes
+ *  how the module's memory behaves, and no other cell on the page should move
+ *  because the Arrow role exists. */
+const ARROW_FLAGS = ['--experimental-wasm-rab-integration'];
+
+function runWorker(
+    slug: string, role: 'query' | 'querycold' | 'fullscan' | 'arrow' | 'mutate',
+): WorkerOutput | null {
+    const flags = role === 'arrow' ? ARROW_FLAGS : [];
+    return runWorkerProcess<WorkerOutput>(workerPath, [slug, role], `${slug}/${role}`, flags);
 }
 
 async function main(): Promise<void> {
@@ -156,6 +167,19 @@ async function main(): Promise<void> {
         mergeMatched(a.label, out);
         for (const f of out.failures) {
             failures.push({ slug: a.slug, label: a.label, role: 'fullscan', ...f });
+            console.error(`  !! ${a.label} could not complete '${f.phase}': ${f.error}`);
+        }
+    }
+
+    // The Arrow read of the same probes, for the stores that export any. Its
+    // own process per adapter: the role loads apache-arrow and runs under the
+    // zero-copy flag, neither of which should touch the measurements above.
+    for (const a of ADAPTERS.filter((x) => x.arrowMatch)) {
+        const out = runWorker(a.slug, 'arrow');
+        if (!out) { workerLost(a, 'arrow'); continue; }
+        results.push(...out.rows);
+        for (const f of out.failures) {
+            failures.push({ slug: a.slug, label: a.label, role: 'arrow', ...f });
             console.error(`  !! ${a.label} could not complete '${f.phase}': ${f.error}`);
         }
     }

@@ -22,7 +22,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
 import { VortexRdfStore, type BuildOptions } from '@vortex-rdf/vortex-rdf-store';
-import { fmtNs, consumeQuads, consumeStrings } from './util.js';
+import type { Table } from 'apache-arrow';
+import { fmtNs, consumeQuads, consumeStrings, consumeArrowCodes, consumeArrowTerms } from './util.js';
 import { df, moduli, type Pat } from './datasets.js';
 import {
     RdfStore,
@@ -68,6 +69,14 @@ export interface StoreAdapter<H = unknown> {
      *  read. Each store's cheapest correct count path (a count API where one
      *  exists, the result set's length otherwise): the COUNT/ASK shape. */
     countOnly(h: H, p: Pat): Promise<number> | number;
+    /** The same rows read as Arrow columns instead of quads, for the stores
+     *  that export any: `strings` delivers the same four term values per row
+     *  that `countMatch` reads, `codes` the `u32` columns an engine joins on
+     *  and no term at all. Returns the row count, as the two above do.
+     *
+     *  Only Vortex has one, and only after [`installArrow`] has run in this
+     *  process; an adapter without it simply has no Arrow cells. */
+    arrowMatch?(h: H, p: Pat, encoding: 'strings' | 'codes'): number;
     // Cold-regime pair, optional: `snapshot` serializes a built store once
     // (untimed) and `open` adopts that snapshot into a fresh handle, which the
     // cold query phase does per iteration. Only the stores with a persistent
@@ -133,6 +142,34 @@ export const VORTEX_VARIANTS: { slug: string; label: string; options: BuildOptio
 // in util.ts read every term value, so materialization is measured work on
 // every store.
 
+/** A store with `matchArrow` installed — what importing the `/arrow` subpath
+ *  adds to the class the main entry exports. Declared locally so this file
+ *  keeps its single, static import of the main entry. */
+type ArrowStore = VortexRdfStore & {
+    matchArrow(
+        s: Pat['s'], p: Pat['p'], o: Pat['o'], g: Pat['g'],
+        options?: { encoding?: string },
+    ): { table: Table; zeroCopy: boolean; free(): void };
+};
+
+/** Install `matchArrow` on the store class, and report whether its views will
+ *  be zero-copy. The import is dynamic and happens once, in the one worker role
+ *  that measures Arrow: `apache-arrow` and the FFI parser are multi-megabyte
+ *  module graphs, and loading them in every worker would move the memory
+ *  readings of every adapter on the page.
+ *
+ *  The subpath patches the class the main entry already exported, so every
+ *  store this process built or will build gains `matchArrow`. Whether its
+ *  parses copy is decided once at that import, by whether the entry could turn
+ *  the module's memory into a resizable buffer — which is what the buffer
+ *  itself then reports. */
+export async function installArrow(): Promise<boolean> {
+    await import('@vortex-rdf/vortex-rdf-store/arrow');
+    const { default: init } = await import('../pkg/web/vortex_rdf.js');
+    const { memory } = await init();
+    return memory.buffer.resizable === true;
+}
+
 export function vortexAdapter(variant: { slug: string; label: string; options: BuildOptions }): StoreAdapter<VortexRdfStore> {
     return {
         slug: variant.slug,
@@ -144,6 +181,19 @@ export function vortexAdapter(variant: { slug: string; label: string; options: B
         deleteAll: async (h, quads) => { for (const q of quads) await h.deleteQuad(q); },
         countMatch: async (h, p) => consumeQuads(await h.getQuads(p.s, p.p, p.o, p.g)),
         countOnly: (h, p) => h.countQuads(p.s, p.p, p.o, p.g),
+        arrowMatch: (h, p, encoding) => {
+            const view = (h as ArrowStore).matchArrow(p.s, p.p, p.o, p.g, { encoding });
+            // Free inside the measurement: under zero-copy the view owns wasm
+            // buffers until it is freed, and a bench that leaves every
+            // iteration's buffers standing measures a growing module.
+            try {
+                return encoding === 'codes'
+                    ? consumeArrowCodes(view.table)
+                    : consumeArrowTerms(view.table);
+            } finally {
+                view.free();
+            }
+        },
         snapshot: (h) => h.toBytes(),
         open: (bytes) => VortexRdfStore.fromBytes(bytes as Uint8Array),
         dispose: (h) => h.free(),

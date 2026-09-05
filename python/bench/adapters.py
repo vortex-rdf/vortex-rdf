@@ -115,6 +115,10 @@ class Adapter:
     #: source file every process start; those get no Open measurement, because
     #: the re-parse is what the Build column already reports.
     has_distinct_open: bool = True
+    #: Whether the library hands a match out as Arrow, i.e. whether
+    #: ``arrow_count`` is implemented. Drives the Arrow role, which is skipped
+    #: entirely for a library without one.
+    supports_arrow: bool = False
 
     def artifact_path(self, workdir: str, src: str) -> str:
         raise NotImplementedError
@@ -141,6 +145,21 @@ class Adapter:
         """Resolve the same prepared pattern and return only the match count
         -- no term is read. Each library's cheapest correct count path: the
         COUNT/ASK shape of the workload."""
+        raise NotImplementedError
+
+    def arrow_count(self, handle: Any, query: Any, encoding: str) -> int:
+        """Resolve the same prepared pattern and read the matched rows as
+        Arrow columns, returning how many there were.
+
+        ``strings`` reads all four term values of every row into Python, which
+        is what ``count`` reads out of quads -- so the pair prices the same
+        delivered data two ways. ``codes`` reads the ``uint32`` code columns'
+        buffers and decodes no term at all: not a like-for-like with the other
+        two, but the currency a query engine joins on.
+
+        Only the libraries with an Arrow export implement it (see
+        ``supports_arrow``); the others simply have no Arrow cells.
+        """
         raise NotImplementedError
 
     def add(self, handle: Any, quads: Iterable[tuple]) -> None:
@@ -177,6 +196,7 @@ class VortexAdapter(Adapter):
     """
 
     mutation_unsupported = "the Python bindings expose no add/delete API"
+    supports_arrow = True
 
     def __init__(
         self,
@@ -226,6 +246,30 @@ class VortexAdapter(Adapter):
 
     def count_only(self, handle: Any, pat: Pat) -> int:
         return handle.count_quads(pat.s, pat.p, pat.o, pat.g)
+
+    def arrow_count(self, handle: Any, pat: Pat, encoding: str) -> int:
+        import pyarrow as pa
+
+        # A fresh stream per call: `__arrow_c_stream__` is taken out of the
+        # object once, so the export is part of every measured iteration
+        # exactly as `get_quads` is.
+        stream = handle.match_arrow(pat.s, pat.p, pat.o, pat.g, encoding=encoding)
+        table = pa.RecordBatchReader.from_stream(stream).read_all()
+        acc = 0
+        if encoding == "codes":
+            # The read an engine does: each column's `uint32` values buffer,
+            # nothing decoded. Buffer 0 is the (absent) validity bitmap.
+            for name in ("s", "p", "o", "g"):
+                for chunk in table.column(name).chunks:
+                    acc += len(chunk.buffers()[1])
+        else:
+            # Every term value, as Python strings -- the same four per row
+            # `count` builds out of `get_quads`.
+            for name in ("s", "p", "o", "g"):
+                for value in table.column(name).to_pylist():
+                    acc += len(value)
+        consume(acc)
+        return table.num_rows
 
 
 # ─── pyoxigraph ─────────────────────────────────────────────────────────────
@@ -540,6 +584,11 @@ def build_adapter(slug: str) -> Adapter:
 #: variant is a row in the cross-library panels alongside the other libraries,
 #: not a footnote to them.
 ALL_SLUGS = VORTEX_SLUGS + ["pyoxigraph", "pycottas", "rdflib", "lightrdf"]
+
+#: The adapters the Arrow role runs for: the ones whose library hands a match
+#: out as Arrow columns. Kept beside `ALL_SLUGS` so the orchestrator never has
+#: to construct an adapter just to ask.
+ARROW_SLUGS = VORTEX_SLUGS
 
 #: Which virtualenv each adapter needs. Vortex variants share one.
 VENV_FOR = {

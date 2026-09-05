@@ -442,6 +442,19 @@
     <div class="panel-grid" id="query-panels"></div>
   </section>
 
+  <section id="arrow" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">ARROW</span>
+      <h2>Data access — quads or Arrow</h2>
+    </div>
+    <p class="group-desc">
+      The same matched rows, handed out two ways: as quad objects, or as Arrow
+      record batches. One layout, one index, one cache regime — the only thing
+      that varies is the interface the rows leave through.
+    </p>
+    <div class="panel-grid" id="arrow-panels"></div>
+  </section>
+
   <section id="decode" class="group">
     <div class="group-head">
       <span class="chan-tag mono">DECODE</span>
@@ -485,6 +498,7 @@
     <a href="#js-overview">Overview</a>
     <a href="#js-ingest">Build &amp; open</a>
     <a href="#js-query">Query</a>
+    <a href="#js-arrow">Arrow</a>
     <a href="#js-mutations">Mutations</a>
     <a href="#js-memory">Footprint</a>
     <a href="#js-data">Raw data</a>
@@ -533,6 +547,21 @@
       <strong>Count-only</strong> is the the same pattern resolved, and only how many rows matched — no value read at all.
     </p>
     <div class="panel-grid" id="js-query-panels"></div>
+  </section>
+
+  <section id="js-arrow" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">ARROW</span>
+      <h2>Data access — quads or Arrow</h2>
+    </div>
+    <p class="group-desc">
+      Vortex-only: the same probes answered through <code>getQuads</code> and
+      through <code>matchArrow</code>, so the two interfaces are priced against
+      each other on identical rows. Measured in a process of its own, under
+      Node's resizable-buffer flag — the worker prints whether the views it got
+      were zero-copy.
+    </p>
+    <div class="panel-grid" id="js-arrow-panels"></div>
   </section>
 
   <section id="js-mutations" class="group">
@@ -592,6 +621,7 @@
     <a href="#py-overview">Overview</a>
     <a href="#py-ingest">Build &amp; open</a>
     <a href="#py-query">Query</a>
+    <a href="#py-arrow">Arrow</a>
     <a href="#py-mutations">Mutations</a>
     <a href="#py-footprint">Footprint</a>
     <a href="#py-data">Raw data</a>
@@ -653,6 +683,21 @@
       re-parses the whole source file and costs about the same regardless of selectivity.
     </p>
     <div class="panel-grid" id="py-query-panels"></div>
+  </section>
+
+  <section id="py-arrow" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">ARROW</span>
+      <h2>Data access — quads or Arrow</h2>
+    </div>
+    <p class="group-desc">
+      Vortex-only: the same probes answered through <code>get_quads</code> and
+      through <code>match_arrow</code> read back with pyarrow, so the two
+      interfaces are priced against each other on identical rows. Measured in a
+      process of its own, so pyarrow's own footprint stays out of the memory
+      panel.
+    </p>
+    <div class="panel-grid" id="py-arrow-panels"></div>
   </section>
 
   <section id="py-mutations" class="group">
@@ -962,6 +1007,35 @@ const matchMatrixPanel = {
   rows: matchMatrixRows(),
 };
 
+// The Arrow access panel: the quad column is the match matrix's own warm cell,
+// so the baseline is a measurement already on this page rather than a second
+// one taken differently.
+const ARROW_ACCESS_MODES = ["quads", "arrow strings", "arrow codes"];
+
+const arrowAccessPanel = {
+  title:"Data access: quads or Arrow, per pattern",
+  note:"One resolved view, three ways to read it. <b>quads</b> is the matrix's own <code>match_warm_dict_noindex_*</code> cell — <code>match_pattern</code> then <code>quads_vec</code>, one quad per row. <b>arrow strings</b> exports that same view as <code>string_view</code> columns, which decodes the same terms; <b>arrow codes</b> exports the <code>u32</code> code columns a query engine joins on and decodes none, so it is the interface's point rather than a like-for-like with the other two. All warm, Dictionary layout, no secondary index — nothing varies but the way out. <span class=\"best-key\">Green</span> marks the faster source in each leaf column.",
+  wide:true, rowHeaders:["Layout","Source"],
+  columns:RUST_PATTERNS, subColumns:ARROW_ACCESS_MODES,
+  rows:[
+    {labels:["Dictionary","in-memory"], ids: RUST_PATTERNS.flatMap(p => [
+      `match_warm_dict_noindex_mem::${p}`,
+      `arrow_strings_dict_mem::${p}`,
+      `arrow_codes_dict_mem::${p}`])},
+    {labels:["Dictionary","file"], ids: RUST_PATTERNS.flatMap(p => [
+      `match_warm_dict_noindex_file::${p}`,
+      `arrow_strings_dict_file::${p}`,
+      `arrow_codes_dict_file::${p}`])},
+  ],
+};
+
+/** The three access cells for one adapter, in header order — the warm
+ *  materialized cell the query matrix already carries, then the two Arrow
+ *  encodings the Arrow role adds beside it. */
+function arrowAccessIds(slug, patterns){
+  return patterns.flatMap(p => [`${slug}::${p}`, `${slug}::${p}::arrow`, `${slug}::${p}::arrow_codes`]);
+}
+
 const decodeLifecyclePanel = {
   title:"Open & full decode, per layout",
   note:"Decoding every quad back out of a store, per layout and per source — the whole-store read, with no pattern in it. The file column reads columns from the artifact; the in-memory column decodes a store already lifted whole.",
@@ -986,22 +1060,24 @@ function fastestOf(byId, entries){
   return best;
 }
 
-/** The fastest warm point lookup in a set of `slug::S` ids, as a KPI tile.
- *  Every tab leads with the same figure so the three can be read against each
- *  other; `S` is the one probe shape all three measure identically. */
+/** The fastest warm `S` lookup in a set of `slug::S` ids, as a KPI tile.
+ *  Pinned to one probe shape rather than minimised over all of them: every tab
+ *  leads with this figure, and `S` is the one shape all three measure
+ *  identically. The label names the shape, because the tables below carry
+ *  other shapes that resolve faster than this tile's number. */
 function fastestPointTile(byId, entries){
   const best = fastestOf(byId, entries);
-  return best ? [{ label:"Fastest point lookup", value:best.rec.median,
-                   sub:`S, warm — ${best.desc}` }] : [];
+  return best ? [{ label:"Fastest S lookup", value:best.rec.median,
+                   sub:`warm — ${best.desc}` }] : [];
 }
 
-/** The same lookup over the Vortex builds alone. The tile above reports the
- *  field's best, this one reports ours; where Vortex is the fastest entrant the
- *  two carry the same figure and differ only in what the sub names. */
+/** The same `S` lookup over the Vortex builds alone. The tile above reports the
+ *  field's best, this one reports ours; on the tabs where both read one suite, a
+ *  Vortex win puts the same figure in both and only the sub differs. */
 function fastestVortexTile(byId, entries){
   const best = fastestOf(byId, entries);
-  return best ? [{ label:"Fastest Vortex lookup", value:best.rec.median,
-                   sub:`S, warm — ${best.desc}` }] : [];
+  return best ? [{ label:"Fastest Vortex S lookup", value:best.rec.median,
+                   sub:`warm — ${best.desc}` }] : [];
 }
 
 /** The cheapest open of an already-built store: what a fresh process pays
@@ -1109,12 +1185,15 @@ function renderRust(){
   const queryHost = document.getElementById("query-panels");
   renderMatrixPanel(queryHost, matchMatrixPanel, rustById);
 
+  renderMatrixPanel(document.getElementById("arrow-panels"), arrowAccessPanel, rustById);
+
   const decodeHost = document.getElementById("decode-panels");
   renderMatrixPanel(decodeHost, decodeLifecyclePanel, rustById);
 
   // Read-side headline KPIs, computed from the run itself. The Vortex lookup is
-  // the fastest fully-selective probe in the whole match matrix; the full scan
-  // is `decode_all`, this suite's whole-store read.
+  // the match matrix's fastest warm `S` cell — one probe shape read across the
+  // whole matrix, not the matrix's minimum; the full scan is `decode_all`, this
+  // suite's whole-store read.
   // Null only if the render could not determine the size at all; showing that
   // beats a stale literal, and beats a throw that would blank the whole tab.
   const RUST_QUADS = RUST_CONFIG.benchSize ?? 0;
@@ -1130,9 +1209,9 @@ function renderRust(){
 
   // The tile order every tab shares: what was compared, how many builds, how
   // many measurements, what data, how many distinct terms, then the four read
-  // headlines — fastest lookup in the field, fastest Vortex lookup, full-scan
-  // throughput, file open. The cross-library figures come from `compare.rs`,
-  // which is the part of this tab comparable with theirs; the Vortex headlines
+  // headlines — fastest `S` lookup in the field, fastest Vortex `S` lookup,
+  // full-scan throughput, file open. The cross-library figures come from
+  // `compare.rs`, the part of this tab comparable with theirs; the Vortex headlines
   // come from the internals suite, and each tile's sub names its measurement.
   // Iteration counts are provenance, and live in the line under each suite.
   const rcById = new Map(RC_DATA.map(d => [byKey(d), d]));
@@ -1343,6 +1422,14 @@ function renderJs(){
       break: a.slug === "rdfstores_default" })),
   }, jsById);
 
+  // Arrow — Vortex only, the two interfaces against each other
+  renderMatrixPanel(document.getElementById("js-arrow-panels"), {
+    title:"Data access: quads or Arrow, per pattern",
+    note:"Vortex only — the other libraries here export no Arrow. <b>quads</b> is the warm materialized cell from the panel above: <code>getQuads</code> plus a read of all four terms of every row. <b>arrow strings</b> is <code>matchArrow</code> under the <code>strings</code> encoding, reading the same four values back out of the columns, so the pair prices identical delivered data. <b>arrow codes</b> is the same export as <code>uint32</code> columns read as typed arrays: no term crosses the boundary at all, which is what an engine joining in code space pays and why this column is not comparable with the other two. <span class=\"best-key\">Green</span> = fastest build in each leaf column.",
+    wide:true, rowHeaders:["Store"], columns:JS_PATTERNS, subColumns:ARROW_ACCESS_MODES,
+    rows: JS_VORTEX.map(a => ({ labels:[a.label], ids: arrowAccessIds(a.slug, JS_PATTERNS) })),
+  }, jsById);
+
   // Mutations — add & delete in one table
   renderMatrixPanel(document.getElementById("js-mut-panels"), {
     title:"Mutations: add & delete",
@@ -1460,6 +1547,14 @@ function renderPy(){
     subSubColumns:["count-only","materialized"],
     note:"Median time to resolve each pattern (and materialize the results). <b>Warm</b> is a repeat query on an open store; <b>cold</b> is the first query on a freshly reopened artifact. <span class=\"best-key\">Green</span> = fastest configuration in each leaf column.",
     rows: PY_ADAPTERS.map(a => ({ labels:[a.label], ids:patternCellIds(a.slug, PY_PATTERNS) })),
+  }, pyById);
+
+  // Arrow — Vortex only, the two interfaces against each other
+  renderMatrixPanel(document.getElementById("py-arrow-panels"), {
+    title:"Data access: quads or Arrow, per pattern",
+    note:"Vortex only — the other libraries here export no Arrow. <b>quads</b> is the warm materialized cell from the panel above: <code>get_quads</code>, reading all four term strings of every row. <b>arrow strings</b> is <code>match_arrow</code> under the <code>strings</code> encoding, read back through <code>pyarrow</code> and into the same four Python strings per row, so the pair prices identical delivered data. <b>arrow codes</b> is the same export as <code>uint32</code> columns, read as buffers: no term is decoded and no Python object is built per row, which is what a consumer joining in code space pays and why this column is not comparable with the other two. <span class=\"best-key\">Green</span> = fastest configuration in each leaf column.",
+    wide:true, rowHeaders:["Configuration"], columns:PY_PATTERNS, subColumns:ARROW_ACCESS_MODES,
+    rows: PY_VORTEX.map(a => ({ labels:[a.label], ids: arrowAccessIds(a.slug, PY_PATTERNS) })),
   }, pyById);
 
   // Mutations — two of the five libraries can do this at all. One row per

@@ -16,6 +16,9 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { Quad } from '@rdfjs/types';
+// Type-only: erased at compile time, so the purity contract above holds — no
+// apache-arrow module is loaded by importing this file.
+import type { Table } from 'apache-arrow';
 
 /** The quad shape every consume helper reads: the three mandatory term slots
  *  plus an optional graph, so rdf-stores, oxigraph and Vortex results all fit. */
@@ -89,6 +92,9 @@ class ConsumeBudgetExceeded extends Error {
  *  window are never checked — a death march needs a large result set. */
 const CONSUME_WINDOW = 65_536;
 
+/** The four primary columns, in the schema's own order. */
+const QUAD_COLUMNS = ['s', 'p', 'o', 'g'] as const;
+
 /** Count a result set by consuming it: read every term of every quad.
  *
  *  The stores return different amounts of *done* work: the pure-JS stores hold
@@ -120,10 +126,42 @@ export function consumeStrings(strings: string[]): void {
     consumeSink += acc;
 }
 
+/** [`consumeQuads`]'s contract for a match handed out as Arrow columns: read
+ *  every term of every row, one column at a time instead of one quad at a
+ *  time. Same four values per row as `consumeQuads`, same escape — so a
+ *  `strings` cell and the quad cell beside it differ in how the rows are
+ *  delivered, not in how much of them is read. */
+export function consumeArrowTerms(table: Table): number {
+    let acc = 0;
+    for (const name of QUAD_COLUMNS) {
+        const column = table.getChild(name);
+        if (!column) continue;
+        for (const value of column) acc += (value as string).length;
+    }
+    consumeSink += acc;
+    return table.numRows;
+}
+
+/** The read an engine does over `codes`: each column's `u32` buffer as a typed
+ *  array. No term is decoded — that is the point of the encoding, and why this
+ *  cell is not comparable with the two that materialize terms. */
+export function consumeArrowCodes(table: Table): number {
+    let acc = 0;
+    for (const name of QUAD_COLUMNS) {
+        const column = table.getChild(name);
+        if (column) acc += column.toArray().length;
+    }
+    consumeSink += acc;
+    return table.numRows;
+}
+
 const here = dirname(fileURLToPath(import.meta.url));
 const tsxBin = resolve(here, '..', 'node_modules', '.bin', 'tsx');
 /** `--expose-gc` is required by shared.ts's memory readings; the heap ceiling
- *  covers the multi-million-quad datasets the workers generate. */
+ *  covers the multi-million-quad datasets the workers generate. Every worker
+ *  gets these; a role that needs more passes them per spawn (`extraFlags`),
+ *  which is how the Arrow role gets zero-copy views without changing the flag
+ *  set under every other measurement on the page. */
 const NODE_FLAGS = ['--expose-gc', '--max-old-space-size=8192'];
 
 /** Wall-clock backstop for one worker process, ms; `0` disables it.
@@ -148,10 +186,12 @@ const WORKER_TIMEOUT_MS = Number(process.env.WORKER_TIMEOUT_MS ?? 30 * 60_000);
  * the headers of compare.bench.ts (cross-adapter memory contamination) and
  * dict-memory.worker.ts (wasm linear memory never shrinks).
  */
-export function runWorkerProcess<T>(workerPath: string, args: string[], label: string): T | null {
+export function runWorkerProcess<T>(
+    workerPath: string, args: string[], label: string, extraFlags: string[] = [],
+): T | null {
     const stem = label.replace(/[^A-Za-z0-9._-]+/g, '-');
     const outFile = join(tmpdir(), `vortex-bench-${stem}-${process.pid}.json`);
-    const res = spawnSync(tsxBin, [...NODE_FLAGS, workerPath, ...args, outFile], {
+    const res = spawnSync(tsxBin, [...NODE_FLAGS, ...extraFlags, workerPath, ...args, outFile], {
         stdio: 'inherit',
         env: process.env,
         ...(WORKER_TIMEOUT_MS > 0 ? { timeout: WORKER_TIMEOUT_MS, killSignal: 'SIGKILL' as const } : {}),

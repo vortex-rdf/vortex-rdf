@@ -8,6 +8,10 @@ set -- see the pyoxigraph pin note in `run.py`.
 
 Results go to stdout as one JSON object; progress goes to stderr, so the
 orchestrator can stream progress to the terminal while parsing the result.
+
+One role per process: `query` (build, open, every pattern in both cache
+regimes, the full scan), `arrow` (the same probes read back as Arrow columns,
+for the libraries that export any) and `mutate`.
 """
 
 from __future__ import annotations
@@ -393,6 +397,63 @@ def run_query(adapter: Adapter, args: argparse.Namespace) -> dict:
     }
 
 
+def run_arrow(adapter: Adapter, args: argparse.Namespace) -> dict:
+    """The Arrow read of the same probes, in a process of its own.
+
+    Two encodings against one baseline: ``::arrow`` reads all four term values
+    of every matched row out of ``string_view`` columns -- the same values
+    ``::<pattern>`` reads out of quads, so the pair prices the same delivered
+    data two ways -- and ``::arrow_codes`` reads the ``uint32`` code columns'
+    buffers, decoding no term at all.
+
+    Its own process because importing pyarrow costs tens of megabytes of RSS,
+    and the query role's reading is this library's peak-memory figure on the
+    dashboard. Only an adapter with ``supports_arrow`` is ever run here.
+    """
+    a = adapter
+    rows: list = []
+    if not a.supports_arrow:
+        return {"rows": rows, "counts": {}, "artifact_bytes": None, "peak_rss_mb": None}
+
+    src = args.quads if a.supports_quads else args.triples
+    artifact = a.artifact_path(args.workdir, src)
+    if not os.path.exists(artifact):
+        a.dispose(a.build(src, artifact))
+    handle = a.open(artifact, src)
+
+    probes = dataset_probes(args.n, dataset_opts(graphs=args.graphs))
+    pattern_set = list(probes["triples"])
+    if a.supports_quads:
+        pattern_set += probes["quads"]
+    pattern_set.append(FULL_SCAN_PATTERN)
+
+    for pat in pattern_set:
+        log(a.label, f"arrow {pat.name}…")
+        query = a.prepare(pat)
+        # The same agreement check the count paths get: an export that resolved
+        # something else would time the wrong work rather than fail.
+        want = a.count_only(handle, query)
+        for encoding, suffix in (("strings", "arrow"), ("codes", "arrow_codes")):
+            got = a.arrow_count(handle, query, encoding)
+            if got != want:
+                raise RuntimeError(
+                    f"arrow {encoding} disagrees for {pat.name}: {got} != {want}"
+                )
+            measure(
+                f"{a.slug}::{pat.name}::{suffix}",
+                lambda _, q=query, e=encoding: a.arrow_count(handle, q, e),
+                rows,
+                QUERY_ITERS,
+                QUERY_WARMUP,
+                regime="warm",
+            )
+
+    a.dispose(handle)
+    del handle
+    gc.collect()
+    return {"rows": rows, "counts": {}, "artifact_bytes": None, "peak_rss_mb": None}
+
+
 def run_mutate(adapter: Adapter, args: argparse.Namespace) -> dict:
     a = adapter
     rows: list = []
@@ -442,7 +503,7 @@ def run_mutate(adapter: Adapter, args: argparse.Namespace) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--slug", required=True)
-    ap.add_argument("--role", choices=["query", "mutate"], default="query")
+    ap.add_argument("--role", choices=["query", "arrow", "mutate"], default="query")
     ap.add_argument("--triples", required=True)
     ap.add_argument("--quads", required=True)
     ap.add_argument("--workdir", required=True)
@@ -452,7 +513,8 @@ def main() -> int:
     args = ap.parse_args()
 
     adapter = build_adapter(args.slug)
-    result = run_query(adapter, args) if args.role == "query" else run_mutate(adapter, args)
+    roles = {"query": run_query, "arrow": run_arrow, "mutate": run_mutate}
+    result = roles[args.role](adapter, args)
     result.update({"slug": adapter.slug, "label": adapter.label, "role": args.role})
     print(json.dumps(result))
     return 0
