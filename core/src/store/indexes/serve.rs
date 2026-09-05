@@ -49,10 +49,12 @@ use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{canonical_u32, into_struct_array};
 use crate::store::arrow::QuadColumn;
-use crate::store::indexes::IndexComponent;
+use crate::store::indexes::{IndexComponent, LazyRowIds};
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
+use crate::store::query::pushdown::Keep;
 use crate::store::scan::gather::primitive_from_u64_reads;
 use crate::store::view::canonical::{LiveCanonical, decode_u32};
+use crate::store::view::order::{SortOrder, keep_runs, sorted_within};
 use crate::store::view::selection::point_sized;
 
 /// The decode tail shared by both backend-typed serve plans: which of the
@@ -71,6 +73,12 @@ struct ServeDecode {
     /// stores whole terms decodes them as strings, or dictionary codes under
     /// the Dictionary layout).
     decode_layout: ResolvedLayout,
+    /// The order the served rows come in — the family's sort order, when the
+    /// component is globally sorted in it; `None` says nothing about it.
+    key_order: Option<SortOrder>,
+    /// How many of the order's leading keys the resolution fixed: constant
+    /// over the run, the next key ascending within it.
+    resolved: usize,
 }
 
 impl ServeDecode {
@@ -276,18 +284,85 @@ impl InMemoryServePlan {
         decode_layout: ResolvedLayout,
         component: &IndexComponent,
         range: Range<usize>,
+        key_order: Option<SortOrder>,
+        resolved: usize,
     ) -> Result<Self> {
         Ok(Self {
             decode: ServeDecode {
                 primary_columns,
                 rid_column,
                 decode_layout,
+                key_order,
+                resolved,
             },
             array: component.rows()?.clone().into_array(),
             range,
             probes: component.probes_arc(),
             canonical: component.canonical_arc(),
         })
+    }
+
+    /// How a term-code constraint on `column` narrows the served run without
+    /// leaving it: unchanged or empty when the column is one of the keys the
+    /// resolution fixed (its one value is in `keep` or not); a sub-run when
+    /// the column is the next key, or a later one that is ascending within
+    /// the run because every key before it is constant there, found by
+    /// binary search; declined otherwise — and for a code set whose runs do
+    /// not coalesce into one, or whose searches would cost more than a pass
+    /// over the run.
+    pub(crate) fn narrow(&self, column: QuadColumn, keep: &Keep) -> Result<Narrow> {
+        let Some(order) = self.decode.key_order else {
+            return Ok(Narrow::Declined);
+        };
+        if self.range.is_empty() {
+            return Ok(Narrow::Unchanged);
+        }
+        let name = self.decode.primary_columns[column.index()];
+        let Some(probe) = self.probes.by_name(&self.array, name) else {
+            return Ok(Narrow::Declined);
+        };
+        let position = order.position(column);
+        if position < self.decode.resolved {
+            let value = probe.value_at(self.range.start);
+            let kept = u32::try_from(value).is_ok_and(|code| keep.contains(code));
+            return Ok(if kept {
+                Narrow::Unchanged
+            } else {
+                Narrow::Empty
+            });
+        }
+        let ascending = position == self.decode.resolved
+            || sorted_within(&self.array, &self.probes, order, self.range.clone(), column)
+                == Some(true);
+        if !ascending {
+            return Ok(Narrow::Declined);
+        }
+        let Some(runs) = keep_runs(probe, self.range.clone(), keep) else {
+            return Ok(Narrow::Declined);
+        };
+        Ok(match runs.as_slice() {
+            [] => Narrow::Empty,
+            [run] if *run == self.range => Narrow::Unchanged,
+            [run] => Narrow::Run(run.clone()),
+            _ => Narrow::Declined,
+        })
+    }
+
+    /// This plan over `sub`, a sub-run of its run, with the deferred row ids
+    /// of exactly those rows — what a view narrowed in place carries.
+    pub(crate) fn restricted(&self, sub: Range<usize>) -> Result<(Self, LazyRowIds)> {
+        let rids = into_struct_array(self.array.clone())?
+            .unmasked_field_by_name(self.decode.rid_column)
+            .map_err(VortexRdfError::Vortex)?
+            .slice(sub.clone())
+            .map_err(VortexRdfError::Vortex)?;
+        Ok((
+            Self {
+                range: sub,
+                ..self.clone()
+            },
+            LazyRowIds::from_component_run(rids),
+        ))
     }
 
     /// The served rows' `u32` term codes for `columns`, in that order, read
@@ -474,6 +549,18 @@ pub(crate) struct FileServePlan {
     row_range: Option<Range<u64>>,
 }
 
+/// How [`InMemoryServePlan::narrow`] answered a term-code constraint.
+pub(crate) enum Narrow {
+    /// Every served row is kept.
+    Unchanged,
+    /// No served row is kept.
+    Empty,
+    /// Exactly this sub-run of the served run is kept.
+    Run(Range<usize>),
+    /// The plan cannot say; the caller reads the rows.
+    Declined,
+}
+
 /// The fewest rows a located run's scan split carries: below this the
 /// per-split overhead (a spawned task, its segment requests, one decode
 /// call) outweighs what spreading the decode buys.
@@ -507,12 +594,16 @@ impl FileServePlan {
         component: &'static str,
         row_range: Option<Range<u64>>,
         memo: Arc<crate::store::persist::native_file::BoundExprMemo>,
+        key_order: Option<SortOrder>,
+        resolved: usize,
     ) -> Self {
         Self {
             decode: ServeDecode {
                 primary_columns,
                 rid_column,
                 decode_layout,
+                key_order,
+                resolved,
             },
             reader,
             constraints,

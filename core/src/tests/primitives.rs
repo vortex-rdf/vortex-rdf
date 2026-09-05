@@ -171,7 +171,9 @@ async fn windows_are_row_slices() {
     }
 }
 
-/// Every keep of `view` on `column` is the rows whose term `admits`.
+/// Every keep of `view` on `column` is the rows whose term `admits` — as a
+/// set: a keep that reads the rows yields them in base order, a served view
+/// in its index's.
 async fn assert_keep(
     view: &VortexRdfStore,
     column: QuadColumn,
@@ -179,6 +181,11 @@ async fn assert_keep(
     admits: impl Fn(&Quad) -> bool,
     tag: &str,
 ) {
+    let spelled = |quads: Vec<Quad>| {
+        let mut rows: Vec<String> = quads.iter().map(|q| q.to_string()).collect();
+        rows.sort();
+        rows
+    };
     let expected: Vec<Quad> = view
         .quads_vec()
         .await
@@ -187,8 +194,12 @@ async fn assert_keep(
         .filter(admits)
         .collect();
     let kept = view.keep(column, keep).await.unwrap();
-    assert_eq!(kept.quads_vec().await.unwrap(), expected, "{tag}");
     assert_eq!(kept.size().await.unwrap(), expected.len(), "{tag}: size");
+    assert_eq!(
+        spelled(kept.quads_vec().await.unwrap()),
+        spelled(expected),
+        "{tag}"
+    );
 }
 
 /// A set keeps exactly its codes' rows and a range exactly the terms of a
@@ -524,4 +535,193 @@ async fn match_pattern_many_equals_the_singles_on_a_file() {
         let store = VortexRdfStore::from_file(&path).await.unwrap();
         assert_many_equals_singles(&store, "file").await;
     }
+}
+
+/// A term-code constraint on a served run narrows the run in place — the
+/// view keeps its plan and its deferred ids — where the plan can say how: on
+/// a key the resolution fixed it is all or nothing; on the next key, or a
+/// later one ascending within the run, it is a binary search; anywhere else
+/// the rows are read. Every answer equals the linear pass.
+#[tokio::test]
+async fn keep_narrows_a_served_run_and_keeps_its_plan() {
+    let quads = modular_quads(4000, 5, 40);
+    let store = VortexRdfStore::from_quads(
+        quad_stream(quads.clone()),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    let dict = store.code_read_snapshot().unwrap();
+    let p1 = predicate(1);
+    let served = store
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    assert!(served.debug_has_serve_plan() && served.debug_selection_pending());
+
+    // `o` is the next key of a `p` run: a code range is a sub-run.
+    let (lo, hi) = dict.prefix_range("\"object 1");
+    let range = Keep::range(lo, hi);
+    let in_range = |q: &Quad| q.object.to_string().starts_with("\"object 1");
+    assert_keep(&served, QuadColumn::O, &range, in_range, "served o range").await;
+    let narrowed = served.keep(QuadColumn::O, &range).await.unwrap();
+    assert!(
+        narrowed.debug_has_serve_plan() && narrowed.debug_selection_pending(),
+        "a narrowed run keeps its plan and its deferred ids"
+    );
+    // The run holds objects 1, 6, 11, 16, … (i ≡ 1 mod 5, i mod 40): a code
+    // set whose runs touch coalesces into one sub-run and keeps the plan; one
+    // with a run of the view between its runs reads the rows.
+    let touching = ["\"object 1\"", "\"object 11\""];
+    let set = Keep::set(touching.iter().map(|o| dict.encode(o).unwrap()));
+    let in_set = |q: &Quad| touching.contains(&q.object.to_string().as_str());
+    assert_keep(
+        &served,
+        QuadColumn::O,
+        &set,
+        in_set,
+        "served o touching set",
+    )
+    .await;
+    assert!(
+        served
+            .keep(QuadColumn::O, &set)
+            .await
+            .unwrap()
+            .debug_has_serve_plan()
+    );
+    let apart = ["\"object 1\"", "\"object 16\""];
+    let set = Keep::set(apart.iter().map(|o| dict.encode(o).unwrap()));
+    let in_set = |q: &Quad| apart.contains(&q.object.to_string().as_str());
+    assert_keep(&served, QuadColumn::O, &set, in_set, "served o set apart").await;
+    assert!(
+        !served
+            .keep(QuadColumn::O, &set)
+            .await
+            .unwrap()
+            .debug_has_serve_plan()
+    );
+    // The fixed key: all or nothing, plan kept.
+    let p1_code = dict.encode(&p1.to_string()).unwrap();
+    let same = served
+        .keep(QuadColumn::P, &Keep::set([p1_code]))
+        .await
+        .unwrap();
+    assert!(same.debug_has_serve_plan());
+    assert_eq!(same.size().await.unwrap(), served.size().await.unwrap());
+    let none = served
+        .keep(QuadColumn::P, &Keep::range(p1_code + 1, p1_code + 2))
+        .await
+        .unwrap();
+    assert_eq!(none.size().await.unwrap(), 0);
+    // A later key that is not ascending within the run reads the rows.
+    let (slo, shi) = dict.prefix_range("<http://example.org/s1");
+    let s_range = Keep::range(slo, shi);
+    let in_s = |q: &Quad| q.subject.to_string().starts_with("<http://example.org/s1");
+    assert_keep(&served, QuadColumn::S, &s_range, in_s, "served s range").await;
+    assert!(
+        !served
+            .keep(QuadColumn::S, &s_range)
+            .await
+            .unwrap()
+            .debug_has_serve_plan()
+    );
+    // With two keys fixed, `s` is the next key.
+    let po = store
+        .match_pattern(None, Some(&p1), Some(&object(1)), None)
+        .await
+        .unwrap();
+    assert!(po.debug_has_serve_plan());
+    assert_keep(&po, QuadColumn::S, &s_range, in_s, "served po, s range").await;
+    assert!(
+        po.keep(QuadColumn::S, &s_range)
+            .await
+            .unwrap()
+            .debug_has_serve_plan()
+    );
+}
+
+/// On the sorted base a keep on `s` — or on a later column while every
+/// column before it is constant over a contiguous selection — narrows by
+/// binary search and keeps the selection a range, so the code export stays a
+/// slice of the base; a selection spanning several subjects reads the rows.
+#[tokio::test]
+async fn keep_searches_a_sorted_prefix_column() {
+    // Forty subjects, ten rows each.
+    let quads: Vec<Quad> = (0..400)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/s{:03}", i / 10),
+                &format!("http://example.org/p{}", i % 4),
+                &format!("object {}", i % 5),
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    let store = VortexRdfStore::from_quads(
+        quad_stream(quads.clone()),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await
+    .unwrap();
+    let dict = store.code_read_snapshot().unwrap();
+    let (lo, hi) = dict.prefix_range("<http://example.org/s01");
+    let s_range = Keep::range(lo, hi);
+    let in_s = |q: &Quad| q.subject.to_string().starts_with("<http://example.org/s01");
+    assert_keep(&store, QuadColumn::S, &s_range, in_s, "store s range").await;
+    let kept = store.keep(QuadColumn::S, &s_range).await.unwrap();
+    let run = kept
+        .debug_selection_range()
+        .expect("a keep on the sorted subject column is a range");
+    let base = store.code_columns(&QuadColumn::ALL).unwrap().unwrap();
+    let sliced = kept.code_columns(&QuadColumn::ALL).unwrap().unwrap();
+    assert_eq!(
+        sliced[0].as_slice().as_ptr(),
+        base[0].as_slice()[run.start as usize..].as_ptr(),
+        "the kept range is a slice of the base"
+    );
+
+    // Within one subject's run `p` is ascending: still a range.
+    let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s003").unwrap());
+    let one = store
+        .match_pattern(Some(&s), None, None, None)
+        .await
+        .unwrap();
+    assert!(one.debug_selection_range().is_some());
+    let (plo, phi) = dict.prefix_range("<http://example.org/p1");
+    let p_range = Keep::range(plo, phi);
+    let in_p = |q: &Quad| {
+        q.predicate
+            .to_string()
+            .starts_with("<http://example.org/p1")
+    };
+    assert_keep(&one, QuadColumn::P, &p_range, in_p, "subject run, p range").await;
+    assert!(
+        one.keep(QuadColumn::P, &p_range)
+            .await
+            .unwrap()
+            .debug_selection_range()
+            .is_some()
+    );
+
+    // A window over several subjects: `p` is not ascending there, so the
+    // rows are read and the answer is an id list.
+    let span = store.window(3, 50).await.unwrap();
+    assert_keep(
+        &span,
+        QuadColumn::P,
+        &p_range,
+        in_p,
+        "spanning window, p range",
+    )
+    .await;
+    assert!(
+        span.keep(QuadColumn::P, &p_range)
+            .await
+            .unwrap()
+            .debug_selection_range()
+            .is_none()
+    );
 }

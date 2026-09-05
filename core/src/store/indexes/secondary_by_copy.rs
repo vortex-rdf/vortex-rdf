@@ -53,6 +53,7 @@ use crate::store::RawQuad;
 use crate::store::array::{make_string_array, stamp_is_sorted};
 use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout, TermRef};
+use crate::store::view::order::SortOrder;
 
 #[cfg(feature = "file-io")]
 use super::FileServePlan;
@@ -114,6 +115,14 @@ impl CopyFamily {
         match self {
             CopyFamily::Posg => "secondary-by-copy/posg",
             CopyFamily::Ospg => "secondary-by-copy/ospg",
+        }
+    }
+
+    /// The order the family's rows are sorted in.
+    fn order(self) -> SortOrder {
+        match self {
+            CopyFamily::Posg => SortOrder::POSG,
+            CopyFamily::Ospg => SortOrder::OSPG,
         }
     }
 
@@ -304,6 +313,8 @@ pub(crate) fn resolve_in_memory(
             copy_decode_layout(layout),
             component,
             run,
+            Some(probe.family.order()),
+            1 + usize::from(probe.second.is_some()),
         )?),
     })
 }
@@ -423,6 +434,7 @@ pub(crate) async fn resolve_file(
         name,
         located,
         file.bound_exprs(),
+        sorted.then_some(probe.family.order()),
     )? {
         // A serving resolution reads the matched quads straight from the
         // copy columns — point reads over a located run, or the pushed-down
@@ -472,7 +484,11 @@ fn build_serve_plan(
     component: &'static str,
     row_range: Option<std::ops::Range<u64>>,
     memo: &std::sync::Arc<crate::store::persist::native_file::BoundExprMemo>,
+    key_order: Option<SortOrder>,
 ) -> Result<Option<FileServePlan>> {
+    // The sort keys the probes fixed — every constraint so far; a bound graph
+    // is a filter, not a key.
+    let resolved = constraints.len();
     let mut constraints = constraints.to_vec();
     if let Some(graph) = graph {
         let Some(scalar) = codes.probe_scalar(TermRef::Graph(graph))? else {
@@ -494,6 +510,8 @@ fn build_serve_plan(
         component,
         row_range,
         memo.clone(),
+        key_order,
+        resolved,
     )))
 }
 

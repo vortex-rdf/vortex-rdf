@@ -90,7 +90,7 @@ tail rows store their terms as strings, and the terms appended have no code
 in the frozen dictionary ([mutations.md §2](mutations.md#2-additions-the-append-tail)).
 Such a view rejects `codes` and `terms` with an error — export `strings`,
 or compact first — exactly the gate
-[`code_read_snapshot`](../core/src/store/mod.rs#L527) applies to the
+[`code_read_snapshot`](../core/src/store/mod.rs#L528) applies to the
 code-column readers.
 
 ### 2.3 The dictionary as an Arrow array
@@ -189,7 +189,7 @@ answered — is a contiguous run of that index's own columns, which hold every
 quad in the family's order. A point-sized run (up to 256 rows) is read code
 by code through the component's cached probes; a wider one is a slice of
 the component's canonical form
-([`InMemoryServePlan::code_columns`](../core/src/store/indexes/serve.rs#L316)).
+([`InMemoryServePlan::code_columns`](../core/src/store/indexes/serve.rs#L391)).
 Components are held compressed ([memory.md §1](memory.md#1-the-three-forms)),
 so that form is the component's live canonical cache: each column decoded
 once, shared by every holder alive, freed with the last — filled when the
@@ -197,7 +197,10 @@ run covers at least 1/32 of the component or a holder already keeps the
 column alive, a narrower cold run decoding only itself. Rows come out in
 the index's order, not the base's. On a file the same match reads the index
 child through the plan's scan — a point read of a small located run, a
-range scan of a wide one — and never materializes the match's row ids.
+range scan of a wide one — and never materializes the match's row ids. A
+`keep` on the base's `s` column, or on a served run's next key, narrows the
+selection to a sub-range, so the export stays a slice
+([matching.md §16.3](matching.md#163-keeps)).
 
 **Primary chunks.** Otherwise
 [`primary_chunks`](../core/src/store/arrow/batches.rs#L145) streams the base's
@@ -389,8 +392,8 @@ so an error message reads the same from every frontend, plus the narrowing
 Python's `match_arrow` takes: `keep` (per column, a `Uint32Array` or array
 of codes as a code set, `{lo, hi}` as a half-open code range —
 [`parse_keep`](../js/src/options.rs#L192)) applied through core's
-[`keep`](../core/src/store/query/pushdown.rs#L182), then `offset`/`limit` through
-[`window`](../core/src/store/query/pushdown.rs#L68), before any row is gathered.
+[`keep`](../core/src/store/query/pushdown.rs#L185), then `offset`/`limit` through
+[`window`](../core/src/store/query/pushdown.rs#L71), before any row is gathered.
 `TermDict.decodeMany` ([`decode_many`](../js/src/store.rs#L120)) decodes a
 code column back in one crossing.
 

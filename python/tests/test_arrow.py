@@ -255,3 +255,16 @@ def test_code_form_is_named_and_gated(vortex_files, tmp_path):
         VortexRdfStore(vortex_files["dictionary"], in_memory=True, codes="compressed")
     with pytest.raises(ValueError, match="in_memory=True"):
         VortexRdfStore(vortex_files["dictionary"], codes="canonical")
+
+
+def test_keep_on_the_subject_column_exports_a_slice_of_the_base(vortex_files):
+    """A keep on `s` narrows the sorted base by binary search to a range, so
+    the export is a slice of the whole-store buffer at that range's start."""
+    store = VortexRdfStore(vortex_files["dictionary"], in_memory=True)
+    whole = _table(store.match_arrow())
+    subjects = whole.column("s").to_pylist()
+    code = sorted(set(subjects))[len(set(subjects)) // 2]
+    kept = _table(store.match_arrow(keep={"s": range(code, code + 1)}))
+    assert kept.num_rows == subjects.count(code)
+    address = lambda table: table.column("s").chunk(0).buffers()[1].address  # noqa: E731
+    assert address(kept) == address(whole) + 4 * subjects.index(code)

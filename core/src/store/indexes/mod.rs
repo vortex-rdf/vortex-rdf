@@ -45,7 +45,7 @@ pub(crate) use row_ids::{
 };
 #[cfg(feature = "file-io")]
 pub(crate) use serve::FileServePlan;
-pub(crate) use serve::InMemoryServePlan;
+pub(crate) use serve::{InMemoryServePlan, Narrow};
 
 /// A secondary index, built as its own sorted children beside the primary
 /// quad rows.

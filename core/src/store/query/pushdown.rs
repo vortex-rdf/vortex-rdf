@@ -16,10 +16,12 @@ use vortex_buffer::Buffer;
 use crate::error::{Result, VortexRdfError};
 #[cfg(feature = "file-io")]
 use crate::session::VORTEX_SESSION;
-use crate::store::array::{canonical_u32, into_struct_array};
+use crate::store::array::{canonical_u32, into_struct_array, subject_sorted};
 use crate::store::arrow::QuadColumn;
+use crate::store::indexes::Narrow;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_scan;
+use crate::store::view::order::{SortOrder, keep_runs, sorted_within};
 use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{LayoutStrategy, QuadsSource, VortexRdfStore};
 
@@ -48,8 +50,9 @@ impl Keep {
         Keep::Range(lo, hi)
     }
 
+    /// Whether `code` is kept.
     #[inline]
-    fn contains(&self, code: u32) -> bool {
+    pub(crate) fn contains(&self, code: u32) -> bool {
         match self {
             Keep::Set(codes) => codes.as_slice().binary_search(&code).is_ok(),
             Keep::Range(lo, hi) => (*lo..*hi).contains(&code),
@@ -201,9 +204,66 @@ impl VortexRdfStore {
                 deleted,
                 probes,
                 canonical,
-                ..
+                serve,
             } => {
+                // A served run narrows in place where the plan can say how:
+                // the view keeps its plan and its deferred ids, over the
+                // sub-run alone.
+                if let Some(plan) = serve {
+                    match plan.narrow(column, keep)? {
+                        Narrow::Unchanged => return Ok(self.clone()),
+                        Narrow::Empty => return Ok(self.empty_view()),
+                        Narrow::Run(sub) => {
+                            let (plan, ids) = plan.restricted(sub)?;
+                            return Ok(self.with_quads(QuadsSource::InMemory {
+                                base: base.clone(),
+                                selection: ViewSelection::Pending(ids),
+                                components: Arc::clone(components),
+                                deleted: deleted.clone(),
+                                probes: Arc::clone(probes),
+                                canonical: Arc::clone(canonical),
+                                serve: Some(plan),
+                            }));
+                        }
+                        Narrow::Declined => {}
+                    }
+                }
                 let selection = selection.materialized()?;
+                // A contiguous selection of the sorted base, on a column that
+                // is ascending over it — `s` always, a later column while
+                // every column before it is constant over the range — narrows
+                // by binary search, and a range stays a range.
+                let contiguous = match &selection {
+                    RowSelection::All => Some(0..base.len()),
+                    RowSelection::Range(range) => Some(range.start as usize..range.end as usize),
+                    RowSelection::Ids(_) => None,
+                };
+                if let Some(range) = contiguous
+                    && subject_sorted(base)
+                    && sorted_within(base, probes, SortOrder::SPOG, range.clone(), column)
+                        == Some(true)
+                    && let Some(probe) = probes.by_name(base, column.name())
+                    && let Some(runs) = keep_runs(probe, range, keep)
+                {
+                    let selection = match runs.as_slice() {
+                        [] => RowSelection::empty(),
+                        [run] => RowSelection::Range(run.start as u64..run.end as u64),
+                        runs => ids_selection(
+                            runs.iter()
+                                .flat_map(|run| run.start as u64..run.end as u64)
+                                .collect(),
+                        ),
+                    };
+                    return Ok(self.with_quads(QuadsSource::InMemory {
+                        base: base.clone(),
+                        selection: ViewSelection::Exact(selection),
+                        components: Arc::clone(components),
+                        deleted: deleted.clone(),
+                        probes: Arc::clone(probes),
+                        canonical: Arc::clone(canonical),
+                        serve: None,
+                    }));
+                }
                 let struct_arr = into_struct_array(base.clone())?;
                 let col = struct_arr
                     .unmasked_field_by_name(column.name())
@@ -273,12 +333,17 @@ impl VortexRdfStore {
                 }
             }
         };
-        Ok(Self {
+        Ok(self.with_quads(quads))
+    }
+
+    /// This view over `quads` — the same layout, indexes and tail.
+    fn with_quads(&self, quads: QuadsSource) -> Self {
+        Self {
             layout: self.layout.clone(),
             indexes: self.indexes.clone(),
             quads,
             tail: self.tail.clone(),
-        })
+        }
     }
 
     /// The base row ids among `selection` whose code in `column` `keep`

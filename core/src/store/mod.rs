@@ -40,6 +40,7 @@ pub use query::pushdown::Keep;
 // use.
 pub use crate::common::quad::{RawQuad, SharedQuad};
 
+pub use view::order::SortOrder;
 pub(crate) use view::source::{QuadsSource, Tail};
 
 use indexes::IndexComponent;

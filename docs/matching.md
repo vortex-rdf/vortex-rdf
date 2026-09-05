@@ -223,7 +223,7 @@ stage only sees what is left.
 
 A built base's code columns are flat canonical primitives; an adopted base
 keeps the encodings its file was written with
-([`resident_built_parts`](../core/src/store/mod.rs#L165),
+([`resident_built_parts`](../core/src/store/mod.rs#L166),
 [`with_searchable_int_children`](../core/src/store/array.rs#L278)). The stages
 below search either form in place — slice compares on canonical columns, the
 cached encoded-search probes on encoded ones. No stage decodes a column; a
@@ -470,6 +470,13 @@ unrefined (the view started as All)  AND  nothing else narrowed the view
 A deferred (`Pending`) selection is kept under the strictly stronger condition
 that additionally requires nothing to be left bound — which is why a pending
 selection always rides with a plan.
+
+One narrowing can keep it: a `keep` ([§16.3](#163-keeps)). On a key the
+resolution fixed the constraint is all or nothing; on the next key — or a
+later one that is ascending within the run because every key before it is
+constant there — it is a binary search to a sub-run, and the view carries
+the plan over that sub-run with its ids still deferred. Anything the plan
+cannot answer reads the rows and drops it.
 
 **Examples** (`SecondaryByCopy`): `(? a ? ?)` keeps its plan — the view
 started `All` and only the index narrowed it — and its ids stay pending, so
@@ -749,7 +756,7 @@ size: `{val, rid}` pairs are a fraction of a second sorted copy of every quad.
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_scan.rs#L486) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/serve.rs#L610)); unlocated: the pushed-down projected+filtered scan of the index child |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_scan.rs#L486) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/serve.rs#L701)); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
 | Dropped when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
 | Tombstones | applied through the plan's `rid` column | applied through the plan's `rid` column |
@@ -936,6 +943,8 @@ located by-copy run and a rid scan of the run otherwise.
 | 14 | tail | tail selection empty | carry unchanged |
 | 15 | tail | no equalities | every selected tail row matches |
 | 16 | tail | `typed_positions` binds every column | typed positions, else mask scan |
+| 17 | `keep`, in memory | the view is served ∧ the column is a fixed key, the next key, or ascending within the run ∧ the runs coalesce | narrow the run in place: plan kept, ids pending (or unchanged / empty) |
+| 18 | `keep`, in memory | contiguous selection ∧ `s` stamped sorted ∧ the column ascending over it (every column before it constant) ∧ a probe ∧ the searches cheaper than a pass | binary search; a range stays a range |
 
 ### Tuning constants
 
@@ -1109,7 +1118,7 @@ shape a join probe loop (one probe per left-hand row) needs.
 
 ### 16.2 Windows
 
-[`window`](../core/src/store/query/pushdown.rs#L68) is `LIMIT`/`OFFSET`: the view
+[`window`](../core/src/store/query/pushdown.rs#L71) is `LIMIT`/`OFFSET`: the view
 over `limit` rows after the first `offset`, in the order every read yields
 them — live base rows in base order, then the tail's. It folds into an exact
 row selection ([`RowSelection::window`](../core/src/store/view/selection.rs#L198)):
@@ -1124,15 +1133,15 @@ to row ids with one evaluation of the filter over the selection
 ([`matching_file_rows`](../core/src/store/scan/file_scan.rs#L300), no column
 projected), then windows those ids and drops the filter. Serve plans are
 dropped too: a window is a narrowing, and a plan's contiguous run would
-over-cover it.
+over-cover it (a keep can narrow the run itself — [§16.3](#163-keeps)).
 
-[`size_capped`](../core/src/store/query/pushdown.rs#L168) is `window(0, n).size()`
+[`size_capped`](../core/src/store/query/pushdown.rs#L171) is `window(0, n).size()`
 — `size_capped(1)` is an `ASK` that reads one row.
 
 ### 16.3 Keeps
 
-[`keep`](../core/src/store/query/pushdown.rs#L182) restricts one column by term
-code: the rows whose code lies in a [`Keep`](../core/src/store/query/pushdown.rs#L28)
+[`keep`](../core/src/store/query/pushdown.rs#L185) restricts one column by term
+code: the rows whose code lies in a [`Keep`](../core/src/store/query/pushdown.rs#L30)
 — a sorted code set, or a half-open code range. Codes are lexicographic ranks
 ([file-format.md §5](file-format.md#5-the-dictionary-child)), so a range is
 what a term prefix maps to: `prefix_range("<http://ex.org/")` is every IRI of
@@ -1140,13 +1149,19 @@ that namespace, and the N-Triples kinds are three fixed ranges (`"`, `<`,
 `_:`). A set is what a dictionary predicate scan yields ([§16.4](#164-term-predicates))
 or what a `VALUES` list encodes to.
 
-In memory the column's canonical `u32` codes are tested directly over the
-selected rows, yielding exact ids — the same loop shape as the typed
-residual filter of [§7](#7-stage-3-the-residual-filter). On a file a range
+In memory a served run narrows in place where its plan can say how
+([§6.4](#64-keeping-or-dropping-the-serve-plan)), and a contiguous selection
+of the sorted base narrows by binary search — on `s`, or on a later column
+while every column before it is constant over the selection — so a range
+stays a range and the code export stays a slice; a code set searches once
+per code while that is cheaper than a pass over the selection. Otherwise the
+column's canonical `u32` codes are tested directly over the selected rows,
+yielding exact ids — the same loop shape as the typed residual filter of
+[§7](#7-stage-3-the-residual-filter). On a file a range
 becomes a pushed-down filter (`col >= lo AND col < hi`, ANDed onto whatever
 the view carried, so the scan prunes by it) and a set is resolved to row ids
 by one ordered scan projecting only that column
-([`file_column_ids`](../core/src/store/query/pushdown.rs#L288)); tombstones and the
+([`file_column_ids`](../core/src/store/query/pushdown.rs#L353)); tombstones and the
 view's own filter stay with the reads. Keeps need every row to be
 code-addressable: they apply to the Dictionary layout only, and a view with
 an append tail (whose terms have no codes) is rejected — compact first.

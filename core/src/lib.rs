@@ -56,7 +56,7 @@ pub use error::{Result, VortexRdfError};
 pub use store::{
     BuiltArray, BuiltStream, ChunkStream, CodeForm, DictForm, DictSnapshot, DictionaryQuadSink,
     IndexType, Indexes, Keep, LayoutStrategy, META_DEFAULT_GRAPH, META_LAYOUT, META_TERM_ENCODING,
-    META_VERSION, NumOp, QuadBatches, QuadColumn, RawQuad, ResidentForm, SharedQuad,
+    META_VERSION, NumOp, QuadBatches, QuadColumn, RawQuad, ResidentForm, SharedQuad, SortOrder,
     SortedInMemoryBuilder, StoreParts, TermEncoding, TermPredicate, Verdict, VortexArrayBuilder,
     VortexRdfStore, export_rdf, quad_schema,
 };
