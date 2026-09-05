@@ -2,7 +2,7 @@
 //! native root, and materializing whole files or auxiliary children on any
 //! target. The opened-store runtime handle the store's file-backed query
 //! paths drive lives store-side, in
-//! [`store::native_file`](crate::store::native_file), beside the scan
+//! [`store::native_file`](crate::store::persist::native_file), beside the scan
 //! machinery that defines its memo semantics; the wire format itself (layout
 //! VTable, descriptors, write strategy) lives in
 //! [`container`](super::container).

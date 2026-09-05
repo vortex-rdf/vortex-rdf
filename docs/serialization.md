@@ -52,9 +52,9 @@ A builder hands these back in one of two shapes
 |---|---|---|---|
 | CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`main.rs`](../cli/src/main.rs#L36)) | out-of-core | file |
 | Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/ser.rs#L155) / [`quads_stream_to_vortex_writer`](../core/src/io/ser.rs#L95) | out-of-core | file / any `VortexWrite` |
-| Rust | [`VortexRdfStore::from_quads`](../core/src/store/mod.rs#L195), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L50) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L36) then [`VortexRdfStore::from_built`](../core/src/store/mod.rs#L257) to name the builder | either | in-memory store |
-| Rust | [`VortexRdfStore::to_bytes`](../core/src/store/serialize.rs#L146) | — (re-serializes a store) | bytes |
-| Rust | [`to_serializable_parts`](../core/src/store/serialize.rs#L125) → [`from_parts`](../core/src/store/mod.rs#L234) | — | in-memory round trip |
+| Rust | [`VortexRdfStore::from_quads`](../core/src/store/mod.rs#L185), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L50) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L36) then [`VortexRdfStore::from_built`](../core/src/store/mod.rs#L247) to name the builder | either | in-memory store |
+| Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L146) | — (re-serializes a store) | bytes |
+| Rust | [`to_serializable_parts`](../core/src/store/persist/serialize.rs#L125) → [`from_parts`](../core/src/store/mod.rs#L224) | — | in-memory round trip |
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize.rs`](../python/src/serialize.rs#L33)) | out-of-core | file |
 | Python | `VortexRdfStore(path, in_memory=True)` | — (opens, then lifts through `to_serializable_parts` → `from_parts`) | in-memory store |
 | Python | `store.to_bytes()` / `VortexRdfStore.from_bytes(data)` | — | bytes |
@@ -383,9 +383,9 @@ container.
 ## 10. Adopting a build in memory
 
 A build that is queried in place, without a file, skips the writer:
-[`from_built`](../core/src/store/mod.rs#L257) turns a `BuiltArray` into the
+[`from_built`](../core/src/store/mod.rs#L247) turns a `BuiltArray` into the
 store's resident form
-([`resident_built_parts`](../core/src/store/mod.rs#L164)):
+([`resident_built_parts`](../core/src/store/mod.rs#L154)):
 
 - the base's `u32` code columns are held as flat canonical primitives
   ([`with_canonical_int_children`](../core/src/store/array.rs#L289)): the
@@ -401,13 +401,13 @@ store's resident form
   components are only ever probed, never read as a payload, so their
   compressed form costs no read path anything;
 - the encoded-search probes over every column are resolved up front
-  ([`StructProbes::warm`](../core/src/store/probes.rs#L43)), so no query pays the
+  ([`StructProbes::warm`](../core/src/store/view/probes.rs#L43)), so no query pays the
   encoding-tree walk.
 
 What each form holds resident, and every cache a store keeps, is in
 [memory.md](memory.md).
 
-The other in-memory constructor, [`from_parts`](../core/src/store/mod.rs#L234),
+The other in-memory constructor, [`from_parts`](../core/src/store/mod.rs#L224),
 adopts a store's split parts (the bindings' round trip): it keeps each integer
 child's existing encoding wherever a probe binds it and decodes only the ones
 that decline. Opening serialized bytes in memory is
@@ -418,14 +418,14 @@ that decline. Opening serialized bytes in memory is
 ## 11. Rebuilds: mutated stores, compaction, export
 
 A store never rewrites its base to answer a mutation: appends accrete in a
-`Tail`, deletes set tombstone bits ([`mutation.rs`](../core/src/store/mutation.rs);
+`Tail`, deletes set tombstone bits ([`mutation.rs`](../core/src/store/mutation/mod.rs);
 the model is [mutations.md](mutations.md)). Serialization and compaction are
 where those layers are folded back into the three parts of
 [§1](#1-what-a-build-produces).
 
 ### 11.1 Serializing a store (`to_bytes`, `to_serializable_parts`)
 
-[`selected_parts`](../core/src/store/serialize.rs#L75) decides what a view's
+[`selected_parts`](../core/src/store/persist/serialize.rs#L75) decides what a view's
 parts are:
 
 | The view is… | Rows | Components | Dictionary |
@@ -434,28 +434,28 @@ parts are:
 | tailed, or tombstoned with indexes | live base rows + live tail rows, **re-sorted** into `(s, p, o, g)` order | **rebuilt** over the merged rows | **fresh** under Dictionary — the tail may hold terms the old dictionary never coded |
 | narrowed (a `match_pattern` result) | its selected rows only | none — its rows are renumbered, and rebuilding indexes for an arbitrary view is compaction's job | the store's own |
 
-The re-sort ([`order_for_rebuild`](../core/src/store/serialize.rs#L43)) sorts
+The re-sort ([`order_for_rebuild`](../core/src/store/persist/serialize.rs#L43)) sorts
 the small tail alone and merges it into the already-sorted base in a linear
 pass; only a base that never carried the stamp pays a full sort. The written
 artifact therefore always claims `quads_sorted` truthfully.
 
 ### 11.2 Compaction
 
-[`compact`](../core/src/store/compaction.rs#L29) /
-[`compact_with_indexes`](../core/src/store/compaction.rs#L57) gather every live
+[`compact`](../core/src/store/mutation/compaction.rs#L29) /
+[`compact_with_indexes`](../core/src/store/mutation/compaction.rs#L57) gather every live
 quad, sort, and rebuild:
 
-- **A file-backed owner stays file-backed** ([`stream_compacted_to_file`](../core/src/store/compaction.rs#L99)):
+- **A file-backed owner stays file-backed** ([`stream_compacted_to_file`](../core/src/store/mutation/compaction.rs#L99)):
   the sorted rows are streamed through `SortedStreamBuilder` — spilling beside
   the store file, not in the OS temp dir — into a sibling temp file
   `<store>.compact-<uuid>.tmp`, which is atomically renamed over the original;
   the store is then reopened with the residency budget it was opened with.
-- **An in-memory store** rebuilds through [`from_raw_quads`](../core/src/store/compaction.rs#L146)
+- **An in-memory store** rebuilds through [`from_raw_quads`](../core/src/store/mutation/compaction.rs#L146)
   (a fresh dictionary under Dictionary, components over the whole set) and
   adopts the result exactly as `from_built` does.
 
 `add_quads` compacts automatically when the tail crosses a threshold
-([`tail_needs_compaction`](../core/src/store/compaction.rs#L197)):
+([`tail_needs_compaction`](../core/src/store/mutation/compaction.rs#L197)):
 
 | Trigger | Value |
 |---|---|
@@ -465,13 +465,13 @@ quad, sort, and rebuild:
 
 Between compactions the tail accretes as chunks and is flattened once the
 accreted rows rival the flat prefix (floor 1,024) or 64 chunks pile up
-([`TAIL_FLATTEN_FLOOR`](../core/src/store/mutation.rs#L277),
-[`TAIL_MAX_CHUNKS`](../core/src/store/mutation.rs#L281)). The tail, tombstone
+([`TAIL_FLATTEN_FLOOR`](../core/src/store/mutation/mod.rs#L279),
+[`TAIL_MAX_CHUNKS`](../core/src/store/mutation/mod.rs#L283)). The tail, tombstone
 and compaction model in full is [mutations.md](mutations.md).
 
 ### 11.3 Back to RDF text
 
-The reverse direction is [`export_rdf`](../core/src/store/export.rs#L18) (the
+The reverse direction is [`export_rdf`](../core/src/store/persist/export.rs#L18) (the
 CLI's `deserialize`, the bindings' `toRdf`): N-Triples and N-Quads are written
 straight from the raw term columns — the strings *are* the serialization — while
 every other format decodes to `oxrdf` terms and drives the `oxrdfio` serializer.
@@ -505,7 +505,7 @@ every other format decodes to `oxrdf` terms and drives the `oxrdfio` serializer.
 | Index children | [`core/src/store/indexes/secondary_by_copy.rs`](../core/src/store/indexes/secondary_by_copy.rs), [`secondary_by_reference.rs`](../core/src/store/indexes/secondary_by_reference.rs), [`components.rs`](../core/src/store/indexes/components.rs) |
 | Write driver and entry points | [`core/src/io/ser.rs`](../core/src/io/ser.rs) |
 | Container write strategy, component sources, wire metadata | [`core/src/io/container/write.rs`](../core/src/io/container/write.rs), [`sources.rs`](../core/src/io/container/sources.rs), [`wire.rs`](../core/src/io/container/wire.rs) |
-| In-memory adoption, compressed-resident form | [`core/src/store/mod.rs`](../core/src/store/mod.rs), [`array.rs`](../core/src/store/array.rs), [`probes.rs`](../core/src/store/probes.rs) |
-| Serialization of mutated stores, compaction, mutation policy ([mutations.md](mutations.md)) | [`core/src/store/serialize.rs`](../core/src/store/serialize.rs), [`compaction.rs`](../core/src/store/compaction.rs), [`mutation.rs`](../core/src/store/mutation.rs) |
-| Export to RDF text | [`core/src/store/export.rs`](../core/src/store/export.rs) |
+| In-memory adoption, compressed-resident form | [`core/src/store/mod.rs`](../core/src/store/mod.rs), [`array.rs`](../core/src/store/array.rs), [`probes.rs`](../core/src/store/view/probes.rs) |
+| Serialization of mutated stores, compaction, mutation policy ([mutations.md](mutations.md)) | [`core/src/store/persist/serialize.rs`](../core/src/store/persist/serialize.rs), [`compaction.rs`](../core/src/store/mutation/compaction.rs), [`mutation.rs`](../core/src/store/mutation/mod.rs) |
+| Export to RDF text | [`core/src/store/persist/export.rs`](../core/src/store/persist/export.rs) |
 | Bindings | [`cli/src/main.rs`](../cli/src/main.rs), [`python/src/serialize.rs`](../python/src/serialize.rs), [`js/src/store.rs`](../js/src/store.rs), [`js/src/ingest.rs`](../js/src/ingest.rs), [`js/src/options.rs`](../js/src/options.rs) |

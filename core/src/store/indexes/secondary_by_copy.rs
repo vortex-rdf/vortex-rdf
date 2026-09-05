@@ -330,7 +330,7 @@ fn copy_decode_layout(layout: &ResolvedLayout) -> ResolvedLayout {
 /// to the pushed-down scan, whose filter answers regardless of sortedness.
 #[cfg(feature = "file-io")]
 pub(crate) async fn resolve_file(
-    file: &crate::store::native_file::NativeStoreFile,
+    file: &crate::store::persist::native_file::NativeStoreFile,
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
@@ -408,7 +408,7 @@ pub(crate) async fn resolve_file(
         ))
     };
     let row_ids = match &located {
-        Some(range) if crate::store::selection::point_sized(range.end - range.start) => {
+        Some(range) if crate::store::view::selection::point_sized(range.end - range.start) => {
             super::rid_point_reads(file, name, COL_RID, range.clone())
                 .await?
                 .map_or_else(deferred, ResolvedRowIds::Eager)
@@ -472,7 +472,7 @@ fn build_serve_plan(
     codes: &mut PatternCodes,
     component: &'static str,
     row_range: Option<std::ops::Range<u64>>,
-    memo: &std::sync::Arc<crate::store::native_file::BoundExprMemo>,
+    memo: &std::sync::Arc<crate::store::persist::native_file::BoundExprMemo>,
 ) -> Result<Option<FileServePlan>> {
     let mut constraints = constraints.to_vec();
     if let Some(graph) = graph {

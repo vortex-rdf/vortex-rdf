@@ -16,7 +16,7 @@ use crate::store::layouts::DictAccess;
 #[cfg(feature = "file-io")]
 use crate::store::layouts::QuadPattern;
 use crate::store::layouts::ResolvedLayout;
-use crate::store::selection::{RowSelection, ViewSelection};
+use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{QuadsSource, VortexRdfStore};
 
 pub(crate) use crate::store::mutation::{TAIL_FLATTEN_FLOOR, TAIL_MAX_CHUNKS};

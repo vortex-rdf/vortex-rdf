@@ -13,8 +13,8 @@ use crate::store::{
     QuadsSource,
     indexes::Indexes,
     layouts::{DictAccess, LayoutStrategy, ResolvedLayout, dictionary::FileBackedDict},
-    native_file::NativeStoreFile,
-    selection::ViewSelection,
+    persist::native_file::NativeStoreFile,
+    view::selection::ViewSelection,
 };
 
 use vortex_file::OpenOptionsSessionExt as _;
@@ -24,10 +24,10 @@ use std::sync::Arc;
 use vortex_array::arrays::StructArray;
 use vortex_array::{IntoArray, VortexSessionExecute};
 
-use super::VortexRdfStore;
+use crate::store::VortexRdfStore;
 
 /// What one entry of a store's component roster means to this version.
-pub(super) enum ComponentKind {
+enum ComponentKind {
     /// The required `dictionary` child (the Dictionary layout's terms).
     Dict,
     /// A known index child: the registry row carrying the identity an
@@ -44,9 +44,7 @@ pub(super) enum ComponentKind {
 /// dictionary child of an unknown implementation and of an *uninterpretable
 /// required* component: skipping one — a future change set, say — would
 /// silently change query results.
-pub(super) fn classify_component(
-    descriptor: &container::StoreComponentDescriptor,
-) -> Result<ComponentKind> {
+fn classify_component(descriptor: &container::StoreComponentDescriptor) -> Result<ComponentKind> {
     if descriptor.name == container::DICT_COMPONENT_NAME {
         if descriptor.implementation != container::DICT_IMPLEMENTATION {
             return Err(VortexRdfError::Deserialization(format!(
@@ -218,8 +216,11 @@ impl VortexRdfStore {
                     // their FSST: a file-backed store is memory-bounded by
                     // design, and its resident dictionary follows.
                     None => DictAccess::Resident(Arc::new(
-                        TermDictionary::from_child_reader(reader, super::DictForm::AsWritten)
-                            .await?,
+                        TermDictionary::from_child_reader(
+                            reader,
+                            crate::store::DictForm::AsWritten,
+                        )
+                        .await?,
                     )),
                 };
                 ResolvedLayout::Dictionary(access)
@@ -275,17 +276,17 @@ impl VortexRdfStore {
     /// borrowed slice into one. The dictionary is adopted as written (see
     /// [`from_bytes_owned_as`](Self::from_bytes_owned_as)).
     pub async fn from_bytes_owned(bytes: impl Into<vortex_buffer::ByteBuffer>) -> Result<Self> {
-        Self::from_bytes_owned_as(bytes, super::DictForm::AsWritten).await
+        Self::from_bytes_owned_as(bytes, crate::store::DictForm::AsWritten).await
     }
 
     /// [`from_bytes_owned`](Self::from_bytes_owned) with the dictionary
-    /// held in `form` (see [`DictForm`](super::DictForm)): its chunks as
+    /// held in `form` (see [`DictForm`](crate::store::DictForm)): its chunks as
     /// written — FSST windows inside the bytes, decoded one term per read —
     /// or decoded whole, once, into one canonical column that every probe,
     /// decode and Arrow export then reads in place.
     pub async fn from_bytes_owned_as(
         bytes: impl Into<vortex_buffer::ByteBuffer>,
-        form: super::DictForm,
+        form: crate::store::DictForm,
     ) -> Result<Self> {
         let file = VORTEX_SESSION
             .open_options()
@@ -348,7 +349,7 @@ impl VortexRdfStore {
                 ComponentKind::Skip => {}
             }
         }
-        let layout = super::resolved_layout(dict, quads.dtype())?;
+        let layout = crate::store::resolved_layout(dict, quads.dtype())?;
         Self::assemble_resident(quads, components, layout)
     }
 }

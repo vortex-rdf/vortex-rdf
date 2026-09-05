@@ -150,7 +150,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 On open the layout checks that the child count is `1 + components.len()`,
 that child 0 has the root's row count, and that every component child's dtype
 matches its descriptor ([`deserialize`](../core/src/io/container/layout.rs#L49));
-[`classify_component`](../core/src/store/open.rs#L47) then turns each
+[`classify_component`](../core/src/store/persist/open.rs#L47) then turns each
 descriptor into the dictionary, a known index, or a skip.
 
 ---
@@ -245,9 +245,9 @@ sum, no I/O) with a budget:
 
 | Budget | Where |
 |---|---|
-| 512 MiB | [`DICT_MAX_RESIDENT_BYTES_DEFAULT`](../core/src/store/open.rs#L108) |
+| 512 MiB | [`DICT_MAX_RESIDENT_BYTES_DEFAULT`](../core/src/store/persist/open.rs#L106) |
 | any byte count | the `VORTEX_RDF_DICT_MAX_RESIDENT_BYTES` environment variable |
-| per open | [`from_file_with_dict_residency`](../core/src/store/open.rs#L149) (`0` forces file-backed, `u64::MAX` forces resident); Python's `max_resident_bytes=` |
+| per open | [`from_file_with_dict_residency`](../core/src/store/persist/open.rs#L147) (`0` forces file-backed, `u64::MAX` forces resident); Python's `max_resident_bytes=` |
 
 - **Resident** (within budget): one scan of the child lifts it into memory,
   keeping every window FSST-compressed. Term → code is a binary search that
@@ -399,7 +399,7 @@ The pattern `(? ? ex:alice ?)` becomes: code of `<http://example.org/alice>`
 | `size()` on a pending filter | statistics and filter masks only; no row is projected |
 | `from_bytes` / `fromBytes` | everything: the quad table is scanned into memory, the subject stamp is restored from `quads_sorted`, the dictionary is lifted (decoded once to one canonical column by default in the bindings, `dictionary='plaintext'`; as written — still FSST — on request, and in the Rust `from_bytes`), and each index child is adopted by its reader with nothing read — it is scanned and canonicalized on its first use |
 
-The opened handle ([`NativeStoreFile`](../core/src/store/native_file.rs#L30))
+The opened handle ([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L30))
 keeps what repeated queries reuse: the layout reader tree (so zone-map tables
 decode once), the quad table's split ranges, one reader per component,
 per-column chunk-probe handles, memoized pruning envelopes, and bound filter
@@ -410,7 +410,7 @@ trees.
 ## 9. The in-memory twin
 
 A store in memory holds the same three pieces the file does, in the forms the
-read paths are written against ([`QuadsSource`](../core/src/store/source.rs#L36)):
+read paths are written against ([`QuadsSource`](../core/src/store/view/source.rs#L36)):
 
 | In the file | In memory |
 |---|---|
@@ -475,9 +475,9 @@ open rather than being read around.
 | row block / zone size | 8,192 rows | Vortex default write strategy |
 | data block target | ~1 MiB | Vortex default write strategy |
 | `DICT_CHUNK_ROWS` | 65,536 terms per FSST window and leaf | [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs#L46) |
-| `DICT_MAX_RESIDENT_BYTES_DEFAULT` | 512 MiB | [`open.rs`](../core/src/store/open.rs#L108) |
+| `DICT_MAX_RESIDENT_BYTES_DEFAULT` | 512 MiB | [`open.rs`](../core/src/store/persist/open.rs#L106) |
 | `PROBE_CACHE_SLOTS` | 256 | [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs#L432) |
-| `POINT_GATHER_MAX_ROWS` | 256 rows — a located run at most this wide is point-read through the chunk probes; the file-backed dictionary point-reads a batch of at most this many codes through its chunk leaves and scans a wider one | [`selection.rs`](../core/src/store/selection.rs#L338) |
+| `POINT_GATHER_MAX_ROWS` | 256 rows — a located run at most this wide is point-read through the chunk probes; the file-backed dictionary point-reads a batch of at most this many codes through its chunk leaves and scans a wider one | [`selection.rs`](../core/src/store/view/selection.rs#L338) |
 | `DEFAULT_CHUNK_ROWS` | 100,000 rows per builder chunk (a producer batch size; the writer re-blocks at 8,192) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L52) |
 
 ---
@@ -489,12 +489,12 @@ open rather than being read around.
 | Container identity, root layout vtable, component addressing | [`core/src/io/container/mod.rs`](../core/src/io/container/mod.rs), [`layout.rs`](../core/src/io/container/layout.rs) |
 | Inventory descriptors and their JSON codec | [`core/src/io/container/wire.rs`](../core/src/io/container/wire.rs) |
 | Write strategy, component sources | [`core/src/io/container/write.rs`](../core/src/io/container/write.rs), [`sources.rs`](../core/src/io/container/sources.rs) |
-| Opening files and bytes, roster interpretation, residency | [`core/src/store/open.rs`](../core/src/store/open.rs), [`core/src/io/read.rs`](../core/src/io/read.rs) |
-| The opened-file handle and its caches | [`core/src/store/native_file.rs`](../core/src/store/native_file.rs) |
+| Opening files and bytes, roster interpretation, residency | [`core/src/store/persist/open.rs`](../core/src/store/persist/open.rs), [`core/src/io/read.rs`](../core/src/io/read.rs) |
+| The opened-file handle and its caches | [`core/src/store/persist/native_file.rs`](../core/src/store/persist/native_file.rs) |
 | Primary column names | [`core/src/store/schema.rs`](../core/src/store/schema.rs), [`layouts/typed_object.rs`](../core/src/store/layouts/typed_object.rs) |
 | Term dictionary: storage, FSST windows, residency, file-backed reads | [`core/src/store/layouts/dictionary/term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`access.rs`](../core/src/store/layouts/dictionary/access.rs), [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs) |
 | Index children: schemas, sort orders, registry, adoption | [`core/src/store/indexes/secondary_by_copy.rs`](../core/src/store/indexes/secondary_by_copy.rs), [`secondary_by_reference.rs`](../core/src/store/indexes/secondary_by_reference.rs), [`components.rs`](../core/src/store/indexes/components.rs) |
 | Chunk probes over wire-encoded leaves | [`encoded-search/src/layout.rs`](../encoded-search/src/layout.rs), [`lib.rs`](../encoded-search/src/lib.rs) |
 | Locating and point-reading index runs on file | [`core/src/store/indexes/row_ids.rs`](../core/src/store/indexes/row_ids.rs), [`scan/gather.rs`](../core/src/store/scan/gather.rs) |
-| In-memory forms: canonical and encoded columns, probes, the live canonical cache, view state | [`core/src/store/array.rs`](../core/src/store/array.rs), [`canonical.rs`](../core/src/store/canonical.rs), [`probes.rs`](../core/src/store/probes.rs), [`source.rs`](../core/src/store/source.rs) |
+| In-memory forms: canonical and encoded columns, probes, the live canonical cache, view state | [`core/src/store/array.rs`](../core/src/store/array.rs), [`canonical.rs`](../core/src/store/view/canonical.rs), [`probes.rs`](../core/src/store/view/probes.rs), [`source.rs`](../core/src/store/view/source.rs) |
 | Session: registered encodings and zone aggregates | [`core/src/session.rs`](../core/src/session.rs) |

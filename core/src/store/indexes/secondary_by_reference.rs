@@ -208,7 +208,7 @@ pub(crate) fn resolve_in_memory(
 /// the primary columns (point reads of their own, for a small id set).
 #[cfg(feature = "file-io")]
 pub(crate) async fn resolve_file(
-    file: &crate::store::native_file::NativeStoreFile,
+    file: &crate::store::persist::native_file::NativeStoreFile,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
 ) -> Result<IndexResolution<FileServePlan>> {
@@ -231,7 +231,7 @@ pub(crate) async fn resolve_file(
         }
         // The located range is exactly this index's matched rows: the value
         // column is the one and only constraint.
-        let row_ids = if crate::store::selection::point_sized(range.end - range.start) {
+        let row_ids = if crate::store::view::selection::point_sized(range.end - range.start) {
             super::rid_point_reads(file, name, COL_RID, range.clone()).await?
         } else {
             Some(
@@ -294,7 +294,7 @@ enum Located<'a> {
 /// shared front half of [`resolve_file`] and the test hook `debug_located_run`.
 #[cfg(feature = "file-io")]
 async fn locate<'a>(
-    file: &crate::store::native_file::NativeStoreFile,
+    file: &crate::store::persist::native_file::NativeStoreFile,
     pattern: QuadPattern<'a>,
     codes: &mut PatternCodes,
 ) -> Result<Located<'a>> {
@@ -329,7 +329,7 @@ async fn locate<'a>(
 /// from results.
 #[cfg(all(test, feature = "file-io"))]
 pub(crate) async fn debug_located_run(
-    file: &crate::store::native_file::NativeStoreFile,
+    file: &crate::store::persist::native_file::NativeStoreFile,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
 ) -> Result<Option<Range<u64>>> {

@@ -9,16 +9,16 @@ use vortex_array::ArrayRef;
 use vortex_mask::Mask;
 
 use crate::error::Result;
-use crate::store::canonical::LiveCanonical;
 use crate::store::indexes::{InMemoryServePlan, IndexComponent};
-use crate::store::probes::StructProbes;
 use crate::store::scan::gather::gather_live;
-use crate::store::selection::{RowSelection, ViewSelection};
+use crate::store::view::canonical::LiveCanonical;
+use crate::store::view::probes::StructProbes;
+use crate::store::view::selection::{RowSelection, ViewSelection};
 
 #[cfg(feature = "file-io")]
 use crate::store::indexes::FileServePlan;
 #[cfg(feature = "file-io")]
-use crate::store::native_file::NativeStoreFile;
+use crate::store::persist::native_file::NativeStoreFile;
 #[cfg(feature = "file-io")]
 use std::path::PathBuf;
 #[cfg(feature = "file-io")]

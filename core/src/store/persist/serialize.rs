@@ -18,7 +18,7 @@ use vortex_array::ArrayRef;
 
 #[cfg(feature = "file-io")]
 use super::open::scanned_index_components;
-use super::{StoreParts, VortexRdfStore};
+use crate::store::{StoreParts, VortexRdfStore};
 
 /// What [`VortexRdfStore::selected_parts`] yields: the rows, the index
 /// components addressing them, the fresh dictionary of a re-encoded

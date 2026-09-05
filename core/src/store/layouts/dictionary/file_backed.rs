@@ -2,7 +2,7 @@
 //! dictionary left in its serialized child, read on demand. Probes and
 //! decodes point-read the child's wire-encoded chunk leaves
 //! ([`TermChunks`]), so a dictionary whose child cannot be point-read is not
-//! file-backed at all — [`store::open`](crate::store::open) hands that shape
+//! file-backed at all — [`store::open`](crate::store::persist::open) hands that shape
 //! to the resident arm instead. The policy enum choosing between this and
 //! the resident form is [`DictAccess`](super::access::DictAccess); the whole
 //! module only compiles with `file-io`, since without a file there is
@@ -27,8 +27,8 @@ use crate::error::{Result, VortexRdfError};
 use crate::io::container::DICT_COMPONENT_NAME;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{StrColReader, buf_as_str};
-use crate::store::native_file::NativeStoreFile;
-use crate::store::selection::POINT_GATHER_MAX_ROWS;
+use crate::store::persist::native_file::NativeStoreFile;
+use crate::store::view::selection::POINT_GATHER_MAX_ROWS;
 
 use super::check_code;
 use super::term_dict::{

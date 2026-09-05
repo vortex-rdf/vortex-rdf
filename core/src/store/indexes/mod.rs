@@ -188,7 +188,7 @@ impl IndexType {
     #[cfg(feature = "file-io")]
     pub(crate) async fn resolve_file(
         self,
-        file: &crate::store::native_file::NativeStoreFile,
+        file: &crate::store::persist::native_file::NativeStoreFile,
         layout: &ResolvedLayout,
         pattern: QuadPattern<'_>,
         codes: &mut PatternCodes,
@@ -246,7 +246,7 @@ impl ResolvedRoles {
 /// resolutions, `FileServePlan` for file ones), so a resolution can only ever
 /// hand the store a plan its own backend can execute.
 ///
-/// [`RowSelection`]: crate::store::selection::RowSelection
+/// [`RowSelection`]: crate::store::view::selection::RowSelection
 // `Resolved` dwarfs the dataless `Declined`, but the enum is a transient
 // per-match return value that is destructured immediately and never stored
 // in bulk.
@@ -333,7 +333,7 @@ enum LazyRowIdSource {
         /// The owning file handle's bind memo and this child's scope tag —
         /// so the deferred scan binds with the same identity every plan and
         /// eager scan of this component uses (see `BoundExprMemo`).
-        memo: Arc<crate::store::native_file::BoundExprMemo>,
+        memo: Arc<crate::store::persist::native_file::BoundExprMemo>,
         scope: &'static str,
     },
 }
@@ -360,7 +360,7 @@ impl LazyRowIds {
         reader: vortex_layout::LayoutReaderRef,
         constraints: Vec<(&'static str, Scalar)>,
         rid_column: &'static str,
-        memo: Arc<crate::store::native_file::BoundExprMemo>,
+        memo: Arc<crate::store::persist::native_file::BoundExprMemo>,
         scope: &'static str,
     ) -> Self {
         Self {
@@ -508,7 +508,7 @@ pub(crate) fn resolve_indexes_in_memory(
 #[cfg(feature = "file-io")]
 pub(crate) async fn resolve_indexes_file(
     indexes: &[IndexType],
-    file: &crate::store::native_file::NativeStoreFile,
+    file: &crate::store::persist::native_file::NativeStoreFile,
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,

@@ -1,13 +1,15 @@
 //! Mutations: appends accrete in the tail and deletes tombstone, so the base
 //! — its row ids, indexes, and file handle — is never rewritten in place.
 
+mod compaction;
+
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::builders::build_struct_array;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_scan;
-use crate::store::selection::RowSelection;
+use crate::store::view::selection::RowSelection;
 use crate::store::{QuadsSource, Tail};
 
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};

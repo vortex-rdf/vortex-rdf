@@ -25,10 +25,10 @@ use vortex_scan::strict_sorted_buffer::StrictSortedBuffer;
 use crate::error::{Result, VortexRdfError};
 use crate::io::read::available_parallelism;
 use crate::store::layouts::{Constraints, PatternCodes, QuadPattern, TermRef};
-use crate::store::native_file::NativeStoreFile;
+use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::scan::gather::primitive_from_u64_reads;
 use crate::store::schema;
-use crate::store::selection::RowSelection;
+use crate::store::view::selection::RowSelection;
 
 /// The bind-memo scope tag for expressions over the quad table's schema
 /// (the transparent root the file scan reads).

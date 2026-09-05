@@ -47,7 +47,7 @@ pub(crate) fn eq_conjunction(
 /// value columns), or a column whose chunks resolve no probe.
 #[cfg(feature = "file-io")]
 pub(crate) async fn locate_component_run(
-    file: &crate::store::native_file::NativeStoreFile,
+    file: &crate::store::persist::native_file::NativeStoreFile,
     component: &str,
     column: &str,
     native: &Scalar,
@@ -82,7 +82,7 @@ pub(crate) async fn locate_component_run(
 /// columns.
 #[cfg(feature = "file-io")]
 pub(crate) async fn rid_point_reads(
-    file: &crate::store::native_file::NativeStoreFile,
+    file: &crate::store::persist::native_file::NativeStoreFile,
     component: &str,
     rid_column: &str,
     range: Range<u64>,
@@ -161,7 +161,7 @@ pub(crate) async fn scan_index_row_ids(
     reader: vortex_layout::LayoutReaderRef,
     value_constraints: &[(&'static str, Scalar)],
     rid_column: &'static str,
-    memo: &crate::store::native_file::BoundExprMemo,
+    memo: &crate::store::persist::native_file::BoundExprMemo,
     scope: &'static str,
 ) -> Result<Buffer<u64>> {
     // Every index probes at least one value column; an empty constraint set
@@ -194,7 +194,7 @@ pub(crate) async fn scan_located_row_ids(
     reader: vortex_layout::LayoutReaderRef,
     rid_column: &'static str,
     range: Range<u64>,
-    memo: &crate::store::native_file::BoundExprMemo,
+    memo: &crate::store::persist::native_file::BoundExprMemo,
     scope: &'static str,
 ) -> Result<Buffer<u64>> {
     read_scanned_row_ids(
@@ -211,7 +211,7 @@ pub(crate) async fn scan_located_row_ids(
 fn rid_scan(
     reader: vortex_layout::LayoutReaderRef,
     rid_column: &'static str,
-    memo: &crate::store::native_file::BoundExprMemo,
+    memo: &crate::store::persist::native_file::BoundExprMemo,
     scope: &'static str,
 ) -> Result<vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>> {
     let projection = memo
@@ -259,7 +259,7 @@ pub(crate) async fn resolve_eager_from_scan(
     constraints: &[(&'static str, Scalar)],
     rid_column: &'static str,
     resolves: ResolvedRoles,
-    memo: &crate::store::native_file::BoundExprMemo,
+    memo: &crate::store::persist::native_file::BoundExprMemo,
     scope: &'static str,
 ) -> Result<IndexResolution<FileServePlan>> {
     let row_ids = scan_index_row_ids(reader, constraints, rid_column, memo, scope).await?;

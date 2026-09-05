@@ -14,6 +14,8 @@
 //! ([`schema::PRIMARY_COLUMNS`](crate::store::schema)); the Arrow schema
 //! restates them, it does not define them.
 
+mod batches;
+
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;

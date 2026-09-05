@@ -149,7 +149,7 @@ fn adopt_deferred(
             cell: OnceLock::new(),
         })),
         sorted,
-        probes: crate::store::probes::StructProbes::new(),
+        probes: crate::store::view::probes::StructProbes::new(),
     })
 }
 
@@ -185,7 +185,7 @@ pub(crate) struct IndexComponent {
     /// serve path's point reads). The rows are immutable once materialized,
     /// so the cache's array-identity guard holds for the component's
     /// lifetime; [`rebuilt`](Self::rebuilt) takes a fresh cache.
-    probes: Arc<crate::store::probes::StructProbes>,
+    probes: Arc<crate::store::view::probes::StructProbes>,
 }
 
 /// How an [`IndexComponent`] holds its rows.
@@ -235,7 +235,7 @@ impl IndexComponent {
             slug,
             rows: ComponentRows::Built(array),
             sorted,
-            probes: crate::store::probes::StructProbes::new(),
+            probes: crate::store::view::probes::StructProbes::new(),
         }
     }
 
@@ -335,7 +335,7 @@ impl IndexComponent {
         let array = into_struct_array(transform(rows)?)?;
         Ok(Self {
             rows: ComponentRows::Built(array),
-            probes: crate::store::probes::StructProbes::new(),
+            probes: crate::store::view::probes::StructProbes::new(),
             ..self
         })
     }
@@ -381,7 +381,7 @@ impl IndexComponent {
 
     /// The component's shared probe cache, for a serve plan that outlives
     /// this reference.
-    pub(crate) fn probes_arc(&self) -> Arc<crate::store::probes::StructProbes> {
+    pub(crate) fn probes_arc(&self) -> Arc<crate::store::view::probes::StructProbes> {
         Arc::clone(&self.probes)
     }
 
@@ -391,7 +391,7 @@ impl IndexComponent {
     /// is left alone: materializing it here would undo the deferral that
     /// `from_bytes` adoption exists for.
     ///
-    /// [`StructProbes::warm`]: crate::store::probes::StructProbes::warm
+    /// [`StructProbes::warm`]: crate::store::view::probes::StructProbes::warm
     pub(crate) fn warm_probes(&self) {
         if matches!(self.rows, ComponentRows::Deferred(_)) {
             return;

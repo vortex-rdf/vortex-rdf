@@ -10,7 +10,7 @@ use crate::store::builders::{DEFAULT_CHUNK_ROWS, build_parts_from_raws};
 use crate::store::indexes::{Indexes, unique_indexes};
 use crate::store::layouts::LayoutStrategy;
 
-use super::VortexRdfStore;
+use crate::store::VortexRdfStore;
 
 impl VortexRdfStore {
     // ── compaction ───────────────────────────────────────────────────────────
@@ -150,10 +150,10 @@ impl VortexRdfStore {
         sorted: bool,
     ) -> Result<Self> {
         let (base, components, dict) = build_parts_from_raws(raws, strategy, &indexes, sorted)?;
-        let layout = super::resolved_layout(dict, base.dtype())?;
+        let layout = crate::store::resolved_layout(dict, base.dtype())?;
         // Compress like every other construction — a compacted store carries
         // the same resident form a freshly built one does.
-        let (base, components) = super::resident_built_parts(base, components)?;
+        let (base, components) = crate::store::resident_built_parts(base, components)?;
         Self::assemble_resident(base, components, layout)
     }
 

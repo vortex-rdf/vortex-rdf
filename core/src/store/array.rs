@@ -274,7 +274,7 @@ fn decode_int_children(rows: ArrayRef, decode: impl Fn(&ArrayRef) -> bool) -> Re
 /// default write strategy, so the wire format is unaffected.
 ///
 /// Code reads over the encoded children go through the base's live
-/// canonical cache ([`LiveCanonical`](crate::store::canonical::LiveCanonical)).
+/// canonical cache ([`LiveCanonical`](crate::store::view::canonical::LiveCanonical)).
 pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
     decode_int_children(rows, |child| {
         vortex_rdf_encoded_search::SortedProbe::resolve(child).is_none()

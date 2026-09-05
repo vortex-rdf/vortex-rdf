@@ -3,28 +3,18 @@
 pub(crate) mod array;
 pub(crate) mod arrow;
 pub(crate) mod builders;
-pub(crate) mod canonical;
 pub(crate) mod indexes;
 pub(crate) mod layouts;
-#[cfg(feature = "file-io")]
-pub(crate) mod native_file;
-pub(crate) mod probes;
 pub(crate) mod scan;
 pub(crate) mod schema;
-pub(crate) mod selection;
-pub(crate) mod source;
+pub(crate) mod view;
 
-// [`VortexRdfStore`]'s impl clusters — the struct itself is defined below.
-mod batches;
-mod compaction;
-mod export;
-mod matching;
+// [`VortexRdfStore`]'s impl clusters, by topic — the struct itself is defined
+// below.
 mod mutation;
-mod open;
-mod pushdown;
-mod rows;
-mod serialize;
-mod streaming;
+pub(crate) mod persist;
+mod query;
+mod read;
 #[cfg(test)]
 pub(crate) mod test_hooks;
 
@@ -35,7 +25,7 @@ pub use arrow::{
 pub use builders::{
     BuiltArray, BuiltStream, ChunkStream, SortedInMemoryBuilder, VortexArrayBuilder,
 };
-pub use export::export_rdf;
+pub use persist::export_rdf;
 // Compiled out on wasm along with the rest of the sorted-stream builder's
 // out-of-core merge (see the module gate in `builders`).
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -44,20 +34,20 @@ pub use indexes::{IndexType, Indexes};
 pub use layouts::LayoutStrategy;
 pub use layouts::dictionary::DictionaryQuadSink;
 pub use layouts::dictionary::{DictForm, DictSnapshot, NumOp, TermPredicate, Verdict};
-pub use pushdown::Keep;
+pub use query::pushdown::Keep;
 // `RawQuad` lives in `common` (it is pure RDF text — see that module's
 // charter); this re-export makes `store::RawQuad` the path builder consumers
 // use.
 pub use crate::common::quad::{RawQuad, SharedQuad};
 
-pub(crate) use source::{QuadsSource, Tail};
+pub(crate) use view::source::{QuadsSource, Tail};
 
 use indexes::IndexComponent;
 
 use crate::error::{Result, VortexRdfError};
 use layouts::dictionary::TermDictionary;
 use layouts::{DictAccess, ResolvedLayout};
-use selection::{RowSelection, ViewSelection};
+use view::selection::{RowSelection, ViewSelection};
 
 use std::iter;
 use std::sync::Arc;
@@ -220,7 +210,7 @@ impl VortexRdfStore {
     /// every index component is materialized into the same resident form, so
     /// its sorted probes bind directly too. Code reads over the encoded
     /// columns go through the base's live canonical cache
-    /// ([`LiveCanonical`](canonical::LiveCanonical)): decoded on demand,
+    /// ([`LiveCanonical`](view::canonical::LiveCanonical)): decoded on demand,
     /// shared while held, freed with the last holder.
     ///
     /// The array's statistics are trusted as provenance: an `IsSorted` stamp
@@ -280,7 +270,7 @@ impl VortexRdfStore {
         let indexes = crate::store::indexes::indexes_from_components(&components);
         // Resolve the encoded-search probes at construction, so no query pays
         // the encoding-tree walk.
-        let store_probes = probes::StructProbes::new();
+        let store_probes = view::probes::StructProbes::new();
         store_probes.warm(&base);
         for component in components.iter() {
             component.warm_probes();
@@ -294,7 +284,7 @@ impl VortexRdfStore {
                 components,
                 deleted: None,
                 probes: store_probes,
-                canonical: canonical::LiveCanonical::new(),
+                canonical: view::canonical::LiveCanonical::new(),
                 serve: None,
             },
             tail: None,
@@ -324,8 +314,8 @@ impl VortexRdfStore {
                 selection: ViewSelection::all(),
                 components: Arc::from(Vec::new()),
                 deleted: None,
-                probes: probes::StructProbes::new(),
-                canonical: canonical::LiveCanonical::new(),
+                probes: view::probes::StructProbes::new(),
+                canonical: view::canonical::LiveCanonical::new(),
                 serve: None,
             },
             tail: None,

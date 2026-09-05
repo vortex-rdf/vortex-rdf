@@ -9,7 +9,7 @@ use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 use crate::store::scan::file_scan;
 use crate::store::scan::gather::gather_live;
 #[cfg(feature = "file-io")]
-use crate::store::selection::point_sized;
+use crate::store::view::selection::point_sized;
 use crate::store::{QuadsSource, RawQuad, SharedQuad};
 
 #[cfg(feature = "file-io")]
@@ -23,7 +23,7 @@ use vortex_array::ArrayRef;
 #[cfg(feature = "file-io")]
 use vortex_layout::scan::scan_builder::ScanBuilder;
 
-use super::VortexRdfStore;
+use crate::store::VortexRdfStore;
 
 impl VortexRdfStore {
     // ── quads streaming ───────────────────────────────────────────────────────
@@ -287,7 +287,7 @@ impl VortexRdfStore {
     /// read locality, and this stream's consumers are order-insignificant
     /// line formats — the restricted scan answers every file view with the
     /// same quads in base row order.
-    pub(super) async fn raw_quad_chunks(
+    pub(crate) async fn raw_quad_chunks(
         &self,
     ) -> Result<Box<dyn Stream<Item = Vec<Result<RawQuad>>> + Unpin + Send + '_>> {
         // Tail rows are in memory and few: decode them eagerly, to be

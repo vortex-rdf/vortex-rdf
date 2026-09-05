@@ -20,7 +20,7 @@ use crate::store::array::{canonical_u32, into_struct_array};
 use crate::store::arrow::QuadColumn;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_scan;
-use crate::store::selection::{RowSelection, ViewSelection};
+use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{LayoutStrategy, QuadsSource, VortexRdfStore};
 
 /// A term-code constraint on one quad column, for [`VortexRdfStore::keep`].
@@ -287,7 +287,7 @@ impl VortexRdfStore {
     #[cfg(feature = "file-io")]
     async fn file_column_ids(
         &self,
-        file: &crate::store::native_file::NativeStoreFile,
+        file: &crate::store::persist::native_file::NativeStoreFile,
         selection: &RowSelection,
         column: QuadColumn,
         keep: &Keep,

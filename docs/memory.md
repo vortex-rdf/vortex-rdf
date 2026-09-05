@@ -20,9 +20,9 @@ is fixed by its provenance:
 
 | Form | Comes from | The base | Index components | Dictionary |
 |---|---|---|---|---|
-| **Built** | [`from_quads`](../core/src/store/mod.rs#L195), [`from_built`](../core/src/store/mod.rs#L257), compaction's rebuild ([`from_raw_quads`](../core/src/store/compaction.rs#L146)) | one struct whose `u32` code columns are flat canonical primitives ([`with_canonical_int_children`](../core/src/store/array.rs#L289)) | compressed into probe-supported encodings — `Constant`, `RunEnd`, bit-packed ([`with_compressed_int_children`](../core/src/store/array.rs#L311)) | one canonical `string_view` column, as the builder froze it ([`from_sorted_column`](../core/src/store/layouts/dictionary/term_dict.rs#L350)); FSST windows are made at write ([`fsst_windows`](../core/src/store/layouts/dictionary/term_dict.rs#L452)) |
-| **Adopted** | [`from_bytes`](../core/src/store/open.rs#L264), [`from_parts`](../core/src/store/mod.rs#L234) — the bindings' `in_memory=True` / `fromBytes` | the writer's own encodings, as refcounted views into the file bytes ([`with_searchable_int_children`](../core/src/store/array.rs#L278)) | `from_parts`: the writer's encodings, made probeable ([`into_searchable`](../core/src/store/indexes/components.rs#L352)); `from_bytes`: deferred, un-executed until first use | decoded once into one canonical column — the bindings' default, `dictionary='plaintext'` — or, as written, the FSST chunks inside the bytes, anything else canonicalized ([`DictForm`](../core/src/store/layouts/dictionary/term_dict.rs#L88)) |
-| **File-backed** | [`from_file`](../core/src/store/open.rs#L132) | nothing resident — every read scans the file and is transient (the file is opened with no decoded-data cache) | on disk, resolved through pushed-down scans and cached chunk probes | resident, or left in the file and point-read by leaf when it outweighs the residency budget |
+| **Built** | [`from_quads`](../core/src/store/mod.rs#L185), [`from_built`](../core/src/store/mod.rs#L247), compaction's rebuild ([`from_raw_quads`](../core/src/store/mutation/compaction.rs#L146)) | one struct whose `u32` code columns are flat canonical primitives ([`with_canonical_int_children`](../core/src/store/array.rs#L289)) | compressed into probe-supported encodings — `Constant`, `RunEnd`, bit-packed ([`with_compressed_int_children`](../core/src/store/array.rs#L311)) | one canonical `string_view` column, as the builder froze it ([`from_sorted_column`](../core/src/store/layouts/dictionary/term_dict.rs#L350)); FSST windows are made at write ([`fsst_windows`](../core/src/store/layouts/dictionary/term_dict.rs#L452)) |
+| **Adopted** | [`from_bytes`](../core/src/store/persist/open.rs#L265), [`from_parts`](../core/src/store/mod.rs#L224) — the bindings' `in_memory=True` / `fromBytes` | the writer's own encodings, as refcounted views into the file bytes ([`with_searchable_int_children`](../core/src/store/array.rs#L278)) | `from_parts`: the writer's encodings, made probeable ([`into_searchable`](../core/src/store/indexes/components.rs#L352)); `from_bytes`: deferred, un-executed until first use | decoded once into one canonical column — the bindings' default, `dictionary='plaintext'` — or, as written, the FSST chunks inside the bytes, anything else canonicalized ([`DictForm`](../core/src/store/layouts/dictionary/term_dict.rs#L88)) |
+| **File-backed** | [`from_file`](../core/src/store/persist/open.rs#L130) | nothing resident — every read scans the file and is transient (the file is opened with no decoded-data cache) | on disk, resolved through pushed-down scans and cached chunk probes | resident, or left in the file and point-read by leaf when it outweighs the residency budget |
 
 The rule behind the split is provenance, not policy. Where the store makes
 the columns itself they are canonical, because that is what every code
@@ -107,15 +107,15 @@ that builds a new base starts with empty caches.
 
 | Slot | Holds | Filled by | Bound | Lifetime |
 |---|---|---|---|---|
-| [`StructProbes`](../core/src/store/probes.rs#L19) | one resolved encoded-search probe per base column — the walk of the column's encoding tree, and per chunk the memoized first and last values ([`Chunk`](../encoded-search/src/node.rs#L72)) | construction ([`warm`](../core/src/store/probes.rs#L43)); the chunk extremes on the first bounds search that touches them | a few words per column and per chunk | the base; a fresh base takes a fresh cache |
-| [`LiveCanonical`](../core/src/store/canonical.rs#L25) | the canonical `u32` form of an encoded base's code columns, one weak slot per column | a contiguous wide code read, or `keep`, over an adopted base ([`code_columns_shared`](../core/src/store/rows.rs#L238)) | 4 B/row per column, and only while some reader holds a buffer of it — every buffer handed out, and every slice of one, holds the decoded column; it is freed with the last of them, in Rust or across the C Data Interface alike | what its holders decide; never the base's. A built base never fills it |
+| [`StructProbes`](../core/src/store/view/probes.rs#L19) | one resolved encoded-search probe per base column — the walk of the column's encoding tree, and per chunk the memoized first and last values ([`Chunk`](../encoded-search/src/node.rs#L72)) | construction ([`warm`](../core/src/store/view/probes.rs#L43)); the chunk extremes on the first bounds search that touches them | a few words per column and per chunk | the base; a fresh base takes a fresh cache |
+| [`LiveCanonical`](../core/src/store/view/canonical.rs#L25) | the canonical `u32` form of an encoded base's code columns, one weak slot per column | a contiguous wide code read, or `keep`, over an adopted base ([`code_columns_shared`](../core/src/store/read/rows.rs#L238)) | 4 B/row per column, and only while some reader holds a buffer of it — every buffer handed out, and every slice of one, holds the decoded column; it is freed with the last of them, in Rust or across the C Data Interface alike | what its holders decide; never the base's. A built base never fills it |
 | tombstones (`deleted`) | one bit per base row | the first delete | 1 bit/row | the base, until compaction |
 
 ### 3.3 Views
 
 | Slot | Holds | Filled by | Bound | Lifetime |
 |---|---|---|---|---|
-| [`LazyRowIds`](../core/src/store/indexes/mod.rs#L313) (a [`ViewSelection::Pending`](../core/src/store/selection.rs#L49)) | the exact base row ids of an index-served match | the first consumer that needs exact ids — a base-order read, a count under tombstones, a chained match, a delete; never by iterating the served rows | 8 B per matched row | the view and its clones |
+| [`LazyRowIds`](../core/src/store/indexes/mod.rs#L313) (a [`ViewSelection::Pending`](../core/src/store/view/selection.rs#L49)) | the exact base row ids of an index-served match | the first consumer that needs exact ids — a base-order read, a count under tombstones, a chained match, a delete; never by iterating the served rows | 8 B per matched row | the view and its clones |
 | [`FileServePlan::bound`](../core/src/store/indexes/serve.rs#L370) | the plan's bound projection and filter | the first read through the plan | two expression trees | the view |
 
 ### 3.4 The dictionary
@@ -138,7 +138,7 @@ that builds a new base starts with empty caches.
 ### 3.6 The file handle
 
 Shared by every view over a file-backed store
-([`NativeStoreFile`](../core/src/store/native_file.rs#L30)); a compaction
+([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L30)); a compaction
 reopens the file and starts afresh.
 
 | Slot | Holds | Filled by | Bound | Lifetime |
@@ -146,7 +146,7 @@ reopens the file and starts afresh.
 | `child_readers` | one Vortex layout reader per child (`quad-source`, `dictionary`, `index:*`) | the first scan of that child | Vortex's per-reader state: the layout tree, and the pruning statistics and evaluation caches it keys by bound-expression identity | the handle |
 | `splits` | the root's scan splits | the first scan | one range per split | the handle |
 | `column_chunks` ([`ColumnChunks`](../encoded-search/src/layout.rs#L89)) | per (child, column), the column's chunk leaves; per leaf, the wire-encoded chunk and its resolved probe ([`ChunkLeaf`](../encoded-search/src/layout.rs#L74)), and the values leaf a dictionary-encoded run shares ([`DictValues`](../encoded-search/src/layout.rs#L41)) | a subject or index probe, a point read: the leaves the bisection touches | up to the column's compressed size, if every leaf is touched | the handle |
-| [`BoundExprMemo`](../core/src/store/native_file.rs#L71) | bound filter and projection expressions, keyed by shape and schema | every pushed-down filter and projection | [`BIND_MEMO_MAX`](../core/src/store/native_file.rs#L75) = 4096 entries; the map is cleared wholesale past it | the handle |
+| [`BoundExprMemo`](../core/src/store/persist/native_file.rs#L71) | bound filter and projection expressions, keyed by shape and schema | every pushed-down filter and projection | [`BIND_MEMO_MAX`](../core/src/store/persist/native_file.rs#L75) = 4096 entries; the map is cleared wholesale past it | the handle |
 | segment cache | none — the file is opened with Vortex's no-op segment cache, so decoded data is never retained between reads | | | |
 
 ### 3.7 Index components
@@ -154,7 +154,7 @@ reopens the file and starts afresh.
 | Slot | Holds | Filled by | Bound | Lifetime |
 |---|---|---|---|---|
 | [`DeferredRows`](../core/src/store/indexes/components.rs#L206) | the rows of a component adopted un-executed by `from_bytes`, in searchable form | the first query routed to that index | the component's size: a full quad copy for `secondary-by-copy`, `{val, rid}` pairs for `secondary-by-reference` | the store |
-| a component's [`StructProbes`](../core/src/store/probes.rs#L19) | as [§3.2](#32-the-in-memory-base), over the component's columns | construction, or the deferred materialization | a few words per column and chunk | the store |
+| a component's [`StructProbes`](../core/src/store/view/probes.rs#L19) | as [§3.2](#32-the-in-memory-base), over the component's columns | construction, or the deferred materialization | a few words per column and chunk | the store |
 
 ## 4. Keeping memory bounded
 
@@ -186,12 +186,12 @@ reopens the file and starts afresh.
 
 | Concern | Where |
 |---|---|
-| The resident forms: canonical base, compressed components, encoded adoption | [`core/src/store/array.rs`](../core/src/store/array.rs), [`mod.rs`](../core/src/store/mod.rs) ([`resident_built_parts`](../core/src/store/mod.rs#L164), [`from_parts`](../core/src/store/mod.rs#L234)) |
-| The live canonical form of an encoded base | [`core/src/store/canonical.rs`](../core/src/store/canonical.rs), [`rows.rs`](../core/src/store/rows.rs) ([`code_columns`](../core/src/store/rows.rs#L186), [`code_columns_shared`](../core/src/store/rows.rs#L238), [`code_columns_gathered`](../core/src/store/rows.rs#L297)) |
+| The resident forms: canonical base, compressed components, encoded adoption | [`core/src/store/array.rs`](../core/src/store/array.rs), [`mod.rs`](../core/src/store/mod.rs) ([`resident_built_parts`](../core/src/store/mod.rs#L154), [`from_parts`](../core/src/store/mod.rs#L224)) |
+| The live canonical form of an encoded base | [`core/src/store/view/canonical.rs`](../core/src/store/view/canonical.rs), [`rows.rs`](../core/src/store/read/rows.rs) ([`code_columns`](../core/src/store/read/rows.rs#L186), [`code_columns_shared`](../core/src/store/read/rows.rs#L238), [`code_columns_gathered`](../core/src/store/read/rows.rs#L297)) |
 | Point reads and gathers | [`core/src/store/scan/gather.rs`](../core/src/store/scan/gather.rs) ([`gather_by_point_reads`](../core/src/store/scan/gather.rs#L51)) |
-| Probes | [`core/src/store/probes.rs`](../core/src/store/probes.rs), [`encoded-search/src/node.rs`](../encoded-search/src/node.rs) |
-| Deferred row ids and serve plans | [`core/src/store/indexes/mod.rs`](../core/src/store/indexes/mod.rs), [`serve.rs`](../core/src/store/indexes/serve.rs), [`selection.rs`](../core/src/store/selection.rs) |
+| Probes | [`core/src/store/view/probes.rs`](../core/src/store/view/probes.rs), [`encoded-search/src/node.rs`](../encoded-search/src/node.rs) |
+| Deferred row ids and serve plans | [`core/src/store/indexes/mod.rs`](../core/src/store/indexes/mod.rs), [`serve.rs`](../core/src/store/indexes/serve.rs), [`selection.rs`](../core/src/store/view/selection.rs) |
 | The dictionary's caches | [`core/src/store/layouts/dictionary/term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs) |
-| The file handle's caches | [`core/src/store/native_file.rs`](../core/src/store/native_file.rs), [`encoded-search/src/layout.rs`](../encoded-search/src/layout.rs) |
+| The file handle's caches | [`core/src/store/persist/native_file.rs`](../core/src/store/persist/native_file.rs), [`encoded-search/src/layout.rs`](../encoded-search/src/layout.rs) |
 | Deferred components | [`core/src/store/indexes/components.rs`](../core/src/store/indexes/components.rs) |
-| Tests | [`core/src/tests/resident.rs`](../core/src/tests/resident.rs) (what each form decodes, shares and frees), [`core/src/store/canonical.rs`](../core/src/store/canonical.rs) (the weak slot), [`python/tests/test_arrow.py`](../python/tests/test_arrow.py) (sharing across the PyCapsule boundary) |
+| Tests | [`core/src/tests/resident.rs`](../core/src/tests/resident.rs) (what each form decodes, shares and frees), [`core/src/store/view/canonical.rs`](../core/src/store/view/canonical.rs) (the weak slot), [`python/tests/test_arrow.py`](../python/tests/test_arrow.py) (sharing across the PyCapsule boundary) |

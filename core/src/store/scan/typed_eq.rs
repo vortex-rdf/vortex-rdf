@@ -12,7 +12,7 @@ use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{PrimitiveArray, StructArray, VarBinView, VarBinViewArray};
 use vortex_array::scalar::Scalar;
 
-use crate::store::selection::RowSelection;
+use crate::store::view::selection::RowSelection;
 
 /// A residual equality constraint's probe value, extracted from its `Scalar`
 /// once per scan — not per chunk, the string extraction allocates.
@@ -277,7 +277,7 @@ pub(crate) fn typed_positions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::selection::RowSelection;
+    use crate::store::view::selection::RowSelection;
     use vortex_array::arrays::Primitive;
     use vortex_array::validity::Validity;
     use vortex_array::{IntoArray, VortexSessionExecute};
