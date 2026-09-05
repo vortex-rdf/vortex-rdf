@@ -73,25 +73,14 @@ impl VortexRdfStore {
             QuadsSource::InMemory {
                 base,
                 selection,
-                components,
                 deleted,
-                probes,
-                canonical,
                 ..
             } => {
                 let selection = selection.materialized()?;
                 let live = selection.live_count(deleted.as_ref(), base.len());
                 let (window, taken) = selection.window(deleted.as_ref(), base.len(), offset, limit);
                 (
-                    QuadsSource::InMemory {
-                        base: base.clone(),
-                        selection: ViewSelection::Exact(window),
-                        components: Arc::clone(components),
-                        deleted: deleted.clone(),
-                        probes: Arc::clone(probes),
-                        canonical: Arc::clone(canonical),
-                        serve: None,
-                    },
+                    self.quads.with_selection(ViewSelection::Exact(window)),
                     taken,
                     live,
                 )
@@ -254,15 +243,9 @@ impl VortexRdfStore {
                                 .collect(),
                         ),
                     };
-                    return Ok(self.with_quads(QuadsSource::InMemory {
-                        base: base.clone(),
-                        selection: ViewSelection::Exact(selection),
-                        components: Arc::clone(components),
-                        deleted: deleted.clone(),
-                        probes: Arc::clone(probes),
-                        canonical: Arc::clone(canonical),
-                        serve: None,
-                    }));
+                    return Ok(
+                        self.with_quads(self.quads.with_selection(ViewSelection::Exact(selection)))
+                    );
                 }
                 let struct_arr = into_struct_array(base.clone())?;
                 let col = struct_arr

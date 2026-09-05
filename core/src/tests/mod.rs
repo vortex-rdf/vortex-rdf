@@ -27,6 +27,8 @@ mod indexes_file;
 mod matching;
 mod mutation;
 mod names;
+mod order;
+mod partitions;
 mod primitives;
 mod resident;
 mod roundtrip;

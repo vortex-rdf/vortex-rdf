@@ -3,7 +3,7 @@
 //! values — what each decodes, what it shares, and when it is freed.
 
 use super::*;
-use crate::store::TermEncoding;
+use crate::store::{ExportOptions, TermEncoding};
 #[cfg(feature = "file-io")]
 use crate::store::{Keep, QuadColumn};
 use arrow_array::RecordBatch;
@@ -203,7 +203,7 @@ async fn built_dictionary_exports_its_own_buffers() {
         "nothing to cache"
     );
     let batches: Vec<RecordBatch> = store
-        .to_record_batches(TermEncoding::Terms, None)
+        .to_record_batches(&ExportOptions::new(TermEncoding::Terms))
         .await
         .unwrap()
         .try_collect()
@@ -242,7 +242,7 @@ async fn adopted_dictionary_arrow_values_are_freed_with_the_last_holder() {
     assert_eq!(store.debug_dict_arrow_values_alive(), Some(false));
 
     let batches: Vec<RecordBatch> = store
-        .to_record_batches(TermEncoding::Terms, None)
+        .to_record_batches(&ExportOptions::new(TermEncoding::Terms))
         .await
         .unwrap()
         .try_collect()
@@ -366,7 +366,7 @@ async fn canonical_code_form_pins_a_served_run() {
 #[cfg(feature = "file-io")]
 async fn codes_batch(view: &VortexRdfStore) -> RecordBatch {
     let batches: Vec<RecordBatch> = view
-        .to_record_batches(TermEncoding::Codes, None)
+        .to_record_batches(&ExportOptions::new(TermEncoding::Codes))
         .await
         .unwrap()
         .try_collect()

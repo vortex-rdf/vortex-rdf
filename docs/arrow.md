@@ -42,8 +42,8 @@ the same views every other read path reads.
 ### 2.1 The quad schema
 
 Every batch carries the schema
-[`quad_schema`](../core/src/store/arrow/mod.rs#L162) gives for the store's
-layout and the requested [`TermEncoding`](../core/src/store/arrow/mod.rs#L49):
+[`quad_schema`](../core/src/store/arrow/mod.rs#L205) gives for the store's
+layout and the requested [`TermEncoding`](../core/src/store/arrow/mod.rs#L55):
 the four primary columns `s`, `p`, `o`, `g`, in the serialized order
 ([`PRIMARY_COLUMNS`](../core/src/store/schema.rs#L28)), all non-nullable,
 every cell typed alike.
@@ -60,14 +60,16 @@ column encodings on a Default-layout store, or any encoding on a
 TypedObject store, are rejected when the schema is asked for.
 
 The schema metadata names the producer
-([`META_LAYOUT`](../core/src/store/arrow/mod.rs#L35) and its siblings):
+([`META_LAYOUT`](../core/src/store/arrow/mod.rs#L37) and its siblings):
 `vortex_rdf.layout` (the canonical kebab-case layout name),
 `vortex_rdf.term_encoding` (`codes` | `terms` | `strings`),
-`vortex_rdf.version` (the crate version) and `vortex_rdf.default_graph`
-(`""`).
+`vortex_rdf.version` (the crate version), `vortex_rdf.default_graph`
+(`""`) and, when the view knows the order its rows come in,
+`vortex_rdf.sort_order` (the four column names most significant first —
+[§2.4](#24-order-and-statistics)).
 
-A **projection** — a list of [`QuadColumn`](../core/src/store/arrow/mod.rs#L98)s
-— restricts and orders the columns ([`projected_schema`](../core/src/store/arrow/mod.rs#L204)
+A **projection** — a list of [`QuadColumn`](../core/src/store/arrow/mod.rs#L104)s
+— restricts and orders the columns ([`projected_schema`](../core/src/store/arrow/mod.rs#L254)
 keeps the metadata); it must be non-empty and name each column once. A
 triple pattern rarely needs all four positions, and a file scan reads only
 the projected columns ([§3.2](#32-code-batches)).
@@ -75,14 +77,24 @@ the projected columns ([§3.2](#32-code-batches)).
 ### 2.2 The batch stream
 
 [`to_record_batches`](../core/src/store/arrow/batches.rs#L60) is the one entry
-point: it takes an encoding and an optional projection and returns a
-[`QuadBatches`](../core/src/store/arrow/mod.rs#L236) — a `Stream` of
+point: it takes an [`ExportOptions`](../core/src/store/arrow/mod.rs#L162) —
+the encoding, the columns to export in their order, and an optional
+`batch_rows` cap — and returns a
+[`QuadBatches`](../core/src/store/arrow/mod.rs#L286) — a `Stream` of
 `RecordBatch`es that all carry the schema `QuadBatches::schema()` reports,
 one batch per decode chunk (the whole in-memory base, or each scan split
-of a file), empty chunks skipped. The stream owns everything it reads —
+of a file), empty chunks skipped. Under `batch_rows` a longer chunk is
+handed out as consecutive slices of itself — `RecordBatch::slice`, sharing
+the chunk's buffers and, under `terms`, its one values array — so an engine
+that pipelines on bounded batches gets them without a copy. The stream owns everything it reads —
 decoded rows, or a scan over the file handle — so it outlives the store
 handle it was taken from, which is what lets a binding hand it to a
 consumer that pulls batches later. Tombstoned rows are never exported.
+
+[`partitions`](../core/src/store/query/partition.rs#L36) cuts a view
+into exactly `n` disjoint views that together cover its rows — the currency
+of a parallel scan: each partition is a view, exported, windowed or kept
+like any other ([matching.md §16.6](matching.md#166-partitions)).
 
 Codes and terms need every row to be addressable in the dictionary a
 consumer will decode against. A view with a non-empty append tail is not:
@@ -90,7 +102,7 @@ tail rows store their terms as strings, and the terms appended have no code
 in the frozen dictionary ([mutations.md §2](mutations.md#2-additions-the-append-tail)).
 Such a view rejects `codes` and `terms` with an error — export `strings`,
 or compact first — exactly the gate
-[`code_read_snapshot`](../core/src/store/mod.rs#L528) applies to the
+[`code_read_snapshot`](../core/src/store/mod.rs#L529) applies to the
 code-column readers.
 
 ### 2.3 The dictionary as an Arrow array
@@ -119,6 +131,28 @@ dictionary cursor
 ([`lower_bound_bytes`](../core/src/store/layouts/dictionary/term_dict.rs#L660)),
 the same probe the exact `encode` runs.
 
+### 2.4 Order and statistics
+
+A view says what a planner may assume before reading it.
+[`sort_order`](../core/src/store/view/order.rs#L83) is the order
+every read yields the rows in, as a [`SortOrder`](../core/src/store/view/order.rs#L24)
+— `s,p,o,g` over the sorted base, whole, a range or an ascending gather of
+it, and the answering index's own order (`p,o,s,g` or `o,s,p,g`) for a
+served match — or `None` wherever nothing witnesses one: under an append
+tail, on a base without the sorted stamp, on a served child not known to
+be sorted. A claimed order is what the batches carry, so a merge join or a
+streaming `DISTINCT` on the leading column needs no sort. The same value
+rides in the schema metadata, and is absent when `None`.
+
+[`statistics`](../core/src/store/view/stats.rs#L33) adds the exact
+row count (a count, no row decoded), the dictionary size as the number of
+distinct terms any column can hold, and per column an inclusive envelope of
+its term codes where one is known without a read: the one value of a key a
+match fixed, the two ends of a sorted run — the leading column of a sorted
+selection, and each following one while the columns before it are constant.
+Codes are lexicographic ranks, so an envelope is a term range too. A file
+view reads nothing for it and reports none.
+
 ---
 
 ## 3. How a batch is produced
@@ -144,12 +178,12 @@ flowchart TD
 The two code-typed encodings and the string encoding take different
 routes, because their inputs are different things.
 
-`codes` and `terms` ([`code_batches`](../core/src/store/arrow/batches.rs#L92))
+`codes` and `terms` ([`code_batches`](../core/src/store/arrow/batches.rs#L91))
 want the primary columns exactly as the Dictionary layout stores them:
 `u32` code columns. Nothing is decoded; the work is finding the right rows
 and converting each column's buffer.
 
-`strings` ([`string_batches`](../core/src/store/arrow/batches.rs#L130)) wants
+`strings` ([`string_batches`](../core/src/store/arrow/batches.rs#L129)) wants
 N-Triples spellings, which under the Dictionary layout means resolving
 codes through the dictionary and under the Default layout means the stored
 strings themselves. Rather than a third decode path, it rides the store's
@@ -159,7 +193,7 @@ existing shared-term decode stream,
 `quads_vec`, which already applies serve plans, drops tombstones, decodes
 each distinct term of a chunk once and appends the tail — and builds a
 `string_view` column per projected position from each decoded chunk
-([`shared_chunk_to_batch`](../core/src/store/arrow/batches.rs#L282)). That is a
+([`shared_chunk_to_batch`](../core/src/store/arrow/batches.rs#L281)). That is a
 copy of every cell's bytes, the price of materializing strings at all.
 
 ### 3.2 Code batches
@@ -171,7 +205,7 @@ Two sources feed the code pipeline, chosen per view.
 a built base's canonical `u32` columns, a served match reading the answering
 index's own columns, or an adopted base's live canonical form — the batch is
 built straight from the projected buffers it returns
-([`code_buffers_to_batch`](../core/src/store/arrow/batches.rs#L225)), and only
+([`code_buffers_to_batch`](../core/src/store/arrow/batches.rs#L224)), and only
 those: a projection decodes nothing it leaves out. This is the path the
 bindings' `match_arrow` / `matchArrow` take — their one engine-facing read —
 so every consumer of a view hands out the same memory. A store *adopted* from
@@ -203,7 +237,7 @@ selection to a sub-range, so the export stays a slice
 ([matching.md §16.3](matching.md#163-keeps)).
 
 **Primary chunks.** Otherwise
-[`primary_chunks`](../core/src/store/arrow/batches.rs#L145) streams the base's
+[`primary_chunks`](../core/src/store/arrow/batches.rs#L144) streams the base's
 primary columns as encoded chunks in base row order, the view's selection
 applied and tombstones excluded: one chunk for an in-memory base (the
 array itself when the view covers all of it), and for a file one chunk per
@@ -214,7 +248,7 @@ only the projected columns are decoded off the file. A served match's
 pending selection materializes first, as it does for every base-order
 read. Each chunk's columns then convert through vortex-arrow's
 buffer-sharing primitive kernel
-([`code_chunk_to_batch`](../core/src/store/arrow/batches.rs#L246)): the Arrow
+([`code_chunk_to_batch`](../core/src/store/arrow/batches.rs#L245)): the Arrow
 `UInt32Array` wraps the chunk's own buffer.
 
 For `terms`, each column's keys are wrapped over the dictionary's values
@@ -276,7 +310,7 @@ pa.array(store.term_dict().filter_codes("is_iri", "")[0])             # a code s
 pa.array(store.term_dict())                                           # the dictionary
 ```
 
-[`match_arrow`](../python/src/store.rs#L528) resolves the pattern and
+[`match_arrow`](../python/src/store.rs#L537) resolves the pattern and
 builds the core batch stream off the GIL, then wraps it in an
 [`ArrowQuadStream`](../python/src/arrow.rs#L117). Its
 [`__arrow_c_schema__`](../python/src/arrow.rs#L143) can be read any number
@@ -287,7 +321,8 @@ exports it as an `FFI_ArrowArrayStream` over a
 consumer issues blocks on the next batch on the bindings' tokio runtime.
 The reader holds no Python state, so it runs wherever the consumer calls it
 from — pyarrow, for one, releases the GIL around `read_next_batch` — and
-batches are produced as they are pulled, never ahead of the consumer.
+batches are produced as they are pulled, never ahead of the consumer. `batch_rows=n` caps the rows per batch, as slices of the chunk they come
+from.
 
 A code set's [`__arrow_c_array__`](../python/src/codes.rs#L205) wraps
 the column's `u32` buffer as a `UInt32Array` — the same memory the buffer
@@ -386,13 +421,13 @@ view before running the next query is the discipline a long-lived worker
 keeps.
 
 **Pushdown.** The options object
-([`parse_arrow_options`](../js/src/options.rs#L157)) carries core's
+([`parse_arrow_options`](../js/src/options.rs#L156)) carries core's
 `encoding` and `projection` vocabulary, parsed by core's own `FromStr` impls
 so an error message reads the same from every frontend, plus the narrowing
 Python's `match_arrow` takes: `keep` (per column, a `Uint32Array` or array
 of codes as a code set, `{lo, hi}` as a half-open code range —
-[`parse_keep`](../js/src/options.rs#L192)) applied through core's
-[`keep`](../core/src/store/query/pushdown.rs#L185), then `offset`/`limit` through
+[`parse_keep`](../js/src/options.rs#L191)) applied through core's
+[`keep`](../core/src/store/query/pushdown.rs#L174), then `offset`/`limit` through
 [`window`](../core/src/store/query/pushdown.rs#L71), before any row is gathered.
 `TermDict.decodeMany` ([`decode_many`](../js/src/store.rs#L120)) decodes a
 code column back in one crossing.
@@ -430,6 +465,6 @@ All three reach the [dashboard](https://vortex-rdf.github.io/vortex-rdf/)'s
 
 | Surface | Tests |
 |---|---|
-| core | [tests/arrow.rs](../core/src/tests/arrow.rs): buffer sharing on a built store, codes/terms/strings against the code and shared-quad readers (in memory and file-backed), tail and tombstone equivalence, projection, rejected combinations; [arrow/mod.rs](../core/src/store/arrow/mod.rs) schema tests; [term_dict.rs](../core/src/store/layouts/dictionary/term_dict.rs) dictionary values and bounds |
+| core | [tests/arrow.rs](../core/src/tests/arrow.rs): buffer sharing on a built store, bounded batches as slices of a chunk, codes/terms/strings against the code and shared-quad readers (in memory and file-backed), tail and tombstone equivalence, projection, rejected combinations; [arrow/mod.rs](../core/src/store/arrow/mod.rs) schema tests; [term_dict.rs](../core/src/store/layouts/dictionary/term_dict.rs) dictionary values and bounds |
 | Python | [tests/test_arrow.py](../python/tests/test_arrow.py): capsule round-trips into pyarrow and polars, buffer-address equality for code sets, stream-versus-`get_quads` equality on file-backed and in-memory stores, one shared dictionary across columns and batches, consume-once semantics, projection, per-layout rejection; [tests/test_primitives.py](../python/tests/test_primitives.py): `keep`, windows and batches through the stream, Arrow arrays as code sets |
 | JavaScript | [test/arrow.test.ts](../js/test/arrow.test.ts): `matchArrow` tables against `getQuads` and `termDict`, schema metadata, string-view and dictionary column types, projection, rejected options and layouts; the `MatchView` lifetime (zero-copy against the module's memory, views surviving growth, `toTable()`, `toIPC()`, `free()`, a Worker transfer); `keep`/`offset`/`limit` against the plain match; `decodeMany`. Run twice: `npm test` covers the parse-time copy, `npm run test:zero-copy` the views ([vitest.zero-copy.config.ts](../js/vitest.zero-copy.config.ts)) |

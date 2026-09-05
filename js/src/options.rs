@@ -7,8 +7,9 @@ use js_sys::Reflect;
 use oxrdfio::RdfFormat;
 use vortex_rdf_core::common::formats::{format_from_name, supported_format_names};
 use vortex_rdf_core::{
-    BuiltArray, CodeForm, DictForm, IndexType, Indexes, Keep, LayoutStrategy, QuadColumn, RawQuad,
-    ResidentForm, Result as CoreResult, SortedInMemoryBuilder, TermEncoding, VortexArrayBuilder,
+    BuiltArray, CodeForm, DictForm, ExportOptions, IndexType, Indexes, Keep, LayoutStrategy,
+    QuadColumn, RawQuad, ResidentForm, Result as CoreResult, SortedInMemoryBuilder, TermEncoding,
+    VortexArrayBuilder,
 };
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
@@ -121,8 +122,7 @@ pub(crate) fn parse_open_options(options: JsValue) -> Result<ResidentForm, JsVal
 /// store applies before any row is gathered (`keep` constraints in column
 /// order, then the `offset`/`limit` row window).
 pub(crate) struct ArrowRead {
-    pub(crate) encoding: TermEncoding,
-    pub(crate) projection: Option<Vec<QuadColumn>>,
+    pub(crate) export: ExportOptions,
     pub(crate) keep: Vec<(QuadColumn, Keep)>,
     pub(crate) limit: Option<usize>,
     pub(crate) offset: usize,
@@ -131,8 +131,7 @@ pub(crate) struct ArrowRead {
 impl Default for ArrowRead {
     fn default() -> Self {
         Self {
-            encoding: TermEncoding::Codes,
-            projection: None,
+            export: ExportOptions::new(TermEncoding::Codes),
             keep: Vec::new(),
             limit: None,
             offset: 0,
@@ -160,7 +159,7 @@ pub(crate) fn parse_arrow_options(options: JsValue) -> Result<ArrowRead, JsValue
         return Ok(read);
     }
     if let Some(name) = get_string_option(&options, "encoding")? {
-        read.encoding = name.parse().map_err(js_err)?;
+        read.export.encoding = name.parse().map_err(js_err)?;
     }
     if let Some(projection) = get_option(&options, "projection")? {
         if !js_sys::Array::is_array(&projection) {
@@ -173,7 +172,7 @@ pub(crate) fn parse_arrow_options(options: JsValue) -> Result<ArrowRead, JsValue
                 None => Err(js_err("Option 'projection' must contain strings")),
             })
             .collect::<Result<Vec<_>, JsValue>>()?;
-        read.projection = Some(columns);
+        read.export.projection = columns;
     }
     if let Some(keep) = get_option(&options, "keep")? {
         read.keep = parse_keep(&keep)?;

@@ -92,7 +92,7 @@ flowchart TD
   selections are `All`.
 - **Every layout, Dictionary included.** An appended term has no code in the
   base's frozen sorted dictionary, so under the Dictionary layout the tail
-  stores Default-layout N-Triples strings ([`tail_layout`](../core/src/store/mod.rs#L400));
+  stores Default-layout N-Triples strings ([`tail_layout`](../core/src/store/mod.rs#L401));
   under the other layouts it uses the store's own columns. Patterns probe the
   base by code and the tail by string, and a query that touches both unions
   the results.
@@ -102,7 +102,7 @@ flowchart TD
   then unions the two. A base short-circuit (a term with no code in the
   dictionary) never skips the tail, since that term may exist in the tail's
   plain strings.
-- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L418) is the number
+- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L419) is the number
   of physical tail rows — the store's only unindexed, unsorted region, and the
   number to watch when tuning compaction.
 
@@ -149,7 +149,7 @@ flowchart TD
   — the single place a view becomes rows — so applying the mask cannot be
   forgotten by one of them. [`size`](../core/src/store/read/rows.rs#L38) counts
   the live bits without gathering; the tail applies its own mask through
-  [`Tail::live_rows`](../core/src/store/view/source.rs#L179).
+  [`Tail::live_rows`](../core/src/store/view/source.rs#L222).
 - **File-backed stores** tombstone the same way (a file cannot be rewritten
   on delete). The doomed set is evaluated to a file-wide mask by
   [`matching_file_row_mask`](../core/src/store/mutation/mod.rs#L259) (through
@@ -255,15 +255,15 @@ store past the threshold rewrites its source file, as above, as part of the
 ## 6. Ownership and `owned()`
 
 Only a store that owns its rows may be mutated
-([`is_owner`](../core/src/store/mod.rs#L451),
-[`ensure_owner`](../core/src/store/mod.rs#L463)): its base selection is
+([`is_owner`](../core/src/store/mod.rs#L452),
+[`ensure_owner`](../core/src/store/mod.rs#L464)): its base selection is
 `All`, it has no pending file filter, and its tail selection (if any) is
 `All`. A view derived from `match_pattern` is a window onto a base it shares,
 so mutating it would either silently drop the rows outside the view or write
 through to data it does not own; a view that happens to select everything (an
 unconstrained match) counts as an owner.
 
-[`owned`](../core/src/store/mod.rs#L434) turns any store into one that can be
+[`owned`](../core/src/store/mod.rs#L435) turns any store into one that can be
 mutated: an owner comes back as a cheap clone (tombstones and indexes kept), a
 narrowed view is compacted with its declared indexes into an independent
 store. Mutating a match result therefore goes `view.owned().await?` first, or

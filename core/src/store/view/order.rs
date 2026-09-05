@@ -8,9 +8,11 @@ use vortex_array::ArrayRef;
 use vortex_rdf_encoded_search::OwnedSortedProbe;
 
 use crate::error::{Result, VortexRdfError};
+use crate::store::array::subject_sorted;
 use crate::store::arrow::QuadColumn;
 use crate::store::query::pushdown::Keep;
 use crate::store::view::probes::StructProbes;
+use crate::store::{QuadsSource, VortexRdfStore};
 
 /// The order a run of rows is sorted in: the four quad columns, most
 /// significant first. The base is [`SPOG`](Self::SPOG); a by-copy index
@@ -67,6 +69,32 @@ impl std::str::FromStr for SortOrder {
             )));
         }
         Ok(Self(order))
+    }
+}
+
+impl VortexRdfStore {
+    /// The order every read of this view yields its rows in, when the view
+    /// knows it: the base's `(s, p, o, g)` for a view over the sorted base —
+    /// whole, a range, or an ascending gather of it — and the answering
+    /// index's own order for a served match. `None` under an append tail
+    /// (its rows come last, unsorted), on a base without the sorted stamp,
+    /// and wherever a served child is not known to be sorted; a consumer
+    /// may then assume nothing.
+    pub fn sort_order(&self) -> Option<SortOrder> {
+        if self.tail_len() != 0 {
+            return None;
+        }
+        match &self.quads {
+            QuadsSource::InMemory { base, serve, .. } => match serve {
+                Some(plan) => plan.key_order(),
+                None => subject_sorted(base).then_some(SortOrder::SPOG),
+            },
+            #[cfg(feature = "file-io")]
+            QuadsSource::File { file, serve, .. } => match serve {
+                Some(plan) => plan.key_order(),
+                None => file.quads_sorted().then_some(SortOrder::SPOG),
+            },
+        }
     }
 }
 

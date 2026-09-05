@@ -55,10 +55,11 @@ pub use error::{Result, VortexRdfError};
 
 pub use store::{
     BuiltArray, BuiltStream, ChunkStream, CodeForm, DictForm, DictSnapshot, DictionaryQuadSink,
-    IndexType, Indexes, Keep, LayoutStrategy, META_DEFAULT_GRAPH, META_LAYOUT, META_TERM_ENCODING,
-    META_VERSION, NumOp, QuadBatches, QuadColumn, RawQuad, ResidentForm, SharedQuad, SortOrder,
-    SortedInMemoryBuilder, StoreParts, TermEncoding, TermPredicate, Verdict, VortexArrayBuilder,
-    VortexRdfStore, export_rdf, quad_schema,
+    ExportOptions, IndexType, Indexes, Keep, LayoutStrategy, META_DEFAULT_GRAPH, META_LAYOUT,
+    META_SORT_ORDER, META_TERM_ENCODING, META_VERSION, NumOp, QuadBatches, QuadColumn, RawQuad,
+    ResidentForm, SharedQuad, SortOrder, SortedInMemoryBuilder, StoreParts, TermEncoding,
+    TermPredicate, Verdict, ViewStatistics, VortexArrayBuilder, VortexRdfStore, export_rdf,
+    quad_schema,
 };
 // Compiled out on wasm along with the rest of the sorted-stream builder's
 // out-of-core merge (see the module gate in `store::builders`).

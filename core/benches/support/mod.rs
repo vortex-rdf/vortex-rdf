@@ -15,8 +15,8 @@ use futures::{Stream, StreamExt, TryStreamExt, stream};
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 
 use vortex_rdf_core::{
-    BuiltArray, IndexType, LayoutStrategy, RawQuad, Result, SortedStreamBuilder, TermEncoding,
-    VortexArrayBuilder, VortexRdfStore,
+    BuiltArray, ExportOptions, IndexType, LayoutStrategy, RawQuad, Result, SortedStreamBuilder,
+    TermEncoding, VortexArrayBuilder, VortexRdfStore,
 };
 
 // The dataset shape — moduli, term spellings, probe patterns — lives on its own
@@ -381,7 +381,7 @@ pub fn run_match_arrow(
                 .await
                 .expect("match_pattern failed");
             let batches: Vec<RecordBatch> = view
-                .to_record_batches(encoding, None)
+                .to_record_batches(&ExportOptions::new(encoding))
                 .await
                 .expect("export batches")
                 .try_collect()

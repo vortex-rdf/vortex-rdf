@@ -460,6 +460,36 @@ impl InMemoryServePlan {
         Ok(Some(out))
     }
 
+    /// The served run: the component rows this plan covers.
+    pub(crate) fn range(&self) -> Range<usize> {
+        self.range.clone()
+    }
+
+    /// The order the served rows come in, when the component is sorted.
+    pub(crate) fn key_order(&self) -> Option<SortOrder> {
+        self.decode.key_order
+    }
+
+    /// How many leading keys of that order the resolution fixed.
+    pub(crate) fn resolved(&self) -> usize {
+        self.decode.resolved
+    }
+
+    /// The component's rows, in child schema.
+    pub(crate) fn rows(&self) -> ArrayRef {
+        self.array.clone()
+    }
+
+    /// The component's probe cache.
+    pub(crate) fn probes(&self) -> &crate::store::view::probes::StructProbes {
+        &self.probes
+    }
+
+    /// The child columns sourcing `(s, p, o, g)`, in that order.
+    pub(crate) fn primary_columns(&self) -> [&'static str; 4] {
+        self.decode.primary_columns
+    }
+
     /// `col` restricted to the served run.
     fn run_of(&self, col: &ArrayRef) -> Result<ArrayRef> {
         col.slice(self.range.clone())
@@ -648,6 +678,11 @@ impl FileServePlan {
     /// The serving component's name on the file handle.
     pub(crate) fn component(&self) -> &'static str {
         self.component
+    }
+
+    /// The order the served rows come in, when the child is sorted.
+    pub(crate) fn key_order(&self) -> Option<SortOrder> {
+        self.decode.key_order
     }
 
     /// The located child-row range the constraints select, when known.

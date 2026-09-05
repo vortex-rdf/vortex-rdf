@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -9,7 +10,7 @@ use pyo3::types::{PyBytes, PyRange, PyRangeMethods, PyString};
 use vortex_buffer::Buffer;
 use vortex_rdf_core::common::terms::{Pattern, parse_pattern_checked};
 use vortex_rdf_core::{
-    CodeForm, DictForm, Keep, QuadColumn, ResidentForm, TermEncoding, VortexRdfError as CoreError,
+    CodeForm, DictForm, ExportOptions, Keep, QuadColumn, ResidentForm, VortexRdfError as CoreError,
     VortexRdfStore as CoreStore,
 };
 
@@ -40,23 +41,31 @@ impl ReadOptions {
     }
 }
 
-/// The `encoding`/`projection` options of an Arrow export, parsed by core's
-/// own `FromStr` impls so an error reads the same from every frontend.
-struct Export {
-    encoding: TermEncoding,
-    projection: Option<Vec<QuadColumn>>,
-}
-
-fn parse_export(encoding: &str, projection: Option<Vec<String>>) -> PyResult<Export> {
-    let encoding: TermEncoding = encoding.parse().map_err(parse_err)?;
-    let projection: Option<Vec<QuadColumn>> = projection
-        .map(|names| names.iter().map(|name| name.parse()).collect())
-        .transpose()
-        .map_err(parse_err)?;
-    Ok(Export {
-        encoding,
-        projection,
-    })
+/// The `encoding`/`projection`/`batch_rows` options of an Arrow export as
+/// core's [`ExportOptions`], parsed by core's own `FromStr` impls so an error
+/// reads the same from every frontend.
+fn parse_export(
+    encoding: &str,
+    projection: Option<Vec<String>>,
+    batch_rows: Option<usize>,
+) -> PyResult<ExportOptions> {
+    let mut options = ExportOptions::new(encoding.parse().map_err(parse_err)?);
+    if let Some(names) = projection {
+        options = options.projection(
+            names
+                .iter()
+                .map(|name| name.parse())
+                .collect::<Result<Vec<QuadColumn>, _>>()
+                .map_err(parse_err)?,
+        );
+    }
+    if let Some(rows) = batch_rows {
+        options = options.batch_rows(
+            NonZeroUsize::new(rows)
+                .ok_or_else(|| PyValueError::new_err("batch_rows must be at least 1"))?,
+        );
+    }
+    Ok(options)
 }
 
 /// Every pattern of a batch parsed up front, so a malformed one raises
@@ -521,7 +530,7 @@ impl VortexRdfStore {
     /// `uint32` Arrow array, a buffer, a sequence of ints. `limit`/`offset`
     /// window the rows in match order, after `keep`. Batches are produced as
     /// the consumer pulls them, off the GIL wherever the consumer releases it.
-    #[pyo3(signature = (s=None, p=None, o=None, g=None, *, encoding="codes", projection=None, keep=None, limit=None, offset=0))]
+    #[pyo3(signature = (s=None, p=None, o=None, g=None, *, encoding="codes", projection=None, keep=None, limit=None, offset=0, batch_rows=None))]
     // The parameter list is the Python signature: four pattern positions plus
     // the keyword options.
     #[allow(clippy::too_many_arguments)]
@@ -537,9 +546,10 @@ impl VortexRdfStore {
         keep: Option<HashMap<String, Bound<'_, PyAny>>>,
         limit: Option<usize>,
         offset: usize,
+        batch_rows: Option<usize>,
     ) -> PyResult<ArrowQuadStream> {
         let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
-        let export = parse_export(encoding, projection)?;
+        let export = parse_export(encoding, projection, batch_rows)?;
         let options = ReadOptions {
             keep: parse_keep(py, keep)?,
             limit,
@@ -550,7 +560,7 @@ impl VortexRdfStore {
                 RUNTIME.block_on(async {
                     self.matched_with(&pattern, &options)
                         .await?
-                        .to_record_batches(export.encoding, export.projection.as_deref())
+                        .to_record_batches(&export)
                         .await
                 })
             })
@@ -563,24 +573,22 @@ impl VortexRdfStore {
     /// before anything is evaluated), the matches run concurrently under one
     /// GIL release, one stream per pattern in input order, all under the
     /// same `encoding` and `projection`.
-    #[pyo3(signature = (patterns, *, encoding="codes", projection=None))]
+    #[pyo3(signature = (patterns, *, encoding="codes", projection=None, batch_rows=None))]
     fn match_arrow_many(
         &self,
         py: Python<'_>,
         patterns: Vec<PyPattern>,
         encoding: &str,
         projection: Option<Vec<String>>,
+        batch_rows: Option<usize>,
     ) -> PyResult<Vec<ArrowQuadStream>> {
         let patterns = parse_patterns(&patterns)?;
-        let export = parse_export(encoding, projection)?;
+        let export = parse_export(encoding, projection, batch_rows)?;
         let streams = py
             .detach(|| -> Result<_, CoreError> {
                 RUNTIME.block_on(async {
                     let views = self.store.match_pattern_many(&patterns).await?;
-                    try_join_all(views.iter().map(|view| {
-                        view.to_record_batches(export.encoding, export.projection.as_deref())
-                    }))
-                    .await
+                    try_join_all(views.iter().map(|view| view.to_record_batches(&export))).await
                 })
             })
             .map_err(store_err)?;

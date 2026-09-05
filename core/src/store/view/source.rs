@@ -164,6 +164,49 @@ pub(crate) struct Tail {
     pub(crate) deleted: Option<Mask>,
 }
 
+impl QuadsSource {
+    /// The same rows, tombstones and caches under `selection`, without the
+    /// serve plan: a plan is its run, and a selection that is not that run
+    /// reads through the rows.
+    pub(crate) fn with_selection(&self, selection: ViewSelection) -> Self {
+        match self {
+            QuadsSource::InMemory {
+                base,
+                components,
+                deleted,
+                probes,
+                canonical,
+                ..
+            } => QuadsSource::InMemory {
+                base: base.clone(),
+                selection,
+                components: Arc::clone(components),
+                deleted: deleted.clone(),
+                probes: Arc::clone(probes),
+                canonical: Arc::clone(canonical),
+                serve: None,
+            },
+            #[cfg(feature = "file-io")]
+            QuadsSource::File {
+                path,
+                dict_max_resident_bytes,
+                file,
+                filter,
+                deleted,
+                ..
+            } => QuadsSource::File {
+                path: path.clone(),
+                dict_max_resident_bytes: *dict_max_resident_bytes,
+                file: Arc::clone(file),
+                filter: filter.clone(),
+                selection,
+                deleted: deleted.clone(),
+                serve: None,
+            },
+        }
+    }
+}
+
 impl Tail {
     /// The same rows and tombstones under a different `selection`.
     pub(crate) fn with_selection(&self, selection: RowSelection) -> Tail {

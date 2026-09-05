@@ -223,7 +223,7 @@ stage only sees what is left.
 
 A built base's code columns are flat canonical primitives; an adopted base
 keeps the encodings its file was written with
-([`resident_built_parts`](../core/src/store/mod.rs#L166),
+([`resident_built_parts`](../core/src/store/mod.rs#L167),
 [`with_searchable_int_children`](../core/src/store/array.rs#L278)). The stages
 below search either form in place — slice compares on canonical columns, the
 cached encoded-search probes on encoded ones. No stage decodes a column; a
@@ -756,7 +756,7 @@ size: `{val, rid}` pairs are a fraction of a second sorted copy of every quad.
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_scan.rs#L486) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/serve.rs#L701)); unlocated: the pushed-down projected+filtered scan of the index child |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_scan.rs#L486) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/serve.rs#L736)); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
 | Dropped when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
 | Tombstones | applied through the plan's `rid` column | applied through the plan's `rid` column |
@@ -906,6 +906,7 @@ The match's decisions show up here
 | `size()` | in memory a lazy component run knows its width without decoding; on file a located plan's run width answers outright when no filter or tombstones apply, otherwise the ids materialize (then filter masks are counted if a filter is pending) | selection length, or `count_matching_rows` over the filter |
 | `code_columns()` / `code_columns_gathered()` / the `codes` export | read the projected `u32` columns straight off the index's own columns — point reads through the probes for a small run, a slice of the component's live canonical form for a wide one, the plan's child scan on file — the pending ids never touched | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views) |
 | `raw_quad_chunks()` | plan deliberately ignored (it reorders rows; the N-Triples export is order-insignificant) | restricted scan in base row order |
+| `sort_order()` / `statistics()` | the index's order, the fixed keys' one value and the next key's two ends — no row read | `(s, p, o, g)` under the sorted stamp, the selection's two ends on `s` and on each following column while the ones before it are constant; a file view claims the order and reads nothing for an envelope |
 
 `LazyRowIds` caches into a shared `OnceLock`, so the first consumer that needs
 the ids pays for them once and every clone of the view reads them back for free.
@@ -1111,7 +1112,7 @@ patterns in one call and hands back their views in input order. The matches
 run concurrently (`try_join_all`), so on a file the pattern scans overlap
 instead of queueing; an in-memory match simply runs to completion when
 polled. The bindings expose it as `match_arrow_many` / `count_quads_many`
-([`match_arrow_many`](../python/src/store.rs#L567)): every pattern of the
+([`match_arrow_many`](../python/src/store.rs#L577)): every pattern of the
 batch is parsed before anything is evaluated, one GIL release covers the
 whole batch, and each pattern comes back as its own Arrow stream — the
 shape a join probe loop (one probe per left-hand row) needs.
@@ -1135,12 +1136,12 @@ projected), then windows those ids and drops the filter. Serve plans are
 dropped too: a window is a narrowing, and a plan's contiguous run would
 over-cover it (a keep can narrow the run itself — [§16.3](#163-keeps)).
 
-[`size_capped`](../core/src/store/query/pushdown.rs#L171) is `window(0, n).size()`
+[`size_capped`](../core/src/store/query/pushdown.rs#L160) is `window(0, n).size()`
 — `size_capped(1)` is an `ASK` that reads one row.
 
 ### 16.3 Keeps
 
-[`keep`](../core/src/store/query/pushdown.rs#L185) restricts one column by term
+[`keep`](../core/src/store/query/pushdown.rs#L174) restricts one column by term
 code: the rows whose code lies in a [`Keep`](../core/src/store/query/pushdown.rs#L30)
 — a sorted code set, or a half-open code range. Codes are lexicographic ranks
 ([file-format.md §5](file-format.md#5-the-dictionary-child)), so a range is
@@ -1161,7 +1162,7 @@ yielding exact ids — the same loop shape as the typed residual filter of
 becomes a pushed-down filter (`col >= lo AND col < hi`, ANDed onto whatever
 the view carried, so the scan prunes by it) and a set is resolved to row ids
 by one ordered scan projecting only that column
-([`file_column_ids`](../core/src/store/query/pushdown.rs#L353)); tombstones and the
+([`file_column_ids`](../core/src/store/query/pushdown.rs#L336)); tombstones and the
 view's own filter stay with the reads. Keeps need every row to be
 code-addressable: they apply to the Dictionary layout only, and a view with
 an append tail (whose terms have no codes) is rejected — compact first.
@@ -1205,7 +1206,7 @@ term still resolves; `encode_many` batches it.
 ### 16.5 In the bindings
 
 Python: `match_arrow(..., keep=, limit=, offset=)`
-([`parse_keep`](../python/src/store.rs#L77): a `range` is a code range,
+([`parse_keep`](../python/src/store.rs#L86): a `range` is a code range,
 anything `decode_many` accepts — a `uint32` Arrow array included — is a
 code set), `count_quads(..., limit=)`, `match_arrow_many`,
 `count_quads_many`, and on `TermDict`: `lower_bound`, `prefix_range`,
@@ -1213,6 +1214,20 @@ code set), `count_quads(..., limit=)`, `match_arrow_many`,
 Arrow-exportable code columns), `encode_many`. Every engine-facing read
 is the Arrow stream; there is no separate code-column read. The wasm
 bindings expose none of the narrowing options yet.
+
+
+### 16.6 Partitions
+
+[`partitions`](../core/src/store/query/partition.rs#L36) cuts a view
+into exactly `n` disjoint views that together cover its rows: a contiguous
+selection into consecutive ranges, an id list into consecutive slices of it,
+a served in-memory run into consecutive sub-runs that keep the plan and
+their deferred ids. A file view's pushed-down filter rides with every
+partition; a served file view's partitions read the base in its order,
+where the view itself reads the index child in the index's. The append
+tail, whose rows every read yields last, rides with the last partition
+alone. Each partition is a view — it windows, keeps and exports like any
+other — which is what a parallel scan hands to its workers.
 
 ---
 

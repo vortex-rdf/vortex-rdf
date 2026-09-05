@@ -103,6 +103,7 @@ describe('matchArrow', () => {
         expect(table.schema.metadata.get('vortex_rdf.layout')).toBe('dictionary');
         expect(table.schema.metadata.get('vortex_rdf.default_graph')).toBe('');
         expect(table.schema.metadata.get('vortex_rdf.version')).toMatch(/^\d+\.\d+\.\d+/);
+        expect(table.schema.metadata.get('vortex_rdf.sort_order')).toBe('s,p,o,g');
         for (const name of COLUMNS) {
             const field = table.schema.fields.find((f) => f.name === name)!;
             expect(field.nullable, name).toBe(false);

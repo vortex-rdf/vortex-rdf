@@ -3,7 +3,7 @@
 //! family's serving path.
 
 use super::*;
-use crate::store::{QuadColumn, TermEncoding};
+use crate::store::{ExportOptions, QuadColumn, TermEncoding};
 
 // ─── Secondary index behavior ──────────────────────────────────────────
 
@@ -957,7 +957,11 @@ async fn test_wide_served_run_exports_slices_of_the_component() {
         view: &VortexRdfStore,
         projection: Option<&[QuadColumn]>,
     ) -> Vec<arrow_array::RecordBatch> {
-        view.to_record_batches(TermEncoding::Codes, projection)
+        let mut options = ExportOptions::new(TermEncoding::Codes);
+        if let Some(projection) = projection {
+            options = options.projection(projection);
+        }
+        view.to_record_batches(&options)
             .await
             .unwrap()
             .try_collect()

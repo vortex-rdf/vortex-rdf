@@ -185,6 +185,7 @@ class VortexRdfStore:
         keep: Optional[Mapping[str, Union[range, _Codes]]] = None,
         limit: Optional[int] = None,
         offset: int = 0,
+        batch_rows: Optional[int] = None,
     ) -> ArrowQuadStream:
         """The matching rows as a stream of Arrow record batches (columns
         ``s``, ``p``, ``o``, ``g``, or the ``projection`` subset in that order).
@@ -200,7 +201,9 @@ class VortexRdfStore:
         ``range`` of codes (what ``TermDict.prefix_range`` yields) or to a
         set of codes in any form ``TermDict.decode_many`` accepts, a
         ``uint32`` Arrow array included. ``limit``/``offset`` window the rows
-        in match order, after ``keep``."""
+        in match order, after ``keep``. ``batch_rows`` caps the rows per
+        batch: a longer chunk arrives as consecutive slices of itself, sharing
+        its buffers."""
         ...
     def match_arrow_many(
         self,
@@ -208,6 +211,7 @@ class VortexRdfStore:
         *,
         encoding: str = "codes",
         projection: Optional[Sequence[str]] = None,
+        batch_rows: Optional[int] = None,
     ) -> List[ArrowQuadStream]:
         """``match_arrow`` for a batch of ``(s, p, o, g)`` patterns: every
         pattern is parsed first (a malformed one raises ``ValueError`` before

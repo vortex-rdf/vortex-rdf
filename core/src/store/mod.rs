@@ -19,8 +19,8 @@ mod read;
 pub(crate) mod test_hooks;
 
 pub use arrow::{
-    META_DEFAULT_GRAPH, META_LAYOUT, META_TERM_ENCODING, META_VERSION, QuadBatches, QuadColumn,
-    TermEncoding, quad_schema,
+    ExportOptions, META_DEFAULT_GRAPH, META_LAYOUT, META_SORT_ORDER, META_TERM_ENCODING,
+    META_VERSION, QuadBatches, QuadColumn, TermEncoding, quad_schema,
 };
 pub use builders::{
     BuiltArray, BuiltStream, ChunkStream, SortedInMemoryBuilder, VortexArrayBuilder,
@@ -42,6 +42,7 @@ pub use crate::common::quad::{RawQuad, SharedQuad};
 
 pub use view::order::SortOrder;
 pub(crate) use view::source::{QuadsSource, Tail};
+pub use view::stats::ViewStatistics;
 
 use indexes::IndexComponent;
 

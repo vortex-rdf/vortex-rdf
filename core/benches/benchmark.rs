@@ -71,8 +71,8 @@ use futures::{TryStreamExt, stream};
 use oxrdf::{NamedNode, NamedOrBlankNode};
 
 use vortex_rdf_core::{
-    DictForm, LayoutStrategy, ResidentForm, TermEncoding, TermPredicate, VortexRdfError,
-    VortexRdfStore, io,
+    DictForm, ExportOptions, LayoutStrategy, ResidentForm, TermEncoding, TermPredicate,
+    VortexRdfError, VortexRdfStore, io,
 };
 
 // The module is shared with `match_lazy.rs` and compiled per-target; items
@@ -784,7 +784,7 @@ fn terms_export(bencher: divan::Bencher, open: impl Fn() -> VortexRdfStore + Syn
     bencher.with_inputs(open).bench_refs(|store| {
         rt().block_on(async {
             let batches: Vec<RecordBatch> = store
-                .to_record_batches(TermEncoding::Terms, None)
+                .to_record_batches(&ExportOptions::new(TermEncoding::Terms))
                 .await
                 .expect("export terms")
                 .try_collect()

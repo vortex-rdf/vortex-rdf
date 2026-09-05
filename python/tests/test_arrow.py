@@ -79,6 +79,7 @@ def test_match_arrow_rows_are_get_quads(vortex_files, encoding, in_memory):
         assert schema.metadata[b"vortex_rdf.layout"] == b"dictionary"
         assert schema.metadata[b"vortex_rdf.default_graph"] == b""
         assert schema.metadata[b"vortex_rdf.version"] == vortex_rdf.__version__.encode()
+        assert schema.metadata[b"vortex_rdf.sort_order"] == b"s,p,o,g"
 
         table = _table(stream)
         assert table.schema.names == COLUMNS
@@ -268,3 +269,16 @@ def test_keep_on_the_subject_column_exports_a_slice_of_the_base(vortex_files):
     assert kept.num_rows == subjects.count(code)
     address = lambda table: table.column("s").chunk(0).buffers()[1].address  # noqa: E731
     assert address(kept) == address(whole) + 4 * subjects.index(code)
+
+
+def test_batch_rows_slices_the_export(vortex_files):
+    """``batch_rows`` caps the rows per batch: the export arrives as
+    consecutive slices of the one chunk, the same rows in the same order."""
+    store = VortexRdfStore(vortex_files["dictionary"], in_memory=True)
+    whole = _table(store.match_arrow())
+    batches = list(pa.RecordBatchReader.from_stream(store.match_arrow(batch_rows=2)))
+    assert len(batches) == -(-whole.num_rows // 2)
+    assert all(batch.num_rows <= 2 for batch in batches)
+    assert pa.Table.from_batches(batches).to_pylist() == whole.to_pylist()
+    with pytest.raises(ValueError, match="batch_rows"):
+        store.match_arrow(batch_rows=0)

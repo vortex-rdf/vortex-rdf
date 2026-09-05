@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use super::*;
-use crate::store::{META_TERM_ENCODING, QuadColumn, TermEncoding};
+use crate::store::{ExportOptions, META_TERM_ENCODING, QuadColumn, TermEncoding};
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt32Type;
 use arrow_array::{Array, RecordBatch};
@@ -18,7 +18,11 @@ async fn batches(
     encoding: TermEncoding,
     projection: Option<&[QuadColumn]>,
 ) -> (SchemaRef, Vec<RecordBatch>) {
-    let stream = store.to_record_batches(encoding, projection).await.unwrap();
+    let mut options = ExportOptions::new(encoding);
+    if let Some(projection) = projection {
+        options = options.projection(projection);
+    }
+    let stream = store.to_record_batches(&options).await.unwrap();
     let schema = stream.schema();
     let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
     for batch in &batches {
@@ -242,7 +246,9 @@ async fn strings_match_the_shared_quads_through_a_tail_and_deletes() {
         if layout == LayoutStrategy::Dictionary {
             for encoding in [TermEncoding::Codes, TermEncoding::Terms] {
                 assert!(
-                    view.to_record_batches(encoding, None).await.is_err(),
+                    view.to_record_batches(&ExportOptions::new(encoding))
+                        .await
+                        .is_err(),
                     "{encoding} must reject a tailed view"
                 );
             }
@@ -282,13 +288,15 @@ async fn projection_picks_columns_in_order() {
     }
     assert!(
         store
-            .to_record_batches(TermEncoding::Codes, Some(&[]))
+            .to_record_batches(&ExportOptions::new(TermEncoding::Codes).projection([]))
             .await
             .is_err()
     );
     assert!(
         store
-            .to_record_batches(TermEncoding::Codes, Some(&[QuadColumn::S, QuadColumn::S]))
+            .to_record_batches(
+                &ExportOptions::new(TermEncoding::Codes).projection([QuadColumn::S, QuadColumn::S]),
+            )
             .await
             .is_err()
     );
@@ -304,11 +312,21 @@ async fn unsupported_layouts_and_encodings_are_rejected() {
         TermEncoding::Terms,
         TermEncoding::Strings,
     ] {
-        assert!(typed.to_record_batches(encoding, None).await.is_err());
+        assert!(
+            typed
+                .to_record_batches(&ExportOptions::new(encoding))
+                .await
+                .is_err()
+        );
     }
     let default = store(modular_quads(5, 2, 2), LayoutStrategy::Default).await;
     for encoding in [TermEncoding::Codes, TermEncoding::Terms] {
-        assert!(default.to_record_batches(encoding, None).await.is_err());
+        assert!(
+            default
+                .to_record_batches(&ExportOptions::new(encoding))
+                .await
+                .is_err()
+        );
     }
     let (_, strings) = batches(&default, TermEncoding::Strings, None).await;
     assert_eq!(batch_rows(&strings, None).len(), 5);
@@ -439,4 +457,67 @@ async fn served_views_export_every_encoding_in_the_index_order() {
             "served exports never materialize the match's row ids"
         );
     }
+}
+
+/// `batch_rows` hands a chunk out as consecutive slices of itself: every
+/// piece shares the chunk's buffers at its offset, the pieces of a `terms`
+/// export share one values array, and the rows are the unbounded export's.
+#[tokio::test]
+async fn batch_rows_slices_a_chunk_zero_copy() {
+    use std::num::NonZeroUsize;
+    async fn collect(store: &VortexRdfStore, options: &ExportOptions) -> Vec<RecordBatch> {
+        store
+            .to_record_batches(options)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap()
+    }
+    let codes = |batch: &RecordBatch| batch.column(0).as_primitive::<UInt32Type>().clone();
+    let store = store(modular_quads(50, 5, 7), LayoutStrategy::Dictionary).await;
+    let whole = collect(&store, &ExportOptions::new(TermEncoding::Codes)).await;
+    assert_eq!(whole.len(), 1);
+    let seven = NonZeroUsize::new(7).unwrap();
+    let bounded = collect(
+        &store,
+        &ExportOptions::new(TermEncoding::Codes).batch_rows(seven),
+    )
+    .await;
+    assert_eq!(bounded.len(), 8);
+    let base = codes(&whole[0]).values().as_ptr() as usize;
+    let mut offset = 0;
+    let mut rows: Vec<u32> = Vec::new();
+    for piece in &bounded {
+        assert!(piece.num_rows() <= 7);
+        assert_eq!(
+            codes(piece).values().as_ptr() as usize,
+            base + 4 * offset,
+            "a slice of the one chunk, at its offset"
+        );
+        offset += piece.num_rows();
+        rows.extend(codes(piece).values().iter());
+    }
+    assert_eq!(rows, codes(&whole[0]).values().to_vec());
+    let terms = collect(
+        &store,
+        &ExportOptions::new(TermEncoding::Terms).batch_rows(seven),
+    )
+    .await;
+    let values: Vec<_> = terms
+        .iter()
+        .map(|batch| {
+            batch
+                .column(2)
+                .as_dictionary::<UInt32Type>()
+                .values()
+                .clone()
+        })
+        .collect();
+    assert!(
+        values
+            .windows(2)
+            .all(|pair| std::sync::Arc::ptr_eq(&pair[0], &pair[1])),
+        "every piece shares the one values array"
+    );
 }

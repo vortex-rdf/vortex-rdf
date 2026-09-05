@@ -385,7 +385,7 @@ impl VortexRdfStore {
                     .map_err(js_err)?;
             }
             let mut stream = matched
-                .to_record_batches(read.encoding, read.projection.as_deref())
+                .to_record_batches(&read.export)
                 .await
                 .map_err(js_err)?;
             let schema = stream.schema();

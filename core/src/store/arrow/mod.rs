@@ -17,6 +17,7 @@
 mod batches;
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -29,6 +30,7 @@ use futures::{Stream, StreamExt};
 use crate::error::{Result, VortexRdfError};
 use crate::store::LayoutStrategy;
 use crate::store::schema::PRIMARY_COLUMNS;
+use crate::store::view::order::SortOrder;
 
 /// Schema-metadata key holding the store's [`LayoutStrategy`] (canonical
 /// kebab-case name).
@@ -40,6 +42,10 @@ pub const META_VERSION: &str = "vortex_rdf.version";
 /// Schema-metadata key holding the spelling of the default graph in the `g`
 /// column: the empty string.
 pub const META_DEFAULT_GRAPH: &str = "vortex_rdf.default_graph";
+/// Schema-metadata key holding the order the exported rows come in — the
+/// four column names, most significant first, `s,p,o,g` for the base —
+/// present only when the view knows it ([`SortOrder`]).
+pub const META_SORT_ORDER: &str = "vortex_rdf.sort_order";
 
 /// How term columns are encoded in an exported record batch.
 ///
@@ -150,16 +156,57 @@ impl std::str::FromStr for QuadColumn {
     }
 }
 
+/// What an export hands out: the cell encoding, the columns and their
+/// order, and how many rows a batch may carry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportOptions {
+    /// The cell type of every column.
+    pub encoding: TermEncoding,
+    /// The columns to export, in this order — non-empty, each named once.
+    pub projection: Vec<QuadColumn>,
+    /// The most rows a batch carries: a longer chunk is handed out as
+    /// consecutive zero-copy slices of it. `None` keeps one batch per chunk.
+    pub batch_rows: Option<NonZeroUsize>,
+}
+
+impl ExportOptions {
+    /// Every column under `encoding`, one batch per chunk.
+    pub fn new(encoding: TermEncoding) -> Self {
+        Self {
+            encoding,
+            projection: QuadColumn::ALL.to_vec(),
+            batch_rows: None,
+        }
+    }
+
+    /// These columns, in this order.
+    pub fn projection(mut self, columns: impl Into<Vec<QuadColumn>>) -> Self {
+        self.projection = columns.into();
+        self
+    }
+
+    /// At most `rows` rows per batch.
+    pub fn batch_rows(mut self, rows: NonZeroUsize) -> Self {
+        self.batch_rows = Some(rows);
+        self
+    }
+}
+
 /// The Arrow schema of a quad record batch under `layout` × `encoding`:
 /// the four non-nullable primary columns (`s`, `p`, `o`, `g`), each typed per
-/// [`TermEncoding`], plus the `vortex_rdf.*` metadata entries.
+/// [`TermEncoding`], plus the `vortex_rdf.*` metadata entries — the rows'
+/// order among them when `sort_order` gives one.
 ///
 /// # Errors
 ///
 /// The combination must be servable: [`TermEncoding::Codes`] and
 /// [`TermEncoding::Terms`] exist only under [`LayoutStrategy::Dictionary`],
 /// and the TypedObject layout has no Arrow export.
-pub fn quad_schema(layout: LayoutStrategy, encoding: TermEncoding) -> Result<SchemaRef> {
+pub fn quad_schema(
+    layout: LayoutStrategy,
+    encoding: TermEncoding,
+    sort_order: Option<SortOrder>,
+) -> Result<SchemaRef> {
     let cell_type = match (layout, encoding) {
         (LayoutStrategy::TypedObject, _) => {
             return Err(VortexRdfError::InvalidOperation(
@@ -184,7 +231,7 @@ pub fn quad_schema(layout: LayoutStrategy, encoding: TermEncoding) -> Result<Sch
         .iter()
         .map(|name| Field::new(*name, cell_type.clone(), false))
         .collect();
-    let metadata = HashMap::from([
+    let mut metadata = HashMap::from([
         (META_LAYOUT.to_string(), layout.to_string()),
         (META_TERM_ENCODING.to_string(), encoding.to_string()),
         (
@@ -193,6 +240,9 @@ pub fn quad_schema(layout: LayoutStrategy, encoding: TermEncoding) -> Result<Sch
         ),
         (META_DEFAULT_GRAPH.to_string(), String::new()),
     ]);
+    if let Some(order) = sort_order {
+        metadata.insert(META_SORT_ORDER.to_string(), order.to_string());
+    }
     Ok(Arc::new(Schema::new_with_metadata(fields, metadata)))
 }
 
@@ -272,7 +322,7 @@ mod tests {
 
     #[test]
     fn dictionary_codes_schema() {
-        let schema = quad_schema(LayoutStrategy::Dictionary, TermEncoding::Codes).unwrap();
+        let schema = quad_schema(LayoutStrategy::Dictionary, TermEncoding::Codes, None).unwrap();
         assert_eq!(schema.fields().len(), 4);
         for (field, name) in schema.fields().iter().zip(PRIMARY_COLUMNS) {
             assert_eq!(field.name(), name);
@@ -283,11 +333,19 @@ mod tests {
         assert_eq!(schema.metadata()[META_TERM_ENCODING], "codes");
         assert_eq!(schema.metadata()[META_DEFAULT_GRAPH], "");
         assert_eq!(schema.metadata()[META_VERSION], env!("CARGO_PKG_VERSION"));
+        assert!(!schema.metadata().contains_key(META_SORT_ORDER));
+        let ordered = quad_schema(
+            LayoutStrategy::Dictionary,
+            TermEncoding::Codes,
+            Some(SortOrder::POSG),
+        )
+        .unwrap();
+        assert_eq!(ordered.metadata()[META_SORT_ORDER], "p,o,s,g");
     }
 
     #[test]
     fn dictionary_terms_schema() {
-        let schema = quad_schema(LayoutStrategy::Dictionary, TermEncoding::Terms).unwrap();
+        let schema = quad_schema(LayoutStrategy::Dictionary, TermEncoding::Terms, None).unwrap();
         let expected =
             DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8View));
         for field in schema.fields() {
@@ -298,7 +356,7 @@ mod tests {
     #[test]
     fn strings_schema_on_both_string_capable_layouts() {
         for layout in [LayoutStrategy::Dictionary, LayoutStrategy::Default] {
-            let schema = quad_schema(layout, TermEncoding::Strings).unwrap();
+            let schema = quad_schema(layout, TermEncoding::Strings, None).unwrap();
             for field in schema.fields() {
                 assert_eq!(field.data_type(), &DataType::Utf8View);
             }
@@ -313,10 +371,10 @@ mod tests {
             TermEncoding::Terms,
             TermEncoding::Strings,
         ] {
-            assert!(quad_schema(LayoutStrategy::TypedObject, encoding).is_err());
+            assert!(quad_schema(LayoutStrategy::TypedObject, encoding, None).is_err());
         }
         for encoding in [TermEncoding::Codes, TermEncoding::Terms] {
-            assert!(quad_schema(LayoutStrategy::Default, encoding).is_err());
+            assert!(quad_schema(LayoutStrategy::Default, encoding, None).is_err());
         }
     }
 

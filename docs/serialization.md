@@ -52,9 +52,9 @@ A builder hands these back in one of two shapes
 |---|---|---|---|
 | CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`main.rs`](../cli/src/main.rs#L36)) | out-of-core | file |
 | Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/ser.rs#L155) / [`quads_stream_to_vortex_writer`](../core/src/io/ser.rs#L95) | out-of-core | file / any `VortexWrite` |
-| Rust | [`VortexRdfStore::from_quads`](../core/src/store/mod.rs#L197), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L50) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L36) then [`VortexRdfStore::from_built`](../core/src/store/mod.rs#L263) to name the builder | either | in-memory store |
+| Rust | [`VortexRdfStore::from_quads`](../core/src/store/mod.rs#L198), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L50) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L36) then [`VortexRdfStore::from_built`](../core/src/store/mod.rs#L264) to name the builder | either | in-memory store |
 | Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L146) | — (re-serializes a store) | bytes |
-| Rust | [`to_serializable_parts`](../core/src/store/persist/serialize.rs#L125) → [`from_parts`](../core/src/store/mod.rs#L236) | — | in-memory round trip |
+| Rust | [`to_serializable_parts`](../core/src/store/persist/serialize.rs#L125) → [`from_parts`](../core/src/store/mod.rs#L237) | — | in-memory round trip |
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize.rs`](../python/src/serialize.rs#L33)) | out-of-core | file |
 | Python | `VortexRdfStore(path, in_memory=True)` | — (opens, then lifts through `to_serializable_parts` → `from_parts`) | in-memory store |
 | Python | `store.to_bytes()` / `VortexRdfStore.from_bytes(data)` | — | bytes |
@@ -63,7 +63,7 @@ A builder hands these back in one of two shapes
 
 Every surface defaults to the `dictionary` layout (the CLI's `--layout`,
 Python's `layout=`, and the JavaScript `BuildOptions`
-([`options.rs`](../js/src/options.rs#L37))) and spells layouts and indexes with
+([`options.rs`](../js/src/options.rs#L39))) and spells layouts and indexes with
 the same kebab-case names, which `LayoutStrategy`/`IndexType` parse and print.
 
 ---
@@ -383,9 +383,9 @@ container.
 ## 10. Adopting a build in memory
 
 A build that is queried in place, without a file, skips the writer:
-[`from_built`](../core/src/store/mod.rs#L263) turns a `BuiltArray` into the
+[`from_built`](../core/src/store/mod.rs#L264) turns a `BuiltArray` into the
 store's resident form
-([`resident_built_parts`](../core/src/store/mod.rs#L166)):
+([`resident_built_parts`](../core/src/store/mod.rs#L167)):
 
 - the base's `u32` code columns are held as flat canonical primitives
   ([`with_canonical_int_children`](../core/src/store/array.rs#L289)): the
@@ -407,7 +407,7 @@ store's resident form
 What each form holds resident, and every cache a store keeps, is in
 [memory.md](memory.md).
 
-The other in-memory constructor, [`from_parts`](../core/src/store/mod.rs#L236),
+The other in-memory constructor, [`from_parts`](../core/src/store/mod.rs#L237),
 adopts a store's split parts (the bindings' round trip): it keeps each integer
 child's existing encoding wherever a probe binds it and decodes only the ones
 that decline. Opening serialized bytes in memory is

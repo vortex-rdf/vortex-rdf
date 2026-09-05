@@ -29,7 +29,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::array::field_as;
 use crate::store::arrow::{
-    QuadBatches, QuadColumn, TermEncoding, arrow_err, projected_schema, quad_schema,
+    ExportOptions, QuadBatches, QuadColumn, TermEncoding, arrow_err, projected_schema, quad_schema,
 };
 use crate::store::layouts::ResolvedLayout;
 use crate::store::{QuadsSource, SharedQuad, VortexRdfStore};
@@ -57,23 +57,22 @@ impl VortexRdfStore {
     /// is rejected: export strings, or compact first. Tombstoned rows are
     /// never exported; empty chunks are skipped. The stream owns what it
     /// reads from and outlives this handle.
-    pub async fn to_record_batches(
-        &self,
-        encoding: TermEncoding,
-        projection: Option<&[QuadColumn]>,
-    ) -> Result<QuadBatches> {
-        let full = quad_schema(self.layout.strategy(), encoding)?;
-        let columns: Vec<QuadColumn> =
-            projection.map_or_else(|| QuadColumn::ALL.to_vec(), <[QuadColumn]>::to_vec);
+    pub async fn to_record_batches(&self, options: &ExportOptions) -> Result<QuadBatches> {
+        let full = quad_schema(self.layout.strategy(), options.encoding, self.sort_order())?;
+        let columns = options.projection.clone();
         let schema = projected_schema(&full, &columns)?;
-        match encoding {
-            TermEncoding::Strings => self.string_batches(schema, columns),
-            TermEncoding::Codes => self.code_batches(schema, columns, None).await,
+        let batches = match options.encoding {
+            TermEncoding::Strings => self.string_batches(schema, columns)?,
+            TermEncoding::Codes => self.code_batches(schema, columns, None).await?,
             TermEncoding::Terms => {
                 let values = self.dictionary_values().await?;
-                self.code_batches(schema, columns, Some(values)).await
+                self.code_batches(schema, columns, Some(values)).await?
             }
-        }
+        };
+        Ok(match options.batch_rows {
+            None => batches,
+            Some(rows) => batches.bounded(rows.get()),
+        })
     }
 
     /// The whole term dictionary as the Arrow values array `terms` batches
@@ -310,6 +309,28 @@ fn term_of(column: QuadColumn, quad: &SharedQuad) -> &str {
 
 /// `batches` without its empty ones (a scan split or the tail may hold no
 /// live row); errors pass through.
+impl QuadBatches {
+    /// The same rows in batches of at most `rows`: a longer batch is handed
+    /// out as consecutive slices of itself, sharing its buffers.
+    fn bounded(self, rows: usize) -> Self {
+        let schema = self.schema();
+        let inner = self
+            .inner
+            .flat_map(move |batch| match batch {
+                Ok(batch) => {
+                    let pieces: Vec<Result<RecordBatch>> = (0..batch.num_rows())
+                        .step_by(rows)
+                        .map(|offset| Ok(batch.slice(offset, rows.min(batch.num_rows() - offset))))
+                        .collect();
+                    stream::iter(pieces).boxed()
+                }
+                Err(e) => stream::once(future::ready(Err(e))).boxed(),
+            })
+            .boxed();
+        Self::new(schema, inner)
+    }
+}
+
 fn non_empty(
     batches: impl Stream<Item = Result<RecordBatch>> + Send + 'static,
 ) -> BoxStream<'static, Result<RecordBatch>> {
