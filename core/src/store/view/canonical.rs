@@ -6,7 +6,11 @@
 //! out keeps the decoded column alive, readers that arrive while one is alive
 //! share it zero-copy, and the column is freed with its last holder. A base
 //! that is never read wide, or whose readers have all dropped, holds nothing
-//! here — the cache is bounded by what is live, never by what was read.
+//! here — the cache is bounded by what is live, never by what was read. A
+//! *pinned* cache ([`LiveCanonical::pinned`]) holds each decoded column
+//! strongly as well, for the store's lifetime: the form
+//! [`CodeForm::Canonical`](crate::store::CodeForm::Canonical) gives an
+//! adopted index component.
 
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
@@ -23,8 +27,16 @@ use crate::store::schema;
 /// [`PRIMARY_COLUMNS`](schema::PRIMARY_COLUMNS) order; shared by every view
 /// over the base (`Arc` in `QuadsSource::InMemory`), like the probes.
 pub(crate) struct LiveCanonical {
-    slots: [Mutex<Weak<Buffer<u32>>>; schema::PRIMARY_COLUMNS.len()],
+    slots: [Slot; schema::PRIMARY_COLUMNS.len()],
+    /// The strong holds of a pinned cache, beside the weak slots; `None`
+    /// leaves every column to its holders.
+    pinned: Option<[Hold; schema::PRIMARY_COLUMNS.len()]>,
 }
+
+/// One column's weak slot: the decoded column while some holder keeps it.
+type Slot = Mutex<Weak<Buffer<u32>>>;
+/// One column's strong hold in a pinned cache.
+type Hold = Mutex<Option<Arc<Buffer<u32>>>>;
 
 /// Decode code column `name` (any encoding) to its canonical `u32` buffer —
 /// one allocation of the column, or of the slice the caller passed.
@@ -59,7 +71,31 @@ impl LiveCanonical {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             slots: std::array::from_fn(|_| Mutex::new(Weak::new())),
+            pinned: None,
         })
+    }
+
+    /// A fresh cache that also keeps every column it decodes for as long as
+    /// it lives.
+    pub(crate) fn pinned() -> Arc<Self> {
+        Arc::new(Self {
+            slots: std::array::from_fn(|_| Mutex::new(Weak::new())),
+            pinned: Some(std::array::from_fn(|_| Mutex::new(None))),
+        })
+    }
+
+    /// A fresh, empty cache of this one's kind — pinned if this one is.
+    pub(crate) fn fresh(&self) -> Arc<Self> {
+        if self.is_pinned() {
+            Self::pinned()
+        } else {
+            Self::new()
+        }
+    }
+
+    /// Whether decoded columns stay resident for the cache's lifetime.
+    pub(crate) fn is_pinned(&self) -> bool {
+        self.pinned.is_some()
     }
 
     /// Column `idx`'s canonical `u32` buffer: shared with every holder
@@ -74,6 +110,9 @@ impl LiveCanonical {
         }
         let owner = Arc::new(decode_u32(col, schema::PRIMARY_COLUMNS[idx])?);
         *slot = Arc::downgrade(&owner);
+        if let Some(pinned) = &self.pinned {
+            *pinned[idx].lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&owner));
+        }
         Ok(Self::handle(owner))
     }
 

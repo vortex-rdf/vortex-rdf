@@ -272,3 +272,106 @@ async fn keep_on_an_adopted_base_leaves_no_decoded_column_behind() {
         kept.quads_vec().await.unwrap()
     );
 }
+
+/// Under `CodeForm::Canonical` an adopted base holds its code columns
+/// canonical: every code read is a slice of them, the live cache is never
+/// filled, and two exports with nothing held between them are the same
+/// buffers.
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn canonical_code_form_holds_the_base_canonical() {
+    use crate::store::{CodeForm, ResidentForm};
+    let built = built(wide_subject_quads(1000, 2)).await;
+    let bytes = built.to_bytes().await.unwrap();
+    let store = VortexRdfStore::from_bytes_owned_as(
+        bytes,
+        ResidentForm {
+            codes: CodeForm::Canonical,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(store.debug_base_int_children_canonical());
+    assert!(
+        !adopted(&built).await.debug_base_int_children_canonical(),
+        "as written, the base keeps the writer's encodings"
+    );
+    let columns = store
+        .code_columns(&QuadColumn::ALL)
+        .unwrap()
+        .expect("canonical columns serve codes");
+    let address = |batch: &RecordBatch, i: usize| {
+        batch
+            .column(i)
+            .as_primitive::<UInt32Type>()
+            .values()
+            .as_ptr()
+    };
+    let first = codes_batch(&store).await;
+    drop(first);
+    let again = codes_batch(&store).await;
+    for (i, column) in columns.iter().enumerate() {
+        assert_eq!(address(&again, i), column.as_slice().as_ptr(), "column {i}");
+    }
+    assert_live(&store, false);
+}
+
+/// Under `CodeForm::Canonical` a component's live canonical form is pinned:
+/// a served run's export fills it — even a run too narrow to fill a weak
+/// cache — and it outlives the batches; as written, it goes with the last
+/// holder.
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn canonical_code_form_pins_a_served_run() {
+    use crate::store::{CodeForm, IndexType, ResidentForm};
+    let quads = graph_modular_quads(40_000, 5, 100, 7, &[GraphName::DefaultGraph]);
+    let built = VortexRdfStore::from_quads(
+        quad_stream(quads),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    let bytes = built.to_bytes().await.unwrap();
+    let p7 = NamedNode::new("http://example.org/p7").unwrap();
+    for (codes, pinned) in [(CodeForm::AsWritten, false), (CodeForm::Canonical, true)] {
+        let store = VortexRdfStore::from_bytes_owned_as(
+            bytes.clone(),
+            ResidentForm {
+                codes,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let view = store
+            .match_pattern(None, Some(&p7), None, None)
+            .await
+            .unwrap();
+        let batch = codes_batch(&view).await;
+        assert_eq!(batch.num_rows(), 400);
+        drop(batch);
+        for idx in 0..4 {
+            assert_eq!(
+                view.debug_component_canonical_alive("index:posg", idx),
+                Some(pinned),
+                "{codes}: column {idx}"
+            );
+        }
+    }
+}
+
+/// The one batch of a whole-view `codes` export.
+#[cfg(feature = "file-io")]
+async fn codes_batch(view: &VortexRdfStore) -> RecordBatch {
+    let batches: Vec<RecordBatch> = view
+        .to_record_batches(TermEncoding::Codes, None)
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    batches.into_iter().next().unwrap()
+}

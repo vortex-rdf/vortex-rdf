@@ -122,6 +122,14 @@ describe('build variants', () => {
                 await expect(
                     VortexRdfStore.fromBytes(bytes, { dictionary: 'fsst' } as never),
                 ).rejects.toThrow(/dictionary form/);
+                for (const codes of ['as-written', 'canonical'] as const) {
+                    const restored = await VortexRdfStore.fromBytes(bytes, { codes });
+                    expect(await restored.size()).toBe(6);
+                    restored.free();
+                }
+                await expect(
+                    VortexRdfStore.fromBytes(bytes, { codes: 'compressed' } as never),
+                ).rejects.toThrow(/code form/);
                 store.free();
             });
 

@@ -141,7 +141,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 | `components[i]` | describes child `i + 1` ([`StoreComponentDescriptor`](../core/src/io/container/wire.rs#L107)) |
 | `name` | the child's identity; non-empty, unique, never `quad-source` |
 | `role` | `dictionary`, `index`, `change-set` (reserved for future delta components) or `other` |
-| `implementation` | the slug a reader interprets the columns through — the key of the [known-component registry](../core/src/store/indexes/components.rs#L63) |
+| `implementation` | the slug a reader interprets the columns through — the key of the [known-component registry](../core/src/store/indexes/components.rs#L64) |
 | `version` | the implementation's version, positive |
 | `required` | a reader that cannot interpret a required component **must fail the open**; an unknown optional component is skipped |
 | `sorted` | the writer's provenance that the sort-key columns are *globally* sorted — a reader may binary-search the child only when this is set; absent means false |
@@ -150,7 +150,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 On open the layout checks that the child count is `1 + components.len()`,
 that child 0 has the root's row count, and that every component child's dtype
 matches its descriptor ([`deserialize`](../core/src/io/container/layout.rs#L49));
-[`classify_component`](../core/src/store/persist/open.rs#L47) then turns each
+[`classify_component`](../core/src/store/persist/open.rs#L48) then turns each
 descriptor into the dictionary, a known index, or a skip.
 
 ---
@@ -245,9 +245,9 @@ sum, no I/O) with a budget:
 
 | Budget | Where |
 |---|---|
-| 512 MiB | [`DICT_MAX_RESIDENT_BYTES_DEFAULT`](../core/src/store/persist/open.rs#L106) |
+| 512 MiB | [`DICT_MAX_RESIDENT_BYTES_DEFAULT`](../core/src/store/persist/open.rs#L107) |
 | any byte count | the `VORTEX_RDF_DICT_MAX_RESIDENT_BYTES` environment variable |
-| per open | [`from_file_with_dict_residency`](../core/src/store/persist/open.rs#L147) (`0` forces file-backed, `u64::MAX` forces resident); Python's `max_resident_bytes=` |
+| per open | [`from_file_with_dict_residency`](../core/src/store/persist/open.rs#L148) (`0` forces file-backed, `u64::MAX` forces resident); Python's `max_resident_bytes=` |
 
 - **Resident** (within budget): one scan of the child lifts it into memory,
   keeping every window FSST-compressed. Term → code is a binary search that
@@ -293,7 +293,7 @@ Shared rules:
   resolved through an index compose with row selections, tombstones and
   further matches without renumbering anything ([matching.md §1](matching.md#1-what-a-match-produces)).
 - **One row per quad.** A child whose row count differs from the quad table's
-  fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L76)).
+  fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L77)).
 - **A bound graph is never a sort key**, and neither index answers a
   bound-subject pattern — the sorted quad table is the better path there.
 
@@ -397,7 +397,7 @@ The pattern `(? ? ex:alice ?)` becomes: code of `<http://example.org/alice>`
 | `from_file` | the file tail: postscript, footer, dtype, layout tree with its JSON inventory. Every descriptor is classified; an unknown required one fails here. Under `Dictionary`, the residency decision runs ([§5](#5-the-dictionary-child)) — a dictionary within budget is the one thing scanned at open. Index children are not touched. |
 | a query | the zone-map tables the filter needs, the chunk leaves a probe bisects, then the leaves of the rows the scan finally decodes — or, on a served match, the index child's own run |
 | `size()` on a pending filter | statistics and filter masks only; no row is projected |
-| `from_bytes` / `fromBytes` | everything: the quad table is scanned into memory, the subject stamp is restored from `quads_sorted`, the dictionary is lifted (decoded once to one canonical column by default in the bindings, `dictionary='plaintext'`; as written — still FSST — on request, and in the Rust `from_bytes`), and each index child is adopted by its reader with nothing read — it is scanned and canonicalized on its first use |
+| `from_bytes` / `fromBytes` | everything: the quad table is scanned into memory, the subject stamp is restored from `quads_sorted`, the code columns are held in the requested form (canonical primitives by default in the bindings, `codes='canonical'`; the writer's encodings on request, and in the Rust `from_bytes`), the dictionary is lifted (decoded once to one canonical column by default in the bindings, `dictionary='plaintext'`; as written — still FSST — on request, and in the Rust `from_bytes`), and each index child is adopted by its reader with nothing read — it is scanned and canonicalized on its first use |
 
 The opened handle ([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L30))
 keeps what repeated queries reuse: the layout reader tree (so zone-map tables
@@ -414,7 +414,7 @@ read paths are written against ([`QuadsSource`](../core/src/store/view/source.rs
 
 | In the file | In memory |
 |---|---|
-| `quad-source` child | `base: ArrayRef` — one struct; built in this process, its `u32` columns are flat canonical primitives; adopted from bytes or a file, they keep the writer's encodings, and a bulk code read goes through the base's live canonical cache ([memory.md](memory.md)) |
+| `quad-source` child | `base: ArrayRef` — one struct; built in this process, its `u32` columns are flat canonical primitives, as they are when adopted with `codes='canonical'`; adopted as written, they keep the writer's encodings, and a bulk code read goes through the base's live canonical cache ([memory.md](memory.md)) |
 | `quads_sorted` | the `IsSorted` stamp on the `s` column |
 | `index:*` children | `components: Arc<[IndexComponent]>` — the same rows under the same column names, with the descriptor's `sorted` flag; adopted from bytes they stay deferred until first use |
 | `dictionary` child | `ResolvedLayout::Dictionary(DictAccess::Resident \| FileBacked)` |
@@ -475,7 +475,7 @@ open rather than being read around.
 | row block / zone size | 8,192 rows | Vortex default write strategy |
 | data block target | ~1 MiB | Vortex default write strategy |
 | `DICT_CHUNK_ROWS` | 65,536 terms per FSST window and leaf | [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs#L46) |
-| `DICT_MAX_RESIDENT_BYTES_DEFAULT` | 512 MiB | [`open.rs`](../core/src/store/persist/open.rs#L106) |
+| `DICT_MAX_RESIDENT_BYTES_DEFAULT` | 512 MiB | [`open.rs`](../core/src/store/persist/open.rs#L107) |
 | `PROBE_CACHE_SLOTS` | 256 | [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs#L432) |
 | `POINT_GATHER_MAX_ROWS` | 256 rows — a located run at most this wide is point-read through the chunk probes; the file-backed dictionary point-reads a batch of at most this many codes through its chunk leaves and scans a wider one | [`selection.rs`](../core/src/store/view/selection.rs#L338) |
 | `DEFAULT_CHUNK_ROWS` | 100,000 rows per builder chunk (a producer batch size; the writer re-blocks at 8,192) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L52) |

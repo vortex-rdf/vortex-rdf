@@ -595,7 +595,7 @@ async fn test_dictionary_terms_stay_fsst_through_bytes() {
     let store = VortexRdfStore::from_built(arr).unwrap();
 
     let bytes = store.to_bytes().await.unwrap();
-    let reread = VortexRdfStore::from_bytes_owned_as(bytes, crate::store::DictForm::AsWritten)
+    let reread = VortexRdfStore::from_bytes_owned_as(bytes, crate::store::ResidentForm::default())
         .await
         .unwrap();
     assert_dictionary_terms_fsst(&reread, "reread");
@@ -624,9 +624,15 @@ async fn test_plaintext_adoption_is_one_canonical_chunk() {
     let store = VortexRdfStore::from_built(arr).unwrap();
 
     let bytes = store.to_bytes().await.unwrap();
-    let plaintext = VortexRdfStore::from_bytes_owned_as(bytes, crate::store::DictForm::Plaintext)
-        .await
-        .unwrap();
+    let plaintext = VortexRdfStore::from_bytes_owned_as(
+        bytes,
+        crate::store::ResidentForm {
+            dict: crate::store::DictForm::Plaintext,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     assert_dictionary_canonical(&plaintext, "plaintext");
 
     assert_eq!(plaintext.size().await.unwrap(), 2_000);

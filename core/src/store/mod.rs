@@ -25,7 +25,7 @@ pub use arrow::{
 pub use builders::{
     BuiltArray, BuiltStream, ChunkStream, SortedInMemoryBuilder, VortexArrayBuilder,
 };
-pub use persist::export_rdf;
+pub use persist::{CodeForm, ResidentForm, export_rdf};
 // Compiled out on wasm along with the rest of the sorted-stream builder's
 // out-of-core merge (see the module gate in `builders`).
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -151,6 +151,17 @@ fn resolved_layout(
 /// which nothing ever reads as a payload. Shared by the builder adoption
 /// (`from_built`) and compaction's rebuild (`from_raw_quads`) — the two
 /// places built columns become a store.
+/// An adopted base in `form`: the writer's encodings kept wherever a probe
+/// binds them ([`with_searchable_int_children`](array::with_searchable_int_children)),
+/// or every integer child decoded to canonical primitives, the form a built
+/// base holds ([`with_canonical_int_children`](array::with_canonical_int_children)).
+pub(crate) fn adopted_base(base: ArrayRef, form: CodeForm) -> Result<ArrayRef> {
+    match form {
+        CodeForm::AsWritten => array::with_searchable_int_children(base),
+        CodeForm::Canonical => array::with_canonical_int_children(base),
+    }
+}
+
 fn resident_built_parts(
     base: ArrayRef,
     components: Vec<IndexComponent>,
@@ -222,20 +233,24 @@ impl VortexRdfStore {
     /// The dictionary is adopted as it arrived (see
     /// [`from_parts_as`](Self::from_parts_as)).
     pub fn from_parts(parts: StoreParts) -> Result<Self> {
-        Self::from_parts_as(parts, DictForm::AsWritten)
+        Self::from_parts_as(parts, ResidentForm::default())
     }
 
-    /// [`from_parts`](Self::from_parts) with the dictionary held in `form`
-    /// (see [`DictForm`]): as it arrived — FSST chunks when the parts came
-    /// out of a file — or decoded whole, once, into one canonical column.
-    pub fn from_parts_as(parts: StoreParts, form: DictForm) -> Result<Self> {
-        let dict = parts.dict.map(|dict| dict.into_form(form)).transpose()?;
+    /// [`from_parts`](Self::from_parts) with the dictionary and the code
+    /// columns held in `form` (see [`ResidentForm`]): as they arrived — FSST
+    /// chunks and the writer's encodings when the parts came out of a file —
+    /// or decoded whole, once, into canonical columns.
+    pub fn from_parts_as(parts: StoreParts, form: ResidentForm) -> Result<Self> {
+        let dict = parts
+            .dict
+            .map(|dict| dict.into_form(form.dict))
+            .transpose()?;
         let layout = resolved_layout(dict, parts.array.dtype())?;
-        let base = array::with_searchable_int_children(parts.array)?;
+        let base = adopted_base(parts.array, form.codes)?;
         let components = parts
             .components
             .into_iter()
-            .map(IndexComponent::into_searchable)
+            .map(|component| Ok(component.into_searchable()?.with_code_form(form.codes)))
             .collect::<Result<Vec<_>>>()?;
         Self::assemble_resident(base, components, layout)
     }

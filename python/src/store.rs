@@ -9,7 +9,7 @@ use pyo3::types::{PyBytes, PyRange, PyRangeMethods, PyString};
 use vortex_buffer::Buffer;
 use vortex_rdf_core::common::terms::{Pattern, parse_pattern_checked};
 use vortex_rdf_core::{
-    DictForm, Keep, QuadColumn, TermEncoding, VortexRdfError as CoreError,
+    CodeForm, DictForm, Keep, QuadColumn, ResidentForm, TermEncoding, VortexRdfError as CoreError,
     VortexRdfStore as CoreStore,
 };
 
@@ -258,19 +258,32 @@ impl VortexRdfStore {
     }
 }
 
-/// The resident form of an adopted store's term dictionary when the caller
-/// names none (see [`parse_dict_form`]).
-const DEFAULT_DICT_FORM: DictForm = DictForm::Plaintext;
+/// The resident forms of an adopted store when the caller names none: the
+/// dictionary plaintext and the code columns canonical — every read in place
+/// (see [`parse_resident_form`]).
+const DEFAULT_RESIDENT_FORM: ResidentForm = ResidentForm {
+    dict: DictForm::Plaintext,
+    codes: CodeForm::Canonical,
+};
 
-/// The `dictionary=` argument resolved through core's names: `"plaintext"`
-/// decodes the column once into one canonical form, `"as-written"` keeps
-/// the file's chunks (FSST, decoded one term per read); `None` is the
-/// binding's default, plaintext.
-fn parse_dict_form(name: Option<&str>) -> PyResult<DictForm> {
-    match name {
-        None => Ok(DEFAULT_DICT_FORM),
-        Some(name) => name.parse().map_err(parse_err),
-    }
+/// The `dictionary=` and `codes=` arguments resolved through core's names.
+/// `dictionary`: `"plaintext"` decodes the column once into one canonical
+/// form, `"as-written"` keeps the file's chunks (FSST, decoded one term per
+/// read). `codes`: `"canonical"` decodes the `u32` code columns once, so every
+/// code read is a slice of them, `"as-written"` keeps the writer's encodings
+/// and decodes a column into a form shared only while some reader holds it.
+/// `None` is the binding's default for each.
+fn parse_resident_form(dictionary: Option<&str>, codes: Option<&str>) -> PyResult<ResidentForm> {
+    Ok(ResidentForm {
+        dict: match dictionary {
+            None => DEFAULT_RESIDENT_FORM.dict,
+            Some(name) => name.parse().map_err(parse_err)?,
+        },
+        codes: match codes {
+            None => DEFAULT_RESIDENT_FORM.codes,
+            Some(name) => name.parse().map_err(parse_err)?,
+        },
+    })
 }
 
 #[pymethods]
@@ -282,17 +295,18 @@ impl VortexRdfStore {
     /// every subsequent match skips the per-call file-scan pipeline.
     /// `max_resident_bytes` overrides the Dictionary layout's
     /// term-dictionary residency budget (the dictionary child's compressed
-    /// size in bytes). `dictionary` picks the resident form of an in-memory
-    /// store's term dictionary (see [`parse_dict_form`]) and applies to
-    /// `in_memory=True` only.
+    /// size in bytes). `dictionary` and `codes` pick the resident forms of an
+    /// in-memory store's term dictionary and code columns (see
+    /// [`parse_resident_form`]) and apply to `in_memory=True` only.
     #[new]
-    #[pyo3(signature = (path, max_resident_bytes=None, in_memory=false, dictionary=None))]
+    #[pyo3(signature = (path, max_resident_bytes=None, in_memory=false, dictionary=None, codes=None))]
     fn new(
         py: Python<'_>,
         path: PathBuf,
         max_resident_bytes: Option<u64>,
         in_memory: bool,
         dictionary: Option<&str>,
+        codes: Option<&str>,
     ) -> PyResult<Self> {
         // Core reports a missing path as `VortexRdfError::Vortex`, not `Io`,
         // so the `FileNotFoundError` contract is honoured here.
@@ -302,13 +316,13 @@ impl VortexRdfStore {
                 path.display()
             )));
         }
-        if dictionary.is_some() && !in_memory {
+        if (dictionary.is_some() || codes.is_some()) && !in_memory {
             return Err(PyValueError::new_err(
-                "dictionary= picks the resident form of an in-memory store; \
-                 a file-backed open keeps the file's own form (use in_memory=True)",
+                "dictionary and codes pick the resident forms of an in-memory store; \
+                 a file-backed open keeps the file's own forms (use in_memory=True)",
             ));
         }
-        let form = parse_dict_form(dictionary)?;
+        let form = parse_resident_form(dictionary, codes)?;
         let store = py
             .detach(|| {
                 RUNTIME.block_on(async {
@@ -339,12 +353,17 @@ impl VortexRdfStore {
     /// the JS bindings' `toBytes`, or reading a `.vortex` file into memory
     /// produces. The whole store lives in memory. `data` should be `bytes`
     /// (or `bytearray`), copied in one memcpy; any other int sequence is
-    /// accepted but extracted element by element. `dictionary` picks the
-    /// resident form of the term dictionary (see [`parse_dict_form`]).
+    /// accepted but extracted element by element. `dictionary` and `codes`
+    /// pick the resident forms (see [`parse_resident_form`]).
     #[staticmethod]
-    #[pyo3(signature = (data, dictionary=None))]
-    fn from_bytes(py: Python<'_>, data: Vec<u8>, dictionary: Option<&str>) -> PyResult<Self> {
-        let form = parse_dict_form(dictionary)?;
+    #[pyo3(signature = (data, dictionary=None, codes=None))]
+    fn from_bytes(
+        py: Python<'_>,
+        data: Vec<u8>,
+        dictionary: Option<&str>,
+        codes: Option<&str>,
+    ) -> PyResult<Self> {
+        let form = parse_resident_form(dictionary, codes)?;
         let store = py
             .detach(|| RUNTIME.block_on(CoreStore::from_bytes_owned_as(data, form)))
             .map_err(store_err)?;

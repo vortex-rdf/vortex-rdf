@@ -92,7 +92,7 @@ flowchart TD
   selections are `All`.
 - **Every layout, Dictionary included.** An appended term has no code in the
   base's frozen sorted dictionary, so under the Dictionary layout the tail
-  stores Default-layout N-Triples strings ([`tail_layout`](../core/src/store/mod.rs#L384));
+  stores Default-layout N-Triples strings ([`tail_layout`](../core/src/store/mod.rs#L399));
   under the other layouts it uses the store's own columns. Patterns probe the
   base by code and the tail by string, and a query that touches both unions
   the results.
@@ -102,7 +102,7 @@ flowchart TD
   then unions the two. A base short-circuit (a term with no code in the
   dictionary) never skips the tail, since that term may exist in the tail's
   plain strings.
-- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L402) is the number
+- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L417) is the number
   of physical tail rows — the store's only unindexed, unsorted region, and the
   number to watch when tuning compaction.
 
@@ -255,15 +255,15 @@ store past the threshold rewrites its source file, as above, as part of the
 ## 6. Ownership and `owned()`
 
 Only a store that owns its rows may be mutated
-([`is_owner`](../core/src/store/mod.rs#L435),
-[`ensure_owner`](../core/src/store/mod.rs#L447)): its base selection is
+([`is_owner`](../core/src/store/mod.rs#L450),
+[`ensure_owner`](../core/src/store/mod.rs#L462)): its base selection is
 `All`, it has no pending file filter, and its tail selection (if any) is
 `All`. A view derived from `match_pattern` is a window onto a base it shares,
 so mutating it would either silently drop the rows outside the view or write
 through to data it does not own; a view that happens to select everything (an
 unconstrained match) counts as an owner.
 
-[`owned`](../core/src/store/mod.rs#L418) turns any store into one that can be
+[`owned`](../core/src/store/mod.rs#L433) turns any store into one that can be
 mutated: an owner comes back as a cheap clone (tombstones and indexes kept), a
 narrowed view is compacted with its declared indexes into an independent
 store. Mutating a match result therefore goes `view.owned().await?` first, or

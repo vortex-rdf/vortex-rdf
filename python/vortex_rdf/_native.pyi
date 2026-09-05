@@ -115,6 +115,7 @@ class VortexRdfStore:
         max_resident_bytes: Optional[int] = None,
         in_memory: bool = False,
         dictionary: Optional[str] = None,
+        codes: Optional[str] = None,
     ) -> None:
         """Open ``path``: file-backed and lazy by default, wholly in memory
         with ``in_memory=True``. ``dictionary`` — ``"plaintext"`` (the default)
@@ -122,12 +123,19 @@ class VortexRdfStore:
         term dictionary: the column decoded once into one canonical form that
         every probe, decode and Arrow export then reads in place, or the
         file's own FSST chunks (a third of the size), decoded one term per
-        read. Only with ``in_memory=True``; ``ValueError`` otherwise."""
+        read. ``codes`` — ``"canonical"`` (the default) or ``"as-written"`` —
+        picks the form of its ``u32`` code columns: decoded once, so every
+        code read and Arrow export is a slice of them, or the writer's
+        encodings, a column decoded into a form shared only while some result
+        holds it. Both only with ``in_memory=True``; ``ValueError``
+        otherwise."""
         ...
     @staticmethod
-    def from_bytes(data: bytes, dictionary: Optional[str] = None) -> "VortexRdfStore":
+    def from_bytes(
+        data: bytes, dictionary: Optional[str] = None, codes: Optional[str] = None
+    ) -> "VortexRdfStore":
         """Open native-container bytes as an in-memory store; ``dictionary``
-        as for ``__init__``."""
+        and ``codes`` as for ``__init__``."""
         ...
     def to_bytes(self) -> bytes: ...
     def layout(self) -> str: ...

@@ -304,7 +304,8 @@ impl InMemoryServePlan {
     /// probes, decoding no column. A wider run slices each column's canonical
     /// form — the column itself when it is canonical, else the component's
     /// live canonical cache: decoded once, shared with every holder alive and
-    /// freed with the last, filled when the run covers at least
+    /// freed with the last (kept for the store's lifetime when the cache is
+    /// pinned), filled when the cache is pinned, the run covers at least
     /// 1/[`CACHE_RUN_FRACTION`] of the component or a holder already keeps
     /// the column alive; a narrower cold run decodes the run alone.
     /// Tombstoned rows are dropped through the rid column.
@@ -397,7 +398,9 @@ impl InMemoryServePlan {
         if let Some(column) = self.canonical.column_if_alive(idx) {
             return Ok(Some(column));
         }
-        if self.range.len().saturating_mul(CACHE_RUN_FRACTION) >= self.array.len() {
+        if self.canonical.is_pinned()
+            || self.range.len().saturating_mul(CACHE_RUN_FRACTION) >= self.array.len()
+        {
             return self.canonical.column(idx, col).map(Some);
         }
         Ok(None)

@@ -25,6 +25,7 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
+use crate::store::CodeForm;
 use crate::store::array::into_struct_array;
 use crate::store::view::canonical::LiveCanonical;
 
@@ -347,7 +348,7 @@ impl IndexComponent {
         Ok(Self {
             rows: ComponentRows::Built(array),
             probes: crate::store::view::probes::StructProbes::new(),
-            canonical: LiveCanonical::new(),
+            canonical: self.canonical.fresh(),
             ..self
         })
     }
@@ -402,6 +403,20 @@ impl IndexComponent {
     /// this reference.
     pub(crate) fn canonical_arc(&self) -> Arc<LiveCanonical> {
         Arc::clone(&self.canonical)
+    }
+
+    /// This component with its code columns held in `form`: under
+    /// [`CodeForm::Canonical`] the live canonical cache is pinned, so a
+    /// served read that decodes a column keeps it for the store's lifetime;
+    /// nothing is decoded ahead of a read.
+    pub(crate) fn with_code_form(self, form: CodeForm) -> Self {
+        match form {
+            CodeForm::AsWritten => self,
+            CodeForm::Canonical => Self {
+                canonical: LiveCanonical::pinned(),
+                ..self
+            },
+        }
     }
 
     /// Whether some reader holds the live canonical form of column `idx`.

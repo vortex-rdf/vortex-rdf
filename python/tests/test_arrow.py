@@ -232,3 +232,26 @@ def test_served_runs_share_the_index_columns_across_exports(tmp_path):
     for name in ["s", "p", "o", "g"]:
         assert first.column(name).num_chunks == 1
         assert address(first, name) == address(second, name)
+
+
+def test_default_code_form_shares_buffers_with_nothing_held(vortex_files):
+    """The bindings' in-memory opens hold the code columns canonical by
+    default: two ``codes`` exports are the same buffers even when nothing is
+    held between them, so an engine that drops its batches between queries
+    never re-pays a decode."""
+    store = VortexRdfStore(vortex_files["dictionary"], in_memory=True)
+    address = lambda table, name: table.column(name).chunk(0).buffers()[1].address  # noqa: E731
+    first = {name: address(_table(store.match_arrow()), name) for name in ["s", "p", "o", "g"]}
+    second = {name: address(_table(store.match_arrow()), name) for name in ["s", "p", "o", "g"]}
+    assert first == second
+
+
+def test_code_form_is_named_and_gated(vortex_files, tmp_path):
+    for codes in ["as-written", "canonical"]:
+        store = VortexRdfStore(vortex_files["dictionary"], in_memory=True, codes=codes)
+        assert _table(store.match_arrow()).num_rows == len(store)
+        assert VortexRdfStore.from_bytes(store.to_bytes(), codes=codes).term_dict() is not None
+    with pytest.raises(ValueError, match="code form"):
+        VortexRdfStore(vortex_files["dictionary"], in_memory=True, codes="compressed")
+    with pytest.raises(ValueError, match="in_memory=True"):
+        VortexRdfStore(vortex_files["dictionary"], codes="canonical")

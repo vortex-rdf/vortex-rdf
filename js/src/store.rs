@@ -143,7 +143,8 @@ impl VortexRdfStore {
 
     /// Takes ownership of the buffer wasm-bindgen marshalled from the caller's
     /// `Uint8Array`, so the load holds a single copy of the bytes. `options`
-    /// (`OpenOptions`) picks the resident form of the term dictionary.
+    /// (`OpenOptions`) picks the resident forms of the term dictionary and
+    /// the code columns.
     #[wasm_bindgen(js_name = fromBytes, skip_typescript)]
     pub async fn from_bytes(bytes: Vec<u8>, options: JsValue) -> Result<VortexRdfStore, JsValue> {
         let form = parse_open_options(options)?;

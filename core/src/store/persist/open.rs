@@ -6,6 +6,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::io::container;
 use crate::io::read;
 use crate::session::VORTEX_SESSION;
+use crate::store::ResidentForm;
 use crate::store::indexes::{IndexComponent, KnownComponent};
 use crate::store::layouts::dictionary::TermDictionary;
 #[cfg(feature = "file-io")]
@@ -276,17 +277,17 @@ impl VortexRdfStore {
     /// borrowed slice into one. The dictionary is adopted as written (see
     /// [`from_bytes_owned_as`](Self::from_bytes_owned_as)).
     pub async fn from_bytes_owned(bytes: impl Into<vortex_buffer::ByteBuffer>) -> Result<Self> {
-        Self::from_bytes_owned_as(bytes, crate::store::DictForm::AsWritten).await
+        Self::from_bytes_owned_as(bytes, ResidentForm::default()).await
     }
 
-    /// [`from_bytes_owned`](Self::from_bytes_owned) with the dictionary
-    /// held in `form` (see [`DictForm`](crate::store::DictForm)): its chunks as
-    /// written — FSST windows inside the bytes, decoded one term per read —
-    /// or decoded whole, once, into one canonical column that every probe,
-    /// decode and Arrow export then reads in place.
+    /// [`from_bytes_owned`](Self::from_bytes_owned) with the dictionary and
+    /// the code columns held in `form` (see [`ResidentForm`]): as written —
+    /// FSST windows and the writer's encodings inside the bytes, decoded per
+    /// read — or decoded whole, once, into canonical columns that every
+    /// probe, decode and Arrow export then read in place.
     pub async fn from_bytes_owned_as(
         bytes: impl Into<vortex_buffer::ByteBuffer>,
-        form: crate::store::DictForm,
+        form: ResidentForm,
     ) -> Result<Self> {
         let file = VORTEX_SESSION
             .open_options()
@@ -305,8 +306,10 @@ impl VortexRdfStore {
             .map_err(VortexRdfError::Vortex)?
             .into_array();
         // Restore the subject stamp from the file's recorded provenance,
-        // through the same helper every materializing read path uses.
+        // through the same helper every materializing read path uses, then
+        // hold the columns in the requested form.
         let quads = crate::store::array::with_subject_stamp(quads, container::quads_sorted(typed))?;
+        let quads = crate::store::adopted_base(quads, form.codes)?;
 
         let mut components: Vec<IndexComponent> = Vec::new();
         let mut dict = None;
@@ -328,7 +331,7 @@ impl VortexRdfStore {
             match kind {
                 ComponentKind::Dict => {
                     dict = Some(Arc::new(
-                        TermDictionary::from_child_reader(reader, form).await?,
+                        TermDictionary::from_child_reader(reader, form.dict).await?,
                     ));
                 }
                 ComponentKind::Index(known) => {
@@ -339,12 +342,15 @@ impl VortexRdfStore {
                     // load pays nothing for index children it never touches.
                     // Sound here because this reader sits over the buffer
                     // the file was opened from (see `adopt_component_reader`).
-                    components.push(crate::store::indexes::adopt_component_reader(
-                        &known,
-                        reader,
-                        descriptor.sorted,
-                        quads.len() as u64,
-                    )?);
+                    components.push(
+                        crate::store::indexes::adopt_component_reader(
+                            &known,
+                            reader,
+                            descriptor.sorted,
+                            quads.len() as u64,
+                        )?
+                        .with_code_form(form.codes),
+                    );
                 }
                 ComponentKind::Skip => {}
             }

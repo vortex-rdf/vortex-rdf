@@ -7,8 +7,8 @@ use js_sys::Reflect;
 use oxrdfio::RdfFormat;
 use vortex_rdf_core::common::formats::{format_from_name, supported_format_names};
 use vortex_rdf_core::{
-    BuiltArray, DictForm, IndexType, Indexes, Keep, LayoutStrategy, QuadColumn, RawQuad,
-    Result as CoreResult, SortedInMemoryBuilder, TermEncoding, VortexArrayBuilder,
+    BuiltArray, CodeForm, DictForm, IndexType, Indexes, Keep, LayoutStrategy, QuadColumn, RawQuad,
+    ResidentForm, Result as CoreResult, SortedInMemoryBuilder, TermEncoding, VortexArrayBuilder,
 };
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
@@ -86,23 +86,34 @@ pub(crate) fn parse_build_options(options: JsValue) -> Result<BuildConfig, JsVal
     Ok(config)
 }
 
-/// The resident form of an adopted store's term dictionary when the caller
-/// names none.
-const DEFAULT_DICT_FORM: DictForm = DictForm::Plaintext;
+/// The resident forms of an adopted store when the caller names none: the
+/// dictionary plaintext and the code columns canonical — every read in place.
+const DEFAULT_RESIDENT_FORM: ResidentForm = ResidentForm {
+    dict: DictForm::Plaintext,
+    codes: CodeForm::Canonical,
+};
 
 /// Resolve the optional JS `OpenOptions` object behind `fromBytes`:
 /// `dictionary` (a dictionary-form name — `plaintext`, the default, decodes
 /// the column once into one canonical form; `as-written` keeps the file's
-/// FSST chunks). Accepts `undefined`/`null` for the default; the vocabulary
-/// is core's `FromStr`, so parse failures carry core's messages.
-pub(crate) fn parse_open_options(options: JsValue) -> Result<DictForm, JsValue> {
+/// FSST chunks) and `codes` (a code-form name — `canonical`, the default,
+/// decodes the `u32` columns once; `as-written` keeps the writer's
+/// encodings). Accepts `undefined`/`null` for the defaults; the vocabulary is
+/// core's `FromStr`, so parse failures carry core's messages.
+pub(crate) fn parse_open_options(options: JsValue) -> Result<ResidentForm, JsValue> {
     if options.is_null() || options.is_undefined() {
-        return Ok(DEFAULT_DICT_FORM);
+        return Ok(DEFAULT_RESIDENT_FORM);
     }
-    match get_string_option(&options, "dictionary")? {
-        Some(name) => name.parse().map_err(js_err),
-        None => Ok(DEFAULT_DICT_FORM),
-    }
+    Ok(ResidentForm {
+        dict: match get_string_option(&options, "dictionary")? {
+            Some(name) => name.parse().map_err(js_err)?,
+            None => DEFAULT_RESIDENT_FORM.dict,
+        },
+        codes: match get_string_option(&options, "codes")? {
+            Some(name) => name.parse().map_err(js_err)?,
+            None => DEFAULT_RESIDENT_FORM.codes,
+        },
+    })
 }
 
 /// The read behind an Arrow export, resolved from the JS `ArrowOptions`

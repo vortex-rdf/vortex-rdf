@@ -90,7 +90,7 @@ tail rows store their terms as strings, and the terms appended have no code
 in the frozen dictionary ([mutations.md §2](mutations.md#2-additions-the-append-tail)).
 Such a view rejects `codes` and `terms` with an error — export `strings`,
 or compact first — exactly the gate
-[`code_read_snapshot`](../core/src/store/mod.rs#L512) applies to the
+[`code_read_snapshot`](../core/src/store/mod.rs#L527) applies to the
 code-column readers.
 
 ### 2.3 The dictionary as an Arrow array
@@ -175,12 +175,13 @@ built straight from the projected buffers it returns
 those: a projection decodes nothing it leaves out. This is the path the
 bindings' `match_arrow` / `matchArrow` take — their one engine-facing read —
 so every consumer of a view hands out the same memory. A store *adopted* from
-bytes or a file keeps its base wire-encoded
-([serialization.md](serialization.md)): a contiguous wide read decodes
-each column once into a form every holder shares and the last holder
-frees, so two exports alive at the same time are the same buffers
-([memory.md](memory.md)); a point-sized or scattered
-selection over an adopted base is gathered instead, one allocation per
+bytes or a file keeps its base wire-encoded unless adopted with
+`codes='canonical'` — the bindings' default, which holds the columns as a
+built base does ([memory.md §1](memory.md#1-the-three-forms)); as written, a
+contiguous wide read decodes each column once into a form every holder
+shares and the last holder frees, so two exports alive at the same time
+are the same buffers ([memory.md](memory.md)); a point-sized or scattered
+selection over an as-written base is gathered instead, one allocation per
 call.
 
 A *served* match — a predicate- or object-bound pattern a by-copy index
@@ -188,7 +189,7 @@ answered — is a contiguous run of that index's own columns, which hold every
 quad in the family's order. A point-sized run (up to 256 rows) is read code
 by code through the component's cached probes; a wider one is a slice of
 the component's canonical form
-([`InMemoryServePlan::code_columns`](../core/src/store/indexes/serve.rs#L315)).
+([`InMemoryServePlan::code_columns`](../core/src/store/indexes/serve.rs#L316)).
 Components are held compressed ([memory.md §1](memory.md#1-the-three-forms)),
 so that form is the component's live canonical cache: each column decoded
 once, shared by every holder alive, freed with the last — filled when the
@@ -272,7 +273,7 @@ pa.array(store.term_dict().filter_codes("is_iri", "")[0])             # a code s
 pa.array(store.term_dict())                                           # the dictionary
 ```
 
-[`match_arrow`](../python/src/store.rs#L509) resolves the pattern and
+[`match_arrow`](../python/src/store.rs#L528) resolves the pattern and
 builds the core batch stream off the GIL, then wraps it in an
 [`ArrowQuadStream`](../python/src/arrow.rs#L117). Its
 [`__arrow_c_schema__`](../python/src/arrow.rs#L143) can be read any number
@@ -314,11 +315,11 @@ The `pyarrow`/`polars` packages appear only as test dependencies
 
 JavaScript has no capsule protocol, but the C Data Interface itself needs
 nothing more than memory both sides can address — and wasm linear memory
-is exactly that. [`matchArrowFFI`](../js/src/store.rs#L364) resolves the
+is exactly that. [`matchArrowFFI`](../js/src/store.rs#L365) resolves the
 pattern, applies the `keep` constraints and the row window, drives the
 core batch stream to completion (no wasm read path performs I/O, so the
 stream is already resolved and nothing suspends) and exports the result as
-C Data Interface structs ([`ArrowFFI::export`](../js/src/store.rs#L541)):
+C Data Interface structs ([`ArrowFFI::export`](../js/src/store.rs#L542)):
 the `ArrowSchema` of the batches, a struct field carrying the quad schema's
 metadata, and one `ArrowArray` — a struct array — per batch. The returned
 `ArrowFFI` handle owns them and reports their addresses (`schemaPtr()`,
@@ -382,12 +383,12 @@ view before running the next query is the discipline a long-lived worker
 keeps.
 
 **Pushdown.** The options object
-([`parse_arrow_options`](../js/src/options.rs#L146)) carries core's
+([`parse_arrow_options`](../js/src/options.rs#L157)) carries core's
 `encoding` and `projection` vocabulary, parsed by core's own `FromStr` impls
 so an error message reads the same from every frontend, plus the narrowing
 Python's `match_arrow` takes: `keep` (per column, a `Uint32Array` or array
 of codes as a code set, `{lo, hi}` as a half-open code range —
-[`parse_keep`](../js/src/options.rs#L181)) applied through core's
+[`parse_keep`](../js/src/options.rs#L192)) applied through core's
 [`keep`](../core/src/store/query/pushdown.rs#L182), then `offset`/`limit` through
 [`window`](../core/src/store/query/pushdown.rs#L68), before any row is gathered.
 `TermDict.decodeMany` ([`decode_many`](../js/src/store.rs#L120)) decodes a

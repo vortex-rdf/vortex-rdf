@@ -71,7 +71,8 @@ use futures::{TryStreamExt, stream};
 use oxrdf::{NamedNode, NamedOrBlankNode};
 
 use vortex_rdf_core::{
-    DictForm, LayoutStrategy, TermEncoding, TermPredicate, VortexRdfError, VortexRdfStore, io,
+    DictForm, LayoutStrategy, ResidentForm, TermEncoding, TermPredicate, VortexRdfError,
+    VortexRdfStore, io,
 };
 
 // The module is shared with `match_lazy.rs` and compiled per-target; items
@@ -717,9 +718,15 @@ fn adopted_dict_store(adoption: DictAdoption, size: usize) -> VortexRdfStore {
     // The cache fills through the runtime, so take the bytes before entering it.
     let bytes = dict_bytes(size);
     rt().block_on(async {
-        VortexRdfStore::from_bytes_owned_as(bytes, adoption.form())
-            .await
-            .expect("adopt dictionary store")
+        VortexRdfStore::from_bytes_owned_as(
+            bytes,
+            ResidentForm {
+                dict: adoption.form(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("adopt dictionary store")
     })
 }
 
@@ -810,9 +817,15 @@ fn dict_adopt_open(bencher: divan::Bencher, adoption: &DictAdoption) {
         .with_inputs(|| dict_bytes(bench_size()))
         .bench_values(|bytes| {
             rt().block_on(async {
-                let store = VortexRdfStore::from_bytes_owned_as(bytes, form)
-                    .await
-                    .expect("adopt");
+                let store = VortexRdfStore::from_bytes_owned_as(
+                    bytes,
+                    ResidentForm {
+                        dict: form,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("adopt");
                 black_box(store.layout())
             })
         });

@@ -111,10 +111,23 @@ export interface ArrowOptions {
  */
 export type DictForm = 'plaintext' | 'as-written';
 
+/**
+ * The resident form of the `u32` code columns of a store opened from bytes
+ * (a store built from quads always holds them canonical).
+ * - 'canonical' (the default): the columns decoded once, so every code read
+ *   and every Arrow export is a slice of them.
+ * - 'as-written': the writer's encodings, as views into the bytes; a wide
+ *   code read decodes a column into a form shared only while some result
+ *   holds it — the lean load, a quarter of the canonical columns' size.
+ */
+export type CodeForm = 'canonical' | 'as-written';
+
 /** Options of `fromBytes`. Any omitted field keeps its default. */
 export interface OpenOptions {
     /** @default 'plaintext' */
     dictionary?: DictForm;
+    /** @default 'canonical' */
+    codes?: CodeForm;
 }
 
 /**

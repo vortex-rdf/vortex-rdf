@@ -35,7 +35,9 @@ mod counting {
     use std::time::{Duration, Instant};
 
     use futures::stream;
-    use vortex_rdf_core::{DictForm, LayoutStrategy, RawQuad, VortexRdfStore};
+    use vortex_rdf_core::{
+        CodeForm, DictForm, LayoutStrategy, RawQuad, ResidentForm, VortexRdfStore,
+    };
 
     use super::dataset;
 
@@ -111,6 +113,20 @@ mod counting {
         (held, delta(before))
     }
 
+    /// What a whole-store code read costs while its four columns are held,
+    /// and what stays after they are dropped.
+    async fn code_read_cost(store: &VortexRdfStore) -> (String, String) {
+        let before = live();
+        let columns = store
+            .code_columns_gathered()
+            .await
+            .expect("code read")
+            .expect("a resident dictionary store serves codes");
+        let held = delta(before);
+        drop(columns);
+        (held, delta(before))
+    }
+
     pub(super) fn main() {
         let n: usize = std::env::var("BENCH_SIZE")
             .ok()
@@ -141,30 +157,39 @@ mod counting {
             .expect("built dictionary")
             .len();
         let (held, after) = arrow_values_cost(&built);
+        let (codes_held, codes_after) = code_read_cost(&built).await;
         println!(
-            "| built (canonical dictionary, {terms} terms) | {} | {built_retained} | {held} | {after} |",
+            "| built (canonical dictionary, {terms} terms) | {} | {built_retained} | {held} | {after} | {codes_held} | {codes_after} |",
             secs(build_time)
         );
 
         let bytes = built.to_bytes().await.expect("to_bytes");
         println!("| file bytes | | {} | | |", mib(bytes.len()));
 
-        for form in [DictForm::AsWritten, DictForm::Plaintext] {
+        for (dict, codes) in [
+            (DictForm::AsWritten, CodeForm::AsWritten),
+            (DictForm::Plaintext, CodeForm::AsWritten),
+            (DictForm::Plaintext, CodeForm::Canonical),
+        ] {
             let before = live();
             let start = Instant::now();
-            let adopted = VortexRdfStore::from_bytes_owned_as(bytes.clone(), form)
-                .await
-                .expect("adopt");
+            let adopted =
+                VortexRdfStore::from_bytes_owned_as(bytes.clone(), ResidentForm { dict, codes })
+                    .await
+                    .expect("adopt");
             let adopt_time = start.elapsed();
             let retained = delta(before);
             let (held, after) = arrow_values_cost(&adopted);
+            let (codes_held, codes_after) = code_read_cost(&adopted).await;
             println!(
-                "| adopted {form} | {} | {retained} (incl. the bytes) | {held} | {after} |",
+                "| adopted {dict} dictionary, {codes} codes | {} | {retained} (incl. the bytes) | {held} | {after} | {codes_held} | {codes_after} |",
                 secs(adopt_time)
             );
             drop(adopted);
         }
-        println!("columns: form | construction | retained | to_arrow held | after drop");
+        println!(
+            "columns: form | construction | retained | to_arrow held | after drop | code read held | after drop"
+        );
         drop(built);
     });
     }

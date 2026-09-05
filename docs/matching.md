@@ -223,7 +223,7 @@ stage only sees what is left.
 
 A built base's code columns are flat canonical primitives; an adopted base
 keeps the encodings its file was written with
-([`resident_built_parts`](../core/src/store/mod.rs#L154),
+([`resident_built_parts`](../core/src/store/mod.rs#L165),
 [`with_searchable_int_children`](../core/src/store/array.rs#L278)). The stages
 below search either form in place — slice compares on canonical columns, the
 cached encoded-search probes on encoded ones. No stage decodes a column; a
@@ -749,7 +749,7 @@ size: `{val, rid}` pairs are a fraction of a second sorted copy of every quad.
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_scan.rs#L486) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/serve.rs#L607)); unlocated: the pushed-down projected+filtered scan of the index child |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_scan.rs#L486) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/serve.rs#L610)); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
 | Dropped when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
 | Tombstones | applied through the plan's `rid` column | applied through the plan's `rid` column |
@@ -1102,7 +1102,7 @@ patterns in one call and hands back their views in input order. The matches
 run concurrently (`try_join_all`), so on a file the pattern scans overlap
 instead of queueing; an in-memory match simply runs to completion when
 polled. The bindings expose it as `match_arrow_many` / `count_quads_many`
-([`match_arrow_many`](../python/src/store.rs#L548)): every pattern of the
+([`match_arrow_many`](../python/src/store.rs#L567)): every pattern of the
 batch is parsed before anything is evaluated, one GIL release covers the
 whole batch, and each pattern comes back as its own Arrow stream — the
 shape a join probe loop (one probe per left-hand row) needs.
