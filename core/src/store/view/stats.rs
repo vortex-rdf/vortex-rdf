@@ -1,7 +1,7 @@
 //! What a planner may assume about a view before reading it.
 
 use crate::error::Result;
-use crate::store::array::{into_struct_array, subject_sorted};
+use crate::store::array::subject_sorted;
 use crate::store::arrow::QuadColumn;
 use crate::store::view::order::{SortOrder, sorted_within};
 use crate::store::view::selection::RowSelection;
@@ -97,7 +97,6 @@ impl VortexRdfStore {
             Some(plan) => plan.probes(),
             None => probes.as_ref(),
         };
-        let _ = into_struct_array(rows.clone())?;
         for (position, column) in order.columns().iter().enumerate() {
             let sorted = position < resolved
                 || sorted_within(&rows, struct_probes, order, first..last + 1, *column)

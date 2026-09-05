@@ -208,7 +208,7 @@ reopens the file and starts afresh.
 
 | Concern | Where |
 |---|---|
-| The resident forms: canonical base, compressed components, encoded adoption | [`core/src/store/array.rs`](../core/src/store/array.rs), [`mod.rs`](../core/src/store/mod.rs) ([`resident_built_parts`](../core/src/store/mod.rs#L167), [`from_parts`](../core/src/store/mod.rs#L237)) |
+| The resident forms: canonical base, compressed components, encoded adoption, the adoption's choice ([`ResidentForm`](../core/src/store/persist/forms.rs#L57)) | [`core/src/store/array.rs`](../core/src/store/array.rs), [`mod.rs`](../core/src/store/mod.rs) ([`resident_built_parts`](../core/src/store/mod.rs#L167), [`from_parts`](../core/src/store/mod.rs#L237)) |
 | The live canonical form of an encoded base | [`core/src/store/view/canonical.rs`](../core/src/store/view/canonical.rs), [`rows.rs`](../core/src/store/read/rows.rs) ([`code_columns`](../core/src/store/read/rows.rs#L192), [`code_columns_shared`](../core/src/store/read/rows.rs#L247), [`code_columns_gathered`](../core/src/store/read/rows.rs#L309)) |
 | Point reads and gathers | [`core/src/store/scan/gather.rs`](../core/src/store/scan/gather.rs) ([`gather_by_point_reads`](../core/src/store/scan/gather.rs#L51)) |
 | Probes | [`core/src/store/view/probes.rs`](../core/src/store/view/probes.rs), [`encoded-search/src/node.rs`](../encoded-search/src/node.rs) |

@@ -1240,6 +1240,9 @@ other — which is what a parallel scan hands to its workers.
 | Concern | File |
 |---|---|
 | Batches, windows, keeps (`window`, `size_capped`, `keep`, `Keep`) | [`core/src/store/query/pushdown.rs`](../core/src/store/query/pushdown.rs), [`core/src/store/query/matching.rs`](../core/src/store/query/matching.rs) |
+| Orders and the searches a sorted column admits (`SortOrder`, `sort_order`, `sorted_within`, `keep_runs`) | [`core/src/store/view/order.rs`](../core/src/store/view/order.rs) |
+| Partitions (`partitions`) | [`core/src/store/query/partition.rs`](../core/src/store/query/partition.rs) |
+| What a planner may assume (`ViewStatistics`, `statistics`) | [`core/src/store/view/stats.rs`](../core/src/store/view/stats.rs) |
 | Term predicates and their verdicts | [`core/src/store/layouts/dictionary/predicates.rs`](../core/src/store/layouts/dictionary/predicates.rs) |
 | `match_pattern`, `match_base`, both backends, `match_tail`, `mask_for`, `contains` | [`core/src/store/query/matching.rs`](../core/src/store/query/matching.rs) |
 | Layouts, `QuadPattern`, `PatternCodes`, `Constraints`, `prepare_pattern` | [`core/src/store/layouts/mod.rs`](../core/src/store/layouts/mod.rs) |
