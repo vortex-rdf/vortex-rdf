@@ -310,7 +310,7 @@ pa.array(store.term_dict().filter_codes("is_iri", "")[0])             # a code s
 pa.array(store.term_dict())                                           # the dictionary
 ```
 
-[`match_arrow`](../python/src/store.rs#L537) resolves the pattern and
+[`match_arrow`](../python/src/store.rs#L599) resolves the pattern and
 builds the core batch stream off the GIL, then wraps it in an
 [`ArrowQuadStream`](../python/src/arrow.rs#L117). Its
 [`__arrow_c_schema__`](../python/src/arrow.rs#L143) can be read any number

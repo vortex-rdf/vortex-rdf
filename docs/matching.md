@@ -1112,10 +1112,13 @@ patterns in one call and hands back their views in input order. The matches
 run concurrently (`try_join_all`), so on a file the pattern scans overlap
 instead of queueing; an in-memory match simply runs to completion when
 polled. The bindings expose it as `match_arrow_many` / `count_quads_many`
-([`match_arrow_many`](../python/src/store.rs#L577)): every pattern of the
+([`match_arrow_many`](../python/src/store.rs#L640)): every pattern of the
 batch is parsed before anything is evaluated, one GIL release covers the
 whole batch, and each pattern comes back as its own Arrow stream — the
-shape a join probe loop (one probe per left-hand row) needs.
+shape a join probe loop (one probe per left-hand row) needs. An entry may
+be a mapping instead of a tuple, carrying its own `keep`, `limit` and
+`offset` ([§16.2](#162-windows), [§16.3](#163-keeps)) beside the four
+positions, so a batch of narrowed probes is still one call.
 
 ### 16.2 Windows
 
@@ -1206,10 +1209,11 @@ term still resolves; `encode_many` batches it.
 ### 16.5 In the bindings
 
 Python: `match_arrow(..., keep=, limit=, offset=)`
-([`parse_keep`](../python/src/store.rs#L86): a `range` is a code range,
+([`parse_keep`](../python/src/store.rs#L146): a `range` is a code range,
 anything `decode_many` accepts — a `uint32` Arrow array included — is a
-code set), `count_quads(..., limit=)`, `match_arrow_many`,
-`count_quads_many`, and on `TermDict`: `lower_bound`, `prefix_range`,
+code set), `count_quads(..., limit=)`, `match_arrow_many` and
+`count_quads_many` (whose mapping entries carry the same three), and on
+`TermDict`: `lower_bound`, `prefix_range`,
 [`filter_codes`](../python/src/codes.rs#L155) (two zero-copy,
 Arrow-exportable code columns), `encode_many`. Every engine-facing read
 is the Arrow stream; there is no separate code-column read. The wasm

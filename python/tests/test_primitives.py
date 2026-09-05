@@ -55,6 +55,19 @@ def test_batch_calls_agree_with_singles(vortex_files, in_memory):
     projected = store.match_arrow_many(PATTERNS[:2], encoding="strings", projection=["o"])
     assert [pa.schema(stream).names for stream in projected] == [["o"], ["o"]]
 
+    # A mapping entry carries its own narrowing, beside bare tuples.
+    dictionary = store.term_dict()
+    lo, hi = dictionary.prefix_range("<")
+    narrowing = {"keep": {"o": range(lo, hi)}, "limit": 2, "offset": 1}
+    s, p, o, g = PATTERNS[0]
+    mixed = [PATTERNS[1], {"s": s, "p": p, "o": o, "g": g, **narrowing}]
+    streams = store.match_arrow_many(mixed)
+    counts = store.count_quads_many(mixed)
+    assert _rows(_columns(streams[0])) == _rows(_codes(store, *PATTERNS[1]))
+    single = _codes(store, *PATTERNS[0], **narrowing)
+    assert _rows(_columns(streams[1])) == _rows(single)
+    assert counts == [store.count_quads(*PATTERNS[1]), len(_rows(single))]
+
 
 def test_batch_calls_parse_every_pattern_first(vortex_files):
     store = VortexRdfStore(vortex_files["dictionary"])
@@ -62,6 +75,10 @@ def test_batch_calls_parse_every_pattern_first(vortex_files):
         store.match_arrow_many([(None, None, None, None), (None, "not a term", None, None)])
     with pytest.raises(ValueError):
         store.count_quads_many([("<http://ex.org/x>", None, None, None), (None, None, "bad", None)])
+    with pytest.raises(ValueError, match="unknown key"):
+        store.match_arrow_many([(None, None, None, None), {"p": None, "limt": 1}])
+    with pytest.raises(ValueError):
+        store.count_quads_many([{"s": "<http://ex.org/x>", "keep": {"o": range(3, 1, -1)}}])
 
 
 @pytest.mark.parametrize("layout", ["default", "typed-object"])

@@ -73,6 +73,7 @@ A query layer narrows a match inside the store rather than over gathered rows:
 
 ```python
 store.match_arrow_many([(None, p, None, None), (s, None, None, None)])   # one call, one GIL release
+store.match_arrow_many([{"p": p, "keep": {"o": range(lo, hi)}, "limit": 10}])  # an entry with its own narrowing
 store.count_quads_many([...])                                            # the counts, in order
 store.count_quads(p=p, limit=1)                                          # an ASK: reads one row
 store.match_arrow(p=p, limit=10, offset=20)                              # a window, in match order

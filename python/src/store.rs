@@ -6,7 +6,7 @@ use std::sync::Arc;
 use futures::future::try_join_all;
 use pyo3::exceptions::{PyFileNotFoundError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyRange, PyRangeMethods, PyString};
+use pyo3::types::{PyBytes, PyDict, PyRange, PyRangeMethods, PyString};
 use vortex_buffer::Buffer;
 use vortex_rdf_core::common::terms::{Pattern, parse_pattern_checked};
 use vortex_rdf_core::{
@@ -68,16 +68,76 @@ fn parse_export(
     Ok(options)
 }
 
-/// Every pattern of a batch parsed up front, so a malformed one raises
-/// `ValueError` before anything is evaluated.
-fn parse_patterns(patterns: &[PyPattern]) -> PyResult<Vec<Pattern>> {
-    patterns
-        .iter()
-        .map(|(s, p, o, g)| {
-            parse_pattern_checked(s.as_deref(), p.as_deref(), o.as_deref(), g.as_deref())
-                .map_err(parse_err)
+/// One entry of a batch as Python spells it: a bare `(s, p, o, g)` tuple,
+/// or a mapping carrying the four positions under `s`, `p`, `o`, `g` (each
+/// optional) beside the narrowing `match_arrow` takes — `keep`, `limit`,
+/// `offset`.
+#[derive(FromPyObject)]
+enum PyProbe<'py> {
+    Pattern(PyPattern),
+    Narrowed(Bound<'py, PyDict>),
+}
+
+/// Every entry of a batch parsed up front — pattern and narrowing alike —
+/// so a malformed one raises `ValueError` before anything is evaluated.
+fn parse_probes<'py>(
+    py: Python<'py>,
+    probes: Vec<PyProbe<'py>>,
+) -> PyResult<Vec<(Pattern, ReadOptions)>> {
+    probes
+        .into_iter()
+        .map(|probe| {
+            let ((s, p, o, g), options) = match probe {
+                PyProbe::Pattern(pattern) => (pattern, ReadOptions::default()),
+                PyProbe::Narrowed(mapping) => {
+                    // A key may be absent or hold `None`: both mean unset.
+                    for key in mapping.keys() {
+                        let key: String = key.extract()?;
+                        if !["s", "p", "o", "g", "keep", "limit", "offset"].contains(&key.as_str())
+                        {
+                            return Err(PyValueError::new_err(format!(
+                                "unknown key {key:?} in a batch pattern; expected s, p, o, g, keep, \
+                                 limit or offset"
+                            )));
+                        }
+                    }
+                    let value = |name: &str| -> PyResult<Option<Bound<'py, PyAny>>> {
+                        Ok(mapping.get_item(name)?.filter(|v| !v.is_none()))
+                    };
+                    let options = ReadOptions {
+                        keep: parse_keep(py, value("keep")?.map(|v| v.extract()).transpose()?)?,
+                        limit: value("limit")?.map(|v| v.extract()).transpose()?,
+                        offset: value("offset")?
+                            .map(|v| v.extract())
+                            .transpose()?
+                            .unwrap_or(0),
+                    };
+                    let text = |name: &str| -> PyResult<Option<String>> {
+                        value(name)?.map(|v| v.extract()).transpose()
+                    };
+                    ((text("s")?, text("p")?, text("o")?, text("g")?), options)
+                }
+            };
+            let pattern =
+                parse_pattern_checked(s.as_deref(), p.as_deref(), o.as_deref(), g.as_deref())
+                    .map_err(parse_err)?;
+            Ok((pattern, options))
         })
         .collect()
+}
+
+/// `view` narrowed by `options`: the `keep` constraints in column order,
+/// then the row window.
+async fn narrowed(mut view: CoreStore, options: &ReadOptions) -> Result<CoreStore, CoreError> {
+    for (column, keep) in &options.keep {
+        view = view.keep(*column, keep).await?;
+    }
+    if options.windowed() {
+        view = view
+            .window(options.offset, options.limit.unwrap_or(usize::MAX))
+            .await?;
+    }
+    Ok(view)
 }
 
 /// The `keep` argument — a mapping from column name to a `range` (a code
@@ -185,16 +245,7 @@ impl VortexRdfStore {
         pattern: &Pattern,
         options: &ReadOptions,
     ) -> Result<CoreStore, CoreError> {
-        let mut view = self.matched(pattern).await?;
-        for (column, keep) in &options.keep {
-            view = view.keep(*column, keep).await?;
-        }
-        if options.windowed() {
-            view = view
-                .window(options.offset, options.limit.unwrap_or(usize::MAX))
-                .await?;
-        }
-        Ok(view)
+        narrowed(self.matched(pattern).await?, options).await
     }
 
     /// The matched rows as `(s, p, o, g)` term-code columns, gathered off the
@@ -483,16 +534,27 @@ impl VortexRdfStore {
         .map_err(store_err)
     }
 
-    /// `count_quads` for a batch of `(s, p, o, g)` patterns in one call:
-    /// every pattern is parsed first (a malformed one raises `ValueError`
-    /// before anything is evaluated), the matches run concurrently under one
-    /// GIL release, and the counts come back in input order.
-    fn count_quads_many(&self, py: Python<'_>, patterns: Vec<PyPattern>) -> PyResult<Vec<usize>> {
-        let patterns = parse_patterns(&patterns)?;
+    /// `count_quads` for a batch of patterns in one call — each a bare
+    /// `(s, p, o, g)` tuple or a mapping that also carries its own `keep`,
+    /// `limit` and `offset`: every entry is parsed first (a malformed one
+    /// raises `ValueError` before anything is evaluated), the matches run
+    /// concurrently under one GIL release, and the counts come back in input
+    /// order.
+    fn count_quads_many(&self, py: Python<'_>, patterns: Vec<PyProbe<'_>>) -> PyResult<Vec<usize>> {
+        let probes = parse_probes(py, patterns)?;
+        let patterns: Vec<Pattern> = probes.iter().map(|(pattern, _)| pattern.clone()).collect();
         py.detach(|| -> Result<Vec<usize>, CoreError> {
             RUNTIME.block_on(async {
                 let views = self.store.match_pattern_many(&patterns).await?;
-                try_join_all(views.iter().map(|view| view.size())).await
+                try_join_all(
+                    views
+                        .into_iter()
+                        .zip(&probes)
+                        .map(|(view, (_, options))| async move {
+                            narrowed(view, options).await?.size().await
+                        }),
+                )
+                .await
             })
         })
         .map_err(store_err)
@@ -568,27 +630,38 @@ impl VortexRdfStore {
         Ok(ArrowQuadStream::new(batches, export.encoding))
     }
 
-    /// `match_arrow` for a batch of `(s, p, o, g)` patterns in one call —
-    /// every pattern parsed first (a malformed one raises `ValueError`
-    /// before anything is evaluated), the matches run concurrently under one
-    /// GIL release, one stream per pattern in input order, all under the
-    /// same `encoding` and `projection`.
+    /// `match_arrow` for a batch of patterns in one call — each a bare
+    /// `(s, p, o, g)` tuple or a mapping that also carries its own `keep`,
+    /// `limit` and `offset` — every entry parsed first (a malformed one
+    /// raises `ValueError` before anything is evaluated), the matches run
+    /// concurrently under one GIL release, one stream per pattern in input
+    /// order, all under the same `encoding`, `projection` and `batch_rows`.
     #[pyo3(signature = (patterns, *, encoding="codes", projection=None, batch_rows=None))]
     fn match_arrow_many(
         &self,
         py: Python<'_>,
-        patterns: Vec<PyPattern>,
+        patterns: Vec<PyProbe<'_>>,
         encoding: &str,
         projection: Option<Vec<String>>,
         batch_rows: Option<usize>,
     ) -> PyResult<Vec<ArrowQuadStream>> {
-        let patterns = parse_patterns(&patterns)?;
+        let probes = parse_probes(py, patterns)?;
+        let patterns: Vec<Pattern> = probes.iter().map(|(pattern, _)| pattern.clone()).collect();
         let export = parse_export(encoding, projection, batch_rows)?;
         let streams = py
             .detach(|| -> Result<_, CoreError> {
                 RUNTIME.block_on(async {
                     let views = self.store.match_pattern_many(&patterns).await?;
-                    try_join_all(views.iter().map(|view| view.to_record_batches(&export))).await
+                    try_join_all(views.into_iter().zip(&probes).map(|(view, (_, options))| {
+                        let export = &export;
+                        async move {
+                            narrowed(view, options)
+                                .await?
+                                .to_record_batches(export)
+                                .await
+                        }
+                    }))
+                    .await
                 })
             })
             .map_err(store_err)?;

@@ -1,7 +1,7 @@
 """Type stubs for the private native extension module."""
 
 import os
-from typing import List, Mapping, Optional, Protocol, Sequence, Tuple, Union
+from typing import Any, List, Mapping, Optional, Protocol, Sequence, Tuple, Union
 
 __version__: str
 
@@ -19,6 +19,9 @@ class _ArrowArray(Protocol):
 _Codes = Union[Sequence[int], memoryview, bytes, bytearray, "U32Column", _ArrowArray]
 # A quad pattern as four optional N-Triples term strings.
 _Pattern = Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]
+# One entry of a batch: a bare pattern, or a mapping carrying the positions
+# under "s", "p", "o", "g" beside its own "keep", "limit" and "offset".
+_Probe = Union[_Pattern, Mapping[str, Any]]
 
 class VortexRdfError(Exception):
     """Raised when a Vortex-RDF store operation fails."""
@@ -146,9 +149,10 @@ class VortexRdfStore:
     def __len__(self) -> int: ...
     def __repr__(self) -> str: ...
     def term_dict(self) -> Optional[TermDict]: ...
-    def count_quads_many(self, patterns: Sequence[_Pattern]) -> List[int]:
-        """``count_quads`` for a batch of ``(s, p, o, g)`` patterns, evaluated
-        like ``match_arrow_many``."""
+    def count_quads_many(self, patterns: Sequence[_Probe]) -> List[int]:
+        """``count_quads`` for a batch of patterns, evaluated like
+        ``match_arrow_many``; a mapping entry's ``keep``, ``limit`` and
+        ``offset`` narrow its count."""
         ...
     def get_quads(
         self,
@@ -207,17 +211,20 @@ class VortexRdfStore:
         ...
     def match_arrow_many(
         self,
-        patterns: Sequence[_Pattern],
+        patterns: Sequence[_Probe],
         *,
         encoding: str = "codes",
         projection: Optional[Sequence[str]] = None,
         batch_rows: Optional[int] = None,
     ) -> List[ArrowQuadStream]:
-        """``match_arrow`` for a batch of ``(s, p, o, g)`` patterns: every
-        pattern is parsed first (a malformed one raises ``ValueError`` before
-        anything is evaluated), the matches run concurrently under one GIL
-        release, one stream per pattern in input order, all under the same
-        ``encoding`` and ``projection``."""
+        """``match_arrow`` for a batch of patterns — each a bare
+        ``(s, p, o, g)`` tuple, or a mapping with the positions under ``"s"``,
+        ``"p"``, ``"o"``, ``"g"`` beside its own ``keep``, ``limit`` and
+        ``offset``, as ``match_arrow`` takes them. Every entry is parsed first
+        (a malformed one raises ``ValueError`` before anything is evaluated),
+        the matches run concurrently under one GIL release, one stream per
+        pattern in input order, all under the same ``encoding``,
+        ``projection`` and ``batch_rows``."""
         ...
 
 def serialize_rdf(
