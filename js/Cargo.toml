@@ -28,7 +28,7 @@ console_error_panic_hook.workspace = true
 # crate in the graph. Two majors because two sets of transitive dependents want
 # different ones -- 0.3 through rand_core 0.9 (oxrdf, vortex-onpair), 0.4
 # through rand 0.10 (vortex-array) and codspeed.
-getrandom = { version = "0.3.4", features = ["wasm_js"] }
+getrandom = { version = "0.4.0", features = ["wasm_js"] }
 getrandom_04 = { package = "getrandom", version = "0.4.3", features = ["wasm_js"] }
 oxrdf.workspace = true
 oxrdfio.workspace = true
