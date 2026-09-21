@@ -163,14 +163,14 @@ pub(crate) struct InterningQuadBuilder {
     /// term → provisional code, owning each distinct term exactly once.
     codes: HashMap<Box<str>, u32>,
     /// One `[s, p, o, g]` of provisional codes per quad, in arrival order.
-    quads: Vec<[u32; 4]>,
+    quad_codes: QuadCodes,
 }
 
 impl InterningQuadBuilder {
     pub(crate) fn new() -> Self {
         Self {
             codes: HashMap::new(),
-            quads: Vec::new(),
+            quad_codes: QuadCodes::empty(),
         }
     }
 
@@ -197,20 +197,24 @@ impl InterningQuadBuilder {
 
     /// Consume one quad: intern its four terms, keep only their codes.
     pub(crate) fn push(&mut self, q: RawQuad) {
-        let quad = [
+        let (s, p, o, g) = (
             self.intern(q.s),
             self.intern(q.p),
             self.intern(q.o),
             self.intern(q.g),
-        ];
-        self.quads.push(quad);
+        );
+
+        self.quad_codes.s.push(s);
+        self.quad_codes.p.push(p);
+        self.quad_codes.o.push(o);
+        self.quad_codes.g.push(g);
     }
 
     /// Freeze the dictionary and produce the dataset's codes in global
     /// (s, p, o, g) order.
     pub(crate) fn finish(mut self) -> Result<(TermDictionary, QuadCodes)> {
         let total_start = debug::timer();
-        let n = self.quads.len();
+        let n = self.quad_codes.len();
 
         let sort_start = debug::timer();
         // Unique terms, so the tuple Ord never reaches the code.
@@ -233,12 +237,27 @@ impl InterningQuadBuilder {
         let freeze_elapsed = debug::elapsed(freeze_start);
 
         let remap_start = debug::timer();
-        for quad in &mut self.quads {
-            for code in quad.iter_mut() {
-                *code = rank_of[*code as usize];
-            }
-        }
-        self.quads.sort_unstable();
+
+        // Only use iter() (by-reference) since we do not want Vec deallocation 
+        // during the loop check: https://www.reddit.com/r/rust/comments/g5kuxo/manual_array_indexing_compared_to_iteratorzip/
+        let mut quads: Vec<_> = self
+            .quad_codes
+            .s
+            .iter()
+            .zip(self.quad_codes.p.iter())
+            .zip(self.quad_codes.o.iter())
+            .zip(self.quad_codes.g.iter())
+            .map(|(((s, p), o), g)| {
+                (
+                    &rank_of[*s as usize],
+                    &rank_of[*p as usize],
+                    &rank_of[*o as usize],
+                    &rank_of[*g as usize],
+                )
+            })
+            .collect();
+
+        quads.sort_unstable();
         let remap_elapsed = debug::elapsed(remap_start);
 
         let mut codes = QuadCodes {
@@ -247,11 +266,12 @@ impl InterningQuadBuilder {
             o: Vec::with_capacity(n),
             g: Vec::with_capacity(n),
         };
-        for [s, p, o, g] in self.quads {
-            codes.s.push(s);
-            codes.p.push(p);
-            codes.o.push(o);
-            codes.g.push(g);
+
+        for (s, p, o, g) in quads {
+            codes.s.push(*s);
+            codes.p.push(*p);
+            codes.o.push(*o);
+            codes.g.push(*g);
         }
 
         log::debug!(

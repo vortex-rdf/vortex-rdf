@@ -72,6 +72,9 @@ pub(crate) struct QuadCodes {
 }
 
 impl QuadCodes {
+    pub(crate) fn len(&self) -> usize {
+        self.s.len()
+    }
     /// The encoding of no quads — what an empty build's index children are
     /// built over, so they carry the code dtypes a non-empty build's would.
     pub(crate) fn empty() -> Self {
