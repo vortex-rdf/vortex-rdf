@@ -238,7 +238,7 @@ impl InterningQuadBuilder {
 
         let remap_start = debug::timer();
 
-        // Only use iter() (by-reference) since we do not want Vec deallocation 
+        // Only use iter() (by-reference) since we do not want Vec deallocation
         // during the loop check: https://www.reddit.com/r/rust/comments/g5kuxo/manual_array_indexing_compared_to_iteratorzip/
         let mut quads: Vec<_> = self
             .quad_codes
@@ -249,10 +249,12 @@ impl InterningQuadBuilder {
             .zip(self.quad_codes.g.iter())
             .map(|(((s, p), o), g)| {
                 (
-                    &rank_of[*s as usize],
-                    &rank_of[*p as usize],
-                    &rank_of[*o as usize],
-                    &rank_of[*g as usize],
+                    //u32's size is lesser than usize
+                    //also won't need dereferencing when sorting later --> better cache locality
+                    rank_of[*s as usize],
+                    rank_of[*p as usize],
+                    rank_of[*o as usize],
+                    rank_of[*g as usize],
                 )
             })
             .collect();
@@ -268,10 +270,10 @@ impl InterningQuadBuilder {
         };
 
         for (s, p, o, g) in quads {
-            codes.s.push(*s);
-            codes.p.push(*p);
-            codes.o.push(*o);
-            codes.g.push(*g);
+            codes.s.push(s);
+            codes.p.push(p);
+            codes.o.push(o);
+            codes.g.push(g);
         }
 
         log::debug!(
