@@ -166,6 +166,18 @@ pub(crate) struct InterningQuadBuilder {
     quad_codes: QuadCodes,
 }
 
+macro_rules! push_column {
+    ($fn_name:ident, $column_name: tt) => {
+        pub(crate) fn $fn_name(&mut self, column: &[Box<str>]) {
+            let codes = (self.codes.len() as u32..)
+                .zip(column.iter())
+                .map(|(next, term)| *self.codes.entry(term.clone()).or_insert(next))
+                .collect();
+            self.quad_codes.$column_name = codes;
+        }
+    };
+}
+
 impl InterningQuadBuilder {
     pub(crate) fn new() -> Self {
         Self {
@@ -173,6 +185,10 @@ impl InterningQuadBuilder {
             quad_codes: QuadCodes::empty(),
         }
     }
+    push_column!(push_s_col, s);
+    push_column!(push_p_col, p);
+    push_column!(push_o_col, o);
+    push_column!(push_g_col, g);
 
     /// Drain a quad stream into a fresh interner: each quad's Strings die
     /// here, leaving one copy of every distinct term plus 16 bytes per quad.
