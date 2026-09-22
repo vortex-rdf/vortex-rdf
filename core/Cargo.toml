@@ -29,6 +29,12 @@ vortex-rdf-encoded-search.workspace = true
 
 tokio.workspace = true
 
+# Apache Arrow dependencies 
+arrow-array = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+arrow-cast = { workspace = true, optional = true }
+
+
 # RDF handling
 oxrdf.workspace = true
 oxrdfio.workspace = true
@@ -70,10 +76,15 @@ mimalloc = ["dep:mimalloc"]
 # so a CLI can take them as arguments. Off by default — the wasm and python
 # builds have no use for an argument parser.
 clap = ["dep:clap"]
+# Opt-in: build stores from Arrow record batches (`ArrowQuadSource`). Off by
+# default so bindings that never touch Arrow don't link it.
+arrow = ["dep:arrow-array", "dep:arrow-cast", "dep:arrow-schema"]
 
 [dev-dependencies]
 divan = { workspace = true }
-oxigraph = { version = "0.5.9", default-features = false, features = ["rocksdb"] }
+oxigraph = { version = "0.5.9", default-features = false, features = [
+    "rocksdb",
+] }
 sophia = "0.10"
 hdt = { version = "0.7", features = ["nt"] }
 tempfile = "3"

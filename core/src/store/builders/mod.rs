@@ -114,6 +114,8 @@ pub struct BuiltStream {
     pub(crate) dict: Option<Arc<TermDictionary>>,
 }
 
+#[cfg(feature = "arrow")]
+pub(crate) mod arrow_builder;
 pub(crate) mod sorted_in_memory;
 // wasm32-unknown-unknown has no filesystem to spill to; compiling the
 // external sort out keeps rkyv and uuid out of the wasm artifact.
@@ -122,6 +124,8 @@ pub(crate) mod sorted_stream;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod spill;
 
+#[cfg(feature = "arrow")]
+pub use arrow_builder::ArrowBuilder;
 pub use sorted_in_memory::SortedInMemoryBuilder;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use sorted_stream::SortedStreamBuilder;

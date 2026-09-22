@@ -53,6 +53,8 @@ pub mod store;
 
 pub use error::{Result, VortexRdfError};
 
+#[cfg(feature = "arrow")]
+pub use store::ArrowBuilder;
 pub use store::{
     BuiltArray, BuiltStream, ChunkStream, DictSnapshot, DictionaryQuadSink, IndexType, Indexes,
     LayoutStrategy, RawQuad, SharedQuad, SortedInMemoryBuilder, StoreParts, VortexArrayBuilder,

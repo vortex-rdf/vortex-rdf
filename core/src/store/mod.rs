@@ -24,6 +24,8 @@ mod streaming;
 #[cfg(test)]
 pub(crate) mod test_hooks;
 
+#[cfg(feature = "arrow")]
+pub use builders::ArrowBuilder;
 pub use builders::{
     BuiltArray, BuiltStream, ChunkStream, SortedInMemoryBuilder, VortexArrayBuilder,
 };
