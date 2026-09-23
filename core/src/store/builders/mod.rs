@@ -117,6 +117,7 @@ pub struct BuiltStream {
 #[cfg(feature = "arrow")]
 pub(crate) mod arrow_builder;
 pub(crate) mod sorted_in_memory;
+pub mod error;
 // wasm32-unknown-unknown has no filesystem to spill to; compiling the
 // external sort out keeps rkyv and uuid out of the wasm artifact.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

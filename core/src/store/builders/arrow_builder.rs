@@ -13,12 +13,13 @@
 //! that never touch Arrow (wasm, the CLI) don't link `arrow-array`.
 
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, RecordBatch};
+use arrow_array::{Array, RecordBatch, RecordBatchReader};
+use arrow_schema::DataType;
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::layouts::dictionary::ingest::{InterningQuadBuilder, finish_interned};
 use crate::store::schema::PRIMARY_COLUMNS;
-use crate::{BuiltArray, Indexes, LayoutStrategy, debug};
+use crate::{BuiltArray, BuiltStream, Indexes, LayoutStrategy, debug};
 
 /// The four quad-term columns an Arrow source's schema must carry.
 const QUAD_COLUMNS: [&str; 4] = PRIMARY_COLUMNS;
@@ -42,6 +43,41 @@ pub trait ArrowBuilder {
     ) -> impl Future<Output = Result<BuiltArray>> + Send;
 }
 
+impl ArrowBuilder for Box<dyn RecordBatchReader + Send> {
+    async fn into_vortex_array(
+        mut self,
+        layout: LayoutStrategy,
+        indexes: Indexes,
+    ) -> Result<BuiltArray> {
+        let start = debug::timer();
+        let (n, build_start, built);
+        //TODO: Implement building with other layout strategies!
+        if layout == LayoutStrategy::Dictionary {
+            build_start = debug::timer();
+            let mut interner = InterningQuadBuilder::new();
+            while let Some(batch) = self.next().transpose()? {
+                intern_batch(&batch, &mut interner)?;
+            }
+            built = finish_interned(interner, &indexes)?;
+            n = built.array.len();
+            log::debug!(
+                "[ArrowBuilder] for [RecordBatchReader] Constructed StructArray in {:?}",
+                debug::elapsed(build_start)
+            );
+            log::debug!(
+                "[ArrowBuilder] for [RecordBatchReader] Completed serialization of {} quads in {:?}",
+                n,
+                debug::elapsed(start)
+            );
+            Ok(built)
+        } else {
+            Err(VortexRdfError::Deserialization(format!(
+                "arrow deserializing: only suppots dictionary layout for now. Current layout: {layout:?}"
+            )))
+        }
+    }
+}
+
 impl ArrowBuilder for RecordBatch {
     async fn into_vortex_array(
         self,
@@ -54,23 +90,15 @@ impl ArrowBuilder for RecordBatch {
         if layout == LayoutStrategy::Dictionary {
             build_start = debug::timer();
             let mut interner = InterningQuadBuilder::new();
-            let columns: Vec<_> = QUAD_COLUMNS
-                .iter()
-                .map(|name| string_column(&self, name))
-                .collect::<Result<_>>()?;
-            let (s, p, o, g) = (&columns[0], &columns[1], &columns[2], &columns[3]);
-            interner.push_s_col(s);
-            interner.push_p_col(p);
-            interner.push_o_col(o);
-            interner.push_g_col(g);
+            intern_batch(&self, &mut interner)?;
             built = finish_interned(interner, &indexes)?;
             n = built.array.len();
             log::debug!(
-                "[SortedInMemoryBuilder] Constructed StructArray in {:?}",
+                "[ArrowBuilder] for [RecordBatch] Constructed StructArray in {:?}",
                 debug::elapsed(build_start)
             );
             log::debug!(
-                "[SortedInMemoryBuilder] Completed serialization of {} quads in {:?}",
+                "[ArrowBuilder] for [RecordBatch] Completed serialization of {} quads in {:?}",
                 n,
                 debug::elapsed(start)
             );
@@ -81,6 +109,19 @@ impl ArrowBuilder for RecordBatch {
             )))
         }
     }
+}
+
+fn intern_batch(batch: &RecordBatch, interner: &mut InterningQuadBuilder) -> Result<()> {
+    let columns: Vec<_> = QUAD_COLUMNS
+        .iter()
+        .map(|name| string_column(&batch, name))
+        .collect::<Result<_>>()?;
+    let (s, p, o, g) = (&columns[0], &columns[1], &columns[2], &columns[3]);
+    interner.push_s_col(s);
+    interner.push_p_col(p);
+    interner.push_o_col(o);
+    interner.push_g_col(g);
+    Ok(())
 }
 
 /// `batch`'s column named `name`, cast to `Utf8` and read as owned strings;

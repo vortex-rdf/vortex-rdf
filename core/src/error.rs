@@ -3,6 +3,8 @@
 use thiserror::Error;
 use vortex_error::VortexError;
 
+use crate::store::builders::error::BuilderError;
+
 /// Every failure the crate reports, by origin.
 #[derive(Error, Debug)]
 pub enum VortexRdfError {
@@ -31,6 +33,9 @@ pub enum VortexRdfError {
     /// a view derived from `match_pattern`, which does not own its rows.
     #[error("Invalid operation: {0}")]
     InvalidOperation(String),
+
+    #[error("Store building error")]
+    Building(#[from] BuilderError),
 }
 
 /// `std::result::Result` with [`VortexRdfError`] as the error type.
