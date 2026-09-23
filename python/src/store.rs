@@ -2,12 +2,19 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(feature = "arrow")]
+use arrow_array::RecordBatchReader;
+#[cfg(feature = "arrow")]
+use arrow_array::ffi_stream::ArrowArrayStreamReader;
+#[cfg(feature = "arrow")]
+use arrow_pyarrow::PyArrowType;
+
 use pyo3::exceptions::PyFileNotFoundError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use vortex_buffer::Buffer;
 use vortex_rdf_core::common::terms::{Pattern, parse_pattern_checked};
-use vortex_rdf_core::{VortexRdfError as CoreError, VortexRdfStore as CoreStore};
+use vortex_rdf_core::{ArrowBuilder, VortexRdfError as CoreError, VortexRdfStore as CoreStore};
 
 use crate::codes::{TermDict, U32Column};
 use crate::{RUNTIME, VortexRdfError, parse_err, store_err};
@@ -200,6 +207,26 @@ impl VortexRdfStore {
             store,
             path: Some(path),
         })
+    }
+
+    #[cfg(feature = "arrow")]
+    #[staticmethod]
+    fn from_pyarrow(
+        py: Python<'_>,
+        data: PyArrowType<ArrowArrayStreamReader>,
+    ) -> PyResult<Self> {
+        let store = py
+            .detach(|| {
+                use vortex_rdf_core::LayoutStrategy;
+
+                let stream_reader: Box<dyn RecordBatchReader + Send> = Box::new(data.0);
+                let built = RUNTIME.block_on(
+                    stream_reader.into_vortex_array(LayoutStrategy::Dictionary, vec![]),
+                )?;
+                CoreStore::from_built(built)
+            })
+            .map_err(store_err)?;
+        Ok(Self { store, path: None })
     }
 
     /// Open a store from native-container bytes: what [`Self::to_bytes`],
