@@ -169,11 +169,15 @@ pub(crate) struct InterningQuadBuilder {
 macro_rules! push_column {
     ($fn_name:ident, $column_name: tt) => {
         pub(crate) fn $fn_name(&mut self, column: &[Box<str>]) {
-            let codes = (self.codes.len() as u32..)
+            let codes: Vec<_> = (self.codes.len() as u32..)
                 .zip(column.iter())
                 .map(|(next, term)| *self.codes.entry(term.clone()).or_insert(next))
                 .collect();
-            self.quad_codes.$column_name = codes;
+            if self.quad_codes.$column_name.len() == 0 {
+                self.quad_codes.$column_name = codes;
+            } else {
+                self.quad_codes.$column_name.extend(codes);
+            }
         }
     };
 }
