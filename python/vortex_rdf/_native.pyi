@@ -2,6 +2,7 @@
 
 import os
 from typing import List, Optional, Sequence, Tuple, Union
+from pyarrow 
 
 __version__: str
 
@@ -52,6 +53,8 @@ class VortexRdfStore:
         max_resident_bytes: Optional[int] = None,
         in_memory: bool = False,
     ) -> None: ...
+    @staticmethod
+    def from_pyarrow(data:"pyarrow.RecordBatchReader") -> "VortexRdfStore"
     @staticmethod
     def from_bytes(data: bytes) -> "VortexRdfStore": ...
     def to_bytes(self) -> bytes: ...

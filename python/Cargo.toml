@@ -20,12 +20,20 @@ test = false
 doctest = false
 
 [dependencies]
-vortex-rdf-core = { workspace = true }
+vortex-rdf-core = {workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 pyo3 = { workspace = true, features = ["extension-module", "abi3-py311"] }
 vortex-buffer.workspace = true
 arrow-pyarrow = { workspace = true, optional = true }
 arrow-array = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+arrow-cast = { workspace = true, optional = true }
 
 [features]
-arrow = ["dep:arrow-pyarrow", "dep:arrow-array"]
+arrow = [
+    "dep:arrow-pyarrow",
+    "dep:arrow-array",
+    "dep:arrow-schema",
+    "dep:arrow-cast",
+    "vortex-rdf-core/arrow",
+]
