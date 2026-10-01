@@ -10,10 +10,73 @@ use vortex_rdf_core::common::terms::{Pattern, parse_pattern_checked};
 use vortex_rdf_core::{VortexRdfError as CoreError, VortexRdfStore as CoreStore};
 
 use crate::codes::{TermDict, U32Column};
+use crate::probes::{parse_keeps, parse_probe, pattern_probe};
 use crate::{RUNTIME, VortexRdfError, parse_err, store_err};
+use vortex_rdf_core::Probe;
 
 /// `(s, p, o, g)` code columns as returned by [`VortexRdfStore::match_codes`].
 type CodeColumns = (U32Column, U32Column, U32Column, U32Column);
+
+fn code_columns([s, p, o, g]: [Buffer<u32>; 4]) -> CodeColumns {
+    (
+        U32Column { codes: s },
+        U32Column { codes: p },
+        U32Column { codes: o },
+        U32Column { codes: g },
+    )
+}
+
+/// A probe from the keyword narrowing of `match_codes`/`count_quads`.
+fn narrowed_probe(
+    s: Option<&str>,
+    p: Option<&str>,
+    o: Option<&str>,
+    g: Option<&str>,
+    keep: Option<&Bound<'_, PyAny>>,
+    limit: Option<usize>,
+    offset: usize,
+) -> PyResult<Probe> {
+    let mut probe = pattern_probe(s, p, o, g)?;
+    if let Some(keep) = keep.filter(|k| !k.is_none()) {
+        probe.keeps = parse_keeps(keep)?;
+    }
+    probe.limit = limit;
+    probe.offset = offset;
+    Ok(probe)
+}
+
+/// Every probe of a `*_many` call, parsed before any evaluation.
+fn parse_probes(probes: &Bound<'_, PyAny>) -> PyResult<Vec<Probe>> {
+    probes
+        .try_iter()?
+        .map(|probe| parse_probe(&probe?))
+        .collect()
+}
+
+/// Run `task` for every probe on the bindings' runtime, one task per probe
+/// so a batch spreads over its workers (an in-memory match is CPU work;
+/// a file-backed one overlaps its reads), and collect the answers in input
+/// order. Called GIL-released.
+fn fan_out<T, F, Fut>(store: &CoreStore, probes: Vec<Probe>, task: F) -> Result<Vec<T>, CoreError>
+where
+    T: Send + 'static,
+    F: Fn(CoreStore, Probe) -> Fut,
+    Fut: std::future::Future<Output = Result<T, CoreError>> + Send + 'static,
+{
+    let handles: Vec<_> = probes
+        .into_iter()
+        .map(|probe| RUNTIME.spawn(task(store.clone(), probe)))
+        .collect();
+    RUNTIME.block_on(async {
+        let mut out = Vec::with_capacity(handles.len());
+        for handle in handles {
+            out.push(handle.await.map_err(|e| {
+                CoreError::InvalidOperation(format!("a batch probe task failed: {e}"))
+            })??);
+        }
+        Ok(out)
+    })
+}
 
 /// One row of [`VortexRdfStore::get_quads`]: subject, predicate, object, graph.
 /// Held as `Py<PyString>` so a term repeated down a column is one Python object
@@ -113,8 +176,16 @@ impl VortexRdfStore {
             // `code_read_snapshot` reports only that the path can apply; the
             // match itself still decides, so fall through when it declines.
             if let Some(codes) = self.matched_code_columns(py, pattern)? {
-                let dict = TermDict { snapshot };
-                let decoded = std::array::from_fn(|i| dict.decode_slice(py, codes[i].as_slice()));
+                let dict = TermDict {
+                    reader: snapshot.into(),
+                };
+                let mut decoded = Vec::with_capacity(4);
+                for column in &codes {
+                    decoded.push(dict.decode_slice(py, column.as_slice())?);
+                }
+                let decoded: [_; 4] = decoded
+                    .try_into()
+                    .unwrap_or_else(|_| unreachable!("four code columns"));
                 return resolve_columns(decoded);
             }
         }
@@ -294,7 +365,15 @@ impl VortexRdfStore {
 
     /// Number of quads matching a pattern, counted from the match's row
     /// selection alone -- no term is materialized into Python.
-    #[pyo3(signature = (s=None, p=None, o=None, g=None))]
+    ///
+    /// `keep` narrows the match to rows whose code in a position is in a
+    /// set or range (see [`Self::match_codes`]; Dictionary layout only), and
+    /// `limit` caps the count, stopping the read as soon as that many rows
+    /// are known to exist (`count_quads(..., limit=1)` is an existence
+    /// test).
+    // The parameters are the Python signature: a pattern and its narrowing.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (s=None, p=None, o=None, g=None, *, keep=None, limit=None))]
     fn count_quads(
         &self,
         py: Python<'_>,
@@ -302,10 +381,31 @@ impl VortexRdfStore {
         p: Option<&str>,
         o: Option<&str>,
         g: Option<&str>,
+        keep: Option<&Bound<'_, PyAny>>,
+        limit: Option<usize>,
     ) -> PyResult<usize> {
-        let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
+        let probe = narrowed_probe(s, p, o, g, keep, limit, 0)?;
         py.detach(|| -> Result<usize, CoreError> {
-            RUNTIME.block_on(async { self.matched(&pattern).await?.size().await })
+            RUNTIME.block_on(async {
+                let counts = self.store.count_many(std::slice::from_ref(&probe)).await?;
+                Ok(counts[0])
+            })
+        })
+        .map_err(store_err)
+    }
+
+    /// [`Self::count_quads`] for a batch of probes in one GIL-released call,
+    /// answering in input order. A probe is an `(s, p, o, g)` tuple of
+    /// optional term strings or a dict with keys `s`, `p`, `o`, `g`,
+    /// `keep`, `limit`, `offset`. Every probe is parsed before any is
+    /// evaluated, so a malformed one raises `ValueError` first.
+    fn count_quads_many(&self, py: Python<'_>, probes: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
+        let probes = parse_probes(probes)?;
+        py.detach(|| {
+            fan_out(&self.store, probes, |store, probe| async move {
+                let counts = store.count_many(std::slice::from_ref(&probe)).await?;
+                Ok(counts[0])
+            })
         })
         .map_err(store_err)
     }
@@ -334,14 +434,13 @@ impl VortexRdfStore {
     }
 
     /// The store's term dictionary, or `None` when the code path does not
-    /// apply: a non-Dictionary layout, a non-resident (file-backed)
-    /// dictionary, or an append tail whose quads are not in the cached
-    /// dictionary. Pair with [`Self::match_codes`]; decode each distinct
-    /// code once, caching on the Python side.
+    /// apply: a non-Dictionary layout, or an append tail whose quads are not
+    /// in the dictionary. A dictionary left in its file (over the residency
+    /// budget) is served through the handle by reading the file on demand;
+    /// `TermDict.file_backed` tells. Pair with [`Self::match_codes`]; decode
+    /// each distinct code once, caching on the Python side.
     fn term_dict(&self) -> Option<TermDict> {
-        self.store
-            .code_read_snapshot()
-            .map(|snapshot| TermDict { snapshot })
+        self.store.dict_reader().map(|reader| TermDict { reader })
     }
 
     /// Match a pattern and return the rows as four zero-copy `u32` term-code
@@ -349,7 +448,18 @@ impl VortexRdfStore {
     /// `None` when the code path does not apply (see `term_dict`). Callers
     /// fall back to [`Self::get_quads`] or [`Self::match_columns`], which
     /// resolve terms on every layout.
-    #[pyo3(signature = (s=None, p=None, o=None, g=None))]
+    ///
+    /// `keep` narrows the match inside the store, before any row is
+    /// gathered: a dict from position (`"s"`, `"p"`, `"o"`, `"g"` or 0-3)
+    /// to the codes to keep there — a code set (`U32Column`, u32 buffer or
+    /// int sequence; what `TermDict.filter_codes` or encoded `VALUES`
+    /// yield) or a code range (a `range` with step 1, or `(lo, hi)`; what
+    /// `TermDict.prefix_range` yields). `offset` and `limit` window the
+    /// rows in base order; a filtered file scan stops at the first block
+    /// that fills the window.
+    // The parameters are the Python signature: a pattern and its narrowing.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (s=None, p=None, o=None, g=None, *, keep=None, limit=None, offset=0))]
     fn match_codes(
         &self,
         py: Python<'_>,
@@ -357,19 +467,48 @@ impl VortexRdfStore {
         p: Option<&str>,
         o: Option<&str>,
         g: Option<&str>,
+        keep: Option<&Bound<'_, PyAny>>,
+        limit: Option<usize>,
+        offset: usize,
     ) -> PyResult<Option<CodeColumns>> {
-        let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
-        if self.store.code_read_snapshot().is_none() {
+        let probe = narrowed_probe(s, p, o, g, keep, limit, offset)?;
+        if self.store.dict_reader().is_none() {
             return Ok(None);
         }
-        let columns = self.matched_code_columns(py, &pattern)?;
-        Ok(columns.map(|[s, p, o, g]| {
-            (
-                U32Column { codes: s },
-                U32Column { codes: p },
-                U32Column { codes: o },
-                U32Column { codes: g },
-            )
-        }))
+        let columns = py
+            .detach(|| -> Result<_, CoreError> {
+                RUNTIME.block_on(async {
+                    self.store
+                        .run_probe(&probe)
+                        .await?
+                        .code_columns_gathered()
+                        .await
+                })
+            })
+            .map_err(store_err)?;
+        Ok(columns.map(code_columns))
+    }
+
+    /// [`Self::match_codes`] for a batch of probes in one GIL-released
+    /// call, answering in input order (see [`Self::count_quads_many`] for
+    /// the probe forms). The probes run concurrently on the bindings'
+    /// runtime; every probe is parsed before any is evaluated.
+    fn match_codes_many(
+        &self,
+        py: Python<'_>,
+        probes: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<Option<CodeColumns>>> {
+        let probes = parse_probes(probes)?;
+        if self.store.dict_reader().is_none() {
+            return Ok(probes.iter().map(|_| None).collect());
+        }
+        let columns = py
+            .detach(|| {
+                fan_out(&self.store, probes, |store, probe| async move {
+                    store.run_probe(&probe).await?.code_columns_gathered().await
+                })
+            })
+            .map_err(store_err)?;
+        Ok(columns.into_iter().map(|c| c.map(code_columns)).collect())
     }
 }
