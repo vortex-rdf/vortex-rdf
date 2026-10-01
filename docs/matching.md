@@ -223,7 +223,7 @@ stage only sees what is left.
 
 Only the *struct* is canonical. Its columns stay in the compressed encodings
 every in-memory construction gives them
-([`compress_built_parts`](../core/src/store/mod.rs#L154)), and the stages below
+([`compress_built_parts`](../core/src/store/mod.rs#L162)), and the stages below
 search them in place through the cached encoded-search probes. No stage
 decompresses a column; a match decodes nothing but the rows a mask scan has to
 compare ([§6.3](#63-residual-column-filtering)).
@@ -523,10 +523,10 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`matching.rs:494-505`](../core/src/store/matching.rs#L494-L505) | — |
-| 1 · subject chunk probe | [`matching.rs:506-524`](../core/src/store/matching.rs#L506-L524), [`locate_subject_run`](../core/src/store/scan/file_scan.rs#L342) | [§7.1](#71-subject-chunk-probe) |
+| 1 · subject chunk probe | [`matching.rs:506-524`](../core/src/store/matching.rs#L506-L524), [`locate_subject_run`](../core/src/store/scan/file_scan.rs#L478) | [§7.1](#71-subject-chunk-probe) |
 | 2 · secondary-index routing | [`matching.rs:525-541`](../core/src/store/matching.rs#L525-L541), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L509) | [§8](#8-the-index-resolvers) |
-| 3 · pushed-down filter | [`matching.rs:554-638`](../core/src/store/matching.rs#L554-L638), [`build_file_filter`](../core/src/store/scan/file_scan.rs#L327) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`matching.rs:547-548`](../core/src/store/matching.rs#L547-L548) and [`matching.rs:639-688`](../core/src/store/matching.rs#L639-L688), [`row_range_from_pruning`](../core/src/store/scan/file_scan.rs#L544) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| 3 · pushed-down filter | [`matching.rs:554-638`](../core/src/store/matching.rs#L554-L638), [`build_file_filter`](../core/src/store/scan/file_scan.rs#L463) | [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`matching.rs:547-548`](../core/src/store/matching.rs#L547-L548) and [`matching.rs:639-688`](../core/src/store/matching.rs#L639-L688), [`row_range_from_pruning`](../core/src/store/scan/file_scan.rs#L680) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
 stage narrows a `RowSelection` directly; here stage 3 can only *describe* the
@@ -536,7 +536,7 @@ scan can honour without reading data.
 ### 7.1 Subject chunk probe
 
 The file mirror of the in-memory subject binary search
-([`locate_subject_run`](../core/src/store/scan/file_scan.rs#L342)): it
+([`locate_subject_run`](../core/src/store/scan/file_scan.rs#L478)): it
 binary-searches the subject column's **encoded chunks** through cached chunk
 probes, reading only the chunks the bisection touches. It requires `u64::try_from(&probe)` to succeed, so
 it engages **only under the Dictionary layout** — a string-subject file falls
@@ -565,7 +565,7 @@ freshly opened file, which fetches the chunks it bisects, ≈ 0.75 ms.
 ### 7.2 Zone-map pruning
 
 When no index resolved anything and no subject range was found,
-[`row_range_from_pruning`](../core/src/store/scan/file_scan.rs#L544) runs one
+[`row_range_from_pruning`](../core/src/store/scan/file_scan.rs#L680) runs one
 `pruning_evaluation` per filter conjunct over the whole file — statistics only,
 no row data — and collapses the surviving mask to its enclosing contiguous
 range. Interior gaps are kept (the scan's own per-split pruning skips them from
@@ -1080,7 +1080,82 @@ unrestricted ([§11](#11-chained-matches)).
 
 ---
 
-## 16. Source map
+## 16. Narrowing beyond a pattern
+
+A pattern binds whole terms. A query engine also pushes restrictions a
+pattern cannot express — a `VALUES` block, a `FILTER` on a term predicate,
+`LIMIT`/`OFFSET`, `ASK` — and the store applies those as derived views too,
+so they compose with `match_pattern` in either order and read through the
+same paths (`size`, `code_columns_gathered`, `quads`). Everything here lives
+in [`core/src/store/narrowing.rs`](../core/src/store/narrowing.rs); the
+batch form in [`core/src/store/batch.rs`](../core/src/store/batch.rs).
+
+### 16.1 `keep` — a code set or range per column
+
+`keep(column, &Keep)` narrows a Dictionary-layout view (with an empty tail:
+codes are the vocabulary only then) to the rows whose code in `column` the
+keep admits — `Keep::Set` (ascending, unique) or `Keep::Range(lo, hi)`.
+Codes rank the dictionary's spellings in byte order, so a term kind
+(`"`, `<`, `_:`) and an IRI namespace are each one range
+(`DictReader::prefix_range`), and a predicate's definite codes
+(`DictReader::filter_codes`) are a set. The keep is applied *after* the
+pattern, never through the pattern compiler, in the first way that applies:
+
+| Backend | Shape | How |
+|---|---|---|
+| memory | the selection is a run of the sorted base that `column` orders — every earlier column of the `(s, p, o, g)` order is constant over it, as a subject-bound match leaves | binary search inside the run through the base's cached probe: two lower bounds for a range, one bounded sub-run per code for a small set |
+| memory | anything else | one pass over the selected rows of the column, read in place (its canonical primitive, else the cached probe); a set tests a bitmap over its span when dense, a binary search when sparse |
+| file | a range, or a set of up to 4,096 codes | a conjunct ANDed onto the view's pushed-down filter — `col >= lo AND col < hi`, an `OR` of equalities (≤ 32 codes) or a `list_contains` — narrowed first by one zone-map pruning pass (a namespace range inside a sorted column prunes whole blocks) |
+| file | a wider set | the pending filter is resolved to exact rows, the column is read for them, and the set is tested in memory |
+
+A served view (its row ids pending behind an index's plan) materializes its
+ids first: the plan reads a run the keep no longer describes. The result is
+an exact `Ids` (or `Range`) selection in base order, so a chained
+`match_pattern` narrows it exactly as [§11](#11-chained-matches) describes.
+
+### 16.2 `window`, `size_capped`, `exists`
+
+`window(offset, limit)` is the view's rows after skipping `offset` and
+taking `limit`, in read order — base rows in base row order, then the
+tail's (available on every layout). In memory and on an unfiltered file view
+it is a position range over the selection, no I/O (`RowSelection::window`
+steps over tombstones). On a file view with a pending filter it is
+`first_matching_rows`: the per-split filter loop of
+[§7](#7-the-file-path), run *in file order* with a few splits in flight, and
+stopped at the first split that fills `offset + limit` rows — so `LIMIT`
+over a filtered scan costs the matching prefix of the file, not all of it.
+The window's view carries exact ids and no filter.
+
+`size_capped(limit)` is `min(size, limit)` by the same loop
+(`count_matching_rows_capped`), and `exists()` is `size_capped(1) > 0` —
+what `contains` now reads, so a membership test over a filtered file view
+stops at its first matching block.
+
+### 16.3 Batches
+
+`match_many(&[Probe])` (and `count_many`) runs a pattern plus its keeps and
+window per probe and answers in input order, the probes concurrently
+(`try_join_all`): a file-backed store overlaps their reads, an in-memory
+match is CPU work and runs probe by probe. The futures are `Send`, so a
+binding layer can instead spawn one task per probe onto its runtime — the
+Python bindings do, for every batch.
+
+### 16.4 Predicates and the dictionary handle
+
+`DictReader` (`VortexRdfStore::dict_reader`) is the term ↔ code surface
+under either residency: a resident dictionary answers in place, a
+file-backed one reads its child. `filter_codes(&TermPredicate)` partitions
+the codes into the ascending `true` codes and the ascending `unknown` codes
+of the predicate's domain with one scan of that domain (kind predicates are
+pure ranges and scan nothing; `str_prefix` on an IRI is a prefix range),
+memoized per dictionary. The verdict rules mirror the Python query layer's
+own fast path, conservatively: `True`/`False` only where that path is
+total, `Unknown` wherever it defers (see
+[`predicates.rs`](../core/src/store/layouts/dictionary/predicates.rs)).
+
+---
+
+## 17. Source map
 
 | Concern | File |
 |---|---|
@@ -1096,5 +1171,10 @@ unrestricted ([§11](#11-chained-matches)).
 | Serve plans and the shared decode tail | [`core/src/store/indexes/serve.rs`](../core/src/store/indexes/serve.rs) |
 | Pushed-down filters, split evaluation, pruning, point reads | [`core/src/store/scan/file_scan.rs`](../core/src/store/scan/file_scan.rs) |
 | Typed residual/tail equality loops | [`core/src/store/scan/typed_eq.rs`](../core/src/store/scan/typed_eq.rs) |
+| `Keep`, `keep`, `window`, `size_capped`, `exists` | [`core/src/store/narrowing.rs`](../core/src/store/narrowing.rs) |
+| `Probe`, `match_many`, `count_many` | [`core/src/store/batch.rs`](../core/src/store/batch.rs) |
+| `DictReader`, `DictSnapshot`, `prefix_range`, tolerant `encode` | [`core/src/store/layouts/dictionary/term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs) |
+| `TermPredicate`, `Verdict`, `KindRanges`, the verdict rules | [`core/src/store/layouts/dictionary/predicates.rs`](../core/src/store/layouts/dictionary/predicates.rs) |
+| Column kernels (`distinct_first_seen`, `value_counts`, `take`, `equi_join_indices`) | [`core/src/store/columns.rs`](../core/src/store/columns.rs) |
 | View state (`QuadsSource`, `Tail`) | [`core/src/store/source.rs`](../core/src/store/source.rs) |
 | Read paths consuming the view | [`core/src/store/streaming.rs`](../core/src/store/streaming.rs), [`core/src/store/rows.rs`](../core/src/store/rows.rs) |

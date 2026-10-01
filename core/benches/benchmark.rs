@@ -549,6 +549,148 @@ fn dict_decode_matched(bencher: divan::Bencher, residency: &DictResidency) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// Group 4b — NARROWING (keep / window / predicates / batches)
+//
+// The restrictions a query engine pushes below a pattern, on the Group 4
+// file (both dictionary residencies where the dictionary is what answers):
+// a `keep` applied inside a predicate-bound file view, a `LIMIT` window and
+// an `ASK` over the same filtered view, a term predicate partitioning the
+// dictionary, and a batch of subject probes.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// A predicate-bound file view narrowed by a `keep` on its subject column:
+/// the namespace range of the first half of the subjects, pushed to the
+/// scan as a range conjunct beside the predicate filter — the shape a
+/// `VALUES`/`FILTER` pushdown takes on a file. Priced with the gather of the
+/// surviving code columns, so the number is what a consumer waits for.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn narrow_keep_range(bencher: divan::Bencher, residency: &DictResidency) {
+    use vortex_rdf_core::{Keep, QuadColumn};
+    let store = open_dict_store(*residency, bench_size());
+    let (_, p, ..) = terms_for(Pattern::P);
+    let p = p.unwrap();
+    let keep = rt().block_on(async {
+        let dict = store.dict_reader().expect("dictionary handle");
+        let half = bench_moduli().n_subj / 2;
+        let lo = dict
+            .lower_bound(&format!("<{}", dataset::subject_iri(0)))
+            .await
+            .unwrap();
+        let hi = dict
+            .lower_bound(&format!("<{}", dataset::subject_iri(half)))
+            .await
+            .unwrap();
+        Keep::range(lo..hi)
+    });
+    bencher.bench(|| {
+        rt().block_on(async {
+            let narrowed = store
+                .match_pattern(None, Some(&p), None, None)
+                .await
+                .expect("match P")
+                .keep(QuadColumn::S, &keep)
+                .await
+                .expect("keep");
+            let columns = narrowed.code_columns_gathered().await.expect("gather");
+            black_box(columns.map(|c| c[0].len()))
+        })
+    });
+}
+
+/// `LIMIT 64` over a predicate-bound file view: the filter's splits are
+/// evaluated in file order and the window stops at the first that fills —
+/// against the full match's gather, this is what `LIMIT` saves.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn narrow_window(bencher: divan::Bencher, residency: &DictResidency) {
+    let store = open_dict_store(*residency, bench_size());
+    let (_, p, ..) = terms_for(Pattern::P);
+    let p = p.unwrap();
+    bencher.bench(|| {
+        rt().block_on(async {
+            let windowed = store
+                .match_pattern(None, Some(&p), None, None)
+                .await
+                .expect("match P")
+                .window(0, 64)
+                .await
+                .expect("window");
+            let columns = windowed.code_columns_gathered().await.expect("gather");
+            black_box(columns.map(|c| c[0].len()))
+        })
+    });
+}
+
+/// `ASK` over a predicate-bound file view: `exists` reads the filter up to
+/// its first matching split.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn narrow_exists(bencher: divan::Bencher, residency: &DictResidency) {
+    let store = open_dict_store(*residency, bench_size());
+    let (_, p, ..) = terms_for(Pattern::P);
+    let p = p.unwrap();
+    bencher.bench(|| {
+        rt().block_on(async {
+            let matched = store
+                .match_pattern(None, Some(&p), None, None)
+                .await
+                .expect("match P");
+            black_box(matched.exists().await.expect("exists"))
+        })
+    });
+}
+
+/// A term predicate over the whole dictionary, un-memoized: a fresh store
+/// each iteration, so the cell prices the scan of the predicate's domain
+/// (resident: a cursor pass; file-backed: the child's chunks) rather than
+/// the memo hit a repeated predicate gets.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn narrow_filter_codes(bencher: divan::Bencher, residency: &DictResidency) {
+    use vortex_rdf_core::TermPredicate;
+    let residency = *residency;
+    let predicate = TermPredicate::parse("str_prefix", "http://").unwrap();
+    bencher
+        .with_inputs(|| open_dict_store(residency, bench_size()))
+        .bench_refs(|store| {
+            rt().block_on(async {
+                let dict = store.dict_reader().expect("dictionary handle");
+                let (truth, unknown) = dict.filter_codes(&predicate).await.expect("filter");
+                black_box((truth.len(), unknown.len()))
+            })
+        });
+}
+
+/// A batch of 64 subject probes in one `match_many`, gathered: the
+/// nested-loop join's shape, where a file-backed store overlaps the probes'
+/// reads.
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
+fn narrow_match_many(bencher: divan::Bencher, residency: &DictResidency) {
+    use vortex_rdf_core::Probe;
+    let store = open_dict_store(*residency, bench_size());
+    let subjects = bench_moduli().n_subj;
+    let probes: Vec<Probe> = (0..64)
+        .map(|i| {
+            let s = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(dataset::subject_iri(
+                (i * 7919) % subjects,
+            )));
+            Probe::new(Some(s), None, None, None)
+        })
+        .collect();
+    bencher.bench(|| {
+        rt().block_on(async {
+            let views = store.match_many(&probes).await.expect("match_many");
+            let mut rows = 0usize;
+            for view in &views {
+                rows += view
+                    .code_columns_gathered()
+                    .await
+                    .expect("gather")
+                    .map_or(0, |c| c[0].len());
+            }
+            black_box(rows)
+        })
+    });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 // Group 5 — MUTATE (append / delete / compact)
 //
 // Mutations are copy-on-write: appends accrete in an in-memory tail, deletes

@@ -225,13 +225,13 @@ are bare codes and cannot be decoded without it.
 | `name` / `role` | `dictionary` / `dictionary` |
 | `implementation` / `version` | `sorted-terms-fsst-v1` / 1 |
 | `required` / `sorted` | `true` / `true` |
-| schema | one column, [`_dict_term`](../core/src/store/layouts/dictionary/term_dict.rs#L38): non-nullable `Utf8` |
+| schema | one column, [`_dict_term`](../core/src/store/layouts/dictionary/term_dict.rs#L45): non-nullable `Utf8` |
 | contents | every distinct term of the dataset — subjects, predicates, objects, graph names and the default graph's `""` in one namespace — sorted, each once |
 | codes | implicit: the term at row *i* has code *i* |
 | size limit | at most `i32::MAX` terms |
 
 The column is FSST-compressed **at the source**, in independent windows of
-65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/term_dict.rs#L46))
+65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/term_dict.rs#L53))
 that share one symbol table trained on the whole column. The child is written
 through a pass-through strategy ([`dict_child_strategy`](../core/src/io/container/write.rs#L191))
 rather than the default pipeline: a Struct over a Chunked layout of Flat
@@ -253,7 +253,7 @@ sum, no I/O) with a budget:
   decodes one term per step (FSST is not order-preserving, so the search
   cannot run on the compressed bytes); code → term is a positional read.
 - **File-backed** (over budget): the terms stay in the file.
-  [`TermChunks`](../core/src/store/layouts/dictionary/file_backed.rs#L46)
+  [`TermChunks`](../core/src/store/layouts/dictionary/file_backed.rs#L52)
   resolves the child's leaves once; a probe binary-searches by per-row reads,
   fetching only the leaves the bisection crosses, and a fetched leaf stays in
   its wire encoding for the store's lifetime. A match's four bound terms are
