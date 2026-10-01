@@ -168,6 +168,25 @@ impl NativeComponentWrite {
 /// The stock write strategy `write_options()` installs — used for the quad
 /// child and the index components (the dictionary child instead passes its
 /// pre-compressed chunks through `write::dict_child_strategy`).
+///
+/// The compressor is the stock cascade minus FastLanes delta. Delta wins on
+/// size for exactly the columns the store binary-searches in place — the
+/// sorted subject column and the index children's lead columns — but a
+/// delta value is a running sum, so a point read decodes its whole
+/// 1,024-value block; every cold probe and point read through the chunk
+/// leaves would pay that where a bit-packed or frame-of-reference column
+/// answers from one word. The store's own files stay on the encodings its
+/// probes read in place (the reader still probes delta, for files written
+/// elsewhere).
 pub(crate) fn default_child_strategy() -> Arc<dyn vortex_layout::LayoutStrategy> {
-    Arc::new(vortex_file::WriteStrategyBuilder::default().build())
+    use vortex_btrblocks::schemes::integer::DeltaScheme;
+    use vortex_btrblocks::{BtrBlocksCompressorBuilder, SchemeExt as _};
+
+    let compressor =
+        BtrBlocksCompressorBuilder::default().exclude_schemes([DeltaScheme::new(1.25).id()]);
+    Arc::new(
+        vortex_file::WriteStrategyBuilder::default()
+            .with_btrblocks_builder(compressor)
+            .build(),
+    )
 }

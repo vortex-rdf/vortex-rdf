@@ -4389,6 +4389,7 @@ dependencies = [
  "uuid",
  "vortex",
  "vortex-array",
+ "vortex-btrblocks",
  "vortex-buffer",
  "vortex-edition",
  "vortex-error",

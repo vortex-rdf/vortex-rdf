@@ -346,7 +346,7 @@ flowchart TD
     R --> F["Vortex footer, postscript, end-of-file marker"]
 ```
 
-- **The quad table** goes through [`default_child_strategy`](../core/src/io/container/sources.rs#L171)
+- **The quad table** goes through [`default_child_strategy`](../core/src/io/container/sources.rs#L181)
   — Vortex's default `WriteStrategyBuilder` pipeline: split the struct into
   columns, repartition each column into 8,192-row blocks, compute zoned
   statistics per block, dictionary-encode a column where sampling says it pays,

@@ -1063,3 +1063,59 @@ async fn test_dictionary_quad_sink_serializes_like_the_builder() {
         "the sink's wire form must be the builder's"
     );
 }
+
+/// The store's own files keep their code columns on the encodings the
+/// probes read in place: no FastLanes delta in the quad child or the index
+/// children, however well it would compress a sorted column. The adoption
+/// keeps wire encodings the probes bind (delta included), so the trees seen
+/// here are the writer's.
+#[tokio::test]
+async fn test_written_code_columns_avoid_delta() {
+    let graphs: Vec<GraphName> = (0..4)
+        .map(|i| GraphName::NamedNode(NamedNode::new(format!("http://example.org/g{i}")).unwrap()))
+        .collect();
+    let quads = graph_modular_quads(32_768, 5, 32, 1024, &graphs);
+    let store = VortexRdfStore::from_quads(
+        quad_stream(quads),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    let bytes = store.to_bytes().await.unwrap();
+    let adopted = VortexRdfStore::from_bytes_owned(bytes).await.unwrap();
+    let parts = adopted.to_serializable_parts().await.unwrap();
+    let mut trees = vec![(
+        "quads".to_string(),
+        format!("{}", parts.array.display_tree_encodings_only()),
+    )];
+    for component in &parts.components {
+        use vortex_array::IntoArray as _;
+        let rows = component.rows().unwrap().clone().into_array();
+        trees.push((
+            component.name.to_string(),
+            format!("{}", rows.display_tree_encodings_only()),
+        ));
+    }
+    for (name, tree) in &trees {
+        assert!(
+            !tree.contains("fastlanes.delta"),
+            "{name} carries a delta-encoded column:\n{tree}"
+        );
+    }
+    // The guard bites: a 32 Ki-row sorted subject column is exactly what the
+    // stock cascade would delta-encode, and it stays on a word-addressable
+    // encoding instead.
+    let quads_tree = &trees[0].1;
+    assert!(
+        [
+            "fastlanes.bitpacked",
+            "fastlanes.for",
+            "vortex.runend",
+            "vortex.sequence"
+        ]
+        .iter()
+        .any(|id| quads_tree.contains(id)),
+        "quads tree:\n{quads_tree}"
+    );
+}
