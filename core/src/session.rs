@@ -74,7 +74,7 @@ fn enable_store_edition(session: &VortexSession) {
     editions
         .declare_edition(Edition {
             id: STORE_EDITION,
-            min_vortex_version: None,
+            min_library_version: None,
         })
         .map_err(|error| vortex_err!("{error}"))
         .vortex_expect("the store edition is valid");

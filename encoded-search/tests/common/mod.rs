@@ -39,7 +39,7 @@ pub fn writer_session() -> VortexSession {
     editions
         .declare_edition(Edition {
             id: TEST_EDITION,
-            min_vortex_version: None,
+            min_library_version: None,
         })
         .unwrap();
     let registered = [
