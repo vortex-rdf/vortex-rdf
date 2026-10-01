@@ -248,25 +248,33 @@ async fn column_chunks_empty_column() {
     );
 }
 
-/// A leaf whose wire encoding the probe does not support (delta) declines
+/// A leaf whose wire encoding the probe does not support (sparse) declines
 /// with `Ok(None)` at query time, while the column itself still resolves.
 #[tokio::test(flavor = "multi_thread")]
 async fn column_chunks_decline_unsupported_leaf() {
-    use vortex_array::VortexSessionExecute as _;
-    use vortex_fastlanes::Delta;
+    use vortex_array::scalar::Scalar;
+    use vortex_sparse::Sparse;
 
     let session = writer_session();
     let data: Vec<u32> = (0..4_096).map(|i| i / 5).collect();
-    let primitive = PrimitiveArray::from_iter(data.iter().copied());
-    let delta = Delta::try_from_primitive_array(&primitive, &mut session.create_execution_ctx())
-        .unwrap()
-        .into_array();
-    assert_eq!(delta.encoding_id().as_str(), "fastlanes.delta");
+    // A few explicit values over a constant fill: still non-decreasing, so
+    // only the encoding — not the data — is what the probe declines.
+    let indices: Vec<u64> = vec![4_093, 4_094, 4_095];
+    let values: Vec<u32> = indices.iter().map(|&i| data[i as usize]).collect();
+    let sparse = Sparse::try_new(
+        PrimitiveArray::from_iter(indices).into_array(),
+        PrimitiveArray::from_iter(values).into_array(),
+        data.len(),
+        Scalar::from(0u32),
+    )
+    .unwrap()
+    .into_array();
+    assert_eq!(sparse.encoding_id().as_str(), "vortex.sparse");
     // The flat strategy writes the chunk in the encoding it arrives in.
     let strategy = struct_strategy(FlatLayoutStrategy::default());
     let file = write_file(
         &session,
-        vec![struct_of(vec![("s", delta)])],
+        vec![struct_of(vec![("s", sparse)])],
         Some(strategy),
     )
     .await;

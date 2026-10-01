@@ -14,12 +14,13 @@ use vortex_array::arrays::{Chunked, Constant, Dict, Primitive, Shared, Slice};
 use vortex_array::dtype::PType;
 use vortex_array::scalar::PValue;
 use vortex_fastlanes::{
-    BitPacked, BitPackedArrayExt as _, BitPackedSlots, FoR, FoRArrayExt as _, FoRSlots,
+    BitPacked, BitPackedArrayExt as _, BitPackedSlots, Delta, DeltaArrayExt as _, DeltaSlots, FoR,
+    FoRArrayExt as _, FoRSlots,
 };
 use vortex_runend::{RunEnd, RunEndArrayExt as _, RunEndSlots};
 use vortex_sequence::Sequence;
 
-use crate::node::{Chunk, Node, PackedNode, PatchProbe, Words};
+use crate::node::{Chunk, DeltaNode, DeltaWidth, Node, PackedNode, PatchProbe, Words};
 
 /// Child array at a fixed slot index, `'a`-borrowed from the erased slots.
 fn slot(slots: &[Option<ArrayRef>], idx: usize) -> Option<&ArrayRef> {
@@ -126,6 +127,22 @@ pub(crate) fn resolve_node<'a>(arr: &'a ArrayRef) -> Option<Node<'a>> {
         }));
     }
 
+    if let Some(view) = arr.as_opt::<Delta>() {
+        // The deltas child carries the validity, so a nullable one declines
+        // through its own resolution; the bases are a plain lane table.
+        let slots = view.slots();
+        let bases = resolve_node(slot(slots, DeltaSlots::BASES)?)?;
+        let deltas = resolve_node(slot(slots, DeltaSlots::DELTAS)?)?;
+        let width = match dtype.as_ptype() {
+            PType::U8 => DeltaWidth::U8,
+            PType::U16 => DeltaWidth::U16,
+            PType::U32 => DeltaWidth::U32,
+            PType::U64 => DeltaWidth::U64,
+            _ => return None,
+        };
+        return DeltaNode::new(bases, deltas, width, view.offset(), arr.len()).map(Node::Delta);
+    }
+
     if let Some(view) = arr.as_opt::<Slice>() {
         let child = resolve_node(slot(view.slots(), SliceSlots::CHILD)?)?;
         let range = view.data().slice_range();
@@ -223,12 +240,21 @@ fn as_slice_parts(arr: &ArrayRef) -> Option<(&ArrayRef, std::ops::Range<usize>)>
     Some((parent, view.data().slice_range().clone()))
 }
 
+/// A non-negative integer `PValue` as `u64`; `None` for negatives and
+/// non-integers. A sequence's multiplier is stored signed whatever the
+/// array's own type (a step of `1` arrives as `1i64`), so the signed arms
+/// matter: a negative step would make the run descend, which the sortedness
+/// contract excludes, so it declines.
 fn pvalue_u64(value: PValue) -> Option<u64> {
     match value {
         PValue::U8(v) => Some(u64::from(v)),
         PValue::U16(v) => Some(u64::from(v)),
         PValue::U32(v) => Some(u64::from(v)),
         PValue::U64(v) => Some(v),
+        PValue::I8(v) => u64::try_from(v).ok(),
+        PValue::I16(v) => u64::try_from(v).ok(),
+        PValue::I32(v) => u64::try_from(v).ok(),
+        PValue::I64(v) => u64::try_from(v).ok(),
         _ => None,
     }
 }

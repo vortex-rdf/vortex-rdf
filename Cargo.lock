@@ -4408,6 +4408,7 @@ name = "vortex-rdf-encoded-search"
 version = "0.10.0"
 dependencies = [
  "codspeed-divan-compat",
+ "fastlanes 0.7.2",
  "futures",
  "self_cell",
  "tokio",
@@ -4422,6 +4423,7 @@ dependencies = [
  "vortex-runend",
  "vortex-sequence",
  "vortex-session",
+ "vortex-sparse",
 ]
 
 [[package]]

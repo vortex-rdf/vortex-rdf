@@ -28,6 +28,7 @@ vortex-fastlanes = "0.86.1"
 vortex-io = "0.86.1"
 vortex-runend = "0.86.1"
 vortex-sequence = "0.86.1"
+vortex-sparse = "0.86.1"
 vortex-session = "0.86.1"
 vortex-fsst = "0.86.1"
 vortex-edition = "0.86.1"
@@ -36,6 +37,7 @@ vortex-file = { version = "0.86.1" }
 vortex-scan = "0.86.1"
 vortex-layout = "0.86.1"
 vortex-buffer = "0.86.1"
+fastlanes = "0.7"
 self_cell = "1.2"
 divan = { package = "codspeed-divan-compat", version = "5.0.1" }
 

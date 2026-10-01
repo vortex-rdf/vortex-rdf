@@ -28,6 +28,7 @@ const SUPPORTED_ENCODINGS: &[&str] = &[
     "vortex.runend",
     "fastlanes.for",
     "fastlanes.bitpacked",
+    "fastlanes.delta",
     "vortex.slice",
     "vortex.chunked",
     "vortex.dict",
@@ -37,6 +38,13 @@ const SUPPORTED_ENCODINGS: &[&str] = &[
 /// Most generic-oracle calls a single fixture makes. Fixtures with fewer
 /// needles than this check every one of them; larger ones are stride-sampled.
 const GENERIC_ORACLE_NEEDLES: usize = 2000;
+
+/// The generic-oracle budget per default-cascade fixture. The cascade yields
+/// dozens of fixtures, and an encoding without a native `search_sorted`
+/// kernel (delta) answers the generic oracle through per-element point reads
+/// that each decode a block, so the full budget would cost minutes there;
+/// every needle still meets the canonical oracle.
+const CASCADE_ORACLE_NEEDLES: usize = 64;
 
 fn ctx() -> ExecutionCtx {
     session().create_execution_ctx()
@@ -96,12 +104,23 @@ fn for_bitpacked_4k() -> (Vec<u32>, ArrayRef) {
     (data, arr)
 }
 
+/// A sorted column with uneven steps, delta-encoded over bit-packed deltas
+/// — the shape the default cascade now gives a sorted code column — at a
+/// length that pads the last 1024-value block.
+fn delta_bitpacked_5k() -> (Vec<u32>, ArrayRef) {
+    // A zero ratio makes the cascade pick Delta whenever it applies.
+    static DELTA: integer::DeltaScheme = integer::DeltaScheme::new(0.0);
+    let data = sorted_random(11, 5_000, 40);
+    let arr = compress_with(&[&DELTA, &integer::BitPackingScheme], &data);
+    (data, arr)
+}
+
 /// Asserts a default-cascade fixture either probes exactly or declined
 /// because its root encoding is outside the supported set; returns whether
 /// it resolved.
 fn assert_probe_or_unsupported(arr: &ArrayRef, data: &[u32]) -> bool {
     if SortedProbe::resolve(arr).is_some() {
-        assert_probe(arr, data, &[]);
+        assert_probe_with_budget(arr, data, &[], CASCADE_ORACLE_NEEDLES);
         true
     } else {
         let id = arr.encoding_id();
@@ -129,6 +148,16 @@ fn generic_bounds(arr: &ArrayRef, needle: u32) -> (usize, usize) {
 /// Three-way agreement on bounds plus exact point access, with an optional
 /// coverage assertion on the resolved probe tree.
 fn assert_probe(arr: &ArrayRef, data: &[u32], expect_kinds: &[NodeKind]) {
+    assert_probe_with_budget(arr, data, expect_kinds, GENERIC_ORACLE_NEEDLES);
+}
+
+/// [`assert_probe`] with an explicit cap on generic-oracle calls.
+fn assert_probe_with_budget(
+    arr: &ArrayRef,
+    data: &[u32],
+    expect_kinds: &[NodeKind],
+    generic_budget: usize,
+) {
     let probe = SortedProbe::resolve(arr)
         .unwrap_or_else(|| panic!("resolve declined ({})", arr.encoding_id()));
     let kinds = probe.node_kinds();
@@ -141,7 +170,7 @@ fn assert_probe(arr: &ArrayRef, data: &[u32], expect_kinds: &[NodeKind]) {
     assert_eq!(probe.len(), data.len());
 
     let needles = needles_for(data);
-    let generic_stride = needles.len().div_ceil(GENERIC_ORACLE_NEEDLES);
+    let generic_stride = needles.len().div_ceil(generic_budget);
     for (i, needle) in needles.iter().copied().enumerate() {
         let got = probe.bounds(needle);
         assert_eq!(
@@ -151,9 +180,9 @@ fn assert_probe(arr: &ArrayRef, data: &[u32], expect_kinds: &[NodeKind]) {
         );
         // A generic `search_sorted` call costs orders of magnitude more than
         // the canonical floor, so a high-cardinality fixture is stride-sampled
-        // down to `GENERIC_ORACLE_NEEDLES` of them. Index 0 and the ptype's
-        // upper edge are always taken, and every needle still meets the
-        // canonical oracle above.
+        // down to `generic_budget` of them. Index 0 and the ptype's upper
+        // edge are always taken, and every needle still meets the canonical
+        // oracle above.
         if i % generic_stride != 0 && needle != u64::from(u32::MAX) {
             continue;
         }
@@ -252,6 +281,25 @@ fn probes_bitpacked_with_patches() {
             &data[range],
             &[NodeKind::BitPacked, NodeKind::Patches],
         );
+    }
+}
+
+#[test]
+fn probes_delta_bitpacked() {
+    let (data, arr) = delta_bitpacked_5k();
+    assert_probe(&arr, &data, &[NodeKind::Delta, NodeKind::BitPacked]);
+}
+
+/// A sliced delta array starts inside a block (a physical offset) and ends
+/// inside another; every value and bound still comes from the right block.
+#[test]
+fn probes_delta_sliced_within_blocks() {
+    let (data, arr) = delta_bitpacked_5k();
+    let sliced = arr.slice(1_030..4_100).unwrap();
+    assert_probe(&sliced, &data[1_030..4_100], &[NodeKind::Delta]);
+    let probe = SortedProbe::resolve(&sliced).expect("a sliced delta array resolves");
+    for (i, &v) in data[1_030..4_100].iter().enumerate().step_by(97) {
+        assert_eq!(probe.value_at(i), u64::from(v), "value at {i}");
     }
 }
 
