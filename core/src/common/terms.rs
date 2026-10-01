@@ -315,6 +315,21 @@ pub fn parse_pattern_checked(
     ))
 }
 
+/// The spelling the dictionary and the columns hold for a user-typed term:
+/// the checked parse of `term` (an IRI with or without angle brackets, a
+/// `_:` blank node, or an escape-aware literal) rendered back through the
+/// storage form — `xsd:string` typing dropped, the language tag lowercased,
+/// escapes normalized — and the default graph's spellings (`""`,
+/// `default`, `[]`) as the empty string the `g` column stores. Malformed
+/// input is an error; a dictionary that holds `term` under *some* spelling
+/// holds it under this one.
+pub fn canonical_spelling(term: &str) -> Result<String> {
+    if term.is_empty() || term.eq_ignore_ascii_case("default") || term == "[]" {
+        return Ok(String::new());
+    }
+    Ok(parse_term_checked(term)?.to_string())
+}
+
 /// [`parse_term`] as a decode step: an object string the columns store,
 /// parsed on the trusted path, with an unrecognized form reported as a
 /// deserialization error.
@@ -598,6 +613,35 @@ mod tests {
             );
             // And the value must render back to exactly the form we started from.
             assert_eq!(expected.to_string(), serialized);
+        }
+    }
+
+    /// The canonical spelling is what the columns store: every tolerated
+    /// variant of a term lands on the one spelling the dictionary holds.
+    #[test]
+    fn canonical_spelling_normalizes_tolerated_variants() {
+        for (typed, stored) in [
+            ("<http://example.org/x>", "<http://example.org/x>"),
+            ("http://example.org/x", "<http://example.org/x>"),
+            ("_:b0", "_:b0"),
+            ("\"v\"", "\"v\""),
+            ("\"v\"^^<http://www.w3.org/2001/XMLSchema#string>", "\"v\""),
+            ("\"v\"@EN-gb", "\"v\"@en-gb"),
+            ("\"a\\u0041b\"", "\"aAb\""),
+            ("\"q\\'\"", "\"q'\""),
+            (
+                "\"42\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+                "\"42\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+            ),
+            ("", ""),
+            ("default", ""),
+            ("DEFAULT", ""),
+            ("[]", ""),
+        ] {
+            assert_eq!(canonical_spelling(typed).unwrap(), stored, "{typed:?}");
+        }
+        for bad in ["not an iri", "\"unterminated", "\"v\"@not a tag"] {
+            assert!(canonical_spelling(bad).is_err(), "{bad:?}");
         }
     }
 

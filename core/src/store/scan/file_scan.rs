@@ -8,7 +8,8 @@ use std::future::Future;
 use std::ops::{BitAnd, Range};
 use std::sync::Arc;
 
-use futures::{StreamExt, stream};
+use futures::future::BoxFuture;
+use futures::{FutureExt as _, StreamExt, stream};
 use oxrdf::NamedOrBlankNode;
 use vortex_array::expr::forms::conjuncts;
 use vortex_array::expr::{BoundExpression, Expression, lit};
@@ -200,27 +201,23 @@ async fn evaluate_filter_split(
     Ok(mask)
 }
 
-/// Evaluate `filter` over every natural file split the selection touches and
-/// map each split's surviving mask through `map` — the shared split loop
-/// behind [`count_matching_rows`] and [`matching_file_rows`], which differ
-/// only in what they do with a split's mask.
+/// The per-split filter tasks of a file view, in file order: one future per
+/// natural split the selection touches, each evaluating `filter` over its
+/// split (zone-map pruning first, then the conjuncts) and answering the
+/// split-relative surviving mask with its range. The shared prelude of
+/// [`map_filter_splits`] and [`fold_filter_splits_ordered`], which differ in
+/// how they drive the tasks.
 ///
-/// The splits are clamped to the selection's bounds, evaluated concurrently
-/// (bounded by available parallelism), and returned in completion order — the
-/// per-split results carry their own range when order matters. The clamped
-/// ranges are owned before the task futures are built: an iterator borrowing
-/// the memoized splits held across the awaits trips rustc's higher-ranked
-/// lifetime inference when callers spawn the resulting future.
-async fn map_filter_splits<T, F>(
+/// The clamped ranges are owned before the task futures are built: an
+/// iterator borrowing the memoized splits held across the awaits trips
+/// rustc's higher-ranked lifetime inference when callers spawn the resulting
+/// future.
+fn filter_split_tasks(
     file: &NativeStoreFile,
     filter: &Expression,
     selection: &RowSelection,
     deleted: Option<&Mask>,
-    map: F,
-) -> Result<Vec<T>>
-where
-    F: Fn(Mask, &Range<u64>) -> T + Clone,
-{
+) -> Result<Vec<SplitTask>> {
     // The cached layout reader tree — reused across every split task below,
     // so zone-map stats are looked up once, not once per split.
     let reader = file.layout_reader().map_err(VortexRdfError::Vortex)?;
@@ -251,26 +248,136 @@ where
             (start < end).then_some(start..end)
         })
         .collect();
-    let tasks = ranges.into_iter().map(|range| {
-        let reader = Arc::clone(&reader);
-        let filter_conjuncts = filter_conjuncts.clone();
-        // The starting mask for this split: the selected rows within
-        // `range`, minus any the caller has tombstoned.
-        let start_mask = split_start_mask(&mask_selection, deleted, &range);
-        let map = map.clone();
-        async move {
-            let mask = evaluate_filter_split(reader, &filter_conjuncts, &range, start_mask).await?;
-            Ok::<T, VortexRdfError>(map(mask, &range))
-        }
-    });
+    Ok(ranges
+        .into_iter()
+        .map(|range| {
+            let reader = Arc::clone(&reader);
+            let filter_conjuncts = filter_conjuncts.clone();
+            // The starting mask for this split: the selected rows within
+            // `range`, minus any the caller has tombstoned.
+            let start_mask = split_start_mask(&mask_selection, deleted, &range);
+            async move {
+                let mask =
+                    evaluate_filter_split(reader, &filter_conjuncts, &range, start_mask).await?;
+                Ok::<_, VortexRdfError>((mask, range))
+            }
+            .boxed()
+        })
+        .collect())
+}
 
+/// One split's filter evaluation, owning everything it reads: the surviving
+/// split-relative mask with the split's range.
+type SplitTask = BoxFuture<'static, Result<(Mask, Range<u64>)>>;
+
+/// Evaluate `filter` over every natural file split the selection touches and
+/// map each split's surviving mask through `map` — the shared split loop
+/// behind [`count_matching_rows`] and [`matching_file_rows`], which differ
+/// only in what they do with a split's mask.
+///
+/// The splits are evaluated concurrently (bounded by available parallelism)
+/// and returned in completion order — the per-split results carry their own
+/// range when order matters.
+async fn map_filter_splits<T, F>(
+    file: &NativeStoreFile,
+    filter: &Expression,
+    selection: &RowSelection,
+    deleted: Option<&Mask>,
+    map: F,
+) -> Result<Vec<T>>
+where
+    F: Fn(Mask, &Range<u64>) -> T,
+{
+    let tasks = filter_split_tasks(file, filter, selection, deleted)?;
     let concurrency = available_parallelism() * 4;
     let mut results = stream::iter(tasks).buffer_unordered(concurrency);
     let mut out = Vec::new();
     while let Some(r) = results.next().await {
-        out.push(r?);
+        let (mask, range) = r?;
+        out.push(map(mask, &range));
     }
     Ok(out)
+}
+
+/// Evaluate `filter` over the selection's splits *in file order*, feeding
+/// each split's surviving mask to `step` until it answers `false` — the
+/// early-exit twin of [`map_filter_splits`] behind the windowed and capped
+/// reads ([`first_matching_rows`], [`count_matching_rows_capped`]). A few
+/// splits are evaluated ahead of the consumer so the exit stays cheap
+/// without serializing the I/O; whatever was in flight past the exit is
+/// dropped unread.
+async fn fold_filter_splits_ordered<F>(
+    file: &NativeStoreFile,
+    filter: &Expression,
+    selection: &RowSelection,
+    deleted: Option<&Mask>,
+    mut step: F,
+) -> Result<()>
+where
+    F: FnMut(Mask, &Range<u64>) -> bool,
+{
+    let tasks = filter_split_tasks(file, filter, selection, deleted)?;
+    let lookahead = available_parallelism().max(2);
+    let mut results = stream::iter(tasks).buffered(lookahead);
+    while let Some(r) = results.next().await {
+        let (mask, range) = r?;
+        if !step(mask, &range) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// The first `want` file rows matching `filter` inside the selection, in file
+/// order — the rows a window `offset + limit` deep needs — evaluating splits
+/// in order and stopping at the first that completes the count. Tombstoned
+/// rows are excluded (they would otherwise fill the window).
+pub(crate) async fn first_matching_rows(
+    file: &NativeStoreFile,
+    filter: &Expression,
+    selection: &RowSelection,
+    deleted: Option<&Mask>,
+    want: usize,
+) -> Result<Buffer<u64>> {
+    let mut ids: Vec<u64> = Vec::new();
+    if want == 0 {
+        return Ok(Buffer::from(ids));
+    }
+    fold_filter_splits_ordered(file, filter, selection, deleted, |mask, range| {
+        match mask.indices() {
+            AllOr::All => ids.extend(range.clone()),
+            AllOr::None => {}
+            AllOr::Some(indices) => {
+                ids.extend(indices.iter().map(|&i| range.start + i as u64));
+            }
+        }
+        ids.len() < want
+    })
+    .await?;
+    ids.truncate(want);
+    Ok(Buffer::from(ids))
+}
+
+/// [`count_matching_rows`] stopping as soon as `cap` matches are counted —
+/// what `size_capped` and `exists` ask: whether (at least) that many rows
+/// match, not how many. Answers `min(matches, cap)`.
+pub(crate) async fn count_matching_rows_capped(
+    file: &NativeStoreFile,
+    filter: &Expression,
+    selection: &RowSelection,
+    deleted: Option<&Mask>,
+    cap: usize,
+) -> Result<usize> {
+    let mut count = 0usize;
+    if cap == 0 {
+        return Ok(0);
+    }
+    fold_filter_splits_ordered(file, filter, selection, deleted, |mask, _| {
+        count += mask.true_count();
+        count < cap
+    })
+    .await?;
+    Ok(count.min(cap))
 }
 
 /// Count rows matching `filter` by driving the layout reader's pruning and
@@ -319,6 +426,35 @@ pub(crate) async fn matching_file_rows(
     let mut matched: Vec<usize> = ids.into_iter().flatten().collect();
     matched.sort_unstable();
     Ok(Mask::from_indices(row_count as usize, matched))
+}
+
+/// One `u32` column of the file at the rows `selection` covers, in file
+/// order — positions align with `selection.apply`, so a mask over the
+/// result refines the selection (`RowSelection::refine`). Tombstones are
+/// not applied (the read paths apply them).
+pub(crate) async fn read_column_codes(
+    file: &NativeStoreFile,
+    column: &'static str,
+    selection: &RowSelection,
+) -> Result<Vec<u32>> {
+    use vortex_array::VortexSessionExecute as _;
+    use vortex_array::arrays::{PrimitiveArray, StructArray};
+    use vortex_array::expr::{root, select};
+
+    let mut scan = file.scan().map_err(VortexRdfError::Vortex)?;
+    let scope = scan.dtype().map_err(VortexRdfError::Vortex)?;
+    scan = scan.with_projection(
+        file.bound_exprs()
+            .bind(QUAD_SCOPE, &select(&[column][..], root()), &scope)
+            .map_err(VortexRdfError::Vortex)?,
+    );
+    let rows = read_all_rows(selection.restrict_scan(scan, None)).await?;
+    let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
+    let struct_arr = rows
+        .execute::<StructArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+    let prim = crate::store::array::field_as::<PrimitiveArray>(&struct_arr, column, &mut ctx)?;
+    Ok(prim.as_slice::<u32>().to_vec())
 }
 
 /// The pushed-down filter for a pattern under `codes`' layout: `AND` of

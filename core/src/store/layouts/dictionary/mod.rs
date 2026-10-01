@@ -44,6 +44,7 @@ pub(crate) mod access;
 #[cfg(feature = "file-io")]
 pub(crate) mod file_backed;
 pub(crate) mod ingest;
+pub mod predicates;
 pub(crate) mod term_dict;
 
 #[cfg(feature = "file-io")]
@@ -53,9 +54,10 @@ pub use self::ingest::DictionaryQuadSink;
 // wasm32-unknown-unknown.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) use self::ingest::{TermCodeMap, TermDictionaryBuilder};
+pub use self::predicates::{Domain, KindRanges, NumOp, TermPredicate, Verdict};
 use self::term_dict::DictCursor;
-pub use self::term_dict::DictSnapshot;
 pub(crate) use self::term_dict::TermDictionary;
+pub use self::term_dict::{DictReader, DictSnapshot};
 
 /// The primary columns: `s`, `p`, `o`, `g` (all u32 codes).
 pub(crate) const COLUMNS: &[&str] = &PRIMARY_COLUMNS;

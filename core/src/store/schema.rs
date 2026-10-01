@@ -26,3 +26,49 @@ pub(crate) const COL_G: &str = "g";
 
 /// The four primary columns in emission order.
 pub(crate) const PRIMARY_COLUMNS: [&str; 4] = [COL_S, COL_P, COL_O, COL_G];
+
+/// One of the four primary quad columns, by role — how the narrowing
+/// surface ([`keep`](crate::store::VortexRdfStore::keep)) and the code
+/// payloads name a column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum QuadColumn {
+    /// The subject.
+    S,
+    /// The predicate.
+    P,
+    /// The object.
+    O,
+    /// The graph name.
+    G,
+}
+
+impl QuadColumn {
+    /// The four columns in emission order — the order of
+    /// [`PRIMARY_COLUMNS`] and of every `(s, p, o, g)` code payload.
+    pub const ALL: [QuadColumn; 4] = [QuadColumn::S, QuadColumn::P, QuadColumn::O, QuadColumn::G];
+
+    /// The column's name in the serialized schema.
+    pub fn name(self) -> &'static str {
+        PRIMARY_COLUMNS[self.index()]
+    }
+
+    /// The column's position in `(s, p, o, g)` order.
+    pub fn index(self) -> usize {
+        match self {
+            QuadColumn::S => 0,
+            QuadColumn::P => 1,
+            QuadColumn::O => 2,
+            QuadColumn::G => 3,
+        }
+    }
+
+    /// The column at `index` in `(s, p, o, g)` order, `None` past the fourth.
+    pub fn from_index(index: usize) -> Option<Self> {
+        Self::ALL.get(index).copied()
+    }
+
+    /// The column named `name` (`s`, `p`, `o` or `g`), `None` for any other.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.name() == name)
+    }
+}

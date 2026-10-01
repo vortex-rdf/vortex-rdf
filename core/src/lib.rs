@@ -52,10 +52,12 @@ mod session;
 pub mod store;
 
 pub use error::{Result, VortexRdfError};
+pub use store::columns;
 
 pub use store::{
-    BuiltArray, BuiltStream, ChunkStream, DictSnapshot, DictionaryQuadSink, IndexType, Indexes,
-    LayoutStrategy, RawQuad, SharedQuad, SortedInMemoryBuilder, StoreParts, VortexArrayBuilder,
+    BuiltArray, BuiltStream, ChunkStream, DictReader, DictSnapshot, DictionaryQuadSink, Domain,
+    IndexType, Indexes, Keep, KindRanges, LayoutStrategy, NumOp, Probe, QuadColumn, RawQuad,
+    SharedQuad, SortedInMemoryBuilder, StoreParts, TermPredicate, Verdict, VortexArrayBuilder,
     VortexRdfStore, export_rdf,
 };
 // Compiled out on wasm along with the rest of the sorted-stream builder's

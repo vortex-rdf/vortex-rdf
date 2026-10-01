@@ -36,6 +36,13 @@ impl VortexRdfStore {
     /// filter references are read, and no rows are projected or decoded.
     /// `file.row_count()` alone would report the unfiltered total.
     pub async fn size(&self) -> Result<usize> {
+        Ok(self.base_size().await? + self.tail_size())
+    }
+
+    /// [`size`](Self::size) for the base alone — the rows the selection (and
+    /// a pending file filter) cover, minus tombstones; the tail's rows are
+    /// [`tail_size`](Self::tail_size).
+    pub(crate) async fn base_size(&self) -> Result<usize> {
         let base = match &self.quads {
             // In-memory patterns resolve to exact row ids at match time —
             // or, for a served match, to a pending run whose width is known
@@ -114,16 +121,20 @@ impl VortexRdfStore {
                 }
             }
         };
-        // The tail's contribution: its selection is always exact (tail matches
-        // are resolved eagerly), minus its own tombstones.
-        let tail = self.tail.as_ref().map_or(0, |tail| match &tail.deleted {
+        Ok(base)
+    }
+
+    /// The tail's contribution to [`size`](Self::size): its selection is
+    /// always exact (tail matches are resolved eagerly), minus its own
+    /// tombstones.
+    pub(crate) fn tail_size(&self) -> usize {
+        self.tail.as_ref().map_or(0, |tail| match &tail.deleted {
             None => tail.selection.len(tail.rows.len()),
             Some(deleted) => tail
                 .selection
                 .live_mask(deleted, tail.rows.len())
                 .true_count(),
-        });
-        Ok(base + tail)
+        })
     }
 
     /// The rows this view selects, base and tail combined, as a single
