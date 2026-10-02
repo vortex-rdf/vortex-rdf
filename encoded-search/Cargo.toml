@@ -15,6 +15,7 @@ categories = ["encoding", "data-structures"]
 all-features = true
 
 [dependencies]
+fastlanes = { workspace = true }
 self_cell = { workspace = true }
 vortex-array = { workspace = true }
 vortex-error = { workspace = true }
@@ -38,6 +39,7 @@ vortex-file = { workspace = true }
 vortex-io = { workspace = true, features = ["tokio"] }
 vortex-layout = { workspace = true }
 vortex-session = { workspace = true }
+vortex-sparse = { workspace = true }
 
 [[test]]
 name = "layout"

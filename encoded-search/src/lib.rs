@@ -140,4 +140,7 @@ pub enum NodeKind {
     /// are not order-preserving, so bounds search probes the composed
     /// logical values rather than the values child.
     Dict,
+    /// FastLanes delta: per 1024-value block, a lane of bases plus transposed
+    /// deltas, decoded one block at a time on first touch.
+    Delta,
 }

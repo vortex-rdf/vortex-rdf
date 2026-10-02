@@ -67,7 +67,8 @@ together in one self-referential value.
 ## Supported encodings
 
 `Primitive`, `Constant`, `Sequence`, `RunEnd`, `FoR`, `BitPacked` (including
-its patches), `Slice`, `Chunked`, and `Dict`, composed arbitrarily; the
+its patches), `Delta` (FastLanes delta, decoded one 1,024-value block at a
+time on first touch), `Slice`, `Chunked`, and `Dict`, composed arbitrarily; the
 transparent `Shared` wrapper resolves to whatever it wraps. `NodeKind` reports
 the resolved tree's shape for tests and diagnostics.
 
