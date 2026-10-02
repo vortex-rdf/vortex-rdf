@@ -26,6 +26,7 @@ use std::ops::Range;
 
 use vortex_buffer::Buffer;
 
+use crate::common::vocab::{RDF_LANG_STRING, XSD, XSD_STRING};
 use crate::error::{Result, VortexRdfError};
 
 /// The code ranges of a sorted dictionary's term kinds. Codes are
@@ -230,10 +231,6 @@ impl std::hash::Hash for Num {
         }
     }
 }
-
-const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
-const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
-const RDF_LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
 
 /// The XSD numeric datatypes the value model covers, by local name, with the
 /// inclusive bounds of the bounded integer types (`None` = unbounded).

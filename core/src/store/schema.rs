@@ -1,14 +1,16 @@
 //! The column names that define the serialized format.
 //!
 //! These are contract, not policy: a name change here changes what a written
-//! file means, so they live in one place. Column names owned by a single
-//! subsystem live with that subsystem instead: each index child's column
-//! names in its index module ([`secondary_by_copy::CopyFamily`],
-//! [`secondary_by_reference`]), the dictionary child's `_dict_term` in
-//! [`term_dict`](crate::store::layouts::dictionary::term_dict), and the
+//! file means, so they live in one place, and a child that carries a primary
+//! column under the primary's name (the copy index families) uses these
+//! constants rather than its own spelling. Column names owned by a single
+//! subsystem live with that subsystem instead: the row id every index child
+//! carries in the index hub ([`indexes::COL_RID`]), the reference index's
+//! `val` in [`secondary_by_reference`], the dictionary child's `_dict_term`
+//! in [`term_dict`](crate::store::layouts::dictionary::term_dict), and the
 //! TypedObject layout's split object columns in [`typed_object`].
 //!
-//! [`secondary_by_copy::CopyFamily`]: crate::store::indexes::secondary_by_copy::CopyFamily
+//! [`indexes::COL_RID`]: crate::store::indexes::COL_RID
 //! [`secondary_by_reference`]: crate::store::indexes::secondary_by_reference
 //! [`typed_object`]: crate::store::layouts::typed_object
 

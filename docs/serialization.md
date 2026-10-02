@@ -262,7 +262,7 @@ Every layout puts `s` first and stamps it when the rows are sorted.
 | `TypedObject` | `s`, `p`, `o_kind` (`u8`), `o_value` (`Utf8`), `o_datatype` (nullable `Utf8`), `o_lang` (nullable `Utf8`), `g` | as `Default`, with the object decomposed |
 | `Dictionary` | `s`, `p`, `o`, `g` — non-nullable `u32` | codes into one sorted dictionary |
 
-**TypedObject decomposition** ([`decompose_object`](../core/src/store/layouts/typed_object.rs#L76)):
+**TypedObject decomposition** ([`decompose_object`](../core/src/store/layouts/typed_object.rs#L77)):
 
 | `o_kind` | Object | `o_value` | `o_datatype` | `o_lang` |
 |---|---|---|---|---|
@@ -297,7 +297,7 @@ dictionary alone.
 
 Indexes never ride inside the quad rows: a builder emits primary-only rows plus
 one *component* per requested family, and that is the only form index data ever
-takes — in memory as an [`IndexComponent`](../core/src/store/indexes/components.rs#L166),
+takes — in memory as an [`IndexComponent`](../core/src/store/indexes/components.rs#L168),
 in a file as an auxiliary child.
 
 | Index | Children | Columns | Sorted by |
@@ -312,7 +312,7 @@ position of the quad in the sorted primary rows.
 
 **In memory** ([`build_components`](../core/src/store/builders/mod.rs#L234)) each
 family is a permutation of the complete sorted dataset: sort the row ids by the
-family's comparator ([`CopyFamily::cmp_quads`](../core/src/store/indexes/secondary_by_copy.rs#L145),
+family's comparator ([`CopyFamily::cmp_quads`](../core/src/store/indexes/secondary_by_copy.rs#L141),
 or the code tuple under Dictionary), then gather the columns through that
 permutation — the permutation itself is the `rid` column. The lead sort column
 is stamped `IsSorted`.

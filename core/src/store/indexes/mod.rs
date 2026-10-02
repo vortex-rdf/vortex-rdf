@@ -9,8 +9,9 @@
 //!
 //! What belongs in a leaf instead: an index's column-name scheme, its sort
 //! orders, how it builds its children, and how it probes them
-//! (`secondary_by_copy`, `secondary_by_reference`) — the hub never hardcodes
-//! a column name. Two further clusters live beside it: `serve` (reading
+//! (`secondary_by_copy`, `secondary_by_reference`) — the hub hardcodes no
+//! column name but the one every child shares, the primary row id
+//! ([`COL_RID`]). Two further clusters live beside it: `serve` (reading
 //! matched quads out of an index's own columns) and `components` (the
 //! persisted-child model and the slug registry), both re-exported here so
 //! callers see one `indexes::` surface.
@@ -46,6 +47,11 @@ pub(crate) use row_ids::{
 #[cfg(feature = "file-io")]
 pub(crate) use serve::FileServePlan;
 pub(crate) use serve::InMemoryServePlan;
+
+/// The primary-row-id column every persisted index child carries beside its
+/// own columns — the currency every resolution answers in, and the one
+/// column name the families share rather than each spelling their own.
+pub(crate) const COL_RID: &str = "rid";
 
 /// A secondary index, built as its own sorted children beside the primary
 /// quad rows.

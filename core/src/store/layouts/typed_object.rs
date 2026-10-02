@@ -10,6 +10,7 @@ use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 use vortex_array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 
 use crate::common::terms::{parse_graph_name, parse_named_node, parse_subject, parse_term};
+use crate::common::vocab::XSD_STRING;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
@@ -82,7 +83,7 @@ pub(crate) fn decompose_object(term: &Term) -> (u8, String, Option<String>, Opti
                 (3, l.value().to_string(), None, Some(lang.to_string()))
             } else {
                 let dt = l.datatype().as_str();
-                if dt == "http://www.w3.org/2001/XMLSchema#string" {
+                if dt == XSD_STRING {
                     (2, l.value().to_string(), None, None)
                 } else {
                     (4, l.value().to_string(), Some(dt.to_string()), None)
@@ -111,7 +112,7 @@ fn compose_object(
             Literal::new_language_tagged_literal_unchecked(value, lang.unwrap_or("")),
         )),
         4 => {
-            let dt_str = datatype.unwrap_or("http://www.w3.org/2001/XMLSchema#string");
+            let dt_str = datatype.unwrap_or(XSD_STRING);
             Ok(Term::Literal(Literal::new_typed_literal(
                 value,
                 NamedNode::new_unchecked(dt_str),

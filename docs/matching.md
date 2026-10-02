@@ -260,7 +260,7 @@ Each stage in the code, and where the details are below:
 |---|---|---|
 | Prelude | [`matching.rs:213-242`](../core/src/store/matching.rs#L213-L242) | — |
 | 1 · prefix probe | [`matching.rs:244-327`](../core/src/store/matching.rs#L244-L327), [`search_sorted_bounds`](../core/src/store/array.rs#L178) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`matching.rs:329-399`](../core/src/store/matching.rs#L329-L399), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L485) | [§6.2](#62-secondary-index-routing) |
+| 2 · secondary-index routing | [`matching.rs:329-399`](../core/src/store/matching.rs#L329-L399), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L491) | [§6.2](#62-secondary-index-routing) |
 | 3 · residual column filtering | [`matching.rs:401-442`](../core/src/store/matching.rs#L401-L442), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L184), [`mask_for`](../core/src/store/matching.rs#L735) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`matching.rs:444-458`](../core/src/store/matching.rs#L444-L458) | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
@@ -524,7 +524,7 @@ Each stage in the code, and where the details are below:
 |---|---|---|
 | Prelude | [`matching.rs:494-505`](../core/src/store/matching.rs#L494-L505) | — |
 | 1 · subject chunk probe | [`matching.rs:506-524`](../core/src/store/matching.rs#L506-L524), [`locate_subject_run`](../core/src/store/scan/file_scan.rs#L478) | [§7.1](#71-subject-chunk-probe) |
-| 2 · secondary-index routing | [`matching.rs:525-541`](../core/src/store/matching.rs#L525-L541), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L509) | [§8](#8-the-index-resolvers) |
+| 2 · secondary-index routing | [`matching.rs:525-541`](../core/src/store/matching.rs#L525-L541), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L515) | [§8](#8-the-index-resolvers) |
 | 3 · pushed-down filter | [`matching.rs:554-638`](../core/src/store/matching.rs#L554-L638), [`build_file_filter`](../core/src/store/scan/file_scan.rs#L463) | [§7.3](#73-what-ends-up-on-the-view) |
 | 4 · selection and serve plan | [`matching.rs:547-548`](../core/src/store/matching.rs#L547-L548) and [`matching.rs:639-688`](../core/src/store/matching.rs#L639-L688), [`row_range_from_pruning`](../core/src/store/scan/file_scan.rs#L680) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 
@@ -1175,6 +1175,7 @@ total, `Unknown` wherever it defers (see
 | `Probe`, `match_many`, `count_many` | [`core/src/store/batch.rs`](../core/src/store/batch.rs) |
 | `DictReader`, `DictSnapshot`, `prefix_range`, tolerant `encode` | [`core/src/store/layouts/dictionary/term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs) |
 | `TermPredicate`, `Verdict`, `KindRanges`, the verdict rules | [`core/src/store/layouts/dictionary/predicates.rs`](../core/src/store/layouts/dictionary/predicates.rs) |
+| The RDF/XSD datatype IRIs the predicates and the TypedObject layout share | [`core/src/common/vocab.rs`](../core/src/common/vocab.rs) |
 | Column kernels (`distinct_first_seen`, `value_counts`, `take`, `equi_join_indices`) | [`core/src/store/columns.rs`](../core/src/store/columns.rs) |
 | View state (`QuadsSource`, `Tail`) | [`core/src/store/source.rs`](../core/src/store/source.rs) |
 | Read paths consuming the view | [`core/src/store/streaming.rs`](../core/src/store/streaming.rs), [`core/src/store/rows.rs`](../core/src/store/rows.rs) |
