@@ -6,7 +6,7 @@
 [package]
 name = "vortex-rdf-interface-tests"
 description = "Conformance tests for the interfaces an external query engine reads vortex-rdf through, driven by vortex's DataFusion integration"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
