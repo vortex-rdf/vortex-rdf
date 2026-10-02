@@ -14,13 +14,13 @@ an engine takes.
 
 | What the engine needs | What it calls |
 |---|---|
-| A table of quads to scan with projection, filter and limit pushdown | [`VortexRdfStore::data_source`](../core/src/store/data_source.rs) on any view, registered with vortex's `VortexTable` |
-| The index copies in their own sort orders, and the dictionary, as tables | [`VortexRdfStore::component_data_source`](../core/src/store/data_source.rs) |
-| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/chunks.rs), [`code_chunks`](../core/src/store/chunks.rs) |
-| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/metadata.rs), [`index_components`](../core/src/store/metadata.rs), [`partitions`](../core/src/store/metadata.rs) |
+| A table of quads to scan with projection, filter and limit pushdown | [`VortexRdfStore::data_source`](../core/src/store/read/data_source.rs) on any view, registered with vortex's `VortexTable` |
+| The index copies in their own sort orders, and the dictionary, as tables | [`VortexRdfStore::component_data_source`](../core/src/store/read/data_source.rs) |
+| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs), [`code_chunks`](../core/src/store/read/chunks.rs) |
+| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs), [`index_components`](../core/src/store/read/metadata.rs), [`partitions`](../core/src/store/read/metadata.rs) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/term_dict.rs) (`dict_reader`), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
-| When codes and plans stop applying | [`generation`](../core/src/store/metadata.rs), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/term_dict.rs) |
+| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/term_dict.rs) |
 | The session to hand vortex's integrations | [`vortex_session()`](../core/src/lib.rs), with `vortex_scan` re-exported |
 
 ---
@@ -241,10 +241,10 @@ out of `cargo test --workspace`; CI runs it in the `interface-tests` job and
 
 | Concern | File |
 |---|---|
-| `DataSource` over a view, component tables, the request plan | [`core/src/store/data_source.rs`](../core/src/store/data_source.rs) |
-| `row_chunks`, `code_chunks` | [`core/src/store/chunks.rs`](../core/src/store/chunks.rs) |
-| `view_statistics`, `index_components`, `partitions`, `generation` | [`core/src/store/metadata.rs`](../core/src/store/metadata.rs) |
-| `RowSelection::split` | [`core/src/store/selection.rs`](../core/src/store/selection.rs) |
+| `DataSource` over a view, component tables, the request plan | [`core/src/store/read/data_source.rs`](../core/src/store/read/data_source.rs) |
+| `row_chunks`, `code_chunks` | [`core/src/store/read/chunks.rs`](../core/src/store/read/chunks.rs) |
+| `view_statistics`, `index_components`, `partitions`, `generation` | [`core/src/store/read/metadata.rs`](../core/src/store/read/metadata.rs) |
+| `RowSelection::split` | [`core/src/store/view/selection.rs`](../core/src/store/view/selection.rs) |
 | `dictionary_id` | [`core/src/store/layouts/dictionary/term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs) |
 | `vortex_session`, the `vortex_scan` re-export | [`core/src/lib.rs`](../core/src/lib.rs) |
 | Conformance through DataFusion, the Arrow recipe, the example | [`interface-tests/Cargo.toml`](../interface-tests/Cargo.toml), [`tests/datafusion.rs`](../interface-tests/tests/datafusion.rs), [`tests/arrow.rs`](../interface-tests/tests/arrow.rs), [`examples/datafusion_table.rs`](../interface-tests/examples/datafusion_table.rs) |
