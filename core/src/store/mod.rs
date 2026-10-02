@@ -2,6 +2,7 @@
 // here (or at the crate root), so each has exactly one canonical public path.
 pub(crate) mod array;
 pub(crate) mod builders;
+pub mod columns;
 pub(crate) mod indexes;
 pub(crate) mod layouts;
 #[cfg(feature = "file-io")]
@@ -13,10 +14,12 @@ pub(crate) mod selection;
 pub(crate) mod source;
 
 // [`VortexRdfStore`]'s impl clusters — the struct itself is defined below.
+mod batch;
 mod compaction;
 mod export;
 mod matching;
 mod mutation;
+mod narrowing;
 mod open;
 mod rows;
 mod serialize;
@@ -30,12 +33,17 @@ pub use builders::{
 pub use export::export_rdf;
 // Compiled out on wasm along with the rest of the sorted-stream builder's
 // out-of-core merge (see the module gate in `builders`).
+pub use batch::Probe;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use builders::SortedStreamBuilder;
 pub use indexes::{IndexType, Indexes};
 pub use layouts::LayoutStrategy;
-pub use layouts::dictionary::DictSnapshot;
 pub use layouts::dictionary::DictionaryQuadSink;
+pub use layouts::dictionary::{
+    DictReader, DictSnapshot, Domain, KindRanges, NumOp, TermPredicate, Verdict,
+};
+pub use narrowing::Keep;
+pub use schema::QuadColumn;
 // `RawQuad` lives in `common` (it is pure RDF text — see that module's
 // charter); this re-export makes `store::RawQuad` the path builder consumers
 // use.
@@ -495,5 +503,24 @@ impl VortexRdfStore {
             return None;
         }
         self.dictionary_snapshot()
+    }
+
+    /// A handle on this store's term dictionary under either residency
+    /// ([`DictReader`]), gated like
+    /// [`code_read_snapshot`](Self::code_read_snapshot) — a Dictionary layout
+    /// and an empty tail — but not on residency: a file-backed dictionary
+    /// answers through the handle by reading its child on demand, where the
+    /// snapshot is `None`. The codes [`code_columns_gathered`] serves are
+    /// decodable against it either way.
+    ///
+    /// [`code_columns_gathered`]: Self::code_columns_gathered
+    pub fn dict_reader(&self) -> Option<DictReader> {
+        if self.tail_len() != 0 {
+            return None;
+        }
+        match &self.layout {
+            ResolvedLayout::Dictionary(access) => Some(access.reader()),
+            _ => None,
+        }
     }
 }

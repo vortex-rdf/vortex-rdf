@@ -145,11 +145,20 @@ def test_in_memory_dictionary_keeps_code_path(vortex_files):
     assert cols is not None and len(cols[0]) == 3
 
 
+def _codes(cols):
+    return [memoryview(col).cast("I").tolist() for col in cols]
+
+
 def _assert_file_backed_dictionary(fallback, resident):
     assert fallback.layout() == "dictionary"
-    assert fallback.term_dict() is None
-    assert fallback.match_codes(p=NAME) is None
-    assert resident.term_dict() is not None
+    # The dictionary stays in the file, but the code path still applies:
+    # the handle reads the file on demand.
+    file_backed = fallback.term_dict()
+    assert file_backed is not None and file_backed.file_backed
+    in_memory = resident.term_dict()
+    assert in_memory is not None and not in_memory.file_backed
+    assert len(file_backed) == len(in_memory)
+    assert _codes(fallback.match_codes(p=NAME)) == _codes(resident.match_codes(p=NAME))
     for pattern in PATTERNS:
         assert sorted(fallback.get_quads(**pattern)) == sorted(resident.get_quads(**pattern))
         assert fallback.match_columns(**pattern) == resident.match_columns(**pattern)
@@ -157,8 +166,9 @@ def _assert_file_backed_dictionary(fallback, resident):
 
 
 def test_residency_budget_zero_forces_file_backed_dictionary(vortex_files):
-    """With no residency budget the dictionary stays in the file, the code
-    path declines and every matcher is served from the shared-term rows."""
+    """With no residency budget the dictionary stays in the file: the
+    string matchers are served from the shared-term rows, and the code path
+    decodes through a file-backed handle."""
     resident = VortexRdfStore(vortex_files["dictionary"])
     fallback = VortexRdfStore(vortex_files["dictionary"], max_resident_bytes=0)
     _assert_file_backed_dictionary(fallback, resident)
@@ -170,7 +180,8 @@ def test_residency_env_var(vortex_files, monkeypatch):
     fallback = VortexRdfStore(vortex_files["dictionary"])
     _assert_file_backed_dictionary(fallback, resident)
     # An explicit budget overrides the environment.
-    assert VortexRdfStore(vortex_files["dictionary"], max_resident_bytes=1 << 30).term_dict() is not None
+    lifted = VortexRdfStore(vortex_files["dictionary"], max_resident_bytes=1 << 30).term_dict()
+    assert lifted is not None and not lifted.file_backed
 
 
 def test_indexes_round_trip(vortex_files, indexed_files, layout):

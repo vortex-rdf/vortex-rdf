@@ -13,7 +13,7 @@ use crate::store::layouts::{PatternCodes, QuadPattern};
 
 #[cfg(feature = "file-io")]
 use super::file_backed::FileBackedDict;
-use super::term_dict::TermDictionary;
+use super::term_dict::{DictReader, TermDictionary};
 
 /// How a resolved Dictionary layout reaches its term dictionary: the
 /// *residency* axis, sitting above `TermStore`'s encoding axis.
@@ -101,6 +101,16 @@ impl DictAccess {
             DictAccess::Resident(dict) => Some(dict),
             #[cfg(feature = "file-io")]
             DictAccess::FileBacked(_) => None,
+        }
+    }
+
+    /// A residency-agnostic handle on the dictionary: the resident one, or
+    /// a clone of the file-backed handle (sharing its caches).
+    pub(crate) fn reader(&self) -> DictReader {
+        match self {
+            DictAccess::Resident(dict) => DictReader::resident(Arc::clone(dict)),
+            #[cfg(feature = "file-io")]
+            DictAccess::FileBacked(fb) => DictReader::file_backed(fb.clone()),
         }
     }
 

@@ -15,6 +15,7 @@ mod builders;
 mod dictionary;
 #[cfg(feature = "file-io")]
 mod dictionary_file_backed;
+mod dictionary_handle;
 // `pub(crate)`: `common::terms`' inline parser tests borrow this module's
 // shared escaped-literal case list.
 pub(crate) mod escaping;
@@ -26,6 +27,8 @@ mod indexes_file;
 mod matching;
 mod mutation;
 mod names;
+mod narrowing;
+mod predicates;
 mod roundtrip;
 #[cfg(feature = "file-io")]
 mod serialization;

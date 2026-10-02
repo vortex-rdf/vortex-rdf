@@ -9,8 +9,10 @@
 //! persisted one back into memory, and reading a persisted child's
 //! implementation slug onto a component identity.
 //!
-//! The column *names* belong to the index modules, not here: each leaf
-//! declares them once in its const [`ComponentIdentity`] table (reached through
+//! The column *names* belong to the index modules, not here (the row id
+//! every child carries is the one exception, named once in the hub as
+//! [`COL_RID`](super::COL_RID)): each leaf declares its identities once in a
+//! const [`ComponentIdentity`] table (reached through
 //! [`IndexType::component_identities`]), and the loops below are parameterized by
 //! those rows.
 

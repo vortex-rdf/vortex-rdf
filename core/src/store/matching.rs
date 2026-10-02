@@ -772,7 +772,8 @@ impl VortexRdfStore {
     /// Whether the store holds a quad equal to `quad` (tombstoned rows count
     /// as absent). One fully-bound `match_pattern`, so it rides whatever fast
     /// path the store has — subject binary search, secondary indexes, or file
-    /// pruning — and checks the tail too.
+    /// pruning — and checks the tail too; the match is read only as far as
+    /// its first row ([`exists`](Self::exists)).
     pub async fn contains(&self, quad: &Quad) -> Result<bool> {
         let matched = self
             .match_pattern(
@@ -782,7 +783,7 @@ impl VortexRdfStore {
                 Some(&quad.graph_name),
             )
             .await?;
-        Ok(matched.size().await? > 0)
+        matched.exists().await
     }
 }
 

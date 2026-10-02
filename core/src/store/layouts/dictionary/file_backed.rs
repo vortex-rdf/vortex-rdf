@@ -8,8 +8,10 @@
 //! module only compiles with `file-io`, since without a file there is
 //! nothing to leave the terms in.
 
+use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
+use futures::{StreamExt as _, TryStreamExt as _};
 use vortex_array::ArrayRef;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::VarBinViewArray;
@@ -23,16 +25,20 @@ use vortex_layout::layouts::zoned::Zoned;
 use vortex_layout::segments::SegmentSource;
 use vortex_layout::{LayoutChildType, LayoutRef};
 
+use crate::common::terms::canonical_spelling;
 use crate::error::{Result, VortexRdfError};
 use crate::io::container::DICT_COMPONENT_NAME;
+use crate::io::read::available_parallelism;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{StrColReader, buf_as_str};
 use crate::store::native_file::NativeStoreFile;
 use crate::store::selection::POINT_GATHER_MAX_ROWS;
 
 use super::check_code;
+use super::predicates::{KindRanges, Scanned, TermPredicate};
 use super::term_dict::{
-    COL_DICT_TERM, ChunkCursor, ProbeCache, TermChunk, TermDictionary, chunk_of,
+    COL_DICT_TERM, ChunkCursor, PredicateMemo, ProbeCache, TermChunk, TermDictionary, VerdictSets,
+    chunk_of, prefix_successor,
 };
 
 /// The dictionary child's flat chunk leaves, fetched on demand in their wire
@@ -204,6 +210,24 @@ impl TermChunks {
         Ok(None)
     }
 
+    /// The row of the first term not below `needle` in byte order (the row
+    /// count when every term is below it) — the async twin of
+    /// `TermDictionary::lower_bound`.
+    pub(crate) async fn lower_bound(&self, needle: &[u8]) -> Result<u32> {
+        let mut cursors: Vec<Option<ChunkCursor<'_>>> =
+            (0..self.specs.len()).map(|_| None).collect();
+        let (mut lo, mut hi) = (0u64, self.row_count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.term_bytes(&mut cursors, mid).await? < needle {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo as u32)
+    }
+
     /// Code → term for each of `codes` (in-bounds, the caller's contract),
     /// reading exactly the probed rows.
     pub(crate) async fn decode_many(&self, codes: &[u32]) -> Result<Vec<Arc<str>>> {
@@ -244,6 +268,12 @@ pub(crate) struct FileBackedDict {
     /// (see `BoundExprMemo` on the store file handle) and grow them per
     /// call. Shared across clones like the reader whose caches it keys.
     projection: Arc<OnceLock<vortex_array::expr::BoundExpression>>,
+    /// The kind ranges, computed on first use (a few probes), shared across
+    /// clones.
+    kinds: Arc<OnceLock<KindRanges>>,
+    /// Memo for [`filter_codes`](Self::filter_codes), shared across clones —
+    /// a partition is a scan of the child, the one read worth keeping.
+    predicates: Arc<PredicateMemo>,
 }
 
 impl FileBackedDict {
@@ -256,7 +286,14 @@ impl FileBackedDict {
             probes: Arc::new(ProbeCache::new()),
             chunks: Arc::new(chunks),
             projection: Arc::new(OnceLock::new()),
+            kinds: Arc::new(OnceLock::new()),
+            predicates: Arc::new(PredicateMemo::new()),
         }
+    }
+
+    /// Number of terms.
+    pub(crate) fn len(&self) -> usize {
+        usize::try_from(self.len).unwrap_or(usize::MAX)
     }
 
     /// The file-backed form of `native`'s dictionary child: its cached
@@ -318,15 +355,7 @@ impl FileBackedDict {
         let rows: vortex_buffer::Buffer<u64> = codes.iter().map(|&code| code as u64).collect();
         let rows = vortex_scan::strict_sorted_buffer::StrictSortedBuffer::try_new(rows)
             .map_err(VortexRdfError::Vortex)?;
-        let projection = match self.projection.get() {
-            Some(bound) => bound.clone(),
-            None => {
-                let bound = select([COL_DICT_TERM], root())
-                    .bind(self.reader.dtype())
-                    .map_err(VortexRdfError::Vortex)?;
-                self.projection.get_or_init(|| bound).clone()
-            }
-        };
+        let projection = self.term_projection()?;
         let arr = crate::store::scan::file_scan::read_all_rows(
             self.scan()
                 .with_row_indices(rows)
@@ -354,6 +383,168 @@ impl FileBackedDict {
         (0..col.len())
             .map(|i| reader.str_at(i).map(Arc::from))
             .collect()
+    }
+
+    /// The child scan's term projection, bound once per handle (see the
+    /// field).
+    fn term_projection(&self) -> Result<vortex_array::expr::BoundExpression> {
+        match self.projection.get() {
+            Some(bound) => Ok(bound.clone()),
+            None => {
+                let bound = select([COL_DICT_TERM], root())
+                    .bind(self.reader.dtype())
+                    .map_err(VortexRdfError::Vortex)?;
+                Ok(self.projection.get_or_init(|| bound).clone())
+            }
+        }
+    }
+
+    /// Code → term for `codes` in any order, repeats allowed, out-of-range
+    /// codes decoding to `None`: the distinct in-range codes are read once
+    /// through [`decode_many`](Self::decode_many) and scattered back.
+    pub(crate) async fn decode_many_any(&self, codes: &[u32]) -> Result<Vec<Option<String>>> {
+        let len = self.len();
+        let mut distinct: Vec<u32> = codes
+            .iter()
+            .copied()
+            .filter(|&code| (code as usize) < len)
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let terms = self.decode_many(&distinct).await?;
+        Ok(codes
+            .iter()
+            .map(|code| {
+                distinct
+                    .binary_search(code)
+                    .ok()
+                    .map(|i| terms[i].to_string())
+            })
+            .collect())
+    }
+
+    /// The async twin of `TermDictionary::encode_tolerant`.
+    pub(crate) async fn encode_tolerant(&self, term: &str) -> Result<Option<u32>> {
+        if let Some(code) = self.encode(term).await? {
+            return Ok(Some(code));
+        }
+        let canonical = canonical_spelling(term)?;
+        if canonical == term {
+            return Ok(None);
+        }
+        self.encode(&canonical).await
+    }
+
+    /// [`encode_tolerant`](Self::encode_tolerant) over a batch, in order,
+    /// with the lookups' chunk reads overlapped.
+    pub(crate) async fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<u32>>> {
+        futures::stream::iter(terms.iter().map(|term| self.encode_tolerant(term)))
+            .buffered(available_parallelism().max(4))
+            .try_collect()
+            .await
+    }
+
+    /// The async twin of `TermDictionary::lower_bound`.
+    pub(crate) async fn lower_bound(&self, needle: &[u8]) -> Result<u32> {
+        self.chunks.lower_bound(needle).await
+    }
+
+    /// The async twin of `TermDictionary::prefix_range`.
+    pub(crate) async fn prefix_range(&self, prefix: &str) -> Result<Range<u32>> {
+        let lo = self.lower_bound(prefix.as_bytes()).await?;
+        let hi = match prefix_successor(prefix.as_bytes()) {
+            Some(successor) => self.lower_bound(&successor).await?,
+            None => self.len() as u32,
+        };
+        Ok(lo..hi.max(lo))
+    }
+
+    /// The async twin of `TermDictionary::kind_ranges`, computed once per
+    /// handle.
+    pub(crate) async fn kind_ranges(&self) -> Result<KindRanges> {
+        if let Some(kinds) = self.kinds.get() {
+            return Ok(kinds.clone());
+        }
+        let default_graph = if self.len > 0 {
+            let first = self.chunks.decode_many(&[0]).await?;
+            first
+                .first()
+                .is_some_and(|term| term.is_empty())
+                .then_some(0)
+        } else {
+            None
+        };
+        let kinds = KindRanges {
+            default_graph,
+            literals: self.prefix_range("\"").await?,
+            iris: self.prefix_range("<").await?,
+            blanks: self.prefix_range("_:").await?,
+            len: self.len() as u32,
+        };
+        Ok(self.kinds.get_or_init(|| kinds).clone())
+    }
+
+    /// The async twin of `TermDictionary::filter_codes`: the predicate's
+    /// scan range is read from the child in row order, one chunk at a
+    /// time, and evaluated as it streams — a file-backed dictionary never
+    /// holds more than a chunk of terms decoded.
+    pub(crate) async fn filter_codes(&self, predicate: &TermPredicate) -> Result<VerdictSets> {
+        let key = predicate.to_string();
+        if let Some(sets) = self.predicates.get(&key) {
+            return Ok(sets);
+        }
+        let kinds = self.kind_ranges().await?;
+        let plan = predicate.scan_plan(&kinds);
+        let mut scanned = Scanned::default();
+        if let Some(range) = plan.scan.filter(|range| !range.is_empty()) {
+            let tasks = self
+                .scan()
+                .with_row_range(u64::from(range.start)..u64::from(range.end))
+                .with_projection(self.term_projection()?)
+                .build()
+                .map_err(VortexRdfError::Vortex)?;
+            // `buffered` yields the splits in row order, so codes are
+            // assigned by counting rows as they stream.
+            let mut chunks = futures::stream::iter(tasks).buffered(available_parallelism());
+            let mut ctx = VORTEX_SESSION.create_execution_ctx();
+            let mut code = range.start;
+            while let Some(chunk) = chunks.next().await {
+                let Some(chunk) = chunk.map_err(VortexRdfError::Vortex)? else {
+                    continue;
+                };
+                let struct_arr = chunk
+                    .execute::<StructArray>(&mut ctx)
+                    .map_err(VortexRdfError::Vortex)?;
+                let col = struct_arr
+                    .unmasked_field_by_name(COL_DICT_TERM)
+                    .map_err(VortexRdfError::Vortex)?
+                    .clone()
+                    .execute::<VarBinViewArray>(&mut ctx)
+                    .map_err(VortexRdfError::Vortex)?;
+                let reader = StrColReader::new(&col);
+                for i in 0..col.len() {
+                    match reader.str_at(i) {
+                        Ok(spelling) => scanned.visit(predicate, code, spelling),
+                        Err(_) => scanned.unknown.push(code),
+                    }
+                    code += 1;
+                }
+            }
+            if code != range.end {
+                return Err(VortexRdfError::Deserialization(format!(
+                    "Dictionary range scan returned {} rows for {} codes",
+                    code - range.start,
+                    range.end - range.start
+                )));
+            }
+        }
+        let mut true_ranges = Vec::with_capacity(plan.true_prefixes.len());
+        for prefix in &plan.true_prefixes {
+            true_ranges.push(self.prefix_range(prefix).await?);
+        }
+        let sets = Arc::new(predicate.assemble(&kinds, scanned, &true_ranges));
+        self.predicates.put(key, Arc::clone(&sets));
+        Ok(sets)
     }
 
     /// Lift the whole dictionary resident — the transient full-column read

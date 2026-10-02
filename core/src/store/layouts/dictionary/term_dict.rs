@@ -11,8 +11,9 @@
 //! [`LayoutStrategy::Dictionary`]: crate::store::layouts::LayoutStrategy::Dictionary
 
 use crate::debug;
-use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use std::collections::{HashSet, VecDeque};
+use std::ops::Range;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
@@ -23,13 +24,19 @@ use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_fsst::{FSST, FSSTArray, FSSTArraySlotsExt as _, fsst_compress, fsst_train_compressor};
 
+use vortex_buffer::Buffer;
+
+use crate::common::terms::canonical_spelling;
 use crate::error::{Result, VortexRdfError};
 use crate::io::read::scan_reader_chunks;
 use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::array::{StrColReader, buf_as_str};
 
+#[cfg(feature = "file-io")]
+use super::file_backed::FileBackedDict;
 use super::ingest::BorrowedTermCodeMap;
+use super::predicates::{KindRanges, Scanned, TermPredicate};
 
 /// The single column of the native container's `dictionary` child: non-nullable
 /// utf8, row i holding the term with code i (sorted, so codes are lexicographic
@@ -150,6 +157,10 @@ pub(crate) struct TermDictionary {
     terms: TermStore,
     /// Memo for [`encode`](Self::encode); see [`ProbeCache`].
     probes: ProbeCache,
+    /// The kind ranges, computed on first use (a few probes).
+    kinds: OnceLock<KindRanges>,
+    /// Memo for [`filter_codes`](Self::filter_codes); see [`PredicateMemo`].
+    predicates: PredicateMemo,
 }
 
 impl TermDictionary {
@@ -158,6 +169,8 @@ impl TermDictionary {
         Self {
             terms,
             probes: ProbeCache::new(),
+            kinds: OnceLock::new(),
+            predicates: PredicateMemo::new(),
         }
     }
 
@@ -422,6 +435,189 @@ impl TermDictionary {
         }
         None
     }
+
+    /// The code of the first term not below `needle` in byte order — the
+    /// dictionary's size when every term is below it. A binary search with
+    /// the same per-probe decode as [`search`](Self::search); the position
+    /// is where `needle` would be inserted, so a present term's code and
+    /// the start of a spelling prefix's run both come out of it.
+    pub(crate) fn lower_bound(&self, needle: &[u8]) -> u32 {
+        let mut cursor = self.cursor();
+        let (mut lo, mut hi) = (0usize, self.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if cursor.bytes_at(mid) < needle {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo as u32
+    }
+
+    /// The codes of the terms spelled with `prefix`, as a half-open range:
+    /// two lower bounds, of the prefix and of its byte successor (see
+    /// [`prefix_successor`]). Term kinds are prefixes (`"`, `<`, `_:`), and
+    /// so are IRI namespaces.
+    pub(crate) fn prefix_range(&self, prefix: &str) -> Range<u32> {
+        let lo = self.lower_bound(prefix.as_bytes());
+        let hi = match prefix_successor(prefix.as_bytes()) {
+            Some(successor) => self.lower_bound(&successor),
+            None => self.len() as u32,
+        };
+        lo..hi.max(lo)
+    }
+
+    /// The code ranges of the term kinds, computed once per dictionary.
+    pub(crate) fn kind_ranges(&self) -> &KindRanges {
+        self.kinds.get_or_init(|| {
+            let default_graph =
+                (self.len() > 0 && self.cursor().bytes_at(0).is_empty()).then_some(0);
+            KindRanges {
+                default_graph,
+                literals: self.prefix_range("\""),
+                iris: self.prefix_range("<"),
+                blanks: self.prefix_range("_:"),
+                len: self.len() as u32,
+            }
+        })
+    }
+
+    /// [`encode`](Self::encode) tolerant of spelling: the exact lookup first,
+    /// then — only when the term's [`canonical_spelling`] differs from what
+    /// was typed — the lookup of that spelling. A term absent under both is
+    /// absent from the dictionary; malformed input is an error rather than
+    /// an absence.
+    pub(crate) fn encode_tolerant(&self, term: &str) -> Result<Option<u32>> {
+        if let Some(code) = self.encode(term) {
+            return Ok(Some(code));
+        }
+        let canonical = canonical_spelling(term)?;
+        if canonical == term {
+            return Ok(None);
+        }
+        Ok(self.encode(&canonical))
+    }
+
+    /// [`encode_tolerant`](Self::encode_tolerant) over a batch, in order.
+    pub(crate) fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<u32>>> {
+        terms
+            .iter()
+            .map(|term| self.encode_tolerant(term))
+            .collect()
+    }
+
+    /// [`decode`](Self::decode) over a batch, in order, through one cursor
+    /// (so a chunked dictionary keeps its warm chunk cursors across the
+    /// batch); an out-of-range code decodes to `None`.
+    pub(crate) fn decode_many(&self, codes: &[u32]) -> Vec<Option<String>> {
+        let len = self.len();
+        let mut cursor = self.cursor();
+        codes
+            .iter()
+            .map(|&code| {
+                if (code as usize) < len {
+                    cursor.str_at(code as usize).ok().map(str::to_owned)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Partition the codes by `predicate`'s verdicts — `(true, unknown)`,
+    /// both ascending — in one pass over the predicate's scan range (see
+    /// [`TermPredicate::scan_plan`]), memoized per dictionary by the
+    /// predicate's canonical rendering ([`PredicateMemo`]).
+    pub(crate) fn filter_codes(&self, predicate: &TermPredicate) -> VerdictSets {
+        let key = predicate.to_string();
+        if let Some(sets) = self.predicates.get(&key) {
+            return sets;
+        }
+        let kinds = self.kind_ranges();
+        let plan = predicate.scan_plan(kinds);
+        let mut scanned = Scanned::default();
+        if let Some(range) = plan.scan {
+            let mut cursor = self.cursor();
+            for code in range {
+                match cursor.str_at(code as usize) {
+                    Ok(spelling) => scanned.visit(predicate, code, spelling),
+                    // A term that is not UTF-8 is nothing the rules speak of.
+                    Err(_) => scanned.unknown.push(code),
+                }
+            }
+        }
+        let true_ranges: Vec<Range<u32>> = plan
+            .true_prefixes
+            .iter()
+            .map(|prefix| self.prefix_range(prefix))
+            .collect();
+        let sets = Arc::new(predicate.assemble(kinds, scanned, &true_ranges));
+        self.predicates.put(key, Arc::clone(&sets));
+        sets
+    }
+}
+
+/// The smallest byte string greater than every string starting with
+/// `prefix`: the prefix with its trailing `0xFF` bytes dropped and the last
+/// remaining byte incremented — or `None` when no such string exists (an
+/// empty or all-`0xFF` prefix, which every string sorts under).
+pub(super) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.len();
+    while end > 0 && prefix[end - 1] == 0xFF {
+        end -= 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    let mut successor = prefix[..end].to_vec();
+    successor[end - 1] += 1;
+    Some(successor)
+}
+
+/// A predicate's partition of a dictionary's codes — `(true, unknown)`,
+/// both ascending — shared between the memo and every caller.
+pub(crate) type VerdictSets = Arc<(Buffer<u32>, Buffer<u32>)>;
+
+/// Partitions a dictionary's [`PredicateMemo`] holds before the oldest is
+/// evicted. A query workload asks a handful of distinct predicates per
+/// query, and an entry can be as wide as the dictionary, so the memo is
+/// bounded rather than keyed on everything ever asked.
+const PREDICATE_MEMO_SLOTS: usize = 32;
+
+/// A bounded first-in-first-out memo of predicate partitions, keyed by the
+/// predicate's canonical rendering. Like [`ProbeCache`], a poisoned lock
+/// degrades to a miss.
+pub(super) struct PredicateMemo {
+    entries: RwLock<VecDeque<(String, VerdictSets)>>,
+}
+
+impl PredicateMemo {
+    pub(super) fn new() -> Self {
+        Self {
+            entries: RwLock::new(VecDeque::with_capacity(PREDICATE_MEMO_SLOTS)),
+        }
+    }
+
+    pub(super) fn get(&self, key: &str) -> Option<VerdictSets> {
+        let entries = self.entries.read().ok()?;
+        entries
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, sets)| Arc::clone(sets))
+    }
+
+    pub(super) fn put(&self, key: String, sets: VerdictSets) {
+        if let Ok(mut entries) = self.entries.write() {
+            if entries.iter().any(|(k, _)| *k == key) {
+                return;
+            }
+            if entries.len() == PREDICATE_MEMO_SLOTS {
+                entries.pop_front();
+            }
+            entries.push_back((key, sets));
+        }
+    }
 }
 
 /// Slots in a dictionary's [`ProbeCache`]. A power of two: the slot index is
@@ -685,6 +881,217 @@ impl DictSnapshot {
     /// Whether the dictionary holds no terms.
     pub fn is_empty(&self) -> bool {
         self.0.len() == 0
+    }
+
+    /// [`encode`](Self::encode) tolerant of spelling: an IRI with or without
+    /// angle brackets, a literal with escape variants, an `xsd:string`
+    /// typing, an upper-case language tag, or a default-graph spelling
+    /// (`""`, `default`, `[]`) all resolve to the code of the stored form
+    /// (see [`canonical_spelling`]). Malformed input is an error.
+    pub fn encode_tolerant(&self, term: &str) -> Result<Option<u32>> {
+        self.0.encode_tolerant(term)
+    }
+
+    /// [`encode_tolerant`](Self::encode_tolerant) over a batch, in order.
+    pub fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<u32>>> {
+        self.0.encode_many(terms)
+    }
+
+    /// [`decode`](Self::decode) over a batch, in order, through one cursor;
+    /// an out-of-range code decodes to `None`.
+    pub fn decode_many(&self, codes: &[u32]) -> Vec<Option<String>> {
+        self.0.decode_many(codes)
+    }
+
+    /// The code of the first term not below `term` in byte order (the
+    /// dictionary's size when every term is below it): a present term's own
+    /// code, or where an absent one would sort.
+    pub fn lower_bound(&self, term: &str) -> u32 {
+        self.0.lower_bound(term.as_bytes())
+    }
+
+    /// The half-open code range `(lo, hi)` of the terms spelled with
+    /// `prefix`. Codes are lexicographic ranks of the N-Triples spelling, so
+    /// a term kind (`"` for literals, `<` for IRIs, `_:` for blank nodes)
+    /// and an IRI namespace (`<http://example.org/`) are each one range.
+    pub fn prefix_range(&self, prefix: &str) -> (u32, u32) {
+        let range = self.0.prefix_range(prefix);
+        (range.start, range.end)
+    }
+
+    /// The code ranges of the term kinds.
+    pub fn kind_ranges(&self) -> KindRanges {
+        self.0.kind_ranges().clone()
+    }
+
+    /// Partition the codes by `predicate`: the ascending codes for which it
+    /// is definitely true, and the ascending codes inside its domain whose
+    /// verdict is unknown (for a full engine to decide). Codes outside the
+    /// predicate's [`domain`](TermPredicate::domain) — non-literals, for the
+    /// literal predicates — appear in neither list, since a caller decides
+    /// them from the term's kind alone (see [`kind_ranges`](Self::kind_ranges)).
+    /// One scan of the domain, memoized per dictionary.
+    pub fn filter_codes(&self, predicate: &TermPredicate) -> (Buffer<u32>, Buffer<u32>) {
+        let sets = self.0.filter_codes(predicate);
+        (sets.0.clone(), sets.1.clone())
+    }
+}
+
+/// A handle on a Dictionary-layout store's term dictionary under either
+/// residency, taken with
+/// [`VortexRdfStore::dict_reader`](crate::store::VortexRdfStore::dict_reader):
+/// the same term ↔ code surface as [`DictSnapshot`], asynchronous so a
+/// dictionary left in its file can answer by reading it. Every method
+/// completes without suspending on a resident dictionary.
+///
+/// Like a snapshot, codes are only meaningful against the dictionary they
+/// were produced with; a file-backed reader additionally keeps the store's
+/// file handle alive.
+#[derive(Clone)]
+pub struct DictReader(DictReaderInner);
+
+#[derive(Clone)]
+enum DictReaderInner {
+    Resident(Arc<TermDictionary>),
+    #[cfg(feature = "file-io")]
+    FileBacked(FileBackedDict),
+}
+
+impl From<DictSnapshot> for DictReader {
+    /// The resident handle on a snapshot's dictionary.
+    fn from(snapshot: DictSnapshot) -> Self {
+        Self::resident(snapshot.0)
+    }
+}
+
+impl DictReader {
+    pub(crate) fn resident(dict: Arc<TermDictionary>) -> Self {
+        Self(DictReaderInner::Resident(dict))
+    }
+
+    #[cfg(feature = "file-io")]
+    pub(crate) fn file_backed(dict: FileBackedDict) -> Self {
+        Self(DictReaderInner::FileBacked(dict))
+    }
+
+    /// Whether the terms are read from the file on demand (`true`) or held
+    /// in memory (`false`).
+    pub fn is_file_backed(&self) -> bool {
+        match &self.0 {
+            DictReaderInner::Resident(_) => false,
+            #[cfg(feature = "file-io")]
+            DictReaderInner::FileBacked(_) => true,
+        }
+    }
+
+    /// Number of terms in the dictionary.
+    pub fn len(&self) -> usize {
+        match &self.0 {
+            DictReaderInner::Resident(dict) => dict.len(),
+            #[cfg(feature = "file-io")]
+            DictReaderInner::FileBacked(dict) => dict.len(),
+        }
+    }
+
+    /// Whether the dictionary holds no terms.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The synchronous [`DictSnapshot`] of a resident dictionary, `None`
+    /// when the terms are file-backed.
+    pub fn snapshot(&self) -> Option<DictSnapshot> {
+        match &self.0 {
+            DictReaderInner::Resident(dict) => Some(DictSnapshot(Arc::clone(dict))),
+            #[cfg(feature = "file-io")]
+            DictReaderInner::FileBacked(_) => None,
+        }
+    }
+
+    /// The N-Triples string for `code`, or `None` when the code is out of
+    /// range.
+    pub async fn decode(&self, code: u32) -> Result<Option<String>> {
+        match &self.0 {
+            DictReaderInner::Resident(dict) => Ok(dict.decode(code)),
+            #[cfg(feature = "file-io")]
+            DictReaderInner::FileBacked(dict) => {
+                Ok(dict.decode_many_any(&[code]).await?.pop().flatten())
+            }
+        }
+    }
+
+    /// [`decode`](Self::decode) over a batch, in order: any order and
+    /// repeats are fine (a file-backed dictionary reads each distinct code
+    /// once, in one batch).
+    pub async fn decode_many(&self, codes: &[u32]) -> Result<Vec<Option<String>>> {
+        match &self.0 {
+            DictReaderInner::Resident(dict) => Ok(dict.decode_many(codes)),
+            #[cfg(feature = "file-io")]
+            DictReaderInner::FileBacked(dict) => dict.decode_many_any(codes).await,
+        }
+    }
+
+    /// The code of `term`, tolerant of spelling (see
+    /// [`DictSnapshot::encode_tolerant`]).
+    pub async fn encode(&self, term: &str) -> Result<Option<u32>> {
+        match &self.0 {
+            DictReaderInner::Resident(dict) => dict.encode_tolerant(term),
+            #[cfg(feature = "file-io")]
+            DictReaderInner::FileBacked(dict) => dict.encode_tolerant(term).await,
+        }
+    }
+
+    /// [`encode`](Self::encode) over a batch, in order (a file-backed
+    /// dictionary overlaps the lookups' reads).
+    pub async fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<u32>>> {
+        match &self.0 {
+            DictReaderInner::Resident(dict) => dict.encode_many(terms),
+            #[cfg(feature = "file-io")]
+            DictReaderInner::FileBacked(dict) => dict.encode_many(terms).await,
+        }
+    }
+
+    /// See [`DictSnapshot::lower_bound`].
+    pub async fn lower_bound(&self, term: &str) -> Result<u32> {
+        match &self.0 {
+            DictReaderInner::Resident(dict) => Ok(dict.lower_bound(term.as_bytes())),
+            #[cfg(feature = "file-io")]
+            DictReaderInner::FileBacked(dict) => dict.lower_bound(term.as_bytes()).await,
+        }
+    }
+
+    /// See [`DictSnapshot::prefix_range`].
+    pub async fn prefix_range(&self, prefix: &str) -> Result<(u32, u32)> {
+        let range = match &self.0 {
+            DictReaderInner::Resident(dict) => dict.prefix_range(prefix),
+            #[cfg(feature = "file-io")]
+            DictReaderInner::FileBacked(dict) => dict.prefix_range(prefix).await?,
+        };
+        Ok((range.start, range.end))
+    }
+
+    /// See [`DictSnapshot::kind_ranges`].
+    pub async fn kind_ranges(&self) -> Result<KindRanges> {
+        match &self.0 {
+            DictReaderInner::Resident(dict) => Ok(dict.kind_ranges().clone()),
+            #[cfg(feature = "file-io")]
+            DictReaderInner::FileBacked(dict) => dict.kind_ranges().await,
+        }
+    }
+
+    /// See [`DictSnapshot::filter_codes`]. A file-backed dictionary scans
+    /// the predicate's domain through its child once per distinct predicate
+    /// (memoized like the resident form).
+    pub async fn filter_codes(
+        &self,
+        predicate: &TermPredicate,
+    ) -> Result<(Buffer<u32>, Buffer<u32>)> {
+        let sets = match &self.0 {
+            DictReaderInner::Resident(dict) => dict.filter_codes(predicate),
+            #[cfg(feature = "file-io")]
+            DictReaderInner::FileBacked(dict) => dict.filter_codes(predicate).await?,
+        };
+        Ok((sets.0.clone(), sets.1.clone()))
     }
 }
 

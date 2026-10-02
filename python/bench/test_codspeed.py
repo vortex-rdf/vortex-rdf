@@ -391,3 +391,80 @@ def test_readback_open(benchmark, tmp_path_factory, data):
     """
     out = _build(data["cube"], tmp_path_factory.mktemp("open") / "out.vortex", "dict_bycopy")
     benchmark(lambda: VortexRdfStore(out))
+
+
+# ─── pushdown::<op> (Python-only) ───────────────────────────────────────────
+#
+# The native primitives a query layer pushes below a pattern — a `keep`
+# applied inside the store, a windowed match, a batch of probes, a term
+# predicate over the dictionary, and the column kernels — on the unindexed
+# Dictionary store, so the cost of each primitive is read against the plain
+# `match_codes` of `readpath`.
+
+
+@pytest.mark.benchmark
+def test_pushdown_keep(benchmark, stores):
+    """A P match narrowed to the first half of the subjects by a code range on
+    `s` — what a FILTER on a namespace or a VALUES block becomes."""
+    store = stores["triples::dict"]
+    dictionary = store.term_dict()
+    p = TRIPLE_PATTERNS[1]  # P
+    lo, hi = dictionary.prefix_range("<")
+    keep = {"s": range(lo, lo + (hi - lo) // 2)}
+    benchmark(lambda: store.match_codes(p.s, p.p, p.o, p.g, keep=keep))
+
+
+@pytest.mark.benchmark
+def test_pushdown_limit(benchmark, stores):
+    """`LIMIT 64` over a P match: the filtered scan stops at the first block
+    that fills the window."""
+    store = stores["triples::dict"]
+    p = TRIPLE_PATTERNS[1]  # P
+    benchmark(lambda: store.match_codes(p.s, p.p, p.o, p.g, limit=64))
+
+
+@pytest.mark.benchmark
+def test_pushdown_exists(benchmark, stores):
+    """An ASK over a P match: `count_quads(limit=1)` reads up to the first
+    matching block."""
+    store = stores["triples::dict"]
+    p = TRIPLE_PATTERNS[1]  # P
+    benchmark(lambda: store.count_quads(p.s, p.p, p.o, p.g, limit=1))
+
+
+@pytest.mark.benchmark
+def test_pushdown_many(benchmark, stores):
+    """64 subject probes in one `match_codes_many` — a nested-loop join's
+    probe batch, one GIL release for the lot."""
+    store = stores["triples::dict"]
+    probes = [(nn(i * 7 % DIM), None, None, None) for i in range(64)]
+    benchmark(lambda: store.match_codes_many(probes))
+
+
+@pytest.mark.benchmark
+@pytest.mark.parametrize("kind", ["is_iri", "str_prefix"])
+def test_pushdown_filter_codes(benchmark, store_paths, kind):
+    """A term predicate partitioning the dictionary: a kind test is pure
+    ranges, a string prefix scans the literals and IRIs. The memo is bypassed
+    by opening the store afresh per round."""
+    path = store_paths["triples::dict"]
+    arg = "http://" if kind == "str_prefix" else ""
+
+    def run():
+        return VortexRdfStore(path).term_dict().filter_codes(kind, arg)
+
+    benchmark(run)
+
+
+@pytest.mark.benchmark
+@pytest.mark.parametrize("op", ["distinct", "value_counts", "join_indices"])
+def test_pushdown_kernels(benchmark, stores, op):
+    """The column kernels over a P match's subject column (`join_indices`
+    joins it with itself: the self-join shape of a star query)."""
+    store = stores["triples::dict"]
+    p = TRIPLE_PATTERNS[1]  # P
+    subjects = store.match_codes(p.s, p.p, p.o, p.g)[0]
+    if op == "join_indices":
+        benchmark(lambda: subjects.join_indices(subjects))
+    else:
+        benchmark(getattr(subjects, op))

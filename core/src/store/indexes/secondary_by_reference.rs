@@ -33,16 +33,18 @@ use vortex_array::{ArrayRef, IntoArray};
 #[cfg(feature = "file-io")]
 use super::FileServePlan;
 use super::components::child_struct;
-use super::{InMemoryServePlan, IndexResolution, ResolvedRoles, ResolvedRowIds, sorted_row_ids};
+use super::{
+    COL_RID, InMemoryServePlan, IndexResolution, ResolvedRoles, ResolvedRowIds, sorted_row_ids,
+};
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
 use crate::store::array::{make_string_array, stamp_is_sorted};
 use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, TermRef};
 
-/// Column names inside a reference component's persisted child.
+/// The value column of a reference component's persisted child; the row id
+/// beside it is the name every index child shares ([`COL_RID`]).
 const COL_VAL: &str = "val";
-const COL_RID: &str = "rid";
 const CHILD_COLUMNS: [&str; 2] = [COL_VAL, COL_RID];
 
 /// This index's persisted-child identity table — one `{val, rid}` table per

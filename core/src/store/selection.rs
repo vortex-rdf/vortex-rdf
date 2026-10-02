@@ -180,6 +180,75 @@ impl RowSelection {
         }
     }
 
+    /// The `limit` rows after skipping `offset` of this selection's live rows,
+    /// in base row order — a contiguous sub-run of a range, a slice of an id
+    /// list, or (with tombstones to step over) the surviving ids. Never
+    /// re-bases: the result names base rows like every other selection.
+    pub(crate) fn window(
+        &self,
+        offset: usize,
+        limit: usize,
+        deleted: Option<&Mask>,
+        base_len: usize,
+    ) -> Self {
+        let Some(deleted) = deleted else {
+            return match self {
+                RowSelection::All => {
+                    let start = offset.min(base_len);
+                    let end = start.saturating_add(limit).min(base_len);
+                    Self::range_or_empty(start as u64..end as u64)
+                }
+                RowSelection::Range(range) => {
+                    let range = clamped(range, base_len);
+                    let start = range.start.saturating_add(offset).min(range.end);
+                    let end = start.saturating_add(limit).min(range.end);
+                    Self::range_or_empty(start as u64..end as u64)
+                }
+                RowSelection::Ids(ids) => {
+                    let start = offset.min(ids.len());
+                    let end = start.saturating_add(limit).min(ids.len());
+                    if start == end {
+                        RowSelection::empty()
+                    } else {
+                        RowSelection::Ids(ids.slice(start..end))
+                    }
+                }
+            };
+        };
+        let live = |id: &u64| !deleted.value(*id as usize);
+        let ids: Buffer<u64> = match self {
+            RowSelection::All => {
+                Buffer::from_iter((0..base_len as u64).filter(live).skip(offset).take(limit))
+            }
+            RowSelection::Range(range) => {
+                let range = clamped(range, base_len);
+                Buffer::from_iter(
+                    (range.start as u64..range.end as u64)
+                        .filter(live)
+                        .skip(offset)
+                        .take(limit),
+                )
+            }
+            RowSelection::Ids(ids) => {
+                Buffer::from_iter(ids.iter().copied().filter(live).skip(offset).take(limit))
+            }
+        };
+        if ids.is_empty() {
+            RowSelection::empty()
+        } else {
+            RowSelection::Ids(ids)
+        }
+    }
+
+    /// `Range(range)`, or the canonical empty selection for an empty one.
+    fn range_or_empty(range: Range<u64>) -> Self {
+        if range.end <= range.start {
+            RowSelection::empty()
+        } else {
+            RowSelection::Range(range)
+        }
+    }
+
     /// Whether this selection is small enough for the point-read paths
     /// (at most [`POINT_GATHER_MAX_ROWS`] rows). `All` never is.
     pub(crate) fn is_point_sized(&self) -> bool {
@@ -435,6 +504,51 @@ mod tests {
         assert_eq!(
             set_bits(&RowSelection::Ids(ids(&[0, 2, 4])).live_mask(&deleted, 5)),
             vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn window_slices_every_variant() {
+        assert_eq!(
+            as_vec(&RowSelection::All.window(2, 3, None, 10)),
+            vec![2, 3, 4]
+        );
+        assert_eq!(
+            as_vec(&RowSelection::All.window(8, 5, None, 10)),
+            vec![8, 9]
+        );
+        assert!(RowSelection::All.window(12, 5, None, 10).is_empty(10));
+        assert!(RowSelection::All.window(0, 0, None, 10).is_empty(10));
+        assert_eq!(
+            as_vec(&RowSelection::Range(5..9).window(1, 2, None, 10)),
+            vec![6, 7]
+        );
+        assert_eq!(
+            as_vec(&RowSelection::Range(5..9).window(3, 10, None, 10)),
+            vec![8]
+        );
+        assert_eq!(
+            as_vec(&RowSelection::Ids(ids(&[1, 4, 6, 9])).window(1, 2, None, 10)),
+            vec![4, 6]
+        );
+        assert!(
+            RowSelection::Ids(ids(&[1, 4]))
+                .window(2, 2, None, 10)
+                .is_empty(10)
+        );
+        // Tombstoned rows are stepped over, not counted.
+        let deleted = Mask::from_indices(10, [2, 3, 6]);
+        assert_eq!(
+            as_vec(&RowSelection::All.window(1, 3, Some(&deleted), 10)),
+            vec![1, 4, 5]
+        );
+        assert_eq!(
+            as_vec(&RowSelection::Range(2..8).window(0, 2, Some(&deleted), 10)),
+            vec![4, 5]
+        );
+        assert_eq!(
+            as_vec(&RowSelection::Ids(ids(&[2, 5, 6, 7])).window(1, 5, Some(&deleted), 10)),
+            vec![7]
         );
     }
 

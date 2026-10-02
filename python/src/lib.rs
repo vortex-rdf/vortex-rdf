@@ -7,6 +7,7 @@
 //! stores are opened lazily from `.vortex` files and queried in place.
 
 mod codes;
+mod probes;
 mod serialize;
 mod store;
 

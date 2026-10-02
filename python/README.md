@@ -50,9 +50,34 @@ dictionary.decode_many(cols[0])                      # bulk-decode a whole colum
 dictionary.encode("<http://xmlns.com/foaf/0.1/name>")  # code for a term, or None
 ```
 
-`decode_many` decodes a batch in one GIL-released call. Buffer-protocol inputs — a column straight from `match_codes`, an `array("I", ...)`, a `uint32` NumPy array — are read in a single bulk copy with no per-element int conversion; any sequence of ints works too. `encode` is the inverse of `decode`. Both `term_dict()` and `match_codes` return `None` when the code path does not apply (a non-Dictionary layout, or a dictionary left file-backed by the residency budget).
+`decode_many` decodes a batch in one GIL-released call. Buffer-protocol inputs — a column straight from `match_codes`, an `array("I", ...)`, a `uint32` NumPy array — are read in a single bulk copy with no per-element int conversion; any sequence of ints works too. `encode` is the inverse of `decode` and tolerant of spelling: an IRI with or without angle brackets, a literal with an explicit `xsd:string` type or an upper-case language tag, and the default graph as `""`, `default` or `[]` all resolve to the stored form's code (a malformed term raises `ValueError`); `encode_many` does a batch. Both `term_dict()` and `match_codes` return `None` when the code path does not apply (a non-Dictionary layout, or an append tail). A dictionary left in the file by the residency budget is served by reading it on demand — `TermDict.file_backed` says so — with the same calls.
 
-Consumers can join, count, and de-duplicate entirely in code space and decode each distinct term once, never materializing a term string for a row they discard.
+Consumers can join, count, and de-duplicate entirely in code space and decode each distinct term once, never materializing a term string for a row they discard. The handle and the columns carry the pieces a query layer pushes below a pattern:
+
+```python
+d = store.term_dict()
+lo, hi = d.prefix_range("<http://xmlns.com/foaf/0.1/")   # codes of one namespace: one range
+literals = d.prefix_range('"')                            # codes of every literal
+true_codes, unknown = d.filter_codes("num_lt", "42")      # codes a term predicate holds for
+true_codes, unknown = d.filter_codes("lang_matches", "en")
+
+# Narrow inside the store, before a row is gathered: a code set or range per position.
+cols = store.match_codes(p=NAME, keep={"o": range(lo, hi)})
+cols = store.match_codes(keep={"s": true_codes, "g": [0]}, limit=100, offset=20)
+n = store.count_quads(p=NAME, keep={"o": true_codes}, limit=1)   # an existence test
+
+# Many probes in one GIL-released call, answered in input order.
+views = store.match_codes_many([(None, NAME, None, None), {"s": "<http://ex.org/bob>", "limit": 5}])
+counts = store.count_quads_many([{"p": NAME, "keep": {"o": literals}}])
+
+# Column kernels, order-preserving: first-seen distinct values, nested-loop joins.
+s, p, o, g = cols
+s.distinct(); o.value_counts()
+left_idx, right_idx = o.join_indices(s)     # rows where o == s, as index pairs
+o.take(left_idx)                            # gather a joined column
+```
+
+`filter_codes(kind, arg)` answers `(true_codes, unknown_codes)`: the codes for which the predicate definitely holds, and the codes inside its domain the native layer leaves to the caller's own evaluator (an ill-typed number, a datatype it does not order). Codes outside the domain — non-literals, for the literal predicates — appear in neither. Kinds: `is_literal`, `is_iri`, `is_blank`, `datatype <iri>`, `lang <tag>`, `lang_matches <range>`, `str_prefix <p>` (`strstarts(str(?v), p)`: a string-like literal's lexical form, an IRI, a blank node's label), and `num_lt`/`num_le`/`num_gt`/`num_ge`/`num_eq`/`num_ne <number>` (value comparison for well-formed numeric literals; different XSD datatypes order by their IRIs; a non-literal is `False` under `=` and the orderings and `True` under `!=`). `keep` takes a dict from position (`"s"`, `"p"`, `"o"`, `"g"` or 0–3) to a code set (`U32Column`, u32 buffer or int sequence) or a code range (`range` with step 1, or `(lo, hi)`); `limit`/`offset` window the rows in base order, and a filtered file scan stops at the first block that fills the window. A probe of the `*_many` calls is an `(s, p, o, g)` tuple or a dict with keys `s`, `p`, `o`, `g`, `keep`, `limit`, `offset`; every probe is parsed before any is evaluated.
 
 ## Build options
 
@@ -81,7 +106,7 @@ Every option after the two paths is keyword-only. `format` is an RDF format name
 
 The default open is lazy and file-backed. `VortexRdfStore(path, in_memory=True)` loads the store into memory once, so each subsequent match skips the per-call file-scan pipeline.
 
-For Dictionary-layout files the term dictionary is lifted into memory when its compressed size in the file fits the residency budget — 512 MiB by default, overridable process-wide with `VORTEX_RDF_DICT_MAX_RESIDENT_BYTES`. `VortexRdfStore(path, max_resident_bytes=n)` sets the budget for that open (the environment variable is ignored for it). A dictionary left file-backed is point-read through its chunk leaves; `term_dict()` and `match_codes` then return `None` and the string reads fall back to the matched quads.
+For Dictionary-layout files the term dictionary is lifted into memory when its compressed size in the file fits the residency budget — 512 MiB by default, overridable process-wide with `VORTEX_RDF_DICT_MAX_RESIDENT_BYTES`. `VortexRdfStore(path, max_resident_bytes=n)` sets the budget for that open (the environment variable is ignored for it). A dictionary left file-backed is point-read through its chunk leaves: the string reads resolve each chunk's distinct codes with one dictionary scan, and `term_dict()` hands out a handle that reads the file on demand (`TermDict.file_backed`), so `match_codes` and the code path keep working.
 
 Stores also round-trip through bytes: `store.to_bytes()` serializes to the native container (the same exchange format as the `.vortex` file, the CLI and the JS bindings), and `VortexRdfStore.from_bytes(data)` opens such a buffer — `bytes` or `bytearray` — as a fully in-memory store.
 

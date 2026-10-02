@@ -47,12 +47,13 @@ use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::{ArrayRef, IntoArray};
 
 use super::components::child_struct;
-use super::{IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds};
+use super::{COL_RID, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds};
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
 use crate::store::array::{make_string_array, stamp_is_sorted};
 use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout, TermRef};
+use crate::store::schema::{COL_G, COL_O, COL_P, COL_S};
 
 #[cfg(feature = "file-io")]
 use super::FileServePlan;
@@ -71,14 +72,9 @@ pub(crate) enum CopyFamily {
     Ospg,
 }
 
-/// Column names inside a copy family's persisted child: the plain primaries
-/// plus the primary row id. Both families use the same names — the child's
-/// identity is what says which sort order the rows are in.
-const COL_S: &str = "s";
-const COL_P: &str = "p";
-const COL_O: &str = "o";
-const COL_G: &str = "g";
-const COL_RID: &str = "rid";
+/// The columns of a copy family's persisted child: the primaries under the
+/// schema's names plus the primary row id. Both families use the same names
+/// — the child's identity is what says which sort order the rows are in.
 const CHILD_COLUMNS: [&str; 5] = [COL_S, COL_P, COL_O, COL_G, COL_RID];
 /// The child columns sourcing the primary `(s, p, o, g)` components, in that
 /// order — what both serve plans project.

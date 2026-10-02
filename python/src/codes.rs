@@ -11,7 +11,10 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyString;
 use vortex_buffer::Buffer;
-use vortex_rdf_core::DictSnapshot;
+use vortex_rdf_core::VortexRdfError as CoreError;
+use vortex_rdf_core::{DictReader, TermPredicate, columns};
+
+use crate::{RUNTIME, parse_err, store_err};
 
 /// Buckets in the decode-sharing cache (see [`TermDict::decode_slice`]).
 /// A power of two, so the bucket index is a mask rather than a division; 256
@@ -23,12 +26,24 @@ const RECENT_BUCKETS: usize = 256;
 /// so emptiness has to be carried by the slot rather than the code.
 const NO_SLOT: u32 = u32::MAX;
 
-/// An immutable handle on a store's term dictionary. Decodes term codes to
-/// their N-Triples strings; safe to keep across store mutations (the snapshot
-/// is frozen at creation).
+/// An immutable handle on a store's term dictionary, resident or left in
+/// its file. Decodes term codes to their N-Triples strings; safe to keep
+/// across store mutations (the handle is frozen at creation).
+///
+/// A file-backed handle answers every call by reading the dictionary child,
+/// GIL released, on the bindings' runtime; a resident one answers in place.
 #[pyclass(frozen, module = "vortex_rdf._native")]
 pub struct TermDict {
-    pub(crate) snapshot: DictSnapshot,
+    pub(crate) reader: DictReader,
+}
+
+/// A malformed term or predicate argument is a `ValueError`; anything else
+/// (an I/O failure reading a file-backed dictionary) is a store error.
+fn term_err(e: CoreError) -> PyErr {
+    match e {
+        CoreError::Deserialization(_) | CoreError::InvalidOperation(_) => parse_err(e),
+        other => store_err(other),
+    }
 }
 
 impl TermDict {
@@ -51,31 +66,43 @@ impl TermDict {
     /// GIL is then retaken to build one `PyString` per distinct term and clone
     /// a reference per occurrence. When nothing was shared those indices are
     /// the identity, and the strings are built straight from the decode order.
-    pub(crate) fn decode_slice(&self, py: Python<'_>, codes: &[u32]) -> Vec<Option<Py<PyString>>> {
+    pub(crate) fn decode_slice(
+        &self,
+        py: Python<'_>,
+        codes: &[u32],
+    ) -> PyResult<Vec<Option<Py<PyString>>>> {
         // `slots[i]` indexes `decoded` for the i-th code, so the mapping from
         // occurrence to decoded term survives the GIL boundary as plain data.
-        let (slots, decoded) = py.detach(|| {
-            let mut slots: Vec<u32> = Vec::with_capacity(codes.len());
-            let mut decoded: Vec<Option<String>> = Vec::new();
-            let mut recent = [(0u32, NO_SLOT); RECENT_BUCKETS];
-            for &code in codes {
-                let bucket = (code as usize) & (RECENT_BUCKETS - 1);
-                let (cached_code, cached_slot) = recent[bucket];
-                let slot = if cached_slot != NO_SLOT && cached_code == code {
-                    cached_slot
-                } else {
-                    let slot = decoded.len() as u32;
-                    decoded.push(self.snapshot.decode(code));
-                    // Overwrites whatever shared this bucket; a hit is
-                    // gated on the stored code, so a lost entry only costs a
-                    // re-decode.
-                    recent[bucket] = (code, slot);
-                    slot
+        let (slots, decoded) = py
+            .detach(|| -> Result<_, CoreError> {
+                let mut slots: Vec<u32> = Vec::with_capacity(codes.len());
+                let mut distinct: Vec<u32> = Vec::new();
+                let mut recent = [(0u32, NO_SLOT); RECENT_BUCKETS];
+                for &code in codes {
+                    let bucket = (code as usize) & (RECENT_BUCKETS - 1);
+                    let (cached_code, cached_slot) = recent[bucket];
+                    let slot = if cached_slot != NO_SLOT && cached_code == code {
+                        cached_slot
+                    } else {
+                        let slot = distinct.len() as u32;
+                        distinct.push(code);
+                        // Overwrites whatever shared this bucket; a hit is
+                        // gated on the stored code, so a lost entry only
+                        // costs a re-decode.
+                        recent[bucket] = (code, slot);
+                        slot
+                    };
+                    slots.push(slot);
+                }
+                // One cursor over the resident terms, or one batched read of
+                // the file-backed child.
+                let decoded = match self.reader.snapshot() {
+                    Some(snapshot) => snapshot.decode_many(&distinct),
+                    None => RUNTIME.block_on(self.reader.decode_many(&distinct))?,
                 };
-                slots.push(slot);
-            }
-            (slots, decoded)
-        });
+                Ok((slots, decoded))
+            })
+            .map_err(store_err)?;
 
         let build = |term: Option<String>| term.map(|t| PyString::new(py, &t).unbind());
 
@@ -83,14 +110,14 @@ impl TermDict {
         // exactly once and can be moved straight out, skipping the lookup table
         // and the per-occurrence refcount bump.
         if decoded.len() == slots.len() {
-            return decoded.into_iter().map(build).collect();
+            return Ok(decoded.into_iter().map(build).collect());
         }
 
         let interned: Vec<Option<Py<PyString>>> = decoded.into_iter().map(build).collect();
-        slots
+        Ok(slots
             .into_iter()
             .map(|slot| interned[slot as usize].as_ref().map(|s| s.clone_ref(py)))
-            .collect()
+            .collect())
     }
 }
 
@@ -98,15 +125,88 @@ impl TermDict {
 impl TermDict {
     /// The N-Triples string for `code`, or `None` when the code is out of
     /// this dictionary's range.
-    fn decode(&self, code: u32) -> Option<String> {
-        self.snapshot.decode(code)
+    fn decode(&self, py: Python<'_>, code: u32) -> PyResult<Option<String>> {
+        if let Some(snapshot) = self.reader.snapshot() {
+            return Ok(snapshot.decode(code));
+        }
+        py.detach(|| RUNTIME.block_on(self.reader.decode(code)))
+            .map_err(term_err)
     }
 
-    /// The code of the N-Triples term string `term`, or `None` when this
-    /// dictionary does not hold the term. The inverse of
-    /// [`decode`](Self::decode).
-    fn encode(&self, term: &str) -> Option<u32> {
-        self.snapshot.encode(term)
+    /// The code of the term `term`, or `None` when this dictionary does not
+    /// hold it. The inverse of [`decode`](Self::decode), tolerant of
+    /// spelling: an IRI with or without angle brackets, a literal with
+    /// escape variants or an explicit `xsd:string` type, an upper-case
+    /// language tag, and the default graph as `""`, `default` or `[]` all
+    /// resolve to the stored form's code. A malformed term raises
+    /// `ValueError`.
+    fn encode(&self, py: Python<'_>, term: &str) -> PyResult<Option<u32>> {
+        if let Some(snapshot) = self.reader.snapshot() {
+            return snapshot.encode_tolerant(term).map_err(term_err);
+        }
+        py.detach(|| RUNTIME.block_on(self.reader.encode(term)))
+            .map_err(term_err)
+    }
+
+    /// [`encode`](Self::encode) over a sequence of terms, in order, in one
+    /// GIL-released call. A malformed term raises `ValueError` before any
+    /// lookup.
+    fn encode_many(&self, py: Python<'_>, terms: Vec<String>) -> PyResult<Vec<Option<u32>>> {
+        py.detach(|| {
+            let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+            RUNTIME.block_on(self.reader.encode_many(&refs))
+        })
+        .map_err(term_err)
+    }
+
+    /// The codes `predicate` partitions this dictionary into: the ascending
+    /// codes for which the predicate is definitely true, and the ascending
+    /// codes inside its domain whose verdict the native layer leaves to the
+    /// caller. Codes outside the domain (non-literals, for the literal
+    /// predicates) appear in neither.
+    ///
+    /// `kind` is one of `is_literal`, `is_iri`, `is_blank`, `datatype`,
+    /// `lang`, `lang_matches`, `str_prefix`, `num_lt`, `num_le`, `num_gt`,
+    /// `num_ge`, `num_eq`, `num_ne`; `arg` is the predicate's argument (an
+    /// IRI, language tag or range, string prefix, or numeric literal
+    /// spelling). An unknown kind or an invalid argument raises
+    /// `ValueError`. Answers are memoized per dictionary.
+    #[pyo3(signature = (kind, arg = ""))]
+    fn filter_codes(
+        &self,
+        py: Python<'_>,
+        kind: &str,
+        arg: &str,
+    ) -> PyResult<(U32Column, U32Column)> {
+        let predicate = TermPredicate::parse(kind, arg).map_err(term_err)?;
+        let (truth, unknown) = py
+            .detach(|| RUNTIME.block_on(self.reader.filter_codes(&predicate)))
+            .map_err(term_err)?;
+        Ok((U32Column { codes: truth }, U32Column { codes: unknown }))
+    }
+
+    /// The half-open code range `(lo, hi)` of the terms whose N-Triples
+    /// spelling starts with `prefix`. Codes rank spellings in byte order,
+    /// so a term kind (`"` for literals, `<` for IRIs, `_:` for blank nodes)
+    /// and an IRI namespace (`<http://example.org/`) are each one range.
+    fn prefix_range(&self, py: Python<'_>, prefix: &str) -> PyResult<(u32, u32)> {
+        py.detach(|| RUNTIME.block_on(self.reader.prefix_range(prefix)))
+            .map_err(term_err)
+    }
+
+    /// The code of the first term not below `term` in byte order — a
+    /// present term's own code, where an absent one would sort, or the
+    /// dictionary's size when every term is below it.
+    fn lower_bound(&self, py: Python<'_>, term: &str) -> PyResult<u32> {
+        py.detach(|| RUNTIME.block_on(self.reader.lower_bound(term)))
+            .map_err(term_err)
+    }
+
+    /// Whether the terms are read from the store's file on demand (`True`)
+    /// rather than held in memory.
+    #[getter]
+    fn file_backed(&self) -> bool {
+        self.reader.is_file_backed()
     }
 
     /// Decode a batch of codes in one call, releasing the GIL for the whole
@@ -127,40 +227,67 @@ impl TermDict {
         py: Python<'_>,
         codes: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<Option<Py<PyString>>>> {
-        if let Ok(buf) = PyBuffer::<u32>::get(codes) {
-            return Ok(self.decode_slice(py, &buf.to_vec(py)?));
-        }
-        if let Ok(buf) = PyBuffer::<u8>::get(codes) {
-            let bytes = buf.to_vec(py)?;
-            if !bytes.len().is_multiple_of(4) {
-                return Err(PyValueError::new_err(format!(
-                    "byte buffer of {} bytes is not a whole number of u32 codes",
-                    bytes.len()
-                )));
-            }
-            let codes: Vec<u32> = bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|b| u32::from_ne_bytes(*b))
-                .collect();
-            return Ok(self.decode_slice(py, &codes));
-        }
-        Ok(self.decode_slice(py, &codes.extract::<Vec<u32>>()?))
+        self.decode_slice(py, &extract_u32s(codes)?)
     }
 
     fn __len__(&self) -> usize {
-        self.snapshot.len()
+        self.reader.len()
     }
 
     fn __repr__(&self) -> String {
-        format!("TermDict(len={})", self.snapshot.len())
+        format!(
+            "TermDict(len={}, file_backed={})",
+            self.reader.len(),
+            if self.reader.is_file_backed() {
+                "True"
+            } else {
+                "False"
+            }
+        )
     }
+}
+
+/// The u32 values of a Python object holding codes or indices: a
+/// [`U32Column`] (its buffer, zero-copy), a u32 buffer
+/// (`memoryview(col).cast("I")`, `array("I", ...)`, a `uint32` NumPy array)
+/// read in one bulk copy, a byte-typed buffer — the raw view a `U32Column`
+/// itself exports — reinterpreted as native-endian u32s, or any other
+/// sequence of ints, at one `PyLong` extraction per element.
+pub(crate) fn extract_u32s(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
+    let py = obj.py();
+    if let Ok(column) = obj.cast::<U32Column>() {
+        return Ok(column.get().codes.as_slice().to_vec());
+    }
+    if let Ok(buf) = PyBuffer::<u32>::get(obj) {
+        return buf.to_vec(py);
+    }
+    if let Ok(buf) = PyBuffer::<u8>::get(obj) {
+        let bytes = buf.to_vec(py)?;
+        if !bytes.len().is_multiple_of(4) {
+            return Err(PyValueError::new_err(format!(
+                "byte buffer of {} bytes is not a whole number of u32 codes",
+                bytes.len()
+            )));
+        }
+        return Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_ne_bytes(*b))
+            .collect());
+    }
+    obj.extract::<Vec<u32>>()
 }
 
 /// One matched term-code column, exposed to Python zero-copy through the
 /// buffer protocol: `memoryview(col).cast("I")` views the Rust memory
 /// directly. The column is read-only and owns (refcounts) its backing buffer.
+///
+/// The column kernels ([`distinct`](Self::distinct),
+/// [`value_counts`](Self::value_counts), [`take`](Self::take),
+/// [`join_indices`](Self::join_indices)) run GIL-released and preserve the
+/// orders a query layer observes: first-seen order for distinct values,
+/// nested-loop order for a join's pairs.
 #[pyclass(frozen, module = "vortex_rdf._native")]
 pub struct U32Column {
     pub(crate) codes: Buffer<u32>,
@@ -168,12 +295,75 @@ pub struct U32Column {
 
 #[pymethods]
 impl U32Column {
+    /// A column holding `values`: another `U32Column` (shared zero-copy), a
+    /// u32 buffer or the raw byte view a column exports (one bulk copy), or
+    /// any sequence of ints.
+    #[new]
+    fn new(values: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(column) = values.cast::<U32Column>() {
+            return Ok(U32Column {
+                codes: column.get().codes.clone(),
+            });
+        }
+        Ok(U32Column {
+            codes: Buffer::from(extract_u32s(values)?),
+        })
+    }
+
     fn __len__(&self) -> usize {
         self.codes.len()
     }
 
     fn __repr__(&self) -> String {
         format!("U32Column(len={})", self.codes.len())
+    }
+
+    /// The distinct values, each at its first occurrence, in that order.
+    fn distinct(&self, py: Python<'_>) -> U32Column {
+        let codes = py.detach(|| columns::distinct_first_seen(self.codes.as_slice()));
+        U32Column { codes }
+    }
+
+    /// `(values, counts)`: the distinct values in first-seen order and how
+    /// often each occurs.
+    fn value_counts(&self, py: Python<'_>) -> (U32Column, U32Column) {
+        let (values, counts) = py.detach(|| columns::value_counts(self.codes.as_slice()));
+        (U32Column { codes: values }, U32Column { codes: counts })
+    }
+
+    /// The values at `indices` (a `U32Column`, u32 buffer or int sequence),
+    /// in that order; an index past the end raises `IndexError`.
+    fn take(&self, py: Python<'_>, indices: &Bound<'_, PyAny>) -> PyResult<U32Column> {
+        let indices = extract_u32s(indices)?;
+        let codes = py
+            .detach(|| columns::take(self.codes.as_slice(), &indices))
+            .map_err(|index| {
+                pyo3::exceptions::PyIndexError::new_err(format!(
+                    "take index {index} is out of range for a column of {} values",
+                    self.codes.len()
+                ))
+            })?;
+        Ok(U32Column { codes })
+    }
+
+    /// The row pairs `(left_indices, right_indices)` where this column's
+    /// value equals `other`'s (a `U32Column`, u32 buffer or int sequence) —
+    /// an equi-join on the two columns as keys, in
+    /// nested-loop order: this column's rows in order, each with its
+    /// matches in `other` in their original order. Gather the joined
+    /// columns with [`take`](Self::take).
+    fn join_indices(
+        &self,
+        py: Python<'_>,
+        other: &Bound<'_, PyAny>,
+    ) -> PyResult<(U32Column, U32Column)> {
+        let right = U32Column::new(other)?.codes;
+        let (left_idx, right_idx) =
+            py.detach(|| columns::equi_join_indices(self.codes.as_slice(), right.as_slice()));
+        Ok((
+            U32Column { codes: left_idx },
+            U32Column { codes: right_idx },
+        ))
     }
 
     /// Fills `view` over the raw u32 data; the exported buffer holds a
