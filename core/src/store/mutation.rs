@@ -99,6 +99,7 @@ impl VortexRdfStore {
             }
         };
         let appended = Self {
+            generation: super::next_generation(),
             layout: self.layout.clone(),
             indexes: self.indexes.clone(),
             quads: self.quads.clone(),
@@ -201,6 +202,7 @@ impl VortexRdfStore {
                 Ok(Self {
                     layout: self.layout.clone(),
                     indexes: self.indexes.clone(),
+                    generation: super::next_generation(),
                     quads: QuadsSource::InMemory {
                         base: base.clone(),
                         selection: selection.clone(),
@@ -230,6 +232,7 @@ impl VortexRdfStore {
                 Ok(Self {
                     layout: self.layout.clone(),
                     indexes: self.indexes.clone(),
+                    generation: super::next_generation(),
                     quads: QuadsSource::File {
                         path: path.clone(),
                         dict_max_resident_bytes: *dict_max_resident_bytes,

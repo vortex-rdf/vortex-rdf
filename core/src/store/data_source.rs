@@ -45,8 +45,6 @@ use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::QuadsSource;
 use crate::store::layouts::LayoutStrategy;
-#[cfg(feature = "file-io")]
-use crate::store::selection::ViewSelection;
 
 /// Rows per chunk a partition emits from an in-memory view — DataFusion's
 /// default batch size; a file-backed view's chunks follow the file's splits
@@ -86,7 +84,7 @@ impl VortexRdfStore {
             self.ensure_code_view("data_source")?;
         }
         let dtype = self.primary_dtype()?;
-        let (row_count, byte_size) = self.row_count_hint().await?;
+        let (row_count, byte_size) = self.row_count_hint();
         Ok(Arc::new(VortexRdfDataSource {
             rows: Rows::View(Arc::new(self.clone())),
             dtype,
@@ -151,33 +149,22 @@ impl VortexRdfStore {
         Ok(dtype)
     }
 
-    /// The row count and byte size a source advertises: exact whenever
-    /// nothing is pending but an in-memory gather, an upper bound while a
-    /// file filter has rows still to test.
-    async fn row_count_hint(&self) -> Result<(Precision<u64>, Precision<u64>)> {
-        let rows = match &self.quads {
-            #[cfg(feature = "file-io")]
-            QuadsSource::File {
-                file,
-                filter: Some(_),
-                selection,
-                ..
-            } => {
-                let base_len = file.row_count() as usize;
-                let selected = match selection {
-                    ViewSelection::Exact(sel) => sel.len(base_len),
-                    ViewSelection::Pending(lazy) => lazy.len_if_known().unwrap_or(base_len),
-                };
-                Precision::inexact((selected + self.tail_size()) as u64)
-            }
-            _ => Precision::exact(self.size().await? as u64),
+    /// The row count and byte size a source advertises — the view's
+    /// statistics as vortex precisions: exact whenever
+    /// [`view_statistics`](Self::view_statistics) knows the count, else
+    /// its upper bound.
+    fn row_count_hint(&self) -> (Precision<u64>, Precision<u64>) {
+        let hint = self.view_statistics().rows;
+        let rows = match hint.exact {
+            Some(n) => Precision::exact(n as u64),
+            None => Precision::inexact(hint.upper_bound as u64),
         };
         let bytes = match self.layout.strategy() {
             // Four `u32` columns: the uncompressed footprint of the rows.
             LayoutStrategy::Dictionary => rows.map(|n| n * 16),
             _ => Precision::Absent,
         };
-        Ok((rows, bytes))
+        (rows, bytes)
     }
 }
 

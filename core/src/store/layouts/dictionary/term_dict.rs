@@ -154,6 +154,8 @@ impl ResidentChunks {
 /// position. Both go through [`cursor`](Self::cursor), whose cost depends on
 /// the encoding the terms are held in.
 pub(crate) struct TermDictionary {
+    /// Identity of this dictionary instance — see [`DictReader::dictionary_id`].
+    id: u64,
     terms: TermStore,
     /// Memo for [`encode`](Self::encode); see [`ProbeCache`].
     probes: ProbeCache,
@@ -163,10 +165,24 @@ pub(crate) struct TermDictionary {
     predicates: PredicateMemo,
 }
 
+/// The next dictionary identity (see [`DictReader::dictionary_id`]): one
+/// process-wide counter shared by resident and file-backed dictionaries.
+pub(crate) fn next_dictionary_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 impl TermDictionary {
+    /// This instance's identity.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Wrap the held terms, with an empty lookup memo.
     fn new(terms: TermStore) -> Self {
         Self {
+            id: next_dictionary_id(),
             terms,
             probes: ProbeCache::new(),
             kinds: OnceLock::new(),
@@ -878,6 +894,12 @@ impl DictSnapshot {
         self.0.len()
     }
 
+    /// Identity of the dictionary behind this snapshot — see
+    /// [`DictReader::dictionary_id`].
+    pub fn dictionary_id(&self) -> u64 {
+        self.0.id()
+    }
+
     /// Whether the dictionary holds no terms.
     pub fn is_empty(&self) -> bool {
         self.0.len() == 0
@@ -981,6 +1003,20 @@ impl DictReader {
             DictReaderInner::Resident(_) => false,
             #[cfg(feature = "file-io")]
             DictReaderInner::FileBacked(_) => true,
+        }
+    }
+
+    /// Identity of the dictionary this handle reads: equal for every view
+    /// of one store (its codes are one vocabulary), different for the
+    /// dictionary a `compact` or a fresh open builds — so a consumer that
+    /// caches codes knows when they stop applying. Two handles with
+    /// different ids may still hold equal terms; only equal ids promise
+    /// equal codes.
+    pub fn dictionary_id(&self) -> u64 {
+        match &self.0 {
+            DictReaderInner::Resident(dict) => dict.id(),
+            #[cfg(feature = "file-io")]
+            DictReaderInner::FileBacked(dict) => dict.id(),
         }
     }
 

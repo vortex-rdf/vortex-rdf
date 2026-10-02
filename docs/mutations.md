@@ -74,7 +74,7 @@ flowchart TD
 - **Set semantics.** A quad equal to one already in the store, or to an
   earlier quad of the batch, is skipped: an in-batch `HashSet` catches the
   latter, and each remaining quad is checked with
-  [`contains`](../core/src/store/matching.rs#L777) — one fully bound
+  [`contains`](../core/src/store/matching.rs#L779) — one fully bound
   `match_pattern` over base and tail ([matching.md §9](matching.md#9-the-tail)).
 - **Accretion.** Each batch joins the tail as one more chunk of a chunked
   accumulator; the accreted chunks are folded into the flat first chunk
@@ -82,7 +82,7 @@ flowchart TD
   small tail does not flatten on every add), or once enough chunks pile up
   that tail scans, which visit every chunk, would stop being dense
   ([`TAIL_FLATTEN_FLOOR`](../core/src/store/mutation.rs#L275),
-  [`TAIL_MAX_CHUNKS`](../core/src/store/mutation.rs#L279)). Amortized, each
+  [`TAIL_MAX_CHUNKS`](../core/src/store/mutation.rs#L282)). Amortized, each
   appended row is copied O(1) times.
 - **Tail-local ids.** The tail has its own `RowSelection` and its own
   `deleted` mask, in tail-local ids (`0..rows.len()`), separate from the
@@ -92,7 +92,7 @@ flowchart TD
   selections are `All`.
 - **Every layout, Dictionary included.** An appended term has no code in the
   base's frozen sorted dictionary, so under the Dictionary layout the tail
-  stores Default-layout N-Triples strings ([`tail_layout`](../core/src/store/mod.rs#L377));
+  stores Default-layout N-Triples strings ([`tail_layout`](../core/src/store/mod.rs#L394));
   under the other layouts it uses the store's own columns. Patterns probe the
   base by code and the tail by string, and a query that touches both unions
   the results.
@@ -102,7 +102,7 @@ flowchart TD
   then unions the two. A base short-circuit (a term with no code in the
   dictionary) never skips the tail, since that term may exist in the tail's
   plain strings.
-- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L395) is the number
+- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L412) is the number
   of physical tail rows — the store's only unindexed, unsorted region, and the
   number to watch when tuning compaction.
 
@@ -110,8 +110,8 @@ flowchart TD
 
 ## 3. Deletions: tombstone masks
 
-[`delete_quad`](../core/src/store/mutation.rs#L120) /
-[`delete_matching`](../core/src/store/mutation.rs#L143) never remove or
+[`delete_quad`](../core/src/store/mutation.rs#L121) /
+[`delete_matching`](../core/src/store/mutation.rs#L144) never remove or
 rewrite rows either — they mark them dead.
 
 ```mermaid
@@ -132,7 +132,7 @@ flowchart TD
   That set is folded into `deleted: Option<Mask>` — one bit per base row —
   carried beside the base, and separately beside the tail. A later delete
   unions into the existing mask
-  ([`union_deleted`](../core/src/store/mutation.rs#L283)), so it composes
+  ([`union_deleted`](../core/src/store/mutation.rs#L286)), so it composes
   with rows already tombstoned; the matcher does not consult the existing
   tombstones, and the union absorbs a doomed set that names already-dead
   rows.
@@ -143,7 +143,7 @@ flowchart TD
 - **The contract.** `match_pattern` deliberately does **not** subtract
   tombstones when it computes a selection (keeping its row positions aligned
   for mask-based refinement); every *read* path does.
-  [`RowSelection::live_mask`](../core/src/store/selection.rs#L307) answers
+  [`RowSelection::live_mask`](../core/src/store/selection.rs#L340) answers
   "which of this selection's own rows are not tombstoned", and the in-memory
   reads all go through [`gather_live`](../core/src/store/scan/gather.rs#L22)
   — the single place a view becomes rows — so applying the mask cannot be
@@ -152,7 +152,7 @@ flowchart TD
   [`Tail::live_rows`](../core/src/store/source.rs#L172).
 - **File-backed stores** tombstone the same way (a file cannot be rewritten
   on delete). The doomed set is evaluated to a file-wide mask by
-  [`matching_file_row_mask`](../core/src/store/mutation.rs#L255) (through
+  [`matching_file_row_mask`](../core/src/store/mutation.rs#L258) (through
   [`matching_file_rows`](../core/src/store/scan/file_scan.rs#L407)), and on
   every later read the mask is applied **inside the scan**
   ([`restrict_scan`](../core/src/store/scan/file_scan.rs#L78)) — as an
@@ -254,15 +254,15 @@ store past the threshold rewrites its source file, as above, as part of the
 ## 6. Ownership and `owned()`
 
 Only a store that owns its rows may be mutated
-([`is_owner`](../core/src/store/mod.rs#L428),
-[`ensure_owner`](../core/src/store/mod.rs#L440)): its base selection is
+([`is_owner`](../core/src/store/mod.rs#L445),
+[`ensure_owner`](../core/src/store/mod.rs#L457)): its base selection is
 `All`, it has no pending file filter, and its tail selection (if any) is
 `All`. A view derived from `match_pattern` is a window onto a base it shares,
 so mutating it would either silently drop the rows outside the view or write
 through to data it does not own; a view that happens to select everything (an
 unconstrained match) counts as an owner.
 
-[`owned`](../core/src/store/mod.rs#L411) turns any store into one that can be
+[`owned`](../core/src/store/mod.rs#L428) turns any store into one that can be
 mutated: an owner comes back as a cheap clone (tombstones and indexes kept), a
 narrowed view is compacted with its declared indexes into an independent
 store. Mutating a match result therefore goes `view.owned().await?` first, or

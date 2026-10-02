@@ -253,6 +253,8 @@ impl TermChunks {
 /// decode instead scans the row indices it wants through `reader`.
 #[derive(Clone)]
 pub(crate) struct FileBackedDict {
+    /// Identity of this handle's dictionary — see [`DictReader::dictionary_id`].
+    id: u64,
     /// The dictionary child's layout reader (child-local row coordinates).
     reader: vortex_layout::LayoutReaderRef,
     /// Number of terms.
@@ -281,6 +283,7 @@ impl FileBackedDict {
     /// through `chunks`; the term count is the reader's row count.
     pub(crate) fn new(reader: vortex_layout::LayoutReaderRef, chunks: TermChunks) -> Self {
         Self {
+            id: super::term_dict::next_dictionary_id(),
             len: reader.row_count(),
             reader,
             probes: Arc::new(ProbeCache::new()),
@@ -289,6 +292,11 @@ impl FileBackedDict {
             kinds: Arc::new(OnceLock::new()),
             predicates: Arc::new(PredicateMemo::new()),
         }
+    }
+
+    /// This handle's dictionary identity.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     /// Number of terms.

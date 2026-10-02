@@ -20,6 +20,7 @@ mod compaction;
 mod data_source;
 mod export;
 mod matching;
+mod metadata;
 mod mutation;
 mod narrowing;
 mod open;
@@ -46,6 +47,7 @@ pub use layouts::dictionary::DictionaryQuadSink;
 pub use layouts::dictionary::{
     DictReader, DictSnapshot, Domain, KindRanges, NumOp, TermPredicate, Verdict,
 };
+pub use metadata::{IndexComponentInfo, RowCountHint, SelectionKind, SortOrder, ViewStatistics};
 pub use narrowing::Keep;
 pub use schema::QuadColumn;
 // `RawQuad` lives in `common` (it is pure RDF text — see that module's
@@ -54,6 +56,15 @@ pub use schema::QuadColumn;
 pub use crate::common::quad::{RawQuad, SharedQuad};
 
 pub(crate) use source::{QuadsSource, Tail};
+
+/// The next store generation (see [`VortexRdfStore::generation`]): one
+/// process-wide counter, so two stores never share a generation unless one
+/// is a view of the other.
+pub(crate) fn next_generation() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 use indexes::IndexComponent;
 
@@ -102,6 +113,9 @@ pub struct VortexRdfStore {
     ///
     /// [`compact_with_indexes`]: Self::compact_with_indexes
     indexes: Indexes,
+    /// Identity of the data behind this view — see
+    /// [`generation`](Self::generation).
+    generation: u64,
     /// Rows appended since construction ([`add_quads`]), kept outside the base
     /// so appending never rewrites it — which is what lets the base's indexes
     /// and tombstones survive an append. `None` until something is appended.
@@ -275,6 +289,7 @@ impl VortexRdfStore {
         Ok(Self {
             layout,
             indexes,
+            generation: next_generation(),
             quads: QuadsSource::InMemory {
                 base,
                 selection: ViewSelection::all(),
@@ -305,6 +320,7 @@ impl VortexRdfStore {
         Self {
             layout: ResolvedLayout::Default,
             indexes: vec![],
+            generation: next_generation(),
             quads: QuadsSource::InMemory {
                 base: quads,
                 selection: ViewSelection::all(),
@@ -325,7 +341,7 @@ impl VortexRdfStore {
     /// view would otherwise run pointless lookups just to intersect with
     /// nothing. No serve plan carries across — a plan is only valid while its
     /// row run is exactly the selection.
-    fn empty_view(&self) -> Self {
+    pub(crate) fn empty_view(&self) -> Self {
         let quads = match &self.quads {
             QuadsSource::InMemory {
                 base,
@@ -365,6 +381,7 @@ impl VortexRdfStore {
         Self {
             layout: self.layout.clone(),
             indexes: vec![],
+            generation: self.generation,
             quads,
             tail,
         }

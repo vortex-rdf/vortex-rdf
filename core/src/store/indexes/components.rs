@@ -246,6 +246,15 @@ impl IndexComponent {
     /// on first touch may both run the pipeline, but the source is immutable
     /// so they canonicalize identical rows; whichever stores first wins and
     /// both read the stored struct — no lock is held across the run.
+    /// The component's row count when its rows are already canonical in
+    /// memory — `None` for an adoption not yet run, which `rows` would force.
+    pub(crate) fn len_if_resident(&self) -> Option<usize> {
+        match &self.rows {
+            ComponentRows::Built(array) => Some(array.len()),
+            ComponentRows::Deferred(deferred) => deferred.cell.get().map(|a| a.len()),
+        }
+    }
+
     pub(crate) fn rows(&self) -> Result<&StructArray> {
         use futures::FutureExt as _;
 

@@ -154,6 +154,39 @@ impl RowSelection {
         }
     }
 
+    /// This selection cut into at most `n` contiguous pieces of about equal
+    /// size, in base row order — what `partitions` hands each partition.
+    /// Empty pieces are left out.
+    pub(crate) fn split(&self, n: usize, base_len: usize) -> Vec<RowSelection> {
+        let n = n.max(1);
+        fn ranges(range: Range<u64>, n: usize) -> Vec<RowSelection> {
+            let len = range.end.saturating_sub(range.start);
+            if len == 0 {
+                return Vec::new();
+            }
+            let per = len.div_ceil(n as u64);
+            (range.start..range.end)
+                .step_by(usize::try_from(per).unwrap_or(usize::MAX))
+                .map(|start| RowSelection::Range(start..(start + per).min(range.end)))
+                .collect()
+        }
+        match self {
+            RowSelection::All => ranges(0..base_len as u64, n),
+            RowSelection::Range(range) => ranges(range.clone(), n),
+            RowSelection::Ids(ids) => {
+                let len = ids.len();
+                if len == 0 {
+                    return Vec::new();
+                }
+                let per = len.div_ceil(n);
+                (0..len)
+                    .step_by(per)
+                    .map(|start| RowSelection::Ids(ids.slice(start..(start + per).min(len))))
+                    .collect()
+            }
+        }
+    }
+
     /// Narrow to the base rows also covered by `range`.
     pub(crate) fn intersect_range(self, range: Range<u64>) -> Self {
         match self {

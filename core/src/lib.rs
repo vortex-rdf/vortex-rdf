@@ -56,10 +56,10 @@ pub use store::columns;
 
 pub use store::{
     BuiltArray, BuiltStream, ChunkStream, CodeChunkStream, DATA_SOURCE_BATCH_ROWS, DictReader,
-    DictSnapshot, DictionaryQuadSink, Domain, IndexType, Indexes, Keep, KindRanges, LayoutStrategy,
-    NumOp, Probe, QuadColumn, RawQuad, RowChunkStream, SharedQuad, SortedInMemoryBuilder,
-    StoreParts, TermPredicate, Verdict, VortexArrayBuilder, VortexRdfDataSource, VortexRdfStore,
-    export_rdf,
+    DictSnapshot, DictionaryQuadSink, Domain, IndexComponentInfo, IndexType, Indexes, Keep,
+    KindRanges, LayoutStrategy, NumOp, Probe, QuadColumn, RawQuad, RowChunkStream, RowCountHint,
+    SelectionKind, SharedQuad, SortOrder, SortedInMemoryBuilder, StoreParts, TermPredicate,
+    Verdict, ViewStatistics, VortexArrayBuilder, VortexRdfDataSource, VortexRdfStore, export_rdf,
 };
 // The vortex scan interface the store's data sources implement — re-exported
 // so a consumer builds its `ScanRequest`s against the version this crate

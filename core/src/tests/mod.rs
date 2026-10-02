@@ -27,6 +27,7 @@ mod indexes;
 #[cfg(feature = "file-io")]
 mod indexes_file;
 mod matching;
+mod metadata;
 mod mutation;
 mod names;
 mod narrowing;

@@ -331,6 +331,7 @@ impl VortexRdfStore {
         Ok(Self {
             layout: self.layout.clone(),
             indexes: self.indexes.clone(),
+            generation: self.generation,
             quads,
             tail,
         })
@@ -457,6 +458,7 @@ impl VortexRdfStore {
         Ok(Self {
             layout: self.layout.clone(),
             indexes: self.indexes.clone(),
+            generation: self.generation,
             quads: QuadsSource::InMemory {
                 base: base.clone(),
                 selection: ViewSelection::Exact(narrowed),
@@ -660,6 +662,7 @@ impl VortexRdfStore {
         Ok(Self {
             layout: self.layout.clone(),
             indexes: self.indexes.clone(),
+            generation: self.generation,
             quads: QuadsSource::File {
                 path: path.clone(),
                 dict_max_resident_bytes: *dict_max_resident_bytes,

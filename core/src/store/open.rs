@@ -230,6 +230,7 @@ impl VortexRdfStore {
         Ok(Self {
             layout,
             indexes,
+            generation: super::next_generation(),
             quads: QuadsSource::File {
                 path: source_path,
                 dict_max_resident_bytes: max_resident_bytes,
