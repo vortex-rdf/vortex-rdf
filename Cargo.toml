@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["core", "encoded-search", "js", "cli", "python"]
+# The DataFusion conformance crate is a workspace of its own (see
+# interface-tests/Cargo.toml), kept out of this one's build and test surface.
+exclude = ["interface-tests"]
 # The python crate is a PyO3 extension module built by maturin; keep it out of
 # the default cargo build/test surface.
 default-members = ["core", "encoded-search", "js", "cli"]

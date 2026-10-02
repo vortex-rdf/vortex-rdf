@@ -1,0 +1,24 @@
+# A workspace of its own: the DataFusion dependency tree stays out of the main
+# workspace's build and test surface (`cargo test --workspace`), and CI runs
+# this crate in a job of its own.
+[workspace]
+
+[package]
+name = "vortex-rdf-interface-tests"
+description = "Conformance tests for the interfaces an external query engine reads vortex-rdf through, driven by vortex's DataFusion integration"
+version = "0.10.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+
+[dependencies]
+vortex-rdf-core = { path = "../core" }
+vortex-datafusion = "0.86.1"
+vortex-arrow = "0.86.1"
+vortex-array = "0.86.1"
+datafusion = { version = "55.0.0", default-features = false, features = ["sql", "nested_expressions"] }
+futures = "0.3.33"
+oxrdf = "0.3.3"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros"] }
+tempfile = "3"
