@@ -66,7 +66,7 @@ mod tests {
     use super::wire::{decode_store_metadata, encode_store_metadata};
     use super::*;
     use crate::session::VORTEX_SESSION;
-    use crate::store::layouts::dictionary::term_dict::COL_DICT_TERM;
+    use crate::store::layouts::dictionary::storage::COL_DICT_TERM;
     use vortex_array::IntoArray;
     use vortex_array::arrays::{StructArray, VarBinViewArray};
     use vortex_array::dtype::{DType, Nullability};

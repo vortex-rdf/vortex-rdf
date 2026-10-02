@@ -3,13 +3,9 @@
 //! either together with the coded quads (the interning ingest) or beside the
 //! owned term → code map the streaming builders encode through.
 
-use std::collections::HashMap;
-// Only [`TermDictionaryBuilder`] collects terms as a set, and it is compiled
-// out with the out-of-core builder that drives it (see the module gate in
-// `store::builders`).
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::{Stream, StreamExt};
 use vortex_array::arrays::VarBinViewArray;
@@ -20,8 +16,8 @@ use crate::store::RawQuad;
 use crate::store::builders::{BuiltArray, build_components_from_codes};
 use crate::store::indexes::Indexes;
 
+use super::codec::{QuadCodes, build_array};
 use super::term_dict::TermDictionary;
-use super::{QuadCodes, build_array};
 
 /// Build-only term → code lookup keyed by owned terms, for the streaming
 /// builders whose quads are moved or re-read from a spill file and cannot be
@@ -34,6 +30,60 @@ pub(crate) type TermCodeMap = HashMap<String, u32>;
 /// Term → code lookup borrowing its keys from the quads being encoded — the
 /// allocation-free counterpart of `TermCodeMap`.
 pub(crate) type BorrowedTermCodeMap<'a> = HashMap<&'a str, u32>;
+
+impl TermDictionary {
+    /// The dataset's unique terms, sorted — the raw material of
+    /// [`from_quads_with_map`](Self::from_quads_with_map). Terms borrow from
+    /// `quads`, so nothing is copied.
+    fn sorted_unique_terms(quads: &[RawQuad]) -> (Vec<&str>, Duration, Duration) {
+        let collect_start = debug::timer();
+        let mut set: HashSet<&str> = HashSet::new();
+        for q in quads {
+            set.insert(&q.s);
+            set.insert(&q.p);
+            set.insert(&q.o);
+            set.insert(&q.g);
+        }
+        let collect_elapsed = debug::elapsed(collect_start);
+        let sort_start = debug::timer();
+        let mut terms: Vec<&str> = set.into_iter().collect();
+        terms.sort_unstable();
+        (terms, collect_elapsed, debug::elapsed(sort_start))
+    }
+
+    /// Build the dictionary and its term → code map in one pass; the map
+    /// borrows its keys from `quads`, so it holds one pointer pair per term
+    /// and no string data. The streaming builders, whose quads cannot be
+    /// borrowed from, use [`TermDictionaryBuilder::finish`] instead.
+    ///
+    /// [`TermDictionaryBuilder::finish`]: super::ingest::TermDictionaryBuilder::finish
+    pub(crate) fn from_quads_with_map(
+        quads: &[RawQuad],
+    ) -> Result<(Self, BorrowedTermCodeMap<'_>)> {
+        let total_start = debug::timer();
+        let (terms, collect_elapsed, sort_elapsed) = Self::sorted_unique_terms(quads);
+        let map_start = debug::timer();
+        let code_map: BorrowedTermCodeMap<'_> = terms
+            .iter()
+            .enumerate()
+            .map(|(code, term)| (*term, code as u32))
+            .collect();
+        let map_elapsed = debug::elapsed(map_start);
+        let freeze_start = debug::timer();
+        let dict = Self::from_sorted(terms.into_iter())?;
+        log::debug!(
+            "[Dictionary] Built dictionary + borrowed code map from {} quads ({} unique terms): collect {:?}, sort {:?}, map {:?}, freeze {:?}, total {:?}",
+            quads.len(),
+            dict.len(),
+            collect_elapsed,
+            sort_elapsed,
+            map_elapsed,
+            debug::elapsed(freeze_start),
+            debug::elapsed(total_start)
+        );
+        Ok((dict, code_map))
+    }
+}
 
 /// Incrementally collects the unique term strings of a dataset during the
 /// ingestion pass of a build. Owned strings exist only for the build's lifetime.

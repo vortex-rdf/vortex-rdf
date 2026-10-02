@@ -42,8 +42,8 @@ pub(crate) mod default;
 pub(crate) mod dictionary;
 pub(crate) mod typed_object;
 
+pub(crate) use self::dictionary::DictAccess;
 use self::dictionary::TermDictionary;
-pub(crate) use self::dictionary::access::DictAccess;
 use self::typed_object::{COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE};
 use crate::store::schema::{COL_G, COL_O, COL_P, COL_S};
 

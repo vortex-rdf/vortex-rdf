@@ -4,7 +4,7 @@
 //! ([`TermChunks`]), so a dictionary whose child cannot be point-read is not
 //! file-backed at all — [`store::open`](crate::store::persist::open) hands that shape
 //! to the resident arm instead. The policy enum choosing between this and
-//! the resident form is [`DictAccess`](super::access::DictAccess); the whole
+//! the resident form is [`DictAccess`](super::handles::DictAccess); the whole
 //! module only compiles with `file-io`, since without a file there is
 //! nothing to leave the terms in.
 
@@ -34,12 +34,9 @@ use crate::store::array::{StrColReader, buf_as_str};
 use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::view::selection::POINT_GATHER_MAX_ROWS;
 
-use super::check_code;
 use super::predicates::{KindRanges, Scanned, TermPredicate};
-use super::term_dict::{
-    COL_DICT_TERM, ChunkCursor, PredicateMemo, ProbeCache, TermChunk, TermDictionary, VerdictSets,
-    chunk_of, prefix_successor,
-};
+use super::storage::{COL_DICT_TERM, ChunkCursor, TermChunk, check_code, chunk_of};
+use super::term_dict::{EncodeMemo, PredicateMemo, TermDictionary, VerdictSets, prefix_successor};
 
 /// The dictionary child's flat chunk leaves, fetched on demand in their wire
 /// encoding and kept for the store's lifetime — the string sibling of the
@@ -249,7 +246,7 @@ impl TermChunks {
 /// `reader` is the dictionary child's layout reader (the native store root's
 /// `dictionary` component), so a term's code is its child row. Probes and
 /// small decodes point-read the wire-encoded chunk leaves through
-/// [`TermChunks`], with probe answers memoized in a [`ProbeCache`]; a wide
+/// [`TermChunks`], with probe answers memoized in a [`EncodeMemo`]; a wide
 /// decode instead scans the row indices it wants through `reader`.
 #[derive(Clone)]
 pub(crate) struct FileBackedDict {
@@ -261,7 +258,7 @@ pub(crate) struct FileBackedDict {
     len: u64,
     /// term → code memo, shared across clones (every derived view of a store
     /// probes the same immutable dictionary).
-    probes: Arc<ProbeCache>,
+    encode_memo: Arc<EncodeMemo>,
     /// Wire-chunk point-read handle, shared across clones — the dictionary
     /// analogue of the quad columns' cached chunk probes.
     chunks: Arc<TermChunks>,
@@ -286,7 +283,7 @@ impl FileBackedDict {
             id: super::term_dict::next_dictionary_id(),
             len: reader.row_count(),
             reader,
-            probes: Arc::new(ProbeCache::new()),
+            encode_memo: Arc::new(EncodeMemo::new()),
             chunks: Arc::new(chunks),
             projection: Arc::new(OnceLock::new()),
             kinds: Arc::new(OnceLock::new()),
@@ -337,11 +334,11 @@ impl FileBackedDict {
 
     /// Term → code: a point-read binary search of the chunk leaves, memoized.
     pub(crate) async fn encode(&self, term: &str) -> Result<Option<u32>> {
-        if let Some(memo) = self.probes.get(term) {
+        if let Some(memo) = self.encode_memo.get(term) {
             return Ok(memo);
         }
         let code = self.chunks.encode(term).await?;
-        self.probes.put(term, code);
+        self.encode_memo.put(term, code);
         Ok(code)
     }
 
@@ -558,7 +555,7 @@ impl FileBackedDict {
     /// Lift the whole dictionary resident — the transient full-column read
     /// behind [`DictAccess::ensure_resident`].
     ///
-    /// [`DictAccess::ensure_resident`]: super::access::DictAccess::ensure_resident
+    /// [`DictAccess::ensure_resident`]: super::handles::DictAccess::ensure_resident
     pub(crate) async fn lift_resident(&self) -> Result<TermDictionary> {
         TermDictionary::from_child_reader(self.reader.clone()).await
     }
