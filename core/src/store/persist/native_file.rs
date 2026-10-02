@@ -1,7 +1,7 @@
 //! The opened native store file: the runtime handle the store's file-backed
 //! query paths drive. Everything it holds is query-execution state:
 //! memoized splits, per-filter pruning envelopes (whose envelope semantics
-//! [`file_scan`](super::scan::file_scan) defines and consumes), and cached
+//! [`file_scan`](crate::store::scan::file_scan) defines and consumes), and cached
 //! component readers. The pure open/materialize primitives are in
 //! [`io::read`](crate::io::read).
 

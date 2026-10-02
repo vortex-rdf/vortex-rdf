@@ -7,7 +7,7 @@ use crate::store::RawQuad;
 use crate::store::builders::build_struct_array;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_scan;
-use crate::store::selection::RowSelection;
+use crate::store::view::selection::RowSelection;
 use crate::store::{QuadsSource, Tail};
 
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
@@ -19,7 +19,7 @@ use vortex_array::arrays::{Chunked, ChunkedArray};
 use vortex_array::{IntoArray, RecursiveCanonical, VortexSessionExecute};
 use vortex_mask::Mask;
 
-use super::VortexRdfStore;
+use crate::store::VortexRdfStore;
 
 impl VortexRdfStore {
     // ── mutations ─────────────────────────────────────────────────────────────
@@ -99,7 +99,7 @@ impl VortexRdfStore {
             }
         };
         let appended = Self {
-            generation: super::next_generation(),
+            generation: crate::store::next_generation(),
             layout: self.layout.clone(),
             indexes: self.indexes.clone(),
             quads: self.quads.clone(),
@@ -202,7 +202,7 @@ impl VortexRdfStore {
                 Ok(Self {
                     layout: self.layout.clone(),
                     indexes: self.indexes.clone(),
-                    generation: super::next_generation(),
+                    generation: crate::store::next_generation(),
                     quads: QuadsSource::InMemory {
                         base: base.clone(),
                         selection: selection.clone(),
@@ -232,7 +232,7 @@ impl VortexRdfStore {
                 Ok(Self {
                     layout: self.layout.clone(),
                     indexes: self.indexes.clone(),
-                    generation: super::next_generation(),
+                    generation: crate::store::next_generation(),
                     quads: QuadsSource::File {
                         path: path.clone(),
                         dict_max_resident_bytes: *dict_max_resident_bytes,

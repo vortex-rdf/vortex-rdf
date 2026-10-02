@@ -2,60 +2,49 @@
 // here (or at the crate root), so each has exactly one canonical public path.
 pub(crate) mod array;
 pub(crate) mod builders;
-pub mod columns;
 pub(crate) mod indexes;
 pub(crate) mod layouts;
-#[cfg(feature = "file-io")]
-pub(crate) mod native_file;
+pub(crate) mod persist;
 pub(crate) mod probes;
+pub(crate) mod query;
+pub(crate) mod read;
 pub(crate) mod scan;
 pub(crate) mod schema;
-pub(crate) mod selection;
-pub(crate) mod source;
-
-// [`VortexRdfStore`]'s impl clusters — the struct itself is defined below.
-mod batch;
-mod chunks;
-mod compaction;
-mod data_source;
-mod export;
-mod matching;
-mod metadata;
-mod mutation;
-mod narrowing;
-mod open;
-mod rows;
-mod serialize;
-mod streaming;
 #[cfg(test)]
 pub(crate) mod test_hooks;
+pub(crate) mod view;
+pub(crate) mod write;
 
 pub use builders::{
     BuiltArray, BuiltStream, ChunkStream, SortedInMemoryBuilder, VortexArrayBuilder,
 };
-pub use export::export_rdf;
 // Compiled out on wasm along with the rest of the sorted-stream builder's
 // out-of-core merge (see the module gate in `builders`).
-pub use batch::Probe;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use builders::SortedStreamBuilder;
-pub use chunks::{CodeChunkStream, RowChunkStream};
-pub use data_source::{DATA_SOURCE_BATCH_ROWS, VortexRdfDataSource};
 pub use indexes::{IndexType, Indexes};
 pub use layouts::LayoutStrategy;
 pub use layouts::dictionary::DictionaryQuadSink;
 pub use layouts::dictionary::{
     DictReader, DictSnapshot, Domain, KindRanges, NumOp, TermPredicate, Verdict,
 };
-pub use metadata::{IndexComponentInfo, RowCountHint, SelectionKind, SortOrder, ViewStatistics};
-pub use narrowing::Keep;
+pub use persist::export::export_rdf;
+pub use query::batch::Probe;
+pub use query::narrowing::Keep;
+pub use read::chunks::{CodeChunkStream, RowChunkStream};
+pub use read::data_source::{DATA_SOURCE_BATCH_ROWS, VortexRdfDataSource};
+pub use read::metadata::{
+    IndexComponentInfo, RowCountHint, SelectionKind, SortOrder, ViewStatistics,
+};
 pub use schema::QuadColumn;
 // `RawQuad` lives in `common` (it is pure RDF text — see that module's
 // charter); this re-export makes `store::RawQuad` the path builder consumers
 // use.
+/// The column kernels, also reachable as `vortex_rdf_core::columns`.
+pub use crate::columns;
 pub use crate::common::quad::{RawQuad, SharedQuad};
 
-pub(crate) use source::{QuadsSource, Tail};
+pub(crate) use view::{QuadsSource, Tail};
 
 /// The next store generation (see [`VortexRdfStore::generation`]): one
 /// process-wide counter, so two stores never share a generation unless one
@@ -71,7 +60,7 @@ use indexes::IndexComponent;
 use crate::error::{Result, VortexRdfError};
 use layouts::dictionary::TermDictionary;
 use layouts::{DictAccess, ResolvedLayout};
-use selection::{RowSelection, ViewSelection};
+use view::selection::{RowSelection, ViewSelection};
 
 use std::iter;
 use std::sync::Arc;

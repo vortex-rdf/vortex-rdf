@@ -6,13 +6,13 @@
 
 use std::num::NonZeroUsize;
 
-use super::VortexRdfStore;
 use crate::error::Result;
 use crate::store::QuadsSource;
+use crate::store::VortexRdfStore;
 use crate::store::array::subject_sorted;
 use crate::store::indexes::IndexType;
 use crate::store::schema::QuadColumn;
-use crate::store::selection::{RowSelection, ViewSelection};
+use crate::store::view::selection::{RowSelection, ViewSelection};
 
 /// A sort order of quad rows, by the columns compared first to last.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -142,7 +142,7 @@ impl VortexRdfStore {
     /// bound, a code range that would need a read is `None`.
     pub fn view_statistics(&self) -> ViewStatistics {
         let tail_rows = self.tail_size();
-        let is_dictionary = self.layout.strategy() == super::LayoutStrategy::Dictionary;
+        let is_dictionary = self.layout.strategy() == crate::store::LayoutStrategy::Dictionary;
         let mut code_bounds: [Option<(u32, u32)>; 4] = [None; 4];
         let (
             rows,

@@ -27,10 +27,10 @@ use crate::store::probes::StructProbes;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_scan;
 use crate::store::schema::{self, QuadColumn};
-use crate::store::selection::{RowSelection, ViewSelection};
+use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{QuadsSource, Tail};
 
-use super::VortexRdfStore;
+use crate::store::VortexRdfStore;
 
 /// Which term codes a [`keep`](VortexRdfStore::keep) admits in a column.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -388,7 +388,7 @@ impl VortexRdfStore {
 
     /// Err unless this view's rows are code-addressable: the Dictionary
     /// layout with an empty append tail.
-    pub(super) fn ensure_code_view(&self, operation: &str) -> Result<()> {
+    pub(in crate::store) fn ensure_code_view(&self, operation: &str) -> Result<()> {
         if self.layout.strategy() != LayoutStrategy::Dictionary {
             return Err(VortexRdfError::InvalidOperation(format!(
                 "{operation} needs the Dictionary layout: this store's {:?} layout stores terms \

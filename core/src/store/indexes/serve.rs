@@ -49,7 +49,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 use crate::store::scan::gather::primitive_from_u64_reads;
-use crate::store::selection::point_sized;
+use crate::store::view::selection::point_sized;
 
 /// The decode tail shared by both backend-typed serve plans: which of the
 /// index's columns source each primary component, which carries the primary
@@ -109,7 +109,7 @@ impl ServeDecode {
     /// probe. The inner `None` means no tombstones — every position in
     /// `range` is live, so the caller iterates the range directly.
     ///
-    /// [`POINT_GATHER_MAX_ROWS`]: crate::store::selection::POINT_GATHER_MAX_ROWS
+    /// [`POINT_GATHER_MAX_ROWS`]: crate::store::view::selection::POINT_GATHER_MAX_ROWS
     fn live_positions(
         &self,
         array: &ArrayRef,
@@ -201,7 +201,7 @@ impl ServeDecode {
         // otherwise decode the sliced columns.
         let rows = match crate::store::scan::gather::gather_by_point_reads(
             &rows,
-            &crate::store::selection::RowSelection::Range(0..len as u64),
+            &crate::store::view::selection::RowSelection::Range(0..len as u64),
             None,
             None,
         )? {
@@ -292,7 +292,7 @@ impl InMemoryServePlan {
     /// hold terms, not codes), or any column whose encoding resolves no
     /// probe.
     ///
-    /// [`POINT_GATHER_MAX_ROWS`]: crate::store::selection::POINT_GATHER_MAX_ROWS
+    /// [`POINT_GATHER_MAX_ROWS`]: crate::store::view::selection::POINT_GATHER_MAX_ROWS
     pub(crate) fn code_columns(&self, deleted: Option<&Mask>) -> Option<[Buffer<u32>; 4]> {
         if !matches!(self.decode.decode_layout, ResolvedLayout::Dictionary(_)) {
             return None;
@@ -364,7 +364,7 @@ pub(crate) struct FileServePlan {
     /// the bound trees by shape, so every plan for a repeated pattern
     /// carries the same identity and hits the child reader's
     /// identity-keyed caches (see `BoundExprMemo`).
-    memo: Arc<crate::store::native_file::BoundExprMemo>,
+    memo: Arc<crate::store::persist::native_file::BoundExprMemo>,
     /// The lazily bound (projection, filter) pair, shared across clones so
     /// the first reader's bind serves them all.
     bound: Arc<
@@ -417,7 +417,7 @@ impl FileServePlan {
         constraints: Vec<(&'static str, Scalar)>,
         component: &'static str,
         row_range: Option<Range<u64>>,
-        memo: Arc<crate::store::native_file::BoundExprMemo>,
+        memo: Arc<crate::store::persist::native_file::BoundExprMemo>,
     ) -> Self {
         Self {
             decode: ServeDecode {

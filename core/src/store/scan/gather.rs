@@ -10,7 +10,7 @@ use vortex_mask::Mask;
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::probes::StructProbes;
-use crate::store::selection::RowSelection;
+use crate::store::view::selection::RowSelection;
 
 /// Gather the rows of `base` that `selection` covers and `deleted` has not
 /// tombstoned.

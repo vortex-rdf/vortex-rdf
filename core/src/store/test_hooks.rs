@@ -15,10 +15,10 @@ use crate::store::array;
 use crate::store::layouts::QuadPattern;
 #[cfg(feature = "file-io")]
 use crate::store::layouts::{DictAccess, ResolvedLayout};
-use crate::store::selection::{RowSelection, ViewSelection};
+use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{QuadsSource, VortexRdfStore};
 
-pub(crate) use crate::store::mutation::{TAIL_FLATTEN_FLOOR, TAIL_MAX_CHUNKS};
+pub(crate) use crate::store::write::mutation::{TAIL_FLATTEN_FLOOR, TAIL_MAX_CHUNKS};
 
 #[cfg(feature = "file-io")]
 use oxrdf::NamedOrBlankNode;

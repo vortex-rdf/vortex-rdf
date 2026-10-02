@@ -10,7 +10,7 @@ use crate::store::builders::{DEFAULT_CHUNK_ROWS, build_parts_from_raws};
 use crate::store::indexes::{Indexes, unique_indexes};
 use crate::store::layouts::LayoutStrategy;
 
-use super::VortexRdfStore;
+use crate::store::VortexRdfStore;
 
 impl VortexRdfStore {
     // ── compaction ───────────────────────────────────────────────────────────
@@ -150,10 +150,10 @@ impl VortexRdfStore {
         sorted: bool,
     ) -> Result<Self> {
         let (base, components, dict) = build_parts_from_raws(raws, strategy, &indexes, sorted)?;
-        let layout = super::resolved_layout(dict, base.dtype())?;
+        let layout = crate::store::resolved_layout(dict, base.dtype())?;
         // Compress like every other construction — a compacted store carries
         // the same resident form a freshly built one does.
-        let (base, components) = super::compress_built_parts(base, components)?;
+        let (base, components) = crate::store::compress_built_parts(base, components)?;
         Self::assemble_resident(base, components, layout)
     }
 
@@ -163,7 +163,7 @@ impl VortexRdfStore {
     /// the compaction thresholds. For a file-backed store this rewrites its
     /// source file in place (see [`compact`](Self::compact)) and keeps it
     /// file-backed — an append past the threshold performs a disk write.
-    pub(super) fn should_auto_compact(&self) -> bool {
+    pub(in crate::store) fn should_auto_compact(&self) -> bool {
         let (base_rows, tail) = match (&self.quads, &self.tail) {
             (QuadsSource::InMemory { base, .. }, Some(tail)) => (base.len(), tail),
             #[cfg(feature = "file-io")]

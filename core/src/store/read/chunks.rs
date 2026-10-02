@@ -20,10 +20,10 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::{ArrayRef, VortexSessionExecute as _};
 use vortex_buffer::Buffer;
 
-use super::VortexRdfStore;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::QuadsSource;
+use crate::store::VortexRdfStore;
 use crate::store::array::{field_as, into_struct_array};
 use crate::store::schema::QuadColumn;
 
@@ -49,7 +49,9 @@ impl VortexRdfStore {
     /// store first).
     pub fn row_chunks(&self, batch_rows: usize) -> Result<RowChunkStream> {
         check_batch(batch_rows)?;
-        if self.layout.strategy() == super::LayoutStrategy::Dictionary && self.tail_len() != 0 {
+        if self.layout.strategy() == crate::store::LayoutStrategy::Dictionary
+            && self.tail_len() != 0
+        {
             self.ensure_code_view("row_chunks")?;
         }
         let store = self.clone();
@@ -223,7 +225,7 @@ fn lazy<T: Send + 'static>(
 
 /// `rows` cut into slices of at most `batch_rows`; an empty array yields no
 /// chunk.
-pub(super) fn rechunk(rows: ArrayRef, batch_rows: usize) -> Result<Vec<ArrayRef>> {
+pub(in crate::store) fn rechunk(rows: ArrayRef, batch_rows: usize) -> Result<Vec<ArrayRef>> {
     let len = rows.len();
     if len == 0 {
         return Ok(Vec::new());

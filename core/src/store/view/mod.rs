@@ -3,6 +3,8 @@
 //! components and serve plan that determine which base rows a view exposes)
 //! and [`Tail`] (rows appended since construction, held apart from the base).
 
+pub(crate) mod selection;
+
 use std::sync::Arc;
 
 use vortex_array::ArrayRef;
@@ -12,12 +14,12 @@ use crate::error::Result;
 use crate::store::indexes::{InMemoryServePlan, IndexComponent};
 use crate::store::probes::StructProbes;
 use crate::store::scan::gather::gather_live;
-use crate::store::selection::{RowSelection, ViewSelection};
+use crate::store::view::selection::{RowSelection, ViewSelection};
 
 #[cfg(feature = "file-io")]
 use crate::store::indexes::FileServePlan;
 #[cfg(feature = "file-io")]
-use crate::store::native_file::NativeStoreFile;
+use crate::store::persist::native_file::NativeStoreFile;
 #[cfg(feature = "file-io")]
 use std::path::PathBuf;
 #[cfg(feature = "file-io")]
@@ -146,8 +148,8 @@ pub(crate) struct Tail {
     /// ([`mutation::TAIL_FLATTEN_FLOOR`], [`mutation::TAIL_MAX_CHUNKS`]), so
     /// scans see at most a bounded chunk count.
     ///
-    /// [`mutation::TAIL_FLATTEN_FLOOR`]: crate::store::mutation::TAIL_FLATTEN_FLOOR
-    /// [`mutation::TAIL_MAX_CHUNKS`]: crate::store::mutation::TAIL_MAX_CHUNKS
+    /// [`mutation::TAIL_FLATTEN_FLOOR`]: crate::store::write::mutation::TAIL_FLATTEN_FLOOR
+    /// [`mutation::TAIL_MAX_CHUNKS`]: crate::store::write::mutation::TAIL_MAX_CHUNKS
     pub(crate) rows: ArrayRef,
     /// The tail rows visible through this store or derived view, in tail-local
     /// ids.

@@ -43,6 +43,8 @@
 //! });
 //! ```
 
+/// Slice kernels over term-code buffers.
+pub mod columns;
 pub mod common;
 pub mod debug;
 pub mod error;
@@ -52,7 +54,6 @@ mod session;
 pub mod store;
 
 pub use error::{Result, VortexRdfError};
-pub use store::columns;
 
 pub use store::{
     BuiltArray, BuiltStream, ChunkStream, CodeChunkStream, DATA_SOURCE_BATCH_ROWS, DictReader,

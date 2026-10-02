@@ -15,7 +15,7 @@
 //! [`selection`](super::selection); what lives here is its execution against
 //! a backend.
 //!
-//! [`RowSelection`]: super::selection::RowSelection
+//! [`RowSelection`]: super::view::selection::RowSelection
 
 #[cfg(feature = "file-io")]
 pub(crate) mod file_scan;

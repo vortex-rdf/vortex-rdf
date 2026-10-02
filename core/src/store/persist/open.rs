@@ -13,8 +13,8 @@ use crate::store::{
     QuadsSource,
     indexes::Indexes,
     layouts::{DictAccess, LayoutStrategy, ResolvedLayout, dictionary::FileBackedDict},
-    native_file::NativeStoreFile,
-    selection::ViewSelection,
+    persist::native_file::NativeStoreFile,
+    view::selection::ViewSelection,
 };
 
 use vortex_file::OpenOptionsSessionExt as _;
@@ -24,10 +24,10 @@ use std::sync::Arc;
 use vortex_array::arrays::StructArray;
 use vortex_array::{IntoArray, VortexSessionExecute};
 
-use super::VortexRdfStore;
+use crate::store::VortexRdfStore;
 
 /// What one entry of a store's component roster means to this version.
-pub(super) enum ComponentKind {
+pub(in crate::store) enum ComponentKind {
     /// The required `dictionary` child (the Dictionary layout's terms).
     Dict,
     /// A known index child: the registry row carrying the identity an
@@ -44,7 +44,7 @@ pub(super) enum ComponentKind {
 /// dictionary child of an unknown implementation and of an *uninterpretable
 /// required* component: skipping one — a future change set, say — would
 /// silently change query results.
-pub(super) fn classify_component(
+pub(in crate::store) fn classify_component(
     descriptor: &container::StoreComponentDescriptor,
 ) -> Result<ComponentKind> {
     if descriptor.name == container::DICT_COMPONENT_NAME {
@@ -74,7 +74,7 @@ pub(super) fn classify_component(
 /// (canonicalized on its first genuine use, as `from_bytes` adopts its
 /// children), with the descriptor's `sorted` provenance carried across.
 #[cfg(feature = "file-io")]
-pub(super) async fn scanned_index_components(
+pub(in crate::store) async fn scanned_index_components(
     file: &NativeStoreFile,
 ) -> Result<Vec<IndexComponent>> {
     let mut components = Vec::new();
@@ -230,7 +230,7 @@ impl VortexRdfStore {
         Ok(Self {
             layout,
             indexes,
-            generation: super::next_generation(),
+            generation: crate::store::next_generation(),
             quads: QuadsSource::File {
                 path: source_path,
                 dict_max_resident_bytes: max_resident_bytes,
@@ -332,7 +332,7 @@ impl VortexRdfStore {
                 ComponentKind::Skip => {}
             }
         }
-        let layout = super::resolved_layout(dict, quads.dtype())?;
+        let layout = crate::store::resolved_layout(dict, quads.dtype())?;
         Self::assemble_resident(quads, components, layout)
     }
 }

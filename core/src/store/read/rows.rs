@@ -12,7 +12,7 @@ use crate::store::layouts::{LayoutStrategy, ResolvedLayout, dictionary};
 use crate::store::scan::file_scan;
 use crate::store::scan::gather::gather_live;
 use crate::store::schema;
-use crate::store::selection::{RowSelection, ViewSelection};
+use crate::store::view::selection::{RowSelection, ViewSelection};
 
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{PrimitiveArray, StructArray};
@@ -26,7 +26,7 @@ use vortex_layout::scan::scan_builder::ScanBuilder;
 #[cfg(feature = "file-io")]
 use vortex_mask::Mask;
 
-use super::VortexRdfStore;
+use crate::store::VortexRdfStore;
 
 impl VortexRdfStore {
     /// Number of quads in the store.
@@ -346,7 +346,7 @@ impl VortexRdfStore {
 
     /// The base rows this view covers (gathered in memory, or scanned from the
     /// file with the pending filter and selection applied) — without the tail.
-    pub(super) async fn base_selected_rows(&self) -> Result<ArrayRef> {
+    pub(in crate::store) async fn base_selected_rows(&self) -> Result<ArrayRef> {
         match &self.quads {
             QuadsSource::InMemory {
                 base,
@@ -421,9 +421,9 @@ impl VortexRdfStore {
     /// pushed-down filter for the components no index resolved, and the row
     /// selection (with tombstoned rows excluded) for those it did.
     #[cfg(feature = "file-io")]
-    pub(super) fn restricted_file_scan(
+    pub(in crate::store) fn restricted_file_scan(
         &self,
-        file: &crate::store::native_file::NativeStoreFile,
+        file: &crate::store::persist::native_file::NativeStoreFile,
         filter: Option<&Expression>,
         selection: &RowSelection,
         deleted: Option<&Mask>,
@@ -437,8 +437,8 @@ impl VortexRdfStore {
     /// them) — what a column export reads so the scan decodes nothing it will
     /// not hand out.
     #[cfg(feature = "file-io")]
-    pub(super) fn restricted_file_scan_projected(
-        file: &crate::store::native_file::NativeStoreFile,
+    pub(in crate::store) fn restricted_file_scan_projected(
+        file: &crate::store::persist::native_file::NativeStoreFile,
         columns: &[&str],
         filter: Option<&Expression>,
         selection: &RowSelection,
@@ -471,7 +471,7 @@ impl VortexRdfStore {
 
     /// The base rows decoded to raw quads, through the async path when the
     /// dictionary is file-backed (only possible on a file-io build).
-    pub(super) async fn base_raw_quads(&self, rows: &ArrayRef) -> Result<Vec<RawQuad>> {
+    pub(in crate::store) async fn base_raw_quads(&self, rows: &ArrayRef) -> Result<Vec<RawQuad>> {
         #[cfg(feature = "file-io")]
         {
             self.layout.raw_quads_async(rows).await
@@ -484,7 +484,10 @@ impl VortexRdfStore {
 
     /// The given base rows decoded to raw quads, followed by the tail's live
     /// rows, and how many of the result came from the base.
-    pub(super) async fn merged_raw_quads(&self, base: &ArrayRef) -> Result<(Vec<RawQuad>, usize)> {
+    pub(in crate::store) async fn merged_raw_quads(
+        &self,
+        base: &ArrayRef,
+    ) -> Result<(Vec<RawQuad>, usize)> {
         let mut raws = self.base_raw_quads(base).await?;
         let base_rows = raws.len();
         if let Some(tail) = &self.tail {
@@ -495,7 +498,7 @@ impl VortexRdfStore {
 
     /// Every live quad this view covers, decoded to raw N-Triples term strings
     /// — base rows first (in view order), then tail rows.
-    pub(super) async fn live_raw_quads(&self) -> Result<Vec<RawQuad>> {
+    pub(in crate::store) async fn live_raw_quads(&self) -> Result<Vec<RawQuad>> {
         let base = self.base_selected_rows().await?;
         Ok(self.merged_raw_quads(&base).await?.0)
     }

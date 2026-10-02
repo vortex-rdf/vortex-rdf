@@ -39,12 +39,12 @@ use vortex_scan::{
     PartitionStream, ScanRequest,
 };
 
-use super::VortexRdfStore;
-use super::chunks::rechunk;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::QuadsSource;
+use crate::store::VortexRdfStore;
 use crate::store::layouts::LayoutStrategy;
+use crate::store::read::chunks::rechunk;
 
 /// Rows per chunk a partition emits from an in-memory view — DataFusion's
 /// default batch size; a file-backed view's chunks follow the file's splits
@@ -109,7 +109,7 @@ impl VortexRdfStore {
                 }
                 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
                 if name == crate::io::container::DICT_COMPONENT_NAME
-                    && let super::layouts::ResolvedLayout::Dictionary(access) = &self.layout
+                    && let crate::store::layouts::ResolvedLayout::Dictionary(access) = &self.layout
                     && let Some(dict) = access.resident()
                 {
                     return Ok(Some(chunks_source(dict.child_chunks()?)));
