@@ -18,12 +18,13 @@
 
 use std::sync::{Arc, OnceLock};
 
-use vortex_array::arrays::StructArray;
+use vortex_array::arrays::{PrimitiveArray, StructArray};
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldName;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
+use vortex_buffer::Buffer;
 
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
@@ -84,30 +85,6 @@ pub(crate) fn check_component_rows(name: &str, component_rows: u64, quad_rows: u
     Ok(())
 }
 
-/// Adopt a scanned persisted child as an in-memory [`IndexComponent`]:
-/// `scanned` is the child's un-executed scan output, `sorted` the
-/// descriptor's provenance. Canonicalization is *deferred* to the
-/// component's first genuine use; the scan itself has already run, so this
-/// form is safe over any segment source — it is how a file view lifts its
-/// children for serialization. The row-count check runs here, eagerly: a
-/// corrupt roster fails at adoption, not at first probe.
-#[cfg(feature = "file-io")]
-pub(crate) fn adopt_scanned_component(
-    known: &KnownComponent,
-    scanned: ArrayRef,
-    sorted: bool,
-    quad_rows: u64,
-) -> Result<IndexComponent> {
-    let rows = scanned.len() as u64;
-    adopt_deferred(
-        known,
-        DeferredSource::Scanned(scanned),
-        rows,
-        sorted,
-        quad_rows,
-    )
-}
-
 /// Adopt a persisted child by its un-scanned reader — the fully deferred
 /// form `from_bytes` uses: nothing of the child is read at open (the roster
 /// row comes off the wire TOC alone), and scan plus canonicalization both
@@ -135,7 +112,7 @@ pub(crate) fn adopt_component_reader(
 /// A deferred component over `source` — the shared tail of both adopters:
 /// the row-count check against the quad rows, then the component under the
 /// registry row's identity with a fresh probe cache.
-fn adopt_deferred(
+pub(super) fn adopt_deferred(
     known: &KnownComponent,
     source: DeferredSource,
     rows: u64,
@@ -211,7 +188,7 @@ struct DeferredRows {
 }
 
 /// How much of the read pipeline a deferred component still owes.
-enum DeferredSource {
+pub(super) enum DeferredSource {
     /// The scan already ran (holding its un-executed output — array metadata
     /// plus refcounts on the source's buffers); only canonicalization is
     /// deferred. Safe over any segment source.
@@ -484,10 +461,60 @@ pub(crate) fn child_struct_dtype(
     )
 }
 
+/// Decode a row-id column into the ascending, unique `Buffer<u64>` every index
+/// resolution answers in.
+///
+/// Sorting is required, not incidental: the ids come out in the index's own
+/// order, and both `Selection::IncludeByIndex` and the selection algebra need
+/// them ascending. They are unique by construction (each index row references
+/// one quad row), so sorting alone suffices.
+pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<u64>> {
+    use vortex_array::builtins::ArrayBuiltins;
+    use vortex_array::dtype::{Nullability, PType};
+
+    if row_id_column.is_empty() {
+        return Ok(Buffer::empty());
+    }
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
+    let ids = row_id_column
+        .cast(DType::Primitive(PType::U64, Nullability::NonNullable))
+        .map_err(VortexRdfError::Vortex)?
+        .execute::<PrimitiveArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?
+        .into_buffer::<u64>();
+
+    // The freshly-executed buffer is normally uniquely owned, so the sort
+    // runs in place with no copy; a shared buffer (someone else still holds
+    // the execution's output) falls back to one copy.
+    match ids.try_into_mut() {
+        Ok(mut ids) => {
+            ids.as_mut_slice().sort_unstable();
+            Ok(ids.freeze())
+        }
+        Err(ids) => {
+            let mut sorted = ids.as_slice().to_vec();
+            sorted.sort_unstable();
+            Ok(Buffer::from(sorted))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use vortex_array::arrays::PrimitiveArray;
+
+    #[test]
+    fn sorted_row_ids_casts_and_sorts() {
+        // A u32 rid column comes back as ascending u64 ids.
+        let column = PrimitiveArray::from_iter([5u32, 1, 3]).into_array();
+        let ids = sorted_row_ids(column).unwrap();
+        assert_eq!(ids.as_slice(), &[1u64, 3, 5]);
+
+        // An empty column short-circuits to an empty buffer.
+        let empty = PrimitiveArray::from_iter(std::iter::empty::<u32>()).into_array();
+        assert!(sorted_row_ids(empty).unwrap().is_empty());
+    }
 
     #[test]
     fn check_component_rows_rejects_mismatch() {

@@ -174,7 +174,7 @@ impl VortexRdfStore {
         &self,
         subject: &NamedOrBlankNode,
     ) -> Result<Option<Range<u64>>> {
-        use crate::store::scan::file_scan;
+        use crate::store::scan::{file_filter, file_reads};
         let QuadsSource::File { file, .. } = &self.quads else {
             return Ok(None);
         };
@@ -182,8 +182,8 @@ impl VortexRdfStore {
         let Some(mut codes) = self.prepared_codes(pattern).await? else {
             return Ok(Some(0..0));
         };
-        match file_scan::build_file_filter(pattern, &mut codes)? {
-            Some(filter) => file_scan::row_range_from_pruning(file, &filter).await,
+        match file_reads::build_file_filter(pattern, &mut codes)? {
+            Some(filter) => file_filter::row_range_from_pruning(file, &filter).await,
             None => Ok(None),
         }
     }
@@ -195,7 +195,7 @@ impl VortexRdfStore {
         &self,
         subject: &NamedOrBlankNode,
     ) -> Result<Option<Range<u64>>> {
-        use crate::store::scan::file_scan;
+        use crate::store::scan::file_reads;
         let QuadsSource::File { file, .. } = &self.quads else {
             return Ok(None);
         };
@@ -205,7 +205,7 @@ impl VortexRdfStore {
         else {
             return Ok(None);
         };
-        file_scan::locate_subject_run(file, &mut codes, subject).await
+        file_reads::locate_subject_run(file, &mut codes, subject).await
     }
 
     /// The index-child run the reference index's file resolution locates for
@@ -223,8 +223,7 @@ impl VortexRdfStore {
         let Some(mut codes) = self.prepared_codes(pattern).await? else {
             return Ok(None);
         };
-        crate::store::indexes::secondary_by_reference::debug_located_run(file, pattern, &mut codes)
-            .await
+        crate::store::indexes::reference::debug_located_run(file, pattern, &mut codes).await
     }
 }
 

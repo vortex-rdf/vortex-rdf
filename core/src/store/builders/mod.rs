@@ -35,9 +35,7 @@ use crate::store::RawQuad;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use crate::store::array::chunked_or_single;
 use crate::store::array::stamp_is_sorted;
-use crate::store::indexes::{
-    IndexComponent, IndexType, Indexes, secondary_by_copy, secondary_by_reference, unique_indexes,
-};
+use crate::store::indexes::{IndexComponent, IndexType, Indexes, copy, reference, unique_indexes};
 use crate::store::layouts::LayoutStrategy;
 use crate::store::layouts::dictionary::{QuadCodes, TermDictionary};
 use futures::{Stream, stream};
@@ -191,8 +189,8 @@ pub(crate) fn build_struct_array(
 /// dataset, handed on as persisted children by
 /// [`into_components`](Self::into_components).
 struct GlobalIndexes {
-    by_copy: Option<secondary_by_copy::GlobalCopyArrays>,
-    by_reference: Option<secondary_by_reference::GlobalReferenceArrays>,
+    by_copy: Option<copy::GlobalCopyArrays>,
+    by_reference: Option<reference::GlobalReferenceArrays>,
 }
 
 impl GlobalIndexes {
@@ -201,8 +199,8 @@ impl GlobalIndexes {
     /// when that family is requested.
     fn build(
         indexes: &[IndexType],
-        copy: impl FnOnce() -> secondary_by_copy::GlobalCopyArrays,
-        reference: impl FnOnce() -> secondary_by_reference::GlobalReferenceArrays,
+        copy: impl FnOnce() -> copy::GlobalCopyArrays,
+        reference: impl FnOnce() -> reference::GlobalReferenceArrays,
     ) -> Self {
         let unique = unique_indexes(indexes);
         Self {
@@ -237,8 +235,8 @@ pub(crate) fn build_components(
 ) -> Result<Vec<IndexComponent>> {
     GlobalIndexes::build(
         indexes,
-        || secondary_by_copy::GlobalCopyArrays::from_quads(quads),
-        || secondary_by_reference::GlobalReferenceArrays::from_quads(quads),
+        || copy::GlobalCopyArrays::from_quads(quads),
+        || reference::GlobalReferenceArrays::from_quads(quads),
     )
     .into_components()
 }
@@ -253,8 +251,8 @@ pub(crate) fn build_components_from_codes(
 ) -> Result<Vec<IndexComponent>> {
     GlobalIndexes::build(
         indexes,
-        || secondary_by_copy::GlobalCopyArrays::from_codes(codes),
-        || secondary_by_reference::GlobalReferenceArrays::from_codes(codes),
+        || copy::GlobalCopyArrays::from_codes(codes),
+        || reference::GlobalReferenceArrays::from_codes(codes),
     )
     .into_components()
 }

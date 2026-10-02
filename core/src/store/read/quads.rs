@@ -6,7 +6,7 @@ use crate::error::Result;
 use crate::error::VortexRdfError;
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 #[cfg(feature = "file-io")]
-use crate::store::scan::file_scan;
+use crate::store::scan::file_reads;
 use crate::store::scan::gather::gather_live;
 #[cfg(feature = "file-io")]
 use crate::store::view::selection::point_sized;
@@ -161,13 +161,13 @@ impl VortexRdfStore {
                         let file = std::sync::Arc::clone(file);
                         let chunk = async move {
                             let projection = serve.projection();
-                            let point = file_scan::component_point_chunk(
+                            let point = file_reads::component_point_chunk(
                                 &file,
                                 serve.component(),
                                 &projection,
                                 range,
                             );
-                            match file_scan::point_rows_or_scan(point, scan).await {
+                            match file_reads::point_rows_or_scan(point, scan).await {
                                 Ok(rows) => {
                                     serve
                                         .decode_columns_async::<T>(&rows, deleted.as_ref())
@@ -220,7 +220,7 @@ impl VortexRdfStore {
                 if exact.is_point_sized()
                     && filter
                         .as_ref()
-                        .is_none_or(|f| file_scan::eq_code_pairs(f).is_some())
+                        .is_none_or(|f| file_reads::eq_code_pairs(f).is_some())
                 {
                     let scan =
                         self.restricted_file_scan(file, filter.as_ref(), exact, deleted.as_ref())?;
@@ -230,14 +230,14 @@ impl VortexRdfStore {
                     let selection = exact.clone();
                     let deleted = deleted.clone();
                     let chunk = async move {
-                        let point = file_scan::file_point_rows(
+                        let point = file_reads::file_point_rows(
                             &file,
                             columns,
                             filter.as_ref(),
                             &selection,
                             deleted.as_ref(),
                         );
-                        match file_scan::point_rows_or_scan(point, scan).await {
+                        match file_reads::point_rows_or_scan(point, scan).await {
                             Ok(rows) => T::decode_async(&layout, &rows).await,
                             Err(e) => vec![Err(e)],
                         }

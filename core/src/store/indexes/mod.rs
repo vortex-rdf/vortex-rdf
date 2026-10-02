@@ -9,7 +9,7 @@
 //!
 //! What belongs in a leaf instead: an index's column-name scheme, its sort
 //! orders, how it builds its children, and how it probes them
-//! (`secondary_by_copy`, `secondary_by_reference`) — the hub hardcodes no
+//! (`copy`, `reference`) — the hub hardcodes no
 //! column name but the one every child shares, the primary row id
 //! ([`COL_RID`]). Two further clusters live beside it: `serve` (reading
 //! matched quads out of an index's own columns) and `components` (the
@@ -28,24 +28,23 @@ use crate::error::{Result, VortexRdfError};
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout};
 
 pub(crate) mod components;
-pub(crate) mod row_ids;
-pub(crate) mod secondary_by_copy;
-pub(crate) mod secondary_by_reference;
+pub(crate) mod copy;
+#[cfg(feature = "file-io")]
+pub(crate) mod file;
+pub(crate) mod reference;
 pub(crate) mod serve;
 
+#[cfg(feature = "file-io")]
+pub(crate) use components::check_component_rows;
 pub(crate) use components::{
     ComponentIdentity, IndexComponent, KnownComponent, adopt_component_reader,
-    indexes_from_components, known_component,
+    indexes_from_components, known_component, sorted_row_ids,
 };
 #[cfg(feature = "file-io")]
-pub(crate) use components::{adopt_scanned_component, check_component_rows};
-pub(crate) use row_ids::sorted_row_ids;
-#[cfg(feature = "file-io")]
-pub(crate) use row_ids::{
-    resolve_eager_from_scan, rid_point_reads, scan_index_row_ids, scan_located_row_ids,
+pub(crate) use file::{
+    FileServePlan, adopt_scanned_component, resolve_eager_from_scan, rid_point_reads,
+    scan_index_row_ids, scan_located_row_ids,
 };
-#[cfg(feature = "file-io")]
-pub(crate) use serve::FileServePlan;
 pub(crate) use serve::InMemoryServePlan;
 
 /// The primary-row-id column every persisted index child carries beside its
@@ -155,8 +154,8 @@ impl IndexType {
     /// variant answers here once and flows into all of them.
     pub(crate) const fn component_identities(self) -> &'static [ComponentIdentity] {
         match self {
-            IndexType::SecondaryByCopy => &secondary_by_copy::IDENTITIES,
-            IndexType::SecondaryByReference => &secondary_by_reference::IDENTITIES,
+            IndexType::SecondaryByCopy => &copy::IDENTITIES,
+            IndexType::SecondaryByReference => &reference::IDENTITIES,
         }
     }
 
@@ -178,10 +177,10 @@ impl IndexType {
     ) -> Result<IndexResolution<InMemoryServePlan>> {
         match self {
             IndexType::SecondaryByCopy => {
-                secondary_by_copy::resolve_in_memory(components, layout, pattern, codes)
+                copy::resolve_in_memory(components, layout, pattern, codes)
             }
             IndexType::SecondaryByReference => {
-                secondary_by_reference::resolve_in_memory(components, pattern, codes)
+                reference::resolve_in_memory(components, pattern, codes)
             }
         }
     }
@@ -200,12 +199,8 @@ impl IndexType {
         codes: &mut PatternCodes,
     ) -> Result<IndexResolution<FileServePlan>> {
         match self {
-            IndexType::SecondaryByCopy => {
-                secondary_by_copy::resolve_file(file, layout, pattern, codes).await
-            }
-            IndexType::SecondaryByReference => {
-                secondary_by_reference::resolve_file(file, pattern, codes).await
-            }
+            IndexType::SecondaryByCopy => copy::resolve_file(file, layout, pattern, codes).await,
+            IndexType::SecondaryByReference => reference::resolve_file(file, pattern, codes).await,
         }
     }
 }

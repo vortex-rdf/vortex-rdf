@@ -34,15 +34,9 @@ use std::sync::Arc;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::dtype::FieldNames;
-#[cfg(feature = "file-io")]
-use vortex_array::expr::{root, select};
-#[cfg(feature = "file-io")]
-use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_buffer::Buffer;
-#[cfg(feature = "file-io")]
-use vortex_layout::scan::split_by::SplitBy;
 use vortex_mask::Mask;
 
 use crate::error::{Result, VortexRdfError};
@@ -56,24 +50,24 @@ use crate::store::view::selection::point_sized;
 /// row id, and the layout the projected columns decode through. Acquisition
 /// differs per backend; everything after it lives here, once.
 #[derive(Clone)]
-struct ServeDecode {
+pub(crate) struct ServeDecode {
     /// The source column for each primary `(s, p, o, g)` component, in that
     /// order — the index's own columns holding the whole quad.
-    primary_columns: [&'static str; 4],
+    pub(super) primary_columns: [&'static str; 4],
     /// The column giving each served row's primary row id, used to drop rows
     /// tombstoned since construction.
-    rid_column: &'static str,
+    pub(super) rid_column: &'static str,
     /// The layout the projected source columns decode through (an index that
     /// stores whole terms decodes them as strings, or dictionary codes under
     /// the Dictionary layout).
-    decode_layout: ResolvedLayout,
+    pub(super) decode_layout: ResolvedLayout,
 }
 
 impl ServeDecode {
     /// Decode the `(s, p, o, g)` rows out of a chunk of the plan's projected
     /// index columns, dropping rows tombstoned in `deleted` via the row-id
     /// column.
-    fn decode_columns<T: ChunkDecode>(
+    pub(super) fn decode_columns<T: ChunkDecode>(
         &self,
         chunk: &ArrayRef,
         deleted: Option<&Mask>,
@@ -88,7 +82,7 @@ impl ServeDecode {
     /// decode — for serving a store whose term dictionary is file-backed,
     /// where each chunk's codes are resolved with a dictionary scan.
     #[cfg(feature = "file-io")]
-    async fn decode_columns_async<T: ChunkDecode>(
+    pub(super) async fn decode_columns_async<T: ChunkDecode>(
         &self,
         chunk: &ArrayRef,
         deleted: Option<&Mask>,
@@ -337,245 +331,5 @@ impl InMemoryServePlan {
             Ok(rows) => self.decode.decode_columns(&rows, deleted),
             Err(e) => vec![Err(VortexRdfError::Vortex(e))],
         }
-    }
-}
-
-/// An index's serving plan for a file-backed view: the matched rows are those
-/// where every `(column, value)` term equality holds — a contiguous run of
-/// the index child, which its sort order clusters — read by a scan of that
-/// run when the resolution located it, else by a scan pushing the equalities
-/// down as a zone-prunable filter, instead of scattering row-id reads across
-/// the primary columns.
-///
-/// The file-backed half of the serving path (see the module docs;
-/// [`InMemoryServePlan`] is the in-memory half). `QuadsSource::File` carries
-/// exactly this type, so a file view can never hold an in-memory plan.
-#[cfg(feature = "file-io")]
-#[derive(Clone)]
-pub(crate) struct FileServePlan {
-    decode: ServeDecode,
-    /// The index component child's cached layout reader.
-    reader: vortex_layout::LayoutReaderRef,
-    constraints: Vec<(&'static str, Scalar)>,
-    /// The file handle's bind memo — the plan binds its projection and
-    /// filter through it on FIRST READ, not at construction: a match-only
-    /// call builds the plan without ever scanning through it, and must not
-    /// pay for binds a count-only consumer will never use. The memo keys
-    /// the bound trees by shape, so every plan for a repeated pattern
-    /// carries the same identity and hits the child reader's
-    /// identity-keyed caches (see `BoundExprMemo`).
-    memo: Arc<crate::store::persist::native_file::BoundExprMemo>,
-    /// The lazily bound (projection, filter) pair, shared across clones so
-    /// the first reader's bind serves them all.
-    bound: Arc<
-        std::sync::OnceLock<(
-            vortex_array::expr::BoundExpression,
-            vortex_array::expr::BoundExpression,
-        )>,
-    >,
-    /// The serving component's name, addressing its cached chunk probes on
-    /// the file handle for point-read serving.
-    component: &'static str,
-    /// The child rows the constraints select, when the resolution located
-    /// them by chunk probes — exactly the constrained rows, letting a small
-    /// run be point-read and a wide one scanned by range
-    /// ([`Self::located_run_scan`]) instead of filtered. `None` when
-    /// unlocated (or when a constraint the location didn't cover would make
-    /// the range over-approximate).
-    row_range: Option<Range<u64>>,
-}
-
-/// The fewest rows a located run's scan split carries: below this the
-/// per-split overhead (a spawned task, its segment requests, one decode
-/// call) outweighs what spreading the decode buys.
-#[cfg(feature = "file-io")]
-const SERVE_SPLIT_MIN_ROWS: u64 = 1024;
-
-/// Rows per split for a located run of `rows`: enough splits to hand every
-/// worker a couple, never fewer than [`SERVE_SPLIT_MIN_ROWS`] rows each.
-#[cfg(feature = "file-io")]
-fn run_split_rows(rows: u64) -> usize {
-    let workers = crate::io::read::available_parallelism() as u64;
-    rows.div_ceil(2 * workers).max(SERVE_SPLIT_MIN_ROWS) as usize
-}
-
-#[cfg(feature = "file-io")]
-impl FileServePlan {
-    /// A plan serving a file's index columns by a pushed-down scan filtered to
-    /// the rows where every `constraints` equality holds — or, over a located
-    /// `row_range`, by point reads (a small run) or a range-restricted scan
-    /// split across the workers (a wide one) — see
-    /// [`Self::located_run_scan`].
-    // The parameters are the plan itself: the column roles, the reader, the
-    // constraints, and the bind memo.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        primary_columns: [&'static str; 4],
-        rid_column: &'static str,
-        decode_layout: ResolvedLayout,
-        reader: vortex_layout::LayoutReaderRef,
-        constraints: Vec<(&'static str, Scalar)>,
-        component: &'static str,
-        row_range: Option<Range<u64>>,
-        memo: Arc<crate::store::persist::native_file::BoundExprMemo>,
-    ) -> Self {
-        Self {
-            decode: ServeDecode {
-                primary_columns,
-                rid_column,
-                decode_layout,
-            },
-            reader,
-            constraints,
-            memo,
-            bound: Arc::new(std::sync::OnceLock::new()),
-            component,
-            row_range,
-        }
-    }
-
-    /// The plan's (projection, filter), bound through the handle's memo on
-    /// first use and shared across clones thereafter.
-    fn bound_exprs(
-        &self,
-    ) -> Result<(
-        vortex_array::expr::BoundExpression,
-        vortex_array::expr::BoundExpression,
-    )> {
-        if let Some(bound) = self.bound.get() {
-            return Ok(bound.clone());
-        }
-        let projection = select(self.projection(), root());
-        // A serve plan always carries at least one constraint (the resolved
-        // lead component), so the conjunction is never empty.
-        let filter = super::row_ids::eq_conjunction(self.constraints.iter().cloned())
-            .expect("a serve plan constrains at least one column");
-        let scope = self.reader.dtype();
-        let bound_projection = self
-            .memo
-            .bind(self.component, &projection, scope)
-            .map_err(VortexRdfError::Vortex)?;
-        let bound_filter = self
-            .memo
-            .bind(self.component, &filter, scope)
-            .map_err(VortexRdfError::Vortex)?;
-        Ok(self
-            .bound
-            .get_or_init(|| (bound_projection, bound_filter))
-            .clone())
-    }
-
-    /// The serving component's name on the file handle.
-    pub(crate) fn component(&self) -> &'static str {
-        self.component
-    }
-
-    /// The located child-row range the constraints select, when known.
-    pub(crate) fn row_range(&self) -> Option<Range<u64>> {
-        self.row_range.clone()
-    }
-
-    /// The columns to project from the file to serve these rows: the four
-    /// component sources plus the row-id column (for tombstones).
-    pub(crate) fn projection(&self) -> [&'static str; 5] {
-        let [s, p, o, g] = self.decode.primary_columns;
-        [s, p, o, g, self.decode.rid_column]
-    }
-
-    /// A scan over the serving index child — where [`Self::projection`] and
-    /// the plan's bound filter apply.
-    fn child_scan(&self) -> vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef> {
-        vortex_layout::scan::scan_builder::ScanBuilder::new(
-            VORTEX_SESSION.clone(),
-            self.reader.clone(),
-        )
-    }
-
-    /// [`Self::child_scan`] with the plan's projection and filter — bound on
-    /// first use — applied. The form the streaming reads consume for an
-    /// unlocated run.
-    pub(crate) fn projected_filtered_scan(
-        &self,
-    ) -> Result<vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>> {
-        let (projection, filter) = self.bound_exprs()?;
-        Ok(self
-            .child_scan()
-            .with_projection(projection)
-            .with_filter(filter))
-    }
-
-    /// A scan of the located run: [`Self::child_scan`] with the plan's
-    /// projection, restricted to `row_range` and split by row count. `None`
-    /// when the run is unlocated — [`Self::projected_filtered_scan`] answers
-    /// then. The form the streaming reads consume for a wide located run.
-    ///
-    /// The scan spawns one task per split and the consumer decodes each
-    /// chunk inside its task, so the split count is the decode's
-    /// parallelism. The child's natural splits are its leaf chunks, which
-    /// cluster a run into one split however wide it is; splitting the range
-    /// by row count spreads the run's decode over the workers instead
-    /// (`run_split_rows`). No filter rides along: the located range is
-    /// exactly the constrained rows (the same fact `size` and the point
-    /// reads rely on), so the term equalities would only re-read and
-    /// re-compare the columns that bounded it.
-    pub(crate) fn located_run_scan(
-        &self,
-    ) -> Result<Option<vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>>> {
-        let Some(range) = self.row_range.clone() else {
-            return Ok(None);
-        };
-        let (projection, _) = self.bound_exprs()?;
-        let split_rows = run_split_rows(range.end - range.start);
-        Ok(Some(
-            self.child_scan()
-                .with_projection(projection)
-                .with_row_range(range)
-                .with_split_by(SplitBy::RowCount(split_rows)),
-        ))
-    }
-
-    /// Decode the `(s, p, o, g)` rows out of a chunk of this plan's projected
-    /// index columns, dropping rows tombstoned in `deleted` via the row-id
-    /// column.
-    pub(crate) fn decode_columns<T: ChunkDecode>(
-        &self,
-        chunk: &ArrayRef,
-        deleted: Option<&Mask>,
-    ) -> Vec<Result<T>> {
-        self.decode.decode_columns(chunk, deleted)
-    }
-
-    /// [`decode_columns`](Self::decode_columns) through the layout's async
-    /// decode — for serving a store whose term dictionary is file-backed,
-    /// where each chunk's codes are resolved with a dictionary scan.
-    pub(crate) async fn decode_columns_async<T: ChunkDecode>(
-        &self,
-        chunk: &ArrayRef,
-        deleted: Option<&Mask>,
-    ) -> Vec<Result<T>> {
-        self.decode.decode_columns_async(chunk, deleted).await
-    }
-}
-
-#[cfg(all(test, feature = "file-io"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn run_split_rows_floor_and_arithmetic() {
-        // Small runs never split below the per-split floor.
-        assert_eq!(run_split_rows(100), SERVE_SPLIT_MIN_ROWS as usize);
-        assert_eq!(run_split_rows(0), SERVE_SPLIT_MIN_ROWS as usize);
-
-        // A wide run hands every worker a couple of splits.
-        let rows = 1u64 << 20;
-        let workers = crate::io::read::available_parallelism() as u64;
-        let split = run_split_rows(rows);
-        assert_eq!(
-            split,
-            rows.div_ceil(2 * workers).max(SERVE_SPLIT_MIN_ROWS) as usize
-        );
-        assert!(split as u64 >= SERVE_SPLIT_MIN_ROWS);
-        assert!((rows as usize).div_ceil(split) as u64 <= 2 * workers + 1);
     }
 }

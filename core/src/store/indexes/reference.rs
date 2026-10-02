@@ -314,7 +314,7 @@ async fn locate<'a>(
         return Ok(Located::Absent);
     };
     let range =
-        super::row_ids::locate_component_run(file, name, COL_VAL, &native, None, descriptor.sorted)
+        super::file::locate_component_run(file, name, COL_VAL, &native, None, descriptor.sorted)
             .await?;
     Ok(Located::Run {
         probe,

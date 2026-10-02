@@ -254,7 +254,7 @@ impl VortexRdfStore {
                 // The pushed-down equalities bound their columns exactly.
                 if is_dictionary
                     && let Some(f) = filter
-                    && let Some(pairs) = crate::store::scan::file_scan::eq_code_pairs(f)
+                    && let Some(pairs) = crate::store::scan::file_reads::eq_code_pairs(f)
                 {
                     for (column, code) in pairs {
                         if let (Some(column), Ok(code)) =
