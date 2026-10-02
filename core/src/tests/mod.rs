@@ -12,6 +12,8 @@ use std::sync::OnceLock;
 
 mod adoption;
 mod builders;
+mod chunks;
+mod data_source;
 mod dictionary;
 #[cfg(feature = "file-io")]
 mod dictionary_file_backed;

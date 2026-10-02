@@ -207,20 +207,12 @@ impl VortexRdfStore {
     /// the bindings' entry point — otherwise runs; that method tries this fast
     /// path first.
     pub(crate) fn code_columns(&self) -> Option<[Buffer<u32>; 4]> {
-        use vortex_array::arrays::Struct;
         if self.layout.strategy() != LayoutStrategy::Dictionary || self.tail_len() != 0 {
             return None;
         }
         // Without `file-io`, InMemory is the only variant.
         #[allow(irrefutable_let_patterns)]
-        let QuadsSource::InMemory {
-            base,
-            selection,
-            deleted,
-            serve,
-            ..
-        } = &self.quads
-        else {
+        let QuadsSource::InMemory { deleted, serve, .. } = &self.quads else {
             return None;
         };
         // Served fast path: the answering index's own columns already hold
@@ -232,6 +224,31 @@ impl VortexRdfStore {
         {
             return Some(columns);
         }
+        self.base_code_columns()
+    }
+
+    /// [`code_columns`](Self::code_columns) without the served fast path:
+    /// the view's codes gathered from the base's own columns in *base row
+    /// order*, whatever answered the match — the order the chunked exports
+    /// ([`code_chunks`](Self::code_chunks)) promise. A served match's pending
+    /// selection materializes here. `None` under the same conditions as
+    /// `code_columns`, or when a base column is not a `u32` primitive the
+    /// shared cache can hand out.
+    pub(crate) fn base_code_columns(&self) -> Option<[Buffer<u32>; 4]> {
+        use vortex_array::arrays::Struct;
+        if self.layout.strategy() != LayoutStrategy::Dictionary || self.tail_len() != 0 {
+            return None;
+        }
+        #[allow(irrefutable_let_patterns)]
+        let QuadsSource::InMemory {
+            base,
+            selection,
+            deleted,
+            ..
+        } = &self.quads
+        else {
+            return None;
+        };
         let struct_arr = base.clone().try_downcast::<Struct>().ok()?;
         let mut prims: Vec<PrimitiveArray> = Vec::with_capacity(4);
         for name in schema::PRIMARY_COLUMNS {
@@ -412,6 +429,22 @@ impl VortexRdfStore {
         deleted: Option<&Mask>,
     ) -> Result<ScanBuilder<ArrayRef>> {
         let proj = self.layout.strategy().primary_column_names();
+        Self::restricted_file_scan_projected(file, proj, filter, selection, deleted)
+    }
+
+    /// [`restricted_file_scan`](Self::restricted_file_scan) projecting only
+    /// `columns` (primary column names, in the order the chunks should carry
+    /// them) — what a column export reads so the scan decodes nothing it will
+    /// not hand out.
+    #[cfg(feature = "file-io")]
+    pub(super) fn restricted_file_scan_projected(
+        file: &crate::store::native_file::NativeStoreFile,
+        columns: &[&str],
+        filter: Option<&Expression>,
+        selection: &RowSelection,
+        deleted: Option<&Mask>,
+    ) -> Result<ScanBuilder<ArrayRef>> {
+        let proj = columns;
         let mut scan = file.scan().map_err(VortexRdfError::Vortex)?;
         // The scan's scope (the quad-source root dtype) is what filters and
         // projections bind against — read it before the projection replaces
@@ -420,8 +453,12 @@ impl VortexRdfStore {
         let scope = scan.dtype().map_err(VortexRdfError::Vortex)?;
         let memo = file.bound_exprs();
         scan = scan.with_projection(
-            memo.bind(file_scan::QUAD_SCOPE, &select(proj, root()), &scope)
-                .map_err(VortexRdfError::Vortex)?,
+            memo.bind(
+                file_scan::QUAD_SCOPE,
+                &select(proj.to_vec(), root()),
+                &scope,
+            )
+            .map_err(VortexRdfError::Vortex)?,
         );
         if let Some(f) = filter {
             scan = scan.with_filter(

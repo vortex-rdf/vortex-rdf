@@ -387,7 +387,7 @@ impl VortexRdfStore {
 
     /// Err unless this view's rows are code-addressable: the Dictionary
     /// layout with an empty append tail.
-    fn ensure_code_view(&self, operation: &str) -> Result<()> {
+    pub(super) fn ensure_code_view(&self, operation: &str) -> Result<()> {
         if self.layout.strategy() != LayoutStrategy::Dictionary {
             return Err(VortexRdfError::InvalidOperation(format!(
                 "{operation} needs the Dictionary layout: this store's {:?} layout stores terms \

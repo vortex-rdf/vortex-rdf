@@ -15,7 +15,9 @@ pub(crate) mod source;
 
 // [`VortexRdfStore`]'s impl clusters — the struct itself is defined below.
 mod batch;
+mod chunks;
 mod compaction;
+mod data_source;
 mod export;
 mod matching;
 mod mutation;
@@ -36,6 +38,8 @@ pub use export::export_rdf;
 pub use batch::Probe;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use builders::SortedStreamBuilder;
+pub use chunks::{CodeChunkStream, RowChunkStream};
+pub use data_source::{DATA_SOURCE_BATCH_ROWS, VortexRdfDataSource};
 pub use indexes::{IndexType, Indexes};
 pub use layouts::LayoutStrategy;
 pub use layouts::dictionary::DictionaryQuadSink;
