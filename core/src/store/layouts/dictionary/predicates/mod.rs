@@ -55,6 +55,24 @@ pub struct KindRanges {
 }
 
 impl KindRanges {
+    /// The ranges of a dictionary of `len` terms whose first term is `""`
+    /// when `first_is_empty`.
+    pub(crate) fn new(
+        first_is_empty: bool,
+        literals: Range<u32>,
+        iris: Range<u32>,
+        blanks: Range<u32>,
+        len: u32,
+    ) -> Self {
+        Self {
+            default_graph: first_is_empty.then_some(0),
+            literals,
+            iris,
+            blanks,
+            len,
+        }
+    }
+
     /// The codes in none of the three kind ranges, ascending — a foreign
     /// writer's spellings, and the default graph's `""`.
     pub fn gaps(&self) -> impl Iterator<Item = u32> + '_ {
@@ -65,15 +83,65 @@ impl KindRanges {
     }
 }
 
-/// What a dictionary has to do to partition its codes by a predicate's
-/// verdicts: the code range to scan term by term (`None` when the predicate
-/// is answered by ranges alone), and the spelling prefixes whose
-/// [`prefix_range`] is a run of `True` codes without any scan.
-///
-/// [`prefix_range`]: super::term_dict::TermDictionary::prefix_range
-pub(crate) struct ScanPlan {
-    pub(crate) scan: Option<Range<u32>>,
-    pub(crate) true_prefixes: Vec<String>,
+/// How a predicate partitions a dictionary's codes into `(true, unknown)`.
+pub(crate) enum Partition<'a> {
+    /// True on one kind's range, unknown on the gaps; nothing is scanned.
+    Kind(fn(&KindRanges) -> &Range<u32>),
+    /// True and unknown as the scan of the literals says; every other code
+    /// is outside the domain.
+    Literals,
+    /// `str_prefix`: the scan of the literals, plus every IRI and blank node
+    /// spelled with the prefix; the gaps are unknown.
+    Str(&'a str),
+}
+
+impl Partition<'_> {
+    /// The code range to scan term by term, `None` when the kind ranges
+    /// answer alone.
+    pub(crate) fn scan(&self, kinds: &KindRanges) -> Option<Range<u32>> {
+        match self {
+            Partition::Kind(_) => None,
+            Partition::Literals | Partition::Str(_) => Some(kinds.literals.clone()),
+        }
+    }
+
+    /// The spelling prefixes whose `prefix_range` is a run of true codes.
+    pub(crate) fn true_prefixes(&self) -> Vec<String> {
+        match self {
+            Partition::Str(prefix) => vec![format!("<{prefix}"), format!("_:{prefix}")],
+            Partition::Kind(_) | Partition::Literals => Vec::new(),
+        }
+    }
+
+    /// The `(true, unknown)` partition, both ascending: `scanned` holds the
+    /// verdicts of the scanned range and `true_ranges` the code ranges of
+    /// [`true_prefixes`](Self::true_prefixes), in that order.
+    pub(crate) fn assemble(
+        &self,
+        kinds: &KindRanges,
+        scanned: Scanned,
+        true_ranges: Vec<Range<u32>>,
+    ) -> (Buffer<u32>, Buffer<u32>) {
+        match self {
+            Partition::Kind(range) => (
+                Buffer::from_iter(range(kinds).clone()),
+                Buffer::from_iter(kinds.gaps()),
+            ),
+            Partition::Literals => (Buffer::from(scanned.truth), Buffer::from(scanned.unknown)),
+            Partition::Str(_) => {
+                // Literals < IRIs < blank nodes, so appending the prefix
+                // ranges in kind order keeps the list ascending.
+                let mut truth = scanned.truth;
+                for range in true_ranges {
+                    truth.extend(range);
+                }
+                let mut unknown: Vec<u32> = (0..kinds.literals.start).collect();
+                unknown.extend(scanned.unknown);
+                unknown.extend(kinds.gaps().filter(|&code| code >= kinds.literals.end));
+                (Buffer::from(truth), Buffer::from(unknown))
+            }
+        }
+    }
 }
 
 /// The verdicts a scan collected, code by code.
@@ -84,13 +152,14 @@ pub(crate) struct Scanned {
 }
 
 impl Scanned {
-    /// Record `predicate`'s verdict for the term `spelling` with code `code`.
+    /// Record `predicate`'s verdict for the term with code `code`; a
+    /// spelling that is not UTF-8 is unknown.
     #[inline]
-    pub(crate) fn visit(&mut self, predicate: &TermPredicate, code: u32, spelling: &str) {
-        match predicate.eval(spelling) {
-            Verdict::True => self.truth.push(code),
-            Verdict::Unknown => self.unknown.push(code),
-            Verdict::False => {}
+    pub(crate) fn visit(&mut self, predicate: &TermPredicate, code: u32, spelling: Result<&str>) {
+        match spelling.map(|spelling| predicate.eval(spelling)) {
+            Ok(Verdict::True) => self.truth.push(code),
+            Ok(Verdict::Unknown) | Err(_) => self.unknown.push(code),
+            Ok(Verdict::False) => {}
         }
     }
 }
@@ -118,29 +187,35 @@ pub enum NumOp {
     Ne,
 }
 
+/// The `num_*` predicate kinds and their operators.
+const NUM_OPS: [(&str, NumOp); 6] = [
+    ("num_lt", NumOp::Lt),
+    ("num_le", NumOp::Le),
+    ("num_gt", NumOp::Gt),
+    ("num_ge", NumOp::Ge),
+    ("num_eq", NumOp::Eq),
+    ("num_ne", NumOp::Ne),
+];
+
 impl NumOp {
     pub(super) fn kind(self) -> &'static str {
-        match self {
-            NumOp::Lt => "num_lt",
-            NumOp::Le => "num_le",
-            NumOp::Gt => "num_gt",
-            NumOp::Ge => "num_ge",
-            NumOp::Eq => "num_eq",
-            NumOp::Ne => "num_ne",
-        }
+        NUM_OPS
+            .iter()
+            .find(|(_, op)| *op == self)
+            .map(|(kind, _)| *kind)
+            .expect("NUM_OPS lists every operator")
     }
 
     /// The verdict for an ordering `ord` of the term against the constant.
     pub(super) fn apply(self, ord: Ordering) -> Verdict {
-        let holds = match self {
+        Verdict::from(match self {
             NumOp::Lt => ord == Ordering::Less,
             NumOp::Le => ord != Ordering::Greater,
             NumOp::Gt => ord == Ordering::Greater,
             NumOp::Ge => ord != Ordering::Less,
             NumOp::Eq => ord == Ordering::Equal,
             NumOp::Ne => ord != Ordering::Equal,
-        };
-        if holds { Verdict::True } else { Verdict::False }
+        })
     }
 
     pub(super) fn is_equality(self) -> bool {
@@ -187,6 +262,16 @@ pub enum TermPredicate {
     StrPrefix(String),
 }
 
+/// `f` on the literal `spelling` parses to; `False` for a non-literal (a
+/// type error), `Unknown` for a literal that does not parse.
+fn on_literal(kind: Kind, spelling: &str, f: impl FnOnce(&LiteralView<'_>) -> Verdict) -> Verdict {
+    match LiteralView::parse(spelling) {
+        Some(lit) => f(&lit),
+        None if kind != Kind::Literal => Verdict::False,
+        None => Verdict::Unknown,
+    }
+}
+
 impl TermPredicate {
     /// Parse a `(kind, arg)` pair.
     ///
@@ -219,29 +304,21 @@ impl TermPredicate {
                 }
                 TermPredicate::LangMatches(arg.to_owned())
             }
-            "num_lt" | "num_le" | "num_gt" | "num_ge" | "num_eq" | "num_ne" => {
-                let op = match kind {
-                    "num_lt" => NumOp::Lt,
-                    "num_le" => NumOp::Le,
-                    "num_gt" => NumOp::Gt,
-                    "num_ge" => NumOp::Ge,
-                    "num_eq" => NumOp::Eq,
-                    _ => NumOp::Ne,
+            "str_prefix" => TermPredicate::StrPrefix(arg.to_owned()),
+            other => {
+                let Some(&(_, op)) = NUM_OPS.iter().find(|(name, _)| *name == other) else {
+                    return Err(invalid(format!(
+                        "unknown term predicate kind {other:?}; expected one of is_literal, \
+                         is_iri, is_blank, datatype, lang, lang_matches, num_lt, num_le, num_gt, \
+                         num_ge, num_eq, num_ne, str_prefix"
+                    )));
                 };
                 let number = Number::parse(arg).ok_or_else(|| {
                     invalid(format!(
-                        "{kind} predicate needs a numeric constant, got {arg:?}"
+                        "{other} predicate needs a numeric constant, got {arg:?}"
                     ))
                 })?;
                 TermPredicate::Num(op, number)
-            }
-            "str_prefix" => TermPredicate::StrPrefix(arg.to_owned()),
-            other => {
-                return Err(invalid(format!(
-                    "unknown term predicate kind {other:?}; expected one of is_literal, is_iri, \
-                     is_blank, datatype, lang, lang_matches, num_lt, num_le, num_gt, num_ge, \
-                     num_eq, num_ne, str_prefix"
-                )));
             }
         };
         Ok(predicate)
@@ -250,50 +327,35 @@ impl TermPredicate {
     /// The code range a dictionary scan must cover for this predicate's
     /// definite answers.
     pub fn domain(&self) -> Domain {
-        match self {
-            TermPredicate::IsLiteral
-            | TermPredicate::IsIri
-            | TermPredicate::IsBlank
-            | TermPredicate::StrPrefix(_) => Domain::All,
-            TermPredicate::Datatype(_)
-            | TermPredicate::Lang(_)
-            | TermPredicate::LangMatches(_)
-            | TermPredicate::Num(..) => Domain::Literals,
+        match self.partition() {
+            Partition::Literals => Domain::Literals,
+            Partition::Kind(_) | Partition::Str(_) => Domain::All,
         }
     }
 
     /// Evaluate the predicate on one N-Triples spelling.
     pub fn eval(&self, spelling: &str) -> Verdict {
         let kind = kind_of(spelling);
-        match kind {
+        if matches!(kind, Kind::DefaultGraph | Kind::Other) {
             // The default graph's name is not a term the predicates speak of.
-            Kind::DefaultGraph | Kind::Other => return Verdict::Unknown,
-            Kind::Literal | Kind::Iri | Kind::Blank => {}
+            return Verdict::Unknown;
         }
         match self {
             TermPredicate::IsLiteral => Verdict::from(kind == Kind::Literal),
             TermPredicate::IsIri => Verdict::from(kind == Kind::Iri),
             TermPredicate::IsBlank => Verdict::from(kind == Kind::Blank),
-            TermPredicate::Datatype(dt) => match LiteralView::parse(spelling) {
-                Some(lit) => Verdict::from(lit.effective_datatype() == dt),
-                // `datatype()` of a non-literal is a type error.
-                None if kind != Kind::Literal => Verdict::False,
-                None => Verdict::Unknown,
-            },
-            TermPredicate::Lang(tag) => match LiteralView::parse(spelling) {
-                Some(lit) => Verdict::from(lit.lang.unwrap_or("") == tag),
-                None if kind != Kind::Literal => Verdict::False,
-                None => Verdict::Unknown,
-            },
-            TermPredicate::LangMatches(range) => match LiteralView::parse(spelling) {
-                Some(lit) => match lit.lang {
-                    Some(tag) => Verdict::from(lang_matches(tag, range)),
-                    // `langMatches("", range)` is false for every range.
-                    None => Verdict::False,
-                },
-                None if kind != Kind::Literal => Verdict::False,
-                None => Verdict::Unknown,
-            },
+            // `datatype()` and `lang()` of a non-literal are type errors.
+            TermPredicate::Datatype(dt) => on_literal(kind, spelling, |lit| {
+                Verdict::from(lit.effective_datatype() == dt)
+            }),
+            TermPredicate::Lang(tag) => on_literal(kind, spelling, |lit| {
+                Verdict::from(lit.lang.unwrap_or("") == tag)
+            }),
+            TermPredicate::LangMatches(range) => on_literal(kind, spelling, |lit| match lit.lang {
+                Some(tag) => Verdict::from(lang_matches(tag, range)),
+                // `langMatches("", range)` is false for every range.
+                None => Verdict::False,
+            }),
             TermPredicate::Num(op, number) => {
                 if kind != Kind::Literal {
                     // Comparing a non-literal is a type error; `=` and `!=`
@@ -303,10 +365,7 @@ impl TermPredicate {
                         _ => Verdict::False,
                     };
                 }
-                let Some(lit) = LiteralView::parse(spelling) else {
-                    return Verdict::Unknown;
-                };
-                number.compare(op, &lit)
+                on_literal(kind, spelling, |lit| number.compare(*op, lit))
             }
             TermPredicate::StrPrefix(prefix) => match kind {
                 Kind::Iri => Verdict::from(spelling[1..spelling.len() - 1].starts_with(prefix)),
@@ -320,77 +379,23 @@ impl TermPredicate {
                     }
                     // `str()` of another typed literal is its lexical form
                     // only after the engine's own canonicalization.
-                    Some(_) => Verdict::Unknown,
-                    None => Verdict::Unknown,
+                    Some(_) | None => Verdict::Unknown,
                 },
             },
         }
     }
 
-    /// How a dictionary with `kinds` partitions its codes by this
-    /// predicate: see [`ScanPlan`].
-    pub(crate) fn scan_plan(&self, kinds: &KindRanges) -> ScanPlan {
+    /// How a dictionary partitions its codes by this predicate.
+    pub(crate) fn partition(&self) -> Partition<'_> {
         match self {
-            TermPredicate::IsLiteral | TermPredicate::IsIri | TermPredicate::IsBlank => ScanPlan {
-                scan: None,
-                true_prefixes: Vec::new(),
-            },
-            // Literals are scanned; an IRI or blank node answers `str()`
-            // with its own spelling, so its prefix test is a code range.
-            TermPredicate::StrPrefix(prefix) => ScanPlan {
-                scan: Some(kinds.literals.clone()),
-                true_prefixes: vec![format!("<{prefix}"), format!("_:{prefix}")],
-            },
+            TermPredicate::IsLiteral => Partition::Kind(|kinds| &kinds.literals),
+            TermPredicate::IsIri => Partition::Kind(|kinds| &kinds.iris),
+            TermPredicate::IsBlank => Partition::Kind(|kinds| &kinds.blanks),
+            TermPredicate::StrPrefix(prefix) => Partition::Str(prefix),
             TermPredicate::Datatype(_)
             | TermPredicate::Lang(_)
             | TermPredicate::LangMatches(_)
-            | TermPredicate::Num(..) => ScanPlan {
-                scan: Some(kinds.literals.clone()),
-                true_prefixes: Vec::new(),
-            },
-        }
-    }
-
-    /// Assemble the `(true_codes, unknown_codes)` partition from what the
-    /// [`ScanPlan`] produced: `scanned` holds the verdicts of the scanned
-    /// range and `true_ranges` the code ranges of the plan's `true_prefixes`,
-    /// in the plan's order. Both outputs are ascending.
-    ///
-    /// Codes outside the predicate's [`domain`](Self::domain) appear in
-    /// neither list; codes inside it that belong to no kind (the default
-    /// graph's `""`, a foreign writer's spelling) are unknown.
-    pub(crate) fn assemble(
-        &self,
-        kinds: &KindRanges,
-        scanned: Scanned,
-        true_ranges: &[Range<u32>],
-    ) -> (Buffer<u32>, Buffer<u32>) {
-        let range = |r: &Range<u32>| Buffer::from_iter(r.clone());
-        let gaps = || Buffer::from_iter(kinds.gaps());
-        match self {
-            TermPredicate::IsLiteral => (range(&kinds.literals), gaps()),
-            TermPredicate::IsIri => (range(&kinds.iris), gaps()),
-            TermPredicate::IsBlank => (range(&kinds.blanks), gaps()),
-            TermPredicate::StrPrefix(_) => {
-                // Literals < IRIs < blank nodes, so appending the prefix
-                // ranges in kind order keeps the list ascending.
-                let mut truth = scanned.truth;
-                for r in true_ranges {
-                    truth.extend(r.clone());
-                }
-                let mut unknown: Vec<u32> = (0..kinds.literals.start).collect();
-                unknown.extend(scanned.unknown);
-                unknown.extend(kinds.literals.end..kinds.iris.start);
-                unknown.extend(kinds.iris.end..kinds.blanks.start);
-                unknown.extend(kinds.blanks.end..kinds.len);
-                (Buffer::from(truth), Buffer::from(unknown))
-            }
-            TermPredicate::Datatype(_)
-            | TermPredicate::Lang(_)
-            | TermPredicate::LangMatches(_)
-            | TermPredicate::Num(..) => {
-                (Buffer::from(scanned.truth), Buffer::from(scanned.unknown))
-            }
+            | TermPredicate::Num(..) => Partition::Literals,
         }
     }
 

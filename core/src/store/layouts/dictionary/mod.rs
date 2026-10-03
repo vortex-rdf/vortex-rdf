@@ -18,7 +18,7 @@ pub(crate) mod storage;
 pub(crate) mod term_dict;
 
 pub(crate) use self::codec::{
-    COLUMNS, QuadCodes, build_chunk, build_code_chunk, code_of, decode_chunk, decode_chunk_shared,
+    QuadCodes, build_chunk, build_code_chunk, code_of, decode_chunk, decode_chunk_shared,
     decode_code_column, empty_struct, encode_quads,
 };
 #[cfg(feature = "file-io")]
@@ -30,6 +30,7 @@ pub(crate) use self::file_backed::FileBackedDict;
 pub(crate) use self::handles::DictAccess;
 pub use self::handles::{DictReader, DictSnapshot};
 pub use self::ingest::DictionaryQuadSink;
+pub(crate) use self::ingest::{code_map, sorted_unique_terms};
 // Read only by the out-of-core builder, which is compiled out on
 // wasm32-unknown-unknown.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

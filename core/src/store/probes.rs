@@ -34,7 +34,7 @@ impl StructProbes {
     /// children on first use. `None` for a child whose encoding declines, a
     /// non-struct base, or a base other than the one first resolved.
     pub(crate) fn child(&self, base: &ArrayRef, idx: usize) -> Option<&Arc<OwnedSortedProbe>> {
-        Some(&self.cells(base)?.get(idx)?.1).and_then(Option::as_ref)
+        self.cells(base)?.get(idx)?.1.as_ref()
     }
 
     /// Resolve `base`'s children now; later lookups against the same base

@@ -3,9 +3,10 @@
 //! either together with the coded quads (the interning ingest) or beside the
 //! owned term → code map the streaming builders encode through.
 
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures::{Stream, StreamExt};
 use vortex_array::arrays::VarBinViewArray;
@@ -31,55 +32,59 @@ pub(crate) type TermCodeMap = HashMap<String, u32>;
 /// allocation-free counterpart of `TermCodeMap`.
 pub(crate) type BorrowedTermCodeMap<'a> = HashMap<&'a str, u32>;
 
-impl TermDictionary {
-    /// The dataset's unique terms, sorted — the raw material of
-    /// [`from_quads_with_map`](Self::from_quads_with_map). Terms borrow from
-    /// `quads`, so nothing is copied.
-    fn sorted_unique_terms(quads: &[RawQuad]) -> (Vec<&str>, Duration, Duration) {
-        let collect_start = debug::timer();
-        let mut set: HashSet<&str> = HashSet::new();
-        for q in quads {
-            set.insert(&q.s);
-            set.insert(&q.p);
-            set.insert(&q.o);
-            set.insert(&q.g);
-        }
-        let collect_elapsed = debug::elapsed(collect_start);
-        let sort_start = debug::timer();
-        let mut terms: Vec<&str> = set.into_iter().collect();
-        terms.sort_unstable();
-        (terms, collect_elapsed, debug::elapsed(sort_start))
+/// The unique terms of `quads`, sorted; each borrows from its quad.
+pub(crate) fn sorted_unique_terms(quads: &[RawQuad]) -> Vec<&str> {
+    let mut set: HashSet<&str> = HashSet::new();
+    for q in quads {
+        set.insert(&q.s);
+        set.insert(&q.p);
+        set.insert(&q.o);
+        set.insert(&q.g);
     }
+    let mut terms: Vec<&str> = set.into_iter().collect();
+    terms.sort_unstable();
+    terms
+}
 
+/// The term → code map of `sorted` unique terms: a term's code is its
+/// index. The map's keys are the terms moved in.
+pub(crate) fn code_map<K>(sorted: Vec<K>) -> HashMap<K, u32>
+where
+    K: Borrow<str> + Eq + Hash,
+{
+    sorted
+        .into_iter()
+        .enumerate()
+        .map(|(code, term)| (term, code as u32))
+        .collect()
+}
+
+/// Freeze `sorted` unique terms into the columnar dictionary, beside their
+/// [`code_map`].
+fn freeze<K>(sorted: Vec<K>) -> Result<(TermDictionary, HashMap<K, u32>)>
+where
+    K: Borrow<str> + Eq + Hash,
+{
+    let dict =
+        TermDictionary::from_sorted(sorted.iter().map(|term| <K as Borrow<str>>::borrow(term)))?;
+    Ok((dict, code_map(sorted)))
+}
+
+impl TermDictionary {
     /// Build the dictionary and its term → code map in one pass; the map
     /// borrows its keys from `quads`, so it holds one pointer pair per term
     /// and no string data. The streaming builders, whose quads cannot be
     /// borrowed from, use [`TermDictionaryBuilder::finish`] instead.
-    ///
-    /// [`TermDictionaryBuilder::finish`]: super::ingest::TermDictionaryBuilder::finish
     pub(crate) fn from_quads_with_map(
         quads: &[RawQuad],
     ) -> Result<(Self, BorrowedTermCodeMap<'_>)> {
-        let total_start = debug::timer();
-        let (terms, collect_elapsed, sort_elapsed) = Self::sorted_unique_terms(quads);
-        let map_start = debug::timer();
-        let code_map: BorrowedTermCodeMap<'_> = terms
-            .iter()
-            .enumerate()
-            .map(|(code, term)| (*term, code as u32))
-            .collect();
-        let map_elapsed = debug::elapsed(map_start);
-        let freeze_start = debug::timer();
-        let dict = Self::from_sorted(terms.into_iter())?;
+        let start = debug::timer();
+        let (dict, code_map) = freeze(sorted_unique_terms(quads))?;
         log::debug!(
-            "[Dictionary] Built dictionary + borrowed code map from {} quads ({} unique terms): collect {:?}, sort {:?}, map {:?}, freeze {:?}, total {:?}",
+            "[Dictionary] Built dictionary + borrowed code map from {} quads ({} unique terms) in {:?}",
             quads.len(),
             dict.len(),
-            collect_elapsed,
-            sort_elapsed,
-            map_elapsed,
-            debug::elapsed(freeze_start),
-            debug::elapsed(total_start)
+            debug::elapsed(start)
         );
         Ok((dict, code_map))
     }
@@ -112,30 +117,14 @@ impl TermDictionaryBuilder {
     /// hand back the term → code map beside it. The map's keys are this
     /// builder's sorted strings, moved in; a term's code is its sorted rank.
     pub(crate) fn finish(self) -> Result<(TermDictionary, TermCodeMap)> {
-        let total_start = debug::timer();
-        let collect_start = debug::timer();
+        let start = debug::timer();
         let mut terms: Vec<String> = self.set.into_iter().collect();
-        let collect_elapsed = debug::elapsed(collect_start);
-        let sort_start = debug::timer();
         terms.sort_unstable();
-        let sort_elapsed = debug::elapsed(sort_start);
-        let freeze_start = debug::timer();
-        let dict = TermDictionary::from_sorted(terms.iter().map(String::as_str))?;
-        let freeze_elapsed = debug::elapsed(freeze_start);
-        let map_start = debug::timer();
-        let code_map: TermCodeMap = terms
-            .into_iter()
-            .enumerate()
-            .map(|(code, term)| (term, code as u32))
-            .collect();
+        let (dict, code_map) = freeze(terms)?;
         log::debug!(
-            "[Dictionary] Finished incremental dictionary ({} unique terms): collect {:?}, sort {:?}, freeze {:?}, map {:?}, total {:?}",
+            "[Dictionary] Finished incremental dictionary ({} unique terms) in {:?}",
             dict.len(),
-            collect_elapsed,
-            sort_elapsed,
-            freeze_elapsed,
-            debug::elapsed(map_start),
-            debug::elapsed(total_start)
+            debug::elapsed(start)
         );
         Ok((dict, code_map))
     }
@@ -259,14 +248,12 @@ impl InterningQuadBuilder {
     /// Freeze the dictionary and produce the dataset's codes in global
     /// (s, p, o, g) order.
     pub(crate) fn finish(mut self) -> Result<(TermDictionary, QuadCodes)> {
-        let total_start = debug::timer();
+        let start = debug::timer();
         let n = self.quads.len();
 
-        let sort_start = debug::timer();
         // Unique terms, so the tuple Ord never reaches the code.
         let mut entries: Vec<(Box<str>, u32)> = self.codes.into_iter().collect();
         entries.sort_unstable();
-        let sort_terms_elapsed = debug::elapsed(sort_start);
 
         // provisional code → sorted rank == dictionary code.
         let mut rank_of = vec![0u32; entries.len()];
@@ -277,19 +264,15 @@ impl InterningQuadBuilder {
         // Freeze by *consuming* the boxes: each term is freed as it is copied
         // into the plain column, so the boxes and the column never coexist in
         // full.
-        let freeze_start = debug::timer();
         let plain = VarBinViewArray::from_iter_str(entries.into_iter().map(|(t, _)| t));
         let dict = TermDictionary::from_sorted_column(plain)?;
-        let freeze_elapsed = debug::elapsed(freeze_start);
 
-        let remap_start = debug::timer();
         for quad in &mut self.quads {
             for code in quad.iter_mut() {
                 *code = rank_of[*code as usize];
             }
         }
         self.quads.sort_unstable();
-        let remap_elapsed = debug::elapsed(remap_start);
 
         let mut codes = QuadCodes {
             s: Vec::with_capacity(n),
@@ -305,13 +288,10 @@ impl InterningQuadBuilder {
         }
 
         log::debug!(
-            "[Dictionary] Interned {} quads ({} unique terms): sort terms {:?}, freeze {:?}, remap+sort quads {:?}, total {:?}",
+            "[Dictionary] Interned {} quads ({} unique terms) in {:?}",
             n,
             dict.len(),
-            sort_terms_elapsed,
-            freeze_elapsed,
-            remap_elapsed,
-            debug::elapsed(total_start)
+            debug::elapsed(start)
         );
         Ok((dict, codes))
     }

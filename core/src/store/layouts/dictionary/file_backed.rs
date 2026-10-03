@@ -12,10 +12,10 @@ use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use futures::{StreamExt as _, TryStreamExt as _};
+use tokio::sync::OnceCell;
 use vortex_array::ArrayRef;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::VarBinViewArray;
-use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::expr::{root, select};
 use vortex_array::serde::SerializedArray;
 use vortex_layout::layouts::chunked::Chunked as ChunkedLayout;
@@ -25,7 +25,6 @@ use vortex_layout::layouts::zoned::Zoned;
 use vortex_layout::segments::SegmentSource;
 use vortex_layout::{LayoutChildType, LayoutRef};
 
-use crate::common::terms::canonical_spelling;
 use crate::error::{Result, VortexRdfError};
 use crate::io::container::DICT_COMPONENT_NAME;
 use crate::io::read::available_parallelism;
@@ -35,8 +34,11 @@ use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::view::selection::POINT_GATHER_MAX_ROWS;
 
 use super::predicates::{KindRanges, Scanned, TermPredicate};
-use super::storage::{COL_DICT_TERM, ChunkCursor, TermChunk, check_code, chunk_of};
-use super::term_dict::{EncodeMemo, PredicateMemo, TermDictionary, VerdictSets, prefix_successor};
+use super::storage::{COL_DICT_TERM, ChunkCursor, TermChunk, check_code, chunk_of, term_column};
+use super::term_dict::{
+    DictMemos, TermDictionary, VerdictSets, next_dictionary_id, prefix_range_from,
+    prefix_successor, tolerant_fallback,
+};
 
 /// The dictionary child's flat chunk leaves, fetched on demand in their wire
 /// encoding and kept for the store's lifetime — the string sibling of the
@@ -61,7 +63,7 @@ pub(crate) struct TermChunks {
 struct ChunkSpec {
     layout: LayoutRef,
     rows: u64,
-    cell: OnceLock<TermChunk>,
+    cell: OnceCell<TermChunk>,
 }
 
 /// Descend through zoned wrappers to their data child (child 0).
@@ -91,37 +93,37 @@ impl TermChunks {
         if row_count == 0 || row_count > u64::from(u32::MAX) {
             return None;
         }
-        let mut specs = Vec::new();
-        let mut starts = Vec::new();
-        if data.is::<Flat>() {
-            specs.push(ChunkSpec {
-                layout: data,
-                rows: row_count,
-                cell: OnceLock::new(),
-            });
-            starts.push(0);
+        let leaves: Vec<(LayoutRef, u64)> = if data.is::<Flat>() {
+            vec![(data, 0)]
         } else if data.is::<ChunkedLayout>() {
+            let mut leaves = Vec::with_capacity(data.nslots());
             for i in 0..data.nslots() {
                 let Some(LayoutChildType::Chunk((_, row_offset))) = data.slot_type(i) else {
                     return None;
                 };
-                let leaf = unwrap_zoned(data.slot(i).ok().flatten()?)?;
-                let rows = leaf.row_count();
-                if rows == 0 {
-                    continue;
-                }
-                if !leaf.is::<Flat>() {
-                    return None;
-                }
-                specs.push(ChunkSpec {
-                    layout: leaf,
-                    rows,
-                    cell: OnceLock::new(),
-                });
-                starts.push(usize::try_from(row_offset).ok()?);
+                leaves.push((data.slot(i).ok().flatten()?, row_offset));
             }
+            leaves
         } else {
             return None;
+        };
+        let mut specs = Vec::with_capacity(leaves.len());
+        let mut starts = Vec::with_capacity(leaves.len());
+        for (leaf, row_offset) in leaves {
+            let leaf = unwrap_zoned(leaf)?;
+            let rows = leaf.row_count();
+            if rows == 0 {
+                continue;
+            }
+            if !leaf.is::<Flat>() {
+                return None;
+            }
+            specs.push(ChunkSpec {
+                layout: leaf,
+                rows,
+                cell: OnceCell::new(),
+            });
+            starts.push(usize::try_from(row_offset).ok()?);
         }
         Some(Self {
             specs,
@@ -136,38 +138,39 @@ impl TermChunks {
         chunk_of(&self.starts, row as usize)
     }
 
+    /// One unopened cursor per chunk, for a run of reads.
+    fn cursors(&self) -> Vec<Option<ChunkCursor<'_>>> {
+        (0..self.specs.len()).map(|_| None).collect()
+    }
+
     /// The fetched form of chunk `idx`, read and adopted on first use. The
-    /// segment read reconstructs the wire encoding (no decompression);
-    /// concurrent first reads may race to build, and the loser's copy is
-    /// dropped.
+    /// segment read reconstructs the wire encoding (no decompression).
     async fn chunk(&self, idx: usize) -> Result<&TermChunk> {
         let spec = &self.specs[idx];
-        if spec.cell.get().is_none() {
-            let flat = spec
-                .layout
-                .as_opt::<Flat>()
-                .expect("term chunk leaves are validated flat at construction");
-            let segment = self
-                .source
-                .request(flat.segment_id())
-                .await
+        spec.cell
+            .get_or_try_init(|| async {
+                let flat = spec
+                    .layout
+                    .as_opt::<Flat>()
+                    .expect("term chunk leaves are validated flat at construction");
+                let segment = self
+                    .source
+                    .request(flat.segment_id())
+                    .await
+                    .map_err(VortexRdfError::Vortex)?;
+                let parts = match flat.array_tree().cloned() {
+                    Some(tree) => SerializedArray::from_flatbuffer_and_segment(tree, segment),
+                    None => SerializedArray::try_from(segment),
+                }
                 .map_err(VortexRdfError::Vortex)?;
-            let parts = match flat.array_tree().cloned() {
-                Some(tree) => SerializedArray::from_flatbuffer_and_segment(tree, segment),
-                None => SerializedArray::try_from(segment),
-            }
-            .map_err(VortexRdfError::Vortex)?;
-            let rows = usize::try_from(spec.rows).expect("chunk row count must fit in usize");
-            let array = parts
-                .decode(flat.dtype(), rows, flat.array_ctx(), &VORTEX_SESSION)
-                .map_err(VortexRdfError::Vortex)?;
-            let mut ctx = VORTEX_SESSION.create_execution_ctx();
-            let _ = spec.cell.set(TermChunk::from_wire(array, &mut ctx)?);
-        }
-        Ok(spec
-            .cell
-            .get()
-            .expect("the chunk was just initialized above"))
+                let rows = usize::try_from(spec.rows).expect("chunk row count must fit in usize");
+                let array = parts
+                    .decode(flat.dtype(), rows, flat.array_ctx(), &VORTEX_SESSION)
+                    .map_err(VortexRdfError::Vortex)?;
+                let mut ctx = VORTEX_SESSION.create_execution_ctx();
+                TermChunk::from_wire(array, &mut ctx)
+            })
+            .await
     }
 
     /// The term bytes at `row`, read through `cursors` — one lazily built
@@ -188,35 +191,17 @@ impl TermChunks {
             .bytes_at(local))
     }
 
-    /// Term → code: a binary search over per-row reads — the async twin of
-    /// `TermDictionary::search`, the same three-way compare per step that
-    /// returns as soon as the probe hits.
-    pub(crate) async fn encode(&self, term: &str) -> Result<Option<u32>> {
-        let needle = term.as_bytes();
-        let mut cursors: Vec<Option<ChunkCursor<'_>>> =
-            (0..self.specs.len()).map(|_| None).collect();
-        let (mut lo, mut hi) = (0u64, self.row_count);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            match self.term_bytes(&mut cursors, mid).await?.cmp(needle) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Equal => return Ok(Some(mid as u32)),
-                std::cmp::Ordering::Greater => hi = mid,
-            }
-        }
-        Ok(None)
-    }
-
     /// The row of the first term not below `needle` in byte order (the row
-    /// count when every term is below it) — the async twin of
-    /// `TermDictionary::lower_bound`.
-    pub(crate) async fn lower_bound(&self, needle: &[u8]) -> Result<u32> {
-        let mut cursors: Vec<Option<ChunkCursor<'_>>> =
-            (0..self.specs.len()).map(|_| None).collect();
+    /// count when every term is below it), read through `cursors`.
+    async fn lower_bound_in<'s>(
+        &'s self,
+        cursors: &mut [Option<ChunkCursor<'s>>],
+        needle: &[u8],
+    ) -> Result<u32> {
         let (mut lo, mut hi) = (0u64, self.row_count);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.term_bytes(&mut cursors, mid).await? < needle {
+            if self.term_bytes(cursors, mid).await? < needle {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -225,11 +210,27 @@ impl TermChunks {
         Ok(lo as u32)
     }
 
+    /// Term → code: the lower bound and one equality probe, over per-row
+    /// reads.
+    pub(crate) async fn encode(&self, term: &str) -> Result<Option<u32>> {
+        let needle = term.as_bytes();
+        let mut cursors = self.cursors();
+        let lo = self.lower_bound_in(&mut cursors, needle).await?;
+        let hit = u64::from(lo) < self.row_count
+            && self.term_bytes(&mut cursors, u64::from(lo)).await? == needle;
+        Ok(hit.then_some(lo))
+    }
+
+    /// The row of the first term not below `needle` in byte order (the row
+    /// count when every term is below it).
+    pub(crate) async fn lower_bound(&self, needle: &[u8]) -> Result<u32> {
+        self.lower_bound_in(&mut self.cursors(), needle).await
+    }
+
     /// Code → term for each of `codes` (in-bounds, the caller's contract),
     /// reading exactly the probed rows.
     pub(crate) async fn decode_many(&self, codes: &[u32]) -> Result<Vec<Arc<str>>> {
-        let mut cursors: Vec<Option<ChunkCursor<'_>>> =
-            (0..self.specs.len()).map(|_| None).collect();
+        let mut cursors = self.cursors();
         let mut out = Vec::with_capacity(codes.len());
         for &code in codes {
             let bytes = self.term_bytes(&mut cursors, u64::from(code)).await?;
@@ -246,59 +247,50 @@ impl TermChunks {
 /// `reader` is the dictionary child's layout reader (the native store root's
 /// `dictionary` component), so a term's code is its child row. Probes and
 /// small decodes point-read the wire-encoded chunk leaves through
-/// [`TermChunks`], with probe answers memoized in a [`EncodeMemo`]; a wide
-/// decode instead scans the row indices it wants through `reader`.
+/// [`TermChunks`], with probe answers memoized; a wide decode instead scans
+/// the row indices it wants through `reader`. Clones share one state.
 #[derive(Clone)]
-pub(crate) struct FileBackedDict {
-    /// Identity of this handle's dictionary — see [`DictReader::dictionary_id`].
+pub(crate) struct FileBackedDict(Arc<Inner>);
+
+struct Inner {
+    /// Identity of this handle's dictionary — see `DictReader::dictionary_id`.
     id: u64,
     /// The dictionary child's layout reader (child-local row coordinates).
     reader: vortex_layout::LayoutReaderRef,
     /// Number of terms.
     len: u64,
-    /// term → code memo, shared across clones (every derived view of a store
-    /// probes the same immutable dictionary).
-    encode_memo: Arc<EncodeMemo>,
-    /// Wire-chunk point-read handle, shared across clones — the dictionary
-    /// analogue of the quad columns' cached chunk probes.
-    chunks: Arc<TermChunks>,
-    /// The wide-batch scan's term projection, bound once per handle — a
-    /// fresh bind per call would miss the reader's identity-keyed caches
-    /// (see `BoundExprMemo` on the store file handle) and grow them per
-    /// call. Shared across clones like the reader whose caches it keys.
-    projection: Arc<OnceLock<vortex_array::expr::BoundExpression>>,
-    /// The kind ranges, computed on first use (a few probes), shared across
-    /// clones.
-    kinds: Arc<OnceLock<KindRanges>>,
-    /// Memo for [`filter_codes`](Self::filter_codes), shared across clones —
-    /// a partition is a scan of the child, the one read worth keeping.
-    predicates: Arc<PredicateMemo>,
+    /// Wire-chunk point-read handle.
+    chunks: TermChunks,
+    /// The wide-batch scan's term projection, bound once: a fresh bind per
+    /// call would miss the reader's identity-keyed caches (see
+    /// `BoundExprMemo` on the store file handle) and grow them per call.
+    projection: OnceLock<vortex_array::expr::BoundExpression>,
+    /// term → code, kind ranges and partition memos.
+    memos: DictMemos,
 }
 
 impl FileBackedDict {
     /// A file-backed dictionary over the child `reader` reads, point-read
     /// through `chunks`; the term count is the reader's row count.
     pub(crate) fn new(reader: vortex_layout::LayoutReaderRef, chunks: TermChunks) -> Self {
-        Self {
-            id: super::term_dict::next_dictionary_id(),
+        Self(Arc::new(Inner {
+            id: next_dictionary_id(),
             len: reader.row_count(),
             reader,
-            encode_memo: Arc::new(EncodeMemo::new()),
-            chunks: Arc::new(chunks),
-            projection: Arc::new(OnceLock::new()),
-            kinds: Arc::new(OnceLock::new()),
-            predicates: Arc::new(PredicateMemo::new()),
-        }
+            chunks,
+            projection: OnceLock::new(),
+            memos: DictMemos::default(),
+        }))
     }
 
     /// This handle's dictionary identity.
     pub(crate) fn id(&self) -> u64 {
-        self.id
+        self.0.id
     }
 
     /// Number of terms.
     pub(crate) fn len(&self) -> usize {
-        usize::try_from(self.len).unwrap_or(usize::MAX)
+        usize::try_from(self.0.len).unwrap_or(usize::MAX)
     }
 
     /// The file-backed form of `native`'s dictionary child: its cached
@@ -328,17 +320,17 @@ impl FileBackedDict {
     fn scan(&self) -> vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef> {
         vortex_layout::scan::scan_builder::ScanBuilder::new(
             VORTEX_SESSION.clone(),
-            self.reader.clone(),
+            self.0.reader.clone(),
         )
     }
 
     /// Term → code: a point-read binary search of the chunk leaves, memoized.
     pub(crate) async fn encode(&self, term: &str) -> Result<Option<u32>> {
-        if let Some(memo) = self.encode_memo.get(term) {
+        if let Some(memo) = self.0.memos.encode.get(term) {
             return Ok(memo);
         }
-        let code = self.chunks.encode(term).await?;
-        self.encode_memo.put(term, code);
+        let code = self.0.chunks.encode(term).await?;
+        self.0.memos.encode.put(term, code);
         Ok(code)
     }
 
@@ -352,10 +344,10 @@ impl FileBackedDict {
             return Ok(Vec::new());
         }
         if let Some(&max) = codes.last() {
-            check_code(max, usize::try_from(self.len).unwrap_or(usize::MAX))?;
+            check_code(max, self.len())?;
         }
         if codes.len() <= POINT_GATHER_MAX_ROWS {
-            return self.chunks.decode_many(codes).await;
+            return self.0.chunks.decode_many(codes).await;
         }
         let rows: vortex_buffer::Buffer<u64> = codes.iter().map(|&code| code as u64).collect();
         let rows = vortex_scan::strict_sorted_buffer::StrictSortedBuffer::try_new(rows)
@@ -368,13 +360,7 @@ impl FileBackedDict {
         )
         .await?;
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let struct_arr = arr
-            .execute::<StructArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-        let col = struct_arr
-            .unmasked_field_by_name(COL_DICT_TERM)
-            .map_err(VortexRdfError::Vortex)?
-            .clone()
+        let col = term_column(arr, &mut ctx)?
             .execute::<VarBinViewArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
         if col.len() != codes.len() {
@@ -393,15 +379,13 @@ impl FileBackedDict {
     /// The child scan's term projection, bound once per handle (see the
     /// field).
     fn term_projection(&self) -> Result<vortex_array::expr::BoundExpression> {
-        match self.projection.get() {
-            Some(bound) => Ok(bound.clone()),
-            None => {
-                let bound = select([COL_DICT_TERM], root())
-                    .bind(self.reader.dtype())
-                    .map_err(VortexRdfError::Vortex)?;
-                Ok(self.projection.get_or_init(|| bound).clone())
-            }
+        if let Some(bound) = self.0.projection.get() {
+            return Ok(bound.clone());
         }
+        let bound = select([COL_DICT_TERM], root())
+            .bind(self.0.reader.dtype())
+            .map_err(VortexRdfError::Vortex)?;
+        Ok(self.0.projection.get_or_init(|| bound).clone())
     }
 
     /// Code → term for `codes` in any order, repeats allowed, out-of-range
@@ -433,11 +417,10 @@ impl FileBackedDict {
         if let Some(code) = self.encode(term).await? {
             return Ok(Some(code));
         }
-        let canonical = canonical_spelling(term)?;
-        if canonical == term {
-            return Ok(None);
+        match tolerant_fallback(term)? {
+            Some(canonical) => self.encode(&canonical).await,
+            None => Ok(None),
         }
-        self.encode(&canonical).await
     }
 
     /// [`encode_tolerant`](Self::encode_tolerant) over a batch, in order,
@@ -451,42 +434,41 @@ impl FileBackedDict {
 
     /// The async twin of `TermDictionary::lower_bound`.
     pub(crate) async fn lower_bound(&self, needle: &[u8]) -> Result<u32> {
-        self.chunks.lower_bound(needle).await
+        self.0.chunks.lower_bound(needle).await
     }
 
     /// The async twin of `TermDictionary::prefix_range`.
     pub(crate) async fn prefix_range(&self, prefix: &str) -> Result<Range<u32>> {
         let lo = self.lower_bound(prefix.as_bytes()).await?;
         let hi = match prefix_successor(prefix.as_bytes()) {
-            Some(successor) => self.lower_bound(&successor).await?,
-            None => self.len() as u32,
+            Some(successor) => Some(self.lower_bound(&successor).await?),
+            None => None,
         };
-        Ok(lo..hi.max(lo))
+        Ok(prefix_range_from(lo, hi, self.len() as u32))
     }
 
     /// The async twin of `TermDictionary::kind_ranges`, computed once per
     /// handle.
     pub(crate) async fn kind_ranges(&self) -> Result<KindRanges> {
-        if let Some(kinds) = self.kinds.get() {
+        if let Some(kinds) = self.0.memos.kinds.get() {
             return Ok(kinds.clone());
         }
-        let default_graph = if self.len > 0 {
-            let first = self.chunks.decode_many(&[0]).await?;
-            first
+        let first_is_empty = self.0.len > 0
+            && self
+                .0
+                .chunks
+                .decode_many(&[0])
+                .await?
                 .first()
-                .is_some_and(|term| term.is_empty())
-                .then_some(0)
-        } else {
-            None
-        };
-        let kinds = KindRanges {
-            default_graph,
-            literals: self.prefix_range("\"").await?,
-            iris: self.prefix_range("<").await?,
-            blanks: self.prefix_range("_:").await?,
-            len: self.len() as u32,
-        };
-        Ok(self.kinds.get_or_init(|| kinds).clone())
+                .is_some_and(|term| term.is_empty());
+        let kinds = KindRanges::new(
+            first_is_empty,
+            self.prefix_range("\"").await?,
+            self.prefix_range("<").await?,
+            self.prefix_range("_:").await?,
+            self.len() as u32,
+        );
+        Ok(self.0.memos.kinds.get_or_init(|| kinds).clone())
     }
 
     /// The async twin of `TermDictionary::filter_codes`: the predicate's
@@ -494,14 +476,13 @@ impl FileBackedDict {
     /// time, and evaluated as it streams — a file-backed dictionary never
     /// holds more than a chunk of terms decoded.
     pub(crate) async fn filter_codes(&self, predicate: &TermPredicate) -> Result<VerdictSets> {
-        let key = predicate.to_string();
-        if let Some(sets) = self.predicates.get(&key) {
+        if let Some(sets) = self.0.memos.predicates.get(predicate) {
             return Ok(sets);
         }
         let kinds = self.kind_ranges().await?;
-        let plan = predicate.scan_plan(&kinds);
+        let partition = predicate.partition();
         let mut scanned = Scanned::default();
-        if let Some(range) = plan.scan.filter(|range| !range.is_empty()) {
+        if let Some(range) = partition.scan(&kinds).filter(|range| !range.is_empty()) {
             let tasks = self
                 .scan()
                 .with_row_range(u64::from(range.start)..u64::from(range.end))
@@ -517,21 +498,12 @@ impl FileBackedDict {
                 let Some(chunk) = chunk.map_err(VortexRdfError::Vortex)? else {
                     continue;
                 };
-                let struct_arr = chunk
-                    .execute::<StructArray>(&mut ctx)
-                    .map_err(VortexRdfError::Vortex)?;
-                let col = struct_arr
-                    .unmasked_field_by_name(COL_DICT_TERM)
-                    .map_err(VortexRdfError::Vortex)?
-                    .clone()
+                let col = term_column(chunk, &mut ctx)?
                     .execute::<VarBinViewArray>(&mut ctx)
                     .map_err(VortexRdfError::Vortex)?;
                 let reader = StrColReader::new(&col);
                 for i in 0..col.len() {
-                    match reader.str_at(i) {
-                        Ok(spelling) => scanned.visit(predicate, code, spelling),
-                        Err(_) => scanned.unknown.push(code),
-                    }
+                    scanned.visit(predicate, code, reader.str_at(i));
                     code += 1;
                 }
             }
@@ -543,12 +515,12 @@ impl FileBackedDict {
                 )));
             }
         }
-        let mut true_ranges = Vec::with_capacity(plan.true_prefixes.len());
-        for prefix in &plan.true_prefixes {
-            true_ranges.push(self.prefix_range(prefix).await?);
+        let mut true_ranges = Vec::new();
+        for prefix in partition.true_prefixes() {
+            true_ranges.push(self.prefix_range(&prefix).await?);
         }
-        let sets = Arc::new(predicate.assemble(&kinds, scanned, &true_ranges));
-        self.predicates.put(key, Arc::clone(&sets));
+        let sets = Arc::new(partition.assemble(&kinds, scanned, true_ranges));
+        self.0.memos.predicates.put(predicate, Arc::clone(&sets));
         Ok(sets)
     }
 
@@ -557,7 +529,7 @@ impl FileBackedDict {
     ///
     /// [`DictAccess::ensure_resident`]: super::handles::DictAccess::ensure_resident
     pub(crate) async fn lift_resident(&self) -> Result<TermDictionary> {
-        TermDictionary::from_child_reader(self.reader.clone()).await
+        TermDictionary::from_child_reader(self.0.reader.clone()).await
     }
 }
 
@@ -591,7 +563,7 @@ mod tests {
             .expect("the written dictionary child must be point-readable");
 
         // One chunk leaf per compression window, none merged, none re-cut.
-        assert_eq!(fbd.chunks.specs.len(), 6);
+        assert_eq!(fbd.0.chunks.specs.len(), 6);
 
         // Probes across every window: interior, first-of-window,
         // last-of-window, and absent.

@@ -12,7 +12,7 @@ use crate::common::terms::canonical_spelling;
 use crate::error::Result;
 
 use super::predicates::{KindRanges, Scanned, TermPredicate};
-use super::storage::{DictCursor, TermChunk, TermStore};
+use super::storage::{DictCursor, ResidentChunks};
 
 /// The frozen, sorted term dictionary in columnar form.
 ///
@@ -21,18 +21,15 @@ use super::storage::{DictCursor, TermChunk, TermStore};
 /// the encoding the terms are held in.
 pub(crate) struct TermDictionary {
     /// Identity of this dictionary instance — see [`DictReader::dictionary_id`].
+    ///
+    /// [`DictReader::dictionary_id`]: super::handles::DictReader::dictionary_id
     id: u64,
-    pub(super) terms: TermStore,
-    /// Memo for [`encode`](Self::encode); see [`EncodeMemo`].
-    encode_memo: EncodeMemo,
-    /// The kind ranges, computed on first use (a few probes).
-    kinds: OnceLock<KindRanges>,
-    /// Memo for [`filter_codes`](Self::filter_codes); see [`PredicateMemo`].
-    predicates: PredicateMemo,
+    pub(super) terms: ResidentChunks,
+    memos: DictMemos,
 }
 
-/// The next dictionary identity (see [`DictReader::dictionary_id`]): one
-/// process-wide counter shared by resident and file-backed dictionaries.
+/// The next dictionary identity: one process-wide counter shared by resident
+/// and file-backed dictionaries.
 pub(crate) fn next_dictionary_id() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -45,38 +42,25 @@ impl TermDictionary {
         self.id
     }
 
-    /// Wrap the held terms, with an empty lookup memo.
-    pub(super) fn new(terms: TermStore) -> Self {
+    /// Wrap the held terms, with empty memos.
+    pub(super) fn new(terms: ResidentChunks) -> Self {
         Self {
             id: next_dictionary_id(),
             terms,
-            encode_memo: EncodeMemo::new(),
-            kinds: OnceLock::new(),
-            predicates: PredicateMemo::new(),
+            memos: DictMemos::default(),
         }
     }
-}
 
-impl TermDictionary {
     /// Number of terms.
     pub(crate) fn len(&self) -> usize {
-        match &self.terms {
-            TermStore::Single(c) => c.len(),
-            TermStore::Chunked(c) => c.len,
-        }
+        self.terms.len
     }
 
     /// A cursor over the terms. Holds the scratch buffer an FSST read decodes
     /// into, so callers needing several terms at once (a quad's four roles)
     /// must take one cursor per role.
     pub(super) fn cursor(&self) -> DictCursor<'_> {
-        match &self.terms {
-            TermStore::Single(c) => DictCursor::Single(c.cursor()),
-            TermStore::Chunked(c) => DictCursor::Chunked {
-                store: c,
-                cursors: c.chunks.iter().map(TermChunk::cursor).collect(),
-            },
-        }
+        DictCursor::new(&self.terms)
     }
 
     /// Decode a code back to its term string (canonical N-Triples form), or
@@ -90,60 +74,26 @@ impl TermDictionary {
     }
 
     /// Encode a term to its code: its position in the sorted dictionary, or
-    /// `None` when the dictionary does not hold it.
-    ///
-    /// Memoized. [`PatternCodes`] already collapses the repeats *within* one
-    /// match; this catches the repeats *across* matches — the same predicate
-    /// walked over many patterns, the same subject chained through several
-    /// matches.
-    ///
-    /// [`PatternCodes`]: crate::store::layouts::PatternCodes
+    /// `None` when the dictionary does not hold it. Memoized.
     pub(crate) fn encode(&self, term: &str) -> Option<u32> {
-        if let Some(memoized) = self.encode_memo.get(term) {
+        if let Some(memoized) = self.memos.encode.get(term) {
             return memoized;
         }
         let found = self.search(term);
-        self.encode_memo.put(term, found);
+        self.memos.encode.put(term, found);
         found
     }
 
-    /// The uncached binary search behind [`encode`](Self::encode): a
-    /// three-way compare per step, returning as soon as the probe hits.
+    /// The uncached lookup behind [`encode`](Self::encode).
     fn search(&self, term: &str) -> Option<u32> {
-        // FSST is not order-preserving, so the search cannot run over the
-        // compressed codes: every probe decodes into the cursor's scratch
-        // buffer.
-        let mut cursor = self.cursor();
-        let needle = term.as_bytes();
-        let (mut lo, mut hi) = (0usize, self.len());
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            match cursor.bytes_at(mid).cmp(needle) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Equal => return Some(mid as u32),
-                std::cmp::Ordering::Greater => hi = mid,
-            }
-        }
-        None
+        self.cursor().search(term.as_bytes())
     }
 
     /// The code of the first term not below `needle` in byte order — the
-    /// dictionary's size when every term is below it. A binary search with
-    /// the same per-probe decode as [`search`](Self::search); the position
-    /// is where `needle` would be inserted, so a present term's code and
-    /// the start of a spelling prefix's run both come out of it.
+    /// dictionary's size when every term is below it: a present term's own
+    /// code, or where an absent one would sort.
     pub(crate) fn lower_bound(&self, needle: &[u8]) -> u32 {
-        let mut cursor = self.cursor();
-        let (mut lo, mut hi) = (0usize, self.len());
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if cursor.bytes_at(mid) < needle {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        lo as u32
+        self.cursor().lower_bound(needle)
     }
 
     /// The codes of the terms spelled with `prefix`, as a half-open range:
@@ -152,25 +102,21 @@ impl TermDictionary {
     /// so are IRI namespaces.
     pub(crate) fn prefix_range(&self, prefix: &str) -> Range<u32> {
         let lo = self.lower_bound(prefix.as_bytes());
-        let hi = match prefix_successor(prefix.as_bytes()) {
-            Some(successor) => self.lower_bound(&successor),
-            None => self.len() as u32,
-        };
-        lo..hi.max(lo)
+        let hi = prefix_successor(prefix.as_bytes()).map(|successor| self.lower_bound(&successor));
+        prefix_range_from(lo, hi, self.len() as u32)
     }
 
     /// The code ranges of the term kinds, computed once per dictionary.
     pub(crate) fn kind_ranges(&self) -> &KindRanges {
-        self.kinds.get_or_init(|| {
-            let default_graph =
-                (self.len() > 0 && self.cursor().bytes_at(0).is_empty()).then_some(0);
-            KindRanges {
-                default_graph,
-                literals: self.prefix_range("\""),
-                iris: self.prefix_range("<"),
-                blanks: self.prefix_range("_:"),
-                len: self.len() as u32,
-            }
+        self.memos.kinds.get_or_init(|| {
+            let first_is_empty = self.len() > 0 && self.cursor().bytes_at(0).is_empty();
+            KindRanges::new(
+                first_is_empty,
+                self.prefix_range("\""),
+                self.prefix_range("<"),
+                self.prefix_range("_:"),
+                self.len() as u32,
+            )
         })
     }
 
@@ -183,11 +129,7 @@ impl TermDictionary {
         if let Some(code) = self.encode(term) {
             return Ok(Some(code));
         }
-        let canonical = canonical_spelling(term)?;
-        if canonical == term {
-            return Ok(None);
-        }
-        Ok(self.encode(&canonical))
+        Ok(tolerant_fallback(term)?.and_then(|canonical| self.encode(&canonical)))
     }
 
     /// [`encode_tolerant`](Self::encode_tolerant) over a batch, in order.
@@ -218,33 +160,28 @@ impl TermDictionary {
 
     /// Partition the codes by `predicate`'s verdicts — `(true, unknown)`,
     /// both ascending — in one pass over the predicate's scan range (see
-    /// [`TermPredicate::scan_plan`]), memoized per dictionary by the
+    /// [`TermPredicate::partition`]), memoized per dictionary by the
     /// predicate's canonical rendering ([`PredicateMemo`]).
     pub(crate) fn filter_codes(&self, predicate: &TermPredicate) -> VerdictSets {
-        let key = predicate.to_string();
-        if let Some(sets) = self.predicates.get(&key) {
+        if let Some(sets) = self.memos.predicates.get(predicate) {
             return sets;
         }
         let kinds = self.kind_ranges();
-        let plan = predicate.scan_plan(kinds);
+        let partition = predicate.partition();
         let mut scanned = Scanned::default();
-        if let Some(range) = plan.scan {
+        if let Some(range) = partition.scan(kinds) {
             let mut cursor = self.cursor();
             for code in range {
-                match cursor.str_at(code as usize) {
-                    Ok(spelling) => scanned.visit(predicate, code, spelling),
-                    // A term that is not UTF-8 is nothing the rules speak of.
-                    Err(_) => scanned.unknown.push(code),
-                }
+                scanned.visit(predicate, code, cursor.str_at(code as usize));
             }
         }
-        let true_ranges: Vec<Range<u32>> = plan
-            .true_prefixes
+        let true_ranges = partition
+            .true_prefixes()
             .iter()
             .map(|prefix| self.prefix_range(prefix))
             .collect();
-        let sets = Arc::new(predicate.assemble(kinds, scanned, &true_ranges));
-        self.predicates.put(key, Arc::clone(&sets));
+        let sets = Arc::new(partition.assemble(kinds, scanned, true_ranges));
+        self.memos.predicates.put(predicate, Arc::clone(&sets));
         sets
     }
 }
@@ -266,9 +203,37 @@ pub(super) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     Some(successor)
 }
 
+/// A prefix's code range from the lower bound `lo` of the prefix and `hi` of
+/// its successor (`None` when it has none: every term from `lo` on is under
+/// the prefix); never below `lo`.
+pub(super) fn prefix_range_from(lo: u32, hi: Option<u32>, len: u32) -> Range<u32> {
+    lo..hi.unwrap_or(len).max(lo)
+}
+
+/// The spelling a failed exact lookup of `term` is retried with: its
+/// [`canonical_spelling`], or `None` when that is the spelling already
+/// looked up. Malformed input is an error.
+pub(super) fn tolerant_fallback(term: &str) -> Result<Option<String>> {
+    let canonical = canonical_spelling(term)?;
+    Ok((canonical != term).then_some(canonical))
+}
+
 /// A predicate's partition of a dictionary's codes — `(true, unknown)`,
 /// both ascending — shared between the memo and every caller.
 pub(crate) type VerdictSets = Arc<(Buffer<u32>, Buffer<u32>)>;
+
+/// The memos a dictionary carries. Entries never go stale: a dictionary's
+/// terms are immutable, and a mutation builds a new dictionary with fresh
+/// memos.
+#[derive(Default)]
+pub(super) struct DictMemos {
+    /// term → code memo.
+    pub(super) encode: EncodeMemo,
+    /// The kind ranges, computed once.
+    pub(super) kinds: OnceLock<KindRanges>,
+    /// Partition memo.
+    pub(super) predicates: PredicateMemo,
+}
 
 /// Partitions a dictionary's [`PredicateMemo`] holds before the oldest is
 /// evicted. A query workload asks a handful of distinct predicates per
@@ -283,22 +248,26 @@ pub(super) struct PredicateMemo {
     entries: RwLock<VecDeque<(String, VerdictSets)>>,
 }
 
-impl PredicateMemo {
-    pub(super) fn new() -> Self {
+impl Default for PredicateMemo {
+    fn default() -> Self {
         Self {
             entries: RwLock::new(VecDeque::with_capacity(PREDICATE_MEMO_SLOTS)),
         }
     }
+}
 
-    pub(super) fn get(&self, key: &str) -> Option<VerdictSets> {
+impl PredicateMemo {
+    pub(super) fn get(&self, predicate: &TermPredicate) -> Option<VerdictSets> {
+        let key = predicate.to_string();
         let entries = self.entries.read().ok()?;
         entries
             .iter()
-            .find(|(k, _)| k == key)
+            .find(|(k, _)| *k == key)
             .map(|(_, sets)| Arc::clone(sets))
     }
 
-    pub(super) fn put(&self, key: String, sets: VerdictSets) {
+    pub(super) fn put(&self, predicate: &TermPredicate, sets: VerdictSets) {
+        let key = predicate.to_string();
         if let Ok(mut entries) = self.entries.write() {
             if entries.iter().any(|(k, _)| *k == key) {
                 return;
@@ -320,12 +289,7 @@ const ENCODE_MEMO_SLOTS: usize = 256;
 
 /// A fixed-size, direct-mapped memo of term → code lookups (absence
 /// included): one slot per hash bucket, overwritten on collision, so its
-/// footprint never grows. Entries never go stale: a dictionary's terms are
-/// immutable and a mutation builds a new dictionary with a fresh cache.
-///
-/// Used by both [`TermDictionary`] and the file-backed form
-/// ([`FileBackedDict`](super::file_backed::FileBackedDict)), whose miss is
-/// the same binary search run over cached wire chunks.
+/// footprint never grows.
 pub(super) struct EncodeMemo {
     slots: RwLock<Box<[Option<EncodeEntry>]>>,
 }
@@ -339,8 +303,8 @@ struct EncodeEntry {
     code: Option<u32>,
 }
 
-impl EncodeMemo {
-    pub(super) fn new() -> Self {
+impl Default for EncodeMemo {
+    fn default() -> Self {
         Self {
             slots: RwLock::new(
                 std::iter::repeat_with(|| None)
@@ -349,7 +313,9 @@ impl EncodeMemo {
             ),
         }
     }
+}
 
+impl EncodeMemo {
     /// FNV-1a over the whole term: RDF terms in a dataset share long IRI
     /// prefixes and differ only near the end, so the distinguishing bytes sit
     /// at the tail.

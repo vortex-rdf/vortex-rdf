@@ -6,7 +6,6 @@ use crate::session::VORTEX_SESSION;
 use crate::store::QuadsSource;
 use crate::store::RawQuad;
 use crate::store::array::{chunked_or_single, field_as, subject_sorted, with_subject_stamp};
-use crate::store::layouts::dictionary::TermDictionary;
 use crate::store::layouts::{LayoutStrategy, ResolvedLayout, dictionary};
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_scan;
@@ -169,7 +168,7 @@ impl VortexRdfStore {
                 if raws.is_empty() {
                     return dictionary::empty_struct();
                 }
-                let (_, code_map) = TermDictionary::from_quads_with_map(&raws)?;
+                let code_map = dictionary::code_map(dictionary::sorted_unique_terms(&raws));
                 // Appended rows break the base's subject sort, and no index
                 // set rides along: the chunk is the primary columns alone.
                 dictionary::build_chunk(&raws, &code_map, false)

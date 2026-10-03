@@ -106,6 +106,16 @@ pub(super) enum NumKind {
     Float,
 }
 
+impl NumKind {
+    /// The kind without its datatype's bounds.
+    pub(super) fn unbounded(self) -> Self {
+        match self {
+            NumKind::Int(..) => NumKind::Int(None, None),
+            other => other,
+        }
+    }
+}
+
 /// The numeric kind of a datatype IRI, or `None` for a non-numeric one.
 pub(super) fn numeric_kind(datatype: &str) -> Option<NumKind> {
     let local = datatype.strip_prefix(XSD)?;
@@ -132,41 +142,23 @@ pub(super) fn parse_number(lexical: &str, kind: NumKind) -> Option<Num> {
 }
 
 /// XSD `integer`: `[+-]?[0-9]+`.
-pub(super) fn parse_integer(lexical: &str) -> Option<i128> {
+fn parse_integer(lexical: &str) -> Option<i128> {
     let (neg, digits) = split_sign(lexical)?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    if digits.is_empty() {
         return None;
     }
-    let mut v: i128 = 0;
-    for b in digits.bytes() {
-        v = v.checked_mul(10)?.checked_add(i128::from(b - b'0'))?;
-    }
+    let v = digits_value(digits.bytes().map(|b| (b as char).to_digit(10)), 10)?;
     Some(if neg { -v } else { v })
 }
 
 /// XSD `decimal`: `[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)`, held as a scaled
 /// mantissa; trailing fractional zeros are kept (they do not change the
 /// value, and the comparison aligns scales anyway).
-pub(super) fn parse_decimal(lexical: &str) -> Option<Num> {
+fn parse_decimal(lexical: &str) -> Option<Num> {
     let (neg, body) = split_sign(lexical)?;
-    let (int_part, frac_part) = match body.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (body, ""),
-    };
-    if int_part.is_empty() && frac_part.is_empty() {
-        return None;
-    }
-    if !int_part.bytes().all(|b| b.is_ascii_digit())
-        || !frac_part.bytes().all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
-    let mut mantissa: i128 = 0;
-    for b in int_part.bytes().chain(frac_part.bytes()) {
-        mantissa = mantissa
-            .checked_mul(10)?
-            .checked_add(i128::from(b - b'0'))?;
-    }
+    let (int_part, frac_part) = split_decimal(body)?;
+    let digits = int_part.bytes().chain(frac_part.bytes());
+    let mantissa = digits_value(digits.map(|b| (b as char).to_digit(10)), 10)?;
     let scale = u32::try_from(frac_part.len()).ok()?;
     Some(Num::Dec {
         mantissa: if neg { -mantissa } else { mantissa },
@@ -177,24 +169,13 @@ pub(super) fn parse_decimal(lexical: &str) -> Option<Num> {
 /// XSD `float`/`double` without the special values:
 /// `[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?`. `INF`, `-INF` and
 /// `NaN` are grammatical but outside the model (`None`).
-pub(super) fn parse_float(lexical: &str) -> Option<Num> {
+fn parse_float(lexical: &str) -> Option<Num> {
     let (neg, body) = split_sign(lexical)?;
     let (mantissa, exponent) = match body.find(['e', 'E']) {
         Some(i) => (&body[..i], Some(&body[i + 1..])),
         None => (body, None),
     };
-    let (int_part, frac_part) = match mantissa.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (mantissa, ""),
-    };
-    if int_part.is_empty() && frac_part.is_empty() {
-        return None;
-    }
-    if !int_part.bytes().all(|b| b.is_ascii_digit())
-        || !frac_part.bytes().all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
+    split_decimal(mantissa)?;
     if let Some(exp) = exponent {
         let (_, digits) = split_sign(exp)?;
         if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -220,6 +201,27 @@ fn split_sign(lexical: &str) -> Option<(bool, &str)> {
     } else {
         Some((false, lexical))
     }
+}
+
+/// The `(integer, fraction)` digits of an unsigned decimal body
+/// (`[0-9]+(\.[0-9]*)?|\.[0-9]+`), `None` when the grammar rejects it.
+fn split_decimal(body: &str) -> Option<(&str, &str)> {
+    let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    let accepted =
+        !(int_part.is_empty() && frac_part.is_empty()) && digits(int_part) && digits(frac_part);
+    accepted.then_some((int_part, frac_part))
+}
+
+/// The value of `digits` in `radix`; `None` for a non-digit or an overflow.
+pub(super) fn digits_value(
+    mut digits: impl Iterator<Item = Option<u32>>,
+    radix: u32,
+) -> Option<i128> {
+    digits.try_fold(0i128, |v, digit| {
+        v.checked_mul(i128::from(radix))?
+            .checked_add(i128::from(digit?))
+    })
 }
 
 /// Integers whose `f64` conversion is exact.
@@ -334,7 +336,7 @@ impl Number {
     }
 
     /// `lit <op> self` under the SPARQL operator mapping.
-    pub(super) fn compare(&self, op: &NumOp, lit: &LiteralView<'_>) -> Verdict {
+    pub(super) fn compare(&self, op: NumOp, lit: &LiteralView<'_>) -> Verdict {
         if let Some(value) = lit.number() {
             return match compare_nums(value, self.value) {
                 Some(ord) => op.apply(ord),

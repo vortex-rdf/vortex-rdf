@@ -4,9 +4,7 @@
 
 use crate::common::vocab::{RDF_LANG_STRING, XSD_STRING};
 
-use super::numeric::{
-    Num, NumKind, numeric_kind, parse_decimal, parse_float, parse_integer, parse_number,
-};
+use super::numeric::{Num, digits_value, numeric_kind, parse_number};
 
 /// A literal spelling split into its parts, borrowed from the spelling.
 pub(super) struct LiteralView<'a> {
@@ -28,10 +26,6 @@ impl<'a> LiteralView<'a> {
     pub(super) fn parse(spelling: &'a str) -> Option<Self> {
         let body = spelling.strip_prefix('"')?;
         if let Some(lexical) = body.strip_suffix('"') {
-            // Guard against the one-character spelling `"`.
-            if spelling.len() < 2 {
-                return None;
-            }
             return Some(Self {
                 lexical,
                 lang: None,
@@ -83,15 +77,9 @@ impl<'a> LiteralView<'a> {
     /// `NaN`) its own, more lenient parser may still accept, so that one is
     /// left to it.
     pub(super) fn parses_unbounded(&self) -> bool {
-        let Some(dt) = self.datatype else {
-            return false;
-        };
-        match numeric_kind(dt) {
-            Some(NumKind::Int(..)) => parse_integer(self.lexical).is_some(),
-            Some(NumKind::Decimal) => parse_decimal(self.lexical).is_some(),
-            Some(NumKind::Float) => parse_float(self.lexical).is_some(),
-            None => false,
-        }
+        self.datatype
+            .and_then(numeric_kind)
+            .is_some_and(|kind| parse_number(self.lexical, kind.unbounded()).is_some())
     }
 }
 
@@ -137,35 +125,34 @@ pub(super) fn unescape_prefix(lexical: &str, want: usize) -> Option<String> {
     }
     let mut out = String::with_capacity(want.min(lexical.len()));
     let mut chars = lexical.chars();
-    while out.chars().count() < want {
+    let mut count = 0;
+    while count < want {
         let Some(c) = chars.next() else { break };
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next()? {
-            't' => out.push('\t'),
-            'b' => out.push('\u{8}'),
-            'n' => out.push('\n'),
-            'r' => out.push('\r'),
-            'f' => out.push('\u{c}'),
-            '"' => out.push('"'),
-            '\'' => out.push('\''),
-            '\\' => out.push('\\'),
-            'u' => out.push(hex_char(&mut chars, 4)?),
-            'U' => out.push(hex_char(&mut chars, 8)?),
-            _ => return None,
-        }
+        let unescaped = if c != '\\' {
+            c
+        } else {
+            match chars.next()? {
+                't' => '\t',
+                'b' => '\u{8}',
+                'n' => '\n',
+                'r' => '\r',
+                'f' => '\u{c}',
+                '"' => '"',
+                '\'' => '\'',
+                '\\' => '\\',
+                'u' => hex_char(&mut chars, 4)?,
+                'U' => hex_char(&mut chars, 8)?,
+                _ => return None,
+            }
+        };
+        out.push(unescaped);
+        count += 1;
     }
     Some(out)
 }
 
+/// The character spelled by the next `len` hex digits of `chars`.
 fn hex_char(chars: &mut std::str::Chars<'_>, len: usize) -> Option<char> {
-    let mut v: u32 = 0;
-    for _ in 0..len {
-        v = v
-            .checked_mul(16)?
-            .checked_add(chars.next()?.to_digit(16)?)?;
-    }
-    char::from_u32(v)
+    let v = digits_value((0..len).map(|_| chars.next()?.to_digit(16)), 16)?;
+    char::from_u32(u32::try_from(v).ok()?)
 }
