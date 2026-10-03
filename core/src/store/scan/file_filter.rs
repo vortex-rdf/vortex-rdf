@@ -21,10 +21,9 @@ use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::scan::file_reads::{QUAD_SCOPE, strict_ids};
 use crate::store::view::selection::RowSelection;
 
-/// Split a file view's [`RowSelection`] into the two knobs the per-split filter
-/// loop understands: a [`Selection`] narrowing the mask (an id list, e.g. from a
-/// secondary index) and the row-id `bounds` it iterates. A `Range` narrows the
-/// bounds; an `Ids` list narrows the mask; `All` narrows neither.
+/// A file view's selection as the split loop's two knobs: a [`Selection`]
+/// narrowing each split's mask (an id list) and the row bounds it iterates
+/// (a range). `All` narrows neither.
 fn split_bounds(selection: &RowSelection, row_count: u64) -> (Selection, Range<u64>) {
     match selection {
         RowSelection::All => (Selection::All, 0..row_count),
@@ -33,10 +32,8 @@ fn split_bounds(selection: &RowSelection, row_count: u64) -> (Selection, Range<u
     }
 }
 
-/// The starting mask for one file split: the rows `selection` covers within
-/// `range`, minus any that `deleted` has tombstoned. Returned split-relative
-/// (one bit per row of `range`), ready for the store's per-split filter
-/// evaluation (`evaluate_filter_split`).
+/// One split's starting mask: the rows `mask_selection` covers within
+/// `range`, minus the tombstoned ones; one bit per row of `range`.
 fn split_start_mask(
     mask_selection: &Selection,
     deleted: Option<&Mask>,
@@ -52,25 +49,17 @@ fn split_start_mask(
     }
 }
 
-/// Evaluate a filter over one file split, threading a narrowing mask through the
-/// two phases the layout reader exposes — cheap zone-map/stats pruning first,
-/// then real per-conjunct filter evaluation for whatever survives. Returns the
-/// split-relative surviving mask; callers either count its set bits or lift them
-/// to absolute row ids. Mirrors the filter phase of vortex's own `split_exec`.
-async fn evaluate_filter_split(
-    reader: Arc<dyn LayoutReader>,
-    filter_conjuncts: &[BoundExpression],
+/// `mask` narrowed by the statistics-only pruning of each conjunct over
+/// `range`, stopping once nothing survives. No row data is read.
+async fn prune_mask(
+    reader: &Arc<dyn LayoutReader>,
+    conjuncts: &[BoundExpression],
     range: &Range<u64>,
-    start_mask: Mask,
+    mut mask: Mask,
 ) -> Result<Mask> {
-    let bound = filter_conjuncts;
-    let mut mask = start_mask;
-    // Phase 1: prune using zone-map/footer stats only — no I/O beyond the
-    // cached stats tables. Each conjunct narrows the mask; stop once nothing
-    // survives.
-    for conjunct in bound {
+    for conjunct in conjuncts {
         if mask.all_false() {
-            return Ok(mask);
+            break;
         }
         let pruned = reader
             .pruning_evaluation(range, conjunct, mask.clone())
@@ -79,10 +68,20 @@ async fn evaluate_filter_split(
             .map_err(VortexRdfError::Vortex)?;
         mask = mask.bitand(&pruned);
     }
-    // Phase 2: for whatever the stats couldn't rule out, read and evaluate each
-    // conjunct for real, threading the narrowing mask so later conjuncts see
-    // fewer rows.
-    for conjunct in bound {
+    Ok(mask)
+}
+
+/// `filter_conjuncts` evaluated over one split: pruning by statistics first,
+/// then each conjunct for real over whatever survives. Returns the
+/// split-relative surviving mask.
+async fn evaluate_filter_split(
+    reader: Arc<dyn LayoutReader>,
+    filter_conjuncts: &[BoundExpression],
+    range: &Range<u64>,
+    start_mask: Mask,
+) -> Result<Mask> {
+    let mut mask = prune_mask(&reader, filter_conjuncts, range, start_mask).await?;
+    for conjunct in filter_conjuncts {
         if mask.all_false() {
             return Ok(mask);
         }
@@ -95,31 +94,19 @@ async fn evaluate_filter_split(
     Ok(mask)
 }
 
-/// The per-split filter tasks of a file view, in file order: one future per
-/// natural split the selection touches, each evaluating `filter` over its
-/// split (zone-map pruning first, then the conjuncts) and answering the
-/// split-relative surviving mask with its range. The shared prelude of
-/// [`map_filter_splits`] and [`fold_filter_splits_ordered`], which differ in
-/// how they drive the tasks.
-///
-/// The clamped ranges are owned before the task futures are built: an
-/// iterator borrowing the memoized splits held across the awaits trips
-/// rustc's higher-ranked lifetime inference when callers spawn the resulting
-/// future.
+/// One future per natural split the selection touches, in file order, each
+/// answering its split-relative surviving mask with its range. The clamped
+/// ranges are owned before the futures are built (a compiler constraint when
+/// callers spawn the result).
 fn filter_split_tasks(
     file: &NativeStoreFile,
     filter: &Expression,
     selection: &RowSelection,
     deleted: Option<&Mask>,
 ) -> Result<Vec<SplitTask>> {
-    // The cached layout reader tree — reused across every split task below,
-    // so zone-map stats are looked up once, not once per split.
     let reader = file.layout_reader().map_err(VortexRdfError::Vortex)?;
-    // Split the filter into its top-level AND-ed conditions (the struct
-    // layout can only prune a single-field expression at a time) and bind
-    // them through the handle's memo: one bound identity per shape, shared
-    // by every split task and every later call, is what keeps vortex's
-    // identity-keyed reader caches hitting (see `BoundExprMemo`).
+    // The struct layout prunes one field at a time, so the filter is bound
+    // conjunct by conjunct.
     let filter_conjuncts: Vec<BoundExpression> = conjuncts(filter)
         .iter()
         .map(|conjunct| {
@@ -128,9 +115,6 @@ fn filter_split_tasks(
         })
         .collect::<vortex_error::VortexResult<_>>()
         .map_err(VortexRdfError::Vortex)?;
-    // Translate the view's selection into the two knobs the split loop
-    // understands: the bounds it iterates and the per-split starting mask
-    // (see `split_start_mask`).
     let (mask_selection, bounds) = split_bounds(selection, file.row_count());
 
     let splits = file.splits().map_err(VortexRdfError::Vortex)?;
@@ -147,8 +131,6 @@ fn filter_split_tasks(
         .map(|range| {
             let reader = Arc::clone(&reader);
             let filter_conjuncts = filter_conjuncts.clone();
-            // The starting mask for this split: the selected rows within
-            // `range`, minus any the caller has tombstoned.
             let start_mask = split_start_mask(&mask_selection, deleted, &range);
             async move {
                 let mask =
@@ -160,18 +142,13 @@ fn filter_split_tasks(
         .collect())
 }
 
-/// One split's filter evaluation, owning everything it reads: the surviving
-/// split-relative mask with the split's range.
+/// One split's filter evaluation: the surviving split-relative mask with the
+/// split's range.
 type SplitTask = BoxFuture<'static, Result<(Mask, Range<u64>)>>;
 
-/// Evaluate `filter` over every natural file split the selection touches and
-/// map each split's surviving mask through `map` — the shared split loop
-/// behind [`count_matching_rows`] and [`matching_file_rows`], which differ
-/// only in what they do with a split's mask.
-///
-/// The splits are evaluated concurrently (bounded by available parallelism)
-/// and returned in completion order — the per-split results carry their own
-/// range when order matters.
+/// `filter` evaluated over every split the selection touches, each surviving
+/// mask mapped through `map`. Splits run concurrently and return in
+/// completion order.
 async fn map_filter_splits<T, F>(
     file: &NativeStoreFile,
     filter: &Expression,
@@ -193,12 +170,9 @@ where
     Ok(out)
 }
 
-/// Evaluate `filter` over the selection's splits *in file order*, feeding
-/// each split's surviving mask to `step` until it answers `false` — the
-/// early-exit twin of [`map_filter_splits`] behind the windowed and capped
-/// reads ([`first_matching_rows`], [`count_matching_rows_capped`]). A few
-/// splits are evaluated ahead of the consumer so the exit stays cheap
-/// without serializing the I/O; whatever was in flight past the exit is
+/// `filter` evaluated over the selection's splits in file order, each
+/// surviving mask fed to `step` until it answers `false`. A few splits are
+/// evaluated ahead of the consumer; whatever is in flight past the exit is
 /// dropped unread.
 async fn fold_filter_splits_ordered<F>(
     file: &NativeStoreFile,
@@ -222,10 +196,8 @@ where
     Ok(())
 }
 
-/// The first `want` file rows matching `filter` inside the selection, in file
-/// order — the rows a window `offset + limit` deep needs — evaluating splits
-/// in order and stopping at the first that completes the count. Tombstoned
-/// rows are excluded (they would otherwise fill the window).
+/// The first `want` live file rows matching `filter` inside the selection, in
+/// file order.
 pub(crate) async fn first_matching_rows(
     file: &NativeStoreFile,
     filter: &Expression,
@@ -252,9 +224,8 @@ pub(crate) async fn first_matching_rows(
     Ok(Buffer::from(ids))
 }
 
-/// [`count_matching_rows`] stopping as soon as `cap` matches are counted —
-/// what `size_capped` and `exists` ask: whether (at least) that many rows
-/// match, not how many. Answers `min(matches, cap)`.
+/// `min(matches, cap)`: [`count_matching_rows`] stopping once `cap` rows are
+/// counted.
 pub(crate) async fn count_matching_rows_capped(
     file: &NativeStoreFile,
     filter: &Expression,
@@ -274,9 +245,8 @@ pub(crate) async fn count_matching_rows_capped(
     Ok(count.min(cap))
 }
 
-/// Count rows matching `filter` by driving the layout reader's pruning and
-/// filter evaluations directly and summing mask true-counts. No column is
-/// ever projected or decoded.
+/// The number of live rows matching `filter` inside the selection; no column
+/// is projected or decoded.
 pub(crate) async fn count_matching_rows(
     file: &NativeStoreFile,
     filter: &Expression,
@@ -290,14 +260,9 @@ pub(crate) async fn count_matching_rows(
     Ok(counts.into_iter().sum())
 }
 
-/// Evaluate a file view's pending filter and selection to a base-wide mask of
-/// the file rows it matches — the concrete row ids a deferred `match_pattern`
-/// on a file resolves to. With no pending filter the selection alone is exact,
-/// so its rows are the matches without a scan.
-///
-/// Tombstones are deliberately not applied: this answers "which rows does the
-/// pattern name", and the caller unions the result into its existing
-/// tombstones.
+/// The file rows a view's pending filter and selection name, as a base-wide
+/// mask. Tombstones are not applied; without a filter the selection alone is
+/// the answer.
 pub(crate) async fn matching_file_rows(
     file: &NativeStoreFile,
     filter: Option<&Expression>,
@@ -307,8 +272,6 @@ pub(crate) async fn matching_file_rows(
     let Some(filter) = filter else {
         return Ok(selection.to_mask(row_count as usize));
     };
-    // Same per-split evaluation as the counting path, but lifting each
-    // split's surviving rows back to absolute file row ids.
     let ids = map_filter_splits(file, filter, selection, None, |mask, range| -> Vec<usize> {
         match mask.indices() {
             AllOr::All => (range.start as usize..range.end as usize).collect(),
@@ -322,83 +285,45 @@ pub(crate) async fn matching_file_rows(
     Ok(Mask::from_indices(row_count as usize, matched))
 }
 
-/// Zone-map envelope of `filter`: the contiguous row range outside of which
-/// the file's statistics prove no row can match.
-///
-/// One `pruning_evaluation` per filter conjunct over the full file — the
-/// zoned layout evaluates its cached zone map vectorized, chunks are
-/// evaluated concurrently, and file-level footer stats short-circuit the
-/// whole thing (the reader is wrapped in `FileStatsLayoutReader`). The
-/// conjuncts are evaluated separately because the struct layout only prunes
-/// single-field expressions.
-///
-/// The envelope is order-agnostic (no sortedness assumption) and keeps
-/// interior non-matching stretches — the scan's own per-split pruning skips
-/// those from the same cached zone masks.
-///
-/// Returns `Some(0..0)` when nothing can match and `None` when the stats
-/// exclude nothing (leaving the range unset).
+/// The contiguous row range outside of which the file's statistics prove no
+/// row matches `filter`: `Some(0..0)` when nothing can match, `None` when the
+/// statistics exclude nothing. Order-agnostic; interior gaps are kept.
+/// Memoized per filter shape on the handle.
 pub(crate) async fn row_range_from_pruning(
     file: &NativeStoreFile,
     filter: &Expression,
 ) -> Result<Option<Range<u64>>> {
     let row_count = file.row_count();
-    // A row count that doesn't fit in usize can't back a Mask; such a file
-    // is answered as "no envelope known" and the match goes on.
     let Ok(len) = usize::try_from(row_count) else {
         return Ok(None);
     };
     if len == 0 {
         return Ok(Some(0..0));
     }
-    // Statistics-only and file-immutable, so the envelope is a pure function
-    // of the filter shape — memoized on the shared file handle for the
-    // repeated-pattern workloads the bindings serve. Keyed by the expression
-    // itself (structural `Eq`/`Hash`), so a hit allocates nothing.
     if let Some(envelope) = file.pruning_envelope(filter) {
         return Ok(envelope);
     }
 
-    // Start from "everything might match" and narrow it down using only
-    // statistics (zone maps / footer stats) — no row data is read here.
     let reader = file.layout_reader().map_err(VortexRdfError::Vortex)?;
-    let mut mask = Mask::new_true(len);
-    for conjunct in conjuncts(filter) {
-        // Once nothing can match, further conjuncts can't un-prune rows.
-        if mask.all_false() {
-            break;
-        }
-        let conjunct = file
-            .bound_exprs()
-            .bind(QUAD_SCOPE, &conjunct, reader.dtype())
-            .map_err(VortexRdfError::Vortex)?;
-        // Evaluate this conjunct's prunability over the *entire* file in one
-        // call: the zoned reader vectorizes this over all its zones and the
-        // file-stats wrapper checks footer-level bounds first.
-        let pruned = reader
-            .pruning_evaluation(&(0..row_count), &conjunct, mask.clone())
-            .map_err(VortexRdfError::Vortex)?
-            .await
-            .map_err(VortexRdfError::Vortex)?;
-        mask = mask.bitand(&pruned);
-    }
+    let bound: Vec<BoundExpression> = conjuncts(filter)
+        .iter()
+        .map(|conjunct| {
+            file.bound_exprs()
+                .bind(QUAD_SCOPE, conjunct, reader.dtype())
+        })
+        .collect::<vortex_error::VortexResult<_>>()
+        .map_err(VortexRdfError::Vortex)?;
+    let mask = prune_mask(&reader, &bound, &(0..row_count), Mask::new_true(len)).await?;
 
-    // Collapse the surviving mask to its enclosing contiguous range: the
-    // first and last set bit. Interior gaps of non-matching rows are kept
-    // (the scan's own per-split pruning will skip those later using the same
-    // cached zone masks) — only the outer dead space is trimmed.
     let envelope = match (mask.first(), mask.last()) {
         (Some(first), Some(last)) => {
             let range = first as u64..last as u64 + 1;
-            // No trimming actually happened — leave the range unset rather
-            // than recording a no-op range.
             if range == (0..row_count) {
                 None
             } else {
                 Some(range)
             }
         }
-        // No bit survived: the filter provably matches nothing in this file.
         _ => Some(0..0),
     };
     file.memoize_pruning_envelope(filter.clone(), envelope.clone());

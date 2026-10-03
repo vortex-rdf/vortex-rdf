@@ -83,6 +83,16 @@ pub(crate) async fn scan_all_reader(reader: vortex_layout::LayoutReaderRef) -> R
     chunked_or_single(scan_reader_chunks(reader).await?, dtype)
 }
 
+/// [`scan_all_reader`] driven to completion on the current thread. The
+/// reader MUST sit over a buffer-backed segment source, whose reads resolve
+/// without pending.
+pub(crate) fn scan_all_reader_sync(reader: vortex_layout::LayoutReaderRef) -> Result<ArrayRef> {
+    use futures::FutureExt as _;
+    scan_all_reader(reader).now_or_never().unwrap_or_else(|| {
+        unreachable!("a buffer-backed segment source resolves its reads synchronously")
+    })
+}
+
 /// [`scan_all_reader`] before assembly: the reader's scan chunks in split
 /// (row) order, each in its stored encoding.
 pub(crate) async fn scan_reader_chunks(

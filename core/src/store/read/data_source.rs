@@ -103,7 +103,7 @@ impl VortexRdfStore {
     pub fn component_data_source(&self, name: &str) -> Result<Option<DataSourceRef>> {
         match &self.quads {
             QuadsSource::InMemory { components, .. } => {
-                if let Some(component) = components.iter().find(|c| c.name == name) {
+                if let Some(component) = components.iter().find(|c| c.identity.name == name) {
                     let rows = component.rows()?.clone().into_array();
                     return Ok(Some(chunks_source(vec![rows])));
                 }

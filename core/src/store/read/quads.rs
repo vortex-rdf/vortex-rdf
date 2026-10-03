@@ -160,13 +160,7 @@ impl VortexRdfStore {
                         let deleted = deleted.clone();
                         let file = std::sync::Arc::clone(file);
                         let chunk = async move {
-                            let projection = serve.projection();
-                            let point = file_reads::component_point_chunk(
-                                &file,
-                                serve.component(),
-                                &projection,
-                                range,
-                            );
+                            let point = serve.point_chunk(&file);
                             match file_reads::point_rows_or_scan(point, scan).await {
                                 Ok(rows) => {
                                     serve

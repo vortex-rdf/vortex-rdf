@@ -382,9 +382,9 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
         .map(|(family, chunks)| {
             container::NativeComponentWrite::new(
                 container::StoreComponentDescriptor {
-                    name: family.component_name().into(),
+                    name: family.identity().name.into(),
                     role: container::StoreComponentRole::Index,
-                    implementation: family.component_slug().into(),
+                    implementation: family.identity().slug.into(),
                     version: 1,
                     required: false,
                     // Per-chunk sorts only: the writer may not claim global order.
@@ -1091,7 +1091,7 @@ async fn test_written_code_columns_avoid_delta() {
         use vortex_array::IntoArray as _;
         let rows = component.rows().unwrap().clone().into_array();
         trees.push((
-            component.name.to_string(),
+            component.identity.name.to_string(),
             format!("{}", rows.display_tree_encodings_only()),
         ));
     }

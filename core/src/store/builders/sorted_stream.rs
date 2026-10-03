@@ -19,7 +19,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::io::container::NativeComponentWrite;
 use crate::store::RawQuad;
 use crate::store::array::{chunked_or_single, with_subject_stamp};
-use crate::store::indexes::copy::{self, out_of_core::CopyKey};
+use crate::store::indexes::copy::out_of_core::CopyKey;
 use crate::store::indexes::{IndexComponent, IndexType, Indexes, known_component, unique_indexes};
 use crate::store::layouts::dictionary::{TermCodeMap, TermDictionary, TermDictionaryBuilder};
 use crate::store::layouts::{LayoutStrategy, dictionary};
@@ -111,8 +111,7 @@ pub(crate) async fn build_array(
             .execute::<StructArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
         components.push(IndexComponent::built(
-            known.identity.name,
-            known.identity.slug,
+            known.identity,
             array,
             component.descriptor.sorted,
         ));
@@ -462,7 +461,7 @@ fn merger_components<V>(
     ref_chunk: RefChunkFn<V>,
 ) -> Result<Vec<NativeComponentWrite>>
 where
-    V: Send + 'static + copy::TermColumn,
+    V: Send + 'static + crate::store::indexes::components::TermColumn,
     (V, u32): Ord + Spillable,
     (CopyKey<V>, u32): Ord + Spillable,
 {
@@ -527,8 +526,8 @@ where
         for (family, merger) in [(CopyFamily::Posg, posg), (CopyFamily::Ospg, ospg)] {
             let mut merger = merger;
             push(
-                family.component_name(),
-                family.component_slug(),
+                family.identity().name,
+                family.identity().slug,
                 copy_dtype.clone(),
                 Box::new(move |n| {
                     let batch = merger.next_batch(n)?;
@@ -547,8 +546,8 @@ where
         ] {
             let mut merger = merger;
             push(
-                family.component_name(),
-                family.component_slug(),
+                family.identity().name,
+                family.identity().slug,
                 ref_dtype.clone(),
                 Box::new(move |n| {
                     let batch = merger.next_batch(n)?;
@@ -578,7 +577,7 @@ fn emit_merged_run_chunks(
         chunk_size,
         &guard,
         false,
-        crate::store::indexes::reference::out_of_core::ref_child_chunk_strings,
+        crate::store::indexes::reference::out_of_core::ref_child_chunk,
     )?;
     let (dtype, chunks) = chunk_stream(
         (merged, guard),
@@ -611,7 +610,7 @@ fn emit_merged_run_dict_chunks(
         chunk_size,
         &guard,
         true,
-        crate::store::indexes::reference::out_of_core::ref_child_chunk_codes,
+        crate::store::indexes::reference::out_of_core::ref_child_chunk,
     )?;
     let (dtype, chunks) = chunk_stream(
         (merged, guard),

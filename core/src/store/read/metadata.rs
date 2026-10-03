@@ -298,11 +298,11 @@ impl VortexRdfStore {
             QuadsSource::InMemory { components, .. } => components
                 .iter()
                 .filter_map(|c| {
-                    let index = index_of_slug(c.slug)?;
+                    let index = index_of_slug(c.identity.slug)?;
                     Some(IndexComponentInfo {
-                        name: c.name,
+                        name: c.identity.name,
                         index,
-                        sort_order: sort_order_of(c.name),
+                        sort_order: sort_order_of(c.identity.name),
                         sorted: c.sorted,
                         rows: c.len_if_resident(),
                         resident: true,

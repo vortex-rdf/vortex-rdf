@@ -1,24 +1,23 @@
 //! Gathering a view's rows out of an in-memory base: the tombstone-aware
-//! slice/take pipeline and the point-read path small selections take
-//! through encoded search probes.
+//! slice/take pipeline and the point-read path point-sized selections take
+//! through encoded-search probes.
 
-use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::struct_::StructArrayExt;
+use vortex_array::arrays::{PrimitiveArray, Struct, StructArray};
 use vortex_array::dtype::PType;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray};
 use vortex_mask::Mask;
+use vortex_rdf_encoded_search::SortedProbe;
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::probes::StructProbes;
 use crate::store::view::selection::RowSelection;
 
-/// Gather the rows of `base` that `selection` covers and `deleted` has not
-/// tombstoned.
-///
-/// The single place the in-memory read paths turn a view into rows, so that
-/// applying the tombstones cannot be forgotten by one of them: deletions are
-/// deliberately kept out of the selection (see [`RowSelection::live_mask`]), so
-/// a selection alone always over-reports.
+/// The rows of `base` that `selection` covers and `deleted` has not
+/// tombstoned. Tombstones live outside the selection
+/// ([`RowSelection::live_mask`]), so every in-memory read gathers through
+/// here.
 pub(crate) fn gather_live(
     base: &ArrayRef,
     selection: &RowSelection,
@@ -39,77 +38,79 @@ pub(crate) fn gather_live(
     rows.filter(live).map_err(VortexRdfError::Vortex)
 }
 
-/// Rows of a small selection, read point-by-point through encoded search
-/// probes into canonical output columns — the read-side counterpart of the
-/// match paths' encoded probing, skipping the per-column slice/canonicalize
-/// pipeline whose fixed cost dominates tiny reads on a compressed-resident
-/// base. `None` declines: a wide or `All` selection, a non-struct base, or
-/// any child (e.g. a string column) no probe resolves — the general pipeline
-/// handles those. Also serves the index serving plans, which canonicalize
-/// their small contiguous chunks through it (`Range(0..len)` over the sliced
-/// component rows).
+/// The live rows of a point-sized selection, read point by point through
+/// encoded-search probes into canonical columns. `None` declines: a wide or
+/// `All` selection, a non-struct base, or a child no probe resolves.
 pub(crate) fn gather_by_point_reads(
     base: &ArrayRef,
     selection: &RowSelection,
     deleted: Option<&Mask>,
     probes: Option<&StructProbes>,
 ) -> Result<Option<ArrayRef>> {
-    use vortex_array::arrays::struct_::StructArrayExt;
-    use vortex_array::arrays::{Struct, StructArray};
-    use vortex_rdf_encoded_search::SortedProbe;
-
     let Some(live) = selection.point_sized_live_rows(deleted) else {
         return Ok(None);
     };
     let live: Vec<usize> = live.into_iter().map(|i| i as usize).collect();
-    let Ok(struct_arr) = base.clone().try_downcast::<Struct>() else {
+    let Some(fields) = base.dtype().as_struct_fields_opt() else {
         return Ok(None);
     };
-    let names = struct_arr.names().clone();
-    let mut children = Vec::with_capacity(names.len());
-    for (idx, name) in names.iter().enumerate() {
-        let Ok(child) = struct_arr.unmasked_field_by_name(name.as_ref()) else {
-            return Ok(None);
-        };
-        // The store's cached probe first (resolution walks the encoding tree
-        // — the fixed cost this path exists to avoid); a transient base
-        // (tail, served rows) resolves per call.
-        let cached = probes.and_then(|p| p.child(base, idx));
-        let local;
-        let probe = match cached {
-            Some(owned) => owned.probe(),
-            None => {
-                let Some(resolved) = SortedProbe::resolve(child) else {
-                    return Ok(None);
-                };
-                local = resolved;
-                &local
-            }
-        };
-        let reads = live.iter().map(|&i| probe.value_at(i));
-        let Some(gathered) = primitive_from_u64_reads(child.dtype().as_ptype(), reads) else {
-            return Ok(None);
-        };
-        children.push(gathered);
-    }
+    let names = fields.names().clone();
+    let name_strs: Vec<&str> = names.iter().map(|n| n.as_ref()).collect();
+    let Some(children) = point_read_columns(base, &name_strs, &live, probes) else {
+        return Ok(None);
+    };
+    let children: Vec<ArrayRef> = children.into_iter().map(IntoArray::into_array).collect();
     let rows = StructArray::try_new(names, children, live.len(), Validity::NonNullable)
         .map_err(VortexRdfError::Vortex)?
         .into_array();
     Ok(Some(rows))
 }
 
-/// A primitive column of `ptype` built from point reads widened to `u64`.
-/// `None` for any type the point-read paths do not produce (the caller
-/// declines to its vectorized path).
+/// `names`' columns of the struct `array` at `positions`, each read point by
+/// point through its encoded-search probe (the cached one in `probes` when it
+/// resolves, else one resolved per call) into a canonical primitive. `None`
+/// when `array` is not a struct, or a column resolves no probe or has a type
+/// the reads cannot produce.
+pub(crate) fn point_read_columns(
+    array: &ArrayRef,
+    names: &[&str],
+    positions: &[usize],
+    probes: Option<&StructProbes>,
+) -> Option<Vec<PrimitiveArray>> {
+    let struct_arr = array.clone().try_downcast::<Struct>().ok()?;
+    let mut children = Vec::with_capacity(names.len());
+    for name in names {
+        let idx = struct_arr
+            .names()
+            .iter()
+            .position(|n| n.as_ref() == *name)?;
+        let child = struct_arr.unmasked_field_by_name(name).ok()?;
+        let cached = probes.and_then(|p| p.child(array, idx));
+        let local;
+        let probe = match cached {
+            Some(owned) => owned.probe(),
+            None => {
+                local = SortedProbe::resolve(child)?;
+                &local
+            }
+        };
+        let reads = positions.iter().map(|&i| probe.value_at(i));
+        children.push(primitive_from_u64_reads(child.dtype().as_ptype(), reads)?);
+    }
+    Some(children)
+}
+
+/// A primitive column of `ptype` from point reads widened to `u64`; `None`
+/// for a type the point-read paths do not produce.
 pub(crate) fn primitive_from_u64_reads(
     ptype: PType,
     reads: impl Iterator<Item = u64>,
-) -> Option<ArrayRef> {
+) -> Option<PrimitiveArray> {
     Some(match ptype {
-        PType::U8 => PrimitiveArray::from_iter(reads.map(|v| v as u8)).into_array(),
-        PType::U16 => PrimitiveArray::from_iter(reads.map(|v| v as u16)).into_array(),
-        PType::U32 => PrimitiveArray::from_iter(reads.map(|v| v as u32)).into_array(),
-        PType::U64 => PrimitiveArray::from_iter(reads).into_array(),
+        PType::U8 => PrimitiveArray::from_iter(reads.map(|v| v as u8)),
+        PType::U16 => PrimitiveArray::from_iter(reads.map(|v| v as u16)),
+        PType::U32 => PrimitiveArray::from_iter(reads.map(|v| v as u32)),
+        PType::U64 => PrimitiveArray::from_iter(reads),
         _ => return None,
     })
 }
@@ -117,8 +118,7 @@ pub(crate) fn primitive_from_u64_reads(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vortex_array::arrays::struct_::StructArrayExt;
-    use vortex_array::arrays::{Primitive, Struct, StructArray, VarBinViewArray};
+    use vortex_array::arrays::{Primitive, VarBinViewArray};
     use vortex_buffer::Buffer;
 
     /// A five-row canonical u32 struct whose `s` column is the row id.
@@ -140,7 +140,7 @@ mod tests {
     }
 
     /// A point-sized id selection is read row by row with the tombstoned
-    /// rows dropped from the gathered struct.
+    /// rows dropped.
     #[test]
     fn gather_by_point_reads_drops_tombstones() {
         let base = u32_struct();
@@ -170,7 +170,7 @@ mod tests {
         );
     }
 
-    /// `All` is never point-sized, so it declines to the slice/take pipeline.
+    /// `All` is never point-sized.
     #[test]
     fn gather_by_point_reads_declines_all() {
         let base = u32_struct();
@@ -179,5 +179,16 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// Named columns come back in the order asked, at the positions asked.
+    #[test]
+    fn point_read_columns_follow_names_and_positions() {
+        let base = u32_struct();
+        let columns = point_read_columns(&base, &["p", "s"], &[4, 1], None).unwrap();
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].as_slice::<u32>(), &[0, 1]);
+        assert_eq!(columns[1].as_slice::<u32>(), &[4, 1]);
+        assert!(point_read_columns(&base, &["nope"], &[0], None).is_none());
     }
 }
