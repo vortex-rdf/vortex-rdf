@@ -82,6 +82,7 @@ impl CopyFamily {
 
     /// Where each quad component (s, p, o, g) sits in this family's
     /// `CopyKey` tuple.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     fn key_positions(self) -> [usize; 4] {
         match self {
             CopyFamily::Posg => [2, 0, 1, 3],
