@@ -1,8 +1,6 @@
-//! Batched probes: many patterns — each with its own keeps and window —
-//! matched in one call, answering in input order. A query engine's
-//! nested-loop join probes the store once per binding; batching lets a
-//! file-backed store overlap those probes' I/O, and hands a binding layer
-//! one call to release its lock around.
+//! Batched probes: many patterns, each with its own keeps and window,
+//! matched in one call and answered in input order; a file-backed store
+//! overlaps the probes' I/O.
 
 use futures::future::try_join_all;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
@@ -15,7 +13,7 @@ use crate::store::VortexRdfStore;
 
 /// One probe of a batch: a pattern (`None` = free, as for
 /// [`match_pattern`](VortexRdfStore::match_pattern)) with the narrowing to
-/// apply to its match — keeps per column, then a window.
+/// apply to its match: keeps per column, then a window.
 #[derive(Clone, Debug, Default)]
 pub struct Probe {
     pub subject: Option<NamedOrBlankNode>,
@@ -66,16 +64,15 @@ impl Probe {
 impl VortexRdfStore {
     /// The view each probe narrows this store to, in input order:
     /// [`match_pattern`](Self::match_pattern), then the probe's keeps, then
-    /// its window. The probes run concurrently, so a file-backed store
-    /// overlaps their reads; in memory a match is CPU work and the batch
-    /// runs it probe by probe. The first error ends the batch.
+    /// its window. The probes run concurrently; the first error ends the
+    /// batch.
     pub async fn match_many(&self, probes: &[Probe]) -> Result<Vec<Self>> {
         try_join_all(probes.iter().map(|probe| self.run_probe(probe))).await
     }
 
-    /// [`size`](Self::size) of each probe's view, in input order — or, for a
-    /// probe with a limit, [`size_capped`](Self::size_capped) at that limit,
-    /// which stops reading at the cap.
+    /// [`size`](Self::size) of each probe's view, in input order; a probe
+    /// with a limit counts with [`size_capped`](Self::size_capped) at that
+    /// limit. The offset is subtracted.
     pub async fn count_many(&self, probes: &[Probe]) -> Result<Vec<usize>> {
         try_join_all(probes.iter().map(|probe| async move {
             let view = self.run_pattern_and_keeps(probe).await?;

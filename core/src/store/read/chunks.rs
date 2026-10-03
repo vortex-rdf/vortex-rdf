@@ -1,17 +1,10 @@
-//! Chunked, Arrow-free exports of a view's rows — the stream a query planner
-//! reads a [`VortexRdfStore`] view through when it wants columns rather than
-//! decoded quads: struct chunks in the layout's own dtype
+//! Chunked exports of a view's rows: struct chunks in the layout's dtype
 //! ([`row_chunks`](VortexRdfStore::row_chunks)) or `u32` code columns
-//! ([`code_chunks`](VortexRdfStore::code_chunks)).
-//!
-//! Every chunk holds at most `batch_rows` rows. Rows come in **base row
-//! order** with the view's narrowing applied — the pattern, keeps, windows
-//! and tombstones — and for the string layouts the append tail's live rows
-//! follow the base, as [`quads`](VortexRdfStore::quads) orders them. A served
-//! match (a view answered from an index copy) materializes its row ids
-//! first, so the order is the base's, never the index's. The streams are
-//! lazy: nothing is gathered or scanned until the first poll, and a
-//! file-backed view streams the scan's chunks as they arrive.
+//! ([`code_chunks`](VortexRdfStore::code_chunks)). Chunks hold at most
+//! `batch_rows` rows and come in base row order with the view's narrowing
+//! and tombstones applied (a served match materializes its row ids first);
+//! under a string layout the tail's live rows follow the base. The streams
+//! build on first poll.
 
 use std::future::Future;
 
@@ -29,26 +22,23 @@ use crate::store::array::{field_as, into_struct_array, rechunk};
 use crate::store::scan::file_reads;
 use crate::store::schema::QuadColumn;
 
-/// A view's rows as struct chunks in the layout's native dtype, each of at
-/// most the requested `batch_rows`.
+/// A view's rows as struct chunks in the layout's dtype, each of at most the
+/// requested `batch_rows`.
 pub type RowChunkStream = BoxStream<'static, Result<ArrayRef>>;
 
-/// A view's rows as `u32` code columns — one buffer per requested column, in
-/// the requested order — each chunk of at most the requested `batch_rows`.
+/// A view's rows as `u32` code columns, one buffer per requested column in
+/// the requested order, each chunk of at most the requested `batch_rows`.
 pub type CodeChunkStream = BoxStream<'static, Result<Vec<Buffer<u32>>>>;
 
 impl VortexRdfStore {
     /// The rows this view selects as struct chunks in the layout's primary
-    /// dtype — `u32` codes under the Dictionary layout, strings otherwise —
-    /// in base row order, each chunk holding at most `batch_rows` rows (a
-    /// file-backed view's chunks follow the file's natural splits, cut to the
-    /// cap; an in-memory view's are exactly `batch_rows` but the last).
-    /// Tombstoned rows are skipped and, under a string layout, the append
-    /// tail's live rows come last.
-    ///
-    /// Errors: `batch_rows == 0`; a Dictionary-layout view with a non-empty
-    /// tail (its tail holds strings whose terms have no code — `compact` the
-    /// store first).
+    /// dtype (`u32` codes under the Dictionary layout, strings otherwise), in
+    /// base row order, each chunk of at most `batch_rows` rows (a file view's
+    /// chunks follow the file's splits cut to the cap; an in-memory view's are
+    /// exactly `batch_rows` but the last). Tombstoned rows are skipped; under
+    /// a string layout the tail's live rows come last. Errors: `batch_rows ==
+    /// 0`; a Dictionary view with a non-empty tail (`compact` the store
+    /// first).
     pub fn row_chunks(&self, batch_rows: usize) -> Result<RowChunkStream> {
         check_batch(batch_rows)?;
         self.ensure_no_dictionary_tail("row_chunks")?;
@@ -58,17 +48,14 @@ impl VortexRdfStore {
         ))
     }
 
-    /// The rows this view selects as `u32` term-code columns, one buffer per
-    /// column of `columns` in that order, in base row order, each chunk
-    /// holding at most `batch_rows` rows. The chunked twin of
-    /// [`code_columns_gathered`](Self::code_columns_gathered), with the same
-    /// vocabulary: the codes of the store's dictionary
-    /// ([`dict_reader`](Self::dict_reader) decodes them).
-    ///
-    /// In memory the buffers are zero-copy slices of the base's columns;
-    /// on file the scan projects only `columns`. Errors: `batch_rows == 0`,
-    /// no columns, or a view whose rows are not code-addressable (a string
-    /// layout, or a Dictionary view with a non-empty tail).
+    /// The rows this view selects as `u32` code columns, one buffer per
+    /// column of `columns` in that order, in base row order, each chunk of at
+    /// most `batch_rows` rows; the codes are the store's dictionary's
+    /// ([`dict_reader`](Self::dict_reader) decodes them). In memory the
+    /// buffers are zero-copy slices of the base's columns; on file the scan
+    /// projects only `columns`. Errors: `batch_rows == 0`, no columns, or a
+    /// view whose rows are not code-addressable (a string layout, or a
+    /// Dictionary view with a non-empty tail).
     pub fn code_chunks(
         &self,
         columns: &[QuadColumn],
@@ -88,8 +75,8 @@ impl VortexRdfStore {
         }))
     }
 
-    /// The chunk stream behind [`row_chunks`](Self::row_chunks), built once
-    /// the stream is first polled.
+    /// The chunk stream behind [`row_chunks`](Self::row_chunks), built on
+    /// first poll.
     async fn row_chunk_source(&self, batch_rows: usize) -> Result<RowChunkStream> {
         let tail = self.tail_chunks(batch_rows)?;
         match &self.quads {
@@ -108,9 +95,8 @@ impl VortexRdfStore {
                 ..
             } => {
                 let selection = selection.materialized_async().await?;
-                // A point-sized selection reads row by row through the
-                // file's chunk probes (see `base_selected_rows`) instead of
-                // decoding whole chunks of the scan.
+                // A point-sized selection reads point by point through the
+                // chunk probes.
                 if selection.is_point_sized() {
                     let rows = self.base_selected_rows().await?;
                     let mut chunks = rechunk(rows, batch_rows)?;
@@ -131,8 +117,8 @@ impl VortexRdfStore {
         }
     }
 
-    /// The chunk stream behind [`code_chunks`](Self::code_chunks), built once
-    /// the stream is first polled.
+    /// The chunk stream behind [`code_chunks`](Self::code_chunks), built on
+    /// first poll.
     async fn code_chunk_source(
         &self,
         columns: &[QuadColumn],
@@ -141,8 +127,8 @@ impl VortexRdfStore {
         let names: Vec<&'static str> = columns.iter().map(|c| c.name()).collect();
         match &self.quads {
             QuadsSource::InMemory { .. } => {
-                // Zero-copy: the requested columns are slices of the base's
-                // own `u32` buffers (or a gather of them for an id selection).
+                // Slices of the base's own `u32` buffers (a gather for an id
+                // selection).
                 if let Some(all) = self.base_code_columns() {
                     let picked: Vec<Buffer<u32>> =
                         columns.iter().map(|c| all[c.index()].clone()).collect();
@@ -156,8 +142,8 @@ impl VortexRdfStore {
                         .collect();
                     return Ok(stream::iter(chunks.into_iter().map(Ok)).boxed());
                 }
-                // A base whose columns the shared cache cannot hand out as
-                // `u32` primitives: go through the row chunks and extract.
+                // Columns the shared cache cannot hand out as `u32`
+                // primitives: extracted from the row chunks.
                 let rows = self.base_selected_rows().await?;
                 let chunks = rechunk(rows, batch_rows)?;
                 Ok(stream::iter(chunks.into_iter().map(move |c| extract_codes(c, &names))).boxed())
@@ -212,9 +198,8 @@ fn check_batch(batch_rows: usize) -> Result<()> {
     Ok(())
 }
 
-/// A stream that builds its source on first poll — the view's gather or
-/// scan runs then, not when the stream is requested — and yields the
-/// build's error as its single item when the build fails.
+/// A stream built from `build` on first poll; a build failure is the
+/// stream's single item.
 fn lazy<T: Send + 'static>(
     build: impl Future<Output = Result<BoxStream<'static, Result<T>>>> + Send + 'static,
 ) -> BoxStream<'static, Result<T>> {

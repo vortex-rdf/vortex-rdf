@@ -1,17 +1,8 @@
-//! Narrowing a view beyond a pattern: keeping only the rows whose code in
-//! one column falls in a set or range ([`Keep`]), windowing the rows, and
-//! capped counts — the restrictions a query engine pushes below a pattern
-//! (`VALUES`, `FILTER` on a term predicate, `LIMIT`/`OFFSET`, `ASK`).
-//!
-//! Every narrowing is an ordinary derived view: it composes with
-//! [`match_pattern`](VortexRdfStore::match_pattern) in either order and is
-//! read through the same paths (`size`, `code_columns_gathered`, `quads`).
-//! Keeps are applied *after* the pattern, never through the pattern
-//! compiler: in memory as a binary search inside a sorted run or a pass over
-//! the selected rows of the column, on file as range or set conjuncts the
-//! scan prunes with its zone maps. Windows and capped counts over a file
-//! view with a pending filter evaluate its splits in file order and stop at
-//! the first split that completes them.
+//! Narrowing a view beyond a pattern: [`Keep`] (the rows whose code in one
+//! column is in a set or range), windows, and the empty view. Every
+//! narrowing is a derived view that composes with
+//! [`match_pattern`](VortexRdfStore::match_pattern) in either order and reads
+//! through the same paths.
 
 use std::ops::Range;
 
@@ -34,7 +25,7 @@ use crate::store::VortexRdfStore;
 /// Which term codes a [`keep`](VortexRdfStore::keep) admits in a column.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Keep {
-    /// Any of these codes — ascending and unique, as [`Keep::set`] builds
+    /// Any of these codes; ascending and unique, as [`Keep::set`] builds
     /// them.
     Set(Buffer<u32>),
     /// Any code in the half-open range `lo..hi`. Codes rank the dictionary's
@@ -94,8 +85,7 @@ impl Keep {
                     return KeepTest::Range(0, 0);
                 };
                 let span = (hi - lo) as usize + 1;
-                // A bitmap costs a bit per code of the span; worth it while
-                // the span is within 8 bits per member (a byte each).
+                // A bitmap while the span is within 8 bits per member.
                 if span <= codes.len().saturating_mul(8) {
                     let mut bits = vec![0u64; span.div_ceil(64)];
                     for &code in codes {
@@ -170,29 +160,16 @@ impl VortexRdfStore {
         }
     }
 
-    /// Narrow this view to the rows whose code in `column` the keep admits —
-    /// the rows a `VALUES` block or a term predicate (see
-    /// `DictReader::filter_codes`) selects, applied inside the store instead
-    /// of over gathered columns. Composes with [`match_pattern`] in either
-    /// order and reads through the same paths; an empty keep is the empty
-    /// view.
-    ///
-    /// Requires the Dictionary layout with an empty append tail (codes are
-    /// the store's vocabulary only then, as for
-    /// [`code_read_snapshot`](Self::code_read_snapshot)); anything else is an
-    /// `InvalidOperation` error.
-    ///
-    /// In memory the keep is a binary search when the selected rows are a
-    /// run of the sorted base that `column` orders (a bound prefix of the
-    /// `(s, p, o, g)` order, as a subject-bound match leaves), else one pass
-    /// over the selected rows of the column read in place. On file it is a
-    /// range or set conjunct ANDed onto the view's pushed-down filter, so the
-    /// scan's zone maps prune whole blocks it cannot satisfy; a very wide set
-    /// is tested in memory over the column's selected rows instead. A served
-    /// view's deferred row ids materialize first (the index's plan reads a
-    /// run the keep no longer describes).
-    ///
-    /// [`match_pattern`]: Self::match_pattern
+    /// Narrow this view to the rows whose code in `column` the keep admits
+    /// (the rows a `VALUES` block or a term predicate selects; see
+    /// `DictReader::filter_codes`). Composes with
+    /// [`match_pattern`](Self::match_pattern) in either order; an empty keep
+    /// is the empty view. Requires the Dictionary layout with an empty append
+    /// tail, `InvalidOperation` otherwise. In memory: a binary search when the
+    /// selected rows are a run of the sorted base that `column` orders, else
+    /// one pass over the selected rows of the column. On file: a range or set
+    /// conjunct on the pushed-down filter, pruned by zone maps; a very wide set
+    /// is tested in memory. A served view's pending ids materialize first.
     pub async fn keep(&self, column: QuadColumn, keep: &Keep) -> Result<Self> {
         self.ensure_code_view("keep")?;
         if keep.is_empty() {
@@ -215,17 +192,11 @@ impl VortexRdfStore {
         Ok(view)
     }
 
-    /// The view's rows after skipping `offset` and taking at most `limit`, in
-    /// the order the view reads them — base rows in base row order, then the
-    /// tail's. A file view with a pending filter resolves it only as far as
-    /// the window reaches: its splits are evaluated in file order and the
-    /// evaluation stops at the first that fills the window, so `LIMIT` over a
-    /// filtered scan costs the matching prefix of the file, not all of it.
+    /// The view's rows after skipping `offset` and taking at most `limit`:
+    /// base rows in base row order, then the tail's. A pending file filter is
+    /// evaluated in file order only as far as the window reaches. The serve
+    /// plan is dropped, so a served view's rows come back in base order.
     /// Available on every layout.
-    ///
-    /// A served view's rows come back in base order, not the index's (the
-    /// plan is dropped: a window is a position range over base order, which
-    /// the index's order does not share).
     pub async fn window(&self, offset: usize, limit: usize) -> Result<Self> {
         let t = debug::timer();
         let selection = self.quads.materialized_selection().await?;
@@ -280,8 +251,7 @@ impl VortexRdfStore {
     /// The in-memory backend of [`keep`](Self::keep).
     fn keep_in_memory(&self, column: QuadColumn, keep: &Keep) -> Result<Self> {
         let t = debug::timer();
-        // Without `file-io`, InMemory is the only variant.
-        #[allow(irrefutable_let_patterns)]
+        #[cfg_attr(not(feature = "file-io"), allow(irrefutable_let_patterns))]
         let QuadsSource::InMemory {
             base,
             selection,
@@ -291,8 +261,6 @@ impl VortexRdfStore {
         else {
             unreachable!("keep routes only InMemory sources here");
         };
-        // A served view's deferred ids are needed now: the plan reads a run
-        // the keep no longer describes.
         let selection = selection.materialized()?;
         let base_len = base.len();
         if selection.is_empty(base_len) {
@@ -331,10 +299,10 @@ impl VortexRdfStore {
     }
 
     /// The keep by binary search, when the selection is a run of the sorted
-    /// base that `column` orders: every column before it in the `(s, p, o,
-    /// g)` order is constant over the run (so the run is sorted by this
-    /// one). A range keep is two lower bounds; a small set is one bounded
-    /// sub-run per code. `None` declines to the row pass.
+    /// base that `column` orders (every earlier column of the `(s, p, o, g)`
+    /// order is constant over the run). A range keep is two lower bounds; a
+    /// small set is one bounded sub-run per code. `None` declines to the row
+    /// pass.
     fn keep_sorted_run(
         struct_arr: &vortex_array::arrays::StructArray,
         base: &ArrayRef,
@@ -389,10 +357,9 @@ impl VortexRdfStore {
         }
     }
 
-    /// The keep by one pass over the selected rows of `column`, read in
-    /// place (its canonical primitive when materialized, else the cached
-    /// probe) — or, for a column neither serves, decoded for the selected
-    /// rows only.
+    /// The keep by one pass over the selected rows of `column`, read in place
+    /// (its canonical primitive when materialized, else the cached probe), or
+    /// decoded for the selected rows only when neither serves.
     fn keep_by_pass(
         struct_arr: &vortex_array::arrays::StructArray,
         base: &ArrayRef,
@@ -457,16 +424,14 @@ impl VortexRdfStore {
             unreachable!("keep routes only File sources here");
         };
         let row_count = file.row_count() as usize;
-        // A served view's deferred ids are needed now: the plan reads index
-        // columns the keep does not bind.
         let selection = selection.materialized_async().await?;
         if selection.is_empty(row_count) {
             return Ok(self.empty_view());
         }
         let (filter, selection) = match keep_conjunct(column, keep) {
             Some(conjunct) => {
-                // Statistics alone may already bound the rows the conjunct
-                // can hold (a namespace range inside a sorted column).
+                // Zone maps may bound the conjunct's rows (a namespace range
+                // in a sorted column).
                 let selection = match file_filter::row_range_from_pruning(file, &conjunct).await? {
                     Some(range) => selection.intersect_range(range),
                     None => selection,
@@ -483,9 +448,9 @@ impl VortexRdfStore {
                 (Some(filter), selection)
             }
             None => {
-                // Too wide a set for an expression: resolve the pending
-                // filter to exact rows, read the column for them, and test
-                // in memory.
+                // Too wide a set for an expression: the pending filter
+                // resolves to exact rows, the column is read for them and
+                // tested in memory.
                 let selection = match filter {
                     Some(f) => {
                         let matched =

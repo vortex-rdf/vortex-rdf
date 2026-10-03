@@ -1,22 +1,15 @@
-//! A vortex [`DataSource`] over any store view — the interface a query
-//! engine built on vortex (its DataFusion integration first of all) reads
-//! this crate through without learning its view model.
-//!
-//! [`data_source`](VortexRdfStore::data_source) wraps a view — matched,
-//! narrowed, windowed or whole — as a source whose rows are the view's rows
-//! in base row order and whose dtype is the layout's primary struct (`u32`
-//! codes under the Dictionary layout, strings otherwise). A scan request's
-//! projection and filter are bound once against that dtype and applied to
-//! every chunk the view streams ([`row_chunks`](VortexRdfStore::row_chunks)),
-//! filter before projection; its `row_range` and `selection` address the
-//! view's output rows; its `limit` is enforced exactly, after filtering. The
-//! source answers one partition, so a consumer that fans out over partitions
-//! sees the whole view in one ordered stream.
-//!
-//! [`component_data_source`](VortexRdfStore::component_data_source) exposes a
-//! store's persisted children — the index copies (`index:posg`, `index:ospg`,
-//! `index:ref-p`, `index:ref-o`) and the `dictionary` — as plain tables, so
-//! an engine can read a sort order or the term column directly.
+//! A vortex [`DataSource`] over a store view, for engines built on vortex
+//! (its DataFusion integration). [`data_source`](VortexRdfStore::data_source)
+//! wraps a view as a source whose rows are the view's rows in base row order
+//! under the layout's primary struct dtype (`u32` codes under the Dictionary
+//! layout, strings otherwise). A scan request's projection and filter are
+//! bound once against that dtype and applied to every chunk
+//! ([`row_chunks`](VortexRdfStore::row_chunks)), filter before projection;
+//! `row_range` and `selection` address the view's output rows; `limit` is
+//! enforced exactly, after filtering; the source answers one partition.
+//! [`component_data_source`](VortexRdfStore::component_data_source) exposes
+//! the persisted children (the index copies and the `dictionary`) as plain
+//! tables.
 
 use std::any::Any;
 use std::ops::Range;
@@ -46,8 +39,8 @@ use crate::store::VortexRdfStore;
 use crate::store::array::rechunk;
 use crate::store::layouts::LayoutStrategy;
 
-/// Rows per chunk a partition emits from an in-memory view — DataFusion's
-/// default batch size; a file-backed view's chunks follow the file's splits
+/// Rows per chunk a partition emits from an in-memory view (DataFusion's
+/// default batch size); a file-backed view's chunks follow the file's splits
 /// cut to this cap.
 pub const DATA_SOURCE_BATCH_ROWS: usize = 8_192;
 
@@ -71,14 +64,11 @@ pub struct VortexRdfDataSource {
 }
 
 impl VortexRdfStore {
-    /// This view as a vortex [`DataSource`]: its rows in base row order, under
+    /// This view as a vortex [`DataSource`]: its rows in base row order under
     /// the layout's primary struct dtype, every narrowing applied. The row
-    /// count is exact unless a pushed-down file filter is still pending
-    /// (then an upper bound, the rows the filter has yet to test).
-    ///
-    /// Errors for a Dictionary-layout view with a non-empty append tail: its
-    /// tail holds strings whose terms have no code, so the view has no single
-    /// dtype — `compact` the store first.
+    /// count is exact unless a pushed-down file filter is pending (then an
+    /// upper bound). Errors for a Dictionary view with a non-empty append
+    /// tail, which has no single dtype (`compact` the store first).
     pub async fn data_source(&self) -> Result<DataSourceRef> {
         self.ensure_no_dictionary_tail("data_source")?;
         let dtype = self.primary_dtype()?;
@@ -93,11 +83,10 @@ impl VortexRdfStore {
 
     /// One of this store's persisted children as a plain table: an index
     /// component by name (`index:posg`, `index:ospg`, `index:ref-p`,
-    /// `index:ref-o`) — its rows sorted as the component's sort order says,
-    /// with the primary row id in `rid` — or the term `dictionary`
-    /// (`{_dict_term}`, row i = the term with code i). `None` for a name
-    /// this store has no child of; the dictionary is reachable when it is
-    /// resident or the store is file-backed.
+    /// `index:ref-o`), its rows in the component's sort order with the
+    /// primary row id in `rid`, or the term `dictionary` (`{_dict_term}`, row
+    /// i = the term with code i). `None` for a name this store has no child
+    /// of; the dictionary is reachable when resident or file-backed.
     pub fn component_data_source(&self, name: &str) -> Result<Option<DataSourceRef>> {
         match &self.quads {
             QuadsSource::InMemory { components, .. } => {
@@ -131,8 +120,7 @@ impl VortexRdfStore {
         }
     }
 
-    /// The struct dtype of this view's rows: the base's, which a string
-    /// layout's tail shares.
+    /// The struct dtype of this view's rows.
     fn primary_dtype(&self) -> Result<DType> {
         let dtype = self.quads.dtype().clone();
         if !matches!(dtype, DType::Struct(..)) {
@@ -143,10 +131,9 @@ impl VortexRdfStore {
         Ok(dtype)
     }
 
-    /// The row count and byte size a source advertises — the view's
-    /// statistics as vortex precisions: exact whenever
-    /// [`view_statistics`](Self::view_statistics) knows the count, else
-    /// its upper bound.
+    /// The row count and byte size a source advertises: exact when
+    /// [`view_statistics`](Self::view_statistics) knows the count, else its
+    /// upper bound.
     fn row_count_hint(&self) -> (Precision<u64>, Precision<u64>) {
         let hint = self.view_statistics().rows;
         let rows = match hint.exact {
