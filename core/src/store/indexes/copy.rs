@@ -17,6 +17,7 @@ use crate::store::RawQuad;
 use crate::store::array::stamp_is_sorted;
 use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{QuadPattern, ResolvedLayout, TermRef};
+use crate::store::read::metadata::SortOrder;
 use crate::store::schema::{COL_G, COL_O, COL_P, COL_S};
 
 /// One sorted copy family, named after its sort order.
@@ -56,6 +57,21 @@ impl CopyFamily {
         }
     }
 
+    /// The family whose child is named `name`.
+    pub(crate) fn of_component(name: &str) -> Option<CopyFamily> {
+        [CopyFamily::Posg, CopyFamily::Ospg]
+            .into_iter()
+            .find(|family| family.identity().name == name)
+    }
+
+    /// The child's row order.
+    pub(crate) fn sort_order(self) -> SortOrder {
+        match self {
+            CopyFamily::Posg => SortOrder::Posg,
+            CopyFamily::Ospg => SortOrder::Ospg,
+        }
+    }
+
     /// The leading sort-key column of the child.
     fn child_lead_col(self) -> &'static str {
         match self {
@@ -83,6 +99,7 @@ impl CopyFamily {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     /// Where each quad component (s, p, o, g) sits in this family's
     /// `CopyKey` tuple.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     fn key_positions(self) -> [usize; 4] {
         match self {
             CopyFamily::Posg => [2, 0, 1, 3],

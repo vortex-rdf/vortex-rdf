@@ -214,36 +214,26 @@ pub(crate) fn object_terms(struct_arr: &StructArray) -> Result<Vec<String>> {
         .collect()
 }
 
-/// Decode a StructArray chunk with typed object sub-columns into Quads.
-pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
+/// A chunk with typed object sub-columns as quads; the outer `Err` is a
+/// chunk-level failure, an inner `Err` a row whose terms fail to parse.
+pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Result<Vec<Result<Quad>>> {
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
-
-    let struct_arr = match chunk.clone().execute::<StructArray>(&mut ctx) {
-        Ok(a) => a,
-        Err(e) => return vec![Err(VortexRdfError::Vortex(e))],
-    };
-
+    let struct_arr = chunk
+        .clone()
+        .execute::<StructArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
     let n = struct_arr.len();
-
-    let columns = (|| {
-        Ok((
-            field_as::<VarBinViewArray>(&struct_arr, COL_S, &mut ctx)?,
-            field_as::<VarBinViewArray>(&struct_arr, COL_P, &mut ctx)?,
-            ObjectColumns::load(&struct_arr, &mut ctx)?,
-            field_as::<VarBinViewArray>(&struct_arr, COL_G, &mut ctx)?,
-        ))
-    })();
-    let (s_col, p_col, o_cols, g_col) = match columns {
-        Ok(columns) => columns,
-        Err(e) => return vec![Err(e)],
-    };
+    let s_col = field_as::<VarBinViewArray>(&struct_arr, COL_S, &mut ctx)?;
+    let p_col = field_as::<VarBinViewArray>(&struct_arr, COL_P, &mut ctx)?;
+    let o_cols = ObjectColumns::load(&struct_arr, &mut ctx)?;
+    let g_col = field_as::<VarBinViewArray>(&struct_arr, COL_G, &mut ctx)?;
 
     let subjects = StrColReader::new(&s_col);
     let predicates = StrColReader::new(&p_col);
     let objects = o_cols.reader();
     let graphs = StrColReader::new(&g_col);
 
-    (0..n)
+    Ok((0..n)
         .map(|i| {
             let subject = parse_subject(subjects.str_at(i)?)?;
             let predicate = parse_named_node(predicates.str_at(i)?)?;
@@ -251,7 +241,7 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
             let graph_name = parse_graph_name(graphs.str_at(i)?)?;
             Ok(Quad::new(subject, predicate, object, graph_name))
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]

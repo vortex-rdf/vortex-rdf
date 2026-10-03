@@ -1,24 +1,8 @@
-//! Which rows of a store's base data a view covers.
-//!
-//! A [`VortexRdfStore`] never rewrites its data to answer a pattern: it keeps
-//! the base data it was constructed from and narrows a `RowSelection` over
-//! it. Everything a selection names is a *base* row id, so ids stay meaningful
-//! however many times a view is refined — which is what lets secondary indexes
-//! (whose components' `rid` columns address the base rows) survive
-//! `match_pattern`, and what lets a matched view later be handed back for
-//! mutation.
-//!
-//! Both backends select rows in this same currency. The three variants also
-//! encode an invariant the file backend needs: a range and an id list are
-//! mutually exclusive, because setting both disables vortex's exact-range
-//! planning (`attempt_split_ranges` bails when a row range is also set).
-//!
-//! A view's selection field wraps this in [`ViewSelection`], which adds one
-//! more state: *pending* — an index-served match whose exact ids are a
-//! deferred computation, run by the first consumer that needs the selection
-//! (serving reads never do).
-//!
-//! [`VortexRdfStore`]: crate::store::VortexRdfStore
+//! Which rows of a store's base a view covers: [`RowSelection`] (base row
+//! ids, ascending and unique, never re-based; a range and an id list are
+//! mutually exclusive so a file scan keeps exact-range planning) and
+//! [`ViewSelection`], which adds the *pending* state of an index-served match
+//! whose ids the first consumer that needs them computes.
 
 use std::ops::Range;
 
@@ -31,18 +15,11 @@ use vortex_mask::{AllOr, Mask};
 use crate::error::{Result, VortexRdfError};
 use crate::store::indexes::LazyRowIds;
 
-/// A view's base-row selection, which may still be *pending*: a match served
-/// by an index left its exact ids uncomputed ([`LazyRowIds`]), because the
-/// attached serving plan answers reads without them.
-///
-/// The two variants keep the pending state impossible to overlook: every
-/// consumer either takes the serving plan (and never touches the selection)
-/// or materializes here first — there is no concrete-looking value to read
-/// out of a pending selection by mistake. A pending selection exists only
-/// alongside `serve: Some` on its view (`QuadsSource`), and only ever
-/// materializes to the id set the eager path would have produced, so
-/// laziness never changes what a view covers — only when the ids are paid
-/// for.
+/// A view's base-row selection, exact or pending. `Pending` holds an
+/// index-served match's uncomputed ids ([`LazyRowIds`]); it exists only on a
+/// view with `serve: Some` and materializes to the ids the eager path would
+/// give. Counts, chained matches, keeps, windows, partitions, deletes and
+/// base-order gathers materialize it; served reads do not.
 #[derive(Clone)]
 pub(crate) enum ViewSelection {
     Exact(RowSelection),
@@ -50,23 +27,18 @@ pub(crate) enum ViewSelection {
 }
 
 impl ViewSelection {
-    /// The unrefined selection — every base row.
+    /// Every base row.
     pub(crate) fn all() -> Self {
         ViewSelection::Exact(RowSelection::All)
     }
 
-    /// Whether this is the unrefined whole-base selection. A pending
-    /// selection is never `All`: it exists only on a view an index resolution
-    /// restricted.
+    /// Whether every base row is selected; a pending selection never is.
     pub(crate) fn is_all(&self) -> bool {
         matches!(self, ViewSelection::Exact(RowSelection::All))
     }
 
-    /// The concrete selection, running a pending resolution's deferred id
-    /// computation if one is still outstanding (cached for every later
-    /// consumer and every clone of the view — see [`LazyRowIds`]) — the
-    /// awaiting form, which also runs a file child's deferred scan.
-    #[cfg(feature = "file-io")]
+    /// The exact selection, running a pending resolution's deferred ids
+    /// (cached on the view); a file child's deferred scan runs here.
     pub(crate) async fn materialized_async(&self) -> Result<RowSelection> {
         match self {
             ViewSelection::Exact(selection) => Ok(selection.clone()),
@@ -74,10 +46,8 @@ impl ViewSelection {
         }
     }
 
-    /// The concrete selection, running a pending resolution's deferred id
-    /// computation if one is still outstanding — the synchronous form for
-    /// in-memory views, whose pending ids never take I/O (see
-    /// [`materialized_async`](Self::materialized_async)).
+    /// The exact selection, running a pending resolution's deferred ids
+    /// synchronously; valid only for in-memory views.
     pub(crate) fn materialized(&self) -> Result<RowSelection> {
         match self {
             ViewSelection::Exact(selection) => Ok(selection.clone()),
@@ -85,33 +55,30 @@ impl ViewSelection {
         }
     }
 
-    /// The already-exact selection, for consumers that structurally cannot
-    /// meet a pending one: a pending selection always rides with a serve
-    /// plan, and these consumers only run on views without one.
-    pub(crate) fn expect_exact(&self) -> &RowSelection {
+    /// The live rows this selection covers, when known without reading: an
+    /// exact selection's live count, or a pending run's width while nothing
+    /// is tombstoned.
+    pub(crate) fn len_if_known(&self, deleted: Option<&Mask>, base_len: usize) -> Option<usize> {
         match self {
-            ViewSelection::Exact(selection) => selection,
-            ViewSelection::Pending(_) => {
-                unreachable!(
-                    "a pending selection always rides with a serve plan; consumers that \
-                     cannot honor the plan materialize the selection first"
-                )
+            ViewSelection::Exact(selection) => Some(selection.live_len(deleted, base_len)),
+            ViewSelection::Pending(lazy) => {
+                deleted.is_none().then(|| lazy.len_if_known()).flatten()
             }
         }
     }
 }
 
-/// The rows of a base array (or file) that a store view covers, as base row
-/// ids. Refinements only ever narrow a selection, never re-base it.
+/// The base rows a view covers, as base row ids; refinements narrow, never
+/// re-base.
 #[derive(Clone, Debug)]
 pub(crate) enum RowSelection {
-    /// Every row of the base — an unrefined view.
+    /// Every row of the base.
     All,
-    /// A contiguous run of base rows: what a sorted-column binary search or a
-    /// zone-map envelope yields.
+    /// A contiguous run of base rows (a sorted-column binary search, a
+    /// zone-map envelope).
     Range(Range<u64>),
-    /// An explicit ascending, unique list of base row ids: what a secondary
-    /// index lookup or a mask scan yields.
+    /// An ascending, unique list of base row ids (an index lookup, a mask
+    /// scan).
     Ids(Buffer<u64>),
 }
 
@@ -132,15 +99,55 @@ impl RowSelection {
         }
     }
 
-    /// Whether the selection provably covers no row. `All` over an empty base
-    /// counts as empty, so callers can normalize without consulting the base.
+    /// The live rows this selection covers: its rows minus the tombstones.
+    pub(crate) fn live_len(&self, deleted: Option<&Mask>, base_len: usize) -> usize {
+        match deleted {
+            None => self.len(base_len),
+            Some(deleted) => self.live_mask(deleted, base_len).true_count(),
+        }
+    }
+
+    /// The base row ids this selection covers, ascending. Not for hot
+    /// per-row loops: those stay monomorphic per variant.
+    pub(crate) fn ids(&self, base_len: usize) -> impl Iterator<Item = u64> + '_ {
+        let (range, ids): (Range<u64>, &[u64]) = match self {
+            RowSelection::All => (0..base_len as u64, &[]),
+            RowSelection::Range(range) => {
+                let range = clamped(range, base_len);
+                (range.start as u64..range.end as u64, &[])
+            }
+            RowSelection::Ids(ids) => (0..0, ids.as_slice()),
+        };
+        range.chain(ids.iter().copied())
+    }
+
+    /// [`ids`](Self::ids) with the tombstoned rows dropped.
+    pub(crate) fn live_ids<'a>(
+        &'a self,
+        deleted: Option<&'a Mask>,
+        base_len: usize,
+    ) -> impl Iterator<Item = u64> + 'a {
+        self.ids(base_len)
+            .filter(move |&id| deleted.is_none_or(|d| !d.value(id as usize)))
+    }
+
+    /// `Ids(ids)`, or the canonical empty selection for an empty list.
+    pub(crate) fn from_ids(ids: Buffer<u64>) -> Self {
+        if ids.is_empty() {
+            RowSelection::empty()
+        } else {
+            RowSelection::Ids(ids)
+        }
+    }
+
+    /// Whether the selection covers no row; `All` over an empty base counts
+    /// as empty.
     pub(crate) fn is_empty(&self, base_len: usize) -> bool {
         self.len(base_len) == 0
     }
 
-    /// Gather the selected rows out of `base` — the one place a view turns
-    /// into physical rows. Row identity is lost in the result, so index
-    /// columns must not be carried across this boundary.
+    /// The selected rows of `base`. Row identity is lost, so index columns
+    /// must not cross this boundary.
     pub(crate) fn apply(&self, base: &ArrayRef) -> Result<ArrayRef> {
         match self {
             RowSelection::All => Ok(base.clone()),
@@ -155,8 +162,7 @@ impl RowSelection {
     }
 
     /// This selection cut into at most `n` contiguous pieces of about equal
-    /// size, in base row order — what `partitions` hands each partition.
-    /// Empty pieces are left out.
+    /// size, in base row order; empty pieces are left out.
     pub(crate) fn split(&self, n: usize, base_len: usize) -> Vec<RowSelection> {
         let n = n.max(1);
         fn ranges(range: Range<u64>, n: usize) -> Vec<RowSelection> {
@@ -201,8 +207,7 @@ impl RowSelection {
         }
     }
 
-    /// Narrow to the base rows also named by `ids` (which must be ascending
-    /// and unique, as every producer of an id list here guarantees).
+    /// Narrow to the base rows also named by `ids` (ascending and unique).
     pub(crate) fn intersect_ids(self, ids: Buffer<u64>) -> Self {
         match self {
             RowSelection::All => RowSelection::Ids(ids),
@@ -213,10 +218,9 @@ impl RowSelection {
         }
     }
 
-    /// The `limit` rows after skipping `offset` of this selection's live rows,
-    /// in base row order — a contiguous sub-run of a range, a slice of an id
-    /// list, or (with tombstones to step over) the surviving ids. Never
-    /// re-bases: the result names base rows like every other selection.
+    /// The `limit` live rows after skipping `offset`, in base row order, as
+    /// base row ids: a sub-run of a range, a slice of an id list, or the
+    /// surviving ids when there are tombstones to step over.
     pub(crate) fn window(
         &self,
         offset: usize,
@@ -248,29 +252,11 @@ impl RowSelection {
                 }
             };
         };
-        let live = |id: &u64| !deleted.value(*id as usize);
-        let ids: Buffer<u64> = match self {
-            RowSelection::All => {
-                Buffer::from_iter((0..base_len as u64).filter(live).skip(offset).take(limit))
-            }
-            RowSelection::Range(range) => {
-                let range = clamped(range, base_len);
-                Buffer::from_iter(
-                    (range.start as u64..range.end as u64)
-                        .filter(live)
-                        .skip(offset)
-                        .take(limit),
-                )
-            }
-            RowSelection::Ids(ids) => {
-                Buffer::from_iter(ids.iter().copied().filter(live).skip(offset).take(limit))
-            }
-        };
-        if ids.is_empty() {
-            RowSelection::empty()
-        } else {
-            RowSelection::Ids(ids)
-        }
+        Self::from_ids(Buffer::from_iter(
+            self.live_ids(Some(deleted), base_len)
+                .skip(offset)
+                .take(limit),
+        ))
     }
 
     /// `Range(range)`, or the canonical empty selection for an empty one.
@@ -282,8 +268,8 @@ impl RowSelection {
         }
     }
 
-    /// Whether this selection is small enough for the point-read paths
-    /// (at most [`POINT_GATHER_MAX_ROWS`] rows). `All` never is.
+    /// Whether the selection has at most [`POINT_GATHER_MAX_ROWS`] rows;
+    /// `All` never does.
     pub(crate) fn is_point_sized(&self) -> bool {
         match self {
             RowSelection::All => false,
@@ -292,9 +278,8 @@ impl RowSelection {
         }
     }
 
-    /// The live base row ids of a point-sized selection, ascending, with the
-    /// `deleted` tombstones dropped; `None` when the selection is not
-    /// point-sized.
+    /// The live base row ids of a point-sized selection, ascending; `None`
+    /// when the selection is not point-sized.
     pub(crate) fn point_sized_live_rows(&self, deleted: Option<&Mask>) -> Option<Vec<u64>> {
         if !self.is_point_sized() {
             return None;
@@ -307,17 +292,13 @@ impl RowSelection {
         })
     }
 
-    /// This selection as a mask over the whole base — one bit per base row.
-    ///
-    /// The dense counterpart of the variants above, for folding a selection
-    /// into another base-wide mask (tombstoning the rows a view covers).
+    /// This selection as a mask over the whole base, one bit per base row.
     pub(crate) fn to_mask(&self, base_len: usize) -> Mask {
         match self {
             RowSelection::All => Mask::new_true(base_len),
             RowSelection::Range(range) => {
                 let range = clamped(range, base_len);
-                // `from_slices` rejects an empty slice, and the canonical empty
-                // selection (`0..0`) is exactly that.
+                // `from_slices` rejects an empty slice.
                 if range.is_empty() {
                     return Mask::new_false(base_len);
                 }
@@ -329,19 +310,13 @@ impl RowSelection {
         }
     }
 
-    /// Which of *this selection's own rows* are not tombstoned: one bit per row
-    /// of `self.apply(base)`, in that order, ready to filter the gathered rows
-    /// or to be counted.
-    ///
-    /// The tombstone contract: deletions live in a base-wide mask, never
-    /// folded into the selection, so tombstoning one row of a large store
-    /// costs a bit per base row — and every read path applies this mask
-    /// before handing rows out.
+    /// Which of this selection's own rows are not tombstoned: one bit per row
+    /// of `self.apply(base)`, in that order. Tombstones live in the base-wide
+    /// `deleted` mask, never in the selection, and every read applies them.
     pub(crate) fn live_mask(&self, deleted: &Mask, base_len: usize) -> Mask {
         match self {
             RowSelection::All => !deleted,
             RowSelection::Range(range) => !&deleted.slice(clamped(range, base_len)),
-            // A sparse selection asks the mask about only the rows it names.
             RowSelection::Ids(ids) => Mask::from_indices(
                 ids.len(),
                 ids.iter()
@@ -352,16 +327,11 @@ impl RowSelection {
         }
     }
 
-    /// Narrow using a mask over *this selection's own rows* — i.e. one bit per
-    /// row of `self.apply(base)`, in that order — translating those local
-    /// positions back into base row ids.
-    ///
-    /// This is how an evaluation that only looked at the selected rows (a mask
-    /// scan over the gathered rows) folds back into a base-relative view
-    /// without the store having to re-evaluate anything over the full base.
+    /// Narrow by a mask over this selection's own rows (one bit per row of
+    /// `self.apply(base)`, in that order), mapping the surviving positions
+    /// back to base row ids.
     pub(crate) fn refine(self, keep: &Mask) -> Self {
         let local = match keep.indices() {
-            // Every selected row survives: the selection is unchanged.
             AllOr::All => return self,
             AllOr::None => return RowSelection::empty(),
             AllOr::Some(indices) => indices,
@@ -383,8 +353,7 @@ impl RowSelection {
     }
 }
 
-/// Restrict an ascending id list to a row range (zero-copy: the surviving ids
-/// are always a contiguous window of a sorted list).
+/// An ascending id list restricted to `range`: a zero-copy slice.
 fn restrict_ids(ids: Buffer<u64>, range: &Range<u64>) -> Buffer<u64> {
     let slice = ids.as_slice();
     let lo = slice.partition_point(|&id| id < range.start);
@@ -404,12 +373,8 @@ fn clamped(range: &Range<u64>, base_len: usize) -> Range<usize> {
     start..end.max(start)
 }
 
-/// Intersection of two ascending id lists.
+/// Intersection of two ascending id lists, by sorted merge.
 fn intersect_sorted_ids(left: &[u64], right: &[u64]) -> Buffer<u64> {
-    // Classic sorted-merge intersection: advance whichever side is behind,
-    // emit a value only when both sides agree on it. The result can hold at
-    // most the smaller list, so one up-front reservation replaces the
-    // growth-doubling reallocations.
     let mut i = 0usize;
     let mut j = 0usize;
     let mut out = Vec::with_capacity(left.len().min(right.len()));
@@ -428,19 +393,14 @@ fn intersect_sorted_ids(left: &[u64], right: &[u64]) -> Buffer<u64> {
     Buffer::from(out)
 }
 
-/// Selection size up to which a gather reads rows point-by-point through
-/// encoded search probes instead of the slice/take pipeline (see
-/// [`gather_by_point_reads`](crate::store::scan::gather::gather_by_point_reads)).
-/// The pipeline's cost is fixed per column
-/// (optimizer pass, execution context, canonicalization) whatever the row
-/// count, while point reads cost per row per column. The file-backed
-/// dictionary makes the same trade: `FileBackedDict::decode_many`
-/// point-reads batches of up to this many codes through the chunk leaves and
-/// scans wider ones.
+/// Selection size up to which a gather reads rows point by point through
+/// encoded-search probes instead of the slice/take pipeline
+/// ([`gather_by_point_reads`](crate::store::scan::gather::gather_by_point_reads));
+/// also the batch size the file-backed dictionary point-reads
+/// (`FileBackedDict::decode_many`).
 pub(crate) const POINT_GATHER_MAX_ROWS: usize = 256;
 
-/// Whether `rows` rows fit the point-read paths (see
-/// [`POINT_GATHER_MAX_ROWS`]).
+/// Whether `rows` rows are within [`POINT_GATHER_MAX_ROWS`].
 pub(crate) fn point_sized(rows: u64) -> bool {
     rows <= POINT_GATHER_MAX_ROWS as u64
 }

@@ -9,11 +9,3 @@ pub(crate) mod file_filter;
 pub(crate) mod file_reads;
 pub(crate) mod gather;
 pub(crate) mod typed_eq;
-
-/// Both file halves under the name the read, query and write paths outside
-/// this module use.
-#[cfg(feature = "file-io")]
-pub(crate) mod file_scan {
-    pub(crate) use super::file_filter::*;
-    pub(crate) use super::file_reads::*;
-}

@@ -2,6 +2,7 @@
 //! vortex data source, and the planner metadata.
 
 pub(crate) mod chunks;
+pub(crate) mod count;
 pub(crate) mod data_source;
 pub(crate) mod metadata;
 pub(crate) mod quads;

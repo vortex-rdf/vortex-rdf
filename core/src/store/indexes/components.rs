@@ -8,8 +8,7 @@ use std::sync::{Arc, OnceLock};
 
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{PrimitiveArray, StructArray};
-use vortex_array::dtype::DType;
-use vortex_array::dtype::FieldName;
+use vortex_array::dtype::{DType, FieldName};
 use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
@@ -45,6 +44,18 @@ pub(crate) fn known_component(implementation: &str) -> Option<KnownComponent> {
             .component_identities()
             .iter()
             .find(|identity| identity.slug == implementation)
+            .map(|identity| KnownComponent { identity, index })
+    })
+}
+
+/// The registry row of the child named `name` (`index:posg`, …); `None` for
+/// a foreign name.
+pub(crate) fn component_named(name: &str) -> Option<KnownComponent> {
+    ALL_INDEX_TYPES.into_iter().find_map(|index| {
+        index
+            .component_identities()
+            .iter()
+            .find(|identity| identity.name == name)
             .map(|identity| KnownComponent { identity, index })
     })
 }

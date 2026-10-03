@@ -144,6 +144,25 @@ pub(crate) fn chunked_or_single(mut chunks: Vec<ArrayRef>, dtype: DType) -> Resu
     }
 }
 
+/// `rows` cut into slices of at most `batch_rows`; an empty array yields no
+/// chunk.
+pub(crate) fn rechunk(rows: ArrayRef, batch_rows: usize) -> Result<Vec<ArrayRef>> {
+    let len = rows.len();
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if len <= batch_rows {
+        return Ok(vec![rows]);
+    }
+    (0..len)
+        .step_by(batch_rows)
+        .map(|start| {
+            rows.slice(start..(start + batch_rows).min(len))
+                .map_err(VortexRdfError::Vortex)
+        })
+        .collect()
+}
+
 /// `arr` as a `StructArray`: a plain downcast when it already is one, else
 /// an execution to the canonical struct.
 pub(crate) fn into_struct_array(arr: ArrayRef) -> Result<StructArray> {

@@ -69,6 +69,7 @@ pub(crate) fn resolve_in_memory(
             row_ids: ResolvedRowIds::Lazy(LazyRowIds::from_component_run(rids)),
             resolves: probe.resolves,
             serve: Some(InMemoryServePlan::new(
+                probe.identity.name,
                 decode,
                 rows.clone().into_array(),
                 run,

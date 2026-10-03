@@ -40,7 +40,7 @@ async fn write_raw<W: Write>(
 ) -> error::Result<()> {
     let decode_start = debug::timer();
     // The raw chunk stream (in-memory, or the lazy file-backed scan).
-    let mut chunks = store.raw_quad_chunks().await?;
+    let mut chunks = store.raw_quad_chunks();
     log::debug!(
         "[export_rdf] Raw chunk stream setup took {:?}",
         debug::elapsed(decode_start)

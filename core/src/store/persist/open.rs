@@ -82,13 +82,13 @@ pub(in crate::store) async fn scanned_index_components(
         let ComponentKind::Index(known) = classify_component(descriptor)? else {
             continue;
         };
-        let Some((_, reader)) = file
-            .component_reader(&descriptor.name)
+        let Some(child) = file
+            .child_reader(known.identity.name)
             .map_err(VortexRdfError::Vortex)?
         else {
             continue;
         };
-        let scanned = read::scan_all_reader(reader).await?;
+        let scanned = read::scan_all_reader(child.reader).await?;
         components.push(adopt_component(
             &known,
             DeferredSource::Scanned(scanned),
@@ -189,8 +189,8 @@ impl VortexRdfStore {
             LayoutStrategy::Dictionary => {
                 // The roster loop above already classified (and so
                 // implementation-checked) the dictionary descriptor.
-                let (_, reader) = file
-                    .component_reader(container::DICT_COMPONENT_NAME)
+                let child = file
+                    .child_reader(container::DICT_COMPONENT_NAME)
                     .map_err(VortexRdfError::Vortex)?
                     .ok_or_else(|| {
                         VortexRdfError::Deserialization(
@@ -217,7 +217,7 @@ impl VortexRdfStore {
                     // One full scan of the dictionary child — chunks keep
                     // their FSST.
                     None => DictAccess::Resident(Arc::new(
-                        TermDictionary::from_child_reader(reader).await?,
+                        TermDictionary::from_child_reader(child.reader).await?,
                     )),
                 };
                 ResolvedLayout::Dictionary(access)
