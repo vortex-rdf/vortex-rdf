@@ -302,6 +302,90 @@ async fn test_copy_index_file_dictionary() {
     run_copy_index_file_test(LayoutStrategy::Dictionary, true).await;
 }
 
+/// Graph-bound patterns over a file's copy index: a bound predicate, or
+/// predicate and object, with a graph is still served by the copy family,
+/// the graph riding the plan's filter instead of a located range; a located
+/// (dictionary-coded) run resolves its ids by point reads at match time, an
+/// unlocated one leaves them pending; tombstones and unknown graphs answer
+/// exactly, under every layout.
+async fn run_copy_index_file_graph_bound(layout: LayoutStrategy, located: bool) {
+    let (quads, graphs) = copy_index_script_dataset();
+    let (_dir, path) =
+        write_store_file(quads.clone(), layout, vec![IndexType::SecondaryByCopy]).await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+
+    // Predicate and graph: i ≡ 1 (mod 3) in g1 (odd i) → 1, 7, 13, 19, 25.
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let by_pg = store
+        .match_pattern(None, Some(&p1), None, Some(&graphs[1]))
+        .await
+        .unwrap();
+    assert!(by_pg.debug_has_serve_plan());
+    assert_eq!(
+        by_pg.debug_serve_row_range(),
+        None,
+        "a graph term keeps the located run off the plan"
+    );
+    assert_eq!(by_pg.debug_selection_pending(), !located);
+    assert_eq!(by_pg.size().await.unwrap(), 5);
+    assert_eq!(
+        view_strings(&by_pg).await,
+        expected_strings(&quads, |i| i % 3 == 1 && i % 2 == 1)
+    );
+
+    // Predicate, object and graph: i ≡ 1 (mod 15) in g0 (even i) → 16.
+    let o1 = Term::Literal(Literal::new_simple_literal("o1"));
+    let by_pog = store
+        .match_pattern(None, Some(&p1), Some(&o1), Some(&graphs[0]))
+        .await
+        .unwrap();
+    assert!(by_pog.debug_has_serve_plan());
+    assert_eq!(by_pog.debug_serve_row_range(), None);
+    assert_eq!(by_pog.debug_selection_pending(), !located);
+    assert_eq!(by_pog.size().await.unwrap(), 1);
+    assert_eq!(
+        view_strings(&by_pog).await,
+        expected_strings(&quads, |i| i % 15 == 1 && i % 2 == 0)
+    );
+
+    // A graph the store never saw matches nothing.
+    let unknown = GraphName::NamedNode(NamedNode::new("http://example.org/nope").unwrap());
+    let none = store
+        .match_pattern(None, Some(&p1), None, Some(&unknown))
+        .await
+        .unwrap();
+    assert_eq!(none.size().await.unwrap(), 0);
+    assert_eq!(view_strings(&none).await, Vec::<String>::new());
+
+    // A tombstone inside the served graph run leaves it.
+    let deleted = store.delete_quad(&quads[7]).await.unwrap();
+    let after = deleted
+        .match_pattern(None, Some(&p1), None, Some(&graphs[1]))
+        .await
+        .unwrap();
+    assert!(after.debug_has_serve_plan());
+    assert_eq!(after.size().await.unwrap(), 4);
+    assert_eq!(
+        view_strings(&after).await,
+        expected_strings(&quads, |i| i % 3 == 1 && i % 2 == 1 && i != 7)
+    );
+}
+
+#[tokio::test]
+async fn test_copy_index_file_graph_bound_default() {
+    run_copy_index_file_graph_bound(LayoutStrategy::Default, false).await;
+}
+
+#[tokio::test]
+async fn test_copy_index_file_graph_bound_typed_object() {
+    run_copy_index_file_graph_bound(LayoutStrategy::TypedObject, false).await;
+}
+
+#[tokio::test]
+async fn test_copy_index_file_graph_bound_dictionary() {
+    run_copy_index_file_graph_bound(LayoutStrategy::Dictionary, true).await;
+}
+
 /// A bound subject on a file locates its row range first; a residual object
 /// over a range at or above the routing gate is then still resolved by the
 /// copy index and intersected with the range.

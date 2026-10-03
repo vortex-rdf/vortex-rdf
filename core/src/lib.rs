@@ -43,6 +43,8 @@
 //! });
 //! ```
 
+/// Slice kernels over term-code buffers.
+pub mod columns;
 pub mod common;
 pub mod debug;
 pub mod error;
@@ -52,16 +54,23 @@ mod session;
 pub mod store;
 
 pub use error::{Result, VortexRdfError};
-pub use store::columns;
 
 pub use store::{
-    BuiltArray, BuiltStream, ChunkStream, DictReader, DictSnapshot, DictionaryQuadSink, Domain,
-    IndexType, Indexes, Keep, KindRanges, LayoutStrategy, NumOp, Probe, QuadColumn, RawQuad,
-    SharedQuad, SortedInMemoryBuilder, StoreParts, TermPredicate, Verdict, VortexArrayBuilder,
-    VortexRdfStore, export_rdf,
+    BuiltArray, BuiltStream, ChunkStream, CodeChunkStream, DATA_SOURCE_BATCH_ROWS, DictReader,
+    DictSnapshot, DictionaryQuadSink, Domain, IndexComponentInfo, IndexType, Indexes, Keep,
+    KindRanges, LayoutStrategy, NumOp, Probe, QuadColumn, RawQuad, RowChunkStream, RowCountHint,
+    SelectionKind, SharedQuad, SortOrder, SortedInMemoryBuilder, StoreParts, TermPredicate,
+    Verdict, ViewStatistics, VortexArrayBuilder, VortexRdfDataSource, VortexRdfStore, export_rdf,
 };
-// Compiled out on wasm along with the rest of the sorted-stream builder's
-// out-of-core merge (see the module gate in `store::builders`).
+// The vortex scan interface the store's data sources implement.
+pub use vortex_scan;
+
+/// The vortex session this crate registers its store layout and edition in;
+/// hand it to vortex's own integrations beside a
+/// [`VortexRdfStore::data_source`].
+pub fn vortex_session() -> &'static vortex_session::VortexSession {
+    &session::VORTEX_SESSION
+}
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use store::SortedStreamBuilder;
 
@@ -71,8 +80,8 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-/// Compiles the README's Rust snippets as doctests. The file-conversion
-/// snippet uses the `file-io` entry points, so the hook follows that gate.
+/// The README's Rust snippets as doctests; the file-conversion snippet needs
+/// `file-io`.
 #[cfg(all(doctest, feature = "file-io"))]
 #[doc = include_str!("../../README.md")]
 struct ReadmeDoctests;

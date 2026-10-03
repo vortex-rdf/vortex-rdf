@@ -1,16 +1,11 @@
-//! The RDF and XSD vocabulary IRIs the store reads off term spellings: the
-//! datatypes a literal's spelling implies and the namespace the numeric
-//! value model recognizes. Each is spelled once here, for the layout that
-//! decomposes literals and the predicates that classify them, and the two
-//! datatype IRIs are taken from `oxrdf`'s own vocabulary so they can never
-//! drift from what its [`Literal::datatype`](oxrdf::Literal::datatype)
-//! reports.
+//! The RDF and XSD vocabulary IRIs read off term spellings; the two datatype
+//! IRIs come from `oxrdf`'s own vocabulary.
 
 /// The XSD namespace, the prefix of every built-in datatype IRI.
 pub(crate) const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 
-/// `xsd:string`, the datatype of a plain literal — dropped from the stored
-/// spelling and from the TypedObject layout's datatype column.
+/// `xsd:string`, the datatype of a plain literal; dropped from the stored
+/// spelling and from the TypedObject datatype column.
 pub(crate) const XSD_STRING: &str = oxrdf::vocab::xsd::STRING.as_str();
 
 /// `rdf:langString`, the datatype of a language-tagged literal.

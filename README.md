@@ -131,6 +131,7 @@ for await (const quad of store.match(null, 'http://ex/p', null, null)) {
 - **Builders** — every build sorts globally by `(s, p, o, g)`: in memory on wasm, out of core (spilling sorted runs to disk) everywhere a filesystem exists. See [docs/serialization.md](docs/serialization.md).
 - **The store** — a base (array or lazily scanned file) plus a view: a row selection, tombstone masks and an append tail; `match_pattern` routes each bound position to the cheapest path (subject prefix probe, index, pushed-down filter, mask scan) and matches the tail independently. See [docs/matching.md](docs/matching.md).
 - **Narrowing beyond a pattern** — `keep` restricts a view to a code set or range per column (a `VALUES` block, a term predicate's codes, a namespace) inside the store; `window`/`size_capped`/`exists` stop a filtered file scan at the first block that fills a `LIMIT` or answers an `ASK`; `match_many` batches probes; `DictReader` serves the dictionary under either residency with `prefix_range`, `filter_codes` and a spelling-tolerant `encode`. See [docs/matching.md §16](docs/matching.md#16-narrowing-beyond-a-pattern).
+- **Interfaces for a query engine** — any view is a vortex `DataSource` (projection, filter and limit pushed into the scan, one partition, exact row counts) that vortex's DataFusion integration registers as a table; the index copies and the dictionary are tables too; `row_chunks`/`code_chunks` stream columns without Arrow; `view_statistics`, `partitions`, `generation` and `dictionary_id` tell a planner what a view holds and when its codes stop applying. See [docs/interfaces.md](docs/interfaces.md).
 - **Mutations & compaction** — additions are accumulated in the `Tail`, deletions are `Tombstone` rows, nothing is rewritten until a compaction rebuilds one sorted, indexed base (automatically once the tail outgrows its thresholds). See [docs/mutations.md](docs/mutations.md).
 - **The `.vortex` container** — one self-describing Vortex file: the quad table, the `dictionary` child and the index children under a `vortex-rdf.store.v1` root, also the byte-exchange format of the bindings. See [docs/file-format.md](docs/file-format.md).
 
@@ -142,6 +143,7 @@ for await (const quad of store.match(null, 'http://ex/p', null, null)) {
 | [docs/matching.md](docs/matching.md) | how a quad pattern is resolved on each backend, and what each path costs |
 | [docs/serialization.md](docs/serialization.md) | how a store is built and written: both sort pipelines, columns per layout, index builds |
 | [docs/mutations.md](docs/mutations.md) | the merge-on-read model: tail, tombstones, compaction and auto-compaction |
+| [docs/interfaces.md](docs/interfaces.md) | the contract an external query engine reads the store through: data sources, component tables, chunk streams, view statistics, identities |
 | [js/README.md](js/README.md) | the JavaScript/WebAssembly bindings |
 | [python/README.md](python/README.md) | the Python bindings |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | git hooks, the local CI mirror, doc-anchor checks, changelog generation |
