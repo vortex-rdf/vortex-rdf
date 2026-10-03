@@ -1,24 +1,17 @@
-//! Kernels over `u32` code columns — the column-at-a-time operations a query
-//! layer runs between matches: distinct values and value counts (for
-//! `DISTINCT`, `GROUP BY`, `COUNT DISTINCT`), an index gather, and the
-//! matching row pairs of an equi-join. They work on plain slices so every
-//! binding can hand them its zero-copy columns, and they are deliberately
-//! order-preserving, because the orders are observable: distinct values come
-//! out in first-seen order, and a join's pairs come out in nested-loop order
-//! (left rows in order, each with its right matches in their original order).
-//!
-//! Term codes are dictionary ranks, so a column's values are dense in a
-//! known range; when that range is small enough relative to the column, a
-//! direct-mapped table beats hashing. Each kernel picks between the two by
-//! [`dense_table_fits`].
+//! Kernels over `u32` code columns: distinct values and value counts, an
+//! index gather, and the matching row pairs of an equi-join. All work on
+//! plain slices and preserve order: distinct values come out in first-seen
+//! order, join pairs in nested-loop order (left rows in order, each with its
+//! right matches in their order). Each kernel uses a direct-mapped table when
+//! the code range is dense relative to the column ([`dense_table_fits`]),
+//! else a hash map.
 
 use std::collections::HashMap;
 
 use vortex_buffer::Buffer;
 
-/// Whether a direct-mapped table over `[0, max_code]` is the better strategy
-/// for a column of `len` values: the table costs `max_code + 1` slots, so it
-/// wins while it stays within a small multiple of the column's length.
+/// Whether a direct-mapped table over `[0, max_code]` (`max_code + 1` slots)
+/// is used for a column of `len` values.
 fn dense_table_fits(max_code: u32, len: usize) -> bool {
     (max_code as usize) < len.saturating_mul(4).max(1 << 16)
 }
@@ -105,14 +98,11 @@ pub fn take(codes: &[u32], indices: &[u32]) -> Result<Buffer<u32>, usize> {
     ))
 }
 
-/// The matching row pairs of two key columns, as parallel index columns
+/// The matching row pairs of two key columns as parallel index columns
 /// `(left_idx, right_idx)`: for every left row in order, each right row with
-/// the same code, in the right column's order — the order a nested loop
-/// produces, which is what makes the result stable across strategies.
-///
-/// The right column is indexed once (a CSR layout: every right row grouped
-/// under its code), then the left column is probed in order. When both
-/// columns are already ascending the pairs come from one merge pass instead.
+/// the same code in the right column's order. The right column is indexed
+/// once (CSR) and the left probed in order; two ascending columns take one
+/// merge pass.
 pub fn equi_join_indices(left: &[u32], right: &[u32]) -> (Buffer<u32>, Buffer<u32>) {
     if left.is_empty() || right.is_empty() {
         return (Buffer::empty(), Buffer::empty());

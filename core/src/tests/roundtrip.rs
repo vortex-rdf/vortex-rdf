@@ -48,9 +48,11 @@ async fn test_builder_roundtrip_sorted_stream() {
 #[test]
 fn test_from_parts_rejects_bare_dictionary_array() {
     let err = VortexRdfStore::from_parts(crate::store::StoreParts {
-        array: bare_code_quad_array(&[1, 2, 3]),
-        components: Vec::new(),
-        dict: None,
+        built: BuiltArray {
+            array: bare_code_quad_array(&[1, 2, 3]),
+            components: Vec::new(),
+            dict: None,
+        },
         quads_sorted: false,
     })
     .err()

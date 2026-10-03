@@ -62,19 +62,15 @@ pub use store::{
     SelectionKind, SharedQuad, SortOrder, SortedInMemoryBuilder, StoreParts, TermPredicate,
     Verdict, ViewStatistics, VortexArrayBuilder, VortexRdfDataSource, VortexRdfStore, export_rdf,
 };
-// The vortex scan interface the store's data sources implement — re-exported
-// so a consumer builds its `ScanRequest`s against the version this crate
-// was compiled with.
+// The vortex scan interface the store's data sources implement.
 pub use vortex_scan;
 
-/// The vortex session this crate registers its store layout and edition in —
-/// the session a consumer hands to vortex's own integrations (its DataFusion
-/// table provider) beside a [`VortexRdfStore::data_source`].
+/// The vortex session this crate registers its store layout and edition in;
+/// hand it to vortex's own integrations beside a
+/// [`VortexRdfStore::data_source`].
 pub fn vortex_session() -> &'static vortex_session::VortexSession {
     &session::VORTEX_SESSION
 }
-// Compiled out on wasm along with the rest of the sorted-stream builder's
-// out-of-core merge (see the module gate in `store::builders`).
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use store::SortedStreamBuilder;
 
@@ -84,8 +80,8 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-/// Compiles the README's Rust snippets as doctests. The file-conversion
-/// snippet uses the `file-io` entry points, so the hook follows that gate.
+/// The README's Rust snippets as doctests; the file-conversion snippet needs
+/// `file-io`.
 #[cfg(all(doctest, feature = "file-io"))]
 #[doc = include_str!("../../README.md")]
 struct ReadmeDoctests;

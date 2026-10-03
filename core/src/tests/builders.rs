@@ -98,8 +98,6 @@ async fn test_default_streaming_chunk_boundaries() {
 
 #[tokio::test]
 async fn test_dictionary_streaming_chunk_boundaries() {
-    use crate::store::builders::assemble_chunks;
-
     let quads = dictionary_test_quads();
 
     for (name, chunks, dict) in
@@ -109,7 +107,8 @@ async fn test_dictionary_streaming_chunk_boundaries() {
         // codes, and the dictionary the stream carried beside them is
         // handed back with the reassembled array — all chunks' codes must
         // reference that same global dictionary.
-        let arr = assemble_chunks(chunks).unwrap();
+        let dtype = chunks[0].dtype().clone();
+        let arr = crate::store::array::chunked_or_single(chunks, dtype).unwrap();
         let store = VortexRdfStore::from_built(crate::store::builders::BuiltArray {
             array: arr,
             components: Vec::new(),

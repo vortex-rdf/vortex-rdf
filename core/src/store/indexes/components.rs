@@ -214,6 +214,30 @@ impl IndexComponent {
         .map_err(VortexRdfError::Vortex)
     }
 
+    /// The inverse of [`to_write`](Self::to_write): a component over the
+    /// write's streamed chunks, executed to one struct, with the
+    /// descriptor's `sorted` provenance. A foreign implementation slug is
+    /// an error.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub(crate) async fn from_write(
+        write: &crate::io::container::NativeComponentWrite,
+    ) -> Result<Self> {
+        use futures::TryStreamExt as _;
+        let known = known_component(&write.descriptor.implementation).ok_or_else(|| {
+            VortexRdfError::Deserialization(format!(
+                "unknown index component implementation: {}",
+                write.descriptor.implementation
+            ))
+        })?;
+        let chunks: Vec<ArrayRef> = write.source.open()?.try_collect().await?;
+        let rows = crate::store::array::chunked_or_single(chunks, write.descriptor.dtype.clone())?;
+        Ok(Self::built(
+            known.identity,
+            into_struct_array(rows)?,
+            write.descriptor.sorted,
+        ))
+    }
+
     /// Whether the rows are materialized.
     #[cfg(all(test, feature = "file-io"))]
     pub(crate) fn is_materialized(&self) -> bool {
@@ -237,17 +261,17 @@ impl IndexComponent {
 
     /// The rows materialized, integer children kept compressed where a probe
     /// binds them and decoded otherwise
-    /// ([`with_searchable_int_children`](crate::store::array::with_searchable_int_children)).
+    /// ([`with_searchable_int_children`](crate::store::resident::with_searchable_int_children)).
     pub(crate) fn into_searchable(self) -> Result<Self> {
-        self.rebuilt(crate::store::array::with_searchable_int_children)
+        self.rebuilt(crate::store::resident::with_searchable_int_children)
     }
 
     /// The rows with their integer children compressed into probe-supported
     /// encodings
-    /// ([`with_compressed_int_children`](crate::store::array::with_compressed_int_children)),
+    /// ([`with_compressed_int_children`](crate::store::resident::with_compressed_int_children)),
     /// without a payload wrapper.
     pub(crate) fn into_compressed(self) -> Result<Self> {
-        self.rebuilt(|rows| crate::store::array::with_compressed_int_children(rows, false))
+        self.rebuilt(|rows| crate::store::resident::with_compressed_int_children(rows, false))
     }
 
     /// The cached probe over `column`, `None` when its encoding declines.

@@ -13,8 +13,9 @@ use vortex_buffer::Buffer;
 use crate::debug;
 use crate::error::{Result, VortexRdfError};
 use crate::store::QuadsSource;
-use crate::store::array::{cached_u32_primitive, column_is_sorted, into_struct_array};
+use crate::store::array::{column_is_sorted, into_struct_array};
 use crate::store::probes::StructProbes;
+use crate::store::resident::cached_u32_primitive;
 #[cfg(feature = "file-io")]
 use crate::store::scan::{file_filter, file_reads};
 use crate::store::schema::{self, QuadColumn};

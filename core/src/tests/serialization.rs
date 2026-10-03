@@ -880,9 +880,9 @@ async fn test_open_rejects_unknown_dictionary_implementation() {
         .to_serializable_parts()
         .await
         .unwrap();
-    let mut dict = parts.dict.as_ref().unwrap().to_write().unwrap();
+    let mut dict = parts.built.dict.as_ref().unwrap().to_write().unwrap();
     dict.descriptor.implementation = "not-a-dictionary-v0".into();
-    let bytes = unstamped_store_bytes(vec![parts.array.clone()], vec![dict]).await;
+    let bytes = unstamped_store_bytes(vec![parts.built.array.clone()], vec![dict]).await;
 
     let (from_bytes, from_file) = open_both(&bytes).await;
     for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
@@ -957,6 +957,7 @@ async fn test_open_rejects_index_child_with_mismatched_rows() {
         .await
         .unwrap();
     let components: Vec<container::NativeComponentWrite> = parts
+        .built
         .components
         .iter()
         .map(|component| {
@@ -974,7 +975,7 @@ async fn test_open_rejects_index_child_with_mismatched_rows() {
             .unwrap()
         })
         .collect();
-    let bytes = unstamped_store_bytes(vec![parts.array.clone()], components).await;
+    let bytes = unstamped_store_bytes(vec![parts.built.array.clone()], components).await;
 
     let (from_bytes, from_file) = open_both(&bytes).await;
     for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
@@ -1016,20 +1017,22 @@ async fn test_from_bytes_rejects_foreign_vortex_bytes() {
     );
 }
 
-/// `serialize_parts` requires a Dictionary-layout primary to come with its
-/// dictionary; the precondition is a debug assertion, so it is pinned in
-/// debug builds only.
+/// `StoreParts::into_stream` requires a Dictionary-layout primary to come
+/// with its dictionary; the precondition is a debug assertion, so it is
+/// pinned in debug builds only.
 #[cfg(debug_assertions)]
-#[tokio::test]
+#[test]
 #[should_panic(expected = "pairs a Dictionary primary with its dictionary")]
-async fn test_serialize_parts_requires_dictionary_beside_code_rows() {
+fn test_parts_stream_requires_dictionary_beside_code_rows() {
     let parts = crate::store::StoreParts {
-        array: bare_code_quad_array(&[1, 2, 3]),
-        components: Vec::new(),
-        dict: None,
+        built: BuiltArray {
+            array: bare_code_quad_array(&[1, 2, 3]),
+            components: Vec::new(),
+            dict: None,
+        },
         quads_sorted: false,
     };
-    let _ = crate::io::ser::serialize_parts(&parts, &mut Vec::new()).await;
+    let _ = parts.into_stream();
 }
 
 // ─── Builder parity on the wire ────────────────────────────────────────
@@ -1085,9 +1088,9 @@ async fn test_written_code_columns_avoid_delta() {
     let parts = adopted.to_serializable_parts().await.unwrap();
     let mut trees = vec![(
         "quads".to_string(),
-        format!("{}", parts.array.display_tree_encodings_only()),
+        format!("{}", parts.built.array.display_tree_encodings_only()),
     )];
-    for component in &parts.components {
+    for component in &parts.built.components {
         use vortex_array::IntoArray as _;
         let rows = component.rows().unwrap().clone().into_array();
         trees.push((
