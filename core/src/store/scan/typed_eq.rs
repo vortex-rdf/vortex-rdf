@@ -147,39 +147,38 @@ impl<'a> TypedEq<'a> {
 
 /// The per-row test over a bound constraint set: the all-code form loops
 /// over `(&[u32], u32)` pairs, the mixed form over the enum.
-enum RowMatcher<'a, 'b> {
-    Codes(Vec<(&'b [u32], u32)>),
-    Mixed(&'b [TypedEq<'a>]),
-}
-
-impl<'a, 'b> RowMatcher<'a, 'b> {
-    fn new(cols: &'b [TypedEq<'a>]) -> Self {
-        match TypedEq::code_views(cols) {
-            Some(codes) => RowMatcher::Codes(codes),
-            None => RowMatcher::Mixed(cols),
-        }
-    }
-
-    #[inline]
-    fn matches(&self, i: usize) -> bool {
-        match self {
-            RowMatcher::Codes(codes) => codes.iter().all(|(s, c)| s[i] == *c),
-            RowMatcher::Mixed(cols) => cols.iter().all(|c| c.matches(i)),
-        }
-    }
-}
-
 /// Selection size above which the typed row loop declines to the mask scan:
 /// always for a lone constraint, and for any set binding a column through an
 /// encoded-search probe.
 const TYPED_EQ_MAX_ROWS: usize = 4_096;
+
+/// The row ids of `selection` whose rows pass `matches`, in selection order.
+/// One monomorphic loop per selection variant: the hot path of a residual
+/// over an unindexed in-memory store.
+fn filter_selected(
+    selection: &RowSelection,
+    base_len: usize,
+    matches: impl Fn(usize) -> bool,
+) -> Vec<u64> {
+    match selection {
+        RowSelection::All => (0..base_len as u64)
+            .filter(|&i| matches(i as usize))
+            .collect(),
+        RowSelection::Range(r) => (r.start..r.end).filter(|&i| matches(i as usize)).collect(),
+        RowSelection::Ids(ids) => ids
+            .iter()
+            .copied()
+            .filter(|&i| matches(i as usize))
+            .collect(),
+    }
+}
 
 /// The base row ids inside `selection` satisfying every equality in `eqs`,
 /// tested row by row through typed column views. `None` declines to the mask
 /// scan: a constraint neither code nor string, a column no view binds, a
 /// lone constraint or a probe-bound column over more than
 /// [`TYPED_EQ_MAX_ROWS`] selected rows. A payload wrapper's canonical form
-/// is materialized only when selected rows × constraints >= `base_len`.
+/// is materialized only when selected rows x constraints >= `base_len`.
 pub(crate) fn typed_residual_ids(
     struct_arr: &StructArray,
     selection: &RowSelection,
@@ -197,11 +196,12 @@ pub(crate) fn typed_residual_ids(
     if cols.iter().any(|c| matches!(c, TypedEq::CodeProbe(..))) && wide {
         return None;
     }
-    let matcher = RowMatcher::new(&cols);
-    let ids: Vec<u64> = selection
-        .ids(base_len)
-        .filter(|&i| matcher.matches(i as usize))
-        .collect();
+    let ids = match TypedEq::code_views(&cols) {
+        Some(codes) => filter_selected(selection, base_len, |i| {
+            codes.iter().all(|(s, c)| s[i] == *c)
+        }),
+        None => filter_selected(selection, base_len, |i| cols.iter().all(|c| c.matches(i))),
+    };
     Some(vortex_buffer::Buffer::from_iter(ids))
 }
 
@@ -224,12 +224,17 @@ pub(crate) fn typed_positions(
     ) -> Option<()> {
         // Every row is tested, so a compressed column is read canonical.
         let cols = TypedEq::bind(sa, eqs, needles, true)?;
-        let matcher = RowMatcher::new(&cols);
-        out.extend(
-            (0..sa.len())
-                .filter(|&i| matcher.matches(i))
-                .map(|i| offset + i),
-        );
+        let rows = 0..sa.len();
+        match TypedEq::code_views(&cols) {
+            Some(codes) => out.extend(
+                rows.filter(|&i| codes.iter().all(|(s, c)| s[i] == *c))
+                    .map(|i| offset + i),
+            ),
+            None => out.extend(
+                rows.filter(|&i| cols.iter().all(|c| c.matches(i)))
+                    .map(|i| offset + i),
+            ),
+        }
         Some(())
     }
     let mut out = Vec::new();

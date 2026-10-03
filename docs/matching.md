@@ -261,7 +261,7 @@ Each stage in the code, and where the details are below:
 | Prelude | [`matching.rs:213-242`](../core/src/store/query/matching.rs#L213-L242) | — |
 | 1 · prefix probe | [`matching.rs:244-327`](../core/src/store/query/matching.rs#L244-L327), [`search_sorted_bounds`](../core/src/store/array.rs#L178) | [§6.1](#61-prefix-probe) |
 | 2 · secondary-index routing | [`matching.rs:329-399`](../core/src/store/query/matching.rs#L329-L399), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L268) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`matching.rs:401-442`](../core/src/store/query/matching.rs#L401-L442), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L183), [`mask_for`](../core/src/store/query/matching.rs#L737) | [§6.3](#63-residual-column-filtering) |
+| 3 · residual column filtering | [`matching.rs:401-442`](../core/src/store/query/matching.rs#L401-L442), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L182), [`mask_for`](../core/src/store/query/matching.rs#L737) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`matching.rs:444-458`](../core/src/store/query/matching.rs#L444-L458) | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe

@@ -132,16 +132,6 @@ impl RowSelection {
         }
     }
 
-    /// The base row ids this selection covers, ascending.
-    pub(crate) fn ids(&self, base_len: usize) -> impl Iterator<Item = u64> + '_ {
-        let (range, ids): (Range<u64>, &[u64]) = match self {
-            RowSelection::All => (0..base_len as u64, &[]),
-            RowSelection::Range(range) => (range.clone(), &[]),
-            RowSelection::Ids(ids) => (0..0, ids.as_slice()),
-        };
-        range.chain(ids.iter().copied())
-    }
-
     /// Whether the selection provably covers no row. `All` over an empty base
     /// counts as empty, so callers can normalize without consulting the base.
     pub(crate) fn is_empty(&self, base_len: usize) -> bool {
