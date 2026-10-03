@@ -1,6 +1,6 @@
 //! The numeric value model behind the `num_*` predicates: XSD numeric
-//! lexical forms parsed exactly (integers, scaled decimals, finite
-//! floats), their comparison, and the parsed constant of a predicate.
+//! lexical forms parsed exactly (integers, scaled decimals, finite floats),
+//! their comparison, and a predicate's parsed constant.
 
 use std::cmp::Ordering;
 
@@ -9,20 +9,18 @@ use crate::common::vocab::{XSD, XSD_STRING};
 use super::literal::LiteralView;
 use super::{NumOp, Verdict};
 
-/// A numeric constant, as a parsed XSD numeric literal.
+/// A numeric constant: a parsed XSD numeric literal and its datatype.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Number {
     value: Num,
-    /// The constant's datatype IRI (without angle brackets), for the
-    /// cross-datatype ordering rule.
+    /// The datatype IRI, without angle brackets.
     datatype: String,
 }
 
 /// The exact value model: integers as `i128`, decimals as a scaled `i128`
-/// mantissa, floats as `f64`. Everything the XSD grammars accept but this
-/// model cannot hold exactly (an integer over 38 digits, a decimal with more
-/// digits than that, `INF`/`NaN`) is left out of the model and answers
-/// `Unknown`.
+/// mantissa, floats as `f64`. Anything the XSD grammars accept but the model
+/// cannot hold exactly (more than 38 digits, `INF`, `NaN`) is outside it and
+/// answers `Unknown`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum Num {
     Int(i128),
@@ -34,9 +32,8 @@ pub(super) enum Num {
     Float(f64),
 }
 
-// `f64` has no `Eq`/`Hash`; the derived traits on `Number` key memo tables,
-// so compare and hash floats by their bit pattern (the parsed constant is
-// always finite).
+// `f64` has no `Eq`/`Hash`: floats compare and hash by bit pattern (a parsed
+// constant is always finite).
 impl Eq for Num {}
 
 impl std::hash::Hash for Num {
@@ -59,9 +56,8 @@ impl std::hash::Hash for Num {
     }
 }
 
-/// The XSD numeric datatypes the value model covers, by local name, with the
-/// inclusive bounds of the bounded integer types (`None` = unbounded).
-/// `unsignedLong` and `long` are bounded too, by `u64`/`i64`.
+/// The XSD numeric datatypes of the model by local name, with the inclusive
+/// bounds of the bounded integer types (`None` = unbounded).
 const NUMERIC_TYPES: &[(&str, NumKind)] = &[
     ("integer", NumKind::Int(None, None)),
     ("nonPositiveInteger", NumKind::Int(None, Some(0))),
@@ -116,7 +112,7 @@ impl NumKind {
     }
 }
 
-/// The numeric kind of a datatype IRI, or `None` for a non-numeric one.
+/// The numeric kind of a datatype IRI; `None` for a non-numeric one.
 pub(super) fn numeric_kind(datatype: &str) -> Option<NumKind> {
     let local = datatype.strip_prefix(XSD)?;
     NUMERIC_TYPES
@@ -125,8 +121,8 @@ pub(super) fn numeric_kind(datatype: &str) -> Option<NumKind> {
         .map(|(_, kind)| *kind)
 }
 
-/// Parse an XSD numeric lexical form of `kind` into the value model, or
-/// `None` when the grammar rejects it or the model cannot hold it exactly.
+/// An XSD numeric lexical form of `kind` in the model; `None` when the
+/// grammar rejects it or the model cannot hold it exactly.
 pub(super) fn parse_number(lexical: &str, kind: NumKind) -> Option<Num> {
     match kind {
         NumKind::Int(lo, hi) => {
@@ -151,9 +147,8 @@ fn parse_integer(lexical: &str) -> Option<i128> {
     Some(if neg { -v } else { v })
 }
 
-/// XSD `decimal`: `[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)`, held as a scaled
-/// mantissa; trailing fractional zeros are kept (they do not change the
-/// value, and the comparison aligns scales anyway).
+/// XSD `decimal`: `[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)`, as a scaled mantissa;
+/// trailing fractional zeros are kept.
 fn parse_decimal(lexical: &str) -> Option<Num> {
     let (neg, body) = split_sign(lexical)?;
     let (int_part, frac_part) = split_decimal(body)?;
@@ -167,8 +162,8 @@ fn parse_decimal(lexical: &str) -> Option<Num> {
 }
 
 /// XSD `float`/`double` without the special values:
-/// `[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?`. `INF`, `-INF` and
-/// `NaN` are grammatical but outside the model (`None`).
+/// `[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?`; `INF`, `-INF` and
+/// `NaN` are outside the model.
 fn parse_float(lexical: &str) -> Option<Num> {
     let (neg, body) = split_sign(lexical)?;
     let (mantissa, exponent) = match body.find(['e', 'E']) {
@@ -182,9 +177,7 @@ fn parse_float(lexical: &str) -> Option<Num> {
             return None;
         }
     }
-    // The grammar above is a subset of what Rust's parser accepts, so this
-    // cannot fail; a value past f64's range parses to infinity, which the
-    // model excludes.
+    // A value past f64's range parses to infinity, which the model excludes.
     let v: f64 = body.parse().ok()?;
     if !v.is_finite() {
         return None;
@@ -192,7 +185,8 @@ fn parse_float(lexical: &str) -> Option<Num> {
     Some(Num::Float(if neg { -v } else { v }))
 }
 
-/// Split an optional leading sign off a lexical form.
+/// The optional leading sign (`true` = negative) and the rest of a lexical
+/// form.
 fn split_sign(lexical: &str) -> Option<(bool, &str)> {
     if let Some(rest) = lexical.strip_prefix('-') {
         Some((true, rest))
@@ -204,7 +198,7 @@ fn split_sign(lexical: &str) -> Option<(bool, &str)> {
 }
 
 /// The `(integer, fraction)` digits of an unsigned decimal body
-/// (`[0-9]+(\.[0-9]*)?|\.[0-9]+`), `None` when the grammar rejects it.
+/// (`[0-9]+(\.[0-9]*)?|\.[0-9]+`); `None` when the grammar rejects it.
 fn split_decimal(body: &str) -> Option<(&str, &str)> {
     let (int_part, frac_part) = body.split_once('.').unwrap_or((body, ""));
     let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
@@ -227,9 +221,9 @@ pub(super) fn digits_value(
 /// Integers whose `f64` conversion is exact.
 const F64_EXACT_INT: i128 = 1 << 53;
 
-/// Compare two values of the model exactly, or `None` when the model cannot
-/// settle the comparison (mixed float/decimal, an integer too wide to hold
-/// exactly in an `f64`, an overflow while aligning scales).
+/// Compare two values exactly; `None` when the model cannot settle it (a
+/// fractional float against a decimal, an integer at or past
+/// [`F64_EXACT_INT`] against a float, an overflow aligning scales).
 fn compare_nums(a: Num, b: Num) -> Option<Ordering> {
     match (a, b) {
         (Num::Int(x), Num::Int(y)) => Some(x.cmp(&y)),
@@ -265,9 +259,9 @@ fn compare_nums(a: Num, b: Num) -> Option<Ordering> {
                 ord.reverse()
             })
         }
-        // A decimal with no fractional digits is an integer, and so is an
-        // integral float below the exact-integer bound; any other mix of
-        // the two models has no exact comparison here.
+        // A decimal without fractional digits is an integer, and so is an
+        // integral float below the exact-integer bound; no other float/decimal
+        // mix compares exactly.
         (Num::Float(_), Num::Dec { mantissa, scale: 0 }) => compare_nums(a, Num::Int(mantissa)),
         (Num::Dec { mantissa, scale: 0 }, Num::Float(_)) => compare_nums(Num::Int(mantissa), b),
         (Num::Float(x), Num::Dec { .. }) => compare_nums(Num::Int(integral_float(x)?), b),
@@ -275,8 +269,8 @@ fn compare_nums(a: Num, b: Num) -> Option<Ordering> {
     }
 }
 
-/// A finite, integral float below the exact-integer bound as the integer it
-/// is; `None` for anything a decimal cannot be compared with exactly.
+/// A finite, integral float below [`F64_EXACT_INT`] as an integer; `None`
+/// otherwise.
 fn integral_float(x: f64) -> Option<i128> {
     if x.is_finite() && x.fract() == 0.0 && (x.abs() as i128) < F64_EXACT_INT {
         Some(x as i128)
@@ -286,8 +280,8 @@ fn integral_float(x: f64) -> Option<i128> {
 }
 
 impl Number {
-    /// Parse a numeric constant: an N-Triples numeric literal, or a bare
-    /// number typed by its syntax (integer, decimal, or double).
+    /// Parse a constant: an N-Triples numeric literal, or a bare number typed
+    /// by its syntax (integer, decimal, or double).
     pub(super) fn parse(arg: &str) -> Option<Self> {
         let arg = arg.trim();
         if arg.starts_with('"') {
@@ -313,7 +307,7 @@ impl Number {
         })
     }
 
-    /// The constant as the N-Triples literal it parsed from (normalized).
+    /// The constant as a normalized N-Triples literal.
     pub(super) fn canonical(&self) -> String {
         let lexical = match self.value {
             Num::Int(i) => i.to_string(),
@@ -343,19 +337,15 @@ impl Number {
                 None => Verdict::Unknown,
             };
         }
-        // Not a numeric value: a numeric datatype whose lexical form the
-        // model does not hold, or a non-numeric literal. For ordering, a
-        // language-tagged literal counts as `xsd:string` (its datatype is
-        // implicit, and that is the datatype the engine orders it by), not
-        // the `rdf:langString` that `datatype()` reports.
+        // Without a value the literal orders by datatype; a language-tagged
+        // literal orders as `xsd:string`.
         let dt = if lit.lang.is_some() {
             XSD_STRING
         } else {
             lit.effective_datatype()
         };
         if op.is_equality() {
-            // Value equality is undefined; term equality would decide, but
-            // only an engine knows how it canonicalizes the lexical form.
+            // Equality without a value is left to the engine.
             return Verdict::Unknown;
         }
         if dt == self.datatype {
@@ -363,22 +353,16 @@ impl Number {
             return Verdict::Unknown;
         }
         if lit.lang.is_none() && !dt.starts_with(XSD) {
-            // A non-XSD datatype against an XSD one: an engine orders them
-            // by datatype IRI only when both are XSD; otherwise a type error
-            // — which a FILTER folds to false — or an implementation-defined
-            // order. Leave it to the engine.
+            // A non-XSD datatype has no datatype-IRI order against an XSD one.
             return Verdict::Unknown;
         }
         if numeric_kind(dt).is_some() && !lit.parses_unbounded() {
-            // A numeric datatype whose lexical form the grammar rejects: the
-            // engine's own parser may still give it a value (`NaN`, a padded
-            // integer) and compare by value, which this model cannot.
+            // A numeric lexical form the grammar rejects may still parse for
+            // the engine.
             return Verdict::Unknown;
         }
-        // Different XSD datatypes with no comparable values — a non-numeric
-        // datatype, or a value outside its datatype's bounds, which the
-        // engine rejects too — order by their datatype IRIs: the rule the
-        // Python fast path applies.
+        // Distinct XSD datatypes with no comparable values order by their
+        // datatype IRIs.
         op.apply(dt.cmp(self.datatype.as_str()))
     }
 }

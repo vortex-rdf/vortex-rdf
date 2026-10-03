@@ -21,26 +21,18 @@ use super::term_dict::TermDictionary;
 /// [`PatternCodes`].
 #[derive(Clone)]
 pub(crate) enum DictAccess {
-    /// The whole dictionary in memory (FSST-compressed or canonical).
+    /// The whole dictionary in memory.
     Resident(Arc<TermDictionary>),
-    /// The dictionary left in its file, read on demand through wire-chunk
-    /// point reads — chosen at open when the dictionary child outweighs the
-    /// residency threshold *and* its layout shape is point-readable (see
-    /// [`VortexRdfStore::from_file_with_dict_residency`](crate::store::VortexRdfStore::from_file_with_dict_residency)).
+    /// The dictionary left in its file, point-read on demand; chosen at open
+    /// when the dictionary child outweighs the residency threshold and its
+    /// layout shape is point-readable.
     #[cfg(feature = "file-io")]
     FileBacked(FileBackedDict),
 }
 
 impl DictAccess {
-    /// Pre-resolve every bound term of `pattern` — the async prelude run
-    /// before the synchronous match core — and mint the [`PatternCodes`]
-    /// witness the core's probes run on.
-    ///
-    /// For `Resident` the lookups are in-memory binary searches, all resolved
-    /// here so the invariant the match core is written against holds under
-    /// either residency — *after the prelude, every bound role is in the
-    /// witness* — which is what lets a file-backed dictionary do its I/O here
-    /// and nowhere else.
+    /// Resolve every bound role of `pattern` into a [`PatternCodes`];
+    /// afterwards no probe of the match touches the dictionary.
     pub(crate) async fn resolve_pattern(&self, pattern: QuadPattern<'_>) -> Result<PatternCodes> {
         match self {
             DictAccess::Resident(dict) => {
@@ -50,17 +42,8 @@ impl DictAccess {
                 }
                 Ok(codes)
             }
-            // Each bound role costs one point-read binary search of the term
-            // column (memoized in the probe cache); the resolved code is then
-            // seeded into the witness so the sync match core never reaches
-            // back here.
-            //
-            // The searches are independent, so they run overlapped rather
-            // than one await after another: whatever chunk fetches they miss
-            // on overlap instead of serializing. Concurrency is why each term
-            // is rendered into its own String here instead of the pattern's
-            // shared scratch buffer, and a race to fetch the same chunk is
-            // already handled by its drop-the-loser `OnceLock`.
+            // The lookups are independent and run overlapped, each term
+            // rendered into its own String.
             #[cfg(feature = "file-io")]
             DictAccess::FileBacked(fb) => {
                 let rendered: Vec<String> = pattern.bound_roles().map(|t| t.to_string()).collect();
@@ -76,10 +59,7 @@ impl DictAccess {
         }
     }
 
-    /// The in-memory dictionary, or `None` when it is file-backed — sync
-    /// callers (snapshots, in-memory chunk decode) treat `None` as "not
-    /// available here"; paths that genuinely need the whole column go through
-    /// [`ensure_resident`](Self::ensure_resident).
+    /// The in-memory dictionary; `None` when file-backed.
     pub(crate) fn resident(&self) -> Option<&Arc<TermDictionary>> {
         match self {
             DictAccess::Resident(dict) => Some(dict),
@@ -88,16 +68,13 @@ impl DictAccess {
         }
     }
 
-    /// A residency-agnostic handle on the dictionary.
+    /// A handle on the dictionary under either residency.
     pub(crate) fn reader(&self) -> DictReader {
         DictReader(self.clone())
     }
 
-    /// The whole dictionary in memory, lifting a file-backed one with a single
-    /// term-column scan — for the operations that need the full column
-    /// (serialization, compaction, tail-merge re-encoding). The lift is
-    /// transient: it is not cached back into the access, so a store's steady
-    /// state keeps the file-backed footprint.
+    /// The whole dictionary in memory, lifting a file-backed one with one
+    /// term-column scan. The lift is transient, not cached.
     pub(crate) async fn ensure_resident(&self) -> Result<Arc<TermDictionary>> {
         match self {
             DictAccess::Resident(dict) => Ok(Arc::clone(dict)),
@@ -106,8 +83,7 @@ impl DictAccess {
         }
     }
 
-    /// Whether the terms are read from the file on demand (`true`) or held
-    /// in memory (`false`).
+    /// Whether the terms are read from the file on demand.
     pub(crate) fn is_file_backed(&self) -> bool {
         match self {
             DictAccess::Resident(_) => false,
@@ -116,7 +92,7 @@ impl DictAccess {
         }
     }
 
-    /// Identity of the dictionary — see [`DictReader::dictionary_id`].
+    /// Identity of the dictionary (see [`DictReader::dictionary_id`]).
     pub(crate) fn id(&self) -> u64 {
         match self {
             DictAccess::Resident(dict) => dict.id(),
@@ -137,30 +113,23 @@ impl DictAccess {
 
 /// An immutable handle on a Dictionary-layout store's term dictionary, taken
 /// with [`VortexRdfStore::code_read_snapshot`](crate::store::VortexRdfStore::code_read_snapshot).
+/// Cloning is an `Arc` bump; the snapshot retains only the dictionary.
 ///
-/// Cloning is an `Arc` bump, and the snapshot retains only the dictionary — not
-/// the store or its quad columns.
-///
-/// **Term codes are only meaningful against the dictionary they were produced
-/// with.** Mutating a store re-encodes it against a *fresh* dictionary, so a
-/// consumer holding codes must decode them through the snapshot taken when it
-/// received them, not through the store as it stands later — otherwise codes
-/// silently resolve to the wrong terms. Holding the snapshot keeps exactly the
-/// dictionary those codes address alive, and nothing more.
+/// Term codes are only meaningful against the dictionary they were produced
+/// with: mutating a store re-encodes it against a fresh dictionary, so codes
+/// are decoded through the snapshot taken when they were received, not
+/// through the store as it stands later.
 #[derive(Clone)]
 pub struct DictSnapshot(pub(crate) Arc<TermDictionary>);
 
 impl DictSnapshot {
-    /// Decode a term code to its N-Triples string, or `None` when the code is
-    /// out of this dictionary's range.
+    /// The N-Triples string of `code`, `None` when the code is out of range.
     pub fn decode(&self, code: u32) -> Option<String> {
         self.0.decode(code)
     }
 
-    /// Encode an N-Triples term string to its code (its position in the
-    /// sorted dictionary), or `None` when this dictionary does not hold the
-    /// term. The inverse of [`decode`](Self::decode); a binary search over
-    /// the dictionary.
+    /// The code of the N-Triples string `term` (its position in the sorted
+    /// dictionary), `None` when the dictionary does not hold it.
     pub fn encode(&self, term: &str) -> Option<u32> {
         self.0.encode(term)
     }
@@ -170,8 +139,7 @@ impl DictSnapshot {
         self.0.len()
     }
 
-    /// Identity of the dictionary behind this snapshot — see
-    /// [`DictReader::dictionary_id`].
+    /// Identity of the dictionary (see [`DictReader::dictionary_id`]).
     pub fn dictionary_id(&self) -> u64 {
         self.0.id()
     }
@@ -182,10 +150,10 @@ impl DictSnapshot {
     }
 
     /// [`encode`](Self::encode) tolerant of spelling: an IRI with or without
-    /// angle brackets, a literal with escape variants, an `xsd:string`
-    /// typing, an upper-case language tag, or a default-graph spelling
-    /// (`""`, `default`, `[]`) all resolve to the code of the stored form
-    /// (see [`canonical_spelling`]). Malformed input is an error.
+    /// angle brackets, a literal's escape variants, an `xsd:string` typing,
+    /// an upper-case language tag and the default-graph spellings (`""`,
+    /// `default`, `[]`) all resolve to the code of the stored form (see
+    /// [`canonical_spelling`]). Malformed input is an error.
     ///
     /// [`canonical_spelling`]: crate::common::terms::canonical_spelling
     pub fn encode_tolerant(&self, term: &str) -> Result<Option<u32>> {
@@ -197,23 +165,21 @@ impl DictSnapshot {
         self.0.encode_many(terms)
     }
 
-    /// [`decode`](Self::decode) over a batch, in order, through one cursor;
-    /// an out-of-range code decodes to `None`.
+    /// [`decode`](Self::decode) over a batch, in order; an out-of-range code
+    /// decodes to `None`.
     pub fn decode_many(&self, codes: &[u32]) -> Vec<Option<String>> {
         self.0.decode_many(codes)
     }
 
-    /// The code of the first term not below `term` in byte order (the
-    /// dictionary's size when every term is below it): a present term's own
-    /// code, or where an absent one would sort.
+    /// The code of the first term not below `term` in byte order; the term
+    /// count when every term is below it.
     pub fn lower_bound(&self, term: &str) -> u32 {
         self.0.lower_bound(term.as_bytes())
     }
 
     /// The half-open code range `(lo, hi)` of the terms spelled with
-    /// `prefix`. Codes are lexicographic ranks of the N-Triples spelling, so
-    /// a term kind (`"` for literals, `<` for IRIs, `_:` for blank nodes)
-    /// and an IRI namespace (`<http://example.org/`) are each one range.
+    /// `prefix`: a term kind (`"`, `<`, `_:`) or an IRI namespace is one
+    /// range.
     pub fn prefix_range(&self, prefix: &str) -> (u32, u32) {
         let range = self.0.prefix_range(prefix);
         (range.start, range.end)
@@ -224,13 +190,10 @@ impl DictSnapshot {
         self.0.kind_ranges().clone()
     }
 
-    /// Partition the codes by `predicate`: the ascending codes for which it
-    /// is definitely true, and the ascending codes inside its domain whose
-    /// verdict is unknown (for a full engine to decide). Codes outside the
-    /// predicate's [`domain`](TermPredicate::domain) — non-literals, for the
-    /// literal predicates — appear in neither list, since a caller decides
-    /// them from the term's kind alone (see [`kind_ranges`](Self::kind_ranges)).
-    /// One scan of the domain, memoized per dictionary.
+    /// The codes for which `predicate` is definitely true, and the codes
+    /// inside its [`domain`](TermPredicate::domain) whose verdict is unknown,
+    /// both ascending. Codes outside the domain appear in neither list.
+    /// Memoized per dictionary.
     pub fn filter_codes(&self, predicate: &TermPredicate) -> (Buffer<u32>, Buffer<u32>) {
         let sets = self.0.filter_codes(predicate);
         (sets.0.clone(), sets.1.clone())
@@ -240,13 +203,10 @@ impl DictSnapshot {
 /// A handle on a Dictionary-layout store's term dictionary under either
 /// residency, taken with
 /// [`VortexRdfStore::dict_reader`](crate::store::VortexRdfStore::dict_reader):
-/// the same term ↔ code surface as [`DictSnapshot`], asynchronous so a
-/// dictionary left in its file can answer by reading it. Every method
-/// completes without suspending on a resident dictionary.
-///
-/// Like a snapshot, codes are only meaningful against the dictionary they
-/// were produced with; a file-backed reader additionally keeps the store's
-/// file handle alive.
+/// [`DictSnapshot`]'s surface, asynchronous so a file-backed dictionary can
+/// read its file; on a resident dictionary every method completes without
+/// suspending. Codes are only meaningful against the dictionary they were
+/// produced with; a file-backed reader keeps the store's file handle alive.
 #[derive(Clone)]
 pub struct DictReader(pub(crate) DictAccess);
 
@@ -258,18 +218,14 @@ impl From<DictSnapshot> for DictReader {
 }
 
 impl DictReader {
-    /// Whether the terms are read from the file on demand (`true`) or held
-    /// in memory (`false`).
+    /// Whether the terms are read from the file on demand.
     pub fn is_file_backed(&self) -> bool {
         self.0.is_file_backed()
     }
 
-    /// Identity of the dictionary this handle reads: equal for every view
-    /// of one store (its codes are one vocabulary), different for the
-    /// dictionary a `compact` or a fresh open builds — so a consumer that
-    /// caches codes knows when they stop applying. Two handles with
-    /// different ids may still hold equal terms; only equal ids promise
-    /// equal codes.
+    /// Identity of the dictionary: equal for every view of one store,
+    /// different for the dictionary a `compact` or a fresh open builds. Equal
+    /// ids mean equal codes; different ids promise nothing.
     pub fn dictionary_id(&self) -> u64 {
         self.0.id()
     }
@@ -284,14 +240,12 @@ impl DictReader {
         self.len() == 0
     }
 
-    /// The synchronous [`DictSnapshot`] of a resident dictionary, `None`
-    /// when the terms are file-backed.
+    /// The [`DictSnapshot`] of a resident dictionary; `None` when file-backed.
     pub fn snapshot(&self) -> Option<DictSnapshot> {
         self.0.resident().map(|dict| DictSnapshot(Arc::clone(dict)))
     }
 
-    /// The N-Triples string for `code`, or `None` when the code is out of
-    /// range.
+    /// The N-Triples string of `code`, `None` when the code is out of range.
     pub async fn decode(&self, code: u32) -> Result<Option<String>> {
         match &self.0 {
             DictAccess::Resident(dict) => Ok(dict.decode(code)),
@@ -302,9 +256,8 @@ impl DictReader {
         }
     }
 
-    /// [`decode`](Self::decode) over a batch, in order: any order and
-    /// repeats are fine (a file-backed dictionary reads each distinct code
-    /// once, in one batch).
+    /// [`decode`](Self::decode) over a batch, in order; any order and
+    /// repeats are accepted.
     pub async fn decode_many(&self, codes: &[u32]) -> Result<Vec<Option<String>>> {
         match &self.0 {
             DictAccess::Resident(dict) => Ok(dict.decode_many(codes)),
@@ -323,8 +276,7 @@ impl DictReader {
         }
     }
 
-    /// [`encode`](Self::encode) over a batch, in order (a file-backed
-    /// dictionary overlaps the lookups' reads).
+    /// [`encode`](Self::encode) over a batch, in order.
     pub async fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<u32>>> {
         match &self.0 {
             DictAccess::Resident(dict) => dict.encode_many(terms),
@@ -361,9 +313,7 @@ impl DictReader {
         }
     }
 
-    /// See [`DictSnapshot::filter_codes`]. A file-backed dictionary scans
-    /// the predicate's domain through its child once per distinct predicate
-    /// (memoized like the resident form).
+    /// See [`DictSnapshot::filter_codes`].
     pub async fn filter_codes(
         &self,
         predicate: &TermPredicate,

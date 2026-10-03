@@ -8,21 +8,18 @@ use super::numeric::{Num, digits_value, numeric_kind, parse_number};
 
 /// A literal spelling split into its parts, borrowed from the spelling.
 pub(super) struct LiteralView<'a> {
-    /// The lexical form as spelled (escapes intact).
+    /// The lexical form as spelled, escapes intact.
     pub(super) lexical: &'a str,
     /// The language tag, as stored.
     pub(super) lang: Option<&'a str>,
-    /// The datatype IRI without angle brackets, as spelled.
+    /// The datatype IRI, without angle brackets.
     pub(super) datatype: Option<&'a str>,
 }
 
 impl<'a> LiteralView<'a> {
-    /// Split `"lex"`, `"lex"@tag` or `"lex"^^<dt>`; `None` for anything else.
-    ///
-    /// The only unescaped `"` in a literal spelling are its two delimiters,
-    /// so searching the terminator from the end is unambiguous: `"^^<` and
-    /// `"@` inside the lexical form can only occur escaped (`\"^^<`), and the
-    /// real terminator always comes later.
+    /// Split `"lex"`, `"lex"@tag` or `"lex"^^<dt>`; `None` for anything
+    /// else. The only unescaped `"` in a literal spelling are its two
+    /// delimiters, so the terminator is found from the end.
     pub(super) fn parse(spelling: &'a str) -> Option<Self> {
         let body = spelling.strip_prefix('"')?;
         if let Some(lexical) = body.strip_suffix('"') {
@@ -48,7 +45,8 @@ impl<'a> LiteralView<'a> {
         })
     }
 
-    /// The datatype the SPARQL `datatype()` function reports.
+    /// The datatype SPARQL's `datatype()` reports: `rdf:langString` for a
+    /// tagged literal, `xsd:string` for a plain one.
     pub(super) fn effective_datatype(&self) -> &str {
         match (self.lang, self.datatype) {
             (Some(_), _) => RDF_LANG_STRING,
@@ -57,8 +55,7 @@ impl<'a> LiteralView<'a> {
         }
     }
 
-    /// Whether the literal is string-like: plain, language-tagged, or typed
-    /// `xsd:string` (which the ingest never writes, but a foreign file may).
+    /// Plain, language-tagged, or typed `xsd:string`.
     pub(super) fn is_string_like(&self) -> bool {
         self.lang.is_some() || self.datatype.is_none_or(|dt| dt == XSD_STRING)
     }
@@ -70,12 +67,8 @@ impl<'a> LiteralView<'a> {
         parse_number(self.lexical, numeric_kind(dt)?)
     }
 
-    /// Whether a numeric literal's lexical form parses disregarding the
-    /// datatype's own bounds — an out-of-range `xsd:byte`, say. An engine
-    /// parses such a form to a value it then rejects, and orders the
-    /// literal by its datatype; a form the grammar rejects (whitespace,
-    /// `NaN`) its own, more lenient parser may still accept, so that one is
-    /// left to it.
+    /// Whether the lexical form parses under the datatype's kind ignoring the
+    /// datatype's bounds: an out-of-range `xsd:byte` does, `NaN` does not.
     pub(super) fn parses_unbounded(&self) -> bool {
         self.datatype
             .and_then(numeric_kind)
@@ -83,8 +76,7 @@ impl<'a> LiteralView<'a> {
     }
 }
 
-/// The kind of a spelling from its first byte, which the sorted dictionary
-/// shares with the kind ranges.
+/// The kind of a spelling, from its first byte.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Kind {
     /// The empty spelling of the default graph.
@@ -92,7 +84,7 @@ pub(super) enum Kind {
     Literal,
     Iri,
     Blank,
-    /// Anything a dictionary of this crate never holds.
+    /// A spelling no dictionary of this crate holds.
     Other,
 }
 
@@ -106,7 +98,7 @@ pub(super) fn kind_of(spelling: &str) -> Kind {
     }
 }
 
-/// BCP 47 basic filtering (RFC 4647 §3.3.1) as SPARQL's `langMatches`.
+/// BCP 47 basic filtering (RFC 4647 §3.3.1), as SPARQL's `langMatches`.
 pub(super) fn lang_matches(tag: &str, range: &str) -> bool {
     if range == "*" {
         return !tag.is_empty();
@@ -116,9 +108,8 @@ pub(super) fn lang_matches(tag: &str, range: &str) -> bool {
     tag == range || (tag.starts_with(&range) && tag.as_bytes().get(range.len()) == Some(&b'-'))
 }
 
-/// Unescape at least the first `want` characters of a lexical form (as
-/// spelled, with N-Triples escapes), stopping early so a long literal costs
-/// only its prefix. `None` for a malformed escape.
+/// The first `want` characters of a lexical form with its N-Triples escapes
+/// undone; `None` for a malformed escape.
 pub(super) fn unescape_prefix(lexical: &str, want: usize) -> Option<String> {
     if !lexical.contains('\\') {
         return Some(lexical.chars().take(want).collect());

@@ -1,12 +1,7 @@
 //! The Dictionary layout's term dictionary: s/p/o/g stored as u32 codes
-//! into one sorted term dictionary that travels beside the array in memory
-//! and as the native container's `dictionary` child in a file.
-//!
-//! [`codec`] encodes and decodes chunks, [`ingest`] collects and interns
-//! terms at build time, [`storage`] holds a resident dictionary's terms,
-//! [`term_dict`] is its lookup API, [`file_backed`] reads terms from the
-//! file child on demand, [`handles`] are the access seam and the public
-//! handles, and [`predicates`] evaluates term predicates on spellings.
+//! into one sorted term dictionary, held beside the array in memory and
+//! written as the native container's `dictionary` child. Codes are the
+//! sorted ranks of the N-Triples spellings, so code order is byte order.
 
 pub(crate) mod codec;
 #[cfg(feature = "file-io")]
@@ -31,8 +26,7 @@ pub(crate) use self::handles::DictAccess;
 pub use self::handles::{DictReader, DictSnapshot};
 pub use self::ingest::DictionaryQuadSink;
 pub(crate) use self::ingest::{code_map, sorted_unique_terms};
-// Read only by the out-of-core builder, which is compiled out on
-// wasm32-unknown-unknown.
+// Compiled out with the out-of-core builder on wasm32-unknown-unknown.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) use self::ingest::{TermCodeMap, TermDictionaryBuilder};
 pub use self::predicates::{Domain, KindRanges, NumOp, TermPredicate, Verdict};

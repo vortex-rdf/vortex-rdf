@@ -1,12 +1,8 @@
-//! The file-backed arm of the Dictionary layout's residency axis: a term
-//! dictionary left in its serialized child, read on demand. Probes and
-//! decodes point-read the child's wire-encoded chunk leaves
-//! ([`TermChunks`]), so a dictionary whose child cannot be point-read is not
-//! file-backed at all — [`store::open`](crate::store::persist::open) hands that shape
-//! to the resident arm instead. The policy enum choosing between this and
-//! the resident form is [`DictAccess`](super::handles::DictAccess); the whole
-//! module only compiles with `file-io`, since without a file there is
-//! nothing to leave the terms in.
+//! A term dictionary left in its serialized child and read on demand:
+//! probes and small decodes point-read the child's flat chunk leaves, wide
+//! decodes scan it. Requires a point-readable child (one flat leaf, or a
+//! chunked layout of flat leaves) with 1 <= row_count <= u32::MAX. File-io
+//! only.
 
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
@@ -41,13 +37,9 @@ use super::term_dict::{
 };
 
 /// The dictionary child's flat chunk leaves, fetched on demand in their wire
-/// encoding and kept for the store's lifetime — the string sibling of the
-/// quad columns' chunk-probe handles on `NativeStoreFile`. A fetched leaf
-/// stays FSST when it arrived FSST (a row read decompresses one value) and
-/// is canonicalized once otherwise. The term column is globally sorted (wire
-/// contract), so term → code probes binary-search rows through per-row
-/// reads, touching only the chunks the bisection crosses; code → term reads
-/// decode exactly the probed rows.
+/// encoding and kept for the store's lifetime. The term column is globally
+/// sorted (wire contract): term → code bisects the rows through per-row
+/// reads, code → term decodes exactly the probed rows.
 pub(crate) struct TermChunks {
     /// The leaves, in row order.
     specs: Vec<ChunkSpec>,
@@ -59,7 +51,7 @@ pub(crate) struct TermChunks {
     source: Arc<dyn SegmentSource>,
 }
 
-/// One flat term-chunk leaf and its fetched form (filled on first use).
+/// One flat leaf and its fetched form, filled on first use.
 struct ChunkSpec {
     layout: LayoutRef,
     rows: u64,
@@ -75,10 +67,10 @@ fn unwrap_zoned(mut node: LayoutRef) -> Option<LayoutRef> {
 }
 
 impl TermChunks {
-    /// Walks the dictionary child's layout to its term column's chunk
-    /// leaves: the field child, through any zoned wrappers, then a chunked
-    /// layout of flat leaves or a single flat leaf. `None` when the shape is
-    /// anything else — the caller keeps the scan paths.
+    /// The term column's leaves under the dictionary child `dict`: the field
+    /// child, through any zoned wrappers, then a chunked layout of flat
+    /// leaves or one flat leaf. `None` for any other shape, an empty child,
+    /// or more than `u32::MAX` rows.
     pub(crate) fn resolve(dict: &LayoutRef, source: Arc<dyn SegmentSource>) -> Option<Self> {
         dict.as_opt::<StructLayout>()?;
         let column = (0..dict.nslots()).find_map(|i| {
@@ -88,8 +80,6 @@ impl TermChunks {
         })?;
         let data = unwrap_zoned(column)?;
         let row_count = data.row_count();
-        // Codes are u32 by construction; an empty child has nothing to
-        // point-read and an oversized one cannot be a term column.
         if row_count == 0 || row_count > u64::from(u32::MAX) {
             return None;
         }
@@ -138,13 +128,13 @@ impl TermChunks {
         chunk_of(&self.starts, row as usize)
     }
 
-    /// One unopened cursor per chunk, for a run of reads.
+    /// One unopened cursor per chunk.
     fn cursors(&self) -> Vec<Option<ChunkCursor<'_>>> {
         (0..self.specs.len()).map(|_| None).collect()
     }
 
-    /// The fetched form of chunk `idx`, read and adopted on first use. The
-    /// segment read reconstructs the wire encoding (no decompression).
+    /// Chunk `idx` in its wire encoding, fetched and adopted on first use;
+    /// concurrent first reads wait for one fetch.
     async fn chunk(&self, idx: usize) -> Result<&TermChunk> {
         let spec = &self.specs[idx];
         spec.cell
@@ -173,9 +163,8 @@ impl TermChunks {
             .await
     }
 
-    /// The term bytes at `row`, read through `cursors` — one lazily built
-    /// cursor per touched chunk, so repeated reads in one call reuse the
-    /// cursor's decode scratch.
+    /// The term bytes at `row`, through `cursors`: one cursor per touched
+    /// chunk, built on first use.
     async fn term_bytes<'s, 'c>(
         &'s self,
         cursors: &'c mut [Option<ChunkCursor<'s>>],
@@ -210,8 +199,7 @@ impl TermChunks {
         Ok(lo as u32)
     }
 
-    /// Term → code: the lower bound and one equality probe, over per-row
-    /// reads.
+    /// Term → code: the lower bound and one equality probe.
     pub(crate) async fn encode(&self, term: &str) -> Result<Option<u32>> {
         let needle = term.as_bytes();
         let mut cursors = self.cursors();
@@ -221,14 +209,13 @@ impl TermChunks {
         Ok(hit.then_some(lo))
     }
 
-    /// The row of the first term not below `needle` in byte order (the row
-    /// count when every term is below it).
+    /// The row of the first term not below `needle` in byte order; the row
+    /// count when every term is below it.
     pub(crate) async fn lower_bound(&self, needle: &[u8]) -> Result<u32> {
         self.lower_bound_in(&mut self.cursors(), needle).await
     }
 
-    /// Code → term for each of `codes` (in-bounds, the caller's contract),
-    /// reading exactly the probed rows.
+    /// The terms of `codes` (in bounds), reading exactly those rows.
     pub(crate) async fn decode_many(&self, codes: &[u32]) -> Result<Vec<Arc<str>>> {
         let mut cursors = self.cursors();
         let mut out = Vec::with_capacity(codes.len());
@@ -240,30 +227,22 @@ impl TermChunks {
     }
 }
 
-/// A term dictionary left in its layout child, with no term held resident:
-/// term → code probes and code → term decodes read the sorted `_dict_term`
-/// column on demand.
-///
-/// `reader` is the dictionary child's layout reader (the native store root's
-/// `dictionary` component), so a term's code is its child row. Probes and
-/// small decodes point-read the wire-encoded chunk leaves through
-/// [`TermChunks`], with probe answers memoized; a wide decode instead scans
-/// the row indices it wants through `reader`. Clones share one state.
+/// A term dictionary left in its layout child: term → code probes and code →
+/// term decodes read the sorted `_dict_term` column on demand, a term's code
+/// being its child row. Clones share one state.
 #[derive(Clone)]
 pub(crate) struct FileBackedDict(Arc<Inner>);
 
 struct Inner {
-    /// Identity of this handle's dictionary — see `DictReader::dictionary_id`.
+    /// Identity of the dictionary (see `DictReader::dictionary_id`).
     id: u64,
-    /// The dictionary child's layout reader (child-local row coordinates).
+    /// The dictionary child's layout reader, in child-local rows.
     reader: vortex_layout::LayoutReaderRef,
     /// Number of terms.
     len: u64,
-    /// Wire-chunk point-read handle.
+    /// Wire-chunk point reads.
     chunks: TermChunks,
-    /// The wide-batch scan's term projection, bound once: a fresh bind per
-    /// call would miss the reader's identity-keyed caches (see
-    /// `BoundExprMemo` on the store file handle) and grow them per call.
+    /// The wide-batch scan's term projection, bound once.
     projection: OnceLock<vortex_array::expr::BoundExpression>,
     /// term → code, kind ranges and partition memos.
     memos: DictMemos,
@@ -271,7 +250,7 @@ struct Inner {
 
 impl FileBackedDict {
     /// A file-backed dictionary over the child `reader` reads, point-read
-    /// through `chunks`; the term count is the reader's row count.
+    /// through `chunks`.
     pub(crate) fn new(reader: vortex_layout::LayoutReaderRef, chunks: TermChunks) -> Self {
         Self(Arc::new(Inner {
             id: next_dictionary_id(),
@@ -283,7 +262,7 @@ impl FileBackedDict {
         }))
     }
 
-    /// This handle's dictionary identity.
+    /// This dictionary's identity.
     pub(crate) fn id(&self) -> u64 {
         self.0.id
     }
@@ -293,11 +272,9 @@ impl FileBackedDict {
         usize::try_from(self.0.len).unwrap_or(usize::MAX)
     }
 
-    /// The file-backed form of `native`'s dictionary child: its cached
-    /// reader plus the wire-chunk handle resolved off the same child. `None`
-    /// when the file has no dictionary component or the child's layout
-    /// shape cannot be point-read (the caller then lifts the dictionary
-    /// resident).
+    /// The file-backed form of `native`'s dictionary child; `None` when the
+    /// file has no dictionary component or the child's layout cannot be
+    /// point-read.
     pub(crate) fn open(native: &NativeStoreFile) -> Result<Option<Self>> {
         let Some((_, reader)) = native
             .component_reader(DICT_COMPONENT_NAME)
@@ -315,8 +292,7 @@ impl FileBackedDict {
             .map(|chunks| Self::new(reader, chunks)))
     }
 
-    /// A scan over the dictionary child — the reader-level equivalent of
-    /// `file.scan()`.
+    /// A scan over the dictionary child.
     fn scan(&self) -> vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef> {
         vortex_layout::scan::scan_builder::ScanBuilder::new(
             VORTEX_SESSION.clone(),
@@ -324,7 +300,7 @@ impl FileBackedDict {
         )
     }
 
-    /// Term → code: a point-read binary search of the chunk leaves, memoized.
+    /// Term → code: a point-read binary search of the leaves, memoized.
     pub(crate) async fn encode(&self, term: &str) -> Result<Option<u32>> {
         if let Some(memo) = self.0.memos.encode.get(term) {
             return Ok(memo);
@@ -334,11 +310,9 @@ impl FileBackedDict {
         Ok(code)
     }
 
-    /// Code → term for reconstruction: resolve `codes` (ascending, unique)
-    /// to their term strings — the dictionary's code → string seam. Batches
-    /// of at most [`POINT_GATHER_MAX_ROWS`] codes are point-read through the
-    /// chunk leaves; wider ones are read with one row-index scan of the
-    /// child.
+    /// The terms of `codes`, which must be ascending, unique and in bounds:
+    /// at most [`POINT_GATHER_MAX_ROWS`] codes are point-read through the
+    /// leaves, more are read with one row-index scan of the child.
     pub(crate) async fn decode_many(&self, codes: &[u32]) -> Result<Vec<Arc<str>>> {
         if codes.is_empty() {
             return Ok(Vec::new());
@@ -376,8 +350,7 @@ impl FileBackedDict {
             .collect()
     }
 
-    /// The child scan's term projection, bound once per handle (see the
-    /// field).
+    /// The child scan's term projection, bound once.
     fn term_projection(&self) -> Result<vortex_array::expr::BoundExpression> {
         if let Some(bound) = self.0.projection.get() {
             return Ok(bound.clone());
@@ -388,9 +361,8 @@ impl FileBackedDict {
         Ok(self.0.projection.get_or_init(|| bound).clone())
     }
 
-    /// Code → term for `codes` in any order, repeats allowed, out-of-range
-    /// codes decoding to `None`: the distinct in-range codes are read once
-    /// through [`decode_many`](Self::decode_many) and scattered back.
+    /// The terms of `codes` in any order, repeats allowed; an out-of-range
+    /// code decodes to `None`.
     pub(crate) async fn decode_many_any(&self, codes: &[u32]) -> Result<Vec<Option<String>>> {
         let len = self.len();
         let mut distinct: Vec<u32> = codes
@@ -412,7 +384,8 @@ impl FileBackedDict {
             .collect())
     }
 
-    /// The async twin of `TermDictionary::encode_tolerant`.
+    /// [`encode`](Self::encode) of `term`, then of its canonical spelling
+    /// when that differs. Malformed input is an error.
     pub(crate) async fn encode_tolerant(&self, term: &str) -> Result<Option<u32>> {
         if let Some(code) = self.encode(term).await? {
             return Ok(Some(code));
@@ -424,7 +397,7 @@ impl FileBackedDict {
     }
 
     /// [`encode_tolerant`](Self::encode_tolerant) over a batch, in order,
-    /// with the lookups' chunk reads overlapped.
+    /// with the reads overlapped.
     pub(crate) async fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<u32>>> {
         futures::stream::iter(terms.iter().map(|term| self.encode_tolerant(term)))
             .buffered(available_parallelism().max(4))
@@ -432,12 +405,13 @@ impl FileBackedDict {
             .await
     }
 
-    /// The async twin of `TermDictionary::lower_bound`.
+    /// The code of the first term not below `needle` in byte order; the term
+    /// count when every term is below it.
     pub(crate) async fn lower_bound(&self, needle: &[u8]) -> Result<u32> {
         self.0.chunks.lower_bound(needle).await
     }
 
-    /// The async twin of `TermDictionary::prefix_range`.
+    /// The codes of the terms spelled with `prefix`.
     pub(crate) async fn prefix_range(&self, prefix: &str) -> Result<Range<u32>> {
         let lo = self.lower_bound(prefix.as_bytes()).await?;
         let hi = match prefix_successor(prefix.as_bytes()) {
@@ -447,8 +421,7 @@ impl FileBackedDict {
         Ok(prefix_range_from(lo, hi, self.len() as u32))
     }
 
-    /// The async twin of `TermDictionary::kind_ranges`, computed once per
-    /// handle.
+    /// The code ranges of the term kinds, computed once.
     pub(crate) async fn kind_ranges(&self) -> Result<KindRanges> {
         if let Some(kinds) = self.0.memos.kinds.get() {
             return Ok(kinds.clone());
@@ -471,10 +444,9 @@ impl FileBackedDict {
         Ok(self.0.memos.kinds.get_or_init(|| kinds).clone())
     }
 
-    /// The async twin of `TermDictionary::filter_codes`: the predicate's
-    /// scan range is read from the child in row order, one chunk at a
-    /// time, and evaluated as it streams — a file-backed dictionary never
-    /// holds more than a chunk of terms decoded.
+    /// The `(true, unknown)` partition of the codes by `predicate`: the scan
+    /// range is read from the child in row order, one chunk at a time.
+    /// Memoized.
     pub(crate) async fn filter_codes(&self, predicate: &TermPredicate) -> Result<VerdictSets> {
         if let Some(sets) = self.0.memos.predicates.get(predicate) {
             return Ok(sets);
@@ -489,8 +461,8 @@ impl FileBackedDict {
                 .with_projection(self.term_projection()?)
                 .build()
                 .map_err(VortexRdfError::Vortex)?;
-            // `buffered` yields the splits in row order, so codes are
-            // assigned by counting rows as they stream.
+            // `buffered` keeps the splits in row order, so codes are assigned
+            // by counting rows.
             let mut chunks = futures::stream::iter(tasks).buffered(available_parallelism());
             let mut ctx = VORTEX_SESSION.create_execution_ctx();
             let mut code = range.start;
@@ -524,10 +496,7 @@ impl FileBackedDict {
         Ok(sets)
     }
 
-    /// Lift the whole dictionary resident — the transient full-column read
-    /// behind [`DictAccess::ensure_resident`].
-    ///
-    /// [`DictAccess::ensure_resident`]: super::handles::DictAccess::ensure_resident
+    /// The whole dictionary lifted resident, with one term-column scan.
     pub(crate) async fn lift_resident(&self) -> Result<TermDictionary> {
         TermDictionary::from_child_reader(self.0.reader.clone()).await
     }
@@ -537,10 +506,8 @@ impl FileBackedDict {
 mod tests {
     use super::*;
 
-    /// The compression windows survive serialization as the child's chunk
-    /// leaves: a windowed dictionary's written child resolves one leaf per
-    /// window, and a `FileBackedDict` over it probes correctly across all of
-    /// them.
+    /// A windowed dictionary's written child resolves one leaf per window,
+    /// and a `FileBackedDict` over it probes correctly across all of them.
     #[tokio::test]
     async fn windowed_dict_child_chunk_leaves() {
         use vortex_buffer::ByteBuffer;

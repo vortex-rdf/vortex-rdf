@@ -1,24 +1,8 @@
-//! Term predicates evaluated on a dictionary's N-Triples spellings — the
-//! native half of a query layer's `FILTER` fast path.
-//!
-//! A [`TermPredicate`] answers a single-variable SPARQL test (`isIRI(?x)`,
-//! `datatype(?x) = <dt>`, `lang(?x) = "en"`, `langMatches(lang(?x), "en")`,
-//! `?x < 5`, `strstarts(str(?x), "http://…")`) for one term, read straight
-//! off its spelling, with a three-valued [`Verdict`]. The rules are
-//! deliberately **conservative**: a verdict is `True` or `False` only where
-//! the SPARQL semantics over the stored spelling are total and cheap to
-//! decide; everything else — a lexical form the XSD grammar does not cover,
-//! a comparison the value model cannot settle exactly, a datatype the rules
-//! do not know — is `Unknown`, for the caller to resolve with a full SPARQL
-//! engine. A caller therefore never gets a wrong definite answer, only a
-//! slower one.
-//!
-//! The predicate's *domain* is the code range a dictionary scan has to cover
-//! to find every `True`: the literal range for the literal predicates,
-//! everything for the kind tests and `str_prefix` (see
-//! [`TermPredicate::domain`]). Codes outside the domain are neither true nor
-//! unknown; a caller decides them from the term's kind alone, which the code
-//! ranges already tell it.
+//! Term predicates evaluated on N-Triples spellings: single-variable SPARQL
+//! tests with a three-valued [`Verdict`]. Verdicts are conservative: `True`
+//! or `False` only where the SPARQL semantics over the spelling are total,
+//! `Unknown` otherwise. A predicate's [`Domain`] is the code range a scan
+//! covers for its definite answers; codes outside it are decided by kind.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -34,12 +18,10 @@ mod numeric;
 use self::literal::{Kind, LiteralView, kind_of, lang_matches, unescape_prefix};
 pub use self::numeric::Number;
 
-/// The code ranges of a sorted dictionary's term kinds. Codes are
-/// lexicographic ranks of the N-Triples spelling, so every kind is one
-/// contiguous range, in byte order: the empty spelling of the default graph
-/// (code 0, when any quad is in the default graph), then literals (`"`),
-/// IRIs (`<`), blank nodes (`_:`). Anything a dictionary of this crate never
-/// holds falls in the gaps between those ranges.
+/// The code ranges of a sorted dictionary's term kinds, contiguous in byte
+/// order: `""` (the default graph, code 0 when present) < `"` literals < `<`
+/// IRIs < `_:` blank nodes. The gaps between the ranges hold foreign
+/// spellings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KindRanges {
     /// The code of `""`, the default graph's name, when present.
@@ -73,8 +55,7 @@ impl KindRanges {
         }
     }
 
-    /// The codes in none of the three kind ranges, ascending — a foreign
-    /// writer's spellings, and the default graph's `""`.
+    /// The codes in none of the three kind ranges, ascending.
     pub fn gaps(&self) -> impl Iterator<Item = u32> + '_ {
         (0..self.literals.start)
             .chain(self.literals.end..self.iris.start)
@@ -227,11 +208,9 @@ impl NumOp {
 /// come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Domain {
-    /// Every code: the kind tests, and `str_prefix` (IRIs and blank nodes
-    /// answer through `str()`).
+    /// Every code: the kind tests, and `str_prefix`.
     All,
-    /// Only literals can be true; every other kind is false by
-    /// construction, or a type error, which a caller decides from the kind.
+    /// Only literals can be true; every other kind is decided from the kind.
     Literals,
 }
 
@@ -244,20 +223,19 @@ pub enum TermPredicate {
     IsIri,
     /// `isBLANK(?x)`.
     IsBlank,
-    /// `datatype(?x) = <iri>` — a plain literal has `xsd:string`, a
+    /// `datatype(?x) = <iri>`: a plain literal has `xsd:string`, a
     /// language-tagged one `rdf:langString`, a typed one its datatype; the
     /// lexical form is never inspected.
     Datatype(String),
-    /// `lang(?x) = "tag"` — exact comparison against the stored tag (which
-    /// the ingest lowercases); an untagged literal has the empty tag.
+    /// `lang(?x) = "tag"`: exact comparison against the stored tag; an
+    /// untagged literal has the empty tag.
     Lang(String),
-    /// `langMatches(lang(?x), "range")` — BCP 47 basic filtering: `*`
-    /// matches any non-empty tag, otherwise a case-insensitive match of the
-    /// range to the tag or to a `-`-delimited prefix of it.
+    /// `langMatches(lang(?x), "range")`: BCP 47 basic filtering, `*`
+    /// matching any non-empty tag.
     LangMatches(String),
     /// `?x <op> <numeric constant>` under the SPARQL operator mapping.
     Num(NumOp, Number),
-    /// `strstarts(str(?x), "prefix")` — on the IRI string, the blank node
+    /// `strstarts(str(?x), "prefix")` on the IRI string, the blank node
     /// label, or the unescaped lexical form of a string-like literal.
     StrPrefix(String),
 }
@@ -324,8 +302,8 @@ impl TermPredicate {
         Ok(predicate)
     }
 
-    /// The code range a dictionary scan must cover for this predicate's
-    /// definite answers.
+    /// The part of the code space this predicate's definite answers come
+    /// from.
     pub fn domain(&self) -> Domain {
         match self.partition() {
             Partition::Literals => Domain::Literals,
@@ -400,7 +378,7 @@ impl TermPredicate {
     }
 
     /// The `(kind, arg)` pair this predicate round-trips to, in canonical
-    /// form — the identity a memo keys on.
+    /// form (the memo key).
     pub fn canonical(&self) -> (&'static str, String) {
         match self {
             TermPredicate::IsLiteral => ("is_literal", String::new()),
@@ -517,7 +495,7 @@ mod tests {
             p("num_gt", "5").eval(&typed("300", "http://www.w3.org/2001/XMLSchema#byte")),
             Verdict::False
         );
-        // Grammatical special values are outside the model and deferred.
+        // Grammatical special values are outside the model.
         for lex in ["NaN", "INF", "-INF"] {
             assert_eq!(lt5.eval(&typed(lex, DBL)), Verdict::Unknown, "{lex}");
         }
@@ -529,8 +507,8 @@ mod tests {
         for lex in ["abc", " 4", "4 ", "1_000", "0x10", "4.5", ""] {
             assert_eq!(lt5.eval(&typed(lex, INT)), Verdict::Unknown, "{lex:?}");
         }
-        // Specials are unknown; an integral float compares with a decimal
-        // exactly, a fractional one does not.
+        // An integral float compares with a decimal exactly, a fractional
+        // one does not.
         assert_eq!(lt5.eval(&typed("NaN", DBL)), Verdict::Unknown);
         assert_eq!(lt5.eval(&typed("INF", DBL)), Verdict::Unknown);
         assert_eq!(p("num_lt", "4.5").eval(&typed("4.0", DBL)), Verdict::True);
@@ -551,7 +529,7 @@ mod tests {
         assert_eq!(p("num_eq", "5").eval("_:b"), Verdict::False);
         assert_eq!(p("num_lt", "5").eval("<http://x>"), Verdict::False);
         // A plain string against an integer orders by datatype IRI
-        // ("…#string" > "…#integer"), as the Python fast path does.
+        // ("…#string" > "…#integer").
         assert_eq!(p("num_gt", "5").eval("\"abc\""), Verdict::True);
         assert_eq!(p("num_lt", "5").eval("\"abc\""), Verdict::False);
         assert_eq!(p("num_lt", "5").eval("\"abc\"@en"), Verdict::False);
@@ -562,9 +540,7 @@ mod tests {
         assert_eq!(p("num_eq", "5").eval("\"abc\""), Verdict::Unknown);
         // Same datatype, unparseable lexical: unknown.
         assert_eq!(p("num_lt", "5").eval(&typed("abc", INT)), Verdict::Unknown);
-        // Different numeric datatype, unparseable lexical: still unknown —
-        // the engine's own parser may accept forms this grammar rejects
-        // and compare by value.
+        // Different numeric datatype, unparseable lexical: unknown.
         assert_eq!(p("num_lt", "5").eval(&typed("abc", DEC)), Verdict::Unknown);
         // Non-XSD datatype: unknown.
         assert_eq!(

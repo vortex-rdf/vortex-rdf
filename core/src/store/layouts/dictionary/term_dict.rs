@@ -14,15 +14,12 @@ use crate::error::Result;
 use super::predicates::{KindRanges, Scanned, TermPredicate};
 use super::storage::{DictCursor, ResidentChunks};
 
-/// The frozen, sorted term dictionary in columnar form.
-///
-/// term → code is a host-side binary search; code → term reads the term at a
-/// position. Both go through [`cursor`](Self::cursor), whose cost depends on
-/// the encoding the terms are held in.
+/// The frozen, sorted term dictionary: term → code by binary search, code →
+/// term by position, both through a [`cursor`](Self::cursor). Codes are
+/// meaningful only against the dictionary that produced them; a mutation
+/// builds a fresh one. Equal [`id`](Self::id)s mean equal codes, different
+/// ids promise nothing.
 pub(crate) struct TermDictionary {
-    /// Identity of this dictionary instance — see [`DictReader::dictionary_id`].
-    ///
-    /// [`DictReader::dictionary_id`]: super::handles::DictReader::dictionary_id
     id: u64,
     pub(super) terms: ResidentChunks,
     memos: DictMemos,
@@ -56,15 +53,12 @@ impl TermDictionary {
         self.terms.len
     }
 
-    /// A cursor over the terms. Holds the scratch buffer an FSST read decodes
-    /// into, so callers needing several terms at once (a quad's four roles)
-    /// must take one cursor per role.
+    /// A cursor over the terms; one per simultaneously held term.
     pub(super) fn cursor(&self) -> DictCursor<'_> {
         DictCursor::new(&self.terms)
     }
 
-    /// Decode a code back to its term string (canonical N-Triples form), or
-    /// `None` if the code is out of the dictionary's range.
+    /// The term with code `code`, `None` when out of range.
     pub(crate) fn decode(&self, code: u32) -> Option<String> {
         let i = code as usize;
         if i >= self.len() {
@@ -73,8 +67,7 @@ impl TermDictionary {
         self.cursor().str_at(i).ok().map(str::to_owned)
     }
 
-    /// Encode a term to its code: its position in the sorted dictionary, or
-    /// `None` when the dictionary does not hold it. Memoized.
+    /// The code of `term`, `None` when absent; memoized.
     pub(crate) fn encode(&self, term: &str) -> Option<u32> {
         if let Some(memoized) = self.memos.encode.get(term) {
             return memoized;
@@ -84,29 +77,26 @@ impl TermDictionary {
         found
     }
 
-    /// The uncached lookup behind [`encode`](Self::encode).
+    /// The unmemoized lookup behind [`encode`](Self::encode).
     fn search(&self, term: &str) -> Option<u32> {
         self.cursor().search(term.as_bytes())
     }
 
-    /// The code of the first term not below `needle` in byte order — the
-    /// dictionary's size when every term is below it: a present term's own
-    /// code, or where an absent one would sort.
+    /// The code of the first term not below `needle` in byte order; the term
+    /// count when every term is below it.
     pub(crate) fn lower_bound(&self, needle: &[u8]) -> u32 {
         self.cursor().lower_bound(needle)
     }
 
-    /// The codes of the terms spelled with `prefix`, as a half-open range:
-    /// two lower bounds, of the prefix and of its byte successor (see
-    /// [`prefix_successor`]). Term kinds are prefixes (`"`, `<`, `_:`), and
-    /// so are IRI namespaces.
+    /// The codes of the terms spelled with `prefix`: the lower bounds of the
+    /// prefix and of its [`prefix_successor`].
     pub(crate) fn prefix_range(&self, prefix: &str) -> Range<u32> {
         let lo = self.lower_bound(prefix.as_bytes());
         let hi = prefix_successor(prefix.as_bytes()).map(|successor| self.lower_bound(&successor));
         prefix_range_from(lo, hi, self.len() as u32)
     }
 
-    /// The code ranges of the term kinds, computed once per dictionary.
+    /// The code ranges of the term kinds, computed once.
     pub(crate) fn kind_ranges(&self) -> &KindRanges {
         self.memos.kinds.get_or_init(|| {
             let first_is_empty = self.len() > 0 && self.cursor().bytes_at(0).is_empty();
@@ -120,11 +110,8 @@ impl TermDictionary {
         })
     }
 
-    /// [`encode`](Self::encode) tolerant of spelling: the exact lookup first,
-    /// then — only when the term's [`canonical_spelling`] differs from what
-    /// was typed — the lookup of that spelling. A term absent under both is
-    /// absent from the dictionary; malformed input is an error rather than
-    /// an absence.
+    /// [`encode`](Self::encode) of `term`, then of its canonical spelling
+    /// when that differs. Malformed input is an error.
     pub(crate) fn encode_tolerant(&self, term: &str) -> Result<Option<u32>> {
         if let Some(code) = self.encode(term) {
             return Ok(Some(code));
@@ -140,9 +127,8 @@ impl TermDictionary {
             .collect()
     }
 
-    /// [`decode`](Self::decode) over a batch, in order, through one cursor
-    /// (so a chunked dictionary keeps its warm chunk cursors across the
-    /// batch); an out-of-range code decodes to `None`.
+    /// [`decode`](Self::decode) over a batch, in order, through one cursor;
+    /// an out-of-range code decodes to `None`.
     pub(crate) fn decode_many(&self, codes: &[u32]) -> Vec<Option<String>> {
         let len = self.len();
         let mut cursor = self.cursor();
@@ -158,10 +144,8 @@ impl TermDictionary {
             .collect()
     }
 
-    /// Partition the codes by `predicate`'s verdicts — `(true, unknown)`,
-    /// both ascending — in one pass over the predicate's scan range (see
-    /// [`TermPredicate::partition`]), memoized per dictionary by the
-    /// predicate's canonical rendering ([`PredicateMemo`]).
+    /// The `(true, unknown)` partition of the codes by `predicate` (see
+    /// [`TermPredicate::partition`]), memoized.
     pub(crate) fn filter_codes(&self, predicate: &TermPredicate) -> VerdictSets {
         if let Some(sets) = self.memos.predicates.get(predicate) {
             return sets;
@@ -186,10 +170,9 @@ impl TermDictionary {
     }
 }
 
-/// The smallest byte string greater than every string starting with
-/// `prefix`: the prefix with its trailing `0xFF` bytes dropped and the last
-/// remaining byte incremented — or `None` when no such string exists (an
-/// empty or all-`0xFF` prefix, which every string sorts under).
+/// The smallest byte string above every string starting with `prefix`: the
+/// trailing `0xFF` bytes dropped and the last remaining byte incremented;
+/// `None` for an empty or all-`0xFF` prefix.
 pub(super) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut end = prefix.len();
     while end > 0 && prefix[end - 1] == 0xFF {
@@ -204,27 +187,26 @@ pub(super) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// A prefix's code range from the lower bound `lo` of the prefix and `hi` of
-/// its successor (`None` when it has none: every term from `lo` on is under
-/// the prefix); never below `lo`.
+/// its successor (`None`: every term from `lo` on has the prefix); never
+/// below `lo`.
 pub(super) fn prefix_range_from(lo: u32, hi: Option<u32>, len: u32) -> Range<u32> {
     lo..hi.unwrap_or(len).max(lo)
 }
 
-/// The spelling a failed exact lookup of `term` is retried with: its
-/// [`canonical_spelling`], or `None` when that is the spelling already
-/// looked up. Malformed input is an error.
+/// The spelling a failed exact lookup of `term` retries with: its
+/// [`canonical_spelling`], or `None` when that is `term` itself. Malformed
+/// input is an error.
 pub(super) fn tolerant_fallback(term: &str) -> Result<Option<String>> {
     let canonical = canonical_spelling(term)?;
     Ok((canonical != term).then_some(canonical))
 }
 
-/// A predicate's partition of a dictionary's codes — `(true, unknown)`,
-/// both ascending — shared between the memo and every caller.
+/// A predicate's partition of a dictionary's codes: `(true, unknown)`, both
+/// ascending.
 pub(crate) type VerdictSets = Arc<(Buffer<u32>, Buffer<u32>)>;
 
-/// The memos a dictionary carries. Entries never go stale: a dictionary's
-/// terms are immutable, and a mutation builds a new dictionary with fresh
-/// memos.
+/// A dictionary's memos. Entries never go stale: the dictionary is
+/// immutable, and a mutation builds a new one with fresh memos.
 #[derive(Default)]
 pub(super) struct DictMemos {
     /// term → code memo.
@@ -235,15 +217,11 @@ pub(super) struct DictMemos {
     pub(super) predicates: PredicateMemo,
 }
 
-/// Partitions a dictionary's [`PredicateMemo`] holds before the oldest is
-/// evicted. A query workload asks a handful of distinct predicates per
-/// query, and an entry can be as wide as the dictionary, so the memo is
-/// bounded rather than keyed on everything ever asked.
+/// Partitions a [`PredicateMemo`] holds before the oldest is evicted.
 const PREDICATE_MEMO_SLOTS: usize = 32;
 
 /// A bounded first-in-first-out memo of predicate partitions, keyed by the
-/// predicate's canonical rendering. Like [`EncodeMemo`], a poisoned lock
-/// degrades to a miss.
+/// predicate's canonical rendering; a poisoned lock is a miss.
 pub(super) struct PredicateMemo {
     entries: RwLock<VecDeque<(String, VerdictSets)>>,
 }
@@ -280,25 +258,19 @@ impl PredicateMemo {
     }
 }
 
-/// Slots in a dictionary's [`EncodeMemo`]. A power of two: the slot index is
-/// the hash masked to this width.
-///
-/// Sized for the working set of a query workload — the bound terms of the
-/// patterns currently being asked — not for the dictionary.
+/// Slots of an [`EncodeMemo`]; a power of two, the slot index being the hash
+/// masked to it.
 const ENCODE_MEMO_SLOTS: usize = 256;
 
-/// A fixed-size, direct-mapped memo of term → code lookups (absence
-/// included): one slot per hash bucket, overwritten on collision, so its
-/// footprint never grows.
+/// A fixed-size, direct-mapped memo of term → code lookups, absence
+/// included: one slot per hash bucket, overwritten on collision; a poisoned
+/// lock is a miss.
 pub(super) struct EncodeMemo {
     slots: RwLock<Box<[Option<EncodeEntry>]>>,
 }
 
 struct EncodeEntry {
-    /// A `String`, so an overwrite reuses the allocation: terms in a dataset
-    /// are of similar length, so the replacing term usually fits the capacity
-    /// the evicted one left behind. A miss is then a hash and a copy, with no
-    /// allocator traffic.
+    /// Reused across overwrites.
     term: String,
     code: Option<u32>,
 }
@@ -316,9 +288,7 @@ impl Default for EncodeMemo {
 }
 
 impl EncodeMemo {
-    /// FNV-1a over the whole term: RDF terms in a dataset share long IRI
-    /// prefixes and differ only near the end, so the distinguishing bytes sit
-    /// at the tail.
+    /// FNV-1a over the whole term, masked to the slot count.
     fn slot(term: &str) -> usize {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for &b in term.as_bytes() {
@@ -328,10 +298,7 @@ impl EncodeMemo {
         (h as usize) & (ENCODE_MEMO_SLOTS - 1)
     }
 
-    /// `Some(code_or_absent)` on a hit, `None` when this term is not memoized.
-    ///
-    /// A poisoned lock degrades to a miss rather than propagating: the memo is
-    /// an optimization, and losing it must not fail a query.
+    /// `Some(code_or_absent)` on a hit, `None` when `term` is not memoized.
     pub(super) fn get(&self, term: &str) -> Option<Option<u32>> {
         let slots = self.slots.read().ok()?;
         match &slots[Self::slot(term)] {
@@ -371,8 +338,8 @@ mod tests {
         TermDictionary::from_sorted(sorted.into_iter()).unwrap()
     }
 
-    /// The memo must be invisible: every lookup agrees with the uncached search,
-    /// on repeats and on absent terms alike.
+    /// Every memoized lookup agrees with the uncached search, on repeats and
+    /// on absent terms alike.
     #[test]
     fn memoized_lookup_matches_the_search() {
         let terms: Vec<String> = (0..500)
@@ -392,8 +359,8 @@ mod tests {
         }
     }
 
-    /// Two terms sharing a slot must not read each other's code. With one slot
-    /// per bucket the second simply evicts the first, and both stay correct.
+    /// Two terms sharing a slot evict each other and never read each other's
+    /// code.
     #[test]
     fn colliding_terms_do_not_alias() {
         let terms: Vec<String> = (0..2_000)
