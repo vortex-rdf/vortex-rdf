@@ -3,7 +3,7 @@
 //! plain slices and preserve order: distinct values come out in first-seen
 //! order, join pairs in nested-loop order (left rows in order, each with its
 //! right matches in their order). Each kernel uses a direct-mapped table when
-//! the code range is dense relative to the column ([`dense_table_fits`]),
+//! the code range is dense relative to the column (`dense_table_fits`),
 //! else a hash map.
 
 use std::collections::HashMap;

@@ -55,7 +55,7 @@ enum Rows {
 }
 
 /// A [`DataSource`] over a store view or one of a store's persisted children;
-/// see the [module docs](self).
+/// see the module docs.
 pub struct VortexRdfDataSource {
     rows: Rows,
     dtype: DType,
