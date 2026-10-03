@@ -350,8 +350,8 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
     // chunk only: the concatenated child is not globally sorted, so its
     // descriptor must say so — the shape a chunked foreign writer could
     // produce and a reader must not binary-search.
-    use crate::store::indexes::secondary_by_copy::CopyFamily;
-    use crate::store::indexes::secondary_by_copy::out_of_core::{CopyKey, copy_child_chunk};
+    use crate::store::indexes::copy::CopyFamily;
+    use crate::store::indexes::copy::out_of_core::{CopyKey, copy_child_chunk};
     let mut quad_chunks = Vec::new();
     let mut child_chunks: Vec<Vec<vortex_array::ArrayRef>> = vec![Vec::new(), Vec::new()];
     for (n, rows) in raws.chunks(4).enumerate() {
@@ -382,16 +382,14 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
         .map(|(family, chunks)| {
             container::NativeComponentWrite::new(
                 container::StoreComponentDescriptor {
-                    name: family.component_name().into(),
+                    name: family.identity().name.into(),
                     role: container::StoreComponentRole::Index,
-                    implementation: family.component_slug().into(),
+                    implementation: family.identity().slug.into(),
                     version: 1,
                     required: false,
                     // Per-chunk sorts only: the writer may not claim global order.
                     sorted: false,
-                    dtype: crate::store::indexes::secondary_by_copy::out_of_core::copy_child_dtype(
-                        false,
-                    ),
+                    dtype: crate::store::indexes::copy::out_of_core::copy_child_dtype(false),
                 },
                 std::sync::Arc::new(container::BufferedComponentSource::try_new(chunks).unwrap()),
                 container::default_child_strategy(),
@@ -1093,7 +1091,7 @@ async fn test_written_code_columns_avoid_delta() {
         use vortex_array::IntoArray as _;
         let rows = component.rows().unwrap().clone().into_array();
         trees.push((
-            component.name.to_string(),
+            component.identity.name.to_string(),
             format!("{}", rows.display_tree_encodings_only()),
         ));
     }

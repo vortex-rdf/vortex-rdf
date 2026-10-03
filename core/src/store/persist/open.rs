@@ -6,7 +6,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::io::container;
 use crate::io::read;
 use crate::session::VORTEX_SESSION;
-use crate::store::indexes::{IndexComponent, KnownComponent};
+use crate::store::indexes::{DeferredSource, IndexComponent, KnownComponent, adopt_component};
 use crate::store::layouts::dictionary::TermDictionary;
 #[cfg(feature = "file-io")]
 use crate::store::{
@@ -89,9 +89,9 @@ pub(in crate::store) async fn scanned_index_components(
             continue;
         };
         let scanned = read::scan_all_reader(reader).await?;
-        components.push(crate::store::indexes::adopt_scanned_component(
+        components.push(adopt_component(
             &known,
-            scanned,
+            DeferredSource::Scanned(scanned),
             descriptor.sorted,
             file.row_count(),
         )?);
@@ -321,10 +321,10 @@ impl VortexRdfStore {
                     // genuine use — an index probe, serialization — so a
                     // load pays nothing for index children it never touches.
                     // Sound here because this reader sits over the buffer
-                    // the file was opened from (see `adopt_component_reader`).
-                    components.push(crate::store::indexes::adopt_component_reader(
+                    // the file was opened from (see `adopt_component`).
+                    components.push(adopt_component(
                         &known,
-                        reader,
+                        DeferredSource::Reader(reader),
                         descriptor.sorted,
                         quads.len() as u64,
                     )?);

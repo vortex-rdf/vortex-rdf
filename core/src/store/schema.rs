@@ -6,12 +6,12 @@
 //! constants rather than its own spelling. Column names owned by a single
 //! subsystem live with that subsystem instead: the row id every index child
 //! carries in the index hub ([`indexes::COL_RID`]), the reference index's
-//! `val` in [`secondary_by_reference`], the dictionary child's `_dict_term`
+//! `val` in [`reference`], the dictionary child's `_dict_term`
 //! in [`term_dict`](crate::store::layouts::dictionary::term_dict), and the
 //! TypedObject layout's split object columns in [`typed_object`].
 //!
 //! [`indexes::COL_RID`]: crate::store::indexes::COL_RID
-//! [`secondary_by_reference`]: crate::store::indexes::secondary_by_reference
+//! [`reference`]: crate::store::indexes::reference
 //! [`typed_object`]: crate::store::layouts::typed_object
 
 /// The subject column — first in every layout. Whether its rows are globally

@@ -1,7 +1,6 @@
 //! Test hooks on [`VortexRdfStore`]: read-only accessors over the store's
-//! internal state, so tests assert which mechanism answered a query (a
-//! serve plan, a deferred selection, a prefix-probe range, a retained wire
-//! encoding) rather than only the result.
+//! internal state (a serve plan, a deferred selection, a prefix-probe range,
+//! a retained wire encoding).
 
 use std::ops::Range;
 
@@ -85,7 +84,7 @@ impl VortexRdfStore {
     pub(crate) fn debug_index_component_int_children_canonical(&self, name: &str) -> Option<bool> {
         match &self.quads {
             QuadsSource::InMemory { components, .. } => {
-                let component = components.iter().find(|c| c.name == name)?;
+                let component = components.iter().find(|c| c.identity.name == name)?;
                 Some(debug_int_children_canonical(component.rows().ok()?))
             }
             #[cfg(feature = "file-io")]
@@ -94,9 +93,7 @@ impl VortexRdfStore {
     }
 
     /// Whether every sorted-stamped child of an in-memory base resolves an
-    /// encoded search probe (see [`debug_sorted_children_probe_resolvable`]):
-    /// false only when a bounds search on some child would fall through to
-    /// the generic kernel. Vacuously true for a file-backed store.
+    /// encoded search probe. Vacuously true for a file-backed store.
     pub(crate) fn debug_base_probe_resolvable(&self) -> bool {
         use vortex_array::arrays::Struct;
         match &self.quads {
@@ -152,7 +149,7 @@ impl VortexRdfStore {
         match &self.quads {
             QuadsSource::InMemory { components, .. } => components
                 .iter()
-                .find(|c| c.name == name)
+                .find(|c| c.identity.name == name)
                 .map(|c| c.is_materialized()),
             QuadsSource::File { .. } => None,
         }
@@ -174,7 +171,7 @@ impl VortexRdfStore {
         &self,
         subject: &NamedOrBlankNode,
     ) -> Result<Option<Range<u64>>> {
-        use crate::store::scan::file_scan;
+        use crate::store::scan::{file_filter, file_reads};
         let QuadsSource::File { file, .. } = &self.quads else {
             return Ok(None);
         };
@@ -182,8 +179,8 @@ impl VortexRdfStore {
         let Some(mut codes) = self.prepared_codes(pattern).await? else {
             return Ok(Some(0..0));
         };
-        match file_scan::build_file_filter(pattern, &mut codes)? {
-            Some(filter) => file_scan::row_range_from_pruning(file, &filter).await,
+        match file_reads::build_file_filter(pattern, &mut codes)? {
+            Some(filter) => file_filter::row_range_from_pruning(file, &filter).await,
             None => Ok(None),
         }
     }
@@ -195,7 +192,7 @@ impl VortexRdfStore {
         &self,
         subject: &NamedOrBlankNode,
     ) -> Result<Option<Range<u64>>> {
-        use crate::store::scan::file_scan;
+        use crate::store::scan::file_reads;
         let QuadsSource::File { file, .. } = &self.quads else {
             return Ok(None);
         };
@@ -205,12 +202,11 @@ impl VortexRdfStore {
         else {
             return Ok(None);
         };
-        file_scan::locate_subject_run(file, &mut codes, subject).await
+        file_reads::locate_subject_run(file, &mut codes, subject).await
     }
 
     /// The index-child run the reference index's file resolution locates for
-    /// a predicate/object pattern; `None` when the location declines and the
-    /// resolution falls back to its pushed-down scan.
+    /// a predicate/object pattern; `None` when the location declines.
     pub(crate) async fn debug_reference_index_located_run(
         &self,
         predicate: Option<&oxrdf::NamedNode>,
@@ -223,13 +219,19 @@ impl VortexRdfStore {
         let Some(mut codes) = self.prepared_codes(pattern).await? else {
             return Ok(None);
         };
-        crate::store::indexes::secondary_by_reference::debug_located_run(file, pattern, &mut codes)
-            .await
+        crate::store::indexes::file::debug_located_run(
+            crate::store::indexes::IndexType::SecondaryByReference,
+            file,
+            &self.layout,
+            pattern,
+            &mut codes,
+        )
+        .await
     }
 }
 
 /// Whether every non-nullable integer child of `struct_arr` is a canonical
-/// primitive — the shared predicate behind the resident-adoption hooks.
+/// primitive.
 fn debug_int_children_canonical(struct_arr: &StructArray) -> bool {
     use vortex_array::arrays::Primitive;
     use vortex_array::arrays::struct_::StructArrayExt;
@@ -243,10 +245,7 @@ fn debug_int_children_canonical(struct_arr: &StructArray) -> bool {
 }
 
 /// Whether every sorted-stamped child of `struct_arr` binds an encoded
-/// search probe — the property that keeps every bounds search off the
-/// generic per-scalar kernel, whether the child is canonical or
-/// wire-encoded. Unsorted children never take bounds searches, so they are
-/// not constrained.
+/// search probe; unsorted children are not constrained.
 fn debug_sorted_children_probe_resolvable(struct_arr: &StructArray) -> bool {
     use vortex_array::arrays::struct_::StructArrayExt;
     struct_arr.names().iter().all(|name| {
