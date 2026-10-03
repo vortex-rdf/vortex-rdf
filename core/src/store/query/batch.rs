@@ -61,11 +61,6 @@ impl Probe {
         self.limit = limit;
         self
     }
-
-    /// Whether the probe narrows its match beyond the pattern.
-    fn narrows(&self) -> bool {
-        !self.keeps.is_empty() || self.offset != 0 || self.limit.is_some()
-    }
 }
 
 impl VortexRdfStore {
@@ -116,7 +111,7 @@ impl VortexRdfStore {
                 probe.graph.as_ref(),
             )
             .await?;
-        if !probe.narrows() || probe.keeps.is_empty() {
+        if probe.keeps.is_empty() {
             return Ok(matched);
         }
         matched.keep_many(&probe.keeps).await

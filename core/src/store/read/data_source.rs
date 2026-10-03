@@ -43,8 +43,8 @@ use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::QuadsSource;
 use crate::store::VortexRdfStore;
+use crate::store::array::rechunk;
 use crate::store::layouts::LayoutStrategy;
-use crate::store::read::chunks::rechunk;
 
 /// Rows per chunk a partition emits from an in-memory view — DataFusion's
 /// default batch size; a file-backed view's chunks follow the file's splits
@@ -80,9 +80,7 @@ impl VortexRdfStore {
     /// tail holds strings whose terms have no code, so the view has no single
     /// dtype — `compact` the store first.
     pub async fn data_source(&self) -> Result<DataSourceRef> {
-        if self.layout.strategy() == LayoutStrategy::Dictionary && self.tail_len() != 0 {
-            self.ensure_code_view("data_source")?;
-        }
+        self.ensure_no_dictionary_tail("data_source")?;
         let dtype = self.primary_dtype()?;
         let (row_count, byte_size) = self.row_count_hint();
         Ok(Arc::new(VortexRdfDataSource {
@@ -136,11 +134,7 @@ impl VortexRdfStore {
     /// The struct dtype of this view's rows: the base's, which a string
     /// layout's tail shares.
     fn primary_dtype(&self) -> Result<DType> {
-        let dtype = match &self.quads {
-            QuadsSource::InMemory { base, .. } => base.dtype().clone(),
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { file, .. } => file.dtype().clone(),
-        };
+        let dtype = self.quads.dtype().clone();
         if !matches!(dtype, DType::Struct(..)) {
             return Err(VortexRdfError::InvalidOperation(format!(
                 "a store's rows are a struct, found {dtype}"

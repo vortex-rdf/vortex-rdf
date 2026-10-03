@@ -23,7 +23,7 @@ pub(crate) mod serve;
 pub(crate) use components::check_component_rows;
 pub(crate) use components::{
     ComponentIdentity, DeferredSource, IndexComponent, KnownComponent, adopt_component,
-    indexes_from_components, known_component, sorted_row_ids,
+    component_named, indexes_from_components, known_component, sorted_row_ids,
 };
 #[cfg(feature = "file-io")]
 pub(crate) use file::FileServePlan;
@@ -105,6 +105,11 @@ impl IndexType {
             IndexType::SecondaryByCopy => &copy::IDENTITIES,
             IndexType::SecondaryByReference => &reference::IDENTITIES,
         }
+    }
+
+    /// The index whose child is named `name` (`index:posg`, …).
+    pub(crate) fn of_component(name: &str) -> Option<IndexType> {
+        component_named(name).map(|known| known.index)
     }
 
     /// The probe this index runs for `pattern`, `None` when it declines the
@@ -232,10 +237,10 @@ impl LazyRowIds {
     }
 
     /// The ids, computed and cached on first call; runs a file child's scan.
-    #[cfg(feature = "file-io")]
     pub(crate) async fn materialized_async(&self) -> Result<Buffer<u64>> {
         match &self.source {
             LazyRowIdSource::Component(_) => self.materialized(),
+            #[cfg(feature = "file-io")]
             LazyRowIdSource::IndexChild(scan) => {
                 if let Some(ids) = self.cell.get() {
                     return Ok(ids.clone());

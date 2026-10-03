@@ -276,8 +276,8 @@ impl FileBackedDict {
     /// file has no dictionary component or the child's layout cannot be
     /// point-read.
     pub(crate) fn open(native: &NativeStoreFile) -> Result<Option<Self>> {
-        let Some((_, reader)) = native
-            .component_reader(DICT_COMPONENT_NAME)
+        let Some(dict_child) = native
+            .child_reader(DICT_COMPONENT_NAME)
             .map_err(VortexRdfError::Vortex)?
         else {
             return Ok(None);
@@ -289,7 +289,7 @@ impl FileBackedDict {
             return Ok(None);
         };
         Ok(TermChunks::resolve(&child, native.segment_source())
-            .map(|chunks| Self::new(reader, chunks)))
+            .map(|chunks| Self::new(dict_child.reader, chunks)))
     }
 
     /// A scan over the dictionary child.
@@ -327,7 +327,7 @@ impl FileBackedDict {
         let rows = vortex_scan::strict_sorted_buffer::StrictSortedBuffer::try_new(rows)
             .map_err(VortexRdfError::Vortex)?;
         let projection = self.term_projection()?;
-        let arr = crate::store::scan::file_scan::read_all_rows(
+        let arr = crate::store::scan::file_reads::read_all_rows(
             self.scan()
                 .with_row_indices(rows)
                 .with_projection(projection),

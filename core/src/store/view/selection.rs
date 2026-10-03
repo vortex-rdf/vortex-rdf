@@ -62,11 +62,8 @@ impl ViewSelection {
         matches!(self, ViewSelection::Exact(RowSelection::All))
     }
 
-    /// The concrete selection, running a pending resolution's deferred id
-    /// computation if one is still outstanding (cached for every later
-    /// consumer and every clone of the view — see [`LazyRowIds`]) — the
-    /// awaiting form, which also runs a file child's deferred scan.
-    #[cfg(feature = "file-io")]
+    /// The exact selection, running a pending resolution's deferred ids
+    /// (cached on the view); a file child's deferred scan runs here.
     pub(crate) async fn materialized_async(&self) -> Result<RowSelection> {
         match self {
             ViewSelection::Exact(selection) => Ok(selection.clone()),
@@ -74,10 +71,8 @@ impl ViewSelection {
         }
     }
 
-    /// The concrete selection, running a pending resolution's deferred id
-    /// computation if one is still outstanding — the synchronous form for
-    /// in-memory views, whose pending ids never take I/O (see
-    /// [`materialized_async`](Self::materialized_async)).
+    /// The exact selection, running a pending resolution's deferred ids
+    /// synchronously; valid only for in-memory views.
     pub(crate) fn materialized(&self) -> Result<RowSelection> {
         match self {
             ViewSelection::Exact(selection) => Ok(selection.clone()),
@@ -85,17 +80,14 @@ impl ViewSelection {
         }
     }
 
-    /// The already-exact selection, for consumers that structurally cannot
-    /// meet a pending one: a pending selection always rides with a serve
-    /// plan, and these consumers only run on views without one.
-    pub(crate) fn expect_exact(&self) -> &RowSelection {
+    /// The live rows this selection covers, when known without reading: an
+    /// exact selection's live count, or a pending run's width while nothing
+    /// is tombstoned.
+    pub(crate) fn len_if_known(&self, deleted: Option<&Mask>, base_len: usize) -> Option<usize> {
         match self {
-            ViewSelection::Exact(selection) => selection,
-            ViewSelection::Pending(_) => {
-                unreachable!(
-                    "a pending selection always rides with a serve plan; consumers that \
-                     cannot honor the plan materialize the selection first"
-                )
+            ViewSelection::Exact(selection) => Some(selection.live_len(deleted, base_len)),
+            ViewSelection::Pending(lazy) => {
+                deleted.is_none().then(|| lazy.len_if_known()).flatten()
             }
         }
     }
@@ -132,14 +124,45 @@ impl RowSelection {
         }
     }
 
-    /// The base row ids this selection covers, ascending.
+    /// The live rows this selection covers: its rows minus the tombstones.
+    pub(crate) fn live_len(&self, deleted: Option<&Mask>, base_len: usize) -> usize {
+        match deleted {
+            None => self.len(base_len),
+            Some(deleted) => self.live_mask(deleted, base_len).true_count(),
+        }
+    }
+
+    /// The base row ids this selection covers, ascending. Not for hot
+    /// per-row loops: those stay monomorphic per variant.
     pub(crate) fn ids(&self, base_len: usize) -> impl Iterator<Item = u64> + '_ {
         let (range, ids): (Range<u64>, &[u64]) = match self {
             RowSelection::All => (0..base_len as u64, &[]),
-            RowSelection::Range(range) => (range.clone(), &[]),
+            RowSelection::Range(range) => {
+                let range = clamped(range, base_len);
+                (range.start as u64..range.end as u64, &[])
+            }
             RowSelection::Ids(ids) => (0..0, ids.as_slice()),
         };
         range.chain(ids.iter().copied())
+    }
+
+    /// [`ids`](Self::ids) with the tombstoned rows dropped.
+    pub(crate) fn live_ids<'a>(
+        &'a self,
+        deleted: Option<&'a Mask>,
+        base_len: usize,
+    ) -> impl Iterator<Item = u64> + 'a {
+        self.ids(base_len)
+            .filter(move |&id| deleted.is_none_or(|d| !d.value(id as usize)))
+    }
+
+    /// `Ids(ids)`, or the canonical empty selection for an empty list.
+    pub(crate) fn from_ids(ids: Buffer<u64>) -> Self {
+        if ids.is_empty() {
+            RowSelection::empty()
+        } else {
+            RowSelection::Ids(ids)
+        }
     }
 
     /// Whether the selection provably covers no row. `All` over an empty base
@@ -258,29 +281,11 @@ impl RowSelection {
                 }
             };
         };
-        let live = |id: &u64| !deleted.value(*id as usize);
-        let ids: Buffer<u64> = match self {
-            RowSelection::All => {
-                Buffer::from_iter((0..base_len as u64).filter(live).skip(offset).take(limit))
-            }
-            RowSelection::Range(range) => {
-                let range = clamped(range, base_len);
-                Buffer::from_iter(
-                    (range.start as u64..range.end as u64)
-                        .filter(live)
-                        .skip(offset)
-                        .take(limit),
-                )
-            }
-            RowSelection::Ids(ids) => {
-                Buffer::from_iter(ids.iter().copied().filter(live).skip(offset).take(limit))
-            }
-        };
-        if ids.is_empty() {
-            RowSelection::empty()
-        } else {
-            RowSelection::Ids(ids)
-        }
+        Self::from_ids(Buffer::from_iter(
+            self.live_ids(Some(deleted), base_len)
+                .skip(offset)
+                .take(limit),
+        ))
     }
 
     /// `Range(range)`, or the canonical empty selection for an empty one.

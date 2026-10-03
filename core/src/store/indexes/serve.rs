@@ -181,6 +181,8 @@ fn primary_struct(children: Vec<ArrayRef>, len: usize) -> Result<ArrayRef> {
 /// them instead of gathering the primary columns by row id.
 #[derive(Clone)]
 pub(crate) struct InMemoryServePlan {
+    /// The serving component's name.
+    component: &'static str,
     decode: ServeDecode,
     /// The component's rows, in child schema.
     array: ArrayRef,
@@ -191,17 +193,24 @@ pub(crate) struct InMemoryServePlan {
 
 impl InMemoryServePlan {
     pub(crate) fn new(
+        component: &'static str,
         decode: ServeDecode,
         array: ArrayRef,
         range: Range<usize>,
         probes: Arc<StructProbes>,
     ) -> Self {
         Self {
+            component,
             decode,
             array,
             range,
             probes,
         }
+    }
+
+    /// The serving component's name.
+    pub(crate) fn component(&self) -> &'static str {
+        self.component
     }
 
     /// The served rows' four `u32` term codes, read off the component's own

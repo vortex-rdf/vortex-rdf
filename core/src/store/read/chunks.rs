@@ -24,7 +24,9 @@ use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::QuadsSource;
 use crate::store::VortexRdfStore;
-use crate::store::array::{field_as, into_struct_array};
+use crate::store::array::{field_as, into_struct_array, rechunk};
+#[cfg(feature = "file-io")]
+use crate::store::scan::file_reads;
 use crate::store::schema::QuadColumn;
 
 /// A view's rows as struct chunks in the layout's native dtype, each of at
@@ -49,11 +51,7 @@ impl VortexRdfStore {
     /// store first).
     pub fn row_chunks(&self, batch_rows: usize) -> Result<RowChunkStream> {
         check_batch(batch_rows)?;
-        if self.layout.strategy() == crate::store::LayoutStrategy::Dictionary
-            && self.tail_len() != 0
-        {
-            self.ensure_code_view("row_chunks")?;
-        }
+        self.ensure_no_dictionary_tail("row_chunks")?;
         let store = self.clone();
         Ok(lazy(
             async move { store.row_chunk_source(batch_rows).await },
@@ -119,8 +117,13 @@ impl VortexRdfStore {
                     chunks.extend(tail);
                     return Ok(stream::iter(chunks.into_iter().map(Ok)).boxed());
                 }
-                let scan =
-                    self.restricted_file_scan(file, filter.as_ref(), &selection, deleted.as_ref())?;
+                let scan = file_reads::restricted_scan(
+                    file,
+                    self.layout.strategy().primary_column_names(),
+                    filter.as_ref(),
+                    &selection,
+                    deleted.as_ref(),
+                )?;
                 Ok(rechunked_scan(scan, batch_rows)?
                     .chain(stream::iter(tail.into_iter().map(Ok)))
                     .boxed())
@@ -176,7 +179,7 @@ impl VortexRdfStore {
                     )
                     .boxed());
                 }
-                let scan = Self::restricted_file_scan_projected(
+                let scan = file_reads::restricted_scan(
                     file,
                     &names,
                     filter.as_ref(),
@@ -221,25 +224,6 @@ fn lazy<T: Send + 'static>(
             Err(e) => stream::iter([Err(e)]).boxed(),
         })
         .boxed()
-}
-
-/// `rows` cut into slices of at most `batch_rows`; an empty array yields no
-/// chunk.
-pub(in crate::store) fn rechunk(rows: ArrayRef, batch_rows: usize) -> Result<Vec<ArrayRef>> {
-    let len = rows.len();
-    if len == 0 {
-        return Ok(Vec::new());
-    }
-    if len <= batch_rows {
-        return Ok(vec![rows]);
-    }
-    (0..len)
-        .step_by(batch_rows)
-        .map(|start| {
-            rows.slice(start..(start + batch_rows).min(len))
-                .map_err(VortexRdfError::Vortex)
-        })
-        .collect()
 }
 
 /// The scan's chunk stream with every chunk cut to `batch_rows`, a chunk's

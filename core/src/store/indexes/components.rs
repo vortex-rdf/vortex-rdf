@@ -48,6 +48,18 @@ pub(crate) fn known_component(implementation: &str) -> Option<KnownComponent> {
     })
 }
 
+/// The registry row of the child named `name` (`index:posg`, …); `None` for
+/// a foreign name.
+pub(crate) fn component_named(name: &str) -> Option<KnownComponent> {
+    ALL_INDEX_TYPES.into_iter().find_map(|index| {
+        index
+            .component_identities()
+            .iter()
+            .find(|identity| identity.name == name)
+            .map(|identity| KnownComponent { identity, index })
+    })
+}
+
 /// Every known index child holds exactly one row per quad.
 pub(crate) fn check_component_rows(name: &str, component_rows: u64, quad_rows: u64) -> Result<()> {
     if component_rows != quad_rows {

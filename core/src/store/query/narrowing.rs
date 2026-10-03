@@ -21,14 +21,13 @@ use vortex_buffer::Buffer;
 
 use crate::debug;
 use crate::error::{Result, VortexRdfError};
+use crate::store::QuadsSource;
 use crate::store::array::{cached_u32_primitive, column_is_sorted, into_struct_array};
-use crate::store::layouts::LayoutStrategy;
 use crate::store::probes::StructProbes;
 #[cfg(feature = "file-io")]
-use crate::store::scan::file_scan;
+use crate::store::scan::{file_filter, file_reads};
 use crate::store::schema::{self, QuadColumn};
 use crate::store::view::selection::{RowSelection, ViewSelection};
-use crate::store::{QuadsSource, Tail};
 
 use crate::store::VortexRdfStore;
 
@@ -158,6 +157,19 @@ impl CodeReader<'_> {
 impl VortexRdfStore {
     // ── narrowing beyond a pattern ────────────────────────────────────────────
 
+    /// An empty view of this store: the same base and tail with no row of
+    /// either selected, no indexes, no serve plan.
+    pub(crate) fn empty_view(&self) -> Self {
+        let tail = self
+            .tail
+            .as_ref()
+            .map(|tail| tail.with_selection(RowSelection::empty()));
+        Self {
+            indexes: vec![],
+            ..self.derived(self.quads.emptied(), tail)
+        }
+    }
+
     /// Narrow this view to the rows whose code in `column` the keep admits —
     /// the rows a `VALUES` block or a term predicate (see
     /// `DictReader::filter_codes`) selects, applied inside the store instead
@@ -216,194 +228,53 @@ impl VortexRdfStore {
     /// the index's order does not share).
     pub async fn window(&self, offset: usize, limit: usize) -> Result<Self> {
         let t = debug::timer();
-        let (quads, base_live, base_taken) = match &self.quads {
-            QuadsSource::InMemory {
-                base,
-                selection,
-                components,
-                deleted,
-                probes,
-                ..
-            } => {
-                let selection = selection.materialized()?;
-                let live = match deleted {
-                    None => selection.len(base.len()),
-                    Some(deleted) => selection.live_mask(deleted, base.len()).true_count(),
-                };
-                let windowed = selection.window(offset, limit, deleted.as_ref(), base.len());
-                let taken = windowed.len(base.len());
-                (
-                    QuadsSource::InMemory {
-                        base: base.clone(),
-                        selection: ViewSelection::Exact(windowed),
-                        components: std::sync::Arc::clone(components),
-                        deleted: deleted.clone(),
-                        probes: std::sync::Arc::clone(probes),
-                        serve: None,
-                    },
-                    live,
-                    taken,
-                )
-            }
-            #[cfg(feature = "file-io")]
-            QuadsSource::File {
-                path,
-                dict_max_resident_bytes,
-                file,
-                filter,
-                selection,
-                deleted,
-                ..
-            } => {
-                let row_count = file.row_count() as usize;
-                let selection = selection.materialized_async().await?;
-                let (windowed, live) = match filter {
-                    None => {
-                        let live = match deleted {
-                            None => selection.len(row_count),
-                            Some(deleted) => selection.live_mask(deleted, row_count).true_count(),
-                        };
-                        (
-                            selection.window(offset, limit, deleted.as_ref(), row_count),
-                            live,
-                        )
-                    }
-                    Some(filter) => {
-                        // Only the matches the window can reach are
-                        // evaluated; fewer than asked means the base is
-                        // exhausted and their count is its live size.
-                        let want = offset.saturating_add(limit);
-                        let found = file_scan::first_matching_rows(
-                            file,
-                            filter,
-                            &selection,
-                            deleted.as_ref(),
-                            want,
-                        )
-                        .await?;
-                        let live = if found.len() < want {
-                            found.len()
-                        } else {
-                            want
-                        };
-                        (
-                            RowSelection::Ids(found).window(offset, limit, None, row_count),
-                            live,
-                        )
-                    }
-                };
-                let taken = windowed.len(row_count);
-                (
-                    QuadsSource::File {
-                        path: path.clone(),
-                        dict_max_resident_bytes: *dict_max_resident_bytes,
-                        file: file.clone(),
-                        filter: None,
-                        selection: ViewSelection::Exact(windowed),
-                        deleted: deleted.clone(),
-                        serve: None,
-                    },
-                    live,
-                    taken,
-                )
-            }
-        };
-        // Whatever the base could not fill falls to the tail: the offset it
-        // did not consume, the limit it did not take.
+        let selection = self.quads.materialized_selection().await?;
+        let (windowed, base_live) = self.base_window(&selection, offset, limit).await?;
+        let base_taken = windowed.len(self.quads.base_len());
+        let quads = self
+            .quads
+            .with_selection(ViewSelection::Exact(windowed))
+            .without_filter();
+        // Whatever the base could not fill falls to the tail.
         let tail = self.tail.as_ref().map(|tail| {
-            let tail_offset = offset.saturating_sub(base_live);
-            let tail_limit = limit.saturating_sub(base_taken);
-            Tail {
-                rows: tail.rows.clone(),
-                selection: tail.selection.window(
-                    tail_offset,
-                    tail_limit,
-                    tail.deleted.as_ref(),
-                    tail.rows.len(),
-                ),
-                deleted: tail.deleted.clone(),
-            }
+            tail.window(
+                offset.saturating_sub(base_live),
+                limit.saturating_sub(base_taken),
+            )
         });
         log::debug!(
             "[window] offset {offset} limit {limit}: {base_taken} base rows at {:?}",
             debug::elapsed(t)
         );
-        Ok(Self {
-            layout: self.layout.clone(),
-            indexes: self.indexes.clone(),
-            generation: self.generation,
-            quads,
-            tail,
-        })
+        Ok(self.derived(quads, tail))
     }
 
-    /// `min(size, limit)`, stopping as soon as `limit` rows are known to
-    /// exist: a file view with a pending filter evaluates its splits in file
-    /// order and stops at the first that reaches the cap (an in-memory view
-    /// knows its size without reading rows). Available on every layout.
-    pub async fn size_capped(&self, limit: usize) -> Result<usize> {
-        if limit == 0 {
-            return Ok(0);
+    /// The base's window and its live row count. A pending file filter is
+    /// evaluated only as far as the window reaches, so fewer rows than asked
+    /// means the base is exhausted and their count is its live size.
+    async fn base_window(
+        &self,
+        selection: &RowSelection,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(RowSelection, usize)> {
+        let base_len = self.quads.base_len();
+        let deleted = self.quads.deleted();
+        #[cfg(feature = "file-io")]
+        if let (Some(file), Some(filter)) = (self.quads.file(), self.quads.filter()) {
+            let want = offset.saturating_add(limit);
+            let found =
+                file_filter::first_matching_rows(file, filter, selection, deleted, want).await?;
+            let live = found.len();
+            return Ok((
+                RowSelection::from_ids(found).window(offset, limit, None, base_len),
+                live,
+            ));
         }
-        let base = match &self.quads {
-            QuadsSource::InMemory { .. } => self.base_size().await?,
-            #[cfg(feature = "file-io")]
-            QuadsSource::File {
-                file,
-                filter,
-                selection,
-                deleted,
-                serve,
-                ..
-            } => match filter {
-                None => self.base_size().await?,
-                Some(filter) => {
-                    // A filter never rides with a served plan; with one the
-                    // selection is already exact, so this never scans an
-                    // index child to count.
-                    debug_assert!(serve.is_none());
-                    let selection = selection.materialized_async().await?;
-                    file_scan::count_matching_rows_capped(
-                        file,
-                        filter,
-                        &selection,
-                        deleted.as_ref(),
-                        limit,
-                    )
-                    .await?
-                }
-            },
-        };
-        if base >= limit {
-            return Ok(limit);
-        }
-        Ok((base + self.tail_size()).min(limit))
-    }
-
-    /// Whether the view holds any quad — [`size_capped`](Self::size_capped)
-    /// of one, so a filtered file view reads only up to its first match.
-    pub async fn exists(&self) -> Result<bool> {
-        Ok(self.size_capped(1).await? > 0)
-    }
-
-    /// Err unless this view's rows are code-addressable: the Dictionary
-    /// layout with an empty append tail.
-    pub(in crate::store) fn ensure_code_view(&self, operation: &str) -> Result<()> {
-        if self.layout.strategy() != LayoutStrategy::Dictionary {
-            return Err(VortexRdfError::InvalidOperation(format!(
-                "{operation} needs the Dictionary layout: this store's {:?} layout stores terms \
-                 as strings, which have no codes to keep",
-                self.layout.strategy()
-            )));
-        }
-        if self.tail_len() != 0 {
-            return Err(VortexRdfError::InvalidOperation(format!(
-                "{operation} needs an empty append tail: the {} appended rows hold terms the \
-                 dictionary has no codes for; compact() the store first",
-                self.tail_len()
-            )));
-        }
-        Ok(())
+        Ok((
+            selection.window(offset, limit, deleted, base_len),
+            selection.live_len(deleted, base_len),
+        ))
     }
 
     /// The in-memory backend of [`keep`](Self::keep).
@@ -414,8 +285,6 @@ impl VortexRdfStore {
         let QuadsSource::InMemory {
             base,
             selection,
-            components,
-            deleted,
             probes,
             ..
         } = &self.quads
@@ -455,20 +324,10 @@ impl VortexRdfStore {
         if narrowed.is_empty(base_len) {
             return Ok(self.empty_view());
         }
-        Ok(Self {
-            layout: self.layout.clone(),
-            indexes: self.indexes.clone(),
-            generation: self.generation,
-            quads: QuadsSource::InMemory {
-                base: base.clone(),
-                selection: ViewSelection::Exact(narrowed),
-                components: std::sync::Arc::clone(components),
-                deleted: deleted.clone(),
-                probes: std::sync::Arc::clone(probes),
-                serve: None,
-            },
-            tail: self.tail.clone(),
-        })
+        Ok(self.derived(
+            self.quads.with_selection(ViewSelection::Exact(narrowed)),
+            self.tail.clone(),
+        ))
     }
 
     /// The keep by binary search, when the selection is a run of the sorted
@@ -570,17 +429,12 @@ impl VortexRdfStore {
                     .apply(col)?
                     .execute::<PrimitiveArray>(&mut ctx)
                     .map_err(VortexRdfError::Vortex)?;
-                let codes = prim.as_slice::<u32>();
-                let positions = (0..codes.len()).filter(|&i| test.admits(codes[i]));
-                let mask = vortex_mask::Mask::from_indices(codes.len(), positions);
-                return Ok(selection.clone().refine(&mask));
+                return Ok(selection
+                    .clone()
+                    .refine(&keep_mask(prim.as_slice::<u32>(), &test)));
             }
         };
-        Ok(if ids.is_empty() {
-            RowSelection::empty()
-        } else {
-            RowSelection::Ids(Buffer::from(ids))
-        })
+        Ok(RowSelection::from_ids(Buffer::from(ids)))
     }
 
     /// The file backend of [`keep`](Self::keep): the keep as a conjunct on
@@ -594,12 +448,9 @@ impl VortexRdfStore {
 
         let t = debug::timer();
         let QuadsSource::File {
-            path,
-            dict_max_resident_bytes,
             file,
             filter,
             selection,
-            deleted,
             ..
         } = &self.quads
         else {
@@ -616,7 +467,7 @@ impl VortexRdfStore {
             Some(conjunct) => {
                 // Statistics alone may already bound the rows the conjunct
                 // can hold (a namespace range inside a sorted column).
-                let selection = match file_scan::row_range_from_pruning(file, &conjunct).await? {
+                let selection = match file_filter::row_range_from_pruning(file, &conjunct).await? {
                     Some(range) => selection.intersect_range(range),
                     None => selection,
                 };
@@ -638,15 +489,13 @@ impl VortexRdfStore {
                 let selection = match filter {
                     Some(f) => {
                         let matched =
-                            file_scan::matching_file_rows(file, Some(f), &selection).await?;
+                            file_filter::matching_file_rows(file, Some(f), &selection).await?;
                         RowSelection::All.refine(&matched)
                     }
                     None => selection,
                 };
-                let codes = file_scan::read_column_codes(file, column.name(), &selection).await?;
-                let test = keep.test();
-                let positions = (0..codes.len()).filter(|&i| test.admits(codes[i]));
-                let mask = vortex_mask::Mask::from_indices(codes.len(), positions);
+                let codes = file_reads::read_column_codes(file, column.name(), &selection).await?;
+                let mask = keep_mask(&codes, &keep.test());
                 log::debug!(
                     "[keep] {:?} tested in memory over {} file rows at {:?}",
                     column,
@@ -659,22 +508,20 @@ impl VortexRdfStore {
         if selection.is_empty(row_count) {
             return Ok(self.empty_view());
         }
-        Ok(Self {
-            layout: self.layout.clone(),
-            indexes: self.indexes.clone(),
-            generation: self.generation,
-            quads: QuadsSource::File {
-                path: path.clone(),
-                dict_max_resident_bytes: *dict_max_resident_bytes,
-                file: file.clone(),
-                filter,
-                selection: ViewSelection::Exact(selection),
-                deleted: deleted.clone(),
-                serve: None,
-            },
-            tail: self.tail.clone(),
-        })
+        Ok(self.derived(
+            self.quads
+                .file_with(filter, ViewSelection::Exact(selection), None),
+            self.tail.clone(),
+        ))
     }
+}
+
+/// The positions of `codes` the keep admits, as a mask over them.
+fn keep_mask(codes: &[u32], test: &KeepTest<'_>) -> vortex_mask::Mask {
+    vortex_mask::Mask::from_indices(
+        codes.len(),
+        (0..codes.len()).filter(|&i| test.admits(codes[i])),
+    )
 }
 
 /// The keep as a filter conjunct over the quad scan's root: a range as

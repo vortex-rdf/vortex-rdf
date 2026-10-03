@@ -120,6 +120,32 @@ pub(super) fn strict_ids(ids: &Buffer<u64>) -> StrictSortedBuffer<u64> {
         .vortex_expect("a RowSelection id list is ascending and unique")
 }
 
+/// A scan of the quad table projecting `columns`, with `filter` pushed down
+/// and `selection` minus `deleted` applied. Expressions bind through the
+/// handle's memo.
+pub(crate) fn restricted_scan(
+    file: &NativeStoreFile,
+    columns: &[&str],
+    filter: Option<&Expression>,
+    selection: &RowSelection,
+    deleted: Option<&Mask>,
+) -> Result<ScanBuilder<ArrayRef>> {
+    let mut scan = file.scan().map_err(VortexRdfError::Vortex)?;
+    let scope = scan.dtype().map_err(VortexRdfError::Vortex)?;
+    let memo = file.bound_exprs();
+    scan = scan.with_projection(
+        memo.bind(QUAD_SCOPE, &select(columns.to_vec(), root()), &scope)
+            .map_err(VortexRdfError::Vortex)?,
+    );
+    if let Some(filter) = filter {
+        scan = scan.with_filter(
+            memo.bind(QUAD_SCOPE, filter, &scope)
+                .map_err(VortexRdfError::Vortex)?,
+        );
+    }
+    Ok(selection.restrict_scan(scan, deleted))
+}
+
 /// One `u32` column of the file at the rows `selection` covers, in file
 /// order; positions align with `selection.apply`. Tombstones are not applied.
 pub(crate) async fn read_column_codes(
@@ -129,14 +155,8 @@ pub(crate) async fn read_column_codes(
 ) -> Result<Vec<u32>> {
     use vortex_array::arrays::PrimitiveArray;
 
-    let mut scan = file.scan().map_err(VortexRdfError::Vortex)?;
-    let scope = scan.dtype().map_err(VortexRdfError::Vortex)?;
-    scan = scan.with_projection(
-        file.bound_exprs()
-            .bind(QUAD_SCOPE, &select(&[column][..], root()), &scope)
-            .map_err(VortexRdfError::Vortex)?,
-    );
-    let codes = scan_column(selection.restrict_scan(scan, None), column).await?;
+    let scan = restricted_scan(file, &[column], None, selection, None)?;
+    let codes = scan_column(scan, column).await?;
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let prim = codes
         .execute::<PrimitiveArray>(&mut ctx)

@@ -17,6 +17,7 @@ use crate::store::RawQuad;
 use crate::store::array::stamp_is_sorted;
 use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{QuadPattern, ResolvedLayout, TermRef};
+use crate::store::read::metadata::SortOrder;
 use crate::store::schema::{COL_G, COL_O, COL_P, COL_S};
 
 /// One sorted copy family, named after its sort order.
@@ -53,6 +54,21 @@ impl CopyFamily {
         match self {
             CopyFamily::Posg => &IDENTITIES[0],
             CopyFamily::Ospg => &IDENTITIES[1],
+        }
+    }
+
+    /// The family whose child is named `name`.
+    pub(crate) fn of_component(name: &str) -> Option<CopyFamily> {
+        [CopyFamily::Posg, CopyFamily::Ospg]
+            .into_iter()
+            .find(|family| family.identity().name == name)
+    }
+
+    /// The child's row order.
+    pub(crate) fn sort_order(self) -> SortOrder {
+        match self {
+            CopyFamily::Posg => SortOrder::Posg,
+            CopyFamily::Ospg => SortOrder::Ospg,
         }
     }
 
