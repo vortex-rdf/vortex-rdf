@@ -1,5 +1,5 @@
-// The submodules are crate-private; their public items are re-exported here
-// or at the crate root.
+// Submodules are crate-private; their public items are re-exported here or
+// at the crate root.
 pub(crate) mod array;
 pub(crate) mod builders;
 mod construct;
@@ -17,15 +17,14 @@ pub(crate) mod test_hooks;
 pub(crate) mod view;
 pub(crate) mod write;
 
-pub use builders::{
-    BuiltArray, BuiltStream, ChunkStream, SortedInMemoryBuilder, VortexArrayBuilder,
-};
-// Compiled out on wasm with the out-of-core builder.
 /// The column kernels, also reachable as `vortex_rdf_core::columns`.
 pub use crate::columns;
 pub use crate::common::quad::{RawQuad, SharedQuad};
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use builders::SortedStreamBuilder;
+pub use builders::{
+    BuiltArray, BuiltStream, ChunkStream, SortedInMemoryBuilder, VortexArrayBuilder,
+};
 pub use indexes::{IndexType, Indexes};
 pub use layouts::LayoutStrategy;
 pub use layouts::dictionary::DictionaryQuadSink;
@@ -44,8 +43,7 @@ pub use schema::QuadColumn;
 
 pub(crate) use view::{QuadsSource, Tail};
 
-/// The next store generation (see [`VortexRdfStore::generation`]): one
-/// process-wide counter.
+/// The next store generation, from one process-wide counter.
 pub(crate) fn next_generation() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -69,30 +67,23 @@ pub struct VortexRdfStore {
     /// The layout resolved against the base; a Dictionary layout carries its
     /// term access.
     layout: ResolvedLayout,
-    /// The secondary indexes pattern matching routes through, read off the
-    /// component roster at construction. Views keep them: a view narrows a
-    /// [`RowSelection`] and never renumbers rows, so the components' `rid`
-    /// columns stay valid; [`compact_with_indexes`](Self::compact_with_indexes)
-    /// rebuilds them over the gathered rows.
+    /// Index types resolvable on this store, from its component roster;
+    /// shared by views (row ids address the base).
     indexes: Indexes,
-    /// Identity of the data behind this view; see
-    /// [`generation`](Self::generation).
+    /// Identity of the data behind this view.
     generation: u64,
-    /// Rows appended since construction ([`add_quads`](Self::add_quads)),
-    /// `None` until an append; [`compact_with_indexes`](Self::compact_with_indexes)
-    /// folds them into the base.
+    /// Rows appended since construction, `None` until an append.
     tail: Option<Tail>,
 }
 
-/// A store's serializable state: the primary quad rows, the index components
-/// describing them and, under the Dictionary layout, the term dictionary the
-/// rows' codes address. Produced by
-/// [`VortexRdfStore::to_serializable_parts`] and adopted back by
+/// A store's serializable state: the built rows, components and dictionary,
+/// and whether the rows are in global `(s, p, o, g)` order. Produced by
+/// [`VortexRdfStore::to_serializable_parts`], adopted back by
 /// [`VortexRdfStore::from_parts`].
 pub struct StoreParts {
     pub(crate) built: BuiltArray,
     /// Whether the rows are in global `(s, p, o, g)` order; written as the
-    /// root's `quads_sorted` (see `WireMetadata::quads_sorted`).
+    /// root's `quads_sorted`.
     #[cfg_attr(
         not(any(feature = "file-io", target_arch = "wasm32")),
         allow(dead_code)
@@ -113,12 +104,10 @@ impl VortexRdfStore {
         }
     }
 
-    // ── ownership & compaction policy ────────────────────────────────────────
+    // ── tail ─────────────────────────────────────────────────────────────────
 
     /// Number of physical rows in the append tail, tombstoned ones included;
-    /// `0` without a tail. `add_quads` folds the tail into the base once it
-    /// crosses the auto-compaction thresholds (rewriting a file-backed
-    /// store's source file); [`compact`](Self::compact) folds it on demand.
+    /// `0` without a tail.
     pub fn tail_len(&self) -> usize {
         self.tail.as_ref().map_or(0, |tail| tail.rows.len())
     }
@@ -146,22 +135,19 @@ impl VortexRdfStore {
         }
     }
 
-    /// An immutable handle on this store's term dictionary ([`DictSnapshot`]),
-    /// `Some` only when the codes this view serves
-    /// ([`code_columns_gathered`](Self::code_columns_gathered)) decode
-    /// against it: the Dictionary layout, an empty append tail (tail rows
-    /// hold terms as strings, with no code in the dictionary) and a resident
-    /// dictionary. Taking a snapshot is O(1) and retains only the dictionary.
+    /// An immutable handle on this store's term dictionary, `Some` only when
+    /// this view's codes decode against it: the Dictionary layout, an empty
+    /// append tail (tail rows hold terms as strings) and a resident
+    /// dictionary. O(1); retains only the dictionary.
     pub fn code_read_snapshot(&self) -> Option<DictSnapshot> {
         self.is_code_view()
             .then(|| self.dictionary_snapshot())
             .flatten()
     }
 
-    /// A handle on this store's term dictionary under either residency
-    /// ([`DictReader`]), gated like
-    /// [`code_read_snapshot`](Self::code_read_snapshot) except that a
-    /// file-backed dictionary answers too, by reading its child on demand.
+    /// A [`DictReader`] on this store's term dictionary, resident or
+    /// file-backed; gated like [`code_read_snapshot`](Self::code_read_snapshot)
+    /// except that a file-backed dictionary answers too.
     pub fn dict_reader(&self) -> Option<DictReader> {
         match &self.layout {
             ResolvedLayout::Dictionary(access) if self.is_code_view() => Some(access.reader()),

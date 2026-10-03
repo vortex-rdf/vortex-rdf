@@ -19,10 +19,8 @@ use crate::store::VortexRdfStore;
 impl VortexRdfStore {
     // ── mutations ─────────────────────────────────────────────────────────────
 
-    /// This store as an owner that can be mutated: a cheap clone when it
-    /// already owns its rows, else an independent compacted copy with its
-    /// declared indexes rebuilt
-    /// ([`compact_with_indexes`](Self::compact_with_indexes)).
+    /// This store as an owner: a clone when it already owns its rows, else an
+    /// independent compacted copy with its indexes rebuilt.
     pub async fn owned(&self) -> Result<Self> {
         if self.is_owner() {
             Ok(self.clone())
@@ -61,14 +59,12 @@ impl VortexRdfStore {
         self.add_quads([quad]).await
     }
 
-    /// Append every quad not already present (RDF/JS dataset semantics: a
-    /// quad equal to an existing one, or to an earlier quad of the batch, is
-    /// skipped). Appends land in the tail, never the base; under the
-    /// Dictionary layout the tail holds terms as strings. Each presence check
-    /// is one fully-bound [`match_pattern`](Self::match_pattern). The add
-    /// that pushes the tail over the auto-compaction thresholds finishes with
-    /// [`compact`](Self::compact), which rewrites a file-backed store's
-    /// source file.
+    /// Append every quad not already present (a quad equal to an existing one,
+    /// or to an earlier quad of the batch, is skipped). Appends land in the
+    /// tail, never the base; under the Dictionary layout the tail holds terms
+    /// as strings. The add that pushes the tail over the auto-compaction
+    /// thresholds finishes with [`compact`](Self::compact), which rewrites a
+    /// file-backed store's source file.
     pub async fn add_quads(&self, quads: impl IntoIterator<Item = Quad>) -> Result<Self> {
         self.ensure_owner("add_quads")?;
 
@@ -126,9 +122,8 @@ impl VortexRdfStore {
     ) -> Result<Self> {
         self.ensure_owner("delete_matching")?;
 
-        // The matched view shares this store's base, so its selection is
-        // already in base row ids; it may name rows already deleted, which
-        // the mask union absorbs.
+        // The matched view's selection is in base row ids; rows already
+        // deleted are absorbed by the mask union.
         let doomed = self
             .match_pattern(subject, predicate, object, graph)
             .await?;

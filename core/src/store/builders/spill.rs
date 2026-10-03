@@ -1,7 +1,6 @@
-//! Temp-file spill machinery behind the out-of-core builder: quads (and, for
-//! globally sorted secondary indexes, `(value, row ID)` pairs) are serialized
-//! to disk with rkyv during ingestion/merge passes and read back during chunk
-//! emission, so peak memory stays bounded by the chunk size.
+//! Temp-file spill machinery behind the out-of-core builder: rkyv-serialized
+//! runs of quads and `(key, row id)` entries, written during the ingest and
+//! merge passes and read back during chunk emission.
 
 use std::collections::BinaryHeap;
 use std::fs::File;
@@ -18,10 +17,7 @@ use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
 
-/// Environment variable overriding where spill directories are created — the
-/// escape hatch for putting out-of-core runs on a specific volume. The OS
-/// temp dir is commonly a size-capped, RAM-backed tmpfs, exactly the wrong
-/// home for runs that exist because the data outgrew memory.
+/// Environment variable overriding where spill directories are created.
 const SPILL_DIR_ENV: &str = "VORTEX_RDF_SPILL_DIR";
 
 /// The rkyv bounds a record type needs to be spilled and read back.
@@ -48,22 +44,15 @@ fn resolve_spill_parent(env_override: Option<std::ffi::OsString>, base: Option<&
         .unwrap_or_else(std::env::temp_dir)
 }
 
-/// A unique temporary spill directory, deleted when dropped so spill files are
-/// cleaned up even if the chunk stream is abandoned before being fully
-/// consumed.
+/// A unique temporary spill directory, deleted when dropped.
 pub(crate) struct TempRunsGuard {
     dir: PathBuf,
 }
 
 impl TempRunsGuard {
-    /// Create `tmp_vortex_{prefix}_{uuid}` under the spill parent.
-    ///
-    /// The parent is resolved in precedence order: the `VORTEX_RDF_SPILL_DIR`
-    /// environment variable, then the caller-provided `base` (compaction
-    /// passes the store file's own directory so spills share the output's
-    /// volume), then [`std::env::temp_dir`]. The library never writes into
-    /// the caller's working directory: an embedding server or binding can run
-    /// with an arbitrary — even read-only — cwd.
+    /// Create `tmp_vortex_{prefix}_{uuid}` under the spill parent:
+    /// `VORTEX_RDF_SPILL_DIR` when set and non-empty, else `base`, else the OS
+    /// temp dir.
     pub(crate) fn create(prefix: &str, base: Option<&Path>) -> Result<Self> {
         let parent = resolve_spill_parent(std::env::var_os(SPILL_DIR_ENV), base);
         let dir = parent.join(format!("tmp_vortex_{}_{}", prefix, uuid::Uuid::new_v4()));
@@ -83,7 +72,8 @@ impl Drop for TempRunsGuard {
     }
 }
 
-/// Incremental rkyv writer for spilling items one at a time.
+/// Incremental writer of one spill run: a `u32` LE length prefix and the
+/// rkyv bytes per record.
 pub(crate) struct RunWriter<T> {
     writer: BufWriter<File>,
     /// Serialization buffer reused across pushes; `clear` keeps its capacity.
@@ -102,8 +92,7 @@ impl<T: Spillable> RunWriter<T> {
     }
 
     pub(crate) fn push(&mut self, item: &T) -> Result<()> {
-        // rkyv consumes and returns its writer by value, so the held buffer
-        // is taken and put back around each serialization.
+        // rkyv takes and returns the buffer by value.
         self.buf.clear();
         let bytes = to_bytes_in::<_, RkyvError>(item, std::mem::take(&mut self.buf))
             .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
@@ -134,13 +123,8 @@ fn write_run<T: Spillable>(path: &Path, items: &[T]) -> Result<()> {
     writer.finish()
 }
 
-/// One sorted run of a merge, read sequentially — either still in memory or
-/// spilled to a temp file.
-///
-/// A dataset that fits in a single run never round-trips through rkyv and
-/// the filesystem: the ingest buffer *is* the run, already sorted and in
-/// memory. Only once a second run exists does spilling buy anything, so the
-/// builder spills lazily and keeps a lone run here.
+/// One sorted run of a merge, read sequentially: still in memory (a dataset
+/// that fit in one run never spills), or a temp file.
 pub(crate) struct Run<T>(RunInner<T>);
 
 enum RunInner<T> {
@@ -215,9 +199,9 @@ impl<T: Spillable> RunReader<T> {
         self.payload.resize(len, 0);
         read_exact_or_corrupt(&mut self.reader, &mut self.payload, "payload")?;
 
-        // SAFETY: spill files are produced by this process using the matching
-        // rkyv serializer and consumed immediately; we don't accept external
-        // untrusted data on this path.
+        // SAFETY: spill files are written by this process with the matching
+        // rkyv serializer and read back unchecked; no external data takes this
+        // path.
         let item = unsafe { rkyv::from_bytes_unchecked::<T, RkyvError>(&self.payload) }
             .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
         Ok(Some(item))
@@ -262,8 +246,7 @@ impl<T: Ord + Spillable> RunSpiller<T> {
     }
 
     pub(crate) fn push(&mut self, item: T) -> Result<()> {
-        // Spill only when the next item would not fit, so a dataset of exactly
-        // `capacity` items stays a single in-memory run (see [`Run`]).
+        // A dataset of exactly `capacity` items stays one in-memory run.
         if self.buf.len() == self.capacity {
             self.flush_run()?;
         }
@@ -288,10 +271,8 @@ impl<T: Ord + Spillable> RunSpiller<T> {
         Ok(())
     }
 
-    /// Flush the tail run and set up the K-way merge over all runs.
-    ///
-    /// Nothing spilled means everything still sits in `buf`: sorting it in
-    /// place is the whole merge, so it becomes a single in-memory run.
+    /// Flush the last run and set up the K-way merge; nothing spilled means
+    /// the sorted buffer is the single in-memory run.
     pub(crate) fn into_merger(mut self) -> Result<RunMerger<T>> {
         if self.run_paths.is_empty() {
             self.buf.sort_unstable();
@@ -364,8 +345,8 @@ impl<T: Ord + Spillable> RunMerger<T> {
     }
 }
 
-/// Where [`merge_quads_feeding_indexes`] puts the merged quads: straight into
-/// memory when the merge had a single input run, otherwise into a spill file.
+/// Where the indexed pipeline puts its merged quads: memory when the merge
+/// had a single input run, else a spill file.
 pub(super) enum MergedSink {
     Memory(Vec<RawQuad>),
     File {
@@ -460,9 +441,8 @@ mod tests {
 
     #[test]
     fn temp_runs_guard_honors_base_and_cleans_up() {
-        // The env override outranks `base` by design, so a preset override in
-        // the test environment would (correctly) redirect this spill; only
-        // assert placement when it is absent.
+        // With the env override set the spill lands elsewhere; assert
+        // placement only without it.
         if std::env::var_os(SPILL_DIR_ENV).is_some() {
             return;
         }

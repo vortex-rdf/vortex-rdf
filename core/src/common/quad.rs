@@ -9,15 +9,10 @@ use oxrdf::Quad;
 use crate::common::terms::quad_from_terms;
 use crate::error::Result;
 
-/// A quad whose terms are shared N-Triples strings: a decoder produces one
-/// `Arc<str>` per distinct term of a chunk and hands it to every row that
-/// repeats the term by reference count, so materializing a wide result costs
-/// one refcount bump per term. `g` is `""` for the
-/// default graph, as the columns store it.
-///
-/// Pointer identity between equal terms is an optimization the decoders
-/// make where they can (a memo hit), never a guarantee: equal content is the
-/// contract.
+/// A quad whose terms are shared N-Triples strings, one `Arc<str>` per
+/// distinct term of a decoded chunk; `g` is `""` for the default graph.
+/// Equal content is the contract; pointer identity between equal terms is
+/// not guaranteed.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SharedQuad {
     /// Subject term.
@@ -48,10 +43,9 @@ impl From<RawQuad> for SharedQuad {
     }
 }
 
-/// A raw (un-encoded) quad holding term strings in N-Triples form.
-/// This is the shared in-memory (and on-disk, for external sorting)
-/// representation consumed by layouts, indexes and builders before
-/// writing to Vortex arrays.
+/// A quad holding its terms as owned N-Triples strings: the builders' input
+/// and the spill-file record. `Ord` is `(s, p, o, g)`; `g` is `""` for the
+/// default graph.
 #[derive(Clone, Hash, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct RawQuad {
     /// Subject term.
@@ -92,8 +86,7 @@ impl RawQuad {
             o: match &q.object {
                 oxrdf::Term::NamedNode(n) => named_node_string(n),
                 oxrdf::Term::BlankNode(b) => blank_node_string(b),
-                // Literals need escaping and datatype/language suffixes —
-                // keep the canonical Display implementation for those.
+                // Literals need escaping and suffixes: the Display form.
                 other => other.to_string(),
             },
             g: match &q.graph_name {
@@ -105,9 +98,7 @@ impl RawQuad {
     }
 }
 
-/// `<iri>` built directly with one exact-capacity allocation. IRIs need no
-/// escaping in N-Triples, so this skips the `Display`/`format!` machinery and
-/// its formatter dispatch plus incremental `String` reallocation.
+/// `<iri>` in one exact-capacity allocation.
 fn named_node_string(n: &oxrdf::NamedNode) -> String {
     let iri = n.as_str();
     let mut s = String::with_capacity(iri.len() + 2);
@@ -117,7 +108,7 @@ fn named_node_string(n: &oxrdf::NamedNode) -> String {
     s
 }
 
-/// `_:id`, same rationale as [`named_node_string`].
+/// `_:id` in one exact-capacity allocation.
 fn blank_node_string(b: &oxrdf::BlankNode) -> String {
     let id = b.as_str();
     let mut s = String::with_capacity(id.len() + 2);

@@ -46,12 +46,10 @@ pub(super) fn resolved_layout(
 
 impl VortexRdfStore {
     /// Build a store from a quad stream: the global `(s, p, o, g)` sort, the
-    /// layout's columns, the requested indexes and the store assembly in one
-    /// call. The builder is the out-of-core `SortedStreamBuilder` wherever a
-    /// filesystem exists and `SortedInMemoryBuilder` on wasm; name one
-    /// directly ([`from_built`](Self::from_built)) to override. The finished
-    /// store is resident; `io::quads_stream_to_vortex_file` streams a dataset
-    /// to a file instead.
+    /// layout's columns, the requested indexes and the assembly in one call,
+    /// through `SortedStreamBuilder` wherever a filesystem exists and
+    /// `SortedInMemoryBuilder` on wasm. The store is resident;
+    /// `io::quads_stream_to_vortex_file` streams a dataset to a file instead.
     pub async fn from_quads(
         quads: impl Stream<Item = Result<RawQuad>> + Unpin + Send + 'static,
         layout: LayoutStrategy,
@@ -67,12 +65,11 @@ impl VortexRdfStore {
     }
 
     /// Rebuild a store from [`StoreParts`], the inverse of
-    /// [`to_serializable_parts`](Self::to_serializable_parts). Dict-less
-    /// Dictionary parts are refused. Integer children stay compressed
-    /// wherever an encoded-search probe binds them and are decoded otherwise
-    /// (`with_searchable_int_children`), components likewise. An `IsSorted`
-    /// stamp on the `s` column is trusted as global `(s, p, o, g)` order; rows
-    /// sorted by subject alone must not carry it.
+    /// [`to_serializable_parts`](Self::to_serializable_parts); dict-less
+    /// Dictionary parts are refused. Integer children stay compressed wherever
+    /// an encoded-search probe binds them and are decoded otherwise. An
+    /// `IsSorted` stamp on the `s` column is trusted as global `(s, p, o, g)`
+    /// order.
     pub fn from_parts(parts: StoreParts) -> Result<Self> {
         Self::adopt(
             parts.built,

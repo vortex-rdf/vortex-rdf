@@ -14,15 +14,10 @@ use crate::store::RawQuad;
 use crate::store::persist::open::scanned_index_components;
 use crate::store::{StoreParts, VortexRdfStore};
 
-/// Put a rebuild's rows into the (s, p, o, g) order every builder emits, so
-/// the array they build carries the subject sorted stamp.
-///
-/// The first `base_rows` entries came from the base and `base_sorted` reports
-/// whether they already hold that order; the rest is the appended tail. When
-/// the base was sorted, sorting the tail alone leaves two concatenated sorted
-/// runs — the case `slice::sort` is documented to merge in a linear pass —
-/// and the tail is small, being capped by auto-compaction. Only a base that
-/// never carried the stamp pays a full sort, which is also what heals it.
+/// Put a rebuild's rows into (s, p, o, g) order. The first `base_rows`
+/// entries are the base, already in order when `base_sorted`; the rest is
+/// the tail. A sorted base gets its tail sorted and the two runs merged, an
+/// unsorted base a full sort.
 fn order_for_rebuild(raws: &mut [RawQuad], base_rows: usize, base_sorted: bool) {
     if !base_sorted {
         raws.sort_unstable();
@@ -71,28 +66,14 @@ impl StoreParts {
 
 impl VortexRdfStore {
     /// The rows this view covers, base and tail combined, as one array of
-    /// primary columns — plus the index components describing them and, when
-    /// a tailed Dictionary view re-encoded them, the *fresh* term dictionary
-    /// those codes address.
-    ///
-    /// Components are included only when their `rid`s actually address the
-    /// returned rows: an unrefined, untombstoned owner passes its components
-    /// through (in memory) or lifts its index children (file); an owner that
-    /// is tailed, or tombstoned and indexed, REBUILDS them over the surviving
-    /// rows (the held components' rids predate the mutation); a narrowed
-    /// view returns none — its gathered rows are renumbered, and rebuilding
-    /// indexes for an arbitrary view is compaction's job, not
-    /// serialization's.
-    ///
-    /// A rebuild also **reorders** the rows it re-emits (see
-    /// [`order_for_rebuild`]), so the merged output is `(s, p, o, g)`-sorted
-    /// and carries the subject stamp — serialization preserves the store's
-    /// quads, not their row numbering.
-    ///
-    /// A tailed Dictionary view re-encodes its rows against a fresh
-    /// dictionary, which is preferred here over the store's cached one (the
-    /// cache predates the tail and would mismatch the new codes); otherwise a
-    /// file-backed dictionary is lifted resident transiently for the write.
+    /// primary columns with the index components describing them and, under
+    /// the Dictionary layout, the term dictionary the codes address. An
+    /// unrefined, untombstoned owner passes its components through (in
+    /// memory) or lifts its index children (file); an owner that is tailed, or
+    /// tombstoned and indexed, rebuilds them over the surviving rows and
+    /// re-emits the rows in `(s, p, o, g)` order (a tailed Dictionary view
+    /// against a fresh dictionary); a narrowed view returns no components. A
+    /// file-backed dictionary is lifted resident for the write.
     pub async fn to_serializable_parts(&self) -> Result<StoreParts> {
         let base = self.base_selected_rows().await?;
         let owner_shaped = self.quads.is_unrefined();
@@ -112,9 +93,8 @@ impl VortexRdfStore {
         let components = if owner_shaped && !tombstoned {
             match &self.quads {
                 QuadsSource::InMemory { components, .. } => components.to_vec(),
-                // An unrefined file view reads its index children
-                // wholesale, so a file-backed store's serialization (and
-                // the bindings' in-memory round-trip) keeps its indexes.
+                // An unrefined file view's serialization keeps its index
+                // children.
                 #[cfg(feature = "file-io")]
                 QuadsSource::File { file, .. } => scanned_index_components(file).await?,
             }
@@ -135,11 +115,10 @@ impl VortexRdfStore {
         })
     }
 
-    /// Serialize this store to native-container bytes: the quad table as the
-    /// transparent root child, the dictionary and index copies as auxiliary
-    /// children. The exchange format of the bindings — read back with
-    /// [`from_bytes`](Self::from_bytes) or written to disk as a `.vortex`
-    /// file.
+    /// This store as native-container bytes: the quad table as the transparent
+    /// root child, the dictionary and index children as auxiliary children;
+    /// read back with [`from_bytes`](Self::from_bytes) or written as a
+    /// `.vortex` file.
     #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
     pub async fn to_bytes(&self) -> Result<Vec<u8>> {
         let stream = self.to_serializable_parts().await?.into_stream()?;
