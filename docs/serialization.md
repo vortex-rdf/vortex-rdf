@@ -153,24 +153,24 @@ flowchart TD
 
 **String layouts.** The stream is drained into a `Vec<RawQuad>`, sorted, and
 built into one struct of primary columns through
-[`build_struct_array`](../core/src/store/builders/mod.rs#L167); the requested
+[`build_struct_array`](../core/src/store/builders/mod.rs#L165); the requested
 index families are sorted over that same vector ([§8](#8-secondary-indexes-at-build-time)).
 
 **Dictionary layout.** Terms are interned as they arrive
-([`InterningQuadBuilder`](../core/src/store/layouts/dictionary/ingest.rs#L162)):
+([`InterningQuadBuilder`](../core/src/store/layouts/dictionary/ingest.rs#L180)):
 each distinct term is held once (a `Box<str>` keyed map), and each quad is kept
 as four provisional `u32` codes. `finish` sorts the distinct terms, freezes them
 into the dictionary, replaces every provisional code by its term's sorted rank —
 which *is* the dictionary code — and sorts the coded rows. Because codes are
 lexicographic ranks, sorting `[u32; 4]` rows is the same order as sorting the
 term strings, so the sort moves 16-byte rows instead of four-string structs.
-[`DictionaryQuadSink`](../core/src/store/layouts/dictionary/ingest.rs#L120) is
+[`DictionaryQuadSink`](../core/src/store/layouts/dictionary/ingest.rs#L149) is
 the push-based form of the same ingest, for callers that produce quads one at a
 time (the wasm array path).
 
 **Streaming variant.** `build_vortex_stream` still sorts the whole dataset in
 memory but emits the primary columns as windows of
-[`DEFAULT_CHUNK_ROWS`](../core/src/store/builders/mod.rs#L52) rows (100,000)
+[`DEFAULT_CHUNK_ROWS`](../core/src/store/builders/mod.rs#L50) rows (100,000)
 only as the writer polls; the components are complete arrays riding beside the
 stream as replayable sources.
 
@@ -204,7 +204,7 @@ flowchart TD
 that would overflow is sorted and spilled as one run file. A dataset that fits
 in a single buffer never touches the filesystem — the sorted buffer *is* the
 run. Under the Dictionary layout every term is also inserted into a
-[`TermDictionaryBuilder`](../core/src/store/layouts/dictionary/ingest.rs#L41)
+[`TermDictionaryBuilder`](../core/src/store/layouts/dictionary/ingest.rs#L91)
 during this same pass, so the global dictionary is complete before any chunk
 flows; the whole distinct-term set is the one thing this pipeline holds for the
 dataset's lifetime.
@@ -213,13 +213,13 @@ dataset's lifetime.
 yields the globally next quad in `(s, p, o, g)` order.
 
 **Phase 3 — emission.** Without indexes the merge is lazy
-([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L150)):
+([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L149)):
 every poll of the chunk stream pulls up to a chunk's worth of quads off the
 heap and builds one struct
-([`build_struct_array`](../core/src/store/builders/mod.rs#L167), or
-[`dictionary::build_chunk`](../core/src/store/layouts/dictionary/mod.rs#L144)
+([`build_struct_array`](../core/src/store/builders/mod.rs#L165), or
+[`dictionary::build_chunk`](../core/src/store/layouts/dictionary/mod.rs#L16)
 encoding each term through the term→code map). With indexes the merge runs to
-completion first ([`merge_quads_feeding_indexes`](../core/src/store/builders/sorted_stream.rs#L326)):
+completion first ([`merge_quads_feeding_indexes`](../core/src/store/builders/sorted_stream.rs#L325)):
 row ids are only known as the merge assigns them, and an index child is a
 *globally* sorted table over those ids, so it needs a second external sort.
 Each merged quad's terms (strings, or codes under Dictionary) are pushed into
@@ -277,17 +277,17 @@ is the sorted set of every distinct term of the dataset — subjects, predicates
 objects and graph names in one namespace, the default graph's `""` included. A
 term's code is its position, so code order equals string order and a bound
 term resolves to its code by binary search. The frozen column is
-FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/term_dict.rs#L273)):
+FSST-compressed at the source ([`from_sorted_column`](../core/src/store/layouts/dictionary/storage.rs#L162)):
 one symbol table is trained on the whole column and the terms are compressed in
-independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/term_dict.rs#L53)
+independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage.rs#L30)
 (65,536) terms, each window a self-contained FSST array. The term count must
 fit an `i32`.
 
 Which pipeline built the dictionary decides how its term→code map is held during
 encoding: borrowed from the live quads in memory
-([`from_quads_with_map`](../core/src/store/layouts/dictionary/term_dict.rs#L359)),
+([`from_quads_with_map`](../core/src/store/layouts/dictionary/ingest.rs#L73)),
 owned when the quads were spilled and cannot be borrowed from
-([`TermDictionaryBuilder::finish`](../core/src/store/layouts/dictionary/ingest.rs#L64)).
+([`TermDictionaryBuilder::finish`](../core/src/store/layouts/dictionary/ingest.rs#L113)).
 Either way the map exists only for the build; stores keep the columnar
 dictionary alone.
 
@@ -297,7 +297,7 @@ dictionary alone.
 
 Indexes never ride inside the quad rows: a builder emits primary-only rows plus
 one *component* per requested family, and that is the only form index data ever
-takes — in memory as an [`IndexComponent`](../core/src/store/indexes/components.rs#L168),
+takes — in memory as an [`IndexComponent`](../core/src/store/indexes/components.rs#L121),
 in a file as an auxiliary child.
 
 | Index | Children | Columns | Sorted by |
@@ -310,9 +310,9 @@ Term columns use the layout's encoding — strings under `Default` and
 for the index), `u32` codes under `Dictionary` — and `rid` is always the `u32`
 position of the quad in the sorted primary rows.
 
-**In memory** ([`build_components`](../core/src/store/builders/mod.rs#L234)) each
+**In memory** ([`build_components`](../core/src/store/builders/mod.rs#L232)) each
 family is a permutation of the complete sorted dataset: sort the row ids by the
-family's comparator ([`CopyFamily::cmp_quads`](../core/src/store/indexes/secondary_by_copy.rs#L141),
+family's comparator ([`CopyFamily::cmp_quads`](../core/src/store/indexes/copy.rs#L93),
 or the code tuple under Dictionary), then gather the columns through that
 permutation — the permutation itself is the `rid` column. The lead sort column
 is stamped `IsSorted`.
@@ -394,7 +394,7 @@ store's *compressed-resident* form
   match fast paths probe the compressed source while the code-column payload
   path decodes the canonical primitive once into the wrapper's cache;
 - the encoded-search probes over every column are resolved up front
-  ([`StructProbes::warm`](../core/src/store/probes.rs#L43)), so no query pays the
+  ([`StructProbes::warm`](../core/src/store/probes.rs#L35)), so no query pays the
   encoding-tree walk.
 
 The other in-memory constructor, [`from_parts`](../core/src/store/mod.rs#L233),
@@ -492,7 +492,7 @@ every other format decodes to `oxrdf` terms and drives the `oxrdfio` serializer.
 | External merge sort, index spill mergers | [`core/src/store/builders/sorted_stream.rs`](../core/src/store/builders/sorted_stream.rs), [`spill.rs`](../core/src/store/builders/spill.rs) |
 | Layout columns | [`core/src/store/layouts/default.rs`](../core/src/store/layouts/default.rs), [`typed_object.rs`](../core/src/store/layouts/typed_object.rs), [`dictionary/mod.rs`](../core/src/store/layouts/dictionary/mod.rs) |
 | Dictionary construction, interning, FSST windows | [`core/src/store/layouts/dictionary/ingest.rs`](../core/src/store/layouts/dictionary/ingest.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs) |
-| Index children | [`core/src/store/indexes/secondary_by_copy.rs`](../core/src/store/indexes/secondary_by_copy.rs), [`secondary_by_reference.rs`](../core/src/store/indexes/secondary_by_reference.rs), [`components.rs`](../core/src/store/indexes/components.rs) |
+| Index children | [`core/src/store/indexes/copy.rs`](../core/src/store/indexes/copy.rs), [`secondary_by_reference.rs`](../core/src/store/indexes/reference.rs), [`components.rs`](../core/src/store/indexes/components.rs) |
 | Write driver and entry points | [`core/src/io/ser.rs`](../core/src/io/ser.rs) |
 | Container write strategy, component sources, wire metadata | [`core/src/io/container/write.rs`](../core/src/io/container/write.rs), [`sources.rs`](../core/src/io/container/sources.rs), [`wire.rs`](../core/src/io/container/wire.rs) |
 | In-memory adoption, compressed-resident form | [`core/src/store/mod.rs`](../core/src/store/mod.rs), [`array.rs`](../core/src/store/array.rs), [`probes.rs`](../core/src/store/probes.rs) |

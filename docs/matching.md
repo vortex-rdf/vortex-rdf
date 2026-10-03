@@ -260,8 +260,8 @@ Each stage in the code, and where the details are below:
 |---|---|---|
 | Prelude | [`matching.rs:213-242`](../core/src/store/query/matching.rs#L213-L242) | — |
 | 1 · prefix probe | [`matching.rs:244-327`](../core/src/store/query/matching.rs#L244-L327), [`search_sorted_bounds`](../core/src/store/array.rs#L178) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`matching.rs:329-399`](../core/src/store/query/matching.rs#L329-L399), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L491) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`matching.rs:401-442`](../core/src/store/query/matching.rs#L401-L442), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L184), [`mask_for`](../core/src/store/query/matching.rs#L737) | [§6.3](#63-residual-column-filtering) |
+| 2 · secondary-index routing | [`matching.rs:329-399`](../core/src/store/query/matching.rs#L329-L399), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L268) | [§6.2](#62-secondary-index-routing) |
+| 3 · residual column filtering | [`matching.rs:401-442`](../core/src/store/query/matching.rs#L401-L442), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L183), [`mask_for`](../core/src/store/query/matching.rs#L737) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`matching.rs:444-458`](../core/src/store/query/matching.rs#L444-L458) | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
@@ -523,10 +523,10 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`matching.rs:494-505`](../core/src/store/query/matching.rs#L494-L505) | — |
-| 1 · subject chunk probe | [`matching.rs:506-524`](../core/src/store/query/matching.rs#L506-L524), [`locate_subject_run`](../core/src/store/scan/file_scan.rs#L478) | [§7.1](#71-subject-chunk-probe) |
-| 2 · secondary-index routing | [`matching.rs:525-541`](../core/src/store/query/matching.rs#L525-L541), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L515) | [§8](#8-the-index-resolvers) |
-| 3 · pushed-down filter | [`matching.rs:554-638`](../core/src/store/query/matching.rs#L554-L638), [`build_file_filter`](../core/src/store/scan/file_scan.rs#L463) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`matching.rs:547-548`](../core/src/store/query/matching.rs#L547-L548) and [`matching.rs:639-688`](../core/src/store/query/matching.rs#L639-L688), [`row_range_from_pruning`](../core/src/store/scan/file_scan.rs#L680) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| 1 · subject chunk probe | [`matching.rs:506-524`](../core/src/store/query/matching.rs#L506-L524), [`locate_subject_run`](../core/src/store/scan/file_reads.rs#L229) | [§7.1](#71-subject-chunk-probe) |
+| 2 · secondary-index routing | [`matching.rs:525-541`](../core/src/store/query/matching.rs#L525-L541), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L290) | [§8](#8-the-index-resolvers) |
+| 3 · pushed-down filter | [`matching.rs:554-638`](../core/src/store/query/matching.rs#L554-L638), [`build_file_filter`](../core/src/store/scan/file_reads.rs#L150) | [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`matching.rs:547-548`](../core/src/store/query/matching.rs#L547-L548) and [`matching.rs:639-688`](../core/src/store/query/matching.rs#L639-L688), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L292) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
 stage narrows a `RowSelection` directly; here stage 3 can only *describe* the
@@ -536,7 +536,7 @@ scan can honour without reading data.
 ### 7.1 Subject chunk probe
 
 The file mirror of the in-memory subject binary search
-([`locate_subject_run`](../core/src/store/scan/file_scan.rs#L478)): it
+([`locate_subject_run`](../core/src/store/scan/file_reads.rs#L229)): it
 binary-searches the subject column's **encoded chunks** through cached chunk
 probes, reading only the chunks the bisection touches. It requires `u64::try_from(&probe)` to succeed, so
 it engages **only under the Dictionary layout** — a string-subject file falls
@@ -565,7 +565,7 @@ freshly opened file, which fetches the chunks it bisects, ≈ 0.75 ms.
 ### 7.2 Zone-map pruning
 
 When no index resolved anything and no subject range was found,
-[`row_range_from_pruning`](../core/src/store/scan/file_scan.rs#L680) runs one
+[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L292) runs one
 `pruning_evaluation` per filter conjunct over the whole file — statistics only,
 no row data — and collapses the surviving mask to its enclosing contiguous
 range. Interior gaps are kept (the scan's own per-split pruning skips them from
@@ -667,13 +667,13 @@ comparator makes the second column sorted inside each lead run). It returns:
   re-sorted only on demand) and **always a serve plan** over the matched run.
 
 **On file:** locates the run by binary-searching the child's cached chunk probes
-([`locate_component_run`](../core/src/store/indexes/row_ids.rs#L49): lead,
+([`locate_component_run`](../core/src/store/indexes/file.rs#L166): lead,
 then a windowed second-key search), integers only. Then:
 
 | Located run | Row ids |
 |---|---|
 | empty | `IndexResolution::Empty` |
-| ≤ 256 rows (`POINT_GATHER_MAX_ROWS`) | **Eager**, via [`rid_point_reads`](../core/src/store/indexes/row_ids.rs#L84) |
+| ≤ 256 rows (`POINT_GATHER_MAX_ROWS`) | **Eager**, via [`rid_point_reads`](../core/src/store/indexes/file.rs#L181) |
 | wider, or unlocated | **Lazy** — a deferred rid-only pushed-down scan |
 
 The serve plan is built from *every* bound non-subject component (p, o, **g**).
@@ -715,12 +715,12 @@ supplies a serve plan** and its row ids are **always eager**.
 run, `sorted_row_ids` puts them back in base row order. Declines when the
 component is absent, unsorted, or probe-incompatible.
 
-**On file:** [`locate_component_run`](../core/src/store/indexes/row_ids.rs#L49)
+**On file:** [`locate_component_run`](../core/src/store/indexes/file.rs#L166)
 binary-searches the value column's chunk probes
 (sorted child + integer probe required). A located run ≤ 256 rows uses
 `rid_point_reads`; a wider one uses a rid-only scan restricted to the range —
 neither pays filter evaluation. Anything the probes decline falls back to
-[`scan_index_row_ids`](../core/src/store/indexes/row_ids.rs#L160), a pushed-down `val == probe` scan that answers whatever the
+[`FileRowIdScan::run`](../core/src/store/indexes/file.rs#L209), a pushed-down `val == probe` scan that answers whatever the
 order.
 
 **Example.** For the running example `index:ref-o` holds
@@ -743,7 +743,7 @@ size: `{val, rid}` pairs are a fraction of a second sorted copy of every quad.
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_scan.rs#L486) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/serve.rs#L521)); unlocated: the pushed-down projected+filtered scan of the index child |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_reads.rs#L359) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/file.rs#L296)); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
 | Dropped when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
 | Tombstones | applied through the plan's `rid` column | applied through the plan's `rid` column |
@@ -1151,7 +1151,7 @@ pure ranges and scan nothing; `str_prefix` on an IRI is a prefix range),
 memoized per dictionary. The verdict rules mirror the Python query layer's
 own fast path, conservatively: `True`/`False` only where that path is
 total, `Unknown` wherever it defers (see
-[`predicates.rs`](../core/src/store/layouts/dictionary/predicates.rs)).
+[`predicates.rs`](../core/src/store/layouts/dictionary/predicates/mod.rs)).
 
 ---
 
@@ -1161,20 +1161,20 @@ total, `Unknown` wherever it defers (see
 |---|---|
 | `match_pattern`, `match_base`, both backends, `match_tail`, `mask_for`, `contains` | [`core/src/store/query/matching.rs`](../core/src/store/query/matching.rs) |
 | Layouts, `QuadPattern`, `PatternCodes`, `Constraints`, `prepare_pattern` | [`core/src/store/layouts/mod.rs`](../core/src/store/layouts/mod.rs) |
-| Dictionary residency and the async prelude | [`core/src/store/layouts/dictionary/access.rs`](../core/src/store/layouts/dictionary/access.rs) |
+| Dictionary residency and the async prelude | [`core/src/store/layouts/dictionary/handles.rs`](../core/src/store/layouts/dictionary/handles.rs) |
 | `RowSelection` / `ViewSelection`, `POINT_GATHER_MAX_ROWS` | [`core/src/store/view/selection.rs`](../core/src/store/view/selection.rs) |
 | Gathering selected rows, point reads through cached probes | [`core/src/store/scan/gather.rs`](../core/src/store/scan/gather.rs) |
 | `IndexResolution`, `ResolvedRowIds`, `LazyRowIds`, planners | [`core/src/store/indexes/mod.rs`](../core/src/store/indexes/mod.rs) |
-| Locating index runs on file, rid point reads and scans, `eq_conjunction` | [`core/src/store/indexes/row_ids.rs`](../core/src/store/indexes/row_ids.rs) |
-| Sorted quad copies (POSG / OSPG) | [`core/src/store/indexes/secondary_by_copy.rs`](../core/src/store/indexes/secondary_by_copy.rs) |
-| Sorted `{val, rid}` pairs | [`core/src/store/indexes/secondary_by_reference.rs`](../core/src/store/indexes/secondary_by_reference.rs) |
+| Locating index runs on file, rid point reads and scans, `eq_conjunction` | [`core/src/store/indexes/file.rs`](../core/src/store/indexes/file.rs) |
+| Sorted quad copies (POSG / OSPG) | [`core/src/store/indexes/copy.rs`](../core/src/store/indexes/copy.rs) |
+| Sorted `{val, rid}` pairs | [`core/src/store/indexes/reference.rs`](../core/src/store/indexes/reference.rs) |
 | Serve plans and the shared decode tail | [`core/src/store/indexes/serve.rs`](../core/src/store/indexes/serve.rs) |
-| Pushed-down filters, split evaluation, pruning, point reads | [`core/src/store/scan/file_scan.rs`](../core/src/store/scan/file_scan.rs) |
+| Pushed-down filters, split evaluation, pruning, point reads | [`core/src/store/scan/file_reads.rs`](../core/src/store/scan/file_reads.rs) |
 | Typed residual/tail equality loops | [`core/src/store/scan/typed_eq.rs`](../core/src/store/scan/typed_eq.rs) |
 | `Keep`, `keep`, `window`, `size_capped`, `exists` | [`core/src/store/query/narrowing.rs`](../core/src/store/query/narrowing.rs) |
 | `Probe`, `match_many`, `count_many` | [`core/src/store/query/batch.rs`](../core/src/store/query/batch.rs) |
 | `DictReader`, `DictSnapshot`, `prefix_range`, tolerant `encode` | [`core/src/store/layouts/dictionary/term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs) |
-| `TermPredicate`, `Verdict`, `KindRanges`, the verdict rules | [`core/src/store/layouts/dictionary/predicates.rs`](../core/src/store/layouts/dictionary/predicates.rs) |
+| `TermPredicate`, `Verdict`, `KindRanges`, the verdict rules | [`core/src/store/layouts/dictionary/predicates/mod.rs`](../core/src/store/layouts/dictionary/predicates/mod.rs) |
 | The RDF/XSD datatype IRIs the predicates and the TypedObject layout share | [`core/src/common/vocab.rs`](../core/src/common/vocab.rs) |
 | Column kernels (`distinct_first_seen`, `value_counts`, `take`, `equi_join_indices`) | [`core/src/columns.rs`](../core/src/columns.rs) |
 | View state (`QuadsSource`, `Tail`) | [`core/src/store/view/mod.rs`](../core/src/store/view/mod.rs) |

@@ -225,13 +225,13 @@ are bare codes and cannot be decoded without it.
 | `name` / `role` | `dictionary` / `dictionary` |
 | `implementation` / `version` | `sorted-terms-fsst-v1` / 1 |
 | `required` / `sorted` | `true` / `true` |
-| schema | one column, [`_dict_term`](../core/src/store/layouts/dictionary/term_dict.rs#L45): non-nullable `Utf8` |
+| schema | one column, [`_dict_term`](../core/src/store/layouts/dictionary/storage.rs#L26): non-nullable `Utf8` |
 | contents | every distinct term of the dataset — subjects, predicates, objects, graph names and the default graph's `""` in one namespace — sorted, each once |
 | codes | implicit: the term at row *i* has code *i* |
 | size limit | at most `i32::MAX` terms |
 
 The column is FSST-compressed **at the source**, in independent windows of
-65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/term_dict.rs#L53))
+65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage.rs#L30))
 that share one symbol table trained on the whole column. The child is written
 through a pass-through strategy ([`dict_child_strategy`](../core/src/io/container/write.rs#L191))
 rather than the default pipeline: a Struct over a Chunked layout of Flat
@@ -253,7 +253,7 @@ sum, no I/O) with a budget:
   decodes one term per step (FSST is not order-preserving, so the search
   cannot run on the compressed bytes); code → term is a positional read.
 - **File-backed** (over budget): the terms stay in the file.
-  [`TermChunks`](../core/src/store/layouts/dictionary/file_backed.rs#L52)
+  [`TermChunks`](../core/src/store/layouts/dictionary/file_backed.rs#L43)
   resolves the child's leaves once; a probe binary-searches by per-row reads,
   fetching only the leaves the bisection crosses, and a fetched leaf stays in
   its wire encoding for the store's lifetime. A match's four bound terms are
@@ -288,7 +288,7 @@ Shared rules:
   resolved through an index compose with row selections, tombstones and
   further matches without renumbering anything ([matching.md §1](matching.md#1-what-a-match-produces)).
 - **One row per quad.** A child whose row count differs from the quad table's
-  fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L77)).
+  fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L54)).
 - **A bound graph is never a sort key**, and neither index answers a
   bound-subject pattern — the sorted quad table is the better path there.
 
@@ -304,7 +304,7 @@ row ids.
 On a file-backed store an index child is never lifted into memory. Under the
 `Dictionary` layout its run is located by binary-searching the child's
 encoded chunks through the chunk probes of [§4](#4-the-quad-table)
-([`locate_component_run`](../core/src/store/indexes/row_ids.rs#L49)): a
+([`locate_component_run`](../core/src/store/indexes/file.rs#L166)): a
 located run of at most `POINT_GATHER_MAX_ROWS` rows is point-read, a wider
 one is read as a scan of exactly that row range. A run the probes cannot
 locate — a string-keyed child under the other layouts — is answered by a
@@ -394,7 +394,7 @@ The pattern `(? ? ex:alice ?)` becomes: code of `<http://example.org/alice>`
 | `size()` on a pending filter | statistics and filter masks only; no row is projected |
 | `from_bytes` / `fromBytes` | everything: the quad table is scanned into memory, the subject stamp is restored from `quads_sorted`, the dictionary is lifted (still FSST), and each index child is adopted by its reader with nothing read — it is scanned and canonicalized on its first use |
 
-The opened handle ([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L30))
+The opened handle ([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L28))
 keeps what repeated queries reuse: the layout reader tree (so zone-map tables
 decode once), the quad table's split ranges, one reader per component,
 per-column chunk-probe handles, memoized pruning envelopes, and bound filter
@@ -471,7 +471,7 @@ open rather than being read around.
 | data block target | ~1 MiB | Vortex default write strategy |
 | `DICT_CHUNK_ROWS` | 65,536 terms per FSST window and leaf | [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs#L46) |
 | `DICT_MAX_RESIDENT_BYTES_DEFAULT` | 512 MiB | [`open.rs`](../core/src/store/persist/open.rs#L108) |
-| `PROBE_CACHE_SLOTS` | 256 | [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs#L432) |
+| `ENCODE_MEMO_SLOTS` | 256 | [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs#L263) |
 | `POINT_GATHER_MAX_ROWS` | 256 rows — a located run at most this wide is point-read through the chunk probes; the file-backed dictionary point-reads a batch of at most this many codes through its chunk leaves and scans a wider one | [`view/selection.rs`](../core/src/store/view/selection.rs#L338) |
 | `DEFAULT_CHUNK_ROWS` | 100,000 rows per builder chunk (a producer batch size; the writer re-blocks at 8,192) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L52) |
 
@@ -487,9 +487,9 @@ open rather than being read around.
 | Opening files and bytes, roster interpretation, residency | [`core/src/store/persist/open.rs`](../core/src/store/persist/open.rs), [`core/src/io/read.rs`](../core/src/io/read.rs) |
 | The opened-file handle and its caches | [`core/src/store/persist/native_file.rs`](../core/src/store/persist/native_file.rs) |
 | Primary column names | [`core/src/store/schema.rs`](../core/src/store/schema.rs), [`layouts/typed_object.rs`](../core/src/store/layouts/typed_object.rs) |
-| Term dictionary: storage, FSST windows, residency, file-backed reads | [`core/src/store/layouts/dictionary/term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`access.rs`](../core/src/store/layouts/dictionary/access.rs), [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs) |
-| Index children: schemas, sort orders, registry, adoption | [`core/src/store/indexes/secondary_by_copy.rs`](../core/src/store/indexes/secondary_by_copy.rs), [`secondary_by_reference.rs`](../core/src/store/indexes/secondary_by_reference.rs), [`components.rs`](../core/src/store/indexes/components.rs) |
+| Term dictionary: storage, FSST windows, residency, file-backed reads | [`core/src/store/layouts/dictionary/term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`access.rs`](../core/src/store/layouts/dictionary/handles.rs), [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs) |
+| Index children: schemas, sort orders, registry, adoption | [`core/src/store/indexes/copy.rs`](../core/src/store/indexes/copy.rs), [`secondary_by_reference.rs`](../core/src/store/indexes/reference.rs), [`components.rs`](../core/src/store/indexes/components.rs) |
 | Chunk probes over wire-encoded leaves | [`encoded-search/src/layout.rs`](../encoded-search/src/layout.rs), [`lib.rs`](../encoded-search/src/lib.rs) |
-| Locating and point-reading index runs on file | [`core/src/store/indexes/row_ids.rs`](../core/src/store/indexes/row_ids.rs), [`scan/gather.rs`](../core/src/store/scan/gather.rs) |
+| Locating and point-reading index runs on file | [`core/src/store/indexes/file.rs`](../core/src/store/indexes/file.rs), [`scan/gather.rs`](../core/src/store/scan/gather.rs) |
 | In-memory forms: compressed-resident columns, probes, view state | [`core/src/store/array.rs`](../core/src/store/array.rs), [`probes.rs`](../core/src/store/probes.rs), [`view/mod.rs`](../core/src/store/view/mod.rs) |
 | Session: registered encodings and zone aggregates | [`core/src/session.rs`](../core/src/session.rs) |

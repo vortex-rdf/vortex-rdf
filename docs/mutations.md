@@ -143,9 +143,9 @@ flowchart TD
 - **The contract.** `match_pattern` deliberately does **not** subtract
   tombstones when it computes a selection (keeping its row positions aligned
   for mask-based refinement); every *read* path does.
-  [`RowSelection::live_mask`](../core/src/store/view/selection.rs#L340) answers
+  [`RowSelection::live_mask`](../core/src/store/view/selection.rs#L350) answers
   "which of this selection's own rows are not tombstoned", and the in-memory
-  reads all go through [`gather_live`](../core/src/store/scan/gather.rs#L22)
+  reads all go through [`gather_live`](../core/src/store/scan/gather.rs#L21)
   — the single place a view becomes rows — so applying the mask cannot be
   forgotten by one of them. [`size`](../core/src/store/read/rows.rs#L38) counts
   the live bits without gathering; the tail applies its own mask through
@@ -153,9 +153,9 @@ flowchart TD
 - **File-backed stores** tombstone the same way (a file cannot be rewritten
   on delete). The doomed set is evaluated to a file-wide mask by
   [`matching_file_row_mask`](../core/src/store/write/mutation.rs#L258) (through
-  [`matching_file_rows`](../core/src/store/scan/file_scan.rs#L407)), and on
+  [`matching_file_rows`](../core/src/store/scan/file_filter.rs#L266)), and on
   every later read the mask is applied **inside the scan**
-  ([`restrict_scan`](../core/src/store/scan/file_scan.rs#L78)) — as an
+  ([`restrict_scan`](../core/src/store/scan/file_reads.rs#L74)) — as an
   `ExcludeByIndex` selection of the deleted ids for an `All` or `Range`
   selection, or subtracted up front from an id list — so it composes with a
   pushed-down filter, whose output carries no row ids to re-align against.
@@ -173,7 +173,7 @@ flowchart TD
 | `compact()` | every live row, base first | every live tail row, then re-sorted with the base |
 
 The rows a rebuild or compaction starts from come from
-[`live_raw_quads`](../core/src/store/read/rows.rs#L501): base rows first (in view
+[`live_raw_quads`](../core/src/store/read/rows.rs#L500): base rows first (in view
 order), then tail rows, tombstones already excluded.
 
 ---
@@ -212,7 +212,7 @@ flowchart TD
 - **A file-backed owner stays file-backed**
   ([`stream_compacted_to_file`](../core/src/store/write/compaction.rs#L99)): the
   sorted rows are streamed through the out-of-core builder
-  ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L150))
+  ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L149))
   into a sibling temp file `<store>.compact-<uuid>.tmp`
   ([`create_store_file`](../core/src/io/ser.rs#L171),
   [`built_stream_to_vortex_writer`](../core/src/io/ser.rs#L124)), which is
@@ -226,7 +226,7 @@ flowchart TD
 - **An in-memory store**, and any *derived view* of a file (whose rows are a
   subset of a file other readers share), rebuilds in memory through
   [`from_raw_quads`](../core/src/store/write/compaction.rs#L146) →
-  [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L272) and adopts
+  [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L270) and adopts
   the result in the same compressed-resident form a freshly built store has
   ([serialization.md §10](serialization.md#10-adopting-a-build-in-memory)).
 
@@ -291,7 +291,7 @@ runs the mutation on the store the view came from.
 | `QuadsSource` (base, selection, `deleted`), `Tail` | [`core/src/store/view/mod.rs`](../core/src/store/view/mod.rs) |
 | `RowSelection::live_mask`, `to_mask` | [`core/src/store/view/selection.rs`](../core/src/store/view/selection.rs) |
 | `gather_live` — the in-memory read paths' one gather | [`core/src/store/scan/gather.rs`](../core/src/store/scan/gather.rs) |
-| `restrict_scan`, `matching_file_rows` — tombstones inside a file scan | [`core/src/store/scan/file_scan.rs`](../core/src/store/scan/file_scan.rs) |
+| `restrict_scan`, `matching_file_rows` — tombstones inside a file scan | [`core/src/store/scan/file_reads.rs`](../core/src/store/scan/file_reads.rs) |
 | `size`, `live_raw_quads` | [`core/src/store/read/rows.rs`](../core/src/store/read/rows.rs) |
 | `match_pattern`, `match_tail`, `contains` | [`core/src/store/query/matching.rs`](../core/src/store/query/matching.rs) |
 | `tail_layout`, `tail_len`, `owned`, `is_owner`, `ensure_owner` | [`core/src/store/mod.rs`](../core/src/store/mod.rs) |
