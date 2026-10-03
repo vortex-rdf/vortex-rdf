@@ -5,9 +5,11 @@ use crate::error::Result;
 #[cfg(feature = "file-io")]
 use crate::error::VortexRdfError;
 use crate::store::QuadsSource;
+#[cfg(feature = "file-io")]
 use crate::store::RawQuad;
-use crate::store::builders::{DEFAULT_CHUNK_ROWS, build_parts_from_raws};
+use crate::store::builders::DEFAULT_CHUNK_ROWS;
 use crate::store::indexes::{Indexes, unique_indexes};
+#[cfg(feature = "file-io")]
 use crate::store::layouts::LayoutStrategy;
 
 use crate::store::VortexRdfStore;
@@ -122,8 +124,8 @@ impl VortexRdfStore {
                 path.parent(),
             )
             .await?;
-            let writer = crate::io::ser::create_store_file(&tmp).await?;
-            crate::io::ser::built_stream_to_vortex_writer(built, writer).await
+            let writer = crate::io::write::create_store_file(&tmp).await?;
+            crate::io::write::built_stream_to_vortex_writer(built, writer).await
         };
         if let Err(e) = write.await {
             // Don't leave a partial temp file behind on a write failure.
@@ -138,23 +140,6 @@ impl VortexRdfStore {
         })?;
         // Reopen with the caller's pinned residency budget, not the default.
         Self::from_file_with_dict_residency(path, dict_max_resident_bytes).await
-    }
-
-    /// Build a fresh owning in-memory store from raw quads under `strategy` —
-    /// the shared back half of compaction (see [`build_parts_from_raws`]).
-    /// `sorted` must be `true` only when `raws` is SPOG-sorted.
-    fn from_raw_quads(
-        raws: &[RawQuad],
-        strategy: LayoutStrategy,
-        indexes: Indexes,
-        sorted: bool,
-    ) -> Result<Self> {
-        let (base, components, dict) = build_parts_from_raws(raws, strategy, &indexes, sorted)?;
-        let layout = crate::store::resolved_layout(dict, base.dtype())?;
-        // Compress like every other construction — a compacted store carries
-        // the same resident form a freshly built one does.
-        let (base, components) = crate::store::compress_built_parts(base, components)?;
-        Self::assemble_resident(base, components, layout)
     }
 
     /// Whether `add_quads` should fold the tail into the base now.

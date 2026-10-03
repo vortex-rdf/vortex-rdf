@@ -332,7 +332,7 @@ impl VortexRdfStore {
                 ComponentKind::Skip => {}
             }
         }
-        let layout = crate::store::resolved_layout(dict, quads.dtype())?;
+        let layout = crate::store::construct::resolved_layout(dict, quads.dtype())?;
         Self::assemble_resident(quads, components, layout)
     }
 }

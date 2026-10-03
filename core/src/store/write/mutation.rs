@@ -1,11 +1,12 @@
 //! Mutations: appends accrete in the tail and deletes tombstone, so the base
 //! (its row ids, indexes and file handle) is never rewritten in place.
 
-use crate::error::Result;
+use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
 use crate::store::builders::build_struct_array;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_filter;
+use crate::store::view::selection::RowSelection;
 use crate::store::{QuadsSource, Tail};
 
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
@@ -17,6 +18,42 @@ use crate::store::VortexRdfStore;
 
 impl VortexRdfStore {
     // ── mutations ─────────────────────────────────────────────────────────────
+
+    /// This store as an owner that can be mutated: a cheap clone when it
+    /// already owns its rows, else an independent compacted copy with its
+    /// declared indexes rebuilt
+    /// ([`compact_with_indexes`](Self::compact_with_indexes)).
+    pub async fn owned(&self) -> Result<Self> {
+        if self.is_owner() {
+            Ok(self.clone())
+        } else {
+            self.compact_with_indexes(self.indexes.clone()).await
+        }
+    }
+
+    /// Whether this store owns its rows: an unrefined base and an unnarrowed
+    /// tail. Only an owner may be mutated; a view selecting everything counts
+    /// as an owner.
+    pub(in crate::store) fn is_owner(&self) -> bool {
+        let tail_owned = self
+            .tail
+            .as_ref()
+            .is_none_or(|tail| matches!(tail.selection, RowSelection::All));
+        tail_owned && self.quads.is_unrefined()
+    }
+
+    /// Err unless [`is_owner`](Self::is_owner).
+    fn ensure_owner(&self, operation: &str) -> Result<()> {
+        if self.is_owner() {
+            return Ok(());
+        }
+        Err(VortexRdfError::InvalidOperation(format!(
+            "{operation} is not supported on a store derived from match_pattern: its rows are a \
+             view onto a larger base, so mutating it would either silently drop the rows outside \
+             the view or write through to data it does not own. Call owned() for an \
+             independent copy to mutate, or call the mutation on the store the view came from."
+        )))
+    }
 
     /// Append a single quad: [`add_quads`](Self::add_quads) with a batch of
     /// one.

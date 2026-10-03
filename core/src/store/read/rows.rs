@@ -97,7 +97,7 @@ impl VortexRdfStore {
         let mut prims: Vec<PrimitiveArray> = Vec::with_capacity(4);
         for name in schema::PRIMARY_COLUMNS {
             let col = struct_arr.unmasked_field_by_name(name).ok()?;
-            prims.push(crate::store::array::shared_u32_primitive(col)?);
+            prims.push(crate::store::resident::shared_u32_primitive(col)?);
         }
         let selection = selection.materialized().ok()?;
         let column = |prim: &PrimitiveArray| -> Buffer<u32> {

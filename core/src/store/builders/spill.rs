@@ -16,6 +16,7 @@ use rkyv::util::AlignedVec;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 
 use crate::error::{Result, VortexRdfError};
+use crate::store::RawQuad;
 
 /// Environment variable overriding where spill directories are created — the
 /// escape hatch for putting out-of-core runs on a specific volume. The OS
@@ -370,6 +371,39 @@ impl<T: Ord + Spillable> RunMerger<T> {
     /// Pull up to `n` items off the merge (fewer at the end of the data).
     pub(crate) fn next_batch(&mut self, n: usize) -> Result<Vec<T>> {
         pull_batch(n, || self.next())
+    }
+}
+
+/// Where [`merge_quads_feeding_indexes`] puts the merged quads: straight into
+/// memory when the merge had a single input run, otherwise into a spill file.
+pub(super) enum MergedSink {
+    Memory(Vec<RawQuad>),
+    File {
+        writer: RunWriter<RawQuad>,
+        path: PathBuf,
+    },
+}
+
+impl MergedSink {
+    pub(super) fn push(&mut self, quad: RawQuad) -> Result<()> {
+        match self {
+            MergedSink::Memory(quads) => {
+                quads.push(quad);
+                Ok(())
+            }
+            MergedSink::File { writer, .. } => writer.push(&quad),
+        }
+    }
+
+    /// Close the sink and hand back the merged quads as a readable run.
+    pub(super) fn finish(self) -> Result<Run<RawQuad>> {
+        match self {
+            MergedSink::Memory(quads) => Ok(Run::memory(quads)),
+            MergedSink::File { writer, path } => {
+                writer.finish()?;
+                Run::file(&path)
+            }
+        }
     }
 }
 

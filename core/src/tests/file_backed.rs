@@ -411,7 +411,7 @@ async fn test_file_backed_subject_chunk_probe_requires_sorted() {
         dict: Some(std::sync::Arc::new(dict)),
         quads_sorted: false,
     };
-    crate::io::ser::serialize_parts(&parts, &mut bytes)
+    crate::io::write::serialize_parts(&parts, &mut bytes)
         .await
         .unwrap();
     let dir = tempfile::tempdir().unwrap();

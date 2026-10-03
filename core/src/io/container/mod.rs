@@ -57,9 +57,11 @@ pub(crate) use sources::{NativeComponentWrite, default_child_strategy};
 // gated the same way.
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) use sources::BufferedComponentSource;
+#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+pub(crate) use sources::dict_child_strategy;
 pub(crate) use wire::{StoreComponentDescriptor, StoreComponentRole};
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-pub(crate) use write::{dict_child_strategy, write_store};
+pub(crate) use write::write_store;
 
 #[cfg(test)]
 mod tests {

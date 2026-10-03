@@ -76,7 +76,7 @@ impl<'a> TypedEq<'a> {
     /// non-nullable unsigned-integer column binds through an encoded-search
     /// probe when its encoding resolves one. Nullable columns decline.
     fn bind_col(col: &'a ArrayRef, needle: &'a Needle, canonicalize: bool) -> Option<TypedEq<'a>> {
-        use crate::store::array::{cached_u32_primitive, shared_u32_primitive};
+        use crate::store::resident::{cached_u32_primitive, shared_u32_primitive};
         use vortex_array::dtype::DType;
         if col.dtype().is_nullable() {
             return None;
@@ -342,7 +342,7 @@ mod tests {
         let n = (TYPED_EQ_MAX_ROWS as u32) * 2;
         let sa = wrapped_struct(n);
         let o = sa.unmasked_field_by_name("o").unwrap().clone();
-        assert!(crate::store::array::cached_u32_primitive(&o).is_none());
+        assert!(crate::store::resident::cached_u32_primitive(&o).is_none());
 
         let eqs = eqs(&[("p", 3), ("o", 10)]);
         let ids = typed_residual_ids(&sa, &RowSelection::All, n as usize, &eqs).unwrap();
@@ -350,7 +350,7 @@ mod tests {
             .filter(|i| i % 7 == 3 && i % 11 == 10)
             .collect();
         assert_eq!(ids.as_slice(), &want[..]);
-        assert!(crate::store::array::cached_u32_primitive(&o).is_some());
+        assert!(crate::store::resident::cached_u32_primitive(&o).is_some());
     }
 
     /// A narrow scan stays on point reads and leaves the wrapper compressed.
@@ -365,7 +365,7 @@ mod tests {
         let ids = typed_residual_ids(&sa, &narrow, n as usize, &eqs).unwrap();
         let want: Vec<u64> = (10..90u64).filter(|i| i % 7 == 3 && i % 11 == 10).collect();
         assert_eq!(ids.as_slice(), &want[..]);
-        assert!(crate::store::array::cached_u32_primitive(&o).is_none());
+        assert!(crate::store::resident::cached_u32_primitive(&o).is_none());
     }
 
     /// A canonical non-u32 unsigned column binds through the probe.

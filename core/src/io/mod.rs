@@ -13,7 +13,7 @@ pub(crate) mod read;
 /// wasm, whose bindings exchange file bytes. `container::write` is gated the
 /// same way.
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-pub(crate) mod ser;
+pub(crate) mod write;
 
 #[cfg(feature = "file-io")]
-pub use ser::{quads_stream_to_vortex_file, quads_stream_to_vortex_writer};
+pub use write::{quads_stream_to_vortex_file, quads_stream_to_vortex_writer};

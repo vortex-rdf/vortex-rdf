@@ -146,7 +146,7 @@ impl VortexRdfStore {
     pub async fn to_bytes(&self) -> Result<Vec<u8>> {
         let parts = self.to_serializable_parts().await?;
         let mut bytes = Vec::new();
-        crate::io::ser::serialize_parts(&parts, &mut bytes).await?;
+        crate::io::write::serialize_parts(&parts, &mut bytes).await?;
         Ok(bytes)
     }
 }

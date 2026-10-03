@@ -237,17 +237,17 @@ impl IndexComponent {
 
     /// The rows materialized, integer children kept compressed where a probe
     /// binds them and decoded otherwise
-    /// ([`with_searchable_int_children`](crate::store::array::with_searchable_int_children)).
+    /// ([`with_searchable_int_children`](crate::store::resident::with_searchable_int_children)).
     pub(crate) fn into_searchable(self) -> Result<Self> {
-        self.rebuilt(crate::store::array::with_searchable_int_children)
+        self.rebuilt(crate::store::resident::with_searchable_int_children)
     }
 
     /// The rows with their integer children compressed into probe-supported
     /// encodings
-    /// ([`with_compressed_int_children`](crate::store::array::with_compressed_int_children)),
+    /// ([`with_compressed_int_children`](crate::store::resident::with_compressed_int_children)),
     /// without a payload wrapper.
     pub(crate) fn into_compressed(self) -> Result<Self> {
-        self.rebuilt(|rows| crate::store::array::with_compressed_int_children(rows, false))
+        self.rebuilt(|rows| crate::store::resident::with_compressed_int_children(rows, false))
     }
 
     /// The cached probe over `column`, `None` when its encoding declines.

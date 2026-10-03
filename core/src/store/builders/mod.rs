@@ -119,6 +119,8 @@ pub(crate) mod sorted_in_memory;
 pub(crate) mod sorted_stream;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod spill;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) mod stream_indexes;
 
 pub use sorted_in_memory::SortedInMemoryBuilder;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

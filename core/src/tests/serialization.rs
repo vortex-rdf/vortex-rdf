@@ -1029,7 +1029,7 @@ async fn test_serialize_parts_requires_dictionary_beside_code_rows() {
         dict: None,
         quads_sorted: false,
     };
-    let _ = crate::io::ser::serialize_parts(&parts, &mut Vec::new()).await;
+    let _ = crate::io::write::serialize_parts(&parts, &mut Vec::new()).await;
 }
 
 // ─── Builder parity on the wire ────────────────────────────────────────

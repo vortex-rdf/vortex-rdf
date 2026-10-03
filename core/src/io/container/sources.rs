@@ -190,3 +190,18 @@ pub(crate) fn default_child_strategy() -> Arc<dyn vortex_layout::LayoutStrategy>
             .build(),
     )
 }
+
+/// The dictionary child's pass-through strategy: every chunk the source
+/// emits is written verbatim as one flat leaf under a chunked node — no
+/// sampling, no re-encoding. The chunks are the source's self-contained FSST
+/// windows (`TermDictionary::compress`), so the child's leaves are the
+/// granularity at which `FileBackedDict` point-reads.
+pub(crate) fn dict_child_strategy() -> Arc<dyn vortex_layout::LayoutStrategy> {
+    use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
+    use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
+    use vortex_layout::layouts::struct_::StructStrategy;
+    Arc::new(StructStrategy::new(
+        Arc::new(FlatLayoutStrategy::default()),
+        Arc::new(ChunkedLayoutStrategy::new(FlatLayoutStrategy::default())),
+    ))
+}
