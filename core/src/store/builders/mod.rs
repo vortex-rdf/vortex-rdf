@@ -36,7 +36,7 @@ use crate::store::array::stamp_is_sorted;
 use crate::store::indexes::{IndexComponent, IndexType, Indexes, copy, reference, unique_indexes};
 use crate::store::layouts::dictionary::{QuadCodes, TermDictionary};
 use crate::store::layouts::{LayoutStrategy, dictionary};
-use futures::{Stream, stream};
+use futures::{Stream, StreamExt as _, stream};
 use std::future::Future;
 use std::sync::Arc;
 use vortex_array::arrays::StructArray;
@@ -108,6 +108,52 @@ pub struct BuiltStream {
         allow(dead_code)
     )]
     pub(crate) dict: Option<Arc<TermDictionary>>,
+}
+
+impl BuiltStream {
+    /// A stream of globally sorted chunks with `components` and `dict`
+    /// beside it.
+    pub(crate) fn sorted(
+        dtype: DType,
+        chunks: ChunkStream,
+        components: Vec<crate::io::container::NativeComponentWrite>,
+        dict: Option<Arc<TermDictionary>>,
+    ) -> Self {
+        Self {
+            dtype,
+            chunks,
+            components,
+            quads_sorted: true,
+            dict,
+        }
+    }
+}
+
+/// The chunk emission every builder shares: `next` yields the next chunk of
+/// at most `chunk_size` rows off `source`, `None` once exhausted; `empty`
+/// supplies the schema-carrying chunk of an empty dataset. The first chunk
+/// is built before returning so the dtype is known up front; the rest are
+/// built as polled.
+pub(crate) fn chunk_stream<S: Send + 'static>(
+    mut source: S,
+    chunk_size: usize,
+    mut next: impl FnMut(&mut S, usize) -> Result<Option<ArrayRef>> + Send + 'static,
+    empty: impl FnOnce() -> Result<ArrayRef>,
+) -> Result<(DType, ChunkStream)> {
+    let first = match next(&mut source, chunk_size)? {
+        Some(chunk) => chunk,
+        None => empty()?,
+    };
+    let dtype = first.dtype().clone();
+    let rest = stream::unfold((source, next), move |(mut source, mut next)| async move {
+        match next(&mut source, chunk_size) {
+            Ok(None) => None,
+            Ok(Some(chunk)) => Some((Ok(chunk), (source, next))),
+            Err(e) => Some((Err(into_vortex_error(e)), (source, next))),
+        }
+    });
+    let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
+    Ok((dtype, chunks))
 }
 
 pub(crate) mod sorted_in_memory;

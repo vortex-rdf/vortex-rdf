@@ -165,11 +165,6 @@ impl<T: Spillable> Run<T> {
             RunInner::File(reader) => reader.next(),
         }
     }
-
-    /// Pull up to `n` items off the run (fewer at the end of the data).
-    pub(crate) fn next_batch(&mut self, n: usize) -> Result<Vec<T>> {
-        pull_batch(n, || self.next())
-    }
 }
 
 /// Pull up to `n` items off `next` (fewer once it yields `None`).
@@ -385,6 +380,18 @@ pub(super) enum MergedSink {
 }
 
 impl MergedSink {
+    /// An in-memory sink, or a writer to `merged.bin` under `dir`.
+    pub(super) fn create(dir: &Path, in_memory: bool) -> Result<Self> {
+        if in_memory {
+            return Ok(MergedSink::Memory(Vec::new()));
+        }
+        let path = dir.join("merged.bin");
+        Ok(MergedSink::File {
+            writer: RunWriter::create(&path)?,
+            path,
+        })
+    }
+
     pub(super) fn push(&mut self, quad: RawQuad) -> Result<()> {
         match self {
             MergedSink::Memory(quads) => {

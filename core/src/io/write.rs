@@ -15,8 +15,10 @@
 
 use crate::error::{Result, VortexRdfError};
 
+#[cfg(feature = "file-io")]
 use crate::debug;
 use crate::io::container::{self, default_child_strategy};
+#[cfg(feature = "file-io")]
 use crate::store::LayoutStrategy;
 use crate::store::builders::BuiltStream;
 use vortex_array::stream::ArrayStreamAdapter;
