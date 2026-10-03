@@ -1,40 +1,27 @@
-//! The native store container: the `vortex-rdf.store.v1` grammar, as a
-//! custom Vortex layout root.
-//!
-//! A store file's root layout is `vortex-rdf.store.v1`: child 0 is the
-//! *transparent* `quad-source` — the quad table itself, to which the root
-//! delegates its dtype, row count, and scan — and every further child is an
-//! *auxiliary* component (the term dictionary, the secondary indexes' own
-//! sorted tables, and future additions such as change sets) with its own
-//! rows and schema, written through the same segment sink and addressable by
-//! name. A session that has this layout registered scans the file exactly
-//! like a plain quad table; the components never appear in its columns.
-//!
-//! One concern per module: [`wire`] is the persisted metadata codec
-//! (component descriptors and their JSON stamp), [`layout`] the root layout
-//! vtable and its read-side inspection, [`sources`] the always-compiled
-//! component producers builders construct on every target, and [`write`] the
-//! write strategy, gated like `io::ser`. `ser` assembles a store's parts and drives
-//! [`write::write_store`]; `read` reads the bytes back.
+//! The native store container, a custom Vortex layout root with id
+//! `vortex-rdf.store.v1`: child 0 is the transparent `quad-source` (the quad
+//! table, whose dtype, row count and scan the root delegates to), and
+//! children 1.. are auxiliary components (the term dictionary, the index
+//! children, future change sets) with their own rows and schema, written
+//! through the same segment sink and addressed by name. [`wire`] is the
+//! metadata codec, [`layout`] the root vtable, [`sources`] the component
+//! producers, [`write`] the write strategy.
 
 pub(crate) mod layout;
-// The write strategy is the sole consumer of the sources' write hooks
-// (`buffered_bytes`, the per-child strategy), so native no-file-io builds —
-// which compile the sources but no serializer — see those as dead. One
-// allowance here at the boundary, not per item.
+// Native no-file-io builds compile the sources but no serializer, which
+// leaves their write hooks dead.
 #[cfg_attr(
     not(any(feature = "file-io", target_arch = "wasm32")),
     allow(dead_code)
 )]
 pub(crate) mod sources;
 pub(crate) mod wire;
-/// Write strategy; gated like `io::ser`.
+/// The write strategy; compiled with `io::write`.
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) mod write;
 
-/// Stable identity of the store root layout. Changing the container grammar
-/// (`wire`, `layout`) means a new versioned id, not a silent
-/// reinterpretation.
+/// The store root layout's id; a change to the container grammar is a new
+/// versioned id.
 pub(crate) const STORE_LAYOUT_ID: &str = "vortex-rdf.store.v1";
 /// The transparent quad table is always child 0.
 const QUAD_SOURCE_CHILD: usize = 0;
@@ -49,16 +36,12 @@ pub(crate) const DICT_IMPLEMENTATION: &str = "sorted-terms-fsst-v1";
 pub(crate) use layout::store_metadata_of_bytes;
 #[cfg(feature = "file-io")]
 pub(crate) use layout::subtree_bytes;
-pub(crate) use layout::{
-    RdfStoreLayoutVTable, is_native_file, quads_sorted, register, store_component, store_components,
-};
-pub(crate) use sources::{NativeComponentWrite, default_child_strategy};
-// Consumed only by the write side (`ser` and `IndexComponent::to_write`),
-// gated the same way.
+pub(crate) use layout::{RdfStoreLayoutVTable, is_native_file, register, store_component};
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) use sources::BufferedComponentSource;
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) use sources::dict_child_strategy;
+pub(crate) use sources::{NativeComponentWrite, default_child_strategy};
 pub(crate) use wire::{StoreComponentDescriptor, StoreComponentRole};
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) use write::write_store;
@@ -137,6 +120,31 @@ mod tests {
 
         let dup = encode_store_metadata(false, &[dict.clone(), dict]).unwrap();
         assert!(decode_store_metadata(&dup).is_err());
+    }
+
+    /// The exact root metadata bytes of a two-component store and of a bare
+    /// one: every reader version depends on them.
+    #[test]
+    fn metadata_json_is_pinned() {
+        let dict = dict_descriptor(dict_chunk(&["a"]).dtype().clone());
+        let index = StoreComponentDescriptor {
+            name: "index:posg".into(),
+            role: StoreComponentRole::Index,
+            implementation: "secondary-by-copy/posg".into(),
+            version: 1,
+            required: false,
+            sorted: true,
+            dtype: quad_chunk(0, 1).dtype().clone(),
+        };
+        let bytes = encode_store_metadata(true, &[dict, index]).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            r#"{"version":1,"quads_sorted":true,"components":[{"name":"dictionary","role":"dictionary","implementation":"sorted-terms-fsst-v1","version":1,"required":true,"sorted":true,"fields":[{"name":"_dict_term","kind":"utf8"}]},{"name":"index:posg","role":"index","implementation":"secondary-by-copy/posg","version":1,"required":false,"sorted":true,"fields":[{"name":"s","kind":"u32"},{"name":"p","kind":"u32"},{"name":"o","kind":"u32"},{"name":"g","kind":"u32"}]}]}"#
+        );
+        assert_eq!(
+            std::str::from_utf8(&encode_store_metadata(false, &[]).unwrap()).unwrap(),
+            r#"{"version":1,"quads_sorted":false,"components":[]}"#
+        );
     }
 
     #[test]
@@ -224,8 +232,7 @@ mod tests {
         assert!(source.open().is_err());
     }
 
-    /// The write-side round trips, compiled only where a store can be
-    /// written (natively behind `file-io`, and on wasm).
+    /// The write-side round trips, compiled where the writer is.
     #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
     mod write_tests {
         use std::sync::Arc;

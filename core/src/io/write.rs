@@ -1,19 +1,8 @@
-//! The write side of the native store container.
-//!
-//! Packs a store's parts — the primary quad table plus each index
-//! component's and the dictionary's own
-//! [`NativeComponentWrite`](crate::io::container::NativeComponentWrite) —
-//! into a [`BuiltStream`] and drives
-//! [`write_store`](crate::io::container::write_store) over it, carrying
-//! each part's sortedness provenance onto the descriptors a reader will
-//! trust. Also owns the `quads_stream_to_*` entry points, which run a
-//! builder's chunk stream straight into that writer.
-//!
-//! Reading these bytes back is [`read`](crate::io::read)'s job,
-//! and the container's own on-disk grammar is
-//! [`container`](crate::io::container)'s.
+//! The write side of the native store container: driving a [`BuiltStream`]
+//! into a writer, and the `quads_stream_to_*` entry points that run the
+//! sorted builder straight into one.
 
-use crate::error::{Result, VortexRdfError};
+use crate::error::Result;
 
 #[cfg(feature = "file-io")]
 use crate::debug;
@@ -31,20 +20,11 @@ use crate::store::{Indexes, RawQuad};
 #[cfg(feature = "file-io")]
 use futures::Stream;
 
-/// Stream quads directly into a native store file as compressed chunks.
-///
-/// The build pipeline is the target's, not the caller's: writing a file means
-/// a filesystem exists, so the rows go through the out-of-core global sort
-/// ([`SortedStreamBuilder`]) — the one pipeline whose peak memory does not
-/// scale with the dataset. (The in-memory sort is what targets without a
-/// filesystem use; see [`SortedInMemoryBuilder`].)
-///
-/// [`SortedInMemoryBuilder`]: crate::SortedInMemoryBuilder
-///
-/// Without index children peak memory is bounded by the chunk size; with
-/// them it also includes the in-flight components' compressed size (see
-/// `RdfStoreWriteStrategy::write_stream` for why). The dictionary is complete
-/// before any chunk flows and becomes the required `dictionary` child.
+/// Stream quads into a native store file as compressed chunks, through the
+/// out-of-core [`SortedStreamBuilder`]. Peak memory is bounded by the chunk
+/// size plus, with index children, the in-flight components' compressed
+/// size; the dictionary is complete before any chunk flows and becomes the
+/// required `dictionary` child.
 #[cfg(feature = "file-io")]
 pub async fn quads_stream_to_vortex_writer<S, W>(
     quads: S,
@@ -57,24 +37,18 @@ where
     W: VortexWrite + Unpin + Send,
 {
     let start = debug::timer();
-
     let built = SortedStreamBuilder::build_vortex_stream(Box::new(quads), layout, indexes).await?;
     built_stream_to_vortex_writer(built, writer).await?;
-
     log::debug!(
-        "[ser::quads_stream_to_vortex_writer] Streaming write took {:?}",
+        "[quads_stream_to_vortex_writer] Streaming write took {:?}",
         debug::elapsed(start)
     );
     Ok(())
 }
 
-/// Drive an already-built chunk stream into `writer`: the primary chunks as
-/// the transparent root child, each component and the dictionary as
-/// auxiliary children. The one writer tail — `serialize_parts` wraps a
-/// store's single primary array in it, `quads_stream_to_vortex_writer` (the
-/// streaming entry point) feeds it a builder's stream, and compaction a
-/// stream it built with its own spill-directory placement. The memory bound
-/// is `RdfStoreWriteStrategy::write_stream`'s.
+/// Drive a built chunk stream into `writer`: the primary chunks as the
+/// transparent root child, each component and the dictionary as auxiliary
+/// children; then shut the writer down.
 pub(crate) async fn built_stream_to_vortex_writer<W>(
     built: BuiltStream,
     mut writer: W,
@@ -86,7 +60,6 @@ where
     if let Some(dict) = &built.dict {
         components.push(dict.to_write()?);
     }
-
     container::write_store(
         &crate::session::VORTEX_SESSION,
         &mut writer,
@@ -95,16 +68,12 @@ where
         built.quads_sorted,
         components,
     )
-    .await
-    .map_err(VortexRdfError::Vortex)?;
-
-    // A shutdown failure is writer I/O, not an encoding problem — surface it
-    // through the `Io` variant.
-    writer.shutdown().await.map_err(VortexRdfError::Io)
+    .await?;
+    writer.shutdown().await?;
+    Ok(())
 }
 
-/// Serialize a quad stream to a native store file at `path` — the path-based
-/// convenience over [`quads_stream_to_vortex_writer`].
+/// Serialize a quad stream to a native store file at `path`.
 #[cfg(feature = "file-io")]
 pub async fn quads_stream_to_vortex_file<S>(
     quads: S,
@@ -119,12 +88,12 @@ where
     quads_stream_to_vortex_writer(quads, writer, layout, indexes).await
 }
 
-/// Create the file a store is written to, reporting a failure as
-/// [`VortexRdfError::Io`] with `path` in the message.
+/// Create the file a store is written to; a failure is reported as
+/// `VortexRdfError::Io` naming `path`.
 #[cfg(feature = "file-io")]
 pub(crate) async fn create_store_file(path: &std::path::Path) -> Result<tokio::fs::File> {
     tokio::fs::File::create(path).await.map_err(|e| {
-        VortexRdfError::Io(std::io::Error::new(
+        crate::error::VortexRdfError::Io(std::io::Error::new(
             e.kind(),
             format!("create {path:?}: {e}"),
         ))

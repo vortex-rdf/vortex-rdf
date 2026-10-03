@@ -283,7 +283,8 @@ async fn filter_codes_matches_eval() {
         "\"a\\\"b\"".to_string(),
         "\"x\"^^<http://ex.org/dt>".to_string(),
     ] {
-        let term = crate::common::terms::parse_term(&spelling).unwrap();
+        let term =
+            crate::common::terms::term(&spelling, crate::common::terms::Trust::Stored).unwrap();
         quads.push(Quad::new(
             s.clone(),
             p.clone(),

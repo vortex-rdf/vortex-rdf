@@ -24,10 +24,12 @@ pub(crate) struct RdfStoreLayoutVTable;
 
 pub(super) type RdfStoreLayout = Layout<RdfStoreLayoutVTable>;
 
+/// The root's persisted state: whether the quad rows are in global
+/// `(s, p, o, g)` order, and the component inventory in child order.
 #[derive(Clone, Debug)]
 pub(crate) struct RdfStoreLayoutData {
-    pub(super) quads_sorted: bool,
-    pub(super) components: Arc<[StoreComponentDescriptor]>,
+    pub(crate) quads_sorted: bool,
+    pub(crate) components: Arc<[StoreComponentDescriptor]>,
 }
 
 impl VTable for RdfStoreLayoutVTable {
@@ -108,8 +110,7 @@ impl VTable for RdfStoreLayoutVTable {
         session: &VortexSession,
         ctx: &LayoutReaderContext,
     ) -> VortexResult<LayoutReaderRef> {
-        // The root's scan IS the quad-source scan; auxiliary components stay
-        // independently addressable through `store_component`.
+        // The root's scan is the quad-source child's.
         layout
             .slot(QUAD_SOURCE_CHILD)?
             .ok_or_else(|| {
@@ -119,15 +120,7 @@ impl VTable for RdfStoreLayoutVTable {
     }
 }
 
-/// Whether the quad rows are recorded in global `(s, p, o, g)` order (the
-/// meaning is defined on `WireMetadata::quads_sorted`); a materialized read
-/// restores the subject sorted stamp from it.
-pub(crate) fn quads_sorted(layout: &RdfStoreLayout) -> bool {
-    layout.data().quads_sorted
-}
-
-/// Register the store layout in a session. Called once from the
-/// `VORTEX_SESSION` initializer on every target — reading requires it.
+/// Register the store layout in `session`; reading a store file requires it.
 pub(crate) fn register(session: &VortexSession) {
     use vortex_layout::session::LayoutSessionExt;
     static LAYOUT: RdfStoreLayoutVTable = RdfStoreLayoutVTable;
@@ -140,11 +133,6 @@ pub(super) fn is_native_root(layout: &LayoutRef) -> bool {
 
 pub(crate) fn is_native_file(file: &vortex_file::VortexFile) -> bool {
     is_native_root(file.footer().layout())
-}
-
-/// The persisted component inventory of a native root.
-pub(crate) fn store_components(layout: &RdfStoreLayout) -> &[StoreComponentDescriptor] {
-    &layout.data().components
 }
 
 /// A named auxiliary child of a native root, with its descriptor.
@@ -162,8 +150,8 @@ pub(crate) fn store_component(
     Ok(Some((descriptor, child)))
 }
 
-/// Test-only: the decoded root metadata of serialized store bytes — the
-/// `quads_sorted` bit and the component inventory.
+/// The decoded root metadata of serialized store bytes: the `quads_sorted`
+/// bit and the component inventory.
 #[cfg(all(test, feature = "file-io"))]
 pub(crate) fn store_metadata_of_bytes(bytes: &[u8]) -> (bool, Vec<StoreComponentDescriptor>) {
     use vortex_file::OpenOptionsSessionExt as _;
@@ -173,12 +161,11 @@ pub(crate) fn store_metadata_of_bytes(bytes: &[u8]) -> (bool, Vec<StoreComponent
         .expect("valid Vortex bytes");
     assert!(is_native_file(&file), "not a native store file");
     let typed = file.footer().layout().as_::<RdfStoreLayoutVTable>();
-    (quads_sorted(typed), typed.data().components.to_vec())
+    (typed.data().quads_sorted, typed.data().components.to_vec())
 }
 
 /// On-disk byte size of a layout subtree: the sum of its segments' lengths
-/// across all descendants, resolved through the footer's segment map. This
-/// is the residency-threshold input for auxiliary components.
+/// across all descendants, resolved through the footer's segment map.
 #[cfg(feature = "file-io")]
 pub(crate) fn subtree_bytes(
     layout: &LayoutRef,

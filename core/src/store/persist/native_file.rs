@@ -15,8 +15,7 @@ use vortex_rdf_encoded_search::ColumnChunks;
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::container::{
-    RdfStoreLayoutVTable, StoreComponentDescriptor, is_native_file, quads_sorted, store_component,
-    store_components, subtree_bytes,
+    RdfStoreLayoutVTable, StoreComponentDescriptor, is_native_file, store_component, subtree_bytes,
 };
 use crate::io::read::unsupported_file_error;
 use crate::session::VORTEX_SESSION;
@@ -170,8 +169,8 @@ impl NativeStoreFile {
             return Err(unsupported_file_error(&file));
         }
         let typed = file.footer().layout().as_::<RdfStoreLayoutVTable>();
-        let components = store_components(typed).to_vec();
-        let quads_sorted = quads_sorted(typed);
+        let components = typed.data().components.to_vec();
+        let quads_sorted = typed.data().quads_sorted;
         let child_readers = components.iter().map(|_| OnceLock::new()).collect();
         Ok(Self {
             file,

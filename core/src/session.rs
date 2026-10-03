@@ -1,6 +1,5 @@
-//! Crate-wide Vortex session infrastructure. Lives at the crate root because
-//! executing *any* Vortex kernel — an in-memory decode as much as a file scan
-//! — needs the session's registries.
+//! The crate-wide Vortex session: the registries every kernel execution and
+//! file scan needs.
 
 use std::sync::LazyLock;
 
@@ -18,10 +17,9 @@ use vortex_io::session::RuntimeSessionExt;
 
 /// The one Vortex session: array, layout, scalar-fn and runtime registries,
 /// with the store's container layout registered and the store edition
-/// enabled. The runtime handle is the only per-target piece: tokio on native
-/// file-io builds; the microtask-queue `WasmRuntime` on
-/// wasm32-unknown-unknown, where the file writer spawns tasks; none on native
-/// no-file-io builds, whose code paths are all handle-free.
+/// enabled. The runtime handle is per target: tokio on native file-io
+/// builds, the microtask-queue `WasmRuntime` on wasm32-unknown-unknown, none
+/// on native no-file-io builds (whose code paths are handle-free).
 pub(crate) static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = VortexSession::empty()
         .with::<ArraySession>()
@@ -43,12 +41,12 @@ pub(crate) static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
 const STORE_EDITION: vortex_edition::EditionId =
     vortex_edition::EditionId::new("vortexrdf", 2026, 8, 0);
 
-/// The zone-map aggregate ids the vortex file writer emits by default
-/// (bounded min/max for string columns, min/max otherwise, nan and null
-/// counts). The aggregate registry cannot be enumerated, so this list is
-/// mirrored by hand: an id the writer emits that is missing here makes every
-/// file write fail with an edition error. The inline test below checks it
-/// against the writer's per-dtype defaults for the schema's column types.
+/// The zone-map aggregate ids the file writer emits by default (bounded
+/// min/max for strings, min/max otherwise, nan and null counts). The
+/// aggregate registry cannot be enumerated, so the list is kept by hand; an
+/// id the writer emits that is missing here fails every file write with an
+/// edition error. The test below checks it against the writer's per-dtype
+/// defaults.
 const ZONE_AGGREGATES: [&str; 6] = [
     "vortex.bounded_max",
     "vortex.bounded_min",
@@ -58,16 +56,14 @@ const ZONE_AGGREGATES: [&str; 6] = [
     "vortex.null_count",
 ];
 
-/// Declare and enable one edition ([`STORE_EDITION`]) containing every
-/// registered array encoding, layout and extension dtype plus
-/// [`ZONE_AGGREGATES`]. The file writer only emits components from an enabled
-/// edition (reading needs registration alone); the edition is a writer
-/// allow-list, so it spans the full registries.
+/// Declare and enable [`STORE_EDITION`] over every registered array
+/// encoding, layout and extension dtype plus [`ZONE_AGGREGATES`]; the file
+/// writer emits only components of an enabled edition.
 fn enable_store_edition(session: &VortexSession) {
     use vortex_array::dtype::session::DTypeSessionExt as _;
     use vortex_array::session::ArraySessionExt as _;
     use vortex_edition::{ComponentKind, Edition, EditionInclusion, EditionSessionExt as _};
-    use vortex_error::{VortexExpect as _, vortex_err};
+    use vortex_error::VortexExpect as _;
     use vortex_layout::session::LayoutSessionExt as _;
 
     let editions = session.editions();
@@ -76,30 +72,11 @@ fn enable_store_edition(session: &VortexSession) {
             id: STORE_EDITION,
             min_library_version: None,
         })
-        .map_err(|error| vortex_err!("{error}"))
         .vortex_expect("the store edition is valid");
     let registered = [
-        (
-            ComponentKind::Array,
-            session
-                .arrays()
-                .registry()
-                .read(|map| map.keys().copied().collect::<Vec<_>>()),
-        ),
-        (
-            ComponentKind::Layout,
-            session
-                .layouts()
-                .registry()
-                .read(|map| map.keys().copied().collect::<Vec<_>>()),
-        ),
-        (
-            ComponentKind::DType,
-            session
-                .dtypes()
-                .registry()
-                .read(|map| map.keys().copied().collect::<Vec<_>>()),
-        ),
+        (ComponentKind::Array, ids(session.arrays().registry())),
+        (ComponentKind::Layout, ids(session.layouts().registry())),
+        (ComponentKind::DType, ids(session.dtypes().registry())),
     ];
     let inclusions = registered
         .iter()
@@ -115,13 +92,16 @@ fn enable_store_edition(session: &VortexSession) {
     for inclusion in inclusions {
         editions
             .declare_inclusion(inclusion)
-            .map_err(|error| vortex_err!("{error}"))
             .vortex_expect("every registered component joins the store edition once");
     }
     session
         .enable_edition(STORE_EDITION)
-        .map_err(|error| vortex_err!("{error}"))
         .vortex_expect("the store edition was just declared");
+}
+
+/// The ids registered in `registry`.
+fn ids<K: Copy, V>(registry: &vortex_session::ArcSwapMap<K, V>) -> Vec<K> {
+    registry.read(|map| map.keys().copied().collect())
 }
 
 #[cfg(test)]
@@ -133,8 +113,7 @@ mod tests {
 
     /// Every zone-map aggregate the file writer emits for the schema's column
     /// dtypes (utf8 strings and unsigned integer codes) is in the enabled
-    /// edition, so no column type the store writes can fail the writer's
-    /// edition check.
+    /// edition.
     #[test]
     fn store_edition_covers_writer_zone_aggregates() {
         let enabled: Vec<String> = VORTEX_SESSION

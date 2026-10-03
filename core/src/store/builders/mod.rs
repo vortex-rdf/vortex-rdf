@@ -224,14 +224,13 @@ pub(crate) fn build_struct_array(
         stamp_is_sorted(&field_arrays[0]);
     }
 
-    StructArray::try_new(
+    Ok(StructArray::try_new(
         field_names.into(),
         field_arrays,
         quads.len(),
         Validity::NonNullable,
-    )
-    .map_err(VortexRdfError::Vortex)
-    .map(|a| a.into_array())
+    )?
+    .into_array())
 }
 
 /// Every requested index's columns, sorted once over the complete in-memory

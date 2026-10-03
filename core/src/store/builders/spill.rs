@@ -205,34 +205,15 @@ impl<T: Spillable> RunReader<T> {
             return Ok(None);
         }
 
-        // A truncated record is a corrupt spill file — a format-level
-        // `Deserialization` failure — while any other read error is plain
-        // filesystem I/O.
         let mut len_bytes = [0u8; 4];
         len_bytes[0] = first_len_byte[0];
-        self.reader.read_exact(&mut len_bytes[1..]).map_err(|e| {
-            if e.kind() == ErrorKind::UnexpectedEof {
-                VortexRdfError::Deserialization(
-                    "Unexpected EOF while reading spill record length".to_string(),
-                )
-            } else {
-                VortexRdfError::Io(e)
-            }
-        })?;
+        read_exact_or_corrupt(&mut self.reader, &mut len_bytes[1..], "length")?;
 
         let len = u32::from_le_bytes(len_bytes) as usize;
-        // Resize without clearing: `read_exact` overwrites all `len` bytes, so
-        // the zero-fill only ever pays for the growth delta.
+        // `read_exact` overwrites every byte, so the resize zero-fills only
+        // the growth.
         self.payload.resize(len, 0);
-        self.reader.read_exact(&mut self.payload).map_err(|e| {
-            if e.kind() == ErrorKind::UnexpectedEof {
-                VortexRdfError::Deserialization(
-                    "Unexpected EOF while reading spill record payload".to_string(),
-                )
-            } else {
-                VortexRdfError::Io(e)
-            }
-        })?;
+        read_exact_or_corrupt(&mut self.reader, &mut self.payload, "payload")?;
 
         // SAFETY: spill files are produced by this process using the matching
         // rkyv serializer and consumed immediately; we don't accept external
@@ -241,6 +222,20 @@ impl<T: Spillable> RunReader<T> {
             .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
         Ok(Some(item))
     }
+}
+
+/// `read_exact` into `buf`; a short read is a corrupt spill file
+/// (`Deserialization`), any other failure plain I/O.
+fn read_exact_or_corrupt(reader: &mut impl Read, buf: &mut [u8], what: &str) -> Result<()> {
+    reader.read_exact(buf).map_err(|e| {
+        if e.kind() == ErrorKind::UnexpectedEof {
+            VortexRdfError::Deserialization(format!(
+                "Unexpected EOF while reading spill record {what}"
+            ))
+        } else {
+            VortexRdfError::Io(e)
+        }
+    })
 }
 
 /// External sort of `T`s: buffers items up to a capacity, spills each full
