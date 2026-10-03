@@ -288,7 +288,7 @@ Shared rules:
   resolved through an index compose with row selections, tombstones and
   further matches without renumbering anything ([matching.md §1](matching.md#1-what-a-match-produces)).
 - **One row per quad.** A child whose row count differs from the quad table's
-  fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L53)).
+  fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L64)).
 - **A bound graph is never a sort key**, and neither index answers a
   bound-subject pattern — the sorted quad table is the better path there.
 
@@ -405,7 +405,7 @@ trees.
 ## 9. The in-memory twin
 
 A store in memory holds the same three pieces the file does, in the forms the
-read paths are written against ([`QuadsSource`](../core/src/store/view/mod.rs#L37)):
+read paths are written against ([`QuadsSource`](../core/src/store/view/mod.rs#L39)):
 
 | In the file | In memory |
 |---|---|

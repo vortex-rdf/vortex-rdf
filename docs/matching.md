@@ -197,7 +197,7 @@ later stages see an empty selection and skip.
 ## 5. Stage C — backend dispatch
 
 Here it is decided **where the base rows live**. `match_base` reads
-the store's [`QuadsSource`](../core/src/store/view/mod.rs#L37) and hands the prelude's witness to the matching backend. `InMemory` holds the
+the store's [`QuadsSource`](../core/src/store/view/mod.rs#L39) and hands the prelude's witness to the matching backend. `InMemory` holds the
 base array (and any index components) resident (i.e., loaded into RAM), so its stages narrow a
 `RowSelection` directly and run synchronously. `File` leaves the rows on disk,
 so its stages can only *define* a filter and a selection for the next scan
@@ -215,7 +215,7 @@ flowchart LR
 
 ## 6. The in-memory path
 
-[`match_base_in_memory`](../core/src/store/query/matching.rs#L191) runs four stages
+[`match_base_in_memory`](../core/src/store/query/matching.rs#L142) runs four stages
 over the base `StructArray`. Each one asks the same two questions — *can I answer
 part of this pattern cheaply?* and *which rows survive?* — narrowing the shared
 `RowSelection` and clearing whatever pattern components it answered, so the next
@@ -223,7 +223,7 @@ stage only sees what is left.
 
 Only the *struct* is canonical. Its columns stay in the compressed encodings
 every in-memory construction gives them
-([`compress_built_parts`](../core/src/store/mod.rs#L169)), and the stages below
+([`compress_built_parts`](../core/src/store/mod.rs#L141)), and the stages below
 search them in place through the cached encoded-search probes. No stage
 decompresses a column; a match decodes nothing but the rows a mask scan has to
 compare ([§6.3](#63-residual-column-filtering)).
@@ -259,9 +259,9 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`matching.rs:213-242`](../core/src/store/query/matching.rs#L213-L242) | — |
-| 1 · prefix probe | [`matching.rs:244-327`](../core/src/store/query/matching.rs#L244-L327), [`search_sorted_bounds`](../core/src/store/array.rs#L178) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`matching.rs:329-399`](../core/src/store/query/matching.rs#L329-L399), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L268) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`matching.rs:401-442`](../core/src/store/query/matching.rs#L401-L442), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L182), [`mask_for`](../core/src/store/query/matching.rs#L737) | [§6.3](#63-residual-column-filtering) |
+| 1 · prefix probe | [`matching.rs:244-327`](../core/src/store/query/matching.rs#L244-L327), [`search_sorted_bounds`](../core/src/store/array.rs#L197) | [§6.1](#61-prefix-probe) |
+| 2 · secondary-index routing | [`matching.rs:329-399`](../core/src/store/query/matching.rs#L329-L399), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L273) | [§6.2](#62-secondary-index-routing) |
+| 3 · residual column filtering | [`matching.rs:401-442`](../core/src/store/query/matching.rs#L401-L442), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L182), [`mask_for`](../core/src/store/query/matching.rs#L534) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`matching.rs:444-458`](../core/src/store/query/matching.rs#L444-L458) | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
@@ -284,7 +284,7 @@ When it engages, the **subject** resolves to its exact `[lo, hi)` run in
   (`probes.by_name(base, "s")`) when the column resolves one and the probe value
   is an integer — the Dictionary layout's code column;
 - otherwise through the per-call
-  [`search_sorted_bounds`](../core/src/store/array.rs#L178), which also handles the
+  [`search_sorted_bounds`](../core/src/store/array.rs#L197), which also handles the
   string layouts' `VarBinView` subject columns.
 
 Then the **roles behind it narrow the run in sort order** — `p` inside the
@@ -481,7 +481,7 @@ longer starts `All` ([§11](#11-chained-matches)).
 
 ## 7. The file path
 
-[`match_base_file`](../core/src/store/query/matching.rs#L486) composes the same
+[`match_base_file`](../core/src/store/query/matching.rs#L366) composes the same
 restrictions as the in-memory path, but **nothing is read**: each stage decides
 what the *next* scan will do, and the result is a filter expression plus a row
 selection.
@@ -523,10 +523,10 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`matching.rs:494-505`](../core/src/store/query/matching.rs#L494-L505) | — |
-| 1 · subject chunk probe | [`matching.rs:506-524`](../core/src/store/query/matching.rs#L506-L524), [`locate_subject_run`](../core/src/store/scan/file_reads.rs#L229) | [§7.1](#71-subject-chunk-probe) |
-| 2 · secondary-index routing | [`matching.rs:525-541`](../core/src/store/query/matching.rs#L525-L541), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L290) | [§8](#8-the-index-resolvers) |
-| 3 · pushed-down filter | [`matching.rs:554-638`](../core/src/store/query/matching.rs#L554-L638), [`build_file_filter`](../core/src/store/scan/file_reads.rs#L150) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`matching.rs:547-548`](../core/src/store/query/matching.rs#L547-L548) and [`matching.rs:639-688`](../core/src/store/query/matching.rs#L639-L688), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L292) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| 1 · subject chunk probe | [`matching.rs:506-524`](../core/src/store/query/matching.rs#L506-L524), [`locate_subject_run`](../core/src/store/scan/file_reads.rs#L249) | [§7.1](#71-subject-chunk-probe) |
+| 2 · secondary-index routing | [`matching.rs:525-541`](../core/src/store/query/matching.rs#L525-L541), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L295) | [§8](#8-the-index-resolvers) |
+| 3 · pushed-down filter | [`match_base_file`](../core/src/store/query/matching.rs#L366), [`prune_by_filter`](../core/src/store/query/matching.rs#L510), [`build_file_filter`](../core/src/store/scan/file_reads.rs#L170) | [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`fold_row_ids`](../core/src/store/query/matching.rs#L583), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L292) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
 stage narrows a `RowSelection` directly; here stage 3 can only *describe* the
@@ -536,7 +536,7 @@ scan can honour without reading data.
 ### 7.1 Subject chunk probe
 
 The file mirror of the in-memory subject binary search
-([`locate_subject_run`](../core/src/store/scan/file_reads.rs#L229)): it
+([`locate_subject_run`](../core/src/store/scan/file_reads.rs#L249)): it
 binary-searches the subject column's **encoded chunks** through cached chunk
 probes, reading only the chunks the bisection touches. It requires `u64::try_from(&probe)` to succeed, so
 it engages **only under the Dictionary layout** — a string-subject file falls
@@ -935,7 +935,7 @@ located by-copy run and a rid scan of the run otherwise.
 
 | Constant | Value | Defined in | Meaning |
 |---|---|---|---|
-| `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/query/matching.rs#L797) | an already-narrowed view below this skips index routing |
+| `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/query/matching.rs#L599) | an already-narrowed view below this skips index routing |
 | `POINT_GATHER_MAX_ROWS` | 256 | [`view/selection.rs`](../core/src/store/view/selection.rs#L338) | runs/selections at or below this are read point-by-point through cached probes (`gather_by_point_reads`, the located-run reads); the file-backed dictionary point-reads a batch of at most this many codes through its chunk leaves and scans a wider one |
 | `TYPED_EQ_MAX_ROWS` | 4096 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L174) | selection size above which the typed row loop declines to the vectorized mask scan: always for a lone residual equality, and for any set that binds a column through an encoded-search probe |
 
