@@ -297,7 +297,7 @@ dictionary alone.
 
 Indexes never ride inside the quad rows: a builder emits primary-only rows plus
 one *component* per requested family, and that is the only form index data ever
-takes — in memory as an [`IndexComponent`](../core/src/store/indexes/components.rs#L121),
+takes — in memory as an [`IndexComponent`](../core/src/store/indexes/components.rs#L120),
 in a file as an auxiliary child.
 
 | Index | Children | Columns | Sorted by |
@@ -312,7 +312,7 @@ position of the quad in the sorted primary rows.
 
 **In memory** ([`build_components`](../core/src/store/builders/mod.rs#L232)) each
 family is a permutation of the complete sorted dataset: sort the row ids by the
-family's comparator ([`CopyFamily::cmp_quads`](../core/src/store/indexes/copy.rs#L93),
+family's comparator ([`CopyFamily::cmp_quads`](../core/src/store/indexes/copy.rs#L94),
 or the code tuple under Dictionary), then gather the columns through that
 permutation — the permutation itself is the `rid` column. The lead sort column
 is stamped `IsSorted`.

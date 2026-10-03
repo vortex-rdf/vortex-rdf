@@ -8,7 +8,6 @@ use std::sync::{Arc, OnceLock};
 
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{PrimitiveArray, StructArray};
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldName;
 use vortex_array::scalar::Scalar;

@@ -80,6 +80,7 @@ impl CopyFamily {
             .expect("the lead column is a child column")
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     /// Where each quad component (s, p, o, g) sits in this family's
     /// `CopyKey` tuple.
     fn key_positions(self) -> [usize; 4] {
