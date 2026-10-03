@@ -59,7 +59,6 @@ impl VortexRdfStore {
     pub async fn compact_with_indexes(&self, indexes: Indexes) -> Result<Self> {
         let unique = unique_indexes(&indexes);
         let mut raws = self.live_raw_quads().await?;
-        raws.sort_unstable();
         // An OWNING file-backed store stays file-backed: stream the live rows
         // through the sorted builder straight over their own source file (no
         // materialized rebuild — quads, index children, and the dictionary
@@ -85,6 +84,7 @@ impl VortexRdfStore {
             )
             .await;
         }
+        raws.sort_unstable();
         Self::from_raw_quads(&raws, self.layout.strategy(), unique, true)
     }
 

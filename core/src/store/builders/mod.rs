@@ -32,12 +32,10 @@
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-use crate::store::array::chunked_or_single;
 use crate::store::array::stamp_is_sorted;
 use crate::store::indexes::{IndexComponent, IndexType, Indexes, copy, reference, unique_indexes};
-use crate::store::layouts::LayoutStrategy;
 use crate::store::layouts::dictionary::{QuadCodes, TermDictionary};
+use crate::store::layouts::{LayoutStrategy, dictionary};
 use futures::{Stream, stream};
 use std::future::Future;
 use std::sync::Arc;
@@ -169,6 +167,9 @@ pub(crate) fn build_struct_array(
     layout: LayoutStrategy,
     s_sorted: bool,
 ) -> Result<ArrayRef> {
+    if layout == LayoutStrategy::Dictionary && quads.is_empty() {
+        return dictionary::build_code_chunk(&QuadCodes::default(), 0..0, s_sorted);
+    }
     let field_names = layout.field_names();
     let field_arrays = layout.build_columns(quads)?;
 
@@ -264,60 +265,28 @@ pub(crate) fn build_components_from_codes(
 /// Dictionary layout — the fresh term dictionary the rows' codes address.
 /// The rebuild every compaction and every mutated store's serialization run.
 ///
-/// The Dictionary layout derives its dictionary from `raws`; an empty set
-/// still yields the components (over empty codes), so the index roster and
-/// its code dtypes survive. `sorted` must be `true` only when `raws` is
-/// SPOG-sorted: it stamps the `s` column. The components are globally
-/// sorted whatever the row order.
+/// `sorted` must be `true` only when `raws` is SPOG-sorted: it stamps the
+/// `s` column. The components are globally sorted whatever the row order.
 pub(crate) fn build_parts_from_raws(
     raws: &[RawQuad],
     strategy: LayoutStrategy,
     indexes: &[IndexType],
     sorted: bool,
-) -> Result<(ArrayRef, Vec<IndexComponent>, Option<Arc<TermDictionary>>)> {
-    use crate::store::layouts::dictionary;
+) -> Result<BuiltArray> {
     match strategy {
-        LayoutStrategy::Dictionary if raws.is_empty() => Ok((
-            dictionary::empty_struct()?,
-            build_components_from_codes(indexes, &QuadCodes::empty())?,
-            Some(Arc::new(TermDictionary::empty())),
-        )),
         LayoutStrategy::Dictionary => {
             let (dict, code_map) = TermDictionary::from_quads_with_map(raws)?;
             let codes = dictionary::encode_quads(raws, &code_map)?;
-            let primary = dictionary::build_code_chunk(&codes, 0..raws.len(), sorted)?;
-            let components = build_components_from_codes(indexes, &codes)?;
-            Ok((primary, components, Some(Arc::new(dict))))
+            Ok(BuiltArray {
+                array: dictionary::build_code_chunk(&codes, 0..raws.len(), sorted)?,
+                components: build_components_from_codes(indexes, &codes)?,
+                dict: Some(Arc::new(dict)),
+            })
         }
-        strategy => {
-            let primary = build_struct_array(raws, strategy, sorted)?;
-            let components = build_components(indexes, raws)?;
-            Ok((primary, components, None))
-        }
+        strategy => Ok(BuiltArray {
+            array: build_struct_array(raws, strategy, sorted)?,
+            components: build_components(indexes, raws)?,
+            dict: None,
+        }),
     }
-}
-
-/// Assemble a builder's per-chunk StructArrays into a single ArrayRef. Every
-/// build emits at least one (possibly empty) chunk, so `chunks` carries the
-/// schema; an empty list is a caller bug.
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) fn assemble_chunks(chunks: Vec<ArrayRef>) -> Result<ArrayRef> {
-    let dtype = chunks
-        .first()
-        .ok_or_else(|| {
-            VortexRdfError::InvalidOperation("assemble_chunks: no chunks to assemble".to_string())
-        })?
-        .dtype()
-        .clone();
-    chunked_or_single(chunks, dtype)
-}
-
-/// An empty StructArray with the given layout's primary schema. Building from
-/// an empty quad slice yields every column empty but with the correct dtype,
-/// so this is just the regular build path with no rows.
-fn make_empty_struct(layout: LayoutStrategy) -> Result<ArrayRef> {
-    if layout == LayoutStrategy::Dictionary {
-        return crate::store::layouts::dictionary::empty_struct();
-    }
-    build_struct_array(&[], layout, false)
 }

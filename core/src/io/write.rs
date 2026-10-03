@@ -18,9 +18,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::debug;
 use crate::io::container::{self, default_child_strategy};
 use crate::store::LayoutStrategy;
-use crate::store::StoreParts;
 use crate::store::builders::BuiltStream;
-use futures::StreamExt as _;
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_io::VortexWrite;
 
@@ -30,52 +28,6 @@ use crate::store::builders::{SortedStreamBuilder, VortexArrayBuilder};
 use crate::store::{Indexes, RawQuad};
 #[cfg(feature = "file-io")]
 use futures::Stream;
-
-/// Serialize a store's split parts — the primary quad array, its in-memory
-/// index components, and (for the Dictionary layout) the term dictionary —
-/// as a native store file. Sortedness provenance is carried faithfully: the
-/// root's `quads_sorted` (see `WireMetadata::quads_sorted`) is
-/// `parts.quads_sorted`, and each index child records its component's
-/// `sorted` flag.
-///
-/// Precondition: a Dictionary-layout primary comes with its dictionary
-/// (`to_serializable_parts` always pairs them).
-pub(crate) async fn serialize_parts<W: VortexWrite + Unpin + Send>(
-    parts: &StoreParts,
-    writer: W,
-) -> Result<()> {
-    let start = debug::timer();
-
-    let primary = parts.array.clone();
-    debug_assert!(
-        !matches!(
-            LayoutStrategy::from_dtype(primary.dtype()),
-            LayoutStrategy::Dictionary
-        ) || parts.dict.is_some(),
-        "to_serializable_parts always pairs a Dictionary primary with its dictionary"
-    );
-
-    let mut components = Vec::with_capacity(parts.components.len());
-    for component in &parts.components {
-        components.push(component.to_write()?);
-    }
-
-    let dtype = primary.dtype().clone();
-    let built = BuiltStream {
-        dtype,
-        chunks: futures::stream::once(async move { Ok(primary) }).boxed(),
-        components,
-        quads_sorted: parts.quads_sorted,
-        dict: parts.dict.clone(),
-    };
-    built_stream_to_vortex_writer(built, writer).await?;
-
-    log::debug!(
-        "[ser::serialize_parts] Vortex writing took {:?}",
-        debug::elapsed(start)
-    );
-    Ok(())
-}
 
 /// Stream quads directly into a native store file as compressed chunks.
 ///

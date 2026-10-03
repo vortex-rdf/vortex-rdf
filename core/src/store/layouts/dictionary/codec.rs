@@ -30,6 +30,7 @@ use super::term_dict::TermDictionary;
 /// Dictionary-encoded quad columns: every term replaced by its u32 code.
 /// Code order is term byte order, so index children built over the codes
 /// sort as they would over the terms.
+#[derive(Default)]
 pub(crate) struct QuadCodes {
     pub(crate) s: Vec<u32>,
     pub(crate) p: Vec<u32>,

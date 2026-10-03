@@ -52,15 +52,10 @@ pub(crate) fn next_generation() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-use indexes::IndexComponent;
-
 use crate::error::{Result, VortexRdfError};
 use layouts::ResolvedLayout;
-use layouts::dictionary::TermDictionary;
 
 use std::sync::Arc;
-
-use vortex_array::ArrayRef;
 
 /// An RDF quad store over a Vortex array or file: a base (in memory or a
 /// file) plus a view over it (a row selection, tombstones and an append
@@ -95,11 +90,9 @@ pub struct VortexRdfStore {
 /// [`VortexRdfStore::to_serializable_parts`] and adopted back by
 /// [`VortexRdfStore::from_parts`].
 pub struct StoreParts {
-    pub(crate) array: ArrayRef,
-    pub(crate) components: Vec<IndexComponent>,
-    pub(crate) dict: Option<Arc<TermDictionary>>,
-    /// Whether `array`'s rows are in global `(s, p, o, g)` order; written as
-    /// the root's `quads_sorted` (see `WireMetadata::quads_sorted`).
+    pub(crate) built: BuiltArray,
+    /// Whether the rows are in global `(s, p, o, g)` order; written as the
+    /// root's `quads_sorted` (see `WireMetadata::quads_sorted`).
     #[cfg_attr(
         not(any(feature = "file-io", target_arch = "wasm32")),
         allow(dead_code)
