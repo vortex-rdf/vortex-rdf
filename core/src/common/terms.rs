@@ -231,26 +231,6 @@ pub(crate) fn term(s: &str, trust: Trust) -> Result<Term> {
     }
 }
 
-/// [`subject`] of a stored spelling.
-pub(crate) fn parse_subject(s: &str) -> Result<NamedOrBlankNode> {
-    subject(s, Trust::Stored)
-}
-
-/// [`named_node`] of a stored spelling.
-pub(crate) fn parse_named_node(s: &str) -> Result<NamedNode> {
-    named_node(s, Trust::Stored)
-}
-
-/// [`term`] of a stored spelling.
-pub(crate) fn parse_object(o: &str) -> Result<Term> {
-    term(o, Trust::Stored)
-}
-
-/// [`graph_name`] of a stored spelling.
-pub(crate) fn parse_graph_name(s: &str) -> Result<GraphName> {
-    graph_name(s, Trust::Stored)
-}
-
 /// A quad from its four stored N-Triples term strings (`g` empty for the
 /// default graph).
 pub(crate) fn quad_from_terms(s: &str, p: &str, o: &str, g: &str) -> Result<Quad> {

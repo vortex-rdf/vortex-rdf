@@ -101,7 +101,7 @@ flowchart TD
     A["match_pattern(s, p, o, g)"] --> B["match_base(s, p, o, g)"]
     B --> C{"store has a tail?"}
     C -- no --> D["return matched view"]
-    C -- yes --> E["match_tail(tail_layout, tail, s, p, o, g)"]
+    C -- yes --> E["match_tail(tail, pattern)"]
     E --> F["matched.tail = narrowed tail"]
     F --> D
 ```
@@ -223,7 +223,7 @@ stage only sees what is left.
 
 Only the *struct* is canonical. Its columns stay in the compressed encodings
 every in-memory construction gives them
-([`compress_built_parts`](../core/src/store/mod.rs#L141)), and the stages below
+([`adopt`](../core/src/store/construct.rs#L105)), and the stages below
 search them in place through the cached encoded-search probes. No stage
 decompresses a column; a match decodes nothing but the rows a mask scan has to
 compare ([§6.3](#63-residual-column-filtering)).
@@ -259,7 +259,7 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`matching.rs:213-242`](../core/src/store/query/matching.rs#L213-L242) | — |
-| 1 · prefix probe | [`matching.rs:244-327`](../core/src/store/query/matching.rs#L244-L327), [`search_sorted_bounds`](../core/src/store/array.rs#L197) | [§6.1](#61-prefix-probe) |
+| 1 · prefix probe | [`matching.rs:244-327`](../core/src/store/query/matching.rs#L244-L327), [`search_sorted_bounds`](../core/src/store/array.rs#L154) | [§6.1](#61-prefix-probe) |
 | 2 · secondary-index routing | [`matching.rs:329-399`](../core/src/store/query/matching.rs#L329-L399), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L273) | [§6.2](#62-secondary-index-routing) |
 | 3 · residual column filtering | [`matching.rs:401-442`](../core/src/store/query/matching.rs#L401-L442), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L182), [`mask_for`](../core/src/store/query/matching.rs#L534) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`matching.rs:444-458`](../core/src/store/query/matching.rs#L444-L458) | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
@@ -274,7 +274,7 @@ rebuild that merges an append tail re-establishes it
 ([`order_for_rebuild`](../core/src/store/persist/serialize.rs)). So the stage is skipped
 only for rows that arrived without the provenance — a foreign or older writer's
 file, whose `quads_sorted: false` keeps
-[`with_subject_stamp`](../core/src/store/array.rs#L124) from inventing a stamp
+[`with_subject_stamp`](../core/src/store/array.rs#L90) from inventing a stamp
 those rows never earned. Compacting such a store restores the fast path.
 
 When it engages, the **subject** resolves to its exact `[lo, hi)` run in
@@ -284,7 +284,7 @@ When it engages, the **subject** resolves to its exact `[lo, hi)` run in
   (`probes.by_name(base, "s")`) when the column resolves one and the probe value
   is an integer — the Dictionary layout's code column;
 - otherwise through the per-call
-  [`search_sorted_bounds`](../core/src/store/array.rs#L197), which also handles the
+  [`search_sorted_bounds`](../core/src/store/array.rs#L154), which also handles the
   string layouts' `VarBinView` subject columns.
 
 Then the **roles behind it narrow the run in sort order** — `p` inside the
@@ -764,7 +764,7 @@ plan.
 ```mermaid
 flowchart TD
     T0{"tail selection already empty?"} -- yes --> TC["carry it unchanged"]
-    T0 -- no --> T1["tail_layout().prepare_pattern(...)<br/>(a string layout: resolves nothing, never suspends)"]
+    T0 -- no --> T1["tail.layout.prepare_pattern(...)<br/>(a string layout: resolves nothing, never suspends)"]
     T1 --> T2{"constraints"}
     T2 -- "AlwaysFalse" --> TE["carry RowSelection::empty()"]
     T2 -- "Eq(eqs), empty" --> TA["unconstrained: carry the selection unchanged"]
@@ -776,7 +776,7 @@ flowchart TD
 
 Notes:
 
-- **`tail_layout()`** is the store's own layout, except under `Dictionary`,
+- **`Tail::layout_for`** gives the tail the store's own layout, except under `Dictionary`,
   where it is `Default`: an appended term has no code in the frozen sorted
   dictionary, so the tail keeps N-Triples strings. Patterns therefore probe the
   base **by code** and the tail **by string**, with two separate witnesses.

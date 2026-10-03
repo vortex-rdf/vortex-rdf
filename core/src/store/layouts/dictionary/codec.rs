@@ -14,7 +14,7 @@ use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
 use crate::common::quad::SharedQuad;
-use crate::common::terms::{parse_graph_name, parse_named_node, parse_object, parse_subject};
+use crate::common::terms::{Trust, graph_name, named_node, subject, term};
 use crate::debug;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
@@ -281,14 +281,18 @@ fn decode_codes(cols: [&[u32]; 4], src: &mut impl TermSource) -> Vec<Result<Quad
 
     (0..n)
         .map(|i| {
-            let subject =
-                sm.get_or_insert(s_codes[i], || parse_subject(src.str_at(0, s_codes[i])?))?;
-            let predicate =
-                pm.get_or_insert(p_codes[i], || parse_named_node(src.str_at(1, p_codes[i])?))?;
-            let object =
-                om.get_or_insert(o_codes[i], || parse_object(src.str_at(2, o_codes[i])?))?;
-            let graph =
-                gm.get_or_insert(g_codes[i], || parse_graph_name(src.str_at(3, g_codes[i])?))?;
+            let subject = sm.get_or_insert(s_codes[i], || {
+                subject(src.str_at(0, s_codes[i])?, Trust::Stored)
+            })?;
+            let predicate = pm.get_or_insert(p_codes[i], || {
+                named_node(src.str_at(1, p_codes[i])?, Trust::Stored)
+            })?;
+            let object = om.get_or_insert(o_codes[i], || {
+                term(src.str_at(2, o_codes[i])?, Trust::Stored)
+            })?;
+            let graph = gm.get_or_insert(g_codes[i], || {
+                graph_name(src.str_at(3, g_codes[i])?, Trust::Stored)
+            })?;
             Ok(Quad::new(subject, predicate, object, graph))
         })
         .collect()
