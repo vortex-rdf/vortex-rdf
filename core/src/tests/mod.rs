@@ -12,6 +12,8 @@ use std::sync::OnceLock;
 
 mod adoption;
 mod builders;
+mod chunks;
+mod data_source;
 mod dictionary;
 #[cfg(feature = "file-io")]
 mod dictionary_file_backed;
@@ -25,6 +27,7 @@ mod indexes;
 #[cfg(feature = "file-io")]
 mod indexes_file;
 mod matching;
+mod metadata;
 mod mutation;
 mod names;
 mod narrowing;
@@ -132,7 +135,7 @@ fn primary_columns(layout: LayoutStrategy) -> &'static [&'static str] {
 /// The names of a build's index children, in emission order — what a schema
 /// assertion checks, since index data never rides in the quad rows.
 fn component_names(built: &BuiltArray) -> Vec<&'static str> {
-    built.components.iter().map(|c| c.name).collect()
+    built.components.iter().map(|c| c.identity.name).collect()
 }
 
 /// Sorted subject strings of every quad a store exposes.

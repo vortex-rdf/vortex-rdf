@@ -1,7 +1,7 @@
 # How a quad pattern is resolved
 
 This document traces what actually runs when a caller asks
-[`VortexRdfStore::match_pattern`](../core/src/store/matching.rs) for the quads
+[`VortexRdfStore::match_pattern`](../core/src/store/query/matching.rs) for the quads
 matching a `(subject, predicate, object, graph)` pattern — every stage, every
 decision point, and how the answer changes with the pattern shape, the storage
 backend (in memory or file), the column layout, the secondary indexes present,
@@ -29,7 +29,7 @@ match, and what lets matches be chained.
 
 Three pieces of vocabulary recur below:
 
-- **`RowSelection`** ([`selection.rs`](../core/src/store/selection.rs)) — `All`,
+- **`RowSelection`** ([`view/selection.rs`](../core/src/store/view/selection.rs)) — `All`,
   a contiguous `Range`, or an ascending unique `Ids` list. A range and an id
   list are mutually exclusive by construction.
 - **`ViewSelection`** — `Exact(RowSelection)` or `Pending(LazyRowIds)`. Pending
@@ -101,7 +101,7 @@ flowchart TD
     A["match_pattern(s, p, o, g)"] --> B["match_base(s, p, o, g)"]
     B --> C{"store has a tail?"}
     C -- no --> D["return matched view"]
-    C -- yes --> E["match_tail(tail_layout, tail, s, p, o, g)"]
+    C -- yes --> E["match_tail(tail, pattern)"]
     E --> F["matched.tail = narrowed tail"]
     F --> D
 ```
@@ -197,7 +197,7 @@ later stages see an empty selection and skip.
 ## 5. Stage C — backend dispatch
 
 Here it is decided **where the base rows live**. `match_base` reads
-the store's [`QuadsSource`](../core/src/store/source.rs#L35) and hands the prelude's witness to the matching backend. `InMemory` holds the
+the store's [`QuadsSource`](../core/src/store/view/mod.rs#L39) and hands the prelude's witness to the matching backend. `InMemory` holds the
 base array (and any index components) resident (i.e., loaded into RAM), so its stages narrow a
 `RowSelection` directly and run synchronously. `File` leaves the rows on disk,
 so its stages can only *define* a filter and a selection for the next scan
@@ -215,7 +215,7 @@ flowchart LR
 
 ## 6. The in-memory path
 
-[`match_base_in_memory`](../core/src/store/matching.rs#L191) runs four stages
+[`match_base_in_memory`](../core/src/store/query/matching.rs#L142) runs four stages
 over the base `StructArray`. Each one asks the same two questions — *can I answer
 part of this pattern cheaply?* and *which rows survive?* — narrowing the shared
 `RowSelection` and clearing whatever pattern components it answered, so the next
@@ -223,7 +223,7 @@ stage only sees what is left.
 
 Only the *struct* is canonical. Its columns stay in the compressed encodings
 every in-memory construction gives them
-([`compress_built_parts`](../core/src/store/mod.rs#L162)), and the stages below
+([`adopt`](../core/src/store/construct.rs#L105)), and the stages below
 search them in place through the cached encoded-search probes. No stage
 decompresses a column; a match decodes nothing but the rows a mask scan has to
 compare ([§6.3](#63-residual-column-filtering)).
@@ -258,11 +258,11 @@ Each stage in the code, and where the details are below:
 
 | Stage | Code | Details |
 |---|---|---|
-| Prelude | [`matching.rs:213-242`](../core/src/store/matching.rs#L213-L242) | — |
-| 1 · prefix probe | [`matching.rs:244-327`](../core/src/store/matching.rs#L244-L327), [`search_sorted_bounds`](../core/src/store/array.rs#L178) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`matching.rs:329-399`](../core/src/store/matching.rs#L329-L399), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L491) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`matching.rs:401-442`](../core/src/store/matching.rs#L401-L442), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L184), [`mask_for`](../core/src/store/matching.rs#L735) | [§6.3](#63-residual-column-filtering) |
-| 4 · finalize | [`matching.rs:444-458`](../core/src/store/matching.rs#L444-L458) | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
+| Prelude | [`matching.rs:213-242`](../core/src/store/query/matching.rs#L213-L242) | — |
+| 1 · prefix probe | [`matching.rs:244-327`](../core/src/store/query/matching.rs#L244-L327), [`search_sorted_bounds`](../core/src/store/array.rs#L154) | [§6.1](#61-prefix-probe) |
+| 2 · secondary-index routing | [`matching.rs:329-399`](../core/src/store/query/matching.rs#L329-L399), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L273) | [§6.2](#62-secondary-index-routing) |
+| 3 · residual column filtering | [`matching.rs:401-442`](../core/src/store/query/matching.rs#L401-L442), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L182), [`mask_for`](../core/src/store/query/matching.rs#L534) | [§6.3](#63-residual-column-filtering) |
+| 4 · finalize | [`matching.rs:444-458`](../core/src/store/query/matching.rs#L444-L458) | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
 
@@ -271,10 +271,10 @@ Engages when the subject is bound **and** the base's `s` column carries the
 rows are in global `(s, p, o, g)` order — nothing this crate writes lacks it:
 every builder sorts, a tombstoned gather preserves the order it inherits, and a
 rebuild that merges an append tail re-establishes it
-([`order_for_rebuild`](../core/src/store/serialize.rs)). So the stage is skipped
+([`order_for_rebuild`](../core/src/store/persist/serialize.rs)). So the stage is skipped
 only for rows that arrived without the provenance — a foreign or older writer's
 file, whose `quads_sorted: false` keeps
-[`with_subject_stamp`](../core/src/store/array.rs#L124) from inventing a stamp
+[`with_subject_stamp`](../core/src/store/array.rs#L90) from inventing a stamp
 those rows never earned. Compacting such a store restores the fast path.
 
 When it engages, the **subject** resolves to its exact `[lo, hi)` run in
@@ -284,7 +284,7 @@ When it engages, the **subject** resolves to its exact `[lo, hi)` run in
   (`probes.by_name(base, "s")`) when the column resolves one and the probe value
   is an integer — the Dictionary layout's code column;
 - otherwise through the per-call
-  [`search_sorted_bounds`](../core/src/store/array.rs#L178), which also handles the
+  [`search_sorted_bounds`](../core/src/store/array.rs#L154), which also handles the
   string layouts' `VarBinView` subject columns.
 
 Then the **roles behind it narrow the run in sort order** — `p` inside the
@@ -481,7 +481,7 @@ longer starts `All` ([§11](#11-chained-matches)).
 
 ## 7. The file path
 
-[`match_base_file`](../core/src/store/matching.rs#L485) composes the same
+[`match_base_file`](../core/src/store/query/matching.rs#L366) composes the same
 restrictions as the in-memory path, but **nothing is read**: each stage decides
 what the *next* scan will do, and the result is a filter expression plus a row
 selection.
@@ -522,11 +522,11 @@ Each stage in the code, and where the details are below:
 
 | Stage | Code | Details |
 |---|---|---|
-| Prelude | [`matching.rs:494-505`](../core/src/store/matching.rs#L494-L505) | — |
-| 1 · subject chunk probe | [`matching.rs:506-524`](../core/src/store/matching.rs#L506-L524), [`locate_subject_run`](../core/src/store/scan/file_scan.rs#L478) | [§7.1](#71-subject-chunk-probe) |
-| 2 · secondary-index routing | [`matching.rs:525-541`](../core/src/store/matching.rs#L525-L541), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L515) | [§8](#8-the-index-resolvers) |
-| 3 · pushed-down filter | [`matching.rs:554-638`](../core/src/store/matching.rs#L554-L638), [`build_file_filter`](../core/src/store/scan/file_scan.rs#L463) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`matching.rs:547-548`](../core/src/store/matching.rs#L547-L548) and [`matching.rs:639-688`](../core/src/store/matching.rs#L639-L688), [`row_range_from_pruning`](../core/src/store/scan/file_scan.rs#L680) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| Prelude | [`matching.rs:494-505`](../core/src/store/query/matching.rs#L494-L505) | — |
+| 1 · subject chunk probe | [`matching.rs:506-524`](../core/src/store/query/matching.rs#L506-L524), [`locate_subject_run`](../core/src/store/scan/file_reads.rs#L249) | [§7.1](#71-subject-chunk-probe) |
+| 2 · secondary-index routing | [`matching.rs:525-541`](../core/src/store/query/matching.rs#L525-L541), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L295) | [§8](#8-the-index-resolvers) |
+| 3 · pushed-down filter | [`match_base_file`](../core/src/store/query/matching.rs#L366), [`prune_by_filter`](../core/src/store/query/matching.rs#L510), [`build_file_filter`](../core/src/store/scan/file_reads.rs#L170) | [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`fold_row_ids`](../core/src/store/query/matching.rs#L583), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L292) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
 stage narrows a `RowSelection` directly; here stage 3 can only *describe* the
@@ -536,7 +536,7 @@ scan can honour without reading data.
 ### 7.1 Subject chunk probe
 
 The file mirror of the in-memory subject binary search
-([`locate_subject_run`](../core/src/store/scan/file_scan.rs#L478)): it
+([`locate_subject_run`](../core/src/store/scan/file_reads.rs#L249)): it
 binary-searches the subject column's **encoded chunks** through cached chunk
 probes, reading only the chunks the bisection touches. It requires `u64::try_from(&probe)` to succeed, so
 it engages **only under the Dictionary layout** — a string-subject file falls
@@ -565,7 +565,7 @@ freshly opened file, which fetches the chunks it bisects, ≈ 0.75 ms.
 ### 7.2 Zone-map pruning
 
 When no index resolved anything and no subject range was found,
-[`row_range_from_pruning`](../core/src/store/scan/file_scan.rs#L680) runs one
+[`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L292) runs one
 `pruning_evaluation` per filter conjunct over the whole file — statistics only,
 no row data — and collapses the surviving mask to its enclosing contiguous
 range. Interior gaps are kept (the scan's own per-split pruning skips them from
@@ -667,13 +667,13 @@ comparator makes the second column sorted inside each lead run). It returns:
   re-sorted only on demand) and **always a serve plan** over the matched run.
 
 **On file:** locates the run by binary-searching the child's cached chunk probes
-([`locate_component_run`](../core/src/store/indexes/row_ids.rs#L49): lead,
+([`locate_component_run`](../core/src/store/indexes/file.rs#L166): lead,
 then a windowed second-key search), integers only. Then:
 
 | Located run | Row ids |
 |---|---|
 | empty | `IndexResolution::Empty` |
-| ≤ 256 rows (`POINT_GATHER_MAX_ROWS`) | **Eager**, via [`rid_point_reads`](../core/src/store/indexes/row_ids.rs#L84) |
+| ≤ 256 rows (`POINT_GATHER_MAX_ROWS`) | **Eager**, via [`rid_point_reads`](../core/src/store/indexes/file.rs#L181) |
 | wider, or unlocated | **Lazy** — a deferred rid-only pushed-down scan |
 
 The serve plan is built from *every* bound non-subject component (p, o, **g**).
@@ -715,12 +715,12 @@ supplies a serve plan** and its row ids are **always eager**.
 run, `sorted_row_ids` puts them back in base row order. Declines when the
 component is absent, unsorted, or probe-incompatible.
 
-**On file:** [`locate_component_run`](../core/src/store/indexes/row_ids.rs#L49)
+**On file:** [`locate_component_run`](../core/src/store/indexes/file.rs#L166)
 binary-searches the value column's chunk probes
 (sorted child + integer probe required). A located run ≤ 256 rows uses
 `rid_point_reads`; a wider one uses a rid-only scan restricted to the range —
 neither pays filter evaluation. Anything the probes decline falls back to
-[`scan_index_row_ids`](../core/src/store/indexes/row_ids.rs#L160), a pushed-down `val == probe` scan that answers whatever the
+[`FileRowIdScan::run`](../core/src/store/indexes/file.rs#L209), a pushed-down `val == probe` scan that answers whatever the
 order.
 
 **Example.** For the running example `index:ref-o` holds
@@ -743,7 +743,7 @@ size: `{val, rid}` pairs are a fraction of a second sorted copy of every quad.
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_scan.rs#L486) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/serve.rs#L521)); unlocated: the pushed-down projected+filtered scan of the index child |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_reads.rs#L359) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/file.rs#L296)); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
 | Dropped when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
 | Tombstones | applied through the plan's `rid` column | applied through the plan's `rid` column |
@@ -757,14 +757,14 @@ copies decode as `Default`).
 
 ## 9. The tail
 
-[`match_tail`](../core/src/store/matching.rs) narrows the append tail — small,
+[`match_tail`](../core/src/store/query/matching.rs) narrows the append tail — small,
 unsorted, unindexed — so a scan over its already-few selected rows is the whole
 plan.
 
 ```mermaid
 flowchart TD
     T0{"tail selection already empty?"} -- yes --> TC["carry it unchanged"]
-    T0 -- no --> T1["tail_layout().prepare_pattern(...)<br/>(a string layout: resolves nothing, never suspends)"]
+    T0 -- no --> T1["tail.layout.prepare_pattern(...)<br/>(a string layout: resolves nothing, never suspends)"]
     T1 --> T2{"constraints"}
     T2 -- "AlwaysFalse" --> TE["carry RowSelection::empty()"]
     T2 -- "Eq(eqs), empty" --> TA["unconstrained: carry the selection unchanged"]
@@ -776,7 +776,7 @@ flowchart TD
 
 Notes:
 
-- **`tail_layout()`** is the store's own layout, except under `Dictionary`,
+- **`Tail::layout_for`** gives the tail the store's own layout, except under `Dictionary`,
   where it is `Default`: an appended term has no code in the frozen sorted
   dictionary, so the tail keeps N-Triples strings. Patterns therefore probe the
   base **by code** and the tail **by string**, with two separate witnesses.
@@ -883,8 +883,8 @@ and ≈ 5.8 ms on file, reading included (`match_chained`, `Default` layout).
 ## 12. What the derived view costs at read time
 
 The match's decisions show up here
-([`streaming.rs`](../core/src/store/streaming.rs),
-[`rows.rs`](../core/src/store/rows.rs)):
+([`read/quads.rs`](../core/src/store/read/quads.rs),
+[`rows.rs`](../core/src/store/read/rows.rs)):
 
 | Consumer | With a serve plan | Without |
 |---|---|---|
@@ -935,8 +935,8 @@ located by-copy run and a rid scan of the run otherwise.
 
 | Constant | Value | Defined in | Meaning |
 |---|---|---|---|
-| `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/matching.rs#L797) | an already-narrowed view below this skips index routing |
-| `POINT_GATHER_MAX_ROWS` | 256 | [`selection.rs`](../core/src/store/selection.rs#L338) | runs/selections at or below this are read point-by-point through cached probes (`gather_by_point_reads`, the located-run reads); the file-backed dictionary point-reads a batch of at most this many codes through its chunk leaves and scans a wider one |
+| `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/query/matching.rs#L599) | an already-narrowed view below this skips index routing |
+| `POINT_GATHER_MAX_ROWS` | 256 | [`view/selection.rs`](../core/src/store/view/selection.rs#L338) | runs/selections at or below this are read point-by-point through cached probes (`gather_by_point_reads`, the located-run reads); the file-backed dictionary point-reads a batch of at most this many codes through its chunk leaves and scans a wider one |
 | `TYPED_EQ_MAX_ROWS` | 4096 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L174) | selection size above which the typed row loop declines to the vectorized mask scan: always for a lone residual equality, and for any set that binds a column through an encoded-search probe |
 
 ---
@@ -1087,8 +1087,8 @@ pattern cannot express — a `VALUES` block, a `FILTER` on a term predicate,
 `LIMIT`/`OFFSET`, `ASK` — and the store applies those as derived views too,
 so they compose with `match_pattern` in either order and read through the
 same paths (`size`, `code_columns_gathered`, `quads`). Everything here lives
-in [`core/src/store/narrowing.rs`](../core/src/store/narrowing.rs); the
-batch form in [`core/src/store/batch.rs`](../core/src/store/batch.rs).
+in [`core/src/store/query/narrowing.rs`](../core/src/store/query/narrowing.rs); the
+batch form in [`core/src/store/query/batch.rs`](../core/src/store/query/batch.rs).
 
 ### 16.1 `keep` — a code set or range per column
 
@@ -1151,7 +1151,7 @@ pure ranges and scan nothing; `str_prefix` on an IRI is a prefix range),
 memoized per dictionary. The verdict rules mirror the Python query layer's
 own fast path, conservatively: `True`/`False` only where that path is
 total, `Unknown` wherever it defers (see
-[`predicates.rs`](../core/src/store/layouts/dictionary/predicates.rs)).
+[`predicates.rs`](../core/src/store/layouts/dictionary/predicates/mod.rs)).
 
 ---
 
@@ -1159,23 +1159,23 @@ total, `Unknown` wherever it defers (see
 
 | Concern | File |
 |---|---|
-| `match_pattern`, `match_base`, both backends, `match_tail`, `mask_for`, `contains` | [`core/src/store/matching.rs`](../core/src/store/matching.rs) |
+| `match_pattern`, `match_base`, both backends, `match_tail`, `mask_for`, `contains` | [`core/src/store/query/matching.rs`](../core/src/store/query/matching.rs) |
 | Layouts, `QuadPattern`, `PatternCodes`, `Constraints`, `prepare_pattern` | [`core/src/store/layouts/mod.rs`](../core/src/store/layouts/mod.rs) |
-| Dictionary residency and the async prelude | [`core/src/store/layouts/dictionary/access.rs`](../core/src/store/layouts/dictionary/access.rs) |
-| `RowSelection` / `ViewSelection`, `POINT_GATHER_MAX_ROWS` | [`core/src/store/selection.rs`](../core/src/store/selection.rs) |
+| Dictionary residency and the async prelude | [`core/src/store/layouts/dictionary/handles.rs`](../core/src/store/layouts/dictionary/handles.rs) |
+| `RowSelection` / `ViewSelection`, `POINT_GATHER_MAX_ROWS` | [`core/src/store/view/selection.rs`](../core/src/store/view/selection.rs) |
 | Gathering selected rows, point reads through cached probes | [`core/src/store/scan/gather.rs`](../core/src/store/scan/gather.rs) |
 | `IndexResolution`, `ResolvedRowIds`, `LazyRowIds`, planners | [`core/src/store/indexes/mod.rs`](../core/src/store/indexes/mod.rs) |
-| Locating index runs on file, rid point reads and scans, `eq_conjunction` | [`core/src/store/indexes/row_ids.rs`](../core/src/store/indexes/row_ids.rs) |
-| Sorted quad copies (POSG / OSPG) | [`core/src/store/indexes/secondary_by_copy.rs`](../core/src/store/indexes/secondary_by_copy.rs) |
-| Sorted `{val, rid}` pairs | [`core/src/store/indexes/secondary_by_reference.rs`](../core/src/store/indexes/secondary_by_reference.rs) |
+| Locating index runs on file, rid point reads and scans, `eq_conjunction` | [`core/src/store/indexes/file.rs`](../core/src/store/indexes/file.rs) |
+| Sorted quad copies (POSG / OSPG) | [`core/src/store/indexes/copy.rs`](../core/src/store/indexes/copy.rs) |
+| Sorted `{val, rid}` pairs | [`core/src/store/indexes/reference.rs`](../core/src/store/indexes/reference.rs) |
 | Serve plans and the shared decode tail | [`core/src/store/indexes/serve.rs`](../core/src/store/indexes/serve.rs) |
-| Pushed-down filters, split evaluation, pruning, point reads | [`core/src/store/scan/file_scan.rs`](../core/src/store/scan/file_scan.rs) |
+| Pushed-down filters, split evaluation, pruning, point reads | [`core/src/store/scan/file_reads.rs`](../core/src/store/scan/file_reads.rs) |
 | Typed residual/tail equality loops | [`core/src/store/scan/typed_eq.rs`](../core/src/store/scan/typed_eq.rs) |
-| `Keep`, `keep`, `window`, `size_capped`, `exists` | [`core/src/store/narrowing.rs`](../core/src/store/narrowing.rs) |
-| `Probe`, `match_many`, `count_many` | [`core/src/store/batch.rs`](../core/src/store/batch.rs) |
+| `Keep`, `keep`, `window`, `size_capped`, `exists` | [`core/src/store/query/narrowing.rs`](../core/src/store/query/narrowing.rs) |
+| `Probe`, `match_many`, `count_many` | [`core/src/store/query/batch.rs`](../core/src/store/query/batch.rs) |
 | `DictReader`, `DictSnapshot`, `prefix_range`, tolerant `encode` | [`core/src/store/layouts/dictionary/term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs) |
-| `TermPredicate`, `Verdict`, `KindRanges`, the verdict rules | [`core/src/store/layouts/dictionary/predicates.rs`](../core/src/store/layouts/dictionary/predicates.rs) |
+| `TermPredicate`, `Verdict`, `KindRanges`, the verdict rules | [`core/src/store/layouts/dictionary/predicates/mod.rs`](../core/src/store/layouts/dictionary/predicates/mod.rs) |
 | The RDF/XSD datatype IRIs the predicates and the TypedObject layout share | [`core/src/common/vocab.rs`](../core/src/common/vocab.rs) |
-| Column kernels (`distinct_first_seen`, `value_counts`, `take`, `equi_join_indices`) | [`core/src/store/columns.rs`](../core/src/store/columns.rs) |
-| View state (`QuadsSource`, `Tail`) | [`core/src/store/source.rs`](../core/src/store/source.rs) |
-| Read paths consuming the view | [`core/src/store/streaming.rs`](../core/src/store/streaming.rs), [`core/src/store/rows.rs`](../core/src/store/rows.rs) |
+| Column kernels (`distinct_first_seen`, `value_counts`, `take`, `equi_join_indices`) | [`core/src/columns.rs`](../core/src/columns.rs) |
+| View state (`QuadsSource`, `Tail`) | [`core/src/store/view/mod.rs`](../core/src/store/view/mod.rs) |
+| Read paths consuming the view | [`core/src/store/read/quads.rs`](../core/src/store/read/quads.rs), [`core/src/store/read/rows.rs`](../core/src/store/read/rows.rs) |

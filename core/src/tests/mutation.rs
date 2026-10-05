@@ -386,6 +386,7 @@ async fn test_selected_rows_on_tailed_dictionary_store() {
 
     let parts = tailed.to_serializable_parts().await.unwrap();
     let dict = parts
+        .built
         .dict
         .expect("a Dictionary rebuild carries its dictionary");
     let decoded: Vec<Quad> = crate::store::layouts::dictionary::decode_chunk(&rows, &dict)

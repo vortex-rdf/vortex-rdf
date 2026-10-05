@@ -1,30 +1,15 @@
-//! How quads become columns, and how a pattern becomes column constraints.
-//!
-//! This hub owns the vocabulary every layout is named through: the
-//! [`LayoutStrategy`] a build requests, the `ResolvedLayout` a store actually
-//! reads through (the strategy plus the state it cannot carry alone — a
-//! Dictionary layout's term access), the `QuadPattern`/`PatternCodes` pattern
-//! form, and the dispatch that turns either into per-layout column building,
-//! chunk decoding, and constraint lowering.
-//!
-//! A leaf owns exactly one layout's physical schema — its column names, its
-//! encode/decode loops (`default`, `typed_object`, `dictionary`) — and never
-//! names another's. The Dictionary leaf is a folder module carrying the whole
-//! term-dictionary subsystem (storage, ingest, residency) beside its
-//! encode/decode paths.
-//!
-//! Secondary indexes are *not* part of a layout. They are built as their own
-//! children beside a layout's quad rows, in that index's own encoding for the
-//! layout (term strings, or the Dictionary layout's u32 codes); the index
-//! modules own those columns and their names — see
+//! Layouts: the [`LayoutStrategy`] a build requests, the [`ResolvedLayout`] a
+//! store reads through (the strategy plus a Dictionary layout's term access),
+//! the [`QuadPattern`]/[`PatternCodes`] pattern form, and the dispatch into
+//! the leaves (`default`, `typed_object`, `dictionary`) for column building,
+//! chunk decoding and constraint lowering. Secondary indexes are not part of
+//! a layout: their children and column names belong to
 //! [`IndexType`](crate::store::indexes::IndexType).
 
 use std::sync::Arc;
 
-#[cfg(feature = "file-io")]
 use futures::FutureExt as _;
-#[cfg(feature = "file-io")]
-use futures::future::BoxFuture;
+use futures::future::{self, BoxFuture};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use vortex_array::arrays::struct_::StructArray;
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
@@ -37,17 +22,18 @@ use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::array::{StrColReader, field_as};
+use crate::store::schema::QuadColumn;
 
 pub(crate) mod default;
 pub(crate) mod dictionary;
 pub(crate) mod typed_object;
 
+pub(crate) use self::dictionary::DictAccess;
 use self::dictionary::TermDictionary;
-pub(crate) use self::dictionary::access::DictAccess;
 use self::typed_object::{COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE};
-use crate::store::schema::{COL_G, COL_O, COL_P, COL_S};
+use crate::store::schema::{COL_G, COL_O, COL_P, COL_S, PRIMARY_COLUMNS};
 
-/// Determines the columnar schema used to store RDF quads in the Vortex StructArray.
+/// The columnar schema RDF quads are stored in.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum LayoutStrategy {
@@ -55,9 +41,8 @@ pub enum LayoutStrategy {
     ///
     /// ### `LayoutStrategy::Default` column schema
     ///
-    /// All four quad fields stored as opaque UTF-8 strings in N-Triples
-    /// serialization form. Vortex applies its own `DictLayout` internally to
-    /// compress repeated values.
+    /// All four quad fields stored as UTF-8 strings in N-Triples
+    /// serialization form.
     ///
     /// | Column | Type              | Content                                                    |
     /// |--------|-------------------|------------------------------------------------------------|
@@ -66,9 +51,9 @@ pub enum LayoutStrategy {
     /// | `o`    | `VarBin<Utf8>`    | Object: `<IRI>`, `_:blank`, `"lit"`, `"lit"@lang`, `"lit"^^<dt>` |
     /// | `g`    | `VarBin<Utf8>`    | Graph: `<IRI>`, `_:blank`, or `""` for DefaultGraph        |
     ///
-    /// Each requested [`IndexType`] appends its own columns on top of these;
-    /// see that enum's variant docs for the per-index column tables (they
-    /// hold term strings here, as under `TypedObject`).
+    /// Each requested [`IndexType`] adds its own children beside these; see
+    /// that enum's variant docs for the per-index column tables (term
+    /// strings here, as under `TypedObject`).
     ///
     /// [`IndexType`]: crate::store::indexes::IndexType
     Default,
@@ -77,8 +62,8 @@ pub enum LayoutStrategy {
     ///
     /// ### `LayoutStrategy::TypedObject` column schema
     ///
-    /// Same as `Default` for `s`, `p`, `g`. The `o` column is decomposed into typed fields
-    /// so that Vortex can apply datatype-appropriate encodings (delta, RLE, dictionary).
+    /// Same as `Default` for `s`, `p`, `g`. The `o` column is decomposed into
+    /// typed fields.
     ///
     /// | Column       | Type                  | Content                                     |
     /// |--------------|-----------------------|---------------------------------------------|
@@ -90,8 +75,8 @@ pub enum LayoutStrategy {
     /// | `o_lang`     | `VarBin<Utf8>` (nullable) | Language tag — non-null when `o_kind = 3`  |
     /// | `g`          | `VarBin<Utf8>`        | (same as Default)                           |
     ///
-    /// Index columns are unaffected by the object split: every requested
-    /// [`IndexType`] appends the same term-string columns it would under
+    /// Index children are unaffected by the object split: every requested
+    /// [`IndexType`] holds the same term-string columns it would under
     /// `Default`, sorting whole object terms in N-Triples form.
     ///
     /// [`IndexType`]: crate::store::indexes::IndexType
@@ -102,19 +87,16 @@ pub enum LayoutStrategy {
     /// ### `LayoutStrategy::Dictionary` column schema
     ///
     /// All four quad fields stored as u32 codes into a single global term
-    /// dictionary. In memory the dictionary lives beside the columns (see
-    /// `dictionary::term_dict`); a serialized
-    /// file carries it as the native
-    /// container's `dictionary` child (see `crate::io::container`), so
-    /// the quad columns stay bare.
+    /// dictionary. In memory the dictionary lives beside the columns; a
+    /// serialized file carries it as the native container's `dictionary`
+    /// child (see `crate::io::container`).
     ///
     /// | Column        | Type                  | Content                                             |
     /// |---------------|-----------------------|-----------------------------------------------------|
     /// | `s`,`p`,`o`,`g` | `PrimitiveArray<u32>` | code = position of the term in the sorted dictionary |
     ///
     /// Term codes are lexicographic ranks, so code comparisons are
-    /// order-isomorphic to string comparisons (sorted builders keep the
-    /// subject binary-search fast path on the u32 column).
+    /// order-isomorphic to string comparisons.
     ///
     /// Every requested [`IndexType`] builds its usual children, except that
     /// their term-valued columns hold u32 codes instead of strings; the
@@ -125,9 +107,7 @@ pub enum LayoutStrategy {
 }
 
 /// The canonical strategy name: kebab-case (`"default"`, `"typed-object"`,
-/// `"dictionary"`), the same spelling the `clap` derive exposes on the CLI —
-/// so every frontend reports one vocabulary and a value printed by one can be
-/// parsed by another.
+/// `"dictionary"`), the spelling the `clap` derive exposes.
 impl std::fmt::Display for LayoutStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -138,9 +118,8 @@ impl std::fmt::Display for LayoutStrategy {
     }
 }
 
-/// Accepts exactly the canonical kebab-case names
-/// [`Display`](std::fmt::Display) emits — `"default"`, `"typed-object"`,
-/// `"dictionary"` — the one vocabulary every frontend shares.
+/// Accepts exactly the kebab-case names [`Display`](std::fmt::Display)
+/// emits: `"default"`, `"typed-object"`, `"dictionary"`.
 impl std::str::FromStr for LayoutStrategy {
     type Err = VortexRdfError;
 
@@ -158,22 +137,18 @@ impl std::str::FromStr for LayoutStrategy {
 }
 
 impl LayoutStrategy {
-    /// Detect the column layout by inspecting the struct schema in the dtype,
-    /// without materializing the array.
+    /// The layout a struct dtype is in: a u32 `s` column is Dictionary, an
+    /// `o_kind` column TypedObject, anything else Default.
     pub(crate) fn from_dtype(dtype: &DType) -> LayoutStrategy {
         if let DType::Struct(fields, _) = dtype {
-            // u32 code columns mean Dictionary; the dictionary itself rides
-            // outside the schema, as the native container's dictionary child.
             if matches!(fields.field(COL_S), Some(DType::Primitive(ptype, _)) if ptype == PType::U32)
             {
                 return LayoutStrategy::Dictionary;
             }
-            // Presence of the typed-object kind column means TypedObject layout.
             if fields.names().iter().any(|n| n.as_ref() == COL_O_KIND) {
                 return LayoutStrategy::TypedObject;
             }
         }
-        // Neither marker column found: plain string columns, Default layout.
         LayoutStrategy::Default
     }
 
@@ -183,12 +158,12 @@ impl LayoutStrategy {
         match self {
             LayoutStrategy::Default => default::COLUMNS,
             LayoutStrategy::TypedObject => typed_object::COLUMNS,
-            LayoutStrategy::Dictionary => dictionary::COLUMNS,
+            LayoutStrategy::Dictionary => &PRIMARY_COLUMNS,
         }
     }
 
     /// [`primary_column_names`](Self::primary_column_names) as owned field
-    /// names, for building the struct dtype.
+    /// names.
     pub(crate) fn field_names(self) -> Vec<Arc<str>> {
         self.primary_column_names()
             .iter()
@@ -196,14 +171,9 @@ impl LayoutStrategy {
             .collect()
     }
 
-    /// Build the primary column arrays for this layout from raw quads.
-    /// An empty slice yields empty columns with the correct dtypes.
-    ///
-    /// Not available for `Dictionary`: encoding needs the global
-    /// [`TermDictionary`], so Dictionary chunks are built by the dedicated
-    /// [`dictionary::build_chunk`] pipeline instead.
-    ///
-    /// [`TermDictionary`]: dictionary::TermDictionary
+    /// The primary column arrays of `quads`; an empty slice yields empty
+    /// columns with the right dtypes. Not available for `Dictionary`, whose
+    /// chunks need the term dictionary ([`dictionary::build_chunk`]).
     pub(crate) fn build_columns(self, quads: &[RawQuad]) -> Result<Vec<ArrayRef>> {
         match self {
             LayoutStrategy::Default => Ok(default::build_columns(quads)),
@@ -217,12 +187,8 @@ impl LayoutStrategy {
     }
 }
 
-/// Query-time layout: the build-time [`LayoutStrategy`] resolved against a
-/// constructed array, carrying any state intrinsic to the layout — for the
-/// Dictionary layout, access to the global term dictionary. Holding the state
-/// in the variant makes "Dictionary layout without a dictionary"
-/// unrepresentable; [`DictAccess`] carries *how* the dictionary is reached
-/// (resident, or left in its file).
+/// The layout a store reads through: the [`LayoutStrategy`] plus, for the
+/// Dictionary layout, how its term dictionary is reached ([`DictAccess`]).
 #[derive(Clone)]
 pub(crate) enum ResolvedLayout {
     Default,
@@ -230,20 +196,8 @@ pub(crate) enum ResolvedLayout {
     Dictionary(DictAccess),
 }
 
-/// One of the four term positions of a quad pattern.
-#[derive(Clone, Copy)]
-enum Role {
-    S,
-    P,
-    O,
-    G,
-}
-
-/// A quad pattern: the four term positions, each bound or free.
-///
-/// Travels as one value because every stage of a match needs all four together
-/// — the fast paths clear whichever components they resolve, and whatever is
-/// still bound afterwards is exactly what the residual filter must compare.
+/// A quad pattern: the four term positions, each bound or free. The match
+/// stages clear the roles they resolve; what stays bound is the residual.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct QuadPattern<'a> {
     pub(crate) subject: Option<&'a NamedOrBlankNode>,
@@ -267,8 +221,7 @@ impl<'a> QuadPattern<'a> {
         }
     }
 
-    /// Whether any component is still bound — i.e. whether there is anything
-    /// left for a residual filter to do.
+    /// Whether any role is bound.
     pub(crate) fn any_bound(&self) -> bool {
         self.subject.is_some()
             || self.predicate.is_some()
@@ -290,11 +243,7 @@ impl<'a> QuadPattern<'a> {
     }
 }
 
-/// A bound term of a quad pattern, tagged with the role it occupies.
-///
-/// Carrying the role with the term is what makes [`PatternCodes`] safe to share
-/// across the match: a probe cannot be attributed to the wrong role, because
-/// there is no way to name one separately from its term.
+/// A bound term of a quad pattern, tagged with its role.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum TermRef<'a> {
     Subject(&'a NamedOrBlankNode),
@@ -303,10 +252,8 @@ pub(crate) enum TermRef<'a> {
     Graph(&'a GraphName),
 }
 
-/// The term's N-Triples form, as the columns store it.
-///
-/// The default graph renders as the empty string — matching the `g` column —
-/// rather than as oxrdf's own `Display`, which writes `DEFAULT`.
+/// The term's N-Triples form as the columns store it: the default graph is
+/// the empty string, not oxrdf's `DEFAULT`.
 impl std::fmt::Display for TermRef<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -320,17 +267,17 @@ impl std::fmt::Display for TermRef<'_> {
 }
 
 impl TermRef<'_> {
-    fn role(&self) -> Role {
+    /// The column this term's role occupies.
+    pub(crate) fn role(&self) -> QuadColumn {
         match self {
-            TermRef::Subject(_) => Role::S,
-            TermRef::Predicate(_) => Role::P,
-            TermRef::Object(_) => Role::O,
-            TermRef::Graph(_) => Role::G,
+            TermRef::Subject(_) => QuadColumn::S,
+            TermRef::Predicate(_) => QuadColumn::P,
+            TermRef::Object(_) => QuadColumn::O,
+            TermRef::Graph(_) => QuadColumn::G,
         }
     }
 
-    /// Render into `out`, which is cleared first — the allocation-free form of
-    /// [`Display`](std::fmt::Display), which defines what is written.
+    /// Render into `out`, cleared first; writes what `Display` writes.
     fn write_nt(&self, out: &mut String) {
         use std::fmt::Write as _;
         out.clear();
@@ -338,71 +285,36 @@ impl TermRef<'_> {
     }
 }
 
-/// How a [`PatternCodes`] witness answers a probe its role cache does not
-/// already hold — fixed at prelude time by the layout (and, for the
-/// Dictionary layout, the dictionary's residency) the witness was prepared
-/// under, so a probe can never be dispatched against the wrong access mode.
+/// How a [`PatternCodes`] answers a probe its role cache does not hold.
 enum CodeResolver {
-    /// `Default` layout: probes are the rendered N-Triples strings; there are
-    /// no codes to resolve.
+    /// Probes are the rendered N-Triples strings.
     Default,
-    /// `TypedObject` layout: string probes like `Default`, except constraints
-    /// decompose the object term into its typed sub-columns.
+    /// String probes; constraints decompose the object into its typed
+    /// sub-columns.
     TypedObject,
-    /// Dictionary resident in memory: codes resolve on demand by in-memory
-    /// binary search (memoized per role here, and across matches in the
-    /// dictionary's own probe cache).
+    /// Codes resolve by binary search of the resident dictionary.
     Resident(Arc<TermDictionary>),
-    /// Dictionary left in its file: the async prelude pre-resolved every
-    /// bound role into the role cache, which is therefore the complete
-    /// answer — there is deliberately no synchronous resolver to fall
-    /// back to.
+    /// The prelude resolved every bound role; there is no synchronous
+    /// resolver behind the cache.
     #[cfg(feature = "file-io")]
     Preresolved,
 }
 
-/// One match's prepared pattern: the term → dictionary-code resolutions the
-/// async prelude computed, the resolver later probes fall back to, and the
-/// buffer bound terms are rendered into.
-///
-/// This is a *witness* type. Its only constructor is the async prelude
-/// ([`prepare_pattern`](ResolvedLayout::prepare_pattern)) — the one place a
-/// dictionary may perform I/O during a match — and every synchronous probe of
-/// the match core is a method on the witness
-/// ([`probe_scalar`](Self::probe_scalar), [`constraints`](Self::constraints)).
-/// Holding one is therefore proof the prelude ran — "prelude skipped" is
-/// unrepresentable — which is what lets a file-backed dictionary confine
-/// its I/O to the prelude.
-///
-/// The role cache also serves memoization: `match_base` derives the same
-/// term → code mapping in several stages — the unmatchable-pattern gate, the
-/// sorted-subject probe, the index probes, and the residual constraints — so
-/// caching per role keeps a fully-bound pattern to one dictionary search and
-/// one render per bound term instead of one per stage.
-///
-/// The render goes into `scratch`: a term's N-Triples form is only needed
-/// long enough to search the dictionary with it, so one buffer serves all
-/// four roles and every stage.
-///
-/// Scoped to a single `match_base`: the tail is matched under a *different*
-/// layout (it stores terms as strings precisely so a term the base's dictionary
-/// has never seen can still match), so a code cached here would be meaningless
-/// there — the tail's match prepares its own witness.
+/// Per-role term -> code cache and render buffer for one base match; built
+/// only by [`prepare_pattern`](ResolvedLayout::prepare_pattern), the one
+/// point where a dictionary may do I/O during a match. Scoped to one
+/// `match_base`: the tail is matched under its own layout and prepares its
+/// own `PatternCodes`.
 pub(crate) struct PatternCodes {
     /// Per role: `None` = not resolved yet, `Some(None)` = resolved and absent
-    /// from the dictionary (so the pattern cannot match).
+    /// from the dictionary.
     roles: [Option<Option<u32>>; 4],
-    /// Reused render target for the bound terms; see the type docs.
+    /// Render target for bound terms, reused across roles.
     scratch: String,
-    /// How probes beyond the prelude-seeded roles resolve; see the type docs.
     resolver: CodeResolver,
 }
 
 impl PatternCodes {
-    /// A fresh witness resolving through `resolver` — reachable only from the
-    /// async prelude (this module and the Dictionary layout's
-    /// `DictAccess::resolve_pattern`), which is what makes holding a
-    /// `PatternCodes` proof that the prelude ran.
     fn new(resolver: CodeResolver) -> Self {
         Self {
             roles: [None; 4],
@@ -411,28 +323,27 @@ impl PatternCodes {
         }
     }
 
-    /// The witness for a resident dictionary: probes beyond the prelude-seeded
-    /// roles resolve by in-memory binary search.
+    /// Codes for a resident dictionary: unseeded roles resolve by in-memory
+    /// binary search.
     pub(in crate::store::layouts) fn resident(dict: Arc<TermDictionary>) -> Self {
         Self::new(CodeResolver::Resident(dict))
     }
 
-    /// The witness for a file-backed dictionary: the prelude pre-resolves
-    /// every bound role, and no synchronous resolver exists beyond them.
+    /// Codes for a file-backed dictionary: the prelude seeds every bound
+    /// role, and nothing resolves beyond them.
     #[cfg(feature = "file-io")]
     pub(in crate::store::layouts) fn preresolved() -> Self {
         Self::new(CodeResolver::Preresolved)
     }
 
-    /// The code for `term`'s role, resolving it through `f` the first time
-    /// only. `term` is rendered into the shared scratch buffer on a miss, and
-    /// not rendered at all on a hit — how the prelude seeds the cache.
+    /// The code for `term`'s role, resolving it through `f` on the first
+    /// call only; `term` is rendered into the scratch buffer on a miss.
     pub(in crate::store::layouts) fn resolve(
         &mut self,
         term: TermRef<'_>,
         f: impl FnOnce(&str) -> Option<u32>,
     ) -> Option<u32> {
-        let role = term.role() as usize;
+        let role = term.role().index();
         if let Some(cached) = self.roles[role] {
             return cached;
         }
@@ -442,25 +353,27 @@ impl PatternCodes {
         resolved
     }
 
-    /// `term`'s N-Triples form in the shared scratch buffer — for the layouts
-    /// that probe with the string itself (no dictionary code to cache).
+    /// `term`'s N-Triples form in the scratch buffer.
     fn render(&mut self, term: TermRef<'_>) -> &str {
         term.write_nt(&mut self.scratch);
         &self.scratch
     }
 
-    /// The dictionary code for `term`'s role: the role cache first (the
-    /// prelude seeded every bound role), then a resident dictionary's binary
-    /// search for a witness that can run one synchronously.
-    ///
-    /// The error arm is the residual contract a witness cannot encode in its
-    /// type: a probe for a role the prepared pattern never bound, on a
-    /// witness with no synchronous resolver. `None` is reserved for
-    /// "resolved and absent from the dictionary", so an unresolvable probe
-    /// must be an error — silently answering `None` would fabricate an empty
-    /// match result.
+    /// Whether this layout probes with the rendered string rather than a
+    /// code (the `Default` and `TypedObject` layouts).
+    fn probes_by_string(&self) -> bool {
+        matches!(
+            self.resolver,
+            CodeResolver::Default | CodeResolver::TypedObject
+        )
+    }
+
+    /// The dictionary code for `term`'s role: the role cache, else a resident
+    /// dictionary's binary search. `None` = absent from the dictionary; an
+    /// unseeded role on a witness without a synchronous resolver is an error
+    /// (answering `None` would fabricate an empty match).
     fn code(&mut self, term: TermRef<'_>) -> Result<Option<u32>> {
-        if let Some(cached) = self.roles[term.role() as usize] {
+        if let Some(cached) = self.roles[term.role().index()] {
             return Ok(cached);
         }
         let CodeResolver::Resident(dict) = &self.resolver else {
@@ -474,132 +387,61 @@ impl PatternCodes {
         Ok(self.resolve(term, |s| dict.encode(s)))
     }
 
-    /// Scalar for probing a term column — the primary `s` column, a secondary
-    /// index's value column, or a pushed-down filter equality. Under the
-    /// Dictionary layout the term is translated to its u32 code
-    /// (sorted-dictionary codes preserve lexicographic order); `None` means
-    /// the term is absent from the dictionary and matches nothing. The string
-    /// layouts probe with the rendered term itself.
-    ///
-    /// Memoized per role, so one match performs a single dictionary search
-    /// and a single render per bound term however many stages and indexes ask
-    /// for the same probe.
+    /// The scalar that probes a term column for `term`: its u32 code under
+    /// the Dictionary layout (`None` = absent, matches nothing), the rendered
+    /// term under the string layouts. Memoized per role.
     pub(crate) fn probe_scalar(&mut self, term: TermRef<'_>) -> Result<Option<Scalar>> {
-        if matches!(
-            self.resolver,
-            CodeResolver::Default | CodeResolver::TypedObject
-        ) {
+        if self.probes_by_string() {
             return Ok(Some(Scalar::from(self.render(term))));
         }
         Ok(self.code(term)?.map(Scalar::from))
     }
 
-    /// Whether the layout can prove the pattern matches no row: a bound term
-    /// that resolved to no dictionary code.
-    ///
-    /// The allocation-free form of testing [`Constraints::AlwaysFalse`] — the
-    /// async prelude resolved every bound role into the role cache, so this
-    /// reads it instead of compiling the per-column equalities only to
-    /// discard them. The string layouts probe with the term itself and have
-    /// no code to miss, so they answer without touching the cache.
-    ///
-    /// A role the prelude left unresolved answers `false`, deferring to the
-    /// constraint path rather than fabricating an empty result.
+    /// Whether a bound role resolved to no dictionary code, read off the role
+    /// cache without compiling constraints. A role the prelude left
+    /// unresolved answers `false`.
     pub(crate) fn provably_empty(&self, pattern: QuadPattern<'_>) -> bool {
-        if matches!(
-            self.resolver,
-            CodeResolver::Default | CodeResolver::TypedObject
-        ) {
-            return false;
-        }
-        [
-            (Role::S, pattern.subject.is_some()),
-            (Role::P, pattern.predicate.is_some()),
-            (Role::O, pattern.object.is_some()),
-            (Role::G, pattern.graph.is_some()),
-        ]
-        .into_iter()
-        .any(|(role, bound)| bound && matches!(self.roles[role as usize], Some(None)))
+        !self.probes_by_string()
+            && pattern
+                .bound_roles()
+                .any(|term| matches!(self.roles[term.role().index()], Some(None)))
     }
 
-    /// Compile a quad pattern into per-column equality constraints — the
-    /// layout-specific term → (column, scalar) mapping, the single source of
-    /// truth consumed by both the in-memory mask scan and the pushed-down
-    /// file filter.
+    /// The pattern as per-column equalities under this layout, in `s`, `p`,
+    /// `o`, `g` order: the rendered term per string column, the typed
+    /// sub-columns of a `TypedObject` object, the code per Dictionary column
+    /// (`AlwaysFalse` when a term has none).
     pub(crate) fn constraints(&mut self, pattern: QuadPattern<'_>) -> Result<Constraints> {
-        let QuadPattern {
-            subject,
-            predicate,
-            object,
-            graph,
-        } = pattern;
+        let typed_object = matches!(self.resolver, CodeResolver::TypedObject);
         let mut eqs: Vec<(&'static str, Scalar)> = Vec::new();
-        match self.resolver {
-            CodeResolver::Default => {
-                if let Some(s) = subject {
-                    eqs.push((COL_S, Scalar::from(self.render(TermRef::Subject(s)))));
+        for term in pattern.bound_roles() {
+            if typed_object && let TermRef::Object(object) = term {
+                let (kind, value, datatype, lang) = typed_object::decompose_object(object);
+                eqs.push((COL_O_KIND, Scalar::from(kind)));
+                eqs.push((COL_O_VALUE, Scalar::from(value.as_str())));
+                if let Some(datatype) = datatype {
+                    eqs.push((COL_O_DATATYPE, Scalar::from(datatype.as_str())));
                 }
-                if let Some(p) = predicate {
-                    eqs.push((COL_P, Scalar::from(self.render(TermRef::Predicate(p)))));
+                if let Some(lang) = lang {
+                    eqs.push((COL_O_LANG, Scalar::from(lang.as_str())));
                 }
-                if let Some(o) = object {
-                    eqs.push((COL_O, Scalar::from(self.render(TermRef::Object(o)))));
+            } else if self.probes_by_string() {
+                eqs.push((term.role().name(), Scalar::from(self.render(term))));
+            } else {
+                match self.code(term)? {
+                    Some(code) => eqs.push((term.role().name(), Scalar::from(code))),
+                    None => return Ok(Constraints::AlwaysFalse),
                 }
-                if let Some(g) = graph {
-                    eqs.push((COL_G, Scalar::from(self.render(TermRef::Graph(g)))));
-                }
-            }
-            CodeResolver::TypedObject => {
-                if let Some(s) = subject {
-                    eqs.push((COL_S, Scalar::from(self.render(TermRef::Subject(s)))));
-                }
-                if let Some(p) = predicate {
-                    eqs.push((COL_P, Scalar::from(self.render(TermRef::Predicate(p)))));
-                }
-                if let Some(o) = object {
-                    let (kind, value, dt, lang) = typed_object::decompose_object(o);
-                    eqs.push((COL_O_KIND, Scalar::from(kind)));
-                    eqs.push((COL_O_VALUE, Scalar::from(value.as_str())));
-                    if let Some(dt_str) = dt {
-                        eqs.push((COL_O_DATATYPE, Scalar::from(dt_str.as_str())));
-                    }
-                    if let Some(lang_str) = lang {
-                        eqs.push((COL_O_LANG, Scalar::from(lang_str.as_str())));
-                    }
-                }
-                if let Some(g) = graph {
-                    eqs.push((COL_G, Scalar::from(self.render(TermRef::Graph(g)))));
-                }
-            }
-            // Dictionary witness (either residency): resolve every bound term
-            // to its code — a term absent from the dictionary cannot match
-            // any quad.
-            _ => {
-                macro_rules! bind {
-                    ($opt:expr, $ctor:expr, $field:expr) => {
-                        if let Some(term) = $opt {
-                            match self.code($ctor(term))? {
-                                Some(code) => eqs.push(($field, Scalar::from(code))),
-                                None => return Ok(Constraints::AlwaysFalse),
-                            }
-                        }
-                    };
-                }
-                bind!(subject, TermRef::Subject, COL_S);
-                bind!(predicate, TermRef::Predicate, COL_P);
-                bind!(object, TermRef::Object, COL_O);
-                bind!(graph, TermRef::Graph, COL_G);
             }
         }
         Ok(Constraints::Eq(eqs))
     }
 }
 
-/// Column equality constraints a quad pattern compiles to under a given
-/// layout: the single source of truth consumed by both the in-memory mask
-/// scan and the pushed-down file filter in `match_pattern`.
+/// The column equalities a pattern compiles to under a layout; the in-memory
+/// mask scan and the pushed-down file filter both consume them.
 pub(crate) enum Constraints {
-    /// A bound term cannot match any quad (e.g. absent from the dictionary).
+    /// A bound term cannot match any quad (absent from the dictionary).
     AlwaysFalse,
     /// Conjunction of per-column equalities; empty means unconstrained.
     Eq(Vec<(&'static str, Scalar)>),
@@ -615,98 +457,63 @@ impl ResolvedLayout {
         }
     }
 
-    /// Decode a StructArray chunk into quads. Dictionary chunks are decoded
-    /// through the layout's own dictionary.
-    ///
-    /// Executes the chunk to a `StructArray` and reads its columns. A
-    /// chunk-level failure (execution, a required column missing or of the
-    /// wrong type) is returned as a single `Err` element; a row whose terms
-    /// fail to parse is an `Err` at that row's position, the other rows
-    /// decoding normally. The shared-string and async variants below follow
-    /// the same contract.
+    /// `chunk`'s rows as quads. A chunk-level failure (execution, a required
+    /// column missing or mistyped) is a single `Err` element; a row whose
+    /// terms fail to parse is an `Err` at that row's position. A file-backed
+    /// dictionary is a chunk-level error here; it decodes through
+    /// [`ChunkDecode::decode_async`].
     pub(crate) fn decode_chunk(&self, chunk: &ArrayRef) -> Vec<Result<Quad>> {
         match self {
-            ResolvedLayout::Default => default::decode_chunk(chunk),
-            ResolvedLayout::TypedObject => typed_object::decode_chunk(chunk),
+            ResolvedLayout::Default => chunk_result(default::decode_chunk(chunk)),
+            ResolvedLayout::TypedObject => chunk_result(typed_object::decode_chunk(chunk)),
             ResolvedLayout::Dictionary(access) => match access.resident() {
                 Some(dict) => dictionary::decode_chunk(chunk, dict),
-                // Defensive: the read paths route file-backed stores through
-                // `decode_chunk_async`, which resolves each chunk's codes with
-                // a scan; reaching here means one of them didn't.
-                None => vec![Err(VortexRdfError::Deserialization(
-                    "a file-backed dictionary decodes chunks through the async read path"
-                        .to_string(),
-                ))],
+                None => file_backed_sync_error(),
             },
         }
     }
 
-    /// [`decode_chunk`](Self::decode_chunk) with the file-backed Dictionary
-    /// case handled: the chunk's distinct codes are resolved to terms with one
-    /// dictionary scan, and the chunk decodes against that map. Every other
-    /// layout (and a resident dictionary) takes the sync path unchanged.
-    #[cfg(feature = "file-io")]
-    pub(crate) async fn decode_chunk_async(&self, chunk: &ArrayRef) -> Vec<Result<Quad>> {
-        if let ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) = self {
-            let terms = match dictionary::resolve_chunk_terms(fb, chunk).await {
-                Ok(terms) => terms,
-                Err(e) => return vec![Err(e)],
-            };
-            return dictionary::decode_chunk_mapped(chunk, &terms);
-        }
-        self.decode_chunk(chunk)
-    }
-
-    /// [`decode_chunk`](Self::decode_chunk) into [`SharedQuad`]s — terms as
+    /// [`decode_chunk`](Self::decode_chunk) into [`SharedQuad`]s: terms as
     /// shared N-Triples strings, decoded once per distinct code under the
-    /// Dictionary layout; the string layouts read their columns as
-    /// [`raw_quads`](Self::raw_quads) does, one string per row.
+    /// Dictionary layout.
     pub(crate) fn decode_chunk_shared(&self, chunk: &ArrayRef) -> Vec<Result<SharedQuad>> {
         match self {
-            ResolvedLayout::Default | ResolvedLayout::TypedObject => match self.raw_quads(chunk) {
-                Ok(raws) => raws
-                    .into_iter()
-                    .map(|raw| Ok(SharedQuad::from(raw)))
-                    .collect(),
-                Err(e) => vec![Err(e)],
-            },
+            ResolvedLayout::Default | ResolvedLayout::TypedObject => {
+                chunk_result(self.raw_quads(chunk).map(|raws| {
+                    raws.into_iter()
+                        .map(|raw| Ok(SharedQuad::from(raw)))
+                        .collect()
+                }))
+            }
             ResolvedLayout::Dictionary(access) => match access.resident() {
                 Some(dict) => dictionary::decode_chunk_shared(chunk, dict),
-                None => vec![Err(VortexRdfError::Deserialization(
-                    "a file-backed dictionary decodes chunks through the async read path"
-                        .to_string(),
-                ))],
+                None => file_backed_sync_error(),
             },
         }
     }
 
-    /// [`decode_chunk_shared`](Self::decode_chunk_shared) with the file-backed
-    /// Dictionary case handled exactly as
-    /// [`decode_chunk_async`](Self::decode_chunk_async) does: one dictionary
-    /// scan resolves the chunk's distinct codes into shared strings, and the
-    /// chunk decodes against that map.
+    /// `sync(self, chunk)`, except under a file-backed dictionary, where the
+    /// chunk's distinct codes are resolved with one read of the dictionary
+    /// child and `mapped` decodes against them.
     #[cfg(feature = "file-io")]
-    pub(crate) async fn decode_chunk_shared_async(
+    async fn decode_resolving<T>(
         &self,
         chunk: &ArrayRef,
-    ) -> Vec<Result<SharedQuad>> {
+        mapped: MappedDecode<T>,
+        sync: fn(&ResolvedLayout, &ArrayRef) -> Vec<Result<T>>,
+    ) -> Vec<Result<T>> {
         if let ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) = self {
-            let terms = match dictionary::resolve_chunk_terms(fb, chunk).await {
-                Ok(terms) => terms,
-                Err(e) => return vec![Err(e)],
+            return match dictionary::resolve_chunk_terms(fb, chunk).await {
+                Ok(terms) => mapped(chunk, &terms),
+                Err(e) => vec![Err(e)],
             };
-            return dictionary::decode_chunk_mapped_shared(chunk, &terms);
         }
-        self.decode_chunk_shared(chunk)
+        sync(self, chunk)
     }
 
-    /// Prepare `pattern` for the synchronous match core: pre-resolve every
-    /// bound term the layout probes by code, and hand back the
-    /// [`PatternCodes`] witness the core's probes run on. The one point in a
-    /// match where a dictionary may perform I/O (see
-    /// [`DictAccess::resolve_pattern`]) — which is why this prelude is the
-    /// witness's only constructor. The string layouts have nothing to
-    /// resolve, so their preparation never suspends.
+    /// The [`PatternCodes`] for `pattern`: every bound term the layout probes
+    /// by code is resolved here, the one point in a match where a dictionary
+    /// may do I/O. The string layouts resolve nothing.
     pub(crate) async fn prepare_pattern(&self, pattern: QuadPattern<'_>) -> Result<PatternCodes> {
         match self {
             ResolvedLayout::Default => Ok(PatternCodes::new(CodeResolver::Default)),
@@ -715,15 +522,11 @@ impl ResolvedLayout {
         }
     }
 
-    /// Decode an array of this layout's rows back into [`RawQuad`]s — each
-    /// term in its N-Triples string form, without an oxrdf parse round-trip.
-    ///
-    /// The inverse of the build-time column encoding, for the operations that
-    /// rebuild a store from its quads (compaction, and reads that must merge a
-    /// string tail into a Dictionary-encoded base): Default reads its four
-    /// string columns verbatim, TypedObject recomposes the object term from
-    /// its typed sub-columns, and Dictionary resolves each u32 code through
-    /// this layout's term dictionary.
+    /// `rows` of this layout as [`RawQuad`]s, each term in its N-Triples
+    /// string form: Default reads its string columns, TypedObject recomposes
+    /// the object from its sub-columns, Dictionary resolves each code through
+    /// its resident dictionary (a file-backed one is an error here; see
+    /// [`raw_quads_async`](Self::raw_quads_async)).
     pub(crate) fn raw_quads(&self, rows: &ArrayRef) -> Result<Vec<RawQuad>> {
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let struct_arr = rows
@@ -766,48 +569,71 @@ impl ResolvedLayout {
             .collect())
     }
 
-    /// [`raw_quads`](Self::raw_quads) with the file-backed Dictionary case
-    /// handled: the whole dictionary is lifted resident transiently (the
-    /// callers — compaction and tail-merge re-encoding — touch most of it
-    /// anyway), then the sync decode runs unchanged.
-    #[cfg(feature = "file-io")]
+    /// [`raw_quads`](Self::raw_quads), lifting a file-backed dictionary
+    /// resident for the decode.
     pub(crate) async fn raw_quads_async(&self, rows: &ArrayRef) -> Result<Vec<RawQuad>> {
+        #[cfg(feature = "file-io")]
         if let ResolvedLayout::Dictionary(access) = self
             && access.is_file_backed()
         {
             let dict = access.ensure_resident().await?;
-            let resident = ResolvedLayout::Dictionary(DictAccess::Resident(dict));
-            return resident.raw_quads(rows);
+            return ResolvedLayout::Dictionary(DictAccess::Resident(dict)).raw_quads(rows);
         }
         self.raw_quads(rows)
     }
 }
 
-/// The two row representations a chunk decodes into: owned oxrdf [`Quad`]s,
-/// or [`SharedQuad`]s whose terms are shared strings. Each pipeline over
-/// chunks — the serve plans, the point-read fast paths, the sync and async
-/// scan streams — is written once against this trait for both.
+/// A decode of a Dictionary chunk against a resolved code -> term map.
+#[cfg(feature = "file-io")]
+type MappedDecode<T> = fn(&ArrayRef, &std::collections::HashMap<u32, Arc<str>>) -> Vec<Result<T>>;
+
+/// The error chunk for a synchronous decode of a file-backed dictionary.
+fn file_backed_sync_error<T>() -> Vec<Result<T>> {
+    vec![Err(VortexRdfError::Deserialization(
+        "a file-backed dictionary decodes chunks through the async read path".to_string(),
+    ))]
+}
+
+/// A leaf's chunk result as the per-row convention: a chunk-level `Err` is
+/// one `Err` element.
+fn chunk_result<T>(result: Result<Vec<Result<T>>>) -> Vec<Result<T>> {
+    match result {
+        Ok(rows) => rows,
+        Err(e) => vec![Err(e)],
+    }
+}
+
+/// A row representation a chunk decodes into: owned [`Quad`]s, [`SharedQuad`]s
+/// with shared-string terms, or [`RawQuad`]s. Every chunk pipeline (serve
+/// plans, point reads, scan streams) is written once against this trait.
 pub(crate) trait ChunkDecode: Sized + Send + 'static {
-    /// [`ResolvedLayout::decode_chunk`] into this representation.
+    /// `chunk`'s rows through `layout`, under [`ResolvedLayout::decode_chunk`]'s
+    /// error convention; a file-backed dictionary is a chunk-level error.
     fn decode(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>>;
-    /// [`ResolvedLayout::decode_chunk_async`] into this representation.
-    #[cfg(feature = "file-io")]
+
+    /// [`decode`](Self::decode), resolving a file-backed dictionary's codes
+    /// with a read of its child; otherwise the synchronous decode.
     fn decode_async<'a>(
         layout: &'a ResolvedLayout,
         chunk: &'a ArrayRef,
-    ) -> BoxFuture<'a, Vec<Result<Self>>>;
+    ) -> BoxFuture<'a, Vec<Result<Self>>> {
+        future::ready(Self::decode(layout, chunk)).boxed()
+    }
 }
 
 impl ChunkDecode for Quad {
     fn decode(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>> {
         layout.decode_chunk(chunk)
     }
+
     #[cfg(feature = "file-io")]
     fn decode_async<'a>(
         layout: &'a ResolvedLayout,
         chunk: &'a ArrayRef,
     ) -> BoxFuture<'a, Vec<Result<Self>>> {
-        layout.decode_chunk_async(chunk).boxed()
+        layout
+            .decode_resolving(chunk, dictionary::decode_chunk_mapped, Self::decode)
+            .boxed()
     }
 }
 
@@ -815,16 +641,39 @@ impl ChunkDecode for SharedQuad {
     fn decode(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>> {
         layout.decode_chunk_shared(chunk)
     }
+
     #[cfg(feature = "file-io")]
     fn decode_async<'a>(
         layout: &'a ResolvedLayout,
         chunk: &'a ArrayRef,
     ) -> BoxFuture<'a, Vec<Result<Self>>> {
-        layout.decode_chunk_shared_async(chunk).boxed()
+        layout
+            .decode_resolving(chunk, dictionary::decode_chunk_mapped_shared, Self::decode)
+            .boxed()
     }
 }
 
-/// Read a UTF-8 string column into owned term strings, one per row.
+impl ChunkDecode for RawQuad {
+    fn decode(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>> {
+        chunk_result(
+            layout
+                .raw_quads(chunk)
+                .map(|raws| raws.into_iter().map(Ok).collect()),
+        )
+    }
+
+    fn decode_async<'a>(
+        layout: &'a ResolvedLayout,
+        chunk: &'a ArrayRef,
+    ) -> BoxFuture<'a, Vec<Result<Self>>> {
+        layout
+            .raw_quads_async(chunk)
+            .map(|raws| chunk_result(raws.map(|raws| raws.into_iter().map(Ok).collect())))
+            .boxed()
+    }
+}
+
+/// A UTF-8 string column as owned term strings, one per row.
 fn read_string_column(struct_arr: &StructArray, name: &str) -> Result<Vec<String>> {
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let col = field_as::<VarBinViewArray>(struct_arr, name, &mut ctx)?;
@@ -834,7 +683,7 @@ fn read_string_column(struct_arr: &StructArray, name: &str) -> Result<Vec<String
         .collect()
 }
 
-/// Read a u32 code column into owned codes, one per row.
+/// A u32 code column as owned codes, one per row.
 fn read_u32_column(struct_arr: &StructArray, name: &str) -> Result<Vec<u32>> {
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let col = field_as::<PrimitiveArray>(struct_arr, name, &mut ctx)?;

@@ -1,8 +1,6 @@
-//! Component sources: replayable producers of one independently typed
-//! component's chunks, plus the descriptor-source-strategy triple a write
-//! consumes. Always compiled — builders construct [`NativeComponentWrite`]s
-//! on every target, even when no serializer is compiled in; only the write
-//! strategy that consumes them (`write`) is gated.
+//! Component sources: replayable producers of one component's chunks, the
+//! descriptor-source-strategy triple a write consumes, and the per-child
+//! write strategies.
 
 use std::sync::Arc;
 
@@ -12,11 +10,8 @@ use vortex_error::{VortexResult, vortex_bail, vortex_ensure_eq};
 
 use super::wire::StoreComponentDescriptor;
 
-/// Replayable producer for one independently typed component. Sources are
-/// buffered arrays ([`BufferedComponentSource`]) or spill-run mergers pulled
-/// chunk by chunk ([`PullComponentSource`]); both are lazy — nothing is
-/// produced until the write strategy polls, which is what lets it bound how
-/// many components compress concurrently.
+/// A replayable producer of one component's chunks, lazy until the write
+/// strategy polls it.
 pub(crate) trait NativeComponentSource: Send + Sync + 'static {
     fn dtype(&self) -> &DType;
     fn open(&self) -> VortexResult<vortex_array::stream::SendableArrayStream>;
@@ -78,16 +73,15 @@ impl NativeComponentSource for BufferedComponentSource {
     }
 }
 
-/// A pull closure yielding one component chunk per call (`Ok(None)` = end).
-// Constructed only by the out-of-core builder, which is compiled out on
-// wasm32-unknown-unknown.
+/// A pull closure yielding one component chunk of at most the given rows
+/// per call, `Ok(None)` once exhausted; a zero-row pull yields the empty
+/// chunk of the component's dtype.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) type PullFn =
     Box<dyn FnMut(usize) -> VortexResult<Option<vortex_array::ArrayRef>> + Send>;
 
-/// A single-shot component source over a pull closure — how spill-run mergers
-/// stream a component's chunks without materializing them (each call reads
-/// the next window off the merger's run files).
+/// A single-shot component source over a pull closure; each call reads the
+/// next window off a spill-run merger.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) struct PullComponentSource {
     dtype: DType,
@@ -122,14 +116,27 @@ impl NativeComponentSource for PullComponentSource {
                 vortex_error::vortex_err!("a pull-backed component source replays only once")
             })?;
         let batch_rows = self.batch_rows;
-        let stream = futures::stream::unfold(Some(pull), move |state| async move {
-            let mut pull = state?;
-            match pull(batch_rows) {
-                Ok(Some(chunk)) => Some((Ok(chunk), Some(pull))),
-                Ok(None) => None,
-                Err(e) => Some((Err(e), None)),
-            }
-        });
+        // At least one chunk is emitted: an empty component contributes its
+        // schema-carrying empty chunk.
+        let stream =
+            futures::stream::unfold((Some(pull), false), move |(state, emitted)| async move {
+                let mut pull = state?;
+                match pull(batch_rows) {
+                    Ok(Some(chunk)) => Some((Ok(chunk), (Some(pull), true))),
+                    Ok(None) if !emitted => {
+                        let empty = pull(0).and_then(|chunk| {
+                            chunk.ok_or_else(|| {
+                                vortex_error::vortex_err!(
+                                    "a zero-row pull must yield an empty chunk"
+                                )
+                            })
+                        });
+                        Some((empty, (None, true)))
+                    }
+                    Ok(None) => None,
+                    Err(e) => Some((Err(e), (None, true))),
+                }
+            });
         Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
             self.dtype.clone(),
             stream,
@@ -137,6 +144,8 @@ impl NativeComponentSource for PullComponentSource {
     }
 }
 
+/// A component to write: its descriptor, chunk source and per-child write
+/// strategy.
 #[derive(Clone)]
 pub(crate) struct NativeComponentWrite {
     pub(crate) descriptor: StoreComponentDescriptor,
@@ -165,19 +174,9 @@ impl NativeComponentWrite {
     }
 }
 
-/// The stock write strategy `write_options()` installs — used for the quad
-/// child and the index components (the dictionary child instead passes its
-/// pre-compressed chunks through `write::dict_child_strategy`).
-///
-/// The compressor is the stock cascade minus FastLanes delta. Delta wins on
-/// size for exactly the columns the store binary-searches in place — the
-/// sorted subject column and the index children's lead columns — but a
-/// delta value is a running sum, so a point read decodes its whole
-/// 1,024-value block; every cold probe and point read through the chunk
-/// leaves would pay that where a bit-packed or frame-of-reference column
-/// answers from one word. The store's own files stay on the encodings its
-/// probes read in place (the reader still probes delta, for files written
-/// elsewhere).
+/// The write strategy of the quad child and the index components: the
+/// BtrBlocks cascade minus FastLanes delta (a point read must not decode a
+/// 1,024-value block).
 pub(crate) fn default_child_strategy() -> Arc<dyn vortex_layout::LayoutStrategy> {
     use vortex_btrblocks::schemes::integer::DeltaScheme;
     use vortex_btrblocks::{BtrBlocksCompressorBuilder, SchemeExt as _};
@@ -189,4 +188,17 @@ pub(crate) fn default_child_strategy() -> Arc<dyn vortex_layout::LayoutStrategy>
             .with_btrblocks_builder(compressor)
             .build(),
     )
+}
+
+/// The dictionary child's pass-through strategy: every source chunk written
+/// verbatim as one flat leaf under a chunked node, so the leaves are the
+/// FSST windows `FileBackedDict` point-reads.
+pub(crate) fn dict_child_strategy() -> Arc<dyn vortex_layout::LayoutStrategy> {
+    use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
+    use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
+    use vortex_layout::layouts::struct_::StructStrategy;
+    Arc::new(StructStrategy::new(
+        Arc::new(FlatLayoutStrategy::default()),
+        Arc::new(ChunkedLayoutStrategy::new(FlatLayoutStrategy::default())),
+    ))
 }
