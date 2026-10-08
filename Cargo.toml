@@ -31,7 +31,7 @@ vortex-sequence = "0.86.1"
 vortex-sparse = "0.86.1"
 vortex-session = "0.86.1"
 vortex-fsst = "0.86.1"
-vortex-edition = "0.86.1"
+vortex-edition = "0.88.0"
 vortex-mask = "0.86.1"
 vortex-file = { version = "0.86.1" }
 vortex-scan = "0.86.1"
