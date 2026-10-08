@@ -6,6 +6,7 @@ use super::*;
 use crate::io::container::{self, DICT_COMPONENT_NAME};
 use crate::store::layouts::dictionary::FileBackedDict;
 use crate::store::native_file::NativeStoreFile;
+use vortex_layout::layouts::zoned::Zoned;
 
 // ─── File-backed dictionary ────────────────────────────────────────────
 
@@ -74,8 +75,7 @@ async fn assert_file_backed_matches_resident(
     assert!(resident.dictionary_snapshot().is_some(), "{tag}");
     assert!(fb.dictionary_snapshot().is_none(), "{tag}");
     // A file open must actually stay file-backed: the written child's shape
-    // resolves a wire-chunk handle, so it never falls back to the resident
-    // arm.
+    // is window-searchable, so it never falls back to the resident arm.
     assert!(fb.debug_dict_file_backed(), "{tag}");
     assert!(!resident.debug_dict_file_backed(), "{tag}");
     // The code-read gate includes residency: no snapshot, no code decoding.
@@ -307,8 +307,7 @@ async fn test_file_backed_dictionary_probe_parity() {
     let dict = resident.dictionary_snapshot().unwrap().0;
 
     // The probe target, built exactly as `from_file` does file-backed: the
-    // dictionary child's cached layout reader plus the wire-chunk handle
-    // resolved off the same child.
+    // dictionary child's layout, with each window's bounds read at open.
     let outer = NativeStoreFile::try_new(
         crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
             .await
@@ -317,10 +316,12 @@ async fn test_file_backed_dictionary_probe_parity() {
     .unwrap();
     let len = dict.len() as u64;
     let fb = FileBackedDict::open(&outer)
+        .await
         .unwrap()
         .expect("the dictionary child's chunk shape must resolve");
 
-    // Every ~397th term plus both extremes, probed twice (cold + memo).
+    // Every ~397th term plus both extremes, probed twice (nothing is cached:
+    // both read the window).
     let sample: Vec<u32> = (0..len as u32)
         .step_by(397)
         .chain([0, len as u32 - 1])
@@ -338,8 +339,7 @@ async fn test_file_backed_dictionary_probe_parity() {
     // Above every stored term: the search runs off the end.
     assert_eq!(fb.encode("\u{10FFFF}").await.unwrap(), None);
 
-    // code → term parity under and over the point-read cap (the wide batch
-    // exercises the row-index scan).
+    // code → term parity in one window and across many.
     for k in [64usize, 300] {
         let codes: Vec<u32> = (0..len as u32)
             .step_by((len as usize / k).max(1))
@@ -440,6 +440,7 @@ async fn test_file_backed_dictionary_rejects_below_first_term() {
     )
     .unwrap();
     let fb = FileBackedDict::open(&outer)
+        .await
         .unwrap()
         .expect("the dictionary child's chunk shape must resolve");
 
@@ -514,7 +515,7 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
     )
     .unwrap();
     assert!(
-        FileBackedDict::open(&outer).unwrap().is_none(),
+        FileBackedDict::open(&outer).await.unwrap().is_none(),
         "a flat dictionary child must decline the point-read handle"
     );
 
@@ -537,7 +538,7 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
             .unwrap(),
     )
     .unwrap();
-    assert!(FileBackedDict::open(&empty_file).unwrap().is_none());
+    assert!(FileBackedDict::open(&empty_file).await.unwrap().is_none());
     let empty = VortexRdfStore::from_file(&empty_path).await.unwrap();
     assert!(!empty.debug_dict_file_backed());
     assert!(empty.dictionary_snapshot().is_some());
@@ -682,4 +683,103 @@ async fn test_large_dictionary_child_lift_keeps_fsst() {
         assert_eq!(lifted.decode(code).as_deref(), Some(term.as_str()));
     }
     assert_eq!(lifted.encode("\u{10FFFF}"), None);
+}
+
+/// A store file written by vortex-rdf 0.11 — a dictionary child without zone
+/// maps — opens memory-mapped through the leaf-bound fallback and answers
+/// exactly like its in-memory load.
+#[tokio::test]
+async fn test_v1_dictionary_fixture_opens_mapped() {
+    const FIXTURE: &[u8] = include_bytes!("fixtures/store-dictionary-both-indexes.vortex");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v1.vortex");
+    std::fs::write(&path, FIXTURE).unwrap();
+    // The fixture is the 0.11 shape: component version 1, and a term column
+    // with no zone-map node to read window bounds from.
+    let native = NativeStoreFile::try_new(
+        crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let descriptor = native
+        .components()
+        .iter()
+        .find(|c| c.name == DICT_COMPONENT_NAME)
+        .unwrap();
+    assert_eq!(descriptor.version, 1);
+    assert!(!dict_term_column(&native).is::<Zoned>());
+    let mapped = VortexRdfStore::from_file(&path).await.unwrap();
+    assert!(mapped.debug_dict_file_backed());
+    let loaded = VortexRdfStore::from_bytes(FIXTURE).await.unwrap();
+    assert_eq!(view_strings(&mapped).await, view_strings(&loaded).await);
+    let reader = mapped.dict_reader().unwrap();
+    let oracle = loaded.code_read_snapshot().unwrap();
+    for code in 0..oracle.len() as u32 {
+        let term = oracle.decode(code).unwrap();
+        assert_eq!(reader.encode(&term).await.unwrap(), Some(code), "{term}");
+        assert_eq!(
+            reader.decode(code).await.unwrap().as_deref(),
+            Some(term.as_str())
+        );
+    }
+}
+
+/// A term column written without zone maps (the 0.11 strategy) still opens
+/// file-backed, its window bounds read from the leaves themselves.
+#[tokio::test]
+async fn test_child_without_zone_maps_reads_bounds_from_leaves() {
+    use crate::io::container::{
+        BufferedComponentSource, NativeComponentWrite, StoreComponentDescriptor, StoreComponentRole,
+    };
+    use crate::store::layouts::dictionary::TermDictionary;
+    use std::sync::Arc;
+
+    let terms: Vec<String> = (0..20_000)
+        .map(|i| format!("\"object value {i:06}\""))
+        .collect();
+    let dict = TermDictionary::from_sorted_column(
+        vortex_array::arrays::VarBinViewArray::from_iter_str(terms.iter().map(String::as_str)),
+    )
+    .unwrap();
+    let chunks = dict.child_chunks().unwrap();
+    let dtype = chunks[0].dtype().clone();
+    let v1 = NativeComponentWrite::new(
+        StoreComponentDescriptor {
+            name: DICT_COMPONENT_NAME.into(),
+            role: StoreComponentRole::Dictionary,
+            implementation: container::DICT_IMPLEMENTATION.into(),
+            version: 1,
+            required: true,
+            sorted: true,
+            dtype,
+        },
+        Arc::new(BufferedComponentSource::try_new(chunks).unwrap()),
+        container::dict_child_strategy(None),
+    )
+    .unwrap();
+    let bytes = unstamped_store_bytes(vec![bare_code_quad_array(&[0])], vec![v1]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v1-shape.vortex");
+    std::fs::write(&path, &bytes).unwrap();
+    let native = NativeStoreFile::try_new(
+        crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!dict_term_column(&native).is::<Zoned>());
+    let fb = FileBackedDict::open(&native)
+        .await
+        .unwrap()
+        .expect("a chunked child is point-readable");
+    for i in (0..20_000).step_by(997).chain([0, 19_999]) {
+        assert_eq!(
+            fb.encode(&terms[i]).await.unwrap(),
+            Some(i as u32),
+            "{}",
+            terms[i]
+        );
+    }
+    assert_eq!(fb.encode("\"object value 0099999\"").await.unwrap(), None);
 }

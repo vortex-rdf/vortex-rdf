@@ -350,8 +350,7 @@ enum CodeResolver {
     /// decompose the object term into its typed sub-columns.
     TypedObject,
     /// Dictionary resident in memory: codes resolve on demand by in-memory
-    /// binary search (memoized per role here, and across matches in the
-    /// dictionary's own probe cache).
+    /// binary search (memoized per role here).
     Resident(Arc<TermDictionary>),
     /// Dictionary left in its file: the async prelude pre-resolved every
     /// bound role into the role cache, which is therefore the complete

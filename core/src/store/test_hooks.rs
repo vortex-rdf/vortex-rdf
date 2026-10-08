@@ -123,7 +123,7 @@ impl VortexRdfStore {
 #[cfg(feature = "file-io")]
 impl VortexRdfStore {
     /// Whether the dictionary was left in its file child (a file-backed
-    /// dictionary is only built around a point-readable wire-chunk handle).
+    /// dictionary is only built over a child whose windows can be searched).
     pub(crate) fn debug_dict_file_backed(&self) -> bool {
         matches!(
             &self.layout,

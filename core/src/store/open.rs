@@ -200,7 +200,7 @@ impl VortexRdfStore {
                 // leaves a probe or decode touches — unless the child's
                 // layout shape declines that handle, and holding it whole is
                 // then the only way to read it at all.
-                let dict_access = match FileBackedDict::open(&file)? {
+                let dict_access = match FileBackedDict::open(&file).await? {
                     Some(dict) => DictAccess::FileBacked(dict),
                     // One full scan of the dictionary child — chunks keep
                     // their FSST.

@@ -11,9 +11,9 @@
 //! [`LayoutStrategy::Dictionary`]: crate::store::layouts::LayoutStrategy::Dictionary
 
 use crate::debug;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::ops::Range;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
@@ -152,25 +152,19 @@ impl ResidentChunks {
 ///
 /// term → code is a host-side binary search; code → term reads the term at a
 /// position. Both go through [`cursor`](Self::cursor), whose cost depends on
-/// the encoding the terms are held in.
+/// the encoding the terms are held in. Nothing is memoized.
 pub(crate) struct TermDictionary {
     terms: TermStore,
-    /// Memo for [`encode`](Self::encode); see [`ProbeCache`].
-    probes: ProbeCache,
     /// The kind ranges, computed on first use (a few probes).
     kinds: OnceLock<KindRanges>,
-    /// Memo for [`filter_codes`](Self::filter_codes); see [`PredicateMemo`].
-    predicates: PredicateMemo,
 }
 
 impl TermDictionary {
-    /// Wrap the held terms, with an empty lookup memo.
+    /// Wrap the held terms.
     fn new(terms: TermStore) -> Self {
         Self {
             terms,
-            probes: ProbeCache::new(),
             kinds: OnceLock::new(),
-            predicates: PredicateMemo::new(),
         }
     }
 
@@ -399,29 +393,11 @@ impl TermDictionary {
     }
 
     /// Encode a term to its code: its position in the sorted dictionary, or
-    /// `None` when the dictionary does not hold it.
-    ///
-    /// Memoized. [`PatternCodes`] already collapses the repeats *within* one
-    /// match; this catches the repeats *across* matches — the same predicate
-    /// walked over many patterns, the same subject chained through several
-    /// matches.
-    ///
-    /// [`PatternCodes`]: crate::store::layouts::PatternCodes
-    pub(crate) fn encode(&self, term: &str) -> Option<u32> {
-        if let Some(memoized) = self.probes.get(term) {
-            return memoized;
-        }
-        let found = self.search(term);
-        self.probes.put(term, found);
-        found
-    }
-
-    /// The uncached binary search behind [`encode`](Self::encode): a
+    /// `None` when the dictionary does not hold it. A binary search with a
     /// three-way compare per step, returning as soon as the probe hits.
-    fn search(&self, term: &str) -> Option<u32> {
+    pub(crate) fn encode(&self, term: &str) -> Option<u32> {
         // FSST is not order-preserving, so the search cannot run over the
-        // compressed codes: every probe decodes into the cursor's scratch
-        // buffer.
+        // compressed codes: every probe decodes into the cursor's scratch.
         let mut cursor = self.cursor();
         let needle = term.as_bytes();
         let (mut lo, mut hi) = (0usize, self.len());
@@ -438,7 +414,7 @@ impl TermDictionary {
 
     /// The code of the first term not below `needle` in byte order — the
     /// dictionary's size when every term is below it. A binary search with
-    /// the same per-probe decode as [`search`](Self::search); the position
+    /// the same per-probe decode as [`encode`](Self::encode); the position
     /// is where `needle` would be inserted, so a present term's code and
     /// the start of a spelling prefix's run both come out of it.
     pub(crate) fn lower_bound(&self, needle: &[u8]) -> u32 {
@@ -527,13 +503,8 @@ impl TermDictionary {
 
     /// Partition the codes by `predicate`'s verdicts — `(true, unknown)`,
     /// both ascending — in one pass over the predicate's scan range (see
-    /// [`TermPredicate::scan_plan`]), memoized per dictionary by the
-    /// predicate's canonical rendering ([`PredicateMemo`]).
+    /// [`TermPredicate::scan_plan`]), computed afresh on every call.
     pub(crate) fn filter_codes(&self, predicate: &TermPredicate) -> VerdictSets {
-        let key = predicate.to_string();
-        if let Some(sets) = self.predicates.get(&key) {
-            return sets;
-        }
         let kinds = self.kind_ranges();
         let plan = predicate.scan_plan(kinds);
         let mut scanned = Scanned::default();
@@ -552,9 +523,7 @@ impl TermDictionary {
             .iter()
             .map(|prefix| self.prefix_range(prefix))
             .collect();
-        let sets = Arc::new(predicate.assemble(kinds, scanned, &true_ranges));
-        self.predicates.put(key, Arc::clone(&sets));
-        sets
+        Arc::new(predicate.assemble(kinds, scanned, &true_ranges))
     }
 }
 
@@ -576,133 +545,8 @@ pub(super) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// A predicate's partition of a dictionary's codes — `(true, unknown)`,
-/// both ascending — shared between the memo and every caller.
+/// both ascending.
 pub(crate) type VerdictSets = Arc<(Buffer<u32>, Buffer<u32>)>;
-
-/// Partitions a dictionary's [`PredicateMemo`] holds before the oldest is
-/// evicted. A query workload asks a handful of distinct predicates per
-/// query, and an entry can be as wide as the dictionary, so the memo is
-/// bounded rather than keyed on everything ever asked.
-const PREDICATE_MEMO_SLOTS: usize = 32;
-
-/// A bounded first-in-first-out memo of predicate partitions, keyed by the
-/// predicate's canonical rendering. Like [`ProbeCache`], a poisoned lock
-/// degrades to a miss.
-pub(super) struct PredicateMemo {
-    entries: RwLock<VecDeque<(String, VerdictSets)>>,
-}
-
-impl PredicateMemo {
-    pub(super) fn new() -> Self {
-        Self {
-            entries: RwLock::new(VecDeque::with_capacity(PREDICATE_MEMO_SLOTS)),
-        }
-    }
-
-    pub(super) fn get(&self, key: &str) -> Option<VerdictSets> {
-        let entries = self.entries.read().ok()?;
-        entries
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, sets)| Arc::clone(sets))
-    }
-
-    pub(super) fn put(&self, key: String, sets: VerdictSets) {
-        if let Ok(mut entries) = self.entries.write() {
-            if entries.iter().any(|(k, _)| *k == key) {
-                return;
-            }
-            if entries.len() == PREDICATE_MEMO_SLOTS {
-                entries.pop_front();
-            }
-            entries.push_back((key, sets));
-        }
-    }
-}
-
-/// Slots in a dictionary's [`ProbeCache`]. A power of two: the slot index is
-/// the hash masked to this width.
-///
-/// Sized for the working set of a query workload — the bound terms of the
-/// patterns currently being asked — not for the dictionary.
-const PROBE_CACHE_SLOTS: usize = 256;
-
-/// A fixed-size, direct-mapped memo of term → code lookups (absence
-/// included): one slot per hash bucket, overwritten on collision, so its
-/// footprint never grows. Entries never go stale: a dictionary's terms are
-/// immutable and a mutation builds a new dictionary with a fresh cache.
-///
-/// Used by both [`TermDictionary`] and the file-backed form
-/// ([`FileBackedDict`](super::file_backed::FileBackedDict)), whose miss is
-/// the same binary search run over cached wire chunks.
-pub(super) struct ProbeCache {
-    slots: RwLock<Box<[Option<ProbeEntry>]>>,
-}
-
-struct ProbeEntry {
-    /// A `String`, so an overwrite reuses the allocation: terms in a dataset
-    /// are of similar length, so the replacing term usually fits the capacity
-    /// the evicted one left behind. A miss is then a hash and a copy, with no
-    /// allocator traffic.
-    term: String,
-    code: Option<u32>,
-}
-
-impl ProbeCache {
-    pub(super) fn new() -> Self {
-        Self {
-            slots: RwLock::new(
-                std::iter::repeat_with(|| None)
-                    .take(PROBE_CACHE_SLOTS)
-                    .collect(),
-            ),
-        }
-    }
-
-    /// FNV-1a over the whole term: RDF terms in a dataset share long IRI
-    /// prefixes and differ only near the end, so the distinguishing bytes sit
-    /// at the tail.
-    fn slot(term: &str) -> usize {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for &b in term.as_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        (h as usize) & (PROBE_CACHE_SLOTS - 1)
-    }
-
-    /// `Some(code_or_absent)` on a hit, `None` when this term is not memoized.
-    ///
-    /// A poisoned lock degrades to a miss rather than propagating: the memo is
-    /// an optimization, and losing it must not fail a query.
-    pub(super) fn get(&self, term: &str) -> Option<Option<u32>> {
-        let slots = self.slots.read().ok()?;
-        match &slots[Self::slot(term)] {
-            Some(entry) if entry.term == term => Some(entry.code),
-            _ => None,
-        }
-    }
-
-    /// Memoize `code` for `term`, evicting whatever shared its slot.
-    pub(super) fn put(&self, term: &str, code: Option<u32>) {
-        if let Ok(mut slots) = self.slots.write() {
-            let slot = Self::slot(term);
-            match &mut slots[slot] {
-                Some(entry) => {
-                    entry.term.clear();
-                    entry.term.push_str(term);
-                    entry.code = code;
-                }
-                empty => {
-                    *empty = Some(ProbeEntry {
-                        term: term.to_owned(),
-                        code,
-                    })
-                }
-            }
-        }
-    }
-}
 
 /// Bytes an FSST symbol expands to at most — one code never yields more.
 const FSST_SYMBOL_LEN: usize = 8;
@@ -930,7 +774,7 @@ impl DictSnapshot {
     /// predicate's [`domain`](TermPredicate::domain) — non-literals, for the
     /// literal predicates — appear in neither list, since a caller decides
     /// them from the term's kind alone (see [`kind_ranges`](Self::kind_ranges)).
-    /// One scan of the domain, memoized per dictionary.
+    /// One scan of the domain.
     pub fn filter_codes(&self, predicate: &TermPredicate) -> (Buffer<u32>, Buffer<u32>) {
         let sets = self.0.filter_codes(predicate);
         (sets.0.clone(), sets.1.clone())
@@ -1079,9 +923,8 @@ impl DictReader {
         }
     }
 
-    /// See [`DictSnapshot::filter_codes`]. A file-backed dictionary scans
-    /// the predicate's domain through its child once per distinct predicate
-    /// (memoized like the resident form).
+    /// See [`DictSnapshot::filter_codes`]. A file-backed dictionary reads the
+    /// predicate's domain window by window.
     pub async fn filter_codes(
         &self,
         predicate: &TermPredicate,
@@ -1228,58 +1071,8 @@ impl TermDictionary {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn dict(terms: &[&str]) -> TermDictionary {
-        let mut sorted = terms.to_vec();
-        sorted.sort_unstable();
-        TermDictionary::from_sorted(sorted.into_iter()).unwrap()
-    }
-
-    /// The memo must be invisible: every lookup agrees with the uncached search,
-    /// on repeats and on absent terms alike.
-    #[test]
-    fn memoized_lookup_matches_the_search() {
-        let terms: Vec<String> = (0..500)
-            .map(|i| format!("<http://example.org/resource/{i:04}>"))
-            .collect();
-        let d = dict(&terms.iter().map(String::as_str).collect::<Vec<_>>());
-
-        for probe in terms
-            .iter()
-            .map(String::as_str)
-            .chain(["<http://absent>", ""])
-        {
-            let expected = d.search(probe);
-            // Twice: the first call fills the slot, the second reads it back.
-            assert_eq!(d.encode(probe), expected, "cold lookup of {probe}");
-            assert_eq!(d.encode(probe), expected, "memoized lookup of {probe}");
-        }
-    }
-
-    /// Two terms sharing a slot must not read each other's code. With one slot
-    /// per bucket the second simply evicts the first, and both stay correct.
-    #[test]
-    fn colliding_terms_do_not_alias() {
-        let terms: Vec<String> = (0..2_000)
-            .map(|i| format!("<http://example.org/collide/{i:05}>"))
-            .collect();
-        let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
-        let d = dict(&refs);
-
-        // Far more distinct terms than slots, so collisions are certain.
-        assert!(terms.len() > PROBE_CACHE_SLOTS);
-        let a = &refs[7];
-        let b = refs
-            .iter()
-            .find(|t| ProbeCache::slot(t) == ProbeCache::slot(a) && *t != a)
-            .expect("2000 terms over 256 slots must collide");
-
-        assert_eq!(d.encode(a), d.search(a));
-        assert_eq!(d.encode(b), d.search(b));
-        // `b` evicted `a`; asking again must re-search, not return `b`'s code.
-        assert_eq!(d.encode(a), d.search(a));
-        assert_ne!(d.encode(a), d.encode(b));
-    }
+    #[cfg(feature = "file-io")]
+    use vortex_layout::layouts::zoned::Zoned;
 
     /// Multi-window compression is invisible to lookups: a dictionary
     /// compressed in many small windows holds independent FSST chunks and
@@ -1392,6 +1185,9 @@ mod tests {
         for (i, term) in terms.iter().enumerate() {
             assert_eq!(snapshot.decode(i as u32).as_deref(), Some(term.as_str()));
         }
+        // And the term column carries no zone-map node at all.
+        let native = crate::tests::open_native_bytes(bytes);
+        assert!(!crate::tests::dict_term_column(&native).is::<Zoned>());
     }
 
     /// A dictionary child without zone maps — the shape vortex-rdf 0.11
@@ -1421,7 +1217,9 @@ mod tests {
             .open_buffer(ByteBuffer::from(bytes))
             .unwrap();
         let native = NativeStoreFile::try_new(file).unwrap();
+        assert!(!crate::tests::dict_term_column(&native).is::<Zoned>());
         let fbd = FileBackedDict::open(&native)
+            .await
             .unwrap()
             .expect("an unzoned chunked child is point-readable");
         for (i, term) in terms.iter().enumerate() {

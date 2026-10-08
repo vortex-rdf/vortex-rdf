@@ -400,10 +400,9 @@ fn intersect_sorted_ids(left: &[u64], right: &[u64]) -> Buffer<u64> {
 /// [`gather_by_point_reads`](crate::store::scan::gather::gather_by_point_reads)).
 /// The pipeline's cost is fixed per column
 /// (optimizer pass, execution context, canonicalization) whatever the row
-/// count, while point reads cost per row per column. The file-backed
-/// dictionary makes the same trade: `FileBackedDict::decode_many`
-/// point-reads batches of up to this many codes through the chunk leaves and
-/// scans wider ones.
+/// count, while point reads cost per row per column. (The file-backed
+/// dictionary needs no such cap: it takes the asked rows out of each window
+/// it rebuilds.)
 pub(crate) const POINT_GATHER_MAX_ROWS: usize = 256;
 
 /// Whether `rows` rows fit the point-read paths (see

@@ -234,6 +234,69 @@ pub(crate) async fn write_dict_only_store(
     .await
 }
 
+/// [`write_dict_only_store`] with the dictionary component written the way
+/// vortex-rdf 0.11 wrote it: version 1, and no zone maps on the term column.
+#[cfg(feature = "file-io")]
+pub(crate) async fn write_v1_dict_only_store(
+    dict: &crate::store::layouts::dictionary::TermDictionary,
+) -> Vec<u8> {
+    use crate::io::container::{
+        self, BufferedComponentSource, NativeComponentWrite, StoreComponentDescriptor,
+        StoreComponentRole,
+    };
+    let chunks = dict.child_chunks().unwrap();
+    let dtype = chunks[0].dtype().clone();
+    let v1 = NativeComponentWrite::new(
+        StoreComponentDescriptor {
+            name: container::DICT_COMPONENT_NAME.into(),
+            role: StoreComponentRole::Dictionary,
+            implementation: container::DICT_IMPLEMENTATION.into(),
+            version: 1,
+            required: true,
+            sorted: true,
+            dtype,
+        },
+        std::sync::Arc::new(BufferedComponentSource::try_new(chunks).unwrap()),
+        container::dict_child_strategy(None),
+    )
+    .unwrap();
+    unstamped_store_bytes(vec![bare_code_quad_array(&[0])], vec![v1]).await
+}
+
+/// A native store file opened over `bytes` held in memory (no file behind it).
+#[cfg(feature = "file-io")]
+pub(crate) fn open_native_bytes(bytes: Vec<u8>) -> crate::store::native_file::NativeStoreFile {
+    use vortex_file::OpenOptionsSessionExt as _;
+    let file = crate::session::VORTEX_SESSION
+        .open_options()
+        .open_buffer(vortex_buffer::ByteBuffer::from(bytes))
+        .unwrap();
+    crate::store::native_file::NativeStoreFile::try_new(file).unwrap()
+}
+
+/// The layout node of a native store file's dictionary-child term column —
+/// the child struct's `_dict_term` field exactly as written: a `Zoned` node
+/// when the column carries zone maps, its chunked (or flat) data otherwise.
+#[cfg(feature = "file-io")]
+pub(crate) fn dict_term_column(
+    native: &crate::store::native_file::NativeStoreFile,
+) -> vortex_layout::LayoutRef {
+    use crate::io::container::DICT_COMPONENT_NAME;
+    use crate::store::layouts::dictionary::term_dict::COL_DICT_TERM;
+    use vortex_layout::LayoutChildType;
+    let child = native
+        .component_layout(DICT_COMPONENT_NAME)
+        .unwrap()
+        .expect("the file carries a dictionary component");
+    (0..child.nslots())
+        .find_map(|i| {
+            matches!(child.slot_type(i), Some(LayoutChildType::Field(ref n)) if n.as_ref() == COL_DICT_TERM)
+                .then(|| child.slot(i).ok().flatten())
+                .flatten()
+        })
+        .expect("the dictionary child has a term column")
+}
+
 /// A `{s, p, o, g}` struct of four identical non-nullable u32 columns
 /// holding `codes` — the Dictionary layout's row shape without a
 /// dictionary to give the codes meaning.

@@ -66,17 +66,12 @@ impl DictAccess {
                 }
                 Ok(codes)
             }
-            // Each bound role costs one point-read binary search of the term
-            // column (memoized in the probe cache); the resolved code is then
-            // seeded into the witness so the sync match core never reaches
-            // back here.
-            //
-            // The searches are independent, so they run overlapped rather
-            // than one await after another: whatever chunk fetches they miss
-            // on overlap instead of serializing. Concurrency is why each term
-            // is rendered into its own String here instead of the pattern's
-            // shared scratch buffer, and a race to fetch the same chunk is
-            // already handled by its drop-the-loser `OnceLock`.
+            // Each bound role costs one window search of the mapped
+            // dictionary child; the resolved code is then seeded into the
+            // witness so the sync match core never reaches back here. The
+            // searches are independent, so they run overlapped rather than
+            // one await after another; concurrency is why each term is
+            // rendered into its own String here.
             #[cfg(feature = "file-io")]
             DictAccess::FileBacked(fb) => {
                 let rendered: Vec<String> = pattern.bound_roles().map(|t| t.to_string()).collect();
@@ -105,7 +100,7 @@ impl DictAccess {
     }
 
     /// A residency-agnostic handle on the dictionary: the resident one, or
-    /// a clone of the file-backed handle (sharing its caches).
+    /// a clone of the file-backed handle (an `Arc` bump).
     pub(crate) fn reader(&self) -> DictReader {
         match self {
             DictAccess::Resident(dict) => DictReader::resident(Arc::clone(dict)),
