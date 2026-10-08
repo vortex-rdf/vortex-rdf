@@ -22,7 +22,7 @@ vortex-rdf-core = { path = "core", version = "0.11.0" }
 vortex-rdf-encoded-search = { path = "encoded-search", version = "0.11.0" }
 vortex = { version = "0.86.1", default-features = false }
 vortex-array = { version = "0.86.1" }
-vortex-btrblocks = "0.86.1"
+vortex-btrblocks = "0.88.0"
 vortex-error = "0.86.1"
 vortex-fastlanes = "0.86.1"
 vortex-io = "0.86.1"
