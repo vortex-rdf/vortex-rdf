@@ -218,7 +218,7 @@ async fn test_file_backed_dictionary_serializes_and_mutates() {
 /// dictionary of the surviving terms, as a serialization-shaped read would,
 /// silently renumbers codes the caller can then only decode wrongly.
 #[tokio::test]
-async fn test_tombstoned_indexed_codes_address_cached_dictionary() {
+async fn test_tombstoned_indexed_codes_address_the_stores_dictionary() {
     let quads = dictionary_test_quads();
     let (_dir, path) = write_store_file(
         quads.clone(),

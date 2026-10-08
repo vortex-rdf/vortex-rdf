@@ -95,7 +95,7 @@ type StringColumns = (
 /// Unwrap decoded columns, raising `VortexRdfError` on anything that cannot
 /// be a valid result.
 ///
-/// A `None` term is a matched row carrying a code the dictionary snapshot
+/// A `None` term is a matched row carrying a code the store's dictionary
 /// cannot resolve; unequal column lengths are a match that produced ragged
 /// columns. Both indicate an inconsistent store, and either would otherwise
 /// surface as a silently wrong result set.
@@ -174,13 +174,13 @@ impl VortexRdfStore {
         py: Python<'_>,
         pattern: &Pattern,
     ) -> PyResult<[Vec<Py<PyString>>; 4]> {
-        if let Some(snapshot) = self.store.code_read_snapshot() {
-            // `code_read_snapshot` reports only that the path can apply; the
-            // match itself still decides, so fall through when it declines.
+        if let Some(reader) = self.store.dict_reader() {
+            // `dict_reader` reports only that the path can apply (a Dictionary
+            // layout, no append tail), whether the dictionary is in memory or
+            // left in the mapped file; the match itself still decides, so fall
+            // through when it declines.
             if let Some(codes) = self.matched_code_columns(py, pattern)? {
-                let dict = TermDict {
-                    reader: snapshot.into(),
-                };
+                let dict = TermDict { reader };
                 let mut decoded = Vec::with_capacity(4);
                 for column in &codes {
                     decoded.push(dict.decode_slice(py, column.as_slice())?);
@@ -325,11 +325,11 @@ impl VortexRdfStore {
     /// the empty string, which is also how a pattern selects it.
     ///
     /// Served from the term-code columns when the store supports them
-    /// (Dictionary layout, resident dictionary, no append tail), reading terms
-    /// out of the dictionary and sharing one Python string across repeats of a
-    /// code; otherwise from the store's shared-term rows, where a term the
-    /// decoder handed to several rows is likewise one Python string. Both
-    /// paths return the same rows.
+    /// (Dictionary layout, no append tail), reading terms out of the
+    /// dictionary — held in memory, or read from the mapped file — and
+    /// sharing one Python string across repeats of a code; otherwise from the
+    /// store's shared-term rows, where a term the decoder handed to several
+    /// rows is likewise one Python string. Both paths return the same rows.
     #[pyo3(signature = (s=None, p=None, o=None, g=None))]
     fn get_quads(
         &self,

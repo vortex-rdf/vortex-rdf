@@ -190,7 +190,9 @@ def test_file_backed_codes_decode_to_quads(vortex_files):
 @pytest.fixture(params=["file", "in-memory"])
 def code_store(request, vortex_files):
     """The fixture's dictionary-layout store under each open mode."""
-    return VortexRdfStore(vortex_files["dictionary"], in_memory=request.param == "in-memory")
+    store = VortexRdfStore(vortex_files["dictionary"], in_memory=request.param == "in-memory")
+    assert store.term_dict().file_backed == (request.param == "file")
+    return store
 
 
 def _rows(cols):

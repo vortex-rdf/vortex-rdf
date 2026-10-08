@@ -145,30 +145,61 @@ def test_in_memory_dictionary_keeps_code_path(vortex_files):
     assert cols is not None and len(cols[0]) == 3
 
 
+def test_mapped_bulk_reads_decode_through_the_dictionary_handle(tmp_path):
+    """A default (mapped) open decodes a bulk result through its file-backed
+    dictionary handle, as the in-memory open does: one Python string per
+    distinct term across the whole result. The matched-quads fallback decodes
+    chunk by chunk, so on a file wider than one chunk (100,000 rows) it would
+    hand back one string per chunk for a term spanning them."""
+    rows = 100_100  # past one chunk of the file
+    nt = tmp_path / "wide.nt"
+    nt.write_text(
+        "".join(
+            f"<http://ex.org/s{i}> <http://ex.org/p> <http://ex.org/o{i % 7}> .\n"
+            for i in range(rows)
+        )
+    )
+    path = tmp_path / "wide.vortex"
+    serialize_rdf(nt, path, layout="dictionary")
+
+    mapped = VortexRdfStore(path)
+    loaded = VortexRdfStore(path, in_memory=True)
+    assert mapped.term_dict().file_backed and not loaded.term_dict().file_backed
+
+    quads = mapped.get_quads()
+    assert len(quads) == rows
+    assert len({id(quad[1]) for quad in quads}) == 1  # the one predicate
+    assert len({id(quad[2]) for quad in quads}) == 7  # the seven objects
+    columns = mapped.match_columns()
+    assert [len({id(term) for term in column}) for column in columns[1:3]] == [1, 7]
+    assert set(quads) == set(loaded.get_quads())
+    assert set(zip(*columns)) == set(quads)
+
+
 def _codes(cols):
     return [memoryview(col).cast("I").tolist() for col in cols]
 
 
-def _assert_file_backed_dictionary(fallback, resident):
-    assert fallback.layout() == "dictionary"
+def _assert_file_backed_dictionary(mapped, loaded):
+    assert mapped.layout() == "dictionary"
     # The dictionary stays in the file, but the code path still applies:
     # the handle reads the file on demand.
-    file_backed = fallback.term_dict()
+    file_backed = mapped.term_dict()
     assert file_backed is not None and file_backed.file_backed
-    in_memory = resident.term_dict()
+    in_memory = loaded.term_dict()
     assert in_memory is not None and not in_memory.file_backed
     assert len(file_backed) == len(in_memory)
-    assert _codes(fallback.match_codes(p=NAME)) == _codes(resident.match_codes(p=NAME))
+    assert _codes(mapped.match_codes(p=NAME)) == _codes(loaded.match_codes(p=NAME))
     for pattern in PATTERNS:
-        assert sorted(fallback.get_quads(**pattern)) == sorted(resident.get_quads(**pattern))
-        assert fallback.match_columns(**pattern) == resident.match_columns(**pattern)
-        assert fallback.count_quads(**pattern) == resident.count_quads(**pattern)
+        assert sorted(mapped.get_quads(**pattern)) == sorted(loaded.get_quads(**pattern))
+        assert mapped.match_columns(**pattern) == loaded.match_columns(**pattern)
+        assert mapped.count_quads(**pattern) == loaded.count_quads(**pattern)
 
 
 def test_file_store_dictionary_is_file_backed(vortex_files):
     """A file store's dictionary stays in the mapped file: the string
-    matchers are served from the shared-term rows, and the code path decodes
-    through a file-backed handle — answering like the in-memory load."""
+    matchers and the code path both decode through a file-backed handle —
+    answering like the in-memory load."""
     mapped = VortexRdfStore(vortex_files["dictionary"])
     loaded = VortexRdfStore(vortex_files["dictionary"], in_memory=True)
     _assert_file_backed_dictionary(mapped, loaded)
