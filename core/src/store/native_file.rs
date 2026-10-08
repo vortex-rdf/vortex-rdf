@@ -1,9 +1,9 @@
 //! The opened native store file: the runtime handle the store's file-backed
-//! query paths drive. Everything it holds is query-execution state:
-//! memoized splits, per-filter pruning envelopes (whose envelope semantics
-//! [`file_scan`](super::scan::file_scan) defines and consumes), and cached
-//! component readers. The pure open/materialize primitives are in
-//! [`io::read`](crate::io::read).
+//! query paths drive. It holds what is fixed per file — the component
+//! inventory, one reader per component, the quad table's split ranges — and
+//! two bounded memos that let Vortex's identity-keyed reader caches hit:
+//! pruning envelopes per filter shape, and bound filter trees. The pure
+//! open/materialize primitives are in [`io::read`](crate::io::read).
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -25,8 +25,7 @@ use crate::io::read::unsupported_file_error;
 /// Derefs to the inner file, whose root reader delegates to the transparent
 /// quad-source child — so scans, splits, row counts, and pruning all speak
 /// quad coordinates, exactly like a plain quad table. Component readers are
-/// built once and cached, so their zone-map stats decode once per store, not
-/// per query (the auxiliary analogue of `with_layout_reader_cache`).
+/// built once and cached, so their zone-map stats decode once per store.
 pub(crate) struct NativeStoreFile {
     file: vortex_file::VortexFile,
     components: Vec<StoreComponentDescriptor>,
@@ -46,11 +45,6 @@ pub(crate) struct NativeStoreFile {
     /// re-ask the same handful of filters, and each envelope costs a pruning
     /// evaluation over every zone. Bounded by [`PRUNING_MEMO_MAX`].
     pruning_envelopes: BoundedMemo<Expression, Option<Range<u64>>>,
-    /// Per-column chunk-probe handles keyed by column name (`None` memoizes
-    /// a column whose layout shape or dtype declines), resolved once per open
-    /// file. Each handle caches fetched chunk probes internally, so repeated
-    /// bound-subject queries and point reads touch segments once.
-    column_chunks: Mutex<ColumnChunksMemo>,
     /// One bound tree per (scope, filter shape), held for the handle's
     /// lifetime — see [`BoundExprMemo`].
     bound_exprs: Arc<BoundExprMemo>,
@@ -145,10 +139,6 @@ impl<K: std::hash::Hash + Eq, V: Clone> BoundedMemo<K, V> {
     }
 }
 
-/// Memoized per-column chunk-probe handles; see
-/// [`NativeStoreFile::column_chunks`].
-type ColumnChunksMemo = HashMap<String, Option<Arc<vortex_rdf_encoded_search::ColumnChunks>>>;
-
 /// Entry cap on [`NativeStoreFile::pruning_envelopes`] — sized for a query
 /// workload's distinct filter shapes, not for arbitrary term churn.
 const PRUNING_MEMO_MAX: usize = 512;
@@ -179,7 +169,6 @@ impl NativeStoreFile {
             child_readers,
             splits: OnceLock::new(),
             pruning_envelopes: BoundedMemo::new(PRUNING_MEMO_MAX),
-            column_chunks: Mutex::new(HashMap::new()),
             bound_exprs: Arc::new(BoundExprMemo::new()),
             mapped: false,
         })
@@ -204,44 +193,29 @@ impl NativeStoreFile {
     }
 
     /// A quad column's chunk-probe handle by name, for point reads and exact
-    /// bound-term row ranges through the wire-encoded chunks. `None`
-    /// (memoized) when the quad child's layout shape or that column's dtype
-    /// declines — callers then keep the scan path.
+    /// bound-term row ranges through the wire-encoded chunks — built per call
+    /// from the layout. Nothing is kept: a handle caches the leaves it
+    /// fetches only while its caller holds it. `None` when the quad child's
+    /// layout shape or that column's dtype declines; callers keep the scan.
     pub(crate) fn column_chunks(
         &self,
         column: &str,
     ) -> Option<Arc<vortex_rdf_encoded_search::ColumnChunks>> {
-        let mut memo = self.column_chunks.lock().expect("column chunks lock");
-        memo.entry(column.to_owned())
-            .or_insert_with(|| {
-                let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
-                let quads = typed.slot(0).ok().flatten()?;
-                vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&quads, column)
-                    .map(Arc::new)
-            })
-            .clone()
+        let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
+        let quads = typed.slot(0).ok().flatten()?;
+        vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&quads, column).map(Arc::new)
     }
 
     /// An index component column's chunk-probe handle, the auxiliary-child
-    /// counterpart of [`column_chunks`](Self::column_chunks) — for locating
-    /// matched runs and point-reading served rows through the component's
-    /// wire-encoded chunks. `None` (memoized) on any decline.
+    /// counterpart of [`column_chunks`](Self::column_chunks), built per call
+    /// alike. `None` on any decline.
     pub(crate) fn component_column_chunks(
         &self,
         component: &str,
         column: &str,
     ) -> Option<Arc<vortex_rdf_encoded_search::ColumnChunks>> {
-        // The `/` separator cannot appear in a bare quad column name, so the
-        // composite keys share the quad columns' memo without collisions.
-        let key = format!("{component}/{column}");
-        let mut memo = self.column_chunks.lock().expect("column chunks lock");
-        memo.entry(key)
-            .or_insert_with(|| {
-                let (_, child) = self.component_child(component).ok().flatten()?;
-                vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&child, column)
-                    .map(Arc::new)
-            })
-            .clone()
+        let (_, child) = self.component_child(component).ok().flatten()?;
+        vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&child, column).map(Arc::new)
     }
 
     /// The quad table's natural splits, memoized. Shadows the inner file's
@@ -377,5 +351,36 @@ mod tests {
         let other_scope = memo.bind("index", &expr, &dtype).unwrap();
         assert_ne!(ExactBoundExpr(other_scope), ExactBoundExpr(first));
         assert_eq!(memo.0.map.lock().unwrap().len(), 2);
+    }
+
+    /// Chunk-probe handles are built per call: nothing keeps them — or the
+    /// leaves they fetch — between calls.
+    #[tokio::test]
+    async fn column_chunks_are_built_per_call() {
+        use vortex_buffer::ByteBuffer;
+        use vortex_file::OpenOptionsSessionExt as _;
+
+        let dict = crate::store::layouts::dictionary::TermDictionary::from_sorted_column(
+            vortex_array::arrays::VarBinViewArray::from_iter_str(["<http://example.org/a>"]),
+        )
+        .unwrap();
+        let bytes = crate::tests::write_dict_only_store(&dict).await;
+        let file = crate::session::VORTEX_SESSION
+            .open_options()
+            .open_buffer(ByteBuffer::from(bytes))
+            .unwrap();
+        let native = NativeStoreFile::try_new(file).unwrap();
+        let a = native
+            .column_chunks("s")
+            .expect("the u32 subject column resolves");
+        let b = native
+            .column_chunks("s")
+            .expect("the u32 subject column resolves");
+        assert!(!Arc::ptr_eq(&a, &b));
+        let source = native.segment_source();
+        assert_eq!(
+            a.value_at(0, &source, native.session()).await.unwrap(),
+            Some(0)
+        );
     }
 }
