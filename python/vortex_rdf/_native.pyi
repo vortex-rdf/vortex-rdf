@@ -40,19 +40,13 @@ class TermDict:
         """`encode` over a sequence of terms, in order, in one GIL-released
         call; a malformed term raises ``ValueError``."""
         ...
-    def filter_codes(self, kind: str, arg: str = "") -> Tuple[U32Column, U32Column]:
-        """Partition the codes by a term predicate: ``(true_codes,
-        unknown_codes)``, both ascending. `true_codes` are the codes for
-        which the predicate definitely holds; `unknown_codes` are the codes
-        inside the predicate's domain the native layer leaves to the caller.
-        Codes outside the domain (non-literals, for the literal predicates)
-        appear in neither.
-
-        `kind` is one of ``is_literal``, ``is_iri``, ``is_blank``,
-        ``datatype``, ``lang``, ``lang_matches``, ``str_prefix``,
-        ``num_lt``, ``num_le``, ``num_gt``, ``num_ge``, ``num_eq``,
-        ``num_ne``; `arg` is the predicate's argument. An unknown kind or an
-        invalid argument raises ``ValueError``. Answers are memoized."""
+    def filter_codes(self, kind: str, arg: str, codes: _U32s) -> Tuple[U32Column, U32Column]:
+        """`kind` over the candidate `codes` (sorted and unique, else
+        ``ValueError``): ``(passed, undecided)``, both subsets of `codes`; a
+        candidate in neither fails. Kinds: ``is_literal``, ``is_iri``,
+        ``is_blank``, ``datatype``, ``lang``, ``lang_matches``,
+        ``str_prefix``, ``num_lt``, ``num_le``, ``num_gt``, ``num_ge``,
+        ``num_eq``, ``num_ne``. Nothing is memoized."""
         ...
     def prefix_range(self, prefix: str) -> Tuple[int, int]:
         """The half-open code range ``(lo, hi)`` of the terms whose

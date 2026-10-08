@@ -6,7 +6,7 @@ from array import array
 
 import pytest
 
-from vortex_rdf import VortexRdfStore
+from vortex_rdf import U32Column, VortexRdfStore
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
@@ -109,64 +109,81 @@ def test_prefix_range_and_lower_bound(dictionary):
     assert lit[0] == 1 and lit[1] == iri[0] and iri[1] == blank[0] and blank[1] == n
 
 
-def test_filter_codes_kinds_and_predicates(dictionary):
+def test_filter_codes_over_candidates(dictionary):
+    """`filter_codes(kind, arg, codes)` answers `(passed, undecided)`, both
+    subsets of the candidates; a candidate in neither fails."""
     _, term_dict = dictionary
     terms = _terms(term_dict)
-    by_kind = {
-        "is_literal": [c for c, t in enumerate(terms) if t.startswith('"')],
-        "is_iri": [c for c, t in enumerate(terms) if t.startswith("<")],
-        "is_blank": [c for c, t in enumerate(terms) if t.startswith("_:")],
-    }
-    for kind, want in by_kind.items():
-        truth, unknown = term_dict.filter_codes(kind)
-        assert _codes(truth) == want, kind
-        # Only the default graph's "" is undecided by its spelling.
-        assert _codes(unknown) == [0], kind
+    every = U32Column(range(len(terms)))
+    code = {t: c for c, t in enumerate(terms)}
+    literal = [c for c, t in enumerate(terms) if t.startswith('"')]
+    iri = [c for c, t in enumerate(terms) if t.startswith("<")]
+    blank = [c for c, t in enumerate(terms) if t.startswith("_:")]
 
-    def literal_codes(pred):
-        return [c for c, t in enumerate(terms) if t.startswith('"') and pred(t)]
+    def run(kind, arg="", codes=every):
+        passed, undecided = term_dict.filter_codes(kind, arg, codes)
+        return _codes(passed), _codes(undecided)
 
-    truth, unknown = term_dict.filter_codes("datatype", f"{XSD}string")
-    assert _codes(truth) == literal_codes(lambda t: t.endswith('"'))
-    assert _codes(unknown) == []
-    truth, _ = term_dict.filter_codes("datatype", f"<{RDF}langString>")
-    assert _codes(truth) == literal_codes(lambda t: "@" in t)
-    truth, _ = term_dict.filter_codes("datatype", f"{XSD}integer")
-    assert _codes(truth) == [term_dict.encode(f'"42"^^<{XSD}integer>')]
-    truth, _ = term_dict.filter_codes("lang", "en")
-    assert _codes(truth) == [term_dict.encode('"Bob"@en')]
-    truth, _ = term_dict.filter_codes("lang_matches", "EN")
-    assert _codes(truth) == [term_dict.encode('"Bob"@en')]
-    truth, unknown = term_dict.filter_codes("str_prefix", "A")
-    assert _codes(truth) == [term_dict.encode('"Alice"'), term_dict.encode('"Anon"')]
-    truth, _ = term_dict.filter_codes("str_prefix", "http://ex.org/a")
-    assert _codes(truth) == sorted(
-        term_dict.encode(t) for t in ("<http://ex.org/age>", "<http://ex.org/alice>")
-    )
-    truth, _ = term_dict.filter_codes("str_prefix", "http://ex.org/al")
-    assert _codes(truth) == [term_dict.encode("<http://ex.org/alice>")]
-    truth, unknown = term_dict.filter_codes("num_lt", "100")
-    # 42 by value; the string literals (plain and tagged alike order as
-    # xsd:string, above xsd:integer) are false.
-    assert _codes(truth) == [term_dict.encode(f'"42"^^<{XSD}integer>')]
-    assert _codes(unknown) == []
-    truth, _ = term_dict.filter_codes("num_gt", "100")
-    assert _codes(truth) == sorted(
-        term_dict.encode(t) for t in ('"Alice"', '"Anon"', '"Bob"@en')
-    )
-    truth, unknown = term_dict.filter_codes("num_ne", "42")
-    assert term_dict.encode(f'"42"^^<{XSD}integer>') not in _codes(truth)
-    # Non-literals are outside a numeric predicate's domain: in neither list
-    # (the kind ranges decide them — `!=` holds for every IRI and blank node).
-    iri_lo, iri_hi = term_dict.prefix_range("<")
-    assert all(not (iri_lo <= c < iri_hi) for c in _codes(truth) + _codes(unknown))
-    # Equality against a non-numeric literal is the engine's call.
-    assert _codes(unknown) == sorted(term_dict.encode(t) for t in ('"Alice"', '"Anon"', '"Bob"@en'))
-    # Memoized: a repeated ask answers the same.
-    assert _codes(term_dict.filter_codes("is_iri")[0]) == by_kind["is_iri"]
+    # Kind tests: decided by the kind ranges; only "" (code 0) is no kind.
+    assert run("is_literal") == (literal, [0])
+    assert run("is_iri") == (iri, [0])
+    assert run("is_blank") == (blank, [0])
+    plain = [c for c in literal if terms[c].endswith('"')]
+    assert run("datatype", f"{XSD}string") == (plain, [0])
+    assert run("datatype", f"<{RDF}langString>")[0] == [code['"Bob"@en']]
+    assert run("datatype", f"{XSD}integer")[0] == [code[f'"42"^^<{XSD}integer>']]
+    assert run("lang", "en")[0] == [code['"Bob"@en']]
+    assert run("lang_matches", "EN")[0] == [code['"Bob"@en']]
+    # 42 by value; string literals order as xsd:string, above xsd:integer.
+    assert run("num_lt", "100") == ([code[f'"42"^^<{XSD}integer>']], [0])
+    assert run("num_gt", "100")[0] == sorted(code[t] for t in ('"Alice"', '"Anon"', '"Bob"@en'))
+    # `!=` holds for every IRI and blank node; a string literal is the engine's call.
+    passed, undecided = run("num_ne", "42")
+    assert passed == iri + blank
+    assert undecided == [0] + sorted(code[t] for t in ('"Alice"', '"Anon"', '"Bob"@en'))
+    # Any candidate subset, any int sequence or buffer.
+    sub = [code['"Alice"'], code['"Bob"@en'], iri[0]]
+    assert run("lang", "en", sub) == ([code['"Bob"@en']], [])
+    assert run("lang", "en", array("I", sub)) == ([code['"Bob"@en']], [])
     for kind, arg in [("no_such_kind", ""), ("datatype", ""), ("num_lt", "abc"), ("lang_matches", "")]:
         with pytest.raises(ValueError):
-            term_dict.filter_codes(kind, arg)
+            term_dict.filter_codes(kind, arg, every)
+
+
+def test_filter_codes_validates_candidates(dictionary):
+    """Candidates must be sorted, unique and inside the dictionary, however
+    they are passed; none at all is two empty columns."""
+    _, term_dict = dictionary
+    n = len(term_dict)
+
+    def forms(codes):
+        """The same candidates as every input the call accepts."""
+        column = U32Column(codes)
+        return [
+            column,
+            list(codes),
+            tuple(codes),
+            array("I", codes),
+            memoryview(array("I", codes)),
+            bytes(memoryview(column)),
+        ]
+
+    for codes in ([3, 1], [1, 1], [0, n], [n + 7], [n - 1, 0]):
+        for candidates in forms(codes):
+            with pytest.raises(ValueError):
+                term_dict.filter_codes("is_iri", "", candidates)
+    for candidates in forms([]):
+        passed, undecided = term_dict.filter_codes("is_iri", "", candidates)
+        assert len(passed) == len(undecided) == 0
+    # What is no list of u32 codes at all is as bad a value.
+    for candidates in ([-1], [1 << 40], [0.5], b"\x01\x02\x03", "abc", None, 5):
+        with pytest.raises(ValueError):
+            term_dict.filter_codes("is_iri", "", candidates)
+    # A valid list answers alike in every form.
+    iri = [c for c, t in enumerate(_terms(term_dict)) if t.startswith("<")]
+    for candidates in forms(iri[:3] + [n - 1]):
+        passed, undecided = term_dict.filter_codes("is_iri", "", candidates)
+        assert (_codes(passed), _codes(undecided)) == (iri[:3], [])
 
 
 def test_file_backed_codes_decode_to_quads(vortex_files):
@@ -221,8 +238,8 @@ def test_keep_narrows_like_filtering(code_store):
         ({"p": range(name, name + 1)}, 1, lambda c: c == name),
         ({1: (knows, name + 1)}, 1, lambda c: knows <= c <= name),
         ({"o": range(lit_lo, lit_hi)}, 2, lambda c: lit_lo <= c < lit_hi),
-        ({"o": term_dict.filter_codes("is_iri")[0]}, 2, lambda c: iri_lo <= c < iri_hi),
-        ({"s": memoryview(term_dict.filter_codes("is_blank")[0])}, 0, lambda c: term_dict.decode(c).startswith("_:")),
+        ({"o": term_dict.filter_codes("is_iri", "", U32Column(range(len(term_dict))))[0]}, 2, lambda c: iri_lo <= c < iri_hi),
+        ({"s": memoryview(term_dict.filter_codes("is_blank", "", U32Column(range(len(term_dict))))[0])}, 0, lambda c: term_dict.decode(c).startswith("_:")),
         ({"s": [alice]}, 0, lambda c: c == alice),
         ({"g": [0]}, 3, lambda c: c == 0),
         ({"p": []}, 1, lambda c: False),

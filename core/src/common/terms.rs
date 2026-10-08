@@ -43,7 +43,7 @@ pub(crate) fn parse_subject(s: &str) -> Result<NamedOrBlankNode> {
 
 /// The three N-Triples literal shapes, with `value` still in its *escaped*
 /// lexical form — the slice between the opening and closing quote.
-enum LiteralForm<'a> {
+pub(crate) enum LiteralForm<'a> {
     Simple { value: &'a str },
     Language { value: &'a str, lang: &'a str },
     Typed { value: &'a str, datatype: &'a str },
@@ -84,7 +84,7 @@ fn closing_quote(s: &str) -> Option<usize> {
 /// the closing quote that is neither suffix. The suffix is read only from
 /// *after* the closing quote, so `^^` or `"@` occurring inside the value
 /// cannot be mistaken for structure.
-fn split_literal(s: &str) -> Option<LiteralForm<'_>> {
+pub(crate) fn split_literal(s: &str) -> Option<LiteralForm<'_>> {
     let end = closing_quote(s)?;
     let value = &s[1..end];
     let rest = &s[end + 1..];

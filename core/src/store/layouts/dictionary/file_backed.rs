@@ -22,6 +22,7 @@ use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 use vortex_array::serde::SerializedArray;
 use vortex_array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
+use vortex_buffer::Buffer;
 use vortex_layout::layouts::chunked::Chunked as ChunkedLayout;
 use vortex_layout::layouts::flat::Flat;
 use vortex_layout::layouts::struct_::Struct as StructLayout;
@@ -38,9 +39,10 @@ use crate::store::array::StrColReader;
 use crate::store::native_file::NativeStoreFile;
 
 use super::check_code;
-use super::predicates::{KindRanges, Scanned, TermPredicate};
+use super::predicates::{KindRanges, TermPredicate, Verdict};
 use super::term_dict::{
-    COL_DICT_TERM, TermDictionary, VerdictSets, chunk_of, prefix_successor, window_bound_aggregates,
+    COL_DICT_TERM, TermDictionary, check_candidates, chunk_of, prefix_successor, split_verdicts,
+    window_bound_aggregates,
 };
 
 /// A window's first and last term.
@@ -122,7 +124,7 @@ impl FileBackedDict {
         };
         let source = native.segment_source();
         let zoned = match &zones {
-            Some(zones) => zone_bounds(zones, leaves.len(), &source).await?,
+            Some(zones) => zone_bounds(zones, &leaves, &source).await?,
             None => None,
         };
         let bounds = match zoned {
@@ -225,16 +227,22 @@ impl FileBackedDict {
         Ok((window.start + lo) as u32)
     }
 
-    /// Visit the terms of `codes` (ascending and in range — the caller's
-    /// contract) in order: per window holding any of them, the leaf is
-    /// rebuilt over its segment and only the asked rows are taken out of the
-    /// FSST array and decompressed. `visit` gets each code's position in
-    /// `codes` and its term (an error for a term that is not UTF-8).
+    /// Visit the terms of `codes` (strictly ascending and inside the
+    /// dictionary, else an `InvalidOperation` error before any window is
+    /// read) in order: per window holding any of them, the leaf is rebuilt
+    /// over its segment and only the asked rows are taken out of the FSST
+    /// array and decompressed. `visit` gets each code's position in `codes`
+    /// and its term (an error for a term that is not UTF-8).
     async fn visit_terms(
         &self,
         codes: &[u32],
         mut visit: impl FnMut(usize, Result<&str>),
     ) -> Result<()> {
+        // Each window's run is found by a partition point, so a list out of
+        // order would leave a code before its window's start (wrapping
+        // `code - window.start`) or a run of nothing (a loop that never
+        // advances).
+        check_candidates(codes, self.len())?;
         let inner = &*self.0;
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let mut at = 0;
@@ -243,6 +251,14 @@ impl FileBackedDict {
             let window = &inner.windows[w];
             let end = window.start + window.rows;
             let run = codes[at..].partition_point(|&code| (code as usize) < end);
+            if run == 0 {
+                // Not reachable past the check above; were it, an error is
+                // better than a loop that never advances.
+                return Err(VortexRdfError::InvalidOperation(format!(
+                    "code {} lies outside window {w}",
+                    codes[at]
+                )));
+            }
             let locals = PrimitiveArray::from_iter(
                 codes[at..at + run]
                     .iter()
@@ -362,25 +378,36 @@ impl FileBackedDict {
         Ok(self.0.kinds.get_or_init(|| kinds).clone())
     }
 
-    /// The dictionary-wide partition — `TermDictionary::filter_codes`'s
-    /// file-backed twin — read window by window, nothing memoized.
-    pub(crate) async fn filter_codes(&self, predicate: &TermPredicate) -> Result<VerdictSets> {
+    /// The file-backed twin of `TermDictionary::filter_codes`: candidates
+    /// whose kind decides them are not read; the rest are read through
+    /// [`visit_terms`](Self::visit_terms), so only the windows holding them
+    /// are rebuilt.
+    pub(crate) async fn filter_codes(
+        &self,
+        predicate: &TermPredicate,
+        codes: &[u32],
+    ) -> Result<(Buffer<u32>, Buffer<u32>)> {
+        check_candidates(codes, self.len())?;
         let kinds = self.kind_ranges().await?;
-        let plan = predicate.scan_plan(&kinds);
-        let mut scanned = Scanned::default();
-        if let Some(range) = plan.scan.filter(|range| !range.is_empty()) {
-            let codes: Vec<u32> = range.collect();
-            self.visit_terms(&codes, |i, term| match term {
-                Ok(spelling) => scanned.visit(predicate, codes[i], spelling),
-                Err(_) => scanned.unknown.push(codes[i]),
-            })
-            .await?;
+        let mut verdicts = vec![Verdict::False; codes.len()];
+        let (mut read_at, mut read) = (Vec::new(), Vec::new());
+        for (i, &code) in codes.iter().enumerate() {
+            match predicate.kind_verdict(kinds.kind_of_code(code)) {
+                Some(verdict) => verdicts[i] = verdict,
+                None => {
+                    read_at.push(i);
+                    read.push(code);
+                }
+            }
         }
-        let mut true_ranges = Vec::with_capacity(plan.true_prefixes.len());
-        for prefix in &plan.true_prefixes {
-            true_ranges.push(self.prefix_range(prefix).await?);
-        }
-        Ok(Arc::new(predicate.assemble(&kinds, scanned, &true_ranges)))
+        self.visit_terms(&read, |j, spelling| {
+            verdicts[read_at[j]] = match spelling {
+                Ok(spelling) => predicate.eval(spelling),
+                Err(_) => Verdict::Unknown,
+            };
+        })
+        .await?;
+        Ok(split_verdicts(codes, &verdicts))
     }
 
     /// Lift the whole dictionary resident — the transient full-column read
@@ -404,11 +431,19 @@ impl FileBackedDict {
     }
 }
 
+/// A zone-mapped term column's zone table, with the rows each zone covers.
+struct Zones {
+    /// The zones child: one row per zone, holding its bounds.
+    table: LayoutRef,
+    /// Rows per zone, the last zone's excepted.
+    zone_len: usize,
+}
+
 /// The term column's flat leaves — one per FSST window, in row order, with
 /// their row counts — and, when the column is zone-mapped with exact window
-/// bounds, its zones child. `None` for any shape a window search cannot
+/// bounds, its zone table. `None` for any shape a window search cannot
 /// address.
-fn term_column(dict: &LayoutRef) -> Option<(Leaves, Option<LayoutRef>)> {
+fn term_column(dict: &LayoutRef) -> Option<(Leaves, Option<Zones>)> {
     dict.as_opt::<StructLayout>()?;
     let column = (0..dict.nslots()).find_map(|i| {
         matches!(dict.slot_type(i), Some(LayoutChildType::Field(ref n)) if n.as_ref() == COL_DICT_TERM)
@@ -416,7 +451,12 @@ fn term_column(dict: &LayoutRef) -> Option<(Leaves, Option<LayoutRef>)> {
             .flatten()
     })?;
     let zones = match column.as_opt::<Zoned>() {
-        Some(zoned) if exact_bounds(&zoned.present_aggregates()) => column.slot(1).ok().flatten(),
+        Some(zoned) if exact_bounds(&zoned.present_aggregates()) => {
+            column.slot(1).ok().flatten().map(|table| Zones {
+                table,
+                zone_len: zoned.zone_len(),
+            })
+        }
         _ => None,
     };
     let data = unwrap_zoned(column)?;
@@ -464,18 +504,35 @@ fn unwrap_zoned(mut node: LayoutRef) -> Option<LayoutRef> {
     Some(node)
 }
 
+/// Whether zone `i` of `zones` covers exactly leaf `i`: one zone per leaf,
+/// every leaf but the last holding `zone_len` rows and the last at most that.
+/// A column written with its windows as zones is cut so; a foreign writer's
+/// may have as many zones as leaves and still cut them elsewhere, which would
+/// hand a window the bounds of other rows.
+fn zones_cut_at_leaves(zones: &Zones, leaves: &[(LayoutRef, usize)]) -> bool {
+    let Some(((_, last), rest)) = leaves.split_last() else {
+        return false;
+    };
+    zones.table.row_count() == leaves.len() as u64
+        && zones.zone_len > 0
+        && rest.iter().all(|(_, rows)| *rows == zones.zone_len)
+        && *last <= zones.zone_len
+}
+
 /// Each window's bounds from the term column's zone table — one zone per
-/// window — or `None` when the table does not line up with the leaves (a
-/// zone count other than the window count, or a null bound).
+/// window — or `None` when the table does not line up with the leaves (see
+/// [`zones_cut_at_leaves`]) or holds a null bound.
 async fn zone_bounds(
-    zones: &LayoutRef,
-    windows: usize,
+    zones: &Zones,
+    leaves: &[(LayoutRef, usize)],
     source: &Arc<dyn SegmentSource>,
 ) -> Result<Option<Vec<Bounds>>> {
-    if zones.row_count() != windows as u64 {
+    if !zones_cut_at_leaves(zones, leaves) {
         return Ok(None);
     }
+    let windows = leaves.len();
     let reader = zones
+        .table
         .new_reader(
             "dictionary-zones".into(),
             Arc::clone(source),
@@ -709,6 +766,37 @@ mod tests {
         ));
     }
 
+    /// A code list that is not strictly ascending is an error, however far
+    /// the last code is in range: `[700, 800, 5]` once passed the last-code
+    /// check and then looped on a run of nothing, `[150, 50]` underflowed
+    /// `code - window.start`.
+    #[tokio::test]
+    async fn unsorted_code_lists_are_errors_not_loops() {
+        let (fbd, terms) = windowed_handle(600, 100).await;
+        for codes in [
+            vec![700u32, 800, 5],
+            vec![150, 50],
+            vec![5, 5],
+            vec![0, 450, 449],
+            vec![599, 0],
+        ] {
+            assert!(
+                matches!(
+                    fbd.decode_many(&codes).await,
+                    Err(VortexRdfError::InvalidOperation(_))
+                ),
+                "{codes:?}"
+            );
+        }
+        // Ascending, unique and in range still decodes, window edges included.
+        let codes = [0u32, 99, 100, 599];
+        let got = fbd.decode_many(&codes).await.unwrap();
+        for (code, term) in codes.iter().zip(&got) {
+            assert_eq!(&**term, terms[*code as usize].as_str());
+        }
+        assert!(fbd.decode_many(&[]).await.unwrap().is_empty());
+    }
+
     /// The dictionary child's term column carries exact window bounds: one
     /// zone per FSST window whose `vortex.min()`/`vortex.max()` are the
     /// window's first and last terms; the component is stamped version 2.
@@ -804,7 +892,7 @@ mod tests {
             .unwrap();
         let (leaves, zones) = term_column(&child).expect("a zoned, chunked term column");
         let zones = zones.expect("the zone maps record exact window bounds");
-        let bounds = zone_bounds(&zones, leaves.len(), &native.segment_source())
+        let bounds = zone_bounds(&zones, &leaves, &native.segment_source())
             .await
             .unwrap()
             .expect("one zone per window");
@@ -898,7 +986,7 @@ mod tests {
     }
 
     /// Searches that cross windows — lower bounds, prefix ranges, the kind
-    /// ranges and dictionary-wide partitions — answer exactly like the
+    /// ranges and predicates over candidate codes — answer exactly like the
     /// resident dictionary they were written from, over terms of every kind:
     /// window boundaries fall inside the literal and IRI runs, and each change
     /// of kind falls inside a window.
@@ -922,6 +1010,8 @@ mod tests {
         assert_eq!(fbd.debug_window_count(), 6);
 
         assert_eq!(fbd.kind_ranges().await.unwrap(), *d.kind_ranges());
+        let all: Vec<u32> = (0..terms.len() as u32).collect();
+        let sparse: Vec<u32> = all.iter().copied().step_by(7).collect();
         let mut probes: Vec<String> = [
             "",
             "\"",
@@ -961,10 +1051,123 @@ mod tests {
             ("num_lt", "95"),
         ] {
             let predicate = TermPredicate::parse(kind, arg).unwrap();
-            assert_eq!(
-                *fbd.filter_codes(&predicate).await.unwrap(),
-                *d.filter_codes(&predicate),
-                "filter_codes {kind} {arg:?}"
+            for codes in [&all, &sparse] {
+                assert_eq!(
+                    fbd.filter_codes(&predicate, codes).await.unwrap(),
+                    d.filter_codes(&predicate, codes).unwrap(),
+                    "filter_codes {kind} {arg:?}"
+                );
+            }
+        }
+    }
+
+    /// A candidate evaluation rebuilds only the windows holding the codes it
+    /// must read.
+    #[tokio::test]
+    async fn filter_codes_rebuilds_only_candidate_windows() {
+        let (fbd, _) = windowed_handle(600, 100).await;
+        fbd.kind_ranges().await.unwrap();
+        let before = fbd.debug_windows_rebuilt();
+        let predicate = TermPredicate::parse("str_prefix", "http://example.org/term/01").unwrap();
+        let (passed, undecided) = fbd
+            .filter_codes(&predicate, &[105, 150, 450])
+            .await
+            .unwrap();
+        assert_eq!(fbd.debug_windows_rebuilt(), before + 2);
+        assert_eq!(passed.as_slice(), &[105, 150]);
+        assert!(undecided.is_empty());
+
+        // A kind test is decided by the kind ranges: nothing is read.
+        let before = fbd.debug_windows_rebuilt();
+        let is_iri = TermPredicate::parse("is_iri", "").unwrap();
+        let (passed, undecided) = fbd.filter_codes(&is_iri, &[105, 150, 450]).await.unwrap();
+        assert_eq!(fbd.debug_windows_rebuilt(), before);
+        assert_eq!(passed.as_slice(), &[105, 150, 450]);
+        assert!(undecided.is_empty());
+    }
+
+    /// A candidate list that is not ascending, unique and inside the
+    /// dictionary is refused before any window is read.
+    #[tokio::test]
+    async fn filter_codes_refuses_bad_candidates_before_reading() {
+        let (fbd, _) = windowed_handle(600, 100).await;
+        fbd.kind_ranges().await.unwrap();
+        let before = fbd.debug_windows_rebuilt();
+        let predicate = TermPredicate::parse("str_prefix", "http://").unwrap();
+        for codes in [
+            vec![700u32, 800, 5],
+            vec![150, 50],
+            vec![5, 5],
+            vec![0, 600],
+        ] {
+            assert!(
+                matches!(
+                    fbd.filter_codes(&predicate, &codes).await,
+                    Err(VortexRdfError::InvalidOperation(_))
+                ),
+                "{codes:?}"
+            );
+        }
+        assert_eq!(fbd.debug_windows_rebuilt(), before);
+    }
+
+    /// Zone `i` stands for window `i` only when the zones are cut where the
+    /// leaves are: every leaf but the last holds exactly `zone_len` rows, the
+    /// last at most that. The same zone count over leaves cut elsewhere (a
+    /// foreign writer's) would hand a window the bounds of other rows, so the
+    /// bounds are read from the leaves instead.
+    #[tokio::test]
+    async fn zone_bounds_need_zones_cut_at_the_leaves() {
+        let terms: Vec<String> = (0..400)
+            .map(|i| format!("<http://example.org/term/{i:04}>"))
+            .collect();
+        let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
+        let d = TermDictionary::compress_windowed(plain, 100).unwrap();
+        let native = crate::tests::open_native_bytes(crate::tests::write_dict_only_store(&d).await);
+        let child = native
+            .component_layout(DICT_COMPONENT_NAME)
+            .unwrap()
+            .unwrap();
+        let (leaves, zones) = term_column(&child).expect("a zoned, chunked term column");
+        let zones = zones.expect("the zone maps record exact window bounds");
+        assert_eq!(zones.zone_len, 100);
+        let source = native.segment_source();
+
+        // As written, zone i is leaf i.
+        let bounds = zone_bounds(&zones, &leaves, &source)
+            .await
+            .unwrap()
+            .expect("zones cut at the leaves");
+        assert_eq!(bounds.len(), 4);
+
+        let recut = |rows: [usize; 4]| -> Leaves {
+            leaves
+                .iter()
+                .zip(rows)
+                .map(|((layout, _), rows)| (layout.clone(), rows))
+                .collect()
+        };
+        // A short last leaf is still aligned.
+        assert!(
+            zone_bounds(&zones, &recut([100, 100, 100, 50]), &source)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // Same count, other cuts: no bounds, whichever leaf is off.
+        for rows in [
+            [50, 150, 100, 100],
+            [99, 101, 100, 100],
+            [100, 150, 50, 100],
+            [100, 100, 99, 101],
+            [100, 100, 100, 150],
+        ] {
+            assert!(
+                zone_bounds(&zones, &recut(rows), &source)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{rows:?}"
             );
         }
     }

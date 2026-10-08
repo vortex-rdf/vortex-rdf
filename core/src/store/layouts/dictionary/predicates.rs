@@ -13,19 +13,18 @@
 //! engine. A caller therefore never gets a wrong definite answer, only a
 //! slower one.
 //!
-//! The predicate's *domain* is the code range a dictionary scan has to cover
-//! to find every `True`: the literal range for the literal predicates,
-//! everything for the kind tests and `str_prefix` (see
-//! [`TermPredicate::domain`]). Codes outside the domain are neither true nor
-//! unknown; a caller decides them from the term's kind alone, which the code
-//! ranges already tell it.
+//! A predicate is evaluated over the *candidate* codes a query produced
+//! (`filter_codes`): a code whose kind range decides it
+//! ([`TermPredicate::kind_verdict`]) is not read; every other one is read and
+//! its spelling parsed — the lexical form unescaped, the language tag and
+//! datatype taken from the spelling — before the predicate looks at it.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
 use std::ops::Range;
 
-use vortex_buffer::Buffer;
-
+use crate::common::terms::{LiteralForm, split_literal};
 use crate::common::vocab::{RDF_LANG_STRING, XSD, XSD_STRING};
 use crate::error::{Result, VortexRdfError};
 
@@ -60,34 +59,29 @@ impl KindRanges {
     }
 }
 
-/// What a dictionary has to do to partition its codes by a predicate's
-/// verdicts: the code range to scan term by term (`None` when the predicate
-/// is answered by ranges alone), and the spelling prefixes whose
-/// [`prefix_range`] is a run of `True` codes without any scan.
-///
-/// [`prefix_range`]: super::term_dict::TermDictionary::prefix_range
-pub(crate) struct ScanPlan {
-    pub(crate) scan: Option<Range<u32>>,
-    pub(crate) true_prefixes: Vec<String>,
-}
-
-/// The verdicts a scan collected, code by code.
-#[derive(Default)]
-pub(crate) struct Scanned {
-    pub(crate) truth: Vec<u32>,
-    pub(crate) unknown: Vec<u32>,
-}
-
-impl Scanned {
-    /// Record `predicate`'s verdict for the term `spelling` with code `code`.
-    #[inline]
-    pub(crate) fn visit(&mut self, predicate: &TermPredicate, code: u32, spelling: &str) {
-        match predicate.eval(spelling) {
-            Verdict::True => self.truth.push(code),
-            Verdict::Unknown => self.unknown.push(code),
-            Verdict::False => {}
+impl KindRanges {
+    /// The kind of `code`'s spelling, read off the ranges.
+    pub(crate) fn kind_of_code(&self, code: u32) -> CodeKind {
+        if self.literals.contains(&code) {
+            CodeKind::Literal
+        } else if self.iris.contains(&code) {
+            CodeKind::Iri
+        } else if self.blanks.contains(&code) {
+            CodeKind::Blank
+        } else {
+            CodeKind::Other
         }
     }
+}
+
+/// What the kind ranges say about a code before its spelling is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CodeKind {
+    Literal,
+    Iri,
+    Blank,
+    /// The default graph's `""`, or a foreign spelling in the gaps.
+    Other,
 }
 
 /// The three-valued answer of a predicate for one term.
@@ -141,18 +135,6 @@ impl NumOp {
     fn is_equality(self) -> bool {
         matches!(self, NumOp::Eq | NumOp::Ne)
     }
-}
-
-/// The part of a dictionary's code space a predicate's definite answers can
-/// come from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Domain {
-    /// Every code: the kind tests, and `str_prefix` (IRIs and blank nodes
-    /// answer through `str()`).
-    All,
-    /// Only literals can be true; every other kind is false by
-    /// construction, or a type error, which a caller decides from the kind.
-    Literals,
 }
 
 /// A single-variable term predicate, parsed from a `(kind, arg)` pair.
@@ -458,8 +440,8 @@ fn integral_float(x: f64) -> Option<i128> {
 
 /// A literal spelling split into its parts, borrowed from the spelling.
 struct LiteralView<'a> {
-    /// The lexical form as spelled (escapes intact).
-    lexical: &'a str,
+    /// The lexical form as spelled (N-Triples escapes intact).
+    raw_lexical: &'a str,
     /// The language tag, as stored.
     lang: Option<&'a str>,
     /// The datatype IRI without angle brackets, as spelled.
@@ -467,39 +449,31 @@ struct LiteralView<'a> {
 }
 
 impl<'a> LiteralView<'a> {
-    /// Split `"lex"`, `"lex"@tag` or `"lex"^^<dt>`; `None` for anything else.
-    ///
-    /// The only unescaped `"` in a literal spelling are its two delimiters,
-    /// so searching the terminator from the end is unambiguous: `"^^<` and
-    /// `"@` inside the lexical form can only occur escaped (`\"^^<`), and the
-    /// real terminator always comes later.
+    /// Split `"lex"`, `"lex"@tag` or `"lex"^^<dt>` through the escape-aware
+    /// reading the decode path uses; `None` for anything else.
     fn parse(spelling: &'a str) -> Option<Self> {
-        let body = spelling.strip_prefix('"')?;
-        if let Some(lexical) = body.strip_suffix('"') {
-            // Guard against the one-character spelling `"`.
-            if spelling.len() < 2 {
-                return None;
-            }
-            return Some(Self {
-                lexical,
+        Some(match split_literal(spelling)? {
+            LiteralForm::Simple { value } => Self {
+                raw_lexical: value,
                 lang: None,
                 datatype: None,
-            });
-        }
-        if spelling.ends_with('>') {
-            let at = spelling.rfind("\"^^<")?;
-            return Some(Self {
-                lexical: &spelling[1..at],
+            },
+            LiteralForm::Language { value, lang } => Self {
+                raw_lexical: value,
+                lang: Some(lang),
+                datatype: None,
+            },
+            LiteralForm::Typed { value, datatype } => Self {
+                raw_lexical: value,
                 lang: None,
-                datatype: Some(&spelling[at + 4..spelling.len() - 1]),
-            });
-        }
-        let at = spelling.rfind("\"@")?;
-        Some(Self {
-            lexical: &spelling[1..at],
-            lang: Some(&spelling[at + 2..]),
-            datatype: None,
+                datatype: Some(datatype.strip_prefix('<')?.strip_suffix('>')?),
+            },
         })
+    }
+
+    /// The lexical form: escapes decoded, `None` for a malformed escape.
+    fn lexical(&self) -> Option<Cow<'a, str>> {
+        unescape_lexical(self.raw_lexical)
     }
 
     /// The datatype the SPARQL `datatype()` function reports.
@@ -521,7 +495,7 @@ impl<'a> LiteralView<'a> {
     /// parses under the model.
     fn number(&self) -> Option<Num> {
         let dt = self.datatype?;
-        parse_number(self.lexical, numeric_kind(dt)?)
+        parse_number(&self.lexical()?, numeric_kind(dt)?)
     }
 
     /// Whether a numeric literal's lexical form parses disregarding the
@@ -531,15 +505,29 @@ impl<'a> LiteralView<'a> {
     /// `NaN`) its own, more lenient parser may still accept, so that one is
     /// left to it.
     fn parses_unbounded(&self) -> bool {
-        let Some(dt) = self.datatype else {
+        let (Some(dt), Some(lexical)) = (self.datatype, self.lexical()) else {
             return false;
         };
         match numeric_kind(dt) {
-            Some(NumKind::Int(..)) => parse_integer(self.lexical).is_some(),
-            Some(NumKind::Decimal) => parse_decimal(self.lexical).is_some(),
-            Some(NumKind::Float) => parse_float(self.lexical).is_some(),
+            Some(NumKind::Int(..)) => parse_integer(&lexical).is_some(),
+            Some(NumKind::Decimal) => parse_decimal(&lexical).is_some(),
+            Some(NumKind::Float) => parse_float(&lexical).is_some(),
             None => false,
         }
+    }
+
+    /// Whether this is an `xsd:long` or `xsd:unsignedLong` whose lexical form
+    /// is an integer outside the type's 64-bit bounds — a value rdflib holds
+    /// to no bound and compares, which this model refuses.
+    fn wide_64(&self) -> bool {
+        let Some(local) = self.datatype.and_then(|dt| dt.strip_prefix(XSD)) else {
+            return false;
+        };
+        (local == "long" || local == "unsignedLong")
+            && self
+                .lexical()
+                .is_some_and(|lexical| parse_integer(&lexical).is_some())
+            && self.number().is_none()
     }
 }
 
@@ -626,21 +614,6 @@ impl TermPredicate {
         Ok(predicate)
     }
 
-    /// The code range a dictionary scan must cover for this predicate's
-    /// definite answers.
-    pub fn domain(&self) -> Domain {
-        match self {
-            TermPredicate::IsLiteral
-            | TermPredicate::IsIri
-            | TermPredicate::IsBlank
-            | TermPredicate::StrPrefix(_) => Domain::All,
-            TermPredicate::Datatype(_)
-            | TermPredicate::Lang(_)
-            | TermPredicate::LangMatches(_)
-            | TermPredicate::Num(..) => Domain::Literals,
-        }
-    }
-
     /// Evaluate the predicate on one N-Triples spelling.
     pub fn eval(&self, spelling: &str) -> Verdict {
         let kind = kind_of(spelling);
@@ -688,88 +661,43 @@ impl TermPredicate {
                 number.compare(op, &lit)
             }
             TermPredicate::StrPrefix(prefix) => match kind {
-                Kind::Iri => Verdict::from(spelling[1..spelling.len() - 1].starts_with(prefix)),
-                Kind::Blank => Verdict::from(spelling[2..].starts_with(prefix)),
+                Kind::Iri => {
+                    Verdict::from(spelling[1..spelling.len() - 1].starts_with(prefix.as_str()))
+                }
+                Kind::Blank => Verdict::from(spelling[2..].starts_with(prefix.as_str())),
                 _ => match LiteralView::parse(spelling) {
-                    Some(lit) if lit.is_string_like() => {
-                        match unescape_prefix(lit.lexical, prefix.len()) {
-                            Some(head) => Verdict::from(head.starts_with(prefix)),
-                            None => Verdict::Unknown,
-                        }
-                    }
+                    Some(lit) if lit.is_string_like() => match lit.lexical() {
+                        Some(text) => Verdict::from(text.starts_with(prefix.as_str())),
+                        None => Verdict::Unknown,
+                    },
                     // `str()` of another typed literal is its lexical form
                     // only after the engine's own canonicalization.
-                    Some(_) => Verdict::Unknown,
-                    None => Verdict::Unknown,
+                    _ => Verdict::Unknown,
                 },
             },
         }
     }
 
-    /// How a dictionary with `kinds` partitions its codes by this
-    /// predicate: see [`ScanPlan`].
-    pub(crate) fn scan_plan(&self, kinds: &KindRanges) -> ScanPlan {
-        match self {
-            TermPredicate::IsLiteral | TermPredicate::IsIri | TermPredicate::IsBlank => ScanPlan {
-                scan: None,
-                true_prefixes: Vec::new(),
-            },
-            // Literals are scanned; an IRI or blank node answers `str()`
-            // with its own spelling, so its prefix test is a code range.
-            TermPredicate::StrPrefix(prefix) => ScanPlan {
-                scan: Some(kinds.literals.clone()),
-                true_prefixes: vec![format!("<{prefix}"), format!("_:{prefix}")],
-            },
-            TermPredicate::Datatype(_)
-            | TermPredicate::Lang(_)
-            | TermPredicate::LangMatches(_)
-            | TermPredicate::Num(..) => ScanPlan {
-                scan: Some(kinds.literals.clone()),
-                true_prefixes: Vec::new(),
-            },
-        }
-    }
-
-    /// Assemble the `(true_codes, unknown_codes)` partition from what the
-    /// [`ScanPlan`] produced: `scanned` holds the verdicts of the scanned
-    /// range and `true_ranges` the code ranges of the plan's `true_prefixes`,
-    /// in the plan's order. Both outputs are ascending.
-    ///
-    /// Codes outside the predicate's [`domain`](Self::domain) appear in
-    /// neither list; codes inside it that belong to no kind (the default
-    /// graph's `""`, a foreign writer's spelling) are unknown.
-    pub(crate) fn assemble(
-        &self,
-        kinds: &KindRanges,
-        scanned: Scanned,
-        true_ranges: &[Range<u32>],
-    ) -> (Buffer<u32>, Buffer<u32>) {
-        let range = |r: &Range<u32>| Buffer::from_iter(r.clone());
-        let gaps = || Buffer::from_iter(kinds.gaps());
-        match self {
-            TermPredicate::IsLiteral => (range(&kinds.literals), gaps()),
-            TermPredicate::IsIri => (range(&kinds.iris), gaps()),
-            TermPredicate::IsBlank => (range(&kinds.blanks), gaps()),
-            TermPredicate::StrPrefix(_) => {
-                // Literals < IRIs < blank nodes, so appending the prefix
-                // ranges in kind order keeps the list ascending.
-                let mut truth = scanned.truth;
-                for r in true_ranges {
-                    truth.extend(r.clone());
-                }
-                let mut unknown: Vec<u32> = (0..kinds.literals.start).collect();
-                unknown.extend(scanned.unknown);
-                unknown.extend(kinds.literals.end..kinds.iris.start);
-                unknown.extend(kinds.iris.end..kinds.blanks.start);
-                unknown.extend(kinds.blanks.end..kinds.len);
-                (Buffer::from(truth), Buffer::from(unknown))
-            }
-            TermPredicate::Datatype(_)
-            | TermPredicate::Lang(_)
-            | TermPredicate::LangMatches(_)
-            | TermPredicate::Num(..) => {
-                (Buffer::from(scanned.truth), Buffer::from(scanned.unknown))
-            }
+    /// The verdict every code of `kind` gets without its spelling being
+    /// read, or `None` when the spelling decides. Always agrees with `eval`
+    /// on a spelling of that kind.
+    pub(crate) fn kind_verdict(&self, kind: CodeKind) -> Option<Verdict> {
+        match (self, kind) {
+            (_, CodeKind::Other) => Some(Verdict::Unknown),
+            (TermPredicate::IsLiteral, kind) => Some(Verdict::from(kind == CodeKind::Literal)),
+            (TermPredicate::IsIri, kind) => Some(Verdict::from(kind == CodeKind::Iri)),
+            (TermPredicate::IsBlank, kind) => Some(Verdict::from(kind == CodeKind::Blank)),
+            (_, CodeKind::Literal) => None,
+            // Term inequality holds for every non-literal.
+            (TermPredicate::Num(NumOp::Ne, _), _) => Some(Verdict::True),
+            (TermPredicate::StrPrefix(_), _) => None,
+            (
+                TermPredicate::Datatype(_)
+                | TermPredicate::Lang(_)
+                | TermPredicate::LangMatches(_)
+                | TermPredicate::Num(..),
+                _,
+            ) => Some(Verdict::False),
         }
     }
 
@@ -814,7 +742,7 @@ impl Number {
         if arg.starts_with('"') {
             let lit = LiteralView::parse(arg)?;
             let datatype = lit.datatype?;
-            let value = parse_number(lit.lexical, numeric_kind(datatype)?)?;
+            let value = parse_number(&lit.lexical()?, numeric_kind(datatype)?)?;
             return Some(Self {
                 value,
                 datatype: datatype.to_owned(),
@@ -863,6 +791,12 @@ impl Number {
                 Some(ord) => op.apply(ord),
                 None => Verdict::Unknown,
             };
+        }
+        if lit.wide_64() {
+            // `xsd:long` / `xsd:unsignedLong` beyond 64 bits: rdflib holds
+            // neither to its bound and compares the value, which this model
+            // refuses — the verdict is the caller's.
+            return Verdict::Unknown;
         }
         // Not a numeric value: a numeric datatype whose lexical form the
         // model does not hold, or a non-numeric literal. For ordering, a
@@ -914,36 +848,35 @@ fn lang_matches(tag: &str, range: &str) -> bool {
     tag == range || (tag.starts_with(&range) && tag.as_bytes().get(range.len()) == Some(&b'-'))
 }
 
-/// Unescape at least the first `want` characters of a lexical form (as
-/// spelled, with N-Triples escapes), stopping early so a long literal costs
-/// only its prefix. `None` for a malformed escape.
-fn unescape_prefix(lexical: &str, want: usize) -> Option<String> {
-    if !lexical.contains('\\') {
-        return Some(lexical.chars().take(want).collect());
+/// The lexical form of a literal spelled with N-Triples escapes (`\t \b \n
+/// \r \f \" \' \\ \uXXXX \UXXXXXXXX`), borrowed when there is none; `None`
+/// for any other backslash sequence, which no two readers agree on.
+fn unescape_lexical(raw: &str) -> Option<Cow<'_, str>> {
+    if !raw.contains('\\') {
+        return Some(Cow::Borrowed(raw));
     }
-    let mut out = String::with_capacity(want.min(lexical.len()));
-    let mut chars = lexical.chars();
-    while out.chars().count() < want {
-        let Some(c) = chars.next() else { break };
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
         if c != '\\' {
             out.push(c);
             continue;
         }
-        match chars.next()? {
-            't' => out.push('\t'),
-            'b' => out.push('\u{8}'),
-            'n' => out.push('\n'),
-            'r' => out.push('\r'),
-            'f' => out.push('\u{c}'),
-            '"' => out.push('"'),
-            '\'' => out.push('\''),
-            '\\' => out.push('\\'),
-            'u' => out.push(hex_char(&mut chars, 4)?),
-            'U' => out.push(hex_char(&mut chars, 8)?),
+        out.push(match chars.next()? {
+            't' => '\t',
+            'b' => '\u{8}',
+            'n' => '\n',
+            'r' => '\r',
+            'f' => '\u{c}',
+            '"' => '"',
+            '\'' => '\'',
+            '\\' => '\\',
+            'u' => hex_char(&mut chars, 4)?,
+            'U' => hex_char(&mut chars, 8)?,
             _ => return None,
-        }
+        });
     }
-    Some(out)
+    Some(Cow::Owned(out))
 }
 
 fn hex_char(chars: &mut std::str::Chars<'_>, len: usize) -> Option<char> {
@@ -1146,10 +1079,81 @@ mod tests {
     }
 
     #[test]
-    fn domains() {
-        assert_eq!(p("is_iri", "").domain(), Domain::All);
-        assert_eq!(p("str_prefix", "x").domain(), Domain::All);
-        assert_eq!(p("num_lt", "1").domain(), Domain::Literals);
-        assert_eq!(p("lang", "en").domain(), Domain::Literals);
+    fn wide_64_bit_longs_are_undecided() {
+        let long = "http://www.w3.org/2001/XMLSchema#long";
+        let ulong = "http://www.w3.org/2001/XMLSchema#unsignedLong";
+        for op in ["num_lt", "num_gt", "num_le", "num_ge"] {
+            assert_eq!(
+                p(op, "5").eval(&typed("99999999999999999999", long)),
+                Verdict::Unknown,
+                "{op}"
+            );
+            assert_eq!(
+                p(op, "5").eval(&typed("-1", ulong)),
+                Verdict::Unknown,
+                "{op}"
+            );
+        }
+        assert_eq!(p("num_lt", "5").eval(&typed("7", long)), Verdict::False);
+        assert_eq!(p("num_lt", "9").eval(&typed("7", ulong)), Verdict::True);
+        // An unbounded integer still compares by value.
+        assert_eq!(
+            p("num_lt", "5").eval(&typed("99999999999999999999", INT)),
+            Verdict::False
+        );
+    }
+
+    #[test]
+    fn lexical_forms_are_read_unescaped() {
+        assert_eq!(
+            p("num_eq", "5").eval("\"\\u0035\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
+            Verdict::True
+        );
+        assert_eq!(
+            p("num_lt", "5").eval("\"\\q\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
+            Verdict::Unknown
+        );
+        assert_eq!(p("str_prefix", "a\"").eval("\"a\\\"b\""), Verdict::True);
+        assert_eq!(
+            p("lang", "en").eval("\"a\\\"@fr\"@en"),
+            Verdict::True,
+            "escaped \"@ is not the tag"
+        );
+    }
+
+    #[test]
+    fn kind_verdicts_agree_with_eval() {
+        let kinds = KindRanges {
+            default_graph: Some(0),
+            literals: 1..3,
+            iris: 3..4,
+            blanks: 4..5,
+            len: 5,
+        };
+        let spellings = [
+            "",
+            "\"a\"",
+            "\"5\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+            "<http://x>",
+            "_:b",
+        ];
+        for (kind, arg) in [
+            ("is_iri", ""),
+            ("is_literal", ""),
+            ("is_blank", ""),
+            ("datatype", INT),
+            ("lang", "en"),
+            ("lang_matches", "*"),
+            ("num_lt", "5"),
+            ("num_ne", "5"),
+            ("str_prefix", "h"),
+        ] {
+            let predicate = p(kind, arg);
+            for (code, spelling) in spellings.iter().enumerate() {
+                if let Some(verdict) = predicate.kind_verdict(kinds.kind_of_code(code as u32)) {
+                    assert_eq!(verdict, predicate.eval(spelling), "{kind} on {spelling}");
+                }
+            }
+        }
     }
 }

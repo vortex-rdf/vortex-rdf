@@ -36,7 +36,7 @@ use crate::store::array::{StrColReader, buf_as_str};
 #[cfg(feature = "file-io")]
 use super::file_backed::FileBackedDict;
 use super::ingest::BorrowedTermCodeMap;
-use super::predicates::{KindRanges, Scanned, TermPredicate};
+use super::predicates::{KindRanges, TermPredicate, Verdict};
 
 /// The single column of the native container's `dictionary` child: non-nullable
 /// utf8, row i holding the term with code i (sorted, so codes are lexicographic
@@ -501,29 +501,33 @@ impl TermDictionary {
             .collect()
     }
 
-    /// Partition the codes by `predicate`'s verdicts — `(true, unknown)`,
-    /// both ascending — in one pass over the predicate's scan range (see
-    /// [`TermPredicate::scan_plan`]), computed afresh on every call.
-    pub(crate) fn filter_codes(&self, predicate: &TermPredicate) -> VerdictSets {
+    /// `predicate` over the candidate `codes` (ascending, unique, inside the
+    /// dictionary): `(passed, undecided)`, both ascending subsets of `codes`,
+    /// a candidate in neither having failed. A code its kind decides
+    /// ([`TermPredicate::kind_verdict`]) is not read; every other one is.
+    /// Nothing is memoized.
+    pub(crate) fn filter_codes(
+        &self,
+        predicate: &TermPredicate,
+        codes: &[u32],
+    ) -> Result<(Buffer<u32>, Buffer<u32>)> {
+        check_candidates(codes, self.len())?;
         let kinds = self.kind_ranges();
-        let plan = predicate.scan_plan(kinds);
-        let mut scanned = Scanned::default();
-        if let Some(range) = plan.scan {
-            let mut cursor = self.cursor();
-            for code in range {
-                match cursor.str_at(code as usize) {
-                    Ok(spelling) => scanned.visit(predicate, code, spelling),
-                    // A term that is not UTF-8 is nothing the rules speak of.
-                    Err(_) => scanned.unknown.push(code),
-                }
-            }
-        }
-        let true_ranges: Vec<Range<u32>> = plan
-            .true_prefixes
+        let mut cursor = self.cursor();
+        let verdicts: Vec<Verdict> = codes
             .iter()
-            .map(|prefix| self.prefix_range(prefix))
+            .map(
+                |&code| match predicate.kind_verdict(kinds.kind_of_code(code)) {
+                    Some(verdict) => verdict,
+                    None => match cursor.str_at(code as usize) {
+                        Ok(spelling) => predicate.eval(spelling),
+                        // A term that is not UTF-8 is nothing the rules speak of.
+                        Err(_) => Verdict::Unknown,
+                    },
+                },
+            )
             .collect();
-        Arc::new(predicate.assemble(kinds, scanned, &true_ranges))
+        Ok(split_verdicts(codes, &verdicts))
     }
 }
 
@@ -544,9 +548,38 @@ pub(super) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     Some(successor)
 }
 
-/// A predicate's partition of a dictionary's codes — `(true, unknown)`,
-/// both ascending.
-pub(crate) type VerdictSets = Arc<(Buffer<u32>, Buffer<u32>)>;
+/// `codes` must be strictly ascending and inside a dictionary of `len`
+/// terms — the contract every candidate evaluation checks before reading.
+pub(super) fn check_candidates(codes: &[u32], len: usize) -> Result<()> {
+    if let Some(pair) = codes.windows(2).find(|pair| pair[0] >= pair[1]) {
+        return Err(VortexRdfError::InvalidOperation(format!(
+            "codes must be sorted and unique: {} follows {}",
+            pair[1], pair[0]
+        )));
+    }
+    if let Some(&last) = codes.last()
+        && last as usize >= len
+    {
+        return Err(VortexRdfError::InvalidOperation(format!(
+            "code {last} is outside the dictionary ({len} terms)"
+        )));
+    }
+    Ok(())
+}
+
+/// The candidates' verdicts as `(passed, undecided)`, both ascending
+/// subsets of `codes`; a code in neither failed.
+pub(super) fn split_verdicts(codes: &[u32], verdicts: &[Verdict]) -> (Buffer<u32>, Buffer<u32>) {
+    let (mut passed, mut undecided) = (Vec::new(), Vec::new());
+    for (&code, verdict) in codes.iter().zip(verdicts) {
+        match verdict {
+            Verdict::True => passed.push(code),
+            Verdict::Unknown => undecided.push(code),
+            Verdict::False => {}
+        }
+    }
+    (Buffer::from(passed), Buffer::from(undecided))
+}
 
 /// Bytes an FSST symbol expands to at most — one code never yields more.
 const FSST_SYMBOL_LEN: usize = 8;
@@ -768,16 +801,17 @@ impl DictSnapshot {
         self.0.kind_ranges().clone()
     }
 
-    /// Partition the codes by `predicate`: the ascending codes for which it
-    /// is definitely true, and the ascending codes inside its domain whose
-    /// verdict is unknown (for a full engine to decide). Codes outside the
-    /// predicate's [`domain`](TermPredicate::domain) — non-literals, for the
-    /// literal predicates — appear in neither list, since a caller decides
-    /// them from the term's kind alone (see [`kind_ranges`](Self::kind_ranges)).
-    /// One scan of the domain.
-    pub fn filter_codes(&self, predicate: &TermPredicate) -> (Buffer<u32>, Buffer<u32>) {
-        let sets = self.0.filter_codes(predicate);
-        (sets.0.clone(), sets.1.clone())
+    /// `predicate` over the candidate `codes` — ascending, unique and inside
+    /// the dictionary, else an `InvalidOperation` error: `(passed,
+    /// undecided)`, both ascending subsets of `codes`; a candidate in
+    /// neither fails the predicate. Only candidates whose kind does not
+    /// decide them are read. Nothing is memoized.
+    pub fn filter_codes(
+        &self,
+        predicate: &TermPredicate,
+        codes: &[u32],
+    ) -> Result<(Buffer<u32>, Buffer<u32>)> {
+        self.0.filter_codes(predicate, codes)
     }
 }
 
@@ -923,18 +957,18 @@ impl DictReader {
         }
     }
 
-    /// See [`DictSnapshot::filter_codes`]. A file-backed dictionary reads the
-    /// predicate's domain window by window.
+    /// See [`DictSnapshot::filter_codes`]. A file-backed dictionary reads
+    /// only the windows holding the candidates it must read.
     pub async fn filter_codes(
         &self,
         predicate: &TermPredicate,
+        codes: &[u32],
     ) -> Result<(Buffer<u32>, Buffer<u32>)> {
-        let sets = match &self.0 {
-            DictReaderInner::Resident(dict) => dict.filter_codes(predicate),
+        match &self.0 {
+            DictReaderInner::Resident(dict) => dict.filter_codes(predicate, codes),
             #[cfg(feature = "file-io")]
-            DictReaderInner::FileBacked(dict) => dict.filter_codes(predicate).await?,
-        };
-        Ok((sets.0.clone(), sets.1.clone()))
+            DictReaderInner::FileBacked(dict) => dict.filter_codes(predicate, codes).await,
+        }
     }
 }
 

@@ -631,24 +631,23 @@ fn narrow_exists(bencher: divan::Bencher, residency: &DictResidency) {
     });
 }
 
-/// A term predicate over the whole dictionary, un-memoized: a fresh store
-/// each iteration, so the cell prices the scan of the predicate's domain
-/// (resident: a cursor pass; file-backed: the child's chunks) rather than
-/// the memo hit a repeated predicate gets.
+/// A term predicate over 4,096 candidate codes spread across the dictionary:
+/// the per-query FILTER evaluation (resident: a cursor read per code;
+/// file-backed: the windows holding them).
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn narrow_filter_codes(bencher: divan::Bencher, residency: &DictResidency) {
     use vortex_rdf_core::TermPredicate;
-    let residency = *residency;
+    let store = open_dict_store(*residency, bench_size());
     let predicate = TermPredicate::parse("str_prefix", "http://").unwrap();
-    bencher
-        .with_inputs(|| open_dict_store(residency, bench_size()))
-        .bench_refs(|store| {
-            rt().block_on(async {
-                let dict = store.dict_reader().expect("dictionary handle");
-                let (truth, unknown) = dict.filter_codes(&predicate).await.expect("filter");
-                black_box((truth.len(), unknown.len()))
-            })
-        });
+    let dict = store.dict_reader().expect("dictionary handle");
+    let step = (dict.len() / 4_096).max(1);
+    let codes: Vec<u32> = (0..dict.len() as u32).step_by(step).take(4_096).collect();
+    bencher.bench(|| {
+        rt().block_on(async {
+            let (passed, undecided) = dict.filter_codes(&predicate, &codes).await.expect("filter");
+            black_box((passed.len(), undecided.len()))
+        })
+    });
 }
 
 /// A batch of 64 subject probes in one `match_many`, gathered: the

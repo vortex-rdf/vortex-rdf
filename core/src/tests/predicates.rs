@@ -198,8 +198,8 @@ fn datatype_and_lang() {
     check(&five, "lang", "en", Definite(false));
     check(&five, "lang", "", Definite(true));
     check(&five, "lang_matches", "*", Definite(false));
-    // Non-literals are outside the domain: errors in the engine, which a
-    // scan never asks about (the kind ranges decide them).
+    // Non-literals: errors in the engine, which `filter_codes` never asks
+    // about (the kind ranges decide them).
     check("<http://ex.org/x>", "lang", "", Definite(false));
     check("_:b0", "lang_matches", "*", Definite(false));
 }
@@ -262,10 +262,9 @@ fn parse_rejects_malformed() {
     assert!(TermPredicate::parse("num_lt", &typed("5", "byte")).is_ok());
 }
 
-/// The dictionary partitions its codes by every predicate exactly as
-/// `eval` answers term by term.
-#[tokio::test]
-async fn filter_codes_matches_eval() {
+/// Spellings covering every kind, escapes and the 64-bit long rule, in a
+/// Dictionary store.
+async fn predicate_store() -> VortexRdfStore {
     let mut quads = dictionary_test_quads();
     let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/typed").unwrap());
     let p = NamedNode::new("http://example.org/value").unwrap();
@@ -277,6 +276,9 @@ async fn filter_codes_matches_eval() {
         typed("1e2", "double"),
         typed("300", "byte"),
         typed("true", "boolean"),
+        typed("99999999999999999999", "long"),
+        typed("-1", "unsignedLong"),
+        typed("7", "long"),
         "\"abc\"@en".to_string(),
         "\"abc\"@en-us".to_string(),
         "\"Abc\"".to_string(),
@@ -291,14 +293,22 @@ async fn filter_codes_matches_eval() {
             GraphName::DefaultGraph,
         ));
     }
-    let store = VortexRdfStore::from_quads(quad_stream(quads), LayoutStrategy::Dictionary, vec![])
+    VortexRdfStore::from_quads(quad_stream(quads), LayoutStrategy::Dictionary, vec![])
         .await
-        .unwrap();
+        .unwrap()
+}
+
+/// Over any candidate subset, `filter_codes` answers exactly what `eval`
+/// answers code by code: passed = True, undecided = Unknown, the rest False.
+#[tokio::test]
+async fn filter_codes_matches_eval() {
+    let store = predicate_store().await;
     let dict = store.code_read_snapshot().unwrap();
     let terms: Vec<String> = (0..dict.len() as u32)
         .map(|c| dict.decode(c).unwrap())
         .collect();
-    let kinds = dict.kind_ranges();
+    let all: Vec<u32> = (0..terms.len() as u32).collect();
+    let odd: Vec<u32> = all.iter().copied().filter(|c| c % 2 == 1).collect();
     for (kind, arg) in [
         ("is_literal", ""),
         ("is_iri", ""),
@@ -319,34 +329,80 @@ async fn filter_codes_matches_eval() {
         ("num_ne", "5"),
     ] {
         let predicate = TermPredicate::parse(kind, arg).unwrap();
-        let (truth, unknown) = dict.filter_codes(&predicate);
-        let in_domain = |code: u32| match predicate.domain() {
-            crate::store::Domain::All => true,
-            crate::store::Domain::Literals => kinds.literals.contains(&code),
-        };
-        let mut want_true = Vec::new();
-        let mut want_unknown = Vec::new();
-        for (code, term) in (0u32..).zip(&terms) {
-            if !in_domain(code) {
-                continue;
+        for codes in [&all, &odd, &vec![]] {
+            let (passed, undecided) = dict.filter_codes(&predicate, codes).unwrap();
+            let (mut want_passed, mut want_undecided) = (Vec::new(), Vec::new());
+            for &code in codes.iter() {
+                match predicate.eval(&terms[code as usize]) {
+                    Verdict::True => want_passed.push(code),
+                    Verdict::Unknown => want_undecided.push(code),
+                    Verdict::False => {}
+                }
             }
-            match predicate.eval(term) {
-                Verdict::True => want_true.push(code),
-                Verdict::Unknown => want_unknown.push(code),
-                Verdict::False => {}
-            }
+            assert_eq!(
+                passed.as_slice(),
+                &want_passed[..],
+                "{kind} {arg:?}: passed"
+            );
+            assert_eq!(
+                undecided.as_slice(),
+                &want_undecided[..],
+                "{kind} {arg:?}: undecided"
+            );
         }
-        assert_eq!(
-            truth.as_slice(),
-            &want_true[..],
-            "{kind} {arg:?}: true codes"
-        );
-        assert_eq!(
-            unknown.as_slice(),
-            &want_unknown[..],
-            "{kind} {arg:?}: unknown codes"
-        );
-        // Memoized: the same answer on re-ask.
-        assert_eq!(dict.filter_codes(&predicate).0.as_slice(), &want_true[..]);
     }
+}
+
+/// A `xsd:long` / `xsd:unsignedLong` beyond its 64-bit bounds reaches the
+/// caller undecided under every comparison — rdflib compares such a value,
+/// which the model refuses — while a long within bounds is decided.
+#[tokio::test]
+async fn filter_codes_leaves_wide_longs_undecided() {
+    let store = predicate_store().await;
+    let dict = store.code_read_snapshot().unwrap();
+    let all: Vec<u32> = (0..dict.len() as u32).collect();
+    let code = |spelling: String| dict.encode(&spelling).expect(&spelling);
+    let wide = [
+        code(typed("99999999999999999999", "long")),
+        code(typed("-1", "unsignedLong")),
+    ];
+    let narrow = code(typed("7", "long"));
+    for kind in ["num_lt", "num_le", "num_gt", "num_ge", "num_eq", "num_ne"] {
+        let predicate = TermPredicate::parse(kind, "9").unwrap();
+        let (passed, undecided) = dict.filter_codes(&predicate, &all).unwrap();
+        for wide_code in wide {
+            assert!(
+                undecided.as_slice().contains(&wide_code),
+                "{kind}: {wide_code} undecided"
+            );
+            assert!(
+                !passed.as_slice().contains(&wide_code),
+                "{kind}: {wide_code} not passed"
+            );
+        }
+        assert!(
+            !undecided.as_slice().contains(&narrow),
+            "{kind}: 7 is decided"
+        );
+    }
+}
+
+/// Candidates must be ascending, unique and inside the dictionary.
+#[tokio::test]
+async fn filter_codes_rejects_bad_candidates() {
+    let store = predicate_store().await;
+    let dict = store.code_read_snapshot().unwrap();
+    let predicate = TermPredicate::parse("is_iri", "").unwrap();
+    let len = dict.len() as u32;
+    for codes in [vec![3u32, 1], vec![1, 1], vec![0, len]] {
+        assert!(
+            matches!(
+                dict.filter_codes(&predicate, &codes),
+                Err(crate::VortexRdfError::InvalidOperation(_))
+            ),
+            "{codes:?}"
+        );
+    }
+    let (passed, undecided) = dict.filter_codes(&predicate, &[]).unwrap();
+    assert!(passed.is_empty() && undecided.is_empty());
 }

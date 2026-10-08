@@ -285,12 +285,39 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
         ("num_ne", "42"),
     ] {
         let predicate = TermPredicate::parse(kind, arg).unwrap();
-        assert_eq!(
-            reader.filter_codes(&predicate).await.unwrap(),
-            oracle.filter_codes(&predicate),
-            "{tag}: filter_codes {kind} {arg:?}"
+        let all: Vec<u32> = (0..oracle.len() as u32).collect();
+        let every_third: Vec<u32> = all.iter().copied().step_by(3).collect();
+        for codes in [&all, &every_third] {
+            assert_eq!(
+                reader.filter_codes(&predicate, codes).await.unwrap(),
+                oracle.filter_codes(&predicate, codes).unwrap(),
+                "{tag}: filter_codes {kind} {arg:?}"
+            );
+        }
+    }
+
+    // Candidates must be ascending, unique and inside the dictionary, under
+    // either residency; none at all is two empty answers.
+    let is_iri = TermPredicate::parse("is_iri", "").unwrap();
+    let len = oracle.len() as u32;
+    for codes in [vec![3u32, 1], vec![1, 1], vec![0, len], vec![len + 7]] {
+        assert!(
+            matches!(
+                reader.filter_codes(&is_iri, &codes).await,
+                Err(crate::VortexRdfError::InvalidOperation(_))
+            ),
+            "{tag}: filter_codes over {codes:?}"
+        );
+        assert!(
+            matches!(
+                oracle.filter_codes(&is_iri, &codes),
+                Err(crate::VortexRdfError::InvalidOperation(_))
+            ),
+            "{tag}: snapshot filter_codes over {codes:?}"
         );
     }
+    let (passed, undecided) = reader.filter_codes(&is_iri, &[]).await.unwrap();
+    assert!(passed.is_empty() && undecided.is_empty(), "{tag}");
 }
 
 /// A resident reader is the snapshot behind an async surface: every method
@@ -468,12 +495,14 @@ async fn test_dict_reader_file_backed_matches_resident() {
     assert!(reader.is_file_backed());
     assert!(reader.snapshot().is_none());
     assert_reader_matches_snapshot(&reader, &oracle, "file-backed").await;
-    // Memoized answers (kind ranges, predicates) stay stable on re-ask.
+    // The kind ranges stay stable on re-ask, and a predicate over the
+    // candidates answers the same each time (nothing is memoized).
     assert_eq!(reader.kind_ranges().await.unwrap(), oracle.kind_ranges());
     let literal = TermPredicate::parse("is_literal", "").unwrap();
+    let all: Vec<u32> = (0..oracle.len() as u32).collect();
     assert_eq!(
-        reader.filter_codes(&literal).await.unwrap(),
-        oracle.filter_codes(&literal)
+        reader.filter_codes(&literal, &all).await.unwrap(),
+        oracle.filter_codes(&literal, &all).unwrap()
     );
 
     // A served and a scanned view's gathered codes decode through the

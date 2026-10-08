@@ -444,16 +444,15 @@ def test_pushdown_many(benchmark, stores):
 @pytest.mark.benchmark
 @pytest.mark.parametrize("kind", ["is_iri", "str_prefix"])
 def test_pushdown_filter_codes(benchmark, store_paths, kind):
-    """A term predicate partitioning the dictionary: a kind test is pure
-    ranges, a string prefix scans the literals and IRIs. The memo is bypassed
-    by opening the store afresh per round."""
-    path = store_paths["triples::dict"]
+    """A term predicate over candidate codes spread across the dictionary —
+    the per-query FILTER evaluation: a kind test reads nothing, a string
+    prefix reads the terms of the candidates their kind does not decide."""
+    from vortex_rdf import U32Column
+
+    term_dict = VortexRdfStore(store_paths["triples::dict"]).term_dict()
     arg = "http://" if kind == "str_prefix" else ""
-
-    def run():
-        return VortexRdfStore(path).term_dict().filter_codes(kind, arg)
-
-    benchmark(run)
+    codes = U32Column(range(0, len(term_dict), max(1, len(term_dict) // 4096)))
+    benchmark(lambda: term_dict.filter_codes(kind, arg, codes))
 
 
 @pytest.mark.benchmark

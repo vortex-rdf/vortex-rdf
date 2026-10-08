@@ -159,30 +159,36 @@ impl TermDict {
         .map_err(term_err)
     }
 
-    /// The codes `predicate` partitions this dictionary into: the ascending
-    /// codes for which the predicate is definitely true, and the ascending
-    /// codes inside its domain whose verdict the native layer leaves to the
-    /// caller. Codes outside the domain (non-literals, for the literal
-    /// predicates) appear in neither.
-    ///
-    /// `kind` is one of `is_literal`, `is_iri`, `is_blank`, `datatype`,
-    /// `lang`, `lang_matches`, `str_prefix`, `num_lt`, `num_le`, `num_gt`,
-    /// `num_ge`, `num_eq`, `num_ne`; `arg` is the predicate's argument (an
-    /// IRI, language tag or range, string prefix, or numeric literal
-    /// spelling). An unknown kind or an invalid argument raises
-    /// `ValueError`. Answers are memoized per dictionary.
-    #[pyo3(signature = (kind, arg = ""))]
+    /// `kind` over the candidate `codes`: `(passed, undecided)`, both
+    /// ascending subsets of `codes`; a candidate in neither fails. `codes`
+    /// (a `U32Column`, a u32 buffer or any int sequence) must be sorted,
+    /// unique and inside the dictionary, else `ValueError`. Only the
+    /// dictionary windows holding candidates the kind ranges do not decide
+    /// are read; nothing is memoized. An unknown kind or an invalid argument
+    /// raises `ValueError`.
+    #[pyo3(signature = (kind, arg, codes))]
     fn filter_codes(
         &self,
         py: Python<'_>,
         kind: &str,
         arg: &str,
+        codes: &Bound<'_, PyAny>,
     ) -> PyResult<(U32Column, U32Column)> {
         let predicate = TermPredicate::parse(kind, arg).map_err(term_err)?;
-        let (truth, unknown) = py
-            .detach(|| RUNTIME.block_on(self.reader.filter_codes(&predicate)))
+        // Like a keep's code set: whatever is no u32 code list is a bad value.
+        let codes = u32_buffer(codes).map_err(|e| {
+            PyValueError::new_err(format!(
+                "codes is a U32Column, a u32 buffer or a sequence of non-negative ints that fit \
+                 a u32: {e}"
+            ))
+        })?;
+        let (passed, undecided) = py
+            .detach(|| match self.reader.snapshot() {
+                Some(snapshot) => snapshot.filter_codes(&predicate, codes.as_slice()),
+                None => RUNTIME.block_on(self.reader.filter_codes(&predicate, codes.as_slice())),
+            })
             .map_err(term_err)?;
-        Ok((U32Column { codes: truth }, U32Column { codes: unknown }))
+        Ok((U32Column { codes: passed }, U32Column { codes: undecided }))
     }
 
     /// The half-open code range `(lo, hi)` of the terms whose N-Triples
@@ -279,6 +285,15 @@ pub(crate) fn extract_u32s(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
     obj.extract::<Vec<u32>>()
 }
 
+/// The u32 values of `obj` as a buffer: a `U32Column`'s own, shared
+/// zero-copy, or [`extract_u32s`]'s copy of anything else.
+fn u32_buffer(obj: &Bound<'_, PyAny>) -> PyResult<Buffer<u32>> {
+    if let Ok(column) = obj.cast::<U32Column>() {
+        return Ok(column.get().codes.clone());
+    }
+    Ok(Buffer::from(extract_u32s(obj)?))
+}
+
 /// One matched term-code column, exposed to Python zero-copy through the
 /// buffer protocol: `memoryview(col).cast("I")` views the Rust memory
 /// directly. The column is read-only and owns (refcounts) its backing buffer.
@@ -300,13 +315,8 @@ impl U32Column {
     /// any sequence of ints.
     #[new]
     fn new(values: &Bound<'_, PyAny>) -> PyResult<Self> {
-        if let Ok(column) = values.cast::<U32Column>() {
-            return Ok(U32Column {
-                codes: column.get().codes.clone(),
-            });
-        }
         Ok(U32Column {
-            codes: Buffer::from(extract_u32s(values)?),
+            codes: u32_buffer(values)?,
         })
     }
 
