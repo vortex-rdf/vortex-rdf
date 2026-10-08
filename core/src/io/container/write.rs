@@ -183,17 +183,39 @@ where
         .await
 }
 
-/// The dictionary child's pass-through strategy: every chunk the source
-/// emits is written verbatim as one flat leaf under a chunked node — no
-/// sampling, no re-encoding. The chunks are the source's self-contained FSST
-/// windows (`TermDictionary::compress`), so the child's leaves are the
-/// granularity at which `FileBackedDict` point-reads.
-pub(crate) fn dict_child_strategy() -> Arc<dyn LayoutStrategy> {
+/// The dictionary child's strategy: every chunk the source emits is written
+/// verbatim as one flat leaf under a chunked node — no sampling, no
+/// re-encoding. The chunks are the source's self-contained FSST windows
+/// (`TermDictionary::compress`), so the leaves are the granularity the
+/// file-backed dictionary reads. With `zone_rows` (the window length) the
+/// term column is zoned one zone per window, recording each window's exact
+/// first and last term (`vortex.min()`/`vortex.max()`); `None` — chunks of
+/// uneven length — writes no zone map.
+pub(crate) fn dict_child_strategy(
+    zone_rows: Option<std::num::NonZeroUsize>,
+) -> Arc<dyn LayoutStrategy> {
     use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
     use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
     use vortex_layout::layouts::struct_::StructStrategy;
+    use vortex_layout::layouts::zoned::writer::{ZonedLayoutOptions, ZonedStrategy};
+
+    let leaves = ChunkedLayoutStrategy::new(FlatLayoutStrategy::default());
+    let terms: Arc<dyn LayoutStrategy> = match zone_rows {
+        Some(block_size) => Arc::new(ZonedStrategy::new(
+            leaves,
+            FlatLayoutStrategy::default(),
+            ZonedLayoutOptions {
+                block_size,
+                aggregate_fns: Some(
+                    crate::store::layouts::dictionary::term_dict::window_bound_aggregates(),
+                ),
+                concurrency: std::num::NonZeroUsize::MIN,
+            },
+        )),
+        None => Arc::new(leaves),
+    };
     Arc::new(StructStrategy::new(
         Arc::new(FlatLayoutStrategy::default()),
-        Arc::new(ChunkedLayoutStrategy::new(FlatLayoutStrategy::default())),
+        terms,
     ))
 }

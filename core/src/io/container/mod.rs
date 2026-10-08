@@ -44,6 +44,12 @@ pub(crate) const DICT_COMPONENT_NAME: &str = "dictionary";
 /// Implementation slug of the dictionary child: the lexicographically sorted
 /// term column, FSST-compressed as held.
 pub(crate) const DICT_IMPLEMENTATION: &str = "sorted-terms-fsst-v1";
+/// Version of the dictionary child this crate writes: 2 adds exact per-window
+/// `vortex.min()`/`vortex.max()` zone maps on the term column (vortex-rdf
+/// 0.12); version 1 (vortex-rdf 0.11 and earlier) carries none. Readers take
+/// both — without zone maps a window's bounds are read from its leaf.
+#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+pub(crate) const DICT_VERSION: u32 = 2;
 
 #[cfg(all(test, feature = "file-io"))]
 pub(crate) use layout::store_metadata_of_bytes;

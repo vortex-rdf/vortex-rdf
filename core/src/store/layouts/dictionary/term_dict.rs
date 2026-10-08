@@ -1136,6 +1136,20 @@ impl TermDictionary {
     }
 }
 
+/// The zone aggregates recording a dictionary window's exact bounds, in the
+/// order the zone table holds them: `vortex.max()` (last term), then
+/// `vortex.min()` (first term). Not the bounded string aggregates Vortex
+/// writes by default, which truncate long terms.
+#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+pub(crate) fn window_bound_aggregates() -> Arc<[vortex_array::aggregate_fn::AggregateFnRef]> {
+    use vortex_array::aggregate_fn::fns::{max::Max, min::Min};
+    use vortex_array::aggregate_fn::{AggregateFnVTableExt as _, NumericalAggregateOpts};
+    Arc::from([
+        Max.bind(NumericalAggregateOpts::skip_nans()),
+        Min.bind(NumericalAggregateOpts::skip_nans()),
+    ])
+}
+
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 impl TermDictionary {
     /// This dictionary as a native store component: the sorted term column,
@@ -1154,13 +1168,13 @@ impl TermDictionary {
                 name: DICT_COMPONENT_NAME.into(),
                 role: StoreComponentRole::Dictionary,
                 implementation: container::DICT_IMPLEMENTATION.into(),
-                version: 1,
+                version: container::DICT_VERSION,
                 required: true,
                 sorted: true,
                 dtype,
             },
             Arc::new(BufferedComponentSource::try_new(chunks).map_err(VortexRdfError::Vortex)?),
-            container::dict_child_strategy(),
+            container::dict_child_strategy(self.uniform_window()),
         )
         .map_err(VortexRdfError::Vortex)
     }
@@ -1188,6 +1202,25 @@ impl TermDictionary {
         match &self.terms {
             TermStore::Single(c) => Ok(vec![wrap(c.array())?]),
             TermStore::Chunked(c) => c.chunks.iter().map(|chunk| wrap(chunk.array())).collect(),
+        }
+    }
+
+    /// The window every held chunk but the last fills — the zone length the
+    /// dictionary child is written with — or `None` when the chunks are not
+    /// one uniform window (chunks adopted from a foreign file), which then
+    /// go without a zone map. An empty dictionary has none.
+    pub(crate) fn uniform_window(&self) -> Option<std::num::NonZeroUsize> {
+        match &self.terms {
+            TermStore::Single(chunk) => std::num::NonZeroUsize::new(chunk.len()),
+            TermStore::Chunked(c) => {
+                let (last, rest) = c.chunks.split_last()?;
+                let window = rest.first().map_or(last.len(), TermChunk::len);
+                let uniform =
+                    rest.iter().all(|chunk| chunk.len() == window) && last.len() <= window;
+                uniform
+                    .then(|| std::num::NonZeroUsize::new(window))
+                    .flatten()
+            }
         }
     }
 }
@@ -1327,5 +1360,78 @@ mod tests {
         }
         assert_eq!(chunked.encode("<http://absent>"), None);
         assert_eq!(chunked.decode(300), None);
+    }
+
+    /// Chunks that are not one uniform window (adopted from a foreign file)
+    /// are written without zone maps, and read back unchanged.
+    #[cfg(feature = "file-io")]
+    #[tokio::test]
+    async fn non_uniform_chunks_write_without_zone_maps() {
+        let terms: Vec<String> = (0..300)
+            .map(|i| format!("<http://example.org/plain/{i:04}>"))
+            .collect();
+        let column = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str)).into_array();
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        let pieces = vec![
+            column.slice(0..120).unwrap(),
+            column.slice(120..300).unwrap(),
+        ];
+        let d = TermDictionary::from_term_chunks(pieces, &mut ctx).unwrap();
+        assert_eq!(d.uniform_window(), None);
+        let windowed = TermDictionary::compress_windowed(
+            VarBinViewArray::from_iter_str(terms.iter().map(String::as_str)),
+            100,
+        )
+        .unwrap();
+        assert_eq!(windowed.uniform_window(), std::num::NonZeroUsize::new(100));
+        let bytes = crate::tests::write_dict_only_store(&d).await;
+        let reread = crate::store::VortexRdfStore::from_bytes(&bytes)
+            .await
+            .unwrap();
+        let snapshot = reread.dictionary_snapshot().unwrap();
+        for (i, term) in terms.iter().enumerate() {
+            assert_eq!(snapshot.decode(i as u32).as_deref(), Some(term.as_str()));
+        }
+    }
+
+    /// A dictionary child without zone maps — the shape vortex-rdf 0.11
+    /// wrote, and what chunks of uneven length still write — opens
+    /// file-backed and point-reads across its chunk leaves.
+    #[cfg(feature = "file-io")]
+    #[tokio::test]
+    async fn unzoned_dict_child_point_reads_file_backed() {
+        use crate::store::native_file::NativeStoreFile;
+        use vortex_buffer::ByteBuffer;
+        use vortex_file::OpenOptionsSessionExt as _;
+
+        let terms: Vec<String> = (0..300)
+            .map(|i| format!("<http://example.org/plain/{i:04}>"))
+            .collect();
+        let column = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str)).into_array();
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        let pieces = vec![
+            column.slice(0..120).unwrap(),
+            column.slice(120..300).unwrap(),
+        ];
+        let d = TermDictionary::from_term_chunks(pieces, &mut ctx).unwrap();
+        assert_eq!(d.uniform_window(), None);
+        let bytes = crate::tests::write_dict_only_store(&d).await;
+        let file = VORTEX_SESSION
+            .open_options()
+            .open_buffer(ByteBuffer::from(bytes))
+            .unwrap();
+        let native = NativeStoreFile::try_new(file).unwrap();
+        let fbd = FileBackedDict::open(&native)
+            .unwrap()
+            .expect("an unzoned chunked child is point-readable");
+        for (i, term) in terms.iter().enumerate() {
+            assert_eq!(fbd.encode(term).await.unwrap(), Some(i as u32), "{term}");
+        }
+        assert_eq!(fbd.encode("<http://absent>").await.unwrap(), None);
+        let codes = [0u32, 119, 120, 299];
+        let decoded = fbd.decode_many(&codes).await.unwrap();
+        for (code, term) in codes.iter().zip(&decoded) {
+            assert_eq!(term.as_ref(), terms[*code as usize]);
+        }
     }
 }

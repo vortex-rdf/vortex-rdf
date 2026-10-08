@@ -605,4 +605,89 @@ mod tests {
         }
         assert_eq!(fbd.encode("<http://zzz>").await.unwrap(), None);
     }
+
+    /// The dictionary child's term column carries exact window bounds: one
+    /// zone per FSST window whose `vortex.min()`/`vortex.max()` are the
+    /// window's first and last terms; the component is stamped version 2.
+    #[tokio::test]
+    async fn dict_child_zone_maps_hold_window_bounds() {
+        use crate::io::container::{DICT_COMPONENT_NAME, DICT_VERSION};
+        use crate::store::array::StrColReader;
+        use vortex_buffer::ByteBuffer;
+        use vortex_file::OpenOptionsSessionExt as _;
+        use vortex_layout::LayoutChildType;
+        use vortex_layout::layouts::zoned::Zoned;
+
+        let terms: Vec<String> = (0..600)
+            .map(|i| format!("<http://example.org/term/{i:04}>"))
+            .collect();
+        let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
+        let d = TermDictionary::compress_windowed(plain, 100).unwrap();
+        let bytes = crate::tests::write_dict_only_store(&d).await;
+        let file = VORTEX_SESSION
+            .open_options()
+            .open_buffer(ByteBuffer::from(bytes))
+            .unwrap();
+        let native = NativeStoreFile::try_new(file).unwrap();
+        let descriptor = native
+            .components()
+            .iter()
+            .find(|c| c.name == DICT_COMPONENT_NAME)
+            .unwrap();
+        assert_eq!(descriptor.version, DICT_VERSION);
+
+        let child = native
+            .component_layout(DICT_COMPONENT_NAME)
+            .unwrap()
+            .unwrap();
+        let column = (0..child.nslots())
+            .find_map(|i| {
+                matches!(child.slot_type(i), Some(LayoutChildType::Field(ref n)) if n.as_ref() == COL_DICT_TERM)
+                    .then(|| child.slot(i).ok().flatten())
+                    .flatten()
+            })
+            .unwrap();
+        let zoned = column
+            .as_opt::<Zoned>()
+            .expect("the term column is zone-mapped");
+        assert_eq!(zoned.nzones(), 6);
+        let names: Vec<String> = super::super::term_dict::window_bound_aggregates()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        for name in &names {
+            assert!(zoned.present_aggregates().contains(name), "{name}");
+        }
+        let zones = column.slot(1).unwrap().unwrap();
+        let reader = zones
+            .new_reader(
+                "zones".into(),
+                native.segment_source(),
+                &VORTEX_SESSION,
+                &Default::default(),
+            )
+            .unwrap();
+        let table = crate::io::read::scan_all_reader(reader).await.unwrap();
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        let table = table.execute::<StructArray>(&mut ctx).unwrap();
+        let maxes = table
+            .unmasked_field_by_name(&names[0])
+            .unwrap()
+            .clone()
+            .execute::<VarBinViewArray>(&mut ctx)
+            .unwrap();
+        let mins = table
+            .unmasked_field_by_name(&names[1])
+            .unwrap()
+            .clone()
+            .execute::<VarBinViewArray>(&mut ctx)
+            .unwrap();
+        for w in 0..6 {
+            assert_eq!(StrColReader::new(&mins).str_at(w).unwrap(), terms[w * 100]);
+            assert_eq!(
+                StrColReader::new(&maxes).str_at(w).unwrap(),
+                terms[w * 100 + 99]
+            );
+        }
+    }
 }
