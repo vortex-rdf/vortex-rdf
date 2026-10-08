@@ -394,30 +394,7 @@ async fn test_file_backed_subject_chunk_probe_chained() {
 /// file arrives in.
 #[tokio::test]
 async fn test_file_backed_subject_chunk_probe_requires_sorted() {
-    use crate::store::layouts::dictionary::{self, TermDictionary};
-
-    let mut raws: Vec<crate::store::RawQuad> = probe_path_quads(50)
-        .iter()
-        .map(crate::store::RawQuad::from_quad)
-        .collect();
-    raws.rotate_left(7);
-    let (dict, code_map) = TermDictionary::from_quads_with_map(&raws).unwrap();
-    let codes = dictionary::encode_quads(&raws, &code_map).unwrap();
-    let primary = dictionary::build_code_chunk(&codes, 0..raws.len(), false).unwrap();
-    let mut bytes: Vec<u8> = Vec::new();
-    let parts = crate::store::StoreParts {
-        array: primary,
-        components: Vec::new(),
-        dict: Some(std::sync::Arc::new(dict)),
-        quads_sorted: false,
-    };
-    crate::io::ser::serialize_parts(&parts, &mut bytes)
-        .await
-        .unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("unsorted.vortex");
-    std::fs::write(&path, &bytes).unwrap();
-
+    let (_dir, path) = write_unsorted_store_file(&probe_path_quads(50), 7).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let s = subject_node(10, 4);
     assert_eq!(

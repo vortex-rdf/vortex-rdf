@@ -51,6 +51,10 @@ pub(crate) struct NativeStoreFile {
     /// Whether the file is read through a memory mapping
     /// (`io::read::FileAccess::Mapped`).
     mapped: bool,
+    /// How many times a quad column has been streamed through a scan for a
+    /// keep (test hook: pins which keeps were served without reading a column).
+    #[cfg(test)]
+    column_streams: std::sync::atomic::AtomicUsize,
 }
 
 /// Structural (scope, expression) → the one [`BoundExpression`] this file
@@ -177,6 +181,8 @@ impl NativeStoreFile {
             pruning_envelopes: BoundedMemo::new(PRUNING_MEMO_MAX),
             bound_exprs: Arc::new(BoundExprMemo::new()),
             mapped: false,
+            #[cfg(test)]
+            column_streams: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -191,6 +197,20 @@ impl NativeStoreFile {
     #[cfg(test)]
     pub(crate) fn debug_bound_exprs(&self) -> usize {
         self.bound_exprs.debug_len()
+    }
+
+    /// Record one column stream for a keep (test hook).
+    #[cfg(test)]
+    pub(crate) fn note_column_stream(&self) {
+        self.column_streams
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many column streams keeps have run on this handle (test hook).
+    #[cfg(test)]
+    pub(crate) fn debug_column_streams(&self) -> usize {
+        self.column_streams
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// This handle, recorded as reading its file through a memory mapping.

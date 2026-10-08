@@ -550,10 +550,12 @@ fn dict_decode_matched(bencher: divan::Bencher, residency: &DictResidency) {
 // ══════════════════════════════════════════════════════════════════════════
 
 /// A predicate-bound file view narrowed by a `keep` on its subject column:
-/// the namespace range of the first half of the subjects, pushed to the
-/// scan as a range conjunct beside the predicate filter — the shape a
-/// `VALUES`/`FILTER` pushdown takes on a file. Priced with the gather of the
-/// surviving code columns, so the number is what a consumer waits for.
+/// the namespace range of the first half of the subjects — on this sorted
+/// file one run, located in the mapped subject column and intersected with
+/// the view's rows, with the predicate filter left pending beside it — the
+/// shape a `VALUES`/`FILTER` pushdown takes on a file. Priced with the gather
+/// of the surviving code columns, which is where the pending filter is
+/// evaluated, so the number is what a consumer waits for.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn narrow_keep_range(bencher: divan::Bencher, residency: &DictResidency) {
     use vortex_rdf_core::{Keep, QuadColumn};

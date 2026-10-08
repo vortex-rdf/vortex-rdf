@@ -150,6 +150,29 @@ impl VortexRdfStore {
         }
     }
 
+    /// How many times a keep has streamed a quad column through a scan on
+    /// this file handle (shared by every view of the file); `None` off-file.
+    pub(crate) fn debug_column_streams(&self) -> Option<usize> {
+        match &self.quads {
+            QuadsSource::InMemory { .. } => None,
+            QuadsSource::File { file, .. } => Some(file.debug_column_streams()),
+        }
+    }
+
+    /// The exact row range the located-run kernel computes for the subject
+    /// codes `range` (`lo <= s < hi`); `None` when it declines — off-file, a
+    /// file not sorted by subject, a column without a probeable chunk.
+    pub(crate) async fn debug_subject_code_range(
+        &self,
+        range: Range<u32>,
+    ) -> Result<Option<Range<u64>>> {
+        use crate::store::scan::file_scan;
+        let QuadsSource::File { file, .. } = &self.quads else {
+            return Ok(None);
+        };
+        file_scan::locate_subject_code_range(file, range).await
+    }
+
     /// Whether one named integer child of an in-memory base is a canonical
     /// primitive. `None` when the base has no such child or is not in memory.
     pub(crate) fn debug_base_child_int_canonical(&self, name: &str) -> Option<bool> {

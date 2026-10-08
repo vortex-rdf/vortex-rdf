@@ -79,6 +79,91 @@ async fn write_store_file(
     (dir, path)
 }
 
+/// A Dictionary-layout store file holding `quads` out of subject order —
+/// rotated left by `rotate` rows — and written without the sorted stamp: the
+/// shape a foreign writer's file arrives in. Keep the `TempDir` alive for the
+/// store's lifetime.
+#[cfg(feature = "file-io")]
+async fn write_unsorted_store_file(
+    quads: &[Quad],
+    rotate: usize,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    use crate::store::layouts::dictionary::{self, TermDictionary};
+
+    let mut raws: Vec<crate::store::RawQuad> =
+        quads.iter().map(crate::store::RawQuad::from_quad).collect();
+    raws.rotate_left(rotate);
+    let (dict, code_map) = TermDictionary::from_quads_with_map(&raws).unwrap();
+    let codes = dictionary::encode_quads(&raws, &code_map).unwrap();
+    let primary = dictionary::build_code_chunk(&codes, 0..raws.len(), false).unwrap();
+    let parts = crate::store::StoreParts {
+        array: primary,
+        components: Vec::new(),
+        dict: Some(std::sync::Arc::new(dict)),
+        quads_sorted: false,
+    };
+    let mut bytes: Vec<u8> = Vec::new();
+    crate::io::ser::serialize_parts(&parts, &mut bytes)
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unsorted.vortex");
+    std::fs::write(&path, &bytes).unwrap();
+    (dir, path)
+}
+
+/// A Dictionary-layout store file holding `quads` in global `s` order and
+/// stamped sorted, with every column written as `chunk_rows`-row flat leaves:
+/// the multi-leaf columns a large file written by the default strategy has,
+/// at a scale a test can afford (the default strategy writes a 160,000-row
+/// column as one leaf). Keep the `TempDir` alive for the store's lifetime.
+#[cfg(feature = "file-io")]
+async fn write_chunked_store_file(
+    quads: &[Quad],
+    chunk_rows: usize,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    use crate::store::layouts::dictionary::{self, TermDictionary};
+    use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
+    use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
+    use vortex_layout::layouts::struct_::StructStrategy;
+
+    let mut raws: Vec<crate::store::RawQuad> =
+        quads.iter().map(crate::store::RawQuad::from_quad).collect();
+    raws.sort_unstable();
+    let (dict, code_map) = TermDictionary::from_quads_with_map(&raws).unwrap();
+    let codes = dictionary::encode_quads(&raws, &code_map).unwrap();
+    let chunks: Vec<vortex_array::ArrayRef> = (0..raws.len())
+        .step_by(chunk_rows)
+        .map(|start| {
+            let end = (start + chunk_rows).min(raws.len());
+            dictionary::build_code_chunk(&codes, start..end, true).unwrap()
+        })
+        .collect();
+    let dtype = chunks[0].dtype().clone();
+    let leaves = ChunkedLayoutStrategy::new(FlatLayoutStrategy::default());
+    let mut bytes: Vec<u8> = Vec::new();
+    crate::io::container::write_store(
+        &crate::session::VORTEX_SESSION,
+        &mut bytes,
+        vortex_array::stream::ArrayStreamAdapter::new(
+            dtype,
+            Box::pin(stream::iter(chunks.into_iter().map(Ok))),
+        ),
+        std::sync::Arc::new(StructStrategy::new(
+            std::sync::Arc::new(FlatLayoutStrategy::default()),
+            std::sync::Arc::new(leaves),
+        )),
+        true,
+        vec![dict.to_write().unwrap()],
+    )
+    .await
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("chunked.vortex");
+    std::fs::write(&path, &bytes).unwrap();
+    (dir, path)
+}
+
 /// The serialized bytes in `cell`, built by `build` on first use, so a
 /// heavyweight fixture is serialized once per process. Concurrent first
 /// callers may both build; `get_or_init` keeps one.

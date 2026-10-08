@@ -430,9 +430,10 @@ pub(crate) async fn matching_file_rows(
 
 /// The positions — within the rows `selection` covers, in file order, as
 /// `selection.apply` aligns them — whose `u32` code in `column` passes
-/// `admit`. The column is streamed chunk by chunk through the projected scan,
-/// so one chunk of codes is held at a time. Tombstones are not applied (the
-/// read paths apply them).
+/// `admit`. The column is streamed through the projected scan rather than
+/// materialized: the scan reads several splits per worker ahead of this loop,
+/// so that many chunks of codes are in flight at once, never the whole column.
+/// Tombstones are not applied (the read paths apply them).
 pub(crate) async fn column_positions(
     file: &NativeStoreFile,
     column: &'static str,
@@ -443,6 +444,8 @@ pub(crate) async fn column_positions(
     use vortex_array::arrays::{PrimitiveArray, StructArray};
     use vortex_array::expr::{root, select};
 
+    #[cfg(test)]
+    file.note_column_stream();
     let mut scan = file.scan().map_err(VortexRdfError::Vortex)?;
     let scope = scan.dtype().map_err(VortexRdfError::Vortex)?;
     scan = scan.with_projection(
@@ -515,6 +518,87 @@ pub(crate) async fn locate_subject_run(
         .bounds(needle, &file.segment_source(), file.session())
         .await
         .map_err(VortexRdfError::Vortex)
+}
+
+/// The subject column's chunk-probe handle for a file sorted by subject.
+/// `None` declines — an unsorted file, or a column whose chunk shape has no
+/// probe.
+fn sorted_subject_chunks(
+    file: &NativeStoreFile,
+) -> Option<Arc<vortex_rdf_encoded_search::ColumnChunks>> {
+    if !file.quads_sorted() {
+        return None;
+    }
+    file.column_chunks(schema::COL_S)
+}
+
+/// The exact row range of subject `code` in the sorted subject column — empty,
+/// at the insertion point, for a code the column lacks. `None` declines: a
+/// chunk the search needs has no probe.
+async fn subject_code_bounds(
+    chunks: &vortex_rdf_encoded_search::ColumnChunks,
+    file: &NativeStoreFile,
+    code: u32,
+) -> Result<Option<Range<u64>>> {
+    chunks
+        .bounds(u64::from(code), &file.segment_source(), file.session())
+        .await
+        .map_err(VortexRdfError::Vortex)
+}
+
+/// The exact row range of the rows whose subject code lies in `range`
+/// (`lo <= s < hi`) in a sorted file, by binary search over the subject
+/// column's encoded chunks. The file is sorted by `s`, so those rows are one
+/// run: it starts where the first code `>= lo` does and ends where the first
+/// code `>= hi` does, and each bound is exact for a code the column lacks.
+/// `None` declines — an unsorted file, a column whose chunk shape has no probe
+/// — and the caller keeps the stream.
+pub(crate) async fn locate_subject_code_range(
+    file: &NativeStoreFile,
+    range: Range<u32>,
+) -> Result<Option<Range<u64>>> {
+    let Some(chunks) = sorted_subject_chunks(file) else {
+        return Ok(None);
+    };
+    let Some(from) = subject_code_bounds(&chunks, file, range.start).await? else {
+        return Ok(None);
+    };
+    let Some(to) = subject_code_bounds(&chunks, file, range.end).await? else {
+        return Ok(None);
+    };
+    Ok(Some(from.start..to.start.max(from.start)))
+}
+
+/// The rows holding each subject code of `codes` — ascending and unique, as
+/// [`Keep::set`](crate::store::Keep::set) builds them — in a sorted file, as
+/// ascending disjoint runs: a code without rows adds none, and codes whose
+/// rows abut share one run. One binary search per code, over chunks fetched
+/// once for the call. `None` declines as [`locate_subject_code_range`] does.
+pub(crate) async fn locate_subject_code_runs(
+    file: &NativeStoreFile,
+    codes: &[u32],
+) -> Result<Option<Vec<Range<u64>>>> {
+    debug_assert!(
+        codes.windows(2).all(|pair| pair[0] < pair[1]),
+        "a set's codes are ascending and unique"
+    );
+    let Some(chunks) = sorted_subject_chunks(file) else {
+        return Ok(None);
+    };
+    let mut runs: Vec<Range<u64>> = Vec::new();
+    for &code in codes {
+        let Some(run) = subject_code_bounds(&chunks, file, code).await? else {
+            return Ok(None);
+        };
+        if run.is_empty() {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(last) if last.end == run.start => last.end = run.end,
+            _ => runs.push(run),
+        }
+    }
+    Ok(Some(runs))
 }
 
 /// Rows of a small exact file selection, read point-by-point through the

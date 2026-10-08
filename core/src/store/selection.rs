@@ -348,6 +348,83 @@ impl RowSelection {
         };
         RowSelection::Ids(ids)
     }
+
+    /// [`refine`](Self::refine) by the ascending local `positions` that
+    /// survive, out of this selection's `len` rows, given as a list. Survivors
+    /// that are one contiguous stretch of every row, or of a range, narrow it
+    /// to a range with no id list built; every row surviving leaves the
+    /// selection as it is, and any other survivors become ids.
+    #[cfg(feature = "file-io")]
+    pub(crate) fn refine_positions(self, positions: Vec<usize>, len: usize) -> Self {
+        let (Some(&first), Some(&last)) = (positions.first(), positions.last()) else {
+            return RowSelection::empty();
+        };
+        if positions.len() == len {
+            return self;
+        }
+        let contiguous = last - first + 1 == positions.len();
+        match self {
+            RowSelection::All if contiguous => RowSelection::Range(first as u64..last as u64 + 1),
+            RowSelection::Range(range) if contiguous => {
+                RowSelection::Range(range.start + first as u64..range.start + last as u64 + 1)
+            }
+            selection => selection.refine(&Mask::from_indices(len, positions)),
+        }
+    }
+
+    /// Narrow to the base rows also covered by any of `runs` — ascending,
+    /// disjoint row ranges, as a sorted column's per-code runs are. A single
+    /// surviving run is a [`Range`](RowSelection::Range) (as
+    /// [`intersect_range`](Self::intersect_range) leaves it) however many
+    /// runs were offered, so a keep admitting one contiguous run builds no id
+    /// list; several become an explicit list, and an id list stays one.
+    #[cfg(feature = "file-io")]
+    pub(crate) fn intersect_runs(self, runs: &[Range<u64>]) -> Self {
+        match self {
+            RowSelection::Ids(ids) => {
+                // Each run keeps one window of the ascending id list, and the
+                // runs ascend, so the windows follow each other.
+                let slice = ids.as_slice();
+                let mut windows: Vec<Range<usize>> = Vec::new();
+                let mut from = 0;
+                for run in runs {
+                    let lo = from + slice[from..].partition_point(|&id| id < run.start);
+                    let hi = lo + slice[lo..].partition_point(|&id| id < run.end);
+                    if lo < hi {
+                        windows.push(lo..hi);
+                    }
+                    from = hi;
+                }
+                match windows.as_slice() {
+                    [] => RowSelection::empty(),
+                    [window] => RowSelection::Ids(ids.slice(window.clone())),
+                    windows => RowSelection::Ids(Buffer::from_iter(
+                        windows
+                            .iter()
+                            .flat_map(|window| slice[window.clone()].iter().copied()),
+                    )),
+                }
+            }
+            selection => {
+                let within = match &selection {
+                    RowSelection::Range(range) => range.clone(),
+                    _ => 0..u64::MAX,
+                };
+                let clipped: Vec<Range<u64>> = runs
+                    .iter()
+                    .map(|run| run.start.max(within.start)..run.end.min(within.end))
+                    .filter(|run| run.start < run.end)
+                    .collect();
+                match clipped.as_slice() {
+                    [] => RowSelection::empty(),
+                    [run] => RowSelection::Range(run.clone()),
+                    runs => RowSelection::Ids(Buffer::from_iter(
+                        runs.iter().flat_map(|run| run.clone()),
+                    )),
+                }
+            }
+        }
+    }
 }
 
 /// Restrict an ascending id list to a row range (zero-copy: the surviving ids
@@ -452,6 +529,79 @@ mod tests {
         );
         // Disjoint ranges collapse to empty rather than an inverted range.
         assert!(RowSelection::Range(1..3).intersect_range(7..9).is_empty(10));
+    }
+
+    #[cfg(feature = "file-io")]
+    #[test]
+    #[allow(
+        clippy::single_range_in_vec_init,
+        reason = "the runs are a slice of ranges, and these cases offer just one"
+    )]
+    fn intersect_runs_keeps_one_run_a_range() {
+        // Several runs over every row: ids, in order.
+        assert_eq!(
+            as_vec(&RowSelection::All.intersect_runs(&[1..3, 6..7, 9..11])),
+            vec![1, 2, 6, 9, 10]
+        );
+        // A range clips the runs to itself, and one survivor is a range.
+        let clipped = RowSelection::Range(2..8).intersect_runs(&[0..3, 6..12]);
+        assert_eq!(as_vec(&clipped), vec![2, 6, 7]);
+        let one = RowSelection::Range(4..8).intersect_runs(&[0..3, 6..12, 20..30]);
+        assert!(matches!(one, RowSelection::Range(ref r) if *r == (6..8)));
+        let single = RowSelection::All.intersect_runs(&[5..9]);
+        assert!(matches!(single, RowSelection::Range(ref r) if *r == (5..9)));
+        // Nothing survives: the canonical empty selection.
+        assert!(
+            RowSelection::Range(0..2)
+                .intersect_runs(&[5..9])
+                .is_empty(10)
+        );
+        assert!(RowSelection::All.intersect_runs(&[]).is_empty(10));
+        // An id list stays an id list, windowed by each run.
+        let list = RowSelection::Ids(ids(&[1, 4, 5, 9, 12, 20]));
+        assert_eq!(
+            as_vec(&list.clone().intersect_runs(&[0..2, 4..6, 10..13])),
+            vec![1, 4, 5, 12]
+        );
+        assert_eq!(
+            as_vec(&list.clone().intersect_runs(&[4..10])),
+            vec![4, 5, 9]
+        );
+        assert!(matches!(
+            list.clone().intersect_runs(&[4..10]),
+            RowSelection::Ids(_)
+        ));
+        assert!(list.clone().intersect_runs(&[6..8, 14..19]).is_empty(30));
+        assert!(list.intersect_runs(&[]).is_empty(30));
+    }
+
+    #[cfg(feature = "file-io")]
+    #[test]
+    fn refine_positions_keeps_a_contiguous_stretch_a_range() {
+        // A contiguous stretch of every row, or of a range, is a range.
+        let stretch = RowSelection::All.refine_positions(vec![3, 4, 5], 10);
+        assert!(matches!(stretch, RowSelection::Range(ref r) if *r == (3..6)));
+        let within = RowSelection::Range(10..20).refine_positions(vec![3, 4, 5], 10);
+        assert!(matches!(within, RowSelection::Range(ref r) if *r == (13..16)));
+        // Gaps make ids; an id list stays one even over a contiguous stretch.
+        assert_eq!(
+            as_vec(&RowSelection::Range(10..20).refine_positions(vec![1, 2, 5], 10)),
+            vec![11, 12, 15]
+        );
+        assert_eq!(
+            as_vec(&RowSelection::Ids(ids(&[2, 4, 6, 8])).refine_positions(vec![1, 2], 4)),
+            vec![4, 6]
+        );
+        // Every row surviving changes nothing; none survives empties it.
+        assert!(matches!(
+            RowSelection::Range(10..14).refine_positions(vec![0, 1, 2, 3], 4),
+            RowSelection::Range(ref r) if *r == (10..14)
+        ));
+        assert!(matches!(
+            RowSelection::All.refine_positions(vec![0, 1, 2], 3),
+            RowSelection::All
+        ));
+        assert!(RowSelection::All.refine_positions(vec![], 4).is_empty(4));
     }
 
     #[test]

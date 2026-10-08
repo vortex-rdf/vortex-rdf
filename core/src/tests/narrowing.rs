@@ -428,6 +428,7 @@ async fn test_narrowing_gates_and_tails() {
 mod file {
     use super::*;
     use crate::store::native_file::NativeStoreFile;
+    use std::ops::Range;
 
     /// Both open modes of a file store — loaded whole and mapped — with and
     /// without indexes (the dir guards ride along, shared by both opens).
@@ -464,8 +465,8 @@ mod file {
         }
     }
 
-    /// A very wide set — beyond what the scan takes as an expression — is
-    /// tested in memory over the column and still agrees with brute force,
+    /// A very wide set — too many codes to look up run by run — is streamed
+    /// and tested in memory over the column and still agrees with brute force,
     /// over a pending filter too.
     #[tokio::test]
     async fn test_keep_wide_set_on_file() {
@@ -616,6 +617,624 @@ mod file {
                 "{tag} chained"
             );
             assert_eq!(row_set(&chained).await, chained_expected, "{tag} chained");
+        }
+    }
+
+    // ─── Keeps on the sorted subject column: located runs ─────────────────
+
+    /// 12,000 distinct quads in subject runs of five rows (2,400 subjects,
+    /// three predicates, eight objects).
+    fn run_quads() -> Vec<Quad> {
+        (0..12_000)
+            .map(|i| {
+                make_quad(
+                    &format!("http://example.org/s{:05}", i / 5),
+                    &format!("http://example.org/p{}", i % 3),
+                    &format!("object {}", i % 8),
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect()
+    }
+
+    /// How a view's selection reads, which fixes the selection a keep leaves.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Sel {
+        /// Every row or one range of rows, nothing pending.
+        Range,
+        /// Every row or one range of rows, with a filter still pending.
+        Pending,
+        /// An explicit id list.
+        Ids,
+    }
+
+    /// A view over the store with the shape of its selection.
+    struct View {
+        tag: &'static str,
+        view: VortexRdfStore,
+        sel: Sel,
+    }
+
+    /// A mapped store file sorted by subject whose columns are twelve
+    /// 1,001-row leaves (so a five-row subject run straddles nine of the
+    /// eleven leaf boundaries), with its rows in file order as the oracle
+    /// every located keep is checked against.
+    struct RunStore {
+        _dir: tempfile::TempDir,
+        store: VortexRdfStore,
+        /// Every row's codes, in file order.
+        rows: Vec<[u32; 4]>,
+        /// The subject namespace's code range.
+        subjects: Range<u32>,
+        /// The first row of every leaf after the first.
+        boundaries: Vec<usize>,
+    }
+
+    impl RunStore {
+        async fn open() -> Self {
+            let (dir, path) = write_chunked_store_file(&run_quads(), 1_001).await;
+            let opened = NativeStoreFile::try_new(
+                crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let boundaries: Vec<usize> = opened
+                .splits()
+                .unwrap()
+                .iter()
+                .skip(1)
+                .map(|split| split.start as usize)
+                .collect();
+            assert_eq!(boundaries.len(), 11, "twelve leaves");
+            let store = VortexRdfStore::from_file(&path).await.unwrap();
+            assert_eq!(store.debug_file_mapped(), Some(true));
+            let rows = row_list(&store).await;
+            assert!(rows.is_sorted_by_key(|row| row[0]), "the file is s-sorted");
+            assert!(
+                boundaries.iter().any(|&b| rows[b - 1][0] == rows[b][0]),
+                "a subject's run must straddle a leaf boundary"
+            );
+            let (lo, hi) = store
+                .dict_reader()
+                .unwrap()
+                .prefix_range("<http://example.org/s")
+                .await
+                .unwrap();
+            Self {
+                _dir: dir,
+                store,
+                rows,
+                subjects: lo..hi,
+                boundaries,
+            }
+        }
+
+        /// Views over every selection shape the located kernel meets: the
+        /// whole store, a pending filter, an id list (an `o` keep's result),
+        /// a row window and a window over the pending filter.
+        async fn views(&self) -> Vec<View> {
+            let p0 = NamedNode::new("http://example.org/p0").unwrap();
+            let pending = self
+                .store
+                .match_pattern(None, Some(&p0), None, None)
+                .await
+                .unwrap();
+            let (o_lo, _) = self
+                .store
+                .dict_reader()
+                .unwrap()
+                .prefix_range("\"object ")
+                .await
+                .unwrap();
+            let ids = self
+                .store
+                .keep(QuadColumn::O, &Keep::set([o_lo + 1, o_lo + 5]))
+                .await
+                .unwrap();
+            vec![
+                View {
+                    tag: "whole",
+                    view: self.store.clone(),
+                    sel: Sel::Range,
+                },
+                View {
+                    tag: "pending",
+                    view: pending.clone(),
+                    sel: Sel::Pending,
+                },
+                View {
+                    tag: "ids",
+                    view: ids,
+                    sel: Sel::Ids,
+                },
+                View {
+                    tag: "window",
+                    view: self.store.window(1_000, 10_000).await.unwrap(),
+                    sel: Sel::Range,
+                },
+                View {
+                    tag: "pending-window",
+                    view: pending.window(5, 3_000).await.unwrap(),
+                    sel: Sel::Ids,
+                },
+            ]
+        }
+
+        /// Range keeps from the block's ends to the runs a leaf boundary cuts.
+        fn range_keeps(&self) -> Vec<(String, Keep)> {
+            let Range { start: lo, end: hi } = self.subjects.clone();
+            let mid = lo + (hi - lo) / 2;
+            let mut keeps = vec![
+                ("every subject".to_string(), Keep::range(lo..hi)),
+                ("first half".to_string(), Keep::range(lo..mid)),
+                ("second half".to_string(), Keep::range(mid..hi)),
+                ("a slice".to_string(), Keep::range(lo + 7..lo + 1_500)),
+                ("one subject".to_string(), Keep::range(mid..mid + 1)),
+                ("past the first".to_string(), Keep::range(lo - 3..lo + 3)),
+                ("past the last".to_string(), Keep::range(hi - 3..hi + 3)),
+                ("every code".to_string(), Keep::range(0..u32::MAX)),
+                ("below the subjects".to_string(), Keep::range(0..lo)),
+                ("above the subjects".to_string(), Keep::range(hi..hi + 100)),
+                ("empty".to_string(), Keep::range(hi..hi)),
+            ];
+            for &b in &self.boundaries {
+                // The subject run a leaf boundary cuts: alone, among its
+                // neighbours, and as the end of a range and the start of one.
+                let (before, after) = (self.rows[b - 1][0], self.rows[b][0]);
+                keeps.extend([
+                    (format!("{b}: the cut run"), Keep::range(after..after + 1)),
+                    (
+                        format!("{b}: with neighbours"),
+                        Keep::range(before - 1..after + 2),
+                    ),
+                    (format!("{b}: up to it"), Keep::range(lo..after)),
+                    (format!("{b}: from it"), Keep::range(after..hi)),
+                ]);
+            }
+            keeps
+        }
+
+        /// Set keeps with whether the located kernel serves each, and whether
+        /// the rows it admits form one contiguous run.
+        fn set_keeps(&self) -> Vec<(&'static str, Keep, bool, bool)> {
+            let Range { start: lo, end: hi } = self.subjects.clone();
+            let mid = lo + (hi - lo) / 2;
+            let cut = self.rows[self.boundaries[0]][0];
+            vec![
+                ("one", Keep::set([mid]), true, true),
+                // Codes outside the subject block name no row.
+                (
+                    "few",
+                    Keep::set([0, lo + 3, mid, mid + 9, hi - 1, hi + 5]),
+                    true,
+                    false,
+                ),
+                // Consecutive subjects' runs are one run.
+                ("adjacent", Keep::set([mid, mid + 1, mid + 2]), true, true),
+                (
+                    "the cut run",
+                    Keep::set([cut - 1, cut, cut + 1]),
+                    true,
+                    true,
+                ),
+                ("absent", Keep::set([0, 1, hi + 1]), true, true),
+                // 1,200 codes: more than one per sixteen rows of any view.
+                ("many", Keep::set((lo..hi).step_by(2)), false, false),
+                // Consecutive, but still past it.
+                (
+                    "adjacent many",
+                    Keep::set(mid - 500..mid + 500),
+                    false,
+                    true,
+                ),
+            ]
+        }
+
+        /// The run of file rows holding exactly the subjects `lo..hi`.
+        fn run(&self, lo: u32, hi: u32) -> Range<u64> {
+            let start = self.rows.partition_point(|row| row[0] < lo);
+            let end = self.rows.partition_point(|row| row[0] < hi);
+            start as u64..end.max(start) as u64
+        }
+    }
+
+    /// The located run is exactly the rows whose subject code is in range:
+    /// at the block's ends, around absent codes, around the run a leaf
+    /// boundary cuts, and for an inverted range.
+    #[tokio::test]
+    async fn test_locate_subject_code_range_is_exact() {
+        let fx = RunStore::open().await;
+        let Range { start: lo, end: hi } = fx.subjects.clone();
+        let mut edges = vec![
+            0,
+            1,
+            lo - 1,
+            lo,
+            lo + 1,
+            (lo + hi) / 2,
+            hi - 1,
+            hi,
+            hi + 1,
+            u32::MAX - 1,
+            u32::MAX,
+        ];
+        for &b in &fx.boundaries {
+            for code in [fx.rows[b - 1][0], fx.rows[b][0]] {
+                edges.extend([code - 1, code, code + 1]);
+            }
+        }
+        edges.sort_unstable();
+        edges.dedup();
+        for &a in &edges {
+            for &b in &edges {
+                assert_eq!(
+                    fx.store.debug_subject_code_range(a..b).await.unwrap(),
+                    Some(fx.run(a, b)),
+                    "subject codes {a}..{b}"
+                );
+            }
+        }
+    }
+
+    /// A range keep on the sorted subject column is a located run: every
+    /// selection shape agrees with brute force in file order, nothing is
+    /// streamed, and a run stays a range wherever the selection was one.
+    #[tokio::test]
+    async fn test_s_range_keeps_are_located() {
+        let fx = RunStore::open().await;
+        let views = fx.views().await;
+        let streams = fx.store.debug_column_streams();
+        for View { tag, view, sel } in &views {
+            let base = row_list(view).await;
+            let mut partial = 0;
+            for (name, keep) in fx.range_keeps() {
+                let narrowed = view.keep(QuadColumn::S, &keep).await.unwrap();
+                let want = brute_keep(&base, QuadColumn::S, &keep);
+                partial += usize::from(!want.is_empty() && want.len() < base.len());
+                assert_eq!(row_list(&narrowed).await, want, "{tag}: {name}");
+                assert_eq!(
+                    narrowed.size().await.unwrap(),
+                    want.len(),
+                    "{tag}: {name}: size"
+                );
+                if !want.is_empty() {
+                    assert_eq!(
+                        narrowed.debug_selection_range().is_some(),
+                        *sel != Sel::Ids,
+                        "{tag}: {name}: a range selection stays a range"
+                    );
+                }
+            }
+            assert!(partial >= 6, "{tag}: the keeps must tell rows apart");
+            // A keep chains on a keep: the located run of a located run.
+            let Range { start: lo, end: hi } = fx.subjects.clone();
+            let first_half = Keep::range(lo..(lo + hi) / 2);
+            let slice = Keep::range(lo + 7..lo + 1_500);
+            let once = view.keep(QuadColumn::S, &first_half).await.unwrap();
+            let twice = once.keep(QuadColumn::S, &slice).await.unwrap();
+            let want = brute_keep(
+                &brute_keep(&base, QuadColumn::S, &first_half),
+                QuadColumn::S,
+                &slice,
+            );
+            assert!(!want.is_empty(), "{tag}: chained");
+            assert_eq!(row_list(&twice).await, want, "{tag}: chained");
+        }
+        assert_eq!(
+            fx.store.debug_column_streams(),
+            streams,
+            "no range keep streamed a column"
+        );
+
+        // On the whole store the located run is the selection itself.
+        let Range { start: lo, end: hi } = fx.subjects.clone();
+        let whole = fx
+            .store
+            .keep(QuadColumn::S, &Keep::range(lo..hi))
+            .await
+            .unwrap();
+        assert_eq!(whole.debug_selection_range(), Some(0..fx.rows.len() as u64));
+        let half = fx
+            .store
+            .keep(QuadColumn::S, &Keep::range(lo..(lo + hi) / 2))
+            .await
+            .unwrap();
+        assert_eq!(
+            half.debug_selection_range(),
+            Some(fx.run(lo, (lo + hi) / 2))
+        );
+    }
+
+    /// A set keep on the sorted subject column is looked up code by code
+    /// while the set is small relative to its selection, and streamed past
+    /// that: both agree with brute force in file order, and the admitted rows
+    /// stay one range whenever they form one run.
+    #[tokio::test]
+    async fn test_s_set_keeps_are_located_up_to_a_bound() {
+        let fx = RunStore::open().await;
+        let views = fx.views().await;
+        for View { tag, view, sel } in &views {
+            let base = row_list(view).await;
+            for (name, keep, located, contiguous) in fx.set_keeps() {
+                let before = fx.store.debug_column_streams().unwrap();
+                let narrowed = view.keep(QuadColumn::S, &keep).await.unwrap();
+                assert_eq!(
+                    fx.store.debug_column_streams().unwrap() - before,
+                    usize::from(!located),
+                    "{tag}: {name}: streamed only past the bound"
+                );
+                let want = brute_keep(&base, QuadColumn::S, &keep);
+                assert_eq!(row_list(&narrowed).await, want, "{tag}: {name}");
+                assert_eq!(
+                    narrowed.size().await.unwrap(),
+                    want.len(),
+                    "{tag}: {name}: size"
+                );
+                if !want.is_empty() {
+                    // Looked up, a run stays a range over a pending filter
+                    // too; streamed, the filter is resolved to ids first.
+                    let range_kept = match (located, sel) {
+                        (_, Sel::Ids) => false,
+                        (true, _) => contiguous,
+                        (false, sel) => contiguous && *sel == Sel::Range,
+                    };
+                    assert_eq!(
+                        narrowed.debug_selection_range().is_some(),
+                        range_kept,
+                        "{tag}: {name}: selection kind"
+                    );
+                }
+            }
+        }
+        // The run of consecutive subjects is exactly their rows.
+        let Range { start: lo, end: hi } = fx.subjects.clone();
+        let mid = lo + (hi - lo) / 2;
+        let adjacent = fx
+            .store
+            .keep(QuadColumn::S, &Keep::set([mid, mid + 1, mid + 2]))
+            .await
+            .unwrap();
+        assert_eq!(adjacent.debug_selection_range(), Some(fx.run(mid, mid + 3)));
+    }
+
+    /// A set of more than one code per sixteen rows of its selection is
+    /// cheaper to stream than to look up: of 160 rows, ten codes are looked
+    /// up and eleven streamed.
+    #[tokio::test]
+    async fn test_s_set_keep_dense_in_its_selection_streams() {
+        let (_dir, path) =
+            write_store_file(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let rows = row_list(&store).await;
+        let window = store.window(100, 160).await.unwrap();
+        // Subjects are unique, so each code names one of the window's rows.
+        let own: Vec<u32> = rows[100..111].iter().map(|row| row[0]).collect();
+        let streams = store.debug_column_streams().unwrap();
+
+        let ten = window
+            .keep(QuadColumn::S, &Keep::set(own[..10].iter().copied()))
+            .await
+            .unwrap();
+        assert_eq!(store.debug_column_streams().unwrap(), streams);
+        assert_eq!(row_list(&ten).await, rows[100..110]);
+
+        let eleven = window
+            .keep(QuadColumn::S, &Keep::set(own.iter().copied()))
+            .await
+            .unwrap();
+        assert_eq!(store.debug_column_streams().unwrap(), streams + 1);
+        assert_eq!(row_list(&eleven).await, rows[100..111]);
+    }
+
+    /// Located keeps bind no expression and read no column: however many
+    /// distinct subject ranges and sets are kept, over the whole store or a
+    /// pending filter, the file handle binds nothing new and streams nothing.
+    /// Another column's keep still streams.
+    #[tokio::test]
+    async fn test_s_keeps_bind_no_expressions_and_stream_nothing() {
+        let quads = fixture_quads();
+        let (_dir, path) =
+            write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let (lo, hi) = store
+            .dict_reader()
+            .unwrap()
+            .prefix_range("<http://example.org/s")
+            .await
+            .unwrap();
+        assert!(hi - lo >= quads.len() as u32);
+        let p1 = NamedNode::new("http://example.org/p1").unwrap();
+        let pending = store
+            .match_pattern(None, Some(&p1), None, None)
+            .await
+            .unwrap();
+        // Warm the shapes a count and a row read bind on the pending view.
+        let warm = pending.size().await.unwrap();
+        view_strings(&pending).await;
+        let bound = store.debug_bound_exprs().unwrap();
+        let streams = store.debug_column_streams().unwrap();
+
+        let whole = store
+            .keep(QuadColumn::S, &Keep::range(lo..hi))
+            .await
+            .unwrap();
+        assert_eq!(whole.debug_selection_range(), Some(0..quads.len() as u64));
+        assert_eq!(whole.size().await.unwrap(), quads.len());
+        let kept = pending
+            .keep(QuadColumn::S, &Keep::range(lo..hi))
+            .await
+            .unwrap();
+        assert_eq!(kept.size().await.unwrap(), warm);
+
+        for i in 0..32u32 {
+            let from = lo + 11 * i;
+            let ranged = pending
+                .keep(QuadColumn::S, &Keep::range(from..from + 100 + i))
+                .await
+                .unwrap();
+            let set = Keep::set([from, from + 3, from + 9 + i]);
+            let picked = store.keep(QuadColumn::S, &set).await.unwrap();
+            assert_eq!(picked.size().await.unwrap(), 3, "keep {i}");
+            assert!(ranged.size().await.unwrap() > 0, "keep {i}");
+        }
+        assert_eq!(store.debug_bound_exprs().unwrap(), bound);
+        assert_eq!(store.debug_column_streams().unwrap(), streams);
+
+        let (o_lo, _) = store
+            .dict_reader()
+            .unwrap()
+            .prefix_range("\"o")
+            .await
+            .unwrap();
+        pending
+            .keep(QuadColumn::O, &Keep::set([o_lo]))
+            .await
+            .unwrap();
+        assert_eq!(store.debug_column_streams().unwrap(), streams + 1);
+    }
+
+    /// A file that is not stamped sorted declines the located kernel whatever
+    /// the range, and its keeps answer through the stream instead — still
+    /// agreeing with brute force, and keeping a contiguous result a range.
+    #[tokio::test]
+    async fn test_s_keeps_on_an_unsorted_file_stream() {
+        let (_dir, path) = write_unsorted_store_file(&fixture_quads(), 7).await;
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let (lo, hi) = store
+            .dict_reader()
+            .unwrap()
+            .prefix_range("<http://example.org/s")
+            .await
+            .unwrap();
+        let mid = lo + (hi - lo) / 2;
+        for range in [lo..hi, lo..mid, 0..u32::MAX, mid..mid + 1] {
+            assert_eq!(
+                store.debug_subject_code_range(range).await.unwrap(),
+                None,
+                "an unsorted file declines"
+            );
+        }
+        let p1 = NamedNode::new("http://example.org/p1").unwrap();
+        let views = [
+            ("whole", store.clone()),
+            (
+                "pending",
+                store
+                    .match_pattern(None, Some(&p1), None, None)
+                    .await
+                    .unwrap(),
+            ),
+        ];
+        let keeps = [
+            ("range", Keep::range(lo..mid)),
+            // Past the seven rows the rotation moved to the end.
+            ("run", Keep::range(lo + 10..mid)),
+            // Subject i is quad i: these three are on the `p1` rows (i % 5 == 1).
+            ("set", Keep::set([lo + 1, lo + 1501, lo + 2996])),
+            ("many", Keep::set((lo..hi).step_by(8))),
+        ];
+        for (tag, view) in &views {
+            let base = row_list(view).await;
+            for (name, keep) in &keeps {
+                let before = store.debug_column_streams().unwrap();
+                let narrowed = view.keep(QuadColumn::S, keep).await.unwrap();
+                assert_eq!(
+                    store.debug_column_streams().unwrap(),
+                    before + 1,
+                    "{tag}: {name}: streamed"
+                );
+                let want = brute_keep(&base, QuadColumn::S, keep);
+                assert!(!want.is_empty() && want.len() < base.len(), "{tag}: {name}");
+                assert_eq!(row_list(&narrowed).await, want, "{tag}: {name}");
+                assert_eq!(narrowed.size().await.unwrap(), want.len());
+            }
+        }
+        // A range of consecutive file rows is one range once streamed.
+        let run = views[0]
+            .1
+            .keep(QuadColumn::S, &Keep::range(lo + 10..mid))
+            .await
+            .unwrap();
+        assert!(run.debug_selection_range().is_some());
+    }
+
+    /// The default writer's file past one scan split's worth of rows: subject
+    /// keeps — ranges, small and mid-size sets looked up, a wide set streamed
+    /// — over the whole file, a pending filter, a row window and an id list
+    /// agree with brute force.
+    #[tokio::test]
+    async fn test_s_keeps_on_a_multi_split_file_match_brute_force() {
+        let (_dir, path) = write_store_file(
+            modular_quads(160_000, 3, 8),
+            LayoutStrategy::Dictionary,
+            vec![],
+        )
+        .await;
+        let opened = NativeStoreFile::try_new(
+            crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            opened.splits().unwrap().len() > 1,
+            "the fixture must span several scan splits"
+        );
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let dict = store.dict_reader().unwrap();
+        let (o_lo, _) = dict.prefix_range("\"object ").await.unwrap();
+        let (lo, hi) = dict.prefix_range("<http://example.org/s").await.unwrap();
+        let p0 = NamedNode::new("http://example.org/p0").unwrap();
+        let views = [
+            ("whole", store.clone()),
+            (
+                "filtered",
+                store
+                    .match_pattern(None, Some(&p0), None, None)
+                    .await
+                    .unwrap(),
+            ),
+            ("window", store.window(10_000, 140_000).await.unwrap()),
+            (
+                "ids",
+                store
+                    .keep(QuadColumn::O, &Keep::set([o_lo + 1, o_lo + 5]))
+                    .await
+                    .unwrap(),
+            ),
+        ];
+        // (name, keep, looked up rather than streamed)
+        let keeps = [
+            ("first half", Keep::range(lo..lo + (hi - lo) / 2), true),
+            ("1%", Keep::range(lo + 70_000..lo + 71_600), true),
+            ("one", Keep::set([lo + 80_000]), true),
+            (
+                "few",
+                Keep::set([lo + 5, lo + 40_000, lo + 80_001, lo + 159_999]),
+                true,
+            ),
+            ("2,000", Keep::set((lo..hi).step_by(80)), true),
+            ("20,000", Keep::set((lo..hi).step_by(8)), false),
+        ];
+        for (tag, view) in &views {
+            let rows = row_set(view).await;
+            for (name, keep, located) in &keeps {
+                let before = store.debug_column_streams().unwrap();
+                let narrowed = view.keep(QuadColumn::S, keep).await.unwrap();
+                assert_eq!(
+                    store.debug_column_streams().unwrap() - before,
+                    usize::from(!located),
+                    "{tag}: {name}: streamed or looked up"
+                );
+                let want = brute_keep(&rows, QuadColumn::S, keep);
+                if *tag == "whole" {
+                    // Every subject has one row, so every keep admits some.
+                    assert!(!want.is_empty(), "{name}");
+                }
+                assert_eq!(row_set(&narrowed).await, want, "{tag}: {name}");
+                assert_eq!(narrowed.size().await.unwrap(), want.len(), "{tag}: {name}");
+            }
         }
     }
 }
