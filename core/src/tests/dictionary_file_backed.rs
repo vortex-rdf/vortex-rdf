@@ -179,8 +179,12 @@ async fn test_file_backed_dictionary_threshold_boundary() {
     let quads = dictionary_test_quads();
     let (_dir, path) = write_store_file(quads, LayoutStrategy::Dictionary, vec![]).await;
 
-    let file =
-        NativeStoreFile::try_new(crate::io::read::open_vortex_file(&path).await.unwrap()).unwrap();
+    let file = NativeStoreFile::try_new(
+        crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     let dict_bytes = file
         .component_bytes(DICT_COMPONENT_NAME)
         .unwrap()
@@ -339,8 +343,12 @@ async fn test_file_backed_dictionary_probe_parity() {
     // The probe target, built exactly as `from_file` does file-backed: the
     // dictionary child's cached layout reader plus the wire-chunk handle
     // resolved off the same child.
-    let outer =
-        NativeStoreFile::try_new(crate::io::read::open_vortex_file(&path).await.unwrap()).unwrap();
+    let outer = NativeStoreFile::try_new(
+        crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     let len = dict.len() as u64;
     let fb = FileBackedDict::open(&outer)
         .unwrap()
@@ -463,8 +471,12 @@ async fn test_file_backed_dictionary_rejects_below_first_term() {
         "fixture must have no term sorting at or below `!`, got {first_term:?}"
     );
 
-    let outer =
-        NativeStoreFile::try_new(crate::io::read::open_vortex_file(&path).await.unwrap()).unwrap();
+    let outer = NativeStoreFile::try_new(
+        crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     let fb = FileBackedDict::open(&outer)
         .unwrap()
         .expect("the dictionary child's chunk shape must resolve");
@@ -534,8 +546,12 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
     let path = dir.path().join("flat.vortex");
     std::fs::write(&path, &bytes).unwrap();
 
-    let outer =
-        NativeStoreFile::try_new(crate::io::read::open_vortex_file(&path).await.unwrap()).unwrap();
+    let outer = NativeStoreFile::try_new(
+        crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     assert!(
         FileBackedDict::open(&outer).unwrap().is_none(),
         "a flat dictionary child must decline the point-read handle"
@@ -558,7 +574,7 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
     // occupies bytes the zero threshold cannot cover.
     let (_dir, empty_path) = write_store_file(Vec::new(), LayoutStrategy::Dictionary, vec![]).await;
     let empty_file = NativeStoreFile::try_new(
-        crate::io::read::open_vortex_file(&empty_path)
+        crate::io::read::open_vortex_file(&empty_path, crate::io::read::FileAccess::Mapped)
             .await
             .unwrap(),
     )
@@ -619,7 +635,9 @@ async fn test_dictionary_native_file_roundtrip() {
     // One self-contained file: the native root with the quad-source child
     // and the dictionary as an auxiliary child.
     assert!(!path.with_extension("dict.vortex").exists());
-    let file = crate::io::read::open_vortex_file(&path).await.unwrap();
+    let file = crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
+        .await
+        .unwrap();
     assert!(container::is_native_file(&file));
     let names: Vec<_> = file.footer().layout().child_names().collect();
     assert_eq!(names.first().map(|n| n.as_ref()), Some("quad-source"));

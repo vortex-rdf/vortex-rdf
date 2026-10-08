@@ -54,6 +54,9 @@ pub(crate) struct NativeStoreFile {
     /// One bound tree per (scope, filter shape), held for the handle's
     /// lifetime — see [`BoundExprMemo`].
     bound_exprs: Arc<BoundExprMemo>,
+    /// Whether the file is read through a memory mapping
+    /// (`io::read::FileAccess::Mapped`).
+    mapped: bool,
 }
 
 /// Structural (scope, expression) → the one [`BoundExpression`] this file
@@ -178,6 +181,7 @@ impl NativeStoreFile {
             pruning_envelopes: BoundedMemo::new(PRUNING_MEMO_MAX),
             column_chunks: Mutex::new(HashMap::new()),
             bound_exprs: Arc::new(BoundExprMemo::new()),
+            mapped: false,
         })
     }
 
@@ -186,6 +190,17 @@ impl NativeStoreFile {
     /// through it.
     pub(crate) fn bound_exprs(&self) -> &Arc<BoundExprMemo> {
         &self.bound_exprs
+    }
+
+    /// This handle, recorded as reading its file through a memory mapping.
+    pub(crate) fn with_mapping(mut self, mapped: bool) -> Self {
+        self.mapped = mapped;
+        self
+    }
+
+    /// Whether the file is read through a memory mapping.
+    pub(crate) fn is_mapped(&self) -> bool {
+        self.mapped
     }
 
     /// A quad column's chunk-probe handle by name, for point reads and exact

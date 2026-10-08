@@ -250,19 +250,15 @@ impl VortexRdfStore {
         let store = py
             .detach(|| {
                 RUNTIME.block_on(async {
-                    let store = match max_resident_bytes {
-                        Some(n) => CoreStore::from_file_with_dict_residency(&path, n).await?,
-                        None => CoreStore::from_file(&path).await?,
-                    };
                     if in_memory {
-                        // Round-trip through the serializable parts: rows,
-                        // index components, and the dictionary those rows'
-                        // codes address, exactly what `from_parts`
-                        // reconstructs a store from.
-                        let parts = store.to_serializable_parts().await?;
-                        CoreStore::from_parts(parts)
+                        // The whole store, read through the file reader and
+                        // adopted in memory — nothing reads the file again.
+                        CoreStore::from_file_in_memory(&path).await
                     } else {
-                        Ok(store)
+                        match max_resident_bytes {
+                            Some(n) => CoreStore::from_file_with_dict_residency(&path, n).await,
+                            None => CoreStore::from_file(&path).await,
+                        }
                     }
                 })
             })

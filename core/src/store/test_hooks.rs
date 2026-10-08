@@ -131,6 +131,16 @@ impl VortexRdfStore {
         )
     }
 
+    /// Whether this store reads a memory-mapped file: `Some(true)` for a
+    /// mapped open, `Some(false)` for a file read through Vortex's reader,
+    /// `None` for an in-memory store.
+    pub(crate) fn debug_file_mapped(&self) -> Option<bool> {
+        match &self.quads {
+            QuadsSource::InMemory { .. } => None,
+            QuadsSource::File { file, .. } => Some(file.is_mapped()),
+        }
+    }
+
     /// Whether one named integer child of an in-memory base is a canonical
     /// primitive. `None` when the base has no such child or is not in memory.
     pub(crate) fn debug_base_child_int_canonical(&self, name: &str) -> Option<bool> {

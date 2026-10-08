@@ -24,6 +24,8 @@ mod file_backed;
 mod indexes;
 #[cfg(feature = "file-io")]
 mod indexes_file;
+#[cfg(feature = "file-io")]
+mod mapping;
 mod matching;
 mod mutation;
 mod names;

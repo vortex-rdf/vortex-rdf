@@ -105,21 +105,48 @@ pub(crate) fn unsupported_file_error(file: &vortex_file::VortexFile) -> VortexRd
     ))
 }
 
-/// Open a Vortex file lazily — no data is read until the returned `VortexFile`
-/// is scanned.
+/// How an opened store file's bytes are reached.
+#[cfg(feature = "file-io")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileAccess {
+    /// Memory-mapped (`memmap2`) and opened over the mapping with
+    /// `open_buffer`: a segment fetch is a slice of the map, and what stays
+    /// in RAM is the kernel's page cache, not this process's heap.
+    Mapped,
+    /// Read through Vortex's file reader (`open_path`): every segment fetch
+    /// is a positioned read into a buffer the caller then owns — the path a
+    /// whole-store load takes, so the loaded store owns its memory.
+    Read,
+}
+
+/// Open a Vortex file lazily — no data is read until the returned
+/// `VortexFile` is scanned. The layout reader is cached on the handle: every
+/// scan and pruning evaluation shares one reader tree.
 ///
-/// The layout reader is cached on the file handle: every scan and pruning
-/// evaluation over the store shares one reader tree, so zone-map stats tables
-/// are read and decoded once and per-expression pruning masks are reused across data access calls.
+/// A mapped file must not be truncated or rewritten in place while open
+/// (its pages would fault); replacing it by rename is fine on Unix.
 #[cfg(feature = "file-io")]
 pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
     path: P,
+    access: FileAccess,
 ) -> Result<vortex_file::VortexFile> {
     use vortex_file::OpenOptionsSessionExt;
-    crate::session::VORTEX_SESSION
+    let options = crate::session::VORTEX_SESSION
         .open_options()
-        .with_layout_reader_cache()
-        .open_path(path)
-        .await
-        .map_err(VortexRdfError::Vortex)
+        .with_layout_reader_cache();
+    match access {
+        FileAccess::Mapped => {
+            let file = std::fs::File::open(path.as_ref())?;
+            // SAFETY: a store file is read-only while open; truncating or
+            // rewriting it in place is unsupported (docs/file-format.md §8).
+            let mmap = unsafe { memmap2::Mmap::map(&file) }?;
+            options
+                .open_buffer(vortex_buffer::ByteBuffer::from(mmap))
+                .map_err(VortexRdfError::Vortex)
+        }
+        FileAccess::Read => options
+            .open_path(path)
+            .await
+            .map_err(VortexRdfError::Vortex),
+    }
 }

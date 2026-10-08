@@ -24,6 +24,9 @@ vortex-edition.workspace = true
 vortex-file.workspace = true
 vortex-scan.workspace = true
 vortex-buffer.workspace = true
+# Memory-mapped store files (`VortexRdfStore::from_file`); enabled by `file-io`
+# together with vortex-buffer's `memmap2` feature (`ByteBuffer: From<Mmap>`).
+memmap2 = { version = "0.9", optional = true }
 vortex-btrblocks.workspace = true
 # Encoding-aware bounds search over compressed columns (sibling workspace crate).
 vortex-rdf-encoded-search.workspace = true
@@ -63,6 +66,8 @@ file-io = [
     "vortex-file/tokio",
     "tokio/fs",
     "vortex-rdf-encoded-search/layout",
+    "vortex-buffer/memmap2",
+    "dep:memmap2",
 ]
 # Opt-in: let a binary that depends on this crate have it install mimalloc as
 # the process's global allocator, instead of picking one itself.

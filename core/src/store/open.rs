@@ -150,6 +150,29 @@ impl VortexRdfStore {
         path: P,
         max_resident_bytes: u64,
     ) -> Result<Self> {
+        Self::open_file(path, max_resident_bytes, read::FileAccess::Mapped).await
+    }
+
+    /// Load a store file whole into memory — quad rows, dictionary and every
+    /// index child — through Vortex's file reader rather than a mapping, so
+    /// the loaded store owns its memory and never reads the file again: the
+    /// explicit "load everything" opt-in (Python's `in_memory=True`). The
+    /// file is opened, then its [`to_serializable_parts`](Self::to_serializable_parts)
+    /// are adopted through [`from_parts`](Self::from_parts).
+    #[cfg(feature = "file-io")]
+    pub async fn from_file_in_memory<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        let opened = Self::open_file(path, u64::MAX, read::FileAccess::Read).await?;
+        Self::from_parts(opened.to_serializable_parts().await?)
+    }
+
+    /// The open behind the file constructors: footer, component roster and
+    /// resolved layout, the file reached through `access`.
+    #[cfg(feature = "file-io")]
+    async fn open_file<P: AsRef<std::path::Path>>(
+        path: P,
+        max_resident_bytes: u64,
+        access: read::FileAccess,
+    ) -> Result<Self> {
         // Remember the source path before it is consumed below, so compaction
         // can later rewrite the compacted rows back over it.
         let source_path = path.as_ref().to_path_buf();
@@ -157,9 +180,19 @@ impl VortexRdfStore {
         // is read yet. The returned handle caches its layout reader tree so
         // later scans/prunes across this store (and stores derived from it)
         // share decoded zone-map stats instead of re-reading them each time.
-        let file = Arc::new(NativeStoreFile::try_new(
-            read::open_vortex_file(path).await?,
-        )?);
+        let file = Arc::new(
+            NativeStoreFile::try_new(read::open_vortex_file(path, access).await?)?
+                .with_mapping(access == read::FileAccess::Mapped),
+        );
+        log::debug!(
+            "[open] {} {}",
+            source_path.display(),
+            if file.is_mapped() {
+                "memory-mapped"
+            } else {
+                "through the file reader"
+            }
+        );
         // Interpret the component roster: the dictionary child feeds the
         // layout below, index children map onto the index set, and unknown
         // components are skipped when optional, fatal when required (a
@@ -212,7 +245,7 @@ impl VortexRdfStore {
                 } else {
                     FileBackedDict::open(&file)?
                 };
-                let access = match file_backed {
+                let dict_access = match file_backed {
                     Some(dict) => DictAccess::FileBacked(dict),
                     // One full scan of the dictionary child — chunks keep
                     // their FSST.
@@ -220,7 +253,7 @@ impl VortexRdfStore {
                         TermDictionary::from_child_reader(reader).await?,
                     )),
                 };
-                ResolvedLayout::Dictionary(access)
+                ResolvedLayout::Dictionary(dict_access)
             }
         };
         // No filter and no selection yet: this view covers all quad rows.
