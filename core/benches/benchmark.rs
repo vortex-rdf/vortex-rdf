@@ -25,7 +25,7 @@
 //!   needed: a cold-only suite cannot see caching work at all, and reports an
 //!   improvement that only a resolved probe cache delivers as noise. Opening is
 //!   never inside either measurement — it is its own benchmark (`open_file`).
-//! * **Decode/load (Group 3) and dictionary residency (Group 4)** sweep only
+//! * **Decode/load (Group 3) and dictionary access (Group 4)** sweep only
 //!   the axis each path actually branches on.
 //! * **Mutate (Group 5)** sweeps a star of the same three axes, because an
 //!   append's presence check and a delete's pattern resolution both route
@@ -297,10 +297,8 @@ fn decode_all_literals(bencher: divan::Bencher) {
         });
 }
 
-/// Open a file-backed store. Default and TypedObject read the footer only;
-/// Dictionary also lifts its term dictionary resident when it is under the
-/// residency threshold (the default for a file this size), so the layouts are
-/// worth distinguishing.
+/// Open a file-backed store: the footer (and, under Dictionary, the
+/// dictionary's window bounds), memory-mapped.
 #[divan::bench(args = [Layout::Default, Layout::TypedObject, Layout::Dictionary], sample_count = HEAVY_SAMPLES)]
 fn open_file(bencher: divan::Bencher, layout: &Layout) {
     let layout = *layout;
@@ -329,15 +327,13 @@ fn from_bytes(bencher: divan::Bencher) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// Group 4 — DICTIONARY RESIDENCY (file-backed vs resident term dictionary)
+// Group 4 — DICTIONARY ACCESS (memory-mapped file vs whole-store load)
 //
-// A Dictionary file's term dictionary can be lifted resident at open or left
-// in its dictionary child and reached by scans through the bounded reader
-// (`from_file_with_dict_residency`, byte threshold). The residency axis moves
-// cost between phases: resident pays one contiguous child read at open and
-// then probes/decodes from memory; file-backed opens on footer metadata alone
-// but pays a pruned child scan per cold term probe and a row-index scan per
-// decoded chunk.
+// A Dictionary file opened with `from_file` is memory-mapped: the term
+// dictionary stays in its child and every probe or decode reads the mapped
+// leaves it touches. `from_file_in_memory` loads the whole store, the
+// dictionary lifted into memory (still FSST). The bench ids keep their
+// `resident`/`file_backed` names so the dashboard's history lines up.
 // ══════════════════════════════════════════════════════════════════════════
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -347,12 +343,13 @@ enum DictResidency {
 }
 
 impl DictResidency {
-    /// The `max_resident_bytes` value that forces this residency.
-    fn threshold(self) -> u64 {
+    /// Open the store at `path` under this access mode.
+    async fn open(self, path: &std::path::Path) -> VortexRdfStore {
         match self {
-            Self::Resident => u64::MAX,
-            Self::FileBacked => 0,
+            Self::Resident => VortexRdfStore::from_file_in_memory(path).await,
+            Self::FileBacked => VortexRdfStore::from_file(path).await,
         }
+        .expect("open dictionary store")
     }
 
     fn short(self) -> &'static str {
@@ -399,25 +396,19 @@ fn cached_writer_file(size: usize) -> PathBuf {
 
 fn open_dict_store(residency: DictResidency, size: usize) -> VortexRdfStore {
     let path = cached_writer_file(size);
-    rt().block_on(async {
-        VortexRdfStore::from_file_with_dict_residency(&path, residency.threshold())
-            .await
-            .expect("open dictionary store")
-    })
+    rt().block_on(residency.open(&path))
 }
 
-/// Open cost across the residency axis: resident pays the child read and
-/// dictionary lift, file-backed only the footer reads.
+/// Open cost across the access axis: the load pays every read at open, the
+/// mapped open only the footer and the window bounds.
 #[divan::bench(args = DICT_CONFIGS, sample_count = HEAVY_SAMPLES)]
 fn dict_open(bencher: divan::Bencher, residency: &DictResidency) {
     let residency = *residency;
     bencher
-        .with_inputs(|| (cached_writer_file(bench_size()), residency.threshold()))
-        .bench_refs(|(path, threshold)| {
+        .with_inputs(|| cached_writer_file(bench_size()))
+        .bench_refs(|path| {
             rt().block_on(async {
-                let store = VortexRdfStore::from_file_with_dict_residency(&*path, *threshold)
-                    .await
-                    .expect("open");
+                let store = residency.open(path).await;
                 black_box(store.layout())
             })
         });

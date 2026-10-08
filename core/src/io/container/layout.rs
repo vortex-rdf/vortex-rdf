@@ -177,9 +177,9 @@ pub(crate) fn store_metadata_of_bytes(bytes: &[u8]) -> (bool, Vec<StoreComponent
 }
 
 /// On-disk byte size of a layout subtree: the sum of its segments' lengths
-/// across all descendants, resolved through the footer's segment map. This
-/// is the residency-threshold input for auxiliary components.
-#[cfg(feature = "file-io")]
+/// across all descendants, resolved through the footer's segment map. What a
+/// component occupies on disk (a test inspection).
+#[cfg(all(test, feature = "file-io"))]
 pub(crate) fn subtree_bytes(
     layout: &LayoutRef,
     segment_map: &[vortex_file::SegmentSpec],

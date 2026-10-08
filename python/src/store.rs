@@ -124,10 +124,12 @@ fn resolve_columns(columns: [Vec<Option<Py<PyString>>>; 4]) -> PyResult<[Vec<Py<
 }
 
 /// A read-only Vortex-RDF store opened from a `.vortex` file or from
-/// native-container bytes. A file open reads only the footer up front and,
-/// under the Dictionary layout, lifts the term dictionary when it fits the
-/// residency budget; each match then scans the file, so one instance is meant
-/// to be kept and queried repeatedly.
+/// native-container bytes. A file is memory-mapped: only the footer (and,
+/// under the Dictionary layout, the dictionary's window bounds) is read up
+/// front, and each query reads the mapped pages it touches. Replace a store's
+/// file by renaming a new one over it, never by truncating or rewriting it in
+/// place (a reader of the mapping would be killed with SIGBUS). One instance
+/// is meant to be kept and queried repeatedly.
 ///
 /// The Python bindings are read-only: stores are built with `serialize_rdf`
 /// (file to file), then opened and queried. There is no in-memory build, RDF
@@ -223,24 +225,19 @@ impl VortexRdfStore {
 
 #[pymethods]
 impl VortexRdfStore {
-    /// Open `path`. By default the store stays file-backed and lazy (only the
-    /// footer is read up front). `in_memory=True` loads the whole store into
-    /// memory instead, keeping its columns in their compressed form wherever
-    /// matches can bind them directly and decoding only the remainder —
-    /// every subsequent match skips the per-call file-scan pipeline.
-    /// `max_resident_bytes` overrides the Dictionary layout's
-    /// term-dictionary residency budget (the dictionary child's compressed
-    /// size in bytes).
+    /// Open `path`. A file store is memory-mapped: what stays in RAM is the
+    /// operating system's page cache (counted as file-backed RSS, not
+    /// anonymous memory), and the file must not be modified while open —
+    /// replace its file by renaming a new one over it, never by truncating or
+    /// rewriting it in place (a reader of the mapping would be killed with
+    /// SIGBUS). `in_memory=True` loads the whole store instead, keeping its
+    /// columns in their compressed form wherever matches can bind them
+    /// directly; every later match then skips the file.
     #[new]
-    #[pyo3(signature = (path, max_resident_bytes=None, in_memory=false))]
-    fn new(
-        py: Python<'_>,
-        path: PathBuf,
-        max_resident_bytes: Option<u64>,
-        in_memory: bool,
-    ) -> PyResult<Self> {
-        // Core reports a missing path as `VortexRdfError::Vortex`, not `Io`,
-        // so the `FileNotFoundError` contract is honoured here.
+    #[pyo3(signature = (path, *, in_memory=false))]
+    fn new(py: Python<'_>, path: PathBuf, in_memory: bool) -> PyResult<Self> {
+        // Core reports a missing path as an I/O error from the open; the
+        // `FileNotFoundError` contract is honoured here with a clear message.
         if !path.is_file() {
             return Err(PyFileNotFoundError::new_err(format!(
                 "no such Vortex file: {}",
@@ -255,10 +252,7 @@ impl VortexRdfStore {
                         // adopted in memory — nothing reads the file again.
                         CoreStore::from_file_in_memory(&path).await
                     } else {
-                        match max_resident_bytes {
-                            Some(n) => CoreStore::from_file_with_dict_residency(&path, n).await,
-                            None => CoreStore::from_file(&path).await,
-                        }
+                        CoreStore::from_file(&path).await
                     }
                 })
             })
@@ -429,12 +423,10 @@ impl VortexRdfStore {
         Ok((subjects, predicates, objects, graphs))
     }
 
-    /// The store's term dictionary, or `None` when the code path does not
-    /// apply: a non-Dictionary layout, or an append tail whose quads are not
-    /// in the dictionary. A dictionary left in its file (over the residency
-    /// budget) is served through the handle by reading the file on demand;
-    /// `TermDict.file_backed` tells. Pair with [`Self::match_codes`]; decode
-    /// each distinct code once, caching on the Python side.
+    /// The store's term dictionary, or `None` for a non-Dictionary layout. A
+    /// file store's dictionary is read from the mapped file on demand
+    /// (`TermDict.file_backed`); an in-memory one answers in place. Pair with
+    /// [`Self::match_codes`]; decode each distinct code once.
     fn term_dict(&self) -> Option<TermDict> {
         self.store.dict_reader().map(|reader| TermDict { reader })
     }

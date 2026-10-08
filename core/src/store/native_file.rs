@@ -15,7 +15,7 @@ use vortex_layout::{LayoutReaderRef, LayoutRef};
 
 use crate::io::container::{
     RdfStoreLayoutVTable, StoreComponentDescriptor, is_native_file, quads_sorted, store_component,
-    store_components, subtree_bytes,
+    store_components,
 };
 use crate::io::read::unsupported_file_error;
 
@@ -323,15 +323,6 @@ impl NativeStoreFile {
                 .expect("the reader was just initialized above")
                 .clone(),
         )))
-    }
-
-    /// A component's on-disk byte size, by name — the residency-threshold
-    /// input.
-    pub(crate) fn component_bytes(&self, name: &str) -> VortexResult<Option<u64>> {
-        let Some((_, child)) = self.component_child(name)? else {
-            return Ok(None);
-        };
-        subtree_bytes(&child, self.file.footer().segment_map()).map(Some)
     }
 }
 

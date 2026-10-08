@@ -68,20 +68,10 @@ impl VortexRdfStore {
         // copy, which the in-memory rebuild below provides.
         #[cfg(feature = "file-io")]
         if self.is_owner()
-            && let QuadsSource::File {
-                path,
-                dict_max_resident_bytes,
-                ..
-            } = &self.quads
+            && let QuadsSource::File { path, .. } = &self.quads
         {
-            return Self::stream_compacted_to_file(
-                raws,
-                self.layout.strategy(),
-                unique,
-                path,
-                *dict_max_resident_bytes,
-            )
-            .await;
+            return Self::stream_compacted_to_file(raws, self.layout.strategy(), unique, path)
+                .await;
         }
         Self::from_raw_quads(&raws, self.layout.strategy(), unique, true)
     }
@@ -101,7 +91,6 @@ impl VortexRdfStore {
         strategy: LayoutStrategy,
         indexes: Indexes,
         path: &std::path::Path,
-        dict_max_resident_bytes: u64,
     ) -> Result<Self> {
         // A sibling temp file keeps the rename on one filesystem (so it is
         // atomic); the uuid suffix avoids colliding with a temp left behind by
@@ -136,8 +125,10 @@ impl VortexRdfStore {
                 format!("replace {path:?}: {e}"),
             ))
         })?;
-        // Reopen with the caller's pinned residency budget, not the default.
-        Self::from_file_with_dict_residency(path, dict_max_resident_bytes).await
+        // Reopen mapped. This store's old mapping keeps the replaced file's
+        // pages until it drops; Windows refuses the rename above while that
+        // mapping lives, and compaction then fails with the I/O error.
+        Self::from_file(path).await
     }
 
     /// Build a fresh owning in-memory store from raw quads under `strategy` —

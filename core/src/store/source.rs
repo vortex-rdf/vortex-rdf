@@ -72,10 +72,6 @@ pub(crate) enum QuadsSource {
         /// its rows over this file atomically and reopens it
         /// (`compaction.rs`); a derived view's compaction never touches it.
         path: PathBuf,
-        /// The dictionary-residency budget the store was opened with, so a
-        /// compaction's reopen (`from_file_with_dict_residency`) preserves
-        /// the same residency mode.
-        dict_max_resident_bytes: u64,
         /// The shared file handle, including its cached schema, metadata, and
         /// layout reader used by scans and pruning. Every root row is a quad
         /// row (the dictionary and index copies ride as auxiliary children

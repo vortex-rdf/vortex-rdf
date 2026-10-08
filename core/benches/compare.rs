@@ -554,9 +554,10 @@ struct VortexAdapter {
     label: &'static str,
     layout: LayoutStrategy,
     indexes: Vec<IndexType>,
-    /// Load the whole store up front instead of staying file-backed and lazy.
-    /// The same axis the Python tab crosses with the secondary index, and the
-    /// configuration that matches how the in-memory libraries here hold data.
+    /// Load the whole store up front (`from_file_in_memory`) instead of opening
+    /// it memory-mapped. The same axis the Python tab crosses with the
+    /// secondary index, and the configuration that matches how the in-memory
+    /// libraries here hold data.
     in_memory: bool,
     /// Whether this variant runs the mutation phase. One Vortex row does: the
     /// add phase starts from an empty store, which no layout/index knob
@@ -592,21 +593,17 @@ impl Adapter for VortexAdapter {
     }
     fn open(&self, artifact: &Path, _src: &Path) -> Box<dyn Queryable> {
         let store = rt().block_on(async {
-            let store = VortexRdfStore::from_file(artifact)
-                .await
-                .expect("open vortex file");
-            if !self.in_memory {
-                return store;
+            if self.in_memory {
+                // The load the Python bindings' `in_memory=True` calls, so the
+                // two tabs' memory rows mean the same thing.
+                VortexRdfStore::from_file_in_memory(artifact)
+                    .await
+                    .expect("load vortex file into memory")
+            } else {
+                VortexRdfStore::from_file(artifact)
+                    .await
+                    .expect("open vortex file")
             }
-            // Round-trip through the serializable parts -- rows, index components
-            // and the dictionary those codes address -- which is what the Python
-            // bindings' `in_memory=True` does, so the two tabs' memory rows mean
-            // the same thing.
-            let parts = store
-                .to_serializable_parts()
-                .await
-                .expect("serializable parts");
-            VortexRdfStore::from_parts(parts).expect("load store into memory")
         });
         Box::new(VortexStore(store))
     }

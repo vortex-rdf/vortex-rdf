@@ -14,10 +14,11 @@ RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 
 @pytest.fixture(params=["resident", "file-backed"])
 def dictionary(request, vortex_files):
-    """The fixture's dictionary-layout store opened with its dictionary
-    resident or left in the file, as `(store, term_dict)`."""
-    budget = None if request.param == "resident" else 0
-    store = VortexRdfStore(vortex_files["dictionary"], max_resident_bytes=budget)
+    """The fixture's dictionary-layout store loaded whole (resident
+    dictionary) or opened from its file (mapped, file-backed dictionary), as
+    `(store, term_dict)`."""
+    path = vortex_files["dictionary"]
+    store = VortexRdfStore(path, in_memory=request.param == "resident")
     term_dict = store.term_dict()
     assert term_dict is not None
     assert term_dict.file_backed == (request.param == "file-backed")
@@ -171,7 +172,7 @@ def test_filter_codes_kinds_and_predicates(dictionary):
 def test_file_backed_codes_decode_to_quads(vortex_files):
     """A file-backed handle decodes what `match_codes` gathers to the quads
     the string matchers return."""
-    store = VortexRdfStore(vortex_files["dictionary"], max_resident_bytes=0)
+    store = VortexRdfStore(vortex_files["dictionary"])
     term_dict = store.term_dict()
     assert term_dict.file_backed
     assert "file_backed=True" in repr(term_dict)
@@ -186,15 +187,10 @@ def test_file_backed_codes_decode_to_quads(vortex_files):
 # ─── keeps, windows, batches ──────────────────────────────────────────────
 
 
-@pytest.fixture(params=["file", "in-memory", "file-backed-dict"])
+@pytest.fixture(params=["file", "in-memory"])
 def code_store(request, vortex_files):
     """The fixture's dictionary-layout store under each open mode."""
-    path = vortex_files["dictionary"]
-    if request.param == "in-memory":
-        return VortexRdfStore(path, in_memory=True)
-    if request.param == "file-backed-dict":
-        return VortexRdfStore(path, max_resident_bytes=0)
-    return VortexRdfStore(path)
+    return VortexRdfStore(vortex_files["dictionary"], in_memory=request.param == "in-memory")
 
 
 def _rows(cols):

@@ -339,14 +339,12 @@ impl VortexRdfStore {
             #[cfg(feature = "file-io")]
             QuadsSource::File {
                 path,
-                dict_max_resident_bytes,
                 file,
                 filter,
                 deleted,
                 ..
             } => QuadsSource::File {
                 path: path.clone(),
-                dict_max_resident_bytes: *dict_max_resident_bytes,
                 file: file.clone(),
                 filter: filter.clone(),
                 selection: ViewSelection::Exact(RowSelection::empty()),

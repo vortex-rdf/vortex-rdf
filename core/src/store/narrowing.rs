@@ -248,7 +248,6 @@ impl VortexRdfStore {
             #[cfg(feature = "file-io")]
             QuadsSource::File {
                 path,
-                dict_max_resident_bytes,
                 file,
                 filter,
                 selection,
@@ -296,7 +295,6 @@ impl VortexRdfStore {
                 (
                     QuadsSource::File {
                         path: path.clone(),
-                        dict_max_resident_bytes: *dict_max_resident_bytes,
                         file: file.clone(),
                         filter: None,
                         selection: ViewSelection::Exact(windowed),
@@ -593,7 +591,6 @@ impl VortexRdfStore {
         let t = debug::timer();
         let QuadsSource::File {
             path,
-            dict_max_resident_bytes,
             file,
             filter,
             selection,
@@ -662,7 +659,6 @@ impl VortexRdfStore {
             indexes: self.indexes.clone(),
             quads: QuadsSource::File {
                 path: path.clone(),
-                dict_max_resident_bytes: *dict_max_resident_bytes,
                 file: file.clone(),
                 filter,
                 selection: ViewSelection::Exact(selection),

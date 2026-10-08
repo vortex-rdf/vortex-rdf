@@ -31,10 +31,8 @@ async fn test_file_backed_dictionary_shared_quads_match_resident() {
         vec![IndexType::SecondaryByCopy],
     )
     .await;
-    let resident = VortexRdfStore::from_file(&path).await.unwrap();
-    let fb = VortexRdfStore::from_file_with_dict_residency(&path, 0)
-        .await
-        .unwrap();
+    let resident = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    let fb = VortexRdfStore::from_file(&path).await.unwrap();
     assert!(fb.debug_dict_file_backed());
 
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
@@ -58,8 +56,8 @@ async fn test_file_backed_dictionary_shared_quads_match_resident() {
     }
 }
 
-/// A store opened with the dictionary forced file-backed must answer every
-/// pattern family identically to the resident open of the same file. Hands
+/// A file store (mapped, its dictionary left in the file) must answer every
+/// pattern family identically to the whole-store load of the same file. Hands
 /// back the temp dir guard with both opens for further probes.
 async fn assert_file_backed_matches_resident(
     indexes: Indexes,
@@ -68,18 +66,16 @@ async fn assert_file_backed_matches_resident(
     let quads = dictionary_test_quads();
     let (dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, indexes).await;
 
-    let resident = VortexRdfStore::from_file(&path).await.unwrap();
-    let fb = VortexRdfStore::from_file_with_dict_residency(&path, 0)
-        .await
-        .unwrap();
+    let resident = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    let fb = VortexRdfStore::from_file(&path).await.unwrap();
 
     // Residency is observable through the sync dictionary surface: a
     // file-backed dictionary has no snapshot and no sync code translation.
     assert!(resident.dictionary_snapshot().is_some(), "{tag}");
     assert!(fb.dictionary_snapshot().is_none(), "{tag}");
-    // A forced-file-backed open must actually stay file-backed: the written
-    // child's shape resolves a wire-chunk handle, so it never falls back to
-    // the resident arm.
+    // A file open must actually stay file-backed: the written child's shape
+    // resolves a wire-chunk handle, so it never falls back to the resident
+    // arm.
     assert!(fb.debug_dict_file_backed(), "{tag}");
     assert!(!resident.debug_dict_file_backed(), "{tag}");
     // The code-read gate includes residency: no snapshot, no code decoding.
@@ -171,36 +167,6 @@ async fn test_file_backed_dictionary_serves_from_copy_index() {
     assert_eq!(served.len(), 4);
 }
 
-/// The residency threshold is inclusive and byte-based: exactly at the
-/// dictionary child's on-disk size the dictionary lifts resident, one byte
-/// below it stays file-backed.
-#[tokio::test]
-async fn test_file_backed_dictionary_threshold_boundary() {
-    let quads = dictionary_test_quads();
-    let (_dir, path) = write_store_file(quads, LayoutStrategy::Dictionary, vec![]).await;
-
-    let file = NativeStoreFile::try_new(
-        crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    let dict_bytes = file
-        .component_bytes(DICT_COMPONENT_NAME)
-        .unwrap()
-        .expect("dictionary child present");
-    assert!(dict_bytes > 1);
-
-    let at = VortexRdfStore::from_file_with_dict_residency(&path, dict_bytes)
-        .await
-        .unwrap();
-    assert!(at.dictionary_snapshot().is_some());
-    let below = VortexRdfStore::from_file_with_dict_residency(&path, dict_bytes - 1)
-        .await
-        .unwrap();
-    assert!(below.dictionary_snapshot().is_none());
-}
-
 /// The operations that need the whole dictionary — serialization, mutation
 /// with its tail merge, compaction — lift a file-backed dictionary
 /// transiently and stay correct.
@@ -208,9 +174,7 @@ async fn test_file_backed_dictionary_threshold_boundary() {
 async fn test_file_backed_dictionary_serializes_and_mutates() {
     let quads = dictionary_test_quads();
     let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
-    let fb = VortexRdfStore::from_file_with_dict_residency(&path, 0)
-        .await
-        .unwrap();
+    let fb = VortexRdfStore::from_file(&path).await.unwrap();
 
     // Serialization lifts the dictionary transiently and writes it as the
     // dictionary child, which a fresh store decodes standalone.
@@ -249,8 +213,8 @@ async fn test_file_backed_dictionary_serializes_and_mutates() {
 
 /// Pins the rows-only read path's dictionary contract: a tombstoned,
 /// *indexed* owner (compacting nothing) must answer `code_columns_gathered`
-/// with codes addressing the store's cached dictionary — the one
-/// `dictionary_snapshot` hands out. Re-encoding this shape against a fresh
+/// with codes addressing the store's own dictionary — the one its
+/// `dict_reader` handle decodes. Re-encoding this shape against a fresh
 /// dictionary of the surviving terms, as a serialization-shaped read would,
 /// silently renumbers codes the caller can then only decode wrongly.
 #[tokio::test]
@@ -262,16 +226,13 @@ async fn test_tombstoned_indexed_codes_address_cached_dictionary() {
         vec![IndexType::SecondaryByCopy],
     )
     .await;
-    // The default open lifts this small dictionary resident, so the sync
-    // snapshot below is available; the quad rows stay file-backed, which is
-    // what routes `code_columns_gathered` off the in-memory fast path and
-    // through the gathered read.
+    // A file store: the dictionary stays file-backed, the quad rows are read from the file.
     let store = VortexRdfStore::from_file(&path).await.unwrap();
 
     // Tombstone the quad whose subject sorts first among the s-terms: a
     // fresh re-encode of the survivors would shift every later subject's
-    // code down by one, so decoding through the cached snapshot would
-    // visibly name the wrong terms.
+    // code down by one, so decoding through the store's dictionary handle
+    // would visibly name the wrong terms.
     let deleted = store.delete_quad(&quads[0]).await.unwrap();
 
     let cols = deleted
@@ -279,12 +240,19 @@ async fn test_tombstoned_indexed_codes_address_cached_dictionary() {
         .await
         .unwrap()
         .expect("a tombstoned Dictionary view still answers codes");
-    let dict = deleted.dictionary_snapshot().unwrap();
+    let reader = deleted
+        .dict_reader()
+        .expect("a tombstoned Dictionary view keeps its dictionary handle");
+    let decoded: Vec<Vec<Option<String>>> =
+        futures::future::try_join_all(cols.iter().map(|col| reader.decode_many(col.as_slice())))
+            .await
+            .unwrap();
     let got: std::collections::BTreeSet<[String; 4]> = (0..cols[0].len())
         .map(|i| {
-            [&cols[0], &cols[1], &cols[2], &cols[3]].map(|col| {
-                dict.decode(col[i])
-                    .expect("returned codes address the cached dictionary")
+            [0, 1, 2, 3].map(|c| {
+                decoded[c][i]
+                    .clone()
+                    .expect("returned codes address the store's dictionary")
             })
         })
         .collect();
@@ -334,10 +302,8 @@ async fn test_file_backed_dictionary_probe_parity() {
     let path = dir.path().join("probe.vortex");
     std::fs::write(&path, bytes).unwrap();
 
-    // The reference answers, from a resident open of the same file.
-    let resident = VortexRdfStore::from_file_with_dict_residency(&path, u64::MAX)
-        .await
-        .unwrap();
+    // The reference answers, from a whole-store load of the same file.
+    let resident = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
     let dict = resident.dictionary_snapshot().unwrap().0;
 
     // The probe target, built exactly as `from_file` does file-backed: the
@@ -410,10 +376,8 @@ async fn test_file_backed_dictionary_serves_wide_run() {
         vec![IndexType::SecondaryByCopy],
     )
     .await;
-    let resident = VortexRdfStore::from_file(&path).await.unwrap();
-    let fb = VortexRdfStore::from_file_with_dict_residency(&path, 0)
-        .await
-        .unwrap();
+    let resident = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    let fb = VortexRdfStore::from_file(&path).await.unwrap();
     assert!(fb.debug_dict_file_backed());
     assert!(!resident.debug_dict_file_backed());
 
@@ -461,9 +425,7 @@ async fn test_file_backed_dictionary_rejects_below_first_term() {
 
     let (_dir, path) = write_store_file(quads, LayoutStrategy::Dictionary, vec![]).await;
 
-    let resident = VortexRdfStore::from_file_with_dict_residency(&path, u64::MAX)
-        .await
-        .unwrap();
+    let resident = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
     let dict = resident.dictionary_snapshot().unwrap().0;
     let first_term = dict.decode(0).unwrap();
     assert!(
@@ -488,9 +450,8 @@ async fn test_file_backed_dictionary_rejects_below_first_term() {
 
 /// A dictionary child whose layout shape cannot be point-read — one flat
 /// leaf holding the whole struct, with no struct layout to find the term
-/// column under — declines the file-backed handle, and an open that asked
-/// for a file-backed dictionary lifts it resident instead, answering every
-/// pattern exactly.
+/// column under — declines the file-backed handle, and the open lifts it
+/// resident instead, answering every pattern exactly.
 #[tokio::test]
 async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
     use crate::io::container::{
@@ -557,9 +518,7 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
         "a flat dictionary child must decline the point-read handle"
     );
 
-    let store = VortexRdfStore::from_file_with_dict_residency(&path, 0)
-        .await
-        .unwrap();
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
     assert!(!store.debug_dict_file_backed());
     assert!(store.dictionary_snapshot().is_some());
     assert_eq!(view_strings(&store).await, quad_strings(&quads));
@@ -570,8 +529,7 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
     );
 
     // An empty dictionary child declines the same way (nothing to
-    // point-read) and opens resident — reachable only when the child still
-    // occupies bytes the zero threshold cannot cover.
+    // point-read) and opens resident.
     let (_dir, empty_path) = write_store_file(Vec::new(), LayoutStrategy::Dictionary, vec![]).await;
     let empty_file = NativeStoreFile::try_new(
         crate::io::read::open_vortex_file(&empty_path, crate::io::read::FileAccess::Mapped)
@@ -579,19 +537,11 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
             .unwrap(),
     )
     .unwrap();
-    if empty_file
-        .component_bytes(DICT_COMPONENT_NAME)
-        .unwrap()
-        .is_some_and(|bytes| bytes > 0)
-    {
-        assert!(FileBackedDict::open(&empty_file).unwrap().is_none());
-        let empty = VortexRdfStore::from_file_with_dict_residency(&empty_path, 0)
-            .await
-            .unwrap();
-        assert!(!empty.debug_dict_file_backed());
-        assert!(empty.dictionary_snapshot().is_some());
-        assert_eq!(empty.size().await.unwrap(), 0);
-    }
+    assert!(FileBackedDict::open(&empty_file).unwrap().is_none());
+    let empty = VortexRdfStore::from_file(&empty_path).await.unwrap();
+    assert!(!empty.debug_dict_file_backed());
+    assert!(empty.dictionary_snapshot().is_some());
+    assert_eq!(empty.size().await.unwrap(), 0);
 }
 
 // ─── Dictionary child round-trips ──────────────────────────────────────

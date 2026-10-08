@@ -165,23 +165,23 @@ def _assert_file_backed_dictionary(fallback, resident):
         assert fallback.count_quads(**pattern) == resident.count_quads(**pattern)
 
 
-def test_residency_budget_zero_forces_file_backed_dictionary(vortex_files):
-    """With no residency budget the dictionary stays in the file: the
-    string matchers are served from the shared-term rows, and the code path
-    decodes through a file-backed handle."""
-    resident = VortexRdfStore(vortex_files["dictionary"])
-    fallback = VortexRdfStore(vortex_files["dictionary"], max_resident_bytes=0)
-    _assert_file_backed_dictionary(fallback, resident)
+def test_file_store_dictionary_is_file_backed(vortex_files):
+    """A file store's dictionary stays in the mapped file: the string
+    matchers are served from the shared-term rows, and the code path decodes
+    through a file-backed handle — answering like the in-memory load."""
+    mapped = VortexRdfStore(vortex_files["dictionary"])
+    loaded = VortexRdfStore(vortex_files["dictionary"], in_memory=True)
+    _assert_file_backed_dictionary(mapped, loaded)
 
 
-def test_residency_env_var(vortex_files, monkeypatch):
-    resident = VortexRdfStore(vortex_files["dictionary"])
-    monkeypatch.setenv("VORTEX_RDF_DICT_MAX_RESIDENT_BYTES", "0")
-    fallback = VortexRdfStore(vortex_files["dictionary"])
-    _assert_file_backed_dictionary(fallback, resident)
-    # An explicit budget overrides the environment.
-    lifted = VortexRdfStore(vortex_files["dictionary"], max_resident_bytes=1 << 30).term_dict()
-    assert lifted is not None and not lifted.file_backed
+def test_residency_knobs_are_gone(vortex_files, monkeypatch):
+    path = vortex_files["dictionary"]
+    with pytest.raises(TypeError):
+        VortexRdfStore(path, max_resident_bytes=0)
+    with pytest.raises(TypeError):
+        VortexRdfStore(path, True)  # in_memory is keyword-only
+    monkeypatch.setenv("VORTEX_RDF_DICT_MAX_RESIDENT_BYTES", str(1 << 40))
+    assert VortexRdfStore(path).term_dict().file_backed
 
 
 def test_indexes_round_trip(vortex_files, indexed_files, layout):

@@ -1,6 +1,6 @@
-//! Opening a serialized store: the file and bytes constructors, the
-//! component-roster interpretation every open path shares, and the
-//! dictionary-residency policy `from_file` applies.
+//! Opening a serialized store: the file constructors (memory-mapped, or
+//! loaded whole), the bytes constructors, and the component-roster
+//! interpretation every open path shares.
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::container;
@@ -99,58 +99,22 @@ pub(super) async fn scanned_index_components(
     Ok(components)
 }
 
-/// Default residency ceiling for a Dictionary-layout file's term dictionary:
-/// up to this many bytes of dictionary child (its FSST-compressed size in the
-/// file, known from the footer with no I/O) the dictionary is lifted resident
-/// at open; above it the dictionary stays file-backed and every store keeps a
-/// bounded footprint however large its term set.
-#[cfg(feature = "file-io")]
-const DICT_MAX_RESIDENT_BYTES_DEFAULT: u64 = 512 << 20;
-
-/// The residency ceiling, with the `VORTEX_RDF_DICT_MAX_RESIDENT_BYTES`
-/// environment override (see [`dict_max_resident_bytes_from`]).
-#[cfg(feature = "file-io")]
-fn dict_max_resident_bytes() -> u64 {
-    dict_max_resident_bytes_from(std::env::var_os("VORTEX_RDF_DICT_MAX_RESIDENT_BYTES"))
-}
-
-/// The residency ceiling from the raw environment value: a plain byte count;
-/// unset or unparseable values fall back to
-/// [`DICT_MAX_RESIDENT_BYTES_DEFAULT`].
-#[cfg(feature = "file-io")]
-fn dict_max_resident_bytes_from(raw: Option<std::ffi::OsString>) -> u64 {
-    raw.and_then(|v| v.into_string().ok())
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DICT_MAX_RESIDENT_BYTES_DEFAULT)
-}
-
 impl VortexRdfStore {
-    /// Open a Vortex file lazily; no data is read until queried — except for
-    /// Dictionary-layout files, whose dictionary child is lifted resident
-    /// when its size fits the residency threshold.
+    /// Open a store file memory-mapped (`memmap2`, through Vortex's
+    /// `open_buffer`): a segment read is a slice of the map, so what stays
+    /// in RAM is the kernel's page cache — file-backed, reclaimable RSS —
+    /// never a copy on this process's heap. Only the footer is read up
+    /// front; under the Dictionary layout the dictionary child's per-window
+    /// term bounds are read too.
+    ///
+    /// The file is read in place for the store's lifetime: it must not be
+    /// truncated or rewritten while open. Replacing it by a rename (as
+    /// [`compact`](Self::compact) does) is fine on Unix, where the mapping
+    /// keeps the old file; Windows refuses to rename over a mapped file.
+    /// Network filesystems are not supported for mapping.
     #[cfg(feature = "file-io")]
     pub async fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
-        Self::from_file_with_dict_residency(path, dict_max_resident_bytes()).await
-    }
-
-    /// [`from_file`](Self::from_file) with an explicit residency threshold: a
-    /// Dictionary-layout file whose dictionary child exceeds
-    /// `max_resident_bytes` (its size in the file, FSST-compressed) keeps the
-    /// dictionary file-backed — probed and decoded by scans through the
-    /// bounded reader — instead of lifting it into memory.
-    ///
-    /// `from_file` uses the built-in default (overridable through the
-    /// `VORTEX_RDF_DICT_MAX_RESIDENT_BYTES` environment variable); this entry
-    /// pins the choice per open — `0` forces file-backed, `u64::MAX` forces
-    /// resident. On a file-backed store the synchronous dictionary surface
-    /// ([`code_read_snapshot`](Self::code_read_snapshot)) answers `None`;
-    /// queries and reconstruction work unchanged.
-    #[cfg(feature = "file-io")]
-    pub async fn from_file_with_dict_residency<P: AsRef<std::path::Path>>(
-        path: P,
-        max_resident_bytes: u64,
-    ) -> Result<Self> {
-        Self::open_file(path, max_resident_bytes, read::FileAccess::Mapped).await
+        Self::open_file(path, read::FileAccess::Mapped).await
     }
 
     /// Load a store file whole into memory — quad rows, dictionary and every
@@ -161,16 +125,17 @@ impl VortexRdfStore {
     /// are adopted through [`from_parts`](Self::from_parts).
     #[cfg(feature = "file-io")]
     pub async fn from_file_in_memory<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
-        let opened = Self::open_file(path, u64::MAX, read::FileAccess::Read).await?;
+        let opened = Self::open_file(path, read::FileAccess::Read).await?;
         Self::from_parts(opened.to_serializable_parts().await?)
     }
 
-    /// The open behind the file constructors: footer, component roster and
-    /// resolved layout, the file reached through `access`.
+    /// The open behind both: footer, component roster and resolved layout,
+    /// the file reached through `access`. The dictionary stays in its child —
+    /// unless the child's shape declines the file-backed handle, and holding
+    /// it whole is then the only way to read it at all.
     #[cfg(feature = "file-io")]
     async fn open_file<P: AsRef<std::path::Path>>(
         path: P,
-        max_resident_bytes: u64,
         access: read::FileAccess,
     ) -> Result<Self> {
         // Remember the source path before it is consumed below, so compaction
@@ -231,21 +196,11 @@ impl VortexRdfStore {
                                 .to_string(),
                         )
                     })?;
-                let dict_bytes = file
-                    .component_bytes(container::DICT_COMPONENT_NAME)
-                    .map_err(VortexRdfError::Vortex)?
-                    .expect("the dictionary component resolved above");
-                // A dictionary that fits the residency budget is held whole.
-                // A larger one stays in its child, read through the chunk
+                // The dictionary stays in its child, read through the chunk
                 // leaves a probe or decode touches — unless the child's
                 // layout shape declines that handle, and holding it whole is
                 // then the only way to read it at all.
-                let file_backed = if dict_bytes <= max_resident_bytes {
-                    None
-                } else {
-                    FileBackedDict::open(&file)?
-                };
-                let dict_access = match file_backed {
+                let dict_access = match FileBackedDict::open(&file)? {
                     Some(dict) => DictAccess::FileBacked(dict),
                     // One full scan of the dictionary child — chunks keep
                     // their FSST.
@@ -265,7 +220,6 @@ impl VortexRdfStore {
             indexes,
             quads: QuadsSource::File {
                 path: source_path,
-                dict_max_resident_bytes: max_resident_bytes,
                 file,
                 filter: None,
                 selection: ViewSelection::all(),
@@ -366,25 +320,5 @@ impl VortexRdfStore {
         }
         let layout = super::resolved_layout(dict, quads.dtype())?;
         Self::assemble_resident(quads, components, layout)
-    }
-}
-
-#[cfg(all(test, feature = "file-io"))]
-mod tests {
-    use super::{DICT_MAX_RESIDENT_BYTES_DEFAULT, dict_max_resident_bytes_from};
-    use std::ffi::OsString;
-
-    #[test]
-    fn dict_max_resident_bytes_override() {
-        assert_eq!(dict_max_resident_bytes_from(Some(OsString::from("0"))), 0);
-        assert_eq!(dict_max_resident_bytes_from(Some(OsString::from("12"))), 12);
-        assert_eq!(
-            dict_max_resident_bytes_from(Some(OsString::from("nope"))),
-            DICT_MAX_RESIDENT_BYTES_DEFAULT
-        );
-        assert_eq!(
-            dict_max_resident_bytes_from(None),
-            DICT_MAX_RESIDENT_BYTES_DEFAULT
-        );
     }
 }

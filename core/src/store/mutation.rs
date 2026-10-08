@@ -218,7 +218,6 @@ impl VortexRdfStore {
             (
                 QuadsSource::File {
                     path,
-                    dict_max_resident_bytes,
                     file,
                     selection,
                     deleted,
@@ -232,7 +231,6 @@ impl VortexRdfStore {
                     indexes: self.indexes.clone(),
                     quads: QuadsSource::File {
                         path: path.clone(),
-                        dict_max_resident_bytes: *dict_max_resident_bytes,
                         file: file.clone(),
                         // An owner has no pending filter, and deleting doesn't
                         // introduce one — it only widens the tombstones.

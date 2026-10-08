@@ -428,8 +428,8 @@ async fn test_narrowing_gates_and_tails() {
 mod file {
     use super::*;
 
-    /// Both residencies of a file store, with and without indexes (the dir
-    /// guards ride along, shared by the two opens of each file).
+    /// Both open modes of a file store — loaded whole and mapped — with and
+    /// without indexes (the dir guards ride along, shared by both opens).
     async fn file_stores() -> Vec<(String, std::sync::Arc<tempfile::TempDir>, VortexRdfStore)> {
         let mut stores = Vec::new();
         for (tag, indexes) in [
@@ -439,20 +439,12 @@ mod file {
         ] {
             let (dir, path) =
                 write_store_file(fixture_quads(), LayoutStrategy::Dictionary, indexes).await;
-            let resident = VortexRdfStore::from_file_with_dict_residency(&path, u64::MAX)
-                .await
-                .unwrap();
-            let fb = VortexRdfStore::from_file_with_dict_residency(&path, 0)
-                .await
-                .unwrap();
-            assert!(fb.debug_dict_file_backed());
+            let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+            let mapped = VortexRdfStore::from_file(&path).await.unwrap();
+            assert!(mapped.debug_dict_file_backed());
             let dir = std::sync::Arc::new(dir);
-            stores.push((
-                format!("{tag}/resident"),
-                std::sync::Arc::clone(&dir),
-                resident,
-            ));
-            stores.push((format!("{tag}/file-backed"), dir, fb));
+            stores.push((format!("{tag}/loaded"), std::sync::Arc::clone(&dir), loaded));
+            stores.push((format!("{tag}/mapped"), dir, mapped));
         }
         stores
     }

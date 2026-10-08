@@ -39,10 +39,10 @@ use super::term_dict::{DictReader, TermDictionary};
 pub(crate) enum DictAccess {
     /// The whole dictionary in memory (FSST-compressed or canonical).
     Resident(Arc<TermDictionary>),
-    /// The dictionary left in its file, read on demand through wire-chunk
-    /// point reads — chosen at open when the dictionary child outweighs the
-    /// residency threshold *and* its layout shape is point-readable (see
-    /// [`VortexRdfStore::from_file_with_dict_residency`](crate::store::VortexRdfStore::from_file_with_dict_residency)).
+    /// The dictionary left in its file, read on demand through the leaves a
+    /// call touches — what every file store opens with, unless the child's
+    /// layout shape declines the handle (see
+    /// [`VortexRdfStore::from_file`](crate::store::VortexRdfStore::from_file)).
     #[cfg(feature = "file-io")]
     FileBacked(FileBackedDict),
 }

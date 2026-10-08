@@ -115,12 +115,12 @@ class U32Column:
     def __buffer__(self, flags: int, /) -> memoryview: ...
 
 class VortexRdfStore:
-    def __init__(
-        self,
-        path: _StrPath,
-        max_resident_bytes: Optional[int] = None,
-        in_memory: bool = False,
-    ) -> None: ...
+    def __init__(self, path: _StrPath, *, in_memory: bool = False) -> None:
+        """Open a `.vortex` file memory-mapped, or load it whole with
+        ``in_memory=True``. A file store is memory-mapped: replace its file by
+        renaming a new one over it, never by truncating or rewriting it in
+        place (a reader of the mapping would be killed with SIGBUS)."""
+        ...
     @staticmethod
     def from_bytes(data: bytes) -> "VortexRdfStore": ...
     def to_bytes(self) -> bytes: ...

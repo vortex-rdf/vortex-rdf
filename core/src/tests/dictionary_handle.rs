@@ -453,12 +453,8 @@ async fn test_dict_reader_file_backed_matches_resident() {
         vec![IndexType::SecondaryByCopy],
     )
     .await;
-    let resident = VortexRdfStore::from_file_with_dict_residency(&path, u64::MAX)
-        .await
-        .unwrap();
-    let fb = VortexRdfStore::from_file_with_dict_residency(&path, 0)
-        .await
-        .unwrap();
+    let resident = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    let fb = VortexRdfStore::from_file(&path).await.unwrap();
     assert!(fb.debug_dict_file_backed());
     assert!(
         fb.code_read_snapshot().is_none(),

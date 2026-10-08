@@ -493,7 +493,6 @@ impl VortexRdfStore {
     ) -> Result<Self> {
         let QuadsSource::File {
             path,
-            dict_max_resident_bytes,
             file,
             filter: existing_filter,
             selection: existing_selection,
@@ -703,7 +702,6 @@ impl VortexRdfStore {
             indexes: self.indexes.clone(),
             quads: QuadsSource::File {
                 path: path.clone(),
-                dict_max_resident_bytes: *dict_max_resident_bytes,
                 file: file.clone(),
                 filter,
                 selection,

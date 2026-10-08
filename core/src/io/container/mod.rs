@@ -47,7 +47,7 @@ pub(crate) const DICT_IMPLEMENTATION: &str = "sorted-terms-fsst-v1";
 
 #[cfg(all(test, feature = "file-io"))]
 pub(crate) use layout::store_metadata_of_bytes;
-#[cfg(feature = "file-io")]
+#[cfg(all(test, feature = "file-io"))]
 pub(crate) use layout::subtree_bytes;
 pub(crate) use layout::{
     RdfStoreLayoutVTable, is_native_file, quads_sorted, register, store_component, store_components,
