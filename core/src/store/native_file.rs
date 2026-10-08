@@ -88,6 +88,12 @@ impl BoundExprMemo {
         self.0
             .get_or_try_insert_with((scope, expr.clone()), || expr.bind(dtype))
     }
+
+    /// Entries held — what the tests read to pin which shapes get bound.
+    #[cfg(test)]
+    pub(crate) fn debug_len(&self) -> usize {
+        self.0.map.lock().expect("memo lock").len()
+    }
 }
 
 /// A lock-guarded memo with an entry cap: once `cap` entries are held, the
@@ -179,6 +185,12 @@ impl NativeStoreFile {
     /// through it.
     pub(crate) fn bound_exprs(&self) -> &Arc<BoundExprMemo> {
         &self.bound_exprs
+    }
+
+    /// The bound-expression memo's entry count (test hook).
+    #[cfg(test)]
+    pub(crate) fn debug_bound_exprs(&self) -> usize {
+        self.bound_exprs.debug_len()
     }
 
     /// This handle, recorded as reading its file through a memory mapping.

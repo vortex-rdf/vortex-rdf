@@ -7,11 +7,11 @@
 //! [`match_pattern`](VortexRdfStore::match_pattern) in either order and is
 //! read through the same paths (`size`, `code_columns_gathered`, `quads`).
 //! Keeps are applied *after* the pattern, never through the pattern
-//! compiler: in memory as a binary search inside a sorted run or a pass over
-//! the selected rows of the column, on file as range or set conjuncts the
-//! scan prunes with its zone maps. Windows and capped counts over a file
-//! view with a pending filter evaluate its splits in file order and stop at
-//! the first split that completes them.
+//! compiler and never as scan expressions: in memory as a binary search
+//! inside a sorted run or a pass over the selected rows of the column, on
+//! file as a pass over the column streamed for the view's rows. Windows and
+//! capped counts over a file view with a pending filter evaluate its splits
+//! in file order and stop at the first split that completes them.
 
 use std::ops::Range;
 
@@ -43,17 +43,6 @@ pub enum Keep {
     /// such range (see `DictReader::prefix_range`).
     Range(u32, u32),
 }
-
-/// A `Keep::Set` of up to this many codes is pushed to a file scan as an
-/// `OR` of equalities (each a zone-prunable conjunct); larger sets go as one
-/// `list_contains` conjunct.
-#[cfg(feature = "file-io")]
-const KEEP_SET_OR_MAX: usize = 32;
-
-/// A `Keep::Set` wider than this is not pushed to the scan as an expression
-/// at all: the column is read for the view's rows and tested in memory.
-#[cfg(feature = "file-io")]
-const KEEP_SET_FILTER_MAX: usize = 4_096;
 
 impl Keep {
     /// The keep admitting exactly `codes` (any order, repeats folded).
@@ -173,12 +162,10 @@ impl VortexRdfStore {
     /// In memory the keep is a binary search when the selected rows are a
     /// run of the sorted base that `column` orders (a bound prefix of the
     /// `(s, p, o, g)` order, as a subject-bound match leaves), else one pass
-    /// over the selected rows of the column read in place. On file it is a
-    /// range or set conjunct ANDed onto the view's pushed-down filter, so the
-    /// scan's zone maps prune whole blocks it cannot satisfy; a very wide set
-    /// is tested in memory over the column's selected rows instead. A served
-    /// view's deferred row ids materialize first (the index's plan reads a
-    /// run the keep no longer describes).
+    /// over the selected rows of the column read in place. On file the view's
+    /// rows are resolved, the column is streamed for them through the mapping
+    /// and the keep is tested in memory — never pushed to the scan as an
+    /// expression. A served view's deferred row ids materialize first.
     ///
     /// [`match_pattern`]: Self::match_pattern
     pub async fn keep(&self, column: QuadColumn, keep: &Keep) -> Result<Self> {
@@ -579,15 +566,14 @@ impl VortexRdfStore {
         })
     }
 
-    /// The file backend of [`keep`](Self::keep): the keep as a conjunct on
-    /// the view's pushed-down filter (a range as two comparisons, a set as an
-    /// `OR` of equalities or a `list_contains`), narrowed by zone-map
-    /// pruning; a set too wide for an expression is tested in memory over the
-    /// column read for the view's rows.
+    /// The file backend of [`keep`](Self::keep): the view's rows are resolved
+    /// to exact ids (a pending filter evaluated, a served view's deferred ids
+    /// materialized), the column is streamed for them through the mapping,
+    /// and the keep is tested in memory. A keep never becomes a filter
+    /// expression: its code list is per query, and every distinct expression
+    /// would pin new entries in Vortex's identity-keyed reader caches.
     #[cfg(feature = "file-io")]
     async fn keep_file(&self, column: QuadColumn, keep: &Keep) -> Result<Self> {
-        use vortex_array::expr::and;
-
         let t = debug::timer();
         let QuadsSource::File {
             path,
@@ -601,57 +587,28 @@ impl VortexRdfStore {
             unreachable!("keep routes only File sources here");
         };
         let row_count = file.row_count() as usize;
-        // A served view's deferred ids are needed now: the plan reads index
-        // columns the keep does not bind.
         let selection = selection.materialized_async().await?;
         if selection.is_empty(row_count) {
             return Ok(self.empty_view());
         }
-        let (filter, selection) = match keep_conjunct(column, keep) {
-            Some(conjunct) => {
-                // Statistics alone may already bound the rows the conjunct
-                // can hold (a namespace range inside a sorted column).
-                let selection = match file_scan::row_range_from_pruning(file, &conjunct).await? {
-                    Some(range) => selection.intersect_range(range),
-                    None => selection,
-                };
-                let filter = match filter {
-                    Some(existing) => and(existing.clone(), conjunct),
-                    None => conjunct,
-                };
-                log::debug!(
-                    "[keep] {:?} pushed to the file scan as a conjunct at {:?}",
-                    column,
-                    debug::elapsed(t)
-                );
-                (Some(filter), selection)
-            }
-            None => {
-                // Too wide a set for an expression: resolve the pending
-                // filter to exact rows, read the column for them, and test
-                // in memory.
-                let selection = match filter {
-                    Some(f) => {
-                        let matched =
-                            file_scan::matching_file_rows(file, Some(f), &selection).await?;
-                        RowSelection::All.refine(&matched)
-                    }
-                    None => selection,
-                };
-                let codes = file_scan::read_column_codes(file, column.name(), &selection).await?;
-                let test = keep.test();
-                let positions = (0..codes.len()).filter(|&i| test.admits(codes[i]));
-                let mask = vortex_mask::Mask::from_indices(codes.len(), positions);
-                log::debug!(
-                    "[keep] {:?} tested in memory over {} file rows at {:?}",
-                    column,
-                    codes.len(),
-                    debug::elapsed(t)
-                );
-                (None, selection.refine(&mask))
-            }
+        let selection = match filter {
+            Some(f) => RowSelection::All
+                .refine(&file_scan::matching_file_rows(file, Some(f), &selection).await?),
+            None => selection,
         };
-        if selection.is_empty(row_count) {
+        let test = keep.test();
+        let positions =
+            file_scan::column_positions(file, column.name(), &selection, |code| test.admits(code))
+                .await?;
+        let selected = selection.len(row_count);
+        let narrowed = selection.refine(&vortex_mask::Mask::from_indices(selected, positions));
+        log::debug!(
+            "[keep] {:?} tested in memory over {} file rows at {:?}",
+            column,
+            selected,
+            debug::elapsed(t)
+        );
+        if narrowed.is_empty(row_count) {
             return Ok(self.empty_view());
         }
         Ok(Self {
@@ -660,42 +617,13 @@ impl VortexRdfStore {
             quads: QuadsSource::File {
                 path: path.clone(),
                 file: file.clone(),
-                filter,
-                selection: ViewSelection::Exact(selection),
+                filter: None,
+                selection: ViewSelection::Exact(narrowed),
                 deleted: deleted.clone(),
                 serve: None,
             },
             tail: self.tail.clone(),
         })
-    }
-}
-
-/// The keep as a filter conjunct over the quad scan's root: a range as
-/// `col >= lo AND col < hi`, a set as an `OR` of equalities up to
-/// [`KEEP_SET_OR_MAX`] codes or one `list_contains` up to
-/// [`KEEP_SET_FILTER_MAX`]; `None` beyond that.
-#[cfg(feature = "file-io")]
-fn keep_conjunct(column: QuadColumn, keep: &Keep) -> Option<vortex_array::expr::Expression> {
-    use std::sync::Arc;
-    use vortex_array::dtype::{DType, Nullability, PType};
-    use vortex_array::expr::{and, eq, get_item, gt_eq, list_contains, lit, lt, or_collect, root};
-    use vortex_array::scalar::Scalar;
-
-    let col = || get_item(column.name(), root());
-    match keep {
-        Keep::Range(lo, hi) => Some(and(gt_eq(col(), lit(*lo)), lt(col(), lit(*hi)))),
-        Keep::Set(codes) if codes.len() <= KEEP_SET_OR_MAX => {
-            or_collect(codes.iter().map(|&code| eq(col(), lit(code))))
-        }
-        Keep::Set(codes) if codes.len() <= KEEP_SET_FILTER_MAX => {
-            let list = Scalar::list(
-                Arc::new(DType::Primitive(PType::U32, Nullability::NonNullable)),
-                codes.iter().map(|&code| Scalar::from(code)).collect(),
-                Nullability::NonNullable,
-            );
-            Some(list_contains(lit(list), col()))
-        }
-        Keep::Set(_) => None,
     }
 }
 

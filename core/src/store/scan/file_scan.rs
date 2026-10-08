@@ -428,15 +428,17 @@ pub(crate) async fn matching_file_rows(
     Ok(Mask::from_indices(row_count as usize, matched))
 }
 
-/// One `u32` column of the file at the rows `selection` covers, in file
-/// order — positions align with `selection.apply`, so a mask over the
-/// result refines the selection (`RowSelection::refine`). Tombstones are
-/// not applied (the read paths apply them).
-pub(crate) async fn read_column_codes(
+/// The positions — within the rows `selection` covers, in file order, as
+/// `selection.apply` aligns them — whose `u32` code in `column` passes
+/// `admit`. The column is streamed chunk by chunk through the projected scan,
+/// so one chunk of codes is held at a time. Tombstones are not applied (the
+/// read paths apply them).
+pub(crate) async fn column_positions(
     file: &NativeStoreFile,
     column: &'static str,
     selection: &RowSelection,
-) -> Result<Vec<u32>> {
+    admit: impl Fn(u32) -> bool,
+) -> Result<Vec<usize>> {
     use vortex_array::VortexSessionExecute as _;
     use vortex_array::arrays::{PrimitiveArray, StructArray};
     use vortex_array::expr::{root, select};
@@ -448,13 +450,30 @@ pub(crate) async fn read_column_codes(
             .bind(QUAD_SCOPE, &select(&[column][..], root()), &scope)
             .map_err(VortexRdfError::Vortex)?,
     );
-    let rows = read_all_rows(selection.restrict_scan(scan, None)).await?;
+    let mut chunks = Box::pin(
+        selection
+            .restrict_scan(scan, None)
+            .into_array_stream()
+            .map_err(VortexRdfError::Vortex)?,
+    );
     let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
-    let struct_arr = rows
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let prim = crate::store::array::field_as::<PrimitiveArray>(&struct_arr, column, &mut ctx)?;
-    Ok(prim.as_slice::<u32>().to_vec())
+    let mut positions = Vec::new();
+    let mut offset = 0usize;
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(VortexRdfError::Vortex)?;
+        let struct_arr = chunk
+            .execute::<StructArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?;
+        let prim = crate::store::array::field_as::<PrimitiveArray>(&struct_arr, column, &mut ctx)?;
+        let codes = prim.as_slice::<u32>();
+        positions.extend(
+            (0..codes.len())
+                .filter(|&i| admit(codes[i]))
+                .map(|i| offset + i),
+        );
+        offset += codes.len();
+    }
+    Ok(positions)
 }
 
 /// The pushed-down filter for a pattern under `codes`' layout: `AND` of

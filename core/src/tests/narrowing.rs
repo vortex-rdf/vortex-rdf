@@ -427,6 +427,7 @@ async fn test_narrowing_gates_and_tails() {
 #[cfg(feature = "file-io")]
 mod file {
     use super::*;
+    use crate::store::native_file::NativeStoreFile;
 
     /// Both open modes of a file store — loaded whole and mapped — with and
     /// without indexes (the dir guards ride along, shared by both opens).
@@ -517,5 +518,104 @@ mod file {
         assert_eq!(store.size().await.unwrap(), quads.len() - 40);
         assert_keeps_match_brute_force(&store, "file/tombstoned").await;
         assert_windows_match_slicing(&store, "file/tombstoned").await;
+    }
+
+    /// A keep on a file view is applied by the store's own kernel, never as a
+    /// filter expression: however many distinct code sets and ranges are
+    /// kept, the file handle binds no shape beyond the ones a first keep and
+    /// a first row read bind.
+    #[tokio::test]
+    async fn test_file_keeps_bind_no_expressions() {
+        let quads = modular_quads(64, 3, 8);
+        let (_dir, path) =
+            write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let dict = store.dict_reader().unwrap();
+        let p0 = NamedNode::new("http://example.org/p0").unwrap();
+        let view = store
+            .match_pattern(None, Some(&p0), None, None)
+            .await
+            .unwrap();
+        let first = dict.encode("\"object 0\"").await.unwrap().unwrap();
+        // One keep and one row read bind every shape the loop uses: the
+        // keep's filter and column projection, and the row read's projection.
+        let warm = view.keep(QuadColumn::O, &Keep::set([first])).await.unwrap();
+        view_strings(&warm).await;
+        let bound = store.debug_bound_exprs().unwrap();
+        for i in 0..8 {
+            let code = dict
+                .encode(&format!("\"object {i}\""))
+                .await
+                .unwrap()
+                .unwrap();
+            let kept = view.keep(QuadColumn::O, &Keep::set([code])).await.unwrap();
+            assert_eq!(
+                view_strings(&kept).await,
+                expected_strings(&quads, |j| j % 3 == 0 && j % 8 == i),
+                "object {i}"
+            );
+            let ranged = view
+                .keep(QuadColumn::O, &Keep::range(code..code + 1))
+                .await
+                .unwrap();
+            assert_eq!(ranged.size().await.unwrap(), kept.size().await.unwrap());
+        }
+        assert_eq!(store.debug_bound_exprs().unwrap(), bound);
+    }
+
+    /// Past one scan split's worth of rows the column streams in several
+    /// chunks: the positions a keep admits must carry across the chunk
+    /// boundaries, over the whole file, a pending filter, a row window and a
+    /// keep chained on a keep.
+    #[tokio::test]
+    async fn test_keep_on_file_spans_splits() {
+        let (_dir, path) = write_store_file(
+            modular_quads(160_000, 3, 8),
+            LayoutStrategy::Dictionary,
+            vec![],
+        )
+        .await;
+        let opened = NativeStoreFile::try_new(
+            crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            opened.splits().unwrap().len() > 1,
+            "the fixture must span several scan splits"
+        );
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let dict = store.dict_reader().unwrap();
+        let (o_lo, _) = dict.prefix_range("\"object ").await.unwrap();
+        let (s_lo, s_hi) = dict.prefix_range("<http://example.org/s").await.unwrap();
+        let objects = Keep::set([o_lo + 1, o_lo + 5]);
+        let subjects = Keep::range(s_lo..s_lo + (s_hi - s_lo) / 2);
+        let p0 = NamedNode::new("http://example.org/p0").unwrap();
+        let views = [
+            ("whole", store.clone()),
+            (
+                "filtered",
+                store
+                    .match_pattern(None, Some(&p0), None, None)
+                    .await
+                    .unwrap(),
+            ),
+            ("window", store.window(10_000, 140_000).await.unwrap()),
+        ];
+        for (tag, view) in views {
+            let rows = row_set(&view).await;
+            let narrowed = view.keep(QuadColumn::O, &objects).await.unwrap();
+            let expected = brute_keep(&rows, QuadColumn::O, &objects);
+            assert!(!expected.is_empty() && expected.len() < rows.len(), "{tag}");
+            assert_eq!(row_set(&narrowed).await, expected, "{tag}");
+            let chained = narrowed.keep(QuadColumn::S, &subjects).await.unwrap();
+            let chained_expected = brute_keep(&expected, QuadColumn::S, &subjects);
+            assert!(
+                !chained_expected.is_empty() && chained_expected.len() < expected.len(),
+                "{tag} chained"
+            );
+            assert_eq!(row_set(&chained).await, chained_expected, "{tag} chained");
+        }
     }
 }

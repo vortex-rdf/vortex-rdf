@@ -141,6 +141,15 @@ impl VortexRdfStore {
         }
     }
 
+    /// How many (scope, filter shape) trees the file handle has bound;
+    /// `None` off-file.
+    pub(crate) fn debug_bound_exprs(&self) -> Option<usize> {
+        match &self.quads {
+            QuadsSource::InMemory { .. } => None,
+            QuadsSource::File { file, .. } => Some(file.debug_bound_exprs()),
+        }
+    }
+
     /// Whether one named integer child of an in-memory base is a canonical
     /// primitive. `None` when the base has no such child or is not in memory.
     pub(crate) fn debug_base_child_int_canonical(&self, name: &str) -> Option<bool> {
