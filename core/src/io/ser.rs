@@ -160,6 +160,10 @@ where
 /// previous store untouched at an existing one, and a store that has `path`
 /// memory-mapped keeps reading the file it mapped (the old file is replaced,
 /// never rewritten in place).
+///
+/// A path that cannot take a store — a missing directory, no permission to
+/// write there, a directory at `path` — is reported before any input is
+/// read, not after the whole ingest, sort and dictionary have run.
 #[cfg(feature = "file-io")]
 pub async fn quads_stream_to_vortex_file<S>(
     quads: S,
@@ -172,10 +176,16 @@ where
 {
     let start = debug::timer();
 
-    // Ingest, sort and the dictionary run to completion before the temp file
-    // exists, so an input that fails never creates one.
-    let built = SortedStreamBuilder::build_vortex_stream(Box::new(quads), layout, indexes).await?;
-    write_store_atomically(path, |writer| built_stream_to_vortex_writer(built, writer)).await?;
+    // The temp file comes first and the build runs inside the write: the
+    // path is checked (and the temp created) before any input is read, and an
+    // input that fails leaves nothing behind, the empty temp file going with
+    // the rest.
+    write_store_atomically(path, |writer| async move {
+        let built =
+            SortedStreamBuilder::build_vortex_stream(Box::new(quads), layout, indexes).await?;
+        built_stream_to_vortex_writer(built, writer).await
+    })
+    .await?;
 
     log::debug!(
         "[ser::quads_stream_to_vortex_file] Streaming write took {:?}",
@@ -188,6 +198,11 @@ where
 /// beside `path`, which is renamed over `path` only once `write` succeeded.
 /// Every store a path-taking writer produces (`quads_stream_to_vortex_file`,
 /// and compaction's rewrite of its own source file) goes through here.
+///
+/// A path that cannot take a store fails before `write` runs: a directory at
+/// `path` is refused, and the temp file is created first, so a missing
+/// directory or a refused write permission is reported at once — a caller
+/// that reads its input inside `write` has not read it yet.
 ///
 /// The temp file is a sibling so the rename stays on one filesystem, which
 /// is what makes it atomic. The uuid in its name avoids colliding with a
@@ -218,6 +233,17 @@ where
             format!("{what} {path:?}: {e}"),
         ))
     };
+
+    // A directory can never be replaced by a store: say so now, not at the
+    // rename after the build.
+    if let Ok(meta) = tokio::fs::metadata(path).await
+        && meta.is_dir()
+    {
+        return Err(io_error(
+            "replace",
+            std::io::Error::new(std::io::ErrorKind::IsADirectory, "is a directory"),
+        ));
+    }
 
     let tmp_path = path.with_extension(format!("write-{}.tmp", uuid::Uuid::new_v4()));
     // `create_new`: a file already at the temp name is never opened, let alone

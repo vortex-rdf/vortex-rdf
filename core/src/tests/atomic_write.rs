@@ -9,6 +9,8 @@ use super::*;
 use oxrdfio::RdfFormat;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Two valid triples, then a line no N-Triples parser accepts: the stream
 /// fails after quads were already ingested.
@@ -142,22 +144,98 @@ async fn test_successful_write_replaces_the_existing_store() {
     assert_eq!(view_strings(&reopened).await, quad_strings(&replacement));
 }
 
-/// A target the rename cannot replace (a directory) fails the write after
-/// the temp file was already written: the failure is reported, the directory
-/// at `path` is untouched, and the temp file is gone.
+/// An input that records whether anyone read it: an empty stream that flips
+/// the flag the first time it is polled.
+fn recording_stream(
+    polled: Arc<AtomicBool>,
+) -> impl futures::Stream<Item = crate::error::Result<crate::store::RawQuad>> + Unpin + Send + 'static
+{
+    futures::stream::poll_fn(move |_| {
+        polled.store(true, Ordering::SeqCst);
+        std::task::Poll::Ready(None)
+    })
+}
+
+/// A path that cannot take a store is reported before the input is read: a
+/// missing directory fails at once, not after the whole ingest, sort and
+/// dictionary have run.
 #[tokio::test]
-async fn test_failed_rename_removes_the_temp_file() {
+async fn test_a_missing_directory_fails_before_the_input_is_read() {
+    for layout in [LayoutStrategy::Default, LayoutStrategy::Dictionary] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("store.vortex");
+        let polled = Arc::new(AtomicBool::new(false));
+
+        let error = crate::io::quads_stream_to_vortex_file(
+            recording_stream(polled.clone()),
+            &path,
+            layout,
+            vec![],
+        )
+        .await
+        .expect_err("there is nowhere to put the store");
+
+        assert!(
+            matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::NotFound),
+            "{layout:?}: {error}"
+        );
+        assert!(
+            !polled.load(Ordering::SeqCst),
+            "{layout:?}: the input was read before the output path was known to take a store"
+        );
+        assert_eq!(entries(dir.path()), Vec::<PathBuf>::new(), "{layout:?}");
+    }
+}
+
+/// A directory at `path` is refused up front too (it could only fail at the
+/// rename, after the build), and is left exactly as it was.
+#[tokio::test]
+async fn test_a_directory_at_the_path_is_refused_before_the_input_is_read() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store.vortex");
     std::fs::create_dir(&path).unwrap();
     std::fs::write(path.join("keep.txt"), b"keep").unwrap();
+    let polled = Arc::new(AtomicBool::new(false));
 
     let error = crate::io::quads_stream_to_vortex_file(
-        quad_stream(modular_quads(4, 2, 2)),
+        recording_stream(polled.clone()),
         &path,
         LayoutStrategy::Dictionary,
         vec![],
     )
+    .await
+    .expect_err("a directory cannot be replaced by a file");
+
+    assert!(
+        matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::IsADirectory),
+        "{error}"
+    );
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "the input was read although the path is a directory"
+    );
+    assert_eq!(entries(dir.path()), vec![path.clone()]);
+    assert_eq!(entries(&path), vec![path.join("keep.txt")]);
+}
+
+/// A rename that fails after the whole store was written — the path became a
+/// directory meanwhile, which the up-front check could not know — leaves the
+/// directory untouched and removes the temp file.
+#[tokio::test]
+async fn test_a_rename_failing_after_the_write_removes_the_temp_file() {
+    use crate::io::ser::write_store_atomically;
+    use vortex_io::VortexWrite as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.vortex");
+    let appears = path.clone();
+
+    let error = write_store_atomically(&path, |mut writer| async move {
+        writer.write_all(b"a whole store".to_vec()).await?;
+        std::fs::create_dir(&appears).unwrap();
+        std::fs::write(appears.join("keep.txt"), b"keep").unwrap();
+        Ok(())
+    })
     .await
     .expect_err("a directory cannot be replaced by a file");
     assert!(matches!(error, VortexRdfError::Io(_)), "{error}");

@@ -299,6 +299,24 @@ def test_serialize_format_and_detect_failure(fixture_nt_path, tmp_path):
     assert len(VortexRdfStore(out)) == 5
 
 
+def test_serialize_to_a_missing_directory_fails_and_creates_nothing(fixture_nt_path, tmp_path):
+    missing = tmp_path / "missing"
+    with pytest.raises(FileNotFoundError):
+        serialize_rdf(fixture_nt_path, missing / "out.vortex")
+    assert not missing.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_serialize_onto_a_directory_fails_and_leaves_it_alone(fixture_nt_path, tmp_path):
+    out = tmp_path / "out.vortex"
+    out.mkdir()
+    (out / "keep.txt").write_text("keep")
+    with pytest.raises(OSError, match="is a directory"):
+        serialize_rdf(fixture_nt_path, out)
+    assert [p.name for p in tmp_path.iterdir()] == ["out.vortex"]
+    assert [p.name for p in out.iterdir()] == ["keep.txt"]
+
+
 def test_dictionary_file_is_self_contained(fixture_nt_path, tmp_path):
     out = tmp_path / "dict.vortex"
     serialize_rdf(fixture_nt_path, out, layout="dictionary")
