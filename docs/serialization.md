@@ -393,7 +393,7 @@ flowchart TD
 
 Two drivers feed this: [`built_stream_to_vortex_writer`](../core/src/io/ser.rs#L124)
 for a builder's chunk stream (files, compaction; a file is written by
-[`write_store_file`](../core/src/io/ser.rs#L210) beside its path and renamed
+[`write_store_atomically`](../core/src/io/ser.rs#L210) beside its path and renamed
 into place, so a failed write leaves no partial file and the previous store
 untouched, and a store that has the old file mapped keeps reading it), and
 [`serialize_parts`](../core/src/io/ser.rs#L43) for a store's split parts

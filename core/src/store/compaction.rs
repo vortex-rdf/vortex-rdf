@@ -85,13 +85,13 @@ impl VortexRdfStore {
     /// after compaction.
     ///
     /// The rows are written to a temporary sibling file and then atomically
-    /// renamed over `path` ([`write_store_file`], which also writes every
+    /// renamed over `path` ([`write_store_atomically`], which also writes every
     /// other store file). Overwriting the file in place would be unsafe
     /// while a reader still maps the original, and a crash mid-write must
     /// never leave the only on-disk copy half-written; the rename makes the
     /// swap atomic and leaves `path` untouched on any earlier failure.
     ///
-    /// [`write_store_file`]: crate::io::ser::write_store_file
+    /// [`write_store_atomically`]: crate::io::ser::write_store_atomically
     #[cfg(feature = "file-io")]
     async fn stream_compacted_to_file(
         raws: Vec<RawQuad>,
@@ -103,7 +103,7 @@ impl VortexRdfStore {
         // The sorted builder spills merge runs to disk, and compaction rewrites
         // the whole store, so those runs can reach dataset size. Point them at
         // the store file's own directory — the one volume known to fit the
-        // data, the same placement as the sibling temp file `write_store_file`
+        // data, the same placement as the sibling temp file `write_store_atomically`
         // creates. The `VORTEX_RDF_SPILL_DIR` override still outranks this
         // default.
         let built = crate::store::builders::sorted_stream::build_chunk_stream(
@@ -114,7 +114,7 @@ impl VortexRdfStore {
             path.parent(),
         )
         .await?;
-        crate::io::ser::write_store_file(path, |writer| {
+        crate::io::ser::write_store_atomically(path, |writer| {
             crate::io::ser::built_stream_to_vortex_writer(built, writer)
         })
         .await?;

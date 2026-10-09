@@ -173,7 +173,7 @@ async fn test_failed_rename_removes_the_temp_file() {
 /// was: absent, or the previous store's exact bytes.
 #[tokio::test]
 async fn test_write_failing_after_the_temp_file_exists_removes_it() {
-    use crate::io::ser::write_store_file;
+    use crate::io::ser::write_store_atomically;
     use vortex_io::VortexWrite as _;
 
     for existing in [false, true] {
@@ -186,7 +186,7 @@ async fn test_write_failing_after_the_temp_file_exists_removes_it() {
         let watched = dir.path().to_path_buf();
         let expected_before = before.clone();
 
-        let error = write_store_file(&path, |mut writer| async move {
+        let error = write_store_atomically(&path, |mut writer| async move {
             writer.write_all(b"half a store".to_vec()).await?;
             // The temp file is a sibling of `path`, and it is there now.
             let during = entries(&watched);
@@ -213,14 +213,14 @@ async fn test_write_failing_after_the_temp_file_exists_removes_it() {
 /// removes the temp file too, and `path` is untouched.
 #[tokio::test]
 async fn test_dropping_the_write_removes_the_temp_file() {
-    use crate::io::ser::write_store_file;
+    use crate::io::ser::write_store_atomically;
     use vortex_io::VortexWrite as _;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store.vortex");
     std::fs::write(&path, b"the previous store").unwrap();
 
-    let stalled = write_store_file(&path, |mut writer| async move {
+    let stalled = write_store_atomically(&path, |mut writer| async move {
         writer.write_all(b"half a store".to_vec()).await?;
         std::future::pending::<()>().await;
         Ok(())
@@ -237,14 +237,14 @@ async fn test_dropping_the_write_removes_the_temp_file() {
 /// be mistaken for a store, and a successful write leaves only `path`.
 #[tokio::test]
 async fn test_temp_file_is_a_sibling_and_gone_after_success() {
-    use crate::io::ser::write_store_file;
+    use crate::io::ser::write_store_atomically;
     use vortex_io::VortexWrite as _;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store.vortex");
     let watched = dir.path().to_path_buf();
 
-    write_store_file(&path, |mut writer| async move {
+    write_store_atomically(&path, |mut writer| async move {
         writer.write_all(b"a store".to_vec()).await?;
         writer.shutdown().await?;
         let during = entries(&watched);

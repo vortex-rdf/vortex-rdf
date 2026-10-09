@@ -9,7 +9,7 @@
 //! trust. Also owns the `quads_stream_to_*` entry points, which run a
 //! builder's chunk stream straight into that writer, and the one way a store
 //! reaches a path on disk: written beside it and renamed into place
-//! ([`write_store_file`](crate::io::ser::write_store_file)).
+//! ([`write_store_atomically`](crate::io::ser::write_store_atomically)).
 //!
 //! Reading these bytes back is [`read`](crate::io::read)'s job,
 //! and the container's own on-disk grammar is
@@ -175,7 +175,7 @@ where
     // Ingest, sort and the dictionary run to completion before the temp file
     // exists, so an input that fails never creates one.
     let built = SortedStreamBuilder::build_vortex_stream(Box::new(quads), layout, indexes).await?;
-    write_store_file(path, |writer| built_stream_to_vortex_writer(built, writer)).await?;
+    write_store_atomically(path, |writer| built_stream_to_vortex_writer(built, writer)).await?;
 
     log::debug!(
         "[ser::quads_stream_to_vortex_file] Streaming write took {:?}",
@@ -207,7 +207,7 @@ where
 /// error from `write`, a failed rename, a panic, or this future being
 /// dropped.
 #[cfg(feature = "file-io")]
-pub(crate) async fn write_store_file<F, Fut>(path: &std::path::Path, write: F) -> Result<()>
+pub(crate) async fn write_store_atomically<F, Fut>(path: &std::path::Path, write: F) -> Result<()>
 where
     F: FnOnce(tokio::fs::File) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
@@ -220,7 +220,12 @@ where
     };
 
     let tmp_path = path.with_extension(format!("write-{}.tmp", uuid::Uuid::new_v4()));
-    let file = tokio::fs::File::create(&tmp_path)
+    // `create_new`: a file already at the temp name is never opened, let alone
+    // truncated and then deleted by the guard below.
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
         .await
         .map_err(|e| io_error("create a temporary file beside", e))?;
     let tmp = TempFile(Some(tmp_path));
@@ -235,7 +240,7 @@ where
 }
 
 /// A temp file that deletes itself when dropped, unless it was
-/// [persisted](Self::persist) — so each error path of [`write_store_file`]
+/// [persisted](Self::persist) — so each error path of [`write_store_atomically`]
 /// (and a dropped future) cleans up without a line of its own.
 #[cfg(feature = "file-io")]
 struct TempFile(Option<std::path::PathBuf>);

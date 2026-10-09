@@ -202,7 +202,7 @@ flowchart TD
     L --> S["sort_unstable, dedup — (s, p, o, g)"]
     S --> O{"owner of a file?"}
     O -- "yes" --> F1["build_chunk_stream over the sorted rows,<br/>spilling beside the store file"]
-    F1 --> F2["write &lt;store&gt;.write-&lt;uuid&gt;.tmp<br/>(write_store_file → built_stream_to_vortex_writer)"]
+    F1 --> F2["write &lt;store&gt;.write-&lt;uuid&gt;.tmp<br/>(write_store_atomically → built_stream_to_vortex_writer)"]
     F2 --> F3["rename the temp file over the original"]
     F3 --> F4["reopen with the same dictionary-residency budget"]
     O -- "no" --> M1["build_parts_from_raws: rows, components,<br/>fresh dictionary under Dictionary"]
@@ -214,7 +214,7 @@ flowchart TD
   sorted rows are streamed through the out-of-core builder
   ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L150))
   into a sibling temp file `<store>.write-<uuid>.tmp`
-  ([`write_store_file`](../core/src/io/ser.rs#L210), the one writer every
+  ([`write_store_atomically`](../core/src/io/ser.rs#L210), the one writer every
   path-taking build shares, around
   [`built_stream_to_vortex_writer`](../core/src/io/ser.rs#L124)), which is
   then renamed over the original path; the store is reopened with the
