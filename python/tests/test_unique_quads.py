@@ -103,5 +103,5 @@ def test_dictionary_holds_one_code_per_rdf_term(tmp_path, probe_nt, indexes):
     # The columns carry those same codes: three rows, each term code in use.
     columns = store.match_codes()
     assert columns is not None
-    rows = list(zip(*(memoryview(column).cast("I").tolist() for column in columns)))
+    rows = list(zip(*(memoryview(column).cast("Q").tolist() for column in columns)))
     assert len(rows) == len(set(rows)) == 3

@@ -27,8 +27,8 @@
 //! columns.
 //!
 //! The copies come in two encodings — term strings (Default and TypedObject
-//! layouts, the object as its full N-Triples term string), or u32 dictionary
-//! codes under the Dictionary layout — and, like the reference index, are
+//! layouts, the object as its full N-Triples term string), or dictionary
+//! codes ([`TermCode`]) under the Dictionary layout — and, like the reference index, are
 //! always sorted over the complete dataset: [`GlobalCopyArrays`] for the
 //! in-memory builders, merged `(sort key, row id)` spill runs for the
 //! out-of-core one, lead column stamped either way. The in-memory resolver
@@ -53,7 +53,7 @@ use crate::store::RawQuad;
 use crate::store::array::{make_string_array, stamp_is_sorted};
 use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout, TermRef};
-use crate::store::schema::{COL_G, COL_O, COL_P, COL_S};
+use crate::store::schema::{COL_G, COL_O, COL_P, COL_S, TermCode};
 
 #[cfg(feature = "file-io")]
 use super::FileServePlan;
@@ -158,7 +158,7 @@ impl CopyFamily {
     /// Row `i`'s sort key as a code tuple — order-equivalent to
     /// [`Self::cmp_quads`] because sorted-dictionary codes are lexicographic
     /// ranks.
-    fn code_key(self, codes: &QuadCodes, i: usize) -> [u32; 4] {
+    fn code_key(self, codes: &QuadCodes, i: usize) -> [TermCode; 4] {
         match self {
             CopyFamily::Posg => [codes.p[i], codes.o[i], codes.s[i], codes.g[i]],
             CopyFamily::Ospg => [codes.o[i], codes.s[i], codes.p[i], codes.g[i]],
@@ -508,13 +508,14 @@ pub(crate) mod out_of_core {
     use super::{CHILD_COLUMNS, CopyFamily, TermColumn};
     use crate::error::Result;
     use crate::store::array::stamp_is_sorted;
+    use crate::store::schema::CODE_PTYPE;
 
-    /// The persisted child's struct dtype: quad components as strings (or u32
+    /// The persisted child's struct dtype: quad components as strings (or
     /// codes under the Dictionary layout) plus the u32 primary row id.
     pub(crate) fn copy_child_dtype(encoded: bool) -> DType {
         use vortex_array::dtype::{Nullability, PType};
         let term = if encoded {
-            DType::Primitive(PType::U32, Nullability::NonNullable)
+            DType::Primitive(CODE_PTYPE, Nullability::NonNullable)
         } else {
             DType::Utf8(Nullability::NonNullable)
         };
@@ -532,8 +533,10 @@ pub(crate) mod out_of_core {
 
     /// One chunk of a copy family's persisted child from a window of its merged
     /// `(sort key, row id)` entries — plain child column names, lead stamped.
-    /// `V` is the term encoding: `String`, or `u32` codes under the Dictionary
-    /// layout.
+    /// `V` is the term encoding: `String`, or [`TermCode`]s under the
+    /// Dictionary layout.
+    ///
+    /// [`TermCode`]: crate::store::TermCode
     pub(crate) fn copy_child_chunk<V: TermColumn>(
         family: CopyFamily,
         keys: &[(CopyKey<V>, u32)],
@@ -564,8 +567,8 @@ pub(crate) mod out_of_core {
 
     /// A quad's terms rearranged into one family's sort-key order, so deriving
     /// `Ord` (and the spill machinery's pair sort) compares by exactly that
-    /// family's comparator. `V` is the term encoding: `String`, or `u32` codes
-    /// under the Dictionary layout.
+    /// family's comparator. `V` is the term encoding: `String`, or
+    /// [`TermCode`](crate::store::TermCode)s under the Dictionary layout.
     ///
     /// Built via [`Self::posg`] / [`Self::ospg`] from an `[s, p, o, g]` tuple;
     /// [`CopyFamily::key_positions`](super::CopyFamily::key_positions) maps the components back out when the sorted
@@ -604,8 +607,8 @@ pub(crate) mod out_of_core {
     }
 }
 
-/// A copy column's term encoding — `String` terms, or `u32` codes under the
-/// Dictionary layout — and the array a column of them assembles into.
+/// A copy column's term encoding — `String` terms, or [`TermCode`]s under
+/// the Dictionary layout — and the array a column of them assembles into.
 pub(crate) trait TermColumn: Clone + Ord {
     fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef
     where
@@ -618,7 +621,7 @@ impl TermColumn for String {
     }
 }
 
-impl TermColumn for u32 {
+impl TermColumn for TermCode {
     fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef {
         PrimitiveArray::from_iter(it.copied()).into_array()
     }
@@ -681,7 +684,7 @@ impl GlobalCopyArrays {
         )
     }
 
-    /// Dictionary-layout variant: sort the u32 codes.
+    /// Dictionary-layout variant: sort the codes.
     pub(crate) fn from_codes(codes: &QuadCodes) -> Self {
         Self::build(
             |family| code_perm(codes, family),

@@ -3,19 +3,19 @@
 //! and over served, scanned and chained views.
 
 use super::*;
-use crate::store::{Keep, QuadColumn};
+use crate::store::{Keep, QuadColumn, TermCode};
 
 /// The row tuples of a view's gathered codes, sorted — order-free, since a
 /// served view gathers in its index's order and a narrowed one in base
 /// order.
-async fn row_set(view: &VortexRdfStore) -> Vec<[u32; 4]> {
+async fn row_set(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
     let mut rows = row_list(view).await;
     rows.sort_unstable();
     rows
 }
 
 /// The row tuples of a view's gathered codes, in the order gathered.
-async fn row_list(view: &VortexRdfStore) -> Vec<[u32; 4]> {
+async fn row_list(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
     let cols = view
         .code_columns_gathered()
         .await
@@ -28,12 +28,12 @@ async fn row_list(view: &VortexRdfStore) -> Vec<[u32; 4]> {
 
 /// The view's rows in base row order: a keep that admits every code drops
 /// the serve plan without dropping a row.
-async fn base_ordered(view: &VortexRdfStore) -> Vec<[u32; 4]> {
-    let all = Keep::range(0..u32::MAX);
+async fn base_ordered(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
+    let all = Keep::range(0..TermCode::MAX);
     row_list(&view.keep(QuadColumn::S, &all).await.unwrap()).await
 }
 
-fn brute_keep(rows: &[[u32; 4]], column: QuadColumn, keep: &Keep) -> Vec<[u32; 4]> {
+fn brute_keep(rows: &[[TermCode; 4]], column: QuadColumn, keep: &Keep) -> Vec<[TermCode; 4]> {
     rows.iter()
         .copied()
         .filter(|row| keep.admits(row[column.index()]))
@@ -68,7 +68,7 @@ async fn keeps_for(store: &VortexRdfStore, column: QuadColumn) -> Vec<Keep> {
         QuadColumn::G => dict.prefix_range("<http://example.org/g").await.unwrap(),
     };
     let mid = lo + (hi - lo) / 2;
-    let codes: Vec<u32> = (lo..hi).collect();
+    let codes: Vec<TermCode> = (lo..hi).collect();
     vec![
         Keep::range(lo..hi),
         Keep::range(lo..mid),
@@ -77,7 +77,7 @@ async fn keeps_for(store: &VortexRdfStore, column: QuadColumn) -> Vec<Keep> {
         Keep::set(codes.iter().copied().step_by(97)),
         Keep::set([mid]),
         Keep::set([0]),
-        Keep::range(0..u32::MAX),
+        Keep::range(0..TermCode::MAX),
         Keep::set([]),
         Keep::range(hi..hi),
     ]
@@ -157,7 +157,7 @@ async fn assert_keeps_match_brute_force(store: &VortexRdfStore, tag: &str) {
                     .await
                     .unwrap()
                     .unwrap();
-                let want_chained: Vec<[u32; 4]> =
+                let want_chained: Vec<[TermCode; 4]> =
                     want.iter().copied().filter(|r| r[1] == p1_code).collect();
                 assert_eq!(
                     row_set(&chained).await,
@@ -251,7 +251,7 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
             (1, n),
         ] {
             let windowed = view.window(offset, limit).await.unwrap();
-            let want: Vec<[u32; 4]> = rows.iter().copied().skip(offset).take(limit).collect();
+            let want: Vec<[TermCode; 4]> = rows.iter().copied().skip(offset).take(limit).collect();
             assert_eq!(
                 row_list(&windowed).await,
                 want,
@@ -270,7 +270,7 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
             );
             // Windows compose: a window of a window re-bases on the first.
             let inner = windowed.window(1, 2).await.unwrap();
-            let want_inner: Vec<[u32; 4]> = want.iter().copied().skip(1).take(2).collect();
+            let want_inner: Vec<[TermCode; 4]> = want.iter().copied().skip(1).take(2).collect();
             assert_eq!(
                 row_list(&inner).await,
                 want_inner,
@@ -663,9 +663,9 @@ mod file {
         _dir: tempfile::TempDir,
         store: VortexRdfStore,
         /// Every row's codes, in file order.
-        rows: Vec<[u32; 4]>,
+        rows: Vec<[TermCode; 4]>,
         /// The subject namespace's code range.
-        subjects: Range<u32>,
+        subjects: Range<TermCode>,
         /// The first row of every leaf after the first.
         boundaries: Vec<usize>,
     }
@@ -773,7 +773,7 @@ mod file {
                 ("one subject".to_string(), Keep::range(mid..mid + 1)),
                 ("past the first".to_string(), Keep::range(lo - 3..lo + 3)),
                 ("past the last".to_string(), Keep::range(hi - 3..hi + 3)),
-                ("every code".to_string(), Keep::range(0..u32::MAX)),
+                ("every code".to_string(), Keep::range(0..TermCode::MAX)),
                 ("below the subjects".to_string(), Keep::range(0..lo)),
                 ("above the subjects".to_string(), Keep::range(hi..hi + 100)),
                 ("empty".to_string(), Keep::range(hi..hi)),
@@ -832,7 +832,7 @@ mod file {
         }
 
         /// The run of file rows holding exactly the subjects `lo..hi`.
-        fn run(&self, lo: u32, hi: u32) -> Range<u64> {
+        fn run(&self, lo: TermCode, hi: TermCode) -> Range<u64> {
             let start = self.rows.partition_point(|row| row[0] < lo);
             let end = self.rows.partition_point(|row| row[0] < hi);
             start as u64..end.max(start) as u64
@@ -856,8 +856,8 @@ mod file {
             hi - 1,
             hi,
             hi + 1,
-            u32::MAX - 1,
-            u32::MAX,
+            TermCode::MAX - 1,
+            TermCode::MAX,
         ];
         for &b in &fx.boundaries {
             for code in [fx.rows[b - 1][0], fx.rows[b][0]] {
@@ -1009,7 +1009,7 @@ mod file {
         let rows = row_list(&store).await;
         let window = store.window(100, 160).await.unwrap();
         // Subjects are unique, so each code names one of the window's rows.
-        let own: Vec<u32> = rows[100..111].iter().map(|row| row[0]).collect();
+        let own: Vec<TermCode> = rows[100..111].iter().map(|row| row[0]).collect();
         let streams = store.debug_column_streams().unwrap();
 
         let ten = window
@@ -1043,7 +1043,7 @@ mod file {
             .prefix_range("<http://example.org/s")
             .await
             .unwrap();
-        assert!(hi - lo >= quads.len() as u32);
+        assert!(hi - lo >= quads.len() as TermCode);
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
         let pending = store
             .match_pattern(None, Some(&p1), None, None)
@@ -1067,7 +1067,7 @@ mod file {
             .unwrap();
         assert_eq!(kept.size().await.unwrap(), warm);
 
-        for i in 0..32u32 {
+        for i in 0..32u64 {
             let from = lo + 11 * i;
             let ranged = pending
                 .keep(QuadColumn::S, &Keep::range(from..from + 100 + i))
@@ -1108,7 +1108,7 @@ mod file {
             .await
             .unwrap();
         let mid = lo + (hi - lo) / 2;
-        for range in [lo..hi, lo..mid, 0..u32::MAX, mid..mid + 1] {
+        for range in [lo..hi, lo..mid, 0..TermCode::MAX, mid..mid + 1] {
             assert_eq!(
                 store.debug_subject_code_range(range).await.unwrap(),
                 None,

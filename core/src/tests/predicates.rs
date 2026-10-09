@@ -615,11 +615,11 @@ async fn predicate_store() -> VortexRdfStore {
 async fn filter_codes_matches_eval() {
     let store = predicate_store().await;
     let dict = store.code_read_snapshot().unwrap();
-    let terms: Vec<String> = (0..dict.len() as u32)
+    let terms: Vec<String> = (0..dict.len() as TermCode)
         .map(|c| dict.decode(c).unwrap())
         .collect();
-    let all: Vec<u32> = (0..terms.len() as u32).collect();
-    let odd: Vec<u32> = all.iter().copied().filter(|c| c % 2 == 1).collect();
+    let all: Vec<TermCode> = (0..terms.len() as TermCode).collect();
+    let odd: Vec<TermCode> = all.iter().copied().filter(|c| c % 2 == 1).collect();
     let mut cases: Vec<(&str, String, TextOptions)> = [
         ("is_literal", ""),
         ("is_iri", ""),
@@ -755,7 +755,7 @@ fn malformed_spellings_are_never_true() {
 async fn filter_codes_leaves_wide_longs_undecided() {
     let store = predicate_store().await;
     let dict = store.code_read_snapshot().unwrap();
-    let all: Vec<u32> = (0..dict.len() as u32).collect();
+    let all: Vec<TermCode> = (0..dict.len() as TermCode).collect();
     let code = |spelling: String| dict.encode(&spelling).expect(&spelling);
     let wide = [
         code(typed("99999999999999999999", "long")),
@@ -788,8 +788,8 @@ async fn filter_codes_rejects_bad_candidates() {
     let store = predicate_store().await;
     let dict = store.code_read_snapshot().unwrap();
     let predicate = TermPredicate::parse("is_iri", "").unwrap();
-    let len = dict.len() as u32;
-    for codes in [vec![3u32, 1], vec![1, 1], vec![0, len]] {
+    let len = dict.len() as TermCode;
+    for codes in [vec![3u64, 1], vec![1, 1], vec![0, len]] {
         assert!(
             matches!(
                 dict.filter_codes(&predicate, &codes),

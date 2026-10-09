@@ -61,7 +61,7 @@ async fn memory_dictionary_store(quads: Vec<Quad>) -> VortexRdfStore {
 
 /// Every term of the dictionary, in code order.
 async fn all_terms(reader: &DictReader) -> Vec<String> {
-    let codes: Vec<u32> = (0..reader.len() as u32).collect();
+    let codes: Vec<TermCode> = (0..reader.len() as TermCode).collect();
     reader
         .decode_many(&codes)
         .await
@@ -72,8 +72,8 @@ async fn all_terms(reader: &DictReader) -> Vec<String> {
 }
 
 /// `lower_bound` by brute force over the sorted terms.
-fn brute_lower_bound(terms: &[String], probe: &str) -> u32 {
-    terms.partition_point(|t| t.as_bytes() < probe.as_bytes()) as u32
+fn brute_lower_bound(terms: &[String], probe: &str) -> TermCode {
+    terms.partition_point(|t| t.as_bytes() < probe.as_bytes()) as TermCode
 }
 
 /// The spellings every term is probed with: itself, byte-order neighbours
@@ -134,7 +134,7 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
     assert_eq!(reader.len(), oracle.len(), "{tag}: len");
     let terms = all_terms(reader).await;
     assert_eq!(terms.len(), oracle.len(), "{tag}: term count");
-    for (code, term) in (0u32..).zip(&terms) {
+    for (code, term) in (0u64..).zip(&terms) {
         assert_eq!(
             oracle.decode(code).as_deref(),
             Some(term.as_str()),
@@ -158,9 +158,9 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
     }
     // Out-of-range codes decode to `None`, singly and inside a batch of any
     // order with repeats.
-    let len = reader.len() as u32;
+    let len = reader.len() as TermCode;
     assert_eq!(reader.decode(len).await.unwrap(), None, "{tag}");
-    let batch: Vec<u32> = [len, 3, 0, 3, len - 1, len + 7, 1, 1, 0]
+    let batch: Vec<TermCode> = [len, 3, 0, 3, len - 1, len + 7, 1, 1, 0]
         .into_iter()
         .filter(|&c| c == len || c == len + 7 || c < len)
         .collect();
@@ -193,7 +193,7 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
         let lo = want;
         let hi = terms.partition_point(|t| {
             t.as_bytes() < probe.as_bytes() || t.as_bytes().starts_with(probe.as_bytes())
-        }) as u32;
+        }) as TermCode;
         assert_eq!(
             reader.prefix_range(probe).await.unwrap(),
             (lo, hi),
@@ -216,7 +216,7 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
     batch.push("http://example.org/absent".to_owned());
     batch.push("_:absent".to_owned());
     let batch_refs: Vec<&str> = batch.iter().map(String::as_str).collect();
-    let want: Vec<Option<u32>> = batch_refs
+    let want: Vec<Option<TermCode>> = batch_refs
         .iter()
         .map(|t| oracle.encode_tolerant(t).unwrap())
         .collect();
@@ -285,8 +285,8 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
         ("num_ne", "42"),
     ] {
         let predicate = TermPredicate::parse(kind, arg).unwrap();
-        let all: Vec<u32> = (0..oracle.len() as u32).collect();
-        let every_third: Vec<u32> = all.iter().copied().step_by(3).collect();
+        let all: Vec<TermCode> = (0..oracle.len() as TermCode).collect();
+        let every_third: Vec<TermCode> = all.iter().copied().step_by(3).collect();
         for codes in [&all, &every_third] {
             assert_eq!(
                 reader.filter_codes(&predicate, codes).await.unwrap(),
@@ -324,8 +324,8 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
                 ..TextOptions::default()
             };
             let predicate = TermPredicate::parse_with(kind, arg, &options).unwrap();
-            let all: Vec<u32> = (0..oracle.len() as u32).collect();
-            let every_third: Vec<u32> = all.iter().copied().step_by(3).collect();
+            let all: Vec<TermCode> = (0..oracle.len() as TermCode).collect();
+            let every_third: Vec<TermCode> = all.iter().copied().step_by(3).collect();
             for codes in [&all, &every_third] {
                 assert_eq!(
                     reader.filter_codes(&predicate, codes).await.unwrap(),
@@ -339,8 +339,8 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
     // Candidates must be ascending, unique and inside the dictionary, under
     // either residency; none at all is two empty answers.
     let is_iri = TermPredicate::parse("is_iri", "").unwrap();
-    let len = oracle.len() as u32;
-    for codes in [vec![3u32, 1], vec![1, 1], vec![0, len], vec![len + 7]] {
+    let len = oracle.len() as TermCode;
+    for codes in [vec![3u64, 1], vec![1, 1], vec![0, len], vec![len + 7]] {
         assert!(
             matches!(
                 reader.filter_codes(&is_iri, &codes).await,
@@ -440,7 +440,7 @@ async fn test_kind_ranges_partition_codes() {
     assert_eq!(kinds.literals.end, kinds.iris.start);
     assert_eq!(kinds.iris.end, kinds.blanks.start);
     assert_eq!(kinds.blanks.end, kinds.len);
-    for (code, term) in (0u32..).zip(&terms) {
+    for (code, term) in (0u64..).zip(&terms) {
         let expected = match term.as_bytes().first() {
             None => None,
             Some(b'"') => Some(&kinds.literals),
@@ -539,7 +539,7 @@ async fn test_dict_reader_file_backed_matches_resident() {
     // candidates answers the same each time (nothing is memoized).
     assert_eq!(reader.kind_ranges().await.unwrap(), oracle.kind_ranges());
     let literal = TermPredicate::parse("is_literal", "").unwrap();
-    let all: Vec<u32> = (0..oracle.len() as u32).collect();
+    let all: Vec<TermCode> = (0..oracle.len() as TermCode).collect();
     assert_eq!(
         reader.filter_codes(&literal, &all).await.unwrap(),
         oracle.filter_codes(&literal, &all).unwrap()

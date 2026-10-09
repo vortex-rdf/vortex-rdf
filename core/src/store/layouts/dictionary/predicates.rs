@@ -29,6 +29,7 @@ use super::regex_filter::RegexTest;
 use crate::common::terms::{LiteralForm, split_literal};
 use crate::common::vocab::{RDF_LANG_STRING, XSD, XSD_STRING};
 use crate::error::{Result, VortexRdfError};
+use crate::store::schema::TermCode;
 
 /// The code ranges of a sorted dictionary's term kinds. Codes are
 /// lexicographic ranks of the N-Triples spelling, so every kind is one
@@ -39,21 +40,21 @@ use crate::error::{Result, VortexRdfError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KindRanges {
     /// The code of `""`, the default graph's name, when present.
-    pub default_graph: Option<u32>,
+    pub default_graph: Option<TermCode>,
     /// Codes of the literals.
-    pub literals: Range<u32>,
+    pub literals: Range<TermCode>,
     /// Codes of the IRIs.
-    pub iris: Range<u32>,
+    pub iris: Range<TermCode>,
     /// Codes of the blank nodes.
-    pub blanks: Range<u32>,
+    pub blanks: Range<TermCode>,
     /// The dictionary's size: every code is below it.
-    pub len: u32,
+    pub len: TermCode,
 }
 
 impl KindRanges {
     /// The codes in none of the three kind ranges, ascending — a foreign
     /// writer's spellings, and the default graph's `""`.
-    pub fn gaps(&self) -> impl Iterator<Item = u32> + '_ {
+    pub fn gaps(&self) -> impl Iterator<Item = TermCode> + '_ {
         (0..self.literals.start)
             .chain(self.literals.end..self.iris.start)
             .chain(self.iris.end..self.blanks.start)
@@ -63,7 +64,7 @@ impl KindRanges {
 
 impl KindRanges {
     /// The kind of `code`'s spelling, read off the ranges.
-    pub(crate) fn kind_of_code(&self, code: u32) -> CodeKind {
+    pub(crate) fn kind_of_code(&self, code: TermCode) -> CodeKind {
         if self.literals.contains(&code) {
             CodeKind::Literal
         } else if self.iris.contains(&code) {
@@ -1705,7 +1706,8 @@ mod tests {
         ] {
             let predicate = p(kind, arg);
             for (code, spelling) in spellings.iter().enumerate() {
-                if let Some(verdict) = predicate.kind_verdict(kinds.kind_of_code(code as u32)) {
+                if let Some(verdict) = predicate.kind_verdict(kinds.kind_of_code(code as TermCode))
+                {
                     assert_eq!(verdict, predicate.eval(spelling), "{kind} on {spelling}");
                 }
             }
@@ -1858,7 +1860,9 @@ mod tests {
             ] {
                 let predicate = TermPredicate::parse_with(kind, arg, &options).unwrap();
                 for (code, spelling) in spellings.iter().enumerate() {
-                    if let Some(verdict) = predicate.kind_verdict(kinds.kind_of_code(code as u32)) {
+                    if let Some(verdict) =
+                        predicate.kind_verdict(kinds.kind_of_code(code as TermCode))
+                    {
                         assert_eq!(
                             verdict,
                             predicate.eval(spelling),

@@ -5,8 +5,8 @@
 //! (`resolve_in_memory` / `resolve_file`, which produce primary row ids
 //! directly for each backend).
 //!
-//! The value columns come in two encodings — term strings, or u32 dictionary
-//! codes under the Dictionary layout — and are always built over the complete
+//! The value columns come in two encodings — term strings, or dictionary
+//! codes ([`TermCode`]) under the Dictionary layout — and are always built over the complete
 //! dataset in one global sort: [`GlobalReferenceArrays`] for the in-memory
 //! builders, merged `(value, row id)` spill runs for the out-of-core one.
 //! Both hand the columns over as this index's two persisted children
@@ -43,10 +43,11 @@ use crate::store::RawQuad;
 use crate::store::array::{make_string_array, stamp_is_sorted};
 use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, TermRef};
+use crate::store::schema::TermCode;
 
 /// The value column of a reference component's persisted child; the row id
 /// beside it is the name every index child shares ([`COL_RID`]).
-const COL_VAL: &str = "val";
+pub(crate) const COL_VAL: &str = "val";
 const CHILD_COLUMNS: [&str; 2] = [COL_VAL, COL_RID];
 
 /// This index's persisted-child identity table — one `{val, rid}` table per
@@ -347,13 +348,14 @@ pub(crate) mod out_of_core {
     use super::CHILD_COLUMNS;
     use crate::error::Result;
     use crate::store::array::{make_string_array, stamp_is_sorted};
+    use crate::store::schema::{CODE_PTYPE, TermCode};
 
-    /// The persisted child's struct dtype: sorted values (strings, or u32 codes
+    /// The persisted child's struct dtype: sorted values (strings, or codes
     /// under the Dictionary layout) plus the u32 primary row id.
     pub(crate) fn ref_child_dtype(encoded: bool) -> DType {
         use vortex_array::dtype::{Nullability, PType};
         let val = if encoded {
-            DType::Primitive(PType::U32, Nullability::NonNullable)
+            DType::Primitive(CODE_PTYPE, Nullability::NonNullable)
         } else {
             DType::Utf8(Nullability::NonNullable)
         };
@@ -373,7 +375,7 @@ pub(crate) mod out_of_core {
     }
 
     /// Code-column variant of [`ref_child_chunk_strings`].
-    pub(crate) fn ref_child_chunk_codes(pairs: &[(u32, u32)]) -> Result<ArrayRef> {
+    pub(crate) fn ref_child_chunk_codes(pairs: &[(TermCode, u32)]) -> Result<ArrayRef> {
         let val = PrimitiveArray::from_iter(pairs.iter().map(|(code, _)| *code)).into_array();
         stamp_is_sorted(&val);
         let rid = PrimitiveArray::from_iter(pairs.iter().map(|(_, rid)| *rid)).into_array();
@@ -415,10 +417,10 @@ impl GlobalReferenceArrays {
         )
     }
 
-    /// Dictionary-layout variant: sort the u32 codes.
+    /// Dictionary-layout variant: sort the codes.
     pub(crate) fn from_codes(codes: &QuadCodes) -> Self {
-        let sorted = |column: &[u32]| -> (ArrayRef, Vec<u32>) {
-            let mut pairs: Vec<(u32, u32)> = column
+        let sorted = |column: &[TermCode]| -> (ArrayRef, Vec<u32>) {
+            let mut pairs: Vec<(TermCode, u32)> = column
                 .iter()
                 .enumerate()
                 .map(|(i, &code)| (code, i as u32))

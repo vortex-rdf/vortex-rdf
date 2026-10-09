@@ -417,8 +417,8 @@ async fn test_file_backed_subject_chunk_probe_requires_sorted() {
 async fn test_from_file_rejects_foreign_vortex_file() {
     use vortex_file::WriteOptionsSessionExt as _;
 
-    // A bare u32 code schema, written by the raw Vortex writer under a
-    // plain root layout.
+    // A bare code schema, written by the raw Vortex writer under a plain
+    // root layout.
     let array = bare_code_quad_array(&[1, 2, 3]);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bare.vortex");

@@ -155,11 +155,11 @@ flowchart TD
     A2 --> A3["build_struct_array(quads, layout, s_sorted = true)<br/>one struct, s stamped IsSorted"]
     A2 --> A4["build_components<br/>each requested family sorted over the whole dataset"]
 
-    L -- "Dictionary" --> B1["InterningQuadBuilder::push per quad:<br/>intern 4 terms → provisional codes, keep four u32 codes"]
+    L -- "Dictionary" --> B1["InterningQuadBuilder::push per quad:<br/>intern 4 terms → provisional codes, keep four u64 codes"]
     B1 --> B2["finish: sort the distinct terms,<br/>rank_of[provisional] = sorted position"]
     B2 --> B3["freeze the sorted column → TermDictionary<br/>(FSST-compressed in 65,536-term windows)"]
     B2 --> B4["remap every quad's codes to ranks,<br/>sort the 16-byte rows, drop repeats"]
-    B4 --> B5["build_array(codes): four u32 columns,<br/>s stamped IsSorted"]
+    B4 --> B5["build_array(codes): four u64 columns,<br/>s stamped IsSorted"]
     B4 --> B6["build the index components<br/>from the ranked code rows"]
 
     A3 --> R["BuiltArray"]
@@ -177,10 +177,10 @@ index families are sorted over that same vector ([§8](#8-secondary-indexes-at-b
 **Dictionary layout.** Terms are interned as they arrive
 ([`InterningQuadBuilder`](../core/src/store/layouts/dictionary/ingest.rs#L162)):
 each distinct term is held once (a `Box<str>` keyed map), and each quad is kept
-as four provisional `u32` codes. `finish` sorts the distinct terms, freezes them
+as four provisional `u64` codes. `finish` sorts the distinct terms, freezes them
 into the dictionary, replaces every provisional code by its term's sorted rank —
 which *is* the dictionary code — and sorts the coded rows. Because codes are
-lexicographic ranks, sorting `[u32; 4]` rows is the same order as sorting the
+lexicographic ranks, sorting `[u64; 4]` rows is the same order as sorting the
 term strings, so the sort moves 16-byte rows instead of four-string structs;
 equal rows are then adjacent and the repeats are dropped, since equal codes are
 equal terms.
@@ -288,7 +288,7 @@ Every layout puts `s` first and stamps it when the rows are sorted.
 |---|---|---|
 | `Default` | `s`, `p`, `o`, `g` — non-nullable `Utf8` | the N-Triples strings, verbatim |
 | `TypedObject` | `s`, `p`, `o_kind` (`u8`), `o_value` (`Utf8`), `o_datatype` (nullable `Utf8`), `o_lang` (nullable `Utf8`), `g` | as `Default`, with the object decomposed |
-| `Dictionary` | `s`, `p`, `o`, `g` — non-nullable `u32` | codes into one sorted dictionary |
+| `Dictionary` | `s`, `p`, `o`, `g` — non-nullable `u64` | codes into one sorted dictionary |
 
 **TypedObject decomposition** ([`decompose_object`](../core/src/store/layouts/typed_object.rs#L77)):
 
@@ -335,7 +335,7 @@ in a file as an auxiliary child.
 
 Term columns use the layout's encoding — strings under `Default` and
 `TypedObject` (a `TypedObject` object is recomposed to its full N-Triples term
-for the index), `u32` codes under `Dictionary` — and `rid` is always the `u32`
+for the index), `u64` codes under `Dictionary` — and `rid` is always the `u32`
 position of the quad in the sorted primary rows.
 
 **In memory** ([`build_components`](../core/src/store/builders/mod.rs#L234)) each
@@ -449,8 +449,9 @@ A build that is queried in place, without a file, skips the writer:
 store's *compressed-resident* form
 ([`compress_built_parts`](../core/src/store/mod.rs#L162)):
 
-- every non-nullable `u32` child of the base and of each component is
-  re-encoded from the bounds the build already knows —
+- every non-nullable `u64` code child and `u32` row-id child of the base
+  and of each component is re-encoded from the bounds the build already
+  knows —
   `Constant` for a single-valued column, `RunEnd` for a sorted column with few
   runs, bit-packed at the observed width otherwise
   ([`with_compressed_int_children`](../core/src/store/array.rs#L298)); the

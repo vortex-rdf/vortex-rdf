@@ -237,7 +237,7 @@ async fn test_a_foreign_root_keeps_the_generic_error() {
 /// layout, the term's N-Triples string under the others.
 #[derive(Debug, PartialEq, PartialOrd)]
 enum Val {
-    Code(u32),
+    Code(TermCode),
     Term(String),
 }
 
@@ -255,7 +255,7 @@ fn reference_child(component: &crate::store::indexes::IndexComponent) -> Vec<(Va
             .collect()
     } else {
         let col: PrimitiveArray = field_as(rows, "val", &mut ctx).unwrap();
-        col.as_slice::<u32>()
+        col.as_slice::<TermCode>()
             .iter()
             .map(|&c| Val::Code(c))
             .collect()

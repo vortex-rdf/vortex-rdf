@@ -137,8 +137,8 @@ carried inside the Layout flatbuffer, so it is read with the footer:
     { "name": "index:posg", "role": "index",
       "implementation": "secondary-by-copy/posg", "version": 1,
       "required": false, "sorted": true,
-      "fields": [ { "name": "s", "kind": "u32" }, { "name": "p", "kind": "u32" },
-                  { "name": "o", "kind": "u32" }, { "name": "g", "kind": "u32" },
+      "fields": [ { "name": "s", "kind": "u64" }, { "name": "p", "kind": "u64" },
+                  { "name": "o", "kind": "u64" }, { "name": "g", "kind": "u64" },
                   { "name": "rid", "kind": "u32" } ] },
     { "name": "dictionary", "role": "dictionary",
       "implementation": "sorted-terms-fsst-v1", "version": 2,
@@ -173,14 +173,17 @@ descriptor into the dictionary, a known index, or a skip.
 
 Child 0 is a struct of primary columns whose shape is decided by the layout
 the store was built with ([serialization.md §7](serialization.md#7-columns-per-layout)).
-A reader detects the layout from the dtype alone: a `u32` subject column means
-`Dictionary`, an `o_kind` field means `TypedObject`, otherwise `Default`.
+A reader detects the layout from the dtype alone: a `u64` subject column means
+`Dictionary`, an `o_kind` field means `TypedObject`, otherwise `Default`. A
+code column of any other integer width — the `u32` codes a pre-release of 0.12
+wrote — is refused at open, in the quad table and in the index children alike:
+rebuild such a store from its RDF source.
 
 | Layout | Columns | Each term is… |
 |---|---|---|
 | `Default` | `s`, `p`, `o`, `g` — non-nullable `Utf8` | its N-Triples spelling: `<iri>`, `_:id`, `"lit"`, `"lit"@lang`, `"lit"^^<dt>`; `g` is `""` for the default graph |
 | `TypedObject` | `s`, `p`, `o_kind` (`u8`), `o_value` (`Utf8`), `o_datatype` (nullable `Utf8`), `o_lang` (nullable `Utf8`), `g` | as `Default`, with the object split: kind 0 IRI, 1 blank node, 2 plain literal, 3 language-tagged, 4 typed |
-| `Dictionary` | `s`, `p`, `o`, `g` — non-nullable `u32` | a code: the term's position in the sorted `dictionary` child |
+| `Dictionary` | `s`, `p`, `o`, `g` — non-nullable `u64` | a code: the term's position in the sorted `dictionary` child. 64 bits, so a dictionary may hold more than 2^32 terms; the writer still bit-packs each column to the width its codes need |
 
 **Row order.** Every writer of this crate emits the rows in `(s, p, o, g)`
 order — string order under the string layouts, code order under `Dictionary`,
@@ -216,7 +219,7 @@ What the store reads from this structure:
 - the **zone-map tables** for pruning: a pushed-down filter is evaluated
   against every block's statistics first, and the surviving blocks' envelope
   bounds the scan ([matching.md §7.2](matching.md#72-zone-map-pruning));
-- the **chunk leaves** of the `u32` code columns as *chunk probes*
+- the **chunk leaves** of the `u64` code columns as *chunk probes*
   ([`ColumnChunks`](../encoded-search/src/layout.rs)): a leaf's segment is
   fetched and its array rebuilt in the wire encoding — not decompressed — and
   then binary-searched or point-read in place. A column the writer
@@ -303,7 +306,7 @@ Shared rules:
 
 - **Term encoding follows the layout**: `Utf8` strings under `Default` and
   `TypedObject` (a `TypedObject` object appears as its full N-Triples term),
-  `u32` codes under `Dictionary`. `rid` is always a non-nullable `u32`.
+  `u64` codes under `Dictionary`. `rid` is always a non-nullable `u32`.
 - **`rid` is the quad's row id in the quad table.** That is what lets a match
   resolved through an index compose with row selections, tombstones and
   further matches without renumbering anything ([matching.md §1](matching.md#1-what-a-match-produces)).
@@ -429,7 +432,7 @@ read paths are written against ([`QuadsSource`](../core/src/store/source.rs#L35)
 
 | In the file | In memory |
 |---|---|
-| `quad-source` child | `base: ArrayRef` — one struct, columns in the *compressed-resident* form: each `u32` column `Constant`, `RunEnd` or bit-packed, behind a `vortex.shared` wrapper whose cache holds the decoded primitive once a bulk read needs it |
+| `quad-source` child | `base: ArrayRef` — one struct, columns in the *compressed-resident* form: each `u64` code column `Constant`, `RunEnd` or bit-packed, behind a `vortex.shared` wrapper whose cache holds the decoded primitive once a bulk read needs it |
 | `quads_sorted` | the `IsSorted` stamp on the `s` column |
 | `index:*` children | `components: Arc<[IndexComponent]>` — the same rows under the same column names, with the descriptor's `sorted` flag; adopted from bytes they stay deferred until first use |
 | `dictionary` child | `ResolvedLayout::Dictionary(DictAccess::Resident \| FileBacked)` |
@@ -462,7 +465,9 @@ checks:
    descriptor's dtype, in inventory order.
 2. The inventory is JSON with `version: 1`; component names are unique and
    never `quad-source`; field kinds are `u32`, `u64` or `utf8`, all
-   non-nullable.
+   non-nullable. Under `Dictionary` every code column — `s`, `p`, `o`, `g`
+   of the quad table and of the copy children, `val` of the reference
+   children — is `u64`.
 3. Terms are spelled in N-Triples form; the default graph is the empty string
    — in the quad columns, the dictionary and the index children alike.
 4. `quads_sorted: true` only when the rows are in global `(s, p, o, g)` order

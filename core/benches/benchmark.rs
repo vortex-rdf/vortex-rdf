@@ -11,7 +11,7 @@
 //!   write-path cross-products measure the same code, so we fix a baseline and
 //!   vary one axis at a time, adding back only the interactions that genuinely
 //!   change behaviour (e.g. Dictionary × index, where the index columns hold
-//!   u32 codes rather than term strings).
+//!   term codes rather than term strings).
 //! * **Match (Group 2)** is a full 18-cell layout × index × source factorial
 //!   (× 8 routing patterns × 2 cache regimes), plus a chained-view pair. Some
 //!   cells are redundant on paper — a bound subject
@@ -646,7 +646,10 @@ fn narrow_filter_codes(bencher: divan::Bencher, residency: &DictResidency) {
     let predicate = TermPredicate::parse_with("str_prefix", "http://", &options).unwrap();
     let dict = store.dict_reader().expect("dictionary handle");
     let step = (dict.len() / 4_096).max(1);
-    let codes: Vec<u32> = (0..dict.len() as u32).step_by(step).take(4_096).collect();
+    let codes: Vec<vortex_rdf_core::TermCode> = (0..dict.len() as vortex_rdf_core::TermCode)
+        .step_by(step)
+        .take(4_096)
+        .collect();
     bencher.bench(|| {
         rt().block_on(async {
             let (passed, undecided) = dict.filter_codes(&predicate, &codes).await.expect("filter");

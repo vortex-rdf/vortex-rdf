@@ -322,9 +322,9 @@ async fn test_file_backed_dictionary_probe_parity() {
 
     // Every ~397th term plus both extremes, probed twice (nothing is cached:
     // both read the window).
-    let sample: Vec<u32> = (0..len as u32)
+    let sample: Vec<TermCode> = (0..len as TermCode)
         .step_by(397)
-        .chain([0, len as u32 - 1])
+        .chain([0, len as TermCode - 1])
         .collect();
     for &code in &sample {
         let term = dict.decode(code).unwrap();
@@ -341,7 +341,7 @@ async fn test_file_backed_dictionary_probe_parity() {
 
     // code → term parity in one window and across many.
     for k in [64usize, 300] {
-        let codes: Vec<u32> = (0..len as u32)
+        let codes: Vec<TermCode> = (0..len as TermCode)
             .step_by((len as usize / k).max(1))
             .take(k)
             .collect();
@@ -358,7 +358,7 @@ async fn test_file_backed_dictionary_probe_parity() {
     // A code past the last term is rejected, an empty batch resolves to
     // nothing.
     assert!(matches!(
-        fb.decode_many(&[len as u32]).await,
+        fb.decode_many(&[len as TermCode]).await,
         Err(VortexRdfError::Deserialization(_))
     ));
     assert!(fb.decode_many(&[]).await.unwrap().is_empty());
@@ -633,7 +633,7 @@ async fn test_large_dictionary_child_lift_keeps_fsst() {
     // written (verbatim, through the pass-through strategy) as several flat
     // leaves and splits back into several chunks.
     let mut builder = TermDictionaryBuilder::new();
-    for i in 0..50_000u32 {
+    for i in 0..50_000u64 {
         builder.insert_quad(&RawQuad {
             s: format!("<http://example.org/subject/{i:07}>"),
             p: format!("<http://example.org/predicate/{i:07}>"),
@@ -677,7 +677,7 @@ async fn test_large_dictionary_child_lift_keeps_fsst() {
     }
 
     // Probe parity across chunk boundaries, both directions.
-    for code in (0..len as u32).step_by(7919) {
+    for code in (0..len as TermCode).step_by(7919) {
         let term = dict.decode(code).unwrap();
         assert_eq!(lifted.encode(&term), Some(code), "{term}");
         assert_eq!(lifted.decode(code).as_deref(), Some(term.as_str()));
@@ -722,7 +722,7 @@ async fn test_unzoned_dictionary_child_opens_mapped() {
     let oracle = loaded.code_read_snapshot().unwrap();
     assert_eq!(reader.len(), oracle.len());
     assert!(!oracle.is_empty());
-    for code in 0..oracle.len() as u32 {
+    for code in 0..oracle.len() as TermCode {
         let term = oracle.decode(code).unwrap();
         assert_eq!(reader.encode(&term).await.unwrap(), Some(code), "{term}");
         assert_eq!(
@@ -783,7 +783,7 @@ async fn test_child_without_zone_maps_reads_bounds_from_leaves() {
     for i in (0..20_000).step_by(997).chain([0, 19_999]) {
         assert_eq!(
             fb.encode(&terms[i]).await.unwrap(),
-            Some(i as u32),
+            Some(i as TermCode),
             "{}",
             terms[i]
         );

@@ -52,7 +52,7 @@ pub(crate) fn parse_err(e: CoreError) -> PyErr {
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<store::VortexRdfStore>()?;
     m.add_class::<codes::TermDict>()?;
-    m.add_class::<codes::U32Column>()?;
+    m.add_class::<codes::U64Column>()?;
     m.add_function(wrap_pyfunction!(serialize::serialize_rdf, m)?)?;
     m.add("VortexRdfError", m.py().get_type::<VortexRdfError>())?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;

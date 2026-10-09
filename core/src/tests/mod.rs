@@ -40,6 +40,7 @@ mod roundtrip;
 mod serialization;
 mod streaming;
 mod unique_quads;
+mod wide_codes;
 
 fn make_quad(s: &str, p: &str, o_lit: &str, g: GraphName) -> Quad {
     Quad::new(
@@ -444,7 +445,7 @@ pub(crate) fn dict_term_column(
 /// A `{s, p, o, g}` struct of four identical non-nullable u32 columns
 /// holding `codes` — the Dictionary layout's row shape without a
 /// dictionary to give the codes meaning.
-fn bare_code_quad_array(codes: &[u32]) -> vortex_array::ArrayRef {
+fn bare_code_quad_array(codes: &[TermCode]) -> vortex_array::ArrayRef {
     use vortex_array::IntoArray as _;
     let col = || vortex_buffer::Buffer::from_iter(codes.iter().copied()).into_array();
     vortex_array::arrays::StructArray::try_new(

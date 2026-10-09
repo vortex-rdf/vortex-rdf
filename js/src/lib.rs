@@ -6,6 +6,7 @@
 
 use wasm_bindgen::prelude::*;
 
+mod codes;
 mod error;
 mod ingest;
 mod options;

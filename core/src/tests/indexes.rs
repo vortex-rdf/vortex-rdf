@@ -180,7 +180,7 @@ async fn test_compact_with_indexes_rebuilds() {
 }
 
 /// The index rebuild reads its value columns from the materialized array in
-/// each layout's own representation: `o`/`p` strings (Default), u32 codes
+/// each layout's own representation: `o`/`p` strings (Default), codes
 /// (Dictionary), and the object term recomposed from typed sub-columns
 /// (TypedObject). Exercise all three end-to-end.
 async fn run_compact_with_indexes_layout(layout: LayoutStrategy) {

@@ -32,6 +32,7 @@ use crate::store::indexes::secondary_by_copy::{self, out_of_core::CopyKey};
 use crate::store::indexes::{IndexComponent, IndexType, Indexes, known_component, unique_indexes};
 use crate::store::layouts::dictionary::{TermCodeMap, TermDictionary, TermDictionaryBuilder};
 use crate::store::layouts::{LayoutStrategy, dictionary};
+use crate::store::schema::TermCode;
 
 use crate::debug;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
@@ -321,7 +322,7 @@ type CopyMergers<V> = (RunMerger<(CopyKey<V>, u32)>, RunMerger<(CopyKey<V>, u32)
 
 /// The external-sort mergers for one build's secondary indexes, present only
 /// for the index types the build requested. `V` is the term encoding: strings,
-/// or u32 dictionary codes.
+/// or dictionary codes ([`TermCode`]).
 struct IndexMergers<V> {
     ref_pairs: Option<RefMergers<V>>,
     copy_keys: Option<CopyMergers<V>>,
@@ -465,7 +466,7 @@ type RefChunkFn<V> = fn(&[(V, u32)]) -> Result<ArrayRef>;
 /// streams its child's chunks straight off its merger — no lockstep zip with
 /// the quad stream, no materialization. The temp-run guard is shared with the
 /// quad stream so the run files outlive every reader. `encoded` says whether
-/// the entries hold u32 dictionary codes (else term strings), which picks the
+/// the entries hold dictionary codes (else term strings), which picks the
 /// child dtypes; `ref_chunk` builds a reference child chunk for that encoding.
 fn merger_components<V>(
     mergers: IndexMergers<V>,
@@ -612,10 +613,10 @@ fn emit_merged_run_chunks(
 }
 
 /// Dictionary-layout variant of [`emit_merged_run_chunks`]: the entries hold
-/// u32 codes; the dictionary rides beside the stream for the serializer.
+/// codes; the dictionary rides beside the stream for the serializer.
 fn emit_merged_run_dict_chunks(
     merged: Run<RawQuad>,
-    mergers: IndexMergers<u32>,
+    mergers: IndexMergers<TermCode>,
     dict: Arc<TermDictionary>,
     code_map: Arc<TermCodeMap>,
     chunk_size: usize,
@@ -645,7 +646,7 @@ fn emit_merged_run_dict_chunks(
 }
 
 /// Dictionary-layout emission over the K-way merge (no secondary indexes):
-/// chunks of u32 codes encoded against the completed global dictionary,
+/// chunks of codes encoded against the completed global dictionary,
 /// which rides beside the stream for the serializer to place.
 fn emit_dict_chunks(
     merger: RunMerger<RawQuad>,

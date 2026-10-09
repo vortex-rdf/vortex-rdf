@@ -39,18 +39,18 @@ store.match_columns(p="<http://xmlns.com/foaf/0.1/name>")    # (subjects, predic
 
 ## Term codes (low-level)
 
-For Dictionary-layout stores, `match_codes` returns the matched rows as four **zero-copy** `u32` term-code columns — `memoryview(col).cast("I")` views the Rust memory directly — decodable through a `term_dict()` handle:
+For Dictionary-layout stores, `match_codes` returns the matched rows as four **zero-copy** `u64` term-code columns (`U64Column`) — `memoryview(col).cast("Q")` views the Rust memory directly — decodable through a `term_dict()` handle. Codes are 64-bit, so a dictionary may hold more than 2^32 terms; a code is a Python int from 0 to 2**64 - 1, and anything else is refused (`OverflowError` or `ValueError`), never narrowed:
 
 ```python
 cols = store.match_codes(p="<http://xmlns.com/foaf/0.1/name>")  # (s, p, o, g) or None
 dictionary = store.term_dict()                                    # TermDict or None
-subjects = memoryview(cols[0]).cast("I")
+subjects = memoryview(cols[0]).cast("Q")
 dictionary.decode(subjects[0])                       # N-Triples string for that code
 dictionary.decode_many(cols[0])                      # bulk-decode a whole column
 dictionary.encode("<http://xmlns.com/foaf/0.1/name>")  # code for a term, or None
 ```
 
-`decode_many` decodes a batch in one GIL-released call. Buffer-protocol inputs — a column straight from `match_codes`, an `array("I", ...)`, a `uint32` NumPy array — are read in a single bulk copy with no per-element int conversion; any sequence of ints works too. `encode` is the inverse of `decode` and tolerant of spelling: an IRI with or without angle brackets, a literal with an explicit `xsd:string` type or an upper-case language tag, and the default graph as `""`, `default` or `[]` all resolve to the stored form's code (a malformed term raises `ValueError`); `encode_many` does a batch. Both `term_dict()` and `match_codes` return `None` when the code path does not apply (a non-Dictionary layout, or an append tail). A dictionary left in the file by the residency budget is served by reading it on demand — `TermDict.file_backed` says so — with the same calls.
+`decode_many` decodes a batch in one GIL-released call. Buffer-protocol inputs — a column straight from `match_codes`, an `array("Q", ...)`, a `uint64` NumPy array (a `uint32` one is widened) — are read in a single bulk copy with no per-element int conversion; any sequence of ints works too. `encode` is the inverse of `decode` and tolerant of spelling: an IRI with or without angle brackets, a literal with an explicit `xsd:string` type or an upper-case language tag, and the default graph as `""`, `default` or `[]` all resolve to the stored form's code (a malformed term raises `ValueError`); `encode_many` does a batch. Both `term_dict()` and `match_codes` return `None` when the code path does not apply (a non-Dictionary layout, or an append tail). A dictionary left in the file by the residency budget is served by reading it on demand — `TermDict.file_backed` says so — with the same calls.
 
 Consumers can join, count, and de-duplicate entirely in code space and decode each distinct term once, never materializing a term string for a row they discard. The handle and the columns carry the pieces a query layer pushes below a pattern:
 
@@ -77,7 +77,7 @@ left_idx, right_idx = o.join_indices(s)     # rows where o == s, as index pairs
 o.take(left_idx)                            # gather a joined column
 ```
 
-`filter_codes(kind, arg)` answers `(true_codes, unknown_codes)`: the codes for which the predicate definitely holds, and the codes inside its domain the native layer leaves to the caller's own evaluator (an ill-typed number, a datatype it does not order). Codes outside the domain — non-literals, for the literal predicates — appear in neither. Kinds: `is_literal`, `is_iri`, `is_blank`, `datatype <iri>`, `lang <tag>`, `lang_matches <range>`, `str_prefix <p>` (`strstarts(str(?v), p)`: a string-like literal's lexical form, an IRI, a blank node's label), and `num_lt`/`num_le`/`num_gt`/`num_ge`/`num_eq`/`num_ne <number>` (value comparison for well-formed numeric literals; different XSD datatypes order by their IRIs; a non-literal is `False` under `=` and the orderings and `True` under `!=`). `keep` takes a dict from position (`"s"`, `"p"`, `"o"`, `"g"` or 0–3) to a code set (`U32Column`, u32 buffer or int sequence) or a code range (`range` with step 1, or `(lo, hi)`); `limit`/`offset` window the rows in base order, and a filtered file scan stops at the first block that fills the window. A probe of the `*_many` calls is an `(s, p, o, g)` tuple or a dict with keys `s`, `p`, `o`, `g`, `keep`, `limit`, `offset`; every probe is parsed before any is evaluated.
+`filter_codes(kind, arg)` answers `(true_codes, unknown_codes)`: the codes for which the predicate definitely holds, and the codes inside its domain the native layer leaves to the caller's own evaluator (an ill-typed number, a datatype it does not order). Codes outside the domain — non-literals, for the literal predicates — appear in neither. Kinds: `is_literal`, `is_iri`, `is_blank`, `datatype <iri>`, `lang <tag>`, `lang_matches <range>`, `str_prefix <p>` (`strstarts(str(?v), p)`: a string-like literal's lexical form, an IRI, a blank node's label), and `num_lt`/`num_le`/`num_gt`/`num_ge`/`num_eq`/`num_ne <number>` (value comparison for well-formed numeric literals; different XSD datatypes order by their IRIs; a non-literal is `False` under `=` and the orderings and `True` under `!=`). `keep` takes a dict from position (`"s"`, `"p"`, `"o"`, `"g"` or 0–3) to a code set (`U64Column`, u64 buffer or int sequence) or a code range (`range` with step 1, or `(lo, hi)`); `limit`/`offset` window the rows in base order, and a filtered file scan stops at the first block that fills the window. A probe of the `*_many` calls is an `(s, p, o, g)` tuple or a dict with keys `s`, `p`, `o`, `g`, `keep`, `limit`, `offset`; every probe is parsed before any is evaluated.
 
 ## Build options
 

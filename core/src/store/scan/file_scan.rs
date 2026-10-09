@@ -28,7 +28,7 @@ use crate::io::read::available_parallelism;
 use crate::store::layouts::{Constraints, PatternCodes, QuadPattern, TermRef};
 use crate::store::native_file::NativeStoreFile;
 use crate::store::scan::gather::primitive_from_u64_reads;
-use crate::store::schema;
+use crate::store::schema::{self, TermCode};
 use crate::store::selection::RowSelection;
 
 /// The bind-memo scope tag for expressions over the quad table's schema
@@ -429,7 +429,7 @@ pub(crate) async fn matching_file_rows(
 }
 
 /// The positions — within the rows `selection` covers, in file order, as
-/// `selection.apply` aligns them — whose `u32` code in `column` passes
+/// `selection.apply` aligns them — whose code in `column` passes
 /// `admit`. The column is streamed through the projected scan rather than
 /// materialized: the scan reads several splits per worker ahead of this loop,
 /// so that many chunks of codes are in flight at once, never the whole column.
@@ -438,7 +438,7 @@ pub(crate) async fn column_positions(
     file: &NativeStoreFile,
     column: &'static str,
     selection: &RowSelection,
-    admit: impl Fn(u32) -> bool,
+    admit: impl Fn(TermCode) -> bool,
 ) -> Result<Vec<usize>> {
     use vortex_array::VortexSessionExecute as _;
     use vortex_array::arrays::{PrimitiveArray, StructArray};
@@ -468,7 +468,7 @@ pub(crate) async fn column_positions(
             .execute::<StructArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
         let prim = crate::store::array::field_as::<PrimitiveArray>(&struct_arr, column, &mut ctx)?;
-        let codes = prim.as_slice::<u32>();
+        let codes = prim.as_slice::<TermCode>();
         positions.extend(
             (0..codes.len())
                 .filter(|&i| admit(codes[i]))
@@ -538,10 +538,10 @@ fn sorted_subject_chunks(
 async fn subject_code_bounds(
     chunks: &vortex_rdf_encoded_search::ColumnChunks,
     file: &NativeStoreFile,
-    code: u32,
+    code: TermCode,
 ) -> Result<Option<Range<u64>>> {
     chunks
-        .bounds(u64::from(code), &file.segment_source(), file.session())
+        .bounds(code, &file.segment_source(), file.session())
         .await
         .map_err(VortexRdfError::Vortex)
 }
@@ -555,7 +555,7 @@ async fn subject_code_bounds(
 /// — and the caller keeps the stream.
 pub(crate) async fn locate_subject_code_range(
     file: &NativeStoreFile,
-    range: Range<u32>,
+    range: Range<TermCode>,
 ) -> Result<Option<Range<u64>>> {
     let Some(chunks) = sorted_subject_chunks(file) else {
         return Ok(None);
@@ -576,7 +576,7 @@ pub(crate) async fn locate_subject_code_range(
 /// once for the call. `None` declines as [`locate_subject_code_range`] does.
 pub(crate) async fn locate_subject_code_runs(
     file: &NativeStoreFile,
-    codes: &[u32],
+    codes: &[TermCode],
 ) -> Result<Option<Vec<Range<u64>>>> {
     debug_assert!(
         codes.windows(2).all(|pair| pair[0] < pair[1]),

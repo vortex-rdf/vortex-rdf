@@ -800,7 +800,7 @@ describe('matchCodes / termDict gates', () => {
         expect(cols).not.toBeNull();
         expect(cols.length).toBe(3);
         for (const col of [cols.s, cols.p, cols.o, cols.g]) {
-            expect(col).toBeInstanceOf(Uint32Array);
+            expect(col).toBeInstanceOf(Float64Array);
             expect(col.length).toBe(3);
         }
         const quads = store.getQuads(null, p1, null, null);
@@ -851,6 +851,46 @@ describe('matchCodes / termDict gates', () => {
         expect(typeof dict.encode('')).toBe('number');
         const code = dict.encode('<http://example.org/s1>')!;
         expect(dict.decode(code)).toBe('<http://example.org/s1>');
+    });
+
+    // Codes are u64 and cross as JS numbers, exact up to 2^53 - 1. A code
+    // past u32::MAX is a code like any other — out of this dictionary's range
+    // here, never wrapped onto the term 2^32 below it — and what is no code
+    // (negative, fractional, not finite, past 2^53 - 1) is refused.
+    test('TermDict takes codes past u32::MAX without wrapping them', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
+        const dict = store.termDict()!;
+        const code = dict.encode('<http://example.org/s1>')!;
+        expect(dict.decode(code)).toBe('<http://example.org/s1>');
+        expect(dict.decode(2 ** 32 + code)).toBeUndefined();
+        expect(dict.decode(2 ** 40 + code)).toBeUndefined();
+        expect(dict.decode(Number.MAX_SAFE_INTEGER)).toBeUndefined();
+    });
+
+    test('TermDict refuses what is no code', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
+        const dict = store.termDict()!;
+        for (const bad of [-1, -0.5, 1.5, NaN, Infinity, -Infinity, 2 ** 53, 2 ** 64]) {
+            expect(() => dict.decode(bad), `${bad}`).toThrow(/code/);
+        }
+    });
+
+    test('matchCodes columns are Float64Arrays of exact codes', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', {
+            layout: 'dictionary',
+            indexes: ['secondary-by-reference'],
+        });
+        const dict = store.termDict()!;
+        const cols = store.matchCodes()!;
+        expect(cols.length).toBe(6);
+        for (const col of [cols.s, cols.p, cols.o, cols.g]) {
+            expect(col).toBeInstanceOf(Float64Array);
+            for (const code of col) {
+                expect(Number.isSafeInteger(code)).toBe(true);
+                expect(dict.decode(code)).toBeDefined();
+                expect(dict.encode(dict.decode(code)!)).toBe(code);
+            }
+        }
     });
 });
 

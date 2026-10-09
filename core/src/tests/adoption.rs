@@ -73,8 +73,11 @@ async fn test_dictionary_fixture_adopts() {
         .collect();
     assert_eq!(snapshot.len(), terms.len());
     for (code, term) in terms.iter().enumerate() {
-        assert_eq!(snapshot.encode(term), Some(code as u32), "{term}");
-        assert_eq!(snapshot.decode(code as u32).as_deref(), Some(term.as_str()));
+        assert_eq!(snapshot.encode(term), Some(code as TermCode), "{term}");
+        assert_eq!(
+            snapshot.decode(code as TermCode).as_deref(),
+            Some(term.as_str())
+        );
     }
 }
 

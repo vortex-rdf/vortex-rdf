@@ -22,9 +22,39 @@ use vortex_file::OpenOptionsSessionExt as _;
 use std::sync::Arc;
 
 use vortex_array::arrays::StructArray;
+use vortex_array::dtype::DType;
 use vortex_array::{IntoArray, VortexSessionExecute};
 
 use super::VortexRdfStore;
+use super::schema::{CODE_PTYPE, PRIMARY_COLUMNS};
+
+/// Refuse a table whose code columns are integers of a width other than
+/// [`TermCode`](super::TermCode)'s: the readers take an integer `s`, `p`,
+/// `o`, `g` (the quad table and the copy index's children) or `val` (the
+/// reference index's) for a `u64` code column, so a file with narrower codes
+/// — written by a pre-release of 0.12, before codes were widened, or by a
+/// foreign writer — must not open. `table` names the table in the error.
+pub(super) fn check_code_columns(table: &str, dtype: &DType) -> Result<()> {
+    use crate::store::indexes::secondary_by_reference::COL_VAL;
+
+    let DType::Struct(fields, _) = dtype else {
+        return Ok(());
+    };
+    for (name, field) in fields.names().iter().zip(fields.fields()) {
+        let is_code_column = PRIMARY_COLUMNS.contains(&name.as_ref()) || name.as_ref() == COL_VAL;
+        if let DType::Primitive(ptype, _) = field
+            && is_code_column
+            && ptype != CODE_PTYPE
+        {
+            return Err(VortexRdfError::Deserialization(format!(
+                "the {table} column {name} holds {ptype} term codes, but this version of \
+                 vortex-rdf reads {CODE_PTYPE} codes only; rebuild the store from its RDF \
+                 source"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// What one entry of a store's component roster means to this version.
 pub(super) enum ComponentKind {
@@ -68,6 +98,7 @@ pub(super) fn classify_component(
         return Ok(ComponentKind::Dict);
     }
     if let Some(known) = crate::store::indexes::known_component(&descriptor.implementation) {
+        check_code_columns(&descriptor.name, &descriptor.dtype)?;
         return Ok(ComponentKind::Index(known));
     }
     if descriptor.required {
@@ -161,6 +192,7 @@ impl VortexRdfStore {
             NativeStoreFile::try_new(read::open_vortex_file(path, access).await?)?
                 .with_mapping(access == read::FileAccess::Mapped),
         );
+        check_code_columns("quad table", file.dtype())?;
         log::debug!(
             "[open] {} {}",
             source_path.display(),
@@ -278,6 +310,7 @@ impl VortexRdfStore {
         if !container::is_native_file(&file) {
             return Err(read::unsupported_file_error(&file));
         }
+        check_code_columns("quad table", file.dtype())?;
         // The root scan is the transparent quad child.
         let quads = read::scan_all(&file).await?;
         let root = file.footer().layout();

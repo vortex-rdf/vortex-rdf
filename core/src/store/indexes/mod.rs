@@ -70,7 +70,7 @@ pub enum IndexType {
     /// (s, p, o, g) order gives subjects.
     ///
     /// Adds two children beside the quad rows, each a `{s, p, o, g, rid}`
-    /// table (`VarBin<Utf8>` term strings, or u32 codes under the Dictionary
+    /// table (`VarBin<Utf8>` term strings, or u64 codes under the Dictionary
     /// layout; `rid` always `u32`):
     /// - `index:posg`: the quads sorted by (p, o, s, g)
     /// - `index:ospg`: the quads sorted by (o, s, p, g)
@@ -88,7 +88,7 @@ pub enum IndexType {
     /// Builds sorted secondary indexes for both predicates **and** objects.
     ///
     /// Adds two children beside the quad rows, each a `{val, rid}` table:
-    /// - `index:ref-o`: object values sorted (`VarBin<Utf8>`; u32 codes under
+    /// - `index:ref-o`: object values sorted (`VarBin<Utf8>`; u64 codes under
     ///   the Dictionary layout), paired with the primary row id (`u32`) each
     ///   came from
     /// - `index:ref-p`: the same for predicate values

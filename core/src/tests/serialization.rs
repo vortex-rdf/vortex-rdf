@@ -851,6 +851,77 @@ fn unknown_component(required: bool) -> container::NativeComponentWrite {
     .unwrap()
 }
 
+/// Term-code columns narrower than [`TermCode`] — the u32 codes a
+/// pre-release of 0.12 wrote — are refused by both readers, with an error
+/// naming the table, the column and its width: in the quad table, and in an
+/// index child beside u64 quad columns.
+#[tokio::test]
+async fn test_open_refuses_code_columns_narrower_than_u64() {
+    use crate::store::layouts::dictionary::TermDictionary;
+    use vortex_array::IntoArray as _;
+    use vortex_array::arrays::{StructArray, VarBinViewArray};
+    use vortex_array::validity::Validity;
+    use vortex_buffer::Buffer;
+
+    let dict = TermDictionary::from_sorted_column(VarBinViewArray::from_iter_str([
+        "<http://example.org/a>",
+    ]))
+    .unwrap();
+    fn narrow(names: &[&'static str]) -> vortex_array::ArrayRef {
+        let columns: Vec<vortex_array::ArrayRef> = names
+            .iter()
+            .map(|_| Buffer::from_iter([0u32]).into_array())
+            .collect();
+        StructArray::try_new(names.into(), columns, 1, Validity::NonNullable)
+            .unwrap()
+            .into_array()
+    }
+
+    let quads = unstamped_store_bytes(
+        vec![narrow(&["s", "p", "o", "g"])],
+        vec![dict.to_write().unwrap()],
+    )
+    .await;
+    let rows = narrow(&["val", "rid"]);
+    let index = container::NativeComponentWrite::new(
+        container::StoreComponentDescriptor {
+            name: "index:ref-o".into(),
+            role: container::StoreComponentRole::Index,
+            implementation: "secondary-by-reference/o".into(),
+            version: 1,
+            required: false,
+            sorted: true,
+            dtype: rows.dtype().clone(),
+        },
+        std::sync::Arc::new(container::BufferedComponentSource::try_new(vec![rows]).unwrap()),
+        container::default_child_strategy(),
+    )
+    .unwrap();
+    let index_child = unstamped_store_bytes(
+        vec![bare_code_quad_array(&[0])],
+        vec![dict.to_write().unwrap(), index],
+    )
+    .await;
+
+    for (bytes, want) in [
+        (quads, "the quad table column s holds u32 term codes"),
+        (
+            index_child,
+            "the index:ref-o column val holds u32 term codes",
+        ),
+    ] {
+        let (from_bytes, from_file) = open_both(&bytes).await;
+        for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
+            let err = result.err().expect("open should fail");
+            assert!(
+                err.to_string().contains(want),
+                "{path}: unexpected error: {err}"
+            );
+            assert!(err.to_string().contains("rebuild"), "{path}: {err}");
+        }
+    }
+}
+
 /// Dictionary-dtype rows written without a dictionary component: bare codes
 /// cannot self-describe, and both readers refuse to open them.
 #[tokio::test]

@@ -8,12 +8,12 @@ __version__: str
 # Path arguments are `PathBuf` on the Rust side, so any `os.PathLike[str]` is
 # accepted alongside `str`.
 _StrPath = Union[str, "os.PathLike[str]"]
-# Codes or indices: a U32Column, a u32 buffer, the raw byte view a U32Column
-# exports, or any sequence of ints.
-_U32s = Union["U32Column", Sequence[int], memoryview, bytes, bytearray]
-# A keep per position: a code set (U32Column, u32 buffer, int sequence) or a
+# Codes or indices: a U64Column, a u64 (or u32) buffer, the raw byte view a
+# U64Column exports, or any sequence of ints from 0 to 2**64 - 1.
+_U64s = Union["U64Column", Sequence[int], memoryview, bytes, bytearray]
+# A keep per position: a code set (U64Column, u64 buffer, int sequence) or a
 # code range (``range`` with step 1, or ``(lo, hi)``).
-_KeepSpec = Dict[Union[str, int], Union[_U32s, range, Tuple[int, int]]]
+_KeepSpec = Dict[Union[str, int], Union[_U64s, range, Tuple[int, int]]]
 # A probe of the batch calls: ``(s, p, o, g)`` or a dict with keys s, p, o,
 # g, keep, limit, offset.
 _Probe = Union[Tuple[Optional[str], Optional[str], Optional[str], Optional[str]], Dict[str, Any]]
@@ -24,7 +24,8 @@ class VortexRdfError(Exception):
 class TermDict:
     def decode(self, code: int) -> Optional[str]:
         """The N-Triples string for `code`, or None when the code is out of
-        this dictionary's range."""
+        this dictionary's range. A code is an int from 0 to 2**64 - 1: a
+        negative one, or one of 2**64 or more, raises ``OverflowError``."""
         ...
     def encode(self, term: str) -> Optional[int]:
         """The code of the term `term`, or None when the dictionary does not
@@ -44,12 +45,12 @@ class TermDict:
         self,
         kind: str,
         arg: str,
-        codes: _U32s,
+        codes: _U64s,
         *,
         flags: str = "",
         case: Optional[str] = None,
         as_str: bool = False,
-    ) -> Tuple[U32Column, U32Column]:
+    ) -> Tuple[U64Column, U64Column]:
         r"""`kind` over the candidate `codes`: ``(passed, undecided)``, both
         ascending subsets of `codes`; a candidate in neither fails, and no
         candidates give two empty columns. `codes` must be sorted, unique and
@@ -119,40 +120,42 @@ class TermDict:
         """Whether terms are read from the store's file on demand rather
         than held in memory."""
         ...
-    def decode_many(self, codes: _U32s) -> List[Optional[str]]:
+    def decode_many(self, codes: _U64s) -> List[Optional[str]]:
         """Decode a batch of codes in one GIL-released call.
 
-        A u32 buffer (``memoryview(col).cast("I")``, ``array("I", ...)``, a
-        uint32 NumPy array) or the raw byte view a `U32Column` exports is read
-        in one copy; any int sequence works element by element. Repeated codes
-        share one string object."""
+        A `U64Column`, a u64 buffer (``memoryview(col).cast("Q")``,
+        ``array("Q", ...)``, a uint64 NumPy array), a u32 buffer (widened) or
+        the raw byte view a `U64Column` exports is read in one copy; any int
+        sequence works element by element. Repeated codes share one string
+        object."""
         ...
     def __len__(self) -> int: ...
     def __repr__(self) -> str: ...
 
-class U32Column:
-    """Read-only u32 column; supports the buffer protocol
-    (``memoryview(col).cast("I")`` is a zero-copy view)."""
+class U64Column:
+    """Read-only u64 column of term codes, row indices or counts; supports
+    the buffer protocol (``memoryview(col).cast("Q")`` is a zero-copy view)."""
 
-    def __init__(self, values: _U32s) -> None:
-        """A column holding `values`: another column (shared), a u32 buffer
-        or raw byte view (one copy), or any sequence of ints."""
+    def __init__(self, values: _U64s) -> None:
+        """A column holding `values`: another column (shared), a u64 or u32
+        buffer or raw byte view (one copy), or any sequence of ints from 0 to
+        2**64 - 1 (an int outside that range raises ``OverflowError``)."""
         ...
     def __len__(self) -> int: ...
     def __repr__(self) -> str: ...
-    def distinct(self) -> "U32Column":
+    def distinct(self) -> "U64Column":
         """The distinct values, each at its first occurrence, in that
         order."""
         ...
-    def value_counts(self) -> Tuple["U32Column", "U32Column"]:
+    def value_counts(self) -> Tuple["U64Column", "U64Column"]:
         """``(values, counts)``: the distinct values in first-seen order and
         how often each occurs."""
         ...
-    def take(self, indices: _U32s) -> "U32Column":
+    def take(self, indices: _U64s) -> "U64Column":
         """The values at `indices`, in that order; an index past the end
         raises ``IndexError``."""
         ...
-    def join_indices(self, other: _U32s) -> Tuple["U32Column", "U32Column"]:
+    def join_indices(self, other: _U64s) -> Tuple["U64Column", "U64Column"]:
         """``(left_indices, right_indices)`` of the rows where this column's
         value equals `other`'s — an equi-join on the two as keys, in
         nested-loop order (this column's rows in order, each with its matches
@@ -199,21 +202,21 @@ class VortexRdfStore:
         keep: Optional[_KeepSpec] = None,
         limit: Optional[int] = None,
         offset: int = 0,
-    ) -> Optional[Tuple[U32Column, U32Column, U32Column, U32Column]]:
-        """The matching rows as four zero-copy u32 code columns ``(s, p, o,
+    ) -> Optional[Tuple[U64Column, U64Column, U64Column, U64Column]]:
+        """The matching rows as four zero-copy u64 code columns ``(s, p, o,
         g)`` decodable through `term_dict`, or None when the code path does
         not apply.
 
         `keep` narrows the match inside the store: a dict from position
         (``"s"``, ``"p"``, ``"o"``, ``"g"`` or 0-3) to the codes to keep
-        there, a code set (`U32Column`, u32 buffer or int sequence) or a code
+        there, a code set (`U64Column`, u64 buffer or int sequence) or a code
         range (a ``range`` with step 1, or ``(lo, hi)``). `offset` and
         `limit` window the rows in base order; a filtered file scan stops at
         the first block that fills the window."""
         ...
     def match_codes_many(
         self, probes: Sequence[_Probe]
-    ) -> List[Optional[Tuple[U32Column, U32Column, U32Column, U32Column]]]:
+    ) -> List[Optional[Tuple[U64Column, U64Column, U64Column, U64Column]]]:
         """`match_codes` for a batch of probes in one GIL-released call,
         answering in input order. A probe is an ``(s, p, o, g)`` tuple of
         optional term strings or a dict with keys ``s``, ``p``, ``o``,

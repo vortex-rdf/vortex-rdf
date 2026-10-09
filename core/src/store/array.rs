@@ -7,13 +7,14 @@
 //! form: [`with_compressed_int_children`] encodes a built store's code
 //! columns into probe-supported encodings, [`with_searchable_int_children`]
 //! keeps an adopted store's encodings wherever a probe binds them, and
-//! [`shared_u32_primitive`] / [`cached_u32_primitive`] hand back the
-//! canonical primitive a slice-bound read path needs — decoding into the
+//! [`shared_code_primitive`] / [`cached_code_primitive`] hand back the
+//! canonical code primitive a slice-bound read path needs — decoding into the
 //! shared wrapper's cache, or only if some earlier read already did.
 
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::schema;
+use crate::store::schema::{CODE_PTYPE, TermCode};
 
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::varbinview::BinaryView;
@@ -273,8 +274,9 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
     )
 }
 
-/// Compress a built struct's u32 code columns into probe-supported
-/// encodings, in place of the canonical primitives the builders emit —
+/// Compress a built struct's integer columns — the [`TermCode`] code
+/// columns and the `u32` row-id columns — into probe-supported encodings,
+/// in place of the canonical primitives the builders emit —
 /// the construction half of the store's compressed-resident form (the
 /// adoption half is [`with_searchable_int_children`]).
 ///
@@ -282,16 +284,16 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
 /// the match fast paths keep binding the column; the choice is made from
 /// bounds the construction already knows (Constant for single-valued, RunEnd
 /// for sorted with few runs, BitPacked at the observed width).
-/// Sortedness stamps carry across; non-u32 and nullable children pass
+/// Sortedness stamps carry across; other widths and nullable children pass
 /// through untouched. A chunked column is compressed chunk by chunk (see
-/// [`compress_u32_child`]) — the builders assemble anything over
+/// [`compress_int_child`]) — the builders assemble anything over
 /// `DEFAULT_CHUNK_ROWS` rows into a `ChunkedArray`, so without that every
 /// build past one chunk would keep the canonical form.
 ///
 /// `payload_lazy` wraps each compressed column in a `vortex.shared` lazy
 /// wrapper: the match fast paths probe the compressed source through the
 /// wrapper, while the code-column payload path materializes the canonical
-/// primitive once into the wrapper's cache (`shared_u32_primitive`) and is
+/// primitive once into the wrapper's cache (`shared_code_primitive`) and is
 /// zero-copy on every later call. Pass it for the primary base — the only
 /// array the payload path reads; components never serve payloads and skip
 /// the wrapper.
@@ -314,7 +316,7 @@ pub(crate) fn with_compressed_int_children(rows: ArrayRef, payload_lazy: bool) -
             .unmasked_field_by_name(name.as_ref())
             .map_err(VortexRdfError::Vortex)?;
         let sorted = column_is_sorted(child);
-        let Some(mut encoded) = compress_u32_child(child, sorted, &mut ctx)? else {
+        let Some(mut encoded) = compress_int_child(child, sorted, &mut ctx)? else {
             children.push(child.clone());
             continue;
         };
@@ -334,23 +336,23 @@ pub(crate) fn with_compressed_int_children(rows: ArrayRef, payload_lazy: bool) -
     )
 }
 
-/// A base child as a canonical non-nullable u32 primitive, zero-copy where
-/// one exists: a canonical column directly, a `vortex.shared` wrapper via its
+/// A base child as a canonical non-nullable code primitive ([`TermCode`]),
+/// zero-copy where one exists: a canonical column directly, a `vortex.shared` wrapper via its
 /// one-way cache — the first call decodes the compressed source into the
 /// cache, every later call is a refcount bump shared by all views over the
 /// base. `None` for any other encoding (callers fall back to the gather
 /// pipeline).
 ///
 /// Decoding into the cache is one pass over the whole column, so callers that
-/// only read a few rows take [`cached_u32_primitive`] instead.
-pub(crate) fn shared_u32_primitive(
+/// only read a few rows take [`cached_code_primitive`] instead.
+pub(crate) fn shared_code_primitive(
     child: &ArrayRef,
 ) -> Option<vortex_array::arrays::PrimitiveArray> {
     use vortex_array::Canonical;
     use vortex_array::arrays::shared::SharedArrayExt as _;
     use vortex_array::arrays::{Primitive, PrimitiveArray, Shared};
 
-    if let Some(prim) = canonical_u32(child) {
+    if let Some(prim) = canonical_code(child) {
         return Some(prim);
     }
     let shared = child.as_opt::<Shared>()?;
@@ -364,43 +366,43 @@ pub(crate) fn shared_u32_primitive(
         })
         .ok()?;
     let prim = cached.try_downcast::<Primitive>().ok()?;
-    (prim.ptype() == vortex_array::dtype::PType::U32).then_some(prim)
+    (prim.ptype() == CODE_PTYPE).then_some(prim)
 }
 
-/// The non-decoding half of [`shared_u32_primitive`]: a base child's canonical
-/// non-nullable u32 primitive when one already exists — the column itself, or
+/// The non-decoding half of [`shared_code_primitive`]: a base child's
+/// canonical non-nullable code primitive when one already exists — the column itself, or
 /// a `vortex.shared` wrapper whose one-way cache some earlier read already
 /// filled. `None` when producing one would mean decoding the compressed
 /// source, so a caller reading a handful of rows can prefer per-row point
 /// reads over a whole-column pass.
-pub(crate) fn cached_u32_primitive(
+pub(crate) fn cached_code_primitive(
     child: &ArrayRef,
 ) -> Option<vortex_array::arrays::PrimitiveArray> {
     use vortex_array::arrays::Shared;
     use vortex_array::arrays::shared::SharedArrayExt as _;
 
-    if let Some(prim) = canonical_u32(child) {
+    if let Some(prim) = canonical_code(child) {
         return Some(prim);
     }
     let shared = child.as_opt::<Shared>()?;
-    canonical_u32(shared.current_array_ref())
+    canonical_code(shared.current_array_ref())
 }
 
-/// A non-nullable canonical u32 primitive, or `None` for anything else — the
-/// shape both `*_u32_primitive` accessors hand back.
-fn canonical_u32(arr: &ArrayRef) -> Option<vortex_array::arrays::PrimitiveArray> {
+/// A non-nullable canonical code primitive ([`TermCode`]), or `None` for
+/// anything else — the shape both `*_code_primitive` accessors hand back.
+fn canonical_code(arr: &ArrayRef) -> Option<vortex_array::arrays::PrimitiveArray> {
     use vortex_array::arrays::Primitive;
 
     if !arr.dtype().is_unsigned_int() || arr.dtype().is_nullable() {
         return None;
     }
     let prim = arr.clone().try_downcast::<Primitive>().ok()?;
-    (prim.ptype() == vortex_array::dtype::PType::U32).then_some(prim)
+    (prim.ptype() == CODE_PTYPE).then_some(prim)
 }
 
 /// One child column's compressed form, or `None` for a column this helper
-/// leaves alone (non-u32, nullable, or an encoding that is already not a
-/// canonical primitive).
+/// leaves alone (not a `u32` or [`TermCode`] column, nullable, or an
+/// encoding that is already not a canonical primitive).
 ///
 /// A chunked column is compressed chunk by chunk and reassembled, which is
 /// what makes the compressed-resident form reach builds above
@@ -409,7 +411,7 @@ fn canonical_u32(arr: &ArrayRef) -> Option<vortex_array::arrays::PrimitiveArray>
 /// the wrapper. Per-chunk is also the natural granularity — the bounds pass
 /// that picks the encoding is per-chunk regardless, and a chunk of a globally
 /// sorted column is itself sorted, so the RunEnd choice stays valid.
-fn compress_u32_child(
+fn compress_int_child(
     child: &ArrayRef,
     sorted: bool,
     ctx: &mut vortex_array::ExecutionCtx,
@@ -424,7 +426,7 @@ fn compress_u32_child(
         let mut out = Vec::with_capacity(chunked.nchunks());
         let mut compressed_any = false;
         for chunk in chunked.chunks() {
-            match compress_u32_child(&chunk, sorted, ctx)? {
+            match compress_int_child(&chunk, sorted, ctx)? {
                 Some(encoded) => {
                     if sorted {
                         stamp_is_sorted(&encoded);
@@ -447,15 +449,51 @@ fn compress_u32_child(
     let Ok(prim) = child.clone().try_downcast::<Primitive>() else {
         return Ok(None);
     };
-    if prim.ptype() != vortex_array::dtype::PType::U32 {
-        return Ok(None);
+    match prim.ptype() {
+        vortex_array::dtype::PType::U32 => Ok(Some(compress_int_column(
+            &prim,
+            prim.as_slice::<u32>(),
+            sorted,
+            ctx,
+        )?)),
+        CODE_PTYPE => Ok(Some(compress_int_column(
+            &prim,
+            prim.as_slice::<TermCode>(),
+            sorted,
+            ctx,
+        )?)),
+        _ => Ok(None),
     }
-    Ok(Some(compress_u32_column(&prim, sorted, ctx)?))
+}
+
+/// An unsigned width [`compress_int_column`] chooses an encoding for: the
+/// `u32` row ids and the [`TermCode`] codes.
+trait PackedWidth: Copy + Ord + Into<vortex_array::scalar::Scalar> {
+    /// Bits in the type.
+    const BITS: u32;
+    /// Leading zero bits of the value.
+    fn leading_zeros(self) -> u32;
+}
+
+impl PackedWidth for u32 {
+    const BITS: u32 = u32::BITS;
+    fn leading_zeros(self) -> u32 {
+        u32::leading_zeros(self)
+    }
+}
+
+impl PackedWidth for TermCode {
+    const BITS: u32 = TermCode::BITS;
+    fn leading_zeros(self) -> u32 {
+        TermCode::leading_zeros(self)
+    }
 }
 
 /// One column's encoding choice; see [`with_compressed_int_children`].
-fn compress_u32_column(
+/// `values` is `prim`'s slice at its own width.
+fn compress_int_column<T: PackedWidth>(
     prim: &vortex_array::arrays::PrimitiveArray,
+    values: &[T],
     sorted: bool,
     ctx: &mut vortex_array::ExecutionCtx,
 ) -> Result<ArrayRef> {
@@ -463,7 +501,6 @@ fn compress_u32_column(
     use vortex::encodings::runend::RunEnd;
     use vortex_array::arrays::ConstantArray;
 
-    let values = prim.as_slice::<u32>();
     if values.is_empty() {
         return Ok(prim.clone().into_array());
     }
@@ -490,8 +527,9 @@ fn compress_u32_column(
         let re = RunEnd::encode(prim.clone().into_array(), ctx).map_err(VortexRdfError::Vortex)?;
         return Ok(re.into_array());
     }
-    let bit_width = (u32::BITS - max.leading_zeros()).max(1) as u8;
-    if bit_width >= 32 {
+    // At most 64, so the narrowing to u8 is exact.
+    let bit_width = (T::BITS - max.leading_zeros()).max(1) as u8;
+    if u32::from(bit_width) >= T::BITS {
         return Ok(prim.clone().into_array());
     }
     let packed = BitPacked::encode(&prim.clone().into_array(), bit_width, ctx)

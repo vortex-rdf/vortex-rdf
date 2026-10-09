@@ -14,6 +14,21 @@
 //! [`secondary_by_reference`]: crate::store::indexes::secondary_by_reference
 //! [`typed_object`]: crate::store::layouts::typed_object
 
+use vortex_array::dtype::PType;
+
+/// A term code: a term's rank in a Dictionary-layout store's sorted term
+/// dictionary — the value of every code column (the quad table's `s`, `p`,
+/// `o`, `g` and the index children's code columns) and of every code a
+/// binding hands across. 64 bits wide, so a dictionary may hold more terms
+/// than a `u32` can count.
+pub type TermCode = u64;
+
+/// The primitive type of a code column on the wire: non-nullable `u64`
+/// ([`TermCode`]). A Dictionary-layout quad table is recognized by its `s`
+/// column having this type; a code column of any other integer width is a
+/// file this crate never wrote and is refused at open.
+pub(crate) const CODE_PTYPE: PType = PType::U64;
+
 /// The subject column — first in every layout. Whether its rows are globally
 /// sorted is per-store provenance
 /// ([`quads_sorted`](crate::io::container::layout::quads_sorted)), not a

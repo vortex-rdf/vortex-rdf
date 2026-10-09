@@ -75,7 +75,7 @@ fn into_vortex_error(e: VortexRdfError) -> vortex_error::VortexError {
 
 /// A built dataset: the quad array plus whatever layout state cannot be
 /// derived from the array alone — for the Dictionary layout, its term
-/// dictionary (the array holds only u32 code columns; the terms travel
+/// dictionary (the array holds only code columns; the terms travel
 /// beside it and reach serialized files as the native container's
 /// `dictionary` child).
 ///
@@ -257,7 +257,7 @@ pub(crate) fn build_components(
 }
 
 /// Dictionary-layout counterpart of [`build_components`]: the children are
-/// built over the dataset's u32 codes. Sorting codes is order-equivalent to
+/// built over the dataset's codes. Sorting codes is order-equivalent to
 /// sorting the term strings, so the children stay binary-searchable —
 /// queries translate the pattern terms to codes first.
 pub(crate) fn build_components_from_codes(

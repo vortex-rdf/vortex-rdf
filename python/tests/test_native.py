@@ -88,7 +88,7 @@ def test_code_path_matches_decoded_rows(vortex_files):
     for pattern in PATTERNS:
         cols = store.match_codes(**pattern)
         assert cols is not None
-        views = [memoryview(c).cast("I").tolist() for c in cols]
+        views = [memoryview(c).cast("Q").tolist() for c in cols]
         from_codes = sorted(
             tuple(dictionary.decode(code) for code in row) for row in zip(*views)
         )
@@ -101,7 +101,7 @@ def test_encode_inverts_decode(vortex_files):
     cols = store.match_codes()
     assert dictionary is not None and cols is not None
     for col in cols:
-        for code in memoryview(col).cast("I"):
+        for code in memoryview(col).cast("Q"):
             term = dictionary.decode(code)
             assert term is not None
             assert dictionary.encode(term) == code
@@ -117,15 +117,16 @@ def test_code_path_unavailable_on_other_layouts(vortex_files, layout):
     assert store.match_codes() is None
 
 
-def test_u32_column_buffer_is_zero_copy_view(vortex_files):
+def test_u64_column_buffer_is_zero_copy_view(vortex_files):
     store = VortexRdfStore(vortex_files["dictionary"])
     cols = store.match_codes()
     view = memoryview(cols[0])
     assert view.readonly
-    typed = view.cast("I")
+    assert view.nbytes == 8 * len(cols[0])
+    typed = view.cast("Q")
     assert len(typed) == len(cols[0]) == 5
     # Two views over the same column expose identical memory.
-    assert typed.tolist() == memoryview(cols[0]).cast("I").tolist()
+    assert typed.tolist() == memoryview(cols[0]).cast("Q").tolist()
 
 
 def test_in_memory_open_matches_file_backed(vortex_files, layout):
@@ -177,7 +178,7 @@ def test_mapped_bulk_reads_decode_through_the_dictionary_handle(tmp_path):
 
 
 def _codes(cols):
-    return [memoryview(col).cast("I").tolist() for col in cols]
+    return [memoryview(col).cast("Q").tolist() for col in cols]
 
 
 def _assert_file_backed_dictionary(mapped, loaded):
@@ -345,7 +346,7 @@ def test_decode_many_shares_one_object_per_repeated_code(vortex_files):
         ("adjacent", [0, 0, 0, 0, 1, 1, 1, 1]),
         ("scattered", [0, 1, 0, 1, 0, 1, 0, 1]),
     ):
-        terms = dictionary.decode_many(array("I", codes))
+        terms = dictionary.decode_many(array("Q", codes))
         assert [id(t) for t in terms] == [
             id(terms[codes.index(c)]) for c in codes
         ], f"{label}: repeated codes did not share one object"
@@ -363,18 +364,23 @@ def test_term_dict_decode_edges(vortex_files):
 
     assert dictionary.decode(end) is None
     assert dictionary.decode_many([end]) == [None]
+    assert dictionary.decode_many(array("Q", [2**63])) == [None]
+    # A u32 buffer is widened.
     assert dictionary.decode_many(array("I", [2**31])) == [None]
 
     # Every accepted input shape decodes the same column identically.
-    codes = memoryview(cols[0]).cast("I").tolist()
+    codes = memoryview(cols[0]).cast("Q").tolist()
     expected = [dictionary.decode(c) for c in codes]
     assert dictionary.decode_many(cols[0]) == expected
     assert dictionary.decode_many(memoryview(cols[0])) == expected
-    assert dictionary.decode_many(memoryview(cols[0]).cast("I")) == expected
+    assert dictionary.decode_many(memoryview(cols[0]).cast("Q")) == expected
     assert dictionary.decode_many(codes) == expected
 
-    with pytest.raises(ValueError, match="whole number of u32"):
-        dictionary.decode_many(bytes(5))
+    # The raw view is read as whole u64s: 12 bytes is three u32s, but no
+    # whole number of u64s.
+    for size in (5, 12):
+        with pytest.raises(ValueError, match="whole number of u64"):
+            dictionary.decode_many(bytes(size))
 
     # A plain int list shares one object per repeated code too.
     shared = dictionary.decode_many([0, 0])

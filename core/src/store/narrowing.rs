@@ -22,12 +22,12 @@ use vortex_buffer::Buffer;
 
 use crate::debug;
 use crate::error::{Result, VortexRdfError};
-use crate::store::array::{cached_u32_primitive, column_is_sorted, into_struct_array};
+use crate::store::array::{cached_code_primitive, column_is_sorted, into_struct_array};
 use crate::store::layouts::LayoutStrategy;
 use crate::store::probes::StructProbes;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_scan;
-use crate::store::schema::{self, QuadColumn};
+use crate::store::schema::{self, QuadColumn, TermCode};
 use crate::store::selection::{RowSelection, ViewSelection};
 use crate::store::{QuadsSource, Tail};
 
@@ -38,24 +38,24 @@ use super::VortexRdfStore;
 pub enum Keep {
     /// Any of these codes — ascending and unique, as [`Keep::set`] builds
     /// them.
-    Set(Buffer<u32>),
+    Set(Buffer<TermCode>),
     /// Any code in the half-open range `lo..hi`. Codes rank the dictionary's
     /// spellings in byte order, so a term kind or an IRI namespace is one
     /// such range (see `DictReader::prefix_range`).
-    Range(u32, u32),
+    Range(TermCode, TermCode),
 }
 
 impl Keep {
     /// The keep admitting exactly `codes` (any order, repeats folded).
-    pub fn set(codes: impl IntoIterator<Item = u32>) -> Self {
-        let mut codes: Vec<u32> = codes.into_iter().collect();
+    pub fn set(codes: impl IntoIterator<Item = TermCode>) -> Self {
+        let mut codes: Vec<TermCode> = codes.into_iter().collect();
         codes.sort_unstable();
         codes.dedup();
         Keep::Set(Buffer::from(codes))
     }
 
     /// The keep admitting every code in `range`.
-    pub fn range(range: Range<u32>) -> Self {
+    pub fn range(range: Range<TermCode>) -> Self {
         Keep::Range(range.start, range.end.max(range.start))
     }
 
@@ -68,7 +68,7 @@ impl Keep {
     }
 
     /// Whether `code` is admitted.
-    pub fn admits(&self, code: u32) -> bool {
+    pub fn admits(&self, code: TermCode) -> bool {
         match self {
             Keep::Set(codes) => codes.as_slice().binary_search(&code).is_ok(),
             Keep::Range(lo, hi) => (*lo..*hi).contains(&code),
@@ -84,18 +84,24 @@ impl Keep {
                 let (Some(&lo), Some(&hi)) = (codes.first(), codes.last()) else {
                     return KeepTest::Range(0, 0);
                 };
-                let span = (hi - lo) as usize + 1;
                 // A bitmap costs a bit per code of the span; worth it while
-                // the span is within 8 bits per member (a byte each).
-                if span <= codes.len().saturating_mul(8) {
-                    let mut bits = vec![0u64; span.div_ceil(64)];
-                    for &code in codes {
-                        let bit = (code - lo) as usize;
-                        bits[bit / 64] |= 1u64 << (bit % 64);
+                // the span is within 8 bits per member (a byte each). A span
+                // wider than a `usize` (on a 32-bit target) takes the sorted
+                // test rather than a wrapped bitmap.
+                let span = usize::try_from(hi - lo)
+                    .ok()
+                    .filter(|&span| span < codes.len().saturating_mul(8));
+                match span {
+                    Some(span) => {
+                        let mut bits = vec![0u64; (span + 1).div_ceil(64)];
+                        for &code in codes {
+                            // At most `span`, so it fits a `usize`.
+                            let bit = (code - lo) as usize;
+                            bits[bit / 64] |= 1u64 << (bit % 64);
+                        }
+                        KeepTest::Bitmap { lo, hi, bits }
                     }
-                    KeepTest::Bitmap { lo, hi, bits }
-                } else {
-                    KeepTest::Sorted(codes)
+                    None => KeepTest::Sorted(codes),
                 }
             }
         }
@@ -105,20 +111,25 @@ impl Keep {
 /// A [`Keep`] as a per-row test: a range compare, a bitmap over a dense set's
 /// span, or a binary search of a sparse one.
 enum KeepTest<'a> {
-    Range(u32, u32),
-    Bitmap { lo: u32, hi: u32, bits: Vec<u64> },
-    Sorted(&'a [u32]),
+    Range(TermCode, TermCode),
+    Bitmap {
+        lo: TermCode,
+        hi: TermCode,
+        bits: Vec<u64>,
+    },
+    Sorted(&'a [TermCode]),
 }
 
 impl KeepTest<'_> {
     #[inline]
-    fn admits(&self, code: u32) -> bool {
+    fn admits(&self, code: TermCode) -> bool {
         match self {
             KeepTest::Range(lo, hi) => (*lo..*hi).contains(&code),
             KeepTest::Bitmap { lo, hi, bits } => {
                 if code < *lo || code > *hi {
                     return false;
                 }
+                // `lo <= code <= hi`, a span the bitmap was sized for.
                 let bit = (code - lo) as usize;
                 bits[bit / 64] & (1u64 << (bit % 64)) != 0
             }
@@ -131,16 +142,17 @@ impl KeepTest<'_> {
 /// its canonical primitive when one is already materialized, else the
 /// store's cached encoded-search probe.
 enum CodeReader<'a> {
-    Slice(&'a [u32]),
+    Slice(&'a [TermCode]),
     Probe(&'a vortex_rdf_encoded_search::OwnedSortedProbe),
 }
 
 impl CodeReader<'_> {
     #[inline]
-    fn code_at(&self, row: usize) -> u32 {
+    fn code_at(&self, row: usize) -> TermCode {
         match self {
             CodeReader::Slice(slice) => slice[row],
-            CodeReader::Probe(probe) => probe.value_at(row) as u32,
+            // A probe reads every width as a u64 — exactly a code.
+            CodeReader::Probe(probe) => probe.value_at(row),
         }
     }
 }
@@ -518,8 +530,8 @@ impl VortexRdfStore {
         let width = run.len();
         match keep {
             Keep::Range(lo, hi) => {
-                let (start, _) = probe.bounds_in(run.clone(), u64::from(*lo));
-                let (end, _) = probe.bounds_in(start..run.end, u64::from(*hi));
+                let (start, _) = probe.bounds_in(run.clone(), *lo);
+                let (end, _) = probe.bounds_in(start..run.end, *hi);
                 Some(RowSelection::Range(start as u64..end as u64))
             }
             Keep::Set(codes) => {
@@ -531,7 +543,7 @@ impl VortexRdfStore {
                 let mut ids: Vec<u64> = Vec::new();
                 let mut from = run.start;
                 for &code in codes.as_slice() {
-                    let (lo, hi) = probe.bounds_in(from..run.end, u64::from(code));
+                    let (lo, hi) = probe.bounds_in(from..run.end, code);
                     ids.extend(lo as u64..hi as u64);
                     from = hi;
                     if from >= run.end {
@@ -559,9 +571,9 @@ impl VortexRdfStore {
             .unmasked_field_by_name(column.name())
             .map_err(VortexRdfError::Vortex)?;
         let test = keep.test();
-        let cached = cached_u32_primitive(col);
+        let cached = cached_code_primitive(col);
         let reader = match (&cached, probes.by_name(base, column.name())) {
-            (Some(prim), _) => Some(CodeReader::Slice(prim.as_slice::<u32>())),
+            (Some(prim), _) => Some(CodeReader::Slice(prim.as_slice::<TermCode>())),
             (None, Some(probe)) => Some(CodeReader::Probe(probe)),
             (None, None) => None,
         };
@@ -583,7 +595,7 @@ impl VortexRdfStore {
                     .apply(col)?
                     .execute::<PrimitiveArray>(&mut ctx)
                     .map_err(VortexRdfError::Vortex)?;
-                let codes = prim.as_slice::<u32>();
+                let codes = prim.as_slice::<TermCode>();
                 let positions = (0..codes.len()).filter(|&i| test.admits(codes[i]));
                 let mask = vortex_mask::Mask::from_indices(codes.len(), positions);
                 return Ok(selection.clone().refine(&mask));
@@ -739,7 +751,7 @@ mod tests {
     #[test]
     fn keep_set_sorts_and_dedups() {
         let keep = Keep::set([5, 1, 3, 3, 1]);
-        assert_eq!(keep, Keep::Set(Buffer::from(vec![1u32, 3, 5])));
+        assert_eq!(keep, Keep::Set(Buffer::from(vec![1u64, 3, 5])));
         assert!(keep.admits(3) && !keep.admits(4));
         assert!(Keep::set([]).is_empty());
         assert!(Keep::range(4..4).is_empty());

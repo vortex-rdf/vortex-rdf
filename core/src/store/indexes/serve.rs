@@ -49,6 +49,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 use crate::store::scan::gather::primitive_from_u64_reads;
+use crate::store::schema::TermCode;
 use crate::store::selection::point_sized;
 
 /// The decode tail shared by both backend-typed serve plans: which of the
@@ -277,7 +278,7 @@ impl InMemoryServePlan {
         }
     }
 
-    /// The served rows' four `u32` term codes, read straight off the index
+    /// The served rows' four [`TermCode`]s, read straight off the index
     /// component's own columns — the code-payload counterpart of
     /// [`decode`](Self::decode).
     ///
@@ -293,7 +294,7 @@ impl InMemoryServePlan {
     /// probe.
     ///
     /// [`POINT_GATHER_MAX_ROWS`]: crate::store::selection::POINT_GATHER_MAX_ROWS
-    pub(crate) fn code_columns(&self, deleted: Option<&Mask>) -> Option<[Buffer<u32>; 4]> {
+    pub(crate) fn code_columns(&self, deleted: Option<&Mask>) -> Option<[Buffer<TermCode>; 4]> {
         if !matches!(self.decode.decode_layout, ResolvedLayout::Dictionary(_)) {
             return None;
         }
@@ -303,9 +304,10 @@ impl InMemoryServePlan {
         let mut columns = Vec::with_capacity(4);
         for name in self.decode.primary_columns {
             let probe = self.probes.by_name(&self.array, name)?;
+            // A probe reads every width as a u64 — exactly a code.
             columns.push(match &live {
-                None => Buffer::from_iter(self.range.clone().map(|pos| probe.value_at(pos) as u32)),
-                Some(live) => Buffer::from_iter(live.iter().map(|&pos| probe.value_at(pos) as u32)),
+                None => Buffer::from_iter(self.range.clone().map(|pos| probe.value_at(pos))),
+                Some(live) => Buffer::from_iter(live.iter().map(|&pos| probe.value_at(pos))),
             });
         }
         let mut columns = columns.into_iter();

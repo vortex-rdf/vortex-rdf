@@ -42,7 +42,7 @@ from rdflib.plugins.sparql import operators as op
 from rdflib.plugins.sparql.sparql import SPARQLError
 from rdflib.term import XSDToPython
 
-from vortex_rdf import U32Column, VortexRdfStore, serialize_rdf
+from vortex_rdf import U64Column, VortexRdfStore, serialize_rdf
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
@@ -188,10 +188,10 @@ def compare(corpus: Corpus, kind, arg, *, flags="", case=None, as_str=False):
     """Native vs rdflib for every candidate; returns the native `(passed,
     undecided)` as sets of codes. Every disagreement is reported at once."""
     passed, undecided = corpus.term_dict.filter_codes(
-        kind, arg, U32Column(corpus.codes), flags=flags, case=case, as_str=as_str
+        kind, arg, U64Column(corpus.codes), flags=flags, case=case, as_str=as_str
     )
-    passed = set(memoryview(passed).cast("I"))
-    undecided = set(memoryview(undecided).cast("I"))
+    passed = set(memoryview(passed).cast("Q"))
+    undecided = set(memoryview(undecided).cast("Q"))
     where = f"{kind} {arg!r} flags={flags!r} case={case} as_str={as_str}"
     problems = []
     if passed & undecided:
@@ -605,9 +605,9 @@ def check_random_patterns(corpus: Corpus, seed: int, count: int) -> Counter:
             for f in flags:
                 cflags |= RE_FLAGS[f]
             compiled = re.compile(pattern, cflags)  # the generator only emits valid patterns
-            passed, undecided = corpus.term_dict.filter_codes("regex", pattern, U32Column(candidates), flags=flags)
-            passed = set(memoryview(passed).cast("I"))
-            undecided = set(memoryview(undecided).cast("I"))
+            passed, undecided = corpus.term_dict.filter_codes("regex", pattern, U64Column(candidates), flags=flags)
+            passed = set(memoryview(passed).cast("Q"))
+            undecided = set(memoryview(undecided).cast("Q"))
             for code in candidates:
                 text = texts[code]
                 want = compiled.search(text) is not None
@@ -730,19 +730,19 @@ def test_normalized_datatypes_are_undecided_under_str(tmp_path):
         lits = set(coded[: len(normalized)])
         texts = {coded[-4], coded[-3]}  # plain, tagged: strings, whatever the option
         typed_texts = {coded[-2], coded[-1]}  # gYear, unknown: strings under STR() only
-        every = U32Column(range(len(term_dict)))
+        every = U64Column(range(len(term_dict)))
         for kind, arg in [
             ("str_prefix", "1"), ("contains", '"-"'), ("strstarts", '"1"'), ("strends", '"2"'), ("regex", "^1-2$"),
         ]:
             for case in (None, "lower", "upper"):
                 where = f"{kind} case={case} in_memory={in_memory}"
                 passed, undecided = term_dict.filter_codes(kind, arg, every, case=case, as_str=True)
-                passed, undecided = set(memoryview(passed).cast("I")), set(memoryview(undecided).cast("I"))
+                passed, undecided = set(memoryview(passed).cast("Q")), set(memoryview(undecided).cast("Q"))
                 assert undecided & universe == lits, f"{where}: undecided {sorted(undecided & universe)}"
                 assert passed & universe == texts | typed_texts, f"{where}: passed {sorted(passed & universe)}"
                 # Without STR() a typed literal is no string: it fails, decided.
                 passed, undecided = term_dict.filter_codes(kind, arg, every, case=case)
-                passed, undecided = set(memoryview(passed).cast("I")), set(memoryview(undecided).cast("I"))
+                passed, undecided = set(memoryview(passed).cast("Q")), set(memoryview(undecided).cast("Q"))
                 assert not undecided & universe, f"{where}: undecided {sorted(undecided & universe)} without as_str"
                 assert passed & universe == texts, f"{where}: passed {sorted(passed & universe)} without as_str"
 

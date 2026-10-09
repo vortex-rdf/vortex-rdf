@@ -8,9 +8,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use vortex_buffer::Buffer;
 use vortex_rdf_core::common::terms::parse_pattern_checked;
-use vortex_rdf_core::{Keep, Probe, QuadColumn};
+use vortex_rdf_core::{Keep, Probe, QuadColumn, TermCode};
 
-use crate::codes::{U32Column, extract_u32s};
+use crate::codes::{U64Column, extract_u64s};
 use crate::parse_err;
 
 /// A `Probe` from a pattern 4-tuple (or list) `(s, p, o, g)`, or a dict with
@@ -104,7 +104,7 @@ pub(crate) fn parse_keeps(obj: &Bound<'_, PyAny>) -> PyResult<Vec<(QuadColumn, K
     let Ok(dict) = obj.cast::<PyDict>() else {
         return Err(PyValueError::new_err(
             "keep must be a dict mapping a position (\"s\", \"p\", \"o\", \"g\" or 0-3) to a \
-             code set (U32Column, u32 buffer or int sequence) or a code range (range or (lo, hi))",
+             code set (U64Column, u64 buffer or int sequence) or a code range (range or (lo, hi))",
         ));
     };
     let mut keeps: Vec<(QuadColumn, Keep)> = Vec::with_capacity(dict.len());
@@ -141,7 +141,8 @@ fn parse_position(position: &Bound<'_, PyAny>) -> PyResult<QuadColumn> {
 }
 
 /// One keep: a `range` with step 1 or a `(lo, hi)` pair of ints is a code
-/// range; a `U32Column`, any u32 buffer or any int sequence is a code set.
+/// range; a `U64Column`, any u64 or u32 buffer or any int sequence is a code
+/// set.
 fn parse_keep(spec: &Bound<'_, PyAny>) -> PyResult<Keep> {
     let py = spec.py();
     let range_type = py.import("builtins")?.getattr("range")?;
@@ -154,7 +155,7 @@ fn parse_keep(spec: &Bound<'_, PyAny>) -> PyResult<Keep> {
         let hi = code_bound(&spec.getattr("stop")?)?;
         return Ok(Keep::range(lo..hi.max(lo)));
     }
-    if let Ok(column) = spec.cast::<U32Column>() {
+    if let Ok(column) = spec.cast::<U64Column>() {
         return Ok(keep_set(column.get().codes.clone()));
     }
     if let Ok(tuple) = spec.cast::<PyTuple>()
@@ -164,10 +165,10 @@ fn parse_keep(spec: &Bound<'_, PyAny>) -> PyResult<Keep> {
         let hi = code_bound(&tuple.get_item(1)?)?;
         return Ok(Keep::range(lo..hi.max(lo)));
     }
-    let codes = extract_u32s(spec).map_err(|e| {
+    let codes = extract_u64s(spec).map_err(|e| {
         PyValueError::new_err(format!(
-            "a keep is a code set (U32Column, u32 buffer or sequence of non-negative ints that \
-             fit a u32) or a code range (range with step 1, or (lo, hi)): {e}"
+            "a keep is a code set (U64Column, u64 buffer or sequence of non-negative ints below \
+             2**64) or a code range (range with step 1, or (lo, hi)): {e}"
         ))
     })?;
     Ok(Keep::set(codes))
@@ -175,7 +176,7 @@ fn parse_keep(spec: &Bound<'_, PyAny>) -> PyResult<Keep> {
 
 /// A sorted, unique buffer is a `Keep::Set` as it stands; anything else is
 /// sorted and folded first.
-fn keep_set(codes: Buffer<u32>) -> Keep {
+fn keep_set(codes: Buffer<TermCode>) -> Keep {
     if codes.as_slice().windows(2).all(|w| w[0] < w[1]) {
         Keep::Set(codes)
     } else {
@@ -183,14 +184,14 @@ fn keep_set(codes: Buffer<u32>) -> Keep {
     }
 }
 
-/// A range bound as a code: a non-negative int that fits a u32.
-fn code_bound(value: &Bound<'_, PyAny>) -> PyResult<u32> {
-    let bound: i128 = value
-        .extract()
-        .map_err(|_| PyValueError::new_err("a keep range bound must be an integer"))?;
-    u32::try_from(bound).map_err(|_| {
+/// A range bound as a code: a non-negative int below 2**64.
+fn code_bound(value: &Bound<'_, PyAny>) -> PyResult<TermCode> {
+    let bound: i128 = value.extract().map_err(|_| {
+        PyValueError::new_err("a keep range bound must be an integer from 0 to 2**64 - 1")
+    })?;
+    TermCode::try_from(bound).map_err(|_| {
         PyValueError::new_err(format!(
-            "keep range bound {bound} is outside the u32 code range"
+            "keep range bound {bound} is outside the code range 0 to 2**64 - 1"
         ))
     })
 }

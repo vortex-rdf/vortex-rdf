@@ -16,7 +16,7 @@ use crate::store::layouts::QuadPattern;
 #[cfg(feature = "file-io")]
 use crate::store::layouts::{DictAccess, ResolvedLayout};
 use crate::store::selection::{RowSelection, ViewSelection};
-use crate::store::{QuadsSource, VortexRdfStore};
+use crate::store::{QuadsSource, TermCode, VortexRdfStore};
 
 pub(crate) use crate::store::mutation::{TAIL_FLATTEN_FLOOR, TAIL_MAX_CHUNKS};
 
@@ -26,6 +26,42 @@ thread_local! {
     /// tests share a process and run on the current-thread runtime, so a test
     /// reads only its own gathers.
     static GATHERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// The code the dictionaries built or opened on this thread give their
+    /// first term (see [`CodeBase`]); 0 outside a guard.
+    static CODE_BASE: std::cell::Cell<TermCode> = const { std::cell::Cell::new(0) };
+}
+
+/// The code a dictionary built or opened on this thread gives its first
+/// term: 0, unless a [`CodeBase`] guard is live. Read once by every
+/// dictionary constructor (`TermDictionary::new`, `FileBackedDict::open`).
+pub(crate) fn code_base() -> TermCode {
+    CODE_BASE.with(std::cell::Cell::get)
+}
+
+/// While alive, every dictionary built or opened on this thread numbers its
+/// terms from `base` instead of 0: code = `base` + rank. A dictionary of a
+/// handful of terms then hands out codes past `u32::MAX`, so a test drives
+/// codes a 32-bit width cannot hold through every path — the build's code
+/// map, the written code columns, matches, keeps, index children, the
+/// dictionary handles and the column kernels — without four billion terms.
+/// The base is never written: a file built under a guard must be reopened
+/// under the same one, as a file of 2^32 more terms would be. Dropping the
+/// guard restores the base it replaced. Thread-local like `GATHERS`, for
+/// the same reason.
+pub(crate) struct CodeBase(TermCode);
+
+impl CodeBase {
+    /// Number this thread's dictionaries from `base` until the guard drops.
+    pub(crate) fn set(base: TermCode) -> Self {
+        CodeBase(CODE_BASE.with(|cell| cell.replace(base)))
+    }
+}
+
+impl Drop for CodeBase {
+    fn drop(&mut self) {
+        CODE_BASE.with(|cell| cell.set(self.0));
+    }
 }
 
 /// Record one gather of live rows (called by `live_raw_quads`).
@@ -217,7 +253,7 @@ impl VortexRdfStore {
     /// file not sorted by subject, a column without a probeable chunk.
     pub(crate) async fn debug_subject_code_range(
         &self,
-        range: Range<u32>,
+        range: Range<TermCode>,
     ) -> Result<Option<Range<u64>>> {
         use crate::store::scan::file_scan;
         let QuadsSource::File { file, .. } = &self.quads else {

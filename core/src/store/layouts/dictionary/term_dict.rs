@@ -1,6 +1,7 @@
 //! The global term dictionary backing [`LayoutStrategy::Dictionary`]:
 //! the lexicographically sorted set of unique RDF term strings, where a term's
-//! code is its sorted position. The s/p/o/g columns store these codes as u32.
+//! code is its sorted position. The s/p/o/g columns store these codes as
+//! [`TermCode`]s (`u64`).
 //!
 //! Because codes are sorted ranks, code comparisons are order-isomorphic to
 //! string comparisons and term → code lookup is a binary search — no HashMap
@@ -32,6 +33,7 @@ use crate::io::read::scan_reader_chunks;
 use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::array::{StrColReader, buf_as_str};
+use crate::store::schema::TermCode;
 
 #[cfg(feature = "file-io")]
 use super::file_backed::FileBackedDict;
@@ -157,6 +159,38 @@ pub(crate) struct TermDictionary {
     terms: TermStore,
     /// The kind ranges, computed on first use (a few probes).
     kinds: OnceLock<KindRanges>,
+    /// The code of the first term (see `code_base`).
+    #[cfg(test)]
+    base: TermCode,
+}
+
+/// The code a dictionary built or opened now gives its first term, under the
+/// tests' `CodeBase` hook: it numbers a dictionary built or opened on its
+/// thread from a base past `u32::MAX`, so a handful of terms exercise codes a
+/// 32-bit width cannot hold. Read once, by a dictionary's constructor;
+/// outside the tests every dictionary starts at 0 (a code is the term's rank,
+/// see [`TermDictionary::base`]).
+#[cfg(test)]
+pub(crate) fn code_base() -> TermCode {
+    crate::store::test_hooks::code_base()
+}
+
+/// The rank of `code` in a dictionary of `len` terms whose first code is
+/// `base`, or `None` when no term of the dictionary has that code. The one
+/// code → rank conversion: checked, never a cast, so a code past what a
+/// `usize` holds (on a 32-bit target) is outside rather than wrapped onto
+/// another term.
+#[inline]
+pub(crate) fn code_rank(code: TermCode, base: TermCode, len: usize) -> Option<usize> {
+    let rank = usize::try_from(code.checked_sub(base)?).ok()?;
+    (rank < len).then_some(rank)
+}
+
+/// The code of the term at `rank` of a dictionary whose first code is
+/// `base`. Lossless: a `usize` is at most 64 bits on every target.
+#[inline]
+pub(crate) fn rank_code(rank: usize, base: TermCode) -> TermCode {
+    base + rank as TermCode
 }
 
 impl TermDictionary {
@@ -165,7 +199,41 @@ impl TermDictionary {
         Self {
             terms,
             kinds: OnceLock::new(),
+            #[cfg(test)]
+            base: code_base(),
         }
+    }
+
+    /// The code of the first term: 0 outside the tests' code-base hook.
+    #[inline]
+    pub(crate) fn base(&self) -> TermCode {
+        #[cfg(test)]
+        {
+            self.base
+        }
+        #[cfg(not(test))]
+        {
+            0
+        }
+    }
+
+    /// The rank of `code`, or `None` when this dictionary holds no term
+    /// with that code.
+    #[inline]
+    pub(crate) fn rank_of(&self, code: TermCode) -> Option<usize> {
+        code_rank(code, self.base(), self.len())
+    }
+
+    /// The code of the term at `rank`.
+    #[inline]
+    pub(crate) fn code_at(&self, rank: usize) -> TermCode {
+        rank_code(rank, self.base())
+    }
+
+    /// One past the last code: every code of this dictionary is below it.
+    #[inline]
+    pub(crate) fn code_end(&self) -> TermCode {
+        self.code_at(self.len())
     }
 
     /// A dictionary of no terms, held canonical: there is nothing to train
@@ -339,23 +407,23 @@ impl TermDictionary {
     ) -> Result<(Self, BorrowedTermCodeMap<'_>)> {
         let total_start = debug::timer();
         let (terms, collect_elapsed, sort_elapsed) = Self::sorted_unique_terms(quads);
+        let freeze_start = debug::timer();
+        let dict = Self::from_sorted(terms.iter().copied())?;
+        let freeze_elapsed = debug::elapsed(freeze_start);
         let map_start = debug::timer();
         let code_map: BorrowedTermCodeMap<'_> = terms
-            .iter()
+            .into_iter()
             .enumerate()
-            .map(|(code, term)| (*term, code as u32))
+            .map(|(rank, term)| (term, dict.code_at(rank)))
             .collect();
-        let map_elapsed = debug::elapsed(map_start);
-        let freeze_start = debug::timer();
-        let dict = Self::from_sorted(terms.into_iter())?;
         log::debug!(
-            "[Dictionary] Built dictionary + borrowed code map from {} quads ({} unique terms): collect {:?}, sort {:?}, map {:?}, freeze {:?}, total {:?}",
+            "[Dictionary] Built dictionary + borrowed code map from {} quads ({} unique terms): collect {:?}, sort {:?}, freeze {:?}, map {:?}, total {:?}",
             quads.len(),
             dict.len(),
             collect_elapsed,
             sort_elapsed,
-            map_elapsed,
-            debug::elapsed(freeze_start),
+            freeze_elapsed,
+            debug::elapsed(map_start),
             debug::elapsed(total_start)
         );
         Ok((dict, code_map))
@@ -384,18 +452,15 @@ impl TermDictionary {
 
     /// Decode a code back to its term string (canonical N-Triples form), or
     /// `None` if the code is out of the dictionary's range.
-    pub(crate) fn decode(&self, code: u32) -> Option<String> {
-        let i = code as usize;
-        if i >= self.len() {
-            return None;
-        }
-        self.cursor().str_at(i).ok().map(str::to_owned)
+    pub(crate) fn decode(&self, code: TermCode) -> Option<String> {
+        let rank = self.rank_of(code)?;
+        self.cursor().str_at(rank).ok().map(str::to_owned)
     }
 
     /// Encode a term to its code: its position in the sorted dictionary, or
     /// `None` when the dictionary does not hold it. A binary search with a
     /// three-way compare per step, returning as soon as the probe hits.
-    pub(crate) fn encode(&self, term: &str) -> Option<u32> {
+    pub(crate) fn encode(&self, term: &str) -> Option<TermCode> {
         // FSST is not order-preserving, so the search cannot run over the
         // compressed codes: every probe decodes into the cursor's scratch.
         let mut cursor = self.cursor();
@@ -405,7 +470,7 @@ impl TermDictionary {
             let mid = lo + (hi - lo) / 2;
             match cursor.bytes_at(mid).cmp(needle) {
                 std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Equal => return Some(mid as u32),
+                std::cmp::Ordering::Equal => return Some(self.code_at(mid)),
                 std::cmp::Ordering::Greater => hi = mid,
             }
         }
@@ -417,7 +482,7 @@ impl TermDictionary {
     /// the same per-probe decode as [`encode`](Self::encode); the position
     /// is where `needle` would be inserted, so a present term's code and
     /// the start of a spelling prefix's run both come out of it.
-    pub(crate) fn lower_bound(&self, needle: &[u8]) -> u32 {
+    pub(crate) fn lower_bound(&self, needle: &[u8]) -> TermCode {
         let mut cursor = self.cursor();
         let (mut lo, mut hi) = (0usize, self.len());
         while lo < hi {
@@ -428,18 +493,18 @@ impl TermDictionary {
                 hi = mid;
             }
         }
-        lo as u32
+        self.code_at(lo)
     }
 
     /// The codes of the terms spelled with `prefix`, as a half-open range:
     /// two lower bounds, of the prefix and of its byte successor (see
     /// [`prefix_successor`]). Term kinds are prefixes (`"`, `<`, `_:`), and
     /// so are IRI namespaces.
-    pub(crate) fn prefix_range(&self, prefix: &str) -> Range<u32> {
+    pub(crate) fn prefix_range(&self, prefix: &str) -> Range<TermCode> {
         let lo = self.lower_bound(prefix.as_bytes());
         let hi = match prefix_successor(prefix.as_bytes()) {
             Some(successor) => self.lower_bound(&successor),
-            None => self.len() as u32,
+            None => self.code_end(),
         };
         lo..hi.max(lo)
     }
@@ -448,13 +513,13 @@ impl TermDictionary {
     pub(crate) fn kind_ranges(&self) -> &KindRanges {
         self.kinds.get_or_init(|| {
             let default_graph =
-                (self.len() > 0 && self.cursor().bytes_at(0).is_empty()).then_some(0);
+                (self.len() > 0 && self.cursor().bytes_at(0).is_empty()).then(|| self.code_at(0));
             KindRanges {
                 default_graph,
                 literals: self.prefix_range("\""),
                 iris: self.prefix_range("<"),
                 blanks: self.prefix_range("_:"),
-                len: self.len() as u32,
+                len: self.code_end(),
             }
         })
     }
@@ -464,7 +529,7 @@ impl TermDictionary {
     /// was typed — the lookup of that spelling. A term absent under both is
     /// absent from the dictionary; malformed input is an error rather than
     /// an absence.
-    pub(crate) fn encode_tolerant(&self, term: &str) -> Result<Option<u32>> {
+    pub(crate) fn encode_tolerant(&self, term: &str) -> Result<Option<TermCode>> {
         if let Some(code) = self.encode(term) {
             return Ok(Some(code));
         }
@@ -476,7 +541,7 @@ impl TermDictionary {
     }
 
     /// [`encode_tolerant`](Self::encode_tolerant) over a batch, in order.
-    pub(crate) fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<u32>>> {
+    pub(crate) fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<TermCode>>> {
         terms
             .iter()
             .map(|term| self.encode_tolerant(term))
@@ -486,17 +551,13 @@ impl TermDictionary {
     /// [`decode`](Self::decode) over a batch, in order, through one cursor
     /// (so a chunked dictionary keeps its warm chunk cursors across the
     /// batch); an out-of-range code decodes to `None`.
-    pub(crate) fn decode_many(&self, codes: &[u32]) -> Vec<Option<String>> {
-        let len = self.len();
+    pub(crate) fn decode_many(&self, codes: &[TermCode]) -> Vec<Option<String>> {
         let mut cursor = self.cursor();
         codes
             .iter()
             .map(|&code| {
-                if (code as usize) < len {
-                    cursor.str_at(code as usize).ok().map(str::to_owned)
-                } else {
-                    None
-                }
+                let rank = self.rank_of(code)?;
+                cursor.str_at(rank).ok().map(str::to_owned)
             })
             .collect()
     }
@@ -509,9 +570,9 @@ impl TermDictionary {
     pub(crate) fn filter_codes(
         &self,
         predicate: &TermPredicate,
-        codes: &[u32],
-    ) -> Result<(Buffer<u32>, Buffer<u32>)> {
-        check_candidates(codes, self.len())?;
+        codes: &[TermCode],
+    ) -> Result<(Buffer<TermCode>, Buffer<TermCode>)> {
+        check_candidates(codes, self.base(), self.len())?;
         let kinds = self.kind_ranges();
         let mut cursor = self.cursor();
         let verdicts: Vec<Verdict> = codes
@@ -519,10 +580,11 @@ impl TermDictionary {
             .map(
                 |&code| match predicate.kind_verdict(kinds.kind_of_code(code)) {
                     Some(verdict) => verdict,
-                    None => match cursor.str_at(code as usize) {
-                        Ok(spelling) => predicate.eval(spelling),
+                    // In range: the candidates were checked above.
+                    None => match self.rank_of(code).map(|rank| cursor.str_at(rank)) {
+                        Some(Ok(spelling)) => predicate.eval(spelling),
                         // A term that is not UTF-8 is nothing the rules speak of.
-                        Err(_) => Verdict::Unknown,
+                        _ => Verdict::Unknown,
                     },
                 },
             )
@@ -549,27 +611,32 @@ pub(super) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// `codes` must be strictly ascending and inside a dictionary of `len`
-/// terms — the contract every candidate evaluation checks before reading.
-pub(super) fn check_candidates(codes: &[u32], len: usize) -> Result<()> {
+/// terms whose first code is `base` — the contract every candidate
+/// evaluation checks before reading.
+pub(super) fn check_candidates(codes: &[TermCode], base: TermCode, len: usize) -> Result<()> {
     if let Some(pair) = codes.windows(2).find(|pair| pair[0] >= pair[1]) {
         return Err(VortexRdfError::InvalidOperation(format!(
             "codes must be sorted and unique: {} follows {}",
             pair[1], pair[0]
         )));
     }
-    if let Some(&last) = codes.last()
-        && last as usize >= len
-    {
-        return Err(VortexRdfError::InvalidOperation(format!(
-            "code {last} is outside the dictionary ({len} terms)"
-        )));
+    // Ascending, so the ends bound every candidate.
+    for &code in [codes.first(), codes.last()].into_iter().flatten() {
+        if code_rank(code, base, len).is_none() {
+            return Err(VortexRdfError::InvalidOperation(format!(
+                "code {code} is outside the dictionary ({len} terms)"
+            )));
+        }
     }
     Ok(())
 }
 
 /// The candidates' verdicts as `(passed, undecided)`, both ascending
 /// subsets of `codes`; a code in neither failed.
-pub(super) fn split_verdicts(codes: &[u32], verdicts: &[Verdict]) -> (Buffer<u32>, Buffer<u32>) {
+pub(super) fn split_verdicts(
+    codes: &[TermCode],
+    verdicts: &[Verdict],
+) -> (Buffer<TermCode>, Buffer<TermCode>) {
     let (mut passed, mut undecided) = (Vec::new(), Vec::new());
     for (&code, verdict) in codes.iter().zip(verdicts) {
         match verdict {
@@ -738,7 +805,7 @@ pub struct DictSnapshot(pub(crate) Arc<TermDictionary>);
 impl DictSnapshot {
     /// Decode a term code to its N-Triples string, or `None` when the code is
     /// out of this dictionary's range.
-    pub fn decode(&self, code: u32) -> Option<String> {
+    pub fn decode(&self, code: TermCode) -> Option<String> {
         self.0.decode(code)
     }
 
@@ -746,7 +813,7 @@ impl DictSnapshot {
     /// sorted dictionary), or `None` when this dictionary does not hold the
     /// term. The inverse of [`decode`](Self::decode); a binary search over
     /// the dictionary.
-    pub fn encode(&self, term: &str) -> Option<u32> {
+    pub fn encode(&self, term: &str) -> Option<TermCode> {
         self.0.encode(term)
     }
 
@@ -765,25 +832,25 @@ impl DictSnapshot {
     /// typing, an upper-case language tag, or a default-graph spelling
     /// (`""`, `default`, `[]`) all resolve to the code of the stored form
     /// (see [`canonical_spelling`]). Malformed input is an error.
-    pub fn encode_tolerant(&self, term: &str) -> Result<Option<u32>> {
+    pub fn encode_tolerant(&self, term: &str) -> Result<Option<TermCode>> {
         self.0.encode_tolerant(term)
     }
 
     /// [`encode_tolerant`](Self::encode_tolerant) over a batch, in order.
-    pub fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<u32>>> {
+    pub fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<TermCode>>> {
         self.0.encode_many(terms)
     }
 
     /// [`decode`](Self::decode) over a batch, in order, through one cursor;
     /// an out-of-range code decodes to `None`.
-    pub fn decode_many(&self, codes: &[u32]) -> Vec<Option<String>> {
+    pub fn decode_many(&self, codes: &[TermCode]) -> Vec<Option<String>> {
         self.0.decode_many(codes)
     }
 
     /// The code of the first term not below `term` in byte order (the
     /// dictionary's size when every term is below it): a present term's own
     /// code, or where an absent one would sort.
-    pub fn lower_bound(&self, term: &str) -> u32 {
+    pub fn lower_bound(&self, term: &str) -> TermCode {
         self.0.lower_bound(term.as_bytes())
     }
 
@@ -791,7 +858,7 @@ impl DictSnapshot {
     /// `prefix`. Codes are lexicographic ranks of the N-Triples spelling, so
     /// a term kind (`"` for literals, `<` for IRIs, `_:` for blank nodes)
     /// and an IRI namespace (`<http://example.org/`) are each one range.
-    pub fn prefix_range(&self, prefix: &str) -> (u32, u32) {
+    pub fn prefix_range(&self, prefix: &str) -> (TermCode, TermCode) {
         let range = self.0.prefix_range(prefix);
         (range.start, range.end)
     }
@@ -809,8 +876,8 @@ impl DictSnapshot {
     pub fn filter_codes(
         &self,
         predicate: &TermPredicate,
-        codes: &[u32],
-    ) -> Result<(Buffer<u32>, Buffer<u32>)> {
+        codes: &[TermCode],
+    ) -> Result<(Buffer<TermCode>, Buffer<TermCode>)> {
         self.0.filter_codes(predicate, codes)
     }
 }
@@ -888,7 +955,7 @@ impl DictReader {
 
     /// The N-Triples string for `code`, or `None` when the code is out of
     /// range.
-    pub async fn decode(&self, code: u32) -> Result<Option<String>> {
+    pub async fn decode(&self, code: TermCode) -> Result<Option<String>> {
         match &self.0 {
             DictReaderInner::Resident(dict) => Ok(dict.decode(code)),
             #[cfg(feature = "file-io")]
@@ -901,7 +968,7 @@ impl DictReader {
     /// [`decode`](Self::decode) over a batch, in order: any order and
     /// repeats are fine (a file-backed dictionary reads each distinct code
     /// once, in one batch).
-    pub async fn decode_many(&self, codes: &[u32]) -> Result<Vec<Option<String>>> {
+    pub async fn decode_many(&self, codes: &[TermCode]) -> Result<Vec<Option<String>>> {
         match &self.0 {
             DictReaderInner::Resident(dict) => Ok(dict.decode_many(codes)),
             #[cfg(feature = "file-io")]
@@ -911,7 +978,7 @@ impl DictReader {
 
     /// The code of `term`, tolerant of spelling (see
     /// [`DictSnapshot::encode_tolerant`]).
-    pub async fn encode(&self, term: &str) -> Result<Option<u32>> {
+    pub async fn encode(&self, term: &str) -> Result<Option<TermCode>> {
         match &self.0 {
             DictReaderInner::Resident(dict) => dict.encode_tolerant(term),
             #[cfg(feature = "file-io")]
@@ -921,7 +988,7 @@ impl DictReader {
 
     /// [`encode`](Self::encode) over a batch, in order (a file-backed
     /// dictionary overlaps the lookups' reads).
-    pub async fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<u32>>> {
+    pub async fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<TermCode>>> {
         match &self.0 {
             DictReaderInner::Resident(dict) => dict.encode_many(terms),
             #[cfg(feature = "file-io")]
@@ -930,7 +997,7 @@ impl DictReader {
     }
 
     /// See [`DictSnapshot::lower_bound`].
-    pub async fn lower_bound(&self, term: &str) -> Result<u32> {
+    pub async fn lower_bound(&self, term: &str) -> Result<TermCode> {
         match &self.0 {
             DictReaderInner::Resident(dict) => Ok(dict.lower_bound(term.as_bytes())),
             #[cfg(feature = "file-io")]
@@ -939,7 +1006,7 @@ impl DictReader {
     }
 
     /// See [`DictSnapshot::prefix_range`].
-    pub async fn prefix_range(&self, prefix: &str) -> Result<(u32, u32)> {
+    pub async fn prefix_range(&self, prefix: &str) -> Result<(TermCode, TermCode)> {
         let range = match &self.0 {
             DictReaderInner::Resident(dict) => dict.prefix_range(prefix),
             #[cfg(feature = "file-io")]
@@ -962,8 +1029,8 @@ impl DictReader {
     pub async fn filter_codes(
         &self,
         predicate: &TermPredicate,
-        codes: &[u32],
-    ) -> Result<(Buffer<u32>, Buffer<u32>)> {
+        codes: &[TermCode],
+    ) -> Result<(Buffer<TermCode>, Buffer<TermCode>)> {
         match &self.0 {
             DictReaderInner::Resident(dict) => dict.filter_codes(predicate, codes),
             #[cfg(feature = "file-io")]
@@ -1133,9 +1200,12 @@ mod tests {
             TermStore::Single(TermChunk::Fsst(_))
         ));
         for (i, term) in terms.iter().enumerate() {
-            assert_eq!(windowed.encode(term), Some(i as u32), "{term}");
-            assert_eq!(windowed.decode(i as u32).as_deref(), Some(term.as_str()));
-            assert_eq!(single.encode(term), Some(i as u32));
+            assert_eq!(windowed.encode(term), Some(i as TermCode), "{term}");
+            assert_eq!(
+                windowed.decode(i as TermCode).as_deref(),
+                Some(term.as_str())
+            );
+            assert_eq!(single.encode(term), Some(i as TermCode));
         }
         assert_eq!(windowed.encode("<http://absent>"), None);
         assert_eq!(windowed.decode(1_000), None);
@@ -1181,8 +1251,8 @@ mod tests {
 
         for (i, term) in terms.iter().enumerate() {
             for d in [&single, &chunked] {
-                assert_eq!(d.encode(term), Some(i as u32), "{term}");
-                assert_eq!(d.decode(i as u32).as_deref(), Some(term.as_str()));
+                assert_eq!(d.encode(term), Some(i as TermCode), "{term}");
+                assert_eq!(d.decode(i as TermCode).as_deref(), Some(term.as_str()));
             }
         }
         assert_eq!(chunked.encode("<http://absent>"), None);
@@ -1217,7 +1287,10 @@ mod tests {
             .unwrap();
         let snapshot = reread.dictionary_snapshot().unwrap();
         for (i, term) in terms.iter().enumerate() {
-            assert_eq!(snapshot.decode(i as u32).as_deref(), Some(term.as_str()));
+            assert_eq!(
+                snapshot.decode(i as TermCode).as_deref(),
+                Some(term.as_str())
+            );
         }
         // And the term column carries no zone-map node at all.
         let native = crate::tests::open_native_bytes(bytes);
@@ -1256,10 +1329,14 @@ mod tests {
             .unwrap()
             .expect("an unzoned chunked child is point-readable");
         for (i, term) in terms.iter().enumerate() {
-            assert_eq!(fbd.encode(term).await.unwrap(), Some(i as u32), "{term}");
+            assert_eq!(
+                fbd.encode(term).await.unwrap(),
+                Some(i as TermCode),
+                "{term}"
+            );
         }
         assert_eq!(fbd.encode("<http://absent>").await.unwrap(), None);
-        let codes = [0u32, 119, 120, 299];
+        let codes = [0u64, 119, 120, 299];
         let decoded = fbd.decode_many(&codes).await.unwrap();
         for (code, term) in codes.iter().zip(&decoded) {
             assert_eq!(term.as_ref(), terms[*code as usize]);

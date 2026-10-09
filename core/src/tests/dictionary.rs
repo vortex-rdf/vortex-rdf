@@ -151,7 +151,7 @@ async fn test_dictionary_match_and_mutations() {
     .unwrap();
     let store = VortexRdfStore::from_built(arr).unwrap();
 
-    // Subject match: hits the IsSorted binary-search fast path on the u32 column.
+    // Subject match: hits the IsSorted binary-search fast path on the TermCode column.
     let s3 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s03").unwrap());
     let by_subject = store
         .match_pattern(Some(&s3), None, None, None)
@@ -161,7 +161,7 @@ async fn test_dictionary_match_and_mutations() {
     let results: Vec<Quad> = by_subject.quads().unwrap().try_collect().await.unwrap();
     assert_eq!(results[0].subject.to_string(), "<http://example.org/s03>");
 
-    // Predicate match: mask scan over the u32 codes (p0 occurs for i = 0,3,6,9).
+    // Predicate match: mask scan over the TermCode codes (p0 occurs for i = 0,3,6,9).
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
     let by_pred = store
         .match_pattern(None, Some(&p0), None, None)
@@ -450,10 +450,10 @@ async fn test_code_read_snapshot_survives_from_bytes() {
         .code_read_snapshot()
         .expect("an adopted Dictionary store is code-readable");
 
-    let decode_rows = |cols: &[vortex_buffer::Buffer<u32>; 4]| -> Vec<String> {
+    let decode_rows = |cols: &[vortex_buffer::Buffer<TermCode>; 4]| -> Vec<String> {
         let mut rows: Vec<String> = (0..cols[0].len())
             .map(|i| {
-                let term = |c: &vortex_buffer::Buffer<u32>| {
+                let term = |c: &vortex_buffer::Buffer<TermCode>| {
                     dict.decode(c[i])
                         .expect("codes address the adopted dictionary")
                 };

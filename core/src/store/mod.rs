@@ -44,7 +44,7 @@ pub use layouts::dictionary::{
 };
 pub(crate) use matching::IdsNeed;
 pub use narrowing::Keep;
-pub use schema::QuadColumn;
+pub use schema::{QuadColumn, TermCode};
 // `RawQuad` lives in `common` (it is pure RDF text — see that module's
 // charter); this re-export makes `store::RawQuad` the path builder consumers
 // use.
@@ -153,7 +153,7 @@ fn resolved_layout(
 }
 
 /// The compressed-resident form every in-memory construction produces: the
-/// base's u32 code columns and each component's integer children are
+/// base's code columns and each component's integer children are
 /// re-encoded into probe-supported encodings (see
 /// [`with_compressed_int_children`](array::with_compressed_int_children)),
 /// with the base additionally payload-wrapped so the code-column read path

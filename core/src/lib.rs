@@ -59,7 +59,7 @@ pub use store::columns;
 pub use store::{
     BuiltArray, BuiltStream, CaseMap, ChunkStream, DictReader, DictSnapshot, DictionaryQuadSink,
     IndexType, Indexes, Keep, KindRanges, LayoutStrategy, NumOp, Probe, QuadColumn, RawQuad,
-    SharedQuad, SortedInMemoryBuilder, StoreParts, TermPredicate, TextOptions, Verdict,
+    SharedQuad, SortedInMemoryBuilder, StoreParts, TermCode, TermPredicate, TextOptions, Verdict,
     VortexArrayBuilder, VortexRdfStore, export_rdf,
 };
 // Compiled out on wasm along with the rest of the sorted-stream builder's

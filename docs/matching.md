@@ -131,8 +131,8 @@ perform I/O, and the only reason the prelude is async at all.
 |---|---|---|---|
 | `Default` | — | nothing but tag the resolver (never suspends) | the N-Triples string |
 | `TypedObject` | — | nothing but tag the resolver (never suspends) | the N-Triples string; the object decomposes into `o_kind`/`o_value`/`o_datatype`/`o_lang` |
-| `Dictionary` | in-memory | seeds the role cache by in-memory binary search | `u32` code |
-| `Dictionary` | file-backed | four **concurrent** point-read binary searches of the dictionary child (`futures::join!`), seeding every bound role | `u32` code |
+| `Dictionary` | in-memory | seeds the role cache by in-memory binary search | `u64` code |
+| `Dictionary` | file-backed | four **concurrent** point-read binary searches of the dictionary child (`futures::join!`), seeding every bound role | `u64` code |
 
 What the witness saves is likewise layout-dependent. Its **role cache holds
 codes**, so under `Dictionary` a fully-bound pattern costs one dictionary search
@@ -154,12 +154,12 @@ as:
 |---|---|---|
 | `Default` | nothing | `s = "<http://example.org/alice>"`, `o = "\"Alice\""` |
 | `TypedObject` | nothing | `s = "<http://example.org/alice>"`, `o_kind = 2u8`, `o_value = "Alice"` |
-| `Dictionary` | `s → 2`, `o → 1` — two binary searches of the dictionary | `s = 2u32`, `o = 1u32` |
+| `Dictionary` | `s → 2`, `o → 1` — two binary searches of the dictionary | `s = 2u64`, `o = 1u64` |
 
 The string layouts compare one column per bound role; `TypedObject` is the
 exception, expanding a bound object into the 2–4 sub-column equalities its
 decomposition implies — `"Alice"@en` would add `o_lang = "en"`, a typed
-literal `o_datatype`. `Dictionary` compares `u32` codes, and short-circuits the
+literal `o_datatype`. `Dictionary` compares `u64` codes, and short-circuits the
 whole pattern to **`Constraints::AlwaysFalse`** the moment any bound term is
 absent from the dictionary: for `(ex:carol ? ? ?)` the subject resolves to no
 code, and nothing below ever runs.
@@ -405,8 +405,8 @@ order:
 1. **Typed residual** ([`scan/typed_eq.rs`](../core/src/store/scan/typed_eq.rs))
    — a direct row loop yielding exact base ids, no slice/compare/mask pipeline.
    It binds each residual equality to a typed column view:
-   - canonical non-nullable `u32` primitives → slice loads (and, when every
-     constraint is a code compare, a branch-free `(&[u32], u32)` loop);
+   - canonical non-nullable `u64` code primitives → slice loads (and, when
+     every constraint is a code compare, a branch-free `(&[u64], u64)` loop);
    - other non-nullable unsigned ints whose encoding resolves an encoded-search
      probe → per-row point reads;
    - canonical non-nullable Utf8 `VarBinView` → length-first view-level compare.
@@ -653,7 +653,7 @@ a `FileServePlan`, which carries a graph equality of its own (see 8.4).
 ### 8.2 `SecondaryByCopy` — two sorted quad copies
 
 Children: `index:posg` (quads sorted by p, o, s, g) and `index:ospg` (sorted by
-o, s, p, g), each `{s, p, o, g, rid}`, term strings or `u32` codes.
+o, s, p, g), each `{s, p, o, g, rid}`, term strings or `u64` codes.
 
 **In memory:** requires the family's component to exist and be *globally* sorted
 (`IndexComponent::find_sorted` — per-chunk sorted data is not binary-searchable).
@@ -891,7 +891,7 @@ The match's decisions show up here
 | `quads()` / `quads_vec()` | decode the plan's run (in memory: slice or point reads; file: point reads ≤ 256 rows, else a range scan of the located run (`located_run_scan`); a projected+filtered scan of the child only when the run was not located) — the pending ids are never touched | gather the selection from the primaries, or run the restricted file scan |
 | `shared_quads_vec()` / `shared_quad_chunks()` | as `quads()`, through the plan's shared-term decode twins — one `Arc<str>` per distinct term of a chunk, handed to every row repeating it | the same gather or restricted scan, decoded to shared terms |
 | `size()` | in memory a lazy component run knows its width without decoding; on file a located plan's run width answers outright when no filter or tombstones apply, otherwise the ids materialize (then filter masks are counted if a filter is pending) | selection length, or `count_matching_rows` over the filter |
-| `code_columns()` / `code_columns_gathered()` | read the four `u32` columns straight off the index's own columns | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views) |
+| `code_columns()` / `code_columns_gathered()` | read the four `u64` code columns straight off the index's own columns | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views) |
 | `raw_quad_chunks()` | plan deliberately ignored (it reorders rows; the N-Triples export is order-insignificant) | restricted scan in base row order |
 
 `LazyRowIds` caches into a shared `OnceLock`, so the first consumer that needs

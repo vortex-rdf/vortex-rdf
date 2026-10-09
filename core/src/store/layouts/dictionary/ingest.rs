@@ -24,6 +24,7 @@ use crate::error::Result;
 use crate::store::RawQuad;
 use crate::store::builders::{BuiltArray, build_components_from_codes};
 use crate::store::indexes::Indexes;
+use crate::store::schema::TermCode;
 
 use super::term_dict::TermDictionary;
 use super::{QuadCodes, build_array};
@@ -34,11 +35,11 @@ use super::{QuadCodes, build_array};
 /// retain only the [`TermDictionary`]. Builders holding a live quad slice use
 /// [`BorrowedTermCodeMap`] (see [`TermDictionary::from_quads_with_map`]).
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) type TermCodeMap = HashMap<String, u32>;
+pub(crate) type TermCodeMap = HashMap<String, TermCode>;
 
 /// Term → code lookup borrowing its keys from the quads being encoded — the
 /// allocation-free counterpart of `TermCodeMap`.
-pub(crate) type BorrowedTermCodeMap<'a> = HashMap<&'a str, u32>;
+pub(crate) type BorrowedTermCodeMap<'a> = HashMap<&'a str, TermCode>;
 
 /// Incrementally collects the unique term strings of a dataset during the
 /// ingestion pass of a build. Owned strings exist only for the build's lifetime.
@@ -81,7 +82,7 @@ impl TermDictionaryBuilder {
         let code_map: TermCodeMap = terms
             .into_iter()
             .enumerate()
-            .map(|(code, term)| (term, code as u32))
+            .map(|(rank, term)| (term, dict.code_at(rank)))
             .collect();
         log::debug!(
             "[Dictionary] Finished incremental dictionary ({} unique terms): collect {:?}, sort {:?}, freeze {:?}, map {:?}, total {:?}",
@@ -153,26 +154,26 @@ impl DictionaryQuadSink {
 
 /// Ingest-time interner producing the dictionary and the coded quads in one
 /// pass: quads are consumed as they arrive, each unique term is held once, and
-/// each quad is kept as four u32 term codes. The coded quads that come out are
+/// each quad is kept as four term codes. The coded quads that come out are
 /// distinct.
 ///
 /// The stream's per-quad Strings exist only transiently: they die inside
 /// [`push`](Self::push), so what accumulates is one copy of each distinct
-/// term plus 16 bytes per quad.
+/// term plus 32 bytes per quad.
 ///
 /// Codes handed out during ingest are provisional (insertion order).
 /// [`finish`](Self::finish) sorts the unique terms, freezes them into the
 /// [`TermDictionary`], and remaps every quad's provisional codes to its terms'
 /// sorted ranks — the dictionary codes, since codes are lexicographic ranks.
-/// It then sorts the coded quads directly — `[u32; 4]` lexicographic order
+/// It then sorts the coded quads directly — `[TermCode; 4]` lexicographic order
 /// equals (s, p, o, g) term order because codes are sorted ranks — and drops
 /// the adjacent repeats, which are the same quad: terms are interned once,
 /// so equal codes are equal terms.
 pub(crate) struct InterningQuadBuilder {
     /// term → provisional code, owning each distinct term exactly once.
-    codes: HashMap<Box<str>, u32>,
+    codes: HashMap<Box<str>, TermCode>,
     /// One `[s, p, o, g]` of provisional codes per quad, in arrival order.
-    quads: Vec<[u32; 4]>,
+    quads: Vec<[TermCode; 4]>,
 }
 
 impl InterningQuadBuilder {
@@ -184,7 +185,7 @@ impl InterningQuadBuilder {
     }
 
     /// Drain a quad stream into a fresh interner: each quad's Strings die
-    /// here, leaving one copy of every distinct term plus 16 bytes per quad.
+    /// here, leaving one copy of every distinct term plus 32 bytes per quad.
     /// [`finish`](Self::finish) then yields the dictionary and the coded
     /// quads in global (s, p, o, g) order.
     pub(crate) async fn from_stream(
@@ -197,8 +198,10 @@ impl InterningQuadBuilder {
         Ok(interner)
     }
 
-    fn intern(&mut self, term: String) -> u32 {
-        let next = self.codes.len() as u32;
+    fn intern(&mut self, term: String) -> TermCode {
+        // Provisional codes are insertion ranks: below the term count, so
+        // they index `rank_of` in `finish`.
+        let next = self.codes.len() as TermCode;
         // `into_boxed_str` is free for exact-capacity Strings (the common
         // case from `RawQuad::from_quad`) and shrinks the rest.
         *self.codes.entry(term.into_boxed_str()).or_insert(next)
@@ -223,14 +226,16 @@ impl InterningQuadBuilder {
 
         let sort_start = debug::timer();
         // Unique terms, so the tuple Ord never reaches the code.
-        let mut entries: Vec<(Box<str>, u32)> = self.codes.into_iter().collect();
+        let mut entries: Vec<(Box<str>, TermCode)> = self.codes.into_iter().collect();
         entries.sort_unstable();
         let sort_terms_elapsed = debug::elapsed(sort_start);
 
-        // provisional code → sorted rank == dictionary code.
-        let mut rank_of = vec![0u32; entries.len()];
+        // provisional code → sorted rank. A provisional code is an insertion
+        // rank below `entries.len()`, so it indexes the table on every
+        // target.
+        let mut rank_of = vec![0usize; entries.len()];
         for (rank, (_, provisional)) in entries.iter().enumerate() {
-            rank_of[*provisional as usize] = rank as u32;
+            rank_of[*provisional as usize] = rank;
         }
 
         // Freeze by *consuming* the boxes: each term is freed as it is copied
@@ -241,10 +246,11 @@ impl InterningQuadBuilder {
         let dict = TermDictionary::from_sorted_column(plain)?;
         let freeze_elapsed = debug::elapsed(freeze_start);
 
+        // sorted rank → dictionary code.
         let remap_start = debug::timer();
         for quad in &mut self.quads {
             for code in quad.iter_mut() {
-                *code = rank_of[*code as usize];
+                *code = dict.code_at(rank_of[*code as usize]);
             }
         }
         self.quads.sort_unstable();

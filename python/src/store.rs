@@ -7,22 +7,22 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use vortex_buffer::Buffer;
 use vortex_rdf_core::common::terms::{Pattern, parse_pattern_checked};
-use vortex_rdf_core::{VortexRdfError as CoreError, VortexRdfStore as CoreStore};
+use vortex_rdf_core::{TermCode, VortexRdfError as CoreError, VortexRdfStore as CoreStore};
 
-use crate::codes::{TermDict, U32Column};
+use crate::codes::{TermDict, U64Column};
 use crate::probes::{parse_keeps, parse_probe, pattern_probe};
 use crate::{RUNTIME, VortexRdfError, parse_err, store_err};
 use vortex_rdf_core::Probe;
 
 /// `(s, p, o, g)` code columns as returned by [`VortexRdfStore::match_codes`].
-type CodeColumns = (U32Column, U32Column, U32Column, U32Column);
+type CodeColumns = (U64Column, U64Column, U64Column, U64Column);
 
-fn code_columns([s, p, o, g]: [Buffer<u32>; 4]) -> CodeColumns {
+fn code_columns([s, p, o, g]: [Buffer<TermCode>; 4]) -> CodeColumns {
     (
-        U32Column { codes: s },
-        U32Column { codes: p },
-        U32Column { codes: o },
-        U32Column { codes: g },
+        U64Column { codes: s },
+        U64Column { codes: p },
+        U64Column { codes: o },
+        U64Column { codes: g },
     )
 }
 
@@ -157,7 +157,7 @@ impl VortexRdfStore {
         &self,
         py: Python<'_>,
         pattern: &Pattern,
-    ) -> PyResult<Option<[Buffer<u32>; 4]>> {
+    ) -> PyResult<Option<[Buffer<TermCode>; 4]>> {
         py.detach(|| -> Result<_, CoreError> {
             RUNTIME.block_on(async { self.matched(pattern).await?.code_columns_gathered().await })
         })
@@ -436,15 +436,15 @@ impl VortexRdfStore {
         self.store.dict_reader().map(|reader| TermDict { reader })
     }
 
-    /// Match a pattern and return the rows as four zero-copy `u32` term-code
-    /// columns `(s, p, o, g)` decodable through [`Self::term_dict`], or
+    /// Match a pattern and return the rows as four zero-copy `u64` term-code
+    /// columns (`U64Column`) `(s, p, o, g)` decodable through [`Self::term_dict`], or
     /// `None` when the code path does not apply (see `term_dict`). Callers
     /// fall back to [`Self::get_quads`] or [`Self::match_columns`], which
     /// resolve terms on every layout.
     ///
     /// `keep` narrows the match inside the store, before any row is
     /// gathered: a dict from position (`"s"`, `"p"`, `"o"`, `"g"` or 0-3)
-    /// to the codes to keep there — a code set (`U32Column`, u32 buffer or
+    /// to the codes to keep there — a code set (`U64Column`, u64 buffer or
     /// int sequence; what `TermDict.filter_codes` or encoded `VALUES`
     /// yield) or a code range (a `range` with step 1, or `(lo, hi)`; what
     /// `TermDict.prefix_range` yields). `offset` and `limit` window the

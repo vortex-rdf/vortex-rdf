@@ -806,7 +806,7 @@ async fn test_reference_index_pending_run_composes() {
             .unwrap();
         let kept_cols = kept.code_columns_gathered().await.unwrap().unwrap();
         for (col, whole) in kept_cols.iter().zip(&all) {
-            let want: Vec<u32> = kept_rows.iter().map(|&i| whole[i]).collect();
+            let want: Vec<TermCode> = kept_rows.iter().map(|&i| whole[i]).collect();
             assert_eq!(col.as_slice(), want.as_slice());
         }
         // The same keep as a probe's, counted and windowed.
@@ -945,7 +945,7 @@ async fn test_only_a_counted_view_is_pending_without_a_plan() {
             .unwrap();
         assert!(counted.debug_pending_without_plan());
         // Resolving it leaves none behind, and the row path never builds one.
-        let admit_all = Keep::range(0..u32::MAX);
+        let admit_all = Keep::range(0..TermCode::MAX);
         let window = counted.window(3, 10).await.unwrap();
         assert!(!window.debug_pending_without_plan());
         let kept = counted.keep(QuadColumn::O, &admit_all).await.unwrap();
