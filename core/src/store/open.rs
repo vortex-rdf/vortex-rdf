@@ -26,7 +26,7 @@ use vortex_array::dtype::DType;
 use vortex_array::{IntoArray, VortexSessionExecute};
 
 use super::VortexRdfStore;
-use super::schema::{CODE_PTYPE, PRIMARY_COLUMNS};
+use super::schema::{CODE_PTYPE, is_code_column_name};
 
 /// Refuse a table whose code columns are integers of a width other than
 /// [`TermCode`](super::TermCode)'s: the readers take an integer `s`, `p`,
@@ -35,15 +35,12 @@ use super::schema::{CODE_PTYPE, PRIMARY_COLUMNS};
 /// — written by a pre-release of 0.12, before codes were widened, or by a
 /// foreign writer — must not open. `table` names the table in the error.
 pub(super) fn check_code_columns(table: &str, dtype: &DType) -> Result<()> {
-    use crate::store::indexes::secondary_by_reference::COL_VAL;
-
     let DType::Struct(fields, _) = dtype else {
         return Ok(());
     };
     for (name, field) in fields.names().iter().zip(fields.fields()) {
-        let is_code_column = PRIMARY_COLUMNS.contains(&name.as_ref()) || name.as_ref() == COL_VAL;
         if let DType::Primitive(ptype, _) = field
-            && is_code_column
+            && is_code_column_name(name.as_ref())
             && ptype != CODE_PTYPE
         {
             return Err(VortexRdfError::Deserialization(format!(

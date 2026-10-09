@@ -14,7 +14,7 @@
 //! [`secondary_by_reference`]: crate::store::indexes::secondary_by_reference
 //! [`typed_object`]: crate::store::layouts::typed_object
 
-use vortex_array::dtype::PType;
+use vortex_array::dtype::{DType, Nullability, PType};
 
 /// A term code: a term's rank in a Dictionary-layout store's sorted term
 /// dictionary — the value of every code column (the quad table's `s`, `p`,
@@ -28,6 +28,23 @@ pub type TermCode = u64;
 /// column having this type; a code column of any other integer width is a
 /// file this crate never wrote and is refused at open.
 pub(crate) const CODE_PTYPE: PType = PType::U64;
+
+/// Whether a column named `name` holds term codes where it is an integer:
+/// the quad table's and the copy index children's `s`, `p`, `o`, `g`, and
+/// the reference index children's `val`. Under the string layouts the same
+/// names hold term strings.
+pub(crate) fn is_code_column_name(name: &str) -> bool {
+    PRIMARY_COLUMNS.contains(&name)
+        || name == crate::store::indexes::secondary_by_reference::COL_VAL
+}
+
+/// Whether the field `name: dtype` is a term-code column as this crate
+/// writes one: a code column name ([`is_code_column_name`]) holding
+/// non-nullable [`CODE_PTYPE`] values.
+pub(crate) fn is_code_field(name: &str, dtype: &DType) -> bool {
+    is_code_column_name(name)
+        && matches!(dtype, DType::Primitive(ptype, Nullability::NonNullable) if *ptype == CODE_PTYPE)
+}
 
 /// The subject column — first in every layout. Whether its rows are globally
 /// sorted is per-store provenance

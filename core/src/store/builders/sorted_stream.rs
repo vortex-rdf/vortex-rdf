@@ -481,9 +481,7 @@ where
     (CopyKey<V>, u32): Ord + Spillable,
 {
     use crate::io::container::sources::PullComponentSource;
-    use crate::io::container::{
-        StoreComponentDescriptor, StoreComponentRole, default_child_strategy,
-    };
+    use crate::io::container::{StoreComponentDescriptor, StoreComponentRole, child_strategy};
     use crate::store::indexes::secondary_by_copy::CopyFamily;
     use crate::store::indexes::secondary_by_copy::out_of_core::{
         copy_child_chunk, copy_child_dtype,
@@ -531,8 +529,8 @@ where
                     sorted: true,
                     dtype: dtype.clone(),
                 },
-                Arc::new(PullComponentSource::new(dtype, chunk_size, pull_fn)),
-                default_child_strategy(),
+                Arc::new(PullComponentSource::new(dtype.clone(), chunk_size, pull_fn)),
+                child_strategy(&dtype),
             )
             .map_err(VortexRdfError::Vortex)?,
         );

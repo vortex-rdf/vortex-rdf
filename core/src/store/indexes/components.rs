@@ -295,9 +295,10 @@ impl IndexComponent {
     pub(crate) fn to_write(&self) -> Result<crate::io::container::NativeComponentWrite> {
         use crate::io::container::{
             BufferedComponentSource, NativeComponentWrite, StoreComponentDescriptor,
-            StoreComponentRole, default_child_strategy,
+            StoreComponentRole, child_strategy,
         };
         let array = self.rows()?.clone().into_array();
+        let strategy = child_strategy(array.dtype());
         NativeComponentWrite::new(
             StoreComponentDescriptor {
                 name: self.name.into(),
@@ -311,7 +312,7 @@ impl IndexComponent {
             Arc::new(
                 BufferedComponentSource::try_new(vec![array]).map_err(VortexRdfError::Vortex)?,
             ),
-            default_child_strategy(),
+            strategy,
         )
         .map_err(VortexRdfError::Vortex)
     }

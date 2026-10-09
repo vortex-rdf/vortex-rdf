@@ -75,7 +75,11 @@ pub(crate) use layout::{
     RdfStoreLayoutVTable, is_legacy_file, is_native_file, legacy_store_message, quads_sorted,
     register, store_component, store_components,
 };
-pub(crate) use sources::{NativeComponentWrite, default_child_strategy};
+#[cfg(test)]
+pub(crate) use sources::default_child_strategy;
+pub(crate) use sources::{NativeComponentWrite, child_strategy};
+#[cfg(all(test, feature = "file-io"))]
+pub(crate) use sources::{ONE_MEG, child_strategy_with};
 // Consumed only by the write side (`ser` and `IndexComponent::to_write`),
 // gated the same way.
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]

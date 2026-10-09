@@ -27,6 +27,8 @@ mod indexes;
 #[cfg(feature = "file-io")]
 mod indexes_file;
 #[cfg(feature = "file-io")]
+mod leaf_geometry;
+#[cfg(feature = "file-io")]
 mod legacy_store;
 #[cfg(feature = "file-io")]
 mod mapping;

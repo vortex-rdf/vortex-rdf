@@ -18,7 +18,7 @@
 use crate::error::{Result, VortexRdfError};
 
 use crate::debug;
-use crate::io::container::{self, default_child_strategy};
+use crate::io::container::{self, child_strategy};
 use crate::store::LayoutStrategy;
 use crate::store::StoreParts;
 use crate::store::builders::BuiltStream;
@@ -142,11 +142,12 @@ where
         components.push(dict.to_write()?);
     }
 
+    let quad_strategy = child_strategy(&built.dtype);
     container::write_store(
         &crate::session::VORTEX_SESSION,
         &mut writer,
         ArrayStreamAdapter::new(built.dtype, built.chunks),
-        default_child_strategy(),
+        quad_strategy,
         built.quads_sorted,
         components,
     )
