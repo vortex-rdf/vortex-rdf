@@ -384,19 +384,20 @@ def test_total_kinds_agree_with_rdflib(corpus, kind, arg):
     assert undecided == {0}, f"{kind} {arg!r}: undecided {sorted(undecided)[:5]}"
 
 
-#: Language ranges outside `*` and ASCII letters, digits and hyphens. rdflib's
-#: `_lang_range_check` reads a `*` in any subtag as a wildcard (`en-*` matches
-#: `en-gb`), strips the whitespace around a range and lower-cases it the
-#: Unicode way (a Kelvin sign is `k`); basic filtering does none of that, so
-#: the native layer leaves a tagged literal undecided for every such range
+#: Language ranges with a character outside ASCII letters, digits and hyphens
+#: (and not `*` alone). rdflib's `_lang_range_check` reads a `*` in any subtag
+#: as a wildcard (`en-*` matches `en-gb`), strips the whitespace around a range
+#: and lower-cases it the Unicode way (a Kelvin sign is `k`); basic filtering
+#: does none of that. The native layer leaves a tagged literal undecided for
+#: every such range, also where rdflib happens to agree (`e*`, `en_gb`),
 #: instead of failing what rdflib passes.
-WIDE_RANGES = [
+NON_BASIC_RANGES = [
     "en-*", "*-gb", "*-*", "e*", " en", "en ", "\ten", "\u3000en", "\u00a0en-gb", "\u212aab", "en_gb", "en.*",
 ]
 
 
-@pytest.mark.parametrize("range_", WIDE_RANGES)
-def test_lang_matches_ranges_rdflib_reads_widely_are_undecided(corpus, range_):
+@pytest.mark.parametrize("range_", NON_BASIC_RANGES)
+def test_lang_matches_ranges_outside_the_basic_alphabet_are_undecided(corpus, range_):
     _, undecided = compare(corpus, "lang_matches", range_)
     tagged = {
         code
@@ -421,13 +422,21 @@ REGEX_CASES = [
     ("a.b", "s"), ("^a", ""), (r"\bfoo\b", ""), (r"[^a-z]", ""), ("(?=a)", ""), ("", ""),
     (r"\\x41", ""), (r"\\x7e b", ""), (r"x[0-9a-f]{2}", ""), (r"[\\/]", ""),
 ]
+#: An unbounded repeat inside an unbounded repeat, which the random generator
+#: does not draw (Python's `re` backtracks exponentially on overlapping ones).
+#: Each body here has one way to match, so `re` stays fast.
+NESTED_REPEATS = ["(a*b)*$", r"(?:\w+ )+\w", "(?:ab+)+c", "^(?:[a-c]+-)*x"]
+REGEX_CASES += [(pattern, "") for pattern in NESTED_REPEATS]
 
 
 @pytest.mark.parametrize("case", [None, "lower", "upper"])
 @pytest.mark.parametrize("as_str", [False, True])
 def test_regex_cases_agree_with_rdflib(corpus, case, as_str):
+    abc = corpus.spellings.index('"abc"')
     for pattern, flags in REGEX_CASES:
-        compare(corpus, "regex", pattern, flags=flags, case=case, as_str=as_str)
+        _, undecided = compare(corpus, "regex", pattern, flags=flags, case=case, as_str=as_str)
+        if pattern in NESTED_REPEATS:  # inside the subset, so a plain ASCII text is decided
+            assert abc not in undecided, f"{pattern!r}: undecided on a plain ASCII text"
 
 
 #: Quantifiers that repeat without bound.
@@ -437,9 +446,10 @@ MAX_LOOPS = 3
 
 
 class PatternGenerator:
-    """Random patterns from the native allow-list grammar. `anchors` collects
-    the `$` end anchors and `\\B` non-boundaries they use, the two constructs
-    that leave some ASCII texts undecided on purpose. Unbounded repeats never
+    """Random patterns from the native allow-list grammar. `uses` collects the
+    constructs a pattern holds that leave some texts undecided on purpose: the
+    `$` end anchor, `\\b` and `\\B`, and the class shorthands `\\d \\w \\s \\D
+    \\W \\S` (as `"shorthand"`, inside a class or outside). Unbounded repeats never
     nest, and a pattern holds at most `MAX_LOOPS` of them: Python's
     backtracking is exponential in the text on a shape like `((x|.*?){1,})*?`,
     which the grammar allows and the native layer decides in microseconds (one
@@ -447,8 +457,12 @@ class PatternGenerator:
 
     def __init__(self, rng: random.Random) -> None:
         self.rng = rng
-        self.anchors: set[str] = set()
+        self.uses: set[str] = set()
         self.loops = 0
+
+    def shorthand(self) -> str:
+        self.uses.add("shorthand")
+        return self.rng.choice([r"\d", r"\w", r"\s", r"\D", r"\W", r"\S"])
 
     def klass(self) -> str:
         rng = self.rng
@@ -458,7 +472,7 @@ class PatternGenerator:
             if r < 0.3:
                 items.append(rng.choice(["a-c", "0-9", "A-Z", "x-z"]))
             elif r < 0.5:
-                items.append(rng.choice([r"\d", r"\w", r"\s", r"\D", r"\W", r"\S"]))
+                items.append(self.shorthand())
             elif r < 0.6:
                 items.append("\\" + rng.choice(".-]\\^["))
             else:
@@ -473,7 +487,7 @@ class PatternGenerator:
         if r < 0.24:
             return self.klass()
         if r < 0.32:
-            return rng.choice([r"\d", r"\w", r"\s", r"\D", r"\W", r"\S"])
+            return self.shorthand()
         if r < 0.40:
             return "."
         if r < 0.48:
@@ -500,11 +514,10 @@ class PatternGenerator:
             parts.append(self.atom(depth, may_loop and not loop) + quantifier)
             if rng.random() < 0.08:
                 boundary = rng.choice([r"\b", r"\B"])
-                if boundary == r"\B":
-                    self.anchors.add(boundary)
+                self.uses.add(boundary)
                 parts.append(boundary)
         if rng.random() < 0.15:
-            self.anchors.add("$")
+            self.uses.add("$")
             parts.append("$")
         return "".join(parts)
 
@@ -513,21 +526,25 @@ class PatternGenerator:
         return "|".join(self.sequence(depth, may_loop) for _ in range(count))
 
 
-def deliberate_gap(text: str, pattern: str, flags: str, anchors: set[str]) -> str | None:
-    """Why the native layer may leave ASCII `text` undecided for an
-    allow-listed `pattern` under `flags`, or None when it has to decide it.
-    These are the documented gaps; any other undecided ASCII text is a bug.
+def deliberate_gap(text: str, pattern: str, flags: str, uses: set[str]) -> str | None:
+    """Why the native layer may leave `text` undecided for an allow-listed
+    `pattern` under `flags`, or None when it has to decide it. These are the
+    gaps `_native.pyi` documents for a pattern inside the subset; any other
+    undecided text is a bug.
 
-    The generator does not reach the remaining deliberate gaps: group nesting
+    The generator does not reach the other deliberate gaps: group nesting
     deeper than 64 and the class shapes `[a||b]` and `[+--]` are outside its
     grammar, and its patterns stay far below the compiled-size bound (150
     seeds of 300 patterns under six flag sets never left one wholly
-    undecided). A pattern that is would be a finding here, not an exemption."""
+    undecided). A pattern that hit one would fail here; add the gap to this
+    function with its reason, since it is deliberate and no native bug."""
     if "i" in flags and not pattern.isascii():
         return "flag i on a non-ASCII pattern leaves every text undecided"
-    if text.endswith("\n") and "$" in anchors and "m" not in flags:
+    if not text.isascii() and ("i" in flags or uses & {"shorthand", r"\b", r"\B"}):
+        return r"shorthands, \b, \B and flag i decide ASCII texts only"
+    if text.endswith("\n") and "$" in uses and "m" not in flags:
         return "Python's $ also matches before a final newline"
-    if text == "" and r"\B" in anchors:
+    if text == "" and r"\B" in uses:
         return r"\B against the empty text differs between Python 3.14 and 3.11-3.13"
     return None
 
@@ -567,10 +584,11 @@ def regex_corpus(request, built_regex_corpus):
 
 def check_random_patterns(corpus: Corpus, seed: int, count: int) -> Counter:
     """`count` random allow-list patterns, each under every flag set, against
-    every plain or tagged literal of `corpus`. A passed text must match, a
-    failed one must not, and an undecided ASCII text must be one of the
+    every plain or tagged literal of `corpus`, ASCII or not. A passed text must
+    match, a failed one must not, and an undecided one must be one of the
     `deliberate_gap`s; anything else raises. Returns the tallies: pairs
-    `compared`, `decided`, and the gaps met by reason."""
+    `compared`, `decided`, the non-ASCII pairs the native layer had to decide
+    and did (`non-ASCII decided`), and the gaps met by reason."""
     texts = {
         code: str(term)
         for code, term in zip(corpus.codes, corpus.terms, strict=True)
@@ -581,7 +599,7 @@ def check_random_patterns(corpus: Corpus, seed: int, count: int) -> Counter:
     tally: Counter = Counter()
     for _ in range(count):
         generator = PatternGenerator(rng)
-        pattern, anchors = generator.pattern(), generator.anchors
+        pattern, uses = generator.pattern(), generator.uses
         for flags in ["", "i", "s", "m", "im", "ism"]:
             cflags = 0
             for f in flags:
@@ -597,18 +615,22 @@ def check_random_patterns(corpus: Corpus, seed: int, count: int) -> Counter:
                     assert want, f"{pattern!r} {flags!r}: passed {text!r}"
                 elif code not in undecided:
                     assert not want, f"{pattern!r} {flags!r}: failed {text!r}"
-                elif text.isascii():
-                    gap = deliberate_gap(text, pattern, flags, anchors)
+                else:
+                    gap = deliberate_gap(text, pattern, flags, uses)
                     assert gap, f"{pattern!r} {flags!r}: an allow-listed pattern left {text!r} undecided"
                     tally[gap] += 1
                 tally["compared"] += 1
-                tally["decided"] += code not in undecided
+                if code not in undecided:
+                    tally["decided"] += 1
+                    if not text.isascii() and deliberate_gap(text, pattern, flags, uses) is None:
+                        tally["non-ASCII decided"] += 1
     return tally
 
 
 def test_random_allow_list_patterns_agree_with_python_re(regex_corpus):
     tally = check_random_patterns(regex_corpus, seed=20261007, count=600)
     assert tally["decided"] > 1_000_000, tally
+    assert tally["non-ASCII decided"] > 50_000, tally  # the non-ASCII half of the promise is exercised
 
 
 # --- The wide 64-bit integer table ------------------------------------------------
