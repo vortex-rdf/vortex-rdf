@@ -248,23 +248,26 @@ impl VortexRdfStore {
                 ..
             } => {
                 let row_count = file.row_count() as usize;
-                // A located run held pending for this window: only the rows
-                // the window reaches are read; its width is its live size.
-                let prefix = match (selection, filter, deleted) {
+                // A located run held pending for this window: only the window's
+                // own rows are read, and the run's width is its live size.
+                let located = match (selection, filter, deleted) {
                     (ViewSelection::Pending(lazy), None, None) => match lazy.len_if_known() {
                         Some(live) => lazy
-                            .prefix_async(offset.saturating_add(limit))
+                            .window_async(offset, limit)
                             .await?
                             .map(|ids| (ids, live)),
                         None => None,
                     },
                     _ => None,
                 };
-                let (windowed, live) = if let Some((ids, live)) = prefix {
-                    (
-                        RowSelection::Ids(ids).window(offset, limit, None, row_count),
-                        live,
-                    )
+                let (windowed, live) = if let Some((ids, live)) = located {
+                    // The ids are the window itself.
+                    let windowed = if ids.is_empty() {
+                        RowSelection::empty()
+                    } else {
+                        RowSelection::Ids(ids)
+                    };
+                    (windowed, live)
                 } else {
                     let selection = selection.materialized_async().await?;
                     match filter {

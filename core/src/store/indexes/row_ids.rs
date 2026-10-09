@@ -204,11 +204,14 @@ pub(crate) async fn scan_located_row_ids(
     .await
 }
 
-/// The row ids of a located index-child run in base row order: point reads
-/// through the rid column's chunk probes for a run within the point-read
-/// cap, otherwise — or when a chunk declines mid-read — a rid-only scan
-/// restricted to the run (the location bounded exactly the matched rows, so
-/// no filter is re-tested).
+/// The row ids of a located index-child run — or of a window of one — in base
+/// row order: point reads through the rid column's chunk probes for a range
+/// within the point-read cap, otherwise — or when a chunk declines mid-read —
+/// a rid-only scan restricted to the range (the location bounded exactly the
+/// matched rows, so no filter is re-tested).
+///
+/// `range` is not empty: an empty run or window reads nothing at all, so its
+/// caller answers it without asking.
 #[cfg(feature = "file-io")]
 pub(crate) async fn read_located_rids(
     file: &crate::store::native_file::NativeStoreFile,
@@ -218,6 +221,10 @@ pub(crate) async fn read_located_rids(
     range: Range<u64>,
     scope: &'static str,
 ) -> Result<Buffer<u64>> {
+    debug_assert!(
+        range.start < range.end,
+        "an empty run or window reads nothing: its caller does not ask"
+    );
     #[cfg(test)]
     file.note_located_rid_reads(range.end - range.start);
     if crate::store::selection::point_sized(range.end - range.start)

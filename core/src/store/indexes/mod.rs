@@ -425,14 +425,21 @@ impl LazyRowIds {
         }
     }
 
-    /// The first `want` ids of a located run when that is fewer than the run
-    /// holds. A reference child's rows are ordered by `(val, rid)` (the order
-    /// this crate's writers emit, docs/file-format.md §6), so within one value
-    /// the rids ascend and the run's first `want` rows are its first `want` in
-    /// base row order. `None` for any other source, or when `want` covers
-    /// the run (materialize it instead).
+    /// The ids of rows `offset..offset + limit` of a located run, in base row
+    /// order — the window's own rows and no others. A reference child's rows
+    /// are ordered by `(val, rid)` (the order this crate's writers emit,
+    /// docs/file-format.md §6), so within one value the rids ascend: row `k`
+    /// of the run holds the run's `k`-th smallest rid, and a window of the
+    /// run's rows is the same window of its ids in base order. A deep page
+    /// costs its limit, one reaching the run's end no more than its rows, and
+    /// an empty window — no limit, or an offset at or past the run's end —
+    /// reads nothing. `None` for any other source.
     #[cfg(feature = "file-io")]
-    pub(crate) async fn prefix_async(&self, want: usize) -> Result<Option<Buffer<u64>>> {
+    pub(crate) async fn window_async(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<Buffer<u64>>> {
         let LazyRowIdSource::LocatedRun {
             file,
             component,
@@ -444,12 +451,15 @@ impl LazyRowIds {
         else {
             return Ok(None);
         };
-        if want as u64 >= range.end - range.start {
-            return Ok(None);
+        let width = range.end - range.start;
+        let start = (offset as u64).min(width);
+        let end = (offset as u64).saturating_add(limit as u64).min(width);
+        if start >= end {
+            return Ok(Some(Buffer::empty()));
         }
-        let prefix = range.start..range.start + want as u64;
+        let rows = range.start + start..range.start + end;
         Ok(Some(
-            read_located_rids(file, component, reader, rid_column, prefix, scope).await?,
+            read_located_rids(file, component, reader, rid_column, rows, scope).await?,
         ))
     }
 

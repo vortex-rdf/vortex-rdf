@@ -586,127 +586,78 @@ async fn test_reference_index_counts_located_runs_from_width() {
     }
 }
 
-/// Counted in the row ids requested from the located run: a count asks for
-/// none, a window short of the run's end asks for exactly `offset + limit` of
-/// them — point-read inside the cap, taken by a scan restricted to the prefix
-/// beyond it — and one that reaches the end asks for the run. Every window
-/// agrees, column for column, with the same window over the whole run, and a
-/// pending view's own ids stay unread unless a window reached the run's end.
-/// What the run's width cannot answer (a residual term, a tombstone) reads the
-/// run.
-#[tokio::test]
-async fn test_reference_index_window_reads_only_its_rows() {
+/// Every `(offset, limit)` window of the run `(p, o)` on `store`, against the
+/// row path (the unwindowed rows, which the public match computes):
+/// - the window holds the same slice of the rows, and its size is the slice's;
+/// - the row ids requested from the located run (the read counter) grow by
+///   exactly the window's size — so by none for an empty window, which is no
+///   limit, or an offset at or past the run's end;
+/// - the pending view the window is also taken beside keeps its own ids
+///   unread;
+/// - a count, capped or not, asks for no id.
+async fn assert_windows_read_only_their_rows(
+    store: &VortexRdfStore,
+    p: Option<&NamedNode>,
+    o: Option<&Term>,
+    width: usize,
+    windows: &[(usize, usize)],
+) {
     use crate::store::{IdsNeed, Probe};
-    let quads = graph_modular_quads(900, 4, 3, 7, &[GraphName::DefaultGraph]);
-    let (_dir, path) = write_store_file(
-        quads.clone(),
-        LayoutStrategy::Dictionary,
-        vec![IndexType::SecondaryByReference],
-    )
-    .await;
-    let store = VortexRdfStore::from_file(&path).await.unwrap();
     let reads = || store.debug_located_rid_reads().unwrap();
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
-    // (pattern, run width, windows short of the run's end, windows reaching it)
-    let shapes = [
-        (
-            (Some(&p1), None),
-            300usize,
-            // 280 and 299 rows are past the 256-row point-read cap.
-            vec![
-                (0usize, 0usize),
-                (0, 1),
-                (0, 5),
-                (7, 20),
-                (40, 0),
-                (100, 180),
-                (0, 299),
-                (298, 1),
-            ],
-            vec![(295, 10), (299, 1), (0, 300), (300, 3), (0, usize::MAX)],
-        ),
-        (
-            (None, Some(&o2)),
-            129,
-            vec![(0, 0), (0, 5), (10, 50), (0, 128), (127, 1)],
-            vec![(120, 20), (128, 1), (0, 129), (129, 5)],
-        ),
-    ];
-    for ((p, o), width, short, reaching) in shapes {
-        let probe = Probe::new(None, p.cloned(), o.cloned(), None);
-        let windowed = |offset: usize, limit: usize| probe.clone().window(offset, Some(limit));
-        let all = store
-            .match_pattern(None, p, o, None)
-            .await
-            .unwrap()
-            .code_columns_gathered()
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(all[0].len(), width);
+    let probe = Probe::new(None, p.cloned(), o.cloned(), None);
+    let span =
+        |offset: usize, limit: usize| (offset.min(width), offset.saturating_add(limit).min(width));
+    let all = store
+        .match_pattern(None, p, o, None)
+        .await
+        .unwrap()
+        .code_columns_gathered()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(all[0].len(), width);
 
-        // A count asks for no id, capped or not.
+    // A count asks for no id, capped or not.
+    let before = reads();
+    let counted = store
+        .count_many(&[
+            probe.clone(),
+            probe.clone().window(5, Some(10)),
+            probe.clone().window(0, Some(1_000)),
+        ])
+        .await
+        .unwrap();
+    let (from, to) = span(5, 10);
+    assert_eq!(counted, vec![width, to - from, width.min(1_000)]);
+    assert_eq!(reads(), before, "a count reads no row id");
+
+    let pending = store
+        .match_pattern_for(None, p, o, None, IdsNeed::CountOrWindow)
+        .await
+        .unwrap();
+    assert_eq!(pending.debug_row_ids_materialized(), Some(false));
+    for &(offset, limit) in windows {
+        let (from, to) = span(offset, limit);
         let before = reads();
-        assert_eq!(
-            store
-                .count_many(&[probe.clone(), windowed(5, 10), windowed(0, 1_000)])
-                .await
-                .unwrap(),
-            vec![width, 10, width]
-        );
-        assert_eq!(reads(), before, "a count reads no row id");
-
-        let pending = store
-            .match_pattern_for(None, p, o, None, IdsNeed::CountOrWindow)
+        let window = store
+            .run_probe(&probe.clone().window(offset, Some(limit)))
             .await
             .unwrap();
-        assert_eq!(pending.debug_row_ids_materialized(), Some(false));
-        for (offset, limit) in short {
-            let before = reads();
-            let window = store.run_probe(&windowed(offset, limit)).await.unwrap();
-            assert_eq!(
-                reads() - before,
-                offset + limit,
-                "({offset}, {limit}) stops short of the run's end and reads only its prefix"
-            );
-            // The same window beside the pending view leaves its ids unread.
-            let beside = pending.window(offset, limit).await.unwrap();
-            assert_eq!(pending.debug_row_ids_materialized(), Some(false));
-            let (from, to) = (offset.min(width), (offset + limit).min(width));
-            for view in [&window, &beside] {
-                assert_eq!(view.size().await.unwrap(), to - from, "({offset}, {limit})");
-                let cols = view.code_columns_gathered().await.unwrap().unwrap();
-                for (col, whole) in cols.iter().zip(&all) {
-                    assert_eq!(
-                        col.as_slice(),
-                        &whole.as_slice()[from..to],
-                        "({offset}, {limit})"
-                    );
-                }
-            }
-        }
-        // A window that reaches the run's end reads the whole run.
-        for (offset, limit) in reaching {
-            let before = reads();
-            let window = store.run_probe(&windowed(offset, limit)).await.unwrap();
-            assert_eq!(
-                reads() - before,
-                width,
-                "({offset}, {limit}) reaches the run's end"
-            );
-            let reading = store
-                .match_pattern_for(None, p, o, None, IdsNeed::CountOrWindow)
-                .await
-                .unwrap();
-            reading.window(offset, limit).await.unwrap();
-            assert_eq!(
-                reading.debug_row_ids_materialized(),
-                Some(true),
-                "({offset}, {limit})"
-            );
-            let (from, to) = (offset.min(width), offset.saturating_add(limit).min(width));
-            let cols = window.code_columns_gathered().await.unwrap().unwrap();
+        assert_eq!(
+            reads() - before,
+            to - from,
+            "({offset}, {limit}) reads exactly its own rows"
+        );
+        // The same window taken beside the pending view leaves its ids unread.
+        let beside = pending.window(offset, limit).await.unwrap();
+        assert_eq!(
+            pending.debug_row_ids_materialized(),
+            Some(false),
+            "({offset}, {limit}) leaves the run's ids unread"
+        );
+        for view in [&window, &beside] {
+            assert_eq!(view.size().await.unwrap(), to - from, "({offset}, {limit})");
+            let cols = view.code_columns_gathered().await.unwrap().unwrap();
             for (col, whole) in cols.iter().zip(&all) {
                 assert_eq!(
                     col.as_slice(),
@@ -716,10 +667,83 @@ async fn test_reference_index_window_reads_only_its_rows() {
             }
         }
     }
+}
+
+/// A window of a located run asks for exactly its own rows from the run — a
+/// deep page costs its limit, one that reaches the run's end no more than
+/// its rows, and an empty one (no limit, or an offset at or past the end)
+/// none — point-read inside the 256-row cap and taken by a range scan
+/// beyond it. What the run's width cannot answer (a residual term, a
+/// tombstone) reads the run.
+#[tokio::test]
+async fn test_reference_index_window_reads_only_its_rows() {
+    use crate::store::Probe;
+    let quads = graph_modular_quads(900, 4, 3, 7, &[GraphName::DefaultGraph]);
+    let (_dir, path) = write_store_file(
+        quads.clone(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByReference],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    // The 300-row predicate run: windows of 280 and 299 rows, and the whole
+    // run, are past the point-read cap.
+    assert_windows_read_only_their_rows(
+        &store,
+        Some(&p1),
+        None,
+        300,
+        &[
+            (0, 0),
+            (0, 1),
+            (0, 5),
+            (7, 20),
+            (40, 0),
+            (100, 180),
+            (0, 299),
+            (298, 1),
+            (250, 10),
+            (200, 50),
+            (150, 150),
+            (295, 10),
+            (299, 1),
+            (299, usize::MAX),
+            (0, 300),
+            (0, usize::MAX),
+            (300, 3),
+            (400, 5),
+            (usize::MAX, 5),
+        ],
+    )
+    .await;
+    // The 129-row object run, inside the cap throughout.
+    assert_windows_read_only_their_rows(
+        &store,
+        None,
+        Some(&o2),
+        129,
+        &[
+            (0, 0),
+            (0, 5),
+            (10, 50),
+            (0, 128),
+            (127, 1),
+            (100, 29),
+            (120, 20),
+            (128, 1),
+            (0, 129),
+            (129, 5),
+            (usize::MAX, 1),
+        ],
+    )
+    .await;
 
     // What the run's width cannot answer reads the run: a residual term
     // leaves the object's 129 ids to be filtered by the predicate, and a
     // tombstone sends the predicate's 300 through the ids.
+    let reads = || store.debug_located_rid_reads().unwrap();
     let before = reads();
     let both = Probe::new(None, Some(p1.clone()), Some(o2.clone()), None);
     assert_eq!(store.count_many(&[both]).await.unwrap(), vec![43]);
