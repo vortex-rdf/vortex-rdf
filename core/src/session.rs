@@ -58,11 +58,22 @@ const ZONE_AGGREGATES: [&str; 6] = [
     "vortex.null_count",
 ];
 
+/// The registered wire form the store edition leaves out:
+/// `fastlanes.for.v2`, frame-of-reference with one reference per
+/// 1,024-value chunk. No Vortex edition includes it yet. The compressor
+/// switches every frame-of-reference column to it once an enabled edition
+/// allows it, and the encoded-search probes read only the single-reference
+/// form in place, so the store's columns stay on `fastlanes.for`.
+fn excluded_from_store_edition(id: &vortex_array::ArrayId) -> bool {
+    *id == vortex::encodings::fastlanes::for_v2_id()
+}
+
 /// Declare and enable one edition ([`STORE_EDITION`]) containing every
-/// registered array encoding, layout and extension dtype plus
-/// [`ZONE_AGGREGATES`]. The file writer only emits components from an enabled
-/// edition (reading needs registration alone); the edition is a writer
-/// allow-list, so it spans the full registries.
+/// registered array encoding (less [`excluded_from_store_edition`]), layout
+/// and extension dtype plus [`ZONE_AGGREGATES`]. The file writer only emits
+/// components from an enabled edition (reading needs registration alone),
+/// and the compressor only produces the wire forms it allows; the edition is
+/// a writer allow-list, so it spans the registries.
 fn enable_store_edition(session: &VortexSession) {
     use vortex_array::dtype::session::DTypeSessionExt as _;
     use vortex_array::session::ArraySessionExt as _;
@@ -81,10 +92,12 @@ fn enable_store_edition(session: &VortexSession) {
     let registered = [
         (
             ComponentKind::Array,
-            session
-                .arrays()
-                .registry()
-                .read(|map| map.keys().copied().collect::<Vec<_>>()),
+            session.arrays().registry().read(|map| {
+                map.keys()
+                    .copied()
+                    .filter(|id| !excluded_from_store_edition(id))
+                    .collect::<Vec<_>>()
+            }),
         ),
         (
             ComponentKind::Layout,

@@ -27,6 +27,7 @@ use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_array::session::ArraySession;
 use vortex_array::{IntoArray, VortexSessionExecute};
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
+use vortex_btrblocks::schemes::integer::{BitPackingScheme, RunEndScheme, SequenceScheme};
 use vortex_rdf_encoded_search::SortedProbe;
 use vortex_session::VortexSession;
 
@@ -34,11 +35,15 @@ let session = VortexSession::empty()
     .with::<ArraySession>()
     .with::<ScalarFnSession>();
 let mut ctx = session.create_execution_ctx();
-let compressor = BtrBlocksCompressorBuilder::default().build();
+let compressor = BtrBlocksCompressorBuilder::empty()
+    .with_new_scheme(&RunEndScheme)
+    .with_new_scheme(&SequenceScheme)
+    .with_new_scheme(&BitPackingScheme)
+    .build();
 
-// A sorted column with 11-row runs, compressed into whatever encoding
-// BtrBlocks picks for it (here: run-end, over frame-of-reference
-// bit-packed values and a sequence of run ends).
+// A sorted column with 11-row runs, compressed into whatever encoding the
+// cascade picks for it (here: run-end over a sequence of run ends and a
+// sequence of values).
 let data: Vec<u32> = (0..2_097_152).map(|i| (i / 11) as u32).collect();
 let canonical = PrimitiveArray::from_iter(data.iter().copied()).into_array();
 let encoded = compressor.compress(&canonical, &mut ctx)?;
@@ -66,11 +71,17 @@ together in one self-referential value.
 
 ## Supported encodings
 
-`Primitive`, `Constant`, `Sequence`, `RunEnd`, `FoR`, `BitPacked` (including
-its patches), `Delta` (FastLanes delta, decoded one 1,024-value block at a
-time on first touch), `Slice`, `Chunked`, and `Dict`, composed arbitrarily; the
-transparent `Shared` wrapper resolves to whatever it wraps. `NodeKind` reports
-the resolved tree's shape for tests and diagnostics.
+`Primitive`, `Constant`, `Sequence`, `RunEnd`, `FoR` (with one reference for
+the whole array), `BitPacked` (with one bit width, including its patches),
+`Delta` (FastLanes delta, decoded one 1,024-value block at a time on first
+touch), `Slice`, `Chunked`, and `Dict`, composed arbitrarily; the transparent
+`Shared` wrapper resolves to whatever it wraps. `NodeKind` reports the resolved
+tree's shape for tests and diagnostics. Frame-of-reference with a reference per
+1,024-value chunk (the `fastlanes.for.v2` wire form) and bit-packing with a
+width per block decline. BtrBlocks' frame-of-reference scheme takes per-chunk
+references whenever its builder allows `fastlanes.for.v2`: `empty()` allows
+every wire form, `from_session` the ones the session's enabled editions
+include.
 
 ## The sortedness contract
 

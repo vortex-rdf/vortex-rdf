@@ -9,7 +9,13 @@ use vortex_io::session::RuntimeSession;
 use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
 
-/// A session with every default encoding registered.
+/// A session with every default encoding registered and an edition enabled
+/// that mirrors the store's: every registered array, layout and dtype plus
+/// the default zone-map aggregates, less the per-chunk frame-of-reference
+/// wire form (`fastlanes.for.v2`). The file writer refuses components
+/// outside an enabled edition, and a compressor built `from_session` only
+/// produces the wire forms the edition allows, so frame-of-reference keeps
+/// the single reference the probe reads in place.
 pub fn session() -> VortexSession {
     let session = VortexSession::empty()
         .with::<ArraySession>()
@@ -17,23 +23,26 @@ pub fn session() -> VortexSession {
         .with::<ScalarFnSession>()
         .with::<RuntimeSession>();
     vortex_file::register_default_encodings(&session);
+    enable_test_edition(&session);
     session
 }
 
-/// [`session`] with a tokio runtime and an edition enabled for the file
-/// writer: it refuses components outside an enabled edition, so this one
-/// covers every registered array, layout and dtype plus the default zone-map
-/// aggregates.
+/// [`session`] with a tokio runtime, for the file writer.
 pub fn writer_session() -> VortexSession {
+    use vortex_io::session::RuntimeSessionExt as _;
+
+    session().with_tokio()
+}
+
+fn enable_test_edition(session: &VortexSession) {
     use vortex_array::dtype::session::DTypeSessionExt as _;
     use vortex_array::session::ArraySessionExt as _;
     use vortex_edition::{
         ComponentKind, Edition, EditionId, EditionInclusion, EditionSessionExt as _,
     };
-    use vortex_io::session::RuntimeSessionExt as _;
+    use vortex_fastlanes::for_v2_id;
     use vortex_layout::session::LayoutSessionExt as _;
 
-    let session = session().with_tokio();
     const TEST_EDITION: EditionId = EditionId::new("test", 2026, 7, 0);
     let editions = session.editions();
     editions
@@ -45,10 +54,12 @@ pub fn writer_session() -> VortexSession {
     let registered = [
         (
             ComponentKind::Array,
-            session
-                .arrays()
-                .registry()
-                .read(|map| map.keys().copied().collect::<Vec<_>>()),
+            session.arrays().registry().read(|map| {
+                map.keys()
+                    .copied()
+                    .filter(|id| *id != for_v2_id())
+                    .collect::<Vec<_>>()
+            }),
         ),
         (
             ComponentKind::Layout,
@@ -89,7 +100,6 @@ pub fn writer_session() -> VortexSession {
             .unwrap();
     }
     session.enable_edition(TEST_EDITION).unwrap();
-    session
 }
 
 /// The `partition_point` floor: the half-open run of `needle` in sorted

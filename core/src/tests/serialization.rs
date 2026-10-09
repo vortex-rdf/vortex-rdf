@@ -1119,3 +1119,55 @@ async fn test_written_code_columns_avoid_delta() {
         "quads tree:\n{quads_tree}"
     );
 }
+
+/// The store's own files keep frame-of-reference on one reference per
+/// array: the store edition leaves out the per-chunk wire form
+/// (`fastlanes.for.v2`), which the chunk probes decline. The guard bites:
+/// the fixture's code columns do pick frame-of-reference, which would take a
+/// reference per 1,024 rows were the edition to allow it.
+#[tokio::test]
+async fn test_written_frame_of_reference_keeps_one_reference() {
+    use vortex::encodings::fastlanes::{FoR, FoRArrayExt as _};
+    use vortex_array::{ArrayRef, IntoArray as _};
+
+    /// `(single, per_chunk)`: the frame-of-reference nodes in `array`'s
+    /// tree with one reference, and with a reference per chunk.
+    fn for_nodes(array: &ArrayRef, counts: &mut (usize, usize)) {
+        if let Some(view) = array.as_opt::<FoR>() {
+            if view.constant_reference().is_some() {
+                counts.0 += 1;
+            } else {
+                counts.1 += 1;
+            }
+        }
+        for child in array.children() {
+            for_nodes(&child, counts);
+        }
+    }
+
+    let graphs: Vec<GraphName> = (0..4)
+        .map(|i| GraphName::NamedNode(NamedNode::new(format!("http://example.org/g{i}")).unwrap()))
+        .collect();
+    let quads = graph_modular_quads(32_768, 5, 32, 1024, &graphs);
+    let store = VortexRdfStore::from_quads(
+        quad_stream(quads),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    let bytes = store.to_bytes().await.unwrap();
+    let adopted = VortexRdfStore::from_bytes_owned(bytes).await.unwrap();
+    let parts = adopted.to_serializable_parts().await.unwrap();
+    let mut counts = (0, 0);
+    for_nodes(&parts.array, &mut counts);
+    for component in &parts.components {
+        for_nodes(&component.rows().unwrap().clone().into_array(), &mut counts);
+    }
+    let (single, per_chunk) = counts;
+    assert_eq!(
+        per_chunk, 0,
+        "{per_chunk} frame-of-reference nodes carry per-chunk references"
+    );
+    assert!(single > 0, "the fixture wrote no frame-of-reference column");
+}

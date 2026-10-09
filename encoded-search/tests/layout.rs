@@ -97,7 +97,7 @@ fn dict_strategy<C: LayoutStrategy, V: LayoutStrategy>(
     use vortex_btrblocks::BtrBlocksCompressorBuilder;
     use vortex_layout::layouts::compressed::CompressorPlugin;
     let compressor: Arc<dyn CompressorPlugin> =
-        Arc::new(BtrBlocksCompressorBuilder::default().build());
+        Arc::new(BtrBlocksCompressorBuilder::from_session(&common::session()).build());
     DictStrategy::new(
         codes,
         values,
