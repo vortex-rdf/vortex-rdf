@@ -141,8 +141,8 @@ fn parse_position(position: &Bound<'_, PyAny>) -> PyResult<QuadColumn> {
 }
 
 /// One keep: a `range` with step 1 or a `(lo, hi)` pair of ints is a code
-/// range; a `U64Column`, any u64 or u32 buffer or any int sequence is a code
-/// set.
+/// range; a `U64Column`, a u64 buffer or any int sequence is a code set (see
+/// [`extract_u64s`]).
 fn parse_keep(spec: &Bound<'_, PyAny>) -> PyResult<Keep> {
     let py = spec.py();
     let range_type = py.import("builtins")?.getattr("range")?;

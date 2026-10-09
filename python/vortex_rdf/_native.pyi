@@ -8,8 +8,10 @@ __version__: str
 # Path arguments are `PathBuf` on the Rust side, so any `os.PathLike[str]` is
 # accepted alongside `str`.
 _StrPath = Union[str, "os.PathLike[str]"]
-# Codes or indices: a U64Column, a u64 (or u32) buffer, the raw byte view a
-# U64Column exports, or any sequence of ints from 0 to 2**64 - 1.
+# Codes or indices: a U64Column, a buffer of u64 (or non-negative int64)
+# items, the raw byte view a U64Column exports, or any sequence of ints from
+# 0 to 2**64 - 1. A buffer of other items (a ``cast("I")`` view, a u32 array)
+# raises ``ValueError``.
 _U64s = Union["U64Column", Sequence[int], memoryview, bytes, bytearray]
 # A keep per position: a code set (U64Column, u64 buffer, int sequence) or a
 # code range (``range`` with step 1, or ``(lo, hi)``).
@@ -124,10 +126,11 @@ class TermDict:
         """Decode a batch of codes in one GIL-released call.
 
         A `U64Column`, a u64 buffer (``memoryview(col).cast("Q")``,
-        ``array("Q", ...)``, a uint64 NumPy array), a u32 buffer (widened) or
-        the raw byte view a `U64Column` exports is read in one copy; any int
-        sequence works element by element. Repeated codes share one string
-        object."""
+        ``array("Q", ...)``, a uint64 NumPy array), a non-negative int64
+        buffer or the raw byte view a `U64Column` exports is read in one
+        copy; a buffer of other items (a ``cast("I")`` view, a u32 array)
+        raises ``ValueError``. Any int sequence works element by element.
+        Repeated codes share one string object."""
         ...
     def __len__(self) -> int: ...
     def __repr__(self) -> str: ...
@@ -137,9 +140,10 @@ class U64Column:
     the buffer protocol (``memoryview(col).cast("Q")`` is a zero-copy view)."""
 
     def __init__(self, values: _U64s) -> None:
-        """A column holding `values`: another column (shared), a u64 or u32
-        buffer or raw byte view (one copy), or any sequence of ints from 0 to
-        2**64 - 1 (an int outside that range raises ``OverflowError``)."""
+        """A column holding `values`: another column (shared), a buffer of
+        u64 or non-negative int64 items or a raw byte view (one copy), or any
+        sequence of ints from 0 to 2**64 - 1 (an int outside that range raises
+        ``OverflowError``). A buffer of other items raises ``ValueError``."""
         ...
     def __len__(self) -> int: ...
     def __repr__(self) -> str: ...

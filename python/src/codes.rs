@@ -5,7 +5,7 @@
 
 use std::os::raw::{c_int, c_void};
 
-use pyo3::buffer::PyBuffer;
+use pyo3::buffer::{ElementType, PyUntypedBuffer};
 use pyo3::exceptions::{PySystemError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
@@ -261,10 +261,12 @@ impl TermDict {
     /// `codes` is preferably a [`U64Column`] (a column from `match_codes`
     /// passes directly) or a u64 buffer (`memoryview(col).cast("Q")`,
     /// `array("Q", ...)`, a `uint64` NumPy array), read in one bulk copy
-    /// with no per-element Python-int conversion; a u32 buffer is widened,
-    /// and a byte-typed buffer — the raw view a `U64Column` exports — is
-    /// reinterpreted as native-endian u64s. Any other sequence of ints still
-    /// works, at one `PyLong` extraction per code.
+    /// with no per-element Python-int conversion; a non-negative `int64`
+    /// buffer is read the same way, and a byte-typed buffer — the raw view a
+    /// `U64Column` exports — is reinterpreted as native-endian u64s. A buffer
+    /// of other items (a `cast("I")` view, a u32 array) raises `ValueError`.
+    /// Any other sequence of ints still works, at one `PyLong` extraction per
+    /// code.
     ///
     /// A repeated code yields the *same* Python string object; see
     /// [`decode_slice`](Self::decode_slice).
@@ -293,41 +295,146 @@ impl TermDict {
     }
 }
 
-/// The u64 values of a Python object holding codes, indices or counts: a
-/// [`U64Column`] (its buffer, copied), a u64 buffer
-/// (`memoryview(col).cast("Q")`, `array("Q", ...)`, a `uint64` NumPy array)
-/// read in one bulk copy, a u32 buffer widened, a byte-typed buffer — the
-/// raw view a `U64Column` itself exports — reinterpreted as native-endian
-/// u64s, or any other sequence of ints, at one `PyLong` extraction per
-/// element. An int that is negative or not below 2**64 raises
-/// `OverflowError`; nothing is narrowed or wrapped.
+/// The u64 values of a Python object holding codes, indices or counts. A
+/// [`U64Column`] is copied whole. Any other object exporting a buffer is read
+/// as one, never element by element, and only when its items are u64 values:
+/// 8-byte unsigned integers (`memoryview(col).cast("Q")`, `array("Q", ...)`,
+/// a `uint64` NumPy array), 8-byte signed integers none of which is negative
+/// (an `int64` NumPy array), or raw bytes in multiples of 8 — the view a
+/// `U64Column` itself exports — read as native-endian u64s. A buffer of any
+/// other items raises `ValueError` naming the u64 view: above all the stale
+/// `cast("I")` view of a column, which would split each code in two. An
+/// object without a buffer is a sequence of ints, at one `PyLong` extraction
+/// per element; an int that is negative or not below 2**64 raises
+/// `OverflowError`. Nothing is narrowed or wrapped.
 pub(crate) fn extract_u64s(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u64>> {
-    let py = obj.py();
     if let Ok(column) = obj.cast::<U64Column>() {
         return Ok(column.get().codes.as_slice().to_vec());
     }
-    if let Ok(buf) = PyBuffer::<u64>::get(obj) {
-        return buf.to_vec(py);
-    }
-    if let Ok(buf) = PyBuffer::<u32>::get(obj) {
-        return Ok(buf.to_vec(py)?.into_iter().map(u64::from).collect());
-    }
-    if let Ok(buf) = PyBuffer::<u8>::get(obj) {
-        let bytes = buf.to_vec(py)?;
-        if !bytes.len().is_multiple_of(8) {
-            return Err(PyValueError::new_err(format!(
-                "byte buffer of {} bytes is not a whole number of u64 values",
-                bytes.len()
-            )));
-        }
-        return Ok(bytes
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .map(|b| u64::from_ne_bytes(*b))
-            .collect());
+    // SAFETY: `obj` is a live object and the GIL is held.
+    if unsafe { ffi::PyObject_CheckBuffer(obj.as_ptr()) } == 1 {
+        // An exporter that fills no strides (a ctypes array) is readable
+        // through a memoryview, which fills them.
+        let buf = PyUntypedBuffer::get(obj).map_err(|e| {
+            PyValueError::new_err(format!(
+                "this buffer cannot be read as u64 codes ({e}): pass memoryview(obj), or \
+                 {U64_FORMS}"
+            ))
+        })?;
+        return buffer_u64s(&buf);
     }
     obj.extract::<Vec<u64>>()
+}
+
+/// What a code argument may be, as the refusals of a buffer spell it.
+const U64_FORMS: &str = "a U64Column, a buffer of 8-byte integers (memoryview(col).cast(\"Q\"), \
+                         array(\"Q\"), a uint64 or non-negative int64 NumPy array) or raw bytes \
+                         in multiples of 8";
+
+/// How a code buffer's items read as u64 values.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CodeItems {
+    /// 8-byte unsigned integers.
+    Unsigned,
+    /// 8-byte signed integers, refused if any is negative.
+    Signed,
+    /// Raw bytes, read as native-endian u64s in groups of 8.
+    Raw,
+}
+
+/// The u64 values of a buffer's items (see [`extract_u64s`]).
+fn buffer_u64s(buf: &PyUntypedBuffer) -> PyResult<Vec<u64>> {
+    let format = buf.format();
+    let items = match (ElementType::from_format(format), buf.item_size()) {
+        (ElementType::UnsignedInteger { bytes: 8 }, 8) => CodeItems::Unsigned,
+        (ElementType::SignedInteger { bytes: 8 }, 8) => CodeItems::Signed,
+        (ElementType::UnsignedInteger { bytes: 1 }, 1) => CodeItems::Raw,
+        _ => {
+            return Err(PyValueError::new_err(format!(
+                "a buffer of {}-byte items (format '{}') holds no u64 codes: pass {U64_FORMS}",
+                buf.item_size(),
+                format.to_string_lossy()
+            )));
+        }
+    };
+    let len_bytes = buf.len_bytes();
+    if !len_bytes.is_multiple_of(8) {
+        // Only raw bytes can get here: 8-byte items fill whole u64s.
+        return Err(PyValueError::new_err(format!(
+            "a byte buffer of {len_bytes} bytes is not a whole number of u64 values"
+        )));
+    }
+    let mut values = vec![0u64; len_bytes / 8];
+    // SAFETY: a u64 has no invalid bit patterns and a u8's alignment divides
+    // a u64's, so the values are writable as their `len_bytes` bytes.
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), len_bytes) };
+    copy_items(buf, bytes);
+    let swap = items != CodeItems::Raw && foreign_byte_order(format.to_bytes());
+    for value in &mut values {
+        if swap {
+            *value = value.swap_bytes();
+        }
+        if items == CodeItems::Signed && (*value as i64) < 0 {
+            return Err(PyValueError::new_err(format!(
+                "a buffer of signed 8-byte items holds {}: codes are non-negative",
+                *value as i64
+            )));
+        }
+    }
+    Ok(values)
+}
+
+/// Whether a struct-module format's byte-order prefix names the byte order
+/// this machine does not use (`<` little-endian, `>` and `!` big-endian;
+/// `@`, `=` or none native).
+fn foreign_byte_order(format: &[u8]) -> bool {
+    match format.first() {
+        Some(b'<') => cfg!(target_endian = "big"),
+        Some(b'>' | b'!') => cfg!(target_endian = "little"),
+        _ => false,
+    }
+}
+
+/// Copies the buffer's items, in C order, into `out` (exactly
+/// `buf.len_bytes()` long): one bulk copy when the buffer is C-contiguous,
+/// item by item otherwise (a strided or indirect view).
+fn copy_items(buf: &PyUntypedBuffer, out: &mut [u8]) {
+    debug_assert_eq!(out.len(), buf.len_bytes());
+    if buf.is_c_contiguous() {
+        // SAFETY: a C-contiguous buffer is `len_bytes` readable bytes at
+        // `buf_ptr`, kept alive by `buf`, and cannot overlap `out`, which
+        // this function's caller owns.
+        unsafe {
+            std::ptr::copy_nonoverlapping(buf.buf_ptr().cast::<u8>(), out.as_mut_ptr(), out.len());
+        }
+        return;
+    }
+    let shape = buf.shape();
+    let item = buf.item_size();
+    if out.is_empty() || item == 0 {
+        return;
+    }
+    // Walk every index in C order: the last dimension varies fastest.
+    let mut index = vec![0usize; shape.len()];
+    for chunk in out.chunks_exact_mut(item) {
+        // SAFETY: `index` is in bounds of `shape`, so `get_ptr` addresses a
+        // whole item of `item` bytes inside the live buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                buf.get_ptr(&index).cast::<u8>(),
+                chunk.as_mut_ptr(),
+                item,
+            );
+        }
+        for d in (0..index.len()).rev() {
+            index[d] += 1;
+            if index[d] < shape[d] {
+                break;
+            }
+            index[d] = 0;
+        }
+    }
 }
 
 /// The u64 values of `obj` as a buffer: a `U64Column`'s own, shared
@@ -359,8 +466,9 @@ pub struct U64Column {
 #[pymethods]
 impl U64Column {
     /// A column holding `values`: another `U64Column` (shared zero-copy), a
-    /// u64 or u32 buffer or the raw byte view a column exports (one bulk
-    /// copy), or any sequence of ints from 0 to 2**64 - 1.
+    /// buffer of u64 or non-negative i64 items or the raw byte view a column
+    /// exports (one bulk copy), or any sequence of ints from 0 to 2**64 - 1.
+    /// A buffer of other items raises `ValueError` (see [`extract_u64s`]).
     #[new]
     fn new(values: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(U64Column {
@@ -389,8 +497,9 @@ impl U64Column {
         (U64Column { codes: values }, U64Column { codes: counts })
     }
 
-    /// The values at `indices` (a `U64Column`, u64 or u32 buffer or int
-    /// sequence), in that order; an index past the end raises `IndexError`.
+    /// The values at `indices` (a `U64Column`, u64 buffer or int sequence,
+    /// as [`extract_u64s`] reads them), in that order; an index past the end
+    /// raises `IndexError`.
     fn take(&self, py: Python<'_>, indices: &Bound<'_, PyAny>) -> PyResult<U64Column> {
         let indices = extract_u64s(indices)?;
         let codes = py
@@ -406,8 +515,7 @@ impl U64Column {
     }
 
     /// The row pairs `(left_indices, right_indices)` where this column's
-    /// value equals `other`'s (a `U64Column`, u64 or u32 buffer or int
-    /// sequence) —
+    /// value equals `other`'s (a `U64Column`, u64 buffer or int sequence) —
     /// an equi-join on the two columns as keys, in
     /// nested-loop order: this column's rows in order, each with its
     /// matches in `other` in their original order. Gather the joined

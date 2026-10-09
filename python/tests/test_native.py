@@ -1,4 +1,5 @@
 import pathlib
+import re
 import shutil
 from array import array
 
@@ -365,8 +366,9 @@ def test_term_dict_decode_edges(vortex_files):
     assert dictionary.decode(end) is None
     assert dictionary.decode_many([end]) == [None]
     assert dictionary.decode_many(array("Q", [2**63])) == [None]
-    # A u32 buffer is widened.
-    assert dictionary.decode_many(array("I", [2**31])) == [None]
+    # A u32 buffer is no u64 codes: refused, naming the u64 view.
+    with pytest.raises(ValueError, match=re.escape('cast("Q")')):
+        dictionary.decode_many(array("I", [2**31]))
 
     # Every accepted input shape decodes the same column identically.
     codes = memoryview(cols[0]).cast("Q").tolist()

@@ -9,6 +9,8 @@ term. The Rust core runs the full round trip, with dictionaries numbered past
 ``u32::MAX`` by a test hook (``core/src/tests/wide_codes.rs``).
 """
 
+import ctypes
+import re
 from array import array
 
 import pytest
@@ -47,8 +49,6 @@ def test_u64_column_carries_codes_past_u32():
     # Every accepted input form keeps the values whole.
     for form in (col, memoryview(col).cast("Q"), array("Q", [WIDE, 0, TOP, WIDE]), bytes(memoryview(col))):
         assert _values(U64Column(form)) == [WIDE, 0, TOP, WIDE]
-    # A u32 buffer widens.
-    assert _values(U64Column(array("I", [5, 7]))) == [5, 7]
     # The kernels carry them through.
     assert _values(col.distinct()) == [WIDE, 0, TOP]
     values, counts = col.value_counts()
@@ -59,6 +59,97 @@ def test_u64_column_carries_codes_past_u32():
     # A code that narrows to 5 does not join 5.
     left, _ = U64Column([5]).join_indices([WIDE])
     assert len(left) == 0
+
+
+#: Every refusal of a buffer whose items are no u64s names the view to use.
+CAST_Q = re.escape('cast("Q")')
+
+
+def _code_takers(store):
+    """Each binding that takes codes or indices, as a call on them."""
+    term_dict = store.term_dict()
+    column = U64Column([1, 2, 3])
+    return {
+        "U64Column": U64Column,
+        "decode_many": term_dict.decode_many,
+        "filter_codes": lambda codes: term_dict.filter_codes("is_iri", "", codes),
+        "keep": lambda codes: store.count_quads(keep={"s": codes}),
+        "take": column.take,
+        "join_indices": column.join_indices,
+    }
+
+
+#: Buffers whose items are no u64 codes — the stale ``cast("I")`` view of a
+#: column, which splits each code in two, other 4-byte items, 2-byte items,
+#: 8-byte floats and signed bytes — each built fresh.
+NOT_U64 = {
+    "cast-I-view": lambda: memoryview(U64Column([WIDE, 1])).cast("I"),
+    "array-I": lambda: array("I", [1, 2]),
+    "array-i": lambda: array("i", [1, 2]),
+    "array-f": lambda: array("f", [1.0, 2.0]),
+    "array-H": lambda: array("H", [1, 2]),
+    "array-h": lambda: array("h", [1, 2]),
+    "array-d": lambda: array("d", [1.0, 2.0]),
+    "array-b": lambda: array("b", bytes(8)),
+}
+
+
+@pytest.mark.parametrize("form", NOT_U64)
+def test_code_inputs_refuse_buffers_of_other_items(store, form):
+    # Refused outright: a buffer is never read element by element.
+    for name, take in _code_takers(store).items():
+        with pytest.raises(ValueError, match=CAST_Q):
+            take(NOT_U64[form]())
+            pytest.fail(f"{name} took {form}")
+
+
+def test_code_inputs_take_u64s_non_negative_i64s_and_raw_bytes(store):
+    # Below 2**63, so the signed forms hold them too; a tuple of four is a
+    # code set even as a keep.
+    values = [WIDE, 0, (1 << 63) - 1, 5]
+    raw = array("Q", values).tobytes()
+    forms = {
+        "U64Column": U64Column(values),
+        "cast-Q-view": memoryview(U64Column(values)).cast("Q"),
+        "raw-view": memoryview(U64Column(values)),
+        "array-Q": array("Q", values),
+        "array-q": array("q", values),
+        "bytes": raw,
+        "bytearray": bytearray(raw),
+        "list": list(values),
+        "tuple": tuple(values),
+    }
+    # `L` and `l` are 8 bytes where a C long is.
+    if array("L").itemsize == 8:
+        forms["array-L"] = array("L", values)
+        forms["array-l"] = array("l", values)
+    term_dict = store.term_dict()
+    decoded = term_dict.decode_many(values)
+    kept = store.count_quads(keep={"s": values})
+    for name, form in forms.items():
+        assert _values(U64Column(form)) == values, name
+        assert term_dict.decode_many(form) == decoded, name
+        assert store.count_quads(keep={"s": form}) == kept, name
+    assert _values(U64Column(range(WIDE, WIDE + 3))) == [WIDE, WIDE + 1, WIDE + 2]
+
+
+def test_code_buffers_read_strided_views_and_either_byte_order():
+    values = [WIDE, 2, 3]
+    assert _values(U64Column(memoryview(array("Q", [WIDE, 9, 2, 9, 3]))[::2])) == values
+    assert _values(U64Column(memoryview(array("Q", values[::-1]))[::-1])) == values
+    for item in (ctypes.c_uint64.__ctype_le__, ctypes.c_uint64.__ctype_be__):
+        view = memoryview((item * 3)(*values))
+        assert _values(U64Column(view)) == values, view.format
+    # A ctypes array exports no strides: refused, pointing at the memoryview.
+    with pytest.raises(ValueError, match=re.escape("memoryview(obj)")):
+        U64Column((ctypes.c_uint64 * 3)(*values))
+
+
+def test_signed_code_buffers_refuse_a_negative():
+    with pytest.raises(ValueError, match="-1"):
+        U64Column(array("q", [5, -1]))
+    with pytest.raises(ValueError, match=str(-(1 << 63))):
+        U64Column(array("q", [-(1 << 63)]))
 
 
 def test_u64_column_take_refuses_indices_that_would_wrap():
