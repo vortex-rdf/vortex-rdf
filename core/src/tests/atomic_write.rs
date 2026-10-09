@@ -768,4 +768,183 @@ mod links_and_permissions {
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(entries(dir.path()), vec![path.clone()]);
     }
+
+    /// A directory the process cannot create files in: `0o555` while the
+    /// guard lives, put back when it drops (so the temp directory can still be
+    /// removed). `None` where the process creates files in such a directory
+    /// anyway (root).
+    struct ReadOnlyDir {
+        path: PathBuf,
+        mode: u32,
+    }
+
+    impl ReadOnlyDir {
+        fn new(path: &Path) -> Option<Self> {
+            let guard = Self {
+                path: path.to_path_buf(),
+                mode: mode_of(path),
+            };
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let probe = path.join("probe");
+            if std::fs::File::create(&probe).is_ok() {
+                std::fs::remove_file(&probe).unwrap();
+                eprintln!("skipped: this process can create files in a 0555 directory (root?)");
+                return None;
+            }
+            Some(guard)
+        }
+    }
+
+    impl Drop for ReadOnlyDir {
+        fn drop(&mut self) {
+            let _ =
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
+        }
+    }
+
+    /// 4,200 new quads: past the 4,096-row auto-compaction floor.
+    fn past_the_floor() -> Vec<Quad> {
+        (100..4_300)
+            .map(|i| {
+                make_quad(
+                    &format!("http://example.org/s{i:05}"),
+                    &format!("http://example.org/p{}", i % 3),
+                    &format!("object {}", i % 5),
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect()
+    }
+
+    /// What an append whose auto-compaction was refused leaves: `batch` is in
+    /// the tail on top of the twelve quads of the base, matches and counts
+    /// see it, nothing was gathered since `gathered` (the refusal came before
+    /// any work), an explicit `compact()` still reports `PermissionDenied`,
+    /// and a later append goes the same way and is kept too. Returns the
+    /// store after that later append.
+    async fn assert_kept_in_the_tail(
+        appended: VortexRdfStore,
+        batch: &[Quad],
+        gathered: usize,
+    ) -> VortexRdfStore {
+        assert_eq!(appended.tail_len(), 4_200, "the batch is in the tail");
+        assert_eq!(appended.size().await.unwrap(), 12 + 4_200);
+        let appended_subject =
+            NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s00100").unwrap());
+        assert_eq!(
+            appended
+                .match_pattern(Some(&appended_subject), None, None, None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
+            1
+        );
+        let p0 = NamedNode::new("http://example.org/p0").unwrap();
+        let expected_p0 = modular_quads(12, 3, 4)
+            .iter()
+            .chain(batch.iter())
+            .filter(|quad| quad.predicate == p0)
+            .count();
+        assert_eq!(
+            appended
+                .match_pattern(None, Some(&p0), None, None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
+            expected_p0
+        );
+        assert_eq!(crate::store::test_hooks::gathers(), gathered);
+
+        // Explicit compaction still says why it cannot happen.
+        let error = appended
+            .compact()
+            .await
+            .err()
+            .expect("an explicit compaction of a store that cannot be rewritten must fail");
+        assert!(
+            matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+            "{error}"
+        );
+
+        // A later append retries, is refused the same way, and is kept too.
+        let extra = make_quad(
+            "http://example.org/s99999",
+            "http://example.org/p0",
+            "object 9",
+            GraphName::DefaultGraph,
+        );
+        let more = appended.add_quad(extra).await.unwrap();
+        assert_eq!(more.tail_len(), 4_201);
+        assert_eq!(more.size().await.unwrap(), 12 + 4_201);
+        assert_eq!(crate::store::test_hooks::gathers(), gathered);
+        more
+    }
+
+    /// An append whose auto-compaction is refused because the store file
+    /// cannot be written keeps its batch: the quads stay in the in-memory
+    /// tail, where matches and counts see them, and the store comes back.
+    /// Nothing is gathered or built to find that out, the file is untouched,
+    /// an explicit `compact()` still reports `PermissionDenied`, and later
+    /// appends go the same way.
+    #[tokio::test]
+    async fn test_appends_past_the_floor_stay_in_the_tail_when_the_file_cannot_be_rewritten() {
+        let (dir, path) = write_store_file(
+            modular_quads(12, 3, 4),
+            LayoutStrategy::Default,
+            vec![IndexType::SecondaryByReference],
+        )
+        .await;
+        if !read_only_is_honoured(&path) {
+            return;
+        }
+        let before = std::fs::read(&path).unwrap();
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let batch = past_the_floor();
+        let gathered = crate::store::test_hooks::gathers();
+
+        let appended = store
+            .add_quads(batch.clone())
+            .await
+            .expect("the batch must be kept in the tail, not lost to the refused compaction");
+        assert_kept_in_the_tail(appended, &batch, gathered).await;
+
+        // The file is as it was.
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(mode_of(&path), 0o444);
+        assert_eq!(entries(dir.path()), vec![path.clone()]);
+    }
+
+    /// The rewrite also needs the directory (the temp file is created beside
+    /// the store, then renamed over it), so a writable store file in a
+    /// directory the process cannot write into is no more compactable than a
+    /// read-only file, and its appends are kept in the tail the same way.
+    #[tokio::test]
+    async fn test_appends_stay_in_the_tail_when_the_directory_cannot_be_written() {
+        let (dir, path) = write_store_file(
+            modular_quads(12, 3, 4),
+            LayoutStrategy::Default,
+            vec![IndexType::SecondaryByReference],
+        )
+        .await;
+        let before = std::fs::read(&path).unwrap();
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let Some(_read_only) = ReadOnlyDir::new(dir.path()) else {
+            return;
+        };
+        let batch = past_the_floor();
+        let gathered = crate::store::test_hooks::gathers();
+
+        let appended = store
+            .add_quads(batch.clone())
+            .await
+            .expect("the batch must be kept in the tail, not lost to the refused compaction");
+        assert_kept_in_the_tail(appended, &batch, gathered).await;
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(entries(dir.path()), vec![path.clone()]);
+    }
 }

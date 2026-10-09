@@ -263,9 +263,13 @@ fn path_error(what: &str, path: &std::path::Path, e: std::io::Error) -> VortexRd
 ///
 /// A store the process cannot write is never replaced: the old file is opened
 /// for writing as a probe (not truncated, not created, nothing changes) before
-/// anything is built, and a `PermissionDenied` answer fails the write with an
-/// error naming the path, as `File::create` refused such a file. A read-only
-/// store signals that it should not be overwritten.
+/// anything is built, and a `PermissionDenied` answer (or a read-only
+/// filesystem's) fails the write with an error naming the path and keeping
+/// the kind, as `File::create` refused such a file. A read-only store signals
+/// that it should not be overwritten. The kind is what
+/// [`VortexRdfError::is_unwritable`] tests, so a caller that can do without
+/// the write (an append whose auto-compaction is refused) tells this refusal
+/// from a real failure.
 ///
 /// The old file is never modified. Overwriting it in place would be
 /// unsafe while a reader still maps it (its pages would be pulled out from
@@ -333,7 +337,9 @@ impl PendingStore {
                     Ok(_probe) => {}
                     // Gone since the stat: a fresh path after all.
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    // Permission denied, or a read-only filesystem: either
+                    // way the store is not to be written.
+                    Err(e) if crate::error::kind_means_unwritable(e.kind()) => {
                         let via = if target == path {
                             String::new()
                         } else {
@@ -342,7 +348,7 @@ impl PendingStore {
                         return Err(io_error(
                             "replace",
                             std::io::Error::new(
-                                std::io::ErrorKind::PermissionDenied,
+                                e.kind(),
                                 format!(
                                     "the existing store{via} is not writable by this process, \
                                      and a store it cannot write is never replaced"

@@ -217,8 +217,9 @@ flowchart TD
   ([`PendingStore::create`](../core/src/io/ser.rs#L288), the one writer every
   path-taking build shares), so a source file the process cannot write (a
   read-only file) is refused with `PermissionDenied` before a quad is
-  gathered or built, and the sibling temp file `<store>.write-<uuid>.tmp`
-  exists before the work starts; then the sorted rows are streamed through the
+  gathered or built ([`add_quads`'s auto-compaction](#51-auto-compaction)
+  keeps its batch in the tail instead), and the sibling temp file
+  `<store>.write-<uuid>.tmp` exists before the work starts; then the sorted rows are streamed through the
   out-of-core builder
   ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L150))
   into it
@@ -255,6 +256,27 @@ either of:
 This applies to in-memory **and file-backed** stores alike: a file-backed
 store past the threshold rewrites its source file, as above, as part of the
 `add_quads` call.
+
+**A store whose file cannot be rewritten keeps its appends in the tail.** A
+source file the process cannot write (a read-only file, a read-only
+filesystem) is never replaced, and neither is one in a directory the process
+cannot write into, so there is nothing to fold the tail into. An `add_quads`
+that crosses a threshold on such a store does not fail and does not lose the
+batch: the batch stays in the in-memory tail, where matches and counts see it
+like any appended row, and the call returns `Ok` with the store. Only that
+refusal (`PermissionDenied` or a read-only filesystem, what
+[`is_unwritable`](../core/src/error.rs#L50) tests) is absorbed; any other
+failure of the compaction (a full disk, a directory at the path) is still
+returned. The refusal is made by
+[`PendingStore::create`](../core/src/io/ser.rs#L288) before a quad is
+gathered, so an append over the threshold costs one failed open of the file
+and no rebuild, and every later append over the threshold retries the same
+way, folding the tail as soon as the file can be written again. An explicit
+`compact()` of such a store still fails with `PermissionDenied`: it is the
+call that reports why the tail is not being folded, and
+[`tail_len`](../core/src/store/mod.rs#L397) shows the tail growing. The tail
+then has no bound but memory, and every query mask-scans it, so a read-only
+store is for reading: append to a copy.
 
 ---
 

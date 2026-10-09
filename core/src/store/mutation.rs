@@ -43,6 +43,10 @@ impl VortexRdfStore {
     /// The add that pushes the tail over the auto-compaction thresholds
     /// finishes by folding it into the base ([`compact`]) — on a file-backed
     /// store a rewrite of its source file (watch [`tail_len`](Self::tail_len)).
+    /// If that file cannot be written (a read-only store: permission denied,
+    /// or a read-only filesystem) it is never rewritten: the batch stays in
+    /// the in-memory tail and the store is returned, and an explicit
+    /// [`compact`] fails with the reason.
     ///
     /// [`compact`]: Self::compact
     pub async fn add_quads(&self, quads: impl IntoIterator<Item = Quad>) -> Result<Self> {
@@ -111,7 +115,19 @@ impl VortexRdfStore {
         };
         // The add that pushes the tail over the thresholds folds it into the base.
         if appended.should_auto_compact() {
-            return appended.compact().await;
+            match appended.compact().await {
+                Ok(compacted) => return Ok(compacted),
+                // A source file the process cannot write (a read-only store)
+                // is never rewritten, so there is nothing to fold the tail
+                // into: the batch stays in the in-memory tail, where queries
+                // see it, and the store is returned as an append without a
+                // compaction is. An explicit `compact()` still reports why it
+                // cannot happen. The refusal comes before anything is
+                // gathered or built, so every later append can retry for the
+                // price of one failed open.
+                Err(error) if error.is_unwritable() => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(appended)
     }
