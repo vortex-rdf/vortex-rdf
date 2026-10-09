@@ -166,12 +166,13 @@ impl NativeComponentWrite {
 }
 
 /// Vortex's default uncompressed block target, the coalescing size of every
-/// column the store writes outside [`code_column_strategy`].
+/// column the store writes except its term-code columns.
 pub(crate) const ONE_MEG: u64 = 1 << 20;
 
-/// Rows per repartitioned block and per zone-map zone — the
-/// `WriteStrategyBuilder` default the store keeps.
-const ROW_BLOCK: usize = 8192;
+/// The uncompressed block target of a term-code column: twice Vortex's
+/// default, so a `u64` code column coalesces to the 262,144 rows per leaf a
+/// `u32` one held at 1 MiB (see [`child_strategy`]).
+pub(crate) const CODE_BLOCK_TARGET: u64 = 2 * ONE_MEG;
 
 /// The compressor every store child is written with: the session's schemes,
 /// limited to the wire forms its write editions allow, minus FastLanes delta.
@@ -194,149 +195,70 @@ fn store_compressor() -> vortex_btrblocks::BtrBlocksCompressorBuilder {
         .exclude_schemes([DeltaScheme::new(1.25).id()])
 }
 
-/// The stock write strategy `write_options()` installs, with the
-/// [`store_compressor`] — what every store child's columns are written with
-/// except its term-code columns (see [`child_strategy`]); the dictionary
-/// child instead passes its pre-compressed chunks through
-/// `write::dict_child_strategy`.
-pub(crate) fn default_child_strategy() -> Arc<dyn vortex_layout::LayoutStrategy> {
+/// Vortex's stock write strategy builder over the [`store_compressor`] — the
+/// pipeline `write_options()` installs — with every other option at its
+/// default.
+fn stock_builder() -> vortex_file::WriteStrategyBuilder {
     vortex_file::WriteStrategyBuilder::from_session(&crate::session::VORTEX_SESSION)
         .with_btrblocks_builder(store_compressor())
-        .build()
 }
 
-/// The write strategy for a store child whose columns are `dtype`'s fields:
-/// [`default_child_strategy`], with each term-code column
-/// ([`is_code_field`](crate::store::schema::is_code_field): a `u64` `s`,
-/// `p`, `o`, `g` or `val`) written by [`code_column_strategy`] instead,
-/// through the writer's per-field override
-/// (`WriteStrategyBuilder::with_field_writer`). Every other column — the
-/// `u32` row ids, the Default and TypedObject layouts' strings — keeps the
-/// stock strategy; a child without code columns gets it unchanged.
-///
-/// The override keeps a code column at the rows per leaf a `u32` code column
-/// had: Vortex coalesces a column to 1 MiB uncompressed per leaf, which is
-/// 262,144 rows of a `u32` but 131,072 of a `u64`, and a column read in
-/// twice as many leaves costs every probe that walks or rebuilds them.
-pub(crate) fn child_strategy(dtype: &DType) -> Arc<dyn vortex_layout::LayoutStrategy> {
-    child_strategy_with(dtype, ONE_MEG, 2 * ONE_MEG)
+/// The stock write strategy (see [`stock_builder`]): what every store
+/// child's columns are written with except its term-code columns (see
+/// [`child_strategy`]); the dictionary child instead passes its
+/// pre-compressed chunks through `write::dict_child_strategy`.
+pub(crate) fn default_child_strategy() -> Arc<dyn vortex_layout::LayoutStrategy> {
+    stock_builder().build()
 }
 
-/// [`child_strategy`] with explicit [`code_column_strategy`] targets — the
-/// tests' handle on the override, which at 1 MiB and 1 MiB must write
-/// exactly what [`default_child_strategy`] writes.
-pub(crate) fn child_strategy_with(
-    dtype: &DType,
-    codes_target: u64,
-    fallback_target: u64,
-) -> Arc<dyn vortex_layout::LayoutStrategy> {
-    use vortex_array::dtype::FieldPath;
-
+/// The fields of `dtype` that are term-code columns
+/// ([`is_code_field`](crate::store::schema::is_code_field): a non-nullable
+/// `u64` `s`, `p`, `o`, `g` or `val`), in field order.
+pub(crate) fn code_fields(dtype: &DType) -> Vec<vortex_array::dtype::FieldName> {
     let DType::Struct(fields, _) = dtype else {
-        return default_child_strategy();
+        return Vec::new();
     };
-    let code_fields: Vec<_> = fields
+    fields
         .names()
         .iter()
         .zip(fields.fields())
         .filter(|(name, field)| crate::store::schema::is_code_field(name.as_ref(), field))
         .map(|(name, _)| name.clone())
-        .collect();
+        .collect()
+}
+
+/// The write strategy for a store child whose columns are `dtype`'s fields:
+/// [`default_child_strategy`], with each of its [`code_fields`] written by
+/// the same stock pipeline coalescing to [`CODE_BLOCK_TARGET`] instead,
+/// through the writer's per-field override
+/// (`WriteStrategyBuilder::with_field_writer`). Every other column — the
+/// `u32` row ids, the Default and TypedObject layouts' strings — keeps the
+/// stock 1 MiB; a child without code columns gets the stock strategy
+/// unchanged.
+///
+/// Vortex coalesces a column to 1 MiB uncompressed per leaf, which is
+/// 262,144 rows of a `u32` but 131,072 of a `u64`, and a column read in
+/// twice as many leaves costs every probe that walks or rebuilds them; at
+/// 2 MiB a plain `u64` code column keeps the rows per leaf a `u32` one had.
+/// The target applies to whatever the pipeline coalesces, so the codes of a
+/// column that dictionary-encodes — as narrow as its cardinality needs,
+/// whatever the width of its values — coalesce to 2 MiB too: 1,048,576 rows
+/// of `u16` codes.
+pub(crate) fn child_strategy(dtype: &DType) -> Arc<dyn vortex_layout::LayoutStrategy> {
+    use vortex_array::dtype::FieldPath;
+
+    let code_fields = code_fields(dtype);
     if code_fields.is_empty() {
         return default_child_strategy();
     }
-    let code = code_column_strategy(codes_target, fallback_target);
-    let mut builder =
-        vortex_file::WriteStrategyBuilder::from_session(&crate::session::VORTEX_SESSION)
-            .with_btrblocks_builder(store_compressor());
+    // A nested stock strategy: handed a single column, it runs Vortex's own
+    // per-column pipeline at the wider target.
+    let code = stock_builder()
+        .with_data_block_target_bytes(Some(CODE_BLOCK_TARGET))
+        .build();
+    let mut builder = stock_builder();
     for name in code_fields {
         builder = builder.with_field_writer(FieldPath::from_name(name), Arc::clone(&code));
     }
     builder.build()
-}
-
-/// A term-code column's leaf pipeline: the per-column pipeline
-/// `WriteStrategyBuilder::build` assembles (vortex-file 0.88, `strategy.rs`)
-/// step for step — repartition into 8 Ki-row blocks, zone statistics per
-/// block, dictionary encoding or its fallback, coalescing, compression,
-/// buffering, one flat leaf per chunk — with the coalescing target split in
-/// two: `codes_target` for the codes of a column that dictionary-encodes,
-/// `fallback_target` for a column that does not.
-///
-/// [`child_strategy`] passes 1 MiB and 2 MiB. A dictionary's codes are as
-/// wide as its cardinality needs, whatever the width of the values, so they
-/// keep the stock 1 MiB and the leaves a `u32` column's dictionary codes
-/// had; a plain `u64` column coalesced to 2 MiB holds the 262,144 rows per
-/// leaf a plain `u32` column held at 1 MiB. Passing 1 MiB twice gives the
-/// stock pipeline exactly, which a test pins by writing a column both ways:
-/// a Vortex upgrade that changes the stock pipeline fails that test instead
-/// of leaving the code columns on the old one.
-fn code_column_strategy(
-    codes_target: u64,
-    fallback_target: u64,
-) -> Arc<dyn vortex_layout::LayoutStrategy> {
-    use std::num::NonZeroUsize;
-
-    use vortex_btrblocks::SchemeExt as _;
-    use vortex_btrblocks::schemes::integer::IntDictScheme;
-    use vortex_layout::layouts::buffered::BufferedStrategy;
-    use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
-    use vortex_layout::layouts::compressed::{CompressingStrategy, CompressorPlugin};
-    use vortex_layout::layouts::dict::writer::DictStrategy;
-    use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
-    use vortex_layout::layouts::repartition::{RepartitionStrategy, RepartitionWriterOptions};
-    use vortex_layout::layouts::zoned::writer::{ZonedLayoutOptions, ZonedStrategy};
-
-    let compressor = store_compressor();
-    let flat = FlatLayoutStrategy::default();
-    // The data compressor leaves integer dictionaries to the dictionary
-    // step, as the stock builder's does.
-    let data_compressor: Arc<dyn CompressorPlugin> = Arc::new(
-        compressor
-            .clone()
-            .exclude_schemes([IntDictScheme.id()])
-            .build(),
-    );
-    // Coalesce to `target` bytes in whole blocks, then compress, buffer and
-    // write one flat leaf per chunk.
-    let coalescing = |target: u64| {
-        let chunked = ChunkedLayoutStrategy::new(flat.clone());
-        let buffered = BufferedStrategy::new(chunked, 2 * ONE_MEG);
-        RepartitionStrategy::new(
-            CompressingStrategy::new(buffered, Arc::clone(&data_compressor)),
-            RepartitionWriterOptions {
-                block_size_minimum: target,
-                block_len_multiple: ROW_BLOCK,
-                block_size_target: Some(target),
-                canonicalize: true,
-            },
-        )
-    };
-    // Zone tables and dictionary values, compressed whole.
-    let stats_compressor: Arc<dyn CompressorPlugin> = Arc::new(compressor.build());
-    let compress_then_flat = CompressingStrategy::new(flat.clone(), Arc::clone(&stats_compressor));
-    let dict = DictStrategy::new(
-        coalescing(codes_target),
-        compress_then_flat.clone(),
-        coalescing(fallback_target),
-        Default::default(),
-        stats_compressor,
-    );
-    let zoned = ZonedStrategy::new(
-        dict,
-        compress_then_flat,
-        ZonedLayoutOptions {
-            block_size: NonZeroUsize::new(ROW_BLOCK).expect("the row block is not empty"),
-            ..Default::default()
-        },
-    );
-    Arc::new(RepartitionStrategy::new(
-        zoned,
-        RepartitionWriterOptions {
-            block_size_minimum: 0,
-            block_len_multiple: ROW_BLOCK,
-            block_size_target: None,
-            canonicalize: false,
-        },
-    ))
 }
