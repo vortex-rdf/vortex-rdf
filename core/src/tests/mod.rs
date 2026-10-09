@@ -37,6 +37,7 @@ mod roundtrip;
 #[cfg(feature = "file-io")]
 mod serialization;
 mod streaming;
+mod unique_quads;
 
 fn make_quad(s: &str, p: &str, o_lit: &str, g: GraphName) -> Quad {
     Quad::new(

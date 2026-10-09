@@ -9,6 +9,15 @@
 //! never materialized whole. The run file format itself belongs to
 //! [`spill`](super::spill), the emission machinery to [`builders`](super);
 //! what lives here is the merge.
+//!
+//! Quads are unique and terms are canonical in what this builder emits. The
+//! quad runs are spilled *distinct*: a quad that arrives more than once, in
+//! one run or in several, is merged out once, and the dictionary collects
+//! the terms of the parsed (so canonical) quads as a set. Row ids are
+//! assigned by that merge, after the repeats are gone, so every index
+//! family's `(value, row id)` records describe the deduplicated rows — and
+//! are themselves unique, since each carries a row id of its own. The
+//! families are spilled and merged as they are, never deduplicated.
 
 use super::spill::{Run, RunMerger, RunSpiller, RunWriter, Spillable, TempRunsGuard};
 use super::{
@@ -134,7 +143,8 @@ pub(crate) async fn build_array(
     })
 }
 
-/// External merge sort producing a lazily-evaluated stream of sorted chunks.
+/// External merge sort producing a lazily-evaluated stream of sorted chunks,
+/// each distinct quad once.
 ///
 /// Phase 1 (ingest → sorted runs on disk) runs to completion before this
 /// function returns — sorted output cannot be emitted until all input has been
@@ -163,7 +173,8 @@ pub(crate) async fn build_chunk_stream(
     // incrementally during this same ingestion pass.
     let mut dict_builder = (layout == LayoutStrategy::Dictionary).then(TermDictionaryBuilder::new);
 
-    let mut spiller = RunSpiller::<RawQuad>::new(guard.path(), "quads", chunk_size);
+    // Distinct: a repeated quad must be one row, and one row id.
+    let mut spiller = RunSpiller::<RawQuad>::distinct(guard.path(), "quads", chunk_size);
     let mut total_ingested = 0usize;
     while let Some(res) = quads_in.next().await {
         let raw = res?;
@@ -316,7 +327,8 @@ struct IndexMergers<V> {
 }
 
 /// First pass of the indexed pipeline: run the K-way quad merge to completion,
-/// collecting merged quads — in memory when there is a single input run (the
+/// collecting merged quads (each distinct quad once, so `rid` counts the
+/// deduplicated rows) — in memory when there is a single input run (the
 /// dataset already fit once), else spilled to `merged.bin` — while feeding
 /// each requested index family's spiller with that quad's terms encoded by
 /// `term_of`: `(value, row id)` pairs for the reference index, full

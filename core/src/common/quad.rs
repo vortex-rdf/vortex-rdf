@@ -52,6 +52,14 @@ impl From<RawQuad> for SharedQuad {
 /// This is the shared in-memory (and on-disk, for external sorting)
 /// representation consumed by layouts, indexes and builders before
 /// writing to Vortex arrays.
+///
+/// The strings are the canonical spelling of their RDF terms, which is what
+/// [`from_quad`](Self::from_quad) and the parsers
+/// ([`parse_quads_from_reader`](crate::common::terms::parse_quads_from_reader))
+/// render: `xsd:string` typing dropped, escapes resolved, language tags
+/// lower-cased. Builders intern the spelling they are given and drop repeated
+/// quads by comparing it, so a quad written by hand in some other spelling of
+/// the same terms would count as a different quad.
 #[derive(Clone, Hash, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct RawQuad {
     /// Subject term.

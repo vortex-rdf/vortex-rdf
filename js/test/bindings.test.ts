@@ -150,6 +150,88 @@ describe('build variants', () => {
     }
 });
 
+// The probe that found the gap in 0.11.0: three RDF triples written eight
+// ways -- "x" four times (twice plain, once typed xsd:string, once through a
+// \u escape), "y"@en twice (@EN and @en), "z" under a subject written two ways.
+const PROBE_NT = [
+    '<http://ex.org/s> <http://ex.org/p> "x" .',
+    '<http://ex.org/s> <http://ex.org/p> "x" .',
+    '<http://ex.org/s> <http://ex.org/p> "x"^^<http://www.w3.org/2001/XMLSchema#string> .',
+    '<http://ex.org/s> <http://ex.org/p> "\\u0078" .',
+    '<http://ex.org/s> <http://ex.org/p> "y"@EN .',
+    '<http://ex.org/s> <http://ex.org/p> "y"@en .',
+    '<http://ex.org/s> <http://ex.org/p> "z" .',
+    '<http://ex.org/\\u0073> <http://ex.org/p> "z" .',
+].join('\n') + '\n';
+
+describe('a built store holds each quad once', () => {
+    const s = df.namedNode('http://ex.org/s');
+    const p = df.namedNode('http://ex.org/p');
+    const xsdString = df.namedNode('http://www.w3.org/2001/XMLSchema#string');
+    const langString = df.namedNode('http://www.w3.org/1999/02/22-rdf-syntax-ns#langString');
+    // A literal the factory would not build: an upper-case language tag.
+    const upperCaseLang = {
+        termType: 'Literal' as const,
+        value: 'y',
+        language: 'EN',
+        datatype: langString,
+    } as unknown as Literal;
+    const spellings = (): Quad[] => [
+        df.quad(s, p, df.literal('x')),
+        df.quad(s, p, df.literal('x')),
+        df.quad(s, p, df.literal('x', xsdString)),
+        df.quad(s, p, upperCaseLang),
+        df.quad(s, p, df.literal('y', 'en')),
+        df.quad(s, p, df.literal('z')),
+        df.quad(s, p, df.literal('z')),
+    ];
+
+    for (const { name, options } of VARIANTS) {
+        describe(name, () => {
+            test('fromString keeps one row per distinct quad', async () => {
+                const store = await VortexRdfStore.fromString(PROBE_NT, 'ntriples', options);
+                expect(await store.size()).toBe(3);
+                expect(store.getQuads().length).toBe(3);
+                expect(store.countQuads(null, null, df.literal('x'), null)).toBe(1);
+                expect(store.countQuads(null, null, df.literal('y', 'en'), null)).toBe(1);
+                expect(store.countQuads(null, p, null, null)).toBe(3);
+
+                const restored = await VortexRdfStore.fromBytes(await store.toBytes());
+                expect(await restored.size()).toBe(3);
+                expect(restored.getQuads().length).toBe(3);
+            });
+
+            test('fromQuads canonicalizes RDF/JS terms before it counts them', async () => {
+                const store = await VortexRdfStore.fromQuads(spellings(), options);
+                expect(await store.size()).toBe(3);
+                expect(store.getQuads().length).toBe(3);
+                expect(store.countQuads(null, null, df.literal('x'), null)).toBe(1);
+
+                const viaStream = await VortexRdfStore.fromQuads(
+                    Readable.from(spellings(), { objectMode: true }),
+                    options,
+                );
+                expect(await viaStream.size()).toBe(3);
+            });
+        });
+    }
+
+    test('the dictionary holds one code per RDF term', async () => {
+        const store = await VortexRdfStore.fromString(PROBE_NT, 'ntriples', { layout: 'dictionary' });
+        const dict = store.termDict()!;
+        const codes = store.matchCodes()!;
+        expect(codes.length).toBe(3);
+        // The subject, the predicate, "x", "y"@en, "z" and the default graph:
+        // six codes in use across the four columns, each a distinct term.
+        const used = new Set([...codes.s, ...codes.p, ...codes.o, ...codes.g]);
+        expect(used.size).toBe(6);
+        expect(new Set([...used].map(code => dict.decode(code))).size).toBe(6);
+        expect(new Set([...used].map(code => dict.decode(code)))).toEqual(new Set([
+            '<http://ex.org/s>', '<http://ex.org/p>', '"x"', '"y"@en', '"z"', '',
+        ]));
+    });
+});
+
 describe('match returns an RDF/JS Stream<Quad>', () => {
     test('for-await and data/end events both yield the matches', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads');

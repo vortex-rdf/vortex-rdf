@@ -2,6 +2,11 @@
 //! that consume a quad stream and produce the frozen [`TermDictionary`] —
 //! either together with the coded quads (the interning ingest) or beside the
 //! owned term → code map the streaming builders encode through.
+//!
+//! Terms are canonical and held once: a term is interned by the spelling the
+//! parser rendered, which is one per RDF term, so a dictionary holds exactly
+//! one code per term. Quads are unique: the interning ingest drops repeated
+//! coded quads after its sort, before anything is derived from them.
 
 use std::collections::HashMap;
 // Only [`TermDictionaryBuilder`] collects terms as a set, and it is compiled
@@ -147,7 +152,8 @@ impl DictionaryQuadSink {
 
 /// Ingest-time interner producing the dictionary and the coded quads in one
 /// pass: quads are consumed as they arrive, each unique term is held once, and
-/// each quad is kept as four u32 term codes.
+/// each quad is kept as four u32 term codes. The coded quads that come out are
+/// distinct.
 ///
 /// The stream's per-quad Strings exist only transiently: they die inside
 /// [`push`](Self::push), so what accumulates is one copy of each distinct
@@ -157,8 +163,10 @@ impl DictionaryQuadSink {
 /// [`finish`](Self::finish) sorts the unique terms, freezes them into the
 /// [`TermDictionary`], and remaps every quad's provisional codes to its terms'
 /// sorted ranks — the dictionary codes, since codes are lexicographic ranks.
-/// It then sorts the coded quads directly: `[u32; 4]` lexicographic order
-/// equals (s, p, o, g) term order because codes are sorted ranks.
+/// It then sorts the coded quads directly — `[u32; 4]` lexicographic order
+/// equals (s, p, o, g) term order because codes are sorted ranks — and drops
+/// the adjacent repeats, which are the same quad: terms are interned once,
+/// so equal codes are equal terms.
 pub(crate) struct InterningQuadBuilder {
     /// term → provisional code, owning each distinct term exactly once.
     codes: HashMap<Box<str>, u32>,
@@ -207,10 +215,10 @@ impl InterningQuadBuilder {
     }
 
     /// Freeze the dictionary and produce the dataset's codes in global
-    /// (s, p, o, g) order.
+    /// (s, p, o, g) order, each distinct quad once.
     pub(crate) fn finish(mut self) -> Result<(TermDictionary, QuadCodes)> {
         let total_start = debug::timer();
-        let n = self.quads.len();
+        let ingested = self.quads.len();
 
         let sort_start = debug::timer();
         // Unique terms, so the tuple Ord never reaches the code.
@@ -239,7 +247,11 @@ impl InterningQuadBuilder {
             }
         }
         self.quads.sort_unstable();
+        // Equal quads are adjacent now; the dictionary already holds each
+        // term once, so equal codes are equal terms.
+        self.quads.dedup();
         let remap_elapsed = debug::elapsed(remap_start);
+        let n = self.quads.len();
 
         let mut codes = QuadCodes {
             s: Vec::with_capacity(n),
@@ -255,7 +267,8 @@ impl InterningQuadBuilder {
         }
 
         log::debug!(
-            "[Dictionary] Interned {} quads ({} unique terms): sort terms {:?}, freeze {:?}, remap+sort quads {:?}, total {:?}",
+            "[Dictionary] Interned {} quads ({} distinct, {} unique terms): sort terms {:?}, freeze {:?}, remap+sort quads {:?}, total {:?}",
+            ingested,
             n,
             dict.len(),
             sort_terms_elapsed,

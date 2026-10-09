@@ -100,6 +100,18 @@ Where the stream comes from:
   into the interning sink ([§5](#5-pipeline-a--sorted-in-memory)), so no
   per-quad strings accumulate.
 
+**A built store holds each quad once and each term once, in canonical form.**
+Every source above reaches the builders through `oxrdf` values, which render
+one spelling per RDF term — `"x"^^xsd:string` and `"x"` are the same
+`RawQuad` string, a `\u` escape is resolved, a language tag is lower-cased
+(`@EN` becomes `@en`) — so interning a spelling interns the term. Both
+pipelines then drop repeated quads straight after sorting, before any row id
+or index child is derived, so the rows and every index describe the same
+deduplicated dataset (an RDF dataset is a set: a quad is in it or is not).
+The rebuilds of [§11](#11-rebuilds-mutated-stores-compaction-export) do the
+same. Nothing re-canonicalizes a `RawQuad` written by hand, whose spelling is
+its author's.
+
 ---
 
 ## 4. Sorting is not a knob
@@ -118,7 +130,9 @@ The order is what the read side is written against: the `s` column carries the
 `(s, p, o, g)` order ([matching.md §6.1](matching.md#61-prefix-probe)); the
 index children are globally sorted, which is what makes them binary-searchable;
 and the file's root metadata records `quads_sorted` so a reader can restore the
-stamp on rows it materializes.
+stamp on rows it materializes. The sort is also where repeated quads are
+dropped ([§3](#3-the-ingest-currency-rawquad)): equal quads are adjacent in
+the order, and each distinct quad leaves it once.
 
 ---
 
@@ -133,14 +147,14 @@ flowchart TD
     S["RawQuad stream"] --> L{"layout?"}
 
     L -- "Default / TypedObject" --> A1["collect every RawQuad in memory"]
-    A1 --> A2["sort_unstable — (s, p, o, g) string order"]
+    A1 --> A2["sort_unstable, dedup — (s, p, o, g) string order"]
     A2 --> A3["build_struct_array(quads, layout, s_sorted = true)<br/>one struct, s stamped IsSorted"]
     A2 --> A4["build_components<br/>each requested family sorted over the whole dataset"]
 
     L -- "Dictionary" --> B1["InterningQuadBuilder::push per quad:<br/>intern 4 terms → provisional codes, keep four u32 codes"]
     B1 --> B2["finish: sort the distinct terms,<br/>rank_of[provisional] = sorted position"]
     B2 --> B3["freeze the sorted column → TermDictionary<br/>(FSST-compressed in 65,536-term windows)"]
-    B2 --> B4["remap every quad's codes to ranks,<br/>sort the 16-byte rows"]
+    B2 --> B4["remap every quad's codes to ranks,<br/>sort the 16-byte rows, drop repeats"]
     B4 --> B5["build_array(codes): four u32 columns,<br/>s stamped IsSorted"]
     B4 --> B6["build the index components<br/>from the ranked code rows"]
 
@@ -151,8 +165,8 @@ flowchart TD
     B6 --> R
 ```
 
-**String layouts.** The stream is drained into a `Vec<RawQuad>`, sorted, and
-built into one struct of primary columns through
+**String layouts.** The stream is drained into a `Vec<RawQuad>`, sorted, stripped
+of its adjacent repeats, and built into one struct of primary columns through
 [`build_struct_array`](../core/src/store/builders/mod.rs#L167); the requested
 index families are sorted over that same vector ([§8](#8-secondary-indexes-at-build-time)).
 
@@ -163,7 +177,9 @@ as four provisional `u32` codes. `finish` sorts the distinct terms, freezes them
 into the dictionary, replaces every provisional code by its term's sorted rank —
 which *is* the dictionary code — and sorts the coded rows. Because codes are
 lexicographic ranks, sorting `[u32; 4]` rows is the same order as sorting the
-term strings, so the sort moves 16-byte rows instead of four-string structs.
+term strings, so the sort moves 16-byte rows instead of four-string structs;
+equal rows are then adjacent and the repeats are dropped, since equal codes are
+equal terms.
 [`DictionaryQuadSink`](../core/src/store/layouts/dictionary/ingest.rs#L120) is
 the push-based form of the same ingest, for callers that produce quads one at a
 time (the wasm array path).
@@ -210,7 +226,14 @@ flows; the whole distinct-term set is the one thing this pipeline holds for the
 dataset's lifetime.
 
 **Phase 2 — merge.** A binary heap holds the head of every run; popping it
-yields the globally next quad in `(s, p, o, g)` order.
+yields the globally next quad in `(s, p, o, g)` order. The quad runs are
+*distinct*: a run drops its repeats as it is sorted, and after each pop the
+merge pops every other copy of that quad off the heap (equal quads are
+adjacent in the merged order, so they are the heads of their runs), so a quad
+that arrives more than once, in one run or in several, is emitted once. Row
+ids are assigned after this, so the index families' `(key, rid)` records —
+spilled and merged as they are, never deduplicated — are unique because their
+row ids are.
 
 **Phase 3 — emission.** Without indexes the merge is lazy
 ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L150)):
@@ -429,13 +452,15 @@ parts are:
 The re-sort ([`order_for_rebuild`](../core/src/store/serialize.rs#L43)) sorts
 the small tail alone and merges it into the already-sorted base in a linear
 pass; only a base that never carried the stamp pays a full sort. The written
-artifact therefore always claims `quads_sorted` truthfully.
+artifact therefore always claims `quads_sorted` truthfully. The sorted rows are
+then deduplicated, as every builder's output is, so the artifact holds each
+quad once even when the rows it was gathered from did not.
 
 ### 11.2 Compaction
 
 [`compact`](../core/src/store/compaction.rs#L29) /
 [`compact_with_indexes`](../core/src/store/compaction.rs#L57) gather every live
-quad, sort, and rebuild:
+quad, sort, drop repeated quads, and rebuild:
 
 - **A file-backed owner stays file-backed** ([`stream_compacted_to_file`](../core/src/store/compaction.rs#L99)):
   the sorted rows are streamed through `SortedStreamBuilder` — spilling beside

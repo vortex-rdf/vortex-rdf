@@ -31,7 +31,8 @@ impl VortexRdfStore {
     }
 
     /// Gather this view's live rows into a standalone, owning store, re-sorted
-    /// by (s, p, o, g), with the given secondary indexes rebuilt over them.
+    /// by (s, p, o, g) with each quad once, and the given secondary indexes
+    /// rebuilt over them.
     ///
     /// Physically gathering the rows renumbers them to a fresh `0..n`, so the
     /// source components' `rid` columns — which addressed the old base — cannot
@@ -58,6 +59,9 @@ impl VortexRdfStore {
         let unique = unique_indexes(&indexes);
         let mut raws = self.live_raw_quads().await?;
         raws.sort_unstable();
+        // The compacted store holds each quad once, whatever the rows it was
+        // gathered from carried: equal quads are adjacent after the sort.
+        raws.dedup();
         // An OWNING file-backed store stays file-backed: stream the live rows
         // through the sorted builder straight over their own source file (no
         // materialized rebuild — quads, index children, and the dictionary

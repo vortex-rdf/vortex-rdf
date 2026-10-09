@@ -250,12 +250,19 @@ impl<T: Spillable> RunReader<T> {
 /// External sort of `T`s: buffers items up to a capacity, spills each full
 /// buffer as a sorted run, and hands back a [`RunMerger`] that streams the
 /// items in global order.
+///
+/// A spiller keeps every item pushed, repeats included — the index
+/// `(value, row id)` records are all different because their row ids are —
+/// unless it was made with [`distinct`](Self::distinct), which is what the
+/// quads themselves go through.
 pub(crate) struct RunSpiller<T> {
     dir: PathBuf,
     name: &'static str,
     capacity: usize,
     buf: Vec<T>,
     run_paths: Vec<PathBuf>,
+    /// Whether equal items collapse to one (see [`distinct`](Self::distinct)).
+    distinct: bool,
 }
 
 impl<T: Ord + Spillable> RunSpiller<T> {
@@ -267,6 +274,28 @@ impl<T: Ord + Spillable> RunSpiller<T> {
             capacity,
             buf: Vec::with_capacity(capacity.min(4096)),
             run_paths: Vec::new(),
+            distinct: false,
+        }
+    }
+
+    /// A spiller whose merge yields each distinct item once: equal items
+    /// collapse as a run is sorted, and again across runs as they merge, so
+    /// a repeat is dropped wherever it falls. Equal items must be adjacent
+    /// in `T`'s order, so its `Ord` has to agree with its `Eq` (all four
+    /// fields of a quad take part in both).
+    pub(crate) fn distinct(dir: &Path, name: &'static str, capacity: usize) -> Self {
+        Self {
+            distinct: true,
+            ..Self::new(dir, name, capacity)
+        }
+    }
+
+    /// Sort the buffer into a run, dropping its repeats when the spiller is
+    /// [`distinct`](Self::distinct) — equal items are adjacent once sorted.
+    fn sort_buf(&mut self) {
+        self.buf.sort_unstable();
+        if self.distinct {
+            self.buf.dedup();
         }
     }
 
@@ -281,7 +310,7 @@ impl<T: Ord + Spillable> RunSpiller<T> {
     }
 
     fn flush_run(&mut self) -> Result<()> {
-        self.buf.sort_unstable();
+        self.sort_buf();
         let path = self
             .dir
             .join(format!("{}_run_{}.bin", self.name, self.run_paths.len()));
@@ -303,7 +332,9 @@ impl<T: Ord + Spillable> RunSpiller<T> {
     /// place is the whole merge, so it becomes a single in-memory run.
     pub(crate) fn into_merger(mut self) -> Result<RunMerger<T>> {
         if self.run_paths.is_empty() {
-            self.buf.sort_unstable();
+            // The one run is deduplicated in place, so the merger reads it
+            // straight through whether or not the spiller is distinct.
+            self.sort_buf();
             log::debug!(
                 "[RunSpiller] Kept the single sorted run of {} ({} items) in memory",
                 self.name,
@@ -319,7 +350,7 @@ impl<T: Ord + Spillable> RunSpiller<T> {
             .iter()
             .map(|p| Run::file(p))
             .collect::<Result<_>>()?;
-        RunMerger::new(runs)
+        RunMerger::merge(runs, self.distinct)
     }
 }
 
@@ -329,20 +360,36 @@ pub(crate) struct RunMerger<T> {
     /// Primed with each run's head; empty while a single run is read
     /// straight through.
     heap: BinaryHeap<MinHeapItem<T>>,
+    /// Whether an item present more than once comes out once.
+    distinct: bool,
 }
 
 impl<T: Ord + Spillable> RunMerger<T> {
-    /// Merge `runs`, each already sorted.
-    pub(crate) fn new(mut runs: Vec<Run<T>>) -> Result<Self> {
+    /// Merge `runs`, each already sorted, keeping every item.
+    pub(crate) fn new(runs: Vec<Run<T>>) -> Result<Self> {
+        Self::merge(runs, false)
+    }
+
+    /// Merge `runs`, each already sorted. With `distinct`, an item that
+    /// appears more than once — in several runs, or repeated inside one —
+    /// comes out once.
+    pub(crate) fn merge(mut runs: Vec<Run<T>>, distinct: bool) -> Result<Self> {
         let mut heap = BinaryHeap::new();
-        if runs.len() > 1 {
+        // A lone run reads straight through, unless its repeats must be
+        // dropped: that takes the heap, which sees the next item of a run
+        // before anything is emitted.
+        if runs.len() > 1 || distinct {
             for (run_idx, run) in runs.iter_mut().enumerate() {
                 if let Some(item) = run.next()? {
                     heap.push(MinHeapItem { item, run_idx });
                 }
             }
         }
-        Ok(Self { runs, heap })
+        Ok(Self {
+            runs,
+            heap,
+            distinct,
+        })
     }
 
     /// How many runs feed the merge.
@@ -352,19 +399,35 @@ impl<T: Ord + Spillable> RunMerger<T> {
 
     /// The next item in global order, or `None` once every run is drained.
     pub(crate) fn next(&mut self) -> Result<Option<T>> {
-        if self.runs.len() == 1 {
+        if self.runs.len() == 1 && !self.distinct {
             return self.runs[0].next();
         }
         let Some(MinHeapItem { item, run_idx }) = self.heap.pop() else {
             return Ok(None);
         };
+        self.refill(run_idx)?;
+        if self.distinct {
+            // Equal items are adjacent in the merged order, so every other
+            // copy of `item` is the head of its run: at the top of the heap.
+            // Popping them leaves the next distinct item on top.
+            while self.heap.peek().is_some_and(|top| top.item == item) {
+                if let Some(MinHeapItem { run_idx, .. }) = self.heap.pop() {
+                    self.refill(run_idx)?;
+                }
+            }
+        }
+        Ok(Some(item))
+    }
+
+    /// Put run `run_idx`'s next item, if it has one, back on the heap.
+    fn refill(&mut self, run_idx: usize) -> Result<()> {
         if let Some(next) = self.runs[run_idx].next()? {
             self.heap.push(MinHeapItem {
                 item: next,
                 run_idx,
             });
         }
-        Ok(Some(item))
+        Ok(())
     }
 
     /// Pull up to `n` items off the merge (fewer at the end of the data).
@@ -493,6 +556,101 @@ mod tests {
                 "{label}: truncated record must not read short"
             );
         }
+    }
+
+    /// Items that repeat inside a run and across runs: twelve distinct pairs
+    /// over a small domain, each showing up three or four times, in a
+    /// scrambled order.
+    fn repeated_items() -> Vec<(u32, u32)> {
+        (0..40u32)
+            .map(|i| {
+                let x = (i * 7919) % 12;
+                (x / 4, x % 4)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn distinct_spiller_collapses_repeats_inside_and_across_runs() {
+        let guard = TempRunsGuard::create("unit_distinct", None).unwrap();
+        let items = repeated_items();
+        let mut expected = items.clone();
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(expected.len(), 12);
+        assert!(expected.len() * 3 <= items.len(), "the test needs repeats");
+
+        for capacity in [1, 3, 4, 7, 13, 40, 100] {
+            let mut spiller: RunSpiller<(u32, u32)> =
+                RunSpiller::distinct(guard.path(), "distinct", capacity);
+            for item in &items {
+                spiller.push(*item).unwrap();
+            }
+            let mut merger = spiller.into_merger().unwrap();
+            // More than one run is the case that needs the heap; one run is
+            // deduplicated in place.
+            assert_eq!(merger.run_count() > 1, capacity < items.len(), "{capacity}");
+            let mut merged = merger.next_batch(5).unwrap();
+            merged.extend(merger.next_batch(usize::MAX).unwrap());
+            assert_eq!(merged, expected, "run capacity {capacity}");
+            assert!(merger.next().unwrap().is_none());
+        }
+    }
+
+    /// The default spiller keeps every item pushed: the index records are
+    /// distinct by their row ids, never by being deduplicated.
+    #[test]
+    fn plain_spiller_keeps_repeats() {
+        let guard = TempRunsGuard::create("unit_plain", None).unwrap();
+        let items = repeated_items();
+        let mut expected = items.clone();
+        expected.sort_unstable();
+
+        for capacity in [3, 100] {
+            let mut spiller: RunSpiller<(u32, u32)> =
+                RunSpiller::new(guard.path(), "plain", capacity);
+            for item in &items {
+                spiller.push(*item).unwrap();
+            }
+            let mut merger = spiller.into_merger().unwrap();
+            assert_eq!(
+                merger.next_batch(usize::MAX).unwrap(),
+                expected,
+                "{capacity}"
+            );
+        }
+    }
+
+    /// A distinct merge over runs that were never deduplicated themselves
+    /// (a lone file run with repeats, and several runs full of them) still
+    /// yields each item once.
+    #[test]
+    fn distinct_merge_of_runs_with_repeats() {
+        let guard = TempRunsGuard::create("unit_distinct_runs", None).unwrap();
+        let write = |name: &str, items: &[(u32, u32)]| {
+            let path = guard.path().join(name);
+            write_run(&path, items).unwrap();
+            Run::<(u32, u32)>::file(&path).unwrap()
+        };
+        let lone = write(
+            "lone.bin",
+            &[(0, 0), (0, 0), (1, 1), (1, 1), (1, 1), (2, 2)],
+        );
+        let mut merger = RunMerger::merge(vec![lone], true).unwrap();
+        assert_eq!(
+            merger.next_batch(usize::MAX).unwrap(),
+            [(0, 0), (1, 1), (2, 2)]
+        );
+
+        let a = write("a.bin", &[(0, 0), (0, 0), (1, 1), (3, 3)]);
+        let b = write("b.bin", &[(0, 0), (1, 1), (1, 1), (2, 2)]);
+        let c = write("c.bin", &[(1, 1), (2, 2), (2, 2), (3, 3), (3, 3)]);
+        let mut merger = RunMerger::merge(vec![a, b, c], true).unwrap();
+        assert_eq!(
+            merger.next_batch(usize::MAX).unwrap(),
+            [(0, 0), (1, 1), (2, 2), (3, 3)]
+        );
+        assert!(merger.next().unwrap().is_none());
     }
 
     #[test]

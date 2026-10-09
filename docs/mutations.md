@@ -199,7 +199,7 @@ compacted had lost it (a tail, or a narrowed match result).
 ```mermaid
 flowchart TD
     C["compact_with_indexes(indexes)"] --> L["live_raw_quads(): base then tail, tombstones out"]
-    L --> S["sort_unstable — (s, p, o, g)"]
+    L --> S["sort_unstable, dedup — (s, p, o, g)"]
     S --> O{"owner of a file?"}
     O -- "yes" --> F1["build_chunk_stream over the sorted rows,<br/>spilling beside the store file"]
     F1 --> F2["write &lt;store&gt;.write-&lt;uuid&gt;.tmp<br/>(write_store_file → built_stream_to_vortex_writer)"]
