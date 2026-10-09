@@ -1,4 +1,4 @@
-//! The vortex-rdf.store.v1 wire contract. Every test here asserts the same
+//! The vortex-rdf.store.v2 wire contract. Every test here asserts the same
 //! contract from a different starting state (tailed, tombstoned,
 //! file-backed, dictionary, locally-sorted multi-chunk): `to_bytes` /
 //! `from_bytes` must carry the store's index components and its sortedness

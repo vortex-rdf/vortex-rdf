@@ -169,7 +169,9 @@ class VortexRdfStore:
         ``in_memory=True``. A file store is memory-mapped: replace its file by
         renaming a new one over it, never by truncating or rewriting it in
         place (a reader of the mapping would be killed with SIGBUS);
-        ``serialize_rdf`` already writes that way."""
+        ``serialize_rdf`` already writes that way. A file written by
+        vortex-rdf 0.11 or earlier is refused (``VortexRdfError``): rebuild
+        it from its RDF source with ``serialize_rdf``."""
         ...
     @staticmethod
     def from_bytes(data: bytes) -> "VortexRdfStore": ...

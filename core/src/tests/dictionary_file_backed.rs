@@ -685,17 +685,25 @@ async fn test_large_dictionary_child_lift_keeps_fsst() {
     assert_eq!(lifted.encode("\u{10FFFF}"), None);
 }
 
-/// A store file written by vortex-rdf 0.11 — a dictionary child without zone
-/// maps — opens memory-mapped through the leaf-bound fallback and answers
-/// exactly like its in-memory load.
+/// A dictionary child written the way vortex-rdf 0.11 wrote it — component
+/// version 1, and a term column with no zone-map node to read window bounds
+/// from — opens memory-mapped through the leaf-bound fallback and answers
+/// exactly like its in-memory load. No 0.12 writer produces one and a store
+/// of 0.11 itself is refused at its root, so the shape is built here under
+/// the current root.
 #[tokio::test]
-async fn test_v1_dictionary_fixture_opens_mapped() {
-    const FIXTURE: &[u8] = include_bytes!("fixtures/store-dictionary-both-indexes.vortex");
+async fn test_v1_dictionary_child_opens_mapped() {
+    use crate::store::layouts::dictionary::TermDictionary;
+
+    let raws: Vec<crate::store::RawQuad> = dictionary_test_quads()
+        .iter()
+        .map(crate::store::RawQuad::from_quad)
+        .collect();
+    let (dict, _code_map) = TermDictionary::from_quads_with_map(&raws).unwrap();
+    let bytes = write_v1_dict_only_store(&dict).await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v1.vortex");
-    std::fs::write(&path, FIXTURE).unwrap();
-    // The fixture is the 0.11 shape: component version 1, and a term column
-    // with no zone-map node to read window bounds from.
+    std::fs::write(&path, &bytes).unwrap();
     let native = NativeStoreFile::try_new(
         crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
             .await
@@ -711,10 +719,11 @@ async fn test_v1_dictionary_fixture_opens_mapped() {
     assert!(!dict_term_column(&native).is::<Zoned>());
     let mapped = VortexRdfStore::from_file(&path).await.unwrap();
     assert!(mapped.debug_dict_file_backed());
-    let loaded = VortexRdfStore::from_bytes(FIXTURE).await.unwrap();
-    assert_eq!(view_strings(&mapped).await, view_strings(&loaded).await);
+    let loaded = VortexRdfStore::from_bytes(&bytes).await.unwrap();
     let reader = mapped.dict_reader().unwrap();
     let oracle = loaded.code_read_snapshot().unwrap();
+    assert_eq!(reader.len(), oracle.len());
+    assert!(!oracle.is_empty());
     for code in 0..oracle.len() as u32 {
         let term = oracle.decode(code).unwrap();
         assert_eq!(reader.encode(&term).await.unwrap(), Some(code), "{term}");

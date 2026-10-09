@@ -232,6 +232,59 @@ describe('a built store holds each quad once', () => {
     });
 });
 
+// 0.12 readers rely on guarantees only a 0.12 writer gives (each quad stored
+// once; reference-index children in (val, rid) order), so the store root
+// layout was renamed from vortex-rdf.store.v1 to vortex-rdf.store.v2 and a v1
+// file is refused. The two ids are the same length, so renaming one into the
+// other in a written store moves no offset (a Vortex file has no checksum over
+// its footer): that is how a file of 0.11 and earlier is made here.
+describe('stores written before 0.12 are refused', () => {
+    const encode = (text: string) => new TextEncoder().encode(text);
+    const current = encode('vortex-rdf.store.v2');
+    const legacy = encode('vortex-rdf.store.v1');
+    const findAll = (bytes: Uint8Array, needle: Uint8Array): number[] => {
+        const at: number[] = [];
+        for (let i = 0; i + needle.length <= bytes.length; i++) {
+            if (needle.every((byte, k) => bytes[i + k] === byte)) at.push(i);
+        }
+        return at;
+    };
+    const asWrittenBefore012 = (bytes: Uint8Array): Uint8Array => {
+        const copy = bytes.slice();
+        const at = findAll(copy, current);
+        expect(at.length).toBe(1);
+        copy.set(legacy, at[0]);
+        return copy;
+    };
+
+    for (const { name, options } of VARIANTS) {
+        test(`${name}: a store written now carries the v2 root; a v1 one is refused`, async () => {
+            const bytes = await (await VortexRdfStore.fromString(NQUADS, 'nquads', options)).toBytes();
+            expect(findAll(bytes, current).length).toBe(1);
+            expect(findAll(bytes, legacy).length).toBe(0);
+
+            const refused = VortexRdfStore.fromBytes(asWrittenBefore012(bytes));
+            await expect(refused).rejects.toThrow(/written by vortex-rdf 0\.11 or earlier/);
+            await expect(VortexRdfStore.fromBytes(asWrittenBefore012(bytes))).rejects.toThrow(
+                /rebuild it from its RDF source with vortex-rdf 0\.12.*serializeRdf/,
+            );
+            await expect(VortexRdfStore.fromBytes(asWrittenBefore012(bytes))).rejects.toThrow(
+                /^(?!.*(not a vortex-rdf store file|Invalid encoding ID))/s,
+            );
+
+            // The current bytes still open.
+            expect(await (await VortexRdfStore.fromBytes(bytes)).size()).toBe(6);
+        });
+    }
+
+    test('deserializeRdf refuses a v1 file the same way', async () => {
+        const bytes = await serializeRdf(NQUADS, 'nquads');
+        await expect(deserializeRdf(asWrittenBefore012(bytes), 'nquads')).rejects.toThrow(
+            /written by vortex-rdf 0\.11 or earlier/,
+        );
+    });
+});
+
 describe('match returns an RDF/JS Stream<Quad>', () => {
     test('for-await and data/end events both yield the matches', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads');

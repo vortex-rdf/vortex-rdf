@@ -182,7 +182,7 @@ const vortex = await serializeRdf(turtleText, 'turtle', { layout: 'dictionary' }
 const nquads = await deserializeRdf(vortex, 'nquads');
 ```
 
-`toBytes` writes the same exchange format the CLI and the Python bindings read, so a buffer can be written to disk as a `.vortex` file or handed across bindings.
+`toBytes` writes the same exchange format the CLI and the Python bindings read, so a buffer can be written to disk as a `.vortex` file or handed across bindings. Bytes written by vortex-rdf 0.11 or earlier are refused: `fromBytes` rejects with an error saying so, and the store has to be rebuilt from its RDF source (`serializeRdf`, or the CLI's `serialize`).
 
 A `VortexRdfStore` is a wasm-side handle: call `free()` when you are done with it, or declare it with `using` (`free` is wired to `Symbol.dispose`); an unfreed store is reclaimed only when its JS wrapper is garbage-collected.
 

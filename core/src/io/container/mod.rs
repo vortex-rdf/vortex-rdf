@@ -1,7 +1,7 @@
-//! The native store container: the `vortex-rdf.store.v1` grammar, as a
+//! The native store container: the `vortex-rdf.store.v2` grammar, as a
 //! custom Vortex layout root.
 //!
-//! A store file's root layout is `vortex-rdf.store.v1`: child 0 is the
+//! A store file's root layout is `vortex-rdf.store.v2`: child 0 is the
 //! *transparent* `quad-source` — the quad table itself, to which the root
 //! delegates its dtype, row count, and scan — and every further child is an
 //! *auxiliary* component (the term dictionary, the secondary indexes' own
@@ -35,7 +35,18 @@ pub(crate) mod write;
 /// Stable identity of the store root layout. Changing the container grammar
 /// (`wire`, `layout`) means a new versioned id, not a silent
 /// reinterpretation.
-pub(crate) const STORE_LAYOUT_ID: &str = "vortex-rdf.store.v1";
+///
+/// `v2` is the root of vortex-rdf 0.12. Its readers rely on two guarantees
+/// that only a 0.12 writer gives — each quad is stored once, and a reference
+/// index's children are in `(val, rid)` order — and a file of 0.11 or earlier
+/// can break either, so the previous root ([`LEGACY_STORE_LAYOUT_ID`]) is
+/// refused, not read.
+pub(crate) const STORE_LAYOUT_ID: &str = "vortex-rdf.store.v2";
+/// The store root layout of vortex-rdf 0.11 and earlier. Nothing writes it
+/// and nothing reads it: it is registered only so that a file carrying it
+/// opens far enough to be refused with an error that says what the file is
+/// (see `LegacyStoreLayoutVTable`).
+pub(crate) const LEGACY_STORE_LAYOUT_ID: &str = "vortex-rdf.store.v1";
 /// The transparent quad table is always child 0.
 const QUAD_SOURCE_CHILD: usize = 0;
 const QUAD_SOURCE_NAME: &str = "quad-source";
@@ -51,12 +62,15 @@ pub(crate) const DICT_IMPLEMENTATION: &str = "sorted-terms-fsst-v1";
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) const DICT_VERSION: u32 = 2;
 
+#[cfg(test)]
+pub(crate) use layout::LegacyStoreLayoutVTable;
 #[cfg(all(test, feature = "file-io"))]
 pub(crate) use layout::store_metadata_of_bytes;
 #[cfg(all(test, feature = "file-io"))]
 pub(crate) use layout::subtree_bytes;
 pub(crate) use layout::{
-    RdfStoreLayoutVTable, is_native_file, quads_sorted, register, store_component, store_components,
+    RdfStoreLayoutVTable, is_legacy_file, is_native_file, legacy_store_message, quads_sorted,
+    register, store_component, store_components,
 };
 pub(crate) use sources::{NativeComponentWrite, default_child_strategy};
 // Consumed only by the write side (`ser` and `IndexComponent::to_write`),
@@ -120,7 +134,30 @@ mod tests {
         use vortex_layout::session::LayoutSessionExt;
         let id = <RdfStoreLayoutVTable as VTable>::id(&RdfStoreLayoutVTable);
         assert_eq!(id.as_ref(), STORE_LAYOUT_ID);
+        // Pinned to the spelling, so the constant cannot move unnoticed: a
+        // new id is a new grammar, and the one it replaces must be refused.
+        assert_eq!(STORE_LAYOUT_ID, "vortex-rdf.store.v2");
+        assert_eq!(LEGACY_STORE_LAYOUT_ID, "vortex-rdf.store.v1");
         assert!(VORTEX_SESSION.layouts().registry().get(&id).is_some());
+    }
+
+    /// The previous root is registered, so that its files open, and nothing
+    /// else: it is no edition's member, so no writer can emit it.
+    #[test]
+    fn the_legacy_root_is_registered_for_reading_only() {
+        use vortex_edition::{ComponentKind, EditionSessionExt as _};
+        use vortex_layout::session::LayoutSessionExt;
+        let id = <LegacyStoreLayoutVTable as VTable>::id(&LegacyStoreLayoutVTable);
+        assert_eq!(id.as_ref(), LEGACY_STORE_LAYOUT_ID);
+        assert!(VORTEX_SESSION.layouts().registry().get(&id).is_some());
+
+        let writable: Vec<String> = VORTEX_SESSION
+            .enabled_component_ids(ComponentKind::Layout)
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        assert!(writable.contains(&STORE_LAYOUT_ID.to_string()));
+        assert!(!writable.contains(&LEGACY_STORE_LAYOUT_ID.to_string()));
     }
 
     #[test]

@@ -214,7 +214,7 @@ flowchart TD
   sorted rows are streamed through the out-of-core builder
   ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L150))
   into a sibling temp file `<store>.write-<uuid>.tmp`
-  ([`write_store_file`](../core/src/io/ser.rs#L171), the one writer every
+  ([`write_store_file`](../core/src/io/ser.rs#L210), the one writer every
   path-taking build shares, around
   [`built_stream_to_vortex_writer`](../core/src/io/ser.rs#L124)), which is
   then renamed over the original path; the store is reopened with the

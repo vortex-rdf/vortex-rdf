@@ -24,7 +24,7 @@ store.get_quads(p="<http://xmlns.com/foaf/0.1/name>")            # [(s, p, o, g)
 
 ## Reading quads
 
-Every read takes a pattern as the keyword arguments `s`, `p`, `o`, `g`; an omitted position is a wildcard. Terms cross the boundary as N-Triples strings (`<iri>`, `_:b0`, `"lit"@en`, `"3"^^<http://www.w3.org/2001/XMLSchema#integer>`); the graph of a quad in the default graph is the empty string, which is also how a pattern selects it. A malformed term raises `ValueError`; a failing store operation raises `VortexRdfError`.
+Every read takes a pattern as the keyword arguments `s`, `p`, `o`, `g`; an omitted position is a wildcard. Terms cross the boundary as N-Triples strings (`<iri>`, `_:b0`, `"lit"@en`, `"3"^^<http://www.w3.org/2001/XMLSchema#integer>`); the graph of a quad in the default graph is the empty string, which is also how a pattern selects it. A malformed term raises `ValueError`; a failing store operation raises `VortexRdfError`. That includes opening a store written by vortex-rdf 0.11 or earlier: its root layout is refused, and the error says to rebuild it from its RDF source with `serialize_rdf`.
 
 ```python
 len(store)                                                   # number of quads

@@ -35,7 +35,7 @@ and `from_file` read one grammar.
 ├──────────────────────────────────────────────────────────────┤
 │ DType flatbuffer         the quad table's struct schema      │
 ├──────────────────────────────────────────────────────────────┤
-│ Layout flatbuffer        root "vortex-rdf.store.v1"          │
+│ Layout flatbuffer        root "vortex-rdf.store.v2"          │
 │                            metadata: JSON inventory          │
 │                            child 0  = quad-source (transp.)  │
 │                            child 1… = the components above   │
@@ -67,7 +67,7 @@ The layouts this store's files contain:
 
 | Layout | Role here |
 |---|---|
-| `vortex-rdf.store.v1` | the root: this crate's own layout ([§3](#3-the-store-root-vortex-rdfstorev1)) |
+| `vortex-rdf.store.v2` | the root: this crate's own layout ([§3](#3-the-store-root-vortex-rdfstorev2)) |
 | Struct | one child per column of a table — the quad table, an index child, the dictionary |
 | Zoned | a column wrapped with a table of per-block statistics, for filter pruning |
 | Dict | a column dictionary-encoded by the writer: a values child and a codes child |
@@ -76,21 +76,35 @@ The layouts this store's files contain:
 
 The footer's **segment map** records every segment's offset and length by id;
 a layout names its segments by id, so any subtree's on-disk size is a sum over
-the map with no I/O ([`subtree_bytes`](../core/src/io/container/layout.rs#L183)).
+the map with no I/O ([`subtree_bytes`](../core/src/io/container/layout.rs#L261)).
 The file's dtype is embedded, so the file is self-describing.
 
 ---
 
-## 3. The store root: `vortex-rdf.store.v1`
+## 3. The store root: `vortex-rdf.store.v2`
 
 The root layout is registered in the crate's Vortex session on every target
-([`register`](../core/src/io/container/layout.rs#L131)); its stable
-id is [`STORE_LAYOUT_ID`](../core/src/io/container/mod.rs#L38). A file whose
+([`register`](../core/src/io/container/layout.rs#L200)); its stable
+id is [`STORE_LAYOUT_ID`](../core/src/io/container/mod.rs#L44). A file whose
 root has any other id is refused as "not a vortex-rdf store file".
+
+The one other id the session knows is the previous generation's,
+`vortex-rdf.store.v1` ([`LEGACY_STORE_LAYOUT_ID`](../core/src/io/container/mod.rs#L49)):
+the root vortex-rdf 0.11 and earlier wrote. It is registered so that such a
+file opens far enough to be named, and is then **refused** with an error that
+says it was written by vortex-rdf 0.11 or earlier and must be rebuilt from its
+RDF source — in every open path (`from_file`, `from_bytes`, the Python
+constructor and `from_bytes`, JavaScript's `fromBytes`). The refusal exists
+because 0.12 readers rely on two guarantees that only a 0.12 writer gives, and
+nothing checks them at open: each quad is stored once, and a reference
+index's children are in `(val, rid)` order (counting a located run from its
+width and reading a window from its own rows assume it). A file of 0.11 or
+earlier can break either; it is not checked or repaired, and no edition admits
+the old id, so nothing writes it.
 
 ```mermaid
 flowchart TD
-    R["<b>vortex-rdf.store.v1</b><br/>dtype = the quad table's struct<br/>row_count = quads<br/>metadata = JSON inventory"]
+    R["<b>vortex-rdf.store.v2</b><br/>dtype = the quad table's struct<br/>row_count = quads<br/>metadata = JSON inventory"]
     R -- "child 0 · transparent" --> Q["<b>quad-source</b><br/>Struct of s, p, o, g …"]
     R -- "child 1 · auxiliary" --> I1["<b>index:posg</b><br/>Struct of s, p, o, g, rid"]
     R -- "child 2 · auxiliary" --> I2["<b>index:ospg</b>"]
@@ -102,7 +116,7 @@ flowchart TD
 
 Two kinds of child:
 
-- **Child 0 is transparent** ([`QUAD_SOURCE_NAME`](../core/src/io/container/mod.rs#L41)):
+- **Child 0 is transparent** ([`QUAD_SOURCE_NAME`](../core/src/io/container/mod.rs#L52)):
   the root delegates its dtype, row count and scan to it. A plain Vortex reader
   with the layout registered scans the file exactly like a quad table and never
   sees the components in its columns.
@@ -437,7 +451,7 @@ The contract a foreign writer has to honor for this crate's readers to answer
 correctly — every one of these is something a reader trusts rather than
 checks:
 
-1. The root layout id is `vortex-rdf.store.v1`; child 0 is the quad table and
+1. The root layout id is `vortex-rdf.store.v2`; child 0 is the quad table and
    carries the root's dtype and row count; every further child matches its
    descriptor's dtype, in inventory order.
 2. The inventory is JSON with `version: 1`; component names are unique and
@@ -455,6 +469,10 @@ checks:
    unique; `required: true`.
 7. Index children hold exactly one row per quad, `rid` addressing quad-table
    rows; unknown index slugs must be `required: false`.
+8. The quad table holds each quad once, and a reference index's children are
+   in `(val, rid)` order. Readers count and window by them without checking —
+   which is why a file of 0.11 or earlier (`vortex-rdf.store.v1`) is refused
+   at open.
 
 Anything a reader cannot interpret and that is marked `required` fails the
 open rather than being read around.
@@ -465,7 +483,8 @@ open rather than being read around.
 
 | Constant | Value | Defined in |
 |---|---|---|
-| `STORE_LAYOUT_ID` | `vortex-rdf.store.v1` | [`container/mod.rs`](../core/src/io/container/mod.rs#L38) |
+| `STORE_LAYOUT_ID` | `vortex-rdf.store.v2` | [`container/mod.rs`](../core/src/io/container/mod.rs#L44) |
+| `LEGACY_STORE_LAYOUT_ID` | `vortex-rdf.store.v1` (refused) | [`container/mod.rs`](../core/src/io/container/mod.rs#L49) |
 | `STORE_METADATA_VERSION` | 1 | [`wire.rs`](../core/src/io/container/wire.rs#L18) |
 | row block / zone size | 8,192 rows | Vortex default write strategy |
 | data block target | ~1 MiB | Vortex default write strategy |

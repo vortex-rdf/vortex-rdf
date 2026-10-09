@@ -231,10 +231,12 @@ impl VortexRdfStore {
     /// anonymous memory), and the file must not be modified while open —
     /// replace its file by renaming a new one over it, never by truncating or
     /// rewriting it in place (a reader of the mapping would be killed with
-    /// SIGBUS); `serialize_rdf` already writes that way. `in_memory=True`
-    /// loads the whole store instead, keeping its
-    /// columns in their compressed form wherever matches can bind them
-    /// directly; every later match then skips the file.
+    /// SIGBUS); `serialize_rdf` already writes that way. A file written by
+    /// vortex-rdf 0.11 or earlier is refused, with an error that says to
+    /// rebuild it from its RDF source. `in_memory=True` loads the whole
+    /// store instead, keeping its columns in their compressed form wherever
+    /// matches can bind them directly; every later match then skips the
+    /// file.
     #[new]
     #[pyo3(signature = (path, *, in_memory=false))]
     fn new(py: Python<'_>, path: PathBuf, in_memory: bool) -> PyResult<Self> {

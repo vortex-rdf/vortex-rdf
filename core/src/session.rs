@@ -56,7 +56,10 @@ static STORE_FAMILY: EditionFamily = EditionFamily {
     doc: "The components vortex-rdf adds to a Vortex file: the store's root layout.",
 };
 
-/// The store edition: the root layout and nothing else.
+/// The store edition: the root layout and nothing else. The previous
+/// generation's root (`vortex-rdf.store.v1`) is registered so its files can
+/// be refused with a message (see `io::container`), but it is in no edition,
+/// so nothing can write it.
 const STORE_EDITION: EditionId = EditionId::new("vortexrdf", 2026, 8, 0);
 
 static STORE_DECLARATION: EditionDeclaration = EditionDeclaration {
@@ -104,7 +107,7 @@ mod tests {
     use vortex_array::dtype::{DType, Nullability, PType};
     use vortex_edition::{ComponentKind, EditionSessionExt as _};
 
-    use crate::io::container::STORE_LAYOUT_ID;
+    use crate::io::container::{LEGACY_STORE_LAYOUT_ID, STORE_LAYOUT_ID};
 
     fn ids(kind: ComponentKind) -> Vec<String> {
         VORTEX_SESSION
@@ -142,6 +145,9 @@ mod tests {
             }
         }
         assert!(ids(ComponentKind::Layout).contains(&STORE_LAYOUT_ID.to_string()));
+        // The root of vortex-rdf 0.11 and earlier is refused on read and
+        // never written.
+        assert!(!ids(ComponentKind::Layout).contains(&LEGACY_STORE_LAYOUT_ID.to_string()));
         let arrays = ids(ComponentKind::Array);
         for id in ["fastlanes.for.v2", "vortex.patched"] {
             assert!(!arrays.contains(&id.to_string()), "{id} is admitted");

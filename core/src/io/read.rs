@@ -96,8 +96,14 @@ pub(crate) async fn scan_reader_chunks(
     collect_chunks(tasks).await
 }
 
-/// The actionable error for a file whose root is not the native store layout.
+/// The actionable error for a file whose root is not the native store layout:
+/// for the root of vortex-rdf 0.11 and earlier, what the file is and how to
+/// rebuild it ([`legacy_store_message`](super::container::legacy_store_message));
+/// for anything else, the layout it expected and the one it found.
 pub(crate) fn unsupported_file_error(file: &vortex_file::VortexFile) -> VortexRdfError {
+    if super::container::is_legacy_file(file) {
+        return VortexRdfError::Deserialization(super::container::legacy_store_message());
+    }
     VortexRdfError::Deserialization(format!(
         "not a vortex-rdf store file: expected the {} root layout, found {}",
         super::container::STORE_LAYOUT_ID,

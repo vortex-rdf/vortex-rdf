@@ -363,7 +363,7 @@ flowchart TD
     S --> C["each component → one auxiliary child,<br/>at most two compressing at a time"]
     C --> C1["index children: the same default strategy"]
     C --> C2["dictionary: pass-through strategy —<br/>every FSST window written verbatim as one flat leaf"]
-    Q --> R["root layout vortex-rdf.store.v1<br/>metadata: quads_sorted + component inventory"]
+    Q --> R["root layout vortex-rdf.store.v2<br/>metadata: quads_sorted + component inventory"]
     C1 --> R
     C2 --> R
     R --> F["Vortex footer, postscript, end-of-file marker"]
@@ -385,7 +385,7 @@ flowchart TD
 - **Ordering.** The quad stream owns the first sequence subtree and each
   component an ordered sibling subtree, so the quad table's segments land ahead
   of every component's, in inventory order; the descriptors and `quads_sorted`
-  are encoded into the root layout's metadata ([file-format.md §3](file-format.md#3-the-store-root-vortex-rdfstorev1)).
+  are encoded into the root layout's metadata ([file-format.md §3](file-format.md#3-the-store-root-vortex-rdfstorev2)).
 - **Provenance.** `quads_sorted` is read off the primary's own `s` stamp when a
   store re-serializes ([`serialize_parts`](../core/src/io/ser.rs#L43)) and is
   `true` by construction for a builder's stream; each component's `sorted` flag
@@ -393,7 +393,7 @@ flowchart TD
 
 Two drivers feed this: [`built_stream_to_vortex_writer`](../core/src/io/ser.rs#L124)
 for a builder's chunk stream (files, compaction; a file is written by
-[`write_store_file`](../core/src/io/ser.rs#L171) beside its path and renamed
+[`write_store_file`](../core/src/io/ser.rs#L210) beside its path and renamed
 into place, so a failed write leaves no partial file and the previous store
 untouched, and a store that has the old file mapped keeps reading it), and
 [`serialize_parts`](../core/src/io/ser.rs#L43) for a store's split parts

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use vortex_array::RawMetadata;
 use vortex_array::dtype::DType;
-use vortex_error::{VortexResult, vortex_ensure_eq};
+use vortex_error::{VortexResult, vortex_bail, vortex_ensure_eq};
 use vortex_layout::segments::SegmentSource;
 use vortex_layout::{
     Layout, LayoutChildType, LayoutDeserializeArgs, LayoutEncoding, LayoutId, LayoutReaderContext,
@@ -16,7 +16,7 @@ use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use super::wire::{StoreComponentDescriptor, decode_store_metadata, encode_store_metadata};
-use super::{QUAD_SOURCE_CHILD, QUAD_SOURCE_NAME, STORE_LAYOUT_ID};
+use super::{LEGACY_STORE_LAYOUT_ID, QUAD_SOURCE_CHILD, QUAD_SOURCE_NAME, STORE_LAYOUT_ID};
 
 /// VTable of the native store root layout.
 #[derive(Clone, Debug)]
@@ -119,6 +119,74 @@ impl VTable for RdfStoreLayoutVTable {
     }
 }
 
+/// What opening a store written by vortex-rdf 0.11 or earlier reports: the
+/// cause (the version and the root layout), that it is refused, and the way
+/// out. The one text every open path gives, in Rust, Python and JavaScript.
+pub(crate) fn legacy_store_message() -> String {
+    format!(
+        "this store was written by vortex-rdf 0.11 or earlier (root layout \
+         {LEGACY_STORE_LAYOUT_ID}), which this version cannot read; rebuild it \
+         from its RDF source with vortex-rdf 0.12 (the CLI's `serialize`, \
+         Python's `serialize_rdf` or JavaScript's `serializeRdf`)"
+    )
+}
+
+/// VTable of the root layout vortex-rdf 0.11 and earlier wrote
+/// ([`LEGACY_STORE_LAYOUT_ID`]).
+///
+/// A store of that vintage is refused, not read — but it has to *open* first,
+/// because Vortex builds a footer's root layout from the session's registry
+/// and an id nobody registered fails the open with "Invalid encoding ID: N",
+/// which names neither the cause nor the way out. Registering the id lets the
+/// open succeed, so [`is_native_file`] is false for it and the open path
+/// reports [`legacy_store_message`]. Nothing is ever read through this layout:
+/// it owns no data, its readers refuse, and no edition admits it for writing.
+#[derive(Clone, Debug)]
+pub(crate) struct LegacyStoreLayoutVTable;
+
+impl VTable for LegacyStoreLayoutVTable {
+    type LayoutData = ();
+    type Metadata = RawMetadata;
+
+    fn id(&self) -> LayoutId {
+        static ID: CachedId = CachedId::new(LEGACY_STORE_LAYOUT_ID);
+        *ID
+    }
+
+    fn metadata(_layout: &Layout<Self>) -> Self::Metadata {
+        // Never serialized: no writer can emit this layout.
+        RawMetadata(Vec::new())
+    }
+
+    fn deserialize(
+        &self,
+        _args: &LayoutDeserializeArgs<'_>,
+        _metadata: &Vec<u8>,
+    ) -> VortexResult<Self::LayoutData> {
+        // The old grammar is not interpreted: the layout is recognized by its
+        // id alone.
+        Ok(())
+    }
+
+    fn child_dtype(_layout: &Layout<Self>, _slot: usize) -> VortexResult<DType> {
+        vortex_bail!("{}", legacy_store_message())
+    }
+
+    fn child_type(_layout: &Layout<Self>, slot: usize) -> LayoutChildType {
+        LayoutChildType::Auxiliary(format!("[{slot}]").into())
+    }
+
+    fn new_reader(
+        _layout: &Layout<Self>,
+        _name: Arc<str>,
+        _segment_source: Arc<dyn SegmentSource>,
+        _session: &VortexSession,
+        _ctx: &LayoutReaderContext,
+    ) -> VortexResult<LayoutReaderRef> {
+        vortex_bail!("{}", legacy_store_message())
+    }
+}
+
 /// Whether the quad rows are recorded in global `(s, p, o, g)` order (the
 /// meaning is defined on `WireMetadata::quads_sorted`); a materialized read
 /// restores the subject sorted stamp from it.
@@ -126,12 +194,17 @@ pub(crate) fn quads_sorted(layout: &RdfStoreLayout) -> bool {
     layout.data().quads_sorted
 }
 
-/// Register the store layout in a session. Called once from the
-/// `VORTEX_SESSION` initializer on every target — reading requires it.
+/// Register the store layout — and the previous generation's, to refuse it —
+/// in a session. Called once from the `VORTEX_SESSION` initializer on every
+/// target — reading requires it.
 pub(crate) fn register(session: &VortexSession) {
     use vortex_layout::session::LayoutSessionExt;
     static LAYOUT: RdfStoreLayoutVTable = RdfStoreLayoutVTable;
+    static LEGACY_LAYOUT: LegacyStoreLayoutVTable = LegacyStoreLayoutVTable;
     session.layouts().register(&LAYOUT as &dyn LayoutEncoding);
+    session
+        .layouts()
+        .register(&LEGACY_LAYOUT as &dyn LayoutEncoding);
 }
 
 pub(super) fn is_native_root(layout: &LayoutRef) -> bool {
@@ -140,6 +213,11 @@ pub(super) fn is_native_root(layout: &LayoutRef) -> bool {
 
 pub(crate) fn is_native_file(file: &vortex_file::VortexFile) -> bool {
     is_native_root(file.footer().layout())
+}
+
+/// Whether the file's root is the layout vortex-rdf 0.11 and earlier wrote.
+pub(crate) fn is_legacy_file(file: &vortex_file::VortexFile) -> bool {
+    file.footer().layout().encoding_id().as_ref() == LEGACY_STORE_LAYOUT_ID
 }
 
 /// The persisted component inventory of a native root.
