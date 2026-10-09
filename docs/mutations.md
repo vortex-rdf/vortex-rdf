@@ -263,15 +263,18 @@ filesystem) is never replaced, and neither is one in a directory the process
 cannot write into, so there is nothing to fold the tail into. An `add_quads`
 that crosses a threshold on such a store does not fail and does not lose the
 batch: the batch stays in the in-memory tail, where matches and counts see it
-like any appended row, and the call returns `Ok` with the store. Only that
-refusal (`PermissionDenied` or a read-only filesystem, what
-[`is_unwritable`](../core/src/error.rs#L50) tests) is absorbed; any other
-failure of the compaction (a full disk, a directory at the path) is still
-returned. The refusal is made by
-[`PendingStore::create`](../core/src/io/ser.rs#L288) before a quad is
-gathered, so an append over the threshold costs one failed open of the file
-and no rebuild, and every later append over the threshold retries the same
-way, folding the tail as soon as the file can be written again. An explicit
+like any appended row, and the call returns `Ok` with the store. Only the
+writer's own refusal is absorbed
+([`is_unwritable`](../core/src/error.rs#L73)): the
+[`PendingStore::create`](../core/src/io/ser.rs#L288) that finds, before a quad
+is gathered, that the file or its directory cannot be written
+(`PermissionDenied`, or a read-only filesystem). Any other failure of the
+compaction is returned, a permission error from later in the rewrite (a spill
+directory, a rename) included: by then the work was done, and hiding the error
+would redo it on every append. An append over the threshold on such a store
+costs one failed open of the file and no rebuild, and every later append over
+the threshold retries the same way, folding the tail as soon as the file can be
+written again. An explicit
 `compact()` of such a store still fails with `PermissionDenied`: it is the
 call that reports why the tail is not being folded, and
 [`tail_len`](../core/src/store/mod.rs#L397) shows the tail growing. The tail

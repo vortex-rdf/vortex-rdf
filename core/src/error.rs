@@ -36,6 +36,7 @@ pub enum VortexRdfError {
 /// Whether an I/O error of this kind says a file cannot be written by this
 /// process: the permission is denied, or the filesystem is read-only. Both
 /// mean "do not write this store", and neither goes away by trying again.
+#[cfg(feature = "file-io")]
 pub(crate) fn kind_means_unwritable(kind: std::io::ErrorKind) -> bool {
     matches!(
         kind,
@@ -43,54 +44,105 @@ pub(crate) fn kind_means_unwritable(kind: std::io::ErrorKind) -> bool {
     )
 }
 
+/// The source of the `Io` error a store writer returns when it finds, before
+/// anything is built, that the store file (or the directory it lives in)
+/// cannot be written by this process. The error keeps its kind
+/// ([`kind_means_unwritable`]) and its message; this marker is what
+/// [`VortexRdfError::is_unwritable`] looks for.
+///
+/// A permission error from further into a rewrite (a spill directory, a
+/// rename over a file someone else owns) is not this refusal: it comes after
+/// the work was done, and is reported as the failure it is.
+#[cfg(feature = "file-io")]
+#[derive(Error, Debug)]
+#[error("{0}")]
+pub(crate) struct StoreNotWritable(String);
+
+#[cfg(feature = "file-io")]
+impl StoreNotWritable {
+    /// The I/O error for a refusal of kind `kind` (see
+    /// [`kind_means_unwritable`]) described by `message`.
+    pub(crate) fn error(kind: std::io::ErrorKind, message: String) -> std::io::Error {
+        debug_assert!(kind_means_unwritable(kind), "{kind:?}");
+        std::io::Error::new(kind, Self(message))
+    }
+}
+
 impl VortexRdfError {
-    /// Whether this is an I/O error saying a file cannot be written by this
-    /// process (see [`kind_means_unwritable`]) — what refuses a store's
-    /// rewrite when its source file is read-only.
+    /// Whether this is a store writer's refusal to write a file this process
+    /// cannot write ([`StoreNotWritable`]) — made before anything is built —
+    /// as opposed to any other I/O failure. It is what lets an append do
+    /// without the compaction of a read-only store. Never true without
+    /// `file-io`, where no store is written to a path.
     pub(crate) fn is_unwritable(&self) -> bool {
-        matches!(self, Self::Io(error) if kind_means_unwritable(error.kind()))
+        #[cfg(feature = "file-io")]
+        if let Self::Io(error) = self {
+            return error
+                .get_ref()
+                .is_some_and(|source| source.is::<StoreNotWritable>());
+        }
+        false
     }
 }
 
 /// `std::result::Result` with [`VortexRdfError`] as the error type.
 pub type Result<T> = std::result::Result<T, VortexRdfError>;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "file-io"))]
 mod tests {
     use super::*;
     use std::io::{Error, ErrorKind};
 
-    /// A permission refusal or a read-only filesystem is "cannot be written";
-    /// a missing file, a directory in the way, a failed parse or any error
-    /// that is not I/O is not.
+    /// A permission refusal and a read-only filesystem are "cannot be
+    /// written"; nothing else is.
     #[test]
-    fn unwritable_is_permission_denied_or_a_read_only_filesystem() {
-        let io = |kind| VortexRdfError::Io(Error::from(kind));
-        assert!(io(ErrorKind::PermissionDenied).is_unwritable());
-        assert!(io(ErrorKind::ReadOnlyFilesystem).is_unwritable());
+    fn unwritable_kinds_are_permission_denied_and_a_read_only_filesystem() {
+        assert!(kind_means_unwritable(ErrorKind::PermissionDenied));
+        assert!(kind_means_unwritable(ErrorKind::ReadOnlyFilesystem));
         for kind in [
             ErrorKind::NotFound,
             ErrorKind::IsADirectory,
             ErrorKind::AlreadyExists,
             ErrorKind::Other,
         ] {
-            assert!(!io(kind).is_unwritable(), "{kind:?}");
+            assert!(!kind_means_unwritable(kind), "{kind:?}");
         }
-        assert!(!VortexRdfError::Deserialization("permission denied".into()).is_unwritable());
-        assert!(!VortexRdfError::InvalidOperation("read-only".into()).is_unwritable());
     }
 
     /// The errors the operating system gives for those two cases map to
     /// them: EACCES and EROFS (30 on Linux, macOS and the BSDs).
     #[cfg(unix)]
     #[test]
-    fn the_os_errors_for_a_denied_write_are_unwritable() {
+    fn the_os_errors_for_a_denied_write_are_unwritable_kinds() {
         const EACCES: i32 = 13;
         const EROFS: i32 = 30;
         for errno in [EACCES, EROFS] {
-            let error = VortexRdfError::Io(Error::from_raw_os_error(errno));
-            assert!(error.is_unwritable(), "errno {errno}: {error}");
+            let error = Error::from_raw_os_error(errno);
+            assert!(
+                kind_means_unwritable(error.kind()),
+                "errno {errno}: {error}"
+            );
         }
-        assert!(!VortexRdfError::Io(Error::from_raw_os_error(2)).is_unwritable());
+        assert!(!kind_means_unwritable(Error::from_raw_os_error(2).kind()));
+    }
+
+    /// The writer's refusal is recognised, whichever of the two kinds it
+    /// carries, and keeps its kind and message. A bare I/O error of the same
+    /// kind is not the refusal (it can come from anywhere in a rewrite), and
+    /// neither is an error of another origin.
+    #[test]
+    fn only_the_writers_refusal_is_unwritable() {
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::ReadOnlyFilesystem] {
+            let refusal = VortexRdfError::Io(StoreNotWritable::error(kind, "no write".into()));
+            assert!(refusal.is_unwritable(), "{kind:?}");
+            assert_eq!(refusal.to_string(), "IO error: no write");
+            assert!(matches!(&refusal, VortexRdfError::Io(e) if e.kind() == kind));
+
+            assert!(!VortexRdfError::Io(Error::from(kind)).is_unwritable());
+            assert!(!VortexRdfError::Io(Error::new(kind, "no write")).is_unwritable());
+        }
+        assert!(!VortexRdfError::Io(Error::from(ErrorKind::NotFound)).is_unwritable());
+        assert!(!VortexRdfError::Deserialization("permission denied".into()).is_unwritable());
+        assert!(!VortexRdfError::InvalidOperation("read-only".into()).is_unwritable());
     }
 }

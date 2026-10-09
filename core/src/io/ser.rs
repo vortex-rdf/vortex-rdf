@@ -266,10 +266,12 @@ fn path_error(what: &str, path: &std::path::Path, e: std::io::Error) -> VortexRd
 /// anything is built, and a `PermissionDenied` answer (or a read-only
 /// filesystem's) fails the write with an error naming the path and keeping
 /// the kind, as `File::create` refused such a file. A read-only store signals
-/// that it should not be overwritten. The kind is what
-/// [`VortexRdfError::is_unwritable`] tests, so a caller that can do without
-/// the write (an append whose auto-compaction is refused) tells this refusal
-/// from a real failure.
+/// that it should not be overwritten. A directory that takes no new file is
+/// refused the same way, when the temp file cannot be created. These two
+/// refusals, and only these, are marked
+/// ([`StoreNotWritable`](crate::error::StoreNotWritable)), so a caller that
+/// can do without the write (an append whose auto-compaction is refused) tells
+/// them from a permission error that comes later, such as a refused rename.
 ///
 /// The old file is never modified. Overwriting it in place would be
 /// unsafe while a reader still maps it (its pages would be pulled out from
@@ -306,6 +308,14 @@ impl PendingStore {
     /// will replace and copy that file's permissions onto it.
     pub(crate) async fn create(path: &std::path::Path) -> Result<Self> {
         let io_error = |what: &str, e: std::io::Error| path_error(what, path, e);
+        // The refusal to write this path: an error like `io_error`'s, marked as
+        // the writer's own (see `StoreNotWritable`).
+        let refusal = |what: &str, e: std::io::Error| {
+            VortexRdfError::Io(crate::error::StoreNotWritable::error(
+                e.kind(),
+                format!("{what} {path:?}: {e}"),
+            ))
+        };
 
         // The file this store replaces: `path`, or where the links at `path` end.
         let target = replacement_target(path)
@@ -345,7 +355,7 @@ impl PendingStore {
                         } else {
                             format!(" ({target:?})")
                         };
-                        return Err(io_error(
+                        return Err(refusal(
                             "replace",
                             std::io::Error::new(
                                 e.kind(),
@@ -372,7 +382,15 @@ impl PendingStore {
             .create_new(true)
             .open(&tmp_path)
             .await
-            .map_err(|e| io_error("create a temporary file beside", e))?;
+            .map_err(|e| {
+                // A directory that takes no new file is as unwritable as a
+                // read-only store; a missing one is just an error.
+                if crate::error::kind_means_unwritable(e.kind()) {
+                    refusal("create a temporary file beside", e)
+                } else {
+                    io_error("create a temporary file beside", e)
+                }
+            })?;
         let tmp = TempFile(Some(tmp_path));
         if let Some(permissions) = permissions {
             // Before the first byte, not before the rename: nothing of a

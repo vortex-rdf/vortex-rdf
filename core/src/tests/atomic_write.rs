@@ -769,37 +769,43 @@ mod links_and_permissions {
         assert_eq!(entries(dir.path()), vec![path.clone()]);
     }
 
-    /// A directory the process cannot create files in: `0o555` while the
-    /// guard lives, put back when it drops (so the temp directory can still be
-    /// removed). `None` where the process creates files in such a directory
-    /// anyway (root).
-    struct ReadOnlyDir {
+    /// Puts a directory's mode back when dropped, so the temp directory can
+    /// still be removed whatever a test did to it.
+    struct RestoreMode {
         path: PathBuf,
         mode: u32,
     }
 
-    impl ReadOnlyDir {
-        fn new(path: &Path) -> Option<Self> {
-            let guard = Self {
+    impl RestoreMode {
+        fn new(path: &Path) -> Self {
+            Self {
                 path: path.to_path_buf(),
                 mode: mode_of(path),
-            };
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
-            let probe = path.join("probe");
-            if std::fs::File::create(&probe).is_ok() {
-                std::fs::remove_file(&probe).unwrap();
-                eprintln!("skipped: this process can create files in a 0555 directory (root?)");
-                return None;
             }
-            Some(guard)
         }
     }
 
-    impl Drop for ReadOnlyDir {
+    impl Drop for RestoreMode {
         fn drop(&mut self) {
             let _ =
                 std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
         }
+    }
+
+    /// Make `path` a directory the process cannot create files in (`0o555`)
+    /// until the guard drops. `None` where the process creates files in such
+    /// a directory anyway (root): the refusal can only be observed where the
+    /// mode is honoured.
+    fn read_only_dir(path: &Path) -> Option<RestoreMode> {
+        let restore = RestoreMode::new(path);
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = path.join("probe");
+        if std::fs::File::create(&probe).is_ok() {
+            std::fs::remove_file(&probe).unwrap();
+            eprintln!("skipped: this process can create files in a 0555 directory (root?)");
+            return None;
+        }
+        Some(restore)
     }
 
     /// 4,200 new quads: past the 4,096-row auto-compaction floor.
@@ -932,7 +938,7 @@ mod links_and_permissions {
         .await;
         let before = std::fs::read(&path).unwrap();
         let store = VortexRdfStore::from_file(&path).await.unwrap();
-        let Some(_read_only) = ReadOnlyDir::new(dir.path()) else {
+        let Some(_read_only) = read_only_dir(dir.path()) else {
             return;
         };
         let batch = past_the_floor();
@@ -946,5 +952,59 @@ mod links_and_permissions {
 
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(entries(dir.path()), vec![path.clone()]);
+    }
+
+    /// Only the writer's refusal before it builds anything — the store file
+    /// or its directory cannot be written — says "unwritable". A permission
+    /// error from later in the rewrite (here the rename, in a directory that
+    /// stopped taking files after the temp file was made) is a failure like
+    /// any other, and an append does not hide it.
+    #[tokio::test]
+    async fn test_only_the_refusal_before_the_build_counts_as_unwritable() {
+        use crate::io::ser::write_store_atomically;
+
+        let (dir, path) =
+            write_store_file(modular_quads(12, 3, 4), LayoutStrategy::Default, vec![]).await;
+        if !read_only_is_honoured(&path) {
+            return;
+        }
+        let error = rebuild(&path, modular_quads(5, 2, 2))
+            .await
+            .expect_err("a read-only store must not be replaced");
+        assert!(error.is_unwritable(), "a read-only file: {error}");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        {
+            let Some(_read_only) = read_only_dir(dir.path()) else {
+                return;
+            };
+            let error = rebuild(&path, modular_quads(5, 2, 2))
+                .await
+                .expect_err("a store in a read-only directory must not be replaced");
+            assert!(error.is_unwritable(), "a read-only directory: {error}");
+        }
+
+        let restore = RestoreMode::new(dir.path());
+        let watched = dir.path().to_path_buf();
+        let result = write_store_atomically(&path, |writer| async move {
+            drop(writer);
+            // The temp file exists; from here on the directory takes no rename.
+            std::fs::set_permissions(&watched, std::fs::Permissions::from_mode(0o555)).unwrap();
+            Ok(())
+        })
+        .await;
+        drop(restore);
+        let Err(error) = result else {
+            eprintln!("skipped: the rename went through in a 0555 directory (root?)");
+            return;
+        };
+        assert!(
+            matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+            "{error}"
+        );
+        assert!(
+            !error.is_unwritable(),
+            "a refused rename after the build is not the pre-flight refusal: {error}"
+        );
     }
 }
