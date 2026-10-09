@@ -19,11 +19,11 @@ from conftest import INDEXES, LAYOUTS
 PROBE_NT = r"""<http://ex.org/s> <http://ex.org/p> "x" .
 <http://ex.org/s> <http://ex.org/p> "x" .
 <http://ex.org/s> <http://ex.org/p> "x"^^<http://www.w3.org/2001/XMLSchema#string> .
-<http://ex.org/s> <http://ex.org/p> "x" .
+<http://ex.org/s> <http://ex.org/p> "\u0078" .
 <http://ex.org/s> <http://ex.org/p> "y"@EN .
 <http://ex.org/s> <http://ex.org/p> "y"@en .
 <http://ex.org/s> <http://ex.org/p> "z" .
-<http://ex.org/s> <http://ex.org/p> "z" .
+<http://ex.org/\u0073> <http://ex.org/p> "z" .
 """
 
 # The three distinct quads, in the form the store returns them (the default
