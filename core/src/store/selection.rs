@@ -14,9 +14,9 @@
 //! planning (`attempt_split_ranges` bails when a row range is also set).
 //!
 //! A view's selection field wraps this in [`ViewSelection`], which adds one
-//! more state: *pending* — an index-served match whose exact ids are a
+//! more state: *pending* — an index-resolved match whose exact ids are a
 //! deferred computation, run by the first consumer that needs the selection
-//! (serving reads never do).
+//! (serving reads never do, nor does a count of a located run).
 //!
 //! [`VortexRdfStore`]: crate::store::VortexRdfStore
 
@@ -31,18 +31,22 @@ use vortex_mask::{AllOr, Mask};
 use crate::error::{Result, VortexRdfError};
 use crate::store::indexes::LazyRowIds;
 
-/// A view's base-row selection, which may still be *pending*: a match served
-/// by an index left its exact ids uncomputed ([`LazyRowIds`]), because the
-/// attached serving plan answers reads without them.
+/// A view's base-row selection, which may still be *pending*: a match
+/// resolved by an index left its exact ids uncomputed ([`LazyRowIds`]),
+/// because the attached serving plan answers reads without them, or because
+/// the view is only counted or windowed and a located run's width answers a
+/// count.
 ///
 /// The two variants keep the pending state impossible to overlook: every
 /// consumer either takes the serving plan (and never touches the selection)
 /// or materializes here first — there is no concrete-looking value to read
-/// out of a pending selection by mistake. A pending selection exists only
-/// alongside `serve: Some` on its view (`QuadsSource`), and only ever
-/// materializes to the id set the eager path would have produced, so
-/// laziness never changes what a view covers — only when the ids are paid
-/// for.
+/// out of a pending selection by mistake. A pending selection exists
+/// alongside `serve: Some` on its view (`QuadsSource`), or — on a view built
+/// for a count or a window (`IdsNeed::CountOrWindow`) — alone over a located
+/// run of known width; such a view is only counted, windowed or kept, never
+/// streamed. It only ever materializes to the id set the eager path would have
+/// produced, so laziness never changes what a view covers — only when the ids
+/// are paid for.
 #[derive(Clone)]
 pub(crate) enum ViewSelection {
     Exact(RowSelection),
@@ -86,15 +90,16 @@ impl ViewSelection {
     }
 
     /// The already-exact selection, for consumers that structurally cannot
-    /// meet a pending one: a pending selection always rides with a serve
-    /// plan, and these consumers only run on views without one.
+    /// meet a pending one: a pending selection rides with a serve plan or sits
+    /// on a view that is only counted or windowed, and these consumers run on
+    /// neither.
     pub(crate) fn expect_exact(&self) -> &RowSelection {
         match self {
             ViewSelection::Exact(selection) => selection,
             ViewSelection::Pending(_) => {
                 unreachable!(
-                    "a pending selection always rides with a serve plan; consumers that \
-                     cannot honor the plan materialize the selection first"
+                    "a pending selection rides with a serve plan or on a count/window view; \
+                     consumers that stream rows only ever see an exact one"
                 )
             }
         }

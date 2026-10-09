@@ -204,6 +204,30 @@ pub(crate) async fn scan_located_row_ids(
     .await
 }
 
+/// The row ids of a located index-child run in base row order: point reads
+/// through the rid column's chunk probes for a run within the point-read
+/// cap, otherwise — or when a chunk declines mid-read — a rid-only scan
+/// restricted to the run (the location bounded exactly the matched rows, so
+/// no filter is re-tested).
+#[cfg(feature = "file-io")]
+pub(crate) async fn read_located_rids(
+    file: &crate::store::native_file::NativeStoreFile,
+    component: &'static str,
+    reader: &vortex_layout::LayoutReaderRef,
+    rid_column: &'static str,
+    range: Range<u64>,
+    scope: &'static str,
+) -> Result<Buffer<u64>> {
+    #[cfg(test)]
+    file.note_located_rid_reads(range.end - range.start);
+    if crate::store::selection::point_sized(range.end - range.start)
+        && let Some(ids) = rid_point_reads(file, component, rid_column, range.clone()).await?
+    {
+        return Ok(ids);
+    }
+    scan_located_row_ids(reader.clone(), rid_column, range, file.bound_exprs(), scope).await
+}
+
 /// A rid-only scan of an index child: just the row-id column, unordered
 /// (callers sort the ids anyway). Restrictions — a filter, a row range — are
 /// the caller's to add.

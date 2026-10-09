@@ -85,16 +85,22 @@ impl VortexRdfStore {
                 // A located serve plan knows the width of the child run it
                 // serves — exactly the constrained rows — so a pending
                 // selection over one counts from the plan, without the
-                // deferred index-child scan the selection itself would run.
-                // Tombstones are defined over primary row ids the plan does
-                // not hold, and a pending filter's selectivity is unknown, so
-                // either sends the count through the selection.
-                let located = match (selection, serve, filter, deleted) {
-                    (ViewSelection::Pending(_), Some(plan), None, None) => plan.row_range(),
+                // deferred index-child scan the selection itself would run;
+                // a pending located run held without a plan knows its own
+                // width the same way. Tombstones are defined over primary row
+                // ids the plan does not hold, and a pending filter's
+                // selectivity is unknown, so either sends the count through
+                // the selection.
+                let known = match (selection, serve, filter, deleted) {
+                    (ViewSelection::Pending(_), Some(plan), None, None) => plan
+                        .row_range()
+                        .map(|range| (range.end - range.start) as usize),
+                    // A located run held pending for a count: its width.
+                    (ViewSelection::Pending(lazy), None, None, None) => lazy.len_if_known(),
                     _ => None,
                 };
-                if let Some(range) = located {
-                    (range.end - range.start) as usize
+                if let Some(rows) = known {
+                    rows
                 } else {
                     // A count needs the selection itself, so a served match's
                     // deferred index-child scan runs here, once, and is

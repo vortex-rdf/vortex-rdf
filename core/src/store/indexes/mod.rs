@@ -42,7 +42,7 @@ pub(crate) use components::{adopt_scanned_component, check_component_rows};
 pub(crate) use row_ids::sorted_row_ids;
 #[cfg(feature = "file-io")]
 pub(crate) use row_ids::{
-    resolve_eager_from_scan, rid_point_reads, scan_index_row_ids, scan_located_row_ids,
+    read_located_rids, resolve_eager_from_scan, rid_point_reads, scan_index_row_ids,
 };
 #[cfg(feature = "file-io")]
 pub(crate) use serve::FileServePlan;
@@ -194,7 +194,7 @@ impl IndexType {
     #[cfg(feature = "file-io")]
     pub(crate) async fn resolve_file(
         self,
-        file: &crate::store::native_file::NativeStoreFile,
+        file: &Arc<crate::store::native_file::NativeStoreFile>,
         layout: &ResolvedLayout,
         pattern: QuadPattern<'_>,
         codes: &mut PatternCodes,
@@ -291,25 +291,35 @@ pub(crate) enum IndexResolution<Plan> {
 /// `Eager` is a resolution that had to compute its ids to answer at all (a
 /// back-reference probe, or a copy resolution without a serving plan) and is
 /// non-empty by construction — an empty scan short-circuits to
-/// [`IndexResolution::Empty`] instead. `Lazy` rides only alongside a serve
-/// plan: the plan answers reads straight from the index's own
-/// columns, so the ids — a second pass over the same data — are deferred until
-/// a consumer actually needs the selection (a count, a chained match, a
-/// delete, a base-order gather). A lazy resolution may therefore materialize
-/// to an *empty* id set; consumers reach it through the view's pending
-/// selection, which handles that like any other narrow selection.
+/// [`IndexResolution::Empty`] instead. `Lazy` rides alongside a serve
+/// plan, or stands alone over a located run whose width is known — only on a
+/// view built for a count or a window (`IdsNeed::CountOrWindow`), which never
+/// streams rows through its selection. A serve plan answers reads straight
+/// from the index's own columns, and a run's width answers a count, so the
+/// ids — a second pass over the same data — are deferred until a consumer
+/// actually needs the selection (a count the width cannot answer, a chained
+/// match, a delete, a base-order gather). A lazy resolution may therefore
+/// materialize to an *empty* id set; consumers reach it through the view's
+/// pending selection, which handles that like any other narrow selection.
 pub(crate) enum ResolvedRowIds {
+    // Only the file resolvers compute their ids at resolution time: an
+    // in-memory resolution hands its run back as a recipe (`Lazy`) and its
+    // consumer runs it, so builds without `file-io` never construct this.
+    #[cfg_attr(not(feature = "file-io"), allow(dead_code))]
     Eager(Buffer<u64>),
     Lazy(LazyRowIds),
 }
 
-/// The exact base row ids of a serve-attached index resolution, computed on
-/// first need and shared across every clone of the view that carries them.
+/// The exact base row ids of an index resolution whose consumer may not need
+/// them — a serve-attached one, or a located run that is only counted or
+/// windowed — computed on first need and shared across every clone of the view
+/// that carries them.
 ///
 /// The serving plan makes the ids redundant for the dominant
 /// match-then-iterate flow — for a file-backed store they cost a whole extra
-/// pushed-down scan of the index child — so the resolution hands back the
-/// *recipe* instead and whichever consumer first needs the selection runs it.
+/// pushed-down scan of the index child — and a located run's width makes them
+/// redundant for a count, so the resolution hands back the *recipe* instead
+/// and whichever consumer first needs the selection runs it.
 /// The result lands in a shared cell: later consumers (and view clones made
 /// before materialization) read it back for free. Two consumers racing on
 /// first need may both run the recipe, but the source is immutable so they
@@ -340,6 +350,18 @@ enum LazyRowIdSource {
         /// so the deferred scan binds with the same identity every plan and
         /// eager scan of this component uses (see `BoundExprMemo`).
         memo: Arc<crate::store::native_file::BoundExprMemo>,
+        scope: &'static str,
+    },
+    /// File-backed: a located run of an index child's rid column — read on
+    /// first need through [`read_located_rids`]; its width is known up front,
+    /// so a count needs none of it.
+    #[cfg(feature = "file-io")]
+    LocatedRun {
+        file: Arc<crate::store::native_file::NativeStoreFile>,
+        component: &'static str,
+        reader: vortex_layout::LayoutReaderRef,
+        rid_column: &'static str,
+        range: Range<u64>,
         scope: &'static str,
     },
 }
@@ -381,14 +403,68 @@ impl LazyRowIds {
         }
     }
 
+    /// Lazy ids over a located run of a file index child.
+    #[cfg(feature = "file-io")]
+    pub(crate) fn from_located_run(
+        file: Arc<crate::store::native_file::NativeStoreFile>,
+        component: &'static str,
+        reader: vortex_layout::LayoutReaderRef,
+        rid_column: &'static str,
+        range: Range<u64>,
+        scope: &'static str,
+    ) -> Self {
+        Self {
+            cell: Arc::new(OnceLock::new()),
+            source: LazyRowIdSource::LocatedRun {
+                file,
+                component,
+                reader,
+                rid_column,
+                range,
+                scope,
+            },
+        }
+    }
+
+    /// The first `want` ids of a located run when that is fewer than the run
+    /// holds. A reference child's rows are ordered by `(val, rid)` (the order
+    /// this crate's writers emit, docs/file-format.md §6), so within one value
+    /// the rids ascend and the run's first `want` rows are its first `want` in
+    /// base row order. `None` for any other source, or when `want` covers
+    /// the run (materialize it instead).
+    #[cfg(feature = "file-io")]
+    pub(crate) async fn prefix_async(&self, want: usize) -> Result<Option<Buffer<u64>>> {
+        let LazyRowIdSource::LocatedRun {
+            file,
+            component,
+            reader,
+            rid_column,
+            range,
+            scope,
+        } = &self.source
+        else {
+            return Ok(None);
+        };
+        if want as u64 >= range.end - range.start {
+            return Ok(None);
+        }
+        let prefix = range.start..range.start + want as u64;
+        Ok(Some(
+            read_located_rids(file, component, reader, rid_column, prefix, scope).await?,
+        ))
+    }
+
     /// How many rows the ids cover, when knowable without computing them: an
     /// in-memory run knows its width up front (so a count on a served match
-    /// never decodes), a file child only after materialization.
+    /// never decodes), and so does a located file run; any other file child
+    /// only after materialization.
     pub(crate) fn len_if_known(&self) -> Option<usize> {
         match &self.source {
             LazyRowIdSource::Component(rids) => Some(rids.len()),
             #[cfg(feature = "file-io")]
             LazyRowIdSource::IndexChild { .. } => self.cell.get().map(Buffer::len),
+            #[cfg(feature = "file-io")]
+            LazyRowIdSource::LocatedRun { range, .. } => Some((range.end - range.start) as usize),
         }
     }
 
@@ -408,6 +484,16 @@ impl LazyRowIds {
                 memo,
                 scope,
             } => scan_index_row_ids(reader.clone(), constraints, rid_column, memo, scope).await?,
+            LazyRowIdSource::LocatedRun {
+                file,
+                component,
+                reader,
+                rid_column,
+                range,
+                scope,
+            } => {
+                read_located_rids(file, component, reader, rid_column, range.clone(), scope).await?
+            }
         };
         Ok(self.cell.get_or_init(|| ids).clone())
     }
@@ -423,7 +509,7 @@ impl LazyRowIds {
         let ids = match &self.source {
             LazyRowIdSource::Component(rids) => sorted_row_ids(rids.clone())?,
             #[cfg(feature = "file-io")]
-            LazyRowIdSource::IndexChild { .. } => {
+            LazyRowIdSource::IndexChild { .. } | LazyRowIdSource::LocatedRun { .. } => {
                 unreachable!("an in-memory view only ever carries component-sourced pending ids")
             }
         };
@@ -514,7 +600,7 @@ pub(crate) fn resolve_indexes_in_memory(
 #[cfg(feature = "file-io")]
 pub(crate) async fn resolve_indexes_file(
     indexes: &[IndexType],
-    file: &crate::store::native_file::NativeStoreFile,
+    file: &Arc<crate::store::native_file::NativeStoreFile>,
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,

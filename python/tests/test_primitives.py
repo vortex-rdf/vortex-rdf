@@ -702,3 +702,27 @@ def test_filter_codes_regex_agrees_with_python_re(regex_dictionary):
     assert {t for t in REGEX_TEXTS if not t.isascii()} <= undecided_of(r"\w")
     assert {t for t in REGEX_TEXTS if not t.isascii()} <= undecided_of("a", "i")
     assert set(REGEX_TEXTS) == undecided_of("(?=a)")
+
+
+def test_reference_index_counts_and_windows(indexed_files):
+    store = VortexRdfStore(indexed_files[("dictionary", "secondary-by-reference")])
+    name = "<http://xmlns.com/foaf/0.1/name>"
+    rows = _rows(store.match_codes(p=name))
+    assert store.count_quads(p=name) == len(rows) == 3
+    assert store.count_quads(p=name, limit=2) == 2
+    assert store.count_quads_many([{"p": name, "limit": 1}, (None, name, None, None)]) == [1, 3]
+    assert _rows(store.match_codes(p=name, limit=2)) == rows[:2]
+    assert _rows(store.match_codes(p=name, offset=1, limit=5)) == rows[1:]
+
+
+@pytest.mark.parametrize("index", [None, "secondary-by-copy", "secondary-by-reference"])
+@pytest.mark.parametrize("in_memory", [False, True])
+def test_an_empty_code_set_keep_matches_nothing(vortex_files, indexed_files, index, in_memory):
+    # pinned contract: a keep with an empty code set is valid and matches nothing
+    path = vortex_files["dictionary"] if index is None else indexed_files[("dictionary", index)]
+    store = VortexRdfStore(path, in_memory=in_memory)
+    name = "<http://xmlns.com/foaf/0.1/name>"
+    empty = {"o": U32Column([])}
+    assert store.count_quads(p=name, keep=empty) == 0
+    assert _rows(store.match_codes(p=name, keep=empty)) == []
+    assert store.count_quads_many([{"p": name, "keep": empty}]) == [0]

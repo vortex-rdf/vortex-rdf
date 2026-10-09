@@ -248,40 +248,61 @@ impl VortexRdfStore {
                 ..
             } => {
                 let row_count = file.row_count() as usize;
-                let selection = selection.materialized_async().await?;
-                let (windowed, live) = match filter {
-                    None => {
-                        let live = match deleted {
-                            None => selection.len(row_count),
-                            Some(deleted) => selection.live_mask(deleted, row_count).true_count(),
-                        };
-                        (
-                            selection.window(offset, limit, deleted.as_ref(), row_count),
-                            live,
-                        )
-                    }
-                    Some(filter) => {
-                        // Only the matches the window can reach are
-                        // evaluated; fewer than asked means the base is
-                        // exhausted and their count is its live size.
-                        let want = offset.saturating_add(limit);
-                        let found = file_scan::first_matching_rows(
-                            file,
-                            filter,
-                            &selection,
-                            deleted.as_ref(),
-                            want,
-                        )
-                        .await?;
-                        let live = if found.len() < want {
-                            found.len()
-                        } else {
-                            want
-                        };
-                        (
-                            RowSelection::Ids(found).window(offset, limit, None, row_count),
-                            live,
-                        )
+                // A located run held pending for this window: only the rows
+                // the window reaches are read; its width is its live size.
+                let prefix = match (selection, filter, deleted) {
+                    (ViewSelection::Pending(lazy), None, None) => match lazy.len_if_known() {
+                        Some(live) => lazy
+                            .prefix_async(offset.saturating_add(limit))
+                            .await?
+                            .map(|ids| (ids, live)),
+                        None => None,
+                    },
+                    _ => None,
+                };
+                let (windowed, live) = if let Some((ids, live)) = prefix {
+                    (
+                        RowSelection::Ids(ids).window(offset, limit, None, row_count),
+                        live,
+                    )
+                } else {
+                    let selection = selection.materialized_async().await?;
+                    match filter {
+                        None => {
+                            let live = match deleted {
+                                None => selection.len(row_count),
+                                Some(deleted) => {
+                                    selection.live_mask(deleted, row_count).true_count()
+                                }
+                            };
+                            (
+                                selection.window(offset, limit, deleted.as_ref(), row_count),
+                                live,
+                            )
+                        }
+                        Some(filter) => {
+                            // Only the matches the window can reach are
+                            // evaluated; fewer than asked means the base is
+                            // exhausted and their count is its live size.
+                            let want = offset.saturating_add(limit);
+                            let found = file_scan::first_matching_rows(
+                                file,
+                                filter,
+                                &selection,
+                                deleted.as_ref(),
+                                want,
+                            )
+                            .await?;
+                            let live = if found.len() < want {
+                                found.len()
+                            } else {
+                                want
+                            };
+                            (
+                                RowSelection::Ids(found).window(offset, limit, None, row_count),
+                                live,
+                            )
+                        }
                     }
                 };
                 let taken = windowed.len(row_count);

@@ -25,6 +25,8 @@
 
 #[cfg(feature = "file-io")]
 use std::ops::Range;
+#[cfg(feature = "file-io")]
+use std::sync::Arc;
 
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::StructArrayExt;
@@ -34,7 +36,7 @@ use vortex_array::{ArrayRef, IntoArray};
 use super::FileServePlan;
 use super::components::child_struct;
 use super::{
-    COL_RID, InMemoryServePlan, IndexResolution, ResolvedRoles, ResolvedRowIds, sorted_row_ids,
+    COL_RID, InMemoryServePlan, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds,
 };
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
@@ -174,17 +176,15 @@ pub(crate) fn resolve_in_memory(
     if run.is_empty() {
         return Ok(IndexResolution::Empty);
     }
-    // Row ids of every quad whose indexed component equals the probe term.
-    // They come out in the index's order (the rid column is ordered by value,
-    // not by row), so `sorted_row_ids` puts them back in base row order.
-    let row_ids = sorted_row_ids(
-        rows.unmasked_field_by_name(COL_RID)
-            .map_err(VortexRdfError::Vortex)?
-            .slice(run)
-            .map_err(VortexRdfError::Vortex)?,
-    )?;
+    // The run's rids, decoded and sorted only when a consumer needs them —
+    // a count takes the run's width.
+    let rids = rows
+        .unmasked_field_by_name(COL_RID)
+        .map_err(VortexRdfError::Vortex)?
+        .slice(run)
+        .map_err(VortexRdfError::Vortex)?;
     Ok(IndexResolution::Resolved {
-        row_ids: ResolvedRowIds::Eager(row_ids),
+        row_ids: ResolvedRowIds::Lazy(LazyRowIds::from_component_run(rids)),
         resolves: probe.resolves,
         // A back-reference index stores no whole quads to serve from.
         serve: None,
@@ -205,12 +205,15 @@ pub(crate) fn resolve_in_memory(
 /// value column, an encoding resolving no probe — falls back to the pushed-down
 /// scan, whose filter answers regardless of order.
 ///
-/// This index stores no whole quads, so every outcome here is an eager row-id
+/// This index stores no whole quads, so every outcome here is a row-id
 /// resolution with no serving plan; the store gathers the matched quads from
-/// the primary columns (point reads of their own, for a small id set).
+/// the primary columns (point reads of their own, for a small id set). The
+/// ids are eager, except a located run's: those stay deferred
+/// ([`LazyRowIds::from_located_run`]) so that a count takes the run's width
+/// and a window reads only its own rows.
 #[cfg(feature = "file-io")]
 pub(crate) async fn resolve_file(
-    file: &crate::store::native_file::NativeStoreFile,
+    file: &Arc<crate::store::native_file::NativeStoreFile>,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
 ) -> Result<IndexResolution<FileServePlan>> {
@@ -232,31 +235,21 @@ pub(crate) async fn resolve_file(
             return Ok(IndexResolution::Empty);
         }
         // The located range is exactly this index's matched rows: the value
-        // column is the one and only constraint.
-        let row_ids = if crate::store::selection::point_sized(range.end - range.start) {
-            super::rid_point_reads(file, name, COL_RID, range.clone()).await?
-        } else {
-            Some(
-                super::scan_located_row_ids(
-                    reader.clone(),
-                    COL_RID,
-                    range,
-                    file.bound_exprs(),
-                    name,
-                )
-                .await?,
-            )
-        };
-        // `None` is a mid-read decline (an unprobeable rid chunk); the scan
-        // below reads the same rows the long way.
-        if let Some(row_ids) = row_ids {
-            return Ok(IndexResolution::Resolved {
-                row_ids: ResolvedRowIds::Eager(row_ids),
-                resolves: probe.resolves,
-                // A back-reference index stores no whole quads to serve from.
-                serve: None,
-            });
-        }
+        // column is the one and only constraint. Its ids are read only when
+        // a consumer needs them.
+        return Ok(IndexResolution::Resolved {
+            row_ids: ResolvedRowIds::Lazy(LazyRowIds::from_located_run(
+                Arc::clone(file),
+                name,
+                reader,
+                COL_RID,
+                range,
+                name,
+            )),
+            resolves: probe.resolves,
+            // A back-reference index stores no whole quads to serve from.
+            serve: None,
+        });
     }
     super::resolve_eager_from_scan(
         reader,
@@ -406,7 +399,9 @@ impl GlobalReferenceArrays {
         let perm_by = |term_of: fn(&RawQuad) -> &str| -> Vec<u32> {
             let mut perm: Vec<u32> = (0..quads.len() as u32).collect();
             perm.sort_unstable_by(|&a, &b| {
-                term_of(&quads[a as usize]).cmp(term_of(&quads[b as usize]))
+                term_of(&quads[a as usize])
+                    .cmp(term_of(&quads[b as usize]))
+                    .then(a.cmp(&b))
             });
             perm
         };
@@ -508,5 +503,51 @@ mod tests {
 
         // Nothing this index covers is bound: declines.
         assert!(choose(QuadPattern::new(None, None, None, None)).is_none());
+    }
+
+    /// Every `{val, rid}` child orders its rows by `(value, row id)`, the
+    /// string-valued ones too: the rids inside one value's run ascend, which
+    /// is what lets a window take the first rows of a located run as the
+    /// first rows in base order.
+    #[test]
+    fn from_quads_breaks_value_ties_by_row_id() {
+        use crate::session::VORTEX_SESSION;
+        use crate::store::array::StrColReader;
+        use vortex_array::VortexSessionExecute;
+        use vortex_array::arrays::VarBinViewArray;
+
+        // Few distinct values over many rows, so every value repeats widely.
+        let quads: Vec<RawQuad> = (0..900u32)
+            .map(|i| RawQuad {
+                s: format!("<http://example.org/s{i:04}>"),
+                p: format!("<http://example.org/p{}>", i % 7),
+                o: format!("\"o{}\"", (i * 5) % 11),
+                g: String::new(),
+            })
+            .collect();
+        let arrays = GlobalReferenceArrays::from_quads(&quads);
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        for (name, val, rid) in [
+            ("o", &arrays.o_val, &arrays.o_rid),
+            ("p", &arrays.p_val, &arrays.p_rid),
+        ] {
+            let val = val.clone().execute::<VarBinViewArray>(&mut ctx).unwrap();
+            let rid = rid.clone().execute::<PrimitiveArray>(&mut ctx).unwrap();
+            let (vals, rids) = (StrColReader::new(&val), rid.as_slice::<u32>());
+            assert_eq!(rids.len(), quads.len());
+            let mut repeats = 0;
+            for row in 1..rids.len() {
+                let (before, at) = (vals.str_at(row - 1).unwrap(), vals.str_at(row).unwrap());
+                assert!(before <= at, "{name}: values ascend at row {row}");
+                if before == at {
+                    repeats += 1;
+                    assert!(
+                        rids[row - 1] < rids[row],
+                        "{name}: rids ascend within {at} at row {row}"
+                    );
+                }
+            }
+            assert!(repeats > quads.len() / 2, "{name}: values repeat");
+        }
     }
 }

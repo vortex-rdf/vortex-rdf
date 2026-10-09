@@ -159,6 +159,15 @@ impl VortexRdfStore {
         }
     }
 
+    /// How many row ids reads of located index-child runs have asked for on
+    /// this file handle (shared by every view of the file); `None` off-file.
+    pub(crate) fn debug_located_rid_reads(&self) -> Option<usize> {
+        match &self.quads {
+            QuadsSource::InMemory { .. } => None,
+            QuadsSource::File { file, .. } => Some(file.debug_located_rid_reads()),
+        }
+    }
+
     /// The exact row range the located-run kernel computes for the subject
     /// codes `range` (`lo <= s < hi`); `None` when it declines — off-file, a
     /// file not sorted by subject, a column without a probeable chunk.

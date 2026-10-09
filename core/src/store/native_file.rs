@@ -55,6 +55,10 @@ pub(crate) struct NativeStoreFile {
     /// keep (test hook: pins which keeps were served without reading a column).
     #[cfg(test)]
     column_streams: std::sync::atomic::AtomicUsize,
+    /// How many row ids reads of located index-child runs have asked for
+    /// (test hook: pins that a count read none and a window only its prefix).
+    #[cfg(test)]
+    located_rid_reads: std::sync::atomic::AtomicUsize,
 }
 
 /// Structural (scope, expression) → the one [`BoundExpression`] this file
@@ -183,6 +187,8 @@ impl NativeStoreFile {
             mapped: false,
             #[cfg(test)]
             column_streams: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            located_rid_reads: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -210,6 +216,22 @@ impl NativeStoreFile {
     #[cfg(test)]
     pub(crate) fn debug_column_streams(&self) -> usize {
         self.column_streams
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record a read of `rows` row ids from a located index-child run (test
+    /// hook).
+    #[cfg(test)]
+    pub(crate) fn note_located_rid_reads(&self, rows: u64) {
+        self.located_rid_reads
+            .fetch_add(rows as usize, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many row ids reads of located runs have asked for on this handle
+    /// (test hook).
+    #[cfg(test)]
+    pub(crate) fn debug_located_rid_reads(&self) -> usize {
+        self.located_rid_reads
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

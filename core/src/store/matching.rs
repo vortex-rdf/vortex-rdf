@@ -38,6 +38,19 @@ use vortex_array::expr::and;
 
 use super::VortexRdfStore;
 
+/// What the caller of a match will do with the view's selection — whether a
+/// located index run may leave its row ids unread without a serve plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IdsNeed {
+    /// The view may be read row by row: every resolution's ids are computed,
+    /// or deferred behind a serve plan (the public `match_pattern`).
+    Rows,
+    /// The view is only counted (`size`, `size_capped`) or windowed: a run
+    /// whose width is known keeps its ids deferred, so a count reads none
+    /// and a window reads only the rows it takes.
+    CountOrWindow,
+}
+
 impl VortexRdfStore {
     // ── pattern matching ──────────────────────────────────────────────────────
 
@@ -56,7 +69,24 @@ impl VortexRdfStore {
         object: Option<&Term>,
         graph: Option<&GraphName>,
     ) -> Result<Self> {
-        let mut matched = self.match_base(subject, predicate, object, graph).await?;
+        self.match_pattern_for(subject, predicate, object, graph, IdsNeed::Rows)
+            .await
+    }
+
+    /// [`match_pattern`](Self::match_pattern) for a caller whose use of the
+    /// view `need` describes; with [`IdsNeed::CountOrWindow`] the view must
+    /// only be counted, windowed or kept (each of which resolves it).
+    pub(crate) async fn match_pattern_for(
+        &self,
+        subject: Option<&NamedOrBlankNode>,
+        predicate: Option<&NamedNode>,
+        object: Option<&Term>,
+        graph: Option<&GraphName>,
+        need: IdsNeed,
+    ) -> Result<Self> {
+        let mut matched = self
+            .match_base(subject, predicate, object, graph, need)
+            .await?;
         // The tail is matched independently of whatever the base concluded —
         // deliberately after any base short-circuit: a term the base's
         // dictionary has never seen proves nothing about rows appended since
@@ -133,6 +163,7 @@ impl VortexRdfStore {
         predicate: Option<&NamedNode>,
         object: Option<&Term>,
         graph: Option<&GraphName>,
+        need: IdsNeed,
     ) -> Result<Self> {
         let t = debug::timer();
 
@@ -151,11 +182,11 @@ impl VortexRdfStore {
 
         match &self.quads {
             QuadsSource::InMemory { .. } => {
-                self.match_base_in_memory(subject, predicate, object, graph, &mut codes, t)
+                self.match_base_in_memory(subject, predicate, object, graph, &mut codes, need, t)
             }
             #[cfg(feature = "file-io")]
             QuadsSource::File { .. } => {
-                self.match_base_file(subject, predicate, object, graph, &mut codes, t)
+                self.match_base_file(subject, predicate, object, graph, &mut codes, need, t)
                     .await
             }
         }
@@ -178,16 +209,18 @@ impl VortexRdfStore {
 
     /// The in-memory backend of [`match_base`](Self::match_base): every
     /// search below runs against the base array and answers in base row ids.
-    /// Those ids are computed here, except for the one case that does not
-    /// need them — a serving index's resolution that is the view's sole
-    /// restriction leaves them pending (`LazyRowIds`), for the first consumer
-    /// that reads through the selection and not the plan.
+    /// Those ids are computed here, except for the cases that do not need
+    /// them — a lazy index resolution that is the view's sole restriction
+    /// leaves them pending (`LazyRowIds`) when it serves the view's reads, or
+    /// when the caller only counts or windows the view (`need`), for the first
+    /// consumer that reads through the selection and not the plan.
     ///
     /// Tombstones are deliberately not consulted here: they are applied by
     /// every read path instead, so matching may name deleted rows without the
     /// result ever showing them. Keeping them out also keeps the mask scan's
     /// positions aligned with `selection.apply`, which is what `refine` maps
     /// back through.
+    #[allow(clippy::too_many_arguments)]
     fn match_base_in_memory(
         &self,
         subject: Option<&NamedOrBlankNode>,
@@ -195,6 +228,7 @@ impl VortexRdfStore {
         object: Option<&Term>,
         graph: Option<&GraphName>,
         codes: &mut PatternCodes,
+        need: IdsNeed,
         t: Option<Instant>,
     ) -> Result<Self> {
         // Without `file-io`, InMemory is the only variant.
@@ -368,13 +402,15 @@ impl VortexRdfStore {
                         // when it is this view's sole restriction and nothing
                         // residual is left to check — reads go through the
                         // plan, so decoding and sorting the run's rids can
-                        // wait for a consumer that needs the selection.
-                        // Anything narrower needs them now.
+                        // wait for a consumer that needs the selection. So
+                        // does a run the caller only counts or windows: its
+                        // width is the count. Anything narrower, or read row
+                        // by row without a plan, needs them now.
                         ResolvedRowIds::Lazy(lazy) => {
                             if unrefined
                                 && !narrowed_elsewhere
                                 && !pat.any_bound()
-                                && serve.is_some()
+                                && (serve.is_some() || need == IdsNeed::CountOrWindow)
                             {
                                 pending = Some(lazy);
                             } else {
@@ -482,6 +518,7 @@ impl VortexRdfStore {
     /// compose into the derived view — index-resolved row ids, a pushed-down
     /// filter, a pruned row range — and no data is read until the next scan.
     #[cfg(feature = "file-io")]
+    #[allow(clippy::too_many_arguments)]
     async fn match_base_file(
         &self,
         subject: Option<&NamedOrBlankNode>,
@@ -489,6 +526,7 @@ impl VortexRdfStore {
         object: Option<&Term>,
         graph: Option<&GraphName>,
         codes: &mut PatternCodes,
+        need: IdsNeed,
         t: Option<Instant>,
     ) -> Result<Self> {
         let QuadsSource::File {
@@ -569,6 +607,7 @@ impl VortexRdfStore {
                 serve,
             } => {
                 let pat = resolves.clear(pat);
+                let residual = file_scan::build_file_filter(pat, codes)?;
                 let serve = keep_serve.then_some(serve).flatten();
                 let selection = match row_ids {
                     // With the plan kept, the resolution is the view's sole
@@ -579,6 +618,22 @@ impl VortexRdfStore {
                     ResolvedRowIds::Lazy(lazy) if serve.is_some() => {
                         log::debug!(
                             "[match_pattern] File index resolved (served, ids pending) at {:?}",
+                            debug::elapsed(t)
+                        );
+                        ViewSelection::Pending(lazy)
+                    }
+                    // A located run the caller only counts or windows: its
+                    // width is the count, and a window reads only its own
+                    // rows — provided nothing else restricts this view and
+                    // nothing residual is left to filter.
+                    ResolvedRowIds::Lazy(lazy)
+                        if need == IdsNeed::CountOrWindow
+                            && keep_serve
+                            && residual.is_none()
+                            && lazy.len_if_known().is_some() =>
+                    {
+                        log::debug!(
+                            "[match_pattern] File index located a run (ids pending for a count) at {:?}",
                             debug::elapsed(t)
                         );
                         ViewSelection::Pending(lazy)
@@ -618,11 +673,7 @@ impl VortexRdfStore {
                         selection
                     }
                 };
-                (
-                    file_scan::build_file_filter(pat, codes)?,
-                    Some(selection),
-                    serve,
-                )
+                (residual, Some(selection), serve)
             }
             // No index applies: the residual pattern (the subject already
             // resolved to its range, when it was) becomes the pushed-down

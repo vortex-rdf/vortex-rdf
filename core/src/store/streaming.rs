@@ -115,8 +115,9 @@ impl VortexRdfStore {
                     // ids; tombstones are applied through the rid column. The
                     // selection may still be pending — the plan never needs it.
                     Some(serve) => serve.decode::<T>(deleted.as_ref()),
-                    // Without a plan the selection is exact (pending ids only
-                    // ever ride alongside one).
+                    // Without a plan the selection is exact (pending ids ride
+                    // alongside one, or on a view that is only counted or
+                    // windowed, never streamed).
                     None => T::decode(
                         &layout,
                         &gather_live(
@@ -251,8 +252,8 @@ impl VortexRdfStore {
                 // Same restriction setup as `base_selected_rows`: primary
                 // columns only, with any pending filter/selection applied
                 // (tombstoned rows excluded). Without a serve plan the
-                // selection is exact (pending ids only ever ride alongside
-                // one).
+                // selection is exact (pending ids ride alongside one, or on a
+                // view that is only counted or windowed, never streamed).
                 let scan = self.restricted_file_scan(
                     file,
                     filter.as_ref(),

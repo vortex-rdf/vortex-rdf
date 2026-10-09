@@ -40,7 +40,8 @@ pub(crate) enum QuadsSource {
         base: ArrayRef,
         /// The base row ids visible through this particular store or derived
         /// view; narrowing a view changes this without rewriting `base`. May
-        /// still be pending on a served match — see `serve`.
+        /// still be pending — on a served match (see `serve`), or on a view
+        /// built only to be counted or windowed (see [`ViewSelection`]).
         selection: ViewSelection,
         /// Secondary-index components held beside `base`, in the same child
         /// schema as a native file's index children; empty for stores built
@@ -82,7 +83,8 @@ pub(crate) enum QuadsSource {
         filter: Option<Expression>,
         /// The file row ids visible through this store or derived view,
         /// typically narrowed by index lookups or pruning. May still be
-        /// pending on a served match — see `serve`.
+        /// pending — on a served match (see `serve`), or on a view built only
+        /// to be counted or windowed (see [`ViewSelection`]).
         selection: ViewSelection,
         /// Rows deleted since the store was opened, one bit per file row
         /// (`None` until something is deleted). Applied by every read path

@@ -42,6 +42,7 @@ pub use layouts::dictionary::DictionaryQuadSink;
 pub use layouts::dictionary::{
     CaseMap, DictReader, DictSnapshot, KindRanges, NumOp, TermPredicate, TextOptions, Verdict,
 };
+pub(crate) use matching::IdsNeed;
 pub use narrowing::Keep;
 pub use schema::QuadColumn;
 // `RawQuad` lives in `common` (it is pure RDF text — see that module's
