@@ -270,7 +270,8 @@ impl VortexRdfStore {
         // clears the one it answers, since its ids already satisfy it.
         let mut pat = QuadPattern::new(subject, predicate, object, graph);
         let mut serve: Option<InMemoryServePlan> = None;
-        // A serve-attached resolution whose exact ids stay deferred — set
+        // A lazy resolution whose exact ids stay deferred — a serve-attached
+        // one, or any when the caller only counts or windows the view — set
         // only when that resolution is this view's sole restriction, and
         // becoming the view's `Pending` selection below.
         let mut pending: Option<LazyRowIds> = None;
@@ -486,8 +487,9 @@ impl VortexRdfStore {
             None
         };
         // A deferred resolution *is* the whole selection (the deferral
-        // condition made it the sole restriction, which also kept `serve`),
-        // so it stays pending until a consumer needs the ids.
+        // condition made it the sole restriction; a served one also kept
+        // `serve`, a counted or windowed one has no plan), so it stays
+        // pending until a consumer needs the ids.
         let selection = match pending {
             Some(lazy) => ViewSelection::Pending(lazy),
             None => ViewSelection::Exact(selection),

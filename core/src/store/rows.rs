@@ -45,9 +45,10 @@ impl VortexRdfStore {
     pub(crate) async fn base_size(&self) -> Result<usize> {
         let base = match &self.quads {
             // In-memory patterns resolve to exact row ids at match time —
-            // or, for a served match, to a pending run whose width is known
-            // without decoding it — so the selection alone knows the answer
-            // and no rows are touched. Deletions are only counted out, never
+            // or, for a served match or a view built only to be counted or
+            // windowed, to a pending run whose width is known without
+            // decoding it — so the selection alone knows the answer and no
+            // rows are touched. Deletions are only counted out, never
             // gathered.
             QuadsSource::InMemory {
                 base,
@@ -102,9 +103,10 @@ impl VortexRdfStore {
                 if let Some(rows) = known {
                     rows
                 } else {
-                    // A count needs the selection itself, so a served match's
-                    // deferred index-child scan runs here, once, and is
-                    // cached on the view.
+                    // A count needs the selection itself, so a deferred
+                    // resolution's ids (a served match's index-child scan, a
+                    // located run's rids under tombstones) are computed here,
+                    // once, and cached on the view.
                     let selection = selection.materialized_async().await?;
                     match filter {
                         // No filter pending: the selection is exact, minus
