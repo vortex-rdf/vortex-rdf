@@ -104,3 +104,7 @@ required-features = ["file-io"]
 [[test]]
 name = "bench_dataset"
 required-features = ["file-io"]
+
+[[test]]
+name = "experimental_patched"
+required-features = ["file-io"]

@@ -182,8 +182,10 @@ pub(crate) fn default_child_strategy() -> Arc<dyn vortex_layout::LayoutStrategy>
     use vortex_btrblocks::schemes::integer::DeltaScheme;
     use vortex_btrblocks::{BtrBlocksCompressorBuilder, SchemeExt as _};
 
-    // The session's schemes, limited to the wire forms its store edition
-    // allows (which keeps frame-of-reference on a single reference).
+    // The session's schemes, limited to the wire forms its write editions
+    // allow: the pinned core edition keeps frame-of-reference on a single
+    // reference and, today, leaves delta out as well; the exclusion keeps
+    // delta out should a later core edition admit it.
     let session = &*crate::session::VORTEX_SESSION;
     let compressor = BtrBlocksCompressorBuilder::from_session(session)
         .exclude_schemes([DeltaScheme::new(1.25).id()]);

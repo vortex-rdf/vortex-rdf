@@ -1121,10 +1121,10 @@ async fn test_written_code_columns_avoid_delta() {
 }
 
 /// The store's own files keep frame-of-reference on one reference per
-/// array: the store edition leaves out the per-chunk wire form
-/// (`fastlanes.for.v2`), which the chunk probes decline. The guard bites:
-/// the fixture's code columns do pick frame-of-reference, which would take a
-/// reference per 1,024 rows were the edition to allow it.
+/// array: the pinned core edition the store writes with leaves out the
+/// per-chunk wire form (`fastlanes.for.v2`), which the chunk probes decline.
+/// The guard bites: with that form admitted, some of the fixture's
+/// frame-of-reference arrays take a reference per 1,024 rows.
 #[tokio::test]
 async fn test_written_frame_of_reference_keeps_one_reference() {
     use vortex::encodings::fastlanes::{FoR, FoRArrayExt as _};
