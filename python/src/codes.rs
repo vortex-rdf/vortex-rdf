@@ -12,7 +12,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyString;
 use vortex_buffer::Buffer;
 use vortex_rdf_core::VortexRdfError as CoreError;
-use vortex_rdf_core::{DictReader, TermPredicate, columns};
+use vortex_rdf_core::{CaseMap, DictReader, TermPredicate, TextOptions, columns};
 
 use crate::{RUNTIME, parse_err, store_err};
 
@@ -162,19 +162,45 @@ impl TermDict {
     /// `kind` over the candidate `codes`: `(passed, undecided)`, both
     /// ascending subsets of `codes`; a candidate in neither fails. `codes`
     /// (a `U32Column`, a u32 buffer or any int sequence) must be sorted,
-    /// unique and inside the dictionary, else `ValueError`. Only the
-    /// dictionary windows holding candidates the kind ranges do not decide
-    /// are read; nothing is memoized. An unknown kind or an invalid argument
-    /// raises `ValueError`.
-    #[pyo3(signature = (kind, arg, codes))]
+    /// unique and inside the dictionary, else `ValueError`. String kinds
+    /// (`str_prefix`, `contains`, `strstarts`, `strends`, `regex`) read the
+    /// term's text: by default rdflib's `string()` (string literals only);
+    /// `as_str=True` reads SPARQL `STR(term)`, where a blank node, or a
+    /// literal whose datatype rdflib normalizes, is undecided. `case`
+    /// ("lower"/"upper") applies Python's `str.lower()`/`str.upper()` first,
+    /// decided on ASCII text only; `flags` are `regex`'s SPARQL flags. Only
+    /// the dictionary windows holding candidates the kind ranges do not
+    /// decide are read; nothing is memoized. An unknown kind or an invalid
+    /// argument or option raises `ValueError`.
+    #[pyo3(signature = (kind, arg, codes, *, flags = "", case = None, as_str = false))]
+    // The parameters are the Python signature.
+    #[allow(clippy::too_many_arguments)]
     fn filter_codes(
         &self,
         py: Python<'_>,
         kind: &str,
         arg: &str,
         codes: &Bound<'_, PyAny>,
+        flags: &str,
+        case: Option<&str>,
+        as_str: bool,
     ) -> PyResult<(U32Column, U32Column)> {
-        let predicate = TermPredicate::parse(kind, arg).map_err(term_err)?;
+        let case = match case {
+            None => None,
+            Some("lower") => Some(CaseMap::Lower),
+            Some("upper") => Some(CaseMap::Upper),
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "case must be None, \"lower\" or \"upper\", got {other:?}"
+                )));
+            }
+        };
+        let options = TextOptions {
+            flags: flags.to_owned(),
+            case,
+            as_str,
+        };
+        let predicate = TermPredicate::parse_with(kind, arg, &options).map_err(term_err)?;
         // Like a keep's code set: whatever is no u32 code list is a bad value.
         let codes = u32_buffer(codes).map_err(|e| {
             PyValueError::new_err(format!(

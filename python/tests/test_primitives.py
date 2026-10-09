@@ -409,3 +409,40 @@ def test_kernels_round_trip_store_columns(code_store):
     assert joined == want
     assert want == [("<http://ex.org/bob>", "<http://ex.org/bob>")] * 2
     assert isinstance(left_idx, U32Column)
+
+
+def test_filter_codes_string_kinds(dictionary):
+    _, term_dict = dictionary
+    terms = _terms(term_dict)
+    every = U32Column(range(len(terms)))
+    code = {t: c for c, t in enumerate(terms)}
+
+    def run(kind, arg, **options):
+        passed, undecided = term_dict.filter_codes(kind, arg, every, **options)
+        return _codes(passed), _codes(undecided)
+
+    alice, anon, bob = code['"Alice"'], code['"Anon"'], code['"Bob"@en']
+    assert run("str_prefix", "A") == ([alice, anon], [0])
+    assert run("contains", '"o"') == ([anon, bob], [0])
+    assert run("contains", '"o"@en') == ([bob], [0])
+    assert run("contains", '"o"@EN') == ([], [0])
+    assert run("strstarts", f'"A"^^<{XSD}string>') == ([alice, anon], [0])
+    assert run("strends", '"e"') == ([alice], [0])
+    assert run("contains", '"O"', case="upper") == ([anon, bob], [0])
+    assert run("contains", '"al"', case="lower") == ([alice], [0])
+    age, alice_iri = code["<http://ex.org/age>"], code["<http://ex.org/alice>"]
+    forty_two = code[f'"42"^^<{XSD}integer>']
+    blank = code["_:b0"]
+    assert run("str_prefix", "http://ex.org/a", as_str=True) == ([age, alice_iri], [0, forty_two, blank])
+    assert run("str_prefix", "http") == ([], [0])
+    assert run("contains", f'"4"^^<{XSD}integer>') == ([], [0])
+    assert run("contains", "<http://ex.org/a>") == ([], [0])
+    for kind, arg, options in [
+        ("contains", '"a"', {"case": "title"}),
+        ("num_lt", "5", {"as_str": True}),
+        ("lang", "en", {"case": "lower"}),
+        ("contains", '"a"', {"flags": "i"}),
+        ("contains", "not a spelling", {}),
+    ]:
+        with pytest.raises(ValueError):
+            term_dict.filter_codes(kind, arg, every, **options)

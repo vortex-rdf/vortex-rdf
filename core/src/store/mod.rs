@@ -40,7 +40,7 @@ pub use indexes::{IndexType, Indexes};
 pub use layouts::LayoutStrategy;
 pub use layouts::dictionary::DictionaryQuadSink;
 pub use layouts::dictionary::{
-    DictReader, DictSnapshot, KindRanges, NumOp, TermPredicate, Verdict,
+    CaseMap, DictReader, DictSnapshot, KindRanges, NumOp, TermPredicate, TextOptions, Verdict,
 };
 pub use narrowing::Keep;
 pub use schema::QuadColumn;

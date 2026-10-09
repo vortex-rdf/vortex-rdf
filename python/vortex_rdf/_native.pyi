@@ -40,13 +40,38 @@ class TermDict:
         """`encode` over a sequence of terms, in order, in one GIL-released
         call; a malformed term raises ``ValueError``."""
         ...
-    def filter_codes(self, kind: str, arg: str, codes: _U32s) -> Tuple[U32Column, U32Column]:
-        """`kind` over the candidate `codes` (sorted and unique, else
-        ``ValueError``): ``(passed, undecided)``, both subsets of `codes`; a
-        candidate in neither fails. Kinds: ``is_literal``, ``is_iri``,
-        ``is_blank``, ``datatype``, ``lang``, ``lang_matches``,
-        ``str_prefix``, ``num_lt``, ``num_le``, ``num_gt``, ``num_ge``,
-        ``num_eq``, ``num_ne``. Nothing is memoized."""
+    def filter_codes(
+        self,
+        kind: str,
+        arg: str,
+        codes: _U32s,
+        *,
+        flags: str = "",
+        case: Optional[str] = None,
+        as_str: bool = False,
+    ) -> Tuple[U32Column, U32Column]:
+        """`kind` over the candidate `codes`: ``(passed, undecided)``, both
+        ascending subsets of `codes`; a candidate in neither fails, and no
+        candidates give two empty columns. `codes` must be sorted, unique and
+        inside the dictionary, else ``ValueError`` (a code past the end
+        included).
+
+        String kinds (``str_prefix``, ``contains``, ``strstarts``,
+        ``strends``, ``regex``) read the term's text: rdflib's ``string()`` by
+        default (string literals only), SPARQL ``STR()`` with `as_str` (an
+        IRI's string, a literal's lexical form; a blank node, or a literal
+        whose datatype rdflib normalizes, is undecided), after an optional
+        `case` wrapper (``"lower"``/``"upper"``, decided on ASCII text only).
+        `arg` is the raw prefix for ``str_prefix``, the constant's N-Triples
+        spelling for ``contains``/``strstarts``/``strends`` (a language-tagged
+        constant needs the same tag, compared as written; a constant that is
+        no string literal matches nothing) and the pattern for ``regex``, the
+        one kind that takes SPARQL `flags`.
+
+        Other kinds: ``is_literal``, ``is_iri``, ``is_blank``, ``datatype``,
+        ``lang``, ``lang_matches``, ``num_lt`` … ``num_ne``. An unknown kind,
+        an invalid argument or an option that does not apply to the kind
+        raises ``ValueError``. Nothing is memoized."""
         ...
     def prefix_range(self, prefix: str) -> Tuple[int, int]:
         """The half-open code range ``(lo, hi)`` of the terms whose

@@ -389,7 +389,9 @@ impl FileBackedDict {
     ) -> Result<(Buffer<u32>, Buffer<u32>)> {
         check_candidates(codes, self.len())?;
         let kinds = self.kind_ranges().await?;
-        let mut verdicts = vec![Verdict::False; codes.len()];
+        // Undecided until a verdict is set: a candidate no branch below reaches
+        // stays undecided rather than silently failing.
+        let mut verdicts = vec![Verdict::Unknown; codes.len()];
         let (mut read_at, mut read) = (Vec::new(), Vec::new());
         for (i, &code) in codes.iter().enumerate() {
             match predicate.kind_verdict(kinds.kind_of_code(code)) {
@@ -1068,7 +1070,16 @@ mod tests {
         let (fbd, _) = windowed_handle(600, 100).await;
         fbd.kind_ranges().await.unwrap();
         let before = fbd.debug_windows_rebuilt();
-        let predicate = TermPredicate::parse("str_prefix", "http://example.org/term/01").unwrap();
+        // An IRI is a text only under `STR()`.
+        let predicate = TermPredicate::parse_with(
+            "str_prefix",
+            "http://example.org/term/01",
+            &super::super::predicates::TextOptions {
+                as_str: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let (passed, undecided) = fbd
             .filter_codes(&predicate, &[105, 150, 450])
             .await
@@ -1084,6 +1095,13 @@ mod tests {
         assert_eq!(fbd.debug_windows_rebuilt(), before);
         assert_eq!(passed.as_slice(), &[105, 150, 450]);
         assert!(undecided.is_empty());
+
+        // Without `STR()` an IRI has no text: its kind fails it, nothing is read.
+        let before = fbd.debug_windows_rebuilt();
+        let plain = TermPredicate::parse("str_prefix", "http://example.org/term/01").unwrap();
+        let (passed, undecided) = fbd.filter_codes(&plain, &[105, 150, 450]).await.unwrap();
+        assert_eq!(fbd.debug_windows_rebuilt(), before);
+        assert!(passed.is_empty() && undecided.is_empty());
     }
 
     /// A candidate list that is not ascending, unique and inside the
@@ -1109,6 +1127,101 @@ mod tests {
             );
         }
         assert_eq!(fbd.debug_windows_rebuilt(), before);
+    }
+
+    /// Spellings no writer of this crate produces — a lone `<`, a `<` and a
+    /// multi-byte character with no closing `>`, a bare `_`, `_:` or `"` — in
+    /// a foreign file's dictionary: every string kind reads them without
+    /// panicking and passes none. One in the IRI or blank-node range fails
+    /// unless the text is `STR()`, where it is undecided; a `_` between the
+    /// ranges and a `"` that is no literal are undecided throughout. Both
+    /// residencies agree.
+    #[tokio::test]
+    async fn filter_codes_survives_foreign_spellings() {
+        use super::super::predicates::{CaseMap, TextOptions};
+
+        let mut terms: Vec<String> = [
+            "\"",
+            "\"a\"",
+            "<",
+            "<é",
+            "<http://ex.org/a>",
+            "_",
+            "_:",
+            "_:b0",
+        ]
+        .map(String::from)
+        .into();
+        terms.sort();
+        let code = |spelling: &str| terms.iter().position(|t| t == spelling).unwrap() as u32;
+        let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
+        let d = TermDictionary::compress_windowed(plain, 3).unwrap();
+        let native = crate::tests::open_native_bytes(crate::tests::write_dict_only_store(&d).await);
+        let fbd = FileBackedDict::open(&native).await.unwrap().unwrap();
+        assert_eq!(fbd.debug_window_count(), 3);
+        assert_eq!(fbd.kind_ranges().await.unwrap(), *d.kind_ranges());
+
+        let all: Vec<u32> = (0..terms.len() as u32).collect();
+        let (quote, lt, lt_e, underscore, blank) =
+            (code("\""), code("<"), code("<é"), code("_"), code("_:"));
+        let foreign = [quote, lt, lt_e, underscore, blank];
+        for (kind, arg) in [
+            ("str_prefix", ""),
+            ("str_prefix", "a"),
+            ("contains", "\"\""),
+            ("contains", "\"a\""),
+            ("strstarts", "\"\""),
+            ("strends", "\"a\"@en"),
+        ] {
+            for (as_str, case) in [
+                (false, None),
+                (true, None),
+                (false, Some(CaseMap::Lower)),
+                (true, Some(CaseMap::Upper)),
+            ] {
+                let options = TextOptions {
+                    as_str,
+                    case,
+                    ..Default::default()
+                };
+                let predicate = TermPredicate::parse_with(kind, arg, &options).unwrap();
+                let (passed, undecided) = fbd.filter_codes(&predicate, &all).await.unwrap();
+                assert_eq!(
+                    (passed.clone(), undecided.clone()),
+                    d.filter_codes(&predicate, &all).unwrap(),
+                    "{kind} {arg:?} {options:?}: residencies"
+                );
+                let undecided_foreign: &[u32] = if as_str {
+                    &foreign
+                } else {
+                    &[quote, underscore]
+                };
+                for term in foreign {
+                    let why = format!("{kind} {arg:?} {options:?} on {:?}", terms[term as usize]);
+                    assert!(!passed.as_slice().contains(&term), "{why}: passed");
+                    assert_eq!(
+                        undecided.as_slice().contains(&term),
+                        undecided_foreign.contains(&term),
+                        "{why}: undecided"
+                    );
+                }
+            }
+        }
+        // The well-formed terms beside them are still decided.
+        let literal = TermPredicate::parse("str_prefix", "a").unwrap();
+        let (passed, _) = fbd.filter_codes(&literal, &all).await.unwrap();
+        assert_eq!(passed.as_slice(), &[code("\"a\"")]);
+        let iri = TermPredicate::parse_with(
+            "str_prefix",
+            "http",
+            &TextOptions {
+                as_str: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (passed, _) = fbd.filter_codes(&iri, &all).await.unwrap();
+        assert_eq!(passed.as_slice(), &[code("<http://ex.org/a>")]);
     }
 
     /// Zone `i` stands for window `i` only when the zones are cut where the

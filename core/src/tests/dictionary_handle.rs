@@ -2,7 +2,7 @@
 //! spelling-tolerant encoder and the byte-order range probes it carries.
 
 use super::*;
-use crate::store::{DictReader, TermPredicate};
+use crate::store::{CaseMap, DictReader, TermPredicate, TextOptions};
 use oxrdf::{BlankNode, Literal};
 
 /// Quads mixing every term kind the dictionary sorts: IRIs, blank nodes,
@@ -293,6 +293,42 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
                 oracle.filter_codes(&predicate, codes).unwrap(),
                 "{tag}: filter_codes {kind} {arg:?}"
             );
+        }
+    }
+
+    // The string kinds read a term's text as `string()` or as `STR()`, with
+    // and without a case wrapper: the file-backed reader reads the windows
+    // holding the candidates and answers as the resident snapshot does.
+    for (kind, arg) in [
+        ("str_prefix", "http://example.org/s0"),
+        ("str_prefix", "object"),
+        ("contains", "\"object\""),
+        ("contains", "\"o\"@de"),
+        ("strstarts", "\"hallo\"@de"),
+        ("strends", "\"3\""),
+        ("strends", "<http://example.org/s00>"),
+    ] {
+        for (as_str, case) in [
+            (false, None),
+            (true, None),
+            (false, Some(CaseMap::Lower)),
+            (true, Some(CaseMap::Upper)),
+        ] {
+            let options = TextOptions {
+                as_str,
+                case,
+                ..TextOptions::default()
+            };
+            let predicate = TermPredicate::parse_with(kind, arg, &options).unwrap();
+            let all: Vec<u32> = (0..oracle.len() as u32).collect();
+            let every_third: Vec<u32> = all.iter().copied().step_by(3).collect();
+            for codes in [&all, &every_third] {
+                assert_eq!(
+                    reader.filter_codes(&predicate, codes).await.unwrap(),
+                    oracle.filter_codes(&predicate, codes).unwrap(),
+                    "{tag}: filter_codes {kind} {arg:?} {options:?}"
+                );
+            }
         }
     }
 

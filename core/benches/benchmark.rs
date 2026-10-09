@@ -636,9 +636,14 @@ fn narrow_exists(bencher: divan::Bencher, residency: &DictResidency) {
 /// file-backed: the windows holding them).
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn narrow_filter_codes(bencher: divan::Bencher, residency: &DictResidency) {
-    use vortex_rdf_core::TermPredicate;
+    use vortex_rdf_core::{TermPredicate, TextOptions};
     let store = open_dict_store(*residency, bench_size());
-    let predicate = TermPredicate::parse("str_prefix", "http://").unwrap();
+    // Over `STR()`: an IRI is a text only there, so its candidates are read.
+    let options = TextOptions {
+        as_str: true,
+        ..TextOptions::default()
+    };
+    let predicate = TermPredicate::parse_with("str_prefix", "http://", &options).unwrap();
     let dict = store.dict_reader().expect("dictionary handle");
     let step = (dict.len() / 4_096).max(1);
     let codes: Vec<u32> = (0..dict.len() as u32).step_by(step).take(4_096).collect();

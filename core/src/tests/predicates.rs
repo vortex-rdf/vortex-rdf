@@ -6,7 +6,7 @@
 //! spellings are that layer's own test corpus.
 
 use super::*;
-use crate::store::{TermPredicate, Verdict};
+use crate::store::{CaseMap, TermPredicate, TextOptions, Verdict};
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 
@@ -222,9 +222,8 @@ fn kinds_and_str_prefix() {
     for kind in ["is_iri", "is_blank", "is_literal"] {
         check("", kind, "", Deferred);
     }
-    // `str_prefix` is `strstarts(str(?v), p)`: the unescaped lexical form of
-    // a string-like literal, the IRI itself, a blank node's label; other
-    // typed literals depend on the engine's canonical form.
+    // `str_prefix` is a string kind: under `string()` only string literals
+    // have a text; IRIs, blank nodes and other typed literals fail.
     check("\"abc\"", "str_prefix", "a", Definite(true));
     check("\"Abc\"", "str_prefix", "a", Definite(false));
     check("\"abc\"@en", "str_prefix", "ab", Definite(true));
@@ -234,11 +233,225 @@ fn kinds_and_str_prefix() {
     check(&typed("abc", "string"), "str_prefix", "ab", Definite(true));
     check("\"\"", "str_prefix", "", Definite(true));
     check("\"\"", "str_prefix", "a", Definite(false));
-    check(&typed("5", "integer"), "str_prefix", "5", Deferred);
-    check("<http://ex.org/x>", "str_prefix", "http", Definite(true));
-    check("<http://ex.org/x>", "str_prefix", "a", Definite(false));
-    check("_:b0", "str_prefix", "b", Definite(true));
-    check("_:b0", "str_prefix", "_", Definite(false));
+    check(&typed("5", "integer"), "str_prefix", "5", Definite(false));
+    check("<http://ex.org/x>", "str_prefix", "http", Definite(false));
+    check("_:b0", "str_prefix", "b", Definite(false));
+}
+
+fn check_text(spelling: &str, kind: &str, arg: &str, options: TextOptions, expect: Verdict) {
+    let got = TermPredicate::parse_with(kind, arg, &options)
+        .unwrap()
+        .eval(spelling);
+    assert_eq!(got, expect, "{kind} {arg:?} {options:?} on {spelling}");
+}
+
+fn opts(case: Option<CaseMap>, as_str: bool) -> TextOptions {
+    TextOptions {
+        flags: String::new(),
+        case,
+        as_str,
+    }
+}
+
+/// The string kinds against rdflib 7.6's `_compatibleStrings`,
+/// `Builtin_STR`, `LCASE`/`UCASE` and `in`/`startswith`/`endswith`.
+#[test]
+fn string_kinds_follow_rdflib() {
+    let none = || opts(None, false);
+    let str_ = || opts(None, true);
+    let xsd_string = format!("\"A\"^^<{XSD}string>");
+    for (spelling, kind, arg, options, expect) in [
+        ("\"Ab\"@en", "contains", "\"b\"", none(), Verdict::True),
+        ("\"Ab\"@en", "contains", "\"b\"@en", none(), Verdict::True),
+        ("\"Ab\"@en", "contains", "\"b\"@EN", none(), Verdict::False),
+        ("\"Ab\"", "contains", "\"b\"@en", none(), Verdict::False),
+        (
+            "\"Ab\"@en",
+            "strstarts",
+            xsd_string.as_str(),
+            none(),
+            Verdict::True,
+        ),
+        ("<http://ex/a>", "contains", "\"a\"", none(), Verdict::False),
+        ("<http://ex/a>", "contains", "\"a\"", str_(), Verdict::True),
+        (
+            "<http://ex/a>",
+            "contains",
+            "\"a\"@en",
+            str_(),
+            Verdict::False,
+        ),
+        (
+            "\"Ab\"@en",
+            "contains",
+            "\"ab\"",
+            opts(Some(CaseMap::Lower), false),
+            Verdict::True,
+        ),
+        (
+            "\"ab\"",
+            "contains",
+            "\"A\"",
+            opts(Some(CaseMap::Upper), false),
+            Verdict::True,
+        ),
+        (
+            "\"Áb\"",
+            "contains",
+            "\"ab\"",
+            opts(Some(CaseMap::Lower), false),
+            Verdict::Unknown,
+        ),
+        ("\"ab\\n\"", "strends", "\"\\n\"", none(), Verdict::True),
+        ("\"caf\\u00E9\"", "contains", "\"é\"", none(), Verdict::True),
+        (
+            "\"5\"",
+            "contains",
+            &format!("\"5\"^^<{XSD}integer>"),
+            none(),
+            Verdict::False,
+        ),
+        ("\"a\"", "contains", "<http://ex/a>", none(), Verdict::False),
+        ("\"anything\"", "contains", "\"\"", none(), Verdict::True),
+        (
+            "\"x\"^^<http://ex/dt>",
+            "str_prefix",
+            "x",
+            none(),
+            Verdict::False,
+        ),
+        (
+            "\"x\"^^<http://ex/dt>",
+            "str_prefix",
+            "x",
+            str_(),
+            Verdict::True,
+        ),
+        // rdflib STR(_:b0) is "b0"
+        ("_:b0", "str_prefix", "b", str_(), Verdict::Unknown),
+        ("\"Ab\"@en", "strends", "\"b\"@fr", none(), Verdict::False),
+    ] {
+        check_text(spelling, kind, arg, options, expect);
+    }
+}
+
+/// `STR()` of a literal rdflib parses into a value is its canonical form,
+/// not the stored lexical form: undecided, never decided on the spelling.
+#[test]
+fn str_of_rdflib_normalized_datatypes_is_undecided() {
+    for spelling in [
+        typed("01", "integer"),
+        typed("1", "boolean"),
+        typed("1e2", "double"),
+        typed("1.50", "decimal"),
+    ] {
+        check_text(
+            &spelling,
+            "contains",
+            "\"0\"",
+            opts(None, true),
+            Verdict::Unknown,
+        );
+    }
+    check_text(
+        &typed("0001", "gYear"),
+        "contains",
+        "\"0\"",
+        opts(None, true),
+        Verdict::True,
+    );
+    check_text(
+        "\"01\"^^<http://ex/dt>",
+        "contains",
+        "\"0\"",
+        opts(None, true),
+        Verdict::True,
+    );
+    // `xsd:string` is the text itself, however a foreign writer spells it.
+    check_text(
+        &typed("01", "string"),
+        "contains",
+        "\"0\"",
+        opts(None, true),
+        Verdict::True,
+    );
+    // Every datatype with an entry in rdflib 7.6's `XSDToPython` but
+    // `xsd:string`, and the two non-XSD ones it parses (`rdf:HTML` only when
+    // its optional `html5rdf` is installed).
+    for local in [
+        "anyURI",
+        "base64Binary",
+        "boolean",
+        "byte",
+        "date",
+        "dateTime",
+        "dayTimeDuration",
+        "decimal",
+        "double",
+        "duration",
+        "float",
+        "hexBinary",
+        "int",
+        "integer",
+        "language",
+        "long",
+        "negativeInteger",
+        "nonNegativeInteger",
+        "nonPositiveInteger",
+        "normalizedString",
+        "positiveInteger",
+        "short",
+        "time",
+        "token",
+        "unsignedByte",
+        "unsignedInt",
+        "unsignedLong",
+        "unsignedShort",
+        "yearMonthDuration",
+    ] {
+        check_text(
+            &typed("0", local),
+            "contains",
+            "\"0\"",
+            opts(None, true),
+            Verdict::Unknown,
+        );
+    }
+    for local in ["XMLLiteral", "HTML"] {
+        let spelling =
+            format!("\"<b>0</b >\"^^<http://www.w3.org/1999/02/22-rdf-syntax-ns#{local}>");
+        check_text(
+            &spelling,
+            "contains",
+            "\"0\"",
+            opts(None, true),
+            Verdict::Unknown,
+        );
+    }
+}
+
+#[test]
+fn string_kind_options_are_validated() {
+    for (kind, arg, options) in [
+        ("num_lt", "5", opts(None, true)),
+        ("lang", "en", opts(Some(CaseMap::Lower), false)),
+        (
+            "contains",
+            "\"a\"",
+            TextOptions {
+                flags: "i".into(),
+                case: None,
+                as_str: false,
+            },
+        ),
+        ("contains", "not a spelling", opts(None, false)),
+        ("contains", "\"x\"@", opts(None, false)),
+    ] {
+        assert!(
+            TermPredicate::parse_with(kind, arg, &options).is_err(),
+            "{kind} {arg:?}"
+        );
+    }
 }
 
 /// Malformed predicates are refused at parse time, with the kind named.
@@ -284,6 +497,8 @@ async fn predicate_store() -> VortexRdfStore {
         "\"Abc\"".to_string(),
         "\"a\\\"b\"".to_string(),
         "\"x\"^^<http://ex.org/dt>".to_string(),
+        "_:b0".to_string(),
+        "_:ab".to_string(),
     ] {
         let term = crate::common::terms::parse_term(&spelling).unwrap();
         quads.push(Quad::new(
@@ -309,7 +524,7 @@ async fn filter_codes_matches_eval() {
         .collect();
     let all: Vec<u32> = (0..terms.len() as u32).collect();
     let odd: Vec<u32> = all.iter().copied().filter(|c| c % 2 == 1).collect();
-    for (kind, arg) in [
+    let mut cases: Vec<(&str, String, TextOptions)> = [
         ("is_literal", ""),
         ("is_iri", ""),
         ("is_blank", ""),
@@ -327,8 +542,36 @@ async fn filter_codes_matches_eval() {
         ("num_ge", "1e2"),
         ("num_eq", "5"),
         ("num_ne", "5"),
+    ]
+    .map(|(kind, arg)| (kind, arg.to_owned(), TextOptions::default()))
+    .into();
+    // The string kinds under each reading of the text and each case wrapper:
+    // IRIs are read only under `STR()`, blank nodes are never decided there.
+    for options in [
+        opts(None, false),
+        opts(None, true),
+        opts(Some(CaseMap::Lower), false),
+        opts(Some(CaseMap::Upper), true),
     ] {
-        let predicate = TermPredicate::parse(kind, arg).unwrap();
+        for (kind, arg) in [
+            ("str_prefix", "a"),
+            ("str_prefix", "http://example.org/s0"),
+            ("contains", "\"b\""),
+            ("contains", "\"b\"@en"),
+            ("contains", "<http://example.org/s0>"),
+            ("strstarts", "\"a\""),
+            ("strstarts", "\"http\""),
+            ("strends", "\"c\""),
+            (
+                "strends",
+                "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+            ),
+        ] {
+            cases.push((kind, arg.to_owned(), options.clone()));
+        }
+    }
+    for (kind, arg, options) in &cases {
+        let predicate = TermPredicate::parse_with(kind, arg, options).unwrap();
         for codes in [&all, &odd, &vec![]] {
             let (passed, undecided) = dict.filter_codes(&predicate, codes).unwrap();
             let (mut want_passed, mut want_undecided) = (Vec::new(), Vec::new());
@@ -342,13 +585,54 @@ async fn filter_codes_matches_eval() {
             assert_eq!(
                 passed.as_slice(),
                 &want_passed[..],
-                "{kind} {arg:?}: passed"
+                "{kind} {arg:?} {options:?}: passed"
             );
             assert_eq!(
                 undecided.as_slice(),
                 &want_undecided[..],
-                "{kind} {arg:?}: undecided"
+                "{kind} {arg:?} {options:?}: undecided"
             );
+        }
+    }
+}
+
+/// A spelling that is no term at all — what a foreign writer's dictionary can
+/// hold in a kind's range — never passes and never panics, under every string
+/// kind and every reading of the text. A bare `"` has no literal to parse and
+/// a bare `<`, `_` or `_:` no IRI or label to read, so they are undecided;
+/// `string()` still rejects the kind such a spelling looks like (an IRI or a
+/// blank node), so there it fails.
+#[test]
+fn malformed_spellings_are_never_true() {
+    for (kind, arg) in [
+        ("str_prefix", "a"),
+        ("str_prefix", ""),
+        ("contains", "\"a\""),
+        ("contains", "\"\""),
+        ("strstarts", "\"a\"@en"),
+        ("strends", "\"a\""),
+        ("strends", "<http://ex.org/a>"),
+    ] {
+        for options in [
+            opts(None, false),
+            opts(None, true),
+            opts(Some(CaseMap::Lower), false),
+            opts(Some(CaseMap::Upper), true),
+        ] {
+            let predicate = TermPredicate::parse_with(kind, arg, &options).unwrap();
+            for spelling in ["<", "<é", "_", "_:", "\"", ""] {
+                let want = match spelling {
+                    // No term, or a literal that does not parse.
+                    "" | "\"" => Verdict::Unknown,
+                    _ if options.as_str => Verdict::Unknown,
+                    _ => Verdict::False,
+                };
+                assert_eq!(
+                    predicate.eval(spelling),
+                    want,
+                    "{kind} {arg:?} {options:?} on {spelling:?}"
+                );
+            }
         }
     }
 }

@@ -54,7 +54,7 @@ pub use self::ingest::DictionaryQuadSink;
 // wasm32-unknown-unknown.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) use self::ingest::{TermCodeMap, TermDictionaryBuilder};
-pub use self::predicates::{KindRanges, NumOp, TermPredicate, Verdict};
+pub use self::predicates::{CaseMap, KindRanges, NumOp, TermPredicate, TextOptions, Verdict};
 use self::term_dict::DictCursor;
 pub(crate) use self::term_dict::TermDictionary;
 pub use self::term_dict::{DictReader, DictSnapshot};
