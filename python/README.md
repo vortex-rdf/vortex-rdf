@@ -121,7 +121,7 @@ uv run pytest tests          # run the test suite
 uv run maturin develop --uv  # fast rebuild while iterating on Rust code
 ```
 
-Rust source changes are picked up by `uv sync` automatically (see `[tool.uv] cache-keys` in pyproject.toml). Without uv: `python -m venv .venv && pip install maturin pytest && maturin develop && pytest tests`.
+Rust source changes are picked up by `uv sync` automatically (see `[tool.uv] cache-keys` in pyproject.toml). Without uv: `python -m venv .venv && pip install maturin pytest "rdflib>=7.6,<8" && maturin develop && pytest tests` (rdflib is the oracle of `tests/test_filter_codes_differential.py`).
 
 Building from source (the sdist or a development build) additionally requires **libclang**: a transitive build dependency of the Vortex file engine (`custom-labels`, via `vortex-io`) generates C bindings with `bindgen` at compile time. It is preinstalled on most dev setups (Xcode, LLVM on Windows); on Linux install e.g. `clang-devel` (dnf) or `libclang-dev` (apt). Installing a published wheel needs none of this.
 
