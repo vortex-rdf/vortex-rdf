@@ -256,10 +256,13 @@ fn path_error(what: &str, path: &std::path::Path, e: std::io::Error) -> VortexRd
 /// at `path` is followed (a chain of them, and a link to a file that is not
 /// there yet, included): the store is written beside the file the links end
 /// at and renamed over it, so a `current -> versions/v3.vortex` setup keeps
-/// its link. The old file's permission bits are copied onto the temp file
-/// before a byte is written, so a private store is never copied into a more
-/// readable temp file. Owner, ACLs and extended attributes are not
-/// preserved: the new file belongs to the writing process.
+/// its link. The temp file for an existing store is created private (`0o600`
+/// on Unix) and the old file's permission bits are set on it before a byte is
+/// written, so a private store is never copied into a more readable temp file,
+/// not even for a moment. A filesystem that refuses that `chmod` fails the
+/// write (there is no store to promise the old permissions to), with the temp
+/// file removed and the old store as it was. Owner, ACLs and extended
+/// attributes are not preserved: the new file belongs to the writing process.
 ///
 /// A store the process cannot write is never replaced: the old file is opened
 /// for writing as a probe (not truncated, not created, nothing changes) before
@@ -305,7 +308,8 @@ impl PendingStore {
     /// Check that `path` can take a store and create the temp file for it:
     /// resolve the links at `path`, refuse a directory and a store this
     /// process cannot write, create the temp file beside the file the store
-    /// will replace and copy that file's permissions onto it.
+    /// will replace (private, for an existing store: see [`create_temp`]) and
+    /// copy that file's permissions onto it.
     pub(crate) async fn create(path: &std::path::Path) -> Result<Self> {
         let io_error = |what: &str, e: std::io::Error| path_error(what, path, e);
         // The refusal to write this path: an error like `io_error`'s, marked as
@@ -375,12 +379,7 @@ impl PendingStore {
         };
 
         let tmp_path = target.with_extension(format!("write-{}.tmp", uuid::Uuid::new_v4()));
-        // `create_new`: a file already at the temp name is never opened, let
-        // alone truncated and then deleted by the guard below.
-        let file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)
+        let file = create_temp(&tmp_path, permissions.is_some())
             .await
             .map_err(|e| {
                 // A directory that takes no new file is as unwritable as a
@@ -393,9 +392,10 @@ impl PendingStore {
             })?;
         let tmp = TempFile(Some(tmp_path));
         if let Some(permissions) = permissions {
-            // Before the first byte, not before the rename: nothing of a
-            // private store is ever readable through the temp file's default
-            // mode.
+            // Before the first byte, not before the rename: the temp file was
+            // born private, so nothing of a private store is ever readable
+            // through its mode, and it only becomes as readable as the old
+            // file was.
             tokio::fs::set_permissions(tmp.path(), permissions)
                 .await
                 .map_err(|e| io_error("copy the permissions onto the temporary file of", e))?;
@@ -440,6 +440,33 @@ impl PendingStore {
         tmp.persist();
         Ok(())
     }
+}
+
+/// Create the temp file at `path`, open for writing.
+///
+/// `create_new`: a file already at the temp name is never opened, let alone
+/// truncated and then deleted by the [`TempFile`] guard.
+///
+/// A temp file that stands in for an existing store (`replacing`) is born
+/// readable and writable by its owner alone on Unix, whatever the umask would
+/// give a new file; the old file's permissions are set on it right after. So a
+/// private store is never in a file others can read, not even for the moment
+/// between the temp file's creation and that `chmod`. A temp file for a fresh
+/// path gets the permissions any new file gets.
+#[cfg(feature = "file-io")]
+pub(crate) async fn create_temp(
+    path: &std::path::Path,
+    replacing: bool,
+) -> std::io::Result<tokio::fs::File> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if replacing {
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = replacing;
+    options.open(path).await
 }
 
 /// How many links [`replacement_target`] follows before it gives up, as many

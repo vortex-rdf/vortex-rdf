@@ -212,9 +212,9 @@ flowchart TD
 ```
 
 - **A file-backed owner stays file-backed**
-  ([`stream_compacted_to_file`](../core/src/store/compaction.rs#L99)): the
+  ([`stream_compacted_to_file`](../core/src/store/compaction.rs#L112)): the
   writer is prepared first
-  ([`PendingStore::create`](../core/src/io/ser.rs#L288), the one writer every
+  ([`PendingStore::create`](../core/src/io/ser.rs#L313), the one writer every
   path-taking build shares), so a source file the process cannot write (a
   read-only file) is refused with `PermissionDenied` before a quad is
   gathered or built ([`add_quads`'s auto-compaction](#51-auto-compaction)
@@ -229,7 +229,7 @@ flowchart TD
   on one filesystem, so it is atomic; a failed write removes the temp file
   and leaves the original untouched. The builder's spill runs are placed in
   the temp file's directory
-  ([`dir`](../core/src/io/ser.rs#L288), [`spill.rs`](../core/src/store/builders/spill.rs#L60)):
+  ([`dir`](../core/src/io/ser.rs#L417), [`spill.rs`](../core/src/store/builders/spill.rs#L60)):
   beside the file being replaced, links followed (a store opened through a
   link spills where the link points, not where the link is), the one volume
   known to fit the data (`VORTEX_RDF_SPILL_DIR` still outranks that default).
@@ -267,8 +267,8 @@ that crosses a threshold on such a store does not fail and does not lose the
 batch: the batch stays in the in-memory tail, where matches and counts see it
 like any appended row, and the call returns `Ok` with the store. Only the
 writer's own refusal is absorbed
-([`is_unwritable`](../core/src/error.rs#L73)): the
-[`PendingStore::create`](../core/src/io/ser.rs#L288) that finds, before a quad
+([`is_unwritable`](../core/src/error.rs#L77)): the
+[`PendingStore::create`](../core/src/io/ser.rs#L313) that finds, before a quad
 is gathered, that the file or its directory cannot be written
 (`PermissionDenied`, or a read-only filesystem). Any other failure of the
 compaction is returned, a permission error from later in the rewrite (a spill

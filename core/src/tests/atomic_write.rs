@@ -628,6 +628,33 @@ mod links_and_permissions {
         assert_eq!(mode_of(&path), 0o600);
     }
 
+    /// A temp file that stands in for an existing store is born private
+    /// (`0o600`), whatever the umask would give a new file, so no byte of a
+    /// private store is ever in a file others can read, not even before the
+    /// old permissions are copied on. A temp for a fresh path gets what any
+    /// new file gets.
+    #[tokio::test]
+    async fn test_a_temp_standing_in_for_a_store_is_born_private() {
+        use crate::io::ser::create_temp;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain");
+        std::fs::File::create(&plain).unwrap();
+        let default = mode_of(&plain);
+        if default == 0o600 {
+            eprintln!("skipped: the umask already makes new files private");
+            return;
+        }
+        let replacing = dir.path().join("replacing.tmp");
+        let fresh = dir.path().join("fresh.tmp");
+
+        create_temp(&replacing, true).await.unwrap();
+        create_temp(&fresh, false).await.unwrap();
+
+        assert_eq!(mode_of(&replacing), 0o600);
+        assert_eq!(mode_of(&fresh), default);
+    }
+
     /// Make `path` read-only, and say whether the process can write it anyway
     /// (root and `CAP_DAC_OVERRIDE` bypass the mode): the refusal can only be
     /// observed where the mode is honoured.

@@ -398,7 +398,7 @@ flowchart TD
 
 Two drivers feed this: [`built_stream_to_vortex_writer`](../core/src/io/ser.rs#L124)
 for a builder's chunk stream (files, compaction; a file is written by
-[`write_store_atomically`](../core/src/io/ser.rs#L210) beside its path and renamed
+[`write_store_atomically`](../core/src/io/ser.rs#L221) beside its path and renamed
 into place, so a failed write leaves no partial file and the previous store
 untouched, and on Unix a store that has the old file mapped keeps reading
 it), and
@@ -406,7 +406,7 @@ it), and
 (`to_bytes`, the bindings' exchange bytes). On the wire the two are the same
 container.
 
-**Replacing a file.** [`PendingStore`](../core/src/io/ser.rs#L288) is the one
+**Replacing a file.** [`PendingStore`](../core/src/io/ser.rs#L297) is the one
 way a store reaches a path (`write_store_atomically` is its `create` followed
 by its `write`). `create` makes `<store>.write-<uuid>.tmp` beside the file it
 replaces *before* any input is read or any row gathered, so a path that cannot
@@ -415,13 +415,20 @@ at the path, a store the process cannot write) is reported at once, by a
 serialization and by a compaction alike; then the build fills the temp file and
 `write` renames it over the old one. What the old file was set up as is kept: a symbolic link
 at the path (or a chain of them) is followed and the file it ends at is
-replaced, so a `current -> versions/v3.vortex` setup keeps its link; the old
-file's permission bits are copied onto the temp file before the first byte is
-written, and a store the process cannot write is never replaced (a read-only
-store signals that it should not be overwritten: the rebuild fails with
-`PermissionDenied` before anything is built, and compaction of such a file
-fails the same way). Owner, ACLs and extended attributes are **not**
-preserved: the new file belongs to the process that wrote it. Two costs follow from the design: a
+replaced, so a `current -> versions/v3.vortex` setup keeps its link; the temp
+file for an existing store is created private (`0600` on Unix, whatever the
+umask) and the old file's permission bits are set on it before the first byte
+is written, so no byte of a private store is ever in a file others can read
+(a path with no store yet gets the permissions any new file does); a
+filesystem that refuses that `chmod` fails the write, with the temp file
+removed and the old store untouched; and a store the process cannot write is
+never replaced (a read-only store signals that it should not be overwritten:
+the rebuild fails with `PermissionDenied`, or the read-only filesystem's error,
+before anything is built, and compaction of such a file fails the same way; an
+append's auto-compaction alone does not fail, it keeps the batch in the
+in-memory tail, see [mutations.md §5.1](mutations.md#51-auto-compaction)).
+Owner, ACLs and extended attributes are **not** preserved: the new file
+belongs to the process that wrote it. Two costs follow from the design: a
 rebuild needs a **writable directory** (a writable file in a read-only
 directory can no longer be rebuilt in place), and about **twice the disk
 space** while the old and the new file coexist (the old file's blocks are freed
@@ -495,7 +502,7 @@ quad once even when the rows it was gathered from did not.
 [`compact_with_indexes`](../core/src/store/compaction.rs#L57) gather every live
 quad, sort, drop repeated quads, and rebuild:
 
-- **A file-backed owner stays file-backed** ([`stream_compacted_to_file`](../core/src/store/compaction.rs#L99)):
+- **A file-backed owner stays file-backed** ([`stream_compacted_to_file`](../core/src/store/compaction.rs#L112)):
   the sorted rows are streamed through `SortedStreamBuilder` — spilling beside
   the store file, not in the OS temp dir — into a sibling temp file
   `<store>.write-<uuid>.tmp`, which is atomically renamed over the original;
