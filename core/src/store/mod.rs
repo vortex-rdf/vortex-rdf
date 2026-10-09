@@ -266,9 +266,10 @@ impl VortexRdfStore {
         layout: ResolvedLayout,
     ) -> Result<Self> {
         // Index children address the base by u32 row id: a base they cannot
-        // number is refused, whoever built the parts.
+        // number is refused, whoever built the parts. Every build checks
+        // first, in its own words; this is the reader's refusal.
         if !components.is_empty() {
-            crate::store::indexes::check_indexed_rows(base.len() as u64)?;
+            crate::store::indexes::check_adopted_rows(base.len() as u64)?;
         }
         let components: Arc<[IndexComponent]> = components.into();
         // The queryable index set follows the component roster, exactly as

@@ -7,7 +7,9 @@
 //! reached with a handful of quads.
 
 use super::*;
-use crate::store::indexes::{MAX_INDEXED_ROWS, check_indexed_rows, next_row_id};
+use crate::store::indexes::{
+    MAX_INDEXED_ROWS, check_adopted_rows, check_indexed_rows, next_row_id,
+};
 use crate::store::test_hooks::RowLimit;
 
 /// The lowered limit the build-path tests run under.
@@ -22,14 +24,33 @@ fn indexes() -> Indexes {
     vec![IndexType::SecondaryByReference, IndexType::SecondaryByCopy]
 }
 
-/// `result` is the refusal of a store past [`LIMIT`] quads.
+/// `result` is a build's refusal of a store past [`LIMIT`] quads.
 fn assert_refused<T>(result: crate::error::Result<T>, label: &str) {
     let Err(err) = result else {
         panic!("{label}: a store past the row limit must be refused");
     };
     let message = err.to_string();
     assert!(
-        message.contains("would exceed 5 quads") && message.contains("u32"),
+        matches!(err, VortexRdfError::Serialization(_))
+            && message.contains("would exceed 5 quads")
+            && message.contains("u32"),
+        "{label}: {message}"
+    );
+}
+
+/// `result` is the refusal to read a store that already holds
+/// `LIMIT + 1` quads: nothing is built, so the store is unreadable, not
+/// unwritable.
+fn assert_unreadable<T>(result: crate::error::Result<T>, label: &str) {
+    let Err(err) = result else {
+        panic!("{label}: a store past the row limit must be refused");
+    };
+    let message = err.to_string();
+    assert!(
+        matches!(err, VortexRdfError::Deserialization(_))
+            && message.contains("the store holds 6 quads, more than this version")
+            && message.contains("at most 5 quads")
+            && message.contains("u32"),
         "{label}: {message}"
     );
 }
@@ -49,10 +70,13 @@ fn row_ids_count_to_the_limit_and_refuse_the_row_past_it() {
     assert_eq!(rows, 3, "a refused row is not counted");
     assert!(check_indexed_rows(3).is_ok());
     assert!(check_indexed_rows(4).is_err());
+    assert!(check_adopted_rows(3).is_ok());
+    assert!(check_adopted_rows(4).is_err());
 }
 
 /// Without the hook the limit is `u32::MAX` quads: the last row id a store
-/// assigns is `u32::MAX - 1`, and the refusal names the limit in full.
+/// assigns is `u32::MAX - 1`, and the build's and the reader's refusals
+/// name the limit in full.
 #[test]
 fn the_format_limit_is_u32_max_quads() {
     assert_eq!(MAX_INDEXED_ROWS, u64::from(u32::MAX));
@@ -62,6 +86,15 @@ fn the_format_limit_is_u32_max_quads() {
         .to_string();
     assert!(
         message.contains("would exceed 4,294,967,295 quads (4,294,967,296 quads)"),
+        "{message}"
+    );
+    assert!(check_adopted_rows(MAX_INDEXED_ROWS).is_ok());
+    let message = check_adopted_rows(MAX_INDEXED_ROWS + 1)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("holds 4,294,967,296 quads, more than this version")
+            && message.contains("at most 4,294,967,295 quads"),
         "{message}"
     );
     let mut rows = MAX_INDEXED_ROWS - 1;
@@ -198,7 +231,8 @@ async fn rebuilds_refuse_a_store_grown_past_the_row_limit() {
 
 /// Adopting index children over a base past the limit is refused, whoever
 /// built the parts — `from_parts`, `from_built` — and so is opening a file
-/// whose index children would have to address it, mapped or loaded.
+/// whose index children would have to address it, mapped or loaded. The
+/// store already holds the rows, so each is a read error.
 #[tokio::test]
 async fn adoption_refuses_index_children_past_the_row_limit() {
     // Built under the format's limit, adopted under the lowered one.
@@ -222,16 +256,16 @@ async fn adoption_refuses_index_children_past_the_row_limit() {
         .unwrap();
 
     let _limit = RowLimit::set(LIMIT as u64);
-    assert_refused(VortexRdfStore::from_parts(parts), "from_parts");
-    assert_refused(VortexRdfStore::from_built(built), "from_built");
+    assert_unreadable(VortexRdfStore::from_parts(parts), "from_parts");
+    assert_unreadable(VortexRdfStore::from_built(built), "from_built");
     #[cfg(feature = "file-io")]
     {
-        assert_refused(VortexRdfStore::from_bytes(&bytes).await, "from_bytes");
+        assert_unreadable(VortexRdfStore::from_bytes(&bytes).await, "from_bytes");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store.vortex");
         std::fs::write(&path, &bytes).unwrap();
-        assert_refused(VortexRdfStore::from_file(&path).await, "from_file");
-        assert_refused(
+        assert_unreadable(VortexRdfStore::from_file(&path).await, "from_file");
+        assert_unreadable(
             VortexRdfStore::from_file_in_memory(&path).await,
             "from_file_in_memory",
         );

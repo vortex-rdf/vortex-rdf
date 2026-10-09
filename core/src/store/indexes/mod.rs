@@ -58,7 +58,9 @@ pub(crate) const COL_RID: &str = "rid";
 /// index builds number rows `0..len` as `u32`, so the row count must fit
 /// one. Every build path that assigns row ids checks against it — through
 /// [`check_indexed_rows`] or, row by row, [`next_row_id`] — and refuses the
-/// store rather than let an id wrap.
+/// store rather than let an id wrap; every open of a file and adoption of
+/// parts checks it through [`check_adopted_rows`] and refuses to read a
+/// store past it.
 pub(crate) const MAX_INDEXED_ROWS: u64 = u32::MAX as u64;
 
 /// The row limit in force: [`MAX_INDEXED_ROWS`], lowered only by the tests'
@@ -88,8 +90,8 @@ fn with_separators(n: u64) -> String {
     out
 }
 
-/// The refusal of a store past the row limit; `rows`, when known, is how
-/// many quads it would hold.
+/// A build's refusal of a store past the row limit; `rows`, when known, is
+/// how many quads it would hold.
 fn too_many_rows(rows: Option<u64>) -> VortexRdfError {
     VortexRdfError::Serialization(format!(
         "the store would exceed {} quads{}, which this version of vortex-rdf cannot hold in a \
@@ -101,11 +103,28 @@ fn too_many_rows(rows: Option<u64>) -> VortexRdfError {
 }
 
 /// Refuse to index `rows` quads past the row limit — the check every
-/// in-memory index build and every adoption of index children runs before
-/// a row id is assigned or trusted.
+/// in-memory index build runs before it assigns a row id.
 pub(crate) fn check_indexed_rows(rows: u64) -> Result<()> {
     if rows > row_limit() {
         return Err(too_many_rows(Some(rows)));
+    }
+    Ok(())
+}
+
+/// Refuse to read a store whose index children address `rows` quads past
+/// the row limit — the check every open of a file and every adoption of
+/// built or serialized parts runs before it trusts a row id. The store
+/// already holds the rows (some other build wrote them), so unlike
+/// [`check_indexed_rows`] this is a read error, not a build's refusal.
+pub(crate) fn check_adopted_rows(rows: u64) -> Result<()> {
+    if rows > row_limit() {
+        return Err(VortexRdfError::Deserialization(format!(
+            "the store holds {} quads, more than this version of vortex-rdf reads: a store \
+             with secondary indexes holds at most {} quads, as an index child records each \
+             row id as a u32",
+            with_separators(rows),
+            with_separators(row_limit()),
+        )));
     }
     Ok(())
 }
