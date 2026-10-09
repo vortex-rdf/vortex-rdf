@@ -32,13 +32,17 @@ use crate::error::{Result, VortexRdfError};
 use crate::store::schema::TermCode;
 
 /// The code ranges of a sorted dictionary's term kinds. Codes are
-/// lexicographic ranks of the N-Triples spelling, so every kind is one
-/// contiguous range, in byte order: the empty spelling of the default graph
-/// (code 0, when any quad is in the default graph), then literals (`"`),
-/// IRIs (`<`), blank nodes (`_:`). Anything a dictionary of this crate never
-/// holds falls in the gaps between those ranges.
+/// lexicographic ranks of the N-Triples spelling, offset by the dictionary's
+/// first code, so every kind is one contiguous range, in byte order: the
+/// empty spelling of the default graph (the first code, when any quad is in
+/// the default graph), then literals (`"`), IRIs (`<`), blank nodes (`_:`).
+/// Anything a dictionary of this crate never holds falls in the gaps between
+/// those ranges.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KindRanges {
+    /// The dictionary's first code: every code is at or above it. 0 in every
+    /// dictionary this version builds.
+    pub start: TermCode,
     /// The code of `""`, the default graph's name, when present.
     pub default_graph: Option<TermCode>,
     /// Codes of the literals.
@@ -47,15 +51,16 @@ pub struct KindRanges {
     pub iris: Range<TermCode>,
     /// Codes of the blank nodes.
     pub blanks: Range<TermCode>,
-    /// The dictionary's size: every code is below it.
+    /// One past the dictionary's last code: every code is below it. With
+    /// `start` 0 it is the dictionary's size.
     pub len: TermCode,
 }
 
 impl KindRanges {
-    /// The codes in none of the three kind ranges, ascending — a foreign
-    /// writer's spellings, and the default graph's `""`.
+    /// The codes in none of the three kind ranges, ascending from `start` —
+    /// a foreign writer's spellings, and the default graph's `""`.
     pub fn gaps(&self) -> impl Iterator<Item = TermCode> + '_ {
-        (0..self.literals.start)
+        (self.start..self.literals.start)
             .chain(self.literals.end..self.iris.start)
             .chain(self.iris.end..self.blanks.start)
             .chain(self.blanks.end..self.len)
@@ -1675,6 +1680,7 @@ mod tests {
     #[test]
     fn kind_verdicts_agree_with_eval() {
         let kinds = KindRanges {
+            start: 0,
             default_graph: Some(0),
             literals: 1..3,
             iris: 3..4,
@@ -1826,6 +1832,7 @@ mod tests {
     #[test]
     fn as_str_kind_verdicts_agree_with_eval() {
         let kinds = KindRanges {
+            start: 0,
             default_graph: Some(0),
             literals: 1..3,
             iris: 3..4,

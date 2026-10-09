@@ -425,6 +425,7 @@ async fn test_kind_ranges_partition_codes() {
     let reader = store.dict_reader().unwrap();
     let terms = all_terms(&reader).await;
     let kinds = reader.kind_ranges().await.unwrap();
+    assert_eq!(kinds.start, 0);
     assert_eq!(kinds.len as usize, terms.len());
     assert_eq!(
         kinds.default_graph,

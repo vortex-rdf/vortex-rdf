@@ -405,6 +405,7 @@ impl FileBackedDict {
             .filter(|window| window.first.is_empty())
             .map(|_| self.0.code_at(0));
         let kinds = KindRanges {
+            start: self.0.base(),
             default_graph,
             literals: self.prefix_range("\"").await?,
             iris: self.prefix_range("<").await?,

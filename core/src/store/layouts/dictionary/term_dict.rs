@@ -515,6 +515,7 @@ impl TermDictionary {
             let default_graph =
                 (self.len() > 0 && self.cursor().bytes_at(0).is_empty()).then(|| self.code_at(0));
             KindRanges {
+                start: self.base(),
                 default_graph,
                 literals: self.prefix_range("\""),
                 iris: self.prefix_range("<"),
