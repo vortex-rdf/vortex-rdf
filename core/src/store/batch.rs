@@ -110,11 +110,18 @@ impl VortexRdfStore {
             IdsNeed::Rows
         };
         let view = self.run_pattern_and_keeps(probe, need).await?;
-        if !windowed {
-            return Ok(view);
-        }
-        view.window(probe.offset, probe.limit.unwrap_or(usize::MAX))
-            .await
+        let view = if windowed {
+            view.window(probe.offset, probe.limit.unwrap_or(usize::MAX))
+                .await?
+        } else {
+            view
+        };
+        // The view leaves the store's hands, and its rows may be streamed.
+        debug_assert!(
+            !view.quads.is_pending_without_plan(),
+            "a probe's view is never pending without a serve plan: only a count or a window holds one"
+        );
+        Ok(view)
     }
 
     /// One probe's view before its window: the pattern and the keeps.

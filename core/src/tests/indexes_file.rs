@@ -919,3 +919,94 @@ async fn test_reference_index_pending_run_composes() {
         }
     }
 }
+
+/// A view built only to be counted or windowed is pending without a serve
+/// plan — the one state nothing that reads rows may hold — and no view a
+/// caller gets back is: not the row path's, nor a window, a keep, or a
+/// probe's, windowed or not, with keeps or without.
+#[tokio::test]
+async fn test_only_a_counted_view_is_pending_without_a_plan() {
+    use crate::store::{IdsNeed, Probe};
+    let quads = graph_modular_quads(900, 4, 3, 7, &[GraphName::DefaultGraph]);
+    let (_dir, path) = write_store_file(
+        quads,
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByReference],
+    )
+    .await;
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    for store in [
+        VortexRdfStore::from_file(&path).await.unwrap(),
+        VortexRdfStore::from_file_in_memory(&path).await.unwrap(),
+    ] {
+        let counted = store
+            .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
+            .await
+            .unwrap();
+        assert!(counted.debug_pending_without_plan());
+        // Resolving it leaves none behind, and the row path never builds one.
+        let admit_all = Keep::range(0..u32::MAX);
+        let window = counted.window(3, 10).await.unwrap();
+        assert!(!window.debug_pending_without_plan());
+        let kept = counted.keep(QuadColumn::O, &admit_all).await.unwrap();
+        assert!(!kept.debug_pending_without_plan());
+        let rows = store
+            .match_pattern(None, Some(&p1), None, None)
+            .await
+            .unwrap();
+        assert!(!rows.debug_pending_without_plan());
+
+        let by_p = Probe::new(None, Some(p1.clone()), None, None);
+        let probes = [
+            by_p.clone(),
+            by_p.clone().window(0, Some(5)),
+            by_p.clone().window(5, None),
+            by_p.clone().window(0, Some(0)),
+            by_p.clone().keep(QuadColumn::O, admit_all.clone()),
+            by_p.clone()
+                .keep(QuadColumn::O, admit_all.clone())
+                .window(1, Some(2)),
+        ];
+        for probe in &probes {
+            let view = store.run_probe(probe).await.unwrap();
+            assert!(!view.debug_pending_without_plan(), "{probe:?}");
+        }
+        for view in store.match_many(&probes).await.unwrap() {
+            assert!(!view.debug_pending_without_plan());
+        }
+    }
+}
+
+/// Streaming the rows of a view built only to be counted is refused loudly,
+/// not answered from a selection nobody read.
+async fn stream_a_counted_view(open: impl AsyncFnOnce(&std::path::Path) -> VortexRdfStore) {
+    use crate::store::IdsNeed;
+    let quads = graph_modular_quads(60, 3, 3, 7, &[GraphName::DefaultGraph]);
+    let (_dir, path) = write_store_file(
+        quads,
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByReference],
+    )
+    .await;
+    let store = open(&path).await;
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let counted = store
+        .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
+        .await
+        .unwrap();
+    assert!(counted.debug_pending_without_plan());
+    let _ = counted.quads_vec().await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "count/window view")]
+async fn test_a_counted_file_view_cannot_be_streamed() {
+    stream_a_counted_view(async |path| VortexRdfStore::from_file(path).await.unwrap()).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "count/window view")]
+async fn test_a_counted_in_memory_view_cannot_be_streamed() {
+    stream_a_counted_view(async |path| VortexRdfStore::from_file_in_memory(path).await.unwrap())
+        .await;
+}

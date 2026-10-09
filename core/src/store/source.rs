@@ -110,6 +110,23 @@ impl QuadsSource {
         }
     }
 
+    /// Whether the selection is still pending with no serve plan to read
+    /// through — the state of a view built only to be counted or windowed
+    /// (`IdsNeed::CountOrWindow`). It is resolved by counting, windowing or
+    /// keeping the view; nothing that reads rows may hold one, so no view a
+    /// caller gets back is in it.
+    pub(crate) fn is_pending_without_plan(&self) -> bool {
+        match self {
+            QuadsSource::InMemory {
+                selection, serve, ..
+            } => matches!(selection, ViewSelection::Pending(_)) && serve.is_none(),
+            #[cfg(feature = "file-io")]
+            QuadsSource::File {
+                selection, serve, ..
+            } => matches!(selection, ViewSelection::Pending(_)) && serve.is_none(),
+        }
+    }
+
     /// Whether this source still covers every base row: no pushed-down
     /// filter and an all-rows selection.
     pub(crate) fn is_unrefined(&self) -> bool {

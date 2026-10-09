@@ -75,7 +75,9 @@ impl VortexRdfStore {
 
     /// [`match_pattern`](Self::match_pattern) for a caller whose use of the
     /// view `need` describes; with [`IdsNeed::CountOrWindow`] the view must
-    /// only be counted, windowed or kept (each of which resolves it).
+    /// only be counted, windowed or kept (each of which resolves it). A view
+    /// built for its rows is never pending without a serve plan, which a
+    /// debug assertion checks.
     pub(crate) async fn match_pattern_for(
         &self,
         subject: Option<&NamedOrBlankNode>,
@@ -97,6 +99,10 @@ impl VortexRdfStore {
                     .await?,
             );
         }
+        debug_assert!(
+            need == IdsNeed::CountOrWindow || !matched.quads.is_pending_without_plan(),
+            "a view built for its rows (IdsNeed::Rows) is never pending without a serve plan"
+        );
         Ok(matched)
     }
 

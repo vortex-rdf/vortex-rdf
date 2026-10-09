@@ -159,6 +159,13 @@ impl VortexRdfStore {
         }
     }
 
+    /// Whether this view's selection is pending with no serve plan to read
+    /// through: the state only a view built to be counted or windowed may be
+    /// in, and none a caller gets back is.
+    pub(crate) fn debug_pending_without_plan(&self) -> bool {
+        self.quads.is_pending_without_plan()
+    }
+
     /// How many row ids reads of located index-child runs have asked for on
     /// this file handle (shared by every view of the file); `None` off-file.
     pub(crate) fn debug_located_rid_reads(&self) -> Option<usize> {
