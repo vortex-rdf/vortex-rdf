@@ -38,7 +38,7 @@ def assert_actionable(error: pytest.ExceptionInfo) -> None:
         "written by vortex-rdf 0.11 or earlier",
         "vortex-rdf.store.v1",
         "cannot read",
-        "rebuild it from its RDF source with vortex-rdf 0.12",
+        "rebuild it from its RDF source with vortex-rdf 0.12 or later",
         "serialize_rdf",
     ):
         assert needle in message, (needle, message)

@@ -126,8 +126,8 @@ pub(crate) fn legacy_store_message() -> String {
     format!(
         "this store was written by vortex-rdf 0.11 or earlier (root layout \
          {LEGACY_STORE_LAYOUT_ID}), which this version cannot read; rebuild it \
-         from its RDF source with vortex-rdf 0.12 (the CLI's `serialize`, \
-         Python's `serialize_rdf` or JavaScript's `serializeRdf`)"
+         from its RDF source with vortex-rdf 0.12 or later (the CLI's \
+         `serialize`, Python's `serialize_rdf` or JavaScript's `serializeRdf`)"
     )
 }
 

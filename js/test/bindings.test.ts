@@ -266,7 +266,7 @@ describe('stores written before 0.12 are refused', () => {
             const refused = VortexRdfStore.fromBytes(asWrittenBefore012(bytes));
             await expect(refused).rejects.toThrow(/written by vortex-rdf 0\.11 or earlier/);
             await expect(VortexRdfStore.fromBytes(asWrittenBefore012(bytes))).rejects.toThrow(
-                /rebuild it from its RDF source with vortex-rdf 0\.12.*serializeRdf/,
+                /rebuild it from its RDF source with vortex-rdf 0\.12 or later.*serializeRdf/,
             );
             await expect(VortexRdfStore.fromBytes(asWrittenBefore012(bytes))).rejects.toThrow(
                 /^(?!.*(not a vortex-rdf store file|Invalid encoding ID))/s,
