@@ -98,9 +98,9 @@ class TermDict:
         ``lang``, ``lang_matches``, ``num_lt`` … ``num_ne``. ``lang_matches``
         is BCP 47 basic filtering, decided for ``*`` and for a range of ASCII
         letters, digits and hyphens (``en``, ``en-GB``); any other range,
-        which rdflib reads more widely (``en-*``, padding whitespace), leaves
-        the language-tagged literals undecided. An unknown kind, an invalid
-        argument or an option that does not apply to the kind raises
+        which rdflib may read differently (``en-*``, padding whitespace),
+        leaves the language-tagged literals undecided. An unknown kind, an
+        invalid argument or an option that does not apply to the kind raises
         ``ValueError``. Nothing is memoized."""
         ...
     def prefix_range(self, prefix: str) -> Tuple[int, int]:

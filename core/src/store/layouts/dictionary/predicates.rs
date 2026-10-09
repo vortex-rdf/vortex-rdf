@@ -158,9 +158,9 @@ pub enum TermPredicate {
     Lang(String),
     /// `langMatches(lang(?x), "range")` — BCP 47 basic filtering: `*`
     /// matches any non-empty tag, otherwise a case-insensitive match of the
-    /// range to the tag or to a `-`-delimited prefix of it. A range of
-    /// anything but ASCII letters, digits and hyphens is undecided on a
-    /// tagged literal: rdflib reads it more widely.
+    /// range to the tag or to a `-`-delimited prefix of it. Any range but
+    /// `*` with a character outside ASCII letters, digits and hyphens is
+    /// undecided on a tagged literal: rdflib may read it differently.
     LangMatches(String),
     /// `?x <op> <numeric constant>` under the SPARQL operator mapping.
     Num(NumOp, Number),
@@ -1137,12 +1137,15 @@ impl Number {
     }
 }
 
-/// BCP 47 basic filtering (RFC 4647 §3.3.1) as SPARQL's `langMatches`, on
-/// the ranges where it and rdflib's `_lang_range_check` agree: `*`, or ASCII
-/// letters, digits and hyphens. rdflib reads any other range more widely: a
-/// `*` in any subtag is a wildcard (`en-*` matches `en-gb`), whitespace
-/// around the range is stripped, and Python lower-cases it (the Kelvin sign
-/// to `k`). Those ranges, and a tag outside the same alphabet, are `Unknown`.
+/// BCP 47 basic filtering (RFC 4647 §3.3.1) as SPARQL's `langMatches`,
+/// decided for `*` and for a range of ASCII letters, digits and hyphens,
+/// where it and rdflib's `_lang_range_check` agree. rdflib may read any other
+/// range differently: a `*` in any subtag is a wildcard (`en-*` matches
+/// `en-gb`), whitespace around the range is stripped, and Python lower-cases
+/// it (the Kelvin sign to `k`). A range with a character outside that
+/// alphabet is `Unknown` whether or not rdflib happens to agree (for `en_gb`
+/// it does). So is a tag outside it, which only a foreign writer's file can
+/// hold (the N-Triples ingest rejects one), so that check is defensive.
 fn lang_matches(tag: &str, range: &str) -> Verdict {
     let plain = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
     if range == "*" {
@@ -1264,13 +1267,14 @@ mod tests {
         assert_eq!(any.eval("\"a\""), Verdict::False);
     }
 
-    /// rdflib's `langMatches` reads a range more widely than basic filtering:
-    /// a `*` in any subtag is a wildcard (`en-*` matches `en-gb`), whitespace
-    /// around the range is stripped, and its case mapping is Python's (the
-    /// Kelvin sign lower-cases to `k`). A tagged literal is left undecided for
-    /// every range that is not `*` or ASCII alphanumerics and hyphens.
+    /// rdflib's `langMatches` may read a range differently from basic
+    /// filtering: a `*` in any subtag is a wildcard (`en-*` matches `en-gb`),
+    /// whitespace around the range is stripped, and its case mapping is
+    /// Python's (the Kelvin sign lower-cases to `k`). A tagged literal is left
+    /// undecided for every range but `*` that holds a character outside ASCII
+    /// letters, digits and hyphens, and for a tag outside that alphabet.
     #[test]
-    fn lang_matches_leaves_ranges_rdflib_reads_differently_undecided() {
+    fn lang_matches_leaves_ranges_outside_the_basic_alphabet_undecided() {
         for range in [
             "en-*",
             "*-gb",
@@ -1308,6 +1312,23 @@ mod tests {
                 p("lang_matches", range).eval("\"a\"@en-gb"),
                 Verdict::from(want),
                 "{range:?}"
+            );
+        }
+        // A tag outside the alphabet is only in a foreign writer's file (the
+        // N-Triples ingest rejects it), but the literal view carries it:
+        // undecided for every range but `*`, which looks at no character of it.
+        for spelling in ["\"a\"@en gb", "\"a\"@ en", "\"a\"@en_gb", "\"a\"@é"] {
+            for range in ["en", "en-gb", "e"] {
+                assert_eq!(
+                    p("lang_matches", range).eval(spelling),
+                    Verdict::Unknown,
+                    "{range:?} on {spelling}"
+                );
+            }
+            assert_eq!(
+                p("lang_matches", "*").eval(spelling),
+                Verdict::True,
+                "{spelling}"
             );
         }
     }
