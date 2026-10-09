@@ -1010,3 +1010,239 @@ async fn test_a_counted_in_memory_view_cannot_be_streamed() {
     stream_a_counted_view(async |path| VortexRdfStore::from_file_in_memory(path).await.unwrap())
         .await;
 }
+
+/// The reference children's columns written as several flat leaves — as a
+/// large file has them — change nothing for a located run that crosses a leaf
+/// boundary: its count is its width, and every window, whether it straddles a
+/// boundary or sits inside a leaf, point-read or range-scanned, holds its rows
+/// and asks for exactly them.
+#[tokio::test]
+async fn test_reference_index_runs_across_rid_leaves() {
+    let quads = graph_modular_quads(900, 4, 3, 7, &[GraphName::DefaultGraph]);
+    let (_dir, path) = write_chunked_reference_store_file(&quads, 128).await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    assert_eq!(store.indexes(), &[IndexType::SecondaryByReference]);
+    // 900 rows in 128-row leaves: seven full ones and a short one, in every
+    // column of both children.
+    for component in ["index:ref-p", "index:ref-o"] {
+        for column in ["val", "rid"] {
+            let chunks = store.debug_component_column_chunks(component, column);
+            let chunks = chunks.unwrap_or_default();
+            assert!(
+                chunks.contains("row_count: 900") && chunks.contains("chunks: 8,"),
+                "{component}.{column}: {chunks}"
+            );
+        }
+    }
+
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    // p1's run is child rows 300..600, o2's 258..387: each holds a leaf
+    // boundary (384 and 512; 384), so a window can straddle one.
+    let p_run = store
+        .debug_reference_index_located_run(Some(&p1), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(p_run, 300..600);
+    let o_run = store
+        .debug_reference_index_located_run(None, Some(&o2))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(o_run, 258..387);
+    for run in [&p_run, &o_run] {
+        assert!(
+            run.start / 128 < (run.end - 1) / 128,
+            "{run:?} crosses a leaf"
+        );
+    }
+    // Positions 84 and 212 of p1's run, and 126 of o2's, are the first rows
+    // of a leaf.
+    assert_windows_read_only_their_rows(
+        &store,
+        Some(&p1),
+        None,
+        300,
+        &[
+            (83, 2),
+            (84, 1),
+            (80, 10),
+            (205, 15),
+            (211, 2),
+            (212, 1),
+            (80, 140),
+            (20, 270),
+            (0, 129),
+            (0, 300),
+        ],
+    )
+    .await;
+    assert_windows_read_only_their_rows(
+        &store,
+        None,
+        Some(&o2),
+        129,
+        &[(125, 2), (126, 1), (120, 15), (100, 29), (0, 129)],
+    )
+    .await;
+}
+
+/// A run at the very start of a reference child (child row 0), and one that
+/// ends at its last row, count and window like any other — on a child of one
+/// leaf and on one of several.
+#[tokio::test]
+async fn test_reference_index_runs_at_the_children_edges() {
+    let quads = graph_modular_quads(900, 4, 3, 7, &[GraphName::DefaultGraph]);
+    let single = write_store_file(
+        quads.clone(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByReference],
+    )
+    .await;
+    let leaves = write_chunked_reference_store_file(&quads, 128).await;
+    let predicate = |n: usize| NamedNode::new(format!("http://example.org/p{n}")).unwrap();
+    let object = |n: usize| Term::Literal(Literal::new_simple_literal(format!("o{n}")));
+    for (_dir, path) in [&single, &leaves] {
+        let store = VortexRdfStore::from_file(path).await.unwrap();
+        // The lowest and the highest predicate and object codes: the first
+        // and the last run of each child.
+        for (p, o, run) in [
+            (Some(predicate(0)), None, 0..300u64),
+            (Some(predicate(2)), None, 600..900),
+            (None, Some(object(0)), 0..129),
+            (None, Some(object(6)), 772..900),
+        ] {
+            let located = store
+                .debug_reference_index_located_run(p.as_ref(), o.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(located, Some(run.clone()), "{p:?} {o:?}");
+            let width = (run.end - run.start) as usize;
+            assert_windows_read_only_their_rows(
+                &store,
+                p.as_ref(),
+                o.as_ref(),
+                width,
+                &[
+                    (0, 1),
+                    (0, 5),
+                    (width - 5, 5),
+                    (width - 1, 1),
+                    (width - 1, 10),
+                    (0, width),
+                    (width, 1),
+                ],
+            )
+            .await;
+        }
+    }
+}
+
+/// With named graphs the graph term is the one a reference index does not
+/// cover: a predicate-only or object-only count is the located run's width
+/// while the graph is free, and goes through the run's ids once the pattern
+/// binds one — the same counts and windows as the row path either way, on
+/// both backends.
+#[tokio::test]
+async fn test_reference_index_counts_with_named_graphs() {
+    use crate::store::{IdsNeed, Probe};
+    let named =
+        |n: &str| GraphName::NamedNode(NamedNode::new(format!("http://example.org/{n}")).unwrap());
+    // Four graphs against three predicates and seven objects: none of the
+    // three determines another.
+    let graphs = [
+        GraphName::DefaultGraph,
+        named("g1"),
+        named("g2"),
+        named("g3"),
+    ];
+    let quads = graph_modular_quads(900, 4, 3, 7, &graphs);
+    let (_dir, path) = write_store_file(
+        quads.clone(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByReference],
+    )
+    .await;
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    for store in [
+        VortexRdfStore::from_file(&path).await.unwrap(),
+        VortexRdfStore::from_file_in_memory(&path).await.unwrap(),
+    ] {
+        for (p, o, run) in [(Some(&p1), None, 300usize), (None, Some(&o2), 129)] {
+            for graph in [None, Some(&graphs[0]), Some(&graphs[1]), Some(&graphs[3])] {
+                let label = format!("p {p:?} o {o:?} graph {graph:?}");
+                let want = quads
+                    .iter()
+                    .filter(|q| {
+                        p.is_none_or(|p| q.predicate == *p)
+                            && o.is_none_or(|o| q.object == *o)
+                            && graph.is_none_or(|g| q.graph_name == *g)
+                    })
+                    .count();
+                assert!(want > 25, "{label}: {want}");
+
+                // The row path.
+                let rows = store.match_pattern(None, p, o, graph).await.unwrap();
+                assert_eq!(rows.size().await.unwrap(), want, "{label}");
+                let all = rows.code_columns_gathered().await.unwrap().unwrap();
+
+                // Counted: the run's width while the graph is free, its ids
+                // once the graph is bound (a residual the index does not cover).
+                let counted = store
+                    .match_pattern_for(None, p, o, graph, IdsNeed::CountOrWindow)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    counted.debug_selection_pending(),
+                    graph.is_none(),
+                    "{label}"
+                );
+                assert_eq!(counted.size().await.unwrap(), want, "{label}");
+                let probe = Probe::new(None, p.cloned(), o.cloned(), graph.cloned());
+                let before = store.debug_located_rid_reads();
+                assert_eq!(
+                    store
+                        .count_many(std::slice::from_ref(&probe))
+                        .await
+                        .unwrap(),
+                    vec![want],
+                    "{label}"
+                );
+                if let Some(before) = before {
+                    let read = store.debug_located_rid_reads().unwrap() - before;
+                    assert_eq!(read, if graph.is_none() { 0 } else { run }, "{label}");
+                }
+                let capped = [
+                    probe.clone().window(3, Some(20)),
+                    probe.clone().window(want - 4, Some(10)),
+                    probe.clone().window(want, Some(5)),
+                ];
+                assert_eq!(
+                    store.count_many(&capped).await.unwrap(),
+                    vec![20, 4, 0],
+                    "{label}"
+                );
+
+                // Windows hold the same slice of the rows as the row path.
+                for (offset, limit) in [(0usize, 5usize), (3, 20), (want - 4, 10), (want, 3)] {
+                    let window = store
+                        .run_probe(&probe.clone().window(offset, Some(limit)))
+                        .await
+                        .unwrap();
+                    let (from, to) = (offset.min(want), (offset + limit).min(want));
+                    assert_eq!(window.size().await.unwrap(), to - from, "{label}");
+                    let cols = window.code_columns_gathered().await.unwrap().unwrap();
+                    for (col, whole) in cols.iter().zip(&all) {
+                        assert_eq!(
+                            col.as_slice(),
+                            &whole.as_slice()[from..to],
+                            "{label} ({offset}, {limit})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

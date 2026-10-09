@@ -122,7 +122,31 @@ async fn write_chunked_store_file(
     quads: &[Quad],
     chunk_rows: usize,
 ) -> (tempfile::TempDir, std::path::PathBuf) {
+    write_chunked_store(quads, chunk_rows, false).await
+}
+
+/// [`write_chunked_store_file`] with the reference index built as well and
+/// its two children written in `chunk_rows`-row flat leaves too — the
+/// multi-leaf `val` and `rid` columns of a large file, so that a located run
+/// can cross a leaf boundary at a scale a test can afford.
+#[cfg(feature = "file-io")]
+async fn write_chunked_reference_store_file(
+    quads: &[Quad],
+    chunk_rows: usize,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    write_chunked_store(quads, chunk_rows, true).await
+}
+
+#[cfg(feature = "file-io")]
+async fn write_chunked_store(
+    quads: &[Quad],
+    chunk_rows: usize,
+    reference_index: bool,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    use crate::io::container::BufferedComponentSource;
+    use crate::store::indexes::secondary_by_reference::GlobalReferenceArrays;
     use crate::store::layouts::dictionary::{self, TermDictionary};
+    use vortex_array::IntoArray as _;
     use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
     use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
     use vortex_layout::layouts::struct_::StructStrategy;
@@ -141,6 +165,32 @@ async fn write_chunked_store_file(
         .collect();
     let dtype = chunks[0].dtype().clone();
     let leaves = ChunkedLayoutStrategy::new(FlatLayoutStrategy::default());
+    let mut components = vec![dict.to_write().unwrap()];
+    if reference_index {
+        // The children's rows are the global `(value, row id)` sort of the
+        // codes, cut into `chunk_rows`-row chunks; each chunk is one flat leaf
+        // of each of its columns.
+        for component in GlobalReferenceArrays::from_codes(&codes)
+            .into_components()
+            .unwrap()
+        {
+            let rows = component.rows().unwrap().clone().into_array();
+            let cut: Vec<vortex_array::ArrayRef> = (0..rows.len())
+                .step_by(chunk_rows)
+                .map(|start| {
+                    rows.slice(start..(start + chunk_rows).min(rows.len()))
+                        .unwrap()
+                })
+                .collect();
+            let mut write = component.to_write().unwrap();
+            write.source = std::sync::Arc::new(BufferedComponentSource::try_new(cut).unwrap());
+            write.strategy = std::sync::Arc::new(StructStrategy::new(
+                std::sync::Arc::new(FlatLayoutStrategy::default()),
+                std::sync::Arc::new(leaves.clone()),
+            ));
+            components.push(write);
+        }
+    }
     let mut bytes: Vec<u8> = Vec::new();
     crate::io::container::write_store(
         &crate::session::VORTEX_SESSION,
@@ -154,7 +204,7 @@ async fn write_chunked_store_file(
             std::sync::Arc::new(leaves),
         )),
         true,
-        vec![dict.to_write().unwrap()],
+        components,
     )
     .await
     .unwrap();

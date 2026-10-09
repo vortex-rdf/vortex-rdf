@@ -166,6 +166,22 @@ impl VortexRdfStore {
         self.quads.is_pending_without_plan()
     }
 
+    /// The debug form of an index component column's chunk-probe handle — its
+    /// row count and how many flat leaves the column has — `None` off-file or
+    /// when the column's shape declines the handle.
+    pub(crate) fn debug_component_column_chunks(
+        &self,
+        component: &str,
+        column: &str,
+    ) -> Option<String> {
+        match &self.quads {
+            QuadsSource::InMemory { .. } => None,
+            QuadsSource::File { file, .. } => file
+                .component_column_chunks(component, column)
+                .map(|chunks| format!("{chunks:?}")),
+        }
+    }
+
     /// How many row ids reads of located index-child runs have asked for on
     /// this file handle (shared by every view of the file); `None` off-file.
     pub(crate) fn debug_located_rid_reads(&self) -> Option<usize> {
