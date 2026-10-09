@@ -174,10 +174,11 @@ impl TermDict {
     /// N-Triples spelling (a malformed one is a `ValueError`); `regex` takes
     /// the pattern as `arg` and the SPARQL `flags` (`i`, `s` and `m` apply,
     /// any other letter is ignored), and decides a subset of patterns —
-    /// every text is undecided for the others. Only the dictionary windows
-    /// holding candidates the kind ranges do not decide are read; nothing is
-    /// memoized. An unknown kind or an invalid argument or option raises
-    /// `ValueError`.
+    /// every text is undecided for the others, and for one whose compiled
+    /// program is large (counted repetitions that multiply). Only the
+    /// dictionary windows holding candidates the kind ranges do not decide
+    /// are read; nothing is memoized. An unknown kind or an invalid argument
+    /// or option raises `ValueError`.
     #[pyo3(signature = (kind, arg, codes, *, flags = "", case = None, as_str = false))]
     // The parameters are the Python signature.
     #[allow(clippy::too_many_arguments)]

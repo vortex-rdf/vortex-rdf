@@ -839,11 +839,11 @@ impl TermPredicate {
     /// `strends` (arg: the constant's strict N-Triples spelling — a literal,
     /// `<iri>` or `_:blank`; a malformed one is an error), `regex` (arg: the
     /// pattern as written, with the SPARQL `flags` option; a pattern outside
-    /// the supported subset parses, and leaves every text undecided). Other
-    /// kinds: `is_literal`, `is_iri`, `is_blank` (no argument), `datatype`
-    /// (an IRI, with or without angle brackets), `lang` (a tag),
-    /// `lang_matches` (a BCP 47 language range), `num_lt` … `num_ne` (an
-    /// N-Triples numeric literal such as
+    /// the supported subset, or too large once compiled, parses and leaves
+    /// every text undecided). Other kinds: `is_literal`, `is_iri`,
+    /// `is_blank` (no argument), `datatype` (an IRI, with or without angle
+    /// brackets), `lang` (a tag), `lang_matches` (a BCP 47 language range),
+    /// `num_lt` … `num_ne` (an N-Triples numeric literal such as
     /// `"5"^^<http://www.w3.org/2001/XMLSchema#integer>`, or a bare number
     /// typed by its syntax: `5` is an integer, `1.5` a decimal, `1e3` a
     /// double). `case`/`as_str` on a non-string kind and `flags` on any kind

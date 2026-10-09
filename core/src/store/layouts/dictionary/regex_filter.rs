@@ -19,19 +19,46 @@
 //! without flag `m` leaves a text ending in `\n` undecided (Python's `$` also
 //! matches before a final newline); and a pattern with `\B` leaves the empty
 //! text undecided (Python 3.14 matches `\B` there, 3.11–3.13 do not).
-//! Python's `\s` also covers `\x1c`–`\x1f` on ASCII text, which Rust's Unicode
-//! `\s` leaves out, so it is written out.
+//! The shorthands are therefore spelled out as ASCII class ranges (see
+//! `SHORTHANDS`): Python's `\s` also covers `\x1c`–`\x1f` on ASCII text, which
+//! Rust's `\s` leaves out, and ranges keep the compiled program small where
+//! Rust's Unicode classes take tens of kilobytes each.
+//!
+//! The compiled program is bounded too (`NFA_SIZE_LIMIT`, about 4,000 NFA
+//! states, with a lazy-DFA cache sized to hold the DFA of the largest such
+//! program): counted repetitions multiply (`(?:a{1000}){5}b` is 5,000 states),
+//! and a pattern over the limit is undecided like any other outside the
+//! subset, instead of costing seconds per candidate on long texts.
 
 use std::fmt::Write as _;
 
 use super::predicates::Verdict;
 
-/// Python's `\s` on ASCII text, as class items: `\t \n \x0b \x0c \r`, the
-/// separators `\x1c`–`\x1f`, and the space.
-const PY_SPACE: &str = r"\t-\r\x1C-\x20";
+/// The class shorthands, spelled out on ASCII as Rust class items. One table
+/// serves both uses, wrapped in `[ ]` where a shorthand stands alone
+/// (`escape`) and spliced where it sits in a class (`class_escape`), so the
+/// spellings cannot drift apart. A pattern using one decides ASCII texts only,
+/// so ASCII is all they have to say, and ranges say it in the fewest states:
+/// Rust's Unicode `\w` is about 64 KiB of program by itself and a negated
+/// class (`[^0-9]`) carries the whole non-ASCII half, where each of these is a
+/// handful of states. Python's `\s` also covers `\x1c`–`\x1f` on ASCII text,
+/// which Rust's `\s` leaves out.
+const SHORTHANDS: [(char, &str); 6] = [
+    ('d', r"0-9"),
+    ('D', r"\x00-\x2F\x3A-\x7F"),
+    ('w', r"0-9A-Z_a-z"),
+    ('W', r"\x00-\x2F\x3A-\x40\x5B-\x5E\x60\x7B-\x7F"),
+    ('s', r"\t-\r\x1C-\x20"),
+    ('S', r"\x00-\x08\x0E-\x1B\x21-\x7F"),
+];
 
-/// Python's `\S` on ASCII text, as a (nested) class.
-const PY_NON_SPACE: &str = r"[^\t-\r\x1C-\x20]";
+/// The class items of the shorthand `\letter`, if it is one.
+fn shorthand(letter: char) -> Option<&'static str> {
+    SHORTHANDS
+        .iter()
+        .find(|&&(l, _)| l == letter)
+        .map(|&(_, items)| items)
+}
 
 /// The grammar's escapable metacharacters.
 const ESCAPABLE: &str = r".*+?()[]{}|^$\/-";
@@ -41,6 +68,21 @@ const RUST_META: &str = r"\.+*?()|[]{}^$#&-~";
 
 /// Largest counted repetition the subset takes.
 const MAX_REPEAT: u32 = 1_000;
+
+/// Largest compiled program the subset takes, in bytes of NFA: about 4,000
+/// states. Matching costs O(states) per byte whenever the lazy DFA is not
+/// enough, so this bounds a pattern's cost; the patterns the subset is for are
+/// a few dozen states. Counted repetitions multiply (`(?:a{1000}){5}` is
+/// 5,000 states), so the limit refuses those while a per-count cap cannot.
+const NFA_SIZE_LIMIT: usize = 1 << 17;
+
+/// The lazy DFA's cache, in bytes: 16 MiB, enough to hold the DFA of the
+/// largest program under `NFA_SIZE_LIMIT` on its worst text (every position of
+/// a 4,000-character literal live at once needs between 8 and 10 MiB). A cache
+/// that is too small is slower, not safer: the engine then runs the NFA
+/// simulation for every candidate (20 s instead of 0.06 s for 100 texts of
+/// 10,000 characters). It is allocated only as the texts need it.
+const DFA_CACHE_LIMIT: usize = 1 << 24;
 
 /// Deepest group nesting the subset takes: the translator recurses once per
 /// level, and a pattern is untrusted input, so the depth is bounded well below
@@ -90,8 +132,8 @@ impl RegexTest {
                 .case_insensitive(i)
                 .dot_matches_new_line(s)
                 .multi_line(m)
-                .size_limit(1 << 22)
-                .dfa_size_limit(1 << 22)
+                .size_limit(NFA_SIZE_LIMIT)
+                .dfa_size_limit(DFA_CACHE_LIMIT)
                 .build()
                 .ok()?;
             Some(Compiled {
@@ -261,23 +303,12 @@ impl Translator<'_> {
 
     fn escape(&mut self) -> Option<bool> {
         let e = self.chars.next()?;
+        if let Some(items) = shorthand(e) {
+            self.unicode_sensitive = true;
+            write!(self.out, "[{items}]").ok()?;
+            return Some(true);
+        }
         match e {
-            'd' | 'D' | 'w' | 'W' => {
-                self.unicode_sensitive = true;
-                self.out.push('\\');
-                self.out.push(e);
-                Some(true)
-            }
-            's' => {
-                self.unicode_sensitive = true;
-                write!(self.out, "[{PY_SPACE}]").ok()?;
-                Some(true)
-            }
-            'S' => {
-                self.unicode_sensitive = true;
-                self.out.push_str(PY_NON_SPACE);
-                Some(true)
-            }
             'b' | 'B' => {
                 self.unicode_sensitive = true;
                 self.has_non_boundary |= e == 'B';
@@ -429,20 +460,11 @@ impl Translator<'_> {
 
     fn class_escape(&mut self) -> Option<ClassItem> {
         let e = self.chars.next()?;
-        let shorthand = |t: &mut Self, text: &'static str| {
-            t.unicode_sensitive = true;
-            ClassItem::Shorthand(text)
-        };
-        Some(match e {
-            'd' => shorthand(self, r"\d"),
-            'D' => shorthand(self, r"\D"),
-            'w' => shorthand(self, r"\w"),
-            'W' => shorthand(self, r"\W"),
-            's' => shorthand(self, PY_SPACE),
-            'S' => shorthand(self, PY_NON_SPACE),
-            e if ESCAPABLE.contains(e) => ClassItem::Char(e),
-            _ => return None,
-        })
+        if let Some(items) = shorthand(e) {
+            self.unicode_sensitive = true;
+            return Some(ClassItem::Shorthand(items));
+        }
+        ESCAPABLE.contains(e).then_some(ClassItem::Char(e))
     }
 }
 
@@ -914,5 +936,235 @@ mod tests {
         // A catastrophic pattern for a backtracking engine is linear here.
         let evil = RegexTest::new("^(a+)+$", "");
         assert_eq!(evil.eval(&format!("{}b", "a".repeat(5_000))), False);
+    }
+
+    /// The compiled program is bounded: counted repetitions that multiply
+    /// (about 5,000 states and up) are outside the subset, while the shapes it
+    /// is for stay decided. Each decided row was checked against Python 3.11,
+    /// 3.13 and 3.14 `re.search`.
+    #[test]
+    fn compiled_size_is_bounded() {
+        for pattern in [
+            "(?:a{1000}){5}b",
+            "(?:a{100}){100}b",
+            "(?:a{1000}){1000}b",
+            r"(?:\w{1000}){5}b",
+            r"(?:\S{100}){100}b",
+        ] {
+            for text in ["", "a", "b", "aaaaab", &"a".repeat(6_000)] {
+                assert_eq!(
+                    RegexTest::new(pattern, "").eval(text),
+                    Unknown,
+                    "{pattern:?} on a text of {} characters",
+                    text.len()
+                );
+            }
+        }
+        let literal = "a".repeat(1_999) + "b"; // 2,000 characters
+        let mut rows: Vec<(String, String, Verdict)> = vec![
+            (
+                "(?:a{50}){50}b".into(),
+                format!("{}b", "a".repeat(2_500)),
+                True,
+            ),
+            (
+                "(?:a{50}){50}b".into(),
+                format!("{}b", "a".repeat(2_499)),
+                False,
+            ),
+            ("(?:a{50}){50}b".into(), "a".repeat(3_000), False),
+            (literal.clone(), format!("x{literal}y"), True),
+            (literal.clone(), format!("x{}", &literal[1..]), False),
+            (r"^\w{3,10}$".into(), "abc_123".into(), True),
+            (r"^\w{3,10}$".into(), "ab".into(), False),
+            (r"^\w{3,10}$".into(), "abcdefghijk".into(), False),
+            (r"^\w{3,10}$".into(), "ab cd".into(), False),
+            (
+                "[0-9A-Za-z_]{1000}x".into(),
+                format!("{}x", "a1_".repeat(334)),
+                True,
+            ),
+            (
+                "[0-9A-Za-z_]{1000}x".into(),
+                format!("{}x", "a".repeat(999)),
+                False,
+            ),
+        ];
+        // Every shorthand, counted to the cap, is cheap enough to decide.
+        for (letter, member) in [
+            ('w', 'a'),
+            ('W', '!'),
+            ('d', '7'),
+            ('D', 'a'),
+            ('s', ' '),
+            ('S', 'a'),
+        ] {
+            let pattern = format!(r"\{letter}{{1000}}x");
+            rows.push((
+                pattern.clone(),
+                format!("{}x", member.to_string().repeat(1_000)),
+                True,
+            ));
+            rows.push((
+                pattern,
+                format!("{}x", member.to_string().repeat(999)),
+                False,
+            ));
+        }
+        for (pattern, text, want) in rows {
+            let shown = &pattern[..pattern.len().min(24)];
+            assert_eq!(
+                RegexTest::new(&pattern, "").eval(&text),
+                want,
+                "{shown:?} on a text of {} characters",
+                text.len()
+            );
+        }
+    }
+
+    /// Groups nest to depth 64, capturing or not, and no further; siblings do
+    /// not count.
+    #[test]
+    fn group_nesting_is_decided_at_64_and_undecided_at_65() {
+        let nested = |depth: usize, open: &dyn Fn(usize) -> &'static str| {
+            let opens: String = (0..depth).map(open).collect();
+            format!("{opens}a{}", ")".repeat(depth))
+        };
+        let capturing = |_: usize| "(";
+        let plain = |_: usize| "(?:";
+        let mixed = |i: usize| if i.is_multiple_of(2) { "(" } else { "(?:" };
+        let kinds: [(&str, &dyn Fn(usize) -> &'static str); 3] = [
+            ("capturing", &capturing),
+            ("plain", &plain),
+            ("mixed", &mixed),
+        ];
+        for (name, open) in kinds {
+            for depth in [1, 2, 63, 64] {
+                let test = RegexTest::new(&nested(depth, open), "");
+                assert_eq!(test.eval("xa"), True, "{depth} {name} levels");
+                assert_eq!(test.eval("x"), False, "{depth} {name} levels");
+            }
+            for depth in [65, 66, 100] {
+                let test = RegexTest::new(&nested(depth, open), "");
+                assert_eq!(test.eval("xa"), Unknown, "{depth} {name} levels");
+                assert_eq!(test.eval("x"), Unknown, "{depth} {name} levels");
+            }
+        }
+        let siblings = RegexTest::new(&"(a)".repeat(100), "");
+        assert_eq!(siblings.eval(&"a".repeat(100)), True);
+        assert_eq!(siblings.eval("aaa"), False);
+    }
+
+    /// Python's ASCII `\d \w \s` (checked against `re` on 3.11, 3.13 and 3.14
+    /// for all 128 characters; `\s` includes `\x1c`–`\x1f`) and their
+    /// complements, alone, in classes, in negated classes and counted.
+    #[test]
+    fn shorthands_are_exact_on_every_ascii_character() {
+        let member = |letter: char, c: char| {
+            let in_set = match letter.to_ascii_lowercase() {
+                'd' => c.is_ascii_digit(),
+                'w' => c.is_ascii_alphanumeric() || c == '_',
+                's' => matches!(c, '\t'..='\r' | '\x1c'..=' '),
+                _ => unreachable!(),
+            };
+            in_set != letter.is_ascii_uppercase()
+        };
+        let mut wrong = Vec::new();
+        for letter in ['d', 'D', 'w', 'W', 's', 'S'] {
+            let patterns = [
+                format!(r"\{letter}"),
+                format!(r"[\{letter}]"),
+                format!(r"[^\{letter}]"),
+                format!(r"[x\{letter}]"),
+                format!(r"[\{letter}x]"),
+                format!(r"[a-c\{letter}_]"),
+                format!(r"[^a-c\{letter}]"),
+                format!(r"\{letter}{{2}}"),
+                format!(r"x\{letter}y"),
+                format!(r"x[^\{letter}]y"),
+            ];
+            for flags in ["", "i", "ms"] {
+                let tests: Vec<RegexTest> = patterns
+                    .iter()
+                    .map(|pattern| RegexTest::new(pattern, flags))
+                    .collect();
+                for code in 0u8..128 {
+                    let c = char::from(code);
+                    let is = member(letter, c);
+                    // Flag `i` folds the class's own letters, not the shorthands.
+                    let folded = if flags.contains('i') {
+                        c.to_ascii_lowercase()
+                    } else {
+                        c
+                    };
+                    let abc = ('a'..='c').contains(&folded);
+                    let x = folded == 'x';
+                    // The text each pattern meets, and whether it matches.
+                    let cases = [
+                        (format!("{c}"), is),
+                        (format!("{c}"), is),
+                        (format!("{c}"), !is),
+                        (format!("{c}"), is || x),
+                        (format!("{c}"), is || x),
+                        (format!("{c}"), is || abc || c == '_'),
+                        (format!("{c}"), !(is || abc)),
+                        (format!("{c}{c}"), is),
+                        (format!("x{c}y"), is),
+                        (format!("x{c}y"), !is),
+                    ];
+                    for ((test, pattern), (text, want)) in tests.iter().zip(&patterns).zip(cases) {
+                        let got = test.eval(&text);
+                        if got != Verdict::from(want) {
+                            wrong.push(format!("{pattern} {flags:?} on {text:?}: {got:?}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} wrong, first: {:#?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(10)]
+        );
+    }
+
+    /// The largest programs the size limit admits still match long texts at
+    /// speed: the lazy DFA's cache holds their DFA, where a smaller cache sends
+    /// every candidate to the NFA simulation (about 20 s for these 100 texts in
+    /// a release build, minutes in a debug one). The budget is generous, so a
+    /// slow machine passes and only that cliff fails.
+    #[test]
+    fn programs_under_the_size_limit_match_long_texts_quickly() {
+        use std::time::{Duration, Instant};
+        let texts: Vec<String> = (0..100).map(|i| "a".repeat(9_900 + i)).collect();
+        let literal = "a".repeat(3_500);
+        for (pattern, want) in [
+            ("(?:a{1000}){3}b", False),
+            ("a{1000}a{1000}a{1000}b", False),
+            ("(?:a{50}){50}b", False),
+            (literal.as_str(), True),
+            (r"\w{1000}b", False),
+            (r"(?:\w{20}){50}b", False),
+        ] {
+            let test = RegexTest::new(pattern, "");
+            assert_ne!(
+                test.eval("a"),
+                Unknown,
+                "{:?} is within the size limit",
+                &pattern[..pattern.len().min(24)]
+            );
+            let start = Instant::now();
+            for text in &texts {
+                assert_eq!(test.eval(text), want);
+                assert!(
+                    start.elapsed() < Duration::from_secs(20),
+                    "{:?} took {:?} for {} texts of about 10,000 characters",
+                    &pattern[..pattern.len().min(24)],
+                    start.elapsed(),
+                    texts.len()
+                );
+            }
+        }
     }
 }

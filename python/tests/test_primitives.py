@@ -551,6 +551,28 @@ def test_filter_codes_rejects_malformed_constants(dictionary):
     term_dict.filter_codes("regex", '"a"^^xsd:string', every)
 
 
+def test_filter_codes_regex_compiled_size_is_bounded(dictionary):
+    """A pattern whose compiled program is large (counted repetitions
+    multiply) is undecided, like any pattern outside the subset, instead of
+    costing seconds per candidate; the shapes the subset is for stay decided."""
+    _, term_dict = dictionary
+    terms = _terms(term_dict)
+    every = U32Column(range(len(terms)))
+    code = {t: c for c, t in enumerate(terms)}
+    alice, anon, bob = code['"Alice"'], code['"Anon"'], code['"Bob"@en']
+
+    def run(arg):
+        passed, undecided = term_dict.filter_codes("regex", arg, every)
+        return _codes(passed), _codes(undecided)
+
+    for pattern in ["(?:a{1000}){5}b", "(?:a{100}){100}b", r"(?:\w{1000}){5}b", "(?:a{1000}){1000}"]:
+        assert run(pattern) == ([], [0, alice, anon, bob]), pattern
+    for pattern in ["(?:a{50}){50}b", "[0-9A-Za-z_]{1000}x", r"\w{1000}x", "a" * 2000]:
+        assert run(pattern) == ([], [0]), pattern
+    assert run(r"^\w{3,10}$") == ([alice, anon, bob], [0])
+    assert run(r"^\W+$") == ([], [0])
+
+
 # Texts for the REGEX tests against Python's own `re`: the edges of the subset
 # (a final newline, the empty text, ASCII and non-ASCII whitespace and word
 # characters, letters Unicode case-folds across ASCII, an astral character).
@@ -563,6 +585,8 @@ REGEX_TEXTS = [
     "\u03c3", "\u03c2", "x y.z@a.b", "aaaa", "ababcc", "ababc", "Alice", "bob", "BOB", "Zed", "a1_", "_", "1", "}",
     "]", "a]", "{", "\u00e0", "\u00ff", "|",
 ]
+# Every ASCII character on its own, so each class shorthand meets all 128.
+REGEX_TEXTS += [chr(c) for c in range(128) if chr(c) not in REGEX_TEXTS]
 
 REGEX_PATTERNS = [
     # Literals, anchors, alternation, groups and quantifiers.
@@ -575,6 +599,9 @@ REGEX_PATTERNS = [
     # Shorthands, boundaries and anchors.
     r"\d", r"\D", r"\w", r"\W", r"\s", r"\S", r"\d+", r"\S+$", r"\bfoo\b", r"\Bo", r"\b", r"\B", r"a\b", r"a\B",
     r"\w+\b$", r"\Aa", r"\Aa|b", r"^\B$", r"x*\B", r"\B$", r"\s$", r"\W$",
+    # Counted and nested shorthands, and programs around the compiled-size limit.
+    r"\w{3}", r"^\w{3,10}$", r"\d{2,}", r"\D{2}", r"\W+", r"\S{1,3}$", r"\s{2}", r"[\w-]{2}", r"[^\w\s]", r"[\D\s]",
+    r"(?:\w\d){2}", r"\w{1000}x", r"\s{1000}", "(?:a{50}){50}b", "(?:a{1000}){5}b", "(?:a{1000}){1000}", "a" * 2000,
     # Classes.
     "[a-c]", "[^a-c]", "[abc]", "[^a]", "[a-]", "[-a]", "[a-c-e]", r"[\d-]", r"[-\d]", r"[\w.]+@[\w.]+", r"[\s,]+",
     r"[\S]", r"[^\s]", r"[\W]", r"[\D]", r"[^\S]", r"[\^\-\]\\]", "[$]", "[.]", "[a|b]", "[a-]]", "[^^]", "[a^]",
@@ -663,7 +690,7 @@ def test_filter_codes_regex_agrees_with_python_re(regex_dictionary):
                 assert compiled is not None, (pattern, flags, text)
                 assert (code in passed) == bool(compiled.search(text)), (pattern, flags, text)
                 decided += 1
-    assert decided > 50_000, decided  # most of the 114k pairs are decided
+    assert decided > 100_000, decided  # most of the pairs are decided
 
     # The rules that leave texts undecided do so, whatever the Python version.
     def undecided_of(pattern, flags=""):

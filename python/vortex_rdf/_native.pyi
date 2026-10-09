@@ -86,12 +86,13 @@ class TermDict:
         ``(?:...)``, alternation, and the quantifiers ``* + ? {n} {n,}
         {n,m}`` with their lazy forms. Any other pattern (backreferences,
         lookaround, inline flags, named groups, other escapes, whatever
-        Python rejects or reads differently from the native engine) leaves
-        every text undecided, as does flag ``i`` on a pattern with a non-ASCII
-        character. A pattern using the shorthands, ``\b``/``\B`` or flag
-        ``i`` decides ASCII texts only; a pattern with ``$`` and without flag
-        ``m`` leaves a text ending in a newline undecided; a pattern with
-        ``\B`` leaves the empty text undecided.
+        Python rejects or reads differently from the native engine, and any
+        pattern whose compiled program is large, such as counted repetitions
+        that multiply) leaves every text undecided, as does flag ``i`` on a
+        pattern with a non-ASCII character. A pattern using the shorthands,
+        ``\b``/``\B`` or flag ``i`` decides ASCII texts only; a pattern with
+        ``$`` and without flag ``m`` leaves a text ending in a newline
+        undecided; a pattern with ``\B`` leaves the empty text undecided.
 
         Other kinds: ``is_literal``, ``is_iri``, ``is_blank``, ``datatype``,
         ``lang``, ``lang_matches``, ``num_lt`` … ``num_ne``. An unknown kind,
