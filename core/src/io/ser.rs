@@ -210,13 +210,42 @@ where
 
 /// Write a store file all-or-nothing: `write` fills a temp file created
 /// beside `path`, which is renamed over `path` only once `write` succeeded.
-/// Every store a path-taking writer produces (`quads_stream_to_vortex_file`,
-/// and compaction's rewrite of its own source file) goes through here.
+/// Every store a path-taking writer produces goes through a [`PendingStore`]:
+/// this is the form for a caller that has its bytes to write straight away
+/// (`quads_stream_to_vortex_file` builds inside `write`), which is
+/// [`PendingStore::create`] followed by [`PendingStore::write`]. A caller that
+/// has work to do before it has bytes (compaction gathers, sorts and builds
+/// first) makes the two calls itself, with the work in between, so that a
+/// path that cannot take a store is refused before that work starts.
+#[cfg(feature = "file-io")]
+pub(crate) async fn write_store_atomically<F, Fut>(path: &std::path::Path, write: F) -> Result<()>
+where
+    F: FnOnce(tokio::fs::File) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    PendingStore::create(path).await?.write(write).await
+}
+
+/// `what` went wrong with the store at `path`: the I/O error, with the path in
+/// the message and its kind kept.
+#[cfg(feature = "file-io")]
+fn path_error(what: &str, path: &std::path::Path, e: std::io::Error) -> VortexRdfError {
+    VortexRdfError::Io(std::io::Error::new(
+        e.kind(),
+        format!("{what} {path:?}: {e}"),
+    ))
+}
+
+/// A store file about to be written all-or-nothing: the path has been checked
+/// and the temp file exists beside the file it will replace, and nothing has
+/// been built yet. [`create`](Self::create) is where a path that cannot take a
+/// store is refused; [`write`](Self::write) fills the temp file and renames it
+/// into place.
 ///
-/// A path that cannot take a store fails before `write` runs: a directory at
-/// `path` is refused, and the temp file is created first, so a missing
-/// directory or a refused write permission is reported at once — a caller
-/// that reads its input inside `write` has not read it yet.
+/// A path that cannot take a store fails in `create`, before anything is
+/// built: a directory at `path` is refused, and the temp file is created
+/// first, so a missing directory or a refused write permission is reported at
+/// once.
 ///
 /// The temp file is a sibling so the rename stays on one filesystem, which
 /// is what makes it atomic. The uuid in its name avoids colliding with a
@@ -253,100 +282,131 @@ where
 /// leave a short or empty file at `path`.
 ///
 /// The temp file is removed on every way out that does not rename it: an
-/// error from `write`, a failed rename, a panic, or this future being
-/// dropped.
+/// error from `write`, a failed rename, a panic, or this value being dropped
+/// (including by the future that holds it being dropped).
 #[cfg(feature = "file-io")]
-pub(crate) async fn write_store_atomically<F, Fut>(path: &std::path::Path, write: F) -> Result<()>
-where
-    F: FnOnce(tokio::fs::File) -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
-{
-    let io_error = |what: &str, e: std::io::Error| {
-        VortexRdfError::Io(std::io::Error::new(
-            e.kind(),
-            format!("{what} {path:?}: {e}"),
-        ))
-    };
+pub(crate) struct PendingStore {
+    /// The path the caller named, for error messages.
+    path: std::path::PathBuf,
+    /// The file the store replaces: `path`, or where the links at `path` end.
+    target: std::path::PathBuf,
+    tmp: TempFile,
+    file: tokio::fs::File,
+}
 
-    // The file this store replaces: `path`, or where the links at `path` end.
-    let target = replacement_target(path)
-        .await
-        .map_err(|e| io_error("resolve", e))?;
-    // A directory can never be replaced by a store: say so now, not at the
-    // rename after the build. Otherwise remember the old file's permissions
-    // (none for a fresh path).
-    let permissions = match tokio::fs::metadata(&target).await {
-        Ok(meta) if meta.is_dir() => {
-            return Err(io_error(
-                "replace",
-                std::io::Error::new(std::io::ErrorKind::IsADirectory, "is a directory"),
-            ));
-        }
-        Ok(meta) => {
-            // A store this process could not write is never replaced: a
-            // read-only store signals that it should not be overwritten, as
-            // `File::create` honoured by failing. The rename itself needs
-            // only the directory, so the file is asked directly — opened for
-            // writing, neither truncated nor created, so nothing changes — and
-            // is judged as `File::create` judged it (root still bypasses).
-            match tokio::fs::OpenOptions::new()
-                .write(true)
-                .open(&target)
-                .await
-            {
-                Ok(_probe) => {}
-                // Gone since the stat: a fresh path after all.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    let via = if target == path {
-                        String::new()
-                    } else {
-                        format!(" ({target:?})")
-                    };
-                    return Err(io_error(
-                        "replace",
-                        std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            format!(
-                                "the existing store{via} is not writable by this process, \
-                                 and a store it cannot write is never replaced"
-                            ),
-                        ),
-                    ));
-                }
-                Err(e) => return Err(io_error("inspect", e)),
-            }
-            Some(meta.permissions())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(io_error("inspect", e)),
-    };
+#[cfg(feature = "file-io")]
+impl PendingStore {
+    /// Check that `path` can take a store and create the temp file for it:
+    /// resolve the links at `path`, refuse a directory and a store this
+    /// process cannot write, create the temp file beside the file the store
+    /// will replace and copy that file's permissions onto it.
+    pub(crate) async fn create(path: &std::path::Path) -> Result<Self> {
+        let io_error = |what: &str, e: std::io::Error| path_error(what, path, e);
 
-    let tmp_path = target.with_extension(format!("write-{}.tmp", uuid::Uuid::new_v4()));
-    // `create_new`: a file already at the temp name is never opened, let alone
-    // truncated and then deleted by the guard below.
-    let file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp_path)
-        .await
-        .map_err(|e| io_error("create a temporary file beside", e))?;
-    let tmp = TempFile(Some(tmp_path));
-    if let Some(permissions) = permissions {
-        // Before the first byte, not before the rename: nothing of a private
-        // store is ever readable through the temp file's default mode.
-        tokio::fs::set_permissions(tmp.path(), permissions)
+        // The file this store replaces: `path`, or where the links at `path` end.
+        let target = replacement_target(path)
             .await
-            .map_err(|e| io_error("copy the permissions onto the temporary file of", e))?;
+            .map_err(|e| io_error("resolve", e))?;
+        // A directory can never be replaced by a store: say so now, not at the
+        // rename after the build. Otherwise remember the old file's permissions
+        // (none for a fresh path).
+        let permissions = match tokio::fs::metadata(&target).await {
+            Ok(meta) if meta.is_dir() => {
+                return Err(io_error(
+                    "replace",
+                    std::io::Error::new(std::io::ErrorKind::IsADirectory, "is a directory"),
+                ));
+            }
+            Ok(meta) => {
+                // A store this process could not write is never replaced: a
+                // read-only store signals that it should not be overwritten,
+                // as `File::create` honoured by failing. The rename itself
+                // needs only the directory, so the file is asked directly —
+                // opened for writing, neither truncated nor created, so
+                // nothing changes — and is judged as `File::create` judged it
+                // (root still bypasses).
+                match tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&target)
+                    .await
+                {
+                    Ok(_probe) => {}
+                    // Gone since the stat: a fresh path after all.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        let via = if target == path {
+                            String::new()
+                        } else {
+                            format!(" ({target:?})")
+                        };
+                        return Err(io_error(
+                            "replace",
+                            std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                format!(
+                                    "the existing store{via} is not writable by this process, \
+                                     and a store it cannot write is never replaced"
+                                ),
+                            ),
+                        ));
+                    }
+                    Err(e) => return Err(io_error("inspect", e)),
+                }
+                Some(meta.permissions())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(io_error("inspect", e)),
+        };
+
+        let tmp_path = target.with_extension(format!("write-{}.tmp", uuid::Uuid::new_v4()));
+        // `create_new`: a file already at the temp name is never opened, let
+        // alone truncated and then deleted by the guard below.
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .await
+            .map_err(|e| io_error("create a temporary file beside", e))?;
+        let tmp = TempFile(Some(tmp_path));
+        if let Some(permissions) = permissions {
+            // Before the first byte, not before the rename: nothing of a
+            // private store is ever readable through the temp file's default
+            // mode.
+            tokio::fs::set_permissions(tmp.path(), permissions)
+                .await
+                .map_err(|e| io_error("copy the permissions onto the temporary file of", e))?;
+        }
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            target,
+            tmp,
+            file,
+        })
     }
 
-    write(file).await?;
-    tokio::fs::rename(tmp.path(), &target)
-        .await
-        .map_err(|e| io_error("replace", e))?;
-    // Renamed into place: there is no temp file left to remove.
-    tmp.persist();
-    Ok(())
+    /// Fill the temp file with `write` and rename it over the file it
+    /// replaces. If `write` fails, or the rename does, the temp file is
+    /// removed and the old file is as it was.
+    pub(crate) async fn write<F, Fut>(self, write: F) -> Result<()>
+    where
+        F: FnOnce(tokio::fs::File) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let Self {
+            path,
+            target,
+            tmp,
+            file,
+        } = self;
+        write(file).await?;
+        tokio::fs::rename(tmp.path(), &target)
+            .await
+            .map_err(|e| path_error("replace", &path, e))?;
+        // Renamed into place: there is no temp file left to remove.
+        tmp.persist();
+        Ok(())
+    }
 }
 
 /// How many links [`replacement_target`] follows before it gives up, as many

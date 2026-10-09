@@ -405,12 +405,14 @@ it), and
 (`to_bytes`, the bindings' exchange bytes). On the wire the two are the same
 container.
 
-**Replacing a file.** [`write_store_atomically`](../core/src/io/ser.rs#L210) is
-the one way a store reaches a path. It creates `<store>.write-<uuid>.tmp`
-beside the file it replaces *before* any input is read, so a path that cannot
+**Replacing a file.** [`PendingStore`](../core/src/io/ser.rs#L288) is the one
+way a store reaches a path (`write_store_atomically` is its `create` followed
+by its `write`). `create` makes `<store>.write-<uuid>.tmp` beside the file it
+replaces *before* any input is read or any row gathered, so a path that cannot
 take a store (a missing directory, no permission to write there, a directory
-at the path) is reported at once, then builds into the temp file and renames
-it over the old one. What the old file was set up as is kept: a symbolic link
+at the path, a store the process cannot write) is reported at once, by a
+serialization and by a compaction alike; then the build fills the temp file and
+`write` renames it over the old one. What the old file was set up as is kept: a symbolic link
 at the path (or a chain of them) is followed and the file it ends at is
 replaced, so a `current -> versions/v3.vortex` setup keeps its link; the old
 file's permission bits are copied onto the temp file before the first byte is

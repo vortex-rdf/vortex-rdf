@@ -198,31 +198,35 @@ compacted had lost it (a tail, or a narrowed match result).
 
 ```mermaid
 flowchart TD
-    C["compact_with_indexes(indexes)"] --> L["live_raw_quads(): base then tail, tombstones out"]
+    C["compact_with_indexes(indexes)"] --> O{"owner of a file?"}
+    O -- "yes" --> P["PendingStore::create: resolve links, refuse a directory<br/>or a store the process cannot write, create<br/>&lt;store&gt;.write-&lt;uuid&gt;.tmp — before anything is gathered"]
+    P --> L["live_raw_quads(): base then tail, tombstones out"]
     L --> S["sort_unstable, dedup — (s, p, o, g)"]
-    S --> O{"owner of a file?"}
-    O -- "yes" --> F1["build_chunk_stream over the sorted rows,<br/>spilling beside the store file"]
-    F1 --> F2["write &lt;store&gt;.write-&lt;uuid&gt;.tmp<br/>(write_store_atomically → built_stream_to_vortex_writer)"]
+    S --> F1["build_chunk_stream over the sorted rows,<br/>spilling beside the store file"]
+    F1 --> F2["built_stream_to_vortex_writer into the temp file"]
     F2 --> F3["rename the temp file over the original"]
     F3 --> F4["reopen with the same dictionary-residency budget"]
-    O -- "no" --> M1["build_parts_from_raws: rows, components,<br/>fresh dictionary under Dictionary"]
+    O -- "no" --> L2["live_raw_quads(), sort_unstable, dedup"]
+    L2 --> M1["build_parts_from_raws: rows, components,<br/>fresh dictionary under Dictionary"]
     M1 --> M2["compress_built_parts → an owning in-memory store"]
 ```
 
 - **A file-backed owner stays file-backed**
   ([`stream_compacted_to_file`](../core/src/store/compaction.rs#L99)): the
-  sorted rows are streamed through the out-of-core builder
+  writer is prepared first
+  ([`PendingStore::create`](../core/src/io/ser.rs#L288), the one writer every
+  path-taking build shares), so a source file the process cannot write (a
+  read-only file) is refused with `PermissionDenied` before a quad is
+  gathered or built, and the sibling temp file `<store>.write-<uuid>.tmp`
+  exists before the work starts; then the sorted rows are streamed through the
+  out-of-core builder
   ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L150))
-  into a sibling temp file `<store>.write-<uuid>.tmp`
-  ([`write_store_atomically`](../core/src/io/ser.rs#L210), the one writer every
-  path-taking build shares, around
-  [`built_stream_to_vortex_writer`](../core/src/io/ser.rs#L124)), which is
+  into it
+  ([`built_stream_to_vortex_writer`](../core/src/io/ser.rs#L124)), which is
   then renamed over the original path; the store is reopened with the
   residency budget it was opened with. The sibling placement keeps the rename
   on one filesystem, so it is atomic; a failed write removes the temp file
-  and leaves the original untouched, and a store file the process cannot
-  write (a read-only file) is not compacted at all: the compaction fails with
-  `PermissionDenied`. The builder's spill runs are placed in
+  and leaves the original untouched. The builder's spill runs are placed in
   the store file's own directory ([`spill.rs`](../core/src/store/builders/spill.rs#L60)),
   the one volume known to fit the data (`VORTEX_RDF_SPILL_DIR` still
   outranks that default).

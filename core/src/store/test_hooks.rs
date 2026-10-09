@@ -20,6 +20,27 @@ use crate::store::{QuadsSource, VortexRdfStore};
 
 pub(crate) use crate::store::mutation::{TAIL_FLATTEN_FLOOR, TAIL_MAX_CHUNKS};
 
+thread_local! {
+    /// How many times this thread gathered a store's live rows into raw quads
+    /// (`live_raw_quads`, compaction's first step). Thread-local because the
+    /// tests share a process and run on the current-thread runtime, so a test
+    /// reads only its own gathers.
+    static GATHERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Record one gather of live rows (called by `live_raw_quads`).
+pub(crate) fn note_gather() {
+    GATHERS.with(|gathers| gathers.set(gathers.get() + 1));
+}
+
+/// The gathers of live rows this thread has made so far: a refusal that comes
+/// before any work leaves it unchanged. (Read by the file-backed compaction
+/// tests.)
+#[cfg(feature = "file-io")]
+pub(crate) fn gathers() -> usize {
+    GATHERS.with(std::cell::Cell::get)
+}
+
 #[cfg(feature = "file-io")]
 use oxrdf::NamedOrBlankNode;
 

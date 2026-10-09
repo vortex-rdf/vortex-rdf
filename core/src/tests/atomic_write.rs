@@ -684,6 +684,21 @@ mod links_and_permissions {
         assert_eq!(entries(dir.path()), vec![path.clone()]);
     }
 
+    /// The counter above counts: compacting a store file the process can
+    /// write gathers its live rows exactly once.
+    #[tokio::test]
+    async fn test_compaction_of_a_writable_store_gathers_once() {
+        let (_dir, path) =
+            write_store_file(modular_quads(12, 3, 4), LayoutStrategy::Default, vec![]).await;
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let gathered = crate::store::test_hooks::gathers();
+
+        let compacted = store.compact().await.unwrap();
+
+        assert_eq!(crate::store::test_hooks::gathers(), gathered + 1);
+        assert_eq!(compacted.size().await.unwrap(), 12);
+    }
+
     /// Through a link, the file the link ends at is the one probed: a link to
     /// a read-only store is refused and left as it was, and so is the store.
     #[tokio::test]
@@ -713,7 +728,8 @@ mod links_and_permissions {
 
     /// Compaction rewrites the store file through the same writer, so a store
     /// file the process cannot write is not compacted either: the compaction
-    /// fails and the file is left as it was.
+    /// fails and the file is left as it was — and it fails first, before the
+    /// live rows are gathered, sorted and built (the gather is counted).
     #[tokio::test]
     async fn test_compaction_leaves_a_store_the_process_cannot_write_alone() {
         let (dir, path) =
@@ -730,14 +746,20 @@ mod links_and_permissions {
             GraphName::DefaultGraph,
         );
 
-        let error = store
-            .add_quad(extra)
-            .await
-            .unwrap()
+        let tailed = store.add_quad(extra).await.unwrap();
+        let gathered = crate::store::test_hooks::gathers();
+
+        let error = tailed
             .compact()
             .await
             .err()
             .expect("a read-only store file must not be rewritten");
+
+        assert_eq!(
+            crate::store::test_hooks::gathers(),
+            gathered,
+            "the live rows were gathered although the store file cannot be rewritten"
+        );
 
         assert!(
             matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),

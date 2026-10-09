@@ -467,6 +467,8 @@ impl VortexRdfStore {
     /// Every live quad this view covers, decoded to raw N-Triples term strings
     /// — base rows first (in view order), then tail rows.
     pub(super) async fn live_raw_quads(&self) -> Result<Vec<RawQuad>> {
+        #[cfg(test)]
+        crate::store::test_hooks::note_gather();
         let base = self.base_selected_rows().await?;
         Ok(self.merged_raw_quads(&base).await?.0)
     }
