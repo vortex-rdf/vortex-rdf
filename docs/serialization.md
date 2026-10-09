@@ -109,8 +109,12 @@ pipelines then drop repeated quads straight after sorting, before any row id
 or index child is derived, so the rows and every index describe the same
 deduplicated dataset (an RDF dataset is a set: a quad is in it or is not).
 The rebuilds of [§11](#11-rebuilds-mutated-stores-compaction-export) do the
-same. Nothing re-canonicalizes a `RawQuad` written by hand, whose spelling is
-its author's.
+same. Builders do not parse a term again, so a build's input must come from
+one of the canonical sources: `RawQuad::from_quad` (an `oxrdf` quad), the
+parser, or [`RawQuad::canonical`](../core/src/common/quad.rs#L111), which
+turns four strings into a `RawQuad` and rejects what is no quad (a literal
+subject, a malformed IRI). A `RawQuad` written by hand in some other spelling
+of the same terms is a different quad.
 
 ---
 

@@ -141,6 +141,10 @@ pub use sorted_stream::SortedStreamBuilder;
 /// [`build_vortex_stream`](Self::build_vortex_stream) emits it lazily for the
 /// file writer. Both sort globally by (s, p, o, g); which implementation
 /// exists is decided by the target (see the module doc).
+///
+/// The input quads must be canonical (from [`RawQuad::from_quad`], the parser
+/// or [`RawQuad::canonical`]): a builder interns and compares the spelling it
+/// is given and does not parse a term again.
 pub trait VortexArrayBuilder {
     /// Build the complete dataset as a single (possibly chunked) in-memory
     /// array, together with the layout state the array alone cannot carry

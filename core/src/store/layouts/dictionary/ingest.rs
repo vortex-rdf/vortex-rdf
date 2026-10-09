@@ -138,7 +138,8 @@ impl DictionaryQuadSink {
     }
 
     /// Intern the quad's four terms and append their codes to the pending
-    /// quad columns.
+    /// quad columns. The quad must be canonical (from `RawQuad::from_quad` or
+    /// `RawQuad::canonical`): the spelling given is the term interned.
     pub fn push(&mut self, quad: RawQuad) {
         self.interner.push(quad);
     }

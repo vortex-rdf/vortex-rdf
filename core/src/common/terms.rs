@@ -330,6 +330,37 @@ pub fn canonical_spelling(term: &str) -> Result<String> {
     Ok(parse_term_checked(term)?.to_string())
 }
 
+/// A quad from four term spellings in any of the forms a person types or a
+/// foreign system writes, rendered in the one canonical spelling the builders
+/// intern ([`RawQuad::canonical`]).
+///
+/// Each position goes through the checked parsers a pattern does and so
+/// takes the same tolerant spellings as [`canonical_spelling`] (an IRI with or
+/// without angle brackets, an `xsd:string`-typed or escaped literal, an
+/// upper-case language tag, `""`, `default` or `[]` for the default graph),
+/// and the quad is rendered by [`RawQuad::from_quad`], so a term comes out
+/// exactly as `canonical_spelling` renders it. Unlike `canonical_spelling` it
+/// also requires each term to be one its position can hold: a literal is no
+/// subject, predicate or graph, and a blank node is no predicate. A failure
+/// names the position.
+pub(crate) fn canonical_raw_quad(s: &str, p: &str, o: &str, g: &str) -> Result<RawQuad> {
+    // The checked parsers report an invalid term without saying where it was.
+    fn at<T>(position: &str, parsed: Result<T>) -> Result<T> {
+        parsed.map_err(|error| match error {
+            VortexRdfError::Deserialization(message) => {
+                VortexRdfError::Deserialization(format!("quad {position}: {message}"))
+            }
+            other => other,
+        })
+    }
+    Ok(RawQuad::from_quad(&Quad::new(
+        at("subject", parse_subject_checked(s))?,
+        at("predicate", parse_named_node_checked(p))?,
+        at("object", parse_term_checked(o))?,
+        at("graph", parse_graph_name_checked(g))?,
+    )))
+}
+
 /// [`parse_term`] as a decode step: an object string the columns store,
 /// parsed on the trusted path, with an unrecognized form reported as a
 /// deserialization error.

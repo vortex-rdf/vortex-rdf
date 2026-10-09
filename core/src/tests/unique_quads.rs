@@ -663,6 +663,55 @@ fn test_quads_from_oxrdf_values_render_one_spelling_per_term() {
     );
 }
 
+/// Builders intern the spelling they are given — re-parsing every term of
+/// every build to canonicalize it is ruled out — so two hand-built quads that
+/// spell one term two ways are two quads with two terms, and the same two
+/// through [`RawQuad::canonical`] are one quad with one. Inputs to a build
+/// come from the parser, [`RawQuad::from_quad`] or [`RawQuad::canonical`].
+#[tokio::test]
+async fn test_builders_intern_the_spelling_they_are_given() {
+    let typed = "\"x\"^^<http://www.w3.org/2001/XMLSchema#string>";
+    let by_hand = |o: &str| RawQuad {
+        s: "<http://ex.org/s>".to_string(),
+        p: "<http://ex.org/p>".to_string(),
+        o: o.to_string(),
+        g: String::new(),
+    };
+    let canonical =
+        |o: &str| RawQuad::canonical("<http://ex.org/s>", "<http://ex.org/p>", o, "").unwrap();
+
+    for layout in LAYOUTS {
+        let who = format!("{layout:?}");
+        let hand_built = build_array::<SortedInMemoryBuilder>(
+            raw_vec_stream(vec![by_hand("\"x\""), by_hand(typed)]),
+            layout,
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert_eq!(hand_built.array.len(), 2, "{who}: two spellings, two quads");
+
+        let built = build_array::<SortedInMemoryBuilder>(
+            raw_vec_stream(vec![canonical("\"x\""), canonical(typed)]),
+            layout,
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert_eq!(built.array.len(), 1, "{who}: one RDF quad, one row");
+        let store = VortexRdfStore::from_built(built).unwrap();
+        assert_eq!(
+            tuple_rows(&store.quads_vec().await.unwrap()).len(),
+            1,
+            "{who}"
+        );
+        if layout == LayoutStrategy::Dictionary {
+            // The subject, the predicate, "x" and the default graph.
+            assert_eq!(store.code_read_snapshot().unwrap().len(), 4);
+        }
+    }
+}
+
 // ─── Compaction ────────────────────────────────────────────────────────
 
 fn quad_of(s: &str, p: &str, o: &str) -> Quad {

@@ -93,6 +93,13 @@ pub(crate) async fn serialize_parts<W: VortexWrite + Unpin + Send>(
 /// them it also includes the in-flight components' compressed size (see
 /// `RdfStoreWriteStrategy::write_stream` for why). The dictionary is complete
 /// before any chunk flows and becomes the required `dictionary` child.
+///
+/// The quads must be canonical: build them with [`RawQuad::from_quad`], the
+/// parser ([`parse_quads_from_reader`]) or [`RawQuad::canonical`]. The
+/// builder interns and compares the spelling it is given, so a hand-built
+/// `RawQuad` in another spelling of the same terms is a different quad.
+///
+/// [`parse_quads_from_reader`]: crate::common::terms::parse_quads_from_reader
 #[cfg(feature = "file-io")]
 pub async fn quads_stream_to_vortex_writer<S, W>(
     quads: S,
@@ -165,6 +172,12 @@ where
 /// A path that cannot take a store — a missing directory, no permission to
 /// write there, a directory at `path` — is reported before any input is
 /// read, not after the whole ingest, sort and dictionary have run.
+///
+/// The quads must be canonical, as for [`quads_stream_to_vortex_writer`]:
+/// from [`RawQuad::from_quad`], the parser ([`parse_quads_from_reader`]) or
+/// [`RawQuad::canonical`].
+///
+/// [`parse_quads_from_reader`]: crate::common::terms::parse_quads_from_reader
 #[cfg(feature = "file-io")]
 pub async fn quads_stream_to_vortex_file<S>(
     quads: S,

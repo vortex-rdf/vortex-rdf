@@ -23,8 +23,10 @@
 //!         Term::Literal(Literal::new_simple_literal("hello")),
 //!         GraphName::DefaultGraph,
 //!     );
-//!     // Builders consume `RawQuad` — terms already in the N-Triples form the
-//!     // columns store. `parse_quads_from_reader` yields these directly.
+//!     // Builders consume `RawQuad` — terms already in the canonical
+//!     // N-Triples form the columns store. `RawQuad::from_quad` and
+//!     // `parse_quads_from_reader` yield these; `RawQuad::canonical` makes
+//!     // one from strings.
 //!     let quads = stream::iter(vec![Ok::<_, VortexRdfError>(RawQuad::from_quad(&quad))]);
 //!
 //!     // Sort the stream globally by (s, p, o, g) and adopt the result as a

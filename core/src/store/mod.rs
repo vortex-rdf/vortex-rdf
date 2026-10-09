@@ -191,6 +191,13 @@ impl VortexRdfStore {
     /// The finished store is resident either way. Writing a dataset larger
     /// than memory never has to materialize it — `io::quads_stream_to_vortex_file`
     /// streams the builder's chunks straight into the file writer instead.
+    ///
+    /// The quads must be canonical: build them with [`RawQuad::from_quad`],
+    /// the parser ([`parse_quads_from_reader`]) or [`RawQuad::canonical`]. The
+    /// builders intern and compare the spelling they are given, so a hand-built
+    /// `RawQuad` in another spelling of the same terms is a different quad.
+    ///
+    /// [`parse_quads_from_reader`]: crate::common::terms::parse_quads_from_reader
     pub async fn from_quads(
         quads: impl Stream<Item = Result<RawQuad>> + Unpin + Send + 'static,
         layout: LayoutStrategy,

@@ -54,12 +54,18 @@ impl From<RawQuad> for SharedQuad {
 /// writing to Vortex arrays.
 ///
 /// The strings are the canonical spelling of their RDF terms, which is what
-/// [`from_quad`](Self::from_quad) and the parsers
+/// [`from_quad`](Self::from_quad), the parsers
 /// ([`parse_quads_from_reader`](crate::common::terms::parse_quads_from_reader))
-/// render: `xsd:string` typing dropped, escapes resolved, language tags
-/// lower-cased. Builders intern the spelling they are given and drop repeated
-/// quads by comparing it, so a quad written by hand in some other spelling of
-/// the same terms would count as a different quad.
+/// and [`canonical`](Self::canonical) render: `xsd:string` typing dropped,
+/// escapes resolved, language tags lower-cased.
+///
+/// **Build inputs must come from one of those three.** Builders intern the
+/// spelling they are given and drop repeated quads by comparing it — they do
+/// not parse a term again, which would cost a full parse of every build — so
+/// a quad written by hand in some other spelling of the same terms counts as
+/// a different quad, with its own dictionary entry. The fields are public so
+/// that a quad can be read; to write one from strings, use
+/// [`canonical`](Self::canonical).
 #[derive(Clone, Hash, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct RawQuad {
     /// Subject term.
@@ -89,6 +95,23 @@ impl PartialOrd for RawQuad {
 }
 
 impl RawQuad {
+    /// A quad from four term spellings in any of the forms a person types or
+    /// a foreign system writes, in the canonical spelling a build expects:
+    /// the way to turn strings into a `RawQuad` that interns and compares like
+    /// one a parser produced.
+    ///
+    /// Each position takes the tolerant spellings of
+    /// [`canonical_spelling`](crate::common::terms::canonical_spelling) — an IRI
+    /// with or without angle brackets, a blank node, a literal with escapes, an
+    /// explicit `xsd:string` type or an upper-case language tag, the default
+    /// graph as `""`, `default` or `[]` — and must hold a term its position can
+    /// (no literal subject, predicate or graph, no blank predicate). `"x"`,
+    /// `"x"^^<…#string>` and `"\u0078"` give the same quad, and `"y"@EN` gives
+    /// `"y"@en`. A malformed spelling is an error naming the position.
+    pub fn canonical(s: &str, p: &str, o: &str, g: &str) -> Result<Self> {
+        crate::common::terms::canonical_raw_quad(s, p, o, g)
+    }
+
     /// Render an oxrdf [`Quad`]'s four terms in N-Triples form.
     pub fn from_quad(q: &Quad) -> Self {
         RawQuad {
@@ -137,6 +160,142 @@ fn blank_node_string(b: &oxrdf::BlankNode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A backslash, spelled so a source file carries no `\u` escape of its own.
+    const BS: char = '\\';
+
+    /// A quad's four terms as the plain tuple tests compare (`RawQuad` has no
+    /// `Debug`).
+    fn row(q: &RawQuad) -> (String, String, String, String) {
+        (q.s.clone(), q.p.clone(), q.o.clone(), q.g.clone())
+    }
+
+    fn canonical_o(o: &str) -> RawQuad {
+        RawQuad::canonical("<http://ex.org/s>", "<http://ex.org/p>", o, "").unwrap()
+    }
+
+    /// Every spelling of an RDF term comes out as one: `xsd:string` typing is
+    /// the plain literal, a `\u` escape is resolved, a language tag is
+    /// lower-cased.
+    #[test]
+    fn canonical_gives_one_spelling_per_rdf_term() {
+        let typed = "\"x\"^^<http://www.w3.org/2001/XMLSchema#string>";
+        assert_eq!(canonical_o(typed).o, "\"x\"");
+        assert_eq!(row(&canonical_o(typed)), row(&canonical_o("\"x\"")));
+
+        let escaped = format!("\"{BS}u0078\"");
+        assert_eq!(row(&canonical_o(&escaped)), row(&canonical_o("\"x\"")));
+
+        assert_eq!(canonical_o("\"y\"@EN").o, "\"y\"@en");
+        assert_eq!(row(&canonical_o("\"y\"@EN")), row(&canonical_o("\"y\"@en")));
+        assert_eq!(row(&canonical_o("\"y\"@En")), row(&canonical_o("\"y\"@en")));
+
+        // A different term stays different: an integer is not its lexical form.
+        let integer = "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>";
+        assert_eq!(canonical_o(integer).o, integer);
+        assert_ne!(canonical_o(integer).o, canonical_o("\"1\"").o);
+    }
+
+    /// Each position takes the tolerant spellings a person types: IRIs with or
+    /// without angle brackets, blank nodes, and the default graph as `""`,
+    /// `default` or `[]`.
+    #[test]
+    fn canonical_accepts_the_spellings_of_each_position() {
+        let want = (
+            "<http://ex.org/s>".to_string(),
+            "<http://ex.org/p>".to_string(),
+            "<http://ex.org/o>".to_string(),
+            "".to_string(),
+        );
+        for g in ["", "default", "DEFAULT", "[]"] {
+            let q = RawQuad::canonical("http://ex.org/s", "http://ex.org/p", "http://ex.org/o", g)
+                .unwrap();
+            assert_eq!(row(&q), want, "graph {g:?}");
+        }
+        let blank = RawQuad::canonical("_:b0", "<http://ex.org/p>", "_:b1", "_:g").unwrap();
+        assert_eq!(
+            row(&blank),
+            (
+                "_:b0".to_string(),
+                "<http://ex.org/p>".to_string(),
+                "_:b1".to_string(),
+                "_:g".to_string()
+            )
+        );
+        let named = RawQuad::canonical(
+            "<http://ex.org/s>",
+            "<http://ex.org/p>",
+            "\"o\"",
+            "http://ex.org/g",
+        )
+        .unwrap();
+        assert_eq!(named.g, "<http://ex.org/g>");
+    }
+
+    /// A malformed spelling, or a term in a position that cannot hold it, is
+    /// refused rather than interned.
+    #[test]
+    fn canonical_rejects_what_is_no_quad() {
+        let ok = ("<http://ex.org/s>", "<http://ex.org/p>", "\"o\"", "");
+        let with = |s: &str, p: &str, o: &str, g: &str| RawQuad::canonical(s, p, o, g).is_err();
+        assert!(!with(ok.0, ok.1, ok.2, ok.3));
+        assert!(with("\"a literal\"", ok.1, ok.2, ok.3), "literal subject");
+        assert!(with(ok.0, "_:b", ok.2, ok.3), "blank predicate");
+        assert!(with(ok.0, "\"p\"", ok.2, ok.3), "literal predicate");
+        assert!(with(ok.0, ok.1, ok.2, "\"g\""), "literal graph");
+        assert!(
+            with("<not an iri>", ok.1, ok.2, ok.3),
+            "malformed subject IRI"
+        );
+        assert!(
+            with(ok.0, ok.1, "\"unterminated", ok.3),
+            "malformed literal"
+        );
+        assert!(
+            with(ok.0, ok.1, "\"x\"@not_a_tag", ok.3),
+            "bad language tag"
+        );
+        assert!(
+            with(ok.0, ok.1, "\"x\"^^<not an iri>", ok.3),
+            "bad datatype"
+        );
+        let message = RawQuad::canonical("<bad iri>", ok.1, ok.2, ok.3)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            message.contains("subject"),
+            "the position is named: {message}"
+        );
+    }
+
+    /// The constructor renders exactly what the other two sources of
+    /// canonical quads do: the object as `canonical_spelling` renders it, the
+    /// whole quad as `from_quad` renders the oxrdf quad.
+    #[test]
+    fn canonical_agrees_with_the_other_sources() {
+        use crate::common::terms::canonical_spelling;
+        for o in [
+            "\"x\"",
+            "\"x\"^^<http://www.w3.org/2001/XMLSchema#string>",
+            "\"y\"@EN",
+            "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+            "http://ex.org/o",
+            "_:b",
+        ] {
+            assert_eq!(canonical_o(o).o, canonical_spelling(o).unwrap(), "{o}");
+        }
+        let quad = oxrdf::Quad::new(
+            oxrdf::NamedOrBlankNode::NamedNode(oxrdf::NamedNode::new("http://ex.org/s").unwrap()),
+            oxrdf::NamedNode::new("http://ex.org/p").unwrap(),
+            oxrdf::Term::Literal(oxrdf::Literal::new_language_tagged_literal("y", "EN").unwrap()),
+            oxrdf::GraphName::DefaultGraph,
+        );
+        assert_eq!(
+            row(&canonical_o("\"y\"@EN")),
+            row(&RawQuad::from_quad(&quad))
+        );
+    }
 
     #[test]
     fn shared_quad_to_quad_rejects_an_object_in_no_term_form() {
