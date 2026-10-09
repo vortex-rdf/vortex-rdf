@@ -704,15 +704,31 @@ def test_filter_codes_regex_agrees_with_python_re(regex_dictionary):
     assert set(REGEX_TEXTS) == undecided_of("(?=a)")
 
 
-def test_reference_index_counts_and_windows(indexed_files):
-    store = VortexRdfStore(indexed_files[("dictionary", "secondary-by-reference")])
+@pytest.mark.parametrize("in_memory", [False, True])
+def test_located_reference_runs_agree_with_the_row_path(indexed_files, in_memory):
+    """A guard, not a discriminator. A located run's count (its width) and its
+    windows (its own rows) are exactly what the row path gives, so every
+    assertion here also holds for an implementation that reads the run's row
+    ids first. What tells the two apart, the row ids a count or a window asks
+    the file for, is not visible from Python; it is asserted where the read
+    counter lives, in core/src/tests/indexes_file.rs."""
+    store = VortexRdfStore(indexed_files[("dictionary", "secondary-by-reference")], in_memory=in_memory)
     name = "<http://xmlns.com/foaf/0.1/name>"
     rows = _rows(store.match_codes(p=name))
     assert store.count_quads(p=name) == len(rows) == 3
     assert store.count_quads(p=name, limit=2) == 2
     assert store.count_quads_many([{"p": name, "limit": 1}, (None, name, None, None)]) == [1, 3]
-    assert _rows(store.match_codes(p=name, limit=2)) == rows[:2]
-    assert _rows(store.match_codes(p=name, offset=1, limit=5)) == rows[1:]
+    # Every window of the run, counted and read, against the same slice of its rows.
+    for offset in range(5):
+        for limit in (None, 0, 1, 2, 5):
+            window = rows[offset:] if limit is None else rows[offset : offset + limit]
+            assert _rows(store.match_codes(p=name, offset=offset, limit=limit)) == window, (offset, limit)
+            probe = {"p": name, "offset": offset, "limit": limit}
+            assert store.count_quads_many([probe]) == [len(window)], (offset, limit)
+    # An object-only run: the fixture's one IRI object.
+    bob = "<http://ex.org/bob>"
+    assert store.count_quads(o=bob) == len(_rows(store.match_codes(o=bob))) == 1
+    assert store.count_quads_many([{"o": bob, "offset": 1}]) == [0]
 
 
 @pytest.mark.parametrize("index", [None, "secondary-by-copy", "secondary-by-reference"])
