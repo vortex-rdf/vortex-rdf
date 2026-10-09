@@ -123,6 +123,23 @@ fn probes_runend_sequence_codes_past_u32() {
 }
 
 #[test]
+fn probes_dict_codes_past_u32() {
+    // The twin of `differential.rs`'s dictionary probe, over twenty codes
+    // past u32::MAX and over twenty that straddle it: the dictionary's
+    // values child holds the wide codes.
+    for start in [BASE, u64::from(u32::MAX) - 95] {
+        let data: Vec<u64> = (0..10_000u64).map(|i| start + (i / 500) * 10).collect();
+        let arr = compress_with(&[&integer::IntDictScheme], &data);
+        assert_eq!(
+            arr.encoding_id().as_str(),
+            "vortex.dict",
+            "fixture must produce a dict array"
+        );
+        assert_probe(&arr, &data, &[NodeKind::Dict]);
+    }
+}
+
+#[test]
 fn probes_constant_code_past_u32() {
     let data = vec![BASE; 1000];
     let arr = compress_default(&data);
