@@ -398,7 +398,13 @@ impl VortexRdfStore {
                     pat = resolves.clear(pat);
                     serve = candidate;
                     match row_ids {
-                        ResolvedRowIds::Eager(ids) => selection = selection.intersect_ids(ids),
+                        // Only the file resolvers answer with ids they
+                        // already computed: both in-memory resolvers hand
+                        // their run back as a recipe.
+                        #[cfg(feature = "file-io")]
+                        ResolvedRowIds::Eager(_) => {
+                            unreachable!("an in-memory resolution is always lazy")
+                        }
                         // A serve-attached resolution keeps its ids deferred
                         // when it is this view's sole restriction and nothing
                         // residual is left to check — reads go through the

@@ -291,7 +291,9 @@ pub(crate) enum IndexResolution<Plan> {
 /// `Eager` is a resolution that had to compute its ids to answer at all (a
 /// back-reference probe, or a copy resolution without a serving plan) and is
 /// non-empty by construction — an empty scan short-circuits to
-/// [`IndexResolution::Empty`] instead. `Lazy` rides alongside a serve
+/// [`IndexResolution::Empty`] instead. Only the file resolvers answer this
+/// way: an in-memory resolution is always `Lazy`, so a build without
+/// `file-io` has no `Eager`. `Lazy` rides alongside a serve
 /// plan, or stands alone over a located run whose width is known — only on a
 /// view built for a count or a window (`IdsNeed::CountOrWindow`), which never
 /// streams rows through its selection. A serve plan answers reads straight
@@ -302,10 +304,7 @@ pub(crate) enum IndexResolution<Plan> {
 /// materialize to an *empty* id set; consumers reach it through the view's
 /// pending selection, which handles that like any other narrow selection.
 pub(crate) enum ResolvedRowIds {
-    // Only the file resolvers compute their ids at resolution time: an
-    // in-memory resolution hands its run back as a recipe (`Lazy`) and its
-    // consumer runs it, so builds without `file-io` never construct this.
-    #[cfg_attr(not(feature = "file-io"), allow(dead_code))]
+    #[cfg(feature = "file-io")]
     Eager(Buffer<u64>),
     Lazy(LazyRowIds),
 }
