@@ -42,8 +42,9 @@ let compressor = BtrBlocksCompressorBuilder::empty()
     .build();
 
 // A sorted column with 11-row runs, compressed into whatever encoding the
-// cascade picks for it (here: run-end over a sequence of run ends and a
-// sequence of values).
+// cascade picks for it (here: run-end, with its values a sequence and its
+// run ends bit-packed at 21 bits with one patch: the last run holds only two
+// rows, so the ends are no sequence, and the final end needs a 22nd bit).
 let data: Vec<u32> = (0..2_097_152).map(|i| (i / 11) as u32).collect();
 let canonical = PrimitiveArray::from_iter(data.iter().copied()).into_array();
 let encoded = compressor.compress(&canonical, &mut ctx)?;
@@ -78,10 +79,12 @@ touch), `Slice`, `Chunked`, and `Dict`, composed arbitrarily; the transparent
 `Shared` wrapper resolves to whatever it wraps. `NodeKind` reports the resolved
 tree's shape for tests and diagnostics. Frame-of-reference with a reference per
 1,024-value chunk (the `fastlanes.for.v2` wire form) and bit-packing with a
-width per block decline. BtrBlocks' frame-of-reference scheme takes per-chunk
-references whenever its builder allows `fastlanes.for.v2`: `empty()` allows
-every wire form, `from_session` the ones the session's enabled editions
-include.
+width per block decline. When its builder allows `fastlanes.for.v2`, BtrBlocks'
+frame-of-reference scheme computes a reference per chunk, and an array whose
+chunk minima differ keeps them (one whose references come out constant is
+still single-reference `fastlanes.for`). `empty()` allows every wire form;
+`from_session` allows those both registered in the session and included in an
+edition it enables, and no Vortex core edition includes `fastlanes.for.v2`.
 
 ## The sortedness contract
 
@@ -141,7 +144,7 @@ cargo bench -p vortex-rdf-encoded-search --bench probe
 ## Compatibility
 
 Each release tracks Vortex new releases. This release is built
-against Vortex `0.85`.
+against Vortex `0.88`.
 
 Minimum supported Rust version: 1.95 (edition 2024).
 
