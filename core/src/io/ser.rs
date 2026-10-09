@@ -409,6 +409,15 @@ impl PendingStore {
         })
     }
 
+    /// The directory the temp file is in: beside the file this store
+    /// replaces, links followed (not beside the link a store was opened
+    /// through). The finished store is renamed within it, which makes it the
+    /// one volume known to take a file as large as the store, and so the
+    /// place for a build's scratch space.
+    pub(crate) fn dir(&self) -> Option<&std::path::Path> {
+        self.target.parent()
+    }
+
     /// Fill the temp file with `write` and rename it over the file it
     /// replaces. If `write` fails, or the rename does, the temp file is
     /// removed and the old file is as it was.

@@ -119,16 +119,17 @@ impl VortexRdfStore {
         let stream = futures::stream::iter(raws.into_iter().map(Ok::<_, VortexRdfError>));
         // The sorted builder spills merge runs to disk, and compaction rewrites
         // the whole store, so those runs can reach dataset size. Point them at
-        // the store file's own directory — the one volume known to fit the
-        // data, the same placement as the sibling temp file the writer
-        // creates. The `VORTEX_RDF_SPILL_DIR` override still outranks this
-        // default.
+        // the directory the writer's temp file is in — beside the file being
+        // replaced, links followed — the one volume known to fit the data,
+        // and the one the finished store is renamed within. (Not `path`'s
+        // directory: a store opened through a link may live elsewhere.) The
+        // `VORTEX_RDF_SPILL_DIR` override still outranks this default.
         let built = crate::store::builders::sorted_stream::build_chunk_stream(
             Box::new(stream),
             self.layout.strategy(),
             indexes,
             DEFAULT_CHUNK_ROWS,
-            path.parent(),
+            pending.dir(),
         )
         .await?;
         pending

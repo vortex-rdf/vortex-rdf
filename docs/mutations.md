@@ -202,7 +202,7 @@ flowchart TD
     O -- "yes" --> P["PendingStore::create: resolve links, refuse a directory<br/>or a store the process cannot write, create<br/>&lt;store&gt;.write-&lt;uuid&gt;.tmp — before anything is gathered"]
     P --> L["live_raw_quads(): base then tail, tombstones out"]
     L --> S["sort_unstable, dedup — (s, p, o, g)"]
-    S --> F1["build_chunk_stream over the sorted rows,<br/>spilling beside the store file"]
+    S --> F1["build_chunk_stream over the sorted rows,<br/>spilling beside the temp file"]
     F1 --> F2["built_stream_to_vortex_writer into the temp file"]
     F2 --> F3["rename the temp file over the original"]
     F3 --> F4["reopen with the same dictionary-residency budget"]
@@ -228,9 +228,11 @@ flowchart TD
   residency budget it was opened with. The sibling placement keeps the rename
   on one filesystem, so it is atomic; a failed write removes the temp file
   and leaves the original untouched. The builder's spill runs are placed in
-  the store file's own directory ([`spill.rs`](../core/src/store/builders/spill.rs#L60)),
-  the one volume known to fit the data (`VORTEX_RDF_SPILL_DIR` still
-  outranks that default).
+  the temp file's directory
+  ([`dir`](../core/src/io/ser.rs#L288), [`spill.rs`](../core/src/store/builders/spill.rs#L60)):
+  beside the file being replaced, links followed (a store opened through a
+  link spills where the link points, not where the link is), the one volume
+  known to fit the data (`VORTEX_RDF_SPILL_DIR` still outranks that default).
 - **An in-memory store**, and any *derived view* of a file (whose rows are a
   subset of a file other readers share), rebuilds in memory through
   [`from_raw_quads`](../core/src/store/compaction.rs#L146) →

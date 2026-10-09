@@ -808,6 +808,53 @@ mod links_and_permissions {
         Some(restore)
     }
 
+    /// Compaction's spill runs go where its temp file goes — beside the file
+    /// the store replaces, links followed — not beside the link the store was
+    /// opened through. Through `current -> versions/v3.vortex` in a directory
+    /// that takes no new files, the compaction succeeds because `versions/`
+    /// does, and nothing is left in either directory.
+    #[tokio::test]
+    async fn test_compaction_spills_beside_the_file_it_replaces_not_the_link() {
+        // `VORTEX_RDF_SPILL_DIR` outranks any placement by design: only assert
+        // the default placement when it is absent.
+        if std::env::var_os("VORTEX_RDF_SPILL_DIR").is_some() {
+            eprintln!("skipped: VORTEX_RDF_SPILL_DIR is set");
+            return;
+        }
+        let (dir, v3, current) = versioned_store().await;
+        let store = VortexRdfStore::from_file(&current).await.unwrap();
+        let extra = make_quad(
+            "http://example.org/s99",
+            "http://example.org/p0",
+            "object 9",
+            GraphName::DefaultGraph,
+        );
+        let tailed = store.add_quad(extra).await.unwrap();
+        let Some(_read_only) = read_only_dir(dir.path()) else {
+            return;
+        };
+
+        let compacted = tailed
+            .compact()
+            .await
+            .expect("the link's directory takes no spill runs, the target's directory does");
+
+        assert!(is_link(&current) && !is_link(&v3));
+        assert_eq!(compacted.size().await.unwrap(), 13);
+        assert_eq!(
+            VortexRdfStore::from_file(&v3)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
+            13
+        );
+        let versions = dir.path().join("versions");
+        assert_eq!(entries(dir.path()), vec![current.clone(), versions.clone()]);
+        assert_eq!(entries(&versions), vec![v3]);
+    }
+
     /// 4,200 new quads: past the 4,096-row auto-compaction floor.
     fn past_the_floor() -> Vec<Quad> {
         (100..4_300)

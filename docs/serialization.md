@@ -269,7 +269,8 @@ length, then the archived value) in a per-build temp directory named
 The parent directory is resolved in this order
 ([`spill.rs`](../core/src/store/builders/spill.rs#L60)): the
 `VORTEX_RDF_SPILL_DIR` environment variable, a caller-supplied base (compaction
-passes the store file's own directory), then the OS temp dir.
+passes the directory of its temp file: beside the file it replaces, links
+followed), then the OS temp dir.
 
 | Build | Peak memory |
 |---|---|

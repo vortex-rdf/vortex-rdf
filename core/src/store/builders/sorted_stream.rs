@@ -155,8 +155,9 @@ pub(crate) async fn build_array(
 /// is dropped.
 ///
 /// `spill_dir` pins where the run files land (compaction points it at the
-/// store file's own directory so spills share the output's volume); `None`
-/// takes [`TempRunsGuard::create`]'s default resolution.
+/// directory of its temp file, beside the file it replaces, so spills share
+/// the output's volume); `None` takes [`TempRunsGuard::create`]'s default
+/// resolution.
 pub(crate) async fn build_chunk_stream(
     mut quads_in: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
