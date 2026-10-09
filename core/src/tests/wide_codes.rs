@@ -164,13 +164,13 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
             "{label}"
         );
     }
-    let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
     let codes: Vec<TermCode> = (BASE..BASE + n).collect();
-    assert_eq!(
-        reader.encode_many(&refs).await.unwrap(),
-        codes.iter().copied().map(Some).collect::<Vec<_>>(),
-        "{label}"
-    );
+    // Every term, then one the dictionary lacks.
+    let mut refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+    refs.push("<http://example.org/nobody>");
+    let mut encoded: Vec<Option<TermCode>> = codes.iter().copied().map(Some).collect();
+    encoded.push(None);
+    assert_eq!(reader.encode_many(&refs).await.unwrap(), encoded, "{label}");
     let mut probe = codes.clone();
     probe.extend([BASE - 1, BASE + n, 5, TermCode::MAX]);
     let mut decoded: Vec<Option<String>> = terms.iter().cloned().map(Some).collect();
@@ -190,10 +190,18 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
     assert_eq!(reader.lower_bound("<").await.unwrap(), iri_lo, "{label}");
     assert_eq!(reader.lower_bound("~").await.unwrap(), BASE + n, "{label}");
     let kinds = reader.kind_ranges().await.unwrap();
+    assert_eq!(kinds.start, BASE, "{label}");
     assert_eq!(kinds.default_graph, Some(BASE), "{label}: \"\" sorts first");
     assert_eq!(kinds.iris, iri_lo..iri_hi, "{label}");
     assert_eq!(kinds.len, BASE + n, "{label}");
     assert!(kinds.literals.start > BASE && kinds.blanks.end <= BASE + n);
+    // The gaps start at the first code, not at 0: only `""` is in them
+    // (taking two, so gaps from 0 fail fast instead of counting to BASE).
+    assert_eq!(
+        kinds.gaps().take(2).collect::<Vec<_>>(),
+        vec![BASE],
+        "{label}"
+    );
 
     let is_iri = TermPredicate::parse("is_iri", "").unwrap();
     let (passed, undecided) = reader.filter_codes(&is_iri, &codes).await.unwrap();
@@ -219,6 +227,7 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
     // A resident dictionary also answers through its snapshot.
     if let Some(snapshot) = reader.snapshot() {
         assert_eq!(snapshot.encode(&terms[1]), Some(BASE + 1), "{label}");
+        assert_eq!(snapshot.encode_many(&refs).unwrap(), encoded, "{label}");
         assert_eq!(
             snapshot.decode(BASE + 1).as_deref(),
             Some(terms[1].as_str())
@@ -351,6 +360,20 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
     let matched = store.run_probe(&probes[0]).await.unwrap();
     let [_, _, o, _] = matched.code_columns_gathered().await.unwrap().unwrap();
     assert_eq!(o.as_slice(), &[bob], "{label}");
+    let views = store.match_many(&probes).await.unwrap();
+    let bob_name = Term::Literal(Literal::new_language_tagged_literal("Bob", "en").unwrap());
+    assert_eq!(
+        decoded_rows(&views[0]).await,
+        expected(quads, |q| q.predicate == name && q.object == bob_name),
+        "{label}: match_many"
+    );
+    assert_eq!(
+        decoded_rows(&views[1]).await,
+        alice_rows,
+        "{label}: match_many"
+    );
+    assert_eq!(views[2].size().await.unwrap(), 0, "{label}: match_many");
+    assert_eq!(views[3].size().await.unwrap(), 2, "{label}: match_many");
 
     // ── the column kernels over wide codes ──────────────────────────────
     let [s, p, _, _] = store.code_columns_gathered().await.unwrap().unwrap();
@@ -391,6 +414,11 @@ async fn codes_past_u32_round_trip_in_memory() {
     #[cfg(feature = "file-io")]
     assert_eq!(store.debug_base_child_int_canonical("s"), Some(false));
     check_store(&store, &quads, "built in memory").await;
+
+    // Handed across as parts and adopted.
+    let parts = store.to_serializable_parts().await.unwrap();
+    let adopted = VortexRdfStore::from_parts(parts).unwrap();
+    check_store(&adopted, &quads, "from_parts").await;
 
     // Serialization needs a writer: compiled in under `file-io` (and on wasm).
     #[cfg(feature = "file-io")]
