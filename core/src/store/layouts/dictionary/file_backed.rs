@@ -6,7 +6,8 @@
 //! returns. The handle holds the child's layout (one flat leaf per FSST
 //! window) and each window's first and last term — read at open from the
 //! child's exact zone maps, or from the leaves of a child written without
-//! them (vortex-rdf 0.11 and earlier). A child whose shape a window search
+//! them (chunks of uneven length have no uniform zone to record). A child
+//! whose shape a window search
 //! cannot address is not file-backed at all: [`store::open`](crate::store::open)
 //! lifts it resident instead. The policy enum choosing between this and the
 //! resident form is [`DictAccess`](super::access::DictAccess); the module
@@ -583,7 +584,7 @@ fn bound_column(
 }
 
 /// Each window's bounds read from its own leaf — the fallback for a term
-/// column without exact zone maps (vortex-rdf 0.11 and earlier, or a foreign
+/// column without exact zone maps (chunks of uneven length, or a foreign
 /// writer): two single-term reads per window, at open.
 async fn leaf_bounds(
     leaves: &[(LayoutRef, usize)],
@@ -920,20 +921,22 @@ mod tests {
         assert_eq!(fbd.lower_bound(near.as_bytes()).await.unwrap(), 151);
     }
 
-    /// A version-1 child (what vortex-rdf 0.11 wrote: no zone maps) with many
-    /// windows — the real shape of an old file — opens mapped with every
+    /// A child written without zone maps (chunks of uneven length have no
+    /// uniform zone to record) with many windows opens mapped with every
     /// window's bounds read from its own leaf, and answers like the plain
     /// column in both directions.
     #[tokio::test]
-    async fn v1_child_with_many_windows_reads_every_bound_from_leaves() {
+    async fn unzoned_child_with_many_windows_reads_every_bound_from_leaves() {
         let terms: Vec<String> = (0..600)
             .map(|i| format!("<http://example.org/term/{i:04}>"))
             .collect();
         let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
         let d = TermDictionary::compress_windowed(plain.clone(), 100).unwrap();
-        let bytes = crate::tests::write_v1_dict_only_store(&d).await;
+        let bytes =
+            crate::tests::write_dict_only_store_as(&d, crate::io::container::DICT_VERSION, false)
+                .await;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v1-windows.vortex");
+        let path = dir.path().join("unzoned-windows.vortex");
         std::fs::write(&path, &bytes).unwrap();
         let native = NativeStoreFile::try_new(
             crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
@@ -946,7 +949,7 @@ mod tests {
             .iter()
             .find(|c| c.name == DICT_COMPONENT_NAME)
             .unwrap();
-        assert_eq!(descriptor.version, 1);
+        assert_eq!(descriptor.version, crate::io::container::DICT_VERSION);
         assert!(!crate::tests::dict_term_column(&native).is::<Zoned>());
 
         let fbd = FileBackedDict::open(&native)

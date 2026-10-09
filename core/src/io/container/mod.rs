@@ -55,11 +55,14 @@ pub(crate) const DICT_COMPONENT_NAME: &str = "dictionary";
 /// Implementation slug of the dictionary child: the lexicographically sorted
 /// term column, FSST-compressed as held.
 pub(crate) const DICT_IMPLEMENTATION: &str = "sorted-terms-fsst-v1";
-/// Version of the dictionary child this crate writes: 2 adds exact per-window
-/// `vortex.min()`/`vortex.max()` zone maps on the term column (vortex-rdf
-/// 0.12); version 1 (vortex-rdf 0.11 and earlier) carries none. Readers take
-/// both — without zone maps a window's bounds are read from its leaf.
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+/// Version of the dictionary child: the one this crate writes and the newest
+/// it reads. 2 adds exact per-window `vortex.min()`/`vortex.max()` zone maps on
+/// the term column (vortex-rdf 0.12). A child written without them — chunks
+/// of uneven length adopted from a foreign file have no uniform zone to
+/// record — is still version 2 and still opens: a window's bounds are then
+/// read from its leaf. A child of a *newer* version is refused at open
+/// (`classify_component`): a newer writer may lay it out in a way this reader
+/// would misread without noticing.
 pub(crate) const DICT_VERSION: u32 = 2;
 
 #[cfg(test)]
@@ -122,7 +125,7 @@ mod tests {
             name: DICT_COMPONENT_NAME.into(),
             role: StoreComponentRole::Dictionary,
             implementation: DICT_IMPLEMENTATION.into(),
-            version: 1,
+            version: DICT_VERSION,
             required: true,
             sorted: true,
             dtype,

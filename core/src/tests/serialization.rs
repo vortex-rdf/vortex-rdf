@@ -897,6 +897,69 @@ async fn test_open_rejects_unknown_dictionary_implementation() {
     }
 }
 
+/// A dictionary component of a version newer than the one this version reads
+/// is rejected at open, with an error that says so, whichever way the store
+/// is opened: a newer writer may lay the child out in a way this reader would
+/// silently misread. The current version, and every older one, still opens.
+#[tokio::test]
+async fn test_open_rejects_a_dictionary_version_newer_than_this_version_reads() {
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(dictionary_test_quads()),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await
+    .unwrap();
+    let parts = VortexRdfStore::from_built(arr)
+        .unwrap()
+        .to_serializable_parts()
+        .await
+        .unwrap();
+    let with_version = |version: u32| {
+        let mut dict = parts.dict.as_ref().unwrap().to_write().unwrap();
+        dict.descriptor.version = version;
+        dict
+    };
+
+    for version in [container::DICT_VERSION, container::DICT_VERSION - 1] {
+        let bytes =
+            unstamped_store_bytes(vec![parts.array.clone()], vec![with_version(version)]).await;
+        let (from_bytes, from_file) = open_both(&bytes).await;
+        for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
+            assert!(result.is_ok(), "{path}: version {version} must open");
+        }
+    }
+
+    for version in [container::DICT_VERSION + 1, 99, u32::MAX] {
+        let bytes =
+            unstamped_store_bytes(vec![parts.array.clone()], vec![with_version(version)]).await;
+        let (from_bytes, from_file) = open_both(&bytes).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("newer.vortex");
+        std::fs::write(&path, &bytes).unwrap();
+        let in_memory = VortexRdfStore::from_file_in_memory(&path).await;
+        for (how, result) in [
+            ("from_bytes", from_bytes),
+            ("from_file", from_file),
+            ("from_file_in_memory", in_memory),
+        ] {
+            let err = result
+                .err()
+                .unwrap_or_else(|| panic!("{how}: version {version} must be refused"));
+            let VortexRdfError::Deserialization(message) = &err else {
+                panic!("{how}: expected a Deserialization error, got {err:?}");
+            };
+            assert!(
+                message.contains(&format!("dictionary component is version {version}"))
+                    && message
+                        .contains(&format!("reads up to version {}", container::DICT_VERSION))
+                    && message.contains("newer vortex-rdf"),
+                "{how}: unexpected error: {message}"
+            );
+        }
+    }
+}
+
 /// A required component this version cannot interpret makes the store
 /// unopenable — skipping it could silently change query results — while an
 /// optional unknown component is skipped and the store answers as if it

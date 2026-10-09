@@ -1224,9 +1224,8 @@ mod tests {
         assert!(!crate::tests::dict_term_column(&native).is::<Zoned>());
     }
 
-    /// A dictionary child without zone maps — the shape vortex-rdf 0.11
-    /// wrote, and what chunks of uneven length still write — opens
-    /// file-backed and point-reads across its chunk leaves.
+    /// A dictionary child without zone maps — what chunks of uneven length
+    /// write — opens file-backed and point-reads across its chunk leaves.
     #[cfg(feature = "file-io")]
     #[tokio::test]
     async fn unzoned_dict_child_point_reads_file_backed() {

@@ -141,7 +141,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
                   { "name": "o", "kind": "u32" }, { "name": "g", "kind": "u32" },
                   { "name": "rid", "kind": "u32" } ] },
     { "name": "dictionary", "role": "dictionary",
-      "implementation": "sorted-terms-fsst-v1", "version": 1,
+      "implementation": "sorted-terms-fsst-v1", "version": 2,
       "required": true, "sorted": true,
       "fields": [ { "name": "_dict_term", "kind": "utf8" } ] }
   ]
@@ -237,7 +237,7 @@ are bare codes and cannot be decoded without it.
 | Property | Value |
 |---|---|
 | `name` / `role` | `dictionary` / `dictionary` |
-| `implementation` / `version` | `sorted-terms-fsst-v1` / 1 |
+| `implementation` / `version` | `sorted-terms-fsst-v1` / 2 ([`DICT_VERSION`](../core/src/io/container/mod.rs#L66)); a child of a higher version is refused at open |
 | `required` / `sorted` | `true` / `true` |
 | schema | one column, [`_dict_term`](../core/src/store/layouts/dictionary/term_dict.rs#L45): non-nullable `Utf8` |
 | contents | every distinct term of the dataset — subjects, predicates, objects, graph names and the default graph's `""` in one namespace — sorted, each once |
@@ -250,8 +250,14 @@ that share one symbol table trained on the whole column. The child is written
 through a pass-through strategy ([`dict_child_strategy`](../core/src/io/container/write.rs#L191))
 rather than the default pipeline: a Struct over a Chunked layout of Flat
 leaves, **one leaf per window, written verbatim** — no sampling, no
-re-encoding, and no zone maps. The window boundaries are therefore visible in
-the file, which is what the file-backed reader relies on.
+re-encoding. The window boundaries are therefore visible in the file, which is
+what the file-backed reader relies on. The term column is wrapped in a zone
+map with one zone per window, recording the window's exact first and last term
+(`vortex.min()`/`vortex.max()`): that is what version 2 adds, and it lets the
+reader get every window's bounds from one small table. A child whose chunks are
+not one uniform window (chunks adopted from a foreign file) is written without
+it and is still version 2; the reader then reads each window's bounds from its
+leaf.
 
 **Residency.** At open the store compares the child's on-disk size (a footer
 sum, no I/O) with a budget:

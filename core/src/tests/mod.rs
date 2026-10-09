@@ -374,11 +374,15 @@ pub(crate) async fn write_dict_only_store(
     .await
 }
 
-/// [`write_dict_only_store`] with the dictionary component written the way
-/// vortex-rdf 0.11 wrote it: version 1, and no zone maps on the term column.
+/// [`write_dict_only_store`] with the dictionary component's descriptor at
+/// `version`, and — when `zoned` is false — no zone maps on the term column,
+/// which is what `TermDictionary::to_write` produces for chunks of uneven
+/// length: a reader finds no window bounds and reads them from each leaf.
 #[cfg(feature = "file-io")]
-pub(crate) async fn write_v1_dict_only_store(
+pub(crate) async fn write_dict_only_store_as(
     dict: &crate::store::layouts::dictionary::TermDictionary,
+    version: u32,
+    zoned: bool,
 ) -> Vec<u8> {
     use crate::io::container::{
         self, BufferedComponentSource, NativeComponentWrite, StoreComponentDescriptor,
@@ -386,21 +390,21 @@ pub(crate) async fn write_v1_dict_only_store(
     };
     let chunks = dict.child_chunks().unwrap();
     let dtype = chunks[0].dtype().clone();
-    let v1 = NativeComponentWrite::new(
+    let component = NativeComponentWrite::new(
         StoreComponentDescriptor {
             name: container::DICT_COMPONENT_NAME.into(),
             role: StoreComponentRole::Dictionary,
             implementation: container::DICT_IMPLEMENTATION.into(),
-            version: 1,
+            version,
             required: true,
             sorted: true,
             dtype,
         },
         std::sync::Arc::new(BufferedComponentSource::try_new(chunks).unwrap()),
-        container::dict_child_strategy(None),
+        container::dict_child_strategy(zoned.then(|| dict.uniform_window()).flatten()),
     )
     .unwrap();
-    unstamped_store_bytes(vec![bare_code_quad_array(&[0])], vec![v1]).await
+    unstamped_store_bytes(vec![bare_code_quad_array(&[0])], vec![component]).await
 }
 
 /// A native store file opened over `bytes` held in memory (no file behind it).

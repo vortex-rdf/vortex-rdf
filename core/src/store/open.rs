@@ -41,7 +41,8 @@ pub(super) enum ComponentKind {
 
 /// Interpret one component descriptor for every open path (`from_file`,
 /// `from_bytes`, `scanned_index_components`), owning the rejection of a
-/// dictionary child of an unknown implementation and of an *uninterpretable
+/// dictionary child of an unknown implementation or of a version newer than
+/// [`DICT_VERSION`](container::DICT_VERSION), and of an *uninterpretable
 /// required* component: skipping one — a future change set, say — would
 /// silently change query results.
 pub(super) fn classify_component(
@@ -52,6 +53,16 @@ pub(super) fn classify_component(
             return Err(VortexRdfError::Deserialization(format!(
                 "unsupported dictionary component implementation: {} v{}",
                 descriptor.implementation, descriptor.version
+            )));
+        }
+        // Fail closed on a layout this reader was never checked against.
+        if descriptor.version > container::DICT_VERSION {
+            return Err(VortexRdfError::Deserialization(format!(
+                "unsupported dictionary component version: this store's dictionary component \
+                 is version {}, but this version of vortex-rdf reads up to version {}; \
+                 open it with a newer vortex-rdf",
+                descriptor.version,
+                container::DICT_VERSION
             )));
         }
         return Ok(ComponentKind::Dict);

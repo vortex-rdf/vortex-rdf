@@ -481,7 +481,7 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
             name: DICT_COMPONENT_NAME.into(),
             role: StoreComponentRole::Dictionary,
             implementation: container::DICT_IMPLEMENTATION.into(),
-            version: 1,
+            version: container::DICT_VERSION,
             required: true,
             sorted: true,
             dtype,
@@ -685,14 +685,12 @@ async fn test_large_dictionary_child_lift_keeps_fsst() {
     assert_eq!(lifted.encode("\u{10FFFF}"), None);
 }
 
-/// A dictionary child written the way vortex-rdf 0.11 wrote it — component
-/// version 1, and a term column with no zone-map node to read window bounds
-/// from — opens memory-mapped through the leaf-bound fallback and answers
-/// exactly like its in-memory load. No 0.12 writer produces one and a store
-/// of 0.11 itself is refused at its root, so the shape is built here under
-/// the current root.
+/// A dictionary child written without zone maps — a term column with no
+/// zone-map node to read window bounds from, which `to_write` produces for
+/// chunks of uneven length — opens memory-mapped through the leaf-bound
+/// fallback and answers exactly like its in-memory load.
 #[tokio::test]
-async fn test_v1_dictionary_child_opens_mapped() {
+async fn test_unzoned_dictionary_child_opens_mapped() {
     use crate::store::layouts::dictionary::TermDictionary;
 
     let raws: Vec<crate::store::RawQuad> = dictionary_test_quads()
@@ -700,9 +698,9 @@ async fn test_v1_dictionary_child_opens_mapped() {
         .map(crate::store::RawQuad::from_quad)
         .collect();
     let (dict, _code_map) = TermDictionary::from_quads_with_map(&raws).unwrap();
-    let bytes = write_v1_dict_only_store(&dict).await;
+    let bytes = write_dict_only_store_as(&dict, container::DICT_VERSION, false).await;
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("v1.vortex");
+    let path = dir.path().join("unzoned.vortex");
     std::fs::write(&path, &bytes).unwrap();
     let native = NativeStoreFile::try_new(
         crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
@@ -715,7 +713,7 @@ async fn test_v1_dictionary_child_opens_mapped() {
         .iter()
         .find(|c| c.name == DICT_COMPONENT_NAME)
         .unwrap();
-    assert_eq!(descriptor.version, 1);
+    assert_eq!(descriptor.version, container::DICT_VERSION);
     assert!(!dict_term_column(&native).is::<Zoned>());
     let mapped = VortexRdfStore::from_file(&path).await.unwrap();
     assert!(mapped.debug_dict_file_backed());
@@ -734,8 +732,8 @@ async fn test_v1_dictionary_child_opens_mapped() {
     }
 }
 
-/// A term column written without zone maps (the 0.11 strategy) still opens
-/// file-backed, its window bounds read from the leaves themselves.
+/// A term column written without zone maps still opens file-backed, its
+/// window bounds read from the leaves themselves.
 #[tokio::test]
 async fn test_child_without_zone_maps_reads_bounds_from_leaves() {
     use crate::io::container::{
@@ -753,12 +751,12 @@ async fn test_child_without_zone_maps_reads_bounds_from_leaves() {
     .unwrap();
     let chunks = dict.child_chunks().unwrap();
     let dtype = chunks[0].dtype().clone();
-    let v1 = NativeComponentWrite::new(
+    let unzoned = NativeComponentWrite::new(
         StoreComponentDescriptor {
             name: DICT_COMPONENT_NAME.into(),
             role: StoreComponentRole::Dictionary,
             implementation: container::DICT_IMPLEMENTATION.into(),
-            version: 1,
+            version: container::DICT_VERSION,
             required: true,
             sorted: true,
             dtype,
@@ -767,9 +765,9 @@ async fn test_child_without_zone_maps_reads_bounds_from_leaves() {
         container::dict_child_strategy(None),
     )
     .unwrap();
-    let bytes = unstamped_store_bytes(vec![bare_code_quad_array(&[0])], vec![v1]).await;
+    let bytes = unstamped_store_bytes(vec![bare_code_quad_array(&[0])], vec![unzoned]).await;
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("v1-shape.vortex");
+    let path = dir.path().join("unzoned-shape.vortex");
     std::fs::write(&path, &bytes).unwrap();
     let native = NativeStoreFile::try_new(
         crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
