@@ -60,7 +60,11 @@ static STORE_FAMILY: EditionFamily = EditionFamily {
 /// generation's root (`vortex-rdf.store.v1`) is registered so its files can
 /// be refused with a message (see `io::container`), but it is in no edition,
 /// so nothing can write it.
-const STORE_EDITION: EditionId = EditionId::new("vortexrdf", 2026, 8, 0);
+///
+/// Dated for the `v2` root (October 2026). vortex-rdf 0.11 shipped
+/// `vortexrdf2026.08.0` with the `v1` root as its member, and a released
+/// edition is frozen: a new member gets a new edition, not a changed old one.
+const STORE_EDITION: EditionId = EditionId::new("vortexrdf", 2026, 10, 0);
 
 static STORE_DECLARATION: EditionDeclaration = EditionDeclaration {
     edition: Edition {
@@ -153,6 +157,29 @@ mod tests {
             assert!(!arrays.contains(&id.to_string()), "{id} is admitted");
         }
         editions.validate().unwrap();
+    }
+
+    /// vortex-rdf 0.11 shipped the store edition `vortexrdf2026.08.0` with the
+    /// `v1` root as its member, and a released edition is frozen. The `v2`
+    /// root is a member of a new edition, dated for this change, and no
+    /// edition with the old id is declared here.
+    #[test]
+    fn the_store_edition_is_new_for_the_v2_root() {
+        let editions = VORTEX_SESSION.editions();
+        let shipped_with_0_11 = EditionId::new("vortexrdf", 2026, 8, 0);
+        assert!(editions.find(&shipped_with_0_11).is_none());
+        assert!(editions.find(&STORE_EDITION).is_some());
+        assert!(STORE_EDITION.is_at_or_before(&STORE_EDITION));
+        assert!(
+            shipped_with_0_11.is_at_or_before(&STORE_EDITION) && shipped_with_0_11 != STORE_EDITION,
+            "{STORE_EDITION} must come after {shipped_with_0_11}"
+        );
+        let members: Vec<String> = editions
+            .components_in(&STORE_EDITION, ComponentKind::Layout)
+            .iter()
+            .map(|inclusion| inclusion.component_id.to_string())
+            .collect();
+        assert_eq!(members, [STORE_LAYOUT_ID.to_string()]);
     }
 
     /// Every zone-map aggregate the file writer emits for the schema's column
