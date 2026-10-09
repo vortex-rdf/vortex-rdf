@@ -23,7 +23,9 @@ impl VortexRdfStore {
     /// different index set. `add_quads` calls this automatically when the tail
     /// outgrows the auto-compaction thresholds; a file-backed store rewrites
     /// its source file (atomically) and stays file-backed, whether compacted
-    /// automatically or explicitly.
+    /// automatically or explicitly. If that file cannot be written (a
+    /// read-only store), `add_quads` keeps the batch in the tail instead, and
+    /// only this explicit call reports the refusal.
     ///
     /// [`compact_with_indexes`]: Self::compact_with_indexes
     pub async fn compact(&self) -> Result<Self> {

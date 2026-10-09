@@ -48,7 +48,7 @@ owns its rows accepts them ([§6](#6-ownership-and-owned)).
 ## 2. Additions: the append tail
 
 [`add_quad`](../core/src/store/mutation.rs#L31) /
-[`add_quads`](../core/src/store/mutation.rs#L48) never touch the base — they
+[`add_quads`](../core/src/store/mutation.rs#L54) never touch the base — they
 append into the **Tail**, the write-optimized half of the design beside the
 read-optimized base.
 
@@ -110,8 +110,8 @@ flowchart TD
 
 ## 3. Deletions: tombstone masks
 
-[`delete_quad`](../core/src/store/mutation.rs#L120) /
-[`delete_matching`](../core/src/store/mutation.rs#L143) never remove or
+[`delete_quad`](../core/src/store/mutation.rs#L140) /
+[`delete_matching`](../core/src/store/mutation.rs#L163) never remove or
 rewrite rows either — they mark them dead.
 
 ```mermaid
@@ -180,7 +180,7 @@ order), then tail rows, tombstones already excluded.
 
 ## 5. Compaction
 
-[`compact`](../core/src/store/compaction.rs#L29) (keep the current index set)
+[`compact`](../core/src/store/compaction.rs#L31) (keep the current index set)
 / [`compact_with_indexes`](../core/src/store/compaction.rs#L57) (rebuild a
 chosen set) are the only operations that rewrite data. A compaction:
 
@@ -212,7 +212,7 @@ flowchart TD
 ```
 
 - **A file-backed owner stays file-backed**
-  ([`stream_compacted_to_file`](../core/src/store/compaction.rs#L112)): the
+  ([`stream_compacted_to_file`](../core/src/store/compaction.rs#L114)): the
   writer is prepared first
   ([`PendingStore::create`](../core/src/io/ser.rs#L313), the one writer every
   path-taking build shares), so a source file the process cannot write (a
@@ -245,7 +245,7 @@ flowchart TD
 `add_quads` is append-then-check: the append itself is policy-free, and
 whichever call pushes the tail past a threshold
 ([`should_auto_compact`](../core/src/store/compaction.rs#L166) →
-[`tail_needs_compaction`](../core/src/store/compaction.rs#L197)) pays for
+[`tail_needs_compaction`](../core/src/store/compaction.rs#L200)) pays for
 folding it back into the base, which amortizes the O(n log n) rebuild to
 roughly constant cost per appended row. The tail is folded once it reaches
 either of:

@@ -498,11 +498,11 @@ quad once even when the rows it was gathered from did not.
 
 ### 11.2 Compaction
 
-[`compact`](../core/src/store/compaction.rs#L29) /
+[`compact`](../core/src/store/compaction.rs#L31) /
 [`compact_with_indexes`](../core/src/store/compaction.rs#L57) gather every live
 quad, sort, drop repeated quads, and rebuild:
 
-- **A file-backed owner stays file-backed** ([`stream_compacted_to_file`](../core/src/store/compaction.rs#L112)):
+- **A file-backed owner stays file-backed** ([`stream_compacted_to_file`](../core/src/store/compaction.rs#L114)):
   the sorted rows are streamed through `SortedStreamBuilder` — spilling beside
   the store file, not in the OS temp dir — into a sibling temp file
   `<store>.write-<uuid>.tmp`, which is atomically renamed over the original;
@@ -512,7 +512,7 @@ quad, sort, drop repeated quads, and rebuild:
   adopts the result exactly as `from_built` does.
 
 `add_quads` compacts automatically when the tail crosses a threshold
-([`tail_needs_compaction`](../core/src/store/compaction.rs#L197)):
+([`tail_needs_compaction`](../core/src/store/compaction.rs#L200)):
 
 | Trigger | Value |
 |---|---|
