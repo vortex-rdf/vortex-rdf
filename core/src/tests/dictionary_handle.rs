@@ -307,6 +307,10 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
         ("strstarts", "\"hallo\"@de"),
         ("strends", "\"3\""),
         ("strends", "<http://example.org/s00>"),
+        ("regex", "^o"),
+        ("regex", "3$"),
+        ("regex", r"\d"),
+        ("regex", "(?=o)"),
     ] {
         for (as_str, case) in [
             (false, None),

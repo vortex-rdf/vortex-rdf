@@ -50,23 +50,48 @@ class TermDict:
         case: Optional[str] = None,
         as_str: bool = False,
     ) -> Tuple[U32Column, U32Column]:
-        """`kind` over the candidate `codes`: ``(passed, undecided)``, both
+        r"""`kind` over the candidate `codes`: ``(passed, undecided)``, both
         ascending subsets of `codes`; a candidate in neither fails, and no
         candidates give two empty columns. `codes` must be sorted, unique and
         inside the dictionary, else ``ValueError`` (a code past the end
         included).
 
         String kinds (``str_prefix``, ``contains``, ``strstarts``,
-        ``strends``, ``regex``) read the term's text: rdflib's ``string()`` by
-        default (string literals only), SPARQL ``STR()`` with `as_str` (an
-        IRI's string, a literal's lexical form; a blank node, or a literal
-        whose datatype rdflib normalizes, is undecided), after an optional
-        `case` wrapper (``"lower"``/``"upper"``, decided on ASCII text only).
-        `arg` is the raw prefix for ``str_prefix``, the constant's N-Triples
-        spelling for ``contains``/``strstarts``/``strends`` (a language-tagged
-        constant needs the same tag, compared as written; a constant that is
-        no string literal matches nothing) and the pattern for ``regex``, the
-        one kind that takes SPARQL `flags`.
+        ``strends``, ``regex``) test a term's text. By default that is
+        rdflib's ``string()`` of the term (string literals only: an IRI or a
+        blank node fails); with `as_str` it is SPARQL ``STR()`` (an IRI's
+        string, a literal's lexical form; a blank node, or a literal whose
+        datatype rdflib normalizes, is undecided). `case` (``"lower"`` or
+        ``"upper"``) then wraps that text, so ``contains`` with ``as_str=True,
+        case="lower"`` is ``CONTAINS(LCASE(STR(?x)), c)``: ``STR()`` is read
+        first and the case wrapper applies to its result (``LCASE`` of an IRI
+        itself raises in SPARQL, which is why the order matters). The wrapper
+        is Python's ``str.lower()``/``str.upper()``, decided on ASCII text
+        only; a non-ASCII text is undecided.
+
+        `arg` is the raw prefix for ``str_prefix``. For ``contains``,
+        ``strstarts`` and ``strends`` it is the constant's strict N-Triples
+        spelling (``"text"``, ``"text"@tag``, ``"text"^^<datatype>``,
+        ``<iri>`` or ``_:label``): a malformed spelling raises
+        ``ValueError``, a language-tagged constant needs the same tag on the
+        text (compared as written), and a constant that is no string literal
+        matches nothing. For ``regex`` it is the pattern as written, and
+        `flags` (the one kind that takes them) are the SPARQL flags: as in
+        rdflib, ``i``, ``s`` and ``m`` apply and any other letter is ignored,
+        and the test is Python's ``re.search``.
+
+        Only a subset of patterns is evaluated natively: literals, ``.``,
+        classes (``[a-z]``, ``[^...]``), the shorthands ``\d \w \s \D \W \S
+        \b \B``, the anchors ``^``, ``$`` and ``\A``, groups ``(...)`` and
+        ``(?:...)``, alternation, and the quantifiers ``* + ? {n} {n,}
+        {n,m}`` with their lazy forms. Any other pattern (backreferences,
+        lookaround, inline flags, named groups, other escapes, whatever
+        Python rejects or reads differently from the native engine) leaves
+        every text undecided, as does flag ``i`` on a pattern with a non-ASCII
+        character. A pattern using the shorthands, ``\b``/``\B`` or flag
+        ``i`` decides ASCII texts only; a pattern with ``$`` and without flag
+        ``m`` leaves a text ending in a newline undecided; a pattern with
+        ``\B`` leaves the empty text undecided.
 
         Other kinds: ``is_literal``, ``is_iri``, ``is_blank``, ``datatype``,
         ``lang``, ``lang_matches``, ``num_lt`` … ``num_ne``. An unknown kind,

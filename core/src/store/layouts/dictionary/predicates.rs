@@ -3,15 +3,16 @@
 //!
 //! A [`TermPredicate`] answers a single-variable SPARQL test (`isIRI(?x)`,
 //! `datatype(?x) = <dt>`, `lang(?x) = "en"`, `langMatches(lang(?x), "en")`,
-//! `?x < 5`, `strstarts(str(?x), "http://…")`, `contains(lcase(?x), "ab")`)
-//! for one term, read straight off its spelling, with a three-valued
-//! [`Verdict`]. The rules are deliberately **conservative**: a verdict is
-//! `True` or `False` only where the SPARQL semantics over the stored
-//! spelling are total and cheap to decide; everything else — a lexical form
-//! the XSD grammar does not cover, a comparison the value model cannot
-//! settle exactly, a datatype the rules do not know — is `Unknown`, for the
-//! caller to resolve with a full SPARQL engine. A caller therefore never
-//! gets a wrong definite answer, only a slower one.
+//! `?x < 5`, `strstarts(str(?x), "http://…")`, `contains(lcase(?x), "ab")`,
+//! `regex(str(?x), "^http")`) for one term, read straight off its spelling,
+//! with a three-valued [`Verdict`]. The rules are deliberately
+//! **conservative**: a verdict is `True` or `False` only where the SPARQL
+//! semantics over the stored spelling are total and cheap to decide;
+//! everything else — a lexical form the XSD grammar does not cover, a
+//! comparison the value model cannot settle exactly, a datatype the rules do
+//! not know — is `Unknown`, for the caller to resolve with a full SPARQL
+//! engine. A caller therefore never gets a wrong definite answer, only a
+//! slower one.
 //!
 //! A predicate is evaluated over the *candidate* codes a query produced
 //! (`filter_codes`): a code whose kind range decides it
@@ -24,6 +25,7 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::ops::Range;
 
+use super::regex_filter::RegexTest;
 use crate::common::terms::{LiteralForm, split_literal};
 use crate::common::vocab::{RDF_LANG_STRING, XSD, XSD_STRING};
 use crate::error::{Result, VortexRdfError};
@@ -216,6 +218,8 @@ enum TextTest {
     StartsWith(TextConstant),
     /// `STRENDS(text, constant)`.
     EndsWith(TextConstant),
+    /// `REGEX(text, pattern, flags)`.
+    Regex(RegexTest),
 }
 
 /// A string constant as rdflib's `_compatibleStrings` reads it.
@@ -230,38 +234,48 @@ enum TextConstant {
 }
 
 impl TextConstant {
-    /// A string constant from its N-Triples spelling.
+    /// A string constant from its strict N-Triples spelling: a literal
+    /// (`"text"`, `"text"@tag` or `"text"^^<datatype>`), an `<iri>` or a
+    /// `_:blank` node. Anything else — an unclosed bracket, a prefixed
+    /// datatype, a language tag outside `[A-Za-z]+(-[A-Za-z0-9]+)*`, text
+    /// after the term — is an error, never a constant that fails every
+    /// candidate unnoticed. A well-formed spelling that is no string literal
+    /// is [`NotAString`](TextConstant::NotAString).
     fn parse(arg: &str) -> Result<Self> {
         let invalid = || {
             VortexRdfError::InvalidOperation(format!(
-                "a string constant is an N-Triples literal spelling (\"text\", \"text\"@tag or \
-                 \"text\"^^<datatype>), got {arg:?}"
+                "a string constant is a strict N-Triples spelling (\"text\", \"text\"@tag, \
+                 \"text\"^^<datatype>, <iri> or _:label), got {arg:?}"
             ))
         };
-        if arg.starts_with('<') || arg.starts_with("_:") {
+        if arg.starts_with('<') {
+            return if is_iri_ref(arg) {
+                Ok(TextConstant::NotAString)
+            } else {
+                Err(invalid())
+            };
+        }
+        if let Some(label) = arg.strip_prefix("_:") {
+            return if oxrdf::BlankNode::new(label).is_ok() {
+                Ok(TextConstant::NotAString)
+            } else {
+                Err(invalid())
+            };
+        }
+        let lit = LiteralView::parse(arg).ok_or_else(invalid)?;
+        if lit.lang.is_some_and(|tag| !is_language_tag(tag))
+            || lit.datatype.is_some_and(|dt| dt.contains(['<', '>']))
+        {
+            return Err(invalid());
+        }
+        let text = lit.lexical().ok_or_else(invalid)?.into_owned();
+        if !lit.is_string_like() {
             return Ok(TextConstant::NotAString);
         }
-        let (value, lang) = match split_literal(arg).ok_or_else(invalid)? {
-            LiteralForm::Simple { value } => (value, None),
-            LiteralForm::Language { value, lang } => {
-                if lang.is_empty() {
-                    return Err(invalid());
-                }
-                (value, Some(lang.to_owned()))
-            }
-            LiteralForm::Typed { value, datatype } => {
-                if datatype
-                    .strip_prefix('<')
-                    .and_then(|dt| dt.strip_suffix('>'))
-                    != Some(XSD_STRING)
-                {
-                    return Ok(TextConstant::NotAString);
-                }
-                (value, None)
-            }
-        };
-        let text = unescape_lexical(value).ok_or_else(invalid)?.into_owned();
-        Ok(TextConstant::Text { text, lang })
+        Ok(TextConstant::Text {
+            text,
+            lang: lit.lang.map(str::to_owned),
+        })
     }
 
     fn render(&self) -> String {
@@ -274,6 +288,24 @@ impl TextConstant {
             TextConstant::NotAString => "<not a string>".to_owned(),
         }
     }
+}
+
+/// Whether `s` is an IRI reference of N-Triples' `IRIREF` shape: `<` and `>`
+/// around text holding neither.
+fn is_iri_ref(s: &str) -> bool {
+    s.strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        .is_some_and(|iri| !iri.contains(['<', '>']))
+}
+
+/// Whether `tag` is an N-Triples `LANGTAG` (without the `@`):
+/// `[A-Za-z]+(-[A-Za-z0-9]+)*`.
+fn is_language_tag(tag: &str) -> bool {
+    let mut subtags = tag.split('-');
+    subtags
+        .next()
+        .is_some_and(|first| !first.is_empty() && first.bytes().all(|b| b.is_ascii_alphabetic()))
+        && subtags.all(|sub| !sub.is_empty() && sub.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
 /// The local names of the XSD datatypes rdflib 7 parses into a Python value
@@ -391,6 +423,7 @@ impl TextPredicate {
             TextTest::Contains(c) => test(c, |t, c| t.contains(c)),
             TextTest::StartsWith(c) => test(c, |t, c| t.starts_with(c)),
             TextTest::EndsWith(c) => test(c, |t, c| t.ends_with(c)),
+            TextTest::Regex(regex) => regex.eval(&text),
         }
     }
 
@@ -400,6 +433,7 @@ impl TextPredicate {
             TextTest::Contains(c) => ("contains", c.render()),
             TextTest::StartsWith(c) => ("strstarts", c.render()),
             TextTest::EndsWith(c) => ("strends", c.render()),
+            TextTest::Regex(regex) => ("regex", regex.render()),
         };
         match self.case {
             Some(CaseMap::Lower) => arg.push_str(" [lower]"),
@@ -802,14 +836,18 @@ impl TermPredicate {
 
     /// Parse a `(kind, arg)` pair and a string kind's options. String kinds:
     /// `str_prefix` (arg: the raw prefix), `contains`, `strstarts`,
-    /// `strends` (arg: the constant's N-Triples spelling). Other kinds:
-    /// `is_literal`, `is_iri`, `is_blank` (no argument), `datatype` (an IRI,
-    /// with or without angle brackets), `lang` (a tag), `lang_matches` (a
-    /// BCP 47 language range), `num_lt` … `num_ne` (an N-Triples numeric
-    /// literal such as `"5"^^<http://www.w3.org/2001/XMLSchema#integer>`,
-    /// or a bare number typed by its syntax: `5` is an integer, `1.5` a
-    /// decimal, `1e3` a double). `case`/`as_str` on a non-string kind and
-    /// `flags` on any kind but `regex` are errors.
+    /// `strends` (arg: the constant's strict N-Triples spelling — a literal,
+    /// `<iri>` or `_:blank`; a malformed one is an error), `regex` (arg: the
+    /// pattern as written, with the SPARQL `flags` option; a pattern outside
+    /// the supported subset parses, and leaves every text undecided). Other
+    /// kinds: `is_literal`, `is_iri`, `is_blank` (no argument), `datatype`
+    /// (an IRI, with or without angle brackets), `lang` (a tag),
+    /// `lang_matches` (a BCP 47 language range), `num_lt` … `num_ne` (an
+    /// N-Triples numeric literal such as
+    /// `"5"^^<http://www.w3.org/2001/XMLSchema#integer>`, or a bare number
+    /// typed by its syntax: `5` is an integer, `1.5` a decimal, `1e3` a
+    /// double). `case`/`as_str` on a non-string kind and `flags` on any kind
+    /// but `regex` are errors.
     pub fn parse_with(kind: &str, arg: &str, options: &TextOptions) -> Result<Self> {
         let invalid = |msg: String| VortexRdfError::InvalidOperation(msg);
         if !options.flags.is_empty() && kind != "regex" {
@@ -829,6 +867,7 @@ impl TermPredicate {
             "contains" => text(TextTest::Contains(TextConstant::parse(arg)?)),
             "strstarts" => text(TextTest::StartsWith(TextConstant::parse(arg)?)),
             "strends" => text(TextTest::EndsWith(TextConstant::parse(arg)?)),
+            "regex" => text(TextTest::Regex(RegexTest::new(arg, &options.flags))),
             _ if options.case.is_some() || options.as_str => {
                 return Err(invalid(format!(
                     "case and as_str apply to the string kinds, not {kind:?}"
@@ -873,7 +912,7 @@ impl TermPredicate {
                 return Err(invalid(format!(
                     "unknown term predicate kind {other:?}; expected one of is_literal, is_iri, \
                      is_blank, datatype, lang, lang_matches, num_lt, num_le, num_gt, num_ge, \
-                     num_eq, num_ne, str_prefix, contains, strstarts, strends"
+                     num_eq, num_ne, str_prefix, contains, strstarts, strends, regex"
                 )));
             }
         };
@@ -1383,15 +1422,128 @@ mod tests {
             TermPredicate::parse_with("contains", "\"a\"", &both).unwrap(),
             p("contains", "\"a\"")
         );
+        // `regex` shows its pattern and flags, and the options after them.
+        assert_eq!(p("regex", "^a").to_string(), "regex(\"^a\" flags=\"\")");
+        let flagged = TextOptions {
+            flags: "i".into(),
+            case: Some(CaseMap::Lower),
+            as_str: true,
+        };
+        assert_eq!(
+            TermPredicate::parse_with("regex", "^a", &flagged)
+                .unwrap()
+                .to_string(),
+            "regex(\"^a\" flags=\"i\" [lower] [str])"
+        );
+        assert_eq!(p("regex", "a"), p("regex", "a"));
+        assert_ne!(p("regex", "a"), p("regex", "b"));
+        assert_ne!(
+            p("regex", "a"),
+            TermPredicate::parse_with(
+                "regex",
+                "a",
+                &TextOptions {
+                    flags: "i".into(),
+                    ..TextOptions::default()
+                }
+            )
+            .unwrap()
+        );
+        // The pattern is raw text, whatever it holds: nothing here refuses it.
+        for pattern in ["", "(", "\"a\"^^xsd:string", "[z-a]", "\\"] {
+            assert!(
+                TermPredicate::parse("regex", pattern).is_ok(),
+                "{pattern:?}"
+            );
+        }
         // A bad escape in a constant is refused; one in a prefix is just text.
         assert!(TermPredicate::parse("contains", "\"a\\q\"").is_err());
         assert!(TermPredicate::parse("str_prefix", "a\\q").is_ok());
         // The message of an unknown kind names the string kinds.
         let message = TermPredicate::parse("nope", "").unwrap_err().to_string();
         assert!(
-            message.contains("contains, strstarts, strends"),
+            message.contains("contains, strstarts, strends, regex"),
             "{message}"
         );
+    }
+
+    /// A string constant is a strict N-Triples spelling: a malformed one is
+    /// refused at parse time — never accepted only to fail every candidate —
+    /// and a well-formed one that is no string literal matches nothing.
+    #[test]
+    fn string_constants_are_strict_n_triples() {
+        let xsd_string = format!("{XSD}string");
+        let mut wrong = Vec::new();
+        for kind in ["contains", "strstarts", "strends"] {
+            for malformed in [
+                // A datatype that is no `<iri>`: a prefixed name, an unclosed
+                // bracket, nothing at all, a stray bracket.
+                "\"a\"^^xsd:string",
+                "\"a\"^^<http://www.w3.org/2001/XMLSchema#string",
+                "\"a\"^^",
+                "\"a\"^^<x>>",
+                "\"a\"^^<<x>",
+                "\"a\"^^<>>",
+                // An IRI that is not `<...>`, and anything that is no term.
+                "<http://ex/a",
+                "http://ex/a>",
+                "<<http://ex/a>>",
+                "<a>b>",
+                "http://ex/a",
+                "a",
+                "",
+                // A language tag outside `[A-Za-z]+(-[A-Za-z0-9]+)*`.
+                "\"a\"@e n",
+                "\"a\"@en^^<x>",
+                "\"a\"@",
+                "\"a\"@-en",
+                "\"a\"@en-",
+                "\"a\"@en--gb",
+                "\"a\"@1en",
+                "\"a\"@en_gb",
+                "\"a\"@é",
+                // A blank node without a valid label.
+                "_:",
+                "_:a b",
+                // Text after the literal, an unterminated literal, a bad
+                // escape (in a string constant or in one that is no string).
+                "\"a\" ",
+                "\"a",
+                "\"a\\q\"",
+                "\"a\\q\"^^<http://ex/dt>",
+            ] {
+                if !matches!(
+                    TermPredicate::parse(kind, malformed),
+                    Err(VortexRdfError::InvalidOperation(_))
+                ) {
+                    wrong.push(format!("{kind} {malformed:?} was not refused"));
+                }
+            }
+            for well_formed in [
+                "\"a\"",
+                "\"\"",
+                "\"a\"@en",
+                "\"a\"@en-GB",
+                "\"a\"@en-x-1",
+                "\"a\"@EN",
+                "\"a\\\"@fr\"@en",
+                &format!("\"a\"^^<{xsd_string}>"),
+                // No string literal: well formed, so it matches nothing.
+                &format!("\"4\"^^<{INT}>"),
+                "\"a\"^^<http://ex/dt>",
+                "<http://ex/a>",
+                "<>",
+                "_:b0",
+                "_:b-0.1",
+            ] {
+                if let Err(e) = TermPredicate::parse(kind, well_formed) {
+                    wrong.push(format!("{kind} {well_formed:?} was refused: {e}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // A prefix is raw text, not a spelling.
+        assert!(TermPredicate::parse("str_prefix", "\"a\"^^xsd:string").is_ok());
     }
 
     #[test]
@@ -1466,6 +1618,8 @@ mod tests {
             ("contains", "\"h\""),
             ("strstarts", "\"h\""),
             ("strends", "\"h\""),
+            ("regex", "h"),
+            ("regex", "(?=h)"),
         ] {
             let predicate = p(kind, arg);
             for (code, spelling) in spellings.iter().enumerate() {
@@ -1519,6 +1673,10 @@ mod tests {
                 "\"a\"^^<http://www.w3.org/2001/XMLSchema#string>",
             ),
             ("strends", "<http://x>"),
+            ("regex", "a"),
+            ("regex", "^$"),
+            ("regex", r"\w$"),
+            ("regex", "(?=a)"),
         ];
         let options = [
             TextOptions::default(),
@@ -1613,6 +1771,8 @@ mod tests {
                 ("contains", "\"b\""),
                 ("strstarts", "\"b\""),
                 ("strends", "\"b\""),
+                ("regex", "b"),
+                ("regex", "(?=b)"),
             ] {
                 let predicate = TermPredicate::parse_with(kind, arg, &options).unwrap();
                 for (code, spelling) in spellings.iter().enumerate() {

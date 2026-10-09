@@ -2,11 +2,13 @@
 residencies, spelling-tolerant encoding, byte-order ranges and term
 predicates."""
 
+import re
+import warnings
 from array import array
 
 import pytest
 
-from vortex_rdf import U32Column, VortexRdfStore
+from vortex_rdf import U32Column, VortexRdfStore, serialize_rdf
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
 RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
@@ -446,3 +448,230 @@ def test_filter_codes_string_kinds(dictionary):
     ]:
         with pytest.raises(ValueError):
             term_dict.filter_codes(kind, arg, every, **options)
+
+
+def test_filter_codes_regex(dictionary):
+    _, term_dict = dictionary
+    terms = _terms(term_dict)
+    every = U32Column(range(len(terms)))
+    code = {t: c for c, t in enumerate(terms)}
+
+    def run(arg, **options):
+        passed, undecided = term_dict.filter_codes("regex", arg, every, **options)
+        return _codes(passed), _codes(undecided)
+
+    alice, anon, bob = code['"Alice"'], code['"Anon"'], code['"Bob"@en']
+    assert run("^A") == ([alice, anon], [0])
+    assert run("B", flags="i") == ([bob], [0])
+    assert run("b$", case="lower") == ([bob], [0])
+    assert run("^http://ex", as_str=True)[0] == sorted(
+        code[t] for t in ("<http://ex.org/age>", "<http://ex.org/alice>", "<http://ex.org/bob>")
+    )
+    # Outside the allow-listed subset: every text undecided, non-texts still fail.
+    assert run("(?=A)") == ([], [0, alice, anon, bob])
+
+
+def test_filter_codes_regex_options(dictionary):
+    """`case` and `as_str` apply to `regex` like to every string kind, in the
+    order `REGEX(LCASE(STR(?x)), pattern)`; `flags` are rdflib's: `i`, `s` and
+    `m` apply and any other letter is ignored."""
+    _, term_dict = dictionary
+    terms = _terms(term_dict)
+    every = U32Column(range(len(terms)))
+    code = {t: c for c, t in enumerate(terms)}
+
+    def run(arg, **options):
+        passed, undecided = term_dict.filter_codes("regex", arg, every, **options)
+        return _codes(passed), _codes(undecided)
+
+    alice, anon, bob = code['"Alice"'], code['"Anon"'], code['"Bob"@en']
+    forty_two, blank = code[f'"42"^^<{XSD}integer>'], code["_:b0"]
+    iris = sorted(code[t] for t in terms if t.startswith("<"))
+    ex = sorted(code[t] for t in ("<http://ex.org/age>", "<http://ex.org/alice>", "<http://ex.org/bob>"))
+    # STR() first, then the case wrapper: an IRI's string is lower-cased as a
+    # whole, and under STR() a blank node or a normalized literal is undecided.
+    assert run("^http://ex\\.org/a", as_str=True, case="lower") == (
+        [code["<http://ex.org/age>"], code["<http://ex.org/alice>"]], [0, forty_two, blank])
+    assert run("^HTTP://EX", as_str=True, case="upper")[0] == ex
+    assert run("^HTTP://EX", as_str=True, case="lower")[0] == []
+    assert run("^http", as_str=True)[0] == iris
+    assert run("^http")[0] == []
+    assert run("^b", as_str=True, case="lower") == ([bob], [0, forty_two, blank])
+    # Flags: `i` honoured, any other letter ignored.
+    assert run("^ALICE$", flags="i")[0] == [alice]
+    assert run("^ALICE$", flags="xq")[0] == []
+    assert run("^ALICE$", flags="I")[0] == []
+    assert run("^b", flags="im", case="upper")[0] == [bob]
+    assert run("^a..n$", flags="i")[0] == [anon]
+    # A pattern outside the subset is undecided on the texts whatever the
+    # options, and the rules for non-texts do not change.
+    assert run("(?=a)", as_str=True) == ([], list(range(len(terms))))
+    assert run("(?=a)", case="lower") == ([], [0, alice, anon, bob])
+    # An option that applies to no kind but the string kinds is refused as before.
+    with pytest.raises(ValueError):
+        term_dict.filter_codes("lang", "en", every, case="lower")
+    with pytest.raises(ValueError):
+        term_dict.filter_codes("contains", '"a"', every, flags="i")
+
+
+def test_filter_codes_rejects_malformed_constants(dictionary):
+    """A string constant is a strict N-Triples spelling: a malformed one raises
+    instead of failing every candidate silently."""
+    _, term_dict = dictionary
+    every = U32Column(range(len(term_dict)))
+    malformed = [
+        '"a"^^xsd:string',  # a prefixed name
+        f'"a"^^<{XSD}string',  # an unclosed `<`
+        '"a"^^',
+        "<http://ex/a",  # an unclosed IRI
+        '"a"@e n',
+        '"a"@en^^<x>',
+        '"a"@',
+        '"a"@en-',
+        '"a"@1en',
+        '"a"^^<x>>',
+        "_:",
+        '"a',
+        "a",
+        "",
+    ]
+    for kind in ("contains", "strstarts", "strends"):
+        for constant in malformed:
+            with pytest.raises(ValueError):
+                term_dict.filter_codes(kind, constant, every)
+        for options in ({"as_str": True}, {"case": "lower"}):
+            with pytest.raises(ValueError):
+                term_dict.filter_codes(kind, malformed[0], every, **options)
+        # Well formed, so valid: a constant that is no string literal matches nothing.
+        for constant in ("<http://ex.org/a>", "_:b0", f'"4"^^<{XSD}integer>', '"a"@en-GB', '"a"@EN'):
+            passed, _ = term_dict.filter_codes(kind, constant, every)
+            assert len(passed) == 0, (kind, constant)
+    # A prefix and a pattern are raw text, not spellings.
+    term_dict.filter_codes("str_prefix", '"a"^^xsd:string', every)
+    term_dict.filter_codes("regex", '"a"^^xsd:string', every)
+
+
+# Texts for the REGEX tests against Python's own `re`: the edges of the subset
+# (a final newline, the empty text, ASCII and non-ASCII whitespace and word
+# characters, letters Unicode case-folds across ASCII, an astral character).
+REGEX_TEXTS = [
+    "", "a", "b", "A", "ab", "AB", "aB", "abc", "xaby", "ab\n", "\n", "\n\n", "a\nb", "a\n\n", "ab\r\n",
+    "a\rb", "foo", "afoob", "a foo b", "foo bar", "x42", "42", "x\u0663", "caf\u00e9", "CAF\u00c9", "\u00e9", "\u00c9",
+    "na\u00efve", "\U0001f600", "a\U0001f600b", "a\x1cb", "\x1c", "\x1d", "\x1e", "\x1f", "a\x0bb", "a\x0cb",
+    " ", "\t", "a b\tc", "\u00a0", "\u2028", "\u0085", "\u2003", "a.b", "a|b", "a$", "$", "^", "a^b", "a-b", "-",
+    "[x]", "a\\b", "a/b", "a&&b", "\u00df", "\u017f", "\u212a", "k", "K", "\u0130", "\u0131", "i", "I", "\u03a3",
+    "\u03c3", "\u03c2", "x y.z@a.b", "aaaa", "ababcc", "ababc", "Alice", "bob", "BOB", "Zed", "a1_", "_", "1", "}",
+    "]", "a]", "{", "\u00e0", "\u00ff", "|",
+]
+
+REGEX_PATTERNS = [
+    # Literals, anchors, alternation, groups and quantifiers.
+    "", "a", "ab", "^a", "a$", "^a$", "^$", "$", "^", "a^b", "a$b", "a|b", "ab|", "|a", "a|b|c", "(a)", "(a)(b)?",
+    "(?:a|b)+", "^(?:a|b)+$", "(?:)", "()", "a*", "a+", "a?", "a{0}", "a{2}", "a{2,}", "a{1,3}", "a{02}",
+    "a*?", "a+?", "a??", "a{1,3}?", "a{2,3}?b", "^(a|b)*?c{1,}$", "(?:^)*b", "x*", "(?:a|)$",
+    # The dot, and the escaped metacharacters.
+    ".", "a.b", "^.$", "^..$", ".*", r"\.", r"\*", r"\+", r"\?", r"\(", r"\)", r"\[", r"\]", r"\{", r"\}", r"\|",
+    r"\^", r"\$", r"\\", r"\/", r"\-", r"a\|b",
+    # Shorthands, boundaries and anchors.
+    r"\d", r"\D", r"\w", r"\W", r"\s", r"\S", r"\d+", r"\S+$", r"\bfoo\b", r"\Bo", r"\b", r"\B", r"a\b", r"a\B",
+    r"\w+\b$", r"\Aa", r"\Aa|b", r"^\B$", r"x*\B", r"\B$", r"\s$", r"\W$",
+    # Classes.
+    "[a-c]", "[^a-c]", "[abc]", "[^a]", "[a-]", "[-a]", "[a-c-e]", r"[\d-]", r"[-\d]", r"[\w.]+@[\w.]+", r"[\s,]+",
+    r"[\S]", r"[^\s]", r"[\W]", r"[\D]", r"[^\S]", r"[\^\-\]\\]", "[$]", "[.]", "[a|b]", "[a-]]", "[^^]", "[a^]",
+    # Non-ASCII characters in the pattern.
+    "\u00e9", "\u00c9", "\u00e9+", "[\u00e9]", "[^\u00e9]", "[\u00e0-\u00ff]", "\u00df", "\u017f", "\u212a", "k", "K",
+    "\u0131", "i", "\u0130", "\u03c3", "\u03a3", "caf\u00e9$",
+    # Outside the subset: Python rejects them, warns, or reads them differently.
+    "(?=a)", "(?i)a", r"\Z", "{", "a{,2}", "a**", "[a&&b]", r"\x41", r"\n", r"\t", "[[]", "(a", "a)", "[]a]",
+    "[a||b]", "[+--]", r"\p{L}", r"(a)\1", "a{2}{3}", "a*+", "(?P<n>a)", "a{1001}", r"[\d-z]", "a{2,1}", "^*", r"\b+",
+]
+
+REGEX_FLAGS = ["", "i", "s", "m", "x", "is", "im", "ims", "I"]
+
+_PY_FLAGS = {"i": re.IGNORECASE, "s": re.DOTALL, "m": re.MULTILINE}
+
+
+def _nt_literal(text):
+    """`text` as an N-Triples string literal, everything but printable ASCII escaped."""
+    out = []
+    for ch in text:
+        cp = ord(ch)
+        if ch in '"\\':
+            out.append("\\" + ch)
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif 0x20 <= cp < 0x7F:
+            out.append(ch)
+        elif cp <= 0xFFFF:
+            out.append(f"\\u{cp:04X}")
+        else:
+            out.append(f"\\U{cp:08X}")
+    return '"' + "".join(out) + '"'
+
+
+@pytest.fixture(scope="module")
+def regex_corpus(tmp_path_factory):
+    assert len(set(REGEX_TEXTS)) == len(REGEX_TEXTS)
+    directory = tmp_path_factory.mktemp("regex")
+    nt = directory / "corpus.nt"
+    nt.write_text(
+        "".join(f"<http://ex.org/s{i}> <http://ex.org/p> {_nt_literal(t)} .\n" for i, t in enumerate(REGEX_TEXTS)),
+        encoding="utf-8",
+    )
+    out = directory / "corpus.vortex"
+    serialize_rdf(nt, out, layout="dictionary")
+    return out
+
+
+@pytest.fixture(params=["resident", "file-backed"])
+def regex_dictionary(request, regex_corpus):
+    store = VortexRdfStore(regex_corpus, in_memory=request.param == "resident")
+    term_dict = store.term_dict()
+    assert term_dict is not None
+    return store, term_dict
+
+
+def test_filter_codes_regex_agrees_with_python_re(regex_dictionary):
+    """rdflib's REGEX is `re.search` with flags `i`/`s`/`m` (any other flag
+    ignored). A text `regex` passes must match, a text it fails must not, and
+    a pattern Python rejects or warns about decides nothing; every other text
+    is undecided and claims nothing."""
+    _, term_dict = regex_dictionary
+    code_of = {t: term_dict.encode(_nt_literal(t)) for t in REGEX_TEXTS}
+    assert all(c is not None for c in code_of.values())
+    every = U32Column(range(len(term_dict)))
+    decided = 0
+    for pattern in REGEX_PATTERNS:
+        for flags in REGEX_FLAGS:
+            bits = 0
+            for flag in flags:
+                bits |= _PY_FLAGS.get(flag, 0)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", FutureWarning)
+                try:
+                    compiled = re.compile(pattern, bits)
+                except (re.error, FutureWarning):
+                    compiled = None
+            passed, undecided = term_dict.filter_codes("regex", pattern, every, flags=flags)
+            passed, undecided = set(_codes(passed)), set(_codes(undecided))
+            assert not passed & undecided
+            for text, code in code_of.items():
+                if code in undecided:
+                    continue
+                assert compiled is not None, (pattern, flags, text)
+                assert (code in passed) == bool(compiled.search(text)), (pattern, flags, text)
+                decided += 1
+    assert decided > 50_000, decided  # most of the 114k pairs are decided
+
+    # The rules that leave texts undecided do so, whatever the Python version.
+    def undecided_of(pattern, flags=""):
+        _, undecided = term_dict.filter_codes("regex", pattern, every, flags=flags)
+        return {t for t, c in code_of.items() if c in set(_codes(undecided))}
+
+    assert {t for t in REGEX_TEXTS if t.endswith("\n")} <= undecided_of("a$")
+    assert "" in undecided_of(r"\B") and "ab" not in undecided_of(r"\B")
+    assert {t for t in REGEX_TEXTS if not t.isascii()} <= undecided_of(r"\w")
+    assert {t for t in REGEX_TEXTS if not t.isascii()} <= undecided_of("a", "i")
+    assert set(REGEX_TEXTS) == undecided_of("(?=a)")

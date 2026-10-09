@@ -45,6 +45,7 @@ pub(crate) mod access;
 pub(crate) mod file_backed;
 pub(crate) mod ingest;
 pub mod predicates;
+mod regex_filter;
 pub(crate) mod term_dict;
 
 #[cfg(feature = "file-io")]

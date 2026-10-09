@@ -163,15 +163,21 @@ impl TermDict {
     /// ascending subsets of `codes`; a candidate in neither fails. `codes`
     /// (a `U32Column`, a u32 buffer or any int sequence) must be sorted,
     /// unique and inside the dictionary, else `ValueError`. String kinds
-    /// (`str_prefix`, `contains`, `strstarts`, `strends`, `regex`) read the
+    /// (`str_prefix`, `contains`, `strstarts`, `strends`, `regex`) test the
     /// term's text: by default rdflib's `string()` (string literals only);
-    /// `as_str=True` reads SPARQL `STR(term)`, where a blank node, or a
-    /// literal whose datatype rdflib normalizes, is undecided. `case`
-    /// ("lower"/"upper") applies Python's `str.lower()`/`str.upper()` first,
-    /// decided on ASCII text only; `flags` are `regex`'s SPARQL flags. Only
-    /// the dictionary windows holding candidates the kind ranges do not
-    /// decide are read; nothing is memoized. An unknown kind or an invalid
-    /// argument or option raises `ValueError`.
+    /// `as_str=True` reads SPARQL `STR(term)` instead, where a blank node, or
+    /// a literal whose datatype rdflib normalizes, is undecided. `case`
+    /// ("lower"/"upper") then wraps that text in Python's
+    /// `str.lower()`/`str.upper()`, decided on ASCII text only: `contains`
+    /// with `as_str=True, case="lower"` is `CONTAINS(LCASE(STR(?x)), c)`.
+    /// The constant of `contains`/`strstarts`/`strends` is a strict
+    /// N-Triples spelling (a malformed one is a `ValueError`); `regex` takes
+    /// the pattern as `arg` and the SPARQL `flags` (`i`, `s` and `m` apply,
+    /// any other letter is ignored), and decides a subset of patterns —
+    /// every text is undecided for the others. Only the dictionary windows
+    /// holding candidates the kind ranges do not decide are read; nothing is
+    /// memoized. An unknown kind or an invalid argument or option raises
+    /// `ValueError`.
     #[pyo3(signature = (kind, arg, codes, *, flags = "", case = None, as_str = false))]
     // The parameters are the Python signature.
     #[allow(clippy::too_many_arguments)]

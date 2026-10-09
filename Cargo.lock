@@ -4390,6 +4390,7 @@ dependencies = [
  "oxigraph",
  "oxrdf",
  "oxrdfio",
+ "regex",
  "rkyv",
  "serde",
  "serde_json",

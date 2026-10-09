@@ -430,6 +430,102 @@ fn str_of_rdflib_normalized_datatypes_is_undecided() {
     }
 }
 
+/// `regex` reads the term's text like the other string kinds — `string()` by
+/// default, `STR()` with `as_str`, after the case wrapper — and its flags are
+/// rdflib's `re` flags.
+#[test]
+fn regex_follows_the_string_kind_rules() {
+    let with = |flags: &str, case, as_str| TextOptions {
+        flags: flags.into(),
+        case,
+        as_str,
+    };
+    let none = || with("", None, false);
+    let str_ = || with("", None, true);
+    let lower = || with("", Some(CaseMap::Lower), false);
+    for (spelling, pattern, options, expect) in [
+        // `string()`: string literals only, the language tag not looked at.
+        ("\"Ab\"@en", "b$", none(), Verdict::True),
+        ("\"Ab\"@en", "^b", none(), Verdict::False),
+        ("\"Ab\"", "^a", with("i", None, false), Verdict::True),
+        ("\"Ab\"", "^a", none(), Verdict::False),
+        ("\"Ab\"", "^a", with("I", None, false), Verdict::False),
+        ("<http://ex/a>", "a", none(), Verdict::False),
+        ("_:b0", "b", none(), Verdict::False),
+        (&typed("5", "integer"), "5", none(), Verdict::False),
+        ("\"5\"^^<http://ex/dt>", "5", none(), Verdict::False),
+        (&typed("a5", "string"), "5$", none(), Verdict::True),
+        // `STR()`: an IRI's string or a lexical form; a blank node, or a
+        // literal whose datatype rdflib normalizes, is undecided.
+        ("<http://ex/a>", "^http://ex/", str_(), Verdict::True),
+        ("<http://ex/a>", "^<", str_(), Verdict::False),
+        ("\"5\"^^<http://ex/dt>", "5", str_(), Verdict::True),
+        ("_:b0", "b", str_(), Verdict::Unknown),
+        (&typed("01", "integer"), "0", str_(), Verdict::Unknown),
+        (&typed("0", "boolean"), "0", str_(), Verdict::Unknown),
+        // The case wrapper: ASCII text only, applied after `STR()`.
+        ("\"Ab\"", "^ab$", lower(), Verdict::True),
+        ("\"Ab\"", "^Ab$", lower(), Verdict::False),
+        (
+            "\"ab\"",
+            "^AB$",
+            with("", Some(CaseMap::Upper), false),
+            Verdict::True,
+        ),
+        ("\"Áb\"", "ab", lower(), Verdict::Unknown),
+        ("\"Áb\"", "^$", lower(), Verdict::Unknown),
+        (
+            "<http://EX/a>",
+            "^http://ex/",
+            with("", Some(CaseMap::Lower), true),
+            Verdict::True,
+        ),
+        (
+            "<http://ex/a>",
+            "^HTTP://EX/",
+            with("", Some(CaseMap::Upper), true),
+            Verdict::True,
+        ),
+        (
+            "<http://ex/a>",
+            "^http://ex/",
+            with("", Some(CaseMap::Upper), true),
+            Verdict::False,
+        ),
+        (
+            "<http://ex/é>",
+            "ex",
+            with("", Some(CaseMap::Lower), true),
+            Verdict::Unknown,
+        ),
+        ("<http://ex/é>", "ex", str_(), Verdict::True),
+        // The text is unescaped before it is read.
+        ("\"a\\nb\"", "a.b", none(), Verdict::False),
+        ("\"a\\nb\"", "a.b", with("s", None, false), Verdict::True),
+        ("\"a\\nb\"", "^b", with("m", None, false), Verdict::True),
+        ("\"caf\\u00E9\"", "\u{e9}$", none(), Verdict::True),
+        ("\"ab\\n\"", "b$", none(), Verdict::Unknown),
+        ("\"ab\\n\"", "b$", with("m", None, false), Verdict::True),
+        // Outside the pattern subset: a text is undecided, a non-text is not.
+        ("\"ab\"", "(?=a)", none(), Verdict::Unknown),
+        ("\"ab\"@en", "(?=a)", lower(), Verdict::Unknown),
+        ("<http://ex/a>", "(?=a)", none(), Verdict::False),
+        ("<http://ex/a>", "(?=a)", str_(), Verdict::Unknown),
+        ("_:b0", "(?=a)", none(), Verdict::False),
+        ("_:b0", "(?=a)", str_(), Verdict::Unknown),
+        (&typed("5", "integer"), "(?=a)", none(), Verdict::False),
+        // Spellings that are no term.
+        ("", "a", none(), Verdict::Unknown),
+        ("\"", "a", none(), Verdict::Unknown),
+        ("<", "a", str_(), Verdict::Unknown),
+    ] {
+        let got = TermPredicate::parse_with("regex", pattern, &options)
+            .unwrap()
+            .eval(spelling);
+        assert_eq!(got, expect, "regex {pattern:?} {options:?} on {spelling}");
+    }
+}
+
 #[test]
 fn string_kind_options_are_validated() {
     for (kind, arg, options) in [
@@ -566,10 +662,22 @@ async fn filter_codes_matches_eval() {
                 "strends",
                 "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>",
             ),
+            ("regex", "^a"),
+            ("regex", "c$"),
+            ("regex", r"\d"),
+            ("regex", "(?=a)"),
         ] {
             cases.push((kind, arg.to_owned(), options.clone()));
         }
     }
+    cases.push((
+        "regex",
+        "^A".to_owned(),
+        TextOptions {
+            flags: "i".into(),
+            ..TextOptions::default()
+        },
+    ));
     for (kind, arg, options) in &cases {
         let predicate = TermPredicate::parse_with(kind, arg, options).unwrap();
         for codes in [&all, &odd, &vec![]] {
@@ -612,6 +720,9 @@ fn malformed_spellings_are_never_true() {
         ("strstarts", "\"a\"@en"),
         ("strends", "\"a\""),
         ("strends", "<http://ex.org/a>"),
+        ("regex", "a"),
+        ("regex", ""),
+        ("regex", "(?=a)"),
     ] {
         for options in [
             opts(None, false),
