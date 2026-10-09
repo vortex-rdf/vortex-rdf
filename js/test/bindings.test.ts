@@ -875,6 +875,19 @@ describe('matchCodes / termDict gates', () => {
         }
     });
 
+    test('TermDict.decode refuses what is no number instead of coercing it', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
+        const dict = store.termDict()!;
+        // Coerced, `null`, `[]`, `false` and `''` would be code 0, and `true`,
+        // `'1'` and `[1]` code 1: real terms of this dictionary.
+        expect(dict.decode(0)).toBeDefined();
+        expect(dict.decode(1)).toBeDefined();
+        const notNumbers: unknown[] = [null, undefined, [], [1], {}, true, false, '1', '', 1n];
+        for (const bad of notNumbers) {
+            expect(() => dict.decode(bad as number), String(bad)).toThrow(/code/);
+        }
+    });
+
     test('matchCodes columns are Float64Arrays of exact codes', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads', {
             layout: 'dictionary',

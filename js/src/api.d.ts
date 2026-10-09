@@ -155,7 +155,8 @@ export class VortexRdfStore {
 export class TermDict {
     /**
      * Decode a term code, or `undefined` when it is out of range. Throws when
-     * `code` is no code: not an integer from 0 to `Number.MAX_SAFE_INTEGER`.
+     * `code` is no code: not a number (nothing is coerced, so `null` or `'1'`
+     * throws), or not an integer from 0 to `Number.MAX_SAFE_INTEGER`.
      */
     decode(code: number): string | undefined;
     /**

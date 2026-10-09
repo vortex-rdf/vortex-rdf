@@ -105,10 +105,20 @@ pub struct TermDict {
 #[wasm_bindgen]
 impl TermDict {
     /// Decode a term code, or `undefined` when it is out of range. A value
-    /// that is no code — not an integer from 0 to 2^53 − 1 — throws.
+    /// that is no code — not a number, or a number that is not an integer
+    /// from 0 to 2^53 − 1 — throws. Taken as a `JsValue`, so nothing is
+    /// coerced: `null`, `[]` or `false` never decodes as code 0, nor `true`,
+    /// `'1'` or `[1]` as code 1.
     #[wasm_bindgen(js_name = decode)]
-    pub fn decode(&self, code: f64) -> Result<Option<String>, JsValue> {
-        let code = code_from_js(code).map_err(js_err)?;
+    pub fn decode(&self, code: JsValue) -> Result<Option<String>, JsValue> {
+        let number = code.as_f64().ok_or_else(|| {
+            js_err(format!(
+                "a term code is a number, an integer from 0 to 2^53 - 1 \
+                 (Number.MAX_SAFE_INTEGER), got {}",
+                code.js_typeof().as_string().unwrap_or_default()
+            ))
+        })?;
+        let code = code_from_js(number).map_err(js_err)?;
         Ok(self.snapshot.decode(code))
     }
 
