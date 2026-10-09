@@ -395,7 +395,8 @@ Two drivers feed this: [`built_stream_to_vortex_writer`](../core/src/io/ser.rs#L
 for a builder's chunk stream (files, compaction; a file is written by
 [`write_store_atomically`](../core/src/io/ser.rs#L210) beside its path and renamed
 into place, so a failed write leaves no partial file and the previous store
-untouched, and a store that has the old file mapped keeps reading it), and
+untouched, and on Unix a store that has the old file mapped keeps reading
+it), and
 [`serialize_parts`](../core/src/io/ser.rs#L43) for a store's split parts
 (`to_bytes`, the bindings' exchange bytes). On the wire the two are the same
 container.
@@ -414,7 +415,13 @@ file belongs to the process that wrote it. Two costs follow from the design: a
 rebuild needs a **writable directory** (a writable file in a read-only
 directory can no longer be rebuilt in place), and about **twice the disk
 space** while the old and the new file coexist (the old file's blocks are freed
-once the last store mapping it is dropped).
+once the last store mapping it is dropped). The swap is atomic against a
+process crash, not durable against power loss: nothing is `fsync`ed before
+the rename, so a power failure right after it can leave a short file on a
+filesystem that does not order a file's data before the rename. And on
+Windows the rename is refused while a store has the old file mapped, so a
+rebuild over a mapped path fails until that store is closed; on Unix the old
+inode simply stays alive for the mapping.
 
 ---
 

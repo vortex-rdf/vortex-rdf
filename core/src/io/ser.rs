@@ -159,7 +159,8 @@ where
 /// halfway through the stream — leaves no file at a fresh `path` and the
 /// previous store untouched at an existing one, and a store that has `path`
 /// memory-mapped keeps reading the file it mapped (the old file is replaced,
-/// never rewritten in place).
+/// never rewritten in place; on Windows the rename is refused while a store
+/// has the file mapped, so the write fails until that store is closed).
 ///
 /// A path that cannot take a store — a missing directory, no permission to
 /// write there, a directory at `path` — is reported before any input is
@@ -221,11 +222,16 @@ where
 /// The old file is never opened for writing. Overwriting it in place would be
 /// unsafe while a reader still maps it (its pages would be pulled out from
 /// under the mapping: SIGBUS, or another store's bytes read as the old
-/// ones), and a crash mid-write must never leave the only on-disk copy
-/// half-written. The rename makes the swap atomic: a reader that mapped the
-/// old file keeps its pages until it drops (Windows refuses the rename over
-/// a mapped file, and the write then fails with the I/O error), and `path`
-/// is untouched on any earlier failure.
+/// ones), and a process that dies mid-write would leave a half-written file
+/// at `path`. The rename makes the swap atomic: a reader that mapped the old
+/// file keeps its pages until it drops (Windows refuses the rename over a
+/// mapped file, and the write then fails with the I/O error until that store
+/// is closed), and `path` is untouched on any earlier failure.
+///
+/// The swap is safe against a process crash, not durable against power loss:
+/// nothing is `fsync`ed before the rename, so on a filesystem that does not
+/// order a file's data before the rename, a power failure right after it can
+/// leave a short or empty file at `path`.
 ///
 /// The temp file is removed on every way out that does not rename it: an
 /// error from `write`, a failed rename, a panic, or this future being

@@ -87,9 +87,11 @@ impl VortexRdfStore {
     /// The rows are written to a temporary sibling file and then atomically
     /// renamed over `path` ([`write_store_atomically`], which also writes every
     /// other store file). Overwriting the file in place would be unsafe
-    /// while a reader still maps the original, and a crash mid-write must
-    /// never leave the only on-disk copy half-written; the rename makes the
-    /// swap atomic and leaves `path` untouched on any earlier failure.
+    /// while a reader still maps the original, and a process that dies
+    /// mid-write would leave a half-written file; the rename makes the swap
+    /// atomic against a process crash (it is not durable against power loss:
+    /// nothing is `fsync`ed first) and leaves `path` untouched on any earlier
+    /// failure.
     ///
     /// [`write_store_atomically`]: crate::io::ser::write_store_atomically
     #[cfg(feature = "file-io")]
