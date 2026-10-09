@@ -158,7 +158,9 @@ pub enum TermPredicate {
     Lang(String),
     /// `langMatches(lang(?x), "range")` — BCP 47 basic filtering: `*`
     /// matches any non-empty tag, otherwise a case-insensitive match of the
-    /// range to the tag or to a `-`-delimited prefix of it.
+    /// range to the tag or to a `-`-delimited prefix of it. A range of
+    /// anything but ASCII letters, digits and hyphens is undecided on a
+    /// tagged literal: rdflib reads it more widely.
     LangMatches(String),
     /// `?x <op> <numeric constant>` under the SPARQL operator mapping.
     Num(NumOp, Number),
@@ -944,7 +946,7 @@ impl TermPredicate {
             },
             TermPredicate::LangMatches(range) => match LiteralView::parse(spelling) {
                 Some(lit) => match lit.lang {
-                    Some(tag) => Verdict::from(lang_matches(tag, range)),
+                    Some(tag) => lang_matches(tag, range),
                     // `langMatches("", range)` is false for every range.
                     None => Verdict::False,
                 },
@@ -1135,14 +1137,25 @@ impl Number {
     }
 }
 
-/// BCP 47 basic filtering (RFC 4647 §3.3.1) as SPARQL's `langMatches`.
-fn lang_matches(tag: &str, range: &str) -> bool {
+/// BCP 47 basic filtering (RFC 4647 §3.3.1) as SPARQL's `langMatches`, on
+/// the ranges where it and rdflib's `_lang_range_check` agree: `*`, or ASCII
+/// letters, digits and hyphens. rdflib reads any other range more widely: a
+/// `*` in any subtag is a wildcard (`en-*` matches `en-gb`), whitespace
+/// around the range is stripped, and Python lower-cases it (the Kelvin sign
+/// to `k`). Those ranges, and a tag outside the same alphabet, are `Unknown`.
+fn lang_matches(tag: &str, range: &str) -> Verdict {
+    let plain = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
     if range == "*" {
-        return !tag.is_empty();
+        return Verdict::from(!tag.is_empty());
+    }
+    if !plain(range) || !plain(tag) {
+        return Verdict::Unknown;
     }
     let tag = tag.to_ascii_lowercase();
     let range = range.to_ascii_lowercase();
-    tag == range || (tag.starts_with(&range) && tag.as_bytes().get(range.len()) == Some(&b'-'))
+    Verdict::from(
+        tag == range || (tag.starts_with(&range) && tag.as_bytes().get(range.len()) == Some(&b'-')),
+    )
 }
 
 /// The lexical form of a literal spelled with N-Triples escapes (`\t \b \n
@@ -1249,6 +1262,54 @@ mod tests {
         let any = p("lang_matches", "*");
         assert_eq!(any.eval("\"a\"@fr"), Verdict::True);
         assert_eq!(any.eval("\"a\""), Verdict::False);
+    }
+
+    /// rdflib's `langMatches` reads a range more widely than basic filtering:
+    /// a `*` in any subtag is a wildcard (`en-*` matches `en-gb`), whitespace
+    /// around the range is stripped, and its case mapping is Python's (the
+    /// Kelvin sign lower-cases to `k`). A tagged literal is left undecided for
+    /// every range that is not `*` or ASCII alphanumerics and hyphens.
+    #[test]
+    fn lang_matches_leaves_ranges_rdflib_reads_differently_undecided() {
+        for range in [
+            "en-*",
+            "*-gb",
+            "*-*",
+            "e*",
+            " en",
+            "en ",
+            "\ten",
+            "\u{3000}en",
+            "\u{a0}en-gb",
+            "\u{212a}ab",
+            "en_gb",
+            "en.*",
+        ] {
+            let m = p("lang_matches", range);
+            assert_eq!(m.eval("\"a\"@en-gb"), Verdict::Unknown, "{range:?}");
+            assert_eq!(m.eval("\"a\"@kab"), Verdict::Unknown, "{range:?}");
+            // An untagged literal and a non-literal match no range, whatever it is.
+            assert_eq!(m.eval("\"a\""), Verdict::False, "{range:?}");
+            assert_eq!(m.eval("<http://x>"), Verdict::False, "{range:?}");
+        }
+        for (range, want) in [
+            ("en", true),
+            ("en-GB", true),
+            ("EN-gb", true),
+            ("e", false),
+            ("en-g", false),
+            ("1996", false),
+            ("*", true),
+            ("en-", false),
+            ("-gb", false),
+            ("en--gb", false),
+        ] {
+            assert_eq!(
+                p("lang_matches", range).eval("\"a\"@en-gb"),
+                Verdict::from(want),
+                "{range:?}"
+            );
+        }
     }
 
     #[test]

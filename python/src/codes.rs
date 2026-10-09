@@ -177,8 +177,11 @@ impl TermDict {
     /// every text is undecided for the others, and for one whose compiled
     /// program is large (counted repetitions that multiply). Only the
     /// dictionary windows holding candidates the kind ranges do not decide
-    /// are read; nothing is memoized. An unknown kind or an invalid argument
-    /// or option raises `ValueError`.
+    /// are read; nothing is memoized. `lang_matches` is BCP 47 basic
+    /// filtering, decided for `*` and for a range of ASCII letters, digits
+    /// and hyphens; any other range, which rdflib reads more widely (`en-*`,
+    /// padding whitespace), leaves the language-tagged literals undecided.
+    /// An unknown kind or an invalid argument or option raises `ValueError`.
     #[pyo3(signature = (kind, arg, codes, *, flags = "", case = None, as_str = false))]
     // The parameters are the Python signature.
     #[allow(clippy::too_many_arguments)]
