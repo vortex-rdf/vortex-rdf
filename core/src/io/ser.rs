@@ -232,7 +232,13 @@ where
 /// readable temp file. Owner, ACLs and extended attributes are not
 /// preserved: the new file belongs to the writing process.
 ///
-/// The old file is never opened for writing. Overwriting it in place would be
+/// A store the process cannot write is never replaced: the old file is opened
+/// for writing as a probe (not truncated, not created, nothing changes) before
+/// anything is built, and a `PermissionDenied` answer fails the write with an
+/// error naming the path, as `File::create` refused such a file. A read-only
+/// store signals that it should not be overwritten.
+///
+/// The old file is never modified. Overwriting it in place would be
 /// unsafe while a reader still maps it (its pages would be pulled out from
 /// under the mapping: SIGBUS, or another store's bytes read as the old
 /// ones), and a process that dies mid-write would leave a half-written file
@@ -276,7 +282,42 @@ where
                 std::io::Error::new(std::io::ErrorKind::IsADirectory, "is a directory"),
             ));
         }
-        Ok(meta) => Some(meta.permissions()),
+        Ok(meta) => {
+            // A store this process could not write is never replaced: a
+            // read-only store signals that it should not be overwritten, as
+            // `File::create` honoured by failing. The rename itself needs
+            // only the directory, so the file is asked directly — opened for
+            // writing, neither truncated nor created, so nothing changes — and
+            // is judged as `File::create` judged it (root still bypasses).
+            match tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&target)
+                .await
+            {
+                Ok(_probe) => {}
+                // Gone since the stat: a fresh path after all.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    let via = if target == path {
+                        String::new()
+                    } else {
+                        format!(" ({target:?})")
+                    };
+                    return Err(io_error(
+                        "replace",
+                        std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!(
+                                "the existing store{via} is not writable by this process, \
+                                 and a store it cannot write is never replaced"
+                            ),
+                        ),
+                    ));
+                }
+                Err(e) => return Err(io_error("inspect", e)),
+            }
+            Some(meta.permissions())
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(io_error("inspect", e)),
     };

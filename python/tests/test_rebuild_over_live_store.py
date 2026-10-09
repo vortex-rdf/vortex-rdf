@@ -86,3 +86,28 @@ def test_serialize_through_a_symlink_keeps_the_link_and_the_permissions(tmp_path
     assert store.stat().st_mode & 0o7777 == 0o640
     assert len(VortexRdfStore(current)) == len(VortexRdfStore(store)) == NEW_TRIPLES
     assert [p.name for p in versions.iterdir()] == ["v3.vortex"]
+
+
+def test_serialize_refuses_to_replace_a_store_it_cannot_write(tmp_path):
+    old_nt, new_nt = tmp_path / "old.nt", tmp_path / "new.nt"
+    write_ntriples(old_nt, "old", OLD_TRIPLES)
+    write_ntriples(new_nt, "new", NEW_TRIPLES)
+    store = tmp_path / "store.vortex"
+    serialize_rdf(old_nt, store)
+    before = store.read_bytes()
+    store.chmod(0o444)
+    try:
+        # Root (or CAP_DAC_OVERRIDE) writes a 0444 file anyway, and the
+        # refusal cannot be observed there.
+        with open(store, "r+b"):
+            pytest.skip("this process can write a 0444 file (root?)")
+    except PermissionError:
+        pass
+
+    with pytest.raises(PermissionError, match="never replaced"):
+        serialize_rdf(new_nt, store)
+
+    assert store.read_bytes() == before
+    assert store.stat().st_mode & 0o7777 == 0o444
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["new.nt", "old.nt", "store.vortex"]
+    assert len(VortexRdfStore(store)) == OLD_TRIPLES

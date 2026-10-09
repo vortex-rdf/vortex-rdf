@@ -343,7 +343,9 @@ async fn test_temp_file_is_a_sibling_and_gone_after_success() {
 /// Replacing a store keeps what the old file was set up as: a symbolic link
 /// at the path (a `current -> versions/v3.vortex` setup) still points at the
 /// replaced file, and the permission bits carry over. Owner, ACLs and
-/// extended attributes are not preserved.
+/// extended attributes are not preserved. A store the process cannot write
+/// (a read-only `0444` file) is never replaced: a read-only store signals
+/// that it should not be overwritten.
 #[cfg(unix)]
 mod links_and_permissions {
     use super::*;
@@ -624,5 +626,124 @@ mod links_and_permissions {
         .unwrap();
 
         assert_eq!(mode_of(&path), 0o600);
+    }
+
+    /// Make `path` read-only, and say whether the process can write it anyway
+    /// (root and `CAP_DAC_OVERRIDE` bypass the mode): the refusal can only be
+    /// observed where the mode is honoured.
+    fn read_only_is_honoured(path: &Path) -> bool {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let bypassed = std::fs::OpenOptions::new().write(true).open(path).is_ok();
+        if bypassed {
+            eprintln!("skipped: this process can write a 0444 file (root?)");
+        }
+        !bypassed
+    }
+
+    /// A store the process cannot write is never replaced, as `File::create`
+    /// never replaced one: the rebuild is refused with `PermissionDenied`
+    /// naming the path, before any input is read, and the store stays
+    /// byte-identical with nothing left beside it.
+    #[tokio::test]
+    async fn test_a_store_the_process_cannot_write_is_never_replaced() {
+        let (dir, path) =
+            write_store_file(modular_quads(12, 3, 4), LayoutStrategy::Default, vec![]).await;
+        if !read_only_is_honoured(&path) {
+            return;
+        }
+        let before = std::fs::read(&path).unwrap();
+        let polled = Arc::new(AtomicBool::new(false));
+
+        let error = crate::io::quads_stream_to_vortex_file(
+            recording_stream(polled.clone()),
+            &path,
+            LayoutStrategy::Dictionary,
+            vec![],
+        )
+        .await
+        .expect_err("a read-only store must not be replaced");
+
+        let VortexRdfError::Io(io_error) = &error else {
+            panic!("expected an I/O error, got {error:?}");
+        };
+        assert_eq!(
+            io_error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains(&format!("{path:?}")),
+            "the error must name the path: {error}"
+        );
+        assert!(
+            !polled.load(Ordering::SeqCst),
+            "the input was read although the store cannot be replaced"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(mode_of(&path), 0o444);
+        assert_eq!(entries(dir.path()), vec![path.clone()]);
+    }
+
+    /// Through a link, the file the link ends at is the one probed: a link to
+    /// a read-only store is refused and left as it was, and so is the store.
+    #[tokio::test]
+    async fn test_a_symlink_to_a_store_the_process_cannot_write_is_refused() {
+        let (dir, v3, current) = versioned_store().await;
+        if !read_only_is_honoured(&v3) {
+            return;
+        }
+        let before = std::fs::read(&v3).unwrap();
+
+        let error = rebuild(&current, modular_quads(5, 2, 2))
+            .await
+            .expect_err("a read-only store must not be replaced");
+
+        assert!(
+            matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains(&format!("{current:?}")),
+            "the error must name the path it was asked to write: {error}"
+        );
+        assert!(is_link(&current));
+        assert_eq!(std::fs::read(&v3).unwrap(), before);
+        assert_eq!(entries(&dir.path().join("versions")), vec![v3]);
+    }
+
+    /// Compaction rewrites the store file through the same writer, so a store
+    /// file the process cannot write is not compacted either: the compaction
+    /// fails and the file is left as it was.
+    #[tokio::test]
+    async fn test_compaction_leaves_a_store_the_process_cannot_write_alone() {
+        let (dir, path) =
+            write_store_file(modular_quads(12, 3, 4), LayoutStrategy::Default, vec![]).await;
+        if !read_only_is_honoured(&path) {
+            return;
+        }
+        let before = std::fs::read(&path).unwrap();
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let extra = make_quad(
+            "http://example.org/s99",
+            "http://example.org/p0",
+            "object 9",
+            GraphName::DefaultGraph,
+        );
+
+        let error = store
+            .add_quad(extra)
+            .await
+            .unwrap()
+            .compact()
+            .await
+            .err()
+            .expect("a read-only store file must not be rewritten");
+
+        assert!(
+            matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(entries(dir.path()), vec![path.clone()]);
     }
 }

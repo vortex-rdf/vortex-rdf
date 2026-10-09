@@ -220,7 +220,9 @@ flowchart TD
   then renamed over the original path; the store is reopened with the
   residency budget it was opened with. The sibling placement keeps the rename
   on one filesystem, so it is atomic; a failed write removes the temp file
-  and leaves the original untouched. The builder's spill runs are placed in
+  and leaves the original untouched, and a store file the process cannot
+  write (a read-only file) is not compacted at all: the compaction fails with
+  `PermissionDenied`. The builder's spill runs are placed in
   the store file's own directory ([`spill.rs`](../core/src/store/builders/spill.rs#L60)),
   the one volume known to fit the data (`VORTEX_RDF_SPILL_DIR` still
   outranks that default).

@@ -51,8 +51,9 @@ impl VortexRdfStore {
     ///
     /// A file-backed store stays file-backed: the compacted rows are written
     /// back over its own source file (via a temp file and an atomic rename) and
-    /// the store is reopened from it. An in-memory store returns the in-memory
-    /// rebuild directly.
+    /// the store is reopened from it. A source file the process cannot write is
+    /// never replaced: the compaction fails with `PermissionDenied` and leaves
+    /// it alone. An in-memory store returns the in-memory rebuild directly.
     ///
     /// [`compact`]: Self::compact
     pub async fn compact_with_indexes(&self, indexes: Indexes) -> Result<Self> {

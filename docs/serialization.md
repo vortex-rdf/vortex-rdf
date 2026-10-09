@@ -414,8 +414,11 @@ it over the old one. What the old file was set up as is kept: a symbolic link
 at the path (or a chain of them) is followed and the file it ends at is
 replaced, so a `current -> versions/v3.vortex` setup keeps its link; the old
 file's permission bits are copied onto the temp file before the first byte is
-written. Owner, ACLs and extended attributes are **not** preserved: the new
-file belongs to the process that wrote it. Two costs follow from the design: a
+written, and a store the process cannot write is never replaced (a read-only
+store signals that it should not be overwritten: the rebuild fails with
+`PermissionDenied` before anything is built, and compaction of such a file
+fails the same way). Owner, ACLs and extended attributes are **not**
+preserved: the new file belongs to the process that wrote it. Two costs follow from the design: a
 rebuild needs a **writable directory** (a writable file in a read-only
 directory can no longer be rebuilt in place), and about **twice the disk
 space** while the old and the new file coexist (the old file's blocks are freed
