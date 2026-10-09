@@ -369,8 +369,10 @@ flowchart TD
   travels on its descriptor.
 
 Two drivers feed this: [`built_stream_to_vortex_writer`](../core/src/io/ser.rs#L124)
-for a builder's chunk stream (files, compaction; the file itself comes from
-[`create_store_file`](../core/src/io/ser.rs#L171)), and
+for a builder's chunk stream (files, compaction; a file is written by
+[`write_store_file`](../core/src/io/ser.rs#L171) beside its path and renamed
+into place, so a failed write leaves no partial file and the previous store
+untouched, and a store that has the old file mapped keeps reading it), and
 [`serialize_parts`](../core/src/io/ser.rs#L43) for a store's split parts
 (`to_bytes`, the bindings' exchange bytes). On the wire the two are the same
 container.
@@ -438,7 +440,7 @@ quad, sort, and rebuild:
 - **A file-backed owner stays file-backed** ([`stream_compacted_to_file`](../core/src/store/compaction.rs#L99)):
   the sorted rows are streamed through `SortedStreamBuilder` — spilling beside
   the store file, not in the OS temp dir — into a sibling temp file
-  `<store>.compact-<uuid>.tmp`, which is atomically renamed over the original;
+  `<store>.write-<uuid>.tmp`, which is atomically renamed over the original;
   the store is then reopened with the residency budget it was opened with.
 - **An in-memory store** rebuilds through [`from_raw_quads`](../core/src/store/compaction.rs#L146)
   (a fresh dictionary under Dictionary, components over the whole set) and

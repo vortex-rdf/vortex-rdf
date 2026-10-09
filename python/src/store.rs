@@ -128,8 +128,9 @@ fn resolve_columns(columns: [Vec<Option<Py<PyString>>>; 4]) -> PyResult<[Vec<Py<
 /// under the Dictionary layout, the dictionary's window bounds) is read up
 /// front, and each query reads the mapped pages it touches. Replace a store's
 /// file by renaming a new one over it, never by truncating or rewriting it in
-/// place (a reader of the mapping would be killed with SIGBUS). One instance
-/// is meant to be kept and queried repeatedly.
+/// place (a reader of the mapping would be killed with SIGBUS); `serialize_rdf`
+/// already writes that way. One instance is meant to be kept and queried
+/// repeatedly.
 ///
 /// The Python bindings are read-only: stores are built with `serialize_rdf`
 /// (file to file), then opened and queried. There is no in-memory build, RDF
@@ -230,7 +231,8 @@ impl VortexRdfStore {
     /// anonymous memory), and the file must not be modified while open —
     /// replace its file by renaming a new one over it, never by truncating or
     /// rewriting it in place (a reader of the mapping would be killed with
-    /// SIGBUS). `in_memory=True` loads the whole store instead, keeping its
+    /// SIGBUS); `serialize_rdf` already writes that way. `in_memory=True`
+    /// loads the whole store instead, keeping its
     /// columns in their compressed form wherever matches can bind them
     /// directly; every later match then skips the file.
     #[new]

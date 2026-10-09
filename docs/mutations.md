@@ -202,7 +202,7 @@ flowchart TD
     L --> S["sort_unstable — (s, p, o, g)"]
     S --> O{"owner of a file?"}
     O -- "yes" --> F1["build_chunk_stream over the sorted rows,<br/>spilling beside the store file"]
-    F1 --> F2["write &lt;store&gt;.compact-&lt;uuid&gt;.tmp<br/>(built_stream_to_vortex_writer)"]
+    F1 --> F2["write &lt;store&gt;.write-&lt;uuid&gt;.tmp<br/>(write_store_file → built_stream_to_vortex_writer)"]
     F2 --> F3["rename the temp file over the original"]
     F3 --> F4["reopen with the same dictionary-residency budget"]
     O -- "no" --> M1["build_parts_from_raws: rows, components,<br/>fresh dictionary under Dictionary"]
@@ -213,8 +213,9 @@ flowchart TD
   ([`stream_compacted_to_file`](../core/src/store/compaction.rs#L99)): the
   sorted rows are streamed through the out-of-core builder
   ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L150))
-  into a sibling temp file `<store>.compact-<uuid>.tmp`
-  ([`create_store_file`](../core/src/io/ser.rs#L171),
+  into a sibling temp file `<store>.write-<uuid>.tmp`
+  ([`write_store_file`](../core/src/io/ser.rs#L171), the one writer every
+  path-taking build shares, around
   [`built_stream_to_vortex_writer`](../core/src/io/ser.rs#L124)), which is
   then renamed over the original path; the store is reopened with the
   residency budget it was opened with. The sibling placement keeps the rename

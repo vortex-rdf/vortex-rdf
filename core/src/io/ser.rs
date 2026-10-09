@@ -7,7 +7,9 @@
 //! [`write_store`](crate::io::container::write_store) over it, carrying
 //! each part's sortedness provenance onto the descriptors a reader will
 //! trust. Also owns the `quads_stream_to_*` entry points, which run a
-//! builder's chunk stream straight into that writer.
+//! builder's chunk stream straight into that writer, and the one way a store
+//! reaches a path on disk: written beside it and renamed into place
+//! ([`write_store_file`](crate::io::ser::write_store_file)).
 //!
 //! Reading these bytes back is [`read`](crate::io::read)'s job,
 //! and the container's own on-disk grammar is
@@ -150,7 +152,14 @@ where
 }
 
 /// Serialize a quad stream to a native store file at `path` — the path-based
-/// convenience over [`quads_stream_to_vortex_writer`].
+/// convenience over [`quads_stream_to_vortex_writer`], with the store written
+/// beside `path` and renamed into place.
+///
+/// The file is all-or-nothing. An input that fails partway — a parse error
+/// halfway through the stream — leaves no file at a fresh `path` and the
+/// previous store untouched at an existing one, and a store that has `path`
+/// memory-mapped keeps reading the file it mapped (the old file is replaced,
+/// never rewritten in place).
 #[cfg(feature = "file-io")]
 pub async fn quads_stream_to_vortex_file<S>(
     quads: S,
@@ -161,18 +170,93 @@ pub async fn quads_stream_to_vortex_file<S>(
 where
     S: Stream<Item = Result<RawQuad>> + Unpin + Send + 'static,
 {
-    let writer = create_store_file(path).await?;
-    quads_stream_to_vortex_writer(quads, writer, layout, indexes).await
+    let start = debug::timer();
+
+    // Ingest, sort and the dictionary run to completion before the temp file
+    // exists, so an input that fails never creates one.
+    let built = SortedStreamBuilder::build_vortex_stream(Box::new(quads), layout, indexes).await?;
+    write_store_file(path, |writer| built_stream_to_vortex_writer(built, writer)).await?;
+
+    log::debug!(
+        "[ser::quads_stream_to_vortex_file] Streaming write took {:?}",
+        debug::elapsed(start)
+    );
+    Ok(())
 }
 
-/// Create the file a store is written to, reporting a failure as
-/// [`VortexRdfError::Io`] with `path` in the message.
+/// Write a store file all-or-nothing: `write` fills a temp file created
+/// beside `path`, which is renamed over `path` only once `write` succeeded.
+/// Every store a path-taking writer produces (`quads_stream_to_vortex_file`,
+/// and compaction's rewrite of its own source file) goes through here.
+///
+/// The temp file is a sibling so the rename stays on one filesystem, which
+/// is what makes it atomic. The uuid in its name avoids colliding with a
+/// temp left behind by an earlier interrupted write, and the `.tmp`
+/// extension keeps it from being mistaken for a store.
+///
+/// The old file is never opened for writing. Overwriting it in place would be
+/// unsafe while a reader still maps it (its pages would be pulled out from
+/// under the mapping: SIGBUS, or another store's bytes read as the old
+/// ones), and a crash mid-write must never leave the only on-disk copy
+/// half-written. The rename makes the swap atomic: a reader that mapped the
+/// old file keeps its pages until it drops (Windows refuses the rename over
+/// a mapped file, and the write then fails with the I/O error), and `path`
+/// is untouched on any earlier failure.
+///
+/// The temp file is removed on every way out that does not rename it: an
+/// error from `write`, a failed rename, a panic, or this future being
+/// dropped.
 #[cfg(feature = "file-io")]
-pub(crate) async fn create_store_file(path: &std::path::Path) -> Result<tokio::fs::File> {
-    tokio::fs::File::create(path).await.map_err(|e| {
+pub(crate) async fn write_store_file<F, Fut>(path: &std::path::Path, write: F) -> Result<()>
+where
+    F: FnOnce(tokio::fs::File) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let io_error = |what: &str, e: std::io::Error| {
         VortexRdfError::Io(std::io::Error::new(
             e.kind(),
-            format!("create {path:?}: {e}"),
+            format!("{what} {path:?}: {e}"),
         ))
-    })
+    };
+
+    let tmp_path = path.with_extension(format!("write-{}.tmp", uuid::Uuid::new_v4()));
+    let file = tokio::fs::File::create(&tmp_path)
+        .await
+        .map_err(|e| io_error("create a temporary file beside", e))?;
+    let tmp = TempFile(Some(tmp_path));
+
+    write(file).await?;
+    tokio::fs::rename(tmp.path(), path)
+        .await
+        .map_err(|e| io_error("replace", e))?;
+    // Renamed into place: there is no temp file left to remove.
+    tmp.persist();
+    Ok(())
+}
+
+/// A temp file that deletes itself when dropped, unless it was
+/// [persisted](Self::persist) — so each error path of [`write_store_file`]
+/// (and a dropped future) cleans up without a line of its own.
+#[cfg(feature = "file-io")]
+struct TempFile(Option<std::path::PathBuf>);
+
+#[cfg(feature = "file-io")]
+impl TempFile {
+    fn path(&self) -> &std::path::Path {
+        self.0.as_deref().expect("a live temp file has a path")
+    }
+
+    /// Keep the file: it has been renamed away, so there is nothing to remove.
+    fn persist(mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(feature = "file-io")]
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }

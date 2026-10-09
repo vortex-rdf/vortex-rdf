@@ -108,3 +108,7 @@ required-features = ["file-io"]
 [[test]]
 name = "experimental_patched"
 required-features = ["file-io"]
+
+[[test]]
+name = "replace_mapped_store"
+required-features = ["file-io"]

@@ -109,8 +109,9 @@ impl VortexRdfStore {
     ///
     /// The file is read in place for the store's lifetime: it must not be
     /// truncated or rewritten while open. Replacing it by a rename (as
-    /// [`compact`](Self::compact) does) is fine on Unix, where the mapping
-    /// keeps the old file; Windows refuses to rename over a mapped file.
+    /// [`compact`](Self::compact) and the file writers do) is fine on Unix,
+    /// where the mapping keeps the old file; Windows refuses to rename over a
+    /// mapped file.
     /// Network filesystems are not supported for mapping.
     #[cfg(feature = "file-io")]
     pub async fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
