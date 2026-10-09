@@ -337,3 +337,292 @@ async fn test_temp_file_is_a_sibling_and_gone_after_success() {
     assert_eq!(entries(dir.path()), vec![path.clone()]);
     assert_eq!(std::fs::read(&path).unwrap(), b"a store");
 }
+
+// ─── Links and permissions (Unix) ──────────────────────────────────────
+
+/// Replacing a store keeps what the old file was set up as: a symbolic link
+/// at the path (a `current -> versions/v3.vortex` setup) still points at the
+/// replaced file, and the permission bits carry over. Owner, ACLs and
+/// extended attributes are not preserved.
+#[cfg(unix)]
+mod links_and_permissions {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    const MODE_MASK: u32 = 0o7777;
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & MODE_MASK
+    }
+
+    fn is_link(path: &Path) -> bool {
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    }
+
+    async fn rebuild(path: &Path, quads: Vec<Quad>) -> crate::error::Result<()> {
+        crate::io::quads_stream_to_vortex_file(
+            quad_stream(quads),
+            path,
+            LayoutStrategy::Default,
+            vec![],
+        )
+        .await
+    }
+
+    /// `dir/versions/v3.vortex` holding twelve quads, and `dir/current` a
+    /// relative link to it.
+    async fn versioned_store() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let versions = dir.path().join("versions");
+        std::fs::create_dir(&versions).unwrap();
+        let v3 = versions.join("v3.vortex");
+        crate::io::quads_stream_to_vortex_file(
+            quad_stream(modular_quads(12, 3, 4)),
+            &v3,
+            LayoutStrategy::Dictionary,
+            vec![],
+        )
+        .await
+        .unwrap();
+        let current = dir.path().join("current");
+        symlink("versions/v3.vortex", &current).unwrap();
+        (dir, v3, current)
+    }
+
+    /// A store written through a link replaces the file the link points to
+    /// and leaves the link as it was; nothing else is left beside either.
+    #[tokio::test]
+    async fn test_a_symlink_to_a_store_keeps_its_link() {
+        let (dir, v3, current) = versioned_store().await;
+
+        rebuild(&current, modular_quads(5, 2, 2)).await.unwrap();
+
+        assert!(is_link(&current), "the link must survive the rebuild");
+        assert_eq!(
+            std::fs::read_link(&current).unwrap(),
+            PathBuf::from("versions/v3.vortex")
+        );
+        assert!(!is_link(&v3));
+        for path in [&current, &v3] {
+            let store = VortexRdfStore::from_file(path).await.unwrap();
+            assert_eq!(store.size().await.unwrap(), 5, "{path:?}");
+            assert_eq!(store.layout(), LayoutStrategy::Default, "{path:?}");
+        }
+        assert_eq!(
+            entries(dir.path()),
+            vec![current.clone(), dir.path().join("versions")]
+        );
+        assert_eq!(entries(&dir.path().join("versions")), vec![v3]);
+    }
+
+    /// Absolute targets and chains of links are followed to the file at the
+    /// end, and every link on the way stays.
+    #[tokio::test]
+    async fn test_a_chain_of_symlinks_is_followed_to_the_end() {
+        let (dir, v3, current) = versioned_store().await;
+        std::fs::remove_file(&current).unwrap();
+        symlink(&v3, &current).unwrap(); // absolute
+        let latest = dir.path().join("latest");
+        symlink("current", &latest).unwrap(); // a link to a link
+
+        rebuild(&latest, modular_quads(7, 2, 2)).await.unwrap();
+
+        assert!(is_link(&latest) && is_link(&current) && !is_link(&v3));
+        assert_eq!(
+            std::fs::read_link(&latest).unwrap(),
+            PathBuf::from("current")
+        );
+        assert_eq!(std::fs::read_link(&current).unwrap(), v3);
+        assert_eq!(
+            VortexRdfStore::from_file(&v3)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
+            7
+        );
+    }
+
+    /// A link to a file that is not there yet is written through, as creating
+    /// the file always did.
+    #[tokio::test]
+    async fn test_a_dangling_symlink_gets_its_target_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let versions = dir.path().join("versions");
+        std::fs::create_dir(&versions).unwrap();
+        let next = dir.path().join("next");
+        symlink("versions/v4.vortex", &next).unwrap();
+
+        rebuild(&next, modular_quads(6, 2, 2)).await.unwrap();
+
+        assert!(is_link(&next));
+        let v4 = versions.join("v4.vortex");
+        assert!(!is_link(&v4));
+        assert_eq!(
+            VortexRdfStore::from_file(&next)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
+            6
+        );
+        assert_eq!(entries(&versions), vec![v4]);
+    }
+
+    /// A link that ends at a directory, or never ends, is refused before the
+    /// input is read, and nothing is replaced.
+    #[tokio::test]
+    async fn test_a_symlink_to_a_directory_or_a_loop_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("target");
+        std::fs::create_dir(&target_dir).unwrap();
+        let to_dir = dir.path().join("to-dir");
+        symlink("target", &to_dir).unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        symlink("b", &a).unwrap();
+        symlink("a", &b).unwrap();
+
+        for (path, what) in [(&to_dir, "to a directory"), (&a, "loop")] {
+            let polled = Arc::new(AtomicBool::new(false));
+            let error = crate::io::quads_stream_to_vortex_file(
+                recording_stream(polled.clone()),
+                path,
+                LayoutStrategy::Default,
+                vec![],
+            )
+            .await
+            .expect_err(what);
+            assert!(matches!(error, VortexRdfError::Io(_)), "{what}: {error}");
+            assert!(!polled.load(Ordering::SeqCst), "{what}: the input was read");
+            assert!(is_link(path), "{what}: the link was replaced");
+        }
+        assert_eq!(entries(&target_dir), Vec::<PathBuf>::new());
+    }
+
+    /// Compaction rewrites the store file through the same writer, so a store
+    /// opened through a link is compacted in place and the link stays.
+    #[tokio::test]
+    async fn test_compacting_a_store_opened_through_a_symlink_keeps_the_link() {
+        let (_dir, v3, current) = versioned_store().await;
+        let store = VortexRdfStore::from_file(&current).await.unwrap();
+        let extra = make_quad(
+            "http://example.org/s99",
+            "http://example.org/p0",
+            "object 9",
+            GraphName::DefaultGraph,
+        );
+
+        let compacted = store
+            .add_quad(extra)
+            .await
+            .unwrap()
+            .compact()
+            .await
+            .unwrap();
+
+        assert!(is_link(&current) && !is_link(&v3));
+        assert_eq!(compacted.size().await.unwrap(), 13);
+        assert_eq!(
+            VortexRdfStore::from_file(&v3)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
+            13
+        );
+    }
+
+    /// The new store has the permission bits of the one it replaces, however
+    /// restrictive or permissive they are.
+    #[tokio::test]
+    async fn test_a_rebuild_keeps_the_permission_bits_of_the_store_it_replaces() {
+        for mode in [0o600, 0o640, 0o664, 0o755] {
+            let (_dir, path) =
+                write_store_file(modular_quads(12, 3, 4), LayoutStrategy::Default, vec![]).await;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            rebuild(&path, modular_quads(5, 2, 2)).await.unwrap();
+
+            assert_eq!(mode_of(&path), mode, "{mode:o}");
+            assert_eq!(
+                VortexRdfStore::from_file(&path)
+                    .await
+                    .unwrap()
+                    .size()
+                    .await
+                    .unwrap(),
+                5
+            );
+        }
+    }
+
+    /// Through a link, the permissions are those of the file it ends at.
+    #[tokio::test]
+    async fn test_a_rebuild_through_a_symlink_keeps_the_targets_permissions() {
+        let (_dir, v3, current) = versioned_store().await;
+        std::fs::set_permissions(&v3, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        rebuild(&current, modular_quads(5, 2, 2)).await.unwrap();
+
+        // v3 is the file that was replaced (it holds the new five quads), and
+        // it kept its bits.
+        assert_eq!(
+            VortexRdfStore::from_file(&v3)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
+            5
+        );
+        assert_eq!(mode_of(&v3), 0o640);
+    }
+
+    /// A path with no store yet gets the permissions any new file does.
+    #[tokio::test]
+    async fn test_a_fresh_path_gets_the_default_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain");
+        std::fs::File::create(&plain).unwrap();
+        let path = dir.path().join("store.vortex");
+
+        rebuild(&path, modular_quads(5, 2, 2)).await.unwrap();
+
+        assert_eq!(mode_of(&path), mode_of(&plain));
+    }
+
+    /// While the replacement is being written it already has the old store's
+    /// permissions, so a private store is never copied into a more readable
+    /// temp file.
+    #[tokio::test]
+    async fn test_the_temp_file_has_the_old_permissions_while_it_is_written() {
+        use crate::io::ser::write_store_atomically;
+        use vortex_io::VortexWrite as _;
+
+        let (dir, path) =
+            write_store_file(modular_quads(12, 3, 4), LayoutStrategy::Default, vec![]).await;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let watched = dir.path().to_path_buf();
+        let store = path.clone();
+
+        write_store_atomically(&path, |mut writer| async move {
+            writer.write_all(b"half a store".to_vec()).await?;
+            let temp = entries(&watched)
+                .into_iter()
+                .find(|entry| *entry != store)
+                .expect("the temp file exists while the store is written");
+            assert_eq!(mode_of(&temp), 0o600);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(mode_of(&path), 0o600);
+    }
+}

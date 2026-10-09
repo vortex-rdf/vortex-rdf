@@ -209,6 +209,15 @@ where
 /// temp left behind by an earlier interrupted write, and the `.tmp`
 /// extension keeps it from being mistaken for a store.
 ///
+/// What the old file was set up as survives the replacement. A symbolic link
+/// at `path` is followed (a chain of them, and a link to a file that is not
+/// there yet, included): the store is written beside the file the links end
+/// at and renamed over it, so a `current -> versions/v3.vortex` setup keeps
+/// its link. The old file's permission bits are copied onto the temp file
+/// before a byte is written, so a private store is never copied into a more
+/// readable temp file. Owner, ACLs and extended attributes are not
+/// preserved: the new file belongs to the writing process.
+///
 /// The old file is never opened for writing. Overwriting it in place would be
 /// unsafe while a reader still maps it (its pages would be pulled out from
 /// under the mapping: SIGBUS, or another store's bytes read as the old
@@ -234,18 +243,26 @@ where
         ))
     };
 
+    // The file this store replaces: `path`, or where the links at `path` end.
+    let target = replacement_target(path)
+        .await
+        .map_err(|e| io_error("resolve", e))?;
     // A directory can never be replaced by a store: say so now, not at the
-    // rename after the build.
-    if let Ok(meta) = tokio::fs::metadata(path).await
-        && meta.is_dir()
-    {
-        return Err(io_error(
-            "replace",
-            std::io::Error::new(std::io::ErrorKind::IsADirectory, "is a directory"),
-        ));
-    }
+    // rename after the build. Otherwise remember the old file's permissions
+    // (none for a fresh path).
+    let permissions = match tokio::fs::metadata(&target).await {
+        Ok(meta) if meta.is_dir() => {
+            return Err(io_error(
+                "replace",
+                std::io::Error::new(std::io::ErrorKind::IsADirectory, "is a directory"),
+            ));
+        }
+        Ok(meta) => Some(meta.permissions()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(io_error("inspect", e)),
+    };
 
-    let tmp_path = path.with_extension(format!("write-{}.tmp", uuid::Uuid::new_v4()));
+    let tmp_path = target.with_extension(format!("write-{}.tmp", uuid::Uuid::new_v4()));
     // `create_new`: a file already at the temp name is never opened, let alone
     // truncated and then deleted by the guard below.
     let file = tokio::fs::OpenOptions::new()
@@ -255,14 +272,52 @@ where
         .await
         .map_err(|e| io_error("create a temporary file beside", e))?;
     let tmp = TempFile(Some(tmp_path));
+    if let Some(permissions) = permissions {
+        // Before the first byte, not before the rename: nothing of a private
+        // store is ever readable through the temp file's default mode.
+        tokio::fs::set_permissions(tmp.path(), permissions)
+            .await
+            .map_err(|e| io_error("copy the permissions onto the temporary file of", e))?;
+    }
 
     write(file).await?;
-    tokio::fs::rename(tmp.path(), path)
+    tokio::fs::rename(tmp.path(), &target)
         .await
         .map_err(|e| io_error("replace", e))?;
     // Renamed into place: there is no temp file left to remove.
     tmp.persist();
     Ok(())
+}
+
+/// How many links [`replacement_target`] follows before it gives up, as many
+/// as Linux does before `ELOOP`.
+#[cfg(feature = "file-io")]
+const MAX_LINK_HOPS: usize = 40;
+
+/// The file a store written "to `path`" replaces: `path` itself, unless it is
+/// a symbolic link, in which case the file the chain of links ends at. A link
+/// to a file that is not there yet ends at that file, which is then created,
+/// as creating through the link always did.
+#[cfg(feature = "file-io")]
+async fn replacement_target(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let mut target = path.to_path_buf();
+    for _ in 0..MAX_LINK_HOPS {
+        match tokio::fs::symlink_metadata(&target).await {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let link = tokio::fs::read_link(&target).await?;
+                // A relative link is relative to the directory that holds it.
+                target = match target.parent() {
+                    Some(dir) => dir.join(link),
+                    None => link,
+                };
+            }
+            // A file, a directory, or nothing there: a fresh path, or the end
+            // of a link to nowhere. Anything the stat cannot say surfaces from
+            // the calls that follow.
+            _ => return Ok(target),
+        }
+    }
+    Err(std::io::Error::other("too many levels of symbolic links"))
 }
 
 /// A temp file that deletes itself when dropped, unless it was

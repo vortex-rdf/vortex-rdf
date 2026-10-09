@@ -3,9 +3,12 @@
 A file store is memory-mapped, so a writer that truncates and rewrites the
 path pulls the pages out from under the open store (SIGBUS on its next
 read). `serialize_rdf` builds beside the path and renames the finished file
-over it, which leaves the open store reading the file it mapped.
+over it, which leaves the open store reading the file it mapped. It also
+keeps what the old file was set up as: a symbolic link at the path, and the
+permission bits.
 """
 
+import pathlib
 import sys
 
 import pytest
@@ -62,3 +65,24 @@ def test_serialize_over_a_live_store_leaves_it_readable(tmp_path, layout):
         "old.nt",
         "store.vortex",
     ]
+
+
+def test_serialize_through_a_symlink_keeps_the_link_and_the_permissions(tmp_path):
+    old_nt, new_nt = tmp_path / "old.nt", tmp_path / "new.nt"
+    write_ntriples(old_nt, "old", OLD_TRIPLES)
+    write_ntriples(new_nt, "new", NEW_TRIPLES)
+    versions = tmp_path / "versions"
+    versions.mkdir()
+    store = versions / "v3.vortex"
+    serialize_rdf(old_nt, store)
+    store.chmod(0o640)
+    current = tmp_path / "current"
+    current.symlink_to("versions/v3.vortex")
+
+    serialize_rdf(new_nt, current)
+
+    assert current.is_symlink() and not store.is_symlink()
+    assert current.readlink() == pathlib.Path("versions/v3.vortex")
+    assert store.stat().st_mode & 0o7777 == 0o640
+    assert len(VortexRdfStore(current)) == len(VortexRdfStore(store)) == NEW_TRIPLES
+    assert [p.name for p in versions.iterdir()] == ["v3.vortex"]
