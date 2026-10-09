@@ -30,6 +30,36 @@ thread_local! {
     /// The code the dictionaries built or opened on this thread give their
     /// first term (see [`CodeBase`]); 0 outside a guard.
     static CODE_BASE: std::cell::Cell<TermCode> = const { std::cell::Cell::new(0) };
+
+    /// The most quads an indexed store built on this thread may hold (see
+    /// [`RowLimit`]); `MAX_INDEXED_ROWS` outside a guard.
+    static ROW_LIMIT: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(crate::store::indexes::MAX_INDEXED_ROWS) };
+}
+
+/// The row limit the index builds on this thread enforce: the format's
+/// `MAX_INDEXED_ROWS`, unless a [`RowLimit`] guard is live.
+pub(crate) fn row_limit() -> u64 {
+    ROW_LIMIT.with(std::cell::Cell::get)
+}
+
+/// While alive, every index build on this thread refuses a store past
+/// `limit` quads instead of past `u32::MAX` — the refusal of a store whose
+/// row ids would not fit a u32, reachable with a handful of quads. Dropping
+/// the guard restores the limit it replaced.
+pub(crate) struct RowLimit(u64);
+
+impl RowLimit {
+    /// Refuse indexed stores past `limit` quads until the guard drops.
+    pub(crate) fn set(limit: u64) -> Self {
+        RowLimit(ROW_LIMIT.with(|cell| cell.replace(limit)))
+    }
+}
+
+impl Drop for RowLimit {
+    fn drop(&mut self) {
+        ROW_LIMIT.with(|cell| cell.set(self.0));
+    }
 }
 
 /// The code a dictionary built or opened on this thread gives its first

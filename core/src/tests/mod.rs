@@ -38,6 +38,7 @@ mod names;
 mod narrowing;
 mod predicates;
 mod roundtrip;
+mod row_limit;
 #[cfg(feature = "file-io")]
 mod serialization;
 mod streaming;

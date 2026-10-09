@@ -631,14 +631,14 @@ impl TermColumn for TermCode {
 
 /// The permutation putting `quads` in `family` order.
 fn string_perm(quads: &[RawQuad], family: CopyFamily) -> Vec<u32> {
-    let mut perm: Vec<u32> = (0..quads.len() as u32).collect();
+    let mut perm: Vec<u32> = (0..quads.len()).map(super::row_id).collect();
     perm.sort_unstable_by(|&a, &b| family.cmp_quads(&quads[a as usize], &quads[b as usize]));
     perm
 }
 
 /// The permutation putting the encoded dataset in `family` order.
 fn code_perm(codes: &QuadCodes, family: CopyFamily) -> Vec<u32> {
-    let mut perm: Vec<u32> = (0..codes.s.len() as u32).collect();
+    let mut perm: Vec<u32> = (0..codes.s.len()).map(super::row_id).collect();
     perm.sort_unstable_by_key(|&i| family.code_key(codes, i as usize));
     perm
 }

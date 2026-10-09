@@ -216,6 +216,8 @@ impl VortexRdfStore {
                         child.row_count(),
                         file.row_count(),
                     )?;
+                    // An index child's u32 row ids cannot address more rows.
+                    crate::store::indexes::check_indexed_rows(file.row_count())?;
                 }
                 if !indexes.contains(&known.index) {
                     indexes.push(known.index);

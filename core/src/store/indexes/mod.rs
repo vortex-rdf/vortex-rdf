@@ -53,6 +53,85 @@ pub(crate) use serve::InMemoryServePlan;
 /// column name the families share rather than each spelling their own.
 pub(crate) const COL_RID: &str = "rid";
 
+/// The most quads a store with secondary indexes holds: every index child
+/// records each row's id in its `u32` [`COL_RID`] column, and the in-memory
+/// index builds number rows `0..len` as `u32`, so the row count must fit
+/// one. Every build path that assigns row ids checks against it — through
+/// [`check_indexed_rows`] or, row by row, [`next_row_id`] — and refuses the
+/// store rather than let an id wrap.
+pub(crate) const MAX_INDEXED_ROWS: u64 = u32::MAX as u64;
+
+/// The row limit in force: [`MAX_INDEXED_ROWS`], lowered only by the tests'
+/// `RowLimit` hook, so that a refusal is reachable without 2^32 rows.
+#[inline]
+fn row_limit() -> u64 {
+    #[cfg(test)]
+    {
+        crate::store::test_hooks::row_limit()
+    }
+    #[cfg(not(test))]
+    {
+        MAX_INDEXED_ROWS
+    }
+}
+
+/// `n` with thousands separators, as the refusal spells the limit.
+fn with_separators(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// The refusal of a store past the row limit; `rows`, when known, is how
+/// many quads it would hold.
+fn too_many_rows(rows: Option<u64>) -> VortexRdfError {
+    VortexRdfError::Serialization(format!(
+        "the store would exceed {} quads{}, which this version of vortex-rdf cannot hold in a \
+         store with secondary indexes: an index child records each row id as a u32",
+        with_separators(row_limit()),
+        rows.map(|n| format!(" ({} quads)", with_separators(n)))
+            .unwrap_or_default()
+    ))
+}
+
+/// Refuse to index `rows` quads past the row limit — the check every
+/// in-memory index build and every adoption of index children runs before
+/// a row id is assigned or trusted.
+pub(crate) fn check_indexed_rows(rows: u64) -> Result<()> {
+    if rows > row_limit() {
+        return Err(too_many_rows(Some(rows)));
+    }
+    Ok(())
+}
+
+/// The id of the next row of an indexed build that has numbered `assigned`
+/// rows so far, counting it — the checked increment of a build that numbers
+/// rows as they stream past and cannot know the count up front. The refusal
+/// comes at the first row past the row limit, before any id wraps.
+pub(crate) fn next_row_id(assigned: &mut u64) -> Result<u32> {
+    if *assigned >= row_limit() {
+        return Err(too_many_rows(None));
+    }
+    // Below the limit, which fits a u32.
+    let rid = *assigned as u32;
+    *assigned += 1;
+    Ok(rid)
+}
+
+/// Row `i`'s id as an index child records it, for `i` below a row count
+/// [`check_indexed_rows`] admitted — the in-memory index builds' numbering.
+/// The check comes first on every path that reaches here, so a failing
+/// conversion is a broken invariant, never a silent wrap.
+pub(crate) fn row_id(i: usize) -> u32 {
+    u32::try_from(i).expect("index builds refuse more than u32::MAX rows before numbering any")
+}
+
 /// A secondary index, built as its own sorted children beside the primary
 /// quad rows.
 ///

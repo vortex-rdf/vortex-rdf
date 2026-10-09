@@ -29,7 +29,9 @@ use crate::io::container::NativeComponentWrite;
 use crate::store::RawQuad;
 use crate::store::array::{chunked_or_single, with_subject_stamp};
 use crate::store::indexes::secondary_by_copy::{self, out_of_core::CopyKey};
-use crate::store::indexes::{IndexComponent, IndexType, Indexes, known_component, unique_indexes};
+use crate::store::indexes::{
+    IndexComponent, IndexType, Indexes, known_component, next_row_id, unique_indexes,
+};
 use crate::store::layouts::dictionary::{TermCodeMap, TermDictionary, TermDictionaryBuilder};
 use crate::store::layouts::{LayoutStrategy, dictionary};
 use crate::store::schema::TermCode;
@@ -368,8 +370,12 @@ where
     let mut ospg_spill = want_copy
         .then(|| RunSpiller::<(CopyKey<V>, u32)>::new(temp_dir, "idx_ospg", pair_capacity));
 
-    let mut rid: u32 = 0;
+    // Rows are numbered as the merge emits them, so the count is unknown up
+    // front: each id is a checked increment, refusing the store at the first
+    // row past what a u32 row id holds rather than wrapping.
+    let mut rows: u64 = 0;
     while let Some(quad) = merger.next()? {
+        let rid = next_row_id(&mut rows)?;
         if want_copy {
             let spog = [
                 term_of(&quad.s)?,
@@ -401,12 +407,11 @@ where
             }
         }
         merged.push(quad)?;
-        rid += 1;
     }
     let merged = merged.finish()?;
     log::debug!(
         "[SortedStreamBuilder] Merged {} quads; index pair runs written",
-        rid
+        rows
     );
 
     let ref_pairs = match (o_spill, p_spill) {

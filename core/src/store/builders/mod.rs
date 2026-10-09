@@ -45,7 +45,8 @@ use crate::store::RawQuad;
 use crate::store::array::chunked_or_single;
 use crate::store::array::stamp_is_sorted;
 use crate::store::indexes::{
-    IndexComponent, IndexType, Indexes, secondary_by_copy, secondary_by_reference, unique_indexes,
+    IndexComponent, IndexType, Indexes, check_indexed_rows, secondary_by_copy,
+    secondary_by_reference, unique_indexes,
 };
 use crate::store::layouts::LayoutStrategy;
 use crate::store::layouts::dictionary::{QuadCodes, TermDictionary};
@@ -248,6 +249,9 @@ pub(crate) fn build_components(
     indexes: &[IndexType],
     quads: &[RawQuad],
 ) -> Result<Vec<IndexComponent>> {
+    if !unique_indexes(indexes).is_empty() {
+        check_indexed_rows(quads.len() as u64)?;
+    }
     GlobalIndexes::build(
         indexes,
         || secondary_by_copy::GlobalCopyArrays::from_quads(quads),
@@ -264,6 +268,9 @@ pub(crate) fn build_components_from_codes(
     indexes: &[IndexType],
     codes: &QuadCodes,
 ) -> Result<Vec<IndexComponent>> {
+    if !unique_indexes(indexes).is_empty() {
+        check_indexed_rows(codes.s.len() as u64)?;
+    }
     GlobalIndexes::build(
         indexes,
         || secondary_by_copy::GlobalCopyArrays::from_codes(codes),

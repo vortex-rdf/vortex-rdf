@@ -399,7 +399,7 @@ impl GlobalReferenceArrays {
     /// just a u32 permutation — no per-term string copies.
     pub(crate) fn from_quads(quads: &[RawQuad]) -> Self {
         let perm_by = |term_of: fn(&RawQuad) -> &str| -> Vec<u32> {
-            let mut perm: Vec<u32> = (0..quads.len() as u32).collect();
+            let mut perm: Vec<u32> = (0..quads.len()).map(super::row_id).collect();
             perm.sort_unstable_by(|&a, &b| {
                 term_of(&quads[a as usize])
                     .cmp(term_of(&quads[b as usize]))
@@ -423,7 +423,7 @@ impl GlobalReferenceArrays {
             let mut pairs: Vec<(TermCode, u32)> = column
                 .iter()
                 .enumerate()
-                .map(|(i, &code)| (code, i as u32))
+                .map(|(i, &code)| (code, super::row_id(i)))
                 .collect();
             pairs.sort_unstable();
             (
