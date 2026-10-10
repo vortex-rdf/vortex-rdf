@@ -75,9 +75,9 @@ fn max_inline_splits() -> usize {
     MAX_INLINE_SPLITS
 }
 
-/// Test hooks for the driver choice: which driver the latest scan on this
-/// thread ran under, and a per-thread override of the split limit, so a test
-/// can force either path without timing anything.
+/// Test hooks for the driver choice: a per-thread override of the split limit,
+/// so a test can force either path, and the driver a scan ran under, read off
+/// how many of its splits were spawned. Nothing here times anything.
 #[cfg(test)]
 pub(crate) mod driver_hooks {
     use std::cell::Cell;
@@ -85,18 +85,7 @@ pub(crate) mod driver_hooks {
     use super::ScanDriver;
 
     thread_local! {
-        static LAST: Cell<Option<ScanDriver>> = const { Cell::new(None) };
         static LIMIT: Cell<Option<usize>> = const { Cell::new(None) };
-    }
-
-    /// Record the driver a scan just ran under.
-    pub(crate) fn record(driver: ScanDriver) {
-        LAST.set(Some(driver));
-    }
-
-    /// The driver of the latest scan on this thread, cleared by the read.
-    pub(crate) fn take_last() -> Option<ScanDriver> {
-        LAST.take()
     }
 
     /// The limit forced on this thread, if any.
@@ -120,6 +109,23 @@ pub(crate) mod driver_hooks {
     impl Drop for ForcedLimit {
         fn drop(&mut self) {
             LIMIT.set(self.previous);
+        }
+    }
+
+    /// The splits spawned on this thread since the last call, cleared by the
+    /// read: counted where the spawn happens, not where it was decided.
+    pub(crate) fn take_spawned() -> usize {
+        crate::io::read::spawn_probe::take()
+    }
+
+    /// The driver a scan of `splits` split futures ran under, given how many
+    /// of them were spawned: none is the inline driver, all of them the
+    /// spawned one. Anything between is neither, and fails the test.
+    pub(crate) fn driver_of(splits: usize, spawned: usize) -> ScanDriver {
+        match spawned {
+            0 => ScanDriver::Inline,
+            n if n == splits => ScanDriver::Spawned,
+            n => panic!("{n} of {splits} splits were spawned: neither driver"),
         }
     }
 }
@@ -161,8 +167,6 @@ pub(crate) async fn read_all_rows(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRe
     } else {
         ScanDriver::Spawned
     };
-    #[cfg(test)]
-    driver_hooks::record(driver);
     match driver {
         ScanDriver::Inline => collect_scan(dtype, tasks).await,
         ScanDriver::Spawned => collect_scan_spawned(dtype, tasks, window).await,
@@ -188,8 +192,6 @@ pub(crate) async fn read_all_rows(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRe
 pub(crate) async fn read_index_row_ids(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRef> {
     let dtype = scan.dtype().map_err(VortexRdfError::Vortex)?;
     let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
-    #[cfg(test)]
-    driver_hooks::record(ScanDriver::Inline);
     collect_scan(dtype, tasks).await
 }
 
@@ -1060,12 +1062,19 @@ mod tests {
             .collect()
     }
 
-    /// What `read_all_rows` did with a scan: its split count, the driver it
-    /// ran under, and the rows it returned.
+    /// What `read_all_rows` did with a scan: its split count, how many of
+    /// them it spawned, and the rows it returned.
     struct Driven {
         splits: usize,
-        driver: ScanDriver,
+        spawned: usize,
         rows: Vec<Vec<TermCode>>,
+    }
+
+    impl Driven {
+        /// The driver that ran the scan, read off the splits it spawned.
+        fn driver(&self) -> ScanDriver {
+            driver_hooks::driver_of(self.splits, self.spawned)
+        }
     }
 
     async fn drive(
@@ -1078,12 +1087,13 @@ mod tests {
             .build()
             .unwrap()
             .len();
+        driver_hooks::take_spawned();
         let rows = read_all_rows(scan_of(file, rows, per_split, ordered))
             .await
             .unwrap();
         Driven {
             splits,
-            driver: driver_hooks::take_last().expect("a scan records its driver"),
+            spawned: driver_hooks::take_spawned(),
             rows: quad_codes(rows),
         }
     }
@@ -1118,7 +1128,11 @@ mod tests {
             let _limit = driver_hooks::ForcedLimit::set(limit);
             let driven = drive(&file, 0..50, 16, true).await;
             assert_eq!(driven.splits, 4);
-            assert_eq!(driven.driver, driver, "limit {limit} on a four-split scan");
+            assert_eq!(
+                driven.driver(),
+                driver,
+                "limit {limit} on a four-split scan"
+            );
             assert_eq!(driven.rows, whole.rows, "{driver:?}: rows and order");
         }
 
@@ -1127,7 +1141,7 @@ mod tests {
         for (limit, driver) in [(4, ScanDriver::Inline), (0, ScanDriver::Spawned)] {
             let _limit = driver_hooks::ForcedLimit::set(limit);
             let driven = drive(&file, 0..50, 16, false).await;
-            assert_eq!(driven.driver, driver, "unordered, limit {limit}");
+            assert_eq!(driven.driver(), driver, "unordered, limit {limit}");
             assert_eq!(driven.rows, whole.rows, "unordered, {driver:?}");
         }
     }
@@ -1139,14 +1153,17 @@ mod tests {
         let limit = MAX_INLINE_SPLITS;
         let (_dir, file) = mapped_file(limit + 8).await;
         let whole = drive(&file, 0..(limit + 8) as u64, limit + 8, true).await;
-        assert_eq!(whole.driver, ScanDriver::Inline, "a single split");
+        assert_eq!(whole.driver(), ScanDriver::Inline, "a single split");
 
         // One row per split.
         let at = drive(&file, 0..limit as u64, 1, true).await;
-        assert_eq!((at.splits, at.driver), (limit, ScanDriver::Inline));
+        assert_eq!((at.splits, at.driver()), (limit, ScanDriver::Inline));
         assert_eq!(at.rows, head(&whole.rows, limit));
         let over = drive(&file, 0..limit as u64 + 1, 1, true).await;
-        assert_eq!((over.splits, over.driver), (limit + 1, ScanDriver::Spawned));
+        assert_eq!(
+            (over.splits, over.driver()),
+            (limit + 1, ScanDriver::Spawned)
+        );
         assert_eq!(over.rows, head(&whole.rows, limit + 1));
     }
 
@@ -1158,13 +1175,18 @@ mod tests {
         let (_dir, file) = mapped_file(50).await;
         let _limit = driver_hooks::ForcedLimit::set(1);
 
+        driver_hooks::take_spawned();
         let rows = read_index_row_ids(scan_of(&file, 0..50, 16, false))
             .await
             .unwrap();
-        assert_eq!(driver_hooks::take_last(), Some(ScanDriver::Inline));
+        assert_eq!(
+            driver_hooks::take_spawned(),
+            0,
+            "no split of it was spawned"
+        );
         let spawned = drive(&file, 0..50, 16, false).await;
         assert_eq!(
-            spawned.driver,
+            spawned.driver(),
             ScanDriver::Spawned,
             "the same scan as a row scan"
         );

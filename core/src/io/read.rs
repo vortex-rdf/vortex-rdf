@@ -98,8 +98,35 @@ where
     use vortex_io::session::RuntimeSessionExt as _;
 
     let handle = crate::session::VORTEX_SESSION.handle();
-    let spawned = futures::stream::iter(tasks).map(move |task| handle.spawn(task));
+    let spawned = futures::stream::iter(tasks).map(move |task| {
+        #[cfg(test)]
+        spawn_probe::note();
+        handle.spawn(task)
+    });
     chunked_or_single(drain_chunks(spawned.buffered(window)).await?, dtype)
+}
+
+/// Test hook: how many split futures [`collect_scan_spawned`] has spawned on
+/// this thread, so a test can tell which driver actually ran a scan. None
+/// spawned is the inline driver; every split spawned is this one.
+#[cfg(all(test, feature = "file-io"))]
+pub(crate) mod spawn_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SPAWNED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Count one spawned split.
+    pub(super) fn note() {
+        SPAWNED.set(SPAWNED.get() + 1);
+    }
+
+    /// The splits spawned on this thread since the last call, cleared by the
+    /// read.
+    pub(crate) fn take() -> usize {
+        SPAWNED.take()
+    }
 }
 
 /// Materialize a whole file by driving its scan's per-split futures inline.
@@ -229,5 +256,27 @@ mod tests {
         let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
         let values = array.execute::<PrimitiveArray>(&mut ctx).unwrap();
         assert_eq!(values.as_slice::<u64>(), (0..splits).collect::<Vec<_>>());
+    }
+
+    /// A split that fails fails the scan: its error comes out of the spawned
+    /// collector, whatever the splits around it did.
+    #[tokio::test]
+    async fn spawned_scan_propagates_a_split_error() {
+        let splits = 4u64;
+        let tasks: Vec<_> = (0..splits)
+            .map(|i| async move {
+                if i == 2 {
+                    return Err(vortex_error::vortex_err!("split {i} failed"));
+                }
+                Ok::<_, vortex_error::VortexError>(Some(
+                    PrimitiveArray::from_iter([i]).into_array(),
+                ))
+            })
+            .collect();
+        let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
+        let error = collect_scan_spawned(dtype, tasks, splits as usize)
+            .await
+            .expect_err("the failing split fails the scan");
+        assert!(error.to_string().contains("split 2 failed"), "{error}");
     }
 }

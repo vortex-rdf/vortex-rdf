@@ -357,7 +357,7 @@ mod tests {
         use crate::store::array::{field_as, into_struct_array};
         use crate::store::indexes::COL_RID;
         use crate::store::native_file::NativeStoreFile;
-        use crate::store::scan::file_scan::{ScanDriver, driver_hooks, read_all_rows};
+        use crate::store::scan::file_scan::{driver_hooks, read_all_rows};
 
         const COMPONENT: &str = "index:ref-p";
         let rows = 50;
@@ -373,6 +373,7 @@ mod tests {
             .unwrap()
             .expect("the reference child of the predicate column");
         let _limit = driver_hooks::ForcedLimit::set(0);
+        driver_hooks::take_spawned();
 
         // The located-run scan: every row of the child.
         let ids = scan_located_row_ids(
@@ -384,7 +385,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(driver_hooks::take_last(), Some(ScanDriver::Inline));
+        assert_eq!(driver_hooks::take_spawned(), 0, "located-run scan spawned");
         assert_eq!(ids.as_slice(), (0..rows as RowId).collect::<Vec<_>>());
 
         // The pushed-down equality, probing the child's first value.
@@ -403,12 +404,15 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(driver_hooks::take_last(), Some(ScanDriver::Inline));
+        assert_eq!(driver_hooks::take_spawned(), 0, "equality scan spawned");
         assert!(!matched.is_empty() && matched.len() < rows);
         assert!(matched.as_slice().windows(2).all(|pair| pair[0] < pair[1]));
 
-        // Control: a row scan of the same file goes to the workers.
+        // Control: a row scan of the same file goes to the workers, every
+        // split of it.
+        let splits = file.scan().unwrap().build().unwrap().len();
+        assert!(splits > 0);
         read_all_rows(file.scan().unwrap()).await.unwrap();
-        assert_eq!(driver_hooks::take_last(), Some(ScanDriver::Spawned));
+        assert_eq!(driver_hooks::take_spawned(), splits);
     }
 }
