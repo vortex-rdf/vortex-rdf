@@ -193,6 +193,7 @@ pub(crate) fn open_failure(
 /// A store keeps it to tell, before it rewrites its source file, whether the
 /// path still names the file it opened. There is no identity elsewhere.
 #[cfg(feature = "file-io")]
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FileIdentity {
     dev: u64,
