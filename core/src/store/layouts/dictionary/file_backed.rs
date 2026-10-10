@@ -135,7 +135,9 @@ impl FileBackedDict {
     /// leaves, and each window's bounds (from the exact zone maps, else from
     /// the leaves). `None` when the file has no dictionary component, or the
     /// child's shape cannot be searched by window (an empty child, a single
-    /// flat struct leaf, unsorted bounds): the caller lifts it resident.
+    /// flat struct leaf): the caller lifts it resident. Windows out of term
+    /// order are an invalid dictionary, not a shape: a `Deserialization`
+    /// error.
     pub(crate) async fn open(native: &NativeStoreFile) -> Result<Option<Self>> {
         let Some((_, reader)) = native
             .component_reader(DICT_COMPONENT_NAME)
@@ -162,7 +164,11 @@ impl FileBackedDict {
             None => leaf_bounds(&leaves, &source).await?,
         };
         if !ordered(&bounds) {
-            return Ok(None);
+            return Err(VortexRdfError::Deserialization(
+                "the dictionary child's windows are not in term order; rebuild the store from \
+                 its RDF source"
+                    .to_string(),
+            ));
         }
         let mut windows = Vec::with_capacity(leaves.len());
         let mut starts = Vec::with_capacity(leaves.len());
@@ -725,6 +731,39 @@ mod tests {
             .unwrap()
             .expect("the written dictionary child must be window-searchable");
         (fbd, terms)
+    }
+
+    /// Windows that are each sorted but out of term order across the child
+    /// are an invalid dictionary: the open fails with a `Deserialization`
+    /// error, not a silent lift of the child into the resident form.
+    #[tokio::test]
+    async fn windows_out_of_term_order_fail_the_open() {
+        let terms: Vec<String> = (0..600)
+            .map(|i| format!("<http://example.org/term/{i:04}>"))
+            .collect();
+        let swapped: Vec<&str> = [0usize, 2, 1, 3, 4, 5]
+            .iter()
+            .flat_map(|w| &terms[w * 100..(w + 1) * 100])
+            .map(String::as_str)
+            .collect();
+        let plain = VarBinViewArray::from_iter_str(swapped);
+        let d = TermDictionary::compress_windowed(plain, 100).unwrap();
+        let bytes = crate::tests::write_dict_only_store(&d).await;
+        let file = VORTEX_SESSION
+            .open_options()
+            .open_buffer(ByteBuffer::from(bytes))
+            .unwrap();
+        let native = NativeStoreFile::try_new(file).unwrap();
+
+        let error = FileBackedDict::open(&native)
+            .await
+            .err()
+            .expect("windows out of term order must not open");
+
+        assert!(
+            matches!(&error, VortexRdfError::Deserialization(message) if message.contains("term order")),
+            "{error}"
+        );
     }
 
     /// The compression windows survive as the child's leaves — one per window,
