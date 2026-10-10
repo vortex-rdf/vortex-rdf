@@ -817,18 +817,26 @@ async fn test_from_parts_retains_dict_children() {
 
 /// Open `bytes` both ways — `from_bytes` over the buffer and `from_file` over
 /// a temp file holding the same bytes — so every open-path contract below
-/// is asserted on each reader.
+/// is asserted on each reader. The directory comes back with the results:
+/// the mapped store reads its file for as long as it lives, and
+/// [`open_in_memory`] opens the same file the third way.
 async fn open_both(
     bytes: &[u8],
 ) -> (
     crate::error::Result<VortexRdfStore>,
     crate::error::Result<VortexRdfStore>,
+    tempfile::TempDir,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store.vortex");
     std::fs::write(&path, bytes).unwrap();
     let from_file = VortexRdfStore::from_file(&path).await;
-    (VortexRdfStore::from_bytes(bytes).await, from_file)
+    (VortexRdfStore::from_bytes(bytes).await, from_file, dir)
+}
+
+/// The file [`open_both`] wrote into `dir`, loaded whole.
+async fn open_in_memory(dir: &tempfile::TempDir) -> crate::error::Result<VortexRdfStore> {
+    VortexRdfStore::from_file_in_memory(dir.path().join("store.vortex")).await
 }
 
 /// A component descriptor of the shape a future change set could write: an
@@ -851,10 +859,9 @@ fn unknown_component(required: bool) -> container::NativeComponentWrite {
     .unwrap()
 }
 
-/// Term-code columns narrower than [`TermCode`] — the u32 codes a
-/// pre-release of 0.12 wrote — are refused by both readers, with an error
-/// naming the table, the column and its width: in the quad table, and in an
-/// index child beside u64 quad columns.
+/// Term-code columns narrower than [`TermCode`] (u32 codes) are refused by
+/// every open path, with an error naming the table, the column and its width:
+/// in the quad table, and in an index child beside u64 quad columns.
 #[tokio::test]
 async fn test_open_refuses_code_columns_narrower_than_u64() {
     use crate::store::layouts::dictionary::TermDictionary;
@@ -910,8 +917,13 @@ async fn test_open_refuses_code_columns_narrower_than_u64() {
             "the index:ref-o column val holds u32 term codes",
         ),
     ] {
-        let (from_bytes, from_file) = open_both(&bytes).await;
-        for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
+        let (from_bytes, from_file, dir) = open_both(&bytes).await;
+        let in_memory = open_in_memory(&dir).await;
+        for (path, result) in [
+            ("from_bytes", from_bytes),
+            ("from_file", from_file),
+            ("from_file_in_memory", in_memory),
+        ] {
             let err = result.err().expect("open should fail");
             assert!(
                 err.to_string().contains(want),
@@ -922,11 +934,10 @@ async fn test_open_refuses_code_columns_narrower_than_u64() {
     }
 }
 
-/// Row-id columns narrower than [`RowId`](crate::store::RowId) — the u32
-/// row ids a pre-release of 0.12 wrote — are refused by both readers, with
-/// an error naming the child, the column and its width: in a reference and
-/// a copy child beside u64 codes, and in a reference child of the Default
-/// layout, whose values are strings.
+/// Row-id columns narrower than [`RowId`](crate::store::RowId) (u32 row ids)
+/// are refused by every open path, with an error naming the child, the column
+/// and its width: in a reference and a copy child beside u64 codes, and in a
+/// reference child of the Default layout, whose values are strings.
 #[tokio::test]
 async fn test_open_refuses_row_ids_narrower_than_u64() {
     use crate::store::layouts::dictionary::TermDictionary;
@@ -1030,8 +1041,13 @@ async fn test_open_refuses_row_ids_narrower_than_u64() {
         ),
         (default_ref, "the index:ref-o column rid holds u32 row ids"),
     ] {
-        let (from_bytes, from_file) = open_both(&bytes).await;
-        for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
+        let (from_bytes, from_file, dir) = open_both(&bytes).await;
+        let in_memory = open_in_memory(&dir).await;
+        for (path, result) in [
+            ("from_bytes", from_bytes),
+            ("from_file", from_file),
+            ("from_file_in_memory", in_memory),
+        ] {
             let err = result.err().expect("open should fail");
             assert!(
                 err.to_string().contains(want),
@@ -1047,7 +1063,7 @@ async fn test_open_refuses_row_ids_narrower_than_u64() {
 #[tokio::test]
 async fn test_open_rejects_dictionary_rows_without_dictionary_component() {
     let bytes = unstamped_store_bytes(vec![bare_code_quad_array(&[0, 1, 2])], vec![]).await;
-    let (from_bytes, from_file) = open_both(&bytes).await;
+    let (from_bytes, from_file, _dir) = open_both(&bytes).await;
     for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
         let err = result.err().expect("open should fail");
         assert!(
@@ -1077,7 +1093,7 @@ async fn test_open_rejects_unknown_dictionary_implementation() {
     dict.descriptor.implementation = "not-a-dictionary-v0".into();
     let bytes = unstamped_store_bytes(vec![parts.array.clone()], vec![dict]).await;
 
-    let (from_bytes, from_file) = open_both(&bytes).await;
+    let (from_bytes, from_file, _dir) = open_both(&bytes).await;
     for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
         let err = result.err().expect("open should fail");
         assert!(
@@ -1115,7 +1131,7 @@ async fn test_open_rejects_a_dictionary_version_newer_than_this_version_reads() 
     for version in [container::DICT_VERSION, container::DICT_VERSION - 1] {
         let bytes =
             unstamped_store_bytes(vec![parts.array.clone()], vec![with_version(version)]).await;
-        let (from_bytes, from_file) = open_both(&bytes).await;
+        let (from_bytes, from_file, _dir) = open_both(&bytes).await;
         for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
             assert!(result.is_ok(), "{path}: version {version} must open");
         }
@@ -1124,11 +1140,8 @@ async fn test_open_rejects_a_dictionary_version_newer_than_this_version_reads() 
     for version in [container::DICT_VERSION + 1, 99, u32::MAX] {
         let bytes =
             unstamped_store_bytes(vec![parts.array.clone()], vec![with_version(version)]).await;
-        let (from_bytes, from_file) = open_both(&bytes).await;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("newer.vortex");
-        std::fs::write(&path, &bytes).unwrap();
-        let in_memory = VortexRdfStore::from_file_in_memory(&path).await;
+        let (from_bytes, from_file, dir) = open_both(&bytes).await;
+        let in_memory = open_in_memory(&dir).await;
         for (how, result) in [
             ("from_bytes", from_bytes),
             ("from_file", from_file),
@@ -1183,18 +1196,15 @@ async fn test_open_rejects_an_index_version_newer_than_this_version_reads() {
         with_version(container::INDEX_VERSION),
     )
     .await;
-    let (from_bytes, from_file) = open_both(&bytes).await;
+    let (from_bytes, from_file, _dir) = open_both(&bytes).await;
     for (how, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
         assert!(result.is_ok(), "{how}: the current version must open");
     }
 
     for version in [container::INDEX_VERSION + 1, 99, u32::MAX] {
         let bytes = unstamped_store_bytes(vec![parts.array.clone()], with_version(version)).await;
-        let (from_bytes, from_file) = open_both(&bytes).await;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("newer.vortex");
-        std::fs::write(&path, &bytes).unwrap();
-        let in_memory = VortexRdfStore::from_file_in_memory(&path).await;
+        let (from_bytes, from_file, dir) = open_both(&bytes).await;
+        let in_memory = open_in_memory(&dir).await;
         for (how, result) in [
             ("from_bytes", from_bytes),
             ("from_file", from_file),
@@ -1246,11 +1256,8 @@ async fn test_open_rejects_a_root_layout_from_a_newer_vortex_rdf() {
             .expect("the footer names the root layout");
         bytes[at..at + newer.len()].copy_from_slice(newer);
 
-        let (from_bytes, from_file) = open_both(&bytes).await;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("newer.vortex");
-        std::fs::write(&path, &bytes).unwrap();
-        let in_memory = VortexRdfStore::from_file_in_memory(&path).await;
+        let (from_bytes, from_file, dir) = open_both(&bytes).await;
+        let in_memory = open_in_memory(&dir).await;
         for (how, result) in [
             ("from_bytes", from_bytes),
             ("from_file", from_file),
@@ -1290,7 +1297,7 @@ async fn test_open_required_unknown_component_rejected_optional_skipped() {
     };
 
     let bytes = unstamped_store_bytes(vec![rows()], vec![unknown_component(true)]).await;
-    let (from_bytes, from_file) = open_both(&bytes).await;
+    let (from_bytes, from_file, _dir) = open_both(&bytes).await;
     for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
         let err = result.err().expect("open should fail");
         assert!(
@@ -1301,7 +1308,7 @@ async fn test_open_required_unknown_component_rejected_optional_skipped() {
     }
 
     let bytes = unstamped_store_bytes(vec![rows()], vec![unknown_component(false)]).await;
-    let (from_bytes, from_file) = open_both(&bytes).await;
+    let (from_bytes, from_file, _dir) = open_both(&bytes).await;
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
         let store = result.unwrap_or_else(|e| panic!("{path}: open should succeed: {e}"));
@@ -1357,7 +1364,7 @@ async fn test_open_rejects_index_child_with_mismatched_rows() {
         .collect();
     let bytes = unstamped_store_bytes(vec![parts.array.clone()], components).await;
 
-    let (from_bytes, from_file) = open_both(&bytes).await;
+    let (from_bytes, from_file, _dir) = open_both(&bytes).await;
     for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
         let err = result.err().expect("open should fail");
         assert!(
@@ -1482,9 +1489,9 @@ async fn test_written_code_columns_avoid_delta() {
             "{name} carries a delta-encoded column:\n{tree}"
         );
     }
-    // The guard bites: a 32 Ki-row sorted subject column is exactly what the
-    // stock cascade would delta-encode, and it stays on a word-addressable
-    // encoding instead.
+    // A 32 Ki-row sorted subject column is what the stock cascade would
+    // delta-encode; the pinned edition leaves delta out, so it stays on a
+    // word-addressable encoding.
     let quads_tree = &trees[0].1;
     assert!(
         [
