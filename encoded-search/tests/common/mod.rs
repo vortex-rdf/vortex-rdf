@@ -56,6 +56,9 @@ fn enable_test_editions(session: &VortexSession) {
         added: &[EditionMember::array(&"fastlanes.delta")],
     };
 
+    // The edition the store writes with (vortex-rdf-core's pinned core
+    // edition): the probes are tested against the wire forms it admits.
+    assert_eq!(CORE_2026_08_3.to_string(), "core2026.08.3");
     for family in EDITION_FAMILIES.iter().copied().chain([&TEST_FAMILY]) {
         session.editions().declare_family(family).unwrap();
     }

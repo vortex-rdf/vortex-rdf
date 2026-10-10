@@ -138,6 +138,9 @@ mod tests {
     /// wire form the readers were never checked against.
     #[test]
     fn session_admits_only_the_pinned_editions() {
+        // The pin is a literal here: pointing `CORE_EDITION` at Vortex's
+        // moving default would pass the subset check below by construction.
+        assert_eq!(CORE_EDITION.to_string(), "core2026.08.3");
         let editions = VORTEX_SESSION.editions();
         for kind in [
             ComponentKind::Array,

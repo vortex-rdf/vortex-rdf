@@ -647,7 +647,7 @@ mod tests {
         let again = native
             .column_chunks("s")
             .expect("the subject column resolves");
-        assert!(format!("{again:?}").contains("fetched: 1"), "{again:?}");
+        assert_eq!(again.fetched_chunks(), 1);
 
         // A decline is memoized as well, for both kinds of key.
         assert!(native.column_chunks("no-such-column").is_none());

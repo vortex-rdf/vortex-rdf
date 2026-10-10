@@ -288,19 +288,19 @@ impl VortexRdfStore {
         self.quads.is_pending_without_plan()
     }
 
-    /// The debug form of an index component column's chunk-probe handle — its
-    /// row count and how many flat leaves the column has — `None` off-file or
-    /// when the column's shape declines the handle.
+    /// An index component column's chunk-probe handle as `(row count, flat
+    /// leaves)` — `None` off-file or when the column's shape declines the
+    /// handle.
     pub(crate) fn debug_component_column_chunks(
         &self,
         component: &str,
         column: &str,
-    ) -> Option<String> {
+    ) -> Option<(u64, usize)> {
         match &self.quads {
             QuadsSource::InMemory { .. } => None,
             QuadsSource::File { file, .. } => file
                 .component_column_chunks(component, column)
-                .map(|chunks| format!("{chunks:?}")),
+                .map(|chunks| (chunks.row_count(), chunks.chunk_count())),
         }
     }
 

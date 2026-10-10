@@ -131,6 +131,19 @@ impl ColumnChunks {
         &self.dtype
     }
 
+    /// Number of flat chunk leaves the column is cut into.
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// How many chunk leaves have been fetched and resolved so far.
+    pub fn fetched_chunks(&self) -> usize {
+        self.chunks
+            .iter()
+            .filter(|chunk| chunk.cell.get().is_some())
+            .count()
+    }
+
     /// Exact global `[lo, hi)` of `needle` in the column, fetching at most
     /// the chunks a binary search over chunk extremes touches (cached
     /// thereafter). Requires the sorted contract. `Ok(None)` when a needed

@@ -1026,11 +1026,10 @@ async fn test_reference_index_runs_across_rid_leaves() {
     // column of both children.
     for component in ["index:ref-p", "index:ref-o"] {
         for column in ["val", "rid"] {
-            let chunks = store.debug_component_column_chunks(component, column);
-            let chunks = chunks.unwrap_or_default();
-            assert!(
-                chunks.contains("row_count: 900") && chunks.contains("chunks: 8,"),
-                "{component}.{column}: {chunks}"
+            assert_eq!(
+                store.debug_component_column_chunks(component, column),
+                Some((900, 8)),
+                "{component}.{column}"
             );
         }
     }
