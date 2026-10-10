@@ -237,7 +237,7 @@ flowchart TD
   this store included, so there a file-backed store cannot compact over its
   own path: the compaction fails with the I/O error and the file stays as it
   was. The builder's spill runs are placed in the temp file's directory
-  ([`dir`](../core/src/io/ser.rs#L497), [`spill.rs`](../core/src/store/builders/spill.rs#L60)):
+  ([`dir`](../core/src/io/ser.rs#L491), [`spill.rs`](../core/src/store/builders/spill.rs#L60)):
   beside the file being replaced, links followed (a store opened through a
   link spills where the link points, not where the link is), the one volume
   known to fit the data (`VORTEX_RDF_SPILL_DIR` outranks that default).
