@@ -222,6 +222,23 @@ pub(crate) fn child_strategy(dtype: &DType) -> Arc<dyn vortex_layout::LayoutStra
     child_strategy_with(dtype, ONE_MEG, 2 * ONE_MEG)
 }
 
+/// The fields of `dtype` that are term-code columns
+/// ([`is_code_field`](crate::store::schema::is_code_field): a non-nullable
+/// `u64` `s`, `p`, `o`, `g` or `val`), in field order — the fields
+/// [`child_strategy`] overrides.
+pub(crate) fn code_fields(dtype: &DType) -> Vec<vortex_array::dtype::FieldName> {
+    let DType::Struct(fields, _) = dtype else {
+        return Vec::new();
+    };
+    fields
+        .names()
+        .iter()
+        .zip(fields.fields())
+        .filter(|(name, field)| crate::store::schema::is_code_field(name.as_ref(), field))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 /// [`child_strategy`] with explicit [`code_column_strategy`] targets — the
 /// tests' handle on the override, which at 1 MiB and 1 MiB must write
 /// exactly what [`default_child_strategy`] writes.
@@ -232,16 +249,7 @@ pub(crate) fn child_strategy_with(
 ) -> Arc<dyn vortex_layout::LayoutStrategy> {
     use vortex_array::dtype::FieldPath;
 
-    let DType::Struct(fields, _) = dtype else {
-        return default_child_strategy();
-    };
-    let code_fields: Vec<_> = fields
-        .names()
-        .iter()
-        .zip(fields.fields())
-        .filter(|(name, field)| crate::store::schema::is_code_field(name.as_ref(), field))
-        .map(|(name, _)| name.clone())
-        .collect();
+    let code_fields = code_fields(dtype);
     if code_fields.is_empty() {
         return default_child_strategy();
     }
