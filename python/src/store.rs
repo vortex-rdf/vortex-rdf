@@ -57,24 +57,39 @@ fn parse_probes(probes: &Bound<'_, PyAny>) -> PyResult<Vec<Probe>> {
 /// so a batch spreads over its workers (an in-memory match is CPU work;
 /// a file-backed one overlaps its reads), and collect the answers in input
 /// order. Called GIL-released.
+///
+/// The first probe to fail ends the call with its error and aborts the probes
+/// still queued or running; a probe that panics re-raises its panic, as it
+/// would from a single call.
 fn fan_out<T, F, Fut>(store: &CoreStore, probes: Vec<Probe>, task: F) -> Result<Vec<T>, CoreError>
 where
     T: Send + 'static,
     F: Fn(CoreStore, Probe) -> Fut,
     Fut: std::future::Future<Output = Result<T, CoreError>> + Send + 'static,
 {
-    let handles: Vec<_> = probes
-        .into_iter()
-        .map(|probe| RUNTIME.spawn(task(store.clone(), probe)))
-        .collect();
     RUNTIME.block_on(async {
-        let mut out = Vec::with_capacity(handles.len());
-        for handle in handles {
-            out.push(handle.await.map_err(|e| {
-                CoreError::InvalidOperation(format!("a batch probe task failed: {e}"))
-            })??);
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, probe) in probes.into_iter().enumerate() {
+            let answer = task(store.clone(), probe);
+            tasks.spawn(async move { (index, answer.await) });
         }
-        Ok(out)
+        let mut answers: Vec<Option<T>> = (0..tasks.len()).map(|_| None).collect();
+        // Returning with probes outstanding drops the set, which aborts them.
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok((index, answer)) => answers[index] = Some(answer?),
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                Err(error) => {
+                    return Err(CoreError::InvalidOperation(format!(
+                        "a batch probe task failed: {error}"
+                    )));
+                }
+            }
+        }
+        Ok(answers
+            .into_iter()
+            .map(|answer| answer.expect("every probe answered"))
+            .collect())
     })
 }
 
