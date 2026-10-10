@@ -138,7 +138,9 @@ class TermDict:
         buffer or the raw byte view a `U64Column` exports is read in one
         copy; a buffer of other items (a ``cast("I")`` view, a u32 array)
         raises ``ValueError``. Any int sequence works element by element.
-        Repeated codes share one string object."""
+        A repeated code usually shares one string object: a small cache of
+        recently decoded codes serves repeats, and a code it has dropped is
+        decoded again as an equal, separate string."""
         ...
     def __len__(self) -> int: ...
     def __repr__(self) -> str: ...
@@ -201,8 +203,8 @@ class VortexRdfStore:
     def __repr__(self) -> str: ...
     def term_dict(self) -> Optional[TermDict]:
         """The store's term dictionary, or None when the code path does not
-        apply (a non-Dictionary layout, or an append tail). A dictionary left
-        in the file is served by reading it on demand (`TermDict.file_backed`)."""
+        apply (a non-Dictionary layout). A dictionary left in the file is
+        served by reading it on demand (`TermDict.file_backed`)."""
         ...
     def match_codes(
         self,

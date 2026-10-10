@@ -125,7 +125,9 @@ Under the default `dictionary` layout, terms are stored as `u64` codes into a so
 const dict = store.termDict();   // TermDict | undefined
 if (dict) {
   const code = dict.encode('<http://schema.org/name>');  // number | undefined
-  console.log(dict.decode(code));                        // '<http://schema.org/name>'
+  if (code !== undefined) {
+    console.log(dict.decode(code));                      // '<http://schema.org/name>'
+  }
 }
 ```
 

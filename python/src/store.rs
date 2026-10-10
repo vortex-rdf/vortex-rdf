@@ -192,7 +192,7 @@ impl VortexRdfStore {
     ) -> PyResult<[Vec<Py<PyString>>; 4]> {
         if let Some(reader) = self.store.dict_reader() {
             // `dict_reader` reports only that the path can apply (a Dictionary
-            // layout, no append tail), whether the dictionary is in memory or
+            // layout), whether the dictionary is in memory or
             // left in the mapped file; the match itself still decides, so fall
             // through when it declines.
             if let Some(codes) = self.matched_code_columns(py, pattern)? {
@@ -345,9 +345,9 @@ impl VortexRdfStore {
     /// the empty string, which is also how a pattern selects it.
     ///
     /// Served from the term-code columns when the store supports them
-    /// (Dictionary layout, no append tail), reading terms out of the
-    /// dictionary — held in memory, or read from the mapped file — and
-    /// sharing one Python string across repeats of a code; otherwise from the
+    /// (Dictionary layout), reading terms out of the dictionary — held in
+    /// memory, or read from the mapped file — and usually sharing one Python
+    /// string across repeats of a code (see `TermDict.decode_many`); otherwise from the
     /// store's shared-term rows, where a term the decoder handed to several
     /// rows is likewise one Python string. Both paths return the same rows.
     #[pyo3(signature = (s=None, p=None, o=None, g=None))]

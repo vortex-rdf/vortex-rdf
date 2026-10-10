@@ -1,7 +1,7 @@
 //! The Dictionary-layout code path: matched rows as zero-copy `u64` term-code
 //! columns ([`U64Column`]) plus a dictionary handle, mirroring the JS bindings' lazy payload
-//! (`js/src/store.rs::match_payload`). Python decodes each distinct code once
-//! and never materializes per-occurrence term strings.
+//! (`js/src/store.rs::match_payload`). A repeated code is decoded once while a
+//! small cache still holds it, and no per-occurrence term string is built.
 
 use std::os::raw::{c_int, c_void};
 
@@ -27,8 +27,8 @@ const RECENT_BUCKETS: usize = 256;
 const NO_SLOT: usize = usize::MAX;
 
 /// An immutable handle on a store's term dictionary, resident or left in
-/// its file. Decodes term codes to their N-Triples strings; safe to keep
-/// across store mutations (the handle is frozen at creation).
+/// its file. Decodes term codes to their N-Triples strings. A handle on a
+/// file-backed dictionary keeps the file's mapping alive.
 ///
 /// A file-backed handle answers every call by reading the dictionary child,
 /// GIL released, on the bindings' runtime; a resident one answers in place.
@@ -47,8 +47,8 @@ fn term_err(e: CoreError) -> PyErr {
 }
 
 impl TermDict {
-    /// Decodes `codes` GIL-released into one Python string per distinct
-    /// code, sharing that object across every occurrence of the code. Callers
+    /// Decodes `codes` GIL-released into Python strings, a repeated code
+    /// sharing its string while the cache below still holds it. Callers
     /// must hand over codes copied out of any Python buffer: a borrowed
     /// buffer view cannot cross the GIL release.
     ///
@@ -268,8 +268,8 @@ impl TermDict {
     /// Any other sequence of ints still works, at one `PyLong` extraction per
     /// code.
     ///
-    /// A repeated code yields the *same* Python string object; see
-    /// [`decode_slice`](Self::decode_slice).
+    /// A repeated code usually yields the same Python string object, as
+    /// [`decode_slice`](Self::decode_slice) describes.
     fn decode_many(
         &self,
         py: Python<'_>,
@@ -302,7 +302,7 @@ impl TermDict {
 /// a `uint64` NumPy array), 8-byte signed integers none of which is negative
 /// (an `int64` NumPy array), or raw bytes in multiples of 8 — the view a
 /// `U64Column` itself exports — read as native-endian u64s. A buffer of any
-/// other items raises `ValueError` naming the u64 view: above all the stale
+/// other items raises `ValueError` naming the u64 view: above all a
 /// `cast("I")` view of a column, which would split each code in two. An
 /// object without a buffer is a sequence of ints, at one `PyLong` extraction
 /// per element; an int that is negative or not below 2**64 raises
