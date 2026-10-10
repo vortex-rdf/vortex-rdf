@@ -191,7 +191,7 @@ pub(crate) fn open_failure(
 
 /// Which file a path named when it was opened: the device and inode on Unix.
 /// A store keeps it to tell, before it rewrites its source file, whether the
-/// path still names the file it opened. There is no identity elsewhere.
+/// path still names the file it opened. Off Unix there is none.
 #[cfg(feature = "file-io")]
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

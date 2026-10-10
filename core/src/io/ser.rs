@@ -373,13 +373,7 @@ impl PendingStore {
                 .write(true)
                 .open(path)
                 .await
-                .map_err(|e| {
-                    if crate::error::kind_means_unwritable(e.kind()) {
-                        refusal("open", e)
-                    } else {
-                        io_error("open", e)
-                    }
-                })?;
+                .map_err(|e| io_error("open", e))?;
             return Ok(Self {
                 path: path.to_path_buf(),
                 sink: Sink::InPlace,
