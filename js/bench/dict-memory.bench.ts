@@ -36,7 +36,7 @@
 //   d(retained per store)/d(terms)  the dictionary's per-term cost
 //   intercept as terms -> 0         quad columns + per-store overhead. For the
 //                                   Dictionary layout this should land near
-//                                   16 bytes/row (four u32 columns) — that
+//                                   32 bytes/row (four u64 code columns) — that
 //                                   agreement is what makes the slope credible.
 //
 // Alongside: what the first Dictionary read costs, what a full scan with every
@@ -177,8 +177,8 @@ function main(): void {
         analysis[slug] = {
             bytesPerTerm: Math.round(f.slope * 1048576),
             interceptMb: Number(f.intercept.toFixed(1)),
-            // The control: four u32 columns are 16 bytes/row regardless of terms.
-            expectedQuadColumnsMb: Number(((N * 16) / 1048576).toFixed(1)),
+            // The control: four u64 code columns are 32 bytes/row regardless of terms.
+            expectedQuadColumnsMb: Number(((N * 32) / 1048576).toFixed(1)),
             retainedPerStoreMb: ps.map((p) => ({
                 terms: p.cardinality.terms, mb: Number((retainedPerStore(p) as number).toFixed(1)),
             })),
