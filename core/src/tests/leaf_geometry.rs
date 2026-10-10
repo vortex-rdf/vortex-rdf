@@ -245,7 +245,7 @@ fn only_id_fields_take_the_override() {
 /// row-id column are plain columns.
 #[cfg(feature = "file-io")]
 #[tokio::test]
-async fn every_store_write_path_keeps_code_leaves_at_262144_rows() {
+async fn every_store_write_path_takes_the_id_column_override() {
     let rows = 140_000usize;
     let quads: Vec<Quad> = (0..rows)
         .map(|i| {
