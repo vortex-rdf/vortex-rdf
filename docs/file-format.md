@@ -79,6 +79,14 @@ and a layout names its segments by id, so a read fetches exactly the segments
 of the leaves it touches. The file's dtype is embedded, so the file is
 self-describing.
 
+The writer is limited to two editions ([`session.rs`](../core/src/session.rs#L50)):
+Vortex's frozen `core` edition `CORE_2026_08_3` — every encoding, layout,
+extension dtype and zone-map aggregate a store file may hold — and the store
+edition, whose one member is the root layout. A frozen edition never changes,
+so a Vortex upgrade cannot widen what a store file holds; a wire form outside
+it, such as per-chunk frame-of-reference (`fastlanes.for.v2`), is never
+written.
+
 ---
 
 ## 3. The store root: `vortex-rdf.store.v2`
@@ -316,8 +324,7 @@ Shared rules:
   `TypedObject` (a `TypedObject` object appears as its full N-Triples term),
   `u64` codes under `Dictionary`. `rid` is always a non-nullable `u64`
   ([`RowId`](../core/src/store/schema.rs#L38)), under every layout; a child
-  whose `rid` is an integer of any other width — the `u32` row ids a
-  pre-release of 0.12 wrote — is refused at open
+  whose `rid` is an integer of any other width is refused at open
   ([`check_id_columns`](../core/src/store/open.rs#L39)): rebuild such a store
   from its RDF source.
 - **Row ids do not limit a store.** A `u64` row id numbers more rows than any
