@@ -1,16 +1,15 @@
-"""Stores written before vortex-rdf 0.12 are refused, with an error that
-names the cause and the way out.
+"""Stores written by vortex-rdf 0.11 and earlier (root layout
+``vortex-rdf.store.v1``) are refused, with an error that names the cause and
+the way out.
 
-0.12 readers rely on two guarantees that only a 0.12 writer gives: each quad
-is stored once, and a reference index's children are in ``(val, rid)`` order.
-A file of 0.11 or earlier can break either and still opens as a Vortex file,
-so the store root layout was renamed from ``vortex-rdf.store.v1`` to
-``vortex-rdf.store.v2`` and a ``v1`` root is refused rather than checked.
+The ``vortex-rdf.store.v2`` readers rely on two guarantees that only a ``v2``
+writer gives: each quad is stored once, and a reference index's children are
+in ``(val, rid)`` order. A ``v1`` file can break either and still opens as a
+Vortex file, so a ``v1`` root is refused rather than checked.
 
 The two ids are the same length, so renaming one into the other in a written
 store moves no offset, and a Vortex file carries no checksum over its footer:
-that is how these tests make a file of 0.11 and earlier without a binary
-fixture.
+that is how these tests make a ``v1`` file without a binary fixture.
 """
 
 import re

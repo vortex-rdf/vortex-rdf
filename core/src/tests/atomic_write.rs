@@ -535,8 +535,8 @@ mod links_and_permissions {
         );
     }
 
-    /// A link to a file that is not there yet is written through, as creating
-    /// the file always did.
+    /// A link to a file that is not there yet is written through: the file is
+    /// created where the link points.
     #[tokio::test]
     async fn test_a_dangling_symlink_gets_its_target_created() {
         let dir = tempfile::tempdir().unwrap();

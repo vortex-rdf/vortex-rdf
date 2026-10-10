@@ -473,7 +473,7 @@ mod tests {
     use super::*;
     use Verdict::{False, True, Unknown};
 
-    /// Python 3.13 `re.search` results (rdflib's call), checked on 2026-10-07.
+    /// Python 3.13 `re.search` results (rdflib's call).
     #[test]
     fn decided_texts_agree_with_python_re() {
         for (pattern, flags, text, want) in [

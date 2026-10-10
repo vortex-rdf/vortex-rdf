@@ -1,11 +1,10 @@
 //! Built stores hold each quad once, and each term once in its canonical
 //! spelling.
 //!
-//! The probe is the one that found the gap in vortex-rdf 0.11.0: eight
-//! N-Quads lines that encode three distinct RDF triples. The parser (oxrdf)
-//! already rewrites every spelling of a term to one canonical N-Triples form,
-//! so the dictionary held six terms; but both builders sorted the rows
-//! without dropping the repeats, and the store kept all eight.
+//! The probe is eight N-Quads lines that encode three distinct RDF triples.
+//! The parser (oxrdf) rewrites every spelling of a term to one canonical
+//! N-Triples form, so the dictionary holds six terms; both builders drop the
+//! repeated rows after sorting, so the store holds three quads.
 //!
 //! Every test here builds from N-Quads text, so the terms go through the same
 //! parser a file or a string does, and compares the store with a brute-force

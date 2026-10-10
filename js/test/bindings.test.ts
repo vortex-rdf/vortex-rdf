@@ -150,7 +150,7 @@ describe('build variants', () => {
     }
 });
 
-// The probe that found the gap in 0.11.0: three RDF triples written eight
+// The probe: three RDF triples written eight
 // ways -- "x" four times (twice plain, once typed xsd:string, once through a
 // \u escape), "y"@en twice (@EN and @en), "z" under a subject written two ways.
 const PROBE_NT = [
@@ -232,12 +232,12 @@ describe('a built store holds each quad once', () => {
     });
 });
 
-// 0.12 readers rely on guarantees only a 0.12 writer gives (each quad stored
-// once; reference-index children in (val, rid) order), so the store root
-// layout was renamed from vortex-rdf.store.v1 to vortex-rdf.store.v2 and a v1
-// file is refused. The two ids are the same length, so renaming one into the
-// other in a written store moves no offset (a Vortex file has no checksum over
-// its footer): that is how a file of 0.11 and earlier is made here.
+// The vortex-rdf.store.v2 readers rely on guarantees only a v2 writer gives
+// (each quad stored once; reference-index children in (val, rid) order), so a
+// store with the v1 root layout (vortex-rdf 0.11 and earlier) is refused. The
+// two ids are the same length, so renaming one into the other in a written
+// store moves no offset (a Vortex file has no checksum over its footer): that
+// is how a v1 file is made here.
 describe('stores written before 0.12 are refused', () => {
     const encode = (text: string) => new TextEncoder().encode(text);
     const current = encode('vortex-rdf.store.v2');
@@ -403,7 +403,7 @@ describe('free functions', () => {
 });
 
 describe('lazy terms outliving a dictionary rebuild', () => {
-    // A Dictionary-layout read hands back `u32` term codes plus a handle on the
+    // A Dictionary-layout read hands back term codes plus a handle on the
     // dictionary they index into. Auto-compaction re-encodes the store against a
     // *fresh* dictionary, renumbering every term, so lazy quads that decoded
     // against the live store would silently resolve old codes to other terms.

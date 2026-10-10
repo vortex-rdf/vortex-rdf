@@ -1,10 +1,9 @@
 """A built store holds each quad once and each term once, in canonical form.
 
-The probe is the one that found the gap in vortex-rdf 0.11.0: eight lines
-that encode three distinct RDF triples. The parser already rewrote every
-spelling of a term to one canonical form, so the dictionary held six terms;
-but the rows were sorted without dropping the repeats, and the store kept all
-eight.
+The probe is eight lines that encode three distinct RDF triples. The parser
+rewrites every spelling of a term to one canonical form, so the dictionary
+holds six terms; the rows are deduplicated after sorting, so the store holds
+three quads.
 """
 
 import pytest

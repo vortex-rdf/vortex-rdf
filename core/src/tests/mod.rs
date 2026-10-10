@@ -510,7 +510,7 @@ pub(crate) fn dict_term_column(
         .expect("the dictionary child has a term column")
 }
 
-/// A `{s, p, o, g}` struct of four identical non-nullable u32 columns
+/// A `{s, p, o, g}` struct of four identical non-nullable u64 columns
 /// holding `codes` — the Dictionary layout's row shape without a
 /// dictionary to give the codes meaning.
 fn bare_code_quad_array(codes: &[TermCode]) -> vortex_array::ArrayRef {
