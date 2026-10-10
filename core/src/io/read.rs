@@ -54,8 +54,13 @@ where
     Ok(chunks)
 }
 
-/// [`collect_chunks`] assembled into one array of `dtype`.
-async fn collect_scan<F>(dtype: vortex_array::dtype::DType, tasks: Vec<F>) -> Result<ArrayRef>
+/// [`collect_chunks`] assembled into one array of `dtype` — the tail of
+/// [`scan_all`] and of the store's `read_all_rows`, which hands it the futures
+/// of a restricted file scan.
+pub(crate) async fn collect_scan<F>(
+    dtype: vortex_array::dtype::DType,
+    tasks: Vec<F>,
+) -> Result<ArrayRef>
 where
     F: Future<Output = VortexResult<Option<ArrayRef>>>,
 {

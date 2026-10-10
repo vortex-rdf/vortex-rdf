@@ -13,7 +13,6 @@ use futures::{FutureExt as _, StreamExt, stream};
 use oxrdf::NamedOrBlankNode;
 use vortex_array::expr::forms::conjuncts;
 use vortex_array::expr::{BoundExpression, Expression, lit};
-use vortex_array::stream::ArrayStreamExt as _;
 use vortex_array::{ArrayRef, MaskFuture};
 use vortex_buffer::Buffer;
 use vortex_error::VortexExpect as _;
@@ -24,7 +23,7 @@ use vortex_scan::selection::Selection;
 use vortex_scan::strict_sorted_buffer::StrictSortedBuffer;
 
 use crate::error::{Result, VortexRdfError};
-use crate::io::read::available_parallelism;
+use crate::io::read::{available_parallelism, collect_scan};
 use crate::store::layouts::{Constraints, PatternCodes, QuadPattern, TermRef};
 use crate::store::native_file::NativeStoreFile;
 use crate::store::scan::gather::primitive_from_u64_reads;
@@ -36,13 +35,22 @@ use crate::store::selection::RowSelection;
 pub(crate) const QUAD_SCOPE: &str = "quads";
 
 /// Run `scan` to completion and materialize every row it yields into one
-/// in-memory array.
+/// in-memory array, in the scan's row order.
+///
+/// The scan is driven inline: its splits are planned here and its split
+/// futures polled on the calling task by [`collect_scan`], not spawned onto
+/// the runtime as `ScanBuilder::into_array_stream` would. The files these
+/// scans read are memory-mapped, so every segment is a slice of the mapped
+/// file and resolves at once; the async driver would add only a spawn per
+/// split and the buffers of the splits it keeps in flight (four per core
+/// spawned, against one per core polled here). Measured in §7 D3 on
+/// 2026-10-10: 6.5% of the BSBM 100K copy stream (17.0% of its Q3) and
+/// RssAnon at exit about halved, from about 195 MB to about 93 MB; nothing
+/// beyond noise on the reference-index store.
 pub(crate) async fn read_all_rows(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRef> {
-    scan.into_array_stream()
-        .map_err(VortexRdfError::Vortex)?
-        .read_all()
-        .await
-        .map_err(VortexRdfError::Vortex)
+    let dtype = scan.dtype().map_err(VortexRdfError::Vortex)?;
+    let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
+    collect_scan(dtype, tasks).await
 }
 
 /// The rows of a point read when it answers, otherwise the rows of `scan` —
@@ -866,5 +874,40 @@ mod tests {
         );
         assert!(eq_code_pairs(&lit(false)).is_none());
         assert!(eq_code_pairs(&eq(get_item("p", root()), lit("x"))).is_none());
+    }
+
+    /// `read_all_rows` drives a scan whose rows come from several splits and
+    /// hands them back whole and in the scan's row order, split after split.
+    /// An order guard: it holds under the async driver and the inline one
+    /// alike, which is the point of a guard (the two differ in cost, measured
+    /// in §7 D3, not in result).
+    #[tokio::test]
+    async fn read_all_rows_keeps_order_inline() {
+        use crate::io::read::{FileAccess, open_vortex_file};
+        use vortex_array::VortexSessionExecute as _;
+        use vortex_array::arrays::{PrimitiveArray, StructArray};
+        use vortex_layout::scan::split_by::SplitBy;
+
+        let quads = crate::tests::modular_quads_for_tests(50);
+        let (_dir, path) = crate::tests::write_store_file_for_tests(quads, vec![]).await;
+        let file =
+            NativeStoreFile::try_new(open_vortex_file(&path, FileAccess::Mapped).await.unwrap())
+                .unwrap();
+
+        // Splits of 16 rows: four futures for the driver to run, the last short.
+        let scan = || file.scan().unwrap().with_split_by(SplitBy::RowCount(16));
+        assert_eq!(scan().build().unwrap().len(), 4);
+        let rows = read_all_rows(scan()).await.unwrap();
+        assert_eq!(rows.len(), 50);
+
+        // The file is subject-sorted and its subjects are unique, so the
+        // subject codes rise with the row order.
+        let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
+        let rows = rows.execute::<StructArray>(&mut ctx).unwrap();
+        let subjects =
+            crate::store::array::field_as::<PrimitiveArray>(&rows, schema::COL_S, &mut ctx)
+                .unwrap();
+        let codes = subjects.as_slice::<TermCode>();
+        assert!(codes.windows(2).all(|pair| pair[0] < pair[1]), "{codes:?}");
     }
 }
