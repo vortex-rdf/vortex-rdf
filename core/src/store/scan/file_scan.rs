@@ -49,14 +49,11 @@ const MAX_INLINE_SPLITS: usize = 42;
 
 /// The limit [`read_all_rows`] applies: [`MAX_INLINE_SPLITS`], or what a test
 /// forced on this thread.
-#[cfg(test)]
 fn max_inline_splits() -> usize {
-    driver_hooks::forced_limit().unwrap_or(MAX_INLINE_SPLITS)
-}
-
-/// The limit [`read_all_rows`] applies.
-#[cfg(not(test))]
-fn max_inline_splits() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = driver_hooks::forced_limit() {
+        return limit;
+    }
     MAX_INLINE_SPLITS
 }
 

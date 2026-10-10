@@ -172,8 +172,7 @@ fn check_addressable(ids: &[RowId]) -> Result<()> {
 /// uses: a binary `Eq` falsifies against the same zone min/max envelope as a
 /// `>= probe AND <= probe` range pair (see vortex's
 /// `stats/rewrite/builtins.rs`) while evaluating a single conjunct. Output
-/// order is irrelevant (the ids are sorted afterwards), so the scan is built
-/// unordered.
+/// order is irrelevant: the ids are sorted afterwards.
 #[cfg(feature = "file-io")]
 pub(crate) async fn scan_index_row_ids(
     reader: vortex_layout::LayoutReaderRef,
@@ -253,10 +252,8 @@ pub(crate) async fn read_located_rids(
     scan_located_row_ids(reader.clone(), rid_column, range, file.bound_exprs(), scope).await
 }
 
-/// A rid-only scan of an index child: just the row-id column, built unordered
-/// (callers sort the ids anyway; [`read_scanned_row_ids`] drives it inline, in
-/// split order, whatever the flag says). Restrictions — a filter, a row range
-/// — are the caller's to add.
+/// A rid-only scan of an index child: just the row-id column. Restrictions — a
+/// filter, a row range — are the caller's to add.
 #[cfg(feature = "file-io")]
 fn rid_scan(
     reader: vortex_layout::LayoutReaderRef,
@@ -269,8 +266,7 @@ fn rid_scan(
         .map_err(VortexRdfError::Vortex)?;
     Ok(
         vortex_layout::scan::scan_builder::ScanBuilder::new(VORTEX_SESSION.clone(), reader)
-            .with_projection(projection)
-            .with_ordered(false),
+            .with_projection(projection),
     )
 }
 
