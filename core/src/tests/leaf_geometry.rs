@@ -136,11 +136,14 @@ async fn id_columns_keep_their_u32_rows_per_leaf() {
 /// At 1 MiB for both targets the id-column override is the stock pipeline,
 /// byte for byte, over plain and dictionary-encoded columns — so an upgrade
 /// that changes Vortex's stock pipeline fails here rather than leaving the id
-/// columns on a stale copy of it. 270,000 rows cut the plain columns into
-/// three 1 MiB leaves.
+/// columns on a stale copy of it. 600,000 rows cut the plain columns into
+/// five 1 MiB leaves and the dictionary-encoded column's u16 codes into two,
+/// so the coalescing of both the plain data and the dictionary codes is
+/// compared across a leaf boundary.
 #[tokio::test]
 async fn id_column_override_at_one_mebibyte_is_the_stock_pipeline() {
-    let wide = table(270_000);
+    let rows = 600_000;
+    let wide = table(rows);
     let stock = written(wide.clone(), container::default_child_strategy()).await;
     let overridden = written(
         wide.clone(),
@@ -149,6 +152,15 @@ async fn id_column_override_at_one_mebibyte_is_the_stock_pipeline() {
     .await;
     assert_eq!(overridden.len(), stock.len());
     assert!(overridden == stock, "the override writes the stock bytes");
+    assert_eq!(
+        store_leaves(stock),
+        vec![
+            ("quad-source/s".to_string(), cut(rows, 131_072)),
+            ("quad-source/p".to_string(), cut(rows, 524_288)),
+            ("quad-source/rid".to_string(), cut(rows, 131_072)),
+        ],
+        "the comparison crosses a leaf of each column"
+    );
 }
 
 /// Only the id fields take the override: non-nullable u64 columns named
