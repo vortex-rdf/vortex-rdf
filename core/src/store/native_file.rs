@@ -52,7 +52,7 @@ pub(crate) struct NativeStoreFile {
     /// subject or index-run location skips the layout walk and the leaf
     /// rebuilds. Bounded by the file's layout: one handle per column, and per
     /// fetched leaf a probe over mapped bytes.
-    column_chunks: Mutex<HashMap<String, Option<Arc<vortex_rdf_encoded_search::ColumnChunks>>>>,
+    column_chunks: Mutex<ChunkHandles>,
     /// One bound tree per (scope, filter shape), held for the handle's
     /// lifetime — see [`BoundExprMemo`].
     bound_exprs: Arc<BoundExprMemo>,
@@ -71,6 +71,16 @@ pub(crate) struct NativeStoreFile {
     #[cfg(test)]
     located_rid_reads: std::sync::atomic::AtomicUsize,
 }
+
+/// The chunk-probe handles of a file, by quad column and by (component,
+/// column); `None` memoizes a decline.
+#[derive(Default)]
+struct ChunkHandles {
+    quads: HashMap<String, ColumnHandle>,
+    components: HashMap<String, HashMap<String, ColumnHandle>>,
+}
+
+type ColumnHandle = Option<Arc<vortex_rdf_encoded_search::ColumnChunks>>;
 
 /// Structural (scope, expression) → the one [`BoundExpression`] this file
 /// hands out for that shape.
@@ -199,7 +209,7 @@ impl NativeStoreFile {
             child_readers,
             splits: OnceLock::new(),
             pruning_envelopes: BoundedMemo::new(PRUNING_MEMO_MAX),
-            column_chunks: Mutex::new(HashMap::new()),
+            column_chunks: Mutex::new(ChunkHandles::default()),
             bound_exprs: Arc::new(BoundExprMemo::new()),
             mapped,
             identity,
@@ -269,39 +279,77 @@ impl NativeStoreFile {
     /// leaves the handle fetched stay probed between calls. `None` when the
     /// quad child's layout shape or that column's dtype declines (memoized
     /// too); callers keep the scan.
-    pub(crate) fn column_chunks(
-        &self,
-        column: &str,
-    ) -> Option<Arc<vortex_rdf_encoded_search::ColumnChunks>> {
-        let mut memo = self.column_chunks.lock().expect("column chunks lock");
-        memo.entry(column.to_owned())
-            .or_insert_with(|| {
-                let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
-                let quads = typed.slot(0).ok().flatten()?;
-                vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&quads, column)
-                    .map(Arc::new)
-            })
-            .clone()
+    pub(crate) fn column_chunks(&self, column: &str) -> ColumnHandle {
+        self.memoized_quad_chunks(column, || {
+            let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
+            let quads = typed.slot(0).ok().flatten()?;
+            vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&quads, column)
+                .map(Arc::new)
+        })
     }
 
     /// An index component column's chunk-probe handle, the auxiliary-child
     /// counterpart of [`column_chunks`](Self::column_chunks), memoized alike
     /// per (component, column). `None` on any decline.
-    pub(crate) fn component_column_chunks(
+    pub(crate) fn component_column_chunks(&self, component: &str, column: &str) -> ColumnHandle {
+        self.memoized_component_chunks(component, column, || {
+            let (_, child) = self.component_child(component).ok().flatten()?;
+            vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&child, column)
+                .map(Arc::new)
+        })
+    }
+
+    /// The memo's guard. Every entry is complete when it is inserted, so a
+    /// lock poisoned by a panic elsewhere guards consistent entries and is
+    /// taken over.
+    fn chunk_handles(&self) -> std::sync::MutexGuard<'_, ChunkHandles> {
+        self.column_chunks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `column`'s memoized handle, from `build` on a miss. The lookup borrows
+    /// the key; `build` runs with the lock released, so two racing misses may
+    /// both build and the first insert wins.
+    fn memoized_quad_chunks(
+        &self,
+        column: &str,
+        build: impl FnOnce() -> ColumnHandle,
+    ) -> ColumnHandle {
+        if let Some(found) = self.chunk_handles().quads.get(column) {
+            return found.clone();
+        }
+        let built = build();
+        self.chunk_handles()
+            .quads
+            .entry(column.to_owned())
+            .or_insert(built)
+            .clone()
+    }
+
+    /// [`memoized_quad_chunks`](Self::memoized_quad_chunks) for a component's
+    /// column.
+    fn memoized_component_chunks(
         &self,
         component: &str,
         column: &str,
-    ) -> Option<Arc<vortex_rdf_encoded_search::ColumnChunks>> {
-        // The `/` separator cannot appear in a bare quad column name, so the
-        // composite keys share the quad columns' memo without collisions.
-        let key = format!("{component}/{column}");
-        let mut memo = self.column_chunks.lock().expect("column chunks lock");
-        memo.entry(key)
-            .or_insert_with(|| {
-                let (_, child) = self.component_child(component).ok().flatten()?;
-                vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&child, column)
-                    .map(Arc::new)
-            })
+        build: impl FnOnce() -> ColumnHandle,
+    ) -> ColumnHandle {
+        if let Some(found) = self
+            .chunk_handles()
+            .components
+            .get(component)
+            .and_then(|columns| columns.get(column))
+        {
+            return found.clone();
+        }
+        let built = build();
+        self.chunk_handles()
+            .components
+            .entry(component.to_owned())
+            .or_default()
+            .entry(column.to_owned())
+            .or_insert(built)
             .clone()
     }
 
@@ -516,7 +564,77 @@ mod tests {
                 .is_none()
         );
         let memo = native.column_chunks.lock().unwrap();
-        assert!(matches!(memo.get("no-such-column"), Some(None)));
-        assert!(matches!(memo.get("no-such-component/val"), Some(None)));
+        assert!(matches!(memo.quads.get("no-such-column"), Some(None)));
+        assert!(matches!(
+            memo.components
+                .get("no-such-component")
+                .and_then(|columns| columns.get("val")),
+            Some(None)
+        ));
+    }
+
+    async fn mapped_native() -> (tempfile::TempDir, NativeStoreFile) {
+        use crate::io::read::{FileAccess, open_vortex_file};
+
+        let quads = crate::tests::modular_quads_for_tests(50);
+        let (dir, path) = crate::tests::write_store_file_for_tests(quads, vec![]).await;
+        let native =
+            NativeStoreFile::try_new(open_vortex_file(&path, FileAccess::Mapped).await.unwrap())
+                .unwrap();
+        (dir, native)
+    }
+
+    /// A handle is built with the memo's lock released, and a hit builds
+    /// nothing.
+    #[tokio::test]
+    async fn chunk_handles_are_built_outside_the_lock() {
+        let (_dir, native) = mapped_native().await;
+
+        let built = native.memoized_quad_chunks("probe", || {
+            assert!(
+                native.column_chunks.try_lock().is_ok(),
+                "the handle was built under the memo's lock"
+            );
+            None
+        });
+        assert!(built.is_none());
+        let hit = native.memoized_quad_chunks("probe", || panic!("a hit does not rebuild"));
+        assert!(hit.is_none());
+
+        native.memoized_component_chunks("index:x", "val", || {
+            assert!(
+                native.column_chunks.try_lock().is_ok(),
+                "the component handle was built under the memo's lock"
+            );
+            None
+        });
+        native.memoized_component_chunks("index:x", "val", || panic!("a hit does not rebuild"));
+    }
+
+    /// A panic while the memo's lock is held leaves the memo usable: its
+    /// entries are whole, so the next lookup takes the poisoned lock over.
+    #[tokio::test]
+    async fn a_poisoned_chunk_handle_lock_is_recovered() {
+        let (_dir, native) = mapped_native().await;
+        let native = Arc::new(native);
+        let before = native
+            .column_chunks("s")
+            .expect("the subject column resolves");
+
+        let poisoner = Arc::clone(&native);
+        let result = std::thread::spawn(move || {
+            let _held = poisoner.column_chunks.lock().unwrap();
+            panic!("poison the memo");
+        })
+        .join();
+        assert!(result.is_err());
+        assert!(native.column_chunks.is_poisoned());
+
+        let after = native
+            .column_chunks("s")
+            .expect("the subject column still resolves");
+        assert!(Arc::ptr_eq(&before, &after));
+        assert!(native.column_chunks("p").is_some());
+        assert!(native.component_column_chunks("nothing", "val").is_none());
     }
 }
