@@ -379,7 +379,7 @@ on a stock Vortex file write:
 ```mermaid
 flowchart TD
     W["write_store(session, writer, quad stream, quads_sorted, components)"] --> S["RdfStoreWriteStrategy::write_stream"]
-    S --> Q["quad stream → child 0 (transparent quad-source)<br/>through the default Vortex write strategy,<br/>plain term-code columns coalesced to ~2 MiB"]
+    S --> Q["quad stream → child 0 (transparent quad-source)<br/>through the default Vortex write strategy,<br/>plain id columns coalesced to ~2 MiB"]
     S --> C["each component → one auxiliary child,<br/>at most two compressing at a time"]
     C --> C1["index children: the same default strategy"]
     C --> C2["dictionary: pass-through strategy —<br/>every FSST window written verbatim as one flat leaf"]
@@ -394,21 +394,23 @@ flowchart TD
   columns, repartition each column into 8,192-row blocks, compute zoned
   statistics per block, dictionary-encode a column where sampling says it pays,
   coalesce chunks toward ~1 MiB segments, compress each chunk with the
-  BtrBlocks-style compressor, and write flat leaf layouts. Each term-code
-  column (a `u64` `s`, `p`, `o`, `g` or `val`) is handed, through the
-  builder's per-field override, to
-  [`code_column_strategy`](../core/src/io/container/sources.rs#L282): the same
+  BtrBlocks-style compressor, and write flat leaf layouts. Each id column —
+  a `u64` term-code `s`, `p`, `o`, `g` or `val`, or a `u64` row-id `rid` —
+  is handed, through the builder's per-field override, to
+  [`id_column_strategy`](../core/src/io/container/sources.rs#L284): the same
   per-column pipeline rebuilt step for step from Vortex's layout strategies,
   with the coalescing target split in two. A column that does not
-  dictionary-encode coalesces toward ~2 MiB, so a plain `u64` code column
+  dictionary-encode coalesces toward ~2 MiB, so a plain `u64` id column
   keeps the 262,144 rows per leaf a `u32` one held at 1 MiB; a dictionary's
   codes, as narrow as its cardinality needs, stay at ~1 MiB. A test pins the
   copy to Vortex's pipeline: at 1 MiB for both targets it must write the
-  stock bytes. A table without code columns — the string layouts — gets the
-  stock pipeline unchanged ([`default_child_strategy`](../core/src/io/container/sources.rs#L202)).
+  stock bytes. A table without id columns — the string layouts' quad
+  table — gets the stock pipeline unchanged
+  ([`default_child_strategy`](../core/src/io/container/sources.rs#L202)).
 - **Index children** take exactly the same strategy, so their encoding is what a
-  plain table write produces: plain code columns at ~2 MiB, dictionary codes
-  and `rid` at ~1 MiB.
+  plain table write produces: plain code columns and `rid` (row ids are
+  unique, so never dictionary-encoded) at ~2 MiB, dictionary codes at ~1 MiB,
+  term strings under the string layouts at ~1 MiB.
 - **The dictionary** takes [`dict_child_strategy`](../core/src/io/container/write.rs#L191):
   its chunks are already FSST-compressed windows, so they are written verbatim
   as one flat leaf each under a chunked node — no sampling, no re-encoding —

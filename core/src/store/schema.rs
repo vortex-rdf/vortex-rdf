@@ -59,6 +59,21 @@ pub(crate) fn is_code_field(name: &str, dtype: &DType) -> bool {
         && matches!(dtype, DType::Primitive(ptype, Nullability::NonNullable) if *ptype == CODE_PTYPE)
 }
 
+/// Whether the field `name: dtype` is a row-id column as this crate writes
+/// one: an index child's `rid` holding non-nullable [`ROW_ID_PTYPE`] values.
+pub(crate) fn is_row_id_field(name: &str, dtype: &DType) -> bool {
+    name == crate::store::indexes::COL_RID
+        && matches!(dtype, DType::Primitive(ptype, Nullability::NonNullable) if *ptype == ROW_ID_PTYPE)
+}
+
+/// Whether the field `name: dtype` is an id column: a term-code column
+/// ([`is_code_field`]) or a row-id column ([`is_row_id_field`]) — the `u64`
+/// columns whose leaves the writer keeps at the rows per leaf they held as
+/// `u32` ([`child_strategy`](crate::io::container::child_strategy)).
+pub(crate) fn is_id_field(name: &str, dtype: &DType) -> bool {
+    is_code_field(name, dtype) || is_row_id_field(name, dtype)
+}
+
 /// The subject column — first in every layout. Whether its rows are globally
 /// sorted is per-store provenance
 /// ([`quads_sorted`](crate::io::container::layout::quads_sorted)), not a

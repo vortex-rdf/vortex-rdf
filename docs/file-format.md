@@ -203,15 +203,16 @@ column
      └─ data
          └─ Chunked       row ranges coalesced toward ~1 MiB of data
              ├─ Flat      one compressed array = one segment
-             ├─ Flat      (~2 MiB for a plain term-code column, below)
+             ├─ Flat      (~2 MiB for a plain id column, below)
              └─ …
 ```
 
-A term-code column — a `u64` `s`, `p`, `o`, `g` or `val` — takes the same
-pipeline with one change, through the writer's per-field override
-([`child_strategy`](../core/src/io/container/sources.rs#L221)): if it does not
-dictionary-encode, it coalesces toward ~2 MiB, so a plain `u64` code column
-holds the 262,144 rows per leaf a `u32` one held at 1 MiB. A code column that
+An id column — a `u64` term-code `s`, `p`, `o`, `g` or `val`, or a `u64`
+row-id `rid` — takes the same pipeline with one change, through the writer's
+per-field override ([`child_strategy`](../core/src/io/container/sources.rs#L221)):
+if it does not dictionary-encode (a row-id column never does: its ids are
+unique), it coalesces toward ~2 MiB, so a plain `u64` id column holds the
+262,144 rows per leaf a `u32` one held at 1 MiB. A code column that
 dictionary-encodes keeps its codes at ~1 MiB: they are as narrow as its
 cardinality needs, whatever the width of its values (524,288 rows of `u16`
 codes, as before the codes were widened). Every other column keeps ~1 MiB.
@@ -521,7 +522,7 @@ open rather than being read around.
 | `LEGACY_STORE_LAYOUT_ID` | `vortex-rdf.store.v1` (refused) | [`container/mod.rs`](../core/src/io/container/mod.rs#L49) |
 | `STORE_METADATA_VERSION` | 1 | [`wire.rs`](../core/src/io/container/wire.rs#L18) |
 | row block / zone size | 8,192 rows | Vortex default write strategy |
-| data block target | ~1 MiB; ~2 MiB for a term-code column that does not dictionary-encode | Vortex default write strategy; [`child_strategy`](../core/src/io/container/sources.rs#L221) |
+| data block target | ~1 MiB; ~2 MiB for an id column (a term code or a row id) that does not dictionary-encode | Vortex default write strategy; [`child_strategy`](../core/src/io/container/sources.rs#L221) |
 | `DICT_CHUNK_ROWS` | 65,536 terms per FSST window and leaf | [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs#L46) |
 | `DICT_MAX_RESIDENT_BYTES_DEFAULT` | 512 MiB | [`open.rs`](../core/src/store/open.rs#L108) |
 | `PROBE_CACHE_SLOTS` | 256 | [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs#L432) |

@@ -1,15 +1,15 @@
 //! The leaf geometry of the columns a store writes: how many rows each flat
 //! leaf of a column holds. Vortex coalesces a column to 1 MiB uncompressed
-//! per leaf, so widening the term codes from u32 to u64 would halve the rows
-//! per leaf of every plain code column; `child_strategy` writes the code
-//! columns at 2 MiB so each keeps the rows per leaf it had as u32 (262,144
-//! for a plain column), keeps a dictionary's codes at the stock 1 MiB, and
-//! leaves every other column on the stock strategy.
+//! per leaf, so widening the term codes and the row ids from u32 to u64
+//! would halve the rows per leaf of every plain id column; `child_strategy`
+//! writes the id columns at 2 MiB so each keeps the rows per leaf it had as
+//! u32 (262,144 for a plain column), keeps a dictionary's codes at the stock
+//! 1 MiB, and leaves every other column on the stock strategy.
 
 use std::sync::Arc;
 
 use super::*;
-use crate::io::container::{self, ONE_MEG, child_strategy, child_strategy_with, code_fields};
+use crate::io::container::{self, ONE_MEG, child_strategy, child_strategy_with, id_fields};
 use vortex_array::IntoArray as _;
 use vortex_array::arrays::StructArray;
 use vortex_array::dtype::FieldNames;
@@ -77,11 +77,12 @@ fn store_leaves(bytes: Vec<u8>) -> Vec<(String, Vec<u64>)> {
 
 /// A quad-table-shaped struct of `rows` rows: `s` unique and ascending (a
 /// plain u64 column), `p` of 1,000 values spread over the whole u32 range (a
-/// u64 column that dictionary-encodes, with u16 codes), beside a u32 `rid`.
+/// u64 column that dictionary-encodes, with u16 codes), beside a u64 `rid`
+/// (unique, so plain).
 fn table(rows: u64) -> vortex_array::ArrayRef {
     let s: Buffer<u64> = (0..rows).collect();
     let p: Buffer<u64> = (0..rows).map(|i| (i % 1_000) * 4_000_000).collect();
-    let rid: Buffer<u32> = (0..rows).map(|i| i as u32).collect();
+    let rid: Buffer<u64> = (0..rows).rev().collect();
     StructArray::try_new(
         FieldNames::from(["s", "p", "rid"]),
         vec![s.into_array(), p.into_array(), rid.into_array()],
@@ -112,14 +113,13 @@ async fn written(
     bytes
 }
 
-/// The u64 code columns `child_strategy` writes have the leaves the same
-/// columns had as u32 under the stock strategy — the geometry before the
-/// widening: 262,144 rows per plain leaf (the stock 1 MiB would cut a u64
-/// one at 131,072), 524,288 per leaf of a dictionary's u16 codes, which stay
-/// at 1 MiB. The u32 `rid` keeps the stock 1 MiB: 262,144 rows. 600,000
-/// rows reach past one leaf of each.
+/// The u64 code and row-id columns `child_strategy` writes have the leaves
+/// the same columns had as u32 under the stock strategy — the geometry
+/// before the widening: 262,144 rows per plain leaf (the stock 1 MiB would
+/// cut a u64 one at 131,072), 524,288 per leaf of a dictionary's u16 codes,
+/// which stay at 1 MiB. 600,000 rows reach past one leaf of each.
 #[tokio::test]
-async fn code_columns_keep_their_u32_rows_per_leaf() {
+async fn id_columns_keep_their_u32_rows_per_leaf() {
     let rows = 600_000;
     let wide = table(rows);
     let leaves = store_leaves(written(wide.clone(), child_strategy(wide.dtype())).await);
@@ -133,13 +133,13 @@ async fn code_columns_keep_their_u32_rows_per_leaf() {
     );
 }
 
-/// At 1 MiB for both targets the code-column override is the stock
-/// pipeline, byte for byte, over a plain and a dictionary-encoded column —
-/// so an upgrade that changes Vortex's stock pipeline fails here rather than
-/// leaving the code columns on a stale copy of it. 270,000 rows cut the
-/// plain column into three 1 MiB leaves.
+/// At 1 MiB for both targets the id-column override is the stock pipeline,
+/// byte for byte, over plain and dictionary-encoded columns — so an upgrade
+/// that changes Vortex's stock pipeline fails here rather than leaving the id
+/// columns on a stale copy of it. 270,000 rows cut the plain columns into
+/// three 1 MiB leaves.
 #[tokio::test]
-async fn code_column_override_at_one_mebibyte_is_the_stock_pipeline() {
+async fn id_column_override_at_one_mebibyte_is_the_stock_pipeline() {
     let wide = table(270_000);
     let stock = written(wide.clone(), container::default_child_strategy()).await;
     let overridden = written(
@@ -151,13 +151,14 @@ async fn code_column_override_at_one_mebibyte_is_the_stock_pipeline() {
     assert!(overridden == stock, "the override writes the stock bytes");
 }
 
-/// Only the term-code fields take the override: non-nullable u64 columns
-/// named `s`, `p`, `o`, `g` or `val` — not string columns of the same names,
-/// not the u32 row ids — so a Default-layout table's strings are written by
-/// the stock strategy.
+/// Only the id fields take the override: non-nullable u64 columns named
+/// `s`, `p`, `o`, `g` or `val` (term codes) or `rid` (row ids) — not string
+/// columns of the same names, not narrower or nullable integers, not other
+/// columns — so a Default-layout table's strings are written by the stock
+/// strategy, and its index children's row ids by the override.
 #[test]
-fn only_code_fields_take_the_override() {
-    use crate::store::schema::is_code_field;
+fn only_id_fields_take_the_override() {
+    use crate::store::schema::{is_code_field, is_id_field, is_row_id_field};
     use vortex_array::dtype::{DType, Nullability, PType, StructFields};
 
     let u64_dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
@@ -167,18 +168,24 @@ fn only_code_fields_take_the_override() {
         assert!(is_code_field(name, &u64_dtype), "{name}");
         assert!(!is_code_field(name, &u32_dtype), "{name}");
         assert!(!is_code_field(name, &utf8), "{name}");
+        assert!(!is_row_id_field(name, &u64_dtype), "{name}");
     }
-    for name in ["rid", "o_kind", "o_value", "_dict_term"] {
-        assert!(!is_code_field(name, &u64_dtype), "{name}");
+    assert!(is_row_id_field("rid", &u64_dtype));
+    assert!(!is_row_id_field("rid", &u32_dtype));
+    assert!(!is_code_field("rid", &u64_dtype));
+    for name in ["o_kind", "o_value", "_dict_term"] {
+        assert!(!is_id_field(name, &u64_dtype), "{name}");
     }
-    assert!(!is_code_field(
-        "s",
-        &DType::Primitive(PType::U64, Nullability::Nullable)
-    ));
+    for name in ["s", "rid"] {
+        assert!(is_id_field(name, &u64_dtype), "{name}");
+        assert!(!is_id_field(
+            name,
+            &DType::Primitive(PType::U64, Nullability::Nullable)
+        ));
+    }
 
-    let names = |dtype: &DType| -> Vec<String> {
-        code_fields(dtype).iter().map(|n| n.to_string()).collect()
-    };
+    let names =
+        |dtype: &DType| -> Vec<String> { id_fields(dtype).iter().map(|n| n.to_string()).collect() };
     let table = |fields: &[(&str, &DType)]| {
         DType::Struct(
             StructFields::new(
@@ -188,15 +195,20 @@ fn only_code_fields_take_the_override() {
             Nullability::NonNullable,
         )
     };
-    // A Dictionary-layout index child: its codes, not its row ids.
+    // A Dictionary-layout index child: its codes and its row ids.
     assert_eq!(
         names(&table(&[
             ("p", &u64_dtype),
             ("o", &u64_dtype),
-            ("rid", &u32_dtype),
+            ("rid", &u64_dtype),
             ("val", &u64_dtype),
         ])),
-        ["p", "o", "val"]
+        ["p", "o", "rid", "val"]
+    );
+    // A Default-layout index child: its row ids only.
+    assert_eq!(
+        names(&table(&[("val", &utf8), ("rid", &u64_dtype)])),
+        ["rid"]
     );
     // A Default-layout quad table: strings under the code names.
     assert!(
@@ -214,11 +226,11 @@ fn only_code_fields_take_the_override() {
 /// The three paths that write a store's children — the out-of-core
 /// builder's quad table and merged index children, and an in-memory store's
 /// serialization of its quad table and index components — all route the
-/// code columns through the override: 140,000 rows fit one leaf of a plain
-/// u64 column there, where the stock 1 MiB would cut two (131,072 and
+/// plain id columns through the override: 140,000 rows fit one leaf of a
+/// plain u64 column there, where the stock 1 MiB would cut two (131,072 and
 /// 8,928). Subjects are unique and each object is its quad's subject, so
-/// every `s` and `o` column, and the reference index's object values, are
-/// plain columns.
+/// every `s` and `o` column, the reference index's object values and every
+/// row-id column are plain columns.
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn every_store_write_path_keeps_code_leaves_at_262144_rows() {
@@ -260,6 +272,10 @@ async fn every_store_write_path_keeps_code_leaves_at_262144_rows() {
             "index:ospg/s",
             "index:ospg/o",
             "index:ref-o/val",
+            "index:posg/rid",
+            "index:ospg/rid",
+            "index:ref-o/rid",
+            "index:ref-p/rid",
         ] {
             assert_eq!(leaves_of(leaves, key), [rows as u64], "{label}: {key}");
         }
