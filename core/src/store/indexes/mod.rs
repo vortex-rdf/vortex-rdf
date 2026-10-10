@@ -132,7 +132,9 @@ pub(crate) fn check_adopted_rows(rows: u64) -> Result<()> {
 /// The id of the next row of an indexed build that has numbered `assigned`
 /// rows so far, counting it — the checked increment of a build that numbers
 /// rows as they stream past and cannot know the count up front. The refusal
-/// comes at the first row past the row limit, before any id wraps.
+/// comes at the first row past the row limit, before any id wraps. Compiled
+/// where its one caller, the out-of-core builder, is.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) fn next_row_id(assigned: &mut u64) -> Result<u32> {
     if *assigned >= row_limit() {
         return Err(too_many_rows(None));
