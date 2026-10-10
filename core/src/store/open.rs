@@ -104,6 +104,17 @@ pub(super) fn classify_component(
         return Ok(ComponentKind::Dict);
     }
     if let Some(known) = crate::store::indexes::known_component(&descriptor.implementation) {
+        // Fail closed on a layout this reader was never checked against.
+        if descriptor.version > container::INDEX_VERSION {
+            return Err(VortexRdfError::Deserialization(format!(
+                "unsupported index component version: this store's component {} is version {}, \
+                 but this version of vortex-rdf reads up to version {}; it was written by a \
+                 newer vortex-rdf, so open it with a newer version of vortex-rdf",
+                descriptor.name,
+                descriptor.version,
+                container::INDEX_VERSION
+            )));
+        }
         check_id_columns(&descriptor.name, &descriptor.dtype)?;
         return Ok(ComponentKind::Index(known));
     }
@@ -308,10 +319,11 @@ impl VortexRdfStore {
     /// whenever the caller already owns the bytes; `from_bytes` copies a
     /// borrowed slice into one.
     pub async fn from_bytes_owned(bytes: impl Into<vortex_buffer::ByteBuffer>) -> Result<Self> {
+        let bytes: vortex_buffer::ByteBuffer = bytes.into();
         let file = VORTEX_SESSION
             .open_options()
-            .open_buffer(bytes.into())
-            .map_err(VortexRdfError::Vortex)?;
+            .open_buffer(bytes.clone())
+            .map_err(|error| read::open_failure(error, &bytes))?;
         if !container::is_native_file(&file) {
             return Err(read::unsupported_file_error(&file));
         }

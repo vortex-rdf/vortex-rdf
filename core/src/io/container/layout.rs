@@ -16,7 +16,10 @@ use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use super::wire::{StoreComponentDescriptor, decode_store_metadata, encode_store_metadata};
-use super::{LEGACY_STORE_LAYOUT_ID, QUAD_SOURCE_CHILD, QUAD_SOURCE_NAME, STORE_LAYOUT_ID};
+use super::{
+    LEGACY_STORE_LAYOUT_ID, QUAD_SOURCE_CHILD, QUAD_SOURCE_NAME, STORE_LAYOUT_FAMILY,
+    STORE_LAYOUT_ID,
+};
 
 /// VTable of the native store root layout.
 #[derive(Clone, Debug)]
@@ -205,6 +208,22 @@ pub(crate) fn register(session: &VortexSession) {
     session
         .layouts()
         .register(&LEGACY_LAYOUT as &dyn LayoutEncoding);
+}
+
+/// The id of the root layout of `bytes` when it is a store root this version
+/// does not know: a `vortex-rdf.store.` id other than the current and the
+/// legacy one. The store session cannot open such a file (its registry has no
+/// entry for the id), so the root is named through a session that reads an
+/// unknown layout as a placeholder.
+pub(crate) fn newer_root_id(bytes: &vortex_buffer::ByteBuffer) -> Option<String> {
+    use vortex_file::OpenOptionsSessionExt as _;
+    let file = crate::session::FOREIGN_LAYOUT_SESSION
+        .open_options()
+        .open_buffer(bytes.clone())
+        .ok()?;
+    let id = file.footer().layout().encoding_id().to_string();
+    (id.starts_with(STORE_LAYOUT_FAMILY) && id != STORE_LAYOUT_ID && id != LEGACY_STORE_LAYOUT_ID)
+        .then_some(id)
 }
 
 pub(super) fn is_native_root(layout: &LayoutRef) -> bool {

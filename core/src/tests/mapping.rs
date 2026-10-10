@@ -66,3 +66,46 @@ async fn test_mapped_store_survives_rename_over_its_path() {
         5
     );
 }
+
+/// A path that cannot be opened is the same I/O error in both modes, naming
+/// the path and keeping the kind: a missing file, and (off root) one the
+/// process may not read.
+#[tokio::test]
+async fn test_open_errors_are_io_errors_naming_the_path_in_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.vortex");
+    #[allow(unused_mut)]
+    let mut cases = vec![(missing, std::io::ErrorKind::NotFound)];
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_store_dir, store) =
+            write_store_file(modular_quads(12, 3, 4), LayoutStrategy::Dictionary, vec![]).await;
+        let sealed = dir.path().join("sealed.vortex");
+        std::fs::copy(&store, &sealed).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&sealed).is_ok() {
+            eprintln!("skipped: this process can read a 0000 file (root?)");
+        } else {
+            cases.push((sealed, std::io::ErrorKind::PermissionDenied));
+        }
+    }
+
+    for (path, kind) in cases {
+        let mapped = VortexRdfStore::from_file(&path).await;
+        let loaded = VortexRdfStore::from_file_in_memory(&path).await;
+        for (how, result) in [("from_file", mapped), ("from_file_in_memory", loaded)] {
+            let error = result
+                .err()
+                .unwrap_or_else(|| panic!("{how}: must not open"));
+            assert!(
+                matches!(&error, VortexRdfError::Io(e) if e.kind() == kind),
+                "{how}: {error:?}"
+            );
+            assert!(
+                error.to_string().contains(&format!("{path:?}")),
+                "{how}: the error must name the path: {error}"
+            );
+        }
+    }
+}

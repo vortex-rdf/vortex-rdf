@@ -39,6 +39,19 @@ pub(crate) static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     session
 });
 
+/// A session that reads a layout it has no registration for as a placeholder.
+/// Nothing is read through it: it names the root layout of a file the store
+/// session refused (see [`newer_root_id`](crate::io::container::newer_root_id)).
+pub(crate) static FOREIGN_LAYOUT_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+    let session = VortexSession::empty()
+        .with::<ArraySession>()
+        .with::<LayoutSession>()
+        .with::<ScalarFnSession>()
+        .with::<RuntimeSession>();
+    session.allow_unknown();
+    session
+});
+
 /// The frozen Vortex `core` edition the store writes with: every array
 /// encoding, layout, extension dtype and zone-map aggregate a store file may
 /// hold, apart from the store's own root layout. Pinned, not Vortex's moving

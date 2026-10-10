@@ -294,7 +294,7 @@ impl IndexComponent {
     #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
     pub(crate) fn to_write(&self) -> Result<crate::io::container::NativeComponentWrite> {
         use crate::io::container::{
-            BufferedComponentSource, NativeComponentWrite, StoreComponentDescriptor,
+            BufferedComponentSource, INDEX_VERSION, NativeComponentWrite, StoreComponentDescriptor,
             StoreComponentRole, child_strategy,
         };
         let array = self.rows()?.clone().into_array();
@@ -304,7 +304,7 @@ impl IndexComponent {
                 name: self.name.into(),
                 role: StoreComponentRole::Index,
                 implementation: self.slug.into(),
-                version: 1,
+                version: INDEX_VERSION,
                 required: false,
                 sorted: self.sorted,
                 dtype: array.dtype().clone(),

@@ -173,6 +173,22 @@ pub(crate) fn unsupported_file_error(file: &vortex_file::VortexFile) -> VortexRd
     ))
 }
 
+/// The error for bytes Vortex could not open: the one that says a newer
+/// vortex-rdf wrote them when their root layout is a store root this version
+/// does not know, Vortex's own otherwise.
+pub(crate) fn open_failure(
+    error: vortex_error::VortexError,
+    bytes: &vortex_buffer::ByteBuffer,
+) -> VortexRdfError {
+    match super::container::newer_root_id(bytes) {
+        Some(id) => VortexRdfError::Deserialization(format!(
+            "this store was written by a newer vortex-rdf (root layout {id}), which this \
+             version cannot read; open it with a newer version of vortex-rdf"
+        )),
+        None => VortexRdfError::Vortex(error),
+    }
+}
+
 /// Which file a path named when it was opened: the device and inode on Unix.
 /// A store keeps it to tell, before it rewrites its source file, whether the
 /// path still names the file it opened. There is no identity elsewhere.
@@ -254,6 +270,10 @@ impl std::ops::Deref for OpenedFile {
 /// `VortexFile` is scanned. The layout reader is cached on the handle: every
 /// scan and pruning evaluation shares one reader tree.
 ///
+/// Both modes reach the file through `File::open` first, so a path that
+/// cannot be opened is the same I/O error in either, with the path in its
+/// message.
+///
 /// A mapped file must not be truncated or rewritten in place while open
 /// (its pages would fault); replacing it by rename is fine on Unix.
 #[cfg(feature = "file-io")]
@@ -261,31 +281,48 @@ pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
     path: P,
     access: FileAccess,
 ) -> Result<OpenedFile> {
+    use crate::error::path_error;
     use vortex_file::OpenOptionsSessionExt;
+
+    let path = path.as_ref();
     let options = crate::session::VORTEX_SESSION
         .open_options()
         .with_layout_reader_cache();
+    let file = std::fs::File::open(path).map_err(|e| path_error("open", path, e))?;
     match access {
         FileAccess::Mapped => {
-            let file = std::fs::File::open(path.as_ref())?;
             let identity = file.metadata().ok().as_ref().and_then(FileIdentity::of);
             // SAFETY: a store file is read-only while open; truncating or
             // rewriting it in place is unsupported (docs/file-format.md §8).
-            let mmap = unsafe { memmap2::Mmap::map(&file) }?;
+            let mmap =
+                unsafe { memmap2::Mmap::map(&file) }.map_err(|e| path_error("map", path, e))?;
+            let bytes = vortex_buffer::ByteBuffer::from(mmap);
             let opened = options
-                .open_buffer(vortex_buffer::ByteBuffer::from(mmap))
-                .map_err(VortexRdfError::Vortex)?;
+                .open_buffer(bytes.clone())
+                .map_err(|e| open_failure(e, &bytes))?;
             Ok(OpenedFile {
                 file: opened,
                 mapped: true,
                 identity,
             })
         }
-        FileAccess::Read => options
-            .open_path(path)
-            .await
-            .map(OpenedFile::from)
-            .map_err(VortexRdfError::Vortex),
+        FileAccess::Read => {
+            drop(file);
+            match options.open_path(path).await {
+                Ok(opened) => Ok(opened.into()),
+                // A mapping reads nothing up front: enough to name a newer
+                // store's root.
+                Err(error) => Err(
+                    match std::fs::File::open(path)
+                        // SAFETY: as above; the mapping only lives for the call.
+                        .and_then(|file| unsafe { memmap2::Mmap::map(&file) })
+                    {
+                        Ok(mmap) => open_failure(error, &vortex_buffer::ByteBuffer::from(mmap)),
+                        Err(_) => VortexRdfError::Vortex(error),
+                    },
+                ),
+            }
+        }
     }
 }
 

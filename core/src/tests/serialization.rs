@@ -1151,6 +1151,131 @@ async fn test_open_rejects_a_dictionary_version_newer_than_this_version_reads() 
     }
 }
 
+/// An index child of a version newer than the one this version reads is
+/// rejected at open like the dictionary child, whichever way the store is
+/// opened. The current version still opens.
+#[tokio::test]
+async fn test_open_rejects_an_index_version_newer_than_this_version_reads() {
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(dictionary_test_quads()),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    let parts = VortexRdfStore::from_built(arr)
+        .unwrap()
+        .to_serializable_parts()
+        .await
+        .unwrap();
+    let with_version = |version: u32| {
+        let mut writes = vec![parts.dict.as_ref().unwrap().to_write().unwrap()];
+        for component in &parts.components {
+            let mut write = component.to_write().unwrap();
+            write.descriptor.version = version;
+            writes.push(write);
+        }
+        writes
+    };
+
+    let bytes = unstamped_store_bytes(
+        vec![parts.array.clone()],
+        with_version(container::INDEX_VERSION),
+    )
+    .await;
+    let (from_bytes, from_file) = open_both(&bytes).await;
+    for (how, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
+        assert!(result.is_ok(), "{how}: the current version must open");
+    }
+
+    for version in [container::INDEX_VERSION + 1, 99, u32::MAX] {
+        let bytes = unstamped_store_bytes(vec![parts.array.clone()], with_version(version)).await;
+        let (from_bytes, from_file) = open_both(&bytes).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("newer.vortex");
+        std::fs::write(&path, &bytes).unwrap();
+        let in_memory = VortexRdfStore::from_file_in_memory(&path).await;
+        for (how, result) in [
+            ("from_bytes", from_bytes),
+            ("from_file", from_file),
+            ("from_file_in_memory", in_memory),
+        ] {
+            let err = result
+                .err()
+                .unwrap_or_else(|| panic!("{how}: version {version} must be refused"));
+            let VortexRdfError::Deserialization(message) = &err else {
+                panic!("{how}: expected a Deserialization error, got {err:?}");
+            };
+            assert!(
+                message.contains(&format!("is version {version}"))
+                    && message
+                        .contains(&format!("reads up to version {}", container::INDEX_VERSION))
+                    && message.contains("written by a newer vortex-rdf")
+                    && message.contains("open it with a newer version"),
+                "{how}: unexpected error: {message}"
+            );
+        }
+    }
+}
+
+/// A root layout from a `vortex-rdf.store.*` generation this version does not
+/// know was written by a newer vortex-rdf: every open path says so instead of
+/// reporting Vortex's unknown-encoding error.
+#[tokio::test]
+async fn test_open_rejects_a_root_layout_from_a_newer_vortex_rdf() {
+    let current: &[u8] = container::STORE_LAYOUT_ID.as_bytes();
+    let newer: &[u8] = b"vortex-rdf.store.v3";
+    assert_eq!(current.len(), newer.len());
+
+    for layout in [LayoutStrategy::Default, LayoutStrategy::Dictionary] {
+        let built = build_array::<SortedInMemoryBuilder>(
+            quad_stream(modular_quads(12, 3, 4)),
+            layout,
+            vec![IndexType::SecondaryByReference],
+        )
+        .await
+        .unwrap();
+        let mut bytes = VortexRdfStore::from_built(built)
+            .unwrap()
+            .to_bytes()
+            .await
+            .unwrap();
+        let at = bytes
+            .windows(current.len())
+            .position(|window| window == current)
+            .expect("the footer names the root layout");
+        bytes[at..at + newer.len()].copy_from_slice(newer);
+
+        let (from_bytes, from_file) = open_both(&bytes).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("newer.vortex");
+        std::fs::write(&path, &bytes).unwrap();
+        let in_memory = VortexRdfStore::from_file_in_memory(&path).await;
+        for (how, result) in [
+            ("from_bytes", from_bytes),
+            ("from_file", from_file),
+            ("from_file_in_memory", in_memory),
+        ] {
+            let err = result
+                .err()
+                .unwrap_or_else(|| panic!("{layout:?}/{how}: a newer root must be refused"));
+            let VortexRdfError::Deserialization(message) = &err else {
+                panic!("{layout:?}/{how}: expected a Deserialization error, got {err:?}");
+            };
+            assert!(
+                message.contains("written by a newer vortex-rdf")
+                    && message.contains("vortex-rdf.store.v3")
+                    && message.contains("open it with a newer version"),
+                "{layout:?}/{how}: unexpected error: {message}"
+            );
+            assert!(
+                !message.contains("Invalid encoding ID"),
+                "{layout:?}/{how}: Vortex's own error leaked: {message}"
+            );
+        }
+    }
+}
+
 /// A required component this version cannot interpret makes the store
 /// unopenable — skipping it could silently change query results — while an
 /// optional unknown component is skipped and the store answers as if it

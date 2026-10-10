@@ -41,6 +41,8 @@ pub(crate) mod write;
 /// `(val, rid)` order. A `v1` file can break either, so
 /// [`LEGACY_STORE_LAYOUT_ID`] is refused, not read.
 pub(crate) const STORE_LAYOUT_ID: &str = "vortex-rdf.store.v2";
+/// What every store root layout id starts with, this version's and any other's.
+pub(crate) const STORE_LAYOUT_FAMILY: &str = "vortex-rdf.store.";
 /// The store root layout of vortex-rdf 0.11 and earlier. Nothing writes it
 /// and nothing reads it: it is registered only so that a file carrying it
 /// opens far enough to be refused with an error that says what the file is
@@ -64,6 +66,10 @@ pub(crate) const DICT_IMPLEMENTATION: &str = "sorted-terms-fsst-v1";
 /// (`classify_component`): a newer writer may lay it out in a way this reader
 /// would misread without noticing.
 pub(crate) const DICT_VERSION: u32 = 2;
+/// Version of an index child: the one this crate writes and the newest it
+/// reads. A child of a newer version is refused at open
+/// (`classify_component`), like a newer dictionary child.
+pub(crate) const INDEX_VERSION: u32 = 1;
 
 #[cfg(test)]
 pub(crate) use layout::LegacyStoreLayoutVTable;
@@ -72,8 +78,8 @@ pub(crate) use layout::store_metadata_of_bytes;
 #[cfg(all(test, feature = "file-io"))]
 pub(crate) use layout::subtree_bytes;
 pub(crate) use layout::{
-    RdfStoreLayoutVTable, is_legacy_file, is_native_file, legacy_store_message, quads_sorted,
-    register, store_component, store_components,
+    RdfStoreLayoutVTable, is_legacy_file, is_native_file, legacy_store_message, newer_root_id,
+    quads_sorted, register, store_component, store_components,
 };
 #[cfg(test)]
 pub(crate) use sources::default_child_strategy;
