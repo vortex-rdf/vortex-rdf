@@ -77,9 +77,9 @@ pub(crate) use layout::{
 };
 #[cfg(test)]
 pub(crate) use sources::default_child_strategy;
-#[cfg(all(test, feature = "file-io"))]
-pub(crate) use sources::{CODE_BLOCK_TARGET, ONE_MEG, code_fields};
 pub(crate) use sources::{NativeComponentWrite, child_strategy};
+#[cfg(all(test, feature = "file-io"))]
+pub(crate) use sources::{ONE_MEG, child_strategy_with};
 // Consumed only by the write side (`ser` and `IndexComponent::to_write`),
 // gated the same way.
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
