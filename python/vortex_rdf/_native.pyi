@@ -1,7 +1,13 @@
 """Type stubs for the private native extension module."""
 
 import os
+import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
+if sys.version_info >= (3, 12):
+    from collections.abc import Buffer
+else:
+    from typing_extensions import Buffer
 
 __version__: str
 
@@ -9,12 +15,14 @@ __version__: str
 # accepted alongside `str`.
 _StrPath = Union[str, "os.PathLike[str]"]
 # Codes or indices: a U64Column, a buffer of u64 (or non-negative int64)
-# items, the raw byte view a U64Column exports, or any sequence of ints from
-# 0 to 2**64 - 1. A buffer of other items (a ``cast("I")`` view, a u32 array)
-# raises ``ValueError``.
-_U64s = Union["U64Column", Sequence[int], memoryview, bytes, bytearray]
-# A keep per position: a code set (U64Column, u64 buffer, int sequence) or a
-# code range (``range`` with step 1, or ``(lo, hi)``).
+# items (``memoryview``, ``array``, a NumPy array, the raw byte view a
+# U64Column exports), or any sequence of ints from 0 to 2**64 - 1. A buffer of
+# other items (a ``cast("I")`` view, a u32 array) raises ``ValueError``.
+_U64s = Union["U64Column", Sequence[int], Buffer]
+# A keep per position: a code set (U64Column, u64 buffer, or a list of ints)
+# or a code range (``range`` with step 1, or a 2-tuple ``(lo, hi)``, the
+# half-open codes ``lo <= code < hi``). A 2-tuple is always a range, never a
+# set: pass ``list(codes)``, not ``tuple(codes)``, for a set.
 _KeepSpec = Dict[Union[str, int], Union[_U64s, range, Tuple[int, int]]]
 # A probe of the batch calls: ``(s, p, o, g)`` or a dict with keys s, p, o,
 # g, keep, limit, offset.
