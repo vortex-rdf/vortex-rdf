@@ -12,7 +12,7 @@ Vortex-RDF is a columnar RDF serialization and a queryable quad store built on t
 ## Key features
 
 - 📊 **Columnar storage**: quads are [Vortex](https://docs.vortex.dev/specs/file-format) arrays, on disk and in memory alike, with the same layout in both.
-- ♻️ **Zero-copy reads**: opening a file memory-maps it and reads only its footer, and pattern filters are pushed down into the scan so only the touched chunks are read.
+- ♻️ **Zero-copy reads**: opening a file memory-maps it and reads only its footer (and, under the Dictionary layout, the dictionary's window bounds), and pattern filters are pushed down into the scan so only the touched chunks are read.
 - 📦 **Adaptive compression**: Vortex picks per-column encodings (FSST, dictionary, run-length, bit-packing, …) and decompresses just in time.
 - ☄️ **Streaming, out-of-core ingestion**: datasets larger than RAM are globally sorted through an external merge sort with bounded memory.
 - 🍀 **RDF 1.1 quads**: named graphs `(s, p, o, g)`, blank nodes, language-tagged and typed literals.

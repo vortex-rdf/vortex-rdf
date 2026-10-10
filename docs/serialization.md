@@ -51,7 +51,7 @@ A builder hands these back in one of two shapes
 | Surface | Call | Pipeline | Produces |
 |---|---|---|---|
 | CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`main.rs`](../cli/src/main.rs#L35)) | out-of-core | file |
-| Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/ser.rs#L183) / [`quads_stream_to_vortex_writer`](../core/src/io/ser.rs#L104) | out-of-core | file / any `VortexWrite` |
+| Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/ser.rs#L192) / [`quads_stream_to_vortex_writer`](../core/src/io/ser.rs#L109) | out-of-core | file / any `VortexWrite` |
 | Rust | [`VortexRdfStore::from_quads`](../core/src/store/mod.rs#L201), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L62) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L42) then [`VortexRdfStore::from_built`](../core/src/store/mod.rs#L249) to name the builder | either | in-memory store |
 | Rust | [`VortexRdfStore::to_bytes`](../core/src/store/serialize.rs#L149) | — (re-serializes a store) | bytes |
 | Rust | [`to_serializable_parts`](../core/src/store/serialize.rs#L128) → [`from_parts`](../core/src/store/mod.rs#L234) | — | in-memory round trip |
@@ -305,7 +305,7 @@ is the sorted set of every distinct term of the dataset — subjects, predicates
 objects and graph names in one namespace, the default graph's `""` included. A
 term's code is its position, so code order equals string order and a bound
 term resolves to its code by binary search. The frozen column is
-FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/term_dict.rs#L323)):
+FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/term_dict.rs#L324)):
 one symbol table is trained on the whole column and the terms are compressed in
 independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/term_dict.rs#L55)
 (65,536) terms, each window a self-contained FSST array. The term count must
@@ -313,7 +313,7 @@ fit an `i32`.
 
 Which pipeline built the dictionary decides how its term→code map is held during
 encoding: borrowed from the live quads in memory
-([`from_quads_with_map`](../core/src/store/layouts/dictionary/term_dict.rs#L409)),
+([`from_quads_with_map`](../core/src/store/layouts/dictionary/term_dict.rs#L410)),
 owned when the quads were spilled and cannot be borrowed from
 ([`TermDictionaryBuilder::finish`](../core/src/store/layouts/dictionary/ingest.rs#L70)).
 Either way the map exists only for the build; stores keep the columnar
@@ -397,7 +397,7 @@ flowchart TD
   BtrBlocks-style compressor, and write flat leaf layouts. Each id column —
   a `u64` term-code `s`, `p`, `o`, `g` or `val`, or a `u64` row-id `rid` —
   is handed, through the builder's per-field override, to
-  [`id_column_strategy`](../core/src/io/container/sources.rs#L284): the same
+  [`id_column_strategy`](../core/src/io/container/sources.rs#L281): the same
   per-column pipeline rebuilt step for step from Vortex's layout strategies,
   with the coalescing target split in two. A column that does not
   dictionary-encode coalesces toward ~2 MiB, 262,144 rows per leaf for a
@@ -423,21 +423,21 @@ flowchart TD
   of every component's, in inventory order; the descriptors and `quads_sorted`
   are encoded into the root layout's metadata ([file-format.md §3](file-format.md#3-the-store-root-vortex-rdfstorev2)).
 - **Provenance.** `quads_sorted` is read off the primary's own `s` stamp when a
-  store re-serializes ([`serialize_parts`](../core/src/io/ser.rs#L45)) and is
+  store re-serializes ([`serialize_parts`](../core/src/io/ser.rs#L49)) and is
   `true` by construction for a builder's stream; each component's `sorted` flag
   travels on its descriptor.
 
-Two drivers feed this: [`built_stream_to_vortex_writer`](../core/src/io/ser.rs#L133)
+Two drivers feed this: [`built_stream_to_vortex_writer`](../core/src/io/ser.rs#L139)
 for a builder's chunk stream (files, compaction; a file is written by
-[`write_store_atomically`](../core/src/io/ser.rs#L222) beside its path and renamed
+[`write_store_atomically`](../core/src/io/ser.rs#L231) beside its path and renamed
 into place, so a failed write leaves no partial file and the previous store
 untouched, and on Unix a store that has the old file mapped keeps reading
 it), and
-[`serialize_parts`](../core/src/io/ser.rs#L45) for a store's split parts
+[`serialize_parts`](../core/src/io/ser.rs#L49) for a store's split parts
 (`to_bytes`, the bindings' exchange bytes). On the wire the two are the same
 container.
 
-**Replacing a file.** [`PendingStore`](../core/src/io/ser.rs#L298) is the one
+**Replacing a file.** [`PendingStore`](../core/src/io/ser.rs#L311) is the one
 way a store reaches a path (`write_store_atomically` is its `create` followed
 by its `write`). `create` makes `<store>.write-<uuid>.tmp` beside the file it
 replaces *before* any input is read or any row gathered, so a path that cannot
@@ -450,7 +450,10 @@ replaced, so a `current -> versions/v3.vortex` setup keeps its link; the temp
 file for an existing store is created private (`0600` on Unix, whatever the
 umask) and the old file's permission bits are set on it before the first byte
 is written, so no byte of a private store is ever in a file others can read
-(a path with no store yet gets the permissions any new file does); a
+(a path with no store yet gets the permissions any new file does); a path that
+resolves to a device or a pipe (`/dev/null`, `/dev/stdout` behind a pipe) takes
+the store in place, with no temp file and no all-or-nothing guarantee, and any
+other file that is not a regular file is refused; a
 filesystem that refuses that `chmod` fails the write, with the temp file
 removed and the old store untouched; and a store the process cannot write is
 never replaced (a read-only store signals that it should not be overwritten:
@@ -459,7 +462,8 @@ before anything is built, and compaction of such a file fails the same way; an
 append's auto-compaction alone does not fail, it keeps the batch in the
 in-memory tail, see [mutations.md §5.1](mutations.md#51-auto-compaction)).
 Owner, ACLs and extended attributes are **not** preserved: the new file
-belongs to the process that wrote it. Two costs follow from the design: a
+belongs to the process that wrote it, and it has a new inode, so another hard
+link to the old file keeps the old store. Two costs follow from the design: a
 rebuild needs a **writable directory** (a writable file in a read-only
 directory cannot be rebuilt), and about **twice the disk space** while the old
 and the new file coexist (the old file's blocks are freed once the last store
@@ -536,19 +540,19 @@ quad once even when the rows it was gathered from did not.
 [`compact_with_indexes`](../core/src/store/compaction.rs#L65) gather every live
 quad, sort, drop repeated quads, and rebuild:
 
-- **A file-backed owner stays file-backed** ([`stream_compacted_to_file`](../core/src/store/compaction.rs#L117)):
+- **A file-backed owner stays file-backed** ([`stream_compacted_to_file`](../core/src/store/compaction.rs#L119)):
   the sorted rows are streamed through `SortedStreamBuilder` — spilling beside
   the store file, not in the OS temp dir — into a sibling temp file
   `<store>.write-<uuid>.tmp`, which is atomically renamed over the original;
   the store is then reopened memory-mapped. On Windows that rename is refused
   while the file is mapped, by this store included, so there a file-backed
   store cannot compact over its own path ([mutations.md §5](mutations.md#5-compaction)).
-- **An in-memory store** rebuilds through [`from_raw_quads`](../core/src/store/compaction.rs#L152)
+- **An in-memory store** rebuilds through [`from_raw_quads`](../core/src/store/compaction.rs#L155)
   (a fresh dictionary under Dictionary, components over the whole set) and
   adopts the result exactly as `from_built` does.
 
 `add_quads` compacts automatically when the tail crosses a threshold
-([`tail_needs_compaction`](../core/src/store/compaction.rs#L203)):
+([`tail_needs_compaction`](../core/src/store/compaction.rs#L206)):
 
 | Trigger | Value |
 |---|---|
@@ -558,8 +562,8 @@ quad, sort, drop repeated quads, and rebuild:
 
 Between compactions the tail accretes as chunks and is flattened once the
 accreted rows rival the flat prefix (floor 1,024) or 64 chunks pile up
-([`TAIL_FLATTEN_FLOOR`](../core/src/store/mutation.rs#L293),
-[`TAIL_MAX_CHUNKS`](../core/src/store/mutation.rs#L297)). The tail, tombstone
+([`TAIL_FLATTEN_FLOOR`](../core/src/store/mutation.rs#L294),
+[`TAIL_MAX_CHUNKS`](../core/src/store/mutation.rs#L298)). The tail, tombstone
 and compaction model in full is [mutations.md](mutations.md).
 
 ### 11.3 Back to RDF text

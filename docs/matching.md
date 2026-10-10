@@ -259,7 +259,7 @@ Each stage in the code, and where the details are below:
 |---|---|---|
 | Prelude | [`matching.rs:240-283`](../core/src/store/matching.rs#L240-L283) | — |
 | 1 · prefix probe | [`matching.rs:285-368`](../core/src/store/matching.rs#L285-L368), [`search_sorted_bounds`](../core/src/store/array.rs#L179) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`matching.rs:370-448`](../core/src/store/matching.rs#L370-L448), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L714) | [§6.2](#62-secondary-index-routing) |
+| 2 · secondary-index routing | [`matching.rs:370-448`](../core/src/store/matching.rs#L370-L448), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L756) | [§6.2](#62-secondary-index-routing) |
 | 3 · residual column filtering | [`matching.rs:450-491`](../core/src/store/matching.rs#L450-L491), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L187), [`mask_for`](../core/src/store/matching.rs#L798) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`matching.rs:493-508`](../core/src/store/matching.rs#L493-L508) | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
@@ -518,7 +518,7 @@ Each stage in the code, and where the details are below:
 |---|---|---|
 | Prelude | [`matching.rs:546-556`](../core/src/store/matching.rs#L546-L556) | — |
 | 1 · subject chunk probe | [`matching.rs:557-575`](../core/src/store/matching.rs#L557-L575), [`locate_subject_run`](../core/src/store/scan/file_scan.rs#L607) | [§7.1](#71-subject-chunk-probe) |
-| 2 · secondary-index routing | [`matching.rs:576-592`](../core/src/store/matching.rs#L576-L592), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L738) | [§8](#8-the-index-resolvers) |
+| 2 · secondary-index routing | [`matching.rs:576-592`](../core/src/store/matching.rs#L576-L592), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L780) | [§8](#8-the-index-resolvers) |
 | 3 · pushed-down filter | [`matching.rs:605-709`](../core/src/store/matching.rs#L605-L709), [`build_file_filter`](../core/src/store/scan/file_scan.rs#L592) | [§7.3](#73-what-ends-up-on-the-view) |
 | 4 · selection and serve plan | [`matching.rs:598-599`](../core/src/store/matching.rs#L598-L599) and [`matching.rs:711-752`](../core/src/store/matching.rs#L711-L752), [`row_range_from_pruning`](../core/src/store/scan/file_scan.rs#L890) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 
@@ -712,12 +712,12 @@ component is absent, unsorted, or probe-incompatible.
 **On file:** [`locate_component_run`](../core/src/store/indexes/row_ids.rs#L51)
 binary-searches the value column's chunk probes (sorted child + integer probe
 required). A located run's ids are `Lazy`
-([`read_located_rids`](../core/src/store/indexes/row_ids.rs#L233)): a count
+([`read_located_rids`](../core/src/store/indexes/row_ids.rs#L235)): a count
 takes the run's width, a window reads only its own rows, and materialized, a
 run ≤ 256 rows uses [`rid_point_reads`](../core/src/store/indexes/row_ids.rs#L86)
 and a wider one a rid-only scan restricted to the range — neither pays filter
 evaluation. Anything the probes decline falls back to
-[`scan_index_row_ids`](../core/src/store/indexes/row_ids.rs#L177), an eager
+[`scan_index_row_ids`](../core/src/store/indexes/row_ids.rs#L179), an eager
 pushed-down `val == probe` scan that answers whatever the order.
 
 **Example.** For the running example `index:ref-o` holds
@@ -740,7 +740,7 @@ second sorted copy of every quad.
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_scan.rs#L832) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/serve.rs#L525)); unlocated: the pushed-down projected+filtered scan of the index child |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_scan.rs#L832) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/serve.rs#L526)); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
 | Dropped when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
 | Tombstones | applied through the plan's `rid` column | applied through the plan's `rid` column |
@@ -990,10 +990,10 @@ RUST_LOG=vortex_rdf_core=debug vortex-rdf-cli match --input alice.vortex \
 prints
 
 ```
-[match_pattern] Prepared pattern codes at 770ns
-[match_pattern] File subject bounded by chunk probe at 2.339µs
-[match_pattern] File index declined at 4.045µs
-[match_pattern] File view built (filter: true, serve: false, pending ids: false) at 8.247µs
+[match_pattern] Prepared pattern codes at …
+[match_pattern] File subject bounded by chunk probe at …
+[match_pattern] File index declined at …
+[match_pattern] File view built (filter: true, serve: false, pending ids: false) at …
 ```
 
 — the prelude, the subject chunk probe finding `[0, 2)`, index routing not

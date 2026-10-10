@@ -81,8 +81,8 @@ flowchart TD
   geometrically — once their rows rival the flat prefix (with a floor so a
   small tail does not flatten on every add), or once enough chunks pile up
   that tail scans, which visit every chunk, would stop being dense
-  ([`TAIL_FLATTEN_FLOOR`](../core/src/store/mutation.rs#L293),
-  [`TAIL_MAX_CHUNKS`](../core/src/store/mutation.rs#L297)). Amortized, each
+  ([`TAIL_FLATTEN_FLOOR`](../core/src/store/mutation.rs#L294),
+  [`TAIL_MAX_CHUNKS`](../core/src/store/mutation.rs#L298)). Amortized, each
   appended row is copied O(1) times.
 - **Tail-local ids.** The tail has its own `RowSelection` and its own
   `deleted` mask, in tail-local ids (`0..rows.len()`), separate from the
@@ -110,8 +110,8 @@ flowchart TD
 
 ## 3. Deletions: tombstone masks
 
-[`delete_quad`](../core/src/store/mutation.rs#L140) /
-[`delete_matching`](../core/src/store/mutation.rs#L163) never remove or
+[`delete_quad`](../core/src/store/mutation.rs#L142) /
+[`delete_matching`](../core/src/store/mutation.rs#L165) never remove or
 rewrite rows either — they mark them dead.
 
 ```mermaid
@@ -132,7 +132,7 @@ flowchart TD
   That set is folded into `deleted: Option<Mask>` — one bit per base row —
   carried beside the base, and separately beside the tail. A later delete
   unions into the existing mask
-  ([`union_deleted`](../core/src/store/mutation.rs#L301)), so it composes
+  ([`union_deleted`](../core/src/store/mutation.rs#L302)), so it composes
   with rows already tombstoned; the matcher does not consult the existing
   tombstones, and the union absorbs a doomed set that names already-dead
   rows.
@@ -143,7 +143,7 @@ flowchart TD
 - **The contract.** `match_pattern` deliberately does **not** subtract
   tombstones when it computes a selection (keeping its row positions aligned
   for mask-based refinement); every *read* path does.
-  [`RowSelection::live_mask`](../core/src/store/selection.rs#L312) answers
+  [`RowSelection::live_mask`](../core/src/store/selection.rs#L313) answers
   "which of this selection's own rows are not tombstoned", and the in-memory
   reads all go through [`gather_live`](../core/src/store/scan/gather.rs#L22)
   — the single place a view becomes rows — so applying the mask cannot be
@@ -152,7 +152,7 @@ flowchart TD
   [`Tail::live_rows`](../core/src/store/source.rs#L187).
 - **File-backed stores** tombstone the same way (a file cannot be rewritten
   on delete). The doomed set is evaluated to a file-wide mask by
-  [`matching_file_row_mask`](../core/src/store/mutation.rs#L273) (through
+  [`matching_file_row_mask`](../core/src/store/mutation.rs#L274) (through
   [`matching_file_rows`](../core/src/store/scan/file_scan.rs#L514)), and on
   every later read the mask is applied **inside the scan**
   ([`restrict_scan`](../core/src/store/scan/file_scan.rs#L185)) — as an
@@ -212,9 +212,9 @@ flowchart TD
 ```
 
 - **A file-backed owner stays file-backed**
-  ([`stream_compacted_to_file`](../core/src/store/compaction.rs#L117)): the
+  ([`stream_compacted_to_file`](../core/src/store/compaction.rs#L119)): the
   writer is prepared first
-  ([`PendingStore::create`](../core/src/io/ser.rs#L314), the one writer every
+  ([`PendingStore::create`](../core/src/io/ser.rs#L342), the one writer every
   path-taking build shares), so a source file the process cannot write (a
   read-only file) is refused with `PermissionDenied` before a quad is
   gathered or built ([`add_quads`'s auto-compaction](#51-auto-compaction)
@@ -224,21 +224,26 @@ flowchart TD
   are then streamed through the out-of-core builder
   ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L164))
   into it
-  ([`built_stream_to_vortex_writer`](../core/src/io/ser.rs#L133)), which is
+  ([`built_stream_to_vortex_writer`](../core/src/io/ser.rs#L139)), which is
   then renamed over the original path, and the store is reopened
-  memory-mapped. The sibling placement keeps the rename on one filesystem, so
+  memory-mapped. Only the file the store opened is replaced: the file's
+  device and inode are recorded at open and checked against the path before
+  the temp file is created and again just before the rename, so a link
+  retargeted to another store, or a file rebuilt by rename, since the store
+  opened fails the compaction (an `InvalidOperation` error, not absorbed by
+  `add_quads`) and leaves that file alone; reopen the store. The sibling placement keeps the rename on one filesystem, so
   it is atomic; a failed write removes the temp file and leaves the original
   untouched. On Windows the rename is refused while the file is mapped, by
   this store included, so there a file-backed store cannot compact over its
   own path: the compaction fails with the I/O error and the file stays as it
   was. The builder's spill runs are placed in the temp file's directory
-  ([`dir`](../core/src/io/ser.rs#L418), [`spill.rs`](../core/src/store/builders/spill.rs#L60)):
+  ([`dir`](../core/src/io/ser.rs#L497), [`spill.rs`](../core/src/store/builders/spill.rs#L60)):
   beside the file being replaced, links followed (a store opened through a
   link spills where the link points, not where the link is), the one volume
   known to fit the data (`VORTEX_RDF_SPILL_DIR` outranks that default).
 - **An in-memory store**, and any *derived view* of a file (whose rows are a
   subset of a file other readers share), rebuilds in memory through
-  [`from_raw_quads`](../core/src/store/compaction.rs#L152) →
+  [`from_raw_quads`](../core/src/store/compaction.rs#L155) →
   [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L296) and adopts
   the result in the same compressed-resident form a freshly built store has
   ([serialization.md §10](serialization.md#10-adopting-a-build-in-memory)).
@@ -247,8 +252,8 @@ flowchart TD
 
 `add_quads` is append-then-check: the append itself is policy-free, and
 whichever call pushes the tail past a threshold
-([`should_auto_compact`](../core/src/store/compaction.rs#L172) →
-[`tail_needs_compaction`](../core/src/store/compaction.rs#L203)) pays for
+([`should_auto_compact`](../core/src/store/compaction.rs#L175) →
+[`tail_needs_compaction`](../core/src/store/compaction.rs#L206)) pays for
 folding it back into the base, which amortizes the O(n log n) rebuild to
 roughly constant cost per appended row. The tail is folded once it reaches
 either of:
@@ -270,22 +275,22 @@ that crosses a threshold on such a store does not fail and does not lose the
 batch: the batch stays in the in-memory tail, where matches and counts see it
 like any appended row, and the call returns `Ok` with the store. Only the
 writer's own refusal is absorbed
-([`is_unwritable`](../core/src/error.rs#L77)): the
-[`PendingStore::create`](../core/src/io/ser.rs#L314) that finds, before a quad
+([`is_unwritable`](../core/src/error.rs#L87)): the
+[`PendingStore::create`](../core/src/io/ser.rs#L342) that finds, before a quad
 is gathered, that the file or its directory cannot be written
 (`PermissionDenied`, or a read-only filesystem). Any other failure of the
 compaction is returned, a permission error from later in the rewrite (a spill
 directory, a rename) included: by then the work was done, and hiding the error
-would redo it on every append. So is a filesystem's refusal to `chmod` the
-temp file (some FUSE mounts): an append over the threshold there fails. An append over the threshold on such a store
-costs one failed open of the file and no rebuild, and every later append over
-the threshold retries the same way, folding the tail as soon as the file can be
-written again. An explicit
-`compact()` of such a store still fails with `PermissionDenied`: it is the
-call that reports why the tail is not being folded, and
-[`tail_len`](../core/src/store/mod.rs#L397) shows the tail growing. The tail
-then has no bound but memory, and every query mask-scans it, so a read-only
-store is for reading: append to a copy.
+would redo it on every append. A filesystem's refusal to `chmod` the temp file
+(some FUSE mounts) is one of those: an append over the threshold there fails.
+An append over the threshold on a store the writer refuses costs one failed
+open of the file and no rebuild (a debug-level log line says so), and every
+later append over the threshold retries the same way, folding the tail as soon
+as the file can be written again. An explicit `compact()` of such a store still
+fails with `PermissionDenied`: it is the call that reports why the tail is not
+being folded, and [`tail_len`](../core/src/store/mod.rs#L397) shows the tail
+growing. The tail then has no bound but memory, and every query mask-scans it,
+so a read-only store is for reading: append to a copy.
 
 ---
 
