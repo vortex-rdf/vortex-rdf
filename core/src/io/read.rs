@@ -76,16 +76,12 @@ where
     chunked_or_single(collect_chunks(tasks).await?, dtype)
 }
 
-/// [`collect_scan`] with the split futures spawned onto the session's runtime
-/// handle, for a scan large enough to need the workers: `window` futures are
-/// in flight, each spawned as the window reaches it, and the chunks come back
-/// in split order, as the inline driver returns them, so the two drivers give
-/// the same rows whatever the scan's `ordered` flag says.
+/// [`collect_scan`] with each split future spawned onto the session's runtime,
+/// `window` of them in flight. The chunks come back in split order, as the
+/// inline driver returns them.
 ///
-/// The windowing is that of `ScanBuilder::into_array_stream` — one spawn per
-/// split, `buffered` over the spawned handles — applied to futures already
-/// planned (`ScanBuilder::build`), which is what lets the caller count the
-/// splits before choosing a driver.
+/// With no tokio runtime on the calling thread there is nothing to spawn
+/// onto: the futures run inline and nothing is spawned.
 #[cfg(feature = "file-io")]
 pub(crate) async fn collect_scan_spawned<F>(
     dtype: vortex_array::dtype::DType,
@@ -97,6 +93,9 @@ where
 {
     use vortex_io::session::RuntimeSessionExt as _;
 
+    if tokio::runtime::Handle::try_current().is_err() {
+        return collect_scan(dtype, tasks).await;
+    }
     let handle = crate::session::VORTEX_SESSION.handle();
     let spawned = futures::stream::iter(tasks).map(move |task| {
         #[cfg(test)]

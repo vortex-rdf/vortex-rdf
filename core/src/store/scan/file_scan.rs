@@ -1167,6 +1167,34 @@ mod tests {
         assert_eq!(over.rows, head(&whole.rows, limit + 1));
     }
 
+    /// A scan above the limit reads with no tokio runtime to spawn onto: it
+    /// runs inline. Driven here by a bare executor on a plain thread.
+    #[tokio::test]
+    async fn read_all_rows_above_the_limit_reads_outside_a_tokio_runtime() {
+        let limit = MAX_INLINE_SPLITS;
+        let (_dir, file) = mapped_file(limit + 8).await;
+        let whole = drive(&file, 0..(limit + 8) as u64, limit + 8, true).await;
+        let scan = scan_of(&file, 0..limit as u64 + 1, 1, true);
+        assert_eq!(
+            scan_of(&file, 0..limit as u64 + 1, 1, true)
+                .build()
+                .unwrap()
+                .len(),
+            limit + 1
+        );
+
+        let (rows, spawned) = std::thread::spawn(move || {
+            futures::executor::block_on(async {
+                let rows = read_all_rows(scan).await.unwrap();
+                (quad_codes(rows), driver_hooks::take_spawned())
+            })
+        })
+        .join()
+        .expect("a scan above the limit must not panic without a tokio runtime");
+        assert_eq!(spawned, 0, "no runtime to spawn onto, so nothing spawned");
+        assert_eq!(rows, head(&whole.rows, limit + 1));
+    }
+
     /// An index child's row-id scan is driven inline however many splits it
     /// has, where a row scan of the same shape is spawned: the classification
     /// is the entry point's, not the scan's.
