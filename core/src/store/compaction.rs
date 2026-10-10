@@ -74,9 +74,11 @@ impl VortexRdfStore {
         // copy, which the in-memory rebuild below provides.
         #[cfg(feature = "file-io")]
         if self.is_owner()
-            && let QuadsSource::File { path, .. } = &self.quads
+            && let QuadsSource::File { path, file, .. } = &self.quads
         {
-            return self.stream_compacted_to_file(unique, path).await;
+            return self
+                .stream_compacted_to_file(unique, path, file.identity())
+                .await;
         }
         let raws = self.sorted_live_raw_quads().await?;
         Self::from_raw_quads(&raws, self.layout.strategy(), unique, true)
@@ -118,8 +120,9 @@ impl VortexRdfStore {
         &self,
         indexes: Indexes,
         path: &std::path::Path,
+        opened: Option<crate::io::read::FileIdentity>,
     ) -> Result<Self> {
-        let pending = crate::io::ser::PendingStore::create(path).await?;
+        let pending = crate::io::ser::PendingStore::create_over(path, opened).await?;
         let raws = self.sorted_live_raw_quads().await?;
         let stream = futures::stream::iter(raws.into_iter().map(Ok::<_, VortexRdfError>));
         // The sorted builder spills merge runs to disk, and compaction rewrites

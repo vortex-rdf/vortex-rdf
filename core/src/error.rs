@@ -44,6 +44,16 @@ pub(crate) fn kind_means_unwritable(kind: std::io::ErrorKind) -> bool {
     )
 }
 
+/// `what` went wrong with the file at `path`: the I/O error, with the path in
+/// the message and its kind kept.
+#[cfg(feature = "file-io")]
+pub(crate) fn path_error(what: &str, path: &std::path::Path, e: std::io::Error) -> VortexRdfError {
+    VortexRdfError::Io(std::io::Error::new(
+        e.kind(),
+        format!("{what} {path:?}: {e}"),
+    ))
+}
+
 /// The source of the `Io` error a store writer returns when it finds, before
 /// anything is built, that the store file (or the directory it lives in)
 /// cannot be written by this process. The error keeps its kind

@@ -338,6 +338,45 @@ async fn test_temp_file_is_a_sibling_and_gone_after_success() {
     assert_eq!(std::fs::read(&path).unwrap(), b"a store");
 }
 
+/// Dropping the creation of a pending store at any of its steps leaves no
+/// temp file behind. Each poll starts one filesystem call and the sleep lets
+/// it finish, so every drop lands on a call that has been made and not yet
+/// seen by the future.
+#[tokio::test]
+async fn test_dropping_the_creation_at_any_step_leaves_no_temp_file() {
+    use crate::io::ser::PendingStore;
+    use std::task::Poll;
+    use std::time::Duration;
+
+    for existing in [false, true] {
+        for steps in 1..=12 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("store.vortex");
+            if existing {
+                std::fs::write(&path, b"the previous store").unwrap();
+            }
+            let mut create = Box::pin(PendingStore::create(&path));
+            for _ in 0..steps {
+                match futures::poll!(create.as_mut()) {
+                    Poll::Ready(_) => break,
+                    Poll::Pending => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            drop(create);
+            std::thread::sleep(Duration::from_millis(50));
+
+            let leftovers: Vec<PathBuf> = entries(dir.path())
+                .into_iter()
+                .filter(|entry| entry != &path)
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "existing={existing}, dropped after {steps} steps: {leftovers:?}"
+            );
+        }
+    }
+}
+
 // ─── Links and permissions (Unix) ──────────────────────────────────────
 
 /// Replacing a store keeps what the old file was set up as: a symbolic link
@@ -648,8 +687,8 @@ mod links_and_permissions {
         let replacing = dir.path().join("replacing.tmp");
         let fresh = dir.path().join("fresh.tmp");
 
-        create_temp(&replacing, true).await.unwrap();
-        create_temp(&fresh, false).await.unwrap();
+        create_temp(&replacing, true).unwrap();
+        create_temp(&fresh, false).unwrap();
 
         assert_eq!(mode_of(&replacing), 0o600);
         assert_eq!(mode_of(&fresh), default);
@@ -1028,6 +1067,136 @@ mod links_and_permissions {
         assert_eq!(entries(dir.path()), vec![path.clone()]);
     }
 
+    /// What compaction says when the file at the store's path is not the file
+    /// the store opened.
+    fn assert_replaced_since_open(error: &VortexRdfError, path: &Path) {
+        assert!(
+            matches!(
+                error,
+                VortexRdfError::InvalidOperation(message)
+                    if message.contains("was replaced since this store opened it")
+                        && message.contains("reopen it")
+                        && message.contains(&format!("{path:?}"))
+            ),
+            "{error}"
+        );
+        assert!(!error.is_unwritable(), "{error}");
+    }
+
+    /// A store opened through `current -> versions/v3.vortex` compacts the
+    /// file it opened. A link retargeted to another store since then is
+    /// refused, and neither store is touched.
+    #[tokio::test]
+    async fn test_compaction_refuses_a_link_retargeted_since_the_store_opened() {
+        let (dir, v3, current) = versioned_store().await;
+        let store = VortexRdfStore::from_file(&current).await.unwrap();
+        let versions = dir.path().join("versions");
+        let v4 = versions.join("v4.vortex");
+        rebuild(&v4, modular_quads(5, 2, 2)).await.unwrap();
+        std::fs::remove_file(&current).unwrap();
+        symlink("versions/v4.vortex", &current).unwrap();
+        let (v3_before, v4_before) = (std::fs::read(&v3).unwrap(), std::fs::read(&v4).unwrap());
+        let extra = make_quad(
+            "http://example.org/s99",
+            "http://example.org/p0",
+            "object 9",
+            GraphName::DefaultGraph,
+        );
+        let tailed = store.add_quad(extra).await.unwrap();
+
+        let error = tailed
+            .compact()
+            .await
+            .err()
+            .expect("the link names another store");
+
+        assert_replaced_since_open(&error, &current);
+        assert_eq!(std::fs::read(&v4).unwrap(), v4_before, "v4 was overwritten");
+        assert_eq!(std::fs::read(&v3).unwrap(), v3_before);
+        assert_eq!(entries(&versions), vec![v3, v4]);
+    }
+
+    /// A file rebuilt by rename while the store has it open is another file
+    /// than the one the store opened: compaction refuses it and leaves the
+    /// rebuilt store as it is.
+    #[tokio::test]
+    async fn test_compaction_refuses_a_file_rebuilt_by_rename_since_the_store_opened() {
+        let (dir, path) =
+            write_store_file(modular_quads(12, 3, 4), LayoutStrategy::Dictionary, vec![]).await;
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        rebuild(&path, modular_quads(5, 2, 2)).await.unwrap();
+        let rebuilt = std::fs::read(&path).unwrap();
+
+        let error = store
+            .compact()
+            .await
+            .err()
+            .expect("the file is not the one the store opened");
+
+        assert_replaced_since_open(&error, &path);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            rebuilt,
+            "the rebuild was overwritten"
+        );
+        assert_eq!(entries(dir.path()), vec![path.clone()]);
+    }
+
+    /// The append that crosses the auto-compaction threshold does not take
+    /// the refusal for the writer's "unwritable": it comes back as the error
+    /// it is, and the rebuilt file is untouched.
+    #[tokio::test]
+    async fn test_an_append_past_the_floor_does_not_absorb_a_replaced_file() {
+        let (dir, path) =
+            write_store_file(modular_quads(12, 3, 4), LayoutStrategy::Default, vec![]).await;
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        rebuild(&path, modular_quads(5, 2, 2)).await.unwrap();
+        let rebuilt = std::fs::read(&path).unwrap();
+
+        let error = store
+            .add_quads(past_the_floor())
+            .await
+            .err()
+            .expect("the refusal is reported, not kept in the tail");
+
+        assert_replaced_since_open(&error, &path);
+        assert_eq!(std::fs::read(&path).unwrap(), rebuilt);
+        assert_eq!(entries(dir.path()), vec![path.clone()]);
+    }
+
+    /// The file is checked again just before the rename: a store replaced
+    /// while the new one was being written is not overwritten, and the temp
+    /// file goes.
+    #[tokio::test]
+    async fn test_a_file_replaced_during_the_write_is_not_overwritten() {
+        use crate::io::read::FileIdentity;
+        use crate::io::ser::PendingStore;
+        use vortex_io::VortexWrite as _;
+
+        let (dir, path) =
+            write_store_file(modular_quads(12, 3, 4), LayoutStrategy::Default, vec![]).await;
+        let opened = FileIdentity::of(&std::fs::metadata(&path).unwrap());
+        let pending = PendingStore::create_over(&path, opened).await.unwrap();
+        let replacement = path.clone();
+
+        let error = pending
+            .write(|mut writer| async move {
+                writer.write_all(b"the compacted rows".to_vec()).await?;
+                rebuild(&replacement, modular_quads(5, 2, 2)).await
+            })
+            .await
+            .expect_err("the file changed while the store was written");
+
+        assert_replaced_since_open(&error, &path);
+        let rebuilt = VortexRdfStore::from_file(&path).await.unwrap();
+        assert_eq!(
+            rebuilt.size().await.unwrap(),
+            5,
+            "the rebuild was overwritten"
+        );
+        assert_eq!(entries(dir.path()), vec![path.clone()]);
+    }
+
     /// Only the writer's refusal before it builds anything — the store file
     /// or its directory cannot be written — says "unwritable". A permission
     /// error from later in the rewrite (here the rename, in a directory that
@@ -1080,5 +1249,104 @@ mod links_and_permissions {
             !error.is_unwritable(),
             "a refused rename after the build is not the pre-flight refusal: {error}"
         );
+    }
+}
+
+// ─── Targets that are not regular files (Unix) ─────────────────────────
+
+/// A path that names a device or a pipe is written through in place: a store
+/// is never renamed over one. Any other kind of file is refused, untouched.
+#[cfg(unix)]
+mod special_targets {
+    use super::*;
+    use std::os::unix::fs::FileTypeExt as _;
+
+    fn file_type(path: &Path) -> std::fs::FileType {
+        std::fs::symlink_metadata(path).unwrap().file_type()
+    }
+
+    async fn write_to(path: &Path) -> crate::error::Result<()> {
+        crate::io::quads_stream_to_vortex_file(
+            quad_stream(modular_quads(12, 3, 4)),
+            path,
+            LayoutStrategy::Dictionary,
+            vec![IndexType::SecondaryByReference],
+        )
+        .await
+    }
+
+    /// `/dev/null` takes the store and is still the device afterwards (as
+    /// root, a rename would have replaced the node; otherwise it is refused).
+    #[tokio::test]
+    async fn test_a_character_device_is_written_through_not_replaced() {
+        let device = Path::new("/dev/null");
+        write_to(device).await.unwrap();
+        assert!(file_type(device).is_char_device(), "/dev/null was replaced");
+    }
+
+    /// A pipe is written into while a reader drains it: the reader gets a
+    /// whole store, and the pipe is still a pipe.
+    #[tokio::test]
+    async fn test_a_pipe_is_written_through_while_a_reader_drains_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        if !std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            eprintln!("skipped: mkfifo is not available");
+            return;
+        }
+        let (sender, received) = std::sync::mpsc::channel();
+        let reader_path = fifo.clone();
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut bytes = Vec::new();
+            let result = std::fs::File::open(&reader_path)
+                .and_then(|mut pipe| pipe.read_to_end(&mut bytes))
+                .map(|_| bytes);
+            let _ = sender.send(result);
+        });
+
+        write_to(&fifo).await.unwrap();
+
+        let bytes = received
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the reader saw the end of the stream")
+            .unwrap();
+        assert!(file_type(&fifo).is_fifo(), "the pipe was replaced");
+        let store = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+        assert_eq!(store.size().await.unwrap(), 12);
+        assert_eq!(entries(dir.path()), vec![fifo]);
+    }
+
+    /// A socket cannot take a store: the write is refused with an error that
+    /// names the path, before any input is read, and the socket stays.
+    #[tokio::test]
+    async fn test_other_special_files_are_refused_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let polled = Arc::new(AtomicBool::new(false));
+
+        let error = crate::io::quads_stream_to_vortex_file(
+            recording_stream(polled.clone()),
+            &socket,
+            LayoutStrategy::Dictionary,
+            vec![],
+        )
+        .await
+        .expect_err("a socket cannot be replaced by a store");
+
+        assert!(matches!(error, VortexRdfError::Io(_)), "{error}");
+        assert!(
+            error.to_string().contains(&format!("{socket:?}"))
+                && error.to_string().contains("not a regular file"),
+            "the error must name the path and say why: {error}"
+        );
+        assert!(!polled.load(Ordering::SeqCst), "the input was read");
+        assert!(file_type(&socket).is_socket(), "the socket was replaced");
+        assert_eq!(entries(dir.path()), vec![socket]);
     }
 }

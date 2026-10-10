@@ -18,7 +18,7 @@ use crate::io::container::{
     RdfStoreLayoutVTable, StoreComponentDescriptor, is_native_file, quads_sorted, store_component,
     store_components,
 };
-use crate::io::read::unsupported_file_error;
+use crate::io::read::{FileIdentity, OpenedFile, unsupported_file_error};
 
 /// An opened native store file: the [`vortex_file::VortexFile`] plus its
 /// component inventory and per-component reader cache.
@@ -56,9 +56,11 @@ pub(crate) struct NativeStoreFile {
     /// One bound tree per (scope, filter shape), held for the handle's
     /// lifetime — see [`BoundExprMemo`].
     bound_exprs: Arc<BoundExprMemo>,
-    /// Whether the file is read through a memory mapping
-    /// (`io::read::FileAccess::Mapped`).
+    /// Whether the file is read through a memory mapping, as the open found
+    /// it.
     mapped: bool,
+    /// The identity of the file this handle maps, where the platform has one.
+    identity: Option<FileIdentity>,
     /// How many times a quad column has been streamed through a scan for a
     /// keep (test hook: pins which keeps were served without reading a column).
     #[cfg(test)]
@@ -177,7 +179,12 @@ impl std::ops::Deref for NativeStoreFile {
 impl NativeStoreFile {
     /// Wrap an opened file, requiring the native store root — the one place
     /// a file's root layout is checked on the open path.
-    pub(crate) fn try_new(file: vortex_file::VortexFile) -> crate::error::Result<Self> {
+    pub(crate) fn try_new(opened: impl Into<OpenedFile>) -> crate::error::Result<Self> {
+        let OpenedFile {
+            file,
+            mapped,
+            identity,
+        } = opened.into();
         if !is_native_file(&file) {
             return Err(unsupported_file_error(&file));
         }
@@ -194,7 +201,8 @@ impl NativeStoreFile {
             pruning_envelopes: BoundedMemo::new(PRUNING_MEMO_MAX),
             column_chunks: Mutex::new(HashMap::new()),
             bound_exprs: Arc::new(BoundExprMemo::new()),
-            mapped: false,
+            mapped,
+            identity,
             #[cfg(test)]
             column_streams: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -245,15 +253,14 @@ impl NativeStoreFile {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// This handle, recorded as reading its file through a memory mapping.
-    pub(crate) fn with_mapping(mut self, mapped: bool) -> Self {
-        self.mapped = mapped;
-        self
-    }
-
     /// Whether the file is read through a memory mapping.
     pub(crate) fn is_mapped(&self) -> bool {
         self.mapped
+    }
+
+    /// The identity of the mapped file, to tell whether its path still names it.
+    pub(crate) fn identity(&self) -> Option<FileIdentity> {
+        self.identity
     }
 
     /// A quad column's chunk-probe handle by name, for point reads and exact

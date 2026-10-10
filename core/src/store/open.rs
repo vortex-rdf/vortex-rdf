@@ -194,10 +194,9 @@ impl VortexRdfStore {
         // is read yet. The returned handle caches its layout reader tree so
         // later scans/prunes across this store (and stores derived from it)
         // share decoded zone-map stats instead of re-reading them each time.
-        let file = Arc::new(
-            NativeStoreFile::try_new(read::open_vortex_file(path, access).await?)?
-                .with_mapping(access == read::FileAccess::Mapped),
-        );
+        let file = Arc::new(NativeStoreFile::try_new(
+            read::open_vortex_file(path, access).await?,
+        )?);
         check_id_columns("quad table", file.dtype())?;
         log::debug!(
             "[open] {} {}",

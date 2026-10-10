@@ -1,16 +1,21 @@
 //! `VORTEX_EXPERIMENTAL_PATCHED_ARRAY=1` registers Vortex's experimental
-//! `vortex.patched` array and has its bit-packing scheme emit it. No core
-//! edition includes it, so no store file carries one: the compressor drops
-//! the bit-packing scheme that declares it, and an array that still comes out
-//! patched (frame-of-reference bit-packs its offsets itself) fails the write
-//! with an edition error instead of reaching the file. Vortex reads the
+//! `vortex.patched` array and has its compressor emit it. No core edition
+//! includes it, so no store file may carry one: a store write refuses to start
+//! while the switch is on, rather than failing at the first chunk that holds
+//! such an array, and reads nothing from its input first. Vortex reads the
 //! switch once per process, so this binary holds a single test that sets it
 //! before anything touches Vortex.
 
-use futures::stream;
-use vortex_rdf_core::{IndexType, LayoutStrategy, RawQuad, VortexRdfStore};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-const ROWS: usize = 50_000;
+use futures::stream;
+use vortex_rdf_core::{
+    IndexType, LayoutStrategy, RawQuad, VortexRdfError, VortexRdfStore,
+    io::{quads_stream_to_vortex_file, quads_stream_to_vortex_writer},
+};
+
+const ROWS: usize = 2_000;
 
 fn quads() -> Vec<RawQuad> {
     (0..ROWS)
@@ -23,12 +28,26 @@ fn quads() -> Vec<RawQuad> {
         .collect()
 }
 
-fn contains(bytes: &[u8], needle: &[u8]) -> bool {
-    bytes.windows(needle.len()).any(|window| window == needle)
+/// An input that records whether anyone read it.
+fn recording_stream(
+    polled: Arc<AtomicBool>,
+) -> impl futures::Stream<Item = Result<RawQuad, VortexRdfError>> + Unpin + Send + 'static {
+    stream::poll_fn(move |_| {
+        polled.store(true, Ordering::SeqCst);
+        std::task::Poll::Ready(None)
+    })
+}
+
+fn assert_refused(error: VortexRdfError, what: &str) {
+    assert!(
+        matches!(&error, VortexRdfError::Serialization(message)
+            if message.contains("VORTEX_EXPERIMENTAL_PATCHED_ARRAY")),
+        "{what}: {error}"
+    );
 }
 
 #[tokio::test]
-async fn experimental_patched_arrays_stay_out_of_store_files() {
+async fn a_store_write_refuses_to_start_while_the_patched_array_switch_is_on() {
     // SAFETY: the binary's only test sets the variable on its own thread
     // before any other thread exists to read the environment.
     unsafe { std::env::set_var("VORTEX_EXPERIMENTAL_PATCHED_ARRAY", "1") };
@@ -37,6 +56,7 @@ async fn experimental_patched_arrays_stay_out_of_store_files() {
         "the switch must be on before Vortex first reads it"
     );
 
+    // Building a store in memory is not a write.
     let store = VortexRdfStore::from_quads(
         stream::iter(quads().into_iter().map(Ok)),
         LayoutStrategy::Dictionary,
@@ -44,21 +64,42 @@ async fn experimental_patched_arrays_stay_out_of_store_files() {
     )
     .await
     .unwrap();
-    match store.to_bytes().await {
-        Ok(bytes) => {
-            // The footer names every array encoding the file may use; the
-            // patched array is not among them, so no array in it is one.
-            assert!(contains(&bytes, b"fastlanes.bitpacked"));
-            assert!(!contains(&bytes, b"vortex.patched"));
-            let back = VortexRdfStore::from_bytes(&bytes).await.unwrap();
-            assert_eq!(back.size().await.unwrap(), ROWS);
-        }
-        Err(error) => {
-            let message = error.to_string();
-            assert!(
-                message.contains("vortex.patched") && message.contains("not permitted"),
-                "{message}"
-            );
-        }
-    }
+    // Not `expect_err`: a store that serialized would print its bytes.
+    let Err(error) = store.to_bytes().await else {
+        panic!("serializing must refuse");
+    };
+    assert_refused(error, "to_bytes");
+
+    let polled = Arc::new(AtomicBool::new(false));
+    let mut sink: Vec<u8> = Vec::new();
+    let error = quads_stream_to_vortex_writer(
+        recording_stream(polled.clone()),
+        &mut sink,
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await
+    .expect_err("streaming into a writer must refuse");
+    assert_refused(error, "quads_stream_to_vortex_writer");
+    assert!(sink.is_empty());
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.vortex");
+    let error = quads_stream_to_vortex_file(
+        recording_stream(polled.clone()),
+        &path,
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await
+    .expect_err("writing a file must refuse");
+    assert_refused(error, "quads_stream_to_vortex_file");
+    assert!(
+        std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+        "the refusal left a file behind"
+    );
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "the input was read before the refusal"
+    );
 }

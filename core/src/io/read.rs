@@ -173,6 +173,36 @@ pub(crate) fn unsupported_file_error(file: &vortex_file::VortexFile) -> VortexRd
     ))
 }
 
+/// Which file a path named when it was opened: the device and inode on Unix.
+/// A store keeps it to tell, before it rewrites its source file, whether the
+/// path still names the file it opened. There is no identity elsewhere.
+#[cfg(feature = "file-io")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FileIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(feature = "file-io")]
+impl FileIdentity {
+    /// The identity of the file `meta` describes, where the platform has one.
+    pub(crate) fn of(meta: &std::fs::Metadata) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            Some(Self {
+                dev: meta.dev(),
+                ino: meta.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = meta;
+            None
+        }
+    }
+}
+
 /// How an opened store file's bytes are reached.
 #[cfg(feature = "file-io")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,6 +217,39 @@ pub(crate) enum FileAccess {
     Read,
 }
 
+/// A store file opened by [`open_vortex_file`], with how its bytes are
+/// reached. `mapped` and `identity` describe what the open did, not what was
+/// asked for.
+#[cfg(feature = "file-io")]
+pub(crate) struct OpenedFile {
+    pub(crate) file: vortex_file::VortexFile,
+    /// Whether the bytes are a memory mapping of the file.
+    pub(crate) mapped: bool,
+    /// The identity of the mapped file; none where the bytes are not a mapping.
+    pub(crate) identity: Option<FileIdentity>,
+}
+
+/// A file opened over a buffer: no mapping, no identity.
+#[cfg(feature = "file-io")]
+impl From<vortex_file::VortexFile> for OpenedFile {
+    fn from(file: vortex_file::VortexFile) -> Self {
+        Self {
+            file,
+            mapped: false,
+            identity: None,
+        }
+    }
+}
+
+#[cfg(feature = "file-io")]
+impl std::ops::Deref for OpenedFile {
+    type Target = vortex_file::VortexFile;
+
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
+
 /// Open a Vortex file lazily — no data is read until the returned
 /// `VortexFile` is scanned. The layout reader is cached on the handle: every
 /// scan and pruning evaluation shares one reader tree.
@@ -197,7 +260,7 @@ pub(crate) enum FileAccess {
 pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
     path: P,
     access: FileAccess,
-) -> Result<vortex_file::VortexFile> {
+) -> Result<OpenedFile> {
     use vortex_file::OpenOptionsSessionExt;
     let options = crate::session::VORTEX_SESSION
         .open_options()
@@ -205,16 +268,23 @@ pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
     match access {
         FileAccess::Mapped => {
             let file = std::fs::File::open(path.as_ref())?;
+            let identity = file.metadata().ok().as_ref().and_then(FileIdentity::of);
             // SAFETY: a store file is read-only while open; truncating or
             // rewriting it in place is unsupported (docs/file-format.md §8).
             let mmap = unsafe { memmap2::Mmap::map(&file) }?;
-            options
+            let opened = options
                 .open_buffer(vortex_buffer::ByteBuffer::from(mmap))
-                .map_err(VortexRdfError::Vortex)
+                .map_err(VortexRdfError::Vortex)?;
+            Ok(OpenedFile {
+                file: opened,
+                mapped: true,
+                identity,
+            })
         }
         FileAccess::Read => options
             .open_path(path)
             .await
+            .map(OpenedFile::from)
             .map_err(VortexRdfError::Vortex),
     }
 }
