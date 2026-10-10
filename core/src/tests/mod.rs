@@ -89,6 +89,25 @@ async fn write_store_file(
     (dir, path)
 }
 
+/// [`modular_quads`] at the stock moduli (three predicates, four objects),
+/// for the unit tests that sit beside the code they cover, outside this
+/// module's tree.
+#[cfg(feature = "file-io")]
+pub(crate) fn modular_quads_for_tests(n: usize) -> Vec<Quad> {
+    modular_quads(n, 3, 4)
+}
+
+/// [`write_store_file`] in the Dictionary layout, for the unit tests that sit
+/// beside the code they cover, outside this module's tree. Keep the `TempDir`
+/// alive for the store's lifetime.
+#[cfg(feature = "file-io")]
+pub(crate) async fn write_store_file_for_tests(
+    quads: Vec<Quad>,
+    indexes: Indexes,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    write_store_file(quads, LayoutStrategy::Dictionary, indexes).await
+}
+
 /// A Dictionary-layout store file holding `quads` out of subject order —
 /// rotated left by `rotate` rows — and written without the sorted stamp: the
 /// shape a foreign writer's file arrives in. Keep the `TempDir` alive for the

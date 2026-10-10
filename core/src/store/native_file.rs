@@ -1,9 +1,10 @@
 //! The opened native store file: the runtime handle the store's file-backed
 //! query paths drive. It holds what is fixed per file — the component
-//! inventory, one reader per component, the quad table's split ranges — and
-//! two bounded memos that let Vortex's identity-keyed reader caches hit:
-//! pruning envelopes per filter shape, and bound filter trees. The pure
-//! open/materialize primitives are in [`io::read`](crate::io::read).
+//! inventory, one reader per component, the quad table's split ranges, one
+//! chunk-probe handle per column — and two bounded memos that let Vortex's
+//! identity-keyed reader caches hit: pruning envelopes per filter shape, and
+//! bound filter trees. The pure open/materialize primitives are in
+//! [`io::read`](crate::io::read).
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -45,6 +46,15 @@ pub(crate) struct NativeStoreFile {
     /// re-ask the same handful of filters, and each envelope costs a pruning
     /// evaluation over every zone. Bounded by [`PRUNING_MEMO_MAX`].
     pruning_envelopes: BoundedMemo<Expression, Option<Range<u64>>>,
+    /// Per-column chunk-probe handles, keyed by quad column (an index
+    /// component's column as `component/column`); `None` memoizes a decline.
+    /// Each handle keeps the probes of the leaves it fetched.
+    ///
+    /// Kept because removing it cost 14.4% of the BSBM 100K copy stream and
+    /// 49.6% of its Q8 (4.5% and 20.9% on Q2 for the reference-index store);
+    /// §7 D1, measured 2026-10-10. Bounded by the file's layout: one handle
+    /// per column, and per fetched leaf a probe over mapped bytes.
+    column_chunks: Mutex<HashMap<String, Option<Arc<vortex_rdf_encoded_search::ColumnChunks>>>>,
     /// One bound tree per (scope, filter shape), held for the handle's
     /// lifetime — see [`BoundExprMemo`].
     bound_exprs: Arc<BoundExprMemo>,
@@ -183,6 +193,7 @@ impl NativeStoreFile {
             child_readers,
             splits: OnceLock::new(),
             pruning_envelopes: BoundedMemo::new(PRUNING_MEMO_MAX),
+            column_chunks: Mutex::new(HashMap::new()),
             bound_exprs: Arc::new(BoundExprMemo::new()),
             mapped: false,
             #[cfg(test)]
@@ -247,29 +258,45 @@ impl NativeStoreFile {
     }
 
     /// A quad column's chunk-probe handle by name, for point reads and exact
-    /// bound-term row ranges through the wire-encoded chunks — built per call
-    /// from the layout. Nothing is kept: a handle caches the leaves it
-    /// fetches only while its caller holds it. `None` when the quad child's
-    /// layout shape or that column's dtype declines; callers keep the scan.
+    /// bound-term row ranges through the wire-encoded chunks — built from the
+    /// layout on first use and memoized for the handle's lifetime, so the
+    /// leaves the handle fetched stay probed between calls. `None` when the
+    /// quad child's layout shape or that column's dtype declines (memoized
+    /// too); callers keep the scan.
     pub(crate) fn column_chunks(
         &self,
         column: &str,
     ) -> Option<Arc<vortex_rdf_encoded_search::ColumnChunks>> {
-        let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
-        let quads = typed.slot(0).ok().flatten()?;
-        vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&quads, column).map(Arc::new)
+        let mut memo = self.column_chunks.lock().expect("column chunks lock");
+        memo.entry(column.to_owned())
+            .or_insert_with(|| {
+                let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
+                let quads = typed.slot(0).ok().flatten()?;
+                vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&quads, column)
+                    .map(Arc::new)
+            })
+            .clone()
     }
 
     /// An index component column's chunk-probe handle, the auxiliary-child
-    /// counterpart of [`column_chunks`](Self::column_chunks), built per call
-    /// alike. `None` on any decline.
+    /// counterpart of [`column_chunks`](Self::column_chunks), memoized alike
+    /// per (component, column). `None` on any decline.
     pub(crate) fn component_column_chunks(
         &self,
         component: &str,
         column: &str,
     ) -> Option<Arc<vortex_rdf_encoded_search::ColumnChunks>> {
-        let (_, child) = self.component_child(component).ok().flatten()?;
-        vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&child, column).map(Arc::new)
+        // The `/` separator cannot appear in a bare quad column name, so the
+        // composite keys share the quad columns' memo without collisions.
+        let key = format!("{component}/{column}");
+        let mut memo = self.column_chunks.lock().expect("column chunks lock");
+        memo.entry(key)
+            .or_insert_with(|| {
+                let (_, child) = self.component_child(component).ok().flatten()?;
+                vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&child, column)
+                    .map(Arc::new)
+            })
+            .clone()
     }
 
     /// The quad table's natural splits, memoized. Shadows the inner file's
@@ -407,34 +434,83 @@ mod tests {
         assert_eq!(memo.0.map.lock().unwrap().len(), 2);
     }
 
-    /// Chunk-probe handles are built per call: nothing keeps them — or the
-    /// leaves they fetch — between calls.
+    /// Chunk-probe handles are memoized, one per quad column and one per
+    /// (index component, column): every call hands out the same handle, so
+    /// the leaves it fetched stay probed between calls, and a column that
+    /// declines stays declined. Bounded by the file's layout (one handle per
+    /// column, and per fetched leaf a probe over mapped bytes), not by the
+    /// workload; kept per §7 D1.
     #[tokio::test]
-    async fn column_chunks_are_built_per_call() {
-        use vortex_buffer::ByteBuffer;
-        use vortex_file::OpenOptionsSessionExt as _;
+    async fn column_chunks_are_memoized_per_column() {
+        use crate::IndexType;
+        use crate::io::read::{FileAccess, open_vortex_file};
 
-        let dict = crate::store::layouts::dictionary::TermDictionary::from_sorted_column(
-            vortex_array::arrays::VarBinViewArray::from_iter_str(["<http://example.org/a>"]),
-        )
-        .unwrap();
-        let bytes = crate::tests::write_dict_only_store(&dict).await;
-        let file = crate::session::VORTEX_SESSION
-            .open_options()
-            .open_buffer(ByteBuffer::from(bytes))
-            .unwrap();
-        let native = NativeStoreFile::try_new(file).unwrap();
+        let quads = crate::tests::modular_quads_for_tests(50);
+        let (_dir, path) =
+            crate::tests::write_store_file_for_tests(quads, vec![IndexType::SecondaryByReference])
+                .await;
+        let native =
+            NativeStoreFile::try_new(open_vortex_file(&path, FileAccess::Mapped).await.unwrap())
+                .unwrap();
+
+        // One handle per quad column and per (component, column).
         let a = native
             .column_chunks("s")
-            .expect("the u32 subject column resolves");
+            .expect("the subject column resolves");
         let b = native
             .column_chunks("s")
-            .expect("the u32 subject column resolves");
-        assert!(!Arc::ptr_eq(&a, &b));
-        let source = native.segment_source();
-        assert_eq!(
-            a.value_at(0, &source, native.session()).await.unwrap(),
-            Some(0)
+            .expect("the subject column resolves");
+        let c = native
+            .component_column_chunks("index:ref-p", "val")
+            .expect("the reference index's value column resolves");
+        let d = native
+            .component_column_chunks("index:ref-p", "val")
+            .expect("the reference index's value column resolves");
+        let (quad_shared, component_shared) = (Arc::ptr_eq(&a, &b), Arc::ptr_eq(&c, &d));
+        assert!(
+            quad_shared && component_shared,
+            "one handle per call site: quad column shared {quad_shared}, \
+             component column shared {component_shared}"
         );
+
+        // Distinct keys get distinct handles: another quad column, another
+        // column of the component, another component's same-named column.
+        let p = native
+            .column_chunks("p")
+            .expect("the predicate column resolves");
+        let rid = native
+            .component_column_chunks("index:ref-p", "rid")
+            .expect("the reference index's row-id column resolves");
+        let other = native
+            .component_column_chunks("index:ref-o", "val")
+            .expect("the other reference child's value column resolves");
+        for (x, y) in [(&a, &p), (&c, &rid), (&c, &other), (&a, &c)] {
+            assert!(!Arc::ptr_eq(x, y));
+        }
+
+        // The leaf a handle fetched stays probed with it: the next call
+        // hands out the handle that already holds it.
+        let source = native.segment_source();
+        assert!(
+            a.value_at(0, &source, native.session())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let again = native
+            .column_chunks("s")
+            .expect("the subject column resolves");
+        assert!(format!("{again:?}").contains("fetched: 1"), "{again:?}");
+
+        // A decline is memoized as well, for both kinds of key.
+        assert!(native.column_chunks("no-such-column").is_none());
+        assert!(
+            native
+                .component_column_chunks("no-such-component", "val")
+                .is_none()
+        );
+        let memo = native.column_chunks.lock().unwrap();
+        assert!(matches!(memo.get("no-such-column"), Some(None)));
+        assert!(matches!(memo.get("no-such-component/val"), Some(None)));
     }
 }
