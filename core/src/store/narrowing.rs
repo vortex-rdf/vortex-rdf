@@ -380,15 +380,12 @@ impl VortexRdfStore {
                 filter,
                 selection,
                 deleted,
-                serve,
                 ..
             } => match filter {
                 None => self.base_size().await?,
                 Some(filter) => {
-                    // A filter never rides with a served plan; with one the
-                    // selection is already exact, so this never scans an
-                    // index child to count.
-                    debug_assert!(serve.is_none());
+                    // The selection resolves first (a served view's ids come
+                    // from its index child); the filter then counts within it.
                     let selection = selection.materialized_async().await?;
                     file_scan::count_matching_rows_capped(
                         file,

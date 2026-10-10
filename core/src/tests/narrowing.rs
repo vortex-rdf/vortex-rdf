@@ -502,6 +502,40 @@ mod file {
         }
     }
 
+    /// A copy-indexed file store serves a predicate + object + graph match
+    /// from the index and keeps the graph test as a residual filter on the
+    /// served view. Counting that view up to a cap, and asking whether it
+    /// holds anything, count through the filter.
+    #[tokio::test]
+    async fn test_a_served_view_with_a_residual_filter_counts_up_to_a_cap() {
+        let quads = fixture_quads();
+        let (_dir, path) = write_store_file(
+            quads.clone(),
+            LayoutStrategy::Dictionary,
+            vec![IndexType::SecondaryByCopy],
+        )
+        .await;
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let p1 = NamedNode::new("http://example.org/p1").unwrap();
+        let o3 = Term::Literal(Literal::new_simple_literal("o3"));
+        let g1 = GraphName::NamedNode(NamedNode::new("http://example.org/g1").unwrap());
+        let expected = quads
+            .iter()
+            .filter(|q| q.predicate == p1 && q.object == o3 && q.graph_name == g1)
+            .count();
+        assert!(expected > 2, "the fixture has matches to cap");
+
+        let view = store
+            .match_pattern(None, Some(&p1), Some(&o3), Some(&g1))
+            .await
+            .unwrap();
+
+        assert_eq!(view.size().await.unwrap(), expected);
+        assert_eq!(view.size_capped(2).await.unwrap(), 2);
+        assert_eq!(view.size_capped(usize::MAX).await.unwrap(), expected);
+        assert!(view.exists().await.unwrap());
+    }
+
     /// Tombstones on a file store are honoured by every narrowing.
     #[tokio::test]
     async fn test_file_narrowing_skips_tombstones() {
