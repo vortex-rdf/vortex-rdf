@@ -258,7 +258,14 @@ impl TermDictionary {
     /// interning builder freezes one directly), and the single owner of the
     /// term-count guard and of the compression step.
     pub(crate) fn from_sorted_column(plain: VarBinViewArray) -> Result<Self> {
-        // List offsets are i32, so the term count must fit in one.
+        // A conservative cap, not a format limit: no dictionary past
+        // `i32::MAX` terms has been built or tested. The guard dates from
+        // the first columnar dictionary, whose comment blamed i32 list
+        // offsets, yet the column was a VarBinView array then as now; nothing
+        // found since needs the count to fit an i32 (the column's length is a
+        // usize, each FSST window's offsets span `DICT_CHUNK_ROWS` terms, and
+        // codes are u64). This build holds every term in memory; lifting the
+        // cap belongs to an out-of-core dictionary builder.
         if plain.len() > i32::MAX as usize {
             return Err(VortexRdfError::Serialization(format!(
                 "Dictionary of {} unique terms exceeds the supported maximum ({})",

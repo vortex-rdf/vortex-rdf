@@ -158,7 +158,7 @@ flowchart TD
     L -- "Dictionary" --> B1["InterningQuadBuilder::push per quad:<br/>intern 4 terms → provisional codes, keep four u64 codes"]
     B1 --> B2["finish: sort the distinct terms,<br/>rank_of[provisional] = sorted position"]
     B2 --> B3["freeze the sorted column → TermDictionary<br/>(FSST-compressed in 65,536-term windows)"]
-    B2 --> B4["remap every quad's codes to ranks,<br/>sort the 16-byte rows, drop repeats"]
+    B2 --> B4["remap every quad's codes to ranks,<br/>sort the 32-byte rows, drop repeats"]
     B4 --> B5["build_array(codes): four u64 columns,<br/>s stamped IsSorted"]
     B4 --> B6["build the index components<br/>from the ranked code rows"]
 
@@ -181,7 +181,7 @@ as four provisional `u64` codes. `finish` sorts the distinct terms, freezes them
 into the dictionary, replaces every provisional code by its term's sorted rank —
 which *is* the dictionary code — and sorts the coded rows. Because codes are
 lexicographic ranks, sorting `[u64; 4]` rows is the same order as sorting the
-term strings, so the sort moves 16-byte rows instead of four-string structs;
+term strings, so the sort moves 32-byte rows instead of four-string structs;
 equal rows are then adjacent and the repeats are dropped, since equal codes are
 equal terms.
 [`DictionaryQuadSink`](../core/src/store/layouts/dictionary/ingest.rs#L120) is
@@ -338,6 +338,19 @@ Term columns use the layout's encoding — strings under `Default` and
 for the index), `u64` codes under `Dictionary` — and `rid` is always the `u32`
 position of the quad in the sorted primary rows.
 
+**At most `u32::MAX` quads.** A `u32` row id numbers at most `u32::MAX` rows
+([`MAX_INDEXED_ROWS`](../core/src/store/indexes/mod.rs#L64)), so a store with
+indexes is refused past that wherever ids are numbered or trusted, instead of
+letting one wrap:
+
+| Where | Check | Refusal |
+|---|---|---|
+| in-memory builds, compaction's in-memory rebuild, `to_bytes` of a store with a tail | the row count, before any id is assigned ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L107)) | `Serialization`: the store *would exceed* `u32::MAX` quads |
+| the out-of-core merge, a file-backed compaction | each row as the merge numbers it ([`next_row_id`](../core/src/store/indexes/mod.rs#L136)); a refused file build leaves no file | the same |
+| opening a file (mapped or loaded), `from_bytes`, adopting parts (`from_parts`, `from_built`) | the quad rows the index children address ([`check_adopted_rows`](../core/src/store/indexes/mod.rs#L119)) | `Deserialization`: the store *holds* more quads than this version reads |
+
+A store without indexes numbers no rows and is not limited.
+
 **In memory** ([`build_components`](../core/src/store/builders/mod.rs#L234)) each
 family is a permutation of the complete sorted dataset: sort the row ids by the
 family's comparator ([`CopyFamily::cmp_quads`](../core/src/store/indexes/secondary_by_copy.rs#L141),
@@ -364,7 +377,7 @@ on a stock Vortex file write:
 ```mermaid
 flowchart TD
     W["write_store(session, writer, quad stream, quads_sorted, components)"] --> S["RdfStoreWriteStrategy::write_stream"]
-    S --> Q["quad stream → child 0 (transparent quad-source)<br/>through the default Vortex write strategy"]
+    S --> Q["quad stream → child 0 (transparent quad-source)<br/>through the default Vortex write strategy,<br/>plain term-code columns coalesced to ~2 MiB"]
     S --> C["each component → one auxiliary child,<br/>at most two compressing at a time"]
     C --> C1["index children: the same default strategy"]
     C --> C2["dictionary: pass-through strategy —<br/>every FSST window written verbatim as one flat leaf"]
@@ -374,14 +387,26 @@ flowchart TD
     R --> F["Vortex footer, postscript, end-of-file marker"]
 ```
 
-- **The quad table** goes through [`default_child_strategy`](../core/src/io/container/sources.rs#L181)
+- **The quad table** goes through [`child_strategy`](../core/src/io/container/sources.rs#L221)
   — Vortex's default `WriteStrategyBuilder` pipeline: split the struct into
   columns, repartition each column into 8,192-row blocks, compute zoned
   statistics per block, dictionary-encode a column where sampling says it pays,
   coalesce chunks toward ~1 MiB segments, compress each chunk with the
-  BtrBlocks-style compressor, and write flat leaf layouts.
+  BtrBlocks-style compressor, and write flat leaf layouts. Each term-code
+  column (a `u64` `s`, `p`, `o`, `g` or `val`) is handed, through the
+  builder's per-field override, to
+  [`code_column_strategy`](../core/src/io/container/sources.rs#L282): the same
+  per-column pipeline rebuilt step for step from Vortex's layout strategies,
+  with the coalescing target split in two. A column that does not
+  dictionary-encode coalesces toward ~2 MiB, so a plain `u64` code column
+  keeps the 262,144 rows per leaf a `u32` one held at 1 MiB; a dictionary's
+  codes, as narrow as its cardinality needs, stay at ~1 MiB. A test pins the
+  copy to Vortex's pipeline: at 1 MiB for both targets it must write the
+  stock bytes. A table without code columns — the string layouts — gets the
+  stock pipeline unchanged ([`default_child_strategy`](../core/src/io/container/sources.rs#L202)).
 - **Index children** take exactly the same strategy, so their encoding is what a
-  plain table write produces.
+  plain table write produces: plain code columns at ~2 MiB, dictionary codes
+  and `rid` at ~1 MiB.
 - **The dictionary** takes [`dict_child_strategy`](../core/src/io/container/write.rs#L191):
   its chunks are already FSST-compressed windows, so they are written verbatim
   as one flat leaf each under a chunked node — no sampling, no re-encoding —

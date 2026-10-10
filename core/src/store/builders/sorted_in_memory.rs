@@ -52,7 +52,7 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
         // sorted.
         //
         // Dictionary layout interns terms as the stream drains, so the sort
-        // runs over 16-byte coded rows and no `Vec<RawQuad>` (four owned
+        // runs over 32-byte coded rows and no `Vec<RawQuad>` (four owned
         // Strings per quad) ever accumulates.
         let (n, build_start, built);
         if layout == LayoutStrategy::Dictionary {
