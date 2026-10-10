@@ -23,7 +23,7 @@ use vortex_scan::selection::Selection;
 use vortex_scan::strict_sorted_buffer::StrictSortedBuffer;
 
 use crate::error::{Result, VortexRdfError};
-use crate::io::read::{available_parallelism, collect_scan};
+use crate::io::read::{available_parallelism, collect_scan, collect_scan_spawned};
 use crate::store::layouts::{Constraints, PatternCodes, QuadPattern, TermRef};
 use crate::store::native_file::NativeStoreFile;
 use crate::store::scan::gather::primitive_from_u64_reads;
@@ -34,22 +34,162 @@ use crate::store::selection::RowSelection;
 /// (the transparent root the file scan reads).
 pub(crate) const QUAD_SCOPE: &str = "quads";
 
-/// Run `scan` to completion and materialize every row it yields into one
+/// How a scan's split futures are driven.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScanDriver {
+    /// Polled on the calling task, by [`collect_scan`].
+    Inline,
+    /// Spawned onto the runtime's workers, by [`collect_scan_spawned`].
+    Spawned,
+}
+
+/// The most split futures a row scan may plan and still be driven inline —
+/// the limit of [`read_all_rows`]'s rule, and why it is 42.
+///
+/// The BSBM 100K replays make row scans of 40 to 42 splits, 321 of the copy
+/// store's 724 scans, at 15 to 16 us per split: 0.60 to 0.65 ms inline, 0.63
+/// to 0.69 ms spawned, a tie. Spawning only them is dearer than the tie
+/// suggests, 0.89 to 0.98 ms: with the index scans inline the workers sit
+/// idle between spawns, and each spawn then pays a cold wake-up.
+///
+/// Replay totals, medians of three interleaved runs, at a limit of 42 and of
+/// 8 (all inline, all spawned in brackets): the copy store 3,404 and 3,613 ms
+/// (3,338; 4,408), the reference-index store 4,591 and 4,603 ms (4,570;
+/// 4,670). Above 42 come the replays' 200- and 274-split reads, a tie or
+/// better spawned (the reference-index store's 200-split ones take 10.0 ms
+/// inline and 4.6 ms spawned), and the whole-table scans, 398 to 400 splits
+/// on the BSBM 100K store (134 leaves of 262,144 rows, each cut into three
+/// splits).
+const MAX_INLINE_SPLITS: usize = 42;
+
+/// The limit [`read_all_rows`] applies: [`MAX_INLINE_SPLITS`], or what a test
+/// forced on this thread.
+#[cfg(test)]
+fn max_inline_splits() -> usize {
+    driver_hooks::forced_limit().unwrap_or(MAX_INLINE_SPLITS)
+}
+
+/// The limit [`read_all_rows`] applies.
+#[cfg(not(test))]
+fn max_inline_splits() -> usize {
+    MAX_INLINE_SPLITS
+}
+
+/// Test hooks for the driver choice: which driver the latest scan on this
+/// thread ran under, and a per-thread override of the split limit, so a test
+/// can force either path without timing anything.
+#[cfg(test)]
+pub(crate) mod driver_hooks {
+    use std::cell::Cell;
+
+    use super::ScanDriver;
+
+    thread_local! {
+        static LAST: Cell<Option<ScanDriver>> = const { Cell::new(None) };
+        static LIMIT: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Record the driver a scan just ran under.
+    pub(crate) fn record(driver: ScanDriver) {
+        LAST.set(Some(driver));
+    }
+
+    /// The driver of the latest scan on this thread, cleared by the read.
+    pub(crate) fn take_last() -> Option<ScanDriver> {
+        LAST.take()
+    }
+
+    /// The limit forced on this thread, if any.
+    pub(super) fn forced_limit() -> Option<usize> {
+        LIMIT.get()
+    }
+
+    /// Forces the split limit to `limit` on this thread until dropped.
+    pub(crate) struct ForcedLimit {
+        previous: Option<usize>,
+    }
+
+    impl ForcedLimit {
+        pub(crate) fn set(limit: usize) -> Self {
+            Self {
+                previous: LIMIT.replace(Some(limit)),
+            }
+        }
+    }
+
+    impl Drop for ForcedLimit {
+        fn drop(&mut self) {
+            LIMIT.set(self.previous);
+        }
+    }
+}
+
+/// Run a row scan to completion and materialize every row it yields into one
 /// in-memory array, in the scan's row order.
 ///
-/// The scan is driven inline: its splits are planned here and its split
-/// futures polled on the calling task by [`collect_scan`], not spawned onto
-/// the runtime as `ScanBuilder::into_array_stream` would. The files these
-/// scans read are memory-mapped, so every segment is a slice of the mapped
-/// file and resolves at once; the async driver would add only a spawn per
-/// split and the buffers of the splits it keeps in flight (four per core
-/// spawned, against one per core polled here). Measured in §7 D3 on
-/// 2026-10-10: 6.5% of the BSBM 100K copy stream (17.0% of its Q3) and
-/// RssAnon at exit about halved, from about 195 MB to about 93 MB; nothing
-/// beyond noise on the reference-index store.
+/// A scan of at most [`MAX_INLINE_SPLITS`] splits is driven inline: its split
+/// futures are polled on the calling task by [`collect_scan`]. A larger one
+/// is spawned: [`collect_scan_spawned`] hands each split future to the
+/// runtime's workers, `scan.concurrency()` per core in flight (the windowing
+/// of `ScanBuilder::into_array_stream`). Either driver returns the chunks in
+/// split order, whatever the scan's `ordered` flag says. The splits are
+/// planned here either way, since their count picks the driver.
+///
+/// What a split costs decides, not how many there are. The files these scans
+/// read are memory-mapped, so a segment is a ready slice and inline driving
+/// waits on nothing; a row split costs its filter and decode work. A spawn
+/// costs a worker's wake-up, about 180 us against 12 us for a one-split scan
+/// inline, and pays only where enough splits of real work spread over the
+/// cores. Measured on BSBM 100K (22 cores, §7 D3, 2026-10-10, medians of
+/// three interleaved runs), the large row reads run 28 to 51 us per split
+/// inline and need the workers:
+/// - an index-free store's filtered scans, 398 to 400 splits at 45 to 51 us:
+///   `o = ProductType1` takes 25 ms inline and 8 to 9 ms spawned;
+/// - the reference-index store's scattered reads, 40 to 200 splits at 28 to
+///   47 us: the 200-split ones take 10.0 ms inline and 4.6 ms spawned;
+/// - the `in_memory=True` load, 400 splits through the file reader, which
+///   waits on its reads: 38 ms inline and 18 ms spawned.
+///
+/// An index child's row-id scan is the other kind, and has its own entry
+/// point, [`read_index_row_ids`].
 pub(crate) async fn read_all_rows(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRef> {
     let dtype = scan.dtype().map_err(VortexRdfError::Vortex)?;
+    let window = scan.concurrency() * available_parallelism();
     let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
+    let driver = if tasks.len() <= max_inline_splits() {
+        ScanDriver::Inline
+    } else {
+        ScanDriver::Spawned
+    };
+    #[cfg(test)]
+    driver_hooks::record(driver);
+    match driver {
+        ScanDriver::Inline => collect_scan(dtype, tasks).await,
+        ScanDriver::Spawned => collect_scan_spawned(dtype, tasks, window).await,
+    }
+}
+
+/// Run an index child's row-id scan to completion and materialize its rows,
+/// always inline, whatever its split count.
+///
+/// The scan reads one column and its splits are cheap: a located run is
+/// sliced out of the child's row-id column, and a pushed-down equality is
+/// pruned by the child's zone maps (the child is sorted on the probed column),
+/// so a split is mostly a zone-map check, about 2 us. Spawning would add a
+/// worker's wake-up and a spawn per split for no work to spread. On the BSBM
+/// 100K copy store 362 of the replay's 724 scans are these filters, with 400
+/// or 464 splits: 0.95 to 1.05 ms inline against 2.7 to 3.2 ms spawned. The
+/// reference-index store's, 1 to 39 splits, take 12 to 170 us against 180 to
+/// 540 us. The ids are decoded by the caller, on its own thread either way.
+///
+/// The classification is this entry point's: a scan does not become a row
+/// scan or an index scan by its `ordered` flag, so an unordered scan of some
+/// other kind goes through [`read_all_rows`] and its limit.
+pub(crate) async fn read_index_row_ids(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRef> {
+    let dtype = scan.dtype().map_err(VortexRdfError::Vortex)?;
+    let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
+    #[cfg(test)]
+    driver_hooks::record(ScanDriver::Inline);
     collect_scan(dtype, tasks).await
 }
 
@@ -858,7 +998,12 @@ pub(crate) async fn row_range_from_pruning(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::read::{FileAccess, open_vortex_file};
+    use std::ops::Range;
+    use vortex_array::VortexSessionExecute as _;
+    use vortex_array::arrays::{PrimitiveArray, StructArray};
     use vortex_array::expr::{and, eq, get_item, root};
+    use vortex_layout::scan::split_by::SplitBy;
 
     /// Only a conjunction of `field == literal` over root fields decodes to
     /// `(column, code)` pairs; any other shape declines.
@@ -876,38 +1021,153 @@ mod tests {
         assert!(eq_code_pairs(&eq(get_item("p", root()), lit("x"))).is_none());
     }
 
-    /// `read_all_rows` drives a scan whose rows come from several splits and
-    /// hands them back whole and in the scan's row order, split after split.
-    /// An order guard: it holds under the async driver and the inline one
-    /// alike, which is the point of a guard (the two differ in cost, measured
-    /// in §7 D3, not in result).
-    #[tokio::test]
-    async fn read_all_rows_keeps_order_inline() {
-        use crate::io::read::{FileAccess, open_vortex_file};
-        use vortex_array::VortexSessionExecute as _;
-        use vortex_array::arrays::{PrimitiveArray, StructArray};
-        use vortex_layout::scan::split_by::SplitBy;
-
-        let quads = crate::tests::modular_quads_for_tests(50);
-        let (_dir, path) = crate::tests::write_store_file_for_tests(quads, vec![]).await;
+    /// A mapped store file of `n` quads: subject-sorted, subjects unique.
+    async fn mapped_file(n: usize) -> (tempfile::TempDir, NativeStoreFile) {
+        let quads = crate::tests::modular_quads_for_tests(n);
+        let (dir, path) = crate::tests::write_store_file_for_tests(quads, vec![]).await;
         let file =
             NativeStoreFile::try_new(open_vortex_file(&path, FileAccess::Mapped).await.unwrap())
                 .unwrap();
+        (dir, file)
+    }
 
-        // Splits of 16 rows: four futures for the driver to run, the last short.
-        let scan = || file.scan().unwrap().with_split_by(SplitBy::RowCount(16));
-        assert_eq!(scan().build().unwrap().len(), 4);
-        let rows = read_all_rows(scan()).await.unwrap();
-        assert_eq!(rows.len(), 50);
+    /// A scan of `rows` of `file`, cut into splits of `per_split` rows.
+    fn scan_of(
+        file: &NativeStoreFile,
+        rows: Range<u64>,
+        per_split: usize,
+        ordered: bool,
+    ) -> ScanBuilder<ArrayRef> {
+        file.scan()
+            .unwrap()
+            .with_row_range(rows)
+            .with_split_by(SplitBy::RowCount(per_split))
+            .with_ordered(ordered)
+    }
 
-        // The file is subject-sorted and its subjects are unique, so the
-        // subject codes rise with the row order.
+    /// The four code columns of `rows`, each in row order.
+    fn quad_codes(rows: ArrayRef) -> Vec<Vec<TermCode>> {
         let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
         let rows = rows.execute::<StructArray>(&mut ctx).unwrap();
-        let subjects =
-            crate::store::array::field_as::<PrimitiveArray>(&rows, schema::COL_S, &mut ctx)
-                .unwrap();
-        let codes = subjects.as_slice::<TermCode>();
-        assert!(codes.windows(2).all(|pair| pair[0] < pair[1]), "{codes:?}");
+        schema::PRIMARY_COLUMNS
+            .iter()
+            .map(|&column| {
+                crate::store::array::field_as::<PrimitiveArray>(&rows, column, &mut ctx)
+                    .unwrap()
+                    .as_slice::<TermCode>()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    /// What `read_all_rows` did with a scan: its split count, the driver it
+    /// ran under, and the rows it returned.
+    struct Driven {
+        splits: usize,
+        driver: ScanDriver,
+        rows: Vec<Vec<TermCode>>,
+    }
+
+    async fn drive(
+        file: &NativeStoreFile,
+        rows: Range<u64>,
+        per_split: usize,
+        ordered: bool,
+    ) -> Driven {
+        let splits = scan_of(file, rows.clone(), per_split, ordered)
+            .build()
+            .unwrap()
+            .len();
+        let rows = read_all_rows(scan_of(file, rows, per_split, ordered))
+            .await
+            .unwrap();
+        Driven {
+            splits,
+            driver: driver_hooks::take_last().expect("a scan records its driver"),
+            rows: quad_codes(rows),
+        }
+    }
+
+    /// The first `n` rows of `columns`.
+    fn head(columns: &[Vec<TermCode>], n: usize) -> Vec<Vec<TermCode>> {
+        columns.iter().map(|c| c[..n].to_vec()).collect()
+    }
+
+    /// `read_all_rows` hands a scan's rows back whole and in the scan's row
+    /// order, split after split, under either driver. An order guard: the
+    /// drivers differ in cost (measured in §7 D3), not in result, so the same
+    /// four-split scan is forced down each path and must return all four
+    /// columns identically.
+    #[tokio::test]
+    async fn read_all_rows_keeps_order_on_either_driver() {
+        let (_dir, file) = mapped_file(50).await;
+
+        // The whole file in one split is the reference.
+        let whole = drive(&file, 0..50, 50, true).await;
+        assert_eq!((whole.splits, whole.rows[0].len()), (1, 50));
+        // The file is subject-sorted and its subjects are unique, so the
+        // subject codes rise with the row order.
+        let subjects = &whole.rows[0];
+        assert!(
+            subjects.windows(2).all(|pair| pair[0] < pair[1]),
+            "{subjects:?}"
+        );
+
+        // Splits of 16 rows: four futures for the driver to run, the last short.
+        for (limit, driver) in [(4, ScanDriver::Inline), (3, ScanDriver::Spawned)] {
+            let _limit = driver_hooks::ForcedLimit::set(limit);
+            let driven = drive(&file, 0..50, 16, true).await;
+            assert_eq!(driven.splits, 4);
+            assert_eq!(driven.driver, driver, "limit {limit} on a four-split scan");
+            assert_eq!(driven.rows, whole.rows, "{driver:?}: rows and order");
+        }
+
+        // An unordered scan is collected in split order as well, by either
+        // driver: the flag relaxes what a caller may rely on, not what it gets.
+        for (limit, driver) in [(4, ScanDriver::Inline), (0, ScanDriver::Spawned)] {
+            let _limit = driver_hooks::ForcedLimit::set(limit);
+            let driven = drive(&file, 0..50, 16, false).await;
+            assert_eq!(driven.driver, driver, "unordered, limit {limit}");
+            assert_eq!(driven.rows, whole.rows, "unordered, {driver:?}");
+        }
+    }
+
+    /// A scan of at most [`MAX_INLINE_SPLITS`] splits runs inline, one with
+    /// more is spawned, with no limit forced: the production gate.
+    #[tokio::test]
+    async fn read_all_rows_runs_inline_up_to_the_split_limit() {
+        let limit = MAX_INLINE_SPLITS;
+        let (_dir, file) = mapped_file(limit + 8).await;
+        let whole = drive(&file, 0..(limit + 8) as u64, limit + 8, true).await;
+        assert_eq!(whole.driver, ScanDriver::Inline, "a single split");
+
+        // One row per split.
+        let at = drive(&file, 0..limit as u64, 1, true).await;
+        assert_eq!((at.splits, at.driver), (limit, ScanDriver::Inline));
+        assert_eq!(at.rows, head(&whole.rows, limit));
+        let over = drive(&file, 0..limit as u64 + 1, 1, true).await;
+        assert_eq!((over.splits, over.driver), (limit + 1, ScanDriver::Spawned));
+        assert_eq!(over.rows, head(&whole.rows, limit + 1));
+    }
+
+    /// An index child's row-id scan is driven inline however many splits it
+    /// has, where a row scan of the same shape is spawned: the classification
+    /// is the entry point's, not the scan's.
+    #[tokio::test]
+    async fn read_index_row_ids_drives_inline_above_the_split_limit() {
+        let (_dir, file) = mapped_file(50).await;
+        let _limit = driver_hooks::ForcedLimit::set(1);
+
+        let rows = read_index_row_ids(scan_of(&file, 0..50, 16, false))
+            .await
+            .unwrap();
+        assert_eq!(driver_hooks::take_last(), Some(ScanDriver::Inline));
+        let spawned = drive(&file, 0..50, 16, false).await;
+        assert_eq!(
+            spawned.driver,
+            ScanDriver::Spawned,
+            "the same scan as a row scan"
+        );
+        assert_eq!(quad_codes(rows), spawned.rows);
     }
 }

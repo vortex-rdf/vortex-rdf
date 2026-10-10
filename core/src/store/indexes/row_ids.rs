@@ -172,7 +172,7 @@ fn check_addressable(ids: &[RowId]) -> Result<()> {
 /// uses: a binary `Eq` falsifies against the same zone min/max envelope as a
 /// `>= probe AND <= probe` range pair (see vortex's
 /// `stats/rewrite/builtins.rs`) while evaluating a single conjunct. Output
-/// order is irrelevant (the ids are sorted afterwards), so the scan may run
+/// order is irrelevant (the ids are sorted afterwards), so the scan is built
 /// unordered.
 #[cfg(feature = "file-io")]
 pub(crate) async fn scan_index_row_ids(
@@ -253,9 +253,10 @@ pub(crate) async fn read_located_rids(
     scan_located_row_ids(reader.clone(), rid_column, range, file.bound_exprs(), scope).await
 }
 
-/// A rid-only scan of an index child: just the row-id column, unordered
-/// (callers sort the ids anyway). Restrictions — a filter, a row range — are
-/// the caller's to add.
+/// A rid-only scan of an index child: just the row-id column, built unordered
+/// (callers sort the ids anyway; [`read_scanned_row_ids`] drives it inline, in
+/// split order, whatever the flag says). Restrictions — a filter, a row range
+/// — are the caller's to add.
 #[cfg(feature = "file-io")]
 fn rid_scan(
     reader: vortex_layout::LayoutReaderRef,
@@ -274,13 +275,16 @@ fn rid_scan(
 }
 
 /// Run a rid-only scan and decode its row-id column into the ascending,
-/// unique buffer every index resolution answers in.
+/// unique buffer every index resolution answers in. The scan is index
+/// business and always driven inline (`file_scan::read_index_row_ids`): its
+/// splits are zone-map checks or slices of a located run, never worth a
+/// spawn.
 #[cfg(feature = "file-io")]
 async fn read_scanned_row_ids(
     scan: vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>,
     rid_column: &'static str,
 ) -> Result<Buffer<RowId>> {
-    let arr = crate::store::scan::file_scan::read_all_rows(scan).await?;
+    let arr = crate::store::scan::file_scan::read_index_row_ids(scan).await?;
 
     if arr.is_empty() {
         return Ok(Buffer::empty());
@@ -338,5 +342,73 @@ mod tests {
         // An empty column short-circuits to an empty buffer.
         let empty = PrimitiveArray::from_iter(std::iter::empty::<RowId>()).into_array();
         assert!(sorted_row_ids(empty).unwrap().is_empty());
+    }
+
+    /// Both rid-scan entry points, the located-run scan and the pushed-down
+    /// equality, drive their scan inline whatever the gate's split limit: the
+    /// classification is made at these call sites, not read off the scan. A
+    /// limit of zero would send any row scan to the workers, and the row scan
+    /// at the end shows it does.
+    #[cfg(feature = "file-io")]
+    #[tokio::test]
+    async fn index_row_id_scans_drive_inline_whatever_the_limit() {
+        use crate::IndexType;
+        use crate::io::read::{FileAccess, open_vortex_file, scan_all_reader};
+        use crate::store::array::{field_as, into_struct_array};
+        use crate::store::indexes::COL_RID;
+        use crate::store::native_file::NativeStoreFile;
+        use crate::store::scan::file_scan::{ScanDriver, driver_hooks, read_all_rows};
+
+        const COMPONENT: &str = "index:ref-p";
+        let rows = 50;
+        let quads = crate::tests::modular_quads_for_tests(rows);
+        let (_dir, path) =
+            crate::tests::write_store_file_for_tests(quads, vec![IndexType::SecondaryByReference])
+                .await;
+        let file =
+            NativeStoreFile::try_new(open_vortex_file(&path, FileAccess::Mapped).await.unwrap())
+                .unwrap();
+        let (_, reader) = file
+            .component_reader(COMPONENT)
+            .unwrap()
+            .expect("the reference child of the predicate column");
+        let _limit = driver_hooks::ForcedLimit::set(0);
+
+        // The located-run scan: every row of the child.
+        let ids = scan_located_row_ids(
+            reader.clone(),
+            COL_RID,
+            0..rows as u64,
+            file.bound_exprs(),
+            COMPONENT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(driver_hooks::take_last(), Some(ScanDriver::Inline));
+        assert_eq!(ids.as_slice(), (0..rows as RowId).collect::<Vec<_>>());
+
+        // The pushed-down equality, probing the child's first value.
+        let child = scan_all_reader(reader.clone()).await.unwrap();
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        let child = into_struct_array(child).unwrap();
+        let first = field_as::<PrimitiveArray>(&child, "val", &mut ctx)
+            .unwrap()
+            .as_slice::<u64>()[0];
+        let matched = scan_index_row_ids(
+            reader,
+            &[("val", Scalar::from(first))],
+            COL_RID,
+            file.bound_exprs(),
+            COMPONENT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(driver_hooks::take_last(), Some(ScanDriver::Inline));
+        assert!(!matched.is_empty() && matched.len() < rows);
+        assert!(matched.as_slice().windows(2).all(|pair| pair[0] < pair[1]));
+
+        // Control: a row scan of the same file goes to the workers.
+        read_all_rows(file.scan().unwrap()).await.unwrap();
+        assert_eq!(driver_hooks::take_last(), Some(ScanDriver::Spawned));
     }
 }

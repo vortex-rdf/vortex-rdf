@@ -44,7 +44,16 @@ async fn collect_chunks<F>(tasks: Vec<F>) -> Result<Vec<ArrayRef>>
 where
     F: Future<Output = VortexResult<Option<ArrayRef>>>,
 {
-    let mut results = futures::stream::iter(tasks).buffered(*AVAILABLE_PARALLELISM);
+    drain_chunks(futures::stream::iter(tasks).buffered(*AVAILABLE_PARALLELISM)).await
+}
+
+/// The non-empty chunks of a stream of per-split results, in the order the
+/// stream yields them — the loop `collect_chunks` and `collect_scan_spawned`
+/// share.
+async fn drain_chunks<S>(mut results: S) -> Result<Vec<ArrayRef>>
+where
+    S: futures::Stream<Item = VortexResult<Option<ArrayRef>>> + Unpin,
+{
     let mut chunks = Vec::new();
     while let Some(chunk) = results.next().await {
         if let Some(chunk) = chunk.map_err(VortexRdfError::Vortex)? {
@@ -65,6 +74,32 @@ where
     F: Future<Output = VortexResult<Option<ArrayRef>>>,
 {
     chunked_or_single(collect_chunks(tasks).await?, dtype)
+}
+
+/// [`collect_scan`] with the split futures spawned onto the session's runtime
+/// handle, for a scan large enough to need the workers: `window` futures are
+/// in flight, each spawned as the window reaches it, and the chunks come back
+/// in split order, as the inline driver returns them, so the two drivers give
+/// the same rows whatever the scan's `ordered` flag says.
+///
+/// The windowing is that of `ScanBuilder::into_array_stream` — one spawn per
+/// split, `buffered` over the spawned handles — applied to futures already
+/// planned (`ScanBuilder::build`), which is what lets the caller count the
+/// splits before choosing a driver.
+#[cfg(feature = "file-io")]
+pub(crate) async fn collect_scan_spawned<F>(
+    dtype: vortex_array::dtype::DType,
+    tasks: Vec<F>,
+    window: usize,
+) -> Result<ArrayRef>
+where
+    F: Future<Output = VortexResult<Option<ArrayRef>>> + Send + 'static,
+{
+    use vortex_io::session::RuntimeSessionExt as _;
+
+    let handle = crate::session::VORTEX_SESSION.handle();
+    let spawned = futures::stream::iter(tasks).map(move |task| handle.spawn(task));
+    chunked_or_single(drain_chunks(spawned.buffered(window)).await?, dtype)
 }
 
 /// Materialize a whole file by driving its scan's per-split futures inline.
@@ -159,5 +194,40 @@ pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
             .open_path(path)
             .await
             .map_err(VortexRdfError::Vortex),
+    }
+}
+
+#[cfg(all(test, feature = "file-io"))]
+mod tests {
+    use super::*;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::dtype::{DType, Nullability, PType};
+    use vortex_array::{IntoArray as _, VortexSessionExecute as _};
+
+    /// The spawned collector returns the chunks in split order even when the
+    /// splits finish in the opposite order: split `i` yields to the scheduler
+    /// `splits - 1 - i` times before it answers, so on this single-threaded
+    /// runtime the last split finishes first and the first split last.
+    #[tokio::test]
+    async fn spawned_scan_collects_in_split_order_whatever_the_finishing_order() {
+        let splits = 6u64;
+        let tasks: Vec<_> = (0..splits)
+            .map(|i| async move {
+                for _ in 0..splits - 1 - i {
+                    tokio::task::yield_now().await;
+                }
+                Ok::<_, vortex_error::VortexError>(Some(
+                    PrimitiveArray::from_iter([i]).into_array(),
+                ))
+            })
+            .collect();
+        let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
+        let array = collect_scan_spawned(dtype, tasks, splits as usize)
+            .await
+            .unwrap();
+
+        let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
+        let values = array.execute::<PrimitiveArray>(&mut ctx).unwrap();
+        assert_eq!(values.as_slice::<u64>(), (0..splits).collect::<Vec<_>>());
     }
 }
