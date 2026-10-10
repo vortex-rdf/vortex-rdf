@@ -129,7 +129,9 @@ impl VortexRdfStore {
                 // anything is gathered or built, so every later append can
                 // retry for the price of one failed open. A permission error
                 // from later in the rewrite is not it, and is returned.
-                Err(error) if error.is_unwritable() => {}
+                Err(error) if error.is_unwritable() => {
+                    log::debug!("[add_quads] compaction refused, batch kept in the tail: {error}");
+                }
                 Err(error) => return Err(error),
             }
         }
