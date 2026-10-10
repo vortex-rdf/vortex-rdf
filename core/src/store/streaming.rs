@@ -361,8 +361,8 @@ impl VortexRdfStore {
 
     /// The decoded chunk stream of `scan`, through `sync` when every chunk
     /// decodes in memory and through `r#async` when the dictionary is
-    /// file-backed — each chunk's codes then resolve with a scan of their
-    /// own, so the decode must await (see [`scan_chunk_stream_async`]).
+    /// file-backed — each chunk's codes then resolve by reading the windows that
+    /// hold them, so the decode must await (see [`scan_chunk_stream_async`]).
     #[cfg(feature = "file-io")]
     fn scan_chunks<T: Send + 'static>(
         &self,
@@ -418,8 +418,8 @@ fn scan_chunk_stream<T: Send + 'static>(
 
 /// The async-decode counterpart of [`scan_chunk_stream`], for reads whose
 /// decode must itself await — a file-backed dictionary resolves each chunk's
-/// codes with a scan of its own, so the decode runs after the chunk stream,
-/// not inside the scan's sync map function.
+/// codes by reading the windows that hold them, so the decode runs after the
+/// chunk stream, not inside the scan's sync map function.
 #[cfg(feature = "file-io")]
 fn scan_chunk_stream_async<T: Send + 'static>(
     scan: ScanBuilder<ArrayRef>,

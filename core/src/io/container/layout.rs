@@ -197,9 +197,9 @@ pub(crate) fn quads_sorted(layout: &RdfStoreLayout) -> bool {
     layout.data().quads_sorted
 }
 
-/// Register the store layout — and the previous generation's, to refuse it —
-/// in a session. Called once from the `VORTEX_SESSION` initializer on every
-/// target — reading requires it.
+/// Register the store layout, and the `v1` root so that its files can be
+/// refused, in a session. Called once from the `VORTEX_SESSION` initializer on
+/// every target: reading requires it.
 pub(crate) fn register(session: &VortexSession) {
     use vortex_layout::session::LayoutSessionExt;
     static LAYOUT: RdfStoreLayoutVTable = RdfStoreLayoutVTable;

@@ -216,9 +216,8 @@ impl VortexRdfStore {
                 },
             ) => {
                 // In memory the matched view's selection maps straight to a
-                // mask — materializing first if the match was served and its
-                // exact ids are still pending (a delete is one of the
-                // consumers that needs them).
+                // mask — materializing first if its exact ids are still pending
+                // (a delete is one of the consumers that needs them).
                 let doomed = doomed.materialized()?.to_mask(base.len());
                 Ok(Self {
                     layout: self.layout.clone(),

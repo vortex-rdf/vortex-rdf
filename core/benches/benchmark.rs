@@ -438,7 +438,7 @@ fn dict_probe_cold(bencher: divan::Bencher, residency: &DictResidency) {
 }
 
 /// The same fully bound pattern on one shared store — the steady state of
-/// repeated lookups for the *same* terms. Nothing is memoized, so every
+/// repeated lookups for the *same* terms. No lookup result is kept, so every
 /// iteration searches the dictionary again: in memory on one arm, through the
 /// same windows of the mapped child, their pages warm, on the other.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]

@@ -22,13 +22,13 @@
 //! The shorthands are therefore spelled out as ASCII class ranges (see
 //! `SHORTHANDS`): Python's `\s` also covers `\x1c`–`\x1f` on ASCII text, which
 //! Rust's `\s` leaves out, and ranges keep the compiled program small where
-//! Rust's Unicode classes take tens of kilobytes each.
+//! Rust's Unicode classes are large.
 //!
-//! The compiled program is bounded too (`NFA_SIZE_LIMIT`, about 4,000 NFA
-//! states, with a lazy-DFA cache sized to hold the DFA of the largest such
-//! program): counted repetitions multiply (`(?:a{1000}){5}b` is 5,000 states),
-//! and a pattern over the limit is undecided like any other outside the
-//! subset, instead of costing seconds per candidate on long texts.
+//! The compiled program is bounded too (`NFA_SIZE_LIMIT`, with a lazy-DFA
+//! cache sized to hold the DFA of the largest such program): counted
+//! repetitions multiply (`(?:a{1000}){5}b` is 5,000 states), and a pattern
+//! over the limit is undecided like any other outside the subset, instead of
+//! costing a candidate time that grows with the program.
 
 use std::fmt::Write as _;
 
@@ -39,8 +39,8 @@ use super::predicates::Verdict;
 /// (`escape`) and spliced where it sits in a class (`class_escape`), so the
 /// spellings cannot drift apart. A pattern using one decides ASCII texts only,
 /// so ASCII is all they have to say, and ranges say it in the fewest states:
-/// Rust's Unicode `\w` is about 64 KiB of program by itself and a negated
-/// class (`[^0-9]`) carries the whole non-ASCII half, where each of these is a
+/// Rust's Unicode `\w` is a large program by itself and a negated class
+/// (`[^0-9]`) carries the whole non-ASCII half, where each of these is a
 /// handful of states. Python's `\s` also covers `\x1c`–`\x1f` on ASCII text,
 /// which Rust's `\s` leaves out.
 const SHORTHANDS: [(char, &str); 6] = [
@@ -69,19 +69,18 @@ const RUST_META: &str = r"\.+*?()|[]{}^$#&-~";
 /// Largest counted repetition the subset takes.
 const MAX_REPEAT: u32 = 1_000;
 
-/// Largest compiled program the subset takes, in bytes of NFA: about 4,000
-/// states. Matching costs O(states) per byte whenever the lazy DFA is not
-/// enough, so this bounds a pattern's cost; the patterns the subset is for are
-/// a few dozen states. Counted repetitions multiply (`(?:a{1000}){5}` is
-/// 5,000 states), so the limit refuses those while a per-count cap cannot.
+/// Largest compiled program the subset takes, in bytes of NFA. Matching costs
+/// O(states) per byte whenever the lazy DFA is not enough, so this bounds a
+/// pattern's cost; the patterns the subset is for are a few dozen states.
+/// Counted repetitions multiply (`(?:a{1000}){5}` is 5,000 states), so the
+/// limit refuses those while a per-count cap cannot.
 const NFA_SIZE_LIMIT: usize = 1 << 17;
 
-/// The lazy DFA's cache, in bytes: 16 MiB, enough to hold the DFA of the
-/// largest program under `NFA_SIZE_LIMIT` on its worst text (every position of
-/// a 4,000-character literal live at once needs between 8 and 10 MiB). A cache
-/// that is too small is slower, not safer: the engine then runs the NFA
-/// simulation for every candidate (20 s instead of 0.06 s for 100 texts of
-/// 10,000 characters). It is allocated only as the texts need it.
+/// The lazy DFA's cache, in bytes: enough to hold the DFA of the largest
+/// program under `NFA_SIZE_LIMIT` on its worst text (every position of a long
+/// literal live at once). A cache that is too small is slower, not safer: the
+/// engine then runs the NFA simulation for every candidate. It is allocated
+/// only as the texts need it.
 const DFA_CACHE_LIMIT: usize = 1 << 24;
 
 /// Deepest group nesting the subset takes: the translator recurses once per

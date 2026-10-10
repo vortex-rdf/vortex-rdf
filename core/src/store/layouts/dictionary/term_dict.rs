@@ -154,7 +154,8 @@ impl ResidentChunks {
 ///
 /// term → code is a host-side binary search; code → term reads the term at a
 /// position. Both go through [`cursor`](Self::cursor), whose cost depends on
-/// the encoding the terms are held in. Nothing is memoized.
+/// the encoding the terms are held in. Only the kind ranges are kept beyond a
+/// call.
 pub(crate) struct TermDictionary {
     terms: TermStore,
     /// The kind ranges, computed on first use (a few probes).

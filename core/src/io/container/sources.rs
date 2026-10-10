@@ -184,8 +184,8 @@ const ROW_BLOCK: usize = 8192;
 /// answers from one word. The store's own files stay on the encodings its
 /// probes read in place (the reader still probes delta, for files written
 /// elsewhere). The pinned core edition keeps frame-of-reference on a single
-/// reference and, today, leaves delta out as well; the exclusion keeps delta
-/// out should a later core edition admit it.
+/// reference and leaves delta out; the exclusion also keeps delta out of an
+/// edition that admits it.
 fn store_compressor() -> vortex_btrblocks::BtrBlocksCompressorBuilder {
     use vortex_btrblocks::schemes::integer::DeltaScheme;
     use vortex_btrblocks::{BtrBlocksCompressorBuilder, SchemeExt as _};
@@ -214,10 +214,10 @@ pub(crate) fn default_child_strategy() -> Arc<dyn vortex_layout::LayoutStrategy>
 /// Default and TypedObject layouts' strings — keeps the stock strategy; a
 /// child without id columns gets it unchanged.
 ///
-/// The override keeps an id column at the rows per leaf it had as a `u32`
-/// column: Vortex coalesces a column to 1 MiB uncompressed per leaf, which
-/// is 262,144 rows of a `u32` but 131,072 of a `u64`, and a column read in
-/// twice as many leaves costs every probe that walks or rebuilds them.
+/// The override cuts a plain id column into leaves of 262,144 rows (coalesced
+/// to 2 MiB uncompressed; Vortex's stock 1 MiB holds 131,072 `u64` values),
+/// and a dictionary-encoded column's codes into leaves of 1 MiB. A column in
+/// fewer leaves costs every probe that walks or rebuilds them less.
 pub(crate) fn child_strategy(dtype: &DType) -> Arc<dyn vortex_layout::LayoutStrategy> {
     child_strategy_with(dtype, ONE_MEG, 2 * ONE_MEG)
 }
@@ -273,14 +273,11 @@ pub(crate) fn child_strategy_with(
 ///
 /// [`child_strategy`] passes 1 MiB and 2 MiB. A dictionary's codes are as
 /// wide as its cardinality needs, whatever the width of the values, so they
-/// keep the stock 1 MiB and the leaves a `u32` column's dictionary codes
-/// had; a plain `u64` column — a term-code column that does not
-/// dictionary-encode, or a row-id column, whose ids are unique — coalesced to
-/// 2 MiB holds the 262,144 rows per leaf a plain `u32` column held at 1 MiB.
-/// Passing 1 MiB twice gives the stock pipeline exactly, which a test pins
-/// by writing columns both ways: a Vortex upgrade that changes the stock
-/// pipeline fails that test instead of leaving the id columns on the old
-/// one.
+/// keep the stock 1 MiB; a plain `u64` column — a term-code column that does
+/// not dictionary-encode, or a row-id column, whose ids are unique — is
+/// coalesced to 2 MiB, which holds 262,144 rows per leaf. Passing 1 MiB twice
+/// gives the stock pipeline exactly, which a test pins by writing columns both
+/// ways: a Vortex upgrade that changes the stock pipeline fails that test.
 fn id_column_strategy(
     codes_target: u64,
     fallback_target: u64,

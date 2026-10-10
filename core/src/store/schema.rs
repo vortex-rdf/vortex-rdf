@@ -68,8 +68,8 @@ pub(crate) fn is_row_id_field(name: &str, dtype: &DType) -> bool {
 
 /// Whether the field `name: dtype` is an id column: a term-code column
 /// ([`is_code_field`]) or a row-id column ([`is_row_id_field`]) — the `u64`
-/// columns whose leaves the writer keeps at the rows per leaf they held as
-/// `u32` ([`child_strategy`](crate::io::container::child_strategy)).
+/// columns whose leaf size the writer sets
+/// ([`child_strategy`](crate::io::container::child_strategy)).
 pub(crate) fn is_id_field(name: &str, dtype: &DType) -> bool {
     is_code_field(name, dtype) || is_row_id_field(name, dtype)
 }

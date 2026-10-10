@@ -87,7 +87,8 @@ impl ServeDecode {
 
     /// [`decode_columns`](Self::decode_columns) through the layout's async
     /// decode — for serving a store whose term dictionary is file-backed,
-    /// where each chunk's codes are resolved with a dictionary scan.
+    /// where each chunk's codes are resolved by reading the dictionary
+    /// windows that hold them.
     #[cfg(feature = "file-io")]
     async fn decode_columns_async<T: ChunkDecode>(
         &self,
@@ -551,7 +552,8 @@ impl FileServePlan {
 
     /// [`decode_columns`](Self::decode_columns) through the layout's async
     /// decode — for serving a store whose term dictionary is file-backed,
-    /// where each chunk's codes are resolved with a dictionary scan.
+    /// where each chunk's codes are resolved by reading the dictionary
+    /// windows that hold them.
     pub(crate) async fn decode_columns_async<T: ChunkDecode>(
         &self,
         chunk: &ArrayRef,

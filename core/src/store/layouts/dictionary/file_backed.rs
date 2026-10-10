@@ -3,7 +3,7 @@
 //! memory-mapped, so reading a window is slicing its segment out of the map
 //! and rebuilding the FSST array over those bytes; only the terms a call
 //! asks for are decompressed, and nothing read is kept once the call
-//! returns. The handle holds the child's layout (one flat leaf per FSST
+//! returns but the kind ranges. The handle holds the child's layout (one flat leaf per FSST
 //! window) and each window's first and last term — read at open from the
 //! child's exact zone maps, or from the leaves of a child written without
 //! them (chunks of uneven length have no uniform zone to record). A child

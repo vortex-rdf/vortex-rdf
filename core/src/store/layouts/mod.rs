@@ -643,9 +643,10 @@ impl ResolvedLayout {
     }
 
     /// [`decode_chunk`](Self::decode_chunk) with the file-backed Dictionary
-    /// case handled: the chunk's distinct codes are resolved to terms with one
-    /// dictionary scan, and the chunk decodes against that map. Every other
-    /// layout (and a resident dictionary) takes the sync path unchanged.
+    /// case handled: the chunk's distinct codes are resolved to terms by one
+    /// read of the dictionary windows holding them, and the chunk decodes
+    /// against that map. Every other layout (and a resident dictionary) takes
+    /// the sync path unchanged.
     #[cfg(feature = "file-io")]
     pub(crate) async fn decode_chunk_async(&self, chunk: &ArrayRef) -> Vec<Result<Quad>> {
         if let ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) = self {

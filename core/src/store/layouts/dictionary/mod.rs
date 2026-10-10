@@ -488,8 +488,8 @@ pub(crate) async fn resolve_chunk_terms(
 
 /// [`decode_chunk`] against a pre-resolved code→term map instead of a
 /// resident dictionary — the file-backed reconstruction path: the caller
-/// resolves the chunk's [`unique_codes`] with one scan and decodes with the
-/// resulting map.
+/// resolves the chunk's [`unique_codes`] with one read of the dictionary
+/// and decodes with the resulting map.
 #[cfg(feature = "file-io")]
 pub(crate) fn decode_chunk_mapped(
     chunk: &ArrayRef,

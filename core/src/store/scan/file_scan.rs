@@ -59,7 +59,7 @@ fn max_inline_splits() -> usize {
 
 /// Test hooks for the driver choice: a per-thread override of the split limit,
 /// and the driver a scan ran under, read off how many of its splits were
-/// spawned. Nothing here times anything.
+/// spawned.
 #[cfg(test)]
 pub(crate) mod driver_hooks {
     use std::cell::Cell;
