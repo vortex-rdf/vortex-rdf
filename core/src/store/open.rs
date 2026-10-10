@@ -26,26 +26,36 @@ use vortex_array::dtype::DType;
 use vortex_array::{IntoArray, VortexSessionExecute};
 
 use super::VortexRdfStore;
-use super::schema::{CODE_PTYPE, is_code_column_name};
+use super::indexes::COL_RID;
+use super::schema::{CODE_PTYPE, ROW_ID_PTYPE, is_code_column_name};
 
-/// Refuse a table whose code columns are integers of a width other than
-/// [`TermCode`](super::TermCode)'s: the readers take an integer `s`, `p`,
-/// `o`, `g` (the quad table and the copy index's children) or `val` (the
-/// reference index's) for a `u64` code column, so a file with narrower codes
-/// — written by a pre-release of 0.12, before codes were widened, or by a
-/// foreign writer — must not open. `table` names the table in the error.
-pub(super) fn check_code_columns(table: &str, dtype: &DType) -> Result<()> {
+/// Refuse a table whose id columns are integers of a width other than the
+/// one this version reads: the readers take an integer `s`, `p`, `o`, `g`
+/// (the quad table and the copy index's children) or `val` (the reference
+/// index's) for a `u64` code column ([`TermCode`](super::TermCode)), and an
+/// index child's `rid` for a `u64` row id ([`RowId`](super::RowId)), so a
+/// file with narrower codes or row ids — written by a pre-release of 0.12,
+/// before they were widened, or by a foreign writer — must not open.
+/// `table` names the table in the error.
+pub(super) fn check_id_columns(table: &str, dtype: &DType) -> Result<()> {
     let DType::Struct(fields, _) = dtype else {
         return Ok(());
     };
     for (name, field) in fields.names().iter().zip(fields.fields()) {
-        if let DType::Primitive(ptype, _) = field
-            && is_code_column_name(name.as_ref())
-            && ptype != CODE_PTYPE
-        {
+        let DType::Primitive(ptype, _) = field else {
+            continue;
+        };
+        if is_code_column_name(name.as_ref()) && ptype != CODE_PTYPE {
             return Err(VortexRdfError::Deserialization(format!(
                 "the {table} column {name} holds {ptype} term codes, but this version of \
                  vortex-rdf reads {CODE_PTYPE} codes only; rebuild the store from its RDF \
+                 source"
+            )));
+        }
+        if name.as_ref() == COL_RID && ptype != ROW_ID_PTYPE {
+            return Err(VortexRdfError::Deserialization(format!(
+                "the {table} column {name} holds {ptype} row ids, but this version of \
+                 vortex-rdf reads {ROW_ID_PTYPE} row ids only; rebuild the store from its RDF \
                  source"
             )));
         }
@@ -95,7 +105,7 @@ pub(super) fn classify_component(
         return Ok(ComponentKind::Dict);
     }
     if let Some(known) = crate::store::indexes::known_component(&descriptor.implementation) {
-        check_code_columns(&descriptor.name, &descriptor.dtype)?;
+        check_id_columns(&descriptor.name, &descriptor.dtype)?;
         return Ok(ComponentKind::Index(known));
     }
     if descriptor.required {
@@ -189,7 +199,7 @@ impl VortexRdfStore {
             NativeStoreFile::try_new(read::open_vortex_file(path, access).await?)?
                 .with_mapping(access == read::FileAccess::Mapped),
         );
-        check_code_columns("quad table", file.dtype())?;
+        check_id_columns("quad table", file.dtype())?;
         log::debug!(
             "[open] {} {}",
             source_path.display(),
@@ -216,8 +226,6 @@ impl VortexRdfStore {
                         child.row_count(),
                         file.row_count(),
                     )?;
-                    // An index child's u32 row ids cannot address more rows.
-                    crate::store::indexes::check_adopted_rows(file.row_count())?;
                 }
                 if !indexes.contains(&known.index) {
                     indexes.push(known.index);
@@ -309,7 +317,7 @@ impl VortexRdfStore {
         if !container::is_native_file(&file) {
             return Err(read::unsupported_file_error(&file));
         }
-        check_code_columns("quad table", file.dtype())?;
+        check_id_columns("quad table", file.dtype())?;
         // The root scan is the transparent quad child.
         let quads = read::scan_all(&file).await?;
         let root = file.footer().layout();

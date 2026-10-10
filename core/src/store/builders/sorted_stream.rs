@@ -34,7 +34,7 @@ use crate::store::indexes::{
 };
 use crate::store::layouts::dictionary::{TermCodeMap, TermDictionary, TermDictionaryBuilder};
 use crate::store::layouts::{LayoutStrategy, dictionary};
-use crate::store::schema::TermCode;
+use crate::store::schema::{RowId, TermCode};
 
 use crate::debug;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
@@ -318,9 +318,12 @@ fn chunk_stream<S: Send + 'static>(
 }
 
 /// The two `SecondaryByReference` mergers of a build: (objects, predicates).
-type RefMergers<V> = (RunMerger<(V, u32)>, RunMerger<(V, u32)>);
+type RefMergers<V> = (RunMerger<(V, RowId)>, RunMerger<(V, RowId)>);
 /// The two `SecondaryByCopy` mergers of a build: (POSG keys, OSPG keys).
-type CopyMergers<V> = (RunMerger<(CopyKey<V>, u32)>, RunMerger<(CopyKey<V>, u32)>);
+type CopyMergers<V> = (
+    RunMerger<(CopyKey<V>, RowId)>,
+    RunMerger<(CopyKey<V>, RowId)>,
+);
 
 /// The external-sort mergers for one build's secondary indexes, present only
 /// for the index types the build requested. `V` is the term encoding: strings,
@@ -349,8 +352,8 @@ fn merge_quads_feeding_indexes<V>(
 ) -> Result<(Run<RawQuad>, IndexMergers<V>)>
 where
     V: Clone,
-    (V, u32): Ord + Spillable,
-    (CopyKey<V>, u32): Ord + Spillable,
+    (V, RowId): Ord + Spillable,
+    (CopyKey<V>, RowId): Ord + Spillable,
 {
     let mut merged = if merger.run_count() <= 1 {
         MergedSink::Memory(Vec::new())
@@ -362,17 +365,17 @@ where
         }
     };
     let mut o_spill =
-        want_ref.then(|| RunSpiller::<(V, u32)>::new(temp_dir, "idx_o", pair_capacity));
+        want_ref.then(|| RunSpiller::<(V, RowId)>::new(temp_dir, "idx_o", pair_capacity));
     let mut p_spill =
-        want_ref.then(|| RunSpiller::<(V, u32)>::new(temp_dir, "idx_p", pair_capacity));
+        want_ref.then(|| RunSpiller::<(V, RowId)>::new(temp_dir, "idx_p", pair_capacity));
     let mut posg_spill = want_copy
-        .then(|| RunSpiller::<(CopyKey<V>, u32)>::new(temp_dir, "idx_posg", pair_capacity));
+        .then(|| RunSpiller::<(CopyKey<V>, RowId)>::new(temp_dir, "idx_posg", pair_capacity));
     let mut ospg_spill = want_copy
-        .then(|| RunSpiller::<(CopyKey<V>, u32)>::new(temp_dir, "idx_ospg", pair_capacity));
+        .then(|| RunSpiller::<(CopyKey<V>, RowId)>::new(temp_dir, "idx_ospg", pair_capacity));
 
     // Rows are numbered as the merge emits them, so the count is unknown up
     // front: each id is a checked increment, refusing the store at the first
-    // row past what a u32 row id holds rather than wrapping.
+    // row past the last u64 row id rather than wrapping.
     let mut rows: u64 = 0;
     while let Some(quad) = merger.next()? {
         let rid = next_row_id(&mut rows)?;
@@ -465,7 +468,7 @@ impl MergedSink {
 }
 
 /// A window of one reference component's merged pairs, as one child chunk.
-type RefChunkFn<V> = fn(&[(V, u32)]) -> Result<ArrayRef>;
+type RefChunkFn<V> = fn(&[(V, RowId)]) -> Result<ArrayRef>;
 
 /// Turn a build's spill-run mergers into native component writes: each family
 /// streams its child's chunks straight off its merger — no lockstep zip with
@@ -482,8 +485,8 @@ fn merger_components<V>(
 ) -> Result<Vec<NativeComponentWrite>>
 where
     V: Send + 'static + secondary_by_copy::TermColumn,
-    (V, u32): Ord + Spillable,
-    (CopyKey<V>, u32): Ord + Spillable,
+    (V, RowId): Ord + Spillable,
+    (CopyKey<V>, RowId): Ord + Spillable,
 {
     use crate::io::container::sources::PullComponentSource;
     use crate::io::container::{StoreComponentDescriptor, StoreComponentRole, child_strategy};

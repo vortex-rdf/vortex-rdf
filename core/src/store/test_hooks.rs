@@ -16,7 +16,7 @@ use crate::store::layouts::QuadPattern;
 #[cfg(feature = "file-io")]
 use crate::store::layouts::{DictAccess, ResolvedLayout};
 use crate::store::selection::{RowSelection, ViewSelection};
-use crate::store::{QuadsSource, TermCode, VortexRdfStore};
+use crate::store::{QuadsSource, RowId, TermCode, VortexRdfStore};
 
 pub(crate) use crate::store::mutation::{TAIL_FLATTEN_FLOOR, TAIL_MAX_CHUNKS};
 
@@ -31,34 +31,43 @@ thread_local! {
     /// first term (see [`CodeBase`]); 0 outside a guard.
     static CODE_BASE: std::cell::Cell<TermCode> = const { std::cell::Cell::new(0) };
 
-    /// The most quads an indexed store built on this thread may hold (see
-    /// [`RowLimit`]); `MAX_INDEXED_ROWS` outside a guard.
-    static ROW_LIMIT: std::cell::Cell<u64> =
-        const { std::cell::Cell::new(crate::store::indexes::MAX_INDEXED_ROWS) };
+    /// The row id the indexed builds on this thread give their first row
+    /// (see [`RowIdBase`]); 0 outside a guard.
+    static ROW_ID_BASE: std::cell::Cell<RowId> = const { std::cell::Cell::new(0) };
 }
 
-/// The row limit the index builds on this thread enforce: the format's
-/// `MAX_INDEXED_ROWS`, unless a [`RowLimit`] guard is live.
-pub(crate) fn row_limit() -> u64 {
-    ROW_LIMIT.with(std::cell::Cell::get)
+/// The row id the indexed builds on this thread give their first row, and
+/// that the readers on this thread take off every row id they read: 0,
+/// unless a [`RowIdBase`] guard is live.
+pub(crate) fn row_id_base() -> RowId {
+    ROW_ID_BASE.with(std::cell::Cell::get)
 }
 
-/// While alive, every index build on this thread refuses a store past
-/// `limit` quads instead of past `u32::MAX` — the refusal of a store whose
-/// row ids would not fit a u32, reachable with a handful of quads. Dropping
-/// the guard restores the limit it replaced.
-pub(crate) struct RowLimit(u64);
+/// While alive, every indexed build on this thread numbers its rows from
+/// `base` instead of 0 — row id = `base` + row — and every reader on this
+/// thread maps a row id back to its row by taking `base` off again. A
+/// handful of quads then carry row ids a 32-bit width cannot hold, through
+/// every path that stores or reads one: the in-memory index builds, the
+/// out-of-core merge's spilled records, the written `rid` columns, located
+/// runs, served reads under tombstones and the rebuilds. A base close to
+/// `RowId::MAX` instead makes the refusal of an id past the last one
+/// reachable with a handful of quads. The base is never written: a store
+/// built under a guard must be read under the same one, as a store of 2^32
+/// more rows would be. Dropping the guard restores the base it replaced.
+/// Thread-local like `GATHERS`, for the same reason.
+pub(crate) struct RowIdBase(RowId);
 
-impl RowLimit {
-    /// Refuse indexed stores past `limit` quads until the guard drops.
-    pub(crate) fn set(limit: u64) -> Self {
-        RowLimit(ROW_LIMIT.with(|cell| cell.replace(limit)))
+impl RowIdBase {
+    /// Number this thread's indexed builds from `base` until the guard
+    /// drops.
+    pub(crate) fn set(base: RowId) -> Self {
+        RowIdBase(ROW_ID_BASE.with(|cell| cell.replace(base)))
     }
 }
 
-impl Drop for RowLimit {
+impl Drop for RowIdBase {
     fn drop(&mut self) {
-        ROW_LIMIT.with(|cell| cell.set(self.0));
+        ROW_ID_BASE.with(|cell| cell.set(self.0));
     }
 }
 

@@ -39,7 +39,7 @@ store.match_columns(p="<http://xmlns.com/foaf/0.1/name>")    # (subjects, predic
 
 ## Term codes (low-level)
 
-For Dictionary-layout stores, `match_codes` returns the matched rows as four **zero-copy** `u64` term-code columns (`U64Column`) — `memoryview(col).cast("Q")` views the Rust memory directly — decodable through a `term_dict()` handle. Codes are 64-bit, so the code width no longer limits a store (a dictionary build is still capped at 2**31 - 1 terms, and a store with secondary indexes at 2**32 - 1 quads); a code is a Python int from 0 to 2**64 - 1, and anything else is refused (`OverflowError` or `ValueError`), never narrowed:
+For Dictionary-layout stores, `match_codes` returns the matched rows as four **zero-copy** `u64` term-code columns (`U64Column`) — `memoryview(col).cast("Q")` views the Rust memory directly — decodable through a `term_dict()` handle. Codes are 64-bit, so the code width no longer limits a store (a dictionary build is still capped at 2**31 - 1 terms, until an out-of-core dictionary builder lands); a code is a Python int from 0 to 2**64 - 1, and anything else is refused (`OverflowError` or `ValueError`), never narrowed:
 
 ```python
 cols = store.match_codes(p="<http://xmlns.com/foaf/0.1/name>")  # (s, p, o, g) or None

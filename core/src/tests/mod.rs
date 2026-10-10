@@ -44,6 +44,7 @@ mod serialization;
 mod streaming;
 mod unique_quads;
 mod wide_codes;
+mod wide_row_ids;
 
 fn make_quad(s: &str, p: &str, o_lit: &str, g: GraphName) -> Quad {
     Quad::new(

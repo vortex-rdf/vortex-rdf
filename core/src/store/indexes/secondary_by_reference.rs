@@ -43,7 +43,7 @@ use crate::store::RawQuad;
 use crate::store::array::{make_string_array, stamp_is_sorted};
 use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, TermRef};
-use crate::store::schema::TermCode;
+use crate::store::schema::{RowId, TermCode};
 
 /// The value column of a reference component's persisted child; the row id
 /// beside it is the name every index child shares ([`COL_RID`]).
@@ -348,12 +348,12 @@ pub(crate) mod out_of_core {
     use super::CHILD_COLUMNS;
     use crate::error::Result;
     use crate::store::array::{make_string_array, stamp_is_sorted};
-    use crate::store::schema::{CODE_PTYPE, TermCode};
+    use crate::store::schema::{CODE_PTYPE, ROW_ID_PTYPE, RowId, TermCode};
 
     /// The persisted child's struct dtype: sorted values (strings, or codes
-    /// under the Dictionary layout) plus the u32 primary row id.
+    /// under the Dictionary layout) plus the u64 primary row id.
     pub(crate) fn ref_child_dtype(encoded: bool) -> DType {
-        use vortex_array::dtype::{Nullability, PType};
+        use vortex_array::dtype::Nullability;
         let val = if encoded {
             DType::Primitive(CODE_PTYPE, Nullability::NonNullable)
         } else {
@@ -361,13 +361,16 @@ pub(crate) mod out_of_core {
         };
         child_struct_dtype(
             &CHILD_COLUMNS,
-            vec![val, DType::Primitive(PType::U32, Nullability::NonNullable)],
+            vec![
+                val,
+                DType::Primitive(ROW_ID_PTYPE, Nullability::NonNullable),
+            ],
         )
     }
 
     /// One chunk of a reference component's persisted child from a window of its
     /// merged `(value, row id)` pairs.
-    pub(crate) fn ref_child_chunk_strings(pairs: &[(String, u32)]) -> Result<ArrayRef> {
+    pub(crate) fn ref_child_chunk_strings(pairs: &[(String, RowId)]) -> Result<ArrayRef> {
         let val = make_string_array(pairs.iter().map(|(v, _)| v.as_str()));
         stamp_is_sorted(&val);
         let rid = PrimitiveArray::from_iter(pairs.iter().map(|(_, rid)| *rid)).into_array();
@@ -375,12 +378,18 @@ pub(crate) mod out_of_core {
     }
 
     /// Code-column variant of [`ref_child_chunk_strings`].
-    pub(crate) fn ref_child_chunk_codes(pairs: &[(TermCode, u32)]) -> Result<ArrayRef> {
+    pub(crate) fn ref_child_chunk_codes(pairs: &[(TermCode, RowId)]) -> Result<ArrayRef> {
         let val = PrimitiveArray::from_iter(pairs.iter().map(|(code, _)| *code)).into_array();
         stamp_is_sorted(&val);
         let rid = PrimitiveArray::from_iter(pairs.iter().map(|(_, rid)| *rid)).into_array();
         child_struct(&CHILD_COLUMNS, vec![val, rid], pairs.len()).map(|a| a.into_array())
     }
+}
+
+/// The `rid` column of a permutation of the dataset: the row ids of the
+/// positions `perm` lists, in that order.
+fn rid_column(perm: &[usize]) -> ArrayRef {
+    PrimitiveArray::from_iter(perm.iter().map(|&i| super::row_id(i))).into_array()
 }
 
 /// The complete dataset's secondary-index columns in global sorted order —
@@ -394,33 +403,36 @@ pub(crate) struct GlobalReferenceArrays {
 }
 
 impl GlobalReferenceArrays {
-    /// Sort by term strings. Row IDs are the quads' positions in `quads`
+    /// Sort by term strings. Row ids number the quads' positions in `quads`
     /// (the builder must pass the dataset in final row order), so the sort is
-    /// just a u32 permutation — no per-term string copies.
+    /// just a permutation of positions — no per-term string copies — whose
+    /// ties break by position, which is row-id order.
     pub(crate) fn from_quads(quads: &[RawQuad]) -> Self {
-        let perm_by = |term_of: fn(&RawQuad) -> &str| -> Vec<u32> {
-            let mut perm: Vec<u32> = (0..quads.len()).map(super::row_id).collect();
+        let perm_by = |term_of: fn(&RawQuad) -> &str| -> Vec<usize> {
+            let mut perm: Vec<usize> = (0..quads.len()).collect();
             perm.sort_unstable_by(|&a, &b| {
-                term_of(&quads[a as usize])
-                    .cmp(term_of(&quads[b as usize]))
-                    .then(a.cmp(&b))
+                term_of(&quads[a]).cmp(term_of(&quads[b])).then(a.cmp(&b))
             });
             perm
         };
         let o_perm = perm_by(|q| &q.o);
+        let (o_val, o_rid) = (
+            make_string_array(o_perm.iter().map(|&i| quads[i].o.as_str())),
+            rid_column(&o_perm),
+        );
+        drop(o_perm);
         let p_perm = perm_by(|q| &q.p);
-        Self::from_arrays(
-            make_string_array(o_perm.iter().map(|&i| quads[i as usize].o.as_str())),
-            o_perm,
-            make_string_array(p_perm.iter().map(|&i| quads[i as usize].p.as_str())),
-            p_perm,
-        )
+        let (p_val, p_rid) = (
+            make_string_array(p_perm.iter().map(|&i| quads[i].p.as_str())),
+            rid_column(&p_perm),
+        );
+        Self::from_arrays(o_val, o_rid, p_val, p_rid)
     }
 
     /// Dictionary-layout variant: sort the codes.
     pub(crate) fn from_codes(codes: &QuadCodes) -> Self {
-        let sorted = |column: &[TermCode]| -> (ArrayRef, Vec<u32>) {
-            let mut pairs: Vec<(TermCode, u32)> = column
+        let sorted = |column: &[TermCode]| -> (ArrayRef, ArrayRef) {
+            let mut pairs: Vec<(TermCode, RowId)> = column
                 .iter()
                 .enumerate()
                 .map(|(i, &code)| (code, super::row_id(i)))
@@ -428,22 +440,22 @@ impl GlobalReferenceArrays {
             pairs.sort_unstable();
             (
                 PrimitiveArray::from_iter(pairs.iter().map(|(code, _)| *code)).into_array(),
-                pairs.into_iter().map(|(_, rid)| rid).collect(),
+                PrimitiveArray::from_iter(pairs.iter().map(|(_, rid)| *rid)).into_array(),
             )
         };
-        let (o_val, o_perm) = sorted(&codes.o);
-        let (p_val, p_perm) = sorted(&codes.p);
-        Self::from_arrays(o_val, o_perm, p_val, p_perm)
+        let (o_val, o_rid) = sorted(&codes.o);
+        let (p_val, p_rid) = sorted(&codes.p);
+        Self::from_arrays(o_val, o_rid, p_val, p_rid)
     }
 
-    fn from_arrays(o_val: ArrayRef, o_perm: Vec<u32>, p_val: ArrayRef, p_perm: Vec<u32>) -> Self {
+    fn from_arrays(o_val: ArrayRef, o_rid: ArrayRef, p_val: ArrayRef, p_rid: ArrayRef) -> Self {
         stamp_is_sorted(&o_val);
         stamp_is_sorted(&p_val);
         Self {
             o_val,
-            o_rid: PrimitiveArray::from_iter(o_perm).into_array(),
+            o_rid,
             p_val,
-            p_rid: PrimitiveArray::from_iter(p_perm).into_array(),
+            p_rid,
         }
     }
 
@@ -535,7 +547,7 @@ mod tests {
         ] {
             let val = val.clone().execute::<VarBinViewArray>(&mut ctx).unwrap();
             let rid = rid.clone().execute::<PrimitiveArray>(&mut ctx).unwrap();
-            let (vals, rids) = (StrColReader::new(&val), rid.as_slice::<u32>());
+            let (vals, rids) = (StrColReader::new(&val), rid.as_slice::<RowId>());
             assert_eq!(rids.len(), quads.len());
             let mut repeats = 0;
             for row in 1..rids.len() {

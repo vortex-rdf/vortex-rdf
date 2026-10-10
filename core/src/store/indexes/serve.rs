@@ -49,7 +49,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 use crate::store::scan::gather::primitive_from_u64_reads;
-use crate::store::schema::TermCode;
+use crate::store::schema::{RowId, TermCode};
 use crate::store::selection::point_sized;
 
 /// The decode tail shared by both backend-typed serve plans: which of the
@@ -125,12 +125,16 @@ impl ServeDecode {
             return Some(None);
         };
         let rid = probes.by_name(array, self.rid_column)?;
-        Some(Some(
-            range
-                .clone()
-                .filter(|&pos| !deleted.value(rid.value_at(pos) as usize))
-                .collect(),
-        ))
+        // A row id no `usize` holds declines to the slice path, whose
+        // decode reports it.
+        let mut live = Vec::with_capacity(range.len());
+        for pos in range.clone() {
+            let row = super::row_index(super::base_row(rid.value_at(pos))).ok()?;
+            if !deleted.value(row) {
+                live.push(pos);
+            }
+        }
+        Some(Some(live))
     }
 
     /// A small run's live rows as a primary-named `(s, p, o, g)` canonical
@@ -218,15 +222,13 @@ impl ServeDecode {
         let rid_col = col(self.rid_column)?
             .execute::<PrimitiveArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
-        let live = Mask::from_indices(
-            len,
-            rid_col
-                .as_slice::<u32>()
-                .iter()
-                .enumerate()
-                .filter(|&(_, &rid)| !deleted.value(rid as usize))
-                .map(|(position, _)| position),
-        );
+        let mut positions = Vec::with_capacity(len);
+        for (position, &rid) in rid_col.as_slice::<RowId>().iter().enumerate() {
+            if !deleted.value(super::row_index(super::base_row(rid))?) {
+                positions.push(position);
+            }
+        }
+        let live = Mask::from_indices(len, positions);
         if live.all_true() {
             return Ok(rows);
         }

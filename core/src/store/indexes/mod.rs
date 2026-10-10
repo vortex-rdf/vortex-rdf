@@ -26,6 +26,7 @@ use vortex_buffer::Buffer;
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout};
+use crate::store::schema::RowId;
 
 pub(crate) mod components;
 pub(crate) mod row_ids;
@@ -53,28 +54,31 @@ pub(crate) use serve::InMemoryServePlan;
 /// column name the families share rather than each spelling their own.
 pub(crate) const COL_RID: &str = "rid";
 
-/// The most quads a store with secondary indexes holds: every index child
-/// records each row's id in its `u32` [`COL_RID`] column, and the in-memory
-/// index builds number rows `0..len` as `u32`, so the row count must fit
-/// one. Every build path that assigns row ids checks against it — through
-/// [`check_indexed_rows`] or, row by row, [`next_row_id`] — and refuses the
-/// store rather than let an id wrap; every open of a file and adoption of
-/// parts checks it through [`check_adopted_rows`] and refuses to read a
-/// store past it.
-pub(crate) const MAX_INDEXED_ROWS: u64 = u32::MAX as u64;
-
-/// The row limit in force: [`MAX_INDEXED_ROWS`], lowered only by the tests'
-/// `RowLimit` hook, so that a refusal is reachable without 2^32 rows.
+/// The row id an indexed build gives its first row: 0, unless the tests'
+/// `RowIdBase` hook offsets the ids — past `u32::MAX`, so a handful of
+/// quads carry ids a 32-bit width cannot hold, or close to [`RowId::MAX`],
+/// so the refusal of an id past the last one is reachable. Every reader
+/// takes the base off again ([`base_row`]).
 #[inline]
-fn row_limit() -> u64 {
+fn row_id_base() -> RowId {
     #[cfg(test)]
     {
-        crate::store::test_hooks::row_limit()
+        crate::store::test_hooks::row_id_base()
     }
     #[cfg(not(test))]
     {
-        MAX_INDEXED_ROWS
+        0
     }
+}
+
+/// The most quads an indexed build numbers: one per row id below
+/// [`RowId::MAX`] from the base on, which no store reaches — but the builds
+/// count against it with checked arithmetic all the same, through
+/// [`check_indexed_rows`] or, row by row, [`next_row_id`], so that a row id
+/// is refused rather than wrapped onto row 0.
+#[inline]
+fn row_limit() -> u64 {
+    RowId::MAX - row_id_base()
 }
 
 /// `n` with thousands separators, as the refusal spells the limit.
@@ -90,12 +94,12 @@ fn with_separators(n: u64) -> String {
     out
 }
 
-/// A build's refusal of a store past the row limit; `rows`, when known, is
-/// how many quads it would hold.
+/// A build's refusal of a store whose row ids would run past the last one;
+/// `rows`, when known, is how many quads it would hold.
 fn too_many_rows(rows: Option<u64>) -> VortexRdfError {
     VortexRdfError::Serialization(format!(
-        "the store would exceed {} quads{}, which this version of vortex-rdf cannot hold in a \
-         store with secondary indexes: an index child records each row id as a u32",
+        "the store would exceed {} quads{}, the most a store with secondary indexes can \
+         number: an index child records each row id as a u64, and no id is wrapped",
         with_separators(row_limit()),
         rows.map(|n| format!(" ({} quads)", with_separators(n)))
             .unwrap_or_default()
@@ -103,7 +107,8 @@ fn too_many_rows(rows: Option<u64>) -> VortexRdfError {
 }
 
 /// Refuse to index `rows` quads past the row limit — the check every
-/// in-memory index build runs before it assigns a row id.
+/// in-memory index build runs before it assigns a row id, which is what
+/// lets [`row_id`] number the rows unchecked.
 pub(crate) fn check_indexed_rows(rows: u64) -> Result<()> {
     if rows > row_limit() {
         return Err(too_many_rows(Some(rows)));
@@ -111,46 +116,69 @@ pub(crate) fn check_indexed_rows(rows: u64) -> Result<()> {
     Ok(())
 }
 
-/// Refuse to read a store whose index children address `rows` quads past
-/// the row limit — the check every open of a file and every adoption of
-/// built or serialized parts runs before it trusts a row id. The store
-/// already holds the rows (some other build wrote them), so unlike
-/// [`check_indexed_rows`] this is a read error, not a build's refusal.
-pub(crate) fn check_adopted_rows(rows: u64) -> Result<()> {
-    if rows > row_limit() {
-        return Err(VortexRdfError::Deserialization(format!(
-            "the store holds {} quads, more than this version of vortex-rdf reads: a store \
-             with secondary indexes holds at most {} quads, as an index child records each \
-             row id as a u32",
-            with_separators(rows),
-            with_separators(row_limit()),
-        )));
-    }
-    Ok(())
-}
-
 /// The id of the next row of an indexed build that has numbered `assigned`
 /// rows so far, counting it — the checked increment of a build that numbers
 /// rows as they stream past and cannot know the count up front. The refusal
-/// comes at the first row past the row limit, before any id wraps. Compiled
-/// where its one caller, the out-of-core builder, is.
+/// comes at the first row past the row limit, before any id wraps, and
+/// leaves the count as it was. Compiled where its one caller, the
+/// out-of-core builder, is.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) fn next_row_id(assigned: &mut u64) -> Result<u32> {
+pub(crate) fn next_row_id(assigned: &mut u64) -> Result<RowId> {
     if *assigned >= row_limit() {
         return Err(too_many_rows(None));
     }
-    // Below the limit, which fits a u32.
-    let rid = *assigned as u32;
+    // Below the limit, so neither sum overflows.
+    let rid = row_id_base() + *assigned;
     *assigned += 1;
     Ok(rid)
 }
 
 /// Row `i`'s id as an index child records it, for `i` below a row count
 /// [`check_indexed_rows`] admitted — the in-memory index builds' numbering.
-/// The check comes first on every path that reaches here, so a failing
-/// conversion is a broken invariant, never a silent wrap.
-pub(crate) fn row_id(i: usize) -> u32 {
-    u32::try_from(i).expect("index builds refuse more than u32::MAX rows before numbering any")
+/// The check comes first on every path that reaches here, so a sum past
+/// [`RowId::MAX`] is a broken invariant, never a silent wrap.
+pub(crate) fn row_id(i: usize) -> RowId {
+    // A usize is at most 64 bits wide on every target: the cast is exact.
+    let row = i as RowId;
+    row_id_base()
+        .checked_add(row)
+        .expect("index builds refuse a store whose row ids would run past RowId::MAX")
+}
+
+/// The base row the row id `rid` an index child recorded names: the id
+/// itself — less the tests' `RowIdBase` offset under that hook, which must
+/// be the one the store was built under.
+#[inline]
+pub(crate) fn base_row(rid: RowId) -> RowId {
+    #[cfg(test)]
+    {
+        rid.checked_sub(row_id_base())
+            .expect("a row id read under the RowIdBase hook was written under it")
+    }
+    #[cfg(not(test))]
+    {
+        rid
+    }
+}
+
+/// The base row `row` as an `I` position, refused when `I` cannot hold it:
+/// a row past what the index type addresses is past every row any base of
+/// that width holds, so it is out of range — never narrowed onto another
+/// row. [`row_index`] is the `usize` form every reader uses; this one is
+/// generic so that the 32-bit case (wasm) is testable on any host.
+pub(crate) fn index_of<I: TryFrom<RowId>>(row: RowId) -> Result<I> {
+    I::try_from(row).map_err(|_| {
+        VortexRdfError::Deserialization(format!(
+            "an index child names row {row}, past the rows this platform addresses"
+        ))
+    })
+}
+
+/// The base row `row` as a `usize` position ([`index_of`]): exact on a
+/// 64-bit target; on a 32-bit one, an error for a row past `usize::MAX`.
+#[inline]
+pub(crate) fn row_index(row: RowId) -> Result<usize> {
+    index_of(row)
 }
 
 /// A secondary index, built as its own sorted children beside the primary
@@ -171,7 +199,7 @@ pub enum IndexType {
     ///
     /// Adds two children beside the quad rows, each a `{s, p, o, g, rid}`
     /// table (`VarBin<Utf8>` term strings, or u64 codes under the Dictionary
-    /// layout; `rid` always `u32`):
+    /// layout; `rid` always a u64 [`RowId`](crate::store::RowId)):
     /// - `index:posg`: the quads sorted by (p, o, s, g)
     /// - `index:ospg`: the quads sorted by (o, s, p, g)
     ///
@@ -189,8 +217,8 @@ pub enum IndexType {
     ///
     /// Adds two children beside the quad rows, each a `{val, rid}` table:
     /// - `index:ref-o`: object values sorted (`VarBin<Utf8>`; u64 codes under
-    ///   the Dictionary layout), paired with the primary row id (`u32`) each
-    ///   came from
+    ///   the Dictionary layout), paired with the primary row id (a u64
+    ///   [`RowId`](crate::store::RowId)) each came from
     /// - `index:ref-p`: the same for predicate values
     ///
     /// Enables binary-search routing in `match_pattern` for predicate-only and

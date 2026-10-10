@@ -442,11 +442,10 @@ async fn codes_past_u32_round_trip_through_a_file() {
     let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, indexes()).await;
 
     // The wire: every code column of the quad table and of the index
-    // children is a non-nullable u64; row ids stay u32.
+    // children is a non-nullable u64, and so is every row id.
     let bytes = std::fs::read(&path).unwrap();
     let (_, components) = crate::io::container::store_metadata_of_bytes(&bytes);
     let u64_dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
-    let u32_dtype = DType::Primitive(PType::U32, Nullability::NonNullable);
     let indexes_seen = components
         .iter()
         .filter(|c| c.name.starts_with("index:"))
@@ -455,12 +454,7 @@ async fn codes_past_u32_round_trip_through_a_file() {
                 panic!("{} is a struct", component.name);
             };
             for (name, dtype) in fields.names().iter().zip(fields.fields()) {
-                let want = if name.as_ref() == "rid" {
-                    &u32_dtype
-                } else {
-                    &u64_dtype
-                };
-                assert_eq!(&dtype, want, "{}.{name}", component.name);
+                assert_eq!(dtype, u64_dtype, "{}.{name}", component.name);
             }
         })
         .count();

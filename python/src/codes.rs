@@ -449,9 +449,9 @@ fn code_buffer(obj: &Bound<'_, PyAny>) -> PyResult<Buffer<u64>> {
 /// One matched term-code column — or a kernel's row indices or counts —
 /// exposed to Python zero-copy through the buffer protocol:
 /// `memoryview(col).cast("Q")` views the Rust memory directly, one native-
-/// endian u64 per value. Codes are u64 ([`TermCode`]), so a dictionary of
-/// more than 2**32 terms hands its codes across unchanged. The column is
-/// read-only and owns (refcounts) its backing buffer.
+/// endian u64 per value. Codes are u64 ([`TermCode`]), so every code crosses
+/// whole, never narrowed. The column is read-only and owns (refcounts) its
+/// backing buffer.
 ///
 /// The column kernels ([`distinct`](Self::distinct),
 /// [`value_counts`](Self::value_counts), [`take`](Self::take),

@@ -408,11 +408,11 @@ fn raw_vec_stream(
 /// The row ids of an index child, which a deduplicated build numbers
 /// `0..rows` with each exactly once — so the `(value, row id)` records are
 /// unique because their ids are, and none describes a row that was dropped.
-fn child_row_ids(component: &crate::store::indexes::IndexComponent) -> Vec<u32> {
+fn child_row_ids(component: &crate::store::indexes::IndexComponent) -> Vec<crate::store::RowId> {
     let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
     let rid: PrimitiveArray =
         crate::store::array::field_as(component.rows().unwrap(), "rid", &mut ctx).unwrap();
-    rid.as_slice::<u32>().to_vec()
+    rid.as_slice::<crate::store::RowId>().to_vec()
 }
 
 fn assert_children_describe_exactly(built: &BuiltArray, rows: usize, who: &str) {
@@ -422,7 +422,7 @@ fn assert_children_describe_exactly(built: &BuiltArray, rows: usize, who: &str) 
         ids.sort_unstable();
         assert_eq!(
             ids,
-            (0..rows as u32).collect::<Vec<_>>(),
+            (0..rows as crate::store::RowId).collect::<Vec<_>>(),
             "{who}: {} child row ids are the deduplicated rows, once each",
             component.name
         );

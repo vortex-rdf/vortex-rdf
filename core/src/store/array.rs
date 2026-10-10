@@ -14,7 +14,7 @@
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::schema;
-use crate::store::schema::{CODE_PTYPE, TermCode};
+use crate::store::schema::CODE_PTYPE;
 
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::varbinview::BinaryView;
@@ -274,11 +274,12 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
     )
 }
 
-/// Compress a built struct's integer columns — the [`TermCode`] code
-/// columns and the `u32` row-id columns — into probe-supported encodings,
-/// in place of the canonical primitives the builders emit —
-/// the construction half of the store's compressed-resident form (the
-/// adoption half is [`with_searchable_int_children`]).
+/// Compress a built struct's integer columns — the `u64` code columns
+/// ([`TermCode`](schema::TermCode)) and row-id columns
+/// ([`RowId`](schema::RowId)) — into probe-supported encodings, in place of
+/// the canonical primitives the builders emit — the construction half of the
+/// store's compressed-resident form (the adoption half is
+/// [`with_searchable_int_children`]).
 ///
 /// Every encoding chosen here is one an encoded search probe resolves, so
 /// the match fast paths keep binding the column; the choice is made from
@@ -336,8 +337,9 @@ pub(crate) fn with_compressed_int_children(rows: ArrayRef, payload_lazy: bool) -
     )
 }
 
-/// A base child as a canonical non-nullable code primitive ([`TermCode`]),
-/// zero-copy where one exists: a canonical column directly, a `vortex.shared` wrapper via its
+/// A base child as a canonical non-nullable code primitive
+/// ([`TermCode`](schema::TermCode)), zero-copy where one exists: a canonical
+/// column directly, a `vortex.shared` wrapper via its
 /// one-way cache — the first call decodes the compressed source into the
 /// cache, every later call is a refcount bump shared by all views over the
 /// base. `None` for any other encoding (callers fall back to the gather
@@ -388,8 +390,9 @@ pub(crate) fn cached_code_primitive(
     canonical_code(shared.current_array_ref())
 }
 
-/// A non-nullable canonical code primitive ([`TermCode`]), or `None` for
-/// anything else — the shape both `*_code_primitive` accessors hand back.
+/// A non-nullable canonical code primitive ([`TermCode`](schema::TermCode)),
+/// or `None` for anything else — the shape both `*_code_primitive` accessors
+/// hand back.
 fn canonical_code(arr: &ArrayRef) -> Option<vortex_array::arrays::PrimitiveArray> {
     use vortex_array::arrays::Primitive;
 
@@ -401,8 +404,8 @@ fn canonical_code(arr: &ArrayRef) -> Option<vortex_array::arrays::PrimitiveArray
 }
 
 /// One child column's compressed form, or `None` for a column this helper
-/// leaves alone (not a `u32` or [`TermCode`] column, nullable, or an
-/// encoding that is already not a canonical primitive).
+/// leaves alone (not a `u64` code or row-id column, nullable, or an encoding
+/// that is already not a canonical primitive).
 ///
 /// A chunked column is compressed chunk by chunk and reassembled, which is
 /// what makes the compressed-resident form reach builds above
@@ -449,51 +452,23 @@ fn compress_int_child(
     let Ok(prim) = child.clone().try_downcast::<Primitive>() else {
         return Ok(None);
     };
-    match prim.ptype() {
-        vortex_array::dtype::PType::U32 => Ok(Some(compress_int_column(
-            &prim,
-            prim.as_slice::<u32>(),
-            sorted,
-            ctx,
-        )?)),
-        CODE_PTYPE => Ok(Some(compress_int_column(
-            &prim,
-            prim.as_slice::<TermCode>(),
-            sorted,
-            ctx,
-        )?)),
-        _ => Ok(None),
+    // Neither a code nor a row id; both are u64 wide.
+    if prim.ptype() != CODE_PTYPE && prim.ptype() != schema::ROW_ID_PTYPE {
+        return Ok(None);
     }
-}
-
-/// An unsigned width [`compress_int_column`] chooses an encoding for: the
-/// `u32` row ids and the [`TermCode`] codes.
-trait PackedWidth: Copy + Ord + Into<vortex_array::scalar::Scalar> {
-    /// Bits in the type.
-    const BITS: u32;
-    /// Leading zero bits of the value.
-    fn leading_zeros(self) -> u32;
-}
-
-impl PackedWidth for u32 {
-    const BITS: u32 = u32::BITS;
-    fn leading_zeros(self) -> u32 {
-        u32::leading_zeros(self)
-    }
-}
-
-impl PackedWidth for TermCode {
-    const BITS: u32 = TermCode::BITS;
-    fn leading_zeros(self) -> u32 {
-        TermCode::leading_zeros(self)
-    }
+    Ok(Some(compress_int_column(
+        &prim,
+        prim.as_slice::<u64>(),
+        sorted,
+        ctx,
+    )?))
 }
 
 /// One column's encoding choice; see [`with_compressed_int_children`].
-/// `values` is `prim`'s slice at its own width.
-fn compress_int_column<T: PackedWidth>(
+/// `values` is `prim`'s slice.
+fn compress_int_column(
     prim: &vortex_array::arrays::PrimitiveArray,
-    values: &[T],
+    values: &[u64],
     sorted: bool,
     ctx: &mut vortex_array::ExecutionCtx,
 ) -> Result<ArrayRef> {
@@ -528,8 +503,8 @@ fn compress_int_column<T: PackedWidth>(
         return Ok(re.into_array());
     }
     // At most 64, so the narrowing to u8 is exact.
-    let bit_width = (T::BITS - max.leading_zeros()).max(1) as u8;
-    if u32::from(bit_width) >= T::BITS {
+    let bit_width = (u64::BITS - max.leading_zeros()).max(1) as u8;
+    if u32::from(bit_width) >= u64::BITS {
         return Ok(prim.clone().into_array());
     }
     let packed = BitPacked::encode(&prim.clone().into_array(), bit_width, ctx)

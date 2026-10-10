@@ -58,7 +58,7 @@ pub use store::columns;
 
 pub use store::{
     BuiltArray, BuiltStream, CaseMap, ChunkStream, DictReader, DictSnapshot, DictionaryQuadSink,
-    IndexType, Indexes, Keep, KindRanges, LayoutStrategy, NumOp, Probe, QuadColumn, RawQuad,
+    IndexType, Indexes, Keep, KindRanges, LayoutStrategy, NumOp, Probe, QuadColumn, RawQuad, RowId,
     SharedQuad, SortedInMemoryBuilder, StoreParts, TermCode, TermPredicate, TextOptions, Verdict,
     VortexArrayBuilder, VortexRdfStore, export_rdf,
 };

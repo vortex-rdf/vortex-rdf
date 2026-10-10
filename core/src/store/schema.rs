@@ -29,6 +29,19 @@ pub type TermCode = u64;
 /// file this crate never wrote and is refused at open.
 pub(crate) const CODE_PTYPE: PType = PType::U64;
 
+/// A row id: a quad's position in the quad table — the value of every index
+/// child's `rid` column ([`COL_RID`](crate::store::indexes::COL_RID)), which
+/// is how an index names the rows it matched, and the currency a match's
+/// row selection, tombstones and further matches share without renumbering
+/// anything. 64 bits wide, so a store with secondary indexes may hold more
+/// quads than a `u32` can count.
+pub type RowId = u64;
+
+/// The primitive type of a row-id column on the wire: non-nullable `u64`
+/// ([`RowId`]). An index child whose `rid` column is an integer of any other
+/// width is a file this crate never wrote and is refused at open.
+pub(crate) const ROW_ID_PTYPE: PType = PType::U64;
+
 /// Whether a column named `name` holds term codes where it is an integer:
 /// the quad table's and the copy index children's `s`, `p`, `o`, `g`, and
 /// the reference index children's `val`. Under the string layouts the same

@@ -335,21 +335,23 @@ in a file as an auxiliary child.
 
 Term columns use the layout's encoding — strings under `Default` and
 `TypedObject` (a `TypedObject` object is recomposed to its full N-Triples term
-for the index), `u64` codes under `Dictionary` — and `rid` is always the `u32`
-position of the quad in the sorted primary rows.
+for the index), `u64` codes under `Dictionary` — and `rid` is always the `u64`
+position of the quad in the sorted primary rows
+([`RowId`](../core/src/store/schema.rs#L38)).
 
-**At most `u32::MAX` quads.** A `u32` row id numbers at most `u32::MAX` rows
-([`MAX_INDEXED_ROWS`](../core/src/store/indexes/mod.rs#L64)), so a store with
-indexes is refused past that wherever ids are numbered or trusted, instead of
-letting one wrap:
+**Row ids never wrap.** A `u64` row id numbers more rows than any store holds,
+so row ids do not limit a store. Every build still numbers rows with checked
+arithmetic and refuses a store whose ids would run past the last one, rather
+than let an id wrap onto row 0:
 
 | Where | Check | Refusal |
 |---|---|---|
-| in-memory builds, compaction's in-memory rebuild, `to_bytes` of a store with a tail | the row count, before any id is assigned ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L107)) | `Serialization`: the store *would exceed* `u32::MAX` quads |
-| the out-of-core merge, a file-backed compaction | each row as the merge numbers it ([`next_row_id`](../core/src/store/indexes/mod.rs#L136)); a refused file build leaves no file | the same |
-| opening a file (mapped or loaded), `from_bytes`, adopting parts (`from_parts`, `from_built`) | the quad rows the index children address ([`check_adopted_rows`](../core/src/store/indexes/mod.rs#L119)) | `Deserialization`: the store *holds* more quads than this version reads |
+| in-memory builds, compaction's in-memory rebuild, `to_bytes` of a store with a tail | the row count, before any id is assigned ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L112)) | `Serialization`: the store *would exceed* `u64::MAX` quads |
+| the out-of-core merge, a file-backed compaction | each row as the merge numbers it ([`next_row_id`](../core/src/store/indexes/mod.rs#L126)); a refused file build leaves no file | the same |
 
-A store without indexes numbers no rows and is not limited.
+Opening a file whose index children record row ids of another width — the
+`u32` row ids a pre-release of 0.12 wrote — is refused with a deserialization
+error that says to rebuild the store ([file-format.md §6](file-format.md#6-the-index-children)).
 
 **In memory** ([`build_components`](../core/src/store/builders/mod.rs#L234)) each
 family is a permutation of the complete sorted dataset: sort the row ids by the
@@ -474,8 +476,8 @@ A build that is queried in place, without a file, skips the writer:
 store's *compressed-resident* form
 ([`compress_built_parts`](../core/src/store/mod.rs#L162)):
 
-- every non-nullable `u64` code child and `u32` row-id child of the base
-  and of each component is re-encoded from the bounds the build already
+- every non-nullable `u64` code child and row-id child of the base and of
+  each component is re-encoded from the bounds the build already
   knows —
   `Constant` for a single-valued column, `RunEnd` for a sorted column with few
   runs, bit-packed at the observed width otherwise

@@ -595,7 +595,7 @@ async fn test_reference_index_counts_located_runs_from_width() {
 /// - the pending view the window is also taken beside keeps its own ids
 ///   unread;
 /// - a count, capped or not, asks for no id.
-async fn assert_windows_read_only_their_rows(
+pub(super) async fn assert_windows_read_only_their_rows(
     store: &VortexRdfStore,
     p: Option<&NamedNode>,
     o: Option<&Term>,

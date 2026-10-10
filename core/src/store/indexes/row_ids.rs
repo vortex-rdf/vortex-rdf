@@ -1,7 +1,8 @@
 //! Row-id acquisition for index resolutions: decoding a component's rid
-//! column into the ascending, unique `Buffer<u64>` every resolution answers
-//! in, and the file-backed readers (point reads through cached chunk probes,
-//! rid-only pushed-down scans) that produce it from an index child.
+//! column into the ascending, unique `Buffer<RowId>` of base rows every
+//! resolution answers in, and the file-backed readers (point reads through
+//! cached chunk probes, rid-only pushed-down scans) that produce it from an
+//! index child.
 
 #[cfg(feature = "file-io")]
 use std::ops::Range;
@@ -15,12 +16,13 @@ use vortex_array::expr::{Expression, and_collect, eq, get_item, lit, root, selec
 #[cfg(feature = "file-io")]
 use vortex_array::scalar::Scalar;
 use vortex_array::{ArrayRef, VortexSessionExecute};
-use vortex_buffer::Buffer;
+use vortex_buffer::{Buffer, BufferMut};
 
 #[cfg(feature = "file-io")]
 use super::{FileServePlan, IndexResolution, ResolvedRoles, ResolvedRowIds};
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
+use crate::store::schema::{ROW_ID_PTYPE, RowId};
 
 /// The conjunction of `column == value` equalities over root fields — the
 /// filter shape every pushed-down index probe and serve scan uses. `None`
@@ -86,12 +88,13 @@ pub(crate) async fn rid_point_reads(
     component: &str,
     rid_column: &str,
     range: Range<u64>,
-) -> Result<Option<Buffer<u64>>> {
+) -> Result<Option<Buffer<RowId>>> {
     let Some(chunks) = file.component_column_chunks(component, rid_column) else {
         return Ok(None);
     };
     let source = file.segment_source();
     let session = file.session();
+    // A point-read run is at most `POINT_GATHER_MAX_ROWS` wide.
     let mut ids = Vec::with_capacity((range.end - range.start) as usize);
     for row in range {
         match chunks
@@ -99,49 +102,64 @@ pub(crate) async fn rid_point_reads(
             .await
             .map_err(VortexRdfError::Vortex)?
         {
-            Some(rid) => ids.push(rid),
+            Some(rid) => ids.push(super::base_row(rid)),
             None => return Ok(None),
         }
     }
     ids.sort_unstable();
+    check_addressable(&ids)?;
     Ok(Some(Buffer::from(ids)))
 }
 
-/// Decode a row-id column into the ascending, unique `Buffer<u64>` every index
-/// resolution answers in.
+/// Decode a row-id column into the ascending, unique `Buffer<RowId>` every
+/// index resolution answers in: the base rows its ids name ([`base_row`]).
 ///
 /// Sorting is required, not incidental: the ids come out in the index's own
 /// order, and both `Selection::IncludeByIndex` and the selection algebra need
 /// them ascending. They are unique by construction (each index row references
 /// one quad row), so sorting alone suffices.
-pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<u64>> {
+///
+/// [`base_row`]: super::base_row
+pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<RowId>> {
     use vortex_array::builtins::ArrayBuiltins;
-    use vortex_array::dtype::{Nullability, PType};
+    use vortex_array::dtype::Nullability;
 
     if row_id_column.is_empty() {
         return Ok(Buffer::empty());
     }
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
+    // A no-op cast for the u64 column every writer here produces.
     let ids = row_id_column
-        .cast(DType::Primitive(PType::U64, Nullability::NonNullable))
+        .cast(DType::Primitive(ROW_ID_PTYPE, Nullability::NonNullable))
         .map_err(VortexRdfError::Vortex)?
         .execute::<PrimitiveArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)?
-        .into_buffer::<u64>();
+        .into_buffer::<RowId>();
 
     // The freshly-executed buffer is normally uniquely owned, so the sort
     // runs in place with no copy; a shared buffer (someone else still holds
     // the execution's output) falls back to one copy.
-    match ids.try_into_mut() {
-        Ok(mut ids) => {
-            ids.as_mut_slice().sort_unstable();
-            Ok(ids.freeze())
-        }
-        Err(ids) => {
-            let mut sorted = ids.as_slice().to_vec();
-            sorted.sort_unstable();
-            Ok(Buffer::from(sorted))
-        }
+    let mut ids = match ids.try_into_mut() {
+        Ok(ids) => ids,
+        Err(ids) => BufferMut::copy_from(ids.as_slice()),
+    };
+    #[cfg(test)]
+    for id in ids.as_mut_slice() {
+        *id = super::base_row(*id);
+    }
+    ids.as_mut_slice().sort_unstable();
+    check_addressable(&ids)?;
+    Ok(ids.freeze())
+}
+
+/// Refuse ascending base rows `ids` whose last one a `usize` cannot hold —
+/// on a 32-bit target (wasm) a row id past `u32::MAX`, which no base there
+/// holds — so that every later use of an id as a position is exact rather
+/// than narrowed onto another row.
+fn check_addressable(ids: &[RowId]) -> Result<()> {
+    match ids.last() {
+        Some(&last) => super::row_index(last).map(|_| ()),
+        None => Ok(()),
     }
 }
 
@@ -163,7 +181,7 @@ pub(crate) async fn scan_index_row_ids(
     rid_column: &'static str,
     memo: &crate::store::native_file::BoundExprMemo,
     scope: &'static str,
-) -> Result<Buffer<u64>> {
+) -> Result<Buffer<RowId>> {
     // Every index probes at least one value column; an empty constraint set
     // would mean "all rows", which no resolver asks for.
     let Some(filter) = eq_conjunction(value_constraints.iter().cloned()) else {
@@ -196,7 +214,7 @@ pub(crate) async fn scan_located_row_ids(
     range: Range<u64>,
     memo: &crate::store::native_file::BoundExprMemo,
     scope: &'static str,
-) -> Result<Buffer<u64>> {
+) -> Result<Buffer<RowId>> {
     read_scanned_row_ids(
         rid_scan(reader, rid_column, memo, scope)?.with_row_range(range),
         rid_column,
@@ -220,7 +238,7 @@ pub(crate) async fn read_located_rids(
     rid_column: &'static str,
     range: Range<u64>,
     scope: &'static str,
-) -> Result<Buffer<u64>> {
+) -> Result<Buffer<RowId>> {
     debug_assert!(
         range.start < range.end,
         "an empty run or window reads nothing: its caller does not ask"
@@ -261,7 +279,7 @@ fn rid_scan(
 async fn read_scanned_row_ids(
     scan: vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>,
     rid_column: &'static str,
-) -> Result<Buffer<u64>> {
+) -> Result<Buffer<RowId>> {
     let arr = crate::store::scan::file_scan::read_all_rows(scan).await?;
 
     if arr.is_empty() {
@@ -310,14 +328,15 @@ mod tests {
     use vortex_array::IntoArray;
 
     #[test]
-    fn sorted_row_ids_casts_and_sorts() {
-        // A u32 rid column comes back as ascending u64 ids.
-        let column = PrimitiveArray::from_iter([5u32, 1, 3]).into_array();
+    fn sorted_row_ids_sorts_whole_ids() {
+        // A rid column comes back as ascending ids, past u32::MAX unchanged.
+        let wide: RowId = 1 << 32;
+        let column = PrimitiveArray::from_iter([wide + 5, 1, wide, 3]).into_array();
         let ids = sorted_row_ids(column).unwrap();
-        assert_eq!(ids.as_slice(), &[1u64, 3, 5]);
+        assert_eq!(ids.as_slice(), &[1, 3, wide, wide + 5]);
 
         // An empty column short-circuits to an empty buffer.
-        let empty = PrimitiveArray::from_iter(std::iter::empty::<u32>()).into_array();
+        let empty = PrimitiveArray::from_iter(std::iter::empty::<RowId>()).into_array();
         assert!(sorted_row_ids(empty).unwrap().is_empty());
     }
 }

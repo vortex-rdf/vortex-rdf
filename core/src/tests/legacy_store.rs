@@ -15,6 +15,7 @@
 //! without a binary fixture.
 
 use super::*;
+use crate::store::RowId;
 use crate::store::array::{StrColReader, field_as};
 use crate::store::builders::sorted_stream;
 use vortex_array::VortexSessionExecute as _;
@@ -242,7 +243,7 @@ enum Val {
 }
 
 /// A reference child's rows as `(val, rid)` pairs, in file order.
-fn reference_child(component: &crate::store::indexes::IndexComponent) -> Vec<(Val, u32)> {
+fn reference_child(component: &crate::store::indexes::IndexComponent) -> Vec<(Val, RowId)> {
     let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
     let rows = component.rows().unwrap();
     let rid: PrimitiveArray = field_as(rows, "rid", &mut ctx).unwrap();
@@ -261,7 +262,7 @@ fn reference_child(component: &crate::store::indexes::IndexComponent) -> Vec<(Va
             .collect()
     };
     vals.into_iter()
-        .zip(rid.as_slice::<u32>().iter().copied())
+        .zip(rid.as_slice::<RowId>().iter().copied())
         .collect()
 }
 
@@ -303,11 +304,11 @@ async fn test_a_0_12_build_gives_the_guarantees_the_refusal_protects() {
                 pairs.windows(2).all(|pair| pair[0] < pair[1]),
                 "{who}: children are in (val, rid) order, each record once"
             );
-            let mut rids: Vec<u32> = pairs.iter().map(|(_, rid)| *rid).collect();
+            let mut rids: Vec<RowId> = pairs.iter().map(|(_, rid)| *rid).collect();
             rids.sort_unstable();
             assert_eq!(
                 rids,
-                (0..24).collect::<Vec<u32>>(),
+                (0..24).collect::<Vec<RowId>>(),
                 "{who}: each row id once"
             );
             checked += 1;

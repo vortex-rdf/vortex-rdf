@@ -360,7 +360,7 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
                 .unwrap(),
         );
         for (family_ix, family) in [CopyFamily::Posg, CopyFamily::Ospg].into_iter().enumerate() {
-            let mut keys: Vec<(CopyKey<String>, u32)> = rows
+            let mut keys: Vec<(CopyKey<String>, crate::store::RowId)> = rows
                 .iter()
                 .enumerate()
                 .map(|(i, q)| {
@@ -369,7 +369,7 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
                         CopyFamily::Posg => CopyKey::posg(&spog),
                         CopyFamily::Ospg => CopyKey::ospg(spog),
                     };
-                    (key, (n * 4 + i) as u32)
+                    (key, (n * 4 + i) as crate::store::RowId)
                 })
                 .collect();
             keys.sort_unstable();
@@ -909,6 +909,126 @@ async fn test_open_refuses_code_columns_narrower_than_u64() {
             index_child,
             "the index:ref-o column val holds u32 term codes",
         ),
+    ] {
+        let (from_bytes, from_file) = open_both(&bytes).await;
+        for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
+            let err = result.err().expect("open should fail");
+            assert!(
+                err.to_string().contains(want),
+                "{path}: unexpected error: {err}"
+            );
+            assert!(err.to_string().contains("rebuild"), "{path}: {err}");
+        }
+    }
+}
+
+/// Row-id columns narrower than [`RowId`](crate::store::RowId) — the u32
+/// row ids a pre-release of 0.12 wrote — are refused by both readers, with
+/// an error naming the child, the column and its width: in a reference and
+/// a copy child beside u64 codes, and in a reference child of the Default
+/// layout, whose values are strings.
+#[tokio::test]
+async fn test_open_refuses_row_ids_narrower_than_u64() {
+    use crate::store::layouts::dictionary::TermDictionary;
+    use vortex_array::IntoArray as _;
+    use vortex_array::arrays::{StructArray, VarBinViewArray};
+    use vortex_array::validity::Validity;
+    use vortex_buffer::Buffer;
+
+    let dict = TermDictionary::from_sorted_column(VarBinViewArray::from_iter_str([
+        "<http://example.org/a>",
+    ]))
+    .unwrap();
+    // One index child of `columns` (the last one a u32 `rid`) under `name`.
+    let child = |name: &str, slug: &str, columns: Vec<(&'static str, vortex_array::ArrayRef)>| {
+        let (names, arrays): (Vec<&str>, Vec<vortex_array::ArrayRef>) = columns.into_iter().unzip();
+        let rows = StructArray::try_new(names.as_slice().into(), arrays, 1, Validity::NonNullable)
+            .unwrap()
+            .into_array();
+        container::NativeComponentWrite::new(
+            container::StoreComponentDescriptor {
+                name: name.into(),
+                role: container::StoreComponentRole::Index,
+                implementation: slug.into(),
+                version: 1,
+                required: false,
+                sorted: true,
+                dtype: rows.dtype().clone(),
+            },
+            std::sync::Arc::new(container::BufferedComponentSource::try_new(vec![rows]).unwrap()),
+            container::default_child_strategy(),
+        )
+        .unwrap()
+    };
+    let code = || Buffer::from_iter([0u64]).into_array();
+    let rid = || Buffer::from_iter([0u32]).into_array();
+
+    let dictionary_ref = unstamped_store_bytes(
+        vec![bare_code_quad_array(&[0])],
+        vec![
+            dict.to_write().unwrap(),
+            child(
+                "index:ref-o",
+                "secondary-by-reference/o",
+                vec![("val", code()), ("rid", rid())],
+            ),
+        ],
+    )
+    .await;
+    let dictionary_copy = unstamped_store_bytes(
+        vec![bare_code_quad_array(&[0])],
+        vec![
+            dict.to_write().unwrap(),
+            child(
+                "index:posg",
+                "secondary-by-copy/posg",
+                vec![
+                    ("s", code()),
+                    ("p", code()),
+                    ("o", code()),
+                    ("g", code()),
+                    ("rid", rid()),
+                ],
+            ),
+        ],
+    )
+    .await;
+    let raw = crate::store::RawQuad::canonical(
+        "<http://example.org/a>",
+        "<http://example.org/a>",
+        "<http://example.org/a>",
+        "",
+    )
+    .unwrap();
+    let default_ref = unstamped_store_bytes(
+        vec![
+            crate::store::builders::build_struct_array(&[raw], LayoutStrategy::Default, true)
+                .unwrap(),
+        ],
+        vec![child(
+            "index:ref-o",
+            "secondary-by-reference/o",
+            vec![
+                (
+                    "val",
+                    VarBinViewArray::from_iter_str(["<http://example.org/a>"]).into_array(),
+                ),
+                ("rid", rid()),
+            ],
+        )],
+    )
+    .await;
+
+    for (bytes, want) in [
+        (
+            dictionary_ref,
+            "the index:ref-o column rid holds u32 row ids",
+        ),
+        (
+            dictionary_copy,
+            "the index:posg column rid holds u32 row ids",
+        ),
+        (default_ref, "the index:ref-o column rid holds u32 row ids"),
     ] {
         let (from_bytes, from_file) = open_both(&bytes).await;
         for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {

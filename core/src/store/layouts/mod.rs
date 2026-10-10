@@ -118,7 +118,7 @@ pub enum LayoutStrategy {
     ///
     /// Every requested [`IndexType`] builds its usual children, except that
     /// their term-valued columns hold codes instead of strings; the row-id
-    /// columns are `u32` under every layout.
+    /// columns are `u64` ([`RowId`](crate::store::RowId)) under every layout.
     ///
     /// [`IndexType`]: crate::store::indexes::IndexType
     Dictionary,
@@ -165,7 +165,7 @@ impl LayoutStrategy {
             // Code columns mean Dictionary; the dictionary itself rides
             // outside the schema, as the native container's dictionary child.
             // Another integer width is no layout of this crate's: the open
-            // refuses it (`check_code_columns`) before anything reads it.
+            // refuses it (`check_id_columns`) before anything reads it.
             if matches!(fields.field(COL_S), Some(DType::Primitive(ptype, _)) if ptype == CODE_PTYPE)
             {
                 return LayoutStrategy::Dictionary;

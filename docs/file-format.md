@@ -139,7 +139,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
       "required": false, "sorted": true,
       "fields": [ { "name": "s", "kind": "u64" }, { "name": "p", "kind": "u64" },
                   { "name": "o", "kind": "u64" }, { "name": "g", "kind": "u64" },
-                  { "name": "rid", "kind": "u32" } ] },
+                  { "name": "rid", "kind": "u64" } ] },
     { "name": "dictionary", "role": "dictionary",
       "implementation": "sorted-terms-fsst-v1", "version": 2,
       "required": true, "sorted": true,
@@ -176,14 +176,15 @@ the store was built with ([serialization.md §7](serialization.md#7-columns-per-
 A reader detects the layout from the dtype alone: a `u64` subject column means
 `Dictionary`, an `o_kind` field means `TypedObject`, otherwise `Default`. A
 code column of any other integer width — the `u32` codes a pre-release of 0.12
-wrote — is refused at open, in the quad table and in the index children alike:
-rebuild such a store from its RDF source.
+wrote — is refused at open, in the quad table and in the index children alike,
+and so is an index child's row-id column of any width but `u64`
+([§6](#6-the-index-children)): rebuild such a store from its RDF source.
 
 | Layout | Columns | Each term is… |
 |---|---|---|
 | `Default` | `s`, `p`, `o`, `g` — non-nullable `Utf8` | its N-Triples spelling: `<iri>`, `_:id`, `"lit"`, `"lit"@lang`, `"lit"^^<dt>`; `g` is `""` for the default graph |
 | `TypedObject` | `s`, `p`, `o_kind` (`u8`), `o_value` (`Utf8`), `o_datatype` (nullable `Utf8`), `o_lang` (nullable `Utf8`), `g` | as `Default`, with the object split: kind 0 IRI, 1 blank node, 2 plain literal, 3 language-tagged, 4 typed |
-| `Dictionary` | `s`, `p`, `o`, `g` — non-nullable `u64` | a code: the term's position in the sorted `dictionary` child. 64 bits, so the code width no longer limits a store; the writer still bit-packs each column to the width its codes need. What limits one today: a dictionary build holds at most `i32::MAX` terms ([§5](#5-the-dictionary-child)), and a store with secondary indexes at most `u32::MAX` quads ([§6](#6-the-index-children)) |
+| `Dictionary` | `s`, `p`, `o`, `g` — non-nullable `u64` | a code: the term's position in the sorted `dictionary` child. 64 bits, so the code width no longer limits a store, and neither does the row-id width of the index children ([§6](#6-the-index-children)); the writer still bit-packs each column to the width its codes need. What limits one today: a dictionary build holds at most `i32::MAX` terms ([§5](#5-the-dictionary-child)) |
 
 **Row order.** Every writer of this crate emits the rows in `(s, p, o, g)`
 order — string order under the string layouts, code order under `Dictionary`,
@@ -228,7 +229,7 @@ What the store reads from this structure:
 - the **zone-map tables** for pruning: a pushed-down filter is evaluated
   against every block's statistics first, and the surviving blocks' envelope
   bounds the scan ([matching.md §7.2](matching.md#72-zone-map-pruning));
-- the **chunk leaves** of the `u64` code columns as *chunk probes*
+- the **chunk leaves** of the `u64` code and row-id columns as *chunk probes*
   ([`ColumnChunks`](../encoded-search/src/layout.rs)): a leaf's segment is
   fetched and its array rebuilt in the wire encoding — not decompressed — and
   then binary-searched or point-read in place. A column the writer
@@ -315,16 +316,19 @@ Shared rules:
 
 - **Term encoding follows the layout**: `Utf8` strings under `Default` and
   `TypedObject` (a `TypedObject` object appears as its full N-Triples term),
-  `u64` codes under `Dictionary`. `rid` is always a non-nullable `u32`.
-- **A store with index children holds at most `u32::MAX` quads**
-  ([`MAX_INDEXED_ROWS`](../core/src/store/indexes/mod.rs#L64)): row ids are
-  `u32`, so this version refuses a store past that wherever ids are numbered
-  or trusted, instead of letting one wrap. A build — in memory, out of core,
-  or a compaction or serialization that rebuilds — fails with a serialization
-  error (the store *would exceed* the limit); opening a file or adopting parts
-  whose index children address more rows fails with a deserialization error
-  (the store *holds* more quads than this version reads). A store without
-  indexes numbers no rows and is not limited.
+  `u64` codes under `Dictionary`. `rid` is always a non-nullable `u64`
+  ([`RowId`](../core/src/store/schema.rs#L38)), under every layout; a child
+  whose `rid` is an integer of any other width — the `u32` row ids a
+  pre-release of 0.12 wrote — is refused at open
+  ([`check_id_columns`](../core/src/store/open.rs#L40)): rebuild such a store
+  from its RDF source.
+- **Row ids do not limit a store.** A `u64` row id numbers more rows than any
+  store holds. The builds still number rows with checked arithmetic — up
+  front for the in-memory builds
+  ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L112)), row by row
+  in the out-of-core merge ([`next_row_id`](../core/src/store/indexes/mod.rs#L126))
+  — and refuse a store whose ids would run past the last one with a
+  serialization error, rather than let an id wrap.
 - **`rid` is the quad's row id in the quad table.** That is what lets a match
   resolved through an index compose with row selections, tombstones and
   further matches without renumbering anything ([matching.md §1](matching.md#1-what-a-match-produces)).
@@ -485,7 +489,8 @@ checks:
    never `quad-source`; field kinds are `u32`, `u64` or `utf8`, all
    non-nullable. Under `Dictionary` every code column — `s`, `p`, `o`, `g`
    of the quad table and of the copy children, `val` of the reference
-   children — is `u64`.
+   children — is `u64`, and under every layout so is each index child's
+   `rid`.
 3. Terms are spelled in N-Triples form; the default graph is the empty string
    — in the quad columns, the dictionary and the index children alike.
 4. `quads_sorted: true` only when the rows are in global `(s, p, o, g)` order
@@ -517,7 +522,6 @@ open rather than being read around.
 | `STORE_METADATA_VERSION` | 1 | [`wire.rs`](../core/src/io/container/wire.rs#L18) |
 | row block / zone size | 8,192 rows | Vortex default write strategy |
 | data block target | ~1 MiB; ~2 MiB for a term-code column that does not dictionary-encode | Vortex default write strategy; [`child_strategy`](../core/src/io/container/sources.rs#L221) |
-| `MAX_INDEXED_ROWS` | `u32::MAX` quads in a store with index children | [`indexes/mod.rs`](../core/src/store/indexes/mod.rs#L64) |
 | `DICT_CHUNK_ROWS` | 65,536 terms per FSST window and leaf | [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs#L46) |
 | `DICT_MAX_RESIDENT_BYTES_DEFAULT` | 512 MiB | [`open.rs`](../core/src/store/open.rs#L108) |
 | `PROBE_CACHE_SLOTS` | 256 | [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs#L432) |
