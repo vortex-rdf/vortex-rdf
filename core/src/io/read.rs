@@ -350,9 +350,15 @@ mod tests {
             })
             .collect();
         let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
+        spawn_probe::take();
         let array = collect_scan_spawned(dtype, tasks, splits as usize)
             .await
             .unwrap();
+        assert_eq!(
+            spawn_probe::take(),
+            splits as usize,
+            "every split ran spawned, none inline"
+        );
 
         let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
         let values = array.execute::<PrimitiveArray>(&mut ctx).unwrap();
@@ -375,9 +381,111 @@ mod tests {
             })
             .collect();
         let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
+        spawn_probe::take();
         let error = collect_scan_spawned(dtype, tasks, splits as usize)
             .await
             .expect_err("the failing split fails the scan");
         assert!(error.to_string().contains("split 2 failed"), "{error}");
+        assert_eq!(
+            spawn_probe::take(),
+            splits as usize,
+            "every split ran spawned, none inline"
+        );
+    }
+
+    /// A panicking split panics the awaiting scan, as it would inline.
+    #[tokio::test]
+    async fn spawned_scan_re_raises_a_split_panic() {
+        use futures::FutureExt as _;
+
+        let splits = 4u64;
+        let tasks: Vec<_> = (0..splits)
+            .map(|i| async move {
+                if i == 2 {
+                    panic!("split 2 panicked");
+                }
+                Ok::<_, vortex_error::VortexError>(Some(
+                    PrimitiveArray::from_iter([i]).into_array(),
+                ))
+            })
+            .collect();
+        let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
+        spawn_probe::take();
+        let outcome =
+            std::panic::AssertUnwindSafe(collect_scan_spawned(dtype, tasks, splits as usize))
+                .catch_unwind()
+                .await;
+
+        let payload = outcome.expect_err("the panic reaches the awaiting scan");
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or_default();
+        assert!(message.contains("split 2 panicked"), "{message}");
+        assert_eq!(
+            spawn_probe::take(),
+            splits as usize,
+            "every split ran spawned, none inline"
+        );
+    }
+
+    /// Dropping the scan aborts the splits it spawned: a split that never
+    /// finishes is dropped with its task, not left running.
+    #[tokio::test]
+    async fn dropping_the_spawned_scan_cancels_its_splits() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Counts the split futures that are dropped.
+        struct Dropped(Arc<AtomicUsize>);
+
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let splits = 4usize;
+        let started = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let tasks: Vec<_> = (0..splits)
+            .map(|_| {
+                let (started, guard) = (started.clone(), Dropped(dropped.clone()));
+                async move {
+                    let _guard = guard;
+                    started.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                    Ok::<Option<ArrayRef>, vortex_error::VortexError>(None)
+                }
+            })
+            .collect();
+        let dtype = DType::Primitive(PType::U64, Nullability::NonNullable);
+        spawn_probe::take();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            collect_scan_spawned(dtype, tasks, splits),
+        )
+        .await
+        .expect_err("a scan of splits that never finish is still running when it is dropped");
+
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            splits,
+            "the splits were running"
+        );
+        assert_eq!(spawn_probe::take(), splits);
+        for _ in 0..100 {
+            if dropped.load(Ordering::SeqCst) == splits {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            splits,
+            "the dropped scan left its splits running"
+        );
     }
 }

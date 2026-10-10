@@ -39,9 +39,44 @@ async fn test_from_file_in_memory_loads_the_whole_store() {
         "the dictionary is resident"
     );
     assert_eq!(loaded.indexes(), &[IndexType::SecondaryByCopy]);
-    // Nothing reads the file any more.
-    std::fs::remove_file(&path).unwrap();
+    // Nothing reads the file any more: its bytes are overwritten in place, so
+    // a read of the old file (through a path, a descriptor or a mapping)
+    // would see garbage.
+    let length = std::fs::metadata(&path).unwrap().len() as usize;
+    std::fs::write(&path, vec![0xA5u8; length]).unwrap();
     assert_eq!(view_strings(&loaded).await, quad_strings(&quads));
+}
+
+/// `/proc/self/maps` is the process's own record of its mappings: a store
+/// opened with `from_file` lists its file there, a store loaded whole never
+/// does, and the mapping is gone once the store is dropped.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_from_file_is_listed_in_the_process_maps_only_while_mapped() {
+    let (_dir, path) = write_store_file(
+        dictionary_test_quads(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByReference],
+    )
+    .await;
+    let real = std::fs::canonicalize(&path).unwrap();
+    let listed = || {
+        std::fs::read_to_string("/proc/self/maps")
+            .unwrap()
+            .lines()
+            .any(|line| line.contains(real.to_str().unwrap()))
+    };
+    assert!(!listed(), "nothing has opened the file yet");
+
+    let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    assert!(!listed(), "a store loaded whole maps nothing");
+    drop(loaded);
+
+    let mapped = VortexRdfStore::from_file(&path).await.unwrap();
+    assert!(listed(), "a mapped store lists its file");
+    assert_eq!(mapped.debug_file_mapped(), Some(true));
+    drop(mapped);
+    assert!(!listed(), "the mapping goes with the store");
 }
 
 /// Compaction replaces a store file by renaming over it: the open, mapped

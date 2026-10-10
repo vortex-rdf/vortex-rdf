@@ -288,7 +288,8 @@ async fn test_write_failing_after_the_temp_file_exists_removes_it() {
 }
 
 /// Dropping the write while it is in flight — a cancelled task, a timeout —
-/// removes the temp file too, and `path` is untouched.
+/// removes the temp file too, and `path` is untouched. The temp file is seen
+/// to exist while the write is stalled, so the cleanup is what removed it.
 #[tokio::test]
 async fn test_dropping_the_write_removes_the_temp_file() {
     use crate::io::ser::write_store_atomically;
@@ -297,9 +298,13 @@ async fn test_dropping_the_write_removes_the_temp_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store.vortex");
     std::fs::write(&path, b"the previous store").unwrap();
+    let watched = dir.path().to_path_buf();
+    let temp_existed = Arc::new(AtomicBool::new(false));
+    let seen = temp_existed.clone();
 
     let stalled = write_store_atomically(&path, |mut writer| async move {
         writer.write_all(b"half a store".to_vec()).await?;
+        seen.store(entries(&watched).len() == 2, Ordering::SeqCst);
         std::future::pending::<()>().await;
         Ok(())
     });
@@ -307,6 +312,48 @@ async fn test_dropping_the_write_removes_the_temp_file() {
         .await
         .expect_err("the stalled write must still be running when it is dropped");
 
+    assert!(
+        temp_existed.load(Ordering::SeqCst),
+        "the temp file was not there when the write was dropped"
+    );
+    assert_eq!(entries(dir.path()), vec![path.clone()]);
+    assert_eq!(std::fs::read(&path).unwrap(), b"the previous store");
+}
+
+/// A panic inside the write, caught by the caller, removes the temp file
+/// and leaves the previous store as it was.
+#[tokio::test]
+async fn test_a_panic_in_the_write_removes_the_temp_file() {
+    use crate::io::ser::write_store_atomically;
+    use futures::FutureExt as _;
+    use vortex_io::VortexWrite as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.vortex");
+    std::fs::write(&path, b"the previous store").unwrap();
+    let watched = dir.path().to_path_buf();
+    let temp_existed = Arc::new(AtomicBool::new(false));
+    let seen = temp_existed.clone();
+
+    let outcome =
+        std::panic::AssertUnwindSafe(write_store_atomically(&path, |mut writer| async move {
+            writer.write_all(b"half a store".to_vec()).await?;
+            seen.store(entries(&watched).len() == 2, Ordering::SeqCst);
+            panic!("the write panicked");
+        }))
+        .catch_unwind()
+        .await;
+
+    let payload = outcome.expect_err("the panic reaches the caller");
+    assert_eq!(
+        payload.downcast_ref::<&str>(),
+        Some(&"the write panicked"),
+        "the panic payload"
+    );
+    assert!(
+        temp_existed.load(Ordering::SeqCst),
+        "the temp file was not there when the write panicked"
+    );
     assert_eq!(entries(dir.path()), vec![path.clone()]);
     assert_eq!(std::fs::read(&path).unwrap(), b"the previous store");
 }
