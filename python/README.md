@@ -1,7 +1,7 @@
 # Vortex-RDF for Python
 [![PyPI](https://img.shields.io/pypi/v/vortex-rdf.svg)](https://pypi.org/project/vortex-rdf/)
 
-Python bindings for [Vortex-RDF](https://github.com/vortex-rdf/vortex-rdf), a columnar RDF store format built on Vortex. Stores are opened lazily from `.vortex` files and queried in place, without loading the dataset into memory. The bindings are read-only (mutations are in the roadmap): build `.vortex` files with `serialize_rdf` (file → file), then open and query them; in-memory builds are not yet supported.
+Python bindings for [Vortex-RDF](https://github.com/vortex-rdf/vortex-rdf), a columnar RDF store format built on Vortex. Stores are opened memory-mapped from `.vortex` files and queried in place, without loading the dataset into memory. The bindings are read-only, with no in-memory build: build `.vortex` files with `serialize_rdf` (file → file), then open and query them.
 
 A separate [`vortex-rdflib`](https://pypi.org/project/vortex-rdflib/) package builds an rdflib integration on these bindings; see its own documentation.
 
@@ -35,11 +35,11 @@ store.get_quads(p="<http://xmlns.com/foaf/0.1/name>")        # [(s, p, o, g), ..
 store.match_columns(p="<http://xmlns.com/foaf/0.1/name>")    # (subjects, predicates, objects, graphs)
 ```
 
-`get_quads` returns whole quads; `match_columns` returns the same rows transposed into four parallel columns, for callers that work a position at a time. Both are served from the term-code columns whenever the store can (Dictionary layout, resident dictionary) and from the matched quads otherwise; results are identical. On the code path a term that repeats down a column is one shared Python string, so a caller converting terms into its own representation can rely on the cached string it is handed.
+`get_quads` returns whole quads; `match_columns` returns the same rows transposed into four parallel columns, for callers that work a position at a time. Both are served from the term-code columns whenever the store can (Dictionary layout) and from the matched quads otherwise; results are identical. On the code path a term that repeats down a column is one shared Python string, so a caller converting terms into its own representation can rely on the cached string it is handed.
 
 ## Term codes (low-level)
 
-For Dictionary-layout stores, `match_codes` returns the matched rows as four **zero-copy** `u64` term-code columns (`U64Column`) — `memoryview(col).cast("Q")` views the Rust memory directly — decodable through a `term_dict()` handle. Codes are 64-bit, so the code width no longer limits a store (a dictionary build is still capped at 2**31 - 1 terms, until an out-of-core dictionary builder lands); a code is a Python int from 0 to 2**64 - 1, and anything else is refused (`OverflowError` or `ValueError`), never narrowed:
+For Dictionary-layout stores, `match_codes` returns the matched rows as four **zero-copy** `u64` term-code columns (`U64Column`) — `memoryview(col).cast("Q")` views the Rust memory directly — decodable through a `term_dict()` handle. A dictionary holds at most 2**31 - 1 terms; a code is a Python int from 0 to 2**64 - 1, and anything else is refused (`OverflowError` or `ValueError`), never narrowed:
 
 ```python
 cols = store.match_codes(p="<http://xmlns.com/foaf/0.1/name>")  # (s, p, o, g) or None
@@ -50,21 +50,27 @@ dictionary.decode_many(cols[0])                      # bulk-decode a whole colum
 dictionary.encode("<http://xmlns.com/foaf/0.1/name>")  # code for a term, or None
 ```
 
-`decode_many` decodes a batch in one GIL-released call. Buffer-protocol inputs — a column straight from `match_codes`, `memoryview(col).cast("Q")`, an `array("Q", ...)`, a `uint64` or non-negative `int64` NumPy array — are read in a single bulk copy with no per-element int conversion; a buffer of any other items (a stale `cast("I")` view, a `uint32` array) raises `ValueError` rather than being read element by element. Any sequence of ints works too. `encode` is the inverse of `decode` and tolerant of spelling: an IRI with or without angle brackets, a literal with an explicit `xsd:string` type or an upper-case language tag, and the default graph as `""`, `default` or `[]` all resolve to the stored form's code (a malformed term raises `ValueError`); `encode_many` does a batch. Both `term_dict()` and `match_codes` return `None` when the code path does not apply (a non-Dictionary layout, or an append tail). A dictionary left in the file by the residency budget is served by reading it on demand — `TermDict.file_backed` says so — with the same calls.
+`decode_many` decodes a batch in one GIL-released call. Buffer-protocol inputs — a column straight from `match_codes`, `memoryview(col).cast("Q")`, an `array("Q", ...)`, a `uint64` or non-negative `int64` NumPy array — are read in a single bulk copy with no per-element int conversion; a buffer of any other items (a stale `cast("I")` view, a `uint32` array) raises `ValueError` rather than being read element by element. Any sequence of ints works too. `encode` is the inverse of `decode` and tolerant of spelling: an IRI with or without angle brackets, a literal with an explicit `xsd:string` type or an upper-case language tag, and the default graph as `""`, `default` or `[]` all resolve to the stored form's code (a malformed term raises `ValueError`); `encode_many` does a batch. Both `term_dict()` and `match_codes` return `None` when the code path does not apply (a non-Dictionary layout, or an append tail). A file store's dictionary is read from the mapped file on demand — `TermDict.file_backed` says so — with the same calls.
 
 Consumers can join, count, and de-duplicate entirely in code space and decode each distinct term once, never materializing a term string for a row they discard. The handle and the columns carry the pieces a query layer pushes below a pattern:
 
 ```python
+NAME = "<http://xmlns.com/foaf/0.1/name>"
 d = store.term_dict()
 lo, hi = d.prefix_range("<http://xmlns.com/foaf/0.1/")   # codes of one namespace: one range
 literals = d.prefix_range('"')                            # codes of every literal
-true_codes, unknown = d.filter_codes("num_lt", "42")      # codes a term predicate holds for
-true_codes, unknown = d.filter_codes("lang_matches", "en")
+
+# A FILTER over the candidates a query produced: sorted, unique codes.
+cols = store.match_codes(p=NAME)
+codes = sorted(memoryview(cols[2].distinct()).cast("Q"))
+passed, undecided = d.filter_codes("num_lt", "42", codes)
+passed, undecided = d.filter_codes("regex", "^ali", codes, flags="i")
+passed, undecided = d.filter_codes("contains", '"bob"', codes, case="lower", as_str=True)
 
 # Narrow inside the store, before a row is gathered: a code set or range per position.
 cols = store.match_codes(p=NAME, keep={"o": range(lo, hi)})
-cols = store.match_codes(keep={"s": true_codes, "g": [0]}, limit=100, offset=20)
-n = store.count_quads(p=NAME, keep={"o": true_codes}, limit=1)   # an existence test
+cols = store.match_codes(p=NAME, keep={"o": passed, "g": [0]}, limit=100, offset=20)
+n = store.count_quads(p=NAME, keep={"o": passed}, limit=1)   # an existence test
 
 # Many probes in one GIL-released call, answered in input order.
 views = store.match_codes_many([(None, NAME, None, None), {"s": "<http://ex.org/bob>", "limit": 5}])
@@ -77,7 +83,9 @@ left_idx, right_idx = o.join_indices(s)     # rows where o == s, as index pairs
 o.take(left_idx)                            # gather a joined column
 ```
 
-`filter_codes(kind, arg)` answers `(true_codes, unknown_codes)`: the codes for which the predicate definitely holds, and the codes inside its domain the native layer leaves to the caller's own evaluator (an ill-typed number, a datatype it does not order). Codes outside the domain — non-literals, for the literal predicates — appear in neither. Kinds: `is_literal`, `is_iri`, `is_blank`, `datatype <iri>`, `lang <tag>`, `lang_matches <range>`, `str_prefix <p>` (`strstarts(str(?v), p)`: a string-like literal's lexical form, an IRI, a blank node's label), and `num_lt`/`num_le`/`num_gt`/`num_ge`/`num_eq`/`num_ne <number>` (value comparison for well-formed numeric literals; different XSD datatypes order by their IRIs; a non-literal is `False` under `=` and the orderings and `True` under `!=`). `keep` takes a dict from position (`"s"`, `"p"`, `"o"`, `"g"` or 0–3) to a code set (`U64Column`, u64 buffer or int sequence) or a code range (`range` with step 1, or `(lo, hi)`); `limit`/`offset` window the rows in base order, and a filtered file scan stops at the first block that fills the window. A probe of the `*_many` calls is an `(s, p, o, g)` tuple or a dict with keys `s`, `p`, `o`, `g`, `keep`, `limit`, `offset`; every probe is parsed before any is evaluated.
+`filter_codes(kind, arg, codes, *, flags="", case=None, as_str=False)` evaluates a FILTER predicate over the candidate `codes` (sorted and unique, else `ValueError`) and answers `(passed, undecided)`, both subsets of `codes`; a candidate in neither fails, and the undecided ones are left to the caller's own evaluator. Nothing is memoized. Kinds: `is_literal`, `is_iri`, `is_blank`; `datatype <iri>`, `lang <tag>`, `lang_matches <range>`; `num_lt`/`num_le`/`num_gt`/`num_ge`/`num_eq`/`num_ne <number>` (value comparison for well-formed numeric literals; `xsd:long`/`xsd:unsignedLong` beyond 64 bits undecided; different XSD datatypes order by their IRIs; a non-literal fails the orderings and `=`, passes `!=`); and the string kinds `str_prefix <p>`, `contains`/`strstarts`/`strends <constant's N-Triples spelling>`, `regex <pattern>` with `flags`. String kinds follow rdflib 7.6: the text is a string literal's lexical form (with `as_str=True`, SPARQL `STR()`: an IRI's string or a literal's lexical form; a blank node, or a literal whose datatype rdflib normalizes, is undecided), `case="lower"|"upper"` wraps that text (Python's `str.lower()`/`str.upper()`, decided on ASCII text only), a language-tagged constant needs the same tag on the text, and `regex` decides only patterns from an allow-listed subset that agrees with Python's `re`; the stub's docstring has the exact rules.
+
+`keep` takes a dict from position (`"s"`, `"p"`, `"o"`, `"g"` or 0–3) to a code set (`U64Column`, u64 buffer or int sequence) or a code range (`range` with step 1, or `(lo, hi)`); `limit`/`offset` window the rows in base order, and a filtered file scan stops at the first block that fills the window. A probe of the `*_many` calls is an `(s, p, o, g)` tuple or a dict with keys `s`, `p`, `o`, `g`, `keep`, `limit`, `offset`; every probe is parsed before any is evaluated.
 
 ## Build options
 
@@ -104,9 +112,7 @@ serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", inde
 
 ## Bytes & files
 
-The default open is lazy and file-backed. `VortexRdfStore(path, in_memory=True)` loads the store into memory once, so each subsequent match skips the per-call file-scan pipeline.
-
-For Dictionary-layout files the term dictionary is lifted into memory when its compressed size in the file fits the residency budget — 512 MiB by default, overridable process-wide with `VORTEX_RDF_DICT_MAX_RESIDENT_BYTES`. `VortexRdfStore(path, max_resident_bytes=n)` sets the budget for that open (the environment variable is ignored for it). A dictionary left file-backed is point-read through its chunk leaves: the string reads resolve each chunk's distinct codes with one dictionary scan, and `term_dict()` hands out a handle that reads the file on demand (`TermDict.file_backed`), so `match_codes` and the code path keep working.
+A file store is **memory-mapped**: opening reads only the footer (and, under the Dictionary layout, the dictionary's window bounds), and every query reads the pages it touches straight from the file. What stays in RAM is the operating system's page cache, which shows up as file-backed RSS (`RssFile`) and is reclaimable — the process's own (anonymous) memory stays small whatever the store's size. Never truncate or rewrite a store file in place while it is open (`serialize_rdf` replaces it by rename instead); network filesystems are not supported. `VortexRdfStore(path, in_memory=True)` loads the whole store into memory instead, so each subsequent match skips the file.
 
 Stores also round-trip through bytes: `store.to_bytes()` serializes to the native container (the same exchange format as the `.vortex` file, the CLI and the JS bindings), and `VortexRdfStore.from_bytes(data)` opens such a buffer — `bytes` or `bytearray` — as a fully in-memory store.
 
