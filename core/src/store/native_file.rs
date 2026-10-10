@@ -590,15 +590,9 @@ mod tests {
     #[tokio::test]
     async fn column_chunks_are_memoized_per_column() {
         use crate::IndexType;
-        use crate::io::read::{FileAccess, open_vortex_file};
 
-        let quads = crate::tests::modular_quads_for_tests(50);
-        let (_dir, path) =
-            crate::tests::write_store_file_for_tests(quads, vec![IndexType::SecondaryByReference])
-                .await;
-        let native =
-            NativeStoreFile::try_new(open_vortex_file(&path, FileAccess::Mapped).await.unwrap())
-                .unwrap();
+        let (_dir, native) =
+            crate::tests::mapped_file(50, vec![IndexType::SecondaryByReference]).await;
 
         // One handle per quad column and per (component, column).
         let a = native
@@ -666,26 +660,11 @@ mod tests {
         ));
     }
 
-    async fn mapped_native() -> (tempfile::TempDir, NativeStoreFile) {
-        mapped_native_with(vec![]).await
-    }
-
-    async fn mapped_native_with(indexes: crate::Indexes) -> (tempfile::TempDir, NativeStoreFile) {
-        use crate::io::read::{FileAccess, open_vortex_file};
-
-        let quads = crate::tests::modular_quads_for_tests(50);
-        let (dir, path) = crate::tests::write_store_file_for_tests(quads, indexes).await;
-        let native =
-            NativeStoreFile::try_new(open_vortex_file(&path, FileAccess::Mapped).await.unwrap())
-                .unwrap();
-        (dir, native)
-    }
-
     /// A handle is built with the memo's lock released, and a hit builds
     /// nothing.
     #[tokio::test]
     async fn chunk_handles_are_built_outside_the_lock() {
-        let (_dir, native) = mapped_native().await;
+        let (_dir, native) = crate::tests::mapped_file(50, vec![]).await;
 
         let built = native.memoized_quad_chunks("probe", || {
             assert!(
@@ -712,7 +691,7 @@ mod tests {
     /// entries are whole, so the next lookup takes the poisoned lock over.
     #[tokio::test]
     async fn a_poisoned_chunk_handle_lock_is_recovered() {
-        let (_dir, native) = mapped_native().await;
+        let (_dir, native) = crate::tests::mapped_file(50, vec![]).await;
         let native = Arc::new(native);
         let before = native
             .column_chunks("s")
@@ -743,7 +722,8 @@ mod tests {
     async fn the_reader_tree_is_retired_when_the_bind_memo_clears() {
         use crate::IndexType;
 
-        let (_dir, native) = mapped_native_with(vec![IndexType::SecondaryByReference]).await;
+        let (_dir, native) =
+            crate::tests::mapped_file(50, vec![IndexType::SecondaryByReference]).await;
         let dtype = native.dtype().clone();
         let bind = |i: u64| {
             native

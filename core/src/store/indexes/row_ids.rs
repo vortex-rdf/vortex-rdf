@@ -347,10 +347,9 @@ mod tests {
     #[tokio::test]
     async fn index_row_id_scans_drive_inline_whatever_the_limit() {
         use crate::IndexType;
-        use crate::io::read::{FileAccess, open_vortex_file, scan_all_reader};
+        use crate::io::read::scan_all_reader;
         use crate::store::array::{field_as, into_struct_array};
         use crate::store::indexes::COL_RID;
-        use crate::store::native_file::NativeStoreFile;
         use crate::store::scan::file_scan::{driver_hooks, read_all_rows};
 
         const COMPONENT: &str = "index:ref-p";
@@ -359,9 +358,7 @@ mod tests {
         let (_dir, path) =
             crate::tests::write_store_file_for_tests(quads, vec![IndexType::SecondaryByReference])
                 .await;
-        let file =
-            NativeStoreFile::try_new(open_vortex_file(&path, FileAccess::Mapped).await.unwrap())
-                .unwrap();
+        let file = crate::tests::open_mapped(&path).await;
         let (_, reader) = file
             .component_reader(COMPONENT)
             .unwrap()

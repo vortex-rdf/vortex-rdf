@@ -957,7 +957,6 @@ pub(crate) async fn row_range_from_pruning(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::read::{FileAccess, open_vortex_file};
     use std::ops::Range;
     use vortex_array::VortexSessionExecute as _;
     use vortex_array::arrays::{PrimitiveArray, StructArray};
@@ -978,16 +977,6 @@ mod tests {
         );
         assert!(eq_code_pairs(&lit(false)).is_none());
         assert!(eq_code_pairs(&eq(get_item("p", root()), lit("x"))).is_none());
-    }
-
-    /// A mapped store file of `n` quads: subject-sorted, subjects unique.
-    async fn mapped_file(n: usize) -> (tempfile::TempDir, NativeStoreFile) {
-        let quads = crate::tests::modular_quads_for_tests(n);
-        let (dir, path) = crate::tests::write_store_file_for_tests(quads, vec![]).await;
-        let file =
-            NativeStoreFile::try_new(open_vortex_file(&path, FileAccess::Mapped).await.unwrap())
-                .unwrap();
-        (dir, file)
     }
 
     /// A scan of `rows` of `file`, cut into splits of `per_split` rows.
@@ -1065,7 +1054,7 @@ mod tests {
     /// down each path and must return all four columns identically.
     #[tokio::test]
     async fn read_all_rows_keeps_order_on_either_driver() {
-        let (_dir, file) = mapped_file(50).await;
+        let (_dir, file) = crate::tests::mapped_file(50, vec![]).await;
 
         // The whole file in one split is the reference.
         let whole = drive(&file, 0..50, 50, true).await;
@@ -1106,7 +1095,7 @@ mod tests {
     #[tokio::test]
     async fn read_all_rows_runs_inline_up_to_the_split_limit() {
         let limit = MAX_INLINE_SPLITS;
-        let (_dir, file) = mapped_file(limit + 8).await;
+        let (_dir, file) = crate::tests::mapped_file(limit + 8, vec![]).await;
         let whole = drive(&file, 0..(limit + 8) as u64, limit + 8, true).await;
         assert_eq!(whole.driver(), ScanDriver::Inline, "a single split");
 
@@ -1127,7 +1116,7 @@ mod tests {
     #[tokio::test]
     async fn read_all_rows_above_the_limit_reads_outside_a_tokio_runtime() {
         let limit = MAX_INLINE_SPLITS;
-        let (_dir, file) = mapped_file(limit + 8).await;
+        let (_dir, file) = crate::tests::mapped_file(limit + 8, vec![]).await;
         let whole = drive(&file, 0..(limit + 8) as u64, limit + 8, true).await;
         let scan = scan_of(&file, 0..limit as u64 + 1, 1, true);
         assert_eq!(
@@ -1155,7 +1144,7 @@ mod tests {
     /// is the entry point's, not the scan's.
     #[tokio::test]
     async fn read_index_row_ids_drives_inline_above_the_split_limit() {
-        let (_dir, file) = mapped_file(50).await;
+        let (_dir, file) = crate::tests::mapped_file(50, vec![]).await;
         let _limit = driver_hooks::ForcedLimit::set(1);
 
         driver_hooks::take_spawned();

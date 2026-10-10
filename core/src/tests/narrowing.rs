@@ -427,7 +427,6 @@ async fn test_narrowing_gates_and_tails() {
 #[cfg(feature = "file-io")]
 mod file {
     use super::*;
-    use crate::store::native_file::NativeStoreFile;
     use std::ops::Range;
 
     /// Both open modes of a file store — loaded whole and mapped — with and
@@ -643,29 +642,31 @@ mod file {
         );
     }
 
-    /// Past one scan split's worth of rows the column streams in several
-    /// chunks: the positions a keep admits must carry across the chunk
-    /// boundaries, over the whole file, a pending filter, a row window and a
-    /// keep chained on a keep.
+    /// One 160,000-row file, past one scan split's worth of rows, serves both
+    /// multi-split keep checks below.
     #[tokio::test]
-    async fn test_keep_on_file_spans_splits() {
+    async fn test_keeps_on_a_multi_split_file() {
         let (_dir, path) = write_store_file(
             modular_quads(160_000, 3, 8),
             LayoutStrategy::Dictionary,
             vec![],
         )
         .await;
-        let opened = NativeStoreFile::try_new(
-            crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let opened = crate::tests::open_mapped(&path).await;
         assert!(
             opened.splits().unwrap().len() > 1,
             "the fixture must span several scan splits"
         );
-        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        keep_spans_scan_splits(&path).await;
+        s_keeps_match_brute_force(&path).await;
+    }
+
+    /// Past one scan split's worth of rows the column streams in several
+    /// chunks: the positions a keep admits must carry across the chunk
+    /// boundaries, over the whole file, a pending filter, a row window and a
+    /// keep chained on a keep.
+    async fn keep_spans_scan_splits(path: &std::path::Path) {
+        let store = VortexRdfStore::from_file(path).await.unwrap();
         let dict = store.dict_reader().unwrap();
         let (o_lo, _) = dict.prefix_range("\"object ").await.unwrap();
         let (s_lo, s_hi) = dict.prefix_range("<http://example.org/s").await.unwrap();
@@ -752,12 +753,7 @@ mod file {
     impl RunStore {
         async fn open() -> Self {
             let (dir, path) = write_chunked_store_file(&run_quads(), 1_001).await;
-            let opened = NativeStoreFile::try_new(
-                crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
-                    .await
-                    .unwrap(),
-            )
-            .unwrap();
+            let opened = crate::tests::open_mapped(&path).await;
             let boundaries: Vec<usize> = opened
                 .splits()
                 .unwrap()
@@ -1242,25 +1238,8 @@ mod file {
     /// keeps — ranges, small and mid-size sets looked up, a wide set streamed
     /// — over the whole file, a pending filter, a row window and an id list
     /// agree with brute force.
-    #[tokio::test]
-    async fn test_s_keeps_on_a_multi_split_file_match_brute_force() {
-        let (_dir, path) = write_store_file(
-            modular_quads(160_000, 3, 8),
-            LayoutStrategy::Dictionary,
-            vec![],
-        )
-        .await;
-        let opened = NativeStoreFile::try_new(
-            crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(
-            opened.splits().unwrap().len() > 1,
-            "the fixture must span several scan splits"
-        );
-        let store = VortexRdfStore::from_file(&path).await.unwrap();
+    async fn s_keeps_match_brute_force(path: &std::path::Path) {
+        let store = VortexRdfStore::from_file(path).await.unwrap();
         let dict = store.dict_reader().unwrap();
         let (o_lo, _) = dict.prefix_range("\"object ").await.unwrap();
         let (lo, hi) = dict.prefix_range("<http://example.org/s").await.unwrap();

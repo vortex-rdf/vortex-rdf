@@ -58,22 +58,6 @@ const DATASET_LINES: usize = 14;
 const DATASET_DISTINCT: usize = 7;
 
 const ALL_INDEXES: [IndexType; 2] = [IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
-const LAYOUTS: [LayoutStrategy; 3] = [
-    LayoutStrategy::Default,
-    LayoutStrategy::TypedObject,
-    LayoutStrategy::Dictionary,
-];
-
-/// Every index set worth building: none, each family, both.
-fn index_sets() -> Vec<Indexes> {
-    vec![
-        vec![],
-        vec![IndexType::SecondaryByCopy],
-        vec![IndexType::SecondaryByReference],
-        ALL_INDEXES.to_vec(),
-    ]
-}
-
 type Row = (String, String, String, String);
 
 fn row(q: &RawQuad) -> Row {

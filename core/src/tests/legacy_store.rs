@@ -25,19 +25,6 @@ use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 const CURRENT: &[u8] = b"vortex-rdf.store.v2";
 const LEGACY: &[u8] = b"vortex-rdf.store.v1";
 
-const LAYOUTS: [LayoutStrategy; 3] = [
-    LayoutStrategy::Default,
-    LayoutStrategy::TypedObject,
-    LayoutStrategy::Dictionary,
-];
-
-fn index_sets() -> [Indexes; 2] {
-    [
-        vec![],
-        vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
-    ]
-}
-
 fn occurrences(bytes: &[u8], needle: &[u8]) -> usize {
     bytes
         .windows(needle.len())

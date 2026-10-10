@@ -46,6 +46,22 @@ mod unique_quads;
 mod wide_codes;
 mod wide_row_ids;
 
+const LAYOUTS: [LayoutStrategy; 3] = [
+    LayoutStrategy::Default,
+    LayoutStrategy::TypedObject,
+    LayoutStrategy::Dictionary,
+];
+
+/// Every index set worth building: none, each family alone, both.
+fn index_sets() -> Vec<Indexes> {
+    vec![
+        vec![],
+        vec![IndexType::SecondaryByCopy],
+        vec![IndexType::SecondaryByReference],
+        vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+    ]
+}
+
 fn make_quad(s: &str, p: &str, o_lit: &str, g: GraphName) -> Quad {
     Quad::new(
         NamedOrBlankNode::NamedNode(NamedNode::new(s).unwrap()),
@@ -440,6 +456,35 @@ pub(crate) fn open_native_bytes(bytes: Vec<u8>) -> crate::store::native_file::Na
         .open_buffer(vortex_buffer::ByteBuffer::from(bytes))
         .unwrap();
     crate::store::native_file::NativeStoreFile::try_new(file).unwrap()
+}
+
+/// `path` opened mapped, as a file-backed store opens it: the
+/// [`NativeStoreFile`](crate::store::native_file::NativeStoreFile) around the
+/// opened file.
+#[cfg(feature = "file-io")]
+pub(crate) async fn open_mapped(
+    path: &std::path::Path,
+) -> crate::store::native_file::NativeStoreFile {
+    use crate::io::read::{FileAccess, open_vortex_file};
+    crate::store::native_file::NativeStoreFile::try_new(
+        open_vortex_file(path, FileAccess::Mapped).await.unwrap(),
+    )
+    .unwrap()
+}
+
+/// A mapped Dictionary-layout store file of `n` quads (subject-sorted,
+/// subjects unique) with `indexes`. Keep the `TempDir` alive for the file's
+/// lifetime.
+#[cfg(feature = "file-io")]
+pub(crate) async fn mapped_file(
+    n: usize,
+    indexes: Indexes,
+) -> (
+    tempfile::TempDir,
+    crate::store::native_file::NativeStoreFile,
+) {
+    let (dir, path) = write_store_file_for_tests(modular_quads_for_tests(n), indexes).await;
+    (dir, open_mapped(&path).await)
 }
 
 /// The layout node of a native store file's dictionary-child term column —

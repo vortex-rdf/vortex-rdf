@@ -5,7 +5,6 @@
 use super::*;
 use crate::io::container::{self, DICT_COMPONENT_NAME};
 use crate::store::layouts::dictionary::FileBackedDict;
-use crate::store::native_file::NativeStoreFile;
 use vortex_layout::layouts::zoned::Zoned;
 
 // ─── File-backed dictionary ────────────────────────────────────────────
@@ -308,12 +307,7 @@ async fn test_file_backed_dictionary_probe_parity() {
 
     // The probe target, built exactly as `from_file` does file-backed: the
     // dictionary child's layout, with each window's bounds read at open.
-    let outer = NativeStoreFile::try_new(
-        crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let outer = crate::tests::open_mapped(&path).await;
     let len = dict.len() as u64;
     let fb = FileBackedDict::open(&outer)
         .await
@@ -433,12 +427,7 @@ async fn test_file_backed_dictionary_rejects_below_first_term() {
         "fixture must have no term sorting at or below `!`, got {first_term:?}"
     );
 
-    let outer = NativeStoreFile::try_new(
-        crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let outer = crate::tests::open_mapped(&path).await;
     let fb = FileBackedDict::open(&outer)
         .await
         .unwrap()
@@ -508,12 +497,7 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
     let path = dir.path().join("flat.vortex");
     std::fs::write(&path, &bytes).unwrap();
 
-    let outer = NativeStoreFile::try_new(
-        crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let outer = crate::tests::open_mapped(&path).await;
     assert!(
         FileBackedDict::open(&outer).await.unwrap().is_none(),
         "a flat dictionary child must decline the point-read handle"
@@ -532,12 +516,7 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
     // An empty dictionary child declines the same way (nothing to
     // point-read) and opens resident.
     let (_dir, empty_path) = write_store_file(Vec::new(), LayoutStrategy::Dictionary, vec![]).await;
-    let empty_file = NativeStoreFile::try_new(
-        crate::io::read::open_vortex_file(&empty_path, crate::io::read::FileAccess::Mapped)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let empty_file = crate::tests::open_mapped(&empty_path).await;
     assert!(FileBackedDict::open(&empty_file).await.unwrap().is_none());
     let empty = VortexRdfStore::from_file(&empty_path).await.unwrap();
     assert!(!empty.debug_dict_file_backed());
@@ -702,12 +681,7 @@ async fn test_unzoned_dictionary_child_opens_mapped() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("unzoned.vortex");
     std::fs::write(&path, &bytes).unwrap();
-    let native = NativeStoreFile::try_new(
-        crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let native = crate::tests::open_mapped(&path).await;
     let descriptor = native
         .components()
         .iter()
@@ -769,12 +743,7 @@ async fn test_child_without_zone_maps_reads_bounds_from_leaves() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("unzoned-shape.vortex");
     std::fs::write(&path, &bytes).unwrap();
-    let native = NativeStoreFile::try_new(
-        crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let native = crate::tests::open_mapped(&path).await;
     assert!(!dict_term_column(&native).is::<Zoned>());
     let fb = FileBackedDict::open(&native)
         .await

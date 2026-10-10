@@ -1017,12 +1017,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("unzoned-windows.vortex");
         std::fs::write(&path, &bytes).unwrap();
-        let native = NativeStoreFile::try_new(
-            crate::io::read::open_vortex_file(&path, crate::io::read::FileAccess::Mapped)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let native = crate::tests::open_mapped(&path).await;
         let descriptor = native
             .components()
             .iter()

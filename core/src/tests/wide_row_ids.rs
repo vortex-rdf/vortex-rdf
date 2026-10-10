@@ -37,19 +37,10 @@ const N: usize = 900;
 /// Rows per spilled run in the out-of-core builds: 900 quads make 15 runs.
 const RUN_ROWS: usize = 64;
 
-const LAYOUTS: [LayoutStrategy; 3] = [
-    LayoutStrategy::Default,
-    LayoutStrategy::TypedObject,
-    LayoutStrategy::Dictionary,
-];
-
 /// Each index alone: the copy index would answer every probe of a store
 /// holding both. (The spilled and compacted stores carry both.)
-fn index_sets() -> [Indexes; 2] {
-    [
-        vec![IndexType::SecondaryByCopy],
-        vec![IndexType::SecondaryByReference],
-    ]
+fn single_index_sets() -> impl Iterator<Item = Indexes> {
+    index_sets().into_iter().filter(|set| set.len() == 1)
 }
 
 fn iri(s: &str) -> NamedNode {
@@ -311,7 +302,7 @@ async fn row_ids_past_u32_round_trip_in_memory() {
     let _base = RowIdBase::set(BASE);
     let quads = dataset();
     for layout in LAYOUTS {
-        for indexes in index_sets() {
+        for indexes in single_index_sets() {
             let label = format!("{layout:?} {indexes:?}");
             let built =
                 build_array::<SortedInMemoryBuilder>(quad_stream(quads.clone()), layout, indexes)
@@ -321,7 +312,7 @@ async fn row_ids_past_u32_round_trip_in_memory() {
             check_adoptions(&store, &quads, &label).await;
         }
     }
-    for indexes in index_sets() {
+    for indexes in single_index_sets() {
         let label = format!("interning sink {indexes:?}");
         let mut sink = DictionaryQuadSink::new(indexes);
         for quad in &quads {
@@ -343,7 +334,7 @@ async fn row_ids_past_u32_round_trip_through_spilled_runs() {
     let _base = RowIdBase::set(BASE);
     let quads = dataset();
     for layout in LAYOUTS {
-        for indexes in index_sets() {
+        for indexes in single_index_sets() {
             let label = format!("spilled {layout:?} {indexes:?}");
             let built = sorted_stream::build_array(
                 Box::new(quad_stream(quads.clone())),
@@ -374,7 +365,7 @@ async fn row_ids_past_u32_round_trip_through_a_file() {
     let p1 = iri("p1");
     let o2 = Term::Literal(Literal::new_simple_literal("o2"));
     for layout in LAYOUTS {
-        for indexes in index_sets() {
+        for indexes in single_index_sets() {
             let label = format!("{layout:?} {indexes:?}");
             let by_reference = indexes == [IndexType::SecondaryByReference];
             let bytes = spilled_store_bytes(quads.clone(), layout, indexes).await;
