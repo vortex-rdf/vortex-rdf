@@ -164,6 +164,13 @@ def test_mapped_bulk_reads_decode_through_the_dictionary_handle(tmp_path):
     path = tmp_path / "wide.vortex"
     serialize_rdf(nt, path, layout="dictionary")
 
+    # The premise: the file spans more than one chunk. A string-layout store of
+    # the same rows is read by the matched-quads fallback, which decodes chunk
+    # by chunk and so hands back one predicate string per chunk.
+    strings = tmp_path / "wide-strings.vortex"
+    serialize_rdf(nt, strings, layout="default")
+    assert len({id(quad[1]) for quad in VortexRdfStore(strings).get_quads()}) >= 2
+
     mapped = VortexRdfStore(path)
     loaded = VortexRdfStore(path, in_memory=True)
     assert mapped.term_dict().file_backed and not loaded.term_dict().file_backed
