@@ -47,9 +47,7 @@ where
     drain_chunks(futures::stream::iter(tasks).buffered(*AVAILABLE_PARALLELISM)).await
 }
 
-/// The non-empty chunks of a stream of per-split results, in the order the
-/// stream yields them — the loop `collect_chunks` and `collect_scan_spawned`
-/// share.
+/// The non-empty chunks of a stream of per-split results, in stream order.
 async fn drain_chunks<S>(mut results: S) -> Result<Vec<ArrayRef>>
 where
     S: futures::Stream<Item = VortexResult<Option<ArrayRef>>> + Unpin,
@@ -63,9 +61,9 @@ where
     Ok(chunks)
 }
 
-/// [`collect_chunks`] assembled into one array of `dtype` — the tail of
-/// [`scan_all`] and of the store's `read_all_rows`, which hands it the futures
-/// of a restricted file scan.
+/// [`collect_chunks`] assembled into one array of `dtype`: the tail of
+/// [`scan_all`], of `read_index_row_ids` and of `read_all_rows` for a scan
+/// within its inline limit.
 pub(crate) async fn collect_scan<F>(
     dtype: vortex_array::dtype::DType,
     tasks: Vec<F>,
@@ -105,9 +103,8 @@ where
     chunked_or_single(drain_chunks(spawned.buffered(window)).await?, dtype)
 }
 
-/// Test hook: how many split futures [`collect_scan_spawned`] has spawned on
-/// this thread, so a test can tell which driver actually ran a scan. None
-/// spawned is the inline driver; every split spawned is this one.
+/// Test hook: the number of split futures [`collect_scan_spawned`] has spawned
+/// on this thread. Zero means a scan ran inline.
 #[cfg(all(test, feature = "file-io"))]
 pub(crate) mod spawn_probe {
     use std::cell::Cell;
@@ -121,8 +118,7 @@ pub(crate) mod spawn_probe {
         SPAWNED.set(SPAWNED.get() + 1);
     }
 
-    /// The splits spawned on this thread since the last call, cleared by the
-    /// read.
+    /// The splits spawned on this thread since the last call.
     pub(crate) fn take() -> usize {
         SPAWNED.take()
     }
@@ -230,10 +226,10 @@ mod tests {
     use vortex_array::dtype::{DType, Nullability, PType};
     use vortex_array::{IntoArray as _, VortexSessionExecute as _};
 
-    /// The spawned collector returns the chunks in split order even when the
-    /// splits finish in the opposite order: split `i` yields to the scheduler
-    /// `splits - 1 - i` times before it answers, so on this single-threaded
-    /// runtime the last split finishes first and the first split last.
+    /// The spawned collector returns the chunks in split order when the splits
+    /// finish in reverse: split `i` yields to the scheduler `splits - 1 - i`
+    /// times, then answers, so on this single-threaded runtime the last split
+    /// finishes first.
     #[tokio::test]
     async fn spawned_scan_collects_in_split_order_whatever_the_finishing_order() {
         let splits = 6u64;
@@ -257,8 +253,8 @@ mod tests {
         assert_eq!(values.as_slice::<u64>(), (0..splits).collect::<Vec<_>>());
     }
 
-    /// A split that fails fails the scan: its error comes out of the spawned
-    /// collector, whatever the splits around it did.
+    /// A failing split fails the scan: its error comes out of the spawned
+    /// collector.
     #[tokio::test]
     async fn spawned_scan_propagates_a_split_error() {
         let splits = 4u64;

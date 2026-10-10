@@ -275,10 +275,8 @@ fn rid_scan(
 }
 
 /// Run a rid-only scan and decode its row-id column into the ascending,
-/// unique buffer every index resolution answers in. The scan is index
-/// business and always driven inline (`file_scan::read_index_row_ids`): its
-/// splits are zone-map checks or slices of a located run, never worth a
-/// spawn.
+/// unique buffer every index resolution answers in. The scan is driven inline
+/// by `file_scan::read_index_row_ids`.
 #[cfg(feature = "file-io")]
 async fn read_scanned_row_ids(
     scan: vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>,
@@ -344,11 +342,9 @@ mod tests {
         assert!(sorted_row_ids(empty).unwrap().is_empty());
     }
 
-    /// Both rid-scan entry points, the located-run scan and the pushed-down
-    /// equality, drive their scan inline whatever the gate's split limit: the
-    /// classification is made at these call sites, not read off the scan. A
-    /// limit of zero would send any row scan to the workers, and the row scan
-    /// at the end shows it does.
+    /// Both rid scans, the located run and the pushed-down equality, spawn
+    /// nothing with the split limit at zero; a control row scan of the file
+    /// spawns all of its splits.
     #[cfg(feature = "file-io")]
     #[tokio::test]
     async fn index_row_id_scans_drive_inline_whatever_the_limit() {

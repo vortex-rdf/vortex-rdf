@@ -43,23 +43,8 @@ pub(crate) enum ScanDriver {
     Spawned,
 }
 
-/// The most split futures a row scan may plan and still be driven inline —
-/// the limit of [`read_all_rows`]'s rule, and why it is 42.
-///
-/// The BSBM 100K replays make row scans of 40 to 42 splits, 321 of the copy
-/// store's 724 scans, at 15 to 16 us per split: 0.60 to 0.65 ms inline, 0.63
-/// to 0.69 ms spawned, a tie. Spawning only them is dearer than the tie
-/// suggests, 0.89 to 0.98 ms: with the index scans inline the workers sit
-/// idle between spawns, and each spawn then pays a cold wake-up.
-///
-/// Replay totals, medians of three interleaved runs, at a limit of 42 and of
-/// 8 (all inline, all spawned in brackets): the copy store 3,404 and 3,613 ms
-/// (3,338; 4,408), the reference-index store 4,591 and 4,603 ms (4,570;
-/// 4,670). Above 42 come the replays' 200- and 274-split reads, a tie or
-/// better spawned (the reference-index store's 200-split ones take 10.0 ms
-/// inline and 4.6 ms spawned), and the whole-table scans, 398 to 400 splits
-/// on the BSBM 100K store (134 leaves of 262,144 rows, each cut into three
-/// splits).
+/// Row scans of up to this many splits run inline: at that size, waking the
+/// workers costs more than the parallel work saves.
 const MAX_INLINE_SPLITS: usize = 42;
 
 /// The limit [`read_all_rows`] applies: [`MAX_INLINE_SPLITS`], or what a test
@@ -76,8 +61,8 @@ fn max_inline_splits() -> usize {
 }
 
 /// Test hooks for the driver choice: a per-thread override of the split limit,
-/// so a test can force either path, and the driver a scan ran under, read off
-/// how many of its splits were spawned. Nothing here times anything.
+/// and the driver a scan ran under, read off how many of its splits were
+/// spawned. Nothing here times anything.
 #[cfg(test)]
 pub(crate) mod driver_hooks {
     use std::cell::Cell;
@@ -112,8 +97,7 @@ pub(crate) mod driver_hooks {
         }
     }
 
-    /// The splits spawned on this thread since the last call, cleared by the
-    /// read: counted where the spawn happens, not where it was decided.
+    /// The splits spawned on this thread since the last call.
     pub(crate) fn take_spawned() -> usize {
         crate::io::read::spawn_probe::take()
     }
@@ -134,30 +118,14 @@ pub(crate) mod driver_hooks {
 /// in-memory array, in the scan's row order.
 ///
 /// A scan of at most [`MAX_INLINE_SPLITS`] splits is driven inline: its split
-/// futures are polled on the calling task by [`collect_scan`]. A larger one
-/// is spawned: [`collect_scan_spawned`] hands each split future to the
-/// runtime's workers, `scan.concurrency()` per core in flight (the windowing
-/// of `ScanBuilder::into_array_stream`). Either driver returns the chunks in
-/// split order, whatever the scan's `ordered` flag says. The splits are
-/// planned here either way, since their count picks the driver.
+/// futures are polled on the calling task by [`collect_scan`]. A larger one is
+/// spawned by [`collect_scan_spawned`], `scan.concurrency()` splits per core in
+/// flight. Either driver returns the chunks in split order, whatever the
+/// scan's `ordered` flag says.
 ///
-/// What a split costs decides, not how many there are. The files these scans
-/// read are memory-mapped, so a segment is a ready slice and inline driving
-/// waits on nothing; a row split costs its filter and decode work. A spawn
-/// costs a worker's wake-up, about 180 us against 12 us for a one-split scan
-/// inline, and pays only where enough splits of real work spread over the
-/// cores. Measured on BSBM 100K (22 cores, §7 D3, 2026-10-10, medians of
-/// three interleaved runs), the large row reads run 28 to 51 us per split
-/// inline and need the workers:
-/// - an index-free store's filtered scans, 398 to 400 splits at 45 to 51 us:
-///   `o = ProductType1` takes 25 ms inline and 8 to 9 ms spawned;
-/// - the reference-index store's scattered reads, 40 to 200 splits at 28 to
-///   47 us: the 200-split ones take 10.0 ms inline and 4.6 ms spawned;
-/// - the `in_memory=True` load, 400 splits through the file reader, which
-///   waits on its reads: 38 ms inline and 18 ms spawned.
-///
-/// An index child's row-id scan is the other kind, and has its own entry
-/// point, [`read_index_row_ids`].
+/// The splits are planned here because their count picks the driver. Row
+/// splits do filter and decode work, so a large scan needs the workers; an
+/// index child's row-id scan goes through [`read_index_row_ids`] instead.
 pub(crate) async fn read_all_rows(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRef> {
     let dtype = scan.dtype().map_err(VortexRdfError::Vortex)?;
     let window = scan.concurrency() * available_parallelism();
@@ -176,19 +144,11 @@ pub(crate) async fn read_all_rows(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRe
 /// Run an index child's row-id scan to completion and materialize its rows,
 /// always inline, whatever its split count.
 ///
-/// The scan reads one column and its splits are cheap: a located run is
-/// sliced out of the child's row-id column, and a pushed-down equality is
-/// pruned by the child's zone maps (the child is sorted on the probed column),
-/// so a split is mostly a zone-map check, about 2 us. Spawning would add a
-/// worker's wake-up and a spawn per split for no work to spread. On the BSBM
-/// 100K copy store 362 of the replay's 724 scans are these filters, with 400
-/// or 464 splits: 0.95 to 1.05 ms inline against 2.7 to 3.2 ms spawned. The
-/// reference-index store's, 1 to 39 splits, take 12 to 170 us against 180 to
-/// 540 us. The ids are decoded by the caller, on its own thread either way.
-///
-/// The classification is this entry point's: a scan does not become a row
-/// scan or an index scan by its `ordered` flag, so an unordered scan of some
-/// other kind goes through [`read_all_rows`] and its limit.
+/// Zone maps prune almost every split of such a scan and a located run is
+/// sliced out of the row-id column, so there is no work to spread; the caller
+/// decodes the ids on its own thread. A scan is an index scan because its
+/// caller says so here, not because of its `ordered` flag: any other scan goes
+/// through [`read_all_rows`].
 pub(crate) async fn read_index_row_ids(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRef> {
     let dtype = scan.dtype().map_err(VortexRdfError::Vortex)?;
     let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
@@ -1103,11 +1063,9 @@ mod tests {
         columns.iter().map(|c| c[..n].to_vec()).collect()
     }
 
-    /// `read_all_rows` hands a scan's rows back whole and in the scan's row
-    /// order, split after split, under either driver. An order guard: the
-    /// drivers differ in cost (measured in §7 D3), not in result, so the same
-    /// four-split scan is forced down each path and must return all four
-    /// columns identically.
+    /// `read_all_rows` hands a scan's rows back whole and in row order, split
+    /// after split, under either driver: the same four-split scan is forced
+    /// down each path and must return all four columns identically.
     #[tokio::test]
     async fn read_all_rows_keeps_order_on_either_driver() {
         let (_dir, file) = mapped_file(50).await;
@@ -1146,8 +1104,8 @@ mod tests {
         }
     }
 
-    /// A scan of at most [`MAX_INLINE_SPLITS`] splits runs inline, one with
-    /// more is spawned, with no limit forced: the production gate.
+    /// A scan of at most [`MAX_INLINE_SPLITS`] splits runs inline and one with
+    /// more is spawned, with no limit forced.
     #[tokio::test]
     async fn read_all_rows_runs_inline_up_to_the_split_limit() {
         let limit = MAX_INLINE_SPLITS;
