@@ -27,6 +27,11 @@ thread_local! {
     /// reads only its own gathers.
     static GATHERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 
+    /// How many row ids this thread's in-memory resolutions decoded from an
+    /// index component's `rid` column (`sorted_row_ids`). Thread-local like
+    /// `GATHERS`.
+    static DECODED_RIDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
     /// The code the dictionaries built or opened on this thread give their
     /// first term (see [`CodeBase`]); 0 outside a guard.
     static CODE_BASE: std::cell::Cell<TermCode> = const { std::cell::Cell::new(0) };
@@ -101,6 +106,17 @@ impl Drop for CodeBase {
     fn drop(&mut self) {
         CODE_BASE.with(|cell| cell.set(self.0));
     }
+}
+
+/// Record `rows` row ids decoded from a component's `rid` column (called by
+/// `sorted_row_ids`).
+pub(crate) fn note_decoded_rids(rows: usize) {
+    DECODED_RIDS.with(|decoded| decoded.set(decoded.get() + rows));
+}
+
+/// The row ids this thread has decoded from component `rid` columns so far.
+pub(crate) fn decoded_rids() -> usize {
+    DECODED_RIDS.with(std::cell::Cell::get)
 }
 
 /// Record one gather of live rows (called by `live_raw_quads`).

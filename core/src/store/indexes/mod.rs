@@ -433,7 +433,7 @@ pub(crate) enum IndexResolution<Plan> {
 /// pending selection, which handles that like any other narrow selection.
 pub(crate) enum ResolvedRowIds {
     #[cfg(feature = "file-io")]
-    Eager(Buffer<u64>),
+    Eager(Buffer<RowId>),
     Lazy(LazyRowIds),
 }
 
@@ -454,7 +454,7 @@ pub(crate) enum ResolvedRowIds {
 /// stored buffer — no lock is held across the computation.
 #[derive(Clone)]
 pub(crate) struct LazyRowIds {
-    cell: Arc<OnceLock<Buffer<u64>>>,
+    cell: Arc<OnceLock<Buffer<RowId>>>,
     source: LazyRowIdSource,
 }
 
@@ -464,8 +464,10 @@ pub(crate) struct LazyRowIds {
 #[derive(Clone)]
 enum LazyRowIdSource {
     /// In-memory: the rid-column slice of the component's matched run, decoded
-    /// and sorted on demand ([`sorted_row_ids`]).
-    Component(ArrayRef),
+    /// and sorted on demand ([`sorted_row_ids`]). `ascending` when the run's
+    /// rids are already in row id order, so a window of the run can be cut
+    /// before anything is decoded.
+    Component { rids: ArrayRef, ascending: bool },
     /// File-backed: the rid-only pushed-down scan of the index child
     /// ([`scan_index_row_ids`]) the eager path would have run at match time.
     #[cfg(feature = "file-io")]
@@ -501,11 +503,28 @@ impl LazyRowIds {
         self.cell.get().is_some()
     }
 
-    /// Lazy ids over an in-memory component's matched rid run.
+    /// Lazy ids over an in-memory component's matched rid run, in the
+    /// component's own order.
     pub(crate) fn from_component_run(rids: ArrayRef) -> Self {
         Self {
             cell: Arc::new(OnceLock::new()),
-            source: LazyRowIdSource::Component(rids),
+            source: LazyRowIdSource::Component {
+                rids,
+                ascending: false,
+            },
+        }
+    }
+
+    /// Lazy ids over an in-memory component's matched rid run whose rids
+    /// ascend: a reference component's rows are ordered by `(val, rid)`, so
+    /// the rows of one value are in row id order.
+    pub(crate) fn from_ascending_component_run(rids: ArrayRef) -> Self {
+        Self {
+            cell: Arc::new(OnceLock::new()),
+            source: LazyRowIdSource::Component {
+                rids,
+                ascending: true,
+            },
         }
     }
 
@@ -567,7 +586,7 @@ impl LazyRowIds {
         &self,
         offset: usize,
         limit: usize,
-    ) -> Result<Option<Buffer<u64>>> {
+    ) -> Result<Option<Buffer<RowId>>> {
         let LazyRowIdSource::LocatedRun {
             file,
             component,
@@ -591,13 +610,36 @@ impl LazyRowIds {
         ))
     }
 
+    /// The ids of rows `offset..offset + limit` of an in-memory run whose rids
+    /// ascend, in base row order — the window's own rows cut out of the rid
+    /// column before they are decoded, so a deep page costs its limit and an
+    /// empty window (no limit, or an offset at or past the run's end) decodes
+    /// nothing. `None` for any other source.
+    pub(crate) fn window(&self, offset: usize, limit: usize) -> Result<Option<Buffer<RowId>>> {
+        let LazyRowIdSource::Component {
+            rids,
+            ascending: true,
+        } = &self.source
+        else {
+            return Ok(None);
+        };
+        let width = rids.len();
+        let start = offset.min(width);
+        let end = offset.saturating_add(limit).min(width);
+        if start >= end {
+            return Ok(Some(Buffer::empty()));
+        }
+        let window = rids.slice(start..end).map_err(VortexRdfError::Vortex)?;
+        Ok(Some(sorted_row_ids(window)?))
+    }
+
     /// How many rows the ids cover, when knowable without computing them: an
     /// in-memory run knows its width up front (so a count on a served match
     /// never decodes), and so does a located file run; any other file child
     /// only after materialization.
     pub(crate) fn len_if_known(&self) -> Option<usize> {
         match &self.source {
-            LazyRowIdSource::Component(rids) => Some(rids.len()),
+            LazyRowIdSource::Component { rids, .. } => Some(rids.len()),
             #[cfg(feature = "file-io")]
             LazyRowIdSource::IndexChild { .. } => self.cell.get().map(Buffer::len),
             #[cfg(feature = "file-io")]
@@ -608,12 +650,12 @@ impl LazyRowIds {
     /// The ids, computing (and caching) them on first call — the awaiting
     /// form, which also runs a file child's deferred scan.
     #[cfg(feature = "file-io")]
-    pub(crate) async fn materialized_async(&self) -> Result<Buffer<u64>> {
+    pub(crate) async fn materialized_async(&self) -> Result<Buffer<RowId>> {
         if let Some(ids) = self.cell.get() {
             return Ok(ids.clone());
         }
         let ids = match &self.source {
-            LazyRowIdSource::Component(rids) => sorted_row_ids(rids.clone())?,
+            LazyRowIdSource::Component { rids, .. } => sorted_row_ids(rids.clone())?,
             LazyRowIdSource::IndexChild {
                 reader,
                 constraints,
@@ -639,12 +681,12 @@ impl LazyRowIds {
     /// form for in-memory sources (a file child's ids take I/O, and every
     /// consumer of a file view's selection is already async; see
     /// [`materialized_async`](Self::materialized_async)).
-    pub(crate) fn materialized(&self) -> Result<Buffer<u64>> {
+    pub(crate) fn materialized(&self) -> Result<Buffer<RowId>> {
         if let Some(ids) = self.cell.get() {
             return Ok(ids.clone());
         }
         let ids = match &self.source {
-            LazyRowIdSource::Component(rids) => sorted_row_ids(rids.clone())?,
+            LazyRowIdSource::Component { rids, .. } => sorted_row_ids(rids.clone())?,
             #[cfg(feature = "file-io")]
             LazyRowIdSource::IndexChild { .. } | LazyRowIdSource::LocatedRun { .. } => {
                 unreachable!("an in-memory view only ever carries component-sourced pending ids")

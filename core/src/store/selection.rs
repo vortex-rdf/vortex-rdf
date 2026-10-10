@@ -30,6 +30,7 @@ use vortex_mask::{AllOr, Mask};
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::indexes::LazyRowIds;
+use crate::store::schema::RowId;
 
 /// A view's base-row selection, which may still be *pending*: a match
 /// resolved by an index left its exact ids uncomputed ([`LazyRowIds`]),
@@ -117,7 +118,7 @@ pub(crate) enum RowSelection {
     Range(Range<u64>),
     /// An explicit ascending, unique list of base row ids: what a secondary
     /// index lookup or a mask scan yields.
-    Ids(Buffer<u64>),
+    Ids(Buffer<RowId>),
 }
 
 impl RowSelection {

@@ -185,7 +185,7 @@ pub(crate) fn resolve_in_memory(
         .slice(run)
         .map_err(VortexRdfError::Vortex)?;
     Ok(IndexResolution::Resolved {
-        row_ids: ResolvedRowIds::Lazy(LazyRowIds::from_component_run(rids)),
+        row_ids: ResolvedRowIds::Lazy(LazyRowIds::from_ascending_component_run(rids)),
         resolves: probe.resolves,
         // A back-reference index stores no whole quads to serve from.
         serve: None,

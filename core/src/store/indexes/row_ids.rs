@@ -127,6 +127,8 @@ pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<RowId>> {
     if row_id_column.is_empty() {
         return Ok(Buffer::empty());
     }
+    #[cfg(test)]
+    crate::store::test_hooks::note_decoded_rids(row_id_column.len());
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     // A no-op cast for the u64 column every writer here produces.
     let ids = row_id_column

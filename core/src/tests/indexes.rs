@@ -934,3 +934,101 @@ async fn test_code_columns_serves_from_the_answering_index() {
     want.sort();
     assert_eq!(got, want);
 }
+
+/// A window of an in-memory reference index's located run decodes exactly its
+/// own rows of the run (rows of one value are in row id order, so a window of
+/// the run is a window of its ids): none for an empty window — no limit, or an
+/// offset at or past the run's end — and never more than the run. The window
+/// holds the same rows as the slice of the whole run, and the pending view it
+/// is taken beside keeps its ids undecoded. A copy index's run is in key
+/// order, so it is decoded whole (and shared with the pending view).
+#[tokio::test]
+async fn test_in_memory_window_decodes_only_its_rows_of_a_located_run() {
+    use crate::store::{IdsNeed, Probe};
+
+    let quads = graph_modular_quads(900, 4, 3, 7, &[GraphName::DefaultGraph]);
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let width = 300;
+    let span =
+        |offset: usize, limit: usize| (offset.min(width), offset.saturating_add(limit).min(width));
+    let windows = [
+        (0, 0),
+        (0, 1),
+        (7, 5),
+        (0, 299),
+        (290, 50),
+        (299, 10),
+        (300, 5),
+        (400, 5),
+        (0, 1_000),
+        (5, usize::MAX),
+    ];
+
+    for (index, decoded_whole) in [
+        (IndexType::SecondaryByReference, false),
+        (IndexType::SecondaryByCopy, true),
+    ] {
+        let store = VortexRdfStore::from_quads(
+            quad_stream(quads.clone()),
+            LayoutStrategy::Dictionary,
+            vec![index],
+        )
+        .await
+        .unwrap();
+        let all = store
+            .match_pattern(None, Some(&p1), None, None)
+            .await
+            .unwrap()
+            .code_columns_gathered()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(all[0].len(), width, "{index:?}");
+        let probe = Probe::new(None, Some(p1.clone()), None, None);
+        let pending = store
+            .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.debug_row_ids_materialized(),
+            Some(false),
+            "{index:?}"
+        );
+
+        for (offset, limit) in windows {
+            let (from, to) = span(offset, limit);
+            let expected = if decoded_whole { width } else { to - from };
+            let before = crate::store::test_hooks::decoded_rids();
+            let window = store
+                .run_probe(&probe.clone().window(offset, Some(limit)))
+                .await
+                .unwrap();
+            let decoded = crate::store::test_hooks::decoded_rids() - before;
+            assert_eq!(decoded, expected, "{index:?} ({offset}, {limit}) decodes");
+
+            let beside = pending.window(offset, limit).await.unwrap();
+            if !decoded_whole {
+                assert_eq!(
+                    pending.debug_row_ids_materialized(),
+                    Some(false),
+                    "{index:?} ({offset}, {limit}) leaves the run's ids undecoded"
+                );
+            }
+            for view in [&window, &beside] {
+                assert_eq!(
+                    view.size().await.unwrap(),
+                    to - from,
+                    "{index:?} ({offset}, {limit})"
+                );
+                let cols = view.code_columns_gathered().await.unwrap().unwrap();
+                for (col, whole) in cols.iter().zip(&all) {
+                    assert_eq!(
+                        col.as_slice(),
+                        &whole.as_slice()[from..to],
+                        "{index:?} ({offset}, {limit})"
+                    );
+                }
+            }
+        }
+    }
+}

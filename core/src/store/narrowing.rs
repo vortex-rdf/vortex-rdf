@@ -27,7 +27,7 @@ use crate::store::layouts::LayoutStrategy;
 use crate::store::probes::StructProbes;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_scan;
-use crate::store::schema::{self, QuadColumn, TermCode};
+use crate::store::schema::{self, QuadColumn, RowId, TermCode};
 use crate::store::selection::{RowSelection, ViewSelection};
 use crate::store::{QuadsSource, Tail};
 
@@ -231,12 +231,29 @@ impl VortexRdfStore {
                 probes,
                 ..
             } => {
-                let selection = selection.materialized()?;
-                let live = match deleted {
-                    None => selection.len(base.len()),
-                    Some(deleted) => selection.live_mask(deleted, base.len()).true_count(),
+                // A located run held pending for this window: only the
+                // window's own rows are decoded, and the run's width is its
+                // live size.
+                let located = match (selection, deleted) {
+                    (ViewSelection::Pending(lazy), None) => match lazy.len_if_known() {
+                        Some(live) => lazy.window(offset, limit)?.map(|ids| (ids, live)),
+                        None => None,
+                    },
+                    _ => None,
                 };
-                let windowed = selection.window(offset, limit, deleted.as_ref(), base.len());
+                let (windowed, live) = if let Some((ids, live)) = located {
+                    (ids_selection(ids), live)
+                } else {
+                    let selection = selection.materialized()?;
+                    let live = match deleted {
+                        None => selection.len(base.len()),
+                        Some(deleted) => selection.live_mask(deleted, base.len()).true_count(),
+                    };
+                    (
+                        selection.window(offset, limit, deleted.as_ref(), base.len()),
+                        live,
+                    )
+                };
                 let taken = windowed.len(base.len());
                 (
                     QuadsSource::InMemory {
@@ -274,13 +291,7 @@ impl VortexRdfStore {
                     _ => None,
                 };
                 let (windowed, live) = if let Some((ids, live)) = located {
-                    // The ids are the window itself.
-                    let windowed = if ids.is_empty() {
-                        RowSelection::empty()
-                    } else {
-                        RowSelection::Ids(ids)
-                    };
-                    (windowed, live)
+                    (ids_selection(ids), live)
                 } else {
                     let selection = selection.materialized_async().await?;
                     match filter {
@@ -729,6 +740,15 @@ impl VortexRdfStore {
 /// plus a fixed scan, and the two meet near this many rows per code.
 #[cfg(feature = "file-io")]
 const LOCATED_SET_ROWS_PER_CODE: usize = 16;
+
+/// The selection of a window's ids, which are the window itself.
+fn ids_selection(ids: Buffer<RowId>) -> RowSelection {
+    if ids.is_empty() {
+        RowSelection::empty()
+    } else {
+        RowSelection::Ids(ids)
+    }
+}
 
 /// Whether a set of `codes` codes on the subject column is looked up code by
 /// code over a selection of `rows` rows rather than streamed: while it has no
