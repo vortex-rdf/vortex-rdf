@@ -462,11 +462,11 @@ keeps for the store's lifetime is fixed per file:
 
 | Kept | Bound |
 |---|---|
-| the layout reader tree, one reader per component, the quad table's split ranges | the file's layout |
+| the reader tree (the quad table's reader and one reader per component), the quad table's split ranges | the file's layout; the reader tree is replaced whenever the bound filter trees below are cleared |
 | per-column chunk-probe handles with the probes of the leaves they fetched, so a repeated location skips the layout walk and the leaf rebuilds | one handle per column; per fetched leaf, a probe over mapped bytes |
 | the dictionary's window bounds ([§5](#5-the-dictionary-child)) and kind ranges | two terms per 65,536-term window; a handful of codes |
 | pruning envelopes per filter shape | 512 entries, cleared wholesale at the cap |
-| bound filter trees, one per filter shape, so Vortex's identity-keyed reader caches hit | 4,096 entries, cleared wholesale at the cap |
+| bound filter trees, one per filter shape, so Vortex's identity-keyed reader caches hit | 4,096 entries, cleared wholesale at the cap; a clear retires the reader tree, so those caches do not outlive it |
 
 Keeps (`VALUES`, FILTER code sets) never become filter expressions, so the
 two memos only see a workload's pattern shapes. No count, decode or predicate

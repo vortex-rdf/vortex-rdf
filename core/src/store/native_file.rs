@@ -1,17 +1,21 @@
 //! The opened native store file: the runtime handle the store's file-backed
-//! query paths drive. It holds what is fixed per file — the component
-//! inventory, one reader per component, the quad table's split ranges, one
-//! chunk-probe handle per column — and two bounded memos that let Vortex's
-//! identity-keyed reader caches hit: pruning envelopes per filter shape, and
-//! bound filter trees. The pure open/materialize primitives are in
-//! [`io::read`](crate::io::read).
+//! query paths drive. It holds what is fixed per file (the component
+//! inventory, the quad table's split ranges, one chunk-probe handle per
+//! column), the reader tree every scan and probe reads through, and two
+//! bounded memos: pruning envelopes per filter shape, and bound filter trees.
+//! Vortex keys its reader caches by the identity of the bound trees, so the
+//! reader tree is retired whenever the bound-tree memo clears. The pure
+//! open/materialize primitives are in [`io::read`](crate::io::read).
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use vortex_array::ArrayRef;
 use vortex_array::expr::{BoundExpression, Expression};
 use vortex_error::VortexResult;
+use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_layout::{LayoutReaderRef, LayoutRef};
 
 use crate::io::container::{
@@ -21,12 +25,16 @@ use crate::io::container::{
 use crate::io::read::{FileIdentity, OpenedFile, unsupported_file_error};
 
 /// An opened native store file: the [`vortex_file::VortexFile`] plus its
-/// component inventory and per-component reader cache.
+/// component inventory and reader tree.
 ///
-/// Derefs to the inner file, whose root reader delegates to the transparent
-/// quad-source child — so scans, splits, row counts, and pruning all speak
-/// quad coordinates, exactly like a plain quad table. Component readers are
-/// built once and cached, so their zone-map stats decode once per store.
+/// Derefs to the inner file for its footer, dtype, row count, segment source
+/// and session. The inner file keeps no reader of its own: scans and probes
+/// take theirs from the reader tree ([`layout_reader`](Self::layout_reader),
+/// [`scan`](Self::scan), [`component_reader`](Self::component_reader)). The
+/// root reader delegates to the transparent quad-source child — so scans,
+/// splits, row counts, and pruning all speak quad coordinates, exactly like a
+/// plain quad table. Readers are built once per tree and cached, so their
+/// zone-map stats decode once per tree.
 pub(crate) struct NativeStoreFile {
     file: vortex_file::VortexFile,
     components: Vec<StoreComponentDescriptor>,
@@ -34,7 +42,9 @@ pub(crate) struct NativeStoreFile {
     /// captured at open so read paths can restore the subject stamp on
     /// materialized rows without re-walking the layout.
     quads_sorted: bool,
-    child_readers: Vec<OnceLock<LayoutReaderRef>>,
+    /// The reader tree scans and probes read through; replaced when the bound
+    /// tree memo clears (see [`ReaderTree`]).
+    readers: Mutex<Arc<ReaderTree>>,
     /// The quad table's natural split ranges, computed once — every
     /// counting/matching call iterates them, and deriving them walks the
     /// layout tree.
@@ -53,8 +63,7 @@ pub(crate) struct NativeStoreFile {
     /// rebuilds. Bounded by the file's layout: one handle per column, and per
     /// fetched leaf a probe over mapped bytes.
     column_chunks: Mutex<ChunkHandles>,
-    /// One bound tree per (scope, filter shape), held for the handle's
-    /// lifetime — see [`BoundExprMemo`].
+    /// One bound tree per (scope, filter shape) — see [`BoundExprMemo`].
     bound_exprs: Arc<BoundExprMemo>,
     /// Whether the file is read through a memory mapping, as the open found
     /// it.
@@ -72,6 +81,38 @@ pub(crate) struct NativeStoreFile {
     located_rid_reads: std::sync::atomic::AtomicUsize,
 }
 
+/// The readers of one opened file: the quad table's root reader and one
+/// reader per component, each built on first use.
+///
+/// Vortex keeps caches inside a reader (zone-map pruning results,
+/// partitioned expressions, dictionary evaluations) keyed by the identity of
+/// the bound expressions it was asked about, and never evicts them. Every
+/// bound expression comes from the file's [`BoundExprMemo`], which clears
+/// wholesale at its cap, so over an endless run of new constants a tree's
+/// caches would grow with each one. A tree is therefore retired when the memo
+/// clears: the next reader taken comes from a fresh tree over the same file,
+/// and a view still holding readers of the old tree keeps it alive until it
+/// drops.
+struct ReaderTree {
+    /// How many times the bound tree memo had cleared when this tree was
+    /// made.
+    generation: u64,
+    /// The file with a reader cache of its own: it builds and holds the root
+    /// reader.
+    root: vortex_file::VortexFile,
+    components: Vec<OnceLock<LayoutReaderRef>>,
+}
+
+impl ReaderTree {
+    fn new(file: &vortex_file::VortexFile, components: usize, generation: u64) -> Self {
+        Self {
+            generation,
+            root: file.clone().with_caching(),
+            components: (0..components).map(|_| OnceLock::new()).collect(),
+        }
+    }
+}
+
 /// The chunk-probe handles of a file, by quad column and by (component,
 /// column); `None` memoizes a decline.
 #[derive(Default)]
@@ -87,18 +128,19 @@ type ColumnHandle = Option<Arc<vortex_rdf_encoded_search::ColumnChunks>>;
 ///
 /// Vortex keys its reader-side pruning and evaluation caches by bound-tree
 /// *identity* (`ExactBoundExpr` compares the children `Arc` pointer), not
-/// structure, and those caches live as long as the cached reader tree — the
-/// handle's lifetime. A fresh `bind` per call would never hit them and grow
-/// them per call; this memo pins one identity per shape so repeats, across
-/// splits and across calls, land on the entries the first use created. A
-/// clone of a memoized tree shares its `Arc`s and therefore its identity.
-/// The scope tag separates trees bound against different schemas (the quad
-/// root vs. an index child). Bounded by [`BIND_MEMO_MAX`].
+/// structure, and those caches live as long as their reader. A fresh `bind`
+/// per call would never hit them and grow them per call; this memo pins one
+/// identity per shape so repeats, across splits and across calls, land on the
+/// entries the first use created. A clone of a memoized tree shares its
+/// `Arc`s and therefore its identity. The scope tag separates trees bound
+/// against different schemas (the quad root vs. an index child). Bounded by
+/// [`BIND_MEMO_MAX`]; each clear retires the file's reader tree
+/// ([`ReaderTree`]).
 pub(crate) struct BoundExprMemo(BoundedMemo<(&'static str, Expression), BoundExpression>);
 
 /// Entry cap on [`BoundExprMemo`] — sized for a query workload's distinct
 /// filter shapes, not for arbitrary term churn.
-const BIND_MEMO_MAX: usize = 4096;
+pub(crate) const BIND_MEMO_MAX: usize = 4096;
 
 impl BoundExprMemo {
     fn new() -> Self {
@@ -118,6 +160,12 @@ impl BoundExprMemo {
             .get_or_try_insert_with((scope, expr.clone()), || expr.bind(dtype))
     }
 
+    /// How many times the memo has cleared: the generation of the reader tree
+    /// its identities belong to.
+    fn clears(&self) -> u64 {
+        self.0.clears.load(Ordering::Acquire)
+    }
+
     /// Entries held — what the tests read to pin which shapes get bound.
     #[cfg(test)]
     pub(crate) fn debug_len(&self) -> usize {
@@ -130,6 +178,8 @@ impl BoundExprMemo {
 struct BoundedMemo<K, V> {
     map: Mutex<HashMap<K, V>>,
     cap: usize,
+    /// How many times the map has been cleared at its cap.
+    clears: AtomicU64,
 }
 
 impl<K: std::hash::Hash + Eq, V: Clone> BoundedMemo<K, V> {
@@ -137,6 +187,7 @@ impl<K: std::hash::Hash + Eq, V: Clone> BoundedMemo<K, V> {
         Self {
             map: Mutex::new(HashMap::new()),
             cap,
+            clears: AtomicU64::new(0),
         }
     }
 
@@ -146,7 +197,7 @@ impl<K: std::hash::Hash + Eq, V: Clone> BoundedMemo<K, V> {
 
     fn insert(&self, key: K, value: V) {
         let mut map = self.map.lock().expect("memo lock");
-        Self::insert_capped(&mut map, self.cap, key, value);
+        self.insert_capped(&mut map, key, value);
     }
 
     /// The value under `key`, computed by `build` and inserted on a miss;
@@ -162,13 +213,14 @@ impl<K: std::hash::Hash + Eq, V: Clone> BoundedMemo<K, V> {
             return Ok(value.clone());
         }
         let value = build()?;
-        Self::insert_capped(&mut map, self.cap, key, value.clone());
+        self.insert_capped(&mut map, key, value.clone());
         Ok(value)
     }
 
-    fn insert_capped(map: &mut HashMap<K, V>, cap: usize, key: K, value: V) {
-        if map.len() >= cap {
+    fn insert_capped(&self, map: &mut HashMap<K, V>, key: K, value: V) {
+        if map.len() >= self.cap {
             map.clear();
+            self.clears.fetch_add(1, Ordering::Release);
         }
         map.insert(key, value);
     }
@@ -201,12 +253,12 @@ impl NativeStoreFile {
         let typed = file.footer().layout().as_::<RdfStoreLayoutVTable>();
         let components = store_components(typed).to_vec();
         let quads_sorted = quads_sorted(typed);
-        let child_readers = components.iter().map(|_| OnceLock::new()).collect();
+        let readers = Mutex::new(Arc::new(ReaderTree::new(&file, components.len(), 0)));
         Ok(Self {
             file,
             components,
             quads_sorted,
-            child_readers,
+            readers,
             splits: OnceLock::new(),
             pruning_envelopes: BoundedMemo::new(PRUNING_MEMO_MAX),
             column_chunks: Mutex::new(ChunkHandles::default()),
@@ -359,7 +411,7 @@ impl NativeStoreFile {
         if let Some(splits) = self.splits.get() {
             return Ok(Arc::clone(splits));
         }
-        let computed: Arc<[Range<u64>]> = self.file.splits()?.into();
+        let computed: Arc<[Range<u64>]> = self.readers().root.splits()?.into();
         let _ = self.splits.set(Arc::clone(&computed));
         Ok(computed)
     }
@@ -408,7 +460,8 @@ impl NativeStoreFile {
         Ok(self.component_child(name)?.map(|(_, child)| child))
     }
 
-    /// A component's descriptor and cached reader, by name.
+    /// A component's descriptor and its reader from the current tree, by
+    /// name.
     pub(crate) fn component_reader(
         &self,
         name: &str,
@@ -416,22 +469,62 @@ impl NativeStoreFile {
         let Some((index, child)) = self.component_child(name)? else {
             return Ok(None);
         };
-        if self.child_readers[index].get().is_none() {
+        let tree = self.readers();
+        let cell = &tree.components[index];
+        if cell.get().is_none() {
             let reader = child.new_reader(
                 self.components[index].name.as_str().into(),
                 self.file.segment_source(),
                 self.file.session(),
                 &Default::default(),
             )?;
-            let _ = self.child_readers[index].set(reader);
+            let _ = cell.set(reader);
         }
         Ok(Some((
             &self.components[index],
-            self.child_readers[index]
-                .get()
+            cell.get()
                 .expect("the reader was just initialized above")
                 .clone(),
         )))
+    }
+
+    /// The current reader tree: the one made for the bound tree memo's
+    /// present generation, replacing a tree the memo has cleared since.
+    fn readers(&self) -> Arc<ReaderTree> {
+        let mut current = self
+            .readers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Read under the lock: a caller that read the count before another
+        // took the lock must not put an older tree back.
+        let generation = self.bound_exprs.clears();
+        if current.generation != generation {
+            *current = Arc::new(ReaderTree::new(
+                &self.file,
+                self.components.len(),
+                generation,
+            ));
+        }
+        Arc::clone(&current)
+    }
+
+    /// The quad table's root reader from the current tree.
+    pub(crate) fn layout_reader(&self) -> VortexResult<LayoutReaderRef> {
+        self.readers().root.layout_reader()
+    }
+
+    /// A scan of the quad table over the current tree's root reader.
+    pub(crate) fn scan(&self) -> VortexResult<ScanBuilder<ArrayRef>> {
+        Ok(ScanBuilder::new(
+            self.file.session().clone(),
+            self.layout_reader()?,
+        ))
+    }
+
+    /// The generation of the current reader tree (test hook).
+    #[cfg(test)]
+    pub(crate) fn debug_reader_generation(&self) -> u64 {
+        self.readers().generation
     }
 }
 
@@ -574,10 +667,14 @@ mod tests {
     }
 
     async fn mapped_native() -> (tempfile::TempDir, NativeStoreFile) {
+        mapped_native_with(vec![]).await
+    }
+
+    async fn mapped_native_with(indexes: crate::Indexes) -> (tempfile::TempDir, NativeStoreFile) {
         use crate::io::read::{FileAccess, open_vortex_file};
 
         let quads = crate::tests::modular_quads_for_tests(50);
-        let (dir, path) = crate::tests::write_store_file_for_tests(quads, vec![]).await;
+        let (dir, path) = crate::tests::write_store_file_for_tests(quads, indexes).await;
         let native =
             NativeStoreFile::try_new(open_vortex_file(&path, FileAccess::Mapped).await.unwrap())
                 .unwrap();
@@ -636,5 +733,57 @@ mod tests {
         assert!(Arc::ptr_eq(&before, &after));
         assert!(native.column_chunks("p").is_some());
         assert!(native.component_column_chunks("nothing", "val").is_none());
+    }
+
+    /// The bound tree memo clearing retires the reader tree: up to the cap the
+    /// same readers come back; the bind that clears the memo makes the next
+    /// root and component readers new ones. A reader a view still holds keeps
+    /// working and keeps its tree alive; once it is dropped nothing does.
+    #[tokio::test]
+    async fn the_reader_tree_is_retired_when_the_bind_memo_clears() {
+        use crate::IndexType;
+
+        let (_dir, native) = mapped_native_with(vec![IndexType::SecondaryByReference]).await;
+        let dtype = native.dtype().clone();
+        let bind = |i: u64| {
+            native
+                .bound_exprs()
+                .bind("quads", &eq(get_item("o", root()), lit(i)), &dtype)
+                .unwrap()
+        };
+        let component = || native.component_reader("index:ref-p").unwrap().unwrap().1;
+
+        let root_reader = native.layout_reader().unwrap();
+        let root_weak = Arc::downgrade(&root_reader);
+        let index_reader = component();
+        let index_weak = Arc::downgrade(&index_reader);
+
+        for i in 0..BIND_MEMO_MAX as u64 {
+            bind(i);
+        }
+        assert_eq!(native.debug_bound_exprs(), BIND_MEMO_MAX);
+        assert!(Arc::ptr_eq(&root_reader, &native.layout_reader().unwrap()));
+        assert!(Arc::ptr_eq(&index_reader, &component()));
+        assert_eq!(native.debug_reader_generation(), 0);
+
+        bind(BIND_MEMO_MAX as u64);
+        assert_eq!(native.debug_bound_exprs(), 1);
+        let next_root = native.layout_reader().unwrap();
+        assert!(!Arc::ptr_eq(&root_reader, &next_root));
+        assert!(!Arc::ptr_eq(&index_reader, &component()));
+        assert!(Arc::ptr_eq(&next_root, &native.layout_reader().unwrap()));
+        assert_eq!(native.debug_reader_generation(), 1);
+
+        assert!(root_weak.upgrade().is_some() && index_weak.upgrade().is_some());
+        assert_eq!(root_reader.row_count(), next_root.row_count());
+        drop((root_reader, index_reader));
+        assert!(
+            root_weak.upgrade().is_none(),
+            "the old root reader lives on"
+        );
+        assert!(
+            index_weak.upgrade().is_none(),
+            "the old component reader lives on"
+        );
     }
 }

@@ -598,6 +598,51 @@ mod file {
         assert_eq!(store.debug_bound_exprs().unwrap(), bound);
     }
 
+    /// Every new constant asked about on an unindexed role binds a new
+    /// expression, and Vortex's reader caches key their entries by that
+    /// identity without evicting any. Past the bound tree memo's cap — which
+    /// clears wholesale — the file's reader tree is retired: the tree that
+    /// was current at the start is gone once the loop has run, answers stay
+    /// exact across the retirement, and the memo stays within its cap.
+    #[tokio::test]
+    async fn test_distinct_constants_retire_the_reader_tree() {
+        let distinct = crate::store::native_file::BIND_MEMO_MAX + 200;
+        let quads: Vec<Quad> = (0..distinct)
+            .map(|i| {
+                make_quad(
+                    &format!("http://example.org/s{i}"),
+                    "http://example.org/p0",
+                    &format!("o{i}"),
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect();
+        let (_dir, path) = write_store_file(quads, LayoutStrategy::Dictionary, vec![]).await;
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let first_tree = {
+            let reader = store.debug_root_reader().unwrap();
+            std::sync::Arc::downgrade(&reader)
+        };
+
+        for i in 0..distinct {
+            let object = Term::Literal(Literal::new_simple_literal(format!("o{i}")));
+            let matched = store
+                .match_pattern(None, None, Some(&object), None)
+                .await
+                .unwrap();
+            assert_eq!(matched.size().await.unwrap(), 1, "object o{i}");
+        }
+
+        assert!(
+            store.debug_bound_exprs().unwrap() <= crate::store::native_file::BIND_MEMO_MAX,
+            "the bound tree memo is capped"
+        );
+        assert!(
+            first_tree.upgrade().is_none(),
+            "the reader tree from before the memo cleared is still alive"
+        );
+    }
+
     /// Past one scan split's worth of rows the column streams in several
     /// chunks: the positions a keep admits must carry across the chunk
     /// boundaries, over the whole file, a pending filter, a row window and a

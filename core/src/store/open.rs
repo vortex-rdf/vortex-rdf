@@ -202,9 +202,9 @@ impl VortexRdfStore {
         // can later rewrite the compacted rows back over it.
         let source_path = path.as_ref().to_path_buf();
         // Opens the file footer only (schema + layout metadata); no row data
-        // is read yet. The returned handle caches its layout reader tree so
-        // later scans/prunes across this store (and stores derived from it)
-        // share decoded zone-map stats instead of re-reading them each time.
+        // is read yet. The handle owns the reader tree, so scans and prunes
+        // across this store (and stores derived from it) share decoded
+        // zone-map stats instead of re-reading them each time.
         let file = Arc::new(NativeStoreFile::try_new(
             read::open_vortex_file(path, access).await?,
         )?);

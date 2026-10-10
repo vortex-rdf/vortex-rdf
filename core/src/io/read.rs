@@ -267,8 +267,9 @@ impl std::ops::Deref for OpenedFile {
 }
 
 /// Open a Vortex file lazily — no data is read until the returned
-/// `VortexFile` is scanned. The layout reader is cached on the handle: every
-/// scan and pruning evaluation shares one reader tree.
+/// `VortexFile` is scanned. The handle caches no reader: the
+/// [`NativeStoreFile`](crate::store::native_file::NativeStoreFile) around it
+/// owns the reader tree.
 ///
 /// Both modes reach the file through `File::open` first, so a path that
 /// cannot be opened is the same I/O error in either, with the path in its
@@ -285,9 +286,7 @@ pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
     use vortex_file::OpenOptionsSessionExt;
 
     let path = path.as_ref();
-    let options = crate::session::VORTEX_SESSION
-        .open_options()
-        .with_layout_reader_cache();
+    let options = crate::session::VORTEX_SESSION.open_options();
     let file = std::fs::File::open(path).map_err(|e| path_error("open", path, e))?;
     match access {
         FileAccess::Mapped => {

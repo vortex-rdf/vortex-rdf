@@ -263,6 +263,15 @@ impl VortexRdfStore {
         }
     }
 
+    /// The file's current quad-table root reader; `None` off-file. A test
+    /// holds it weakly to see whether a reader tree outlives its retirement.
+    pub(crate) fn debug_root_reader(&self) -> Option<vortex_layout::LayoutReaderRef> {
+        match &self.quads {
+            QuadsSource::InMemory { .. } => None,
+            QuadsSource::File { file, .. } => file.layout_reader().ok(),
+        }
+    }
+
     /// How many times a keep has streamed a quad column through a scan on
     /// this file handle (shared by every view of the file); `None` off-file.
     pub(crate) fn debug_column_streams(&self) -> Option<usize> {
