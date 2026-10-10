@@ -36,11 +36,10 @@ pub(crate) mod write;
 /// (`wire`, `layout`) means a new versioned id, not a silent
 /// reinterpretation.
 ///
-/// `v2` is the root of vortex-rdf 0.12. Its readers rely on two guarantees
-/// that only a 0.12 writer gives — each quad is stored once, and a reference
-/// index's children are in `(val, rid)` order — and a file of 0.11 or earlier
-/// can break either, so the previous root ([`LEGACY_STORE_LAYOUT_ID`]) is
-/// refused, not read.
+/// Readers of `v2` rely on two guarantees its writers give and nothing checks
+/// at open: each quad is stored once, and a reference index's children are in
+/// `(val, rid)` order. A `v1` file can break either, so
+/// [`LEGACY_STORE_LAYOUT_ID`] is refused, not read.
 pub(crate) const STORE_LAYOUT_ID: &str = "vortex-rdf.store.v2";
 /// The store root layout of vortex-rdf 0.11 and earlier. Nothing writes it
 /// and nothing reads it: it is registered only so that a file carrying it
@@ -56,11 +55,12 @@ pub(crate) const DICT_COMPONENT_NAME: &str = "dictionary";
 /// term column, FSST-compressed as held.
 pub(crate) const DICT_IMPLEMENTATION: &str = "sorted-terms-fsst-v1";
 /// Version of the dictionary child: the one this crate writes and the newest
-/// it reads. 2 adds exact per-window `vortex.min()`/`vortex.max()` zone maps on
-/// the term column (vortex-rdf 0.12). A child written without them — chunks
-/// of uneven length adopted from a foreign file have no uniform zone to
-/// record — is still version 2 and still opens: a window's bounds are then
-/// read from its leaf. A child of a *newer* version is refused at open
+/// it reads. Its term column carries exact per-window
+/// `vortex.min()`/`vortex.max()` zone maps exactly when the windows are
+/// uniform (chunks of uneven length, adopted from a foreign file, have no
+/// uniform zone to record). Readers inspect the layout for them and read a
+/// window's bounds from its leaf when they are absent, as in a version-1
+/// child. A child of a newer version is refused at open
 /// (`classify_component`): a newer writer may lay it out in a way this reader
 /// would misread without noticing.
 pub(crate) const DICT_VERSION: u32 = 2;

@@ -55,8 +55,11 @@ impl VortexRdfStore {
     /// back over its own source file (via a temp file and an atomic rename) and
     /// the store is reopened from it. A source file the process cannot write is
     /// never replaced: the compaction fails with `PermissionDenied` and leaves
-    /// it alone, before it has gathered or built anything. An in-memory store
-    /// returns the in-memory rebuild directly.
+    /// it alone, before it has gathered or built anything. On Windows the
+    /// rename is refused while the file is mapped, by this store included, so
+    /// there a file-backed store cannot compact over its own path: the
+    /// compaction fails with the I/O error and the file is left as it was. An
+    /// in-memory store returns the in-memory rebuild directly.
     ///
     /// [`compact`]: Self::compact
     pub async fn compact_with_indexes(&self, indexes: Indexes) -> Result<Self> {
@@ -163,9 +166,9 @@ impl VortexRdfStore {
     /// Whether `add_quads` should fold the tail into the base now.
     ///
     /// Both in-memory and file-backed bases auto-compact once the tail crosses
-    /// the compaction thresholds. For a file-backed store this rewrites its
-    /// source file in place (see [`compact`](Self::compact)) and keeps it
-    /// file-backed — an append past the threshold performs a disk write.
+    /// the compaction thresholds. For a file-backed store this replaces its
+    /// source file (see [`compact`](Self::compact)) and keeps it file-backed —
+    /// an append past the threshold performs a disk write.
     pub(super) fn should_auto_compact(&self) -> bool {
         let (base_rows, tail) = match (&self.quads, &self.tail) {
             (QuadsSource::InMemory { base, .. }, Some(tail)) => (base.len(), tail),

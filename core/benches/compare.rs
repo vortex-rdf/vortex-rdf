@@ -709,7 +709,7 @@ impl Queryable for VortexStore {
             // would answer a full scan from metadata in nanoseconds -- a number
             // that compares nothing. `quads_vec` builds four terms per row, and
             // the fold below reads them, which is what every other adapter here
-            // now does too (see `Queryable::count`).
+            // does too (see `Queryable::count`).
             let quads = view.quads_vec().await.expect("materialize");
             let bytes: usize = quads.iter().map(oxrdf_quad_bytes).sum();
             std::hint::black_box(bytes);

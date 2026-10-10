@@ -182,8 +182,9 @@ impl VortexRdfStore {
     /// filter stays pending (a set of more than one code per sixteen rows of
     /// the view is streamed instead). Any other keep resolves the view's
     /// rows, streams the column for them through the mapping and tests the
-    /// keep in memory — never pushed to the scan as an expression. A served
-    /// view's deferred row ids materialize first.
+    /// keep in memory — never pushed to the scan as an expression. A pending
+    /// view's deferred row ids (a served match's, or a run held for a count)
+    /// materialize first.
     ///
     /// [`match_pattern`]: Self::match_pattern
     pub async fn keep(&self, column: QuadColumn, keep: &Keep) -> Result<Self> {
@@ -448,8 +449,8 @@ impl VortexRdfStore {
         else {
             unreachable!("keep routes only InMemory sources here");
         };
-        // A served view's deferred ids are needed now: the plan reads a run
-        // the keep no longer describes.
+        // A pending view's deferred ids are needed now: the keep narrows exact
+        // row ids, and a serve plan's run no longer describes its result.
         let selection = selection.materialized()?;
         let base_len = base.len();
         if selection.is_empty(base_len) {
@@ -614,11 +615,11 @@ impl VortexRdfStore {
     /// leaf metadata, so the selection narrows to them and a pending filter
     /// stays pending. Every other keep — and any the location declines — is
     /// tested in memory: the view's rows are resolved to exact ids (a pending
-    /// filter evaluated, a served view's deferred ids materialized), the
-    /// column is streamed for them through the mapping and each code is
-    /// tested. A keep never becomes a filter expression: its code list is per
-    /// query, and every distinct expression would pin new entries in
-    /// Vortex's identity-keyed reader caches.
+    /// filter evaluated, deferred row ids materialized), the column is
+    /// streamed for them through the mapping and each code is tested. A keep
+    /// never becomes a filter expression: its code list is per query, and
+    /// every distinct expression would pin new entries in Vortex's
+    /// identity-keyed reader caches.
     #[cfg(feature = "file-io")]
     async fn keep_file(&self, column: QuadColumn, keep: &Keep) -> Result<Self> {
         let t = debug::timer();
@@ -725,12 +726,10 @@ impl VortexRdfStore {
 }
 
 /// How many selected rows a code of a set keep on the subject column is worth
-/// when deciding between looking the set up and streaming the column. A
-/// lookup is two binary searches over the mapped chunk metadata, about 0.15 µs
-/// a code whatever the selection; the stream costs 4–15 ns a selected row
-/// (more as the set grows) plus about 20 µs a scan. Measured warm and mapped
-/// on an 8M-row store, the two meet at 8–16 rows per code from a few thousand
-/// selected rows up; below that both cost microseconds.
+/// when deciding between looking the set up and streaming the column: a
+/// lookup costs two binary searches over the mapped chunk metadata per code,
+/// whatever the selection, while the stream costs a little per selected row
+/// plus a fixed scan, and the two meet near this many rows per code.
 #[cfg(feature = "file-io")]
 const LOCATED_SET_ROWS_PER_CODE: usize = 16;
 

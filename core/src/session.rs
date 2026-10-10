@@ -56,14 +56,11 @@ static STORE_FAMILY: EditionFamily = EditionFamily {
     doc: "The components vortex-rdf adds to a Vortex file: the store's root layout.",
 };
 
-/// The store edition: the root layout and nothing else. The previous
-/// generation's root (`vortex-rdf.store.v1`) is registered so its files can
-/// be refused with a message (see `io::container`), but it is in no edition,
-/// so nothing can write it.
-///
-/// Dated for the `v2` root (October 2026). vortex-rdf 0.11 shipped
-/// `vortexrdf2026.08.0` with the `v1` root as its member, and a released
-/// edition is frozen: a new member gets a new edition, not a changed old one.
+/// The store edition: the `v2` root layout and nothing else. The `v1` root
+/// (`vortex-rdf.store.v1`) is registered so its files can be refused with a
+/// message (see `io::container`), but it is in no edition, so nothing can
+/// write it. A released edition is frozen: a new member gets a new edition,
+/// not a changed one.
 const STORE_EDITION: EditionId = EditionId::new("vortexrdf", 2026, 10, 0);
 
 static STORE_DECLARATION: EditionDeclaration = EditionDeclaration {

@@ -48,12 +48,10 @@ pub(crate) struct NativeStoreFile {
     pruning_envelopes: BoundedMemo<Expression, Option<Range<u64>>>,
     /// Per-column chunk-probe handles, keyed by quad column (an index
     /// component's column as `component/column`); `None` memoizes a decline.
-    /// Each handle keeps the probes of the leaves it fetched.
-    ///
-    /// Kept because removing it cost 14.4% of the BSBM 100K copy stream and
-    /// 49.6% of its Q8 (4.5% and 20.9% on Q2 for the reference-index store);
-    /// §7 D1, measured 2026-10-10. Bounded by the file's layout: one handle
-    /// per column, and per fetched leaf a probe over mapped bytes.
+    /// Each handle keeps the probes of the leaves it fetched, so a repeated
+    /// subject or index-run location skips the layout walk and the leaf
+    /// rebuilds. Bounded by the file's layout: one handle per column, and per
+    /// fetched leaf a probe over mapped bytes.
     column_chunks: Mutex<HashMap<String, Option<Arc<vortex_rdf_encoded_search::ColumnChunks>>>>,
     /// One bound tree per (scope, filter shape), held for the handle's
     /// lifetime — see [`BoundExprMemo`].
@@ -66,7 +64,8 @@ pub(crate) struct NativeStoreFile {
     #[cfg(test)]
     column_streams: std::sync::atomic::AtomicUsize,
     /// How many row ids reads of located index-child runs have asked for
-    /// (test hook: pins that a count read none and a window only its prefix).
+    /// (test hook: pins that a count reads none and a window only its own
+    /// rows).
     #[cfg(test)]
     located_rid_reads: std::sync::atomic::AtomicUsize,
 }
@@ -439,7 +438,7 @@ mod tests {
     /// the leaves it fetched stay probed between calls, and a column that
     /// declines stays declined. Bounded by the file's layout (one handle per
     /// column, and per fetched leaf a probe over mapped bytes), not by the
-    /// workload; kept per §7 D1.
+    /// workload.
     #[tokio::test]
     async fn column_chunks_are_memoized_per_column() {
         use crate::IndexType;

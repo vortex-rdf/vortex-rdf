@@ -129,8 +129,9 @@ impl VortexRdfStore {
         }
     }
 
-    /// Whether this view's base selection is still pending — a served match
-    /// whose exact row ids no consumer has needed yet.
+    /// Whether this view's base selection is still pending — a served match,
+    /// or a run held for a count, whose exact row ids no consumer has needed
+    /// yet.
     pub(crate) fn debug_selection_pending(&self) -> bool {
         matches!(self.quads.view_selection(), ViewSelection::Pending(_))
     }

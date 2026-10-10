@@ -60,9 +60,9 @@ impl TempRunsGuard {
     /// The parent is resolved in precedence order: the `VORTEX_RDF_SPILL_DIR`
     /// environment variable, then the caller-provided `base` (compaction
     /// passes the directory its temp file is in, beside the file it replaces,
-    /// so spills share the output's volume), then [`std::env::temp_dir`]. The library never writes into
-    /// the caller's working directory: an embedding server or binding can run
-    /// with an arbitrary — even read-only — cwd.
+    /// so spills share the output's volume), then [`std::env::temp_dir`]. The
+    /// library never writes into the caller's working directory: an embedding
+    /// server or binding can run with an arbitrary — even read-only — cwd.
     pub(crate) fn create(prefix: &str, base: Option<&Path>) -> Result<Self> {
         let parent = resolve_spill_parent(std::env::var_os(SPILL_DIR_ENV), base);
         let dir = parent.join(format!("tmp_vortex_{}_{}", prefix, uuid::Uuid::new_v4()));

@@ -10,7 +10,7 @@ escaped backslash (`"C:\\x41"`), which the N-Triples parser and the native
 layer both read as written. A passed code must be true for rdflib, a failed
 one false; an undecided one is the caller's. Regex patterns drawn at random
 from the native allow-list grammar are compared with Python's `re.search` (the
-call rdflib makes), and the native layer must decide every ASCII text bar the
+call rdflib makes), and the native layer must decide every text bar the
 documented gaps listed in `deliberate_gap`. The corpus covers language tags,
 `xsd:string`, other datatypes, IRIs, blank nodes, N-Triples escapes, trailing
 newlines, non-ASCII text and control characters; a table of 64-bit integers

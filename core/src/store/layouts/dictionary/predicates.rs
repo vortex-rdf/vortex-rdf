@@ -1148,9 +1148,9 @@ impl Number {
 /// where it and rdflib's `_lang_range_check` agree. rdflib may read any other
 /// range differently: a `*` in any subtag is a wildcard (`en-*` matches
 /// `en-gb`), whitespace around the range is stripped, and Python lower-cases
-/// it (the Kelvin sign to `k`). A range with a character outside that
-/// alphabet is `Unknown` whether or not rdflib happens to agree (for `en_gb`
-/// it does). So is a tag outside it, which only a foreign writer's file can
+/// it (the Kelvin sign to `k`). A range other than `*` with a character
+/// outside that alphabet is `Unknown` whether or not rdflib happens to agree
+/// (for `en_gb` it does). So is a tag outside it, which only a foreign writer's file can
 /// hold (the N-Triples ingest rejects one), so that check is defensive.
 fn lang_matches(tag: &str, range: &str) -> Verdict {
     let plain = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');

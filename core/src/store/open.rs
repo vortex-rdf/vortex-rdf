@@ -34,9 +34,8 @@ use super::schema::{CODE_PTYPE, ROW_ID_PTYPE, is_code_column_name};
 /// (the quad table and the copy index's children) or `val` (the reference
 /// index's) for a `u64` code column ([`TermCode`](super::TermCode)), and an
 /// index child's `rid` for a `u64` row id ([`RowId`](super::RowId)), so a
-/// file with narrower codes or row ids — written by a pre-release of 0.12,
-/// before they were widened, or by a foreign writer — must not open.
-/// `table` names the table in the error.
+/// file with narrower codes or row ids must not open. `table` names the
+/// table in the error.
 pub(super) fn check_id_columns(table: &str, dtype: &DType) -> Result<()> {
     let DType::Struct(fields, _) = dtype else {
         return Ok(());

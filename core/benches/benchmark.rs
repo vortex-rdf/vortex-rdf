@@ -415,11 +415,10 @@ fn dict_open(bencher: divan::Bencher, residency: &DictResidency) {
 }
 
 /// Cold term → code probes: a fully bound pattern (four dictionary probes) on a
-/// store opened fresh each iteration, so neither the probe memo nor the
-/// file-backed dictionary's chunk cache carries anything over. Resident
-/// probes are in-memory binary searches; file-backed ones binary-search the
-/// term column through chunk leaves fetched on demand, so this cell prices
-/// those first fetches rather than the search over them.
+/// store opened fresh each iteration, so nothing the store holds carries over
+/// (the operating system's page cache does). Resident probes are in-memory
+/// binary searches; file-backed ones pick a window by its bounds and
+/// binary-search its leaf, rebuilt over the mapped segment.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_probe_cold(bencher: divan::Bencher, residency: &DictResidency) {
     let residency = *residency;
@@ -439,11 +438,9 @@ fn dict_probe_cold(bencher: divan::Bencher, residency: &DictResidency) {
 }
 
 /// The same fully bound pattern on one shared store — the steady state of
-/// repeated lookups for the *same* terms. After the first iteration the probe
-/// memo answers every term on both arms, so this cell prices the match
-/// machinery around the dictionary rather than the dictionary itself. The
-/// residency axis shows in [`dict_probe_cold`], which pays the chunk fetches,
-/// and to a much smaller degree in [`dict_probe_distinct`] — not here.
+/// repeated lookups for the *same* terms. Nothing is memoized, so every
+/// iteration searches the dictionary again: in memory on one arm, through the
+/// same windows of the mapped child, their pages warm, on the other.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_probe_warm(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
@@ -460,14 +457,11 @@ fn dict_probe_warm(bencher: divan::Bencher, residency: &DictResidency) {
     });
 }
 
-/// Term→ID probes that always miss the memo: one shared store, so its chunk
-/// cache stays warm, probed with a different subject every iteration. This is
-/// the steady state of a query workload over a large term set — distinct
-/// lookups against a store that has been open a while — and the cell that
-/// prices the search itself: the memo cannot answer it and the chunk fetches
-/// are already paid, so what is left is what residency costs a warm binary
-/// search. The term is built outside the timed closure, as the other probe
-/// cells do.
+/// Term→ID probes for a different subject every iteration, on one shared
+/// store: the steady state of a query workload over a large term set —
+/// distinct lookups against a store that has been open a while — and the cell
+/// that prices the search across windows. The term is built outside the timed
+/// closure, as the other probe cells do.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_probe_distinct(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
@@ -494,11 +488,9 @@ fn dict_probe_distinct(bencher: divan::Bencher, residency: &DictResidency) {
 }
 
 /// Reconstruction of a point result (subject-bound, the ten-odd rows describing
-/// one resource): the chunk's handful of distinct codes stays under the
-/// point-read cap, so a file-backed dictionary resolves them by reading exactly
-/// those rows out of its cached wire chunks instead of scanning. The bound term
-/// is memoized after the first iteration, so this cell prices the decode, not
-/// the probe.
+/// one resource), the subject's probe included: a file-backed dictionary
+/// groups the chunk's handful of distinct codes by window and takes exactly
+/// those rows out of each window it rebuilds.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_decode_point(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
@@ -518,10 +510,9 @@ fn dict_decode_point(bencher: divan::Bencher, residency: &DictResidency) {
 
 /// Reconstruction of a wide matched subset (predicate-bound, one 32nd of the
 /// rows — the predicate vocabulary is 32 terms): resident decodes codes against
-/// the in-memory dictionary. The matched chunk holds far more distinct codes
-/// than the point-read cap admits, so a file-backed dictionary resolves them
-/// with one row-index scan — the bulk path, whose whole-leaf decode is what
-/// wins at this width. [`dict_decode_point`] covers the other side of the cap.
+/// the in-memory dictionary; a file-backed dictionary takes each chunk's many
+/// distinct codes out of the windows holding them. [`dict_decode_point`]
+/// covers a point result.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_decode_matched(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
