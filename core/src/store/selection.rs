@@ -176,7 +176,7 @@ impl RowSelection {
 
     /// Narrow to the base rows also named by `ids` (which must be ascending
     /// and unique, as every producer of an id list here guarantees).
-    pub(crate) fn intersect_ids(self, ids: Buffer<u64>) -> Self {
+    pub(crate) fn intersect_ids(self, ids: Buffer<RowId>) -> Self {
         match self {
             RowSelection::All => RowSelection::Ids(ids),
             RowSelection::Range(range) => RowSelection::Ids(restrict_ids(ids, &range)),
@@ -221,8 +221,8 @@ impl RowSelection {
                 }
             };
         };
-        let live = |id: &u64| !deleted.value(*id as usize);
-        let ids: Buffer<u64> = match self {
+        let live = |id: &RowId| !deleted.value(*id as usize);
+        let ids: Buffer<RowId> = match self {
             RowSelection::All => {
                 Buffer::from_iter((0..base_len as u64).filter(live).skip(offset).take(limit))
             }
@@ -435,7 +435,7 @@ impl RowSelection {
 
 /// Restrict an ascending id list to a row range (zero-copy: the surviving ids
 /// are always a contiguous window of a sorted list).
-fn restrict_ids(ids: Buffer<u64>, range: &Range<u64>) -> Buffer<u64> {
+fn restrict_ids(ids: Buffer<RowId>, range: &Range<RowId>) -> Buffer<RowId> {
     let slice = ids.as_slice();
     let lo = slice.partition_point(|&id| id < range.start);
     let hi = slice.partition_point(|&id| id < range.end);
@@ -455,7 +455,7 @@ fn clamped(range: &Range<u64>, base_len: usize) -> Range<usize> {
 }
 
 /// Intersection of two ascending id lists.
-fn intersect_sorted_ids(left: &[u64], right: &[u64]) -> Buffer<u64> {
+fn intersect_sorted_ids(left: &[RowId], right: &[RowId]) -> Buffer<RowId> {
     // Classic sorted-merge intersection: advance whichever side is behind,
     // emit a value only when both sides agree on it. The result can hold at
     // most the smaller list, so one up-front reservation replaces the
@@ -498,7 +498,7 @@ pub(crate) fn point_sized(rows: u64) -> bool {
 mod tests {
     use super::*;
 
-    fn ids(values: &[u64]) -> Buffer<u64> {
+    fn ids(values: &[RowId]) -> Buffer<RowId> {
         Buffer::from_iter(values.iter().copied())
     }
 

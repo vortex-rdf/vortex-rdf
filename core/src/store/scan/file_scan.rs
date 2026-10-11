@@ -27,7 +27,7 @@ use crate::io::read::{available_parallelism, collect_scan, collect_scan_spawned}
 use crate::store::layouts::{Constraints, PatternCodes, QuadPattern, TermRef};
 use crate::store::native_file::NativeStoreFile;
 use crate::store::scan::gather::primitive_from_u64_reads;
-use crate::store::schema::{self, TermCode};
+use crate::store::schema::{self, RowId, TermCode};
 use crate::store::selection::RowSelection;
 
 /// The bind-memo scope tag for expressions over the quad table's schema
@@ -206,18 +206,18 @@ impl RowSelection {
 
 /// The set positions of a tombstone mask as an ascending id list — the sparse
 /// form the scan wants for an exclusion.
-fn deleted_ids(deleted: &Mask) -> StrictSortedBuffer<u64> {
+fn deleted_ids(deleted: &Mask) -> StrictSortedBuffer<RowId> {
     let ids = match deleted.indices() {
-        AllOr::All => Buffer::from_iter(0..deleted.len() as u64),
+        AllOr::All => Buffer::from_iter(0..deleted.len() as RowId),
         AllOr::None => Buffer::empty(),
-        AllOr::Some(indices) => Buffer::from_iter(indices.iter().map(|&i| i as u64)),
+        AllOr::Some(indices) => Buffer::from_iter(indices.iter().map(|&i| i as RowId)),
     };
     StrictSortedBuffer::try_new(ids).vortex_expect("mask indices are ascending and unique")
 }
 
 /// An ascending id list with the tombstoned rows removed — used when a sparse
 /// id selection and the deletions would both want the scan's selection knob.
-fn subtract_deleted(ids: &Buffer<u64>, deleted: &Mask) -> StrictSortedBuffer<u64> {
+fn subtract_deleted(ids: &Buffer<RowId>, deleted: &Mask) -> StrictSortedBuffer<RowId> {
     let ids = Buffer::from_iter(
         ids.iter()
             .copied()
@@ -229,7 +229,7 @@ fn subtract_deleted(ids: &Buffer<u64>, deleted: &Mask) -> StrictSortedBuffer<u64
 /// A [`RowSelection::Ids`] list as the strictly-sorted buffer the scan wants —
 /// ascending and unique is that variant's construction invariant (index
 /// resolutions answer in ascending unique row ids).
-fn strict_ids(ids: &Buffer<u64>) -> StrictSortedBuffer<u64> {
+fn strict_ids(ids: &Buffer<RowId>) -> StrictSortedBuffer<RowId> {
     StrictSortedBuffer::try_new(ids.clone())
         .vortex_expect("a RowSelection id list is ascending and unique")
 }
@@ -445,8 +445,8 @@ pub(crate) async fn first_matching_rows(
     selection: &RowSelection,
     deleted: Option<&Mask>,
     want: usize,
-) -> Result<Buffer<u64>> {
-    let mut ids: Vec<u64> = Vec::new();
+) -> Result<Buffer<RowId>> {
+    let mut ids: Vec<RowId> = Vec::new();
     if want == 0 {
         return Ok(Buffer::from(ids));
     }
