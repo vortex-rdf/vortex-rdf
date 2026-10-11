@@ -33,17 +33,34 @@ pub(crate) fn code_to_js(code: TermCode) -> Result<f64, String> {
         // At most 2^53 − 1, so the conversion is exact.
         Ok(code as f64)
     } else {
-        Err(format!(
-            "term code {code} is past 2^53 - 1 (Number.MAX_SAFE_INTEGER): no JS number holds it \
-             exactly"
-        ))
+        Err(past_js_numbers(code))
     }
 }
 
+/// The error for `code`, past 2^53 − 1.
+fn past_js_numbers(code: TermCode) -> String {
+    format!(
+        "term code {code} is past 2^53 - 1 (Number.MAX_SAFE_INTEGER): no JS number holds it \
+         exactly"
+    )
+}
+
 /// A code column as the numbers of a `Float64Array`, or the error for its
-/// first code past 2^53 − 1 (see [`code_to_js`]).
+/// first code past 2^53 − 1 (see [`code_to_js`]). The column's largest code
+/// is checked first, so the conversion is a plain cast into one allocation of
+/// the column's length.
 pub(crate) fn codes_to_js(codes: &[TermCode]) -> Result<Vec<f64>, String> {
-    codes.iter().map(|&code| code_to_js(code)).collect()
+    let largest = codes.iter().copied().max().unwrap_or(0);
+    if largest > MAX_JS_CODE {
+        let first = codes
+            .iter()
+            .copied()
+            .find(|&code| code > MAX_JS_CODE)
+            .unwrap_or(largest);
+        return Err(past_js_numbers(first));
+    }
+    // Every code is at most 2^53 − 1, so each cast is exact.
+    Ok(codes.iter().map(|&code| code as f64).collect())
 }
 
 #[cfg(test)]
@@ -102,5 +119,23 @@ mod tests {
             assert!(err.contains(&code.to_string()), "{err}");
         }
         assert!(codes_to_js(&[0, WIDE, MAX_JS_CODE + 1]).is_err());
+    }
+
+    /// A column converts into one allocation of exactly its length.
+    #[test]
+    fn a_code_column_converts_into_one_allocation() {
+        let codes: Vec<TermCode> = (0..1_000).map(|i| i * 7 + WIDE).collect();
+        let numbers = codes_to_js(&codes).unwrap();
+        assert_eq!(numbers.len(), codes.len());
+        assert_eq!(numbers.capacity(), codes.len());
+        assert!(numbers.iter().zip(&codes).all(|(&n, &c)| n == c as f64));
+    }
+
+    /// With several codes past 2^53 − 1, the error names the first of them.
+    #[test]
+    fn the_error_names_the_first_code_past_the_bound() {
+        let err = codes_to_js(&[5, MAX_JS_CODE + 2, 7, MAX_JS_CODE + 1]).unwrap_err();
+        assert!(err.contains(&(MAX_JS_CODE + 2).to_string()), "{err}");
+        assert!(!err.contains(&(MAX_JS_CODE + 1).to_string()), "{err}");
     }
 }
