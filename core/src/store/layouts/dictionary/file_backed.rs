@@ -1,27 +1,31 @@
 //! The file-backed arm of the Dictionary layout's residency axis: a term
 //! dictionary read in place from its serialized child. A file store is
 //! memory-mapped, so reading a window is slicing its segment out of the map
-//! and rebuilding the FSST array over those bytes; only the terms a call
-//! asks for are decompressed, and nothing read is kept once the call
-//! returns but the kind ranges. The handle holds the child's layout (one
-//! flat leaf per FSST window) and each window's first and last term — read at
-//! open from the child's exact zone maps, or from the leaves of a child
-//! written without them (chunks of uneven length have no uniform zone to
-//! record). A child whose shape a window search cannot address is not
-//! file-backed at all: [`store::open`](crate::store::open) lifts it resident
-//! instead. The policy enum choosing between this and the resident form is
+//! and rebuilding the FSST array over those bytes (its code offsets are
+//! unpacked once); only the terms a call asks for are decompressed. Rebuilt
+//! windows are kept in a byte-bounded, least-recently-used cache
+//! ([`WINDOW_CACHE_BYTES`] per opened file), so probes and decodes landing in
+//! a recently used window do not rebuild it. The handle holds the child's
+//! layout (one flat leaf per FSST window) and each window's first and last
+//! term — read at open from the child's exact zone maps, or from the leaves
+//! of a child written without them (chunks of uneven length have no uniform
+//! zone to record) — and the kind ranges. A child whose shape a window
+//! search cannot address is not file-backed at all:
+//! [`store::open`](crate::store::open) lifts it resident instead. The policy
+//! enum choosing between this and the resident form is
 //! [`DictAccess`](super::access::DictAccess); the module only compiles with
 //! `file-io`, since without a file there is nothing to leave the terms in.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use futures::{StreamExt as _, TryStreamExt as _};
+use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
-use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 use vortex_array::serde::SerializedArray;
-use vortex_array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
+use vortex_array::{ArrayRef, ExecutionCtx, VortexSessionExecute};
 use vortex_buffer::Buffer;
 use vortex_layout::layouts::chunked::Chunked as ChunkedLayout;
 use vortex_layout::layouts::flat::Flat;
@@ -42,8 +46,8 @@ use crate::store::schema::TermCode;
 use super::check_code;
 use super::predicates::{KindRanges, TermPredicate, Verdict};
 use super::term_dict::{
-    COL_DICT_TERM, TermDictionary, check_candidates, chunk_of, code_rank, prefix_successor,
-    rank_code, split_verdicts, window_bound_aggregates,
+    COL_DICT_TERM, TermChunk, TermDictionary, check_candidates, chunk_of, code_rank,
+    prefix_successor, rank_code, split_verdicts, window_bound_aggregates,
 };
 
 /// A window's first and last term.
@@ -62,8 +66,90 @@ struct Window {
     last: Box<[u8]>,
 }
 
-/// What a [`FileBackedDict`] holds: the child's layout metadata and the
-/// per-window bounds — never a term read for a call.
+/// What one opened file's window cache may hold: the heap bytes of its
+/// rebuilt windows (see [`TermChunk::heap_bytes`]), least recently used
+/// evicted first. An FSST window of 65,536 terms costs about 256 KiB (its
+/// unpacked code offsets), so about 16 windows fit.
+const WINDOW_CACHE_BYTES: usize = 4 << 20;
+
+/// The rebuilt windows of one file, by window index, bounded by the heap
+/// bytes of their chunks. A lookup refreshes a window's recency; an insert
+/// evicts the least recently used windows until the new one fits, and a
+/// window larger than the whole budget is not kept.
+struct WindowCache {
+    budget: usize,
+    /// Heap bytes of every cached chunk.
+    bytes: usize,
+    /// The last recency stamp handed out.
+    clock: u64,
+    windows: HashMap<usize, CachedWindow>,
+}
+
+/// A cached window with its heap bytes and the stamp of its last use.
+struct CachedWindow {
+    chunk: Arc<TermChunk>,
+    bytes: usize,
+    last_use: u64,
+}
+
+impl WindowCache {
+    fn new(budget: usize) -> Self {
+        Self {
+            budget,
+            bytes: 0,
+            clock: 0,
+            windows: HashMap::new(),
+        }
+    }
+
+    /// Window `w`'s chunk, now the most recently used.
+    fn get(&mut self, w: usize) -> Option<Arc<TermChunk>> {
+        let cached = self.windows.get_mut(&w)?;
+        self.clock += 1;
+        cached.last_use = self.clock;
+        Some(Arc::clone(&cached.chunk))
+    }
+
+    /// Keep `chunk` as window `w`'s entry and return the chunk to use: the
+    /// entry already there when another task rebuilt the window first, else
+    /// `chunk` itself (kept unless it exceeds the budget).
+    fn insert(&mut self, w: usize, chunk: Arc<TermChunk>) -> Arc<TermChunk> {
+        if let Some(kept) = self.get(w) {
+            return kept;
+        }
+        let bytes = chunk.heap_bytes();
+        if bytes > self.budget {
+            return chunk;
+        }
+        while self.bytes + bytes > self.budget {
+            let Some(oldest) = self
+                .windows
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_use)
+                .map(|(&w, _)| w)
+            else {
+                break;
+            };
+            if let Some(evicted) = self.windows.remove(&oldest) {
+                self.bytes -= evicted.bytes;
+            }
+        }
+        self.clock += 1;
+        self.bytes += bytes;
+        self.windows.insert(
+            w,
+            CachedWindow {
+                chunk: Arc::clone(&chunk),
+                bytes,
+                last_use: self.clock,
+            },
+        );
+        chunk
+    }
+}
+
+/// What a [`FileBackedDict`] holds: the child's layout metadata, the
+/// per-window bounds and the bounded cache of rebuilt windows.
 struct Windows {
     /// The dictionary child's layout reader, for the transient whole-column
     /// lift (serialization, compaction).
@@ -78,8 +164,11 @@ struct Windows {
     /// The kind ranges (three code ranges and the default graph's code),
     /// computed on first use.
     kinds: OnceLock<KindRanges>,
-    /// Windows rebuilt since open — what the tests read to pin that a call
-    /// touches only the windows holding its codes.
+    /// Rebuilt windows, kept for reuse. The lock is held for a lookup or an
+    /// insert, never across an `.await`.
+    cache: Mutex<WindowCache>,
+    /// Windows rebuilt since open (the cache's misses) — what the tests read
+    /// to pin that a call rebuilds only the windows holding its codes.
     #[cfg(test)]
     rebuilt: std::sync::atomic::AtomicUsize,
     /// The code of the first term (see `term_dict::code_base`).
@@ -113,19 +202,36 @@ impl Windows {
         rank_code(rank, self.base())
     }
 
-    /// Window `w`'s leaf, rebuilt over its segment.
-    async fn window_array(&self, w: usize) -> Result<ArrayRef> {
+    /// The cache's guard. Every entry is complete when it is inserted, so a
+    /// lock poisoned by a panic elsewhere guards a consistent cache and is
+    /// taken over.
+    fn cache(&self) -> MutexGuard<'_, WindowCache> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Window `w` as a term chunk: the cached one, else its leaf rebuilt
+    /// over its segment and adopted through [`TermChunk::from_wire`] (FSST
+    /// stays compressed with its offsets unpacked once; any other encoding is
+    /// canonicalized), then cached. The leaf is rebuilt with the lock
+    /// released, so two tasks missing one window both rebuild it and the
+    /// cache keeps the first insert.
+    async fn window_chunk(&self, w: usize) -> Result<Arc<TermChunk>> {
+        if let Some(chunk) = self.cache().get(w) {
+            return Ok(chunk);
+        }
         #[cfg(test)]
         self.rebuilt
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let window = &self.windows[w];
-        rebuild_leaf(&window.layout, window.rows, &self.source).await
+        let leaf = rebuild_leaf(&window.layout, window.rows, &self.source).await?;
+        let chunk = TermChunk::from_wire(leaf, &mut VORTEX_SESSION.create_execution_ctx())?;
+        Ok(self.cache().insert(w, Arc::new(chunk)))
     }
 }
 
-/// A term dictionary left in its layout child, with no term held: term →
-/// code probes and code → term decodes read, per call, the windows they
-/// need from the (mapped) file. Cloning is an `Arc` bump.
+/// A term dictionary left in its layout child: term → code probes and code →
+/// term decodes read the windows they need from the (mapped) file, through a
+/// bounded cache of rebuilt windows. Cloning is an `Arc` bump.
 #[derive(Clone)]
 pub(crate) struct FileBackedDict(Arc<Windows>);
 
@@ -138,6 +244,11 @@ impl FileBackedDict {
     /// order are an invalid dictionary, not a shape: a `Deserialization`
     /// error.
     pub(crate) async fn open(native: &NativeStoreFile) -> Result<Option<Self>> {
+        Self::open_with_budget(native, WINDOW_CACHE_BYTES).await
+    }
+
+    /// [`open`](Self::open) with a window cache of `budget` heap bytes.
+    async fn open_with_budget(native: &NativeStoreFile, budget: usize) -> Result<Option<Self>> {
         let Some((_, reader)) = native
             .component_reader(DICT_COMPONENT_NAME)
             .map_err(VortexRdfError::Vortex)?
@@ -190,6 +301,7 @@ impl FileBackedDict {
             len: start,
             source,
             kinds: OnceLock::new(),
+            cache: Mutex::new(WindowCache::new(budget)),
             #[cfg(test)]
             rebuilt: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -203,8 +315,9 @@ impl FileBackedDict {
     }
 
     /// Term → code: the window whose bounds enclose `term`, then a binary
-    /// search of that one window — none at all for a window's first or last
-    /// term, or a term falling between two windows.
+    /// search of that one window (through the window cache) — none at all
+    /// for a window's first or last term, or a term falling between two
+    /// windows.
     pub(crate) async fn encode(&self, term: &str) -> Result<Option<TermCode>> {
         let inner = &*self.0;
         let needle = term.as_bytes();
@@ -222,12 +335,12 @@ impl FileBackedDict {
         if needle == &*window.last {
             return Ok(Some(inner.code_at(window.start + window.rows - 1)));
         }
-        let array = inner.window_array(w).await?;
-        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        let chunk = inner.window_chunk(w).await?;
+        let mut cursor = chunk.cursor();
         let (mut lo, mut hi) = (1, window.rows - 1);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            match term_cmp(&array, mid, needle, &mut ctx)? {
+            match cursor.bytes_at(mid).cmp(needle) {
                 Ordering::Less => lo = mid + 1,
                 Ordering::Equal => return Ok(Some(inner.code_at(window.start + mid))),
                 Ordering::Greater => hi = mid,
@@ -250,12 +363,12 @@ impl FileBackedDict {
             return Ok(inner.code_at(window.start));
         }
         // first < needle <= last: the bound lies inside, past the first term.
-        let array = inner.window_array(w).await?;
-        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        let chunk = inner.window_chunk(w).await?;
+        let mut cursor = chunk.cursor();
         let (mut lo, mut hi) = (1, window.rows - 1);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if term_cmp(&array, mid, needle, &mut ctx)? == Ordering::Less {
+            if cursor.bytes_at(mid) < needle {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -266,10 +379,10 @@ impl FileBackedDict {
 
     /// Visit the terms of `codes` (strictly ascending and inside the
     /// dictionary, else an `InvalidOperation` error before any window is
-    /// read) in order: per window holding any of them, the leaf is rebuilt
-    /// over its segment and only the asked rows are taken out of the FSST
-    /// array and decompressed. `visit` gets each code's position in `codes`
-    /// and its term (an error for a term that is not UTF-8).
+    /// read) in order: per window holding any of them, one cached chunk and
+    /// one cursor, which decompresses only the asked rows. `visit` gets each
+    /// code's position in `codes` and its term (an error for a term that is
+    /// not UTF-8).
     async fn visit_terms(
         &self,
         codes: &[TermCode],
@@ -286,7 +399,6 @@ impl FileBackedDict {
         // as a `usize`.
         let base = inner.base();
         let rank = |code: TermCode| (code - base) as usize;
-        let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let mut at = 0;
         while at < codes.len() {
             let (w, _) = chunk_of(&inner.starts, rank(codes[at]));
@@ -301,22 +413,10 @@ impl FileBackedDict {
                     codes[at]
                 )));
             }
-            let locals = PrimitiveArray::from_iter(
-                codes[at..at + run]
-                    .iter()
-                    .map(|&code| (rank(code) - window.start) as u64),
-            )
-            .into_array();
-            let taken = inner
-                .window_array(w)
-                .await?
-                .take(locals)
-                .map_err(VortexRdfError::Vortex)?
-                .execute::<VarBinViewArray>(&mut ctx)
-                .map_err(VortexRdfError::Vortex)?;
-            let reader = StrColReader::new(&taken);
-            for i in 0..run {
-                visit(at + i, reader.str_at(i));
+            let chunk = inner.window_chunk(w).await?;
+            let mut cursor = chunk.cursor();
+            for (i, &code) in codes[at..at + run].iter().enumerate() {
+                visit(at + i, cursor.str_at(rank(code) - window.start));
             }
             at += run;
         }
@@ -423,7 +523,7 @@ impl FileBackedDict {
     /// The file-backed twin of `TermDictionary::filter_codes`: candidates
     /// whose kind decides them are not read; the rest are read through
     /// [`visit_terms`](Self::visit_terms), so only the windows holding them
-    /// are rebuilt.
+    /// are read.
     pub(crate) async fn filter_codes(
         &self,
         predicate: &TermPredicate,
@@ -472,6 +572,28 @@ impl FileBackedDict {
     #[cfg(test)]
     pub(crate) fn debug_window_count(&self) -> usize {
         self.0.windows.len()
+    }
+
+    /// Heap bytes the window cache holds.
+    #[cfg(test)]
+    pub(crate) fn debug_cached_bytes(&self) -> usize {
+        self.0.cache().bytes
+    }
+
+    /// The indices of the cached windows, ascending.
+    #[cfg(test)]
+    pub(crate) fn debug_cached_windows(&self) -> Vec<usize> {
+        let mut cached: Vec<usize> = self.0.cache().windows.keys().copied().collect();
+        cached.sort_unstable();
+        cached
+    }
+
+    /// Drop every cached window.
+    #[cfg(test)]
+    pub(crate) fn debug_clear_cache(&self) {
+        let mut cache = self.0.cache();
+        cache.windows.clear();
+        cache.bytes = 0;
     }
 }
 
@@ -626,7 +748,8 @@ fn bound_column(
 
 /// Each window's bounds read from its own leaf — the fallback for a term
 /// column without exact zone maps (chunks of uneven length, or a foreign
-/// writer): two single-term reads per window, at open.
+/// writer): two single-term reads per window through a chunk cursor, at open.
+/// The windows are not cached.
 async fn leaf_bounds(
     leaves: &[(LayoutRef, usize)],
     source: &Arc<dyn SegmentSource>,
@@ -634,11 +757,12 @@ async fn leaf_bounds(
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let mut bounds = Vec::with_capacity(leaves.len());
     for (layout, rows) in leaves {
-        let array = rebuild_leaf(layout, *rows, source).await?;
-        bounds.push((
-            term_bytes(&array, 0, &mut ctx)?,
-            term_bytes(&array, rows - 1, &mut ctx)?,
-        ));
+        let leaf = rebuild_leaf(layout, *rows, source).await?;
+        let chunk = TermChunk::from_wire(leaf, &mut ctx)?;
+        let mut cursor = chunk.cursor();
+        let first = Box::from(cursor.bytes_at(0));
+        let last = Box::from(cursor.bytes_at(rows - 1));
+        bounds.push((first, last));
     }
     Ok(bounds)
 }
@@ -675,61 +799,47 @@ async fn rebuild_leaf(
         .map_err(VortexRdfError::Vortex)
 }
 
-/// Term `local` of a rebuilt leaf compared with `needle`, decompressing that
-/// one term.
-fn term_cmp(
-    array: &ArrayRef,
-    local: usize,
-    needle: &[u8],
-    ctx: &mut ExecutionCtx,
-) -> Result<Ordering> {
-    let scalar = array
-        .execute_scalar(local, ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let utf8 = scalar.as_utf8();
-    let term = utf8
-        .value()
-        .map_or(&b""[..], |term| term.as_str().as_bytes());
-    Ok(term.cmp(needle))
-}
-
-/// Term `local` of a rebuilt leaf, owned.
-fn term_bytes(array: &ArrayRef, local: usize, ctx: &mut ExecutionCtx) -> Result<Box<[u8]>> {
-    let scalar = array
-        .execute_scalar(local, ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    Ok(scalar
-        .as_utf8()
-        .value()
-        .map(|term| Box::from(term.as_str().as_bytes()))
-        .unwrap_or_default())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use vortex_buffer::ByteBuffer;
     use vortex_file::OpenOptionsSessionExt as _;
 
-    /// `n` IRIs compressed in windows of `window` terms, written as a store's
-    /// dictionary child and opened file-backed over the written bytes.
-    async fn windowed_handle(n: usize, window: usize) -> (FileBackedDict, Vec<String>) {
+    /// `n` IRIs compressed in windows of `window` terms and written as a
+    /// store's dictionary child: the opened file, the resident dictionary
+    /// they were written from, and the terms.
+    async fn windowed_native(
+        n: usize,
+        window: usize,
+    ) -> (NativeStoreFile, TermDictionary, Vec<String>) {
         let terms: Vec<String> = (0..n)
             .map(|i| format!("<http://example.org/term/{i:04}>"))
             .collect();
         let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
         let d = TermDictionary::compress_windowed(plain, window).unwrap();
-        let bytes = crate::tests::write_dict_only_store(&d).await;
-        let file = VORTEX_SESSION
-            .open_options()
-            .open_buffer(ByteBuffer::from(bytes))
-            .unwrap();
-        let native = NativeStoreFile::try_new(file).unwrap();
+        let native = crate::tests::open_native_bytes(crate::tests::write_dict_only_store(&d).await);
+        (native, d, terms)
+    }
+
+    /// [`windowed_native`] opened file-backed.
+    async fn windowed_handle(n: usize, window: usize) -> (FileBackedDict, Vec<String>) {
+        let (native, _, terms) = windowed_native(n, window).await;
         let fbd = FileBackedDict::open(&native)
             .await
             .unwrap()
             .expect("the written dictionary child must be window-searchable");
         (fbd, terms)
+    }
+
+    /// The heap bytes of one 100-term FSST window: its unpacked code offsets,
+    /// one `u32` per term plus one.
+    const WINDOW_BYTES: usize = 101 * size_of::<u32>();
+
+    /// Probe an interior term of window `w` of a handle over 100-term
+    /// windows.
+    async fn touch(fbd: &FileBackedDict, terms: &[String], w: usize) {
+        let i = w * 100 + 37;
+        assert_eq!(fbd.encode(&terms[i]).await.unwrap(), Some(i as TermCode));
     }
 
     /// Windows that are each sorted but out of term order across the child
@@ -845,6 +955,156 @@ mod tests {
             fbd.decode_many(&[600]).await,
             Err(VortexRdfError::Deserialization(_))
         ));
+    }
+
+    /// Probes inside one window rebuild it once: a repeated term, another
+    /// term of the window and a lower bound inside it read the same window.
+    #[tokio::test]
+    async fn probes_of_one_window_rebuild_it_once() {
+        let (fbd, terms) = windowed_handle(600, 100).await;
+        let before = fbd.debug_windows_rebuilt();
+        for _ in 0..3 {
+            assert_eq!(fbd.encode(&terms[137]).await.unwrap(), Some(137));
+        }
+        assert_eq!(fbd.debug_windows_rebuilt() - before, 1);
+        assert_eq!(fbd.encode(&terms[142]).await.unwrap(), Some(142));
+        let inside = format!("{}~", terms[150]);
+        assert_eq!(fbd.lower_bound(inside.as_bytes()).await.unwrap(), 151);
+        assert_eq!(fbd.debug_windows_rebuilt() - before, 1);
+
+        fbd.debug_clear_cache();
+        assert_eq!(fbd.encode(&terms[137]).await.unwrap(), Some(137));
+        assert_eq!(fbd.debug_windows_rebuilt() - before, 2);
+    }
+
+    /// Repeated decodes of the same codes rebuild their windows once, through
+    /// both decode entry points.
+    #[tokio::test]
+    async fn repeated_decodes_rebuild_once() {
+        let (fbd, terms) = windowed_handle(600, 100).await;
+        let codes = [105u64, 150, 199, 401, 450];
+        let before = fbd.debug_windows_rebuilt();
+        for _ in 0..3 {
+            let got = fbd.decode_many(&codes).await.unwrap();
+            for (code, term) in codes.iter().zip(&got) {
+                assert_eq!(&**term, terms[*code as usize].as_str());
+            }
+        }
+        assert_eq!(fbd.debug_windows_rebuilt() - before, 2);
+        let any = fbd.decode_many_any(&[450, 105, 450, 9999]).await.unwrap();
+        assert_eq!(any[0].as_deref(), Some(terms[450].as_str()));
+        assert_eq!(any[1].as_deref(), Some(terms[105].as_str()));
+        assert_eq!(any[3], None);
+        assert_eq!(fbd.debug_windows_rebuilt() - before, 2);
+    }
+
+    /// The cache holds at most its budget and evicts the least recently used
+    /// window: with room for two windows, touching windows 0, 1 and 2 evicts
+    /// 0, a hit on 1 refreshes it, and 0 is then a miss that evicts 2.
+    #[tokio::test]
+    async fn the_window_cache_evicts_the_least_recently_used_within_its_budget() {
+        let (native, _, terms) = windowed_native(600, 100).await;
+        let budget = 2 * WINDOW_BYTES;
+        let fbd = FileBackedDict::open_with_budget(&native, budget)
+            .await
+            .unwrap()
+            .unwrap();
+        // (window touched, windows rebuilt by it, windows cached after it)
+        let steps: [(usize, usize, &[usize]); 6] = [
+            (0, 1, &[0]),
+            (1, 1, &[0, 1]),
+            (2, 1, &[1, 2]),
+            (1, 0, &[1, 2]),
+            (0, 1, &[0, 1]),
+            (2, 1, &[0, 2]),
+        ];
+        for (w, rebuilds, cached) in steps {
+            let before = fbd.debug_windows_rebuilt();
+            touch(&fbd, &terms, w).await;
+            assert_eq!(fbd.debug_windows_rebuilt() - before, rebuilds, "window {w}");
+            assert_eq!(fbd.debug_cached_windows(), cached, "after window {w}");
+            assert!(fbd.debug_cached_bytes() <= budget, "after window {w}");
+        }
+    }
+
+    /// A window larger than the whole budget is used but not kept: every
+    /// read rebuilds it and answers correctly, and nothing is cached.
+    #[tokio::test]
+    async fn a_window_past_the_budget_is_used_but_not_kept() {
+        let (native, _, terms) = windowed_native(600, 100).await;
+        let fbd = FileBackedDict::open_with_budget(&native, WINDOW_BYTES - 1)
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..3 {
+            touch(&fbd, &terms, 2).await;
+        }
+        assert_eq!(fbd.debug_windows_rebuilt(), 3);
+        let got = fbd.decode_many(&[105, 250]).await.unwrap();
+        assert_eq!(&*got[0], terms[105].as_str());
+        assert_eq!(&*got[1], terms[250].as_str());
+        assert_eq!(fbd.debug_windows_rebuilt(), 5);
+        assert!(fbd.debug_cached_windows().is_empty());
+        assert_eq!(fbd.debug_cached_bytes(), 0);
+    }
+
+    /// A window two tasks missed together is kept once, and both use the one
+    /// kept chunk.
+    #[test]
+    fn a_window_missed_twice_together_is_kept_once() {
+        let chunk = || {
+            Arc::new(TermChunk::Canonical(VarBinViewArray::from_iter_str([
+                "<a>", "<b>", "<c>",
+            ])))
+        };
+        let mut cache = WindowCache::new(WINDOW_CACHE_BYTES);
+        let first = cache.insert(3, chunk());
+        let second = cache.insert(3, chunk());
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(cache.windows.len(), 1);
+        assert_eq!(cache.bytes, first.heap_bytes());
+    }
+
+    /// An FSST window costs its unpacked code offsets, a canonical chunk its
+    /// array; the cache totals them.
+    #[tokio::test]
+    async fn cached_windows_are_accounted_by_their_heap_bytes() {
+        let (fbd, terms) = windowed_handle(600, 100).await;
+        touch(&fbd, &terms, 0).await;
+        assert_eq!(fbd.debug_cached_bytes(), WINDOW_BYTES);
+        touch(&fbd, &terms, 4).await;
+        assert_eq!(fbd.debug_cached_bytes(), 2 * WINDOW_BYTES);
+        fbd.debug_clear_cache();
+        assert_eq!(fbd.debug_cached_bytes(), 0);
+
+        let plain = VarBinViewArray::from_iter_str(["<a>", "<b>", "<c>"]);
+        let nbytes = usize::try_from(plain.nbytes()).unwrap();
+        assert_eq!(TermChunk::Canonical(plain).heap_bytes(), nbytes);
+    }
+
+    /// `encode_many` over terms that cycle through every window, under a
+    /// two-window budget that turns the cache over throughout, returns the
+    /// resident dictionary's codes.
+    #[tokio::test]
+    async fn encode_many_under_a_two_window_budget_matches_the_resident_dictionary() {
+        let (native, d, terms) = windowed_native(600, 100).await;
+        let budget = 2 * WINDOW_BYTES;
+        let fbd = FileBackedDict::open_with_budget(&native, budget)
+            .await
+            .unwrap()
+            .unwrap();
+        // 101 is coprime to 600: a permutation whose neighbours sit in
+        // different windows.
+        let mut probes: Vec<String> = (0..600).map(|i| terms[i * 101 % 600].clone()).collect();
+        probes.extend(["<http://zzz>", "<http://example.org/term/0250x>"].map(String::from));
+        let refs: Vec<&str> = probes.iter().map(String::as_str).collect();
+
+        assert_eq!(
+            fbd.encode_many(&refs).await.unwrap(),
+            d.encode_many(&refs).unwrap()
+        );
+        assert!(fbd.debug_windows_rebuilt() > fbd.debug_window_count());
+        assert!(fbd.debug_cached_bytes() <= budget);
     }
 
     /// A code list that is not strictly ascending is an error, however far
@@ -986,13 +1246,16 @@ mod tests {
 
         let fbd = FileBackedDict::open(&native).await.unwrap().unwrap();
         assert_eq!(fbd.debug_window_count(), 4);
-        let before = fbd.debug_windows_rebuilt();
+        // Eight edge terms (a window's first and last) read no leaf.
+        for i in (0..4).flat_map(|w| [w * 100, w * 100 + 99]) {
+            assert_eq!(fbd.encode(&terms[i]).await.unwrap(), Some(i as TermCode));
+        }
+        assert_eq!(fbd.debug_windows_rebuilt(), 0);
+        // Every term finds its own code; each window is rebuilt once.
         for (i, term) in terms.iter().enumerate() {
             assert_eq!(fbd.encode(term).await.unwrap(), Some(i as TermCode), "{i}");
         }
-        // Eight edge terms (a window's first and last) read no leaf; each of
-        // the others rebuilt exactly one window.
-        assert_eq!(fbd.debug_windows_rebuilt() - before, 400 - 8);
+        assert_eq!(fbd.debug_windows_rebuilt(), 4);
         // A near miss — the last byte changed — is absent, not a neighbour.
         let near = format!("{}?", &terms[150][..terms[150].len() - 1]);
         assert_eq!(fbd.encode(&near).await.unwrap(), None);
@@ -1044,7 +1307,12 @@ mod tests {
 
         // Encode and decode parity with the plain column, term by term.
         let column = StrColReader::new(&plain);
-        let before = fbd.debug_windows_rebuilt();
+        // The edge terms are answered from the bounds read at open.
+        for code in (0..6).flat_map(|w| [w * 100, w * 100 + 99]) {
+            let term = column.str_at(code).unwrap();
+            assert_eq!(fbd.encode(term).await.unwrap(), Some(code as TermCode));
+        }
+        assert_eq!(fbd.debug_windows_rebuilt(), 0);
         for code in 0..600 {
             let term = column.str_at(code).unwrap();
             assert_eq!(
@@ -1053,8 +1321,8 @@ mod tests {
                 "{term}"
             );
         }
-        // The edge terms were answered from the bounds read at open.
-        assert_eq!(fbd.debug_windows_rebuilt() - before, 600 - 12);
+        // Each window is rebuilt once.
+        assert_eq!(fbd.debug_windows_rebuilt(), 6);
         let codes: Vec<TermCode> = (0..600).collect();
         let decoded = fbd.decode_many(&codes).await.unwrap();
         for (code, term) in decoded.iter().enumerate() {

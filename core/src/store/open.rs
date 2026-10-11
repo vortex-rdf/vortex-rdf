@@ -162,9 +162,10 @@ impl VortexRdfStore {
     /// Open a store file memory-mapped (`memmap2`, through Vortex's
     /// `open_buffer`): a segment read is a slice of the map, so what stays
     /// in RAM is the kernel's page cache — file-backed, reclaimable RSS —
-    /// never a copy on this process's heap. Only the footer is read up
-    /// front; under the Dictionary layout the dictionary child's per-window
-    /// term bounds are read too.
+    /// and the dictionary's bounded window cache, never a copy of the file
+    /// on this process's heap. Only the footer is read up front; under the
+    /// Dictionary layout the dictionary child's per-window term bounds are
+    /// read too.
     ///
     /// The file is read in place for the store's lifetime: it must not be
     /// truncated or rewritten while open. Replacing it by a rename (as

@@ -227,7 +227,8 @@ impl FileIdentity {
 pub(crate) enum FileAccess {
     /// Memory-mapped (`memmap2`) and opened over the mapping with
     /// `open_buffer`: a segment fetch is a slice of the map, and what stays
-    /// in RAM is the kernel's page cache, not this process's heap.
+    /// in RAM is the kernel's page cache and the dictionary's bounded window
+    /// cache, not a copy of the file on this process's heap.
     Mapped,
     /// Read through Vortex's file reader (`open_path`): every segment fetch
     /// is a positioned read into a buffer the caller then owns — the path a

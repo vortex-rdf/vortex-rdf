@@ -122,6 +122,18 @@ impl TermChunk {
         }
     }
 
+    /// The heap this chunk occupies, which is what a cache of chunks budgets:
+    /// an FSST chunk's unpacked code offsets (one `u32` per term, plus one),
+    /// a canonical chunk's array. Segment bytes a chunk only references are
+    /// not counted.
+    #[cfg(feature = "file-io")]
+    pub(super) fn heap_bytes(&self) -> usize {
+        match self {
+            TermChunk::Canonical(a) => usize::try_from(a.nbytes()).unwrap_or(usize::MAX),
+            TermChunk::Fsst(f) => f.offsets.len() * size_of::<u32>(),
+        }
+    }
+
     /// A fresh cursor over this chunk's terms. Scratch is allocated lazily
     /// inside `bytes_at`, so a single-term decode allocates only for the
     /// chunk it touches.
@@ -757,6 +769,14 @@ pub(super) enum ChunkCursor<'a> {
 }
 
 impl ChunkCursor<'_> {
+    /// Term `local` as a `&str`, borrowed from the cursor like
+    /// [`bytes_at`](Self::bytes_at).
+    #[cfg(feature = "file-io")]
+    #[inline]
+    pub(super) fn str_at(&mut self, local: usize) -> Result<&str> {
+        buf_as_str(self.bytes_at(local))
+    }
+
     #[inline]
     pub(super) fn bytes_at(&mut self, local: usize) -> &[u8] {
         match self {
