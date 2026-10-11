@@ -205,11 +205,11 @@ impl VortexRdfStore {
 #[pymethods]
 impl VortexRdfStore {
     /// Open `path`. A file store is memory-mapped: what stays in RAM is the
-    /// operating system's page cache (counted as file-backed RSS, not
-    /// anonymous memory), and the file must not be modified while open —
-    /// replace its file by renaming a new one over it, never by truncating or
-    /// rewriting it in place (a reader of the mapping would be killed with
-    /// SIGBUS); `serialize_rdf` already writes that way (on Windows it fails
+    /// operating system's page cache (counted as file-backed RSS) plus at
+    /// most 4 MiB of rebuilt dictionary windows per store (anonymous memory),
+    /// and the file must not be modified while open — replace its file by
+    /// renaming a new one over it, never by truncating or rewriting it in
+    /// place (a reader of the mapping would be killed with SIGBUS); `serialize_rdf` already writes that way (on Windows it fails
     /// until the store mapping the file, and every `TermDict` and `U64Column`
     /// taken from it, is dropped). The mapping lives as long as the store or
     /// any of those. A file written by vortex-rdf 0.11 or earlier is refused,

@@ -573,7 +573,8 @@ impl TermDictionary {
     /// [`decode`](Self::decode) over a batch, in order, handed to
     /// `visit(position, term)` instead of collected: one cursor serves the
     /// batch (so a chunked dictionary keeps its warm chunk cursors), and an
-    /// out-of-range code, or a term that is not UTF-8, visits as `None`.
+    /// out-of-range code visits as `None`. Terms are trusted to be UTF-8, as
+    /// the column's dtype declares.
     pub(crate) fn decode_many_with(
         &self,
         codes: &[TermCode],
@@ -686,8 +687,8 @@ const FSST_SYMBOL_LEN: usize = 8;
 /// Extra output headroom for `decompress_into`.
 ///
 /// Its 8-symbols-at-a-time path only runs while the output has
-/// `8 * FSST_SYMBOL_LEN` bytes of room left, so a buffer sized exactly to the
-/// longest term silently falls back to the byte-at-a-time tail loop.
+/// `8 * FSST_SYMBOL_LEN` bytes of room left, so a buffer sized exactly to a
+/// term's expanded codes silently falls back to the byte-at-a-time tail loop.
 const FSST_DECODE_HEADROOM: usize = 8 * FSST_SYMBOL_LEN;
 
 /// FSST-compressed sorted terms, with the pieces a hot lookup needs hoisted
@@ -696,8 +697,9 @@ pub(super) struct FsstTerms {
     /// Kept whole so the dictionary can be serialized without recompressing.
     array: FSSTArray,
     /// Code offsets as `u32`, so a per-row read is a slice index. A leaf's
-    /// 32-bit offsets are viewed in place (written offsets are never
-    /// negative); every other width is widened into a copy.
+    /// 32-bit offsets (`i32` or `u32`) are viewed in place (written offsets
+    /// are never negative); every other width is converted to `u32` in a
+    /// copy.
     offsets: Buffer<u32>,
 }
 
@@ -709,10 +711,10 @@ impl FsstTerms {
             .clone()
             .execute::<PrimitiveArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
-        // Width is whatever the writer's scheme selection produced — a small
-        // dictionary's offsets fit in a u8 — so accept every integer type.
-        // The u32 arm of the macro casts u32 -> u32; that is the price of one
-        // arm covering every width.
+        // 32-bit offsets are viewed as they are. A foreign writer may store
+        // them in any other integer width, which is converted to `u32` in a
+        // copy; the macro covers every width, so its `u32` arm casts
+        // u32 -> u32 without being reached.
         #[allow(clippy::unnecessary_cast)]
         let offsets: Buffer<u32> = match offsets.ptype() {
             PType::U32 => offsets.to_buffer::<u32>(),
@@ -1017,9 +1019,9 @@ impl DictReader {
     /// Codes may come in any order and repeat. A resident dictionary visits
     /// in the order of `codes`; a file-backed one visits the out-of-range
     /// positions first, then reads each distinct code once, in one batch, and
-    /// visits every position holding it, in code order. A file-backed term
-    /// that is not UTF-8 is an error, and positions visited before it stay
-    /// visited.
+    /// visits every position holding it, in code order. The `Result` reports
+    /// a failed read of the file; terms are trusted to be UTF-8, as the
+    /// column's dtype declares.
     pub async fn decode_many_with(
         &self,
         codes: &[TermCode],
@@ -1318,7 +1320,8 @@ mod tests {
 
     /// A chunk whose code offsets are stored as `T` holds the same offsets and
     /// decodes the same terms as the 32-bit original; it views the stored
-    /// buffer only when `T` is 32 bits wide, and widens a copy otherwise.
+    /// buffer only when `T` is 32 bits wide, and converts into a copy
+    /// otherwise.
     fn check_offsets_stored_as<T>(original: &FsstTerms, terms: &[String])
     where
         T: NativePType + TryFrom<u32>,

@@ -401,8 +401,8 @@ impl FileBackedDict {
     /// dictionary, else an `InvalidOperation` error before any window is
     /// read) in order: per window holding any of them, one cached chunk and
     /// one cursor, which decompresses only the asked rows. `visit` gets each
-    /// code's position in `codes` and its term (an error for a term that is
-    /// not UTF-8).
+    /// code's position in `codes` and its term, trusted to be UTF-8 as the
+    /// column's dtype declares.
     async fn visit_terms(
         &self,
         codes: &[TermCode],
@@ -471,8 +471,8 @@ impl FileBackedDict {
     /// each distinct code is read once through
     /// [`visit_terms`](Self::visit_terms), and every position holding it is
     /// visited with the borrowed term — no string is built per term. Out-of-
-    /// range positions are visited first; the rest in code order. A term that
-    /// is not UTF-8 fails the call after the other terms are visited.
+    /// range positions are visited first; the rest in code order. Terms are
+    /// trusted to be UTF-8, as the column's dtype declares.
     pub(crate) async fn decode_many_with(
         &self,
         codes: &[TermCode],
@@ -993,7 +993,7 @@ mod tests {
                 "window {w}'s interior"
             );
         }
-        // Every window is cached by now, so a stray read would be a hit that
+        // All six windows are cached here, so a stray read would be a hit that
         // moves no rebuild count: the request count is what pins "no leaf".
         let (before, asked) = (fbd.debug_windows_rebuilt(), fbd.debug_windows_requested());
         let between = format!("{}~", terms[99]);
@@ -1672,8 +1672,8 @@ mod tests {
         assert_eq!(passed.as_slice(), &[105, 150]);
         assert!(undecided.is_empty());
 
-        // The windows are cached now: the request count, which a hit moves
-        // as a miss does, is what pins that the next two steps read nothing.
+        // The two windows are cached: the request count, which a hit moves as
+        // a miss does, is what pins that the next two steps read nothing.
         // A kind test is decided by the kind ranges: nothing is read.
         let (before, asked) = (fbd.debug_windows_rebuilt(), fbd.debug_windows_requested());
         let is_iri = TermPredicate::parse("is_iri", "").unwrap();

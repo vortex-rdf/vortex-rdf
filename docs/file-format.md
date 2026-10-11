@@ -302,10 +302,10 @@ the bounds from the leaves.
 - **The window cache** holds the windows a file-backed dictionary rebuilt. A
   window missing from it is rebuilt over its mapped segment (metadata over the
   bytes, nothing decompressed), its FSST code offsets are read once as 32-bit
-  values (a 32-bit offsets array is used in place, any other width is widened
-  into a copy), and it is kept; a repeated probe or decode of that window
-  skips the rebuild. Its size is bounded per opened file (see the table
-  below).
+  values (a 32-bit offsets array is used in place, any other width is
+  converted to 32 bits in a copy), and it is kept; a repeated probe or decode
+  of that window skips the rebuild. Its size is bounded per opened file (see
+  the table in [§8](#8-reading-a-file)).
 - The kind ranges are kept for the handle's lifetime; the operating system's
   page cache holds the pages the reads touched.
 
@@ -589,6 +589,8 @@ open rather than being read around.
 | row block / zone size | 8,192 rows | Vortex default write strategy |
 | data block target | ~1 MiB; ~2 MiB for an id column (a term code or a row id) that does not dictionary-encode | Vortex default write strategy; [`child_strategy`](../core/src/io/container/sources.rs#L221) |
 | `DICT_CHUNK_ROWS` | 65,536 terms per FSST window and leaf | [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs#L57) |
+| `WINDOW_CACHE_BYTES` | 4 MiB per opened file: what a file-backed dictionary's window cache may hold, each window charged its code offsets and `WINDOW_ENTRY_OVERHEAD` ([§8](#8-reading-a-file)) | [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs#L76) |
+| `WINDOW_ENTRY_OVERHEAD` | 4 KiB charged per cached window beyond its chunk's bytes | [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs#L82) |
 | `DICT_VERSION` | 2 | [`container/mod.rs`](../core/src/io/container/mod.rs#L68) |
 | `INDEX_VERSION` | 1 | [`container/mod.rs`](../core/src/io/container/mod.rs#L72) |
 | `POINT_GATHER_MAX_ROWS` | 256 rows — a located run at most this wide is point-read through the chunk probes | [`selection.rs`](../core/src/store/selection.rs#L489) |
