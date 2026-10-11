@@ -15,6 +15,7 @@
 //! [`dense_table_fits`].
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use vortex_buffer::Buffer;
 
@@ -133,16 +134,38 @@ pub fn take(codes: &[TermCode], indices: &[u64]) -> Result<Buffer<TermCode>, usi
 /// The right column is indexed once (a CSR layout: every right row grouped
 /// under its code), then the left column is probed in order. When both
 /// columns are already ascending the pairs come from one merge pass instead.
+/// Either way a counting pass finds the number of pairs first, and each
+/// output is allocated once at that length.
 pub fn equi_join_indices(left: &[TermCode], right: &[TermCode]) -> (Buffer<u64>, Buffer<u64>) {
+    let (out_l, out_r) = join_pairs(left, right);
+    (Buffer::from(out_l), Buffer::from(out_r))
+}
+
+/// The pair columns of [`equi_join_indices`], each allocated once at its
+/// final length.
+fn join_pairs(left: &[TermCode], right: &[TermCode]) -> (Vec<u64>, Vec<u64>) {
     if left.is_empty() || right.is_empty() {
-        return (Buffer::empty(), Buffer::empty());
+        return (Vec::new(), Vec::new());
     }
     if is_ascending(left) && is_ascending(right) {
-        return merge_join(left, right);
+        merge_join(left, right)
+    } else {
+        hash_join(left, right)
     }
+}
+
+fn is_ascending(codes: &[TermCode]) -> bool {
+    codes.windows(2).all(|w| w[0] <= w[1])
+}
+
+/// The join of a left column against a [`RightIndex`] of the right one: for
+/// each left row in order, its right matches. A counting pass sizes both
+/// outputs before they are filled.
+fn hash_join(left: &[TermCode], right: &[TermCode]) -> (Vec<u64>, Vec<u64>) {
     let index = RightIndex::build(right);
-    let mut out_l = Vec::new();
-    let mut out_r = Vec::new();
+    let total = index.match_count(left);
+    let mut out_l = Vec::with_capacity(total);
+    let mut out_r = Vec::with_capacity(total);
     for (i, &code) in left.iter().enumerate() {
         let rows = index.rows_for(code);
         if rows.is_empty() {
@@ -151,18 +174,16 @@ pub fn equi_join_indices(left: &[TermCode], right: &[TermCode]) -> (Buffer<u64>,
         out_l.extend(std::iter::repeat_n(row(i), rows.len()));
         out_r.extend_from_slice(rows);
     }
-    (Buffer::from(out_l), Buffer::from(out_r))
+    (out_l, out_r)
 }
 
-fn is_ascending(codes: &[TermCode]) -> bool {
-    codes.windows(2).all(|w| w[0] <= w[1])
-}
-
-/// The join of two ascending key columns: walk both, and for each run of
-/// equal codes emit the cross product in nested-loop order.
-fn merge_join(left: &[TermCode], right: &[TermCode]) -> (Buffer<u64>, Buffer<u64>) {
-    let mut out_l = Vec::new();
-    let mut out_r = Vec::new();
+/// Calls `visit(left_run, right_run)`, in order, for each pair of equal-code
+/// runs of two ascending columns.
+fn for_each_run_pair(
+    left: &[TermCode],
+    right: &[TermCode],
+    mut visit: impl FnMut(Range<usize>, Range<usize>),
+) {
     let (mut i, mut j) = (0usize, 0usize);
     while i < left.len() && j < right.len() {
         let (a, b) = (left[i], right[j]);
@@ -173,15 +194,37 @@ fn merge_join(left: &[TermCode], right: &[TermCode]) -> (Buffer<u64>, Buffer<u64
         } else {
             let run_l = i + left[i..].iter().take_while(|&&c| c == a).count();
             let run_r = j + right[j..].iter().take_while(|&&c| c == a).count();
-            for li in i..run_l {
-                out_l.extend(std::iter::repeat_n(row(li), run_r - j));
-                out_r.extend((j..run_r).map(row));
-            }
+            visit(i..run_l, j..run_r);
             i = run_l;
             j = run_r;
         }
     }
-    (Buffer::from(out_l), Buffer::from(out_r))
+}
+
+/// The number of pairs [`merge_join`] produces: the product of the two run
+/// lengths, summed over the equal runs.
+fn merge_join_len(left: &[TermCode], right: &[TermCode]) -> usize {
+    let mut total = 0;
+    for_each_run_pair(left, right, |run_l, run_r| {
+        total += run_l.len() * run_r.len()
+    });
+    total
+}
+
+/// The join of two ascending key columns: walk both, and for each run of
+/// equal codes emit the cross product in nested-loop order. A counting walk
+/// sizes both outputs before they are filled.
+fn merge_join(left: &[TermCode], right: &[TermCode]) -> (Vec<u64>, Vec<u64>) {
+    let total = merge_join_len(left, right);
+    let mut out_l = Vec::with_capacity(total);
+    let mut out_r = Vec::with_capacity(total);
+    for_each_run_pair(left, right, |run_l, run_r| {
+        for li in run_l {
+            out_l.extend(std::iter::repeat_n(row(li), run_r.len()));
+            out_r.extend(run_r.clone().map(row));
+        }
+    });
+    (out_l, out_r)
 }
 
 /// The right column grouped by code: `rows[starts[c]..starts[c+1]]` are the
@@ -221,6 +264,12 @@ impl RightIndex {
             }
             RightIndex::Sparse(map)
         }
+    }
+
+    /// The number of pairs `left` forms with the indexed column: the rows
+    /// holding each left code, summed over the left column.
+    fn match_count(&self, left: &[TermCode]) -> usize {
+        left.iter().map(|&code| self.rows_for(code).len()).sum()
     }
 
     fn rows_for(&self, code: TermCode) -> &[u64] {
@@ -342,6 +391,65 @@ mod tests {
                 or.as_slice(),
                 "right indices for {l:?} ⋈ {r:?}"
             );
+        }
+    }
+
+    /// Column pairs that exercise the sizing of both join paths: empty
+    /// inputs, all-equal codes, disjoint codes, and repeats on one or both
+    /// sides, ascending and not.
+    fn sizing_cases() -> Vec<(Vec<TermCode>, Vec<TermCode>)> {
+        vec![
+            (vec![], vec![]),
+            (vec![], vec![1, 2]),
+            (vec![1, 2], vec![]),
+            (vec![5; 7], vec![5; 3]),
+            (vec![1, 2, 3], vec![4, 5, 6]),
+            (vec![4, 5, 6], vec![1, 2, 3]),
+            (vec![9, 8, 7], vec![1, 2, 3]),
+            (vec![1, 1, 2, 2, 2, 9], vec![1, 2, 2, 3, 9, 9]),
+            (vec![9, 2, 2, 1, 2, 9, 1], vec![2, 9, 1, 2, 9, 9]),
+            (vec![WIDE, 7, WIDE], vec![7, WIDE, WIDE]),
+            (vec![7, 7, WIDE], vec![7, WIDE, WIDE, WIDE]),
+        ]
+    }
+
+    /// The counting pass of each path equals the number of pairs the join
+    /// produces.
+    #[test]
+    fn join_counts_equal_the_produced_lengths() {
+        for (l, r) in sizing_cases() {
+            let produced = nested_loop(&l, &r).0.len();
+            assert_eq!(
+                RightIndex::build(&r).match_count(&l),
+                produced,
+                "hash count for {l:?} ⋈ {r:?}"
+            );
+            if is_ascending(&l) && is_ascending(&r) {
+                assert_eq!(
+                    merge_join_len(&l, &r),
+                    produced,
+                    "merge count for {l:?} ⋈ {r:?}"
+                );
+            }
+        }
+    }
+
+    /// Both paths fill vectors whose capacity is their length, so neither
+    /// grows its output by reallocation.
+    #[test]
+    fn join_outputs_are_allocated_at_their_final_length() {
+        for (l, r) in sizing_cases() {
+            let (want_l, want_r) = nested_loop(&l, &r);
+            let mut paths = vec![("hash", hash_join(&l, &r))];
+            if is_ascending(&l) && is_ascending(&r) {
+                paths.push(("merge", merge_join(&l, &r)));
+            }
+            for (path, (out_l, out_r)) in paths {
+                assert_eq!(out_l, want_l, "{path} left for {l:?} ⋈ {r:?}");
+                assert_eq!(out_r, want_r, "{path} right for {l:?} ⋈ {r:?}");
+                assert_eq!(out_l.capacity(), out_l.len(), "{path} left capacity");
+                assert_eq!(out_r.capacity(), out_r.len(), "{path} right capacity");
+            }
         }
     }
 
