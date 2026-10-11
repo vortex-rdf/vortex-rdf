@@ -489,7 +489,9 @@ where
     (CopyKey<V>, RowId): Ord + Spillable,
 {
     use crate::io::container::sources::PullComponentSource;
-    use crate::io::container::{StoreComponentDescriptor, StoreComponentRole, child_strategy};
+    use crate::io::container::{
+        INDEX_VERSION, StoreComponentDescriptor, StoreComponentRole, child_strategy,
+    };
     use crate::store::indexes::secondary_by_copy::CopyFamily;
     use crate::store::indexes::secondary_by_copy::out_of_core::{
         copy_child_chunk, copy_child_dtype,
@@ -531,7 +533,7 @@ where
                     name: name.into(),
                     role: StoreComponentRole::Index,
                     implementation: slug.into(),
-                    version: 1,
+                    version: INDEX_VERSION,
                     required: false,
                     // The merger emits each family in its global sort order.
                     sorted: true,

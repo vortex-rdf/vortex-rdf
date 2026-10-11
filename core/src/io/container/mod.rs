@@ -180,7 +180,7 @@ mod tests {
             name: "index:posg".into(),
             role: StoreComponentRole::Index,
             implementation: "secondary-by-copy/posg".into(),
-            version: 1,
+            version: INDEX_VERSION,
             required: false,
             sorted: true,
             dtype: quad_chunk(0, 1).dtype().clone(),

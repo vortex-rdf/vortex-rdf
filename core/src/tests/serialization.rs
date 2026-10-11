@@ -1164,6 +1164,70 @@ async fn test_open_rejects_a_dictionary_version_newer_than_this_version_reads() 
     }
 }
 
+/// Every writer stamps its index children with `INDEX_VERSION`, the number
+/// the open-time ceiling check reads: the streaming file writer behind
+/// `serialize_rdf`, the streaming writer into a sink, compaction of a file
+/// store, and `to_bytes`.
+#[tokio::test]
+async fn test_every_writer_stamps_index_children_with_the_index_version() {
+    let index_versions = |bytes: &[u8]| -> Vec<(String, u32)> {
+        let (_, components) = container::store_metadata_of_bytes(bytes);
+        components
+            .into_iter()
+            .filter(|component| component.role == container::StoreComponentRole::Index)
+            .map(|component| (component.name, component.version))
+            .collect()
+    };
+    for layout in LAYOUTS {
+        for indexes in index_sets().into_iter().filter(|set| !set.is_empty()) {
+            let label = format!("{layout:?} {indexes:?}");
+            let quads = modular_quads(12, 3, 4);
+
+            let (_dir, path) = write_store_file(quads.clone(), layout, indexes.clone()).await;
+            let written = std::fs::read(&path).unwrap();
+            let mut sink: Vec<u8> = Vec::new();
+            crate::io::quads_stream_to_vortex_writer(
+                quad_stream(quads.clone()),
+                &mut sink,
+                layout,
+                indexes.clone(),
+            )
+            .await
+            .unwrap();
+            let compacted = VortexRdfStore::from_file(&path)
+                .await
+                .unwrap()
+                .compact()
+                .await
+                .unwrap();
+            drop(compacted);
+            let built = VortexRdfStore::from_quads(quad_stream(quads), layout, indexes.clone())
+                .await
+                .unwrap()
+                .to_bytes()
+                .await
+                .unwrap();
+
+            for (writer, bytes) in [
+                ("quads_stream_to_vortex_file", written),
+                ("quads_stream_to_vortex_writer", sink),
+                ("compact", std::fs::read(&path).unwrap()),
+                ("to_bytes", built),
+            ] {
+                let versions = index_versions(&bytes);
+                assert!(!versions.is_empty(), "{label}: {writer} wrote no index");
+                for (name, version) in versions {
+                    assert_eq!(
+                        version,
+                        container::INDEX_VERSION,
+                        "{label}: {writer} stamped {name}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// An index child of a version newer than the one this version reads is
 /// rejected at open like the dictionary child, whichever way the store is
 /// opened. The current version still opens.
