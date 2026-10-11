@@ -155,6 +155,23 @@ def test_decode_many_shares_strings_when_the_decoded_batch_repeats_a_code(wide_d
     assert term_dict.decode_many(array("Q", codes)) == want
 
 
+def test_decode_many_of_a_batch_longer_than_the_text_reservation(wide_dictionary):
+    """A batch of 240,800 codes asks for far more text than the batch decode
+    reserves up front (1 MiB at most): the buffer grows as the terms are
+    written and every string comes out right, in order, with the
+    out-of-range codes among them as `None`."""
+    term_dict, spellings = wide_dictionary
+    n = len(term_dict)
+    # Cycling through the codes defeats the sharing cache, so almost every
+    # occurrence is decoded again.
+    codes = list(range(n)) * 400
+    got = term_dict.decode_many(codes)
+    assert len(got) == len(codes)
+    assert got == spellings * 400
+    beyond = list(range(n, n + 100_000))
+    assert term_dict.decode_many(beyond) == [None] * len(beyond)
+
+
 def test_prefix_range_and_lower_bound(dictionary):
     _, term_dict = dictionary
     terms = _terms(term_dict)

@@ -27,6 +27,15 @@ const RECENT_BUCKETS: usize = 256;
 /// so emptiness has to be carried by the slot rather than the code.
 const NO_SLOT: usize = usize::MAX;
 
+/// Bytes of text a [`PackedTerms`] reserves per position up front: a short
+/// IRI or literal is longer, so the buffer grows only a few times.
+const PACKED_TEXT_PER_POSITION: usize = 32;
+
+/// The most a [`PackedTerms`] reserves up front however long the batch. The
+/// buffer grows from there as terms are written, so a batch of mostly
+/// out-of-range codes does not reserve text it never fills.
+const PACKED_TEXT_RESERVE_MAX: usize = 1 << 20;
+
 /// Terms decoded GIL-released, packed into one buffer and indexed by the
 /// position of their code in the batch. A term is a range of `text`; a
 /// position holding none (an out-of-range code) has no range. Positions may
@@ -38,10 +47,11 @@ struct PackedTerms {
 
 impl PackedTerms {
     fn new(len: usize) -> Self {
+        let reserve = len
+            .saturating_mul(PACKED_TEXT_PER_POSITION)
+            .min(PACKED_TEXT_RESERVE_MAX);
         Self {
-            // A short IRI or literal is longer than this, so the buffer
-            // grows at most a few times.
-            text: String::with_capacity(len.saturating_mul(32)),
+            text: String::with_capacity(reserve),
             ranges: vec![None; len],
         }
     }
