@@ -56,9 +56,9 @@ fn enable_test_editions(session: &VortexSession) {
         added: &[EditionMember::array(&"fastlanes.delta")],
     };
 
-    // The edition the store writes with (vortex-rdf-core's pinned core
-    // edition): the probes are tested against the wire forms it admits.
-    assert_eq!(CORE_2026_08_3.to_string(), "core2026.08.3");
+    // Must equal `CORE_EDITION` in vortex-rdf-core's `session.rs`, the edition
+    // the store writes with: the probes are tested against the wire forms it
+    // admits. Moving that pin means moving this one by hand.
     for family in EDITION_FAMILIES.iter().copied().chain([&TEST_FAMILY]) {
         session.editions().declare_family(family).unwrap();
     }
