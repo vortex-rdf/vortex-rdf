@@ -1,9 +1,9 @@
 //! The file-backed arm of the Dictionary layout's residency axis: a term
 //! dictionary read in place from its serialized child. A file store is
 //! memory-mapped, so reading a window is slicing its segment out of the map
-//! and rebuilding the FSST array over those bytes (its code offsets are
-//! unpacked once); only the terms a call asks for are decompressed. Rebuilt
-//! windows are kept in a byte-bounded, least-recently-used cache
+//! and rebuilding the FSST array over those bytes (its code offsets are read
+//! once as 32-bit values); only the terms a call asks for are decompressed.
+//! Rebuilt windows are kept in a byte-bounded, least-recently-used cache
 //! ([`WINDOW_CACHE_BYTES`] per opened file), so probes and decodes landing in
 //! a recently used window do not rebuild it. The handle holds the child's
 //! layout (one flat leaf per FSST window) and each window's first and last
@@ -66,26 +66,27 @@ struct Window {
     last: Box<[u8]>,
 }
 
-/// What one opened file's window cache may hold: the heap bytes of its
-/// rebuilt windows (see [`TermChunk::heap_bytes`]), least recently used
-/// evicted first. An FSST window of 65,536 terms costs about 256 KiB (its
-/// unpacked code offsets), so about 16 windows fit.
+/// What one opened file's window cache may hold: the bytes its windows hold
+/// onto (see [`TermChunk::heap_bytes`]), an upper bound on their heap, least
+/// recently used evicted first. An FSST window of 65,536 terms costs about
+/// 256 KiB (its code offsets, 4 bytes each), so about 16 windows fit.
 const WINDOW_CACHE_BYTES: usize = 4 << 20;
 
-/// The rebuilt windows of one file, by window index, bounded by the heap
-/// bytes of their chunks. A lookup refreshes a window's recency; an insert
+/// The rebuilt windows of one file, by window index, bounded by the bytes of
+/// their chunks. A lookup refreshes a window's recency; an insert
 /// evicts the least recently used windows until the new one fits, and a
 /// window larger than the whole budget is not kept.
 struct WindowCache {
     budget: usize,
-    /// Heap bytes of every cached chunk.
+    /// Bytes of every cached chunk (see [`TermChunk::heap_bytes`]).
     bytes: usize,
     /// The last recency stamp handed out.
     clock: u64,
     windows: HashMap<usize, CachedWindow>,
 }
 
-/// A cached window with its heap bytes and the stamp of its last use.
+/// A cached window with its bytes (see [`TermChunk::heap_bytes`]) and the
+/// stamp of its last use.
 struct CachedWindow {
     chunk: Arc<TermChunk>,
     bytes: usize,
@@ -211,8 +212,8 @@ impl Windows {
 
     /// Window `w` as a term chunk: the cached one, else its leaf rebuilt
     /// over its segment and adopted through [`TermChunk::from_wire`] (FSST
-    /// stays compressed with its offsets unpacked once; any other encoding is
-    /// canonicalized), then cached. The leaf is rebuilt with the lock
+    /// stays compressed, its code offsets read once as 32-bit values; any
+    /// other encoding is canonicalized), then cached. The leaf is rebuilt with the lock
     /// released, so two tasks missing one window both rebuild it and the
     /// cache keeps the first insert.
     async fn window_chunk(&self, w: usize) -> Result<Arc<TermChunk>> {
@@ -247,7 +248,7 @@ impl FileBackedDict {
         Self::open_with_budget(native, WINDOW_CACHE_BYTES).await
     }
 
-    /// [`open`](Self::open) with a window cache of `budget` heap bytes.
+    /// [`open`](Self::open) with a window cache of `budget` bytes.
     async fn open_with_budget(native: &NativeStoreFile, budget: usize) -> Result<Option<Self>> {
         let Some((_, reader)) = native
             .component_reader(DICT_COMPONENT_NAME)
@@ -600,7 +601,7 @@ impl FileBackedDict {
         self.0.windows.len()
     }
 
-    /// Heap bytes the window cache holds.
+    /// Bytes the window cache holds.
     #[cfg(test)]
     pub(crate) fn debug_cached_bytes(&self) -> usize {
         self.0.cache().bytes
@@ -831,6 +832,16 @@ mod tests {
     use vortex_buffer::ByteBuffer;
     use vortex_file::OpenOptionsSessionExt as _;
 
+    /// `terms` (sorted, unique) compressed in windows of `window` terms and
+    /// written as a store's dictionary child: the opened file and the
+    /// resident dictionary they were written from.
+    async fn native_over(terms: &[String], window: usize) -> (NativeStoreFile, TermDictionary) {
+        let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
+        let d = TermDictionary::compress_windowed(plain, window).unwrap();
+        let native = crate::tests::open_native_bytes(crate::tests::write_dict_only_store(&d).await);
+        (native, d)
+    }
+
     /// `n` IRIs compressed in windows of `window` terms and written as a
     /// store's dictionary child: the opened file, the resident dictionary
     /// they were written from, and the terms.
@@ -841,9 +852,7 @@ mod tests {
         let terms: Vec<String> = (0..n)
             .map(|i| format!("<http://example.org/term/{i:04}>"))
             .collect();
-        let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
-        let d = TermDictionary::compress_windowed(plain, window).unwrap();
-        let native = crate::tests::open_native_bytes(crate::tests::write_dict_only_store(&d).await);
+        let (native, d) = native_over(&terms, window).await;
         (native, d, terms)
     }
 
@@ -857,8 +866,8 @@ mod tests {
         (fbd, terms)
     }
 
-    /// The heap bytes of one 100-term FSST window: its unpacked code offsets,
-    /// one `u32` per term plus one.
+    /// What one 100-term FSST window costs the cache: its code offsets, one
+    /// `u32` per term plus one.
     const WINDOW_BYTES: usize = 101 * size_of::<u32>();
 
     /// Probe an interior term of window `w` of a handle over 100-term
@@ -1024,6 +1033,72 @@ mod tests {
         assert_eq!(fbd.debug_windows_rebuilt() - before, 2);
     }
 
+    /// A cached window's 32-bit code offsets are the leaf's own bytes: a
+    /// fresh rebuild of the same leaf has its offsets at the address the
+    /// cached chunk's offsets sit at.
+    #[tokio::test]
+    async fn cached_windows_view_their_leafs_offsets() {
+        use vortex_array::arrays::PrimitiveArray;
+        use vortex_fsst::{FSST, FSSTArraySlotsExt as _};
+
+        let (fbd, _) = windowed_handle(600, 100).await;
+        for w in [0, 2, 5] {
+            let chunk = fbd.0.window_chunk(w).await.unwrap();
+            let window = &fbd.0.windows[w];
+            let leaf = rebuild_leaf(&window.layout, window.rows, &fbd.0.source)
+                .await
+                .unwrap();
+            let fsst = leaf.try_downcast::<FSST>().expect("an FSST leaf");
+            let mut ctx = VORTEX_SESSION.create_execution_ctx();
+            let stored = fsst
+                .codes_offsets()
+                .clone()
+                .execute::<PrimitiveArray>(&mut ctx)
+                .unwrap();
+            assert_eq!(
+                chunk.offsets_addr(),
+                Some(stored.as_slice::<i32>().as_ptr() as usize),
+                "window {w}"
+            );
+        }
+    }
+
+    /// Windows holding terms of widely varying lengths resolve every probe,
+    /// positional read and batch, however the codes are ordered.
+    #[tokio::test]
+    async fn windows_of_widely_varying_term_lengths_resolve() {
+        let terms = crate::tests::widely_varying_terms();
+        let n = terms.len();
+        for window in [n, 6] {
+            let (native, d) = native_over(&terms, window).await;
+            let fbd = FileBackedDict::open(&native).await.unwrap().unwrap();
+            for (i, term) in terms.iter().enumerate() {
+                assert_eq!(fbd.encode(term).await.unwrap(), Some(i as TermCode));
+                assert_eq!(
+                    fbd.lower_bound(term.as_bytes()).await.unwrap(),
+                    i as TermCode
+                );
+            }
+            let past_the_longest = format!("{}~", terms[9]);
+            assert_eq!(fbd.encode(&past_the_longest).await.unwrap(), None);
+            assert_eq!(
+                fbd.lower_bound(past_the_longest.as_bytes()).await.unwrap(),
+                d.lower_bound(past_the_longest.as_bytes())
+            );
+            // Ascending codes decode short, long and short terms through one
+            // cursor per window.
+            let codes: Vec<TermCode> = (0..n as TermCode).collect();
+            let decoded = fbd.decode_many(&codes).await.unwrap();
+            assert!(decoded.iter().zip(&terms).all(|(got, want)| &**got == want));
+            // Any order, repeats included.
+            let scattered: Vec<TermCode> = [9, 0, 5, 9, 15, 2, 1, 5, 7, 12, 3, 9].into();
+            let got = fbd.decode_many_any(&scattered).await.unwrap();
+            for (code, term) in scattered.iter().zip(&got) {
+                assert_eq!(term.as_deref(), Some(terms[*code as usize].as_str()));
+            }
+        }
+    }
+
     /// The visitor delivers each position once, in any order with repeats and
     /// out-of-range codes, reading each window holding a code once.
     #[tokio::test]
@@ -1117,7 +1192,7 @@ mod tests {
         assert_eq!(cache.bytes, first.heap_bytes());
     }
 
-    /// An FSST window costs its unpacked code offsets, a canonical chunk its
+    /// An FSST window costs its code offsets, a canonical chunk its
     /// array; the cache totals them.
     #[tokio::test]
     async fn cached_windows_are_accounted_by_their_heap_bytes() {

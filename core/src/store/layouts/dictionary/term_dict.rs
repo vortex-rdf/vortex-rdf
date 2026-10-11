@@ -17,8 +17,10 @@ use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use vortex_array::arrays::primitive::PrimitiveArrayExt as _;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
+use vortex_array::dtype::PType;
 use vortex_array::match_each_integer_ptype;
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 use vortex_array::validity::Validity;
@@ -122,10 +124,12 @@ impl TermChunk {
         }
     }
 
-    /// The heap this chunk occupies, which is what a cache of chunks budgets:
-    /// an FSST chunk's unpacked code offsets (one `u32` per term, plus one),
-    /// a canonical chunk's array. Segment bytes a chunk only references are
-    /// not counted.
+    /// What this chunk costs a cache of chunks: an FSST chunk's code offsets
+    /// (one `u32` per term, plus one), whether they are a view of the leaf's
+    /// own buffer or a widened copy, and a canonical chunk's array. That is
+    /// an upper bound on the heap the chunk takes, and the bytes it holds
+    /// onto either way. The leaf's code bytes, which the chunk only
+    /// references, are not counted.
     #[cfg(feature = "file-io")]
     pub(super) fn heap_bytes(&self) -> usize {
         match self {
@@ -134,9 +138,9 @@ impl TermChunk {
         }
     }
 
-    /// A fresh cursor over this chunk's terms. Scratch is allocated lazily
-    /// inside `bytes_at`, so a single-term decode allocates only for the
-    /// chunk it touches.
+    /// A fresh cursor over this chunk's terms. An FSST cursor's scratch
+    /// starts empty and `bytes_at` grows it to the term it decodes, so a
+    /// single-term decode allocates only for the chunk it touches.
     pub(super) fn cursor(&self) -> ChunkCursor<'_> {
         match self {
             TermChunk::Canonical(a) => ChunkCursor::Canonical(StrColReader::new(a)),
@@ -691,11 +695,10 @@ const FSST_DECODE_HEADROOM: usize = 8 * FSST_SYMBOL_LEN;
 pub(super) struct FsstTerms {
     /// Kept whole so the dictionary can be serialized without recompressing.
     array: FSSTArray,
-    /// Code offsets, unpacked once at open so a per-row read is a slice
-    /// index.
-    offsets: Arc<[u32]>,
-    /// Scratch size that keeps `decompress_into` on its fast path.
-    scratch_cap: usize,
+    /// Code offsets as `u32`, so a per-row read is a slice index. A leaf's
+    /// 32-bit offsets are viewed in place (written offsets are never
+    /// negative); every other width is widened into a copy.
+    offsets: Buffer<u32>,
 }
 
 impl FsstTerms {
@@ -711,38 +714,35 @@ impl FsstTerms {
         // The u32 arm of the macro casts u32 -> u32; that is the price of one
         // arm covering every width.
         #[allow(clippy::unnecessary_cast)]
-        let offsets: Arc<[u32]> = match_each_integer_ptype!(offsets.ptype(), |O| {
-            offsets.as_slice::<O>().iter().map(|&o| o as u32).collect()
-        });
-        // An FSST code expands to at most one 8-byte symbol, so this bounds the
-        // longest decoded term without decoding anything.
-        let widest = offsets
-            .windows(2)
-            .map(|w| (w[1] - w[0]) as usize)
-            .max()
-            .unwrap_or(0);
-        Ok(Self {
-            array,
-            offsets,
-            scratch_cap: widest * FSST_SYMBOL_LEN + FSST_DECODE_HEADROOM,
-        })
+        let offsets: Buffer<u32> = match offsets.ptype() {
+            PType::U32 => offsets.to_buffer::<u32>(),
+            PType::I32 => offsets.reinterpret_cast(PType::U32).to_buffer::<u32>(),
+            ptype => match_each_integer_ptype!(ptype, |O| {
+                offsets.as_slice::<O>().iter().map(|&o| o as u32).collect()
+            }),
+        };
+        Ok(Self { array, offsets })
     }
 
     fn len(&self) -> usize {
         self.array.len()
     }
 
-    fn new_scratch(&self) -> Vec<u8> {
-        Vec::with_capacity(self.scratch_cap)
-    }
-
-    /// Decode term `i` into `scratch`, returning the bytes written.
+    /// Decode term `i` into `scratch`, returning the bytes written. The
+    /// scratch is grown to hold the term: an FSST code expands to at most
+    /// one 8-byte symbol, and `decompress_into`'s 8-symbols-at-a-time path
+    /// only runs while the output has `FSST_DECODE_HEADROOM` bytes of room
+    /// left, so a buffer sized exactly to the term would fall back to the
+    /// byte-at-a-time tail loop.
     fn decode_into<'a>(&self, i: usize, scratch: &'a mut Vec<u8>) -> &'a [u8] {
         let (start, end) = (self.offsets[i] as usize, self.offsets[i + 1] as usize);
-        let n = self.array.decompressor().decompress_into(
-            &self.array.codes_bytes()[start..end],
-            scratch.spare_capacity_mut(),
-        );
+        let codes = &self.array.codes_bytes()[start..end];
+        scratch.clear();
+        scratch.reserve(codes.len() * FSST_SYMBOL_LEN + FSST_DECODE_HEADROOM);
+        let n = self
+            .array
+            .decompressor()
+            .decompress_into(codes, scratch.spare_capacity_mut());
         // SAFETY: `decompress_into` initialized the first `n` bytes.
         unsafe {
             scratch.set_len(n);
@@ -791,16 +791,7 @@ impl ChunkCursor<'_> {
     pub(super) fn bytes_at(&mut self, local: usize) -> &[u8] {
         match self {
             ChunkCursor::Canonical(r) => r.bytes_at(local),
-            ChunkCursor::Fsst { terms, scratch } => {
-                // Allocated on first use: a windowed dictionary builds one
-                // cursor per chunk, and most reads (binary-search probes,
-                // single-term decodes) only ever touch a few of them.
-                if scratch.capacity() == 0 {
-                    *scratch = terms.new_scratch();
-                }
-                scratch.clear();
-                terms.decode_into(local, scratch)
-            }
+            ChunkCursor::Fsst { terms, scratch } => terms.decode_into(local, scratch),
         }
     }
 }
@@ -1148,6 +1139,19 @@ impl TermDictionary {
     }
 }
 
+#[cfg(test)]
+impl TermChunk {
+    /// The address of an FSST chunk's code offsets, for tests that pin
+    /// whether they view the leaf's own buffer.
+    #[cfg(test)]
+    pub(super) fn offsets_addr(&self) -> Option<usize> {
+        match self {
+            TermChunk::Canonical(_) => None,
+            TermChunk::Fsst(f) => Some(f.offsets.as_ptr() as usize),
+        }
+    }
+}
+
 /// The zone aggregates recording a dictionary window's exact bounds, in the
 /// order the zone table holds them: `vortex.max()` (last term), then
 /// `vortex.min()` (first term). Not the bounded string aggregates Vortex
@@ -1240,8 +1244,169 @@ impl TermDictionary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vortex_array::arrays::VarBinArray;
+    use vortex_array::dtype::{DType, NativePType, Nullability, PType};
+    use vortex_array::validity::Validity;
     #[cfg(feature = "file-io")]
     use vortex_layout::layouts::zoned::Zoned;
+
+    /// 32-bit code offsets are the very buffer of the array's offsets child:
+    /// viewed, not copied.
+    #[test]
+    fn thirty_two_bit_offsets_are_viewed_not_copied() {
+        let terms: Vec<String> = (0..300)
+            .map(|i| format!("<http://example.org/term/{i:04}>"))
+            .collect();
+        let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
+        let dict = TermDictionary::compress_windowed(plain, 100).unwrap();
+        let TermStore::Chunked(chunks) = &dict.terms else {
+            panic!("a dictionary above the window size must be chunked");
+        };
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        for chunk in &chunks.chunks {
+            let TermChunk::Fsst(fsst) = chunk else {
+                panic!("a built dictionary holds FSST chunks");
+            };
+            let child = fsst
+                .array
+                .codes_offsets()
+                .clone()
+                .execute::<PrimitiveArray>(&mut ctx)
+                .unwrap();
+            assert_eq!(child.ptype(), PType::I32, "the built offsets are 32-bit");
+            assert_eq!(fsst.offsets.len(), child.len());
+            assert_eq!(
+                fsst.offsets.as_ptr() as usize,
+                child.as_slice::<i32>().as_ptr() as usize
+            );
+            assert_eq!(chunk.offsets_addr(), Some(fsst.offsets.as_ptr() as usize));
+        }
+    }
+
+    /// `array` rebuilt with its code offsets stored as `T`.
+    fn with_offsets_as<T>(array: &FSSTArray, ctx: &mut vortex_array::ExecutionCtx) -> FSSTArray
+    where
+        T: NativePType + TryFrom<u32>,
+        <T as TryFrom<u32>>::Error: std::fmt::Debug,
+    {
+        let offsets = array
+            .codes_offsets()
+            .clone()
+            .execute::<PrimitiveArray>(ctx)
+            .unwrap();
+        let narrowed = PrimitiveArray::from_iter(
+            offsets
+                .as_slice::<i32>()
+                .iter()
+                .map(|&o| T::try_from(o as u32).unwrap()),
+        );
+        let codes = VarBinArray::new(
+            narrowed.into_array(),
+            array.codes_bytes().clone(),
+            DType::Binary(Nullability::NonNullable),
+            Validity::NonNullable,
+        );
+        FSST::try_new_with_symbol_table(
+            array.dtype().clone(),
+            array.symbol_table(),
+            codes,
+            array.uncompressed_lengths().clone(),
+            ctx,
+        )
+        .unwrap()
+    }
+
+    /// A chunk whose code offsets are stored as `T` holds the same offsets and
+    /// decodes the same terms as the 32-bit original; it views the stored
+    /// buffer only when `T` is 32 bits wide, and widens a copy otherwise.
+    fn check_offsets_stored_as<T>(original: &FsstTerms, terms: &[String])
+    where
+        T: NativePType + TryFrom<u32>,
+        <T as TryFrom<u32>>::Error: std::fmt::Debug,
+    {
+        let name = std::any::type_name::<T>();
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        let rebuilt = with_offsets_as::<T>(&original.array, &mut ctx);
+        let stored = rebuilt
+            .codes_offsets()
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)
+            .unwrap();
+        assert_eq!(
+            stored.ptype(),
+            T::PTYPE,
+            "{name}: the offsets are stored so"
+        );
+        let chunk = FsstTerms::new(rebuilt).unwrap();
+        assert_eq!(chunk.offsets[..], original.offsets[..], "{name}: offsets");
+        assert_eq!(
+            std::ptr::eq(
+                chunk.offsets.as_ptr(),
+                stored.as_slice::<T>().as_ptr().cast()
+            ),
+            T::PTYPE.byte_width() == 4,
+            "{name}: viewed exactly when 32-bit"
+        );
+        let chunk = TermChunk::Fsst(chunk);
+        #[cfg(feature = "file-io")]
+        assert_eq!(chunk.heap_bytes(), 4 * original.offsets.len(), "{name}");
+        let mut cursor = chunk.cursor();
+        for (i, term) in terms.iter().enumerate() {
+            assert_eq!(cursor.bytes_at(i), term.as_bytes(), "{name}: term {i}");
+        }
+    }
+
+    #[test]
+    fn fsst_code_offsets_of_every_width_decode_alike() {
+        let terms: Vec<String> = (0..8).map(|i| format!("<http://e.org/{i}>")).collect();
+        let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
+        let dict = TermDictionary::compress_windowed(plain, usize::MAX).unwrap();
+        let TermStore::Single(TermChunk::Fsst(original)) = &dict.terms else {
+            panic!("a small dictionary is one FSST chunk");
+        };
+        // Every stored offset must fit the narrowest width tried.
+        assert!(original.offsets.iter().all(|&o| o < 128));
+        check_offsets_stored_as::<u8>(original, &terms);
+        check_offsets_stored_as::<i8>(original, &terms);
+        check_offsets_stored_as::<u16>(original, &terms);
+        check_offsets_stored_as::<i16>(original, &terms);
+        check_offsets_stored_as::<u32>(original, &terms);
+        check_offsets_stored_as::<i32>(original, &terms);
+        check_offsets_stored_as::<u64>(original, &terms);
+        check_offsets_stored_as::<i64>(original, &terms);
+    }
+
+    /// A cursor's scratch buffer grows to each term it decodes: terms far
+    /// longer than any before them, short ones after, every probe, batch and
+    /// positional read through one chunk or several.
+    #[test]
+    fn scratch_grows_to_terms_far_longer_than_the_first() {
+        let terms = crate::tests::widely_varying_terms();
+        let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
+        let n = terms.len();
+        for window in [usize::MAX, 6] {
+            let dict = TermDictionary::compress_windowed(plain.clone(), window).unwrap();
+            // One cursor: short, longer, longest, short again, descending.
+            let mut cursor = dict.cursor();
+            let order: Vec<usize> = (0..n).chain((0..n).rev()).chain([0, 9, 1, 5, 9]).collect();
+            for &i in &order {
+                assert_eq!(cursor.str_at(i).unwrap(), terms[i], "window {window}: {i}");
+            }
+            let codes: Vec<TermCode> = order.iter().map(|&i| i as TermCode).collect();
+            let decoded = dict.decode_many(&codes);
+            for (&i, term) in order.iter().zip(&decoded) {
+                assert_eq!(term.as_deref(), Some(terms[i].as_str()), "window {window}");
+            }
+            for (i, term) in terms.iter().enumerate() {
+                assert_eq!(dict.encode(term), Some(i as TermCode), "window {window}");
+                assert_eq!(dict.lower_bound(term.as_bytes()), i as TermCode);
+                assert_eq!(dict.decode(i as TermCode).as_deref(), Some(term.as_str()));
+            }
+            let past_the_longest = format!("{}~", terms[9]);
+            assert_eq!(dict.encode(&past_the_longest), None);
+            assert_eq!(dict.lower_bound(past_the_longest.as_bytes()), 10);
+        }
+    }
 
     /// Multi-window compression is invisible to lookups: a dictionary
     /// compressed in many small windows holds independent FSST chunks and

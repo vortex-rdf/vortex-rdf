@@ -447,6 +447,31 @@ pub(crate) async fn write_dict_only_store_as(
     unstamped_store_bytes(vec![bare_code_quad_array(&[0])], vec![component]).await
 }
 
+/// Sorted, unique terms whose lengths swing from a few bytes to tens of
+/// thousands, so a chunk holds terms far longer than any scratch buffer sized
+/// for the ones before them.
+pub(crate) fn widely_varying_terms() -> Vec<String> {
+    const LENGTHS: [usize; 16] = [
+        10, 40, 3_000, 15, 200, 12_000, 8, 90, 600, 40_000, 12, 5, 700, 20, 9_000, 30,
+    ];
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    LENGTHS
+        .iter()
+        .enumerate()
+        .map(|(i, &len)| {
+            let filler: String = (0..len)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    char::from(b'a' + ((state >> 33) % 26) as u8)
+                })
+                .collect();
+            format!("<http://e.org/{i:02}/{filler}>")
+        })
+        .collect()
+}
+
 /// A native store file opened over `bytes` held in memory (no file behind it).
 #[cfg(feature = "file-io")]
 pub(crate) fn open_native_bytes(bytes: Vec<u8>) -> crate::store::native_file::NativeStoreFile {

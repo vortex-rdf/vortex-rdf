@@ -306,15 +306,15 @@ is the sorted set of every distinct term of the dataset — subjects, predicates
 objects and graph names in one namespace, the default graph's `""` included. A
 term's code is its position, so code order equals string order and a bound
 term resolves to its code by binary search. The frozen column is
-FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/term_dict.rs#L336)):
+FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/term_dict.rs#L340)):
 one symbol table is trained on the whole column and the terms are compressed in
-independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/term_dict.rs#L55)
+independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/term_dict.rs#L57)
 (65,536) terms, each window a self-contained FSST array. The term count must
 fit an `i32`.
 
 Which pipeline built the dictionary decides how its term→code map is held during
 encoding: borrowed from the live quads in memory
-([`from_quads_with_map`](../core/src/store/layouts/dictionary/term_dict.rs#L422)),
+([`from_quads_with_map`](../core/src/store/layouts/dictionary/term_dict.rs#L426)),
 owned when the quads were spilled and cannot be borrowed from
 ([`TermDictionaryBuilder::finish`](../core/src/store/layouts/dictionary/ingest.rs#L70)).
 Either way the map exists only for the build; stores keep the columnar
@@ -584,7 +584,7 @@ every other format decodes to `oxrdf` terms and drives the `oxrdfio` serializer.
 | `--indexes` / `indexes` | every surface | none | which index families to build ([§8](#8-secondary-indexes-at-build-time)) |
 | `DEFAULT_CHUNK_ROWS` | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L62) | 100,000 rows | run size, emitted chunk size, spiller capacity, auto-compaction cap |
 | `VORTEX_RDF_SPILL_DIR` | environment | unset (caller base, else OS temp) | where spill runs live |
-| `DICT_CHUNK_ROWS` | [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs#L55) | 65,536 terms | FSST window = dictionary child leaf |
+| `DICT_CHUNK_ROWS` | [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs#L57) | 65,536 terms | FSST window = dictionary child leaf |
 | row block / segment target | Vortex default write strategy; [`child_strategy`](../core/src/io/container/sources.rs#L221) | 8,192 rows / ~1 MiB; ~2 MiB for a plain id column | zone-map granularity, and the segment size of every written column except a plain `u64` term-code or row-id column, which coalesces toward ~2 MiB ([§9](#9-writing-the-container)) |
 
 ---
