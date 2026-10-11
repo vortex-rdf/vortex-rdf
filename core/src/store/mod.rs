@@ -40,10 +40,11 @@ pub use indexes::{IndexType, Indexes};
 pub use layouts::LayoutStrategy;
 pub use layouts::dictionary::DictionaryQuadSink;
 pub use layouts::dictionary::{
-    DictReader, DictSnapshot, Domain, KindRanges, NumOp, TermPredicate, Verdict,
+    CaseMap, DictReader, DictSnapshot, KindRanges, NumOp, TermPredicate, TextOptions, Verdict,
 };
+pub(crate) use matching::IdsNeed;
 pub use narrowing::Keep;
-pub use schema::QuadColumn;
+pub use schema::{QuadColumn, RowId, TermCode};
 // `RawQuad` lives in `common` (it is pure RDF text — see that module's
 // charter); this re-export makes `store::RawQuad` the path builder consumers
 // use.
@@ -152,7 +153,7 @@ fn resolved_layout(
 }
 
 /// The compressed-resident form every in-memory construction produces: the
-/// base's u32 code columns and each component's integer children are
+/// base's code columns and each component's integer children are
 /// re-encoded into probe-supported encodings (see
 /// [`with_compressed_int_children`](array::with_compressed_int_children)),
 /// with the base additionally payload-wrapped so the code-column read path
@@ -190,6 +191,13 @@ impl VortexRdfStore {
     /// The finished store is resident either way. Writing a dataset larger
     /// than memory never has to materialize it — `io::quads_stream_to_vortex_file`
     /// streams the builder's chunks straight into the file writer instead.
+    ///
+    /// The quads must be canonical: build them with [`RawQuad::from_quad`],
+    /// the parser ([`parse_quads_from_reader`]) or [`RawQuad::canonical`]. The
+    /// builders intern and compare the spelling they are given, so a hand-built
+    /// `RawQuad` in another spelling of the same terms is a different quad.
+    ///
+    /// [`parse_quads_from_reader`]: crate::common::terms::parse_quads_from_reader
     pub async fn from_quads(
         quads: impl Stream<Item = Result<RawQuad>> + Unpin + Send + 'static,
         layout: LayoutStrategy,
@@ -339,14 +347,12 @@ impl VortexRdfStore {
             #[cfg(feature = "file-io")]
             QuadsSource::File {
                 path,
-                dict_max_resident_bytes,
                 file,
                 filter,
                 deleted,
                 ..
             } => QuadsSource::File {
                 path: path.clone(),
-                dict_max_resident_bytes: *dict_max_resident_bytes,
                 file: file.clone(),
                 filter: filter.clone(),
                 selection: ViewSelection::Exact(RowSelection::empty()),

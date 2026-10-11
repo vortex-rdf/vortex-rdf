@@ -43,7 +43,7 @@ pub(crate) fn parse_subject(s: &str) -> Result<NamedOrBlankNode> {
 
 /// The three N-Triples literal shapes, with `value` still in its *escaped*
 /// lexical form — the slice between the opening and closing quote.
-enum LiteralForm<'a> {
+pub(crate) enum LiteralForm<'a> {
     Simple { value: &'a str },
     Language { value: &'a str, lang: &'a str },
     Typed { value: &'a str, datatype: &'a str },
@@ -84,7 +84,7 @@ fn closing_quote(s: &str) -> Option<usize> {
 /// the closing quote that is neither suffix. The suffix is read only from
 /// *after* the closing quote, so `^^` or `"@` occurring inside the value
 /// cannot be mistaken for structure.
-fn split_literal(s: &str) -> Option<LiteralForm<'_>> {
+pub(crate) fn split_literal(s: &str) -> Option<LiteralForm<'_>> {
     let end = closing_quote(s)?;
     let value = &s[1..end];
     let rest = &s[end + 1..];
@@ -328,6 +328,37 @@ pub fn canonical_spelling(term: &str) -> Result<String> {
         return Ok(String::new());
     }
     Ok(parse_term_checked(term)?.to_string())
+}
+
+/// A quad from four term spellings in any of the forms a person types or a
+/// foreign system writes, rendered in the one canonical spelling the builders
+/// intern ([`RawQuad::canonical`]).
+///
+/// Each position goes through the checked parsers a pattern does and so
+/// takes the same tolerant spellings as [`canonical_spelling`] (an IRI with or
+/// without angle brackets, an `xsd:string`-typed or escaped literal, an
+/// upper-case language tag, `""`, `default` or `[]` for the default graph),
+/// and the quad is rendered by [`RawQuad::from_quad`], so a term comes out
+/// exactly as `canonical_spelling` renders it. Unlike `canonical_spelling` it
+/// also requires each term to be one its position can hold: a literal is no
+/// subject, predicate or graph, and a blank node is no predicate. A failure
+/// names the position.
+pub(crate) fn canonical_raw_quad(s: &str, p: &str, o: &str, g: &str) -> Result<RawQuad> {
+    // The checked parsers report an invalid term without saying where it was.
+    fn at<T>(position: &str, parsed: Result<T>) -> Result<T> {
+        parsed.map_err(|error| match error {
+            VortexRdfError::Deserialization(message) => {
+                VortexRdfError::Deserialization(format!("quad {position}: {message}"))
+            }
+            other => other,
+        })
+    }
+    Ok(RawQuad::from_quad(&Quad::new(
+        at("subject", parse_subject_checked(s))?,
+        at("predicate", parse_named_node_checked(p))?,
+        at("object", parse_term_checked(o))?,
+        at("graph", parse_graph_name_checked(g))?,
+    )))
 }
 
 /// [`parse_term`] as a decode step: an object string the columns store,

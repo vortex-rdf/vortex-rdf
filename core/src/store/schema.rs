@@ -14,6 +14,66 @@
 //! [`secondary_by_reference`]: crate::store::indexes::secondary_by_reference
 //! [`typed_object`]: crate::store::layouts::typed_object
 
+use vortex_array::dtype::{DType, Nullability, PType};
+
+/// A term code: a term's rank in a Dictionary-layout store's sorted term
+/// dictionary — the value of every code column (the quad table's `s`, `p`,
+/// `o`, `g` and the index children's code columns) and of every code a
+/// binding hands across. 64 bits wide, so a dictionary may hold more terms
+/// than a `u32` can count.
+pub type TermCode = u64;
+
+/// The primitive type of a code column on the wire: non-nullable `u64`
+/// ([`TermCode`]). A Dictionary-layout quad table is recognized by its `s`
+/// column having this type; a code column of any other integer width is a
+/// file this crate never wrote and is refused at open.
+pub(crate) const CODE_PTYPE: PType = PType::U64;
+
+/// A row id: a quad's position in the quad table — the value of every index
+/// child's `rid` column ([`COL_RID`](crate::store::indexes::COL_RID)), which
+/// is how an index names the rows it matched, and the currency a match's
+/// row selection, tombstones and further matches share without renumbering
+/// anything. 64 bits wide, so a store with secondary indexes may hold more
+/// quads than a `u32` can count.
+pub type RowId = u64;
+
+/// The primitive type of a row-id column on the wire: non-nullable `u64`
+/// ([`RowId`]). An index child whose `rid` column is an integer of any other
+/// width is a file this crate never wrote and is refused at open.
+pub(crate) const ROW_ID_PTYPE: PType = PType::U64;
+
+/// Whether a column named `name` holds term codes where it is an integer:
+/// the quad table's and the copy index children's `s`, `p`, `o`, `g`, and
+/// the reference index children's `val`. Under the string layouts the same
+/// names hold term strings.
+pub(crate) fn is_code_column_name(name: &str) -> bool {
+    PRIMARY_COLUMNS.contains(&name)
+        || name == crate::store::indexes::secondary_by_reference::COL_VAL
+}
+
+/// Whether the field `name: dtype` is a term-code column as this crate
+/// writes one: a code column name ([`is_code_column_name`]) holding
+/// non-nullable [`CODE_PTYPE`] values.
+pub(crate) fn is_code_field(name: &str, dtype: &DType) -> bool {
+    is_code_column_name(name)
+        && matches!(dtype, DType::Primitive(ptype, Nullability::NonNullable) if *ptype == CODE_PTYPE)
+}
+
+/// Whether the field `name: dtype` is a row-id column as this crate writes
+/// one: an index child's `rid` holding non-nullable [`ROW_ID_PTYPE`] values.
+pub(crate) fn is_row_id_field(name: &str, dtype: &DType) -> bool {
+    name == crate::store::indexes::COL_RID
+        && matches!(dtype, DType::Primitive(ptype, Nullability::NonNullable) if *ptype == ROW_ID_PTYPE)
+}
+
+/// Whether the field `name: dtype` is an id column: a term-code column
+/// ([`is_code_field`]) or a row-id column ([`is_row_id_field`]) — the `u64`
+/// columns whose leaf size the writer sets
+/// ([`child_strategy`](crate::io::container::child_strategy)).
+pub(crate) fn is_id_field(name: &str, dtype: &DType) -> bool {
+    is_code_field(name, dtype) || is_row_id_field(name, dtype)
+}
+
 /// The subject column — first in every layout. Whether its rows are globally
 /// sorted is per-store provenance
 /// ([`quads_sorted`](crate::io::container::layout::quads_sorted)), not a

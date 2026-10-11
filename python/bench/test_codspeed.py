@@ -253,7 +253,7 @@ def test_readpath(benchmark, stores, op):
     """The read entry points on the unindexed store for one selective pattern
     (S), isolating the boundary cost each carries.
 
-    `match_codes` is the lazy one — u32 columns, no term strings — so it is the
+    `match_codes` is the lazy one — u64 columns, no term strings — so it is the
     Python analogue of the JS suite's `readpath::matchCodes`. The other two
     materialize terms, which in JS is `readpath::getQuads_decoded`; the
     bindings have no lazy quad object, so there is no undecoded `get_quads`.
@@ -352,7 +352,7 @@ def test_decode_many(benchmark, stores, shape):
     dictionary = store.term_dict()
     p = next(x for x in dataset_probes(DIM**3)["triples"] if x.name == "P")
     columns = store.match_codes(p.s, p.p, p.o, p.g)
-    codes = array("I", memoryview(columns[1 if shape == "constant" else 0]).cast("I"))
+    codes = array("Q", memoryview(columns[1 if shape == "constant" else 0]).cast("Q"))
     _assert_shape(shape, codes)
     benchmark(lambda: dictionary.decode_many(codes))
 
@@ -360,7 +360,7 @@ def test_decode_many(benchmark, stores, shape):
 @pytest.mark.benchmark
 def test_decode_many_scattered(benchmark, scattered_store):
     codes = array(
-        "I", memoryview(scattered_store.match_codes(None, RDF_TYPE, None, None)[2]).cast("I")
+        "Q", memoryview(scattered_store.match_codes(None, RDF_TYPE, None, None)[2]).cast("Q")
     )
     _assert_shape("scattered", codes)
     benchmark(lambda: scattered_store.term_dict().decode_many(codes))
@@ -444,16 +444,17 @@ def test_pushdown_many(benchmark, stores):
 @pytest.mark.benchmark
 @pytest.mark.parametrize("kind", ["is_iri", "str_prefix"])
 def test_pushdown_filter_codes(benchmark, store_paths, kind):
-    """A term predicate partitioning the dictionary: a kind test is pure
-    ranges, a string prefix scans the literals and IRIs. The memo is bypassed
-    by opening the store afresh per round."""
-    path = store_paths["triples::dict"]
+    """A term predicate over candidate codes spread across the dictionary —
+    the per-query FILTER evaluation: a kind test reads nothing, a string
+    prefix over `STR()` reads the terms of the candidates their kind does not
+    decide (an IRI is a text only there)."""
+    from vortex_rdf import U64Column
+
+    term_dict = VortexRdfStore(store_paths["triples::dict"]).term_dict()
     arg = "http://" if kind == "str_prefix" else ""
-
-    def run():
-        return VortexRdfStore(path).term_dict().filter_codes(kind, arg)
-
-    benchmark(run)
+    options = {"as_str": True} if kind == "str_prefix" else {}
+    codes = U64Column(range(0, len(term_dict), max(1, len(term_dict) // 4096)))
+    benchmark(lambda: term_dict.filter_codes(kind, arg, codes, **options))
 
 
 @pytest.mark.benchmark

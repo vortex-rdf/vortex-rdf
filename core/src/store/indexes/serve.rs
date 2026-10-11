@@ -49,6 +49,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 use crate::store::scan::gather::primitive_from_u64_reads;
+use crate::store::schema::{RowId, TermCode};
 use crate::store::selection::point_sized;
 
 /// The decode tail shared by both backend-typed serve plans: which of the
@@ -86,7 +87,8 @@ impl ServeDecode {
 
     /// [`decode_columns`](Self::decode_columns) through the layout's async
     /// decode — for serving a store whose term dictionary is file-backed,
-    /// where each chunk's codes are resolved with a dictionary scan.
+    /// where each chunk's codes are resolved by reading the dictionary
+    /// windows that hold them.
     #[cfg(feature = "file-io")]
     async fn decode_columns_async<T: ChunkDecode>(
         &self,
@@ -124,12 +126,16 @@ impl ServeDecode {
             return Some(None);
         };
         let rid = probes.by_name(array, self.rid_column)?;
-        Some(Some(
-            range
-                .clone()
-                .filter(|&pos| !deleted.value(rid.value_at(pos) as usize))
-                .collect(),
-        ))
+        // A row id no `usize` holds declines to the slice path, whose
+        // decode reports it.
+        let mut live = Vec::with_capacity(range.len());
+        for pos in range.clone() {
+            let row = super::row_index(super::base_row(rid.value_at(pos))).ok()?;
+            if !deleted.value(row) {
+                live.push(pos);
+            }
+        }
+        Some(Some(live))
     }
 
     /// A small run's live rows as a primary-named `(s, p, o, g)` canonical
@@ -170,6 +176,30 @@ impl ServeDecode {
             .map_err(VortexRdfError::Vortex)?
             .into_array(),
         ))
+    }
+
+    /// A chunk's live rows as four code columns, `(s, p, o, g)` — the
+    /// code-payload counterpart of [`decode_columns`](Self::decode_columns)
+    /// for a Dictionary decode layout, whose columns hold codes.
+    #[cfg(feature = "file-io")]
+    fn chunk_code_columns(
+        &self,
+        chunk: &ArrayRef,
+        deleted: Option<&Mask>,
+    ) -> Result<[Buffer<TermCode>; 4]> {
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        let rows = self
+            .chunk_rows(chunk, deleted)?
+            .execute::<StructArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?;
+        let [s, p, o, g] = crate::store::schema::PRIMARY_COLUMNS;
+        let mut column = |name: &str| -> Result<Buffer<TermCode>> {
+            Ok(
+                crate::store::array::field_as::<PrimitiveArray>(&rows, name, &mut ctx)?
+                    .into_buffer::<TermCode>(),
+            )
+        };
+        Ok([column(s)?, column(p)?, column(o)?, column(g)?])
     }
 
     /// A chunk's live rows as a primary-named `(s, p, o, g)` struct: relabel the
@@ -217,15 +247,13 @@ impl ServeDecode {
         let rid_col = col(self.rid_column)?
             .execute::<PrimitiveArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
-        let live = Mask::from_indices(
-            len,
-            rid_col
-                .as_slice::<u32>()
-                .iter()
-                .enumerate()
-                .filter(|&(_, &rid)| !deleted.value(rid as usize))
-                .map(|(position, _)| position),
-        );
+        let mut positions = Vec::with_capacity(len);
+        for (position, &rid) in rid_col.as_slice::<RowId>().iter().enumerate() {
+            if !deleted.value(super::row_index(super::base_row(rid))?) {
+                positions.push(position);
+            }
+        }
+        let live = Mask::from_indices(len, positions);
         if live.all_true() {
             return Ok(rows);
         }
@@ -277,7 +305,7 @@ impl InMemoryServePlan {
         }
     }
 
-    /// The served rows' four `u32` term codes, read straight off the index
+    /// The served rows' four [`TermCode`]s, read straight off the index
     /// component's own columns — the code-payload counterpart of
     /// [`decode`](Self::decode).
     ///
@@ -293,7 +321,7 @@ impl InMemoryServePlan {
     /// probe.
     ///
     /// [`POINT_GATHER_MAX_ROWS`]: crate::store::selection::POINT_GATHER_MAX_ROWS
-    pub(crate) fn code_columns(&self, deleted: Option<&Mask>) -> Option<[Buffer<u32>; 4]> {
+    pub(crate) fn code_columns(&self, deleted: Option<&Mask>) -> Option<[Buffer<TermCode>; 4]> {
         if !matches!(self.decode.decode_layout, ResolvedLayout::Dictionary(_)) {
             return None;
         }
@@ -303,9 +331,10 @@ impl InMemoryServePlan {
         let mut columns = Vec::with_capacity(4);
         for name in self.decode.primary_columns {
             let probe = self.probes.by_name(&self.array, name)?;
+            // A probe reads every width as a u64 — exactly a code.
             columns.push(match &live {
-                None => Buffer::from_iter(self.range.clone().map(|pos| probe.value_at(pos) as u32)),
-                Some(live) => Buffer::from_iter(live.iter().map(|&pos| probe.value_at(pos) as u32)),
+                None => Buffer::from_iter(self.range.clone().map(|pos| probe.value_at(pos))),
+                Some(live) => Buffer::from_iter(live.iter().map(|&pos| probe.value_at(pos))),
             });
         }
         let mut columns = columns.into_iter();
@@ -534,6 +563,29 @@ impl FileServePlan {
         ))
     }
 
+    /// The served rows' four [`TermCode`]s, read off the index child's own
+    /// columns by a scan of exactly the located run, or by the filtered child
+    /// scan when the run is unlocated — the file counterpart of
+    /// [`InMemoryServePlan::code_columns`], for a view whose row ids are still
+    /// deferred. Rows come back in the index's order, as the served stream
+    /// reads them, tombstoned rows dropped via the row-id column. `None`
+    /// declines to the caller's gather path: a non-Dictionary decode layout,
+    /// whose columns hold terms, not codes.
+    pub(crate) async fn code_columns(
+        &self,
+        deleted: Option<&Mask>,
+    ) -> Result<Option<[Buffer<TermCode>; 4]>> {
+        if !matches!(self.decode.decode_layout, ResolvedLayout::Dictionary(_)) {
+            return Ok(None);
+        }
+        let scan = match self.located_run_scan()? {
+            Some(scan) => scan,
+            None => self.projected_filtered_scan()?,
+        };
+        let chunk = crate::store::scan::file_scan::read_all_rows(scan).await?;
+        self.decode.chunk_code_columns(&chunk, deleted).map(Some)
+    }
+
     /// Decode the `(s, p, o, g)` rows out of a chunk of this plan's projected
     /// index columns, dropping rows tombstoned in `deleted` via the row-id
     /// column.
@@ -547,7 +599,8 @@ impl FileServePlan {
 
     /// [`decode_columns`](Self::decode_columns) through the layout's async
     /// decode — for serving a store whose term dictionary is file-backed,
-    /// where each chunk's codes are resolved with a dictionary scan.
+    /// where each chunk's codes are resolved by reading the dictionary
+    /// windows that hold them.
     pub(crate) async fn decode_columns_async<T: ChunkDecode>(
         &self,
         chunk: &ArrayRef,

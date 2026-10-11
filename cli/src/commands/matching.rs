@@ -48,11 +48,6 @@ pub async fn run(args: MatchArgs) -> Result<()> {
         .or_else(|| detect_format(output.as_deref()))
         .unwrap_or(RdfFormat::NQuads);
 
-    let writer: Box<dyn Write> = match &output {
-        Some(p) => Box::new(File::create(p).context("Failed to create output file")?),
-        None => Box::new(stdout()),
-    };
-
     let is_vortex = input.extension().map(|e| e == "vortex").unwrap_or(false);
 
     let load_start = debug_time::timer();
@@ -99,6 +94,12 @@ pub async fn run(args: MatchArgs) -> Result<()> {
         debug_time::elapsed(match_start)
     );
 
+    // The output file is created once the input has been read and matched, so
+    // a failure before that leaves an existing output file as it was.
+    let writer: Box<dyn Write> = match &output {
+        Some(p) => Box::new(File::create(p).context("Failed to create output file")?),
+        None => Box::new(stdout()),
+    };
     export_rdf(filtered, writer, output_format)
         .await
         .context("Failed to export filtered results")?;

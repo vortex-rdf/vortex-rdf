@@ -34,9 +34,11 @@ The documents under `docs/` (and the READMEs) link into the source with
 `path#Lnn` anchors. `scripts/check-doc-anchors.sh` verifies every relative
 markdown link in `README.md`, `CONTRIBUTING.md`, `docs/*.md`, `js/README.md`,
 `python/README.md`, `js/bench/README.md` and `encoded-search/README.md`: the
-target file exists, an anchored line is within the file, and a link whose text
-is a single backticked identifier (a `` `foo` `` label on a `#L42` anchor) names
-something that appears on that line. It runs in `scripts/ci-check.sh` and therefore in the
+target file exists, an anchored line is within the file, and every line anchor
+names what it points at, which has to appear on the anchored lines: the link's
+label when it is a single backticked identifier, else the link's title, else the
+identifier that opens the table row the link sits in. A line anchor with none
+of these fails. It runs in `scripts/ci-check.sh` and therefore in the
 `pre-push` hook; run it by itself after moving code the docs point at, and
 re-point the anchors it reports.
 

@@ -6,7 +6,7 @@
 // string is decoded from UTF-8 bytes only when `.value`/`.termType` is read (and
 // then interned), never eagerly and never per-term across the wasm boundary.
 // Two column backings:
-//   - Dictionary layout: a Uint32Array of codes + a shared LazyDict over an
+//   - Dictionary layout: a Float64Array of codes (exact integers) + a shared LazyDict over an
 //     immutable snapshot of the store's term dictionary, decoding codes on
 //     demand. `.equals` between terms of the same store is an integer code
 //     compare, so it never decodes at all.
@@ -98,7 +98,7 @@ export function makeDictView(dict) {
 }
 
 // ── A single column's backing: code+dict, or packed term bytes ───────────────
-// `col` is either { dict: LazyDict, codes: Uint32Array } or { offsets, bytes }.
+// `col` is either { dict: LazyDict, codes: Float64Array } or { offsets, bytes }.
 function ntAt(col, i) {
     return col.dict
         ? col.dict.decode(col.codes[i])

@@ -1,4 +1,4 @@
-//! The native container codec: the `vortex-rdf.store.v1` grammar
+//! The native container codec: the `vortex-rdf.store.v2` grammar
 //! (`container`), the write driver over it (`ser`), and read-side file
 //! access (`read`). Textual RDF conversion lives outside this module:
 //! parsing in `common::terms`, export in `store::export` (re-exported at the

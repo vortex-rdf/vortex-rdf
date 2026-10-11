@@ -845,6 +845,146 @@ async fn test_file_backed_add_auto_compacts_past_threshold() {
     );
 }
 
+/// `n` quads from subject number `first` on, over a few predicates and
+/// objects.
+#[cfg(feature = "file-io")]
+fn compaction_batch(first: usize, n: usize) -> Vec<Quad> {
+    (first..first + n)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/s{i:06}"),
+                &format!("http://example.org/p{}", i % 3),
+                &format!("object {}", i % 7),
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect()
+}
+
+/// The loop of a long-lived writer: three appends in a row past the
+/// compaction floor on the store each append returned. Every compaction
+/// replaces the file (a new inode) with a larger one, the returned store
+/// stays mapped and can compact again, and a reopen of the path holds exactly
+/// the quads appended so far.
+#[cfg(all(unix, feature = "file-io"))]
+#[tokio::test]
+async fn test_chained_compactions_of_a_mapped_store() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mut expected = compaction_batch(0, 12);
+    let (_dir, path) = write_store_file(
+        expected.clone(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+    )
+    .await;
+    let mut store = VortexRdfStore::from_file(&path).await.unwrap();
+    let mut file = std::fs::metadata(&path).unwrap();
+    for round in 0..3 {
+        let batch = compaction_batch(expected.len(), 4_100 + 50 * round);
+        expected.extend(batch.clone());
+        store = store.add_quads(batch).await.unwrap();
+        assert_eq!(
+            store.tail_len(),
+            0,
+            "round {round}: the append must compact"
+        );
+        assert_eq!(
+            store.debug_file_mapped(),
+            Some(true),
+            "round {round}: the compacted store stays mapped"
+        );
+
+        let after = std::fs::metadata(&path).unwrap();
+        assert_ne!(
+            after.ino(),
+            file.ino(),
+            "round {round}: the file was not replaced"
+        );
+        assert!(
+            after.len() > file.len(),
+            "round {round}: the file did not grow"
+        );
+        file = after;
+
+        assert_eq!(
+            view_strings(&store).await,
+            quad_strings(&expected),
+            "round {round}: the returned store"
+        );
+        let reopened = VortexRdfStore::from_file(&path).await.unwrap();
+        assert_eq!(
+            view_strings(&reopened).await,
+            quad_strings(&expected),
+            "round {round}: a reopen of the path"
+        );
+    }
+}
+
+/// The same loop on in-memory stores, loaded from a file and built in
+/// memory: every append past the floor folds the tail in, the store grows,
+/// its serialization reopens to the quads appended so far, and the file it
+/// was loaded from is never touched.
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn test_chained_compactions_of_an_in_memory_store() {
+    let indexes = vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
+    let initial = compaction_batch(0, 12);
+    let (_dir, path) =
+        write_store_file(initial.clone(), LayoutStrategy::Dictionary, indexes.clone()).await;
+    let bytes_on_disk = std::fs::read(&path).unwrap();
+    let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    let built = VortexRdfStore::from_quads(
+        quad_stream(initial.clone()),
+        LayoutStrategy::Dictionary,
+        indexes,
+    )
+    .await
+    .unwrap();
+
+    for (how, mut store) in [("loaded", loaded), ("built", built)] {
+        let mut expected = initial.clone();
+        for round in 0..3 {
+            let batch = compaction_batch(expected.len(), 4_100 + 50 * round);
+            let size_before = store.size().await.unwrap();
+            expected.extend(batch.clone());
+            store = store.add_quads(batch).await.unwrap();
+            assert_eq!(
+                store.tail_len(),
+                0,
+                "{how} round {round}: the append must compact"
+            );
+            assert_eq!(
+                store.debug_file_mapped(),
+                None,
+                "{how} round {round}: in memory"
+            );
+            assert!(
+                store.size().await.unwrap() > size_before,
+                "{how} round {round}: the store did not grow"
+            );
+            assert_eq!(
+                view_strings(&store).await,
+                quad_strings(&expected),
+                "{how} round {round}: the returned store"
+            );
+            let reopened = VortexRdfStore::from_bytes(&store.to_bytes().await.unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                view_strings(&reopened).await,
+                quad_strings(&expected),
+                "{how} round {round}: a reopen of its serialization"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes_on_disk,
+                "{how} round {round}: the file the store was loaded from changed"
+            );
+        }
+    }
+}
+
 /// Compacting a file-backed store rewrites the compacted rows back over its
 /// own source file and stays file-backed: an independent reopen of the path
 /// sees the folded-in, tombstone-free data, the rebuilt index survives, a

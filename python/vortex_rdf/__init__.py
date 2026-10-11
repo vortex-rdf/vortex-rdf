@@ -7,7 +7,7 @@ rdflib Store on top of these bindings.
 
 from ._native import (
     TermDict,
-    U32Column,
+    U64Column,
     VortexRdfError,
     VortexRdfStore,
     __version__,
@@ -16,7 +16,7 @@ from ._native import (
 
 __all__ = [
     "TermDict",
-    "U32Column",
+    "U64Column",
     "VortexRdfError",
     "VortexRdfStore",
     "__version__",

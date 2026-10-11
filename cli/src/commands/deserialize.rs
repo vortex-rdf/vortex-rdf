@@ -24,33 +24,30 @@ pub async fn run(args: DeserializeArgs) -> Result<()> {
         .or_else(|| detect_format(output.as_deref()))
         .unwrap_or(RdfFormat::NQuads);
 
-    let writer: Box<dyn Write> = match &output {
-        Some(p) => Box::new(File::create(p).context("Failed to create output file")?),
-        None => Box::new(stdout()),
-    };
-
-    match &input {
-        Some(path) => {
-            let store = VortexRdfStore::from_file(path)
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-            export_rdf(store, writer, format)
-                .await
-                .context("Failed to export RDF from Vortex")?;
-        }
+    // The input is read before the output file is created, so a store that
+    // cannot be opened leaves an existing output file as it was.
+    let store = match &input {
+        Some(path) => VortexRdfStore::from_file(path)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?,
         None => {
             let mut buffer = Vec::new();
             stdin()
                 .read_to_end(&mut buffer)
                 .context("Failed to read from stdin")?;
-            let store = VortexRdfStore::from_bytes(&buffer)
+            VortexRdfStore::from_bytes(&buffer)
                 .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-            export_rdf(store, writer, format)
-                .await
-                .context("Failed to export RDF from Vortex")?;
+                .map_err(|e| anyhow::anyhow!(e))?
         }
-    }
+    };
+
+    let writer: Box<dyn Write> = match &output {
+        Some(p) => Box::new(File::create(p).context("Failed to create output file")?),
+        None => Box::new(stdout()),
+    };
+    export_rdf(store, writer, format)
+        .await
+        .context("Failed to export RDF from Vortex")?;
     info!("Deserialization took {:?}", start.elapsed());
 
     Ok(())

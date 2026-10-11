@@ -3,91 +3,93 @@
 //!
 //! A [`TermPredicate`] answers a single-variable SPARQL test (`isIRI(?x)`,
 //! `datatype(?x) = <dt>`, `lang(?x) = "en"`, `langMatches(lang(?x), "en")`,
-//! `?x < 5`, `strstarts(str(?x), "http://…")`) for one term, read straight
-//! off its spelling, with a three-valued [`Verdict`]. The rules are
-//! deliberately **conservative**: a verdict is `True` or `False` only where
-//! the SPARQL semantics over the stored spelling are total and cheap to
-//! decide; everything else — a lexical form the XSD grammar does not cover,
-//! a comparison the value model cannot settle exactly, a datatype the rules
-//! do not know — is `Unknown`, for the caller to resolve with a full SPARQL
+//! `?x < 5`, `strstarts(str(?x), "http://…")`, `contains(lcase(?x), "ab")`,
+//! `regex(str(?x), "^http")`) for one term, read straight off its spelling,
+//! with a three-valued [`Verdict`]. The rules are deliberately
+//! **conservative**: a verdict is `True` or `False` only where the SPARQL
+//! semantics over the stored spelling are total and cheap to decide;
+//! everything else — a lexical form the XSD grammar does not cover, a
+//! comparison the value model cannot settle exactly, a datatype the rules do
+//! not know — is `Unknown`, for the caller to resolve with a full SPARQL
 //! engine. A caller therefore never gets a wrong definite answer, only a
 //! slower one.
 //!
-//! The predicate's *domain* is the code range a dictionary scan has to cover
-//! to find every `True`: the literal range for the literal predicates,
-//! everything for the kind tests and `str_prefix` (see
-//! [`TermPredicate::domain`]). Codes outside the domain are neither true nor
-//! unknown; a caller decides them from the term's kind alone, which the code
-//! ranges already tell it.
+//! A predicate is evaluated over the *candidate* codes a query produced
+//! (`filter_codes`): a code whose kind range decides it
+//! ([`TermPredicate::kind_verdict`]) is not read; every other one is read and
+//! its spelling parsed — the lexical form unescaped, the language tag and
+//! datatype taken from the spelling — before the predicate looks at it.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
 use std::ops::Range;
 
-use vortex_buffer::Buffer;
-
+use super::regex_filter::RegexTest;
+use crate::common::terms::{LiteralForm, split_literal};
 use crate::common::vocab::{RDF_LANG_STRING, XSD, XSD_STRING};
 use crate::error::{Result, VortexRdfError};
+use crate::store::schema::TermCode;
 
 /// The code ranges of a sorted dictionary's term kinds. Codes are
-/// lexicographic ranks of the N-Triples spelling, so every kind is one
-/// contiguous range, in byte order: the empty spelling of the default graph
-/// (code 0, when any quad is in the default graph), then literals (`"`),
-/// IRIs (`<`), blank nodes (`_:`). Anything a dictionary of this crate never
-/// holds falls in the gaps between those ranges.
+/// lexicographic ranks of the N-Triples spelling, offset by the dictionary's
+/// first code, so every kind is one contiguous range, in byte order: the
+/// empty spelling of the default graph (the first code, when any quad is in
+/// the default graph), then literals (`"`), IRIs (`<`), blank nodes (`_:`).
+/// Anything a dictionary of this crate never holds falls in the gaps between
+/// those ranges.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KindRanges {
+    /// The dictionary's first code: every code is at or above it. 0 in every
+    /// dictionary this version builds.
+    pub start: TermCode,
     /// The code of `""`, the default graph's name, when present.
-    pub default_graph: Option<u32>,
+    pub default_graph: Option<TermCode>,
     /// Codes of the literals.
-    pub literals: Range<u32>,
+    pub literals: Range<TermCode>,
     /// Codes of the IRIs.
-    pub iris: Range<u32>,
+    pub iris: Range<TermCode>,
     /// Codes of the blank nodes.
-    pub blanks: Range<u32>,
-    /// The dictionary's size: every code is below it.
-    pub len: u32,
+    pub blanks: Range<TermCode>,
+    /// One past the dictionary's last code: every code is below it. With
+    /// `start` 0 it is the dictionary's size.
+    pub len: TermCode,
 }
 
 impl KindRanges {
-    /// The codes in none of the three kind ranges, ascending — a foreign
-    /// writer's spellings, and the default graph's `""`.
-    pub fn gaps(&self) -> impl Iterator<Item = u32> + '_ {
-        (0..self.literals.start)
+    /// The codes in none of the three kind ranges, ascending from `start` —
+    /// a foreign writer's spellings, and the default graph's `""`.
+    pub fn gaps(&self) -> impl Iterator<Item = TermCode> + '_ {
+        (self.start..self.literals.start)
             .chain(self.literals.end..self.iris.start)
             .chain(self.iris.end..self.blanks.start)
             .chain(self.blanks.end..self.len)
     }
 }
 
-/// What a dictionary has to do to partition its codes by a predicate's
-/// verdicts: the code range to scan term by term (`None` when the predicate
-/// is answered by ranges alone), and the spelling prefixes whose
-/// [`prefix_range`] is a run of `True` codes without any scan.
-///
-/// [`prefix_range`]: super::term_dict::TermDictionary::prefix_range
-pub(crate) struct ScanPlan {
-    pub(crate) scan: Option<Range<u32>>,
-    pub(crate) true_prefixes: Vec<String>,
-}
-
-/// The verdicts a scan collected, code by code.
-#[derive(Default)]
-pub(crate) struct Scanned {
-    pub(crate) truth: Vec<u32>,
-    pub(crate) unknown: Vec<u32>,
-}
-
-impl Scanned {
-    /// Record `predicate`'s verdict for the term `spelling` with code `code`.
-    #[inline]
-    pub(crate) fn visit(&mut self, predicate: &TermPredicate, code: u32, spelling: &str) {
-        match predicate.eval(spelling) {
-            Verdict::True => self.truth.push(code),
-            Verdict::Unknown => self.unknown.push(code),
-            Verdict::False => {}
+impl KindRanges {
+    /// The kind of `code`'s spelling, read off the ranges.
+    pub(crate) fn kind_of_code(&self, code: TermCode) -> CodeKind {
+        if self.literals.contains(&code) {
+            CodeKind::Literal
+        } else if self.iris.contains(&code) {
+            CodeKind::Iri
+        } else if self.blanks.contains(&code) {
+            CodeKind::Blank
+        } else {
+            CodeKind::Other
         }
     }
+}
+
+/// What the kind ranges say about a code before its spelling is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CodeKind {
+    Literal,
+    Iri,
+    Blank,
+    /// The default graph's `""`, or a foreign spelling in the gaps.
+    Other,
 }
 
 /// The three-valued answer of a predicate for one term.
@@ -143,20 +145,9 @@ impl NumOp {
     }
 }
 
-/// The part of a dictionary's code space a predicate's definite answers can
-/// come from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Domain {
-    /// Every code: the kind tests, and `str_prefix` (IRIs and blank nodes
-    /// answer through `str()`).
-    All,
-    /// Only literals can be true; every other kind is false by
-    /// construction, or a type error, which a caller decides from the kind.
-    Literals,
-}
-
-/// A single-variable term predicate, parsed from a `(kind, arg)` pair.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// A single-variable term predicate, parsed from `(kind, arg)` and, for the
+/// string kinds, [`TextOptions`].
+#[derive(Debug, Clone, PartialEq)]
 pub enum TermPredicate {
     /// `isLITERAL(?x)`.
     IsLiteral,
@@ -173,13 +164,16 @@ pub enum TermPredicate {
     Lang(String),
     /// `langMatches(lang(?x), "range")` — BCP 47 basic filtering: `*`
     /// matches any non-empty tag, otherwise a case-insensitive match of the
-    /// range to the tag or to a `-`-delimited prefix of it.
+    /// range to the tag or to a `-`-delimited prefix of it. Any range but
+    /// `*` with a character outside ASCII letters, digits and hyphens is
+    /// undecided on a tagged literal: rdflib may read it differently.
     LangMatches(String),
     /// `?x <op> <numeric constant>` under the SPARQL operator mapping.
     Num(NumOp, Number),
-    /// `strstarts(str(?x), "prefix")` — on the IRI string, the blank node
-    /// label, or the unescaped lexical form of a string-like literal.
-    StrPrefix(String),
+    /// A string kind: `str_prefix`, `contains`, `strstarts`, `strends`
+    /// (and `regex`), read on the term's text under the [`TextOptions`] it
+    /// was parsed with.
+    Text(TextPredicate),
 }
 
 /// A numeric constant, as a parsed XSD numeric literal.
@@ -189,6 +183,276 @@ pub struct Number {
     /// The constant's datatype IRI (without angle brackets), for the
     /// cross-datatype ordering rule.
     datatype: String,
+}
+
+/// The options of a string kind beyond `(kind, arg)`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TextOptions {
+    /// SPARQL `REGEX` flags (`regex` only): `i`, `s` and `m` are honoured,
+    /// any other flag ignored, as rdflib does.
+    pub flags: String,
+    /// A case wrapper applied to the text first (`LCASE`/`UCASE`).
+    pub case: Option<CaseMap>,
+    /// Whether the text is SPARQL `STR(term)`: an IRI's string, a literal's
+    /// lexical form as a simple literal (undecided for a datatype rdflib
+    /// normalizes), a blank node undecided — instead of rdflib's `string()`
+    /// (string literals only).
+    pub as_str: bool,
+}
+
+/// A case wrapper on a string kind's text, with Python `str.lower()` /
+/// `str.upper()` semantics; decided on ASCII text only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseMap {
+    Lower,
+    Upper,
+}
+
+/// A string kind: its test and how a term's text is read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextPredicate {
+    test: TextTest,
+    case: Option<CaseMap>,
+    as_str: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum TextTest {
+    /// `str_prefix`: the text starts with the prefix (a simple-literal constant).
+    Prefix(String),
+    /// `CONTAINS(text, constant)`.
+    Contains(TextConstant),
+    /// `STRSTARTS(text, constant)`.
+    StartsWith(TextConstant),
+    /// `STRENDS(text, constant)`.
+    EndsWith(TextConstant),
+    /// `REGEX(text, pattern, flags)`.
+    Regex(RegexTest),
+}
+
+/// A string constant as rdflib's `_compatibleStrings` reads it.
+#[derive(Debug, Clone, PartialEq)]
+enum TextConstant {
+    /// A string literal: its lexical form and language tag as spelled (rdflib
+    /// compares tags exactly).
+    Text { text: String, lang: Option<String> },
+    /// Anything rdflib's `string()` rejects — a non-string typed literal, an
+    /// IRI, a blank node: every candidate fails.
+    NotAString,
+}
+
+impl TextConstant {
+    /// A string constant from its strict N-Triples spelling: a literal
+    /// (`"text"`, `"text"@tag` or `"text"^^<datatype>`), an `<iri>` or a
+    /// `_:blank` node. Anything else — an unclosed bracket, a prefixed
+    /// datatype, a language tag outside `[A-Za-z]+(-[A-Za-z0-9]+)*`, text
+    /// after the term — is an error, never a constant that fails every
+    /// candidate unnoticed. A well-formed spelling that is no string literal
+    /// is [`NotAString`](TextConstant::NotAString).
+    fn parse(arg: &str) -> Result<Self> {
+        let invalid = || {
+            VortexRdfError::InvalidOperation(format!(
+                "a string constant is a strict N-Triples spelling (\"text\", \"text\"@tag, \
+                 \"text\"^^<datatype>, <iri> or _:label), got {arg:?}"
+            ))
+        };
+        if arg.starts_with('<') {
+            return if is_iri_ref(arg) {
+                Ok(TextConstant::NotAString)
+            } else {
+                Err(invalid())
+            };
+        }
+        if let Some(label) = arg.strip_prefix("_:") {
+            return if oxrdf::BlankNode::new(label).is_ok() {
+                Ok(TextConstant::NotAString)
+            } else {
+                Err(invalid())
+            };
+        }
+        let lit = LiteralView::parse(arg).ok_or_else(invalid)?;
+        if lit.lang.is_some_and(|tag| !is_language_tag(tag))
+            || lit.datatype.is_some_and(|dt| dt.contains(['<', '>']))
+        {
+            return Err(invalid());
+        }
+        let text = lit.lexical().ok_or_else(invalid)?.into_owned();
+        if !lit.is_string_like() {
+            return Ok(TextConstant::NotAString);
+        }
+        Ok(TextConstant::Text {
+            text,
+            lang: lit.lang.map(str::to_owned),
+        })
+    }
+
+    fn render(&self) -> String {
+        match self {
+            TextConstant::Text { text, lang: None } => format!("{text:?}"),
+            TextConstant::Text {
+                text,
+                lang: Some(lang),
+            } => format!("{text:?}@{lang}"),
+            TextConstant::NotAString => "<not a string>".to_owned(),
+        }
+    }
+}
+
+/// Whether `s` is an IRI reference of N-Triples' `IRIREF` shape: `<` and `>`
+/// around text holding neither.
+fn is_iri_ref(s: &str) -> bool {
+    s.strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        .is_some_and(|iri| !iri.contains(['<', '>']))
+}
+
+/// Whether `tag` is an N-Triples `LANGTAG` (without the `@`):
+/// `[A-Za-z]+(-[A-Za-z0-9]+)*`.
+fn is_language_tag(tag: &str) -> bool {
+    let mut subtags = tag.split('-');
+    subtags
+        .next()
+        .is_some_and(|first| !first.is_empty() && first.bytes().all(|b| b.is_ascii_alphabetic()))
+        && subtags.all(|sub| !sub.is_empty() && sub.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// The local names of the XSD datatypes rdflib 7 parses into a Python value
+/// and writes back in canonical form (`rdflib.term.XSDToPython`), so its
+/// `STR()` of such a literal can differ from the stored lexical form
+/// (`STR("01"^^xsd:integer)` is `"1"`). `xsd:string` is not among them.
+const RDFLIB_NORMALIZED_XSD: &[&str] = &[
+    "anyURI",
+    "base64Binary",
+    "boolean",
+    "byte",
+    "date",
+    "dateTime",
+    "dayTimeDuration",
+    "decimal",
+    "double",
+    "duration",
+    "float",
+    "hexBinary",
+    "int",
+    "integer",
+    "language",
+    "long",
+    "negativeInteger",
+    "nonNegativeInteger",
+    "nonPositiveInteger",
+    "normalizedString",
+    "positiveInteger",
+    "short",
+    "time",
+    "token",
+    "unsignedByte",
+    "unsignedInt",
+    "unsignedLong",
+    "unsignedShort",
+    "yearMonthDuration",
+];
+
+/// The non-XSD datatypes rdflib 7 parses and writes back in canonical form:
+/// `rdf:XMLLiteral`, and `rdf:HTML` when rdflib's optional `html5rdf` is
+/// installed.
+const RDFLIB_NORMALIZED_RDF: &[&str] = &[
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns#XMLLiteral",
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns#HTML",
+];
+
+/// Whether rdflib's `STR()` of a literal typed `dt` may not be its stored
+/// lexical form.
+fn rdflib_normalizes(dt: &str) -> bool {
+    RDFLIB_NORMALIZED_RDF.contains(&dt)
+        || dt
+            .strip_prefix(XSD)
+            .is_some_and(|local| RDFLIB_NORMALIZED_XSD.contains(&local))
+}
+
+impl TextPredicate {
+    /// The term's text and language under `string()` (`as_str` off) or
+    /// `STR()` (on); `Err(verdict)` when there is no text — rdflib raises and
+    /// the FILTER fails — or none this layer reads exactly (`Unknown`).
+    fn text_of<'s>(
+        &self,
+        spelling: &'s str,
+        kind: Kind,
+    ) -> std::result::Result<(Cow<'s, str>, Option<&'s str>), Verdict> {
+        match kind {
+            Kind::Iri if self.as_str => spelling
+                .strip_prefix('<')
+                .and_then(|iri| iri.strip_suffix('>'))
+                .map(|iri| (Cow::Borrowed(iri), None))
+                .ok_or(Verdict::Unknown),
+            // rdflib's `STR()` of a blank node is its label: not decided here.
+            Kind::Blank if self.as_str => Err(Verdict::Unknown),
+            // `string()` of an IRI or a blank node raises: the FILTER fails.
+            Kind::Iri | Kind::Blank => Err(Verdict::False),
+            Kind::DefaultGraph | Kind::Other => Err(Verdict::Unknown),
+            Kind::Literal => {
+                let lit = LiteralView::parse(spelling).ok_or(Verdict::Unknown)?;
+                let lexical = lit.lexical().ok_or(Verdict::Unknown)?;
+                if self.as_str {
+                    match lit.datatype {
+                        Some(dt) if dt != XSD_STRING && rdflib_normalizes(dt) => {
+                            Err(Verdict::Unknown)
+                        }
+                        _ => Ok((lexical, None)),
+                    }
+                } else if lit.is_string_like() {
+                    Ok((lexical, lit.lang))
+                } else {
+                    Err(Verdict::False)
+                }
+            }
+        }
+    }
+
+    fn eval(&self, spelling: &str, kind: Kind) -> Verdict {
+        let (text, lang) = match self.text_of(spelling, kind) {
+            Ok(text) => text,
+            Err(verdict) => return verdict,
+        };
+        let text = match self.case {
+            None => text,
+            Some(_) if !text.is_ascii() => return Verdict::Unknown,
+            Some(CaseMap::Lower) => Cow::Owned(text.to_ascii_lowercase()),
+            Some(CaseMap::Upper) => Cow::Owned(text.to_ascii_uppercase()),
+        };
+        let test = |constant: &TextConstant, holds: fn(&str, &str) -> bool| match constant {
+            TextConstant::NotAString => Verdict::False,
+            TextConstant::Text {
+                lang: Some(tag), ..
+            } if lang != Some(tag.as_str()) => Verdict::False,
+            TextConstant::Text { text: c, .. } => Verdict::from(holds(&text, c)),
+        };
+        match &self.test {
+            TextTest::Prefix(prefix) => Verdict::from(text.starts_with(prefix.as_str())),
+            TextTest::Contains(c) => test(c, |t, c| t.contains(c)),
+            TextTest::StartsWith(c) => test(c, |t, c| t.starts_with(c)),
+            TextTest::EndsWith(c) => test(c, |t, c| t.ends_with(c)),
+            TextTest::Regex(regex) => regex.eval(&text),
+        }
+    }
+
+    fn canonical(&self) -> (&'static str, String) {
+        let (kind, mut arg) = match &self.test {
+            TextTest::Prefix(prefix) => ("str_prefix", prefix.clone()),
+            TextTest::Contains(c) => ("contains", c.render()),
+            TextTest::StartsWith(c) => ("strstarts", c.render()),
+            TextTest::EndsWith(c) => ("strends", c.render()),
+            TextTest::Regex(regex) => ("regex", regex.render()),
+        };
+        match self.case {
+            Some(CaseMap::Lower) => arg.push_str(" [lower]"),
+            Some(CaseMap::Upper) => arg.push_str(" [upper]"),
+            None => {}
+        }
+        if self.as_str {
+            arg.push_str(" [str]");
+        }
+        (kind, arg)
+    }
 }
 
 /// The exact value model: integers as `i128`, decimals as a scaled `i128`
@@ -458,8 +722,8 @@ fn integral_float(x: f64) -> Option<i128> {
 
 /// A literal spelling split into its parts, borrowed from the spelling.
 struct LiteralView<'a> {
-    /// The lexical form as spelled (escapes intact).
-    lexical: &'a str,
+    /// The lexical form as spelled (N-Triples escapes intact).
+    raw_lexical: &'a str,
     /// The language tag, as stored.
     lang: Option<&'a str>,
     /// The datatype IRI without angle brackets, as spelled.
@@ -467,39 +731,31 @@ struct LiteralView<'a> {
 }
 
 impl<'a> LiteralView<'a> {
-    /// Split `"lex"`, `"lex"@tag` or `"lex"^^<dt>`; `None` for anything else.
-    ///
-    /// The only unescaped `"` in a literal spelling are its two delimiters,
-    /// so searching the terminator from the end is unambiguous: `"^^<` and
-    /// `"@` inside the lexical form can only occur escaped (`\"^^<`), and the
-    /// real terminator always comes later.
+    /// Split `"lex"`, `"lex"@tag` or `"lex"^^<dt>` through the escape-aware
+    /// reading the decode path uses; `None` for anything else.
     fn parse(spelling: &'a str) -> Option<Self> {
-        let body = spelling.strip_prefix('"')?;
-        if let Some(lexical) = body.strip_suffix('"') {
-            // Guard against the one-character spelling `"`.
-            if spelling.len() < 2 {
-                return None;
-            }
-            return Some(Self {
-                lexical,
+        Some(match split_literal(spelling)? {
+            LiteralForm::Simple { value } => Self {
+                raw_lexical: value,
                 lang: None,
                 datatype: None,
-            });
-        }
-        if spelling.ends_with('>') {
-            let at = spelling.rfind("\"^^<")?;
-            return Some(Self {
-                lexical: &spelling[1..at],
+            },
+            LiteralForm::Language { value, lang } => Self {
+                raw_lexical: value,
+                lang: Some(lang),
+                datatype: None,
+            },
+            LiteralForm::Typed { value, datatype } => Self {
+                raw_lexical: value,
                 lang: None,
-                datatype: Some(&spelling[at + 4..spelling.len() - 1]),
-            });
-        }
-        let at = spelling.rfind("\"@")?;
-        Some(Self {
-            lexical: &spelling[1..at],
-            lang: Some(&spelling[at + 2..]),
-            datatype: None,
+                datatype: Some(datatype.strip_prefix('<')?.strip_suffix('>')?),
+            },
         })
+    }
+
+    /// The lexical form: escapes decoded, `None` for a malformed escape.
+    fn lexical(&self) -> Option<Cow<'a, str>> {
+        unescape_lexical(self.raw_lexical)
     }
 
     /// The datatype the SPARQL `datatype()` function reports.
@@ -521,7 +777,7 @@ impl<'a> LiteralView<'a> {
     /// parses under the model.
     fn number(&self) -> Option<Num> {
         let dt = self.datatype?;
-        parse_number(self.lexical, numeric_kind(dt)?)
+        parse_number(&self.lexical()?, numeric_kind(dt)?)
     }
 
     /// Whether a numeric literal's lexical form parses disregarding the
@@ -531,15 +787,29 @@ impl<'a> LiteralView<'a> {
     /// `NaN`) its own, more lenient parser may still accept, so that one is
     /// left to it.
     fn parses_unbounded(&self) -> bool {
-        let Some(dt) = self.datatype else {
+        let (Some(dt), Some(lexical)) = (self.datatype, self.lexical()) else {
             return false;
         };
         match numeric_kind(dt) {
-            Some(NumKind::Int(..)) => parse_integer(self.lexical).is_some(),
-            Some(NumKind::Decimal) => parse_decimal(self.lexical).is_some(),
-            Some(NumKind::Float) => parse_float(self.lexical).is_some(),
+            Some(NumKind::Int(..)) => parse_integer(&lexical).is_some(),
+            Some(NumKind::Decimal) => parse_decimal(&lexical).is_some(),
+            Some(NumKind::Float) => parse_float(&lexical).is_some(),
             None => false,
         }
+    }
+
+    /// Whether this is an `xsd:long` or `xsd:unsignedLong` whose lexical form
+    /// is an integer outside the type's 64-bit bounds — a value rdflib holds
+    /// to no bound and compares, which this model refuses.
+    fn wide_64(&self) -> bool {
+        let Some(local) = self.datatype.and_then(|dt| dt.strip_prefix(XSD)) else {
+            return false;
+        };
+        (local == "long" || local == "unsignedLong")
+            && self
+                .lexical()
+                .is_some_and(|lexical| parse_integer(&lexical).is_some())
+            && self.number().is_none()
     }
 }
 
@@ -567,18 +837,50 @@ fn kind_of(spelling: &str) -> Kind {
 }
 
 impl TermPredicate {
-    /// Parse a `(kind, arg)` pair.
-    ///
-    /// Kinds: `is_literal`, `is_iri`, `is_blank` (no argument), `datatype`
-    /// (an IRI, with or without angle brackets), `lang` (a tag), `lang_matches`
-    /// (a BCP 47 language range), `num_lt`, `num_le`, `num_gt`, `num_ge`,
-    /// `num_eq`, `num_ne` (an N-Triples numeric literal such as
+    /// Parse a `(kind, arg)` pair with default [`TextOptions`].
+    pub fn parse(kind: &str, arg: &str) -> Result<Self> {
+        Self::parse_with(kind, arg, &TextOptions::default())
+    }
+
+    /// Parse a `(kind, arg)` pair and a string kind's options. String kinds:
+    /// `str_prefix` (arg: the raw prefix), `contains`, `strstarts`,
+    /// `strends` (arg: the constant's strict N-Triples spelling — a literal,
+    /// `<iri>` or `_:blank`; a malformed one is an error), `regex` (arg: the
+    /// pattern as written, with the SPARQL `flags` option; a pattern outside
+    /// the supported subset, or too large once compiled, parses and leaves
+    /// every text undecided). Other kinds: `is_literal`, `is_iri`,
+    /// `is_blank` (no argument), `datatype` (an IRI, with or without angle
+    /// brackets), `lang` (a tag), `lang_matches` (a BCP 47 language range),
+    /// `num_lt` … `num_ne` (an N-Triples numeric literal such as
     /// `"5"^^<http://www.w3.org/2001/XMLSchema#integer>`, or a bare number
     /// typed by its syntax: `5` is an integer, `1.5` a decimal, `1e3` a
-    /// double), and `str_prefix` (the raw prefix string).
-    pub fn parse(kind: &str, arg: &str) -> Result<Self> {
+    /// double). `case`/`as_str` on a non-string kind and `flags` on any kind
+    /// but `regex` are errors.
+    pub fn parse_with(kind: &str, arg: &str, options: &TextOptions) -> Result<Self> {
         let invalid = |msg: String| VortexRdfError::InvalidOperation(msg);
+        if !options.flags.is_empty() && kind != "regex" {
+            return Err(invalid(format!(
+                "flags apply to the regex kind, not {kind:?}"
+            )));
+        }
+        let text = |test: TextTest| {
+            TermPredicate::Text(TextPredicate {
+                test,
+                case: options.case,
+                as_str: options.as_str,
+            })
+        };
         let predicate = match kind {
+            "str_prefix" => text(TextTest::Prefix(arg.to_owned())),
+            "contains" => text(TextTest::Contains(TextConstant::parse(arg)?)),
+            "strstarts" => text(TextTest::StartsWith(TextConstant::parse(arg)?)),
+            "strends" => text(TextTest::EndsWith(TextConstant::parse(arg)?)),
+            "regex" => text(TextTest::Regex(RegexTest::new(arg, &options.flags))),
+            _ if options.case.is_some() || options.as_str => {
+                return Err(invalid(format!(
+                    "case and as_str apply to the string kinds, not {kind:?}"
+                )));
+            }
             "is_literal" => TermPredicate::IsLiteral,
             "is_iri" => TermPredicate::IsIri,
             "is_blank" => TermPredicate::IsBlank,
@@ -614,31 +916,15 @@ impl TermPredicate {
                 })?;
                 TermPredicate::Num(op, number)
             }
-            "str_prefix" => TermPredicate::StrPrefix(arg.to_owned()),
             other => {
                 return Err(invalid(format!(
                     "unknown term predicate kind {other:?}; expected one of is_literal, is_iri, \
                      is_blank, datatype, lang, lang_matches, num_lt, num_le, num_gt, num_ge, \
-                     num_eq, num_ne, str_prefix"
+                     num_eq, num_ne, str_prefix, contains, strstarts, strends, regex"
                 )));
             }
         };
         Ok(predicate)
-    }
-
-    /// The code range a dictionary scan must cover for this predicate's
-    /// definite answers.
-    pub fn domain(&self) -> Domain {
-        match self {
-            TermPredicate::IsLiteral
-            | TermPredicate::IsIri
-            | TermPredicate::IsBlank
-            | TermPredicate::StrPrefix(_) => Domain::All,
-            TermPredicate::Datatype(_)
-            | TermPredicate::Lang(_)
-            | TermPredicate::LangMatches(_)
-            | TermPredicate::Num(..) => Domain::Literals,
-        }
     }
 
     /// Evaluate the predicate on one N-Triples spelling.
@@ -666,7 +952,7 @@ impl TermPredicate {
             },
             TermPredicate::LangMatches(range) => match LiteralView::parse(spelling) {
                 Some(lit) => match lit.lang {
-                    Some(tag) => Verdict::from(lang_matches(tag, range)),
+                    Some(tag) => lang_matches(tag, range),
                     // `langMatches("", range)` is false for every range.
                     None => Verdict::False,
                 },
@@ -687,94 +973,41 @@ impl TermPredicate {
                 };
                 number.compare(op, &lit)
             }
-            TermPredicate::StrPrefix(prefix) => match kind {
-                Kind::Iri => Verdict::from(spelling[1..spelling.len() - 1].starts_with(prefix)),
-                Kind::Blank => Verdict::from(spelling[2..].starts_with(prefix)),
-                _ => match LiteralView::parse(spelling) {
-                    Some(lit) if lit.is_string_like() => {
-                        match unescape_prefix(lit.lexical, prefix.len()) {
-                            Some(head) => Verdict::from(head.starts_with(prefix)),
-                            None => Verdict::Unknown,
-                        }
-                    }
-                    // `str()` of another typed literal is its lexical form
-                    // only after the engine's own canonicalization.
-                    Some(_) => Verdict::Unknown,
-                    None => Verdict::Unknown,
-                },
-            },
+            TermPredicate::Text(text) => text.eval(spelling, kind),
         }
     }
 
-    /// How a dictionary with `kinds` partitions its codes by this
-    /// predicate: see [`ScanPlan`].
-    pub(crate) fn scan_plan(&self, kinds: &KindRanges) -> ScanPlan {
-        match self {
-            TermPredicate::IsLiteral | TermPredicate::IsIri | TermPredicate::IsBlank => ScanPlan {
-                scan: None,
-                true_prefixes: Vec::new(),
-            },
-            // Literals are scanned; an IRI or blank node answers `str()`
-            // with its own spelling, so its prefix test is a code range.
-            TermPredicate::StrPrefix(prefix) => ScanPlan {
-                scan: Some(kinds.literals.clone()),
-                true_prefixes: vec![format!("<{prefix}"), format!("_:{prefix}")],
-            },
-            TermPredicate::Datatype(_)
-            | TermPredicate::Lang(_)
-            | TermPredicate::LangMatches(_)
-            | TermPredicate::Num(..) => ScanPlan {
-                scan: Some(kinds.literals.clone()),
-                true_prefixes: Vec::new(),
-            },
+    /// The verdict every code of `kind` gets without its spelling being
+    /// read, or `None` when the spelling decides. Always agrees with `eval`
+    /// on a spelling of that kind.
+    pub(crate) fn kind_verdict(&self, kind: CodeKind) -> Option<Verdict> {
+        match (self, kind) {
+            (_, CodeKind::Other) => Some(Verdict::Unknown),
+            (TermPredicate::IsLiteral, kind) => Some(Verdict::from(kind == CodeKind::Literal)),
+            (TermPredicate::IsIri, kind) => Some(Verdict::from(kind == CodeKind::Iri)),
+            (TermPredicate::IsBlank, kind) => Some(Verdict::from(kind == CodeKind::Blank)),
+            (_, CodeKind::Literal) => None,
+            // Term inequality holds for every non-literal.
+            (TermPredicate::Num(NumOp::Ne, _), _) => Some(Verdict::True),
+            // `STR()` of an IRI is its string: read it. rdflib's `STR()` of a
+            // blank node is its label, which this layer does not decide.
+            (TermPredicate::Text(text), CodeKind::Iri) if text.as_str => None,
+            (TermPredicate::Text(text), CodeKind::Blank) if text.as_str => Some(Verdict::Unknown),
+            (
+                TermPredicate::Datatype(_)
+                | TermPredicate::Lang(_)
+                | TermPredicate::LangMatches(_)
+                | TermPredicate::Num(..)
+                | TermPredicate::Text(_),
+                _,
+            ) => Some(Verdict::False),
         }
     }
 
-    /// Assemble the `(true_codes, unknown_codes)` partition from what the
-    /// [`ScanPlan`] produced: `scanned` holds the verdicts of the scanned
-    /// range and `true_ranges` the code ranges of the plan's `true_prefixes`,
-    /// in the plan's order. Both outputs are ascending.
-    ///
-    /// Codes outside the predicate's [`domain`](Self::domain) appear in
-    /// neither list; codes inside it that belong to no kind (the default
-    /// graph's `""`, a foreign writer's spelling) are unknown.
-    pub(crate) fn assemble(
-        &self,
-        kinds: &KindRanges,
-        scanned: Scanned,
-        true_ranges: &[Range<u32>],
-    ) -> (Buffer<u32>, Buffer<u32>) {
-        let range = |r: &Range<u32>| Buffer::from_iter(r.clone());
-        let gaps = || Buffer::from_iter(kinds.gaps());
-        match self {
-            TermPredicate::IsLiteral => (range(&kinds.literals), gaps()),
-            TermPredicate::IsIri => (range(&kinds.iris), gaps()),
-            TermPredicate::IsBlank => (range(&kinds.blanks), gaps()),
-            TermPredicate::StrPrefix(_) => {
-                // Literals < IRIs < blank nodes, so appending the prefix
-                // ranges in kind order keeps the list ascending.
-                let mut truth = scanned.truth;
-                for r in true_ranges {
-                    truth.extend(r.clone());
-                }
-                let mut unknown: Vec<u32> = (0..kinds.literals.start).collect();
-                unknown.extend(scanned.unknown);
-                unknown.extend(kinds.literals.end..kinds.iris.start);
-                unknown.extend(kinds.iris.end..kinds.blanks.start);
-                unknown.extend(kinds.blanks.end..kinds.len);
-                (Buffer::from(truth), Buffer::from(unknown))
-            }
-            TermPredicate::Datatype(_)
-            | TermPredicate::Lang(_)
-            | TermPredicate::LangMatches(_)
-            | TermPredicate::Num(..) => {
-                (Buffer::from(scanned.truth), Buffer::from(scanned.unknown))
-            }
-        }
-    }
-
-    /// The `(kind, arg)` pair this predicate round-trips to, in canonical
-    /// form — the identity a memo keys on.
+    /// The `(kind, arg)` pair [`Display`](fmt::Display) prints. The kind
+    /// and numeric predicates print a pair `parse` accepts back; a string
+    /// kind's `arg` also names its options (` [lower]`, ` [upper]`,
+    /// ` [str]`) and quotes its constant for reading, not for parsing.
     pub fn canonical(&self) -> (&'static str, String) {
         match self {
             TermPredicate::IsLiteral => ("is_literal", String::new()),
@@ -784,7 +1017,7 @@ impl TermPredicate {
             TermPredicate::Lang(tag) => ("lang", tag.clone()),
             TermPredicate::LangMatches(range) => ("lang_matches", range.clone()),
             TermPredicate::Num(op, number) => (op.kind(), number.canonical()),
-            TermPredicate::StrPrefix(prefix) => ("str_prefix", prefix.clone()),
+            TermPredicate::Text(text) => text.canonical(),
         }
     }
 }
@@ -814,7 +1047,7 @@ impl Number {
         if arg.starts_with('"') {
             let lit = LiteralView::parse(arg)?;
             let datatype = lit.datatype?;
-            let value = parse_number(lit.lexical, numeric_kind(datatype)?)?;
+            let value = parse_number(&lit.lexical()?, numeric_kind(datatype)?)?;
             return Some(Self {
                 value,
                 datatype: datatype.to_owned(),
@@ -864,6 +1097,12 @@ impl Number {
                 None => Verdict::Unknown,
             };
         }
+        if lit.wide_64() {
+            // `xsd:long` / `xsd:unsignedLong` beyond 64 bits: rdflib holds
+            // neither to its bound and compares the value, which this model
+            // refuses — the verdict is the caller's.
+            return Verdict::Unknown;
+        }
         // Not a numeric value: a numeric datatype whose lexical form the
         // model does not hold, or a non-numeric literal. For ordering, a
         // language-tagged literal counts as `xsd:string` (its datatype is
@@ -904,46 +1143,59 @@ impl Number {
     }
 }
 
-/// BCP 47 basic filtering (RFC 4647 §3.3.1) as SPARQL's `langMatches`.
-fn lang_matches(tag: &str, range: &str) -> bool {
+/// BCP 47 basic filtering (RFC 4647 §3.3.1) as SPARQL's `langMatches`,
+/// decided for `*` and for a range of ASCII letters, digits and hyphens,
+/// where it and rdflib's `_lang_range_check` agree. rdflib may read any other
+/// range differently: a `*` in any subtag is a wildcard (`en-*` matches
+/// `en-gb`), whitespace around the range is stripped, and Python lower-cases
+/// it (the Kelvin sign to `k`). A range other than `*` with a character
+/// outside that alphabet is `Unknown` whether or not rdflib happens to agree
+/// (for `en_gb` it does). So is a tag outside it, which only a foreign writer's file can
+/// hold (the N-Triples ingest rejects one), so that check is defensive.
+fn lang_matches(tag: &str, range: &str) -> Verdict {
+    let plain = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
     if range == "*" {
-        return !tag.is_empty();
+        return Verdict::from(!tag.is_empty());
+    }
+    if !plain(range) || !plain(tag) {
+        return Verdict::Unknown;
     }
     let tag = tag.to_ascii_lowercase();
     let range = range.to_ascii_lowercase();
-    tag == range || (tag.starts_with(&range) && tag.as_bytes().get(range.len()) == Some(&b'-'))
+    Verdict::from(
+        tag == range || (tag.starts_with(&range) && tag.as_bytes().get(range.len()) == Some(&b'-')),
+    )
 }
 
-/// Unescape at least the first `want` characters of a lexical form (as
-/// spelled, with N-Triples escapes), stopping early so a long literal costs
-/// only its prefix. `None` for a malformed escape.
-fn unescape_prefix(lexical: &str, want: usize) -> Option<String> {
-    if !lexical.contains('\\') {
-        return Some(lexical.chars().take(want).collect());
+/// The lexical form of a literal spelled with N-Triples escapes (`\t \b \n
+/// \r \f \" \' \\ \uXXXX \UXXXXXXXX`), borrowed when there is none; `None`
+/// for any other backslash sequence, which no two readers agree on.
+fn unescape_lexical(raw: &str) -> Option<Cow<'_, str>> {
+    if !raw.contains('\\') {
+        return Some(Cow::Borrowed(raw));
     }
-    let mut out = String::with_capacity(want.min(lexical.len()));
-    let mut chars = lexical.chars();
-    while out.chars().count() < want {
-        let Some(c) = chars.next() else { break };
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
         if c != '\\' {
             out.push(c);
             continue;
         }
-        match chars.next()? {
-            't' => out.push('\t'),
-            'b' => out.push('\u{8}'),
-            'n' => out.push('\n'),
-            'r' => out.push('\r'),
-            'f' => out.push('\u{c}'),
-            '"' => out.push('"'),
-            '\'' => out.push('\''),
-            '\\' => out.push('\\'),
-            'u' => out.push(hex_char(&mut chars, 4)?),
-            'U' => out.push(hex_char(&mut chars, 8)?),
+        out.push(match chars.next()? {
+            't' => '\t',
+            'b' => '\u{8}',
+            'n' => '\n',
+            'r' => '\r',
+            'f' => '\u{c}',
+            '"' => '"',
+            '\'' => '\'',
+            '\\' => '\\',
+            'u' => hex_char(&mut chars, 4)?,
+            'U' => hex_char(&mut chars, 8)?,
             _ => return None,
-        }
+        });
     }
-    Some(out)
+    Some(Cow::Owned(out))
 }
 
 fn hex_char(chars: &mut std::str::Chars<'_>, len: usize) -> Option<char> {
@@ -1019,6 +1271,72 @@ mod tests {
         let any = p("lang_matches", "*");
         assert_eq!(any.eval("\"a\"@fr"), Verdict::True);
         assert_eq!(any.eval("\"a\""), Verdict::False);
+    }
+
+    /// rdflib's `langMatches` may read a range differently from basic
+    /// filtering: a `*` in any subtag is a wildcard (`en-*` matches `en-gb`),
+    /// whitespace around the range is stripped, and its case mapping is
+    /// Python's (the Kelvin sign lower-cases to `k`). A tagged literal is left
+    /// undecided for every range but `*` that holds a character outside ASCII
+    /// letters, digits and hyphens, and for a tag outside that alphabet.
+    #[test]
+    fn lang_matches_leaves_ranges_outside_the_basic_alphabet_undecided() {
+        for range in [
+            "en-*",
+            "*-gb",
+            "*-*",
+            "e*",
+            " en",
+            "en ",
+            "\ten",
+            "\u{3000}en",
+            "\u{a0}en-gb",
+            "\u{212a}ab",
+            "en_gb",
+            "en.*",
+        ] {
+            let m = p("lang_matches", range);
+            assert_eq!(m.eval("\"a\"@en-gb"), Verdict::Unknown, "{range:?}");
+            assert_eq!(m.eval("\"a\"@kab"), Verdict::Unknown, "{range:?}");
+            // An untagged literal and a non-literal match no range, whatever it is.
+            assert_eq!(m.eval("\"a\""), Verdict::False, "{range:?}");
+            assert_eq!(m.eval("<http://x>"), Verdict::False, "{range:?}");
+        }
+        for (range, want) in [
+            ("en", true),
+            ("en-GB", true),
+            ("EN-gb", true),
+            ("e", false),
+            ("en-g", false),
+            ("1996", false),
+            ("*", true),
+            ("en-", false),
+            ("-gb", false),
+            ("en--gb", false),
+        ] {
+            assert_eq!(
+                p("lang_matches", range).eval("\"a\"@en-gb"),
+                Verdict::from(want),
+                "{range:?}"
+            );
+        }
+        // A tag outside the alphabet is only in a foreign writer's file (the
+        // N-Triples ingest rejects it), but the literal view carries it:
+        // undecided for every range but `*`, which looks at no character of it.
+        for spelling in ["\"a\"@en gb", "\"a\"@ en", "\"a\"@en_gb", "\"a\"@é"] {
+            for range in ["en", "en-gb", "e"] {
+                assert_eq!(
+                    p("lang_matches", range).eval(spelling),
+                    Verdict::Unknown,
+                    "{range:?} on {spelling}"
+                );
+            }
+            assert_eq!(
+                p("lang_matches", "*").eval(spelling),
+                Verdict::True,
+                "{spelling}"
+            );
+        }
     }
 
     #[test]
@@ -1099,9 +1417,23 @@ mod tests {
     #[test]
     fn str_prefix_over_every_kind() {
         let http = p("str_prefix", "http://ex/");
-        assert_eq!(http.eval("<http://ex/a>"), Verdict::True);
-        assert_eq!(http.eval("<http://other/a>"), Verdict::False);
-        assert_eq!(p("str_prefix", "b").eval("_:b0"), Verdict::True);
+        assert_eq!(
+            http.eval("<http://ex/a>"),
+            Verdict::False,
+            "string() rejects an IRI"
+        );
+        let as_str = TermPredicate::parse_with(
+            "str_prefix",
+            "http://ex/",
+            &TextOptions {
+                as_str: true,
+                ..TextOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(as_str.eval("<http://ex/a>"), Verdict::True);
+        assert_eq!(as_str.eval("<http://other/a>"), Verdict::False);
+        assert_eq!(p("str_prefix", "b").eval("_:b0"), Verdict::False);
         assert_eq!(p("str_prefix", "ab").eval("\"abc\""), Verdict::True);
         assert_eq!(p("str_prefix", "ab").eval("\"abc\"@en"), Verdict::True);
         assert_eq!(
@@ -1112,10 +1444,7 @@ mod tests {
         assert_eq!(p("str_prefix", "a\tb").eval("\"a\\tb\""), Verdict::True);
         assert_eq!(p("str_prefix", "é").eval("\"\\u00E9x\""), Verdict::True);
         assert_eq!(p("str_prefix", "ab").eval("\"xab\""), Verdict::False);
-        assert_eq!(
-            p("str_prefix", "4").eval(&typed("42", INT)),
-            Verdict::Unknown
-        );
+        assert_eq!(p("str_prefix", "4").eval(&typed("42", INT)), Verdict::False);
         assert_eq!(p("str_prefix", "").eval("\"\""), Verdict::True);
     }
 
@@ -1146,10 +1475,409 @@ mod tests {
     }
 
     #[test]
-    fn domains() {
-        assert_eq!(p("is_iri", "").domain(), Domain::All);
-        assert_eq!(p("str_prefix", "x").domain(), Domain::All);
-        assert_eq!(p("num_lt", "1").domain(), Domain::Literals);
-        assert_eq!(p("lang", "en").domain(), Domain::Literals);
+    fn string_kinds_parse_and_display_with_their_options() {
+        assert_eq!(p("str_prefix", "ab").to_string(), "str_prefix(ab)");
+        assert_eq!(
+            p("contains", "\"a\\nb\"").to_string(),
+            "contains(\"a\\nb\")"
+        );
+        assert_eq!(
+            p("strstarts", "\"b\"@en").to_string(),
+            "strstarts(\"b\"@en)"
+        );
+        assert_eq!(
+            p("strends", "<http://x>").to_string(),
+            "strends(<not a string>)",
+            "an IRI constant is no string"
+        );
+        let both = TextOptions {
+            case: Some(CaseMap::Upper),
+            as_str: true,
+            ..TextOptions::default()
+        };
+        assert_eq!(
+            TermPredicate::parse_with("contains", "\"b\"", &both)
+                .unwrap()
+                .to_string(),
+            "contains(\"b\" [upper] [str])"
+        );
+        // A typed `xsd:string` constant is the plain one; the options and
+        // the language tag tell predicates apart.
+        let xsd_string = format!("\"a\"^^<{XSD}string>");
+        assert_eq!(p("contains", &xsd_string), p("contains", "\"a\""));
+        assert_ne!(p("contains", "\"a\"@en"), p("contains", "\"a\""));
+        assert_ne!(
+            TermPredicate::parse_with("contains", "\"a\"", &both).unwrap(),
+            p("contains", "\"a\"")
+        );
+        // `regex` shows its pattern and flags, and the options after them.
+        assert_eq!(p("regex", "^a").to_string(), "regex(\"^a\" flags=\"\")");
+        let flagged = TextOptions {
+            flags: "i".into(),
+            case: Some(CaseMap::Lower),
+            as_str: true,
+        };
+        assert_eq!(
+            TermPredicate::parse_with("regex", "^a", &flagged)
+                .unwrap()
+                .to_string(),
+            "regex(\"^a\" flags=\"i\" [lower] [str])"
+        );
+        assert_eq!(p("regex", "a"), p("regex", "a"));
+        assert_ne!(p("regex", "a"), p("regex", "b"));
+        assert_ne!(
+            p("regex", "a"),
+            TermPredicate::parse_with(
+                "regex",
+                "a",
+                &TextOptions {
+                    flags: "i".into(),
+                    ..TextOptions::default()
+                }
+            )
+            .unwrap()
+        );
+        // The pattern is raw text, whatever it holds: nothing here refuses it.
+        for pattern in ["", "(", "\"a\"^^xsd:string", "[z-a]", "\\"] {
+            assert!(
+                TermPredicate::parse("regex", pattern).is_ok(),
+                "{pattern:?}"
+            );
+        }
+        // A bad escape in a constant is refused; one in a prefix is just text.
+        assert!(TermPredicate::parse("contains", "\"a\\q\"").is_err());
+        assert!(TermPredicate::parse("str_prefix", "a\\q").is_ok());
+        // The message of an unknown kind names the string kinds.
+        let message = TermPredicate::parse("nope", "").unwrap_err().to_string();
+        assert!(
+            message.contains("contains, strstarts, strends, regex"),
+            "{message}"
+        );
+    }
+
+    /// A string constant is a strict N-Triples spelling: a malformed one is
+    /// refused at parse time — never accepted only to fail every candidate —
+    /// and a well-formed one that is no string literal matches nothing.
+    #[test]
+    fn string_constants_are_strict_n_triples() {
+        let xsd_string = format!("{XSD}string");
+        let mut wrong = Vec::new();
+        for kind in ["contains", "strstarts", "strends"] {
+            for malformed in [
+                // A datatype that is no `<iri>`: a prefixed name, an unclosed
+                // bracket, nothing at all, a stray bracket.
+                "\"a\"^^xsd:string",
+                "\"a\"^^<http://www.w3.org/2001/XMLSchema#string",
+                "\"a\"^^",
+                "\"a\"^^<x>>",
+                "\"a\"^^<<x>",
+                "\"a\"^^<>>",
+                // An IRI that is not `<...>`, and anything that is no term.
+                "<http://ex/a",
+                "http://ex/a>",
+                "<<http://ex/a>>",
+                "<a>b>",
+                "http://ex/a",
+                "a",
+                "",
+                // A language tag outside `[A-Za-z]+(-[A-Za-z0-9]+)*`.
+                "\"a\"@e n",
+                "\"a\"@en^^<x>",
+                "\"a\"@",
+                "\"a\"@-en",
+                "\"a\"@en-",
+                "\"a\"@en--gb",
+                "\"a\"@1en",
+                "\"a\"@en_gb",
+                "\"a\"@é",
+                // A blank node without a valid label.
+                "_:",
+                "_:a b",
+                // Text after the literal, an unterminated literal, a bad
+                // escape (in a string constant or in one that is no string).
+                "\"a\" ",
+                "\"a",
+                "\"a\\q\"",
+                "\"a\\q\"^^<http://ex/dt>",
+            ] {
+                if !matches!(
+                    TermPredicate::parse(kind, malformed),
+                    Err(VortexRdfError::InvalidOperation(_))
+                ) {
+                    wrong.push(format!("{kind} {malformed:?} was not refused"));
+                }
+            }
+            for well_formed in [
+                "\"a\"",
+                "\"\"",
+                "\"a\"@en",
+                "\"a\"@en-GB",
+                "\"a\"@en-x-1",
+                "\"a\"@EN",
+                "\"a\\\"@fr\"@en",
+                &format!("\"a\"^^<{xsd_string}>"),
+                // No string literal: well formed, so it matches nothing.
+                &format!("\"4\"^^<{INT}>"),
+                "\"a\"^^<http://ex/dt>",
+                "<http://ex/a>",
+                "<>",
+                "_:b0",
+                "_:b-0.1",
+            ] {
+                if let Err(e) = TermPredicate::parse(kind, well_formed) {
+                    wrong.push(format!("{kind} {well_formed:?} was refused: {e}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // A prefix is raw text, not a spelling.
+        assert!(TermPredicate::parse("str_prefix", "\"a\"^^xsd:string").is_ok());
+    }
+
+    #[test]
+    fn wide_64_bit_longs_are_undecided() {
+        let long = "http://www.w3.org/2001/XMLSchema#long";
+        let ulong = "http://www.w3.org/2001/XMLSchema#unsignedLong";
+        for op in ["num_lt", "num_gt", "num_le", "num_ge"] {
+            assert_eq!(
+                p(op, "5").eval(&typed("99999999999999999999", long)),
+                Verdict::Unknown,
+                "{op}"
+            );
+            assert_eq!(
+                p(op, "5").eval(&typed("-1", ulong)),
+                Verdict::Unknown,
+                "{op}"
+            );
+        }
+        assert_eq!(p("num_lt", "5").eval(&typed("7", long)), Verdict::False);
+        assert_eq!(p("num_lt", "9").eval(&typed("7", ulong)), Verdict::True);
+        // An unbounded integer still compares by value.
+        assert_eq!(
+            p("num_lt", "5").eval(&typed("99999999999999999999", INT)),
+            Verdict::False
+        );
+    }
+
+    #[test]
+    fn lexical_forms_are_read_unescaped() {
+        assert_eq!(
+            p("num_eq", "5").eval("\"\\u0035\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
+            Verdict::True
+        );
+        assert_eq!(
+            p("num_lt", "5").eval("\"\\q\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
+            Verdict::Unknown
+        );
+        assert_eq!(p("str_prefix", "a\"").eval("\"a\\\"b\""), Verdict::True);
+        assert_eq!(
+            p("lang", "en").eval("\"a\\\"@fr\"@en"),
+            Verdict::True,
+            "escaped \"@ is not the tag"
+        );
+    }
+
+    #[test]
+    fn kind_verdicts_agree_with_eval() {
+        let kinds = KindRanges {
+            start: 0,
+            default_graph: Some(0),
+            literals: 1..3,
+            iris: 3..4,
+            blanks: 4..5,
+            len: 5,
+        };
+        let spellings = [
+            "",
+            "\"a\"",
+            "\"5\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+            "<http://x>",
+            "_:b",
+        ];
+        for (kind, arg) in [
+            ("is_iri", ""),
+            ("is_literal", ""),
+            ("is_blank", ""),
+            ("datatype", INT),
+            ("lang", "en"),
+            ("lang_matches", "*"),
+            ("num_lt", "5"),
+            ("num_ne", "5"),
+            ("str_prefix", "h"),
+            ("contains", "\"h\""),
+            ("strstarts", "\"h\""),
+            ("strends", "\"h\""),
+            ("regex", "h"),
+            ("regex", "(?=h)"),
+        ] {
+            let predicate = p(kind, arg);
+            for (code, spelling) in spellings.iter().enumerate() {
+                if let Some(verdict) = predicate.kind_verdict(kinds.kind_of_code(code as TermCode))
+                {
+                    assert_eq!(verdict, predicate.eval(spelling), "{kind} on {spelling}");
+                }
+            }
+        }
+    }
+
+    /// The kind a code of this range would be given: what the first byte of
+    /// its spelling says.
+    fn code_kind(spelling: &str) -> CodeKind {
+        match kind_of(spelling) {
+            Kind::Literal => CodeKind::Literal,
+            Kind::Iri => CodeKind::Iri,
+            Kind::Blank => CodeKind::Blank,
+            Kind::DefaultGraph | Kind::Other => CodeKind::Other,
+        }
+    }
+
+    /// Every spelling up to four characters over the characters that carry a
+    /// term's structure — quotes, brackets, escapes, `@`, `^`, `_`, `:` and a
+    /// multi-byte letter — which a foreign writer's dictionary may hold in
+    /// any kind's range: no predicate panics on one, a string kind never
+    /// passes one that is no term, and a verdict the kind alone gives is the
+    /// one `eval` gives.
+    #[test]
+    fn malformed_spellings_never_panic() {
+        let alphabet = ['"', '<', '>', '_', ':', '\\', '@', '^', 'é', 'a'];
+        let mut spellings = vec![String::new()];
+        let mut layer = vec![String::new()];
+        for _ in 0..4 {
+            layer = layer
+                .iter()
+                .flat_map(|s| alphabet.iter().map(move |c| format!("{s}{c}")))
+                .collect();
+            spellings.extend(layer.iter().cloned());
+        }
+        assert_eq!(spellings.len(), 11_111);
+
+        let string_kinds = [
+            ("str_prefix", "a"),
+            ("str_prefix", ""),
+            ("contains", "\"a\""),
+            ("contains", "\"\""),
+            ("contains", "\"é\"@en"),
+            ("strstarts", "\"a\""),
+            (
+                "strends",
+                "\"a\"^^<http://www.w3.org/2001/XMLSchema#string>",
+            ),
+            ("strends", "<http://x>"),
+            ("regex", "a"),
+            ("regex", "^$"),
+            ("regex", r"\w$"),
+            ("regex", "(?=a)"),
+        ];
+        let options = [
+            TextOptions::default(),
+            TextOptions {
+                as_str: true,
+                ..TextOptions::default()
+            },
+            TextOptions {
+                case: Some(CaseMap::Lower),
+                ..TextOptions::default()
+            },
+            TextOptions {
+                as_str: true,
+                case: Some(CaseMap::Upper),
+                ..TextOptions::default()
+            },
+        ];
+        let mut predicates: Vec<TermPredicate> = string_kinds
+            .iter()
+            .flat_map(|&(kind, arg)| {
+                options
+                    .iter()
+                    .map(move |o| TermPredicate::parse_with(kind, arg, o).unwrap())
+            })
+            .collect();
+        predicates.extend(
+            [
+                ("is_literal", ""),
+                ("is_iri", ""),
+                ("is_blank", ""),
+                ("datatype", INT),
+                ("lang", "en"),
+                ("lang", ""),
+                ("lang_matches", "*"),
+                ("lang_matches", "en"),
+                ("num_lt", "5"),
+                ("num_eq", "5"),
+                ("num_ne", "5"),
+            ]
+            .map(|(kind, arg)| p(kind, arg)),
+        );
+        for predicate in &predicates {
+            for spelling in &spellings {
+                let verdict = predicate.eval(spelling);
+                if let Some(by_kind) = predicate.kind_verdict(code_kind(spelling)) {
+                    assert_eq!(by_kind, verdict, "{predicate} on {spelling:?}");
+                }
+                if matches!(predicate, TermPredicate::Text(_))
+                    && !spelling.starts_with('"')
+                    && verdict == Verdict::True
+                {
+                    // Beside literals, only an IRI under `STR()` has a text:
+                    // whatever else passes must be spelled `<…>`.
+                    assert!(
+                        spelling.starts_with('<') && spelling.ends_with('>'),
+                        "{predicate} passed {spelling:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn as_str_kind_verdicts_agree_with_eval() {
+        let kinds = KindRanges {
+            start: 0,
+            default_graph: Some(0),
+            literals: 1..3,
+            iris: 3..4,
+            blanks: 4..5,
+            len: 5,
+        };
+        let spellings = [
+            "",
+            "\"a\"",
+            "\"5\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+            "<http://x>",
+            "_:b",
+        ];
+        for options in [
+            TextOptions {
+                as_str: true,
+                ..TextOptions::default()
+            },
+            TextOptions {
+                as_str: true,
+                case: Some(CaseMap::Lower),
+                ..TextOptions::default()
+            },
+        ] {
+            for (kind, arg) in [
+                ("str_prefix", "b"),
+                ("contains", "\"b\""),
+                ("strstarts", "\"b\""),
+                ("strends", "\"b\""),
+                ("regex", "b"),
+                ("regex", "(?=b)"),
+            ] {
+                let predicate = TermPredicate::parse_with(kind, arg, &options).unwrap();
+                for (code, spelling) in spellings.iter().enumerate() {
+                    if let Some(verdict) =
+                        predicate.kind_verdict(kinds.kind_of_code(code as TermCode))
+                    {
+                        assert_eq!(
+                            verdict,
+                            predicate.eval(spelling),
+                            "{kind} {options:?} on {spelling}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

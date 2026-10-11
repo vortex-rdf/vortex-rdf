@@ -14,9 +14,9 @@
 //! planning (`attempt_split_ranges` bails when a row range is also set).
 //!
 //! A view's selection field wraps this in [`ViewSelection`], which adds one
-//! more state: *pending* — an index-served match whose exact ids are a
+//! more state: *pending* — an index-resolved match whose exact ids are a
 //! deferred computation, run by the first consumer that needs the selection
-//! (serving reads never do).
+//! (serving reads never do, nor does a count of a located run).
 //!
 //! [`VortexRdfStore`]: crate::store::VortexRdfStore
 
@@ -30,19 +30,24 @@ use vortex_mask::{AllOr, Mask};
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::indexes::LazyRowIds;
+use crate::store::schema::RowId;
 
-/// A view's base-row selection, which may still be *pending*: a match served
-/// by an index left its exact ids uncomputed ([`LazyRowIds`]), because the
-/// attached serving plan answers reads without them.
+/// A view's base-row selection, which may still be *pending*: a match
+/// resolved by an index left its exact ids uncomputed ([`LazyRowIds`]),
+/// because the attached serving plan answers reads without them, or because
+/// the view is only counted or windowed and a located run's width answers a
+/// count.
 ///
 /// The two variants keep the pending state impossible to overlook: every
 /// consumer either takes the serving plan (and never touches the selection)
 /// or materializes here first — there is no concrete-looking value to read
-/// out of a pending selection by mistake. A pending selection exists only
-/// alongside `serve: Some` on its view (`QuadsSource`), and only ever
-/// materializes to the id set the eager path would have produced, so
-/// laziness never changes what a view covers — only when the ids are paid
-/// for.
+/// out of a pending selection by mistake. A pending selection exists
+/// alongside `serve: Some` on its view (`QuadsSource`), or — on a view built
+/// for a count or a window (`IdsNeed::CountOrWindow`) — alone over a located
+/// run of known width; such a view is only counted, windowed or kept, never
+/// streamed. It only ever materializes to the id set the eager path would have
+/// produced, so laziness never changes what a view covers — only when the ids
+/// are paid for.
 #[derive(Clone)]
 pub(crate) enum ViewSelection {
     Exact(RowSelection),
@@ -86,15 +91,16 @@ impl ViewSelection {
     }
 
     /// The already-exact selection, for consumers that structurally cannot
-    /// meet a pending one: a pending selection always rides with a serve
-    /// plan, and these consumers only run on views without one.
+    /// meet a pending one: a pending selection rides with a serve plan or sits
+    /// on a view that is only counted or windowed, and these consumers run on
+    /// neither.
     pub(crate) fn expect_exact(&self) -> &RowSelection {
         match self {
             ViewSelection::Exact(selection) => selection,
             ViewSelection::Pending(_) => {
                 unreachable!(
-                    "a pending selection always rides with a serve plan; consumers that \
-                     cannot honor the plan materialize the selection first"
+                    "a pending selection rides with a serve plan or on a count/window view; \
+                     consumers that stream rows only ever see an exact one"
                 )
             }
         }
@@ -112,7 +118,7 @@ pub(crate) enum RowSelection {
     Range(Range<u64>),
     /// An explicit ascending, unique list of base row ids: what a secondary
     /// index lookup or a mask scan yields.
-    Ids(Buffer<u64>),
+    Ids(Buffer<RowId>),
 }
 
 impl RowSelection {
@@ -170,7 +176,7 @@ impl RowSelection {
 
     /// Narrow to the base rows also named by `ids` (which must be ascending
     /// and unique, as every producer of an id list here guarantees).
-    pub(crate) fn intersect_ids(self, ids: Buffer<u64>) -> Self {
+    pub(crate) fn intersect_ids(self, ids: Buffer<RowId>) -> Self {
         match self {
             RowSelection::All => RowSelection::Ids(ids),
             RowSelection::Range(range) => RowSelection::Ids(restrict_ids(ids, &range)),
@@ -215,8 +221,8 @@ impl RowSelection {
                 }
             };
         };
-        let live = |id: &u64| !deleted.value(*id as usize);
-        let ids: Buffer<u64> = match self {
+        let live = |id: &RowId| !deleted.value(*id as usize);
+        let ids: Buffer<RowId> = match self {
             RowSelection::All => {
                 Buffer::from_iter((0..base_len as u64).filter(live).skip(offset).take(limit))
             }
@@ -348,11 +354,88 @@ impl RowSelection {
         };
         RowSelection::Ids(ids)
     }
+
+    /// [`refine`](Self::refine) by the ascending local `positions` that
+    /// survive, out of this selection's `len` rows, given as a list. Survivors
+    /// that are one contiguous stretch of every row, or of a range, narrow it
+    /// to a range with no id list built; every row surviving leaves the
+    /// selection as it is, and any other survivors become ids.
+    #[cfg(feature = "file-io")]
+    pub(crate) fn refine_positions(self, positions: Vec<usize>, len: usize) -> Self {
+        let (Some(&first), Some(&last)) = (positions.first(), positions.last()) else {
+            return RowSelection::empty();
+        };
+        if positions.len() == len {
+            return self;
+        }
+        let contiguous = last - first + 1 == positions.len();
+        match self {
+            RowSelection::All if contiguous => RowSelection::Range(first as u64..last as u64 + 1),
+            RowSelection::Range(range) if contiguous => {
+                RowSelection::Range(range.start + first as u64..range.start + last as u64 + 1)
+            }
+            selection => selection.refine(&Mask::from_indices(len, positions)),
+        }
+    }
+
+    /// Narrow to the base rows also covered by any of `runs` — ascending,
+    /// disjoint row ranges, as a sorted column's per-code runs are. A single
+    /// surviving run is a [`Range`](RowSelection::Range) (as
+    /// [`intersect_range`](Self::intersect_range) leaves it) however many
+    /// runs were offered, so a keep admitting one contiguous run builds no id
+    /// list; several become an explicit list, and an id list stays one.
+    #[cfg(feature = "file-io")]
+    pub(crate) fn intersect_runs(self, runs: &[Range<u64>]) -> Self {
+        match self {
+            RowSelection::Ids(ids) => {
+                // Each run keeps one window of the ascending id list, and the
+                // runs ascend, so the windows follow each other.
+                let slice = ids.as_slice();
+                let mut windows: Vec<Range<usize>> = Vec::new();
+                let mut from = 0;
+                for run in runs {
+                    let lo = from + slice[from..].partition_point(|&id| id < run.start);
+                    let hi = lo + slice[lo..].partition_point(|&id| id < run.end);
+                    if lo < hi {
+                        windows.push(lo..hi);
+                    }
+                    from = hi;
+                }
+                match windows.as_slice() {
+                    [] => RowSelection::empty(),
+                    [window] => RowSelection::Ids(ids.slice(window.clone())),
+                    windows => RowSelection::Ids(Buffer::from_iter(
+                        windows
+                            .iter()
+                            .flat_map(|window| slice[window.clone()].iter().copied()),
+                    )),
+                }
+            }
+            selection => {
+                let within = match &selection {
+                    RowSelection::Range(range) => range.clone(),
+                    _ => 0..u64::MAX,
+                };
+                let clipped: Vec<Range<u64>> = runs
+                    .iter()
+                    .map(|run| run.start.max(within.start)..run.end.min(within.end))
+                    .filter(|run| run.start < run.end)
+                    .collect();
+                match clipped.as_slice() {
+                    [] => RowSelection::empty(),
+                    [run] => RowSelection::Range(run.clone()),
+                    runs => RowSelection::Ids(Buffer::from_iter(
+                        runs.iter().flat_map(|run| run.clone()),
+                    )),
+                }
+            }
+        }
+    }
 }
 
 /// Restrict an ascending id list to a row range (zero-copy: the surviving ids
 /// are always a contiguous window of a sorted list).
-fn restrict_ids(ids: Buffer<u64>, range: &Range<u64>) -> Buffer<u64> {
+fn restrict_ids(ids: Buffer<RowId>, range: &Range<RowId>) -> Buffer<RowId> {
     let slice = ids.as_slice();
     let lo = slice.partition_point(|&id| id < range.start);
     let hi = slice.partition_point(|&id| id < range.end);
@@ -372,7 +455,7 @@ fn clamped(range: &Range<u64>, base_len: usize) -> Range<usize> {
 }
 
 /// Intersection of two ascending id lists.
-fn intersect_sorted_ids(left: &[u64], right: &[u64]) -> Buffer<u64> {
+fn intersect_sorted_ids(left: &[RowId], right: &[RowId]) -> Buffer<RowId> {
     // Classic sorted-merge intersection: advance whichever side is behind,
     // emit a value only when both sides agree on it. The result can hold at
     // most the smaller list, so one up-front reservation replaces the
@@ -400,10 +483,9 @@ fn intersect_sorted_ids(left: &[u64], right: &[u64]) -> Buffer<u64> {
 /// [`gather_by_point_reads`](crate::store::scan::gather::gather_by_point_reads)).
 /// The pipeline's cost is fixed per column
 /// (optimizer pass, execution context, canonicalization) whatever the row
-/// count, while point reads cost per row per column. The file-backed
-/// dictionary makes the same trade: `FileBackedDict::decode_many`
-/// point-reads batches of up to this many codes through the chunk leaves and
-/// scans wider ones.
+/// count, while point reads cost per row per column. (The file-backed
+/// dictionary needs no such cap: it takes the asked rows out of each window
+/// it rebuilds.)
 pub(crate) const POINT_GATHER_MAX_ROWS: usize = 256;
 
 /// Whether `rows` rows fit the point-read paths (see
@@ -416,7 +498,7 @@ pub(crate) fn point_sized(rows: u64) -> bool {
 mod tests {
     use super::*;
 
-    fn ids(values: &[u64]) -> Buffer<u64> {
+    fn ids(values: &[RowId]) -> Buffer<RowId> {
         Buffer::from_iter(values.iter().copied())
     }
 
@@ -453,6 +535,79 @@ mod tests {
         );
         // Disjoint ranges collapse to empty rather than an inverted range.
         assert!(RowSelection::Range(1..3).intersect_range(7..9).is_empty(10));
+    }
+
+    #[cfg(feature = "file-io")]
+    #[test]
+    #[allow(
+        clippy::single_range_in_vec_init,
+        reason = "the runs are a slice of ranges, and these cases offer just one"
+    )]
+    fn intersect_runs_keeps_one_run_a_range() {
+        // Several runs over every row: ids, in order.
+        assert_eq!(
+            as_vec(&RowSelection::All.intersect_runs(&[1..3, 6..7, 9..11])),
+            vec![1, 2, 6, 9, 10]
+        );
+        // A range clips the runs to itself, and one survivor is a range.
+        let clipped = RowSelection::Range(2..8).intersect_runs(&[0..3, 6..12]);
+        assert_eq!(as_vec(&clipped), vec![2, 6, 7]);
+        let one = RowSelection::Range(4..8).intersect_runs(&[0..3, 6..12, 20..30]);
+        assert!(matches!(one, RowSelection::Range(ref r) if *r == (6..8)));
+        let single = RowSelection::All.intersect_runs(&[5..9]);
+        assert!(matches!(single, RowSelection::Range(ref r) if *r == (5..9)));
+        // Nothing survives: the canonical empty selection.
+        assert!(
+            RowSelection::Range(0..2)
+                .intersect_runs(&[5..9])
+                .is_empty(10)
+        );
+        assert!(RowSelection::All.intersect_runs(&[]).is_empty(10));
+        // An id list stays an id list, windowed by each run.
+        let list = RowSelection::Ids(ids(&[1, 4, 5, 9, 12, 20]));
+        assert_eq!(
+            as_vec(&list.clone().intersect_runs(&[0..2, 4..6, 10..13])),
+            vec![1, 4, 5, 12]
+        );
+        assert_eq!(
+            as_vec(&list.clone().intersect_runs(&[4..10])),
+            vec![4, 5, 9]
+        );
+        assert!(matches!(
+            list.clone().intersect_runs(&[4..10]),
+            RowSelection::Ids(_)
+        ));
+        assert!(list.clone().intersect_runs(&[6..8, 14..19]).is_empty(30));
+        assert!(list.intersect_runs(&[]).is_empty(30));
+    }
+
+    #[cfg(feature = "file-io")]
+    #[test]
+    fn refine_positions_keeps_a_contiguous_stretch_a_range() {
+        // A contiguous stretch of every row, or of a range, is a range.
+        let stretch = RowSelection::All.refine_positions(vec![3, 4, 5], 10);
+        assert!(matches!(stretch, RowSelection::Range(ref r) if *r == (3..6)));
+        let within = RowSelection::Range(10..20).refine_positions(vec![3, 4, 5], 10);
+        assert!(matches!(within, RowSelection::Range(ref r) if *r == (13..16)));
+        // Gaps make ids; an id list stays one even over a contiguous stretch.
+        assert_eq!(
+            as_vec(&RowSelection::Range(10..20).refine_positions(vec![1, 2, 5], 10)),
+            vec![11, 12, 15]
+        );
+        assert_eq!(
+            as_vec(&RowSelection::Ids(ids(&[2, 4, 6, 8])).refine_positions(vec![1, 2], 4)),
+            vec![4, 6]
+        );
+        // Every row surviving changes nothing; none survives empties it.
+        assert!(matches!(
+            RowSelection::Range(10..14).refine_positions(vec![0, 1, 2, 3], 4),
+            RowSelection::Range(ref r) if *r == (10..14)
+        ));
+        assert!(matches!(
+            RowSelection::All.refine_positions(vec![0, 1, 2], 3),
+            RowSelection::All
+        ));
+        assert!(RowSelection::All.refine_positions(vec![], 4).is_empty(4));
     }
 
     #[test]

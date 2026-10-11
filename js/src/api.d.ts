@@ -4,8 +4,8 @@ import { Quad, Term, Stream } from '@rdfjs/types';
  * How quad terms are encoded into columns.
  * - 'default': all four terms stored as N-Triples strings.
  * - 'typed-object': the object is split into kind/value/datatype/language columns.
- * - 'dictionary': every term is replaced by a u32 code into a global sorted term
- *   dictionary. Added quads live in an in-memory string tail until the store
+ * - 'dictionary': every term is replaced by a code (a u64, handed to JS as a
+ *   number) into a global sorted term dictionary. Added quads live in an in-memory string tail until the store
  *   is serialized or compacted.
  *
  * These kebab-case names are the canonical vocabulary shared by every
@@ -121,13 +121,15 @@ export class VortexRdfStore {
      */
     countQuads(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null): number;
     /**
-     * Low-level. Resolve a pattern to the matched rows' raw u32 term codes —
-     * `{ s, p, o, g }` as `Uint32Array`s plus `length` — with no term strings
-     * materialized. `null` unless the store's rows are code-addressable
+     * Low-level. Resolve a pattern to the matched rows' raw term codes —
+     * `{ s, p, o, g }` as `Float64Array`s plus `length` — with no term strings
+     * materialized. Codes are u64 and every one is an exact integer number;
+     * a code past `Number.MAX_SAFE_INTEGER` (2^53 - 1) throws rather than
+     * rounding. `null` unless the store's rows are code-addressable
      * (Dictionary layout, no pending appends, resident dictionary); decode
      * codes through `termDict()`.
      */
-    matchCodes(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null): { s: Uint32Array; p: Uint32Array; o: Uint32Array; g: Uint32Array; length: number } | null;
+    matchCodes(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null): { s: Float64Array; p: Float64Array; o: Float64Array; g: Float64Array; length: number } | null;
     /**
      * Low-level. An immutable handle on this store's term dictionary — the one
      * door to code↔term translation. `undefined` unless the store's rows are
@@ -144,14 +146,24 @@ export class VortexRdfStore {
 
 /**
  * An immutable snapshot of a Dictionary-layout store's term dictionary,
- * translating u32 term codes to N-Triples term strings (`<iri>`, `_:blank`,
+ * translating term codes to N-Triples term strings (`<iri>`, `_:blank`,
  * `"lit"@lang`, `"lit"^^<dt>`, or `''` for the default graph) and back.
- * Obtained with `VortexRdfStore.termDict()`.
+ * Codes are u64 and cross as numbers, exact up to `Number.MAX_SAFE_INTEGER`
+ * (2^53 - 1): never rounded, never wrapped. Obtained with
+ * `VortexRdfStore.termDict()`.
  */
 export class TermDict {
-    /** Decode a term code, or `undefined` when it is out of range. */
+    /**
+     * Decode a term code, or `undefined` when it is out of range. Throws when
+     * `code` is no code: not a number (nothing is coerced, so `null` or `'1'`
+     * throws), or not an integer from 0 to `Number.MAX_SAFE_INTEGER`.
+     */
     decode(code: number): string | undefined;
-    /** Encode an N-Triples term string to its code (inverse of `decode`), or `undefined` when the term is absent. */
+    /**
+     * Encode an N-Triples term string to its code (inverse of `decode`), or
+     * `undefined` when the term is absent. Throws for a code past
+     * `Number.MAX_SAFE_INTEGER`, which no number holds exactly.
+     */
     encode(term: string): number | undefined;
     /** Release the wasm-side handle (also invoked by `Symbol.dispose`). */
     free(): void;

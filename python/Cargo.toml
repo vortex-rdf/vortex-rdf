@@ -12,7 +12,9 @@ publish = false
 # The compiled module is imported as `vortex_rdf._native` (see
 # `[tool.maturin] module-name` in pyproject.toml). `test = false` keeps
 # `cargo test --workspace` from producing a test binary that would need to
-# link libpython — the crate's behavior is covered by the pytest suite.
+# link libpython — the crate's behavior is covered by the pytest suite, apart
+# from the batch fan-out (`src/fan_out.rs`, free of Python types), which
+# `tests/fan_out.rs` compiles on its own.
 [lib]
 name = "_native"
 crate-type = ["cdylib"]

@@ -15,18 +15,20 @@ use vortex_array::scalar::Scalar;
 use vortex_array::search_sorted::{SearchSorted, SearchSortedSide};
 use vortex_array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 use vortex_btrblocks::schemes::integer;
-use vortex_btrblocks::{BtrBlocksCompressorBuilder, Scheme};
+use vortex_btrblocks::{BtrBlocksCompressorBuilder, CompressionSessionExt as _, Scheme, SchemeExt};
 use vortex_rdf_encoded_search::{NodeKind, SortedProbe};
 use vortex_sequence::Sequence;
 
 /// Top-level encoding ids the probe resolves; a declined array with one of
-/// these at its root is a resolver bug, not an unsupported shape.
+/// these at its root is a resolver bug, not an unsupported shape. Every
+/// frame-of-reference array reports `fastlanes.for.v2` in memory; the
+/// session's edition keeps the compressor's on a single reference.
 const SUPPORTED_ENCODINGS: &[&str] = &[
     "vortex.primitive",
     "vortex.constant",
     "vortex.sequence",
     "vortex.runend",
-    "fastlanes.for",
+    "fastlanes.for.v2",
     "fastlanes.bitpacked",
     "fastlanes.delta",
     "vortex.slice",
@@ -50,8 +52,21 @@ fn ctx() -> ExecutionCtx {
     session().create_execution_ctx()
 }
 
+/// The frame-of-reference scheme; the session's edition refines it to a
+/// single reference.
+static FOR: integer::FoRScheme = integer::FoRScheme::v1();
+
+/// Compress through exactly `schemes`, with the wire forms the session's
+/// edition allows.
 fn compress_with(schemes: &[&'static dyn Scheme], data: &[u32]) -> ArrayRef {
-    let mut builder = BtrBlocksCompressorBuilder::empty();
+    let session = session();
+    let stock: Vec<_> = session
+        .compression()
+        .schemes()
+        .iter()
+        .map(|s| s.id())
+        .collect();
+    let mut builder = BtrBlocksCompressorBuilder::from_session(&session).exclude_schemes(stock);
     for scheme in schemes {
         builder = builder.with_new_scheme(*scheme);
     }
@@ -61,7 +76,7 @@ fn compress_with(schemes: &[&'static dyn Scheme], data: &[u32]) -> ArrayRef {
 
 fn compress_default(data: &[u32]) -> ArrayRef {
     let canonical = PrimitiveArray::from_iter(data.iter().copied()).into_array();
-    BtrBlocksCompressorBuilder::default()
+    BtrBlocksCompressorBuilder::from_session(&session())
         .build()
         .compress(&canonical, &mut ctx())
         .unwrap()
@@ -100,7 +115,7 @@ fn bitpacked_4k() -> (Vec<u32>, ArrayRef) {
 
 fn for_bitpacked_4k() -> (Vec<u32>, ArrayRef) {
     let data: Vec<u32> = (0..4096u32).map(|i| 1_000_000_000 + i / 3).collect();
-    let arr = compress_with(&[&integer::FoRScheme, &integer::BitPackingScheme], &data);
+    let arr = compress_with(&[&FOR, &integer::BitPackingScheme], &data);
     (data, arr)
 }
 
@@ -481,7 +496,7 @@ fn probes_chunked_mixed_encodings() {
         compress_with(&[&integer::RunEndScheme, &integer::SequenceScheme], &c1),
         PrimitiveArray::from_iter(std::iter::empty::<u32>()).into_array(),
         compress_with(&[&integer::BitPackingScheme], &c2),
-        compress_with(&[&integer::FoRScheme, &integer::SequenceScheme], &c3),
+        compress_with(&[&FOR, &integer::SequenceScheme], &c3),
     ];
     let dtype = chunks[0].dtype().clone();
     let arr = ChunkedArray::try_new(chunks, dtype).unwrap().into_array();
@@ -539,6 +554,43 @@ fn declines_signed_dtype() {
 #[test]
 fn declines_float_dtype() {
     let arr = PrimitiveArray::from_iter([1.0f32, 2.0]).into_array();
+    assert!(SortedProbe::resolve(&arr).is_none());
+}
+
+#[test]
+fn declines_per_chunk_for_references() {
+    // One reference per 1,024-value chunk (the `fastlanes.for.v2` wire
+    // form): a needle maps to a different encoded value in every chunk.
+    use vortex_fastlanes::{FoR, FoRArrayExt as _};
+    let data: Vec<u32> = (0..4096u32).map(|i| 1_000_000_000 + i * 3).collect();
+    let arr = FoR::encode_chunked(PrimitiveArray::from_iter(data), &mut ctx())
+        .unwrap()
+        .into_array();
+    let view = arr.as_opt::<FoR>().unwrap();
+    assert!(
+        view.constant_reference().is_none(),
+        "fixture must carry per-chunk references"
+    );
+    assert!(SortedProbe::resolve(&arr).is_none());
+}
+
+#[test]
+fn declines_blocked_bit_widths() {
+    // A bit width per 1,024-value block: each block's words sit at its own
+    // stride.
+    use vortex_fastlanes::{BitPacked, BitPackedArrayExt as _, BitPackedData};
+    let data: Vec<u32> = (0..2048u32)
+        .map(|i| if i < 1024 { i / 256 } else { 1000 + i })
+        .collect();
+    let canonical = PrimitiveArray::from_iter(data).into_array();
+    let arr = BitPackedData::encode_blocked(&canonical, &[2, 12], &mut ctx())
+        .unwrap()
+        .into_array();
+    let view = arr.as_opt::<BitPacked>().unwrap();
+    assert!(
+        !view.bit_widths().is_global(),
+        "fixture must carry per-block widths"
+    );
     assert!(SortedProbe::resolve(&arr).is_none());
 }
 

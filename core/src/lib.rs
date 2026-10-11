@@ -23,8 +23,10 @@
 //!         Term::Literal(Literal::new_simple_literal("hello")),
 //!         GraphName::DefaultGraph,
 //!     );
-//!     // Builders consume `RawQuad` — terms already in the N-Triples form the
-//!     // columns store. `parse_quads_from_reader` yields these directly.
+//!     // Builders consume `RawQuad` — terms already in the canonical
+//!     // N-Triples form the columns store. `RawQuad::from_quad` and
+//!     // `parse_quads_from_reader` yield these; `RawQuad::canonical` makes
+//!     // one from strings.
 //!     let quads = stream::iter(vec![Ok::<_, VortexRdfError>(RawQuad::from_quad(&quad))]);
 //!
 //!     // Sort the stream globally by (s, p, o, g) and adopt the result as a
@@ -55,10 +57,10 @@ pub use error::{Result, VortexRdfError};
 pub use store::columns;
 
 pub use store::{
-    BuiltArray, BuiltStream, ChunkStream, DictReader, DictSnapshot, DictionaryQuadSink, Domain,
-    IndexType, Indexes, Keep, KindRanges, LayoutStrategy, NumOp, Probe, QuadColumn, RawQuad,
-    SharedQuad, SortedInMemoryBuilder, StoreParts, TermPredicate, Verdict, VortexArrayBuilder,
-    VortexRdfStore, export_rdf,
+    BuiltArray, BuiltStream, CaseMap, ChunkStream, DictReader, DictSnapshot, DictionaryQuadSink,
+    IndexType, Indexes, Keep, KindRanges, LayoutStrategy, NumOp, Probe, QuadColumn, RawQuad, RowId,
+    SharedQuad, SortedInMemoryBuilder, StoreParts, TermCode, TermPredicate, TextOptions, Verdict,
+    VortexArrayBuilder, VortexRdfStore, export_rdf,
 };
 // Compiled out on wasm along with the rest of the sorted-stream builder's
 // out-of-core merge (see the module gate in `store::builders`).

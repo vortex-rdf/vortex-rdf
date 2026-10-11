@@ -294,16 +294,17 @@ impl IndexComponent {
     #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
     pub(crate) fn to_write(&self) -> Result<crate::io::container::NativeComponentWrite> {
         use crate::io::container::{
-            BufferedComponentSource, NativeComponentWrite, StoreComponentDescriptor,
-            StoreComponentRole, default_child_strategy,
+            BufferedComponentSource, INDEX_VERSION, NativeComponentWrite, StoreComponentDescriptor,
+            StoreComponentRole, child_strategy,
         };
         let array = self.rows()?.clone().into_array();
+        let strategy = child_strategy(array.dtype());
         NativeComponentWrite::new(
             StoreComponentDescriptor {
                 name: self.name.into(),
                 role: StoreComponentRole::Index,
                 implementation: self.slug.into(),
-                version: 1,
+                version: INDEX_VERSION,
                 required: false,
                 sorted: self.sorted,
                 dtype: array.dtype().clone(),
@@ -311,7 +312,7 @@ impl IndexComponent {
             Arc::new(
                 BufferedComponentSource::try_new(vec![array]).map_err(VortexRdfError::Vortex)?,
             ),
-            default_child_strategy(),
+            strategy,
         )
         .map_err(VortexRdfError::Vortex)
     }

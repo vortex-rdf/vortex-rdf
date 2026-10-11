@@ -9,6 +9,15 @@
 //! never materialized whole. The run file format itself belongs to
 //! [`spill`](super::spill), the emission machinery to [`builders`](super);
 //! what lives here is the merge.
+//!
+//! Quads are unique and terms are canonical in what this builder emits. The
+//! quad runs are spilled *distinct*: a quad that arrives more than once, in
+//! one run or in several, is merged out once, and the dictionary collects
+//! the terms of the parsed (so canonical) quads as a set. Row ids are
+//! assigned by that merge, after the repeats are gone, so every index
+//! family's `(value, row id)` records describe the deduplicated rows — and
+//! are themselves unique, since each carries a row id of its own. The
+//! families are spilled and merged as they are, never deduplicated.
 
 use super::spill::{Run, RunMerger, RunSpiller, RunWriter, Spillable, TempRunsGuard};
 use super::{
@@ -20,9 +29,12 @@ use crate::io::container::NativeComponentWrite;
 use crate::store::RawQuad;
 use crate::store::array::{chunked_or_single, with_subject_stamp};
 use crate::store::indexes::secondary_by_copy::{self, out_of_core::CopyKey};
-use crate::store::indexes::{IndexComponent, IndexType, Indexes, known_component, unique_indexes};
+use crate::store::indexes::{
+    IndexComponent, IndexType, Indexes, known_component, next_row_id, unique_indexes,
+};
 use crate::store::layouts::dictionary::{TermCodeMap, TermDictionary, TermDictionaryBuilder};
 use crate::store::layouts::{LayoutStrategy, dictionary};
+use crate::store::schema::{RowId, TermCode};
 
 use crate::debug;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
@@ -134,7 +146,8 @@ pub(crate) async fn build_array(
     })
 }
 
-/// External merge sort producing a lazily-evaluated stream of sorted chunks.
+/// External merge sort producing a lazily-evaluated stream of sorted chunks,
+/// each distinct quad once.
 ///
 /// Phase 1 (ingest → sorted runs on disk) runs to completion before this
 /// function returns — sorted output cannot be emitted until all input has been
@@ -145,8 +158,9 @@ pub(crate) async fn build_array(
 /// is dropped.
 ///
 /// `spill_dir` pins where the run files land (compaction points it at the
-/// store file's own directory so spills share the output's volume); `None`
-/// takes [`TempRunsGuard::create`]'s default resolution.
+/// directory of its temp file, beside the file it replaces, so spills share
+/// the output's volume); `None` takes [`TempRunsGuard::create`]'s default
+/// resolution.
 pub(crate) async fn build_chunk_stream(
     mut quads_in: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
@@ -163,7 +177,8 @@ pub(crate) async fn build_chunk_stream(
     // incrementally during this same ingestion pass.
     let mut dict_builder = (layout == LayoutStrategy::Dictionary).then(TermDictionaryBuilder::new);
 
-    let mut spiller = RunSpiller::<RawQuad>::new(guard.path(), "quads", chunk_size);
+    // Distinct: a repeated quad must be one row, and one row id.
+    let mut spiller = RunSpiller::<RawQuad>::distinct(guard.path(), "quads", chunk_size);
     let mut total_ingested = 0usize;
     while let Some(res) = quads_in.next().await {
         let raw = res?;
@@ -303,20 +318,24 @@ fn chunk_stream<S: Send + 'static>(
 }
 
 /// The two `SecondaryByReference` mergers of a build: (objects, predicates).
-type RefMergers<V> = (RunMerger<(V, u32)>, RunMerger<(V, u32)>);
+type RefMergers<V> = (RunMerger<(V, RowId)>, RunMerger<(V, RowId)>);
 /// The two `SecondaryByCopy` mergers of a build: (POSG keys, OSPG keys).
-type CopyMergers<V> = (RunMerger<(CopyKey<V>, u32)>, RunMerger<(CopyKey<V>, u32)>);
+type CopyMergers<V> = (
+    RunMerger<(CopyKey<V>, RowId)>,
+    RunMerger<(CopyKey<V>, RowId)>,
+);
 
 /// The external-sort mergers for one build's secondary indexes, present only
 /// for the index types the build requested. `V` is the term encoding: strings,
-/// or u32 dictionary codes.
+/// or dictionary codes ([`TermCode`]).
 struct IndexMergers<V> {
     ref_pairs: Option<RefMergers<V>>,
     copy_keys: Option<CopyMergers<V>>,
 }
 
 /// First pass of the indexed pipeline: run the K-way quad merge to completion,
-/// collecting merged quads — in memory when there is a single input run (the
+/// collecting merged quads (each distinct quad once, so `rid` counts the
+/// deduplicated rows) — in memory when there is a single input run (the
 /// dataset already fit once), else spilled to `merged.bin` — while feeding
 /// each requested index family's spiller with that quad's terms encoded by
 /// `term_of`: `(value, row id)` pairs for the reference index, full
@@ -333,8 +352,8 @@ fn merge_quads_feeding_indexes<V>(
 ) -> Result<(Run<RawQuad>, IndexMergers<V>)>
 where
     V: Clone,
-    (V, u32): Ord + Spillable,
-    (CopyKey<V>, u32): Ord + Spillable,
+    (V, RowId): Ord + Spillable,
+    (CopyKey<V>, RowId): Ord + Spillable,
 {
     let mut merged = if merger.run_count() <= 1 {
         MergedSink::Memory(Vec::new())
@@ -346,16 +365,20 @@ where
         }
     };
     let mut o_spill =
-        want_ref.then(|| RunSpiller::<(V, u32)>::new(temp_dir, "idx_o", pair_capacity));
+        want_ref.then(|| RunSpiller::<(V, RowId)>::new(temp_dir, "idx_o", pair_capacity));
     let mut p_spill =
-        want_ref.then(|| RunSpiller::<(V, u32)>::new(temp_dir, "idx_p", pair_capacity));
+        want_ref.then(|| RunSpiller::<(V, RowId)>::new(temp_dir, "idx_p", pair_capacity));
     let mut posg_spill = want_copy
-        .then(|| RunSpiller::<(CopyKey<V>, u32)>::new(temp_dir, "idx_posg", pair_capacity));
+        .then(|| RunSpiller::<(CopyKey<V>, RowId)>::new(temp_dir, "idx_posg", pair_capacity));
     let mut ospg_spill = want_copy
-        .then(|| RunSpiller::<(CopyKey<V>, u32)>::new(temp_dir, "idx_ospg", pair_capacity));
+        .then(|| RunSpiller::<(CopyKey<V>, RowId)>::new(temp_dir, "idx_ospg", pair_capacity));
 
-    let mut rid: u32 = 0;
+    // Rows are numbered as the merge emits them, so the count is unknown up
+    // front: each id is a checked increment, refusing the store at the first
+    // row past the last u64 row id rather than wrapping.
+    let mut rows: u64 = 0;
     while let Some(quad) = merger.next()? {
+        let rid = next_row_id(&mut rows)?;
         if want_copy {
             let spog = [
                 term_of(&quad.s)?,
@@ -387,12 +410,11 @@ where
             }
         }
         merged.push(quad)?;
-        rid += 1;
     }
     let merged = merged.finish()?;
     log::debug!(
         "[SortedStreamBuilder] Merged {} quads; index pair runs written",
-        rid
+        rows
     );
 
     let ref_pairs = match (o_spill, p_spill) {
@@ -446,13 +468,13 @@ impl MergedSink {
 }
 
 /// A window of one reference component's merged pairs, as one child chunk.
-type RefChunkFn<V> = fn(&[(V, u32)]) -> Result<ArrayRef>;
+type RefChunkFn<V> = fn(&[(V, RowId)]) -> Result<ArrayRef>;
 
 /// Turn a build's spill-run mergers into native component writes: each family
 /// streams its child's chunks straight off its merger — no lockstep zip with
 /// the quad stream, no materialization. The temp-run guard is shared with the
 /// quad stream so the run files outlive every reader. `encoded` says whether
-/// the entries hold u32 dictionary codes (else term strings), which picks the
+/// the entries hold dictionary codes (else term strings), which picks the
 /// child dtypes; `ref_chunk` builds a reference child chunk for that encoding.
 fn merger_components<V>(
     mergers: IndexMergers<V>,
@@ -463,12 +485,12 @@ fn merger_components<V>(
 ) -> Result<Vec<NativeComponentWrite>>
 where
     V: Send + 'static + secondary_by_copy::TermColumn,
-    (V, u32): Ord + Spillable,
-    (CopyKey<V>, u32): Ord + Spillable,
+    (V, RowId): Ord + Spillable,
+    (CopyKey<V>, RowId): Ord + Spillable,
 {
     use crate::io::container::sources::PullComponentSource;
     use crate::io::container::{
-        StoreComponentDescriptor, StoreComponentRole, default_child_strategy,
+        INDEX_VERSION, StoreComponentDescriptor, StoreComponentRole, child_strategy,
     };
     use crate::store::indexes::secondary_by_copy::CopyFamily;
     use crate::store::indexes::secondary_by_copy::out_of_core::{
@@ -511,14 +533,14 @@ where
                     name: name.into(),
                     role: StoreComponentRole::Index,
                     implementation: slug.into(),
-                    version: 1,
+                    version: INDEX_VERSION,
                     required: false,
                     // The merger emits each family in its global sort order.
                     sorted: true,
                     dtype: dtype.clone(),
                 },
-                Arc::new(PullComponentSource::new(dtype, chunk_size, pull_fn)),
-                default_child_strategy(),
+                Arc::new(PullComponentSource::new(dtype.clone(), chunk_size, pull_fn)),
+                child_strategy(&dtype),
             )
             .map_err(VortexRdfError::Vortex)?,
         );
@@ -599,10 +621,10 @@ fn emit_merged_run_chunks(
 }
 
 /// Dictionary-layout variant of [`emit_merged_run_chunks`]: the entries hold
-/// u32 codes; the dictionary rides beside the stream for the serializer.
+/// codes; the dictionary rides beside the stream for the serializer.
 fn emit_merged_run_dict_chunks(
     merged: Run<RawQuad>,
-    mergers: IndexMergers<u32>,
+    mergers: IndexMergers<TermCode>,
     dict: Arc<TermDictionary>,
     code_map: Arc<TermCodeMap>,
     chunk_size: usize,
@@ -632,7 +654,7 @@ fn emit_merged_run_dict_chunks(
 }
 
 /// Dictionary-layout emission over the K-way merge (no secondary indexes):
-/// chunks of u32 codes encoded against the completed global dictionary,
+/// chunks of codes encoded against the completed global dictionary,
 /// which rides beside the stream for the serializer to place.
 fn emit_dict_chunks(
     merger: RunMerger<RawQuad>,

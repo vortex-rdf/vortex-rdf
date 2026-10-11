@@ -26,6 +26,7 @@ use vortex_buffer::Buffer;
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout};
+use crate::store::schema::RowId;
 
 pub(crate) mod components;
 pub(crate) mod row_ids;
@@ -42,7 +43,7 @@ pub(crate) use components::{adopt_scanned_component, check_component_rows};
 pub(crate) use row_ids::sorted_row_ids;
 #[cfg(feature = "file-io")]
 pub(crate) use row_ids::{
-    resolve_eager_from_scan, rid_point_reads, scan_index_row_ids, scan_located_row_ids,
+    read_located_rids, resolve_eager_from_scan, rid_point_reads, scan_index_row_ids,
 };
 #[cfg(feature = "file-io")]
 pub(crate) use serve::FileServePlan;
@@ -52,6 +53,133 @@ pub(crate) use serve::InMemoryServePlan;
 /// own columns — the currency every resolution answers in, and the one
 /// column name the families share rather than each spelling their own.
 pub(crate) const COL_RID: &str = "rid";
+
+/// The row id an indexed build gives its first row: 0, unless the tests'
+/// `RowIdBase` hook offsets the ids — past `u32::MAX`, so a handful of
+/// quads carry ids a 32-bit width cannot hold, or close to [`RowId::MAX`],
+/// so the refusal of an id past the last one is reachable. Every reader
+/// takes the base off again ([`base_row`]).
+#[inline]
+fn row_id_base() -> RowId {
+    #[cfg(test)]
+    {
+        crate::store::test_hooks::row_id_base()
+    }
+    #[cfg(not(test))]
+    {
+        0
+    }
+}
+
+/// The most quads an indexed build numbers: one per row id below
+/// [`RowId::MAX`] from the base on, which no store reaches — but the builds
+/// count against it with checked arithmetic all the same, through
+/// [`check_indexed_rows`] or, row by row, [`next_row_id`], so that a row id
+/// is refused rather than wrapped onto row 0.
+#[inline]
+fn row_limit() -> u64 {
+    RowId::MAX - row_id_base()
+}
+
+/// `n` with thousands separators, as the refusal spells the limit.
+fn with_separators(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// A build's refusal of a store whose row ids would run past the last one;
+/// `rows`, when known, is how many quads it would hold.
+fn too_many_rows(rows: Option<u64>) -> VortexRdfError {
+    VortexRdfError::Serialization(format!(
+        "the store would exceed {} quads{}, the most a store with secondary indexes can \
+         number: an index child records each row id as a u64, and no id is wrapped",
+        with_separators(row_limit()),
+        rows.map(|n| format!(" ({} quads)", with_separators(n)))
+            .unwrap_or_default()
+    ))
+}
+
+/// Refuse to index `rows` quads past the row limit — the check every
+/// in-memory index build runs before it assigns a row id, which is what
+/// lets [`row_id`] number the rows unchecked.
+pub(crate) fn check_indexed_rows(rows: u64) -> Result<()> {
+    if rows > row_limit() {
+        return Err(too_many_rows(Some(rows)));
+    }
+    Ok(())
+}
+
+/// The id of the next row of an indexed build that has numbered `assigned`
+/// rows so far, counting it — the checked increment of a build that numbers
+/// rows as they stream past and cannot know the count up front. The refusal
+/// comes at the first row past the row limit, before any id wraps, and
+/// leaves the count as it was. Compiled where its one caller, the
+/// out-of-core builder, is.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) fn next_row_id(assigned: &mut u64) -> Result<RowId> {
+    if *assigned >= row_limit() {
+        return Err(too_many_rows(None));
+    }
+    // Below the limit, so neither sum overflows.
+    let rid = row_id_base() + *assigned;
+    *assigned += 1;
+    Ok(rid)
+}
+
+/// Row `i`'s id as an index child records it, for `i` below a row count
+/// [`check_indexed_rows`] admitted — the in-memory index builds' numbering.
+/// The check comes first on every path that reaches here, so a sum past
+/// [`RowId::MAX`] is a broken invariant, never a silent wrap.
+pub(crate) fn row_id(i: usize) -> RowId {
+    // A usize is at most 64 bits wide on every target: the cast is exact.
+    let row = i as RowId;
+    row_id_base()
+        .checked_add(row)
+        .expect("index builds refuse a store whose row ids would run past RowId::MAX")
+}
+
+/// The base row the row id `rid` an index child recorded names: the id
+/// itself — less the tests' `RowIdBase` offset under that hook, which must
+/// be the one the store was built under.
+#[inline]
+pub(crate) fn base_row(rid: RowId) -> RowId {
+    #[cfg(test)]
+    {
+        rid.checked_sub(row_id_base())
+            .expect("a row id read under the RowIdBase hook was written under it")
+    }
+    #[cfg(not(test))]
+    {
+        rid
+    }
+}
+
+/// The base row `row` as an `I` position, refused when `I` cannot hold it:
+/// a row past what the index type addresses is past every row any base of
+/// that width holds, so it is out of range — never narrowed onto another
+/// row. [`row_index`] is the `usize` form every reader uses; this one is
+/// generic so that the 32-bit case (wasm) is testable on any host.
+pub(crate) fn index_of<I: TryFrom<RowId>>(row: RowId) -> Result<I> {
+    I::try_from(row).map_err(|_| {
+        VortexRdfError::Deserialization(format!(
+            "an index child names row {row}, past the rows this platform addresses"
+        ))
+    })
+}
+
+/// The base row `row` as a `usize` position ([`index_of`]): exact on a
+/// 64-bit target; on a 32-bit one, an error for a row past `usize::MAX`.
+#[inline]
+pub(crate) fn row_index(row: RowId) -> Result<usize> {
+    index_of(row)
+}
 
 /// A secondary index, built as its own sorted children beside the primary
 /// quad rows.
@@ -70,8 +198,8 @@ pub enum IndexType {
     /// (s, p, o, g) order gives subjects.
     ///
     /// Adds two children beside the quad rows, each a `{s, p, o, g, rid}`
-    /// table (`VarBin<Utf8>` term strings, or u32 codes under the Dictionary
-    /// layout; `rid` always `u32`):
+    /// table (`VarBin<Utf8>` term strings, or u64 codes under the Dictionary
+    /// layout; `rid` always a u64 [`RowId`](crate::store::RowId)):
     /// - `index:posg`: the quads sorted by (p, o, s, g)
     /// - `index:ospg`: the quads sorted by (o, s, p, g)
     ///
@@ -88,9 +216,9 @@ pub enum IndexType {
     /// Builds sorted secondary indexes for both predicates **and** objects.
     ///
     /// Adds two children beside the quad rows, each a `{val, rid}` table:
-    /// - `index:ref-o`: object values sorted (`VarBin<Utf8>`; u32 codes under
-    ///   the Dictionary layout), paired with the primary row id (`u32`) each
-    ///   came from
+    /// - `index:ref-o`: object values sorted (`VarBin<Utf8>`; u64 codes under
+    ///   the Dictionary layout), paired with the primary row id (a u64
+    ///   [`RowId`](crate::store::RowId)) each came from
     /// - `index:ref-p`: the same for predicate values
     ///
     /// Enables binary-search routing in `match_pattern` for predicate-only and
@@ -194,7 +322,7 @@ impl IndexType {
     #[cfg(feature = "file-io")]
     pub(crate) async fn resolve_file(
         self,
-        file: &crate::store::native_file::NativeStoreFile,
+        file: &Arc<crate::store::native_file::NativeStoreFile>,
         layout: &ResolvedLayout,
         pattern: QuadPattern<'_>,
         codes: &mut PatternCodes,
@@ -291,25 +419,34 @@ pub(crate) enum IndexResolution<Plan> {
 /// `Eager` is a resolution that had to compute its ids to answer at all (a
 /// back-reference probe, or a copy resolution without a serving plan) and is
 /// non-empty by construction — an empty scan short-circuits to
-/// [`IndexResolution::Empty`] instead. `Lazy` rides only alongside a serve
-/// plan: the plan answers reads straight from the index's own
-/// columns, so the ids — a second pass over the same data — are deferred until
-/// a consumer actually needs the selection (a count, a chained match, a
-/// delete, a base-order gather). A lazy resolution may therefore materialize
-/// to an *empty* id set; consumers reach it through the view's pending
-/// selection, which handles that like any other narrow selection.
+/// [`IndexResolution::Empty`] instead. Only the file resolvers answer this
+/// way: an in-memory resolution is always `Lazy`, so a build without
+/// `file-io` has no `Eager`. `Lazy` rides alongside a serve
+/// plan, or stands alone over a located run whose width is known — only on a
+/// view built for a count or a window (`IdsNeed::CountOrWindow`), which never
+/// streams rows through its selection. A serve plan answers reads straight
+/// from the index's own columns, and a run's width answers a count, so the
+/// ids — a second pass over the same data — are deferred until a consumer
+/// actually needs the selection (a count the width cannot answer, a chained
+/// match, a delete, a base-order gather). A lazy resolution may therefore
+/// materialize to an *empty* id set; consumers reach it through the view's
+/// pending selection, which handles that like any other narrow selection.
 pub(crate) enum ResolvedRowIds {
-    Eager(Buffer<u64>),
+    #[cfg(feature = "file-io")]
+    Eager(Buffer<RowId>),
     Lazy(LazyRowIds),
 }
 
-/// The exact base row ids of a serve-attached index resolution, computed on
-/// first need and shared across every clone of the view that carries them.
+/// The exact base row ids of an index resolution whose consumer may not need
+/// them — a serve-attached one, or a located run that is only counted or
+/// windowed — computed on first need and shared across every clone of the view
+/// that carries them.
 ///
 /// The serving plan makes the ids redundant for the dominant
 /// match-then-iterate flow — for a file-backed store they cost a whole extra
-/// pushed-down scan of the index child — so the resolution hands back the
-/// *recipe* instead and whichever consumer first needs the selection runs it.
+/// pushed-down scan of the index child — and a located run's width makes them
+/// redundant for a count, so the resolution hands back the *recipe* instead
+/// and whichever consumer first needs the selection runs it.
 /// The result lands in a shared cell: later consumers (and view clones made
 /// before materialization) read it back for free. Two consumers racing on
 /// first need may both run the recipe, but the source is immutable so they
@@ -317,7 +454,7 @@ pub(crate) enum ResolvedRowIds {
 /// stored buffer — no lock is held across the computation.
 #[derive(Clone)]
 pub(crate) struct LazyRowIds {
-    cell: Arc<OnceLock<Buffer<u64>>>,
+    cell: Arc<OnceLock<Buffer<RowId>>>,
     source: LazyRowIdSource,
 }
 
@@ -327,8 +464,10 @@ pub(crate) struct LazyRowIds {
 #[derive(Clone)]
 enum LazyRowIdSource {
     /// In-memory: the rid-column slice of the component's matched run, decoded
-    /// and sorted on demand ([`sorted_row_ids`]).
-    Component(ArrayRef),
+    /// and sorted on demand ([`sorted_row_ids`]). `ascending` when the run's
+    /// rids are already in row id order, so a window of the run can be cut
+    /// before anything is decoded.
+    Component { rids: ArrayRef, ascending: bool },
     /// File-backed: the rid-only pushed-down scan of the index child
     /// ([`scan_index_row_ids`]) the eager path would have run at match time.
     #[cfg(feature = "file-io")]
@@ -342,6 +481,18 @@ enum LazyRowIdSource {
         memo: Arc<crate::store::native_file::BoundExprMemo>,
         scope: &'static str,
     },
+    /// File-backed: a located run of an index child's rid column — read on
+    /// first need through [`read_located_rids`]; its width is known up front,
+    /// so a count needs none of it.
+    #[cfg(feature = "file-io")]
+    LocatedRun {
+        file: Arc<crate::store::native_file::NativeStoreFile>,
+        component: &'static str,
+        reader: vortex_layout::LayoutReaderRef,
+        rid_column: &'static str,
+        range: Range<u64>,
+        scope: &'static str,
+    },
 }
 
 impl LazyRowIds {
@@ -352,11 +503,28 @@ impl LazyRowIds {
         self.cell.get().is_some()
     }
 
-    /// Lazy ids over an in-memory component's matched rid run.
+    /// Lazy ids over an in-memory component's matched rid run, in the
+    /// component's own order.
     pub(crate) fn from_component_run(rids: ArrayRef) -> Self {
         Self {
             cell: Arc::new(OnceLock::new()),
-            source: LazyRowIdSource::Component(rids),
+            source: LazyRowIdSource::Component {
+                rids,
+                ascending: false,
+            },
+        }
+    }
+
+    /// Lazy ids over an in-memory component's matched rid run whose rids
+    /// ascend: a reference component's rows are ordered by `(val, rid)`, so
+    /// the rows of one value are in row id order.
+    pub(crate) fn from_ascending_component_run(rids: ArrayRef) -> Self {
+        Self {
+            cell: Arc::new(OnceLock::new()),
+            source: LazyRowIdSource::Component {
+                rids,
+                ascending: true,
+            },
         }
     }
 
@@ -381,26 +549,113 @@ impl LazyRowIds {
         }
     }
 
+    /// Lazy ids over a located run of a file index child.
+    #[cfg(feature = "file-io")]
+    pub(crate) fn from_located_run(
+        file: Arc<crate::store::native_file::NativeStoreFile>,
+        component: &'static str,
+        reader: vortex_layout::LayoutReaderRef,
+        rid_column: &'static str,
+        range: Range<u64>,
+        scope: &'static str,
+    ) -> Self {
+        Self {
+            cell: Arc::new(OnceLock::new()),
+            source: LazyRowIdSource::LocatedRun {
+                file,
+                component,
+                reader,
+                rid_column,
+                range,
+                scope,
+            },
+        }
+    }
+
+    /// The ids of rows `offset..offset + limit` of a located run, in base row
+    /// order — the window's own rows and no others. A reference child's rows
+    /// are ordered by `(val, rid)` (the order this crate's writers emit,
+    /// docs/file-format.md §6), so within one value the rids ascend: row `k`
+    /// of the run holds the run's `k`-th smallest rid, and a window of the
+    /// run's rows is the same window of its ids in base order. A deep page
+    /// costs its limit, one reaching the run's end no more than its rows, and
+    /// an empty window — no limit, or an offset at or past the run's end —
+    /// reads nothing. `None` for any other source.
+    #[cfg(feature = "file-io")]
+    pub(crate) async fn window_async(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<Buffer<RowId>>> {
+        let LazyRowIdSource::LocatedRun {
+            file,
+            component,
+            reader,
+            rid_column,
+            range,
+            scope,
+        } = &self.source
+        else {
+            return Ok(None);
+        };
+        let width = range.end - range.start;
+        let start = (offset as u64).min(width);
+        let end = (offset as u64).saturating_add(limit as u64).min(width);
+        if start >= end {
+            return Ok(Some(Buffer::empty()));
+        }
+        let rows = range.start + start..range.start + end;
+        Ok(Some(
+            read_located_rids(file, component, reader, rid_column, rows, scope).await?,
+        ))
+    }
+
+    /// The ids of rows `offset..offset + limit` of an in-memory run whose rids
+    /// ascend, in base row order — the window's own rows cut out of the rid
+    /// column before they are decoded, so a deep page costs its limit and an
+    /// empty window (no limit, or an offset at or past the run's end) decodes
+    /// nothing. `None` for any other source.
+    pub(crate) fn window(&self, offset: usize, limit: usize) -> Result<Option<Buffer<RowId>>> {
+        let LazyRowIdSource::Component {
+            rids,
+            ascending: true,
+        } = &self.source
+        else {
+            return Ok(None);
+        };
+        let width = rids.len();
+        let start = offset.min(width);
+        let end = offset.saturating_add(limit).min(width);
+        if start >= end {
+            return Ok(Some(Buffer::empty()));
+        }
+        let window = rids.slice(start..end).map_err(VortexRdfError::Vortex)?;
+        Ok(Some(sorted_row_ids(window)?))
+    }
+
     /// How many rows the ids cover, when knowable without computing them: an
     /// in-memory run knows its width up front (so a count on a served match
-    /// never decodes), a file child only after materialization.
+    /// never decodes), and so does a located file run; any other file child
+    /// only after materialization.
     pub(crate) fn len_if_known(&self) -> Option<usize> {
         match &self.source {
-            LazyRowIdSource::Component(rids) => Some(rids.len()),
+            LazyRowIdSource::Component { rids, .. } => Some(rids.len()),
             #[cfg(feature = "file-io")]
             LazyRowIdSource::IndexChild { .. } => self.cell.get().map(Buffer::len),
+            #[cfg(feature = "file-io")]
+            LazyRowIdSource::LocatedRun { range, .. } => Some((range.end - range.start) as usize),
         }
     }
 
     /// The ids, computing (and caching) them on first call — the awaiting
     /// form, which also runs a file child's deferred scan.
     #[cfg(feature = "file-io")]
-    pub(crate) async fn materialized_async(&self) -> Result<Buffer<u64>> {
+    pub(crate) async fn materialized_async(&self) -> Result<Buffer<RowId>> {
         if let Some(ids) = self.cell.get() {
             return Ok(ids.clone());
         }
         let ids = match &self.source {
-            LazyRowIdSource::Component(rids) => sorted_row_ids(rids.clone())?,
+            LazyRowIdSource::Component { rids, .. } => sorted_row_ids(rids.clone())?,
             LazyRowIdSource::IndexChild {
                 reader,
                 constraints,
@@ -408,6 +663,16 @@ impl LazyRowIds {
                 memo,
                 scope,
             } => scan_index_row_ids(reader.clone(), constraints, rid_column, memo, scope).await?,
+            LazyRowIdSource::LocatedRun {
+                file,
+                component,
+                reader,
+                rid_column,
+                range,
+                scope,
+            } => {
+                read_located_rids(file, component, reader, rid_column, range.clone(), scope).await?
+            }
         };
         Ok(self.cell.get_or_init(|| ids).clone())
     }
@@ -416,14 +681,14 @@ impl LazyRowIds {
     /// form for in-memory sources (a file child's ids take I/O, and every
     /// consumer of a file view's selection is already async; see
     /// [`materialized_async`](Self::materialized_async)).
-    pub(crate) fn materialized(&self) -> Result<Buffer<u64>> {
+    pub(crate) fn materialized(&self) -> Result<Buffer<RowId>> {
         if let Some(ids) = self.cell.get() {
             return Ok(ids.clone());
         }
         let ids = match &self.source {
-            LazyRowIdSource::Component(rids) => sorted_row_ids(rids.clone())?,
+            LazyRowIdSource::Component { rids, .. } => sorted_row_ids(rids.clone())?,
             #[cfg(feature = "file-io")]
-            LazyRowIdSource::IndexChild { .. } => {
+            LazyRowIdSource::IndexChild { .. } | LazyRowIdSource::LocatedRun { .. } => {
                 unreachable!("an in-memory view only ever carries component-sourced pending ids")
             }
         };
@@ -514,7 +779,7 @@ pub(crate) fn resolve_indexes_in_memory(
 #[cfg(feature = "file-io")]
 pub(crate) async fn resolve_indexes_file(
     indexes: &[IndexType],
-    file: &crate::store::native_file::NativeStoreFile,
+    file: &Arc<crate::store::native_file::NativeStoreFile>,
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,

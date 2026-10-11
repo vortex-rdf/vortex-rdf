@@ -5,8 +5,8 @@
 //! (`resolve_in_memory` / `resolve_file`, which produce primary row ids
 //! directly for each backend).
 //!
-//! The value columns come in two encodings — term strings, or u32 dictionary
-//! codes under the Dictionary layout — and are always built over the complete
+//! The value columns come in two encodings — term strings, or dictionary
+//! codes ([`TermCode`]) under the Dictionary layout — and are always built over the complete
 //! dataset in one global sort: [`GlobalReferenceArrays`] for the in-memory
 //! builders, merged `(value, row id)` spill runs for the out-of-core one.
 //! Both hand the columns over as this index's two persisted children
@@ -25,6 +25,8 @@
 
 #[cfg(feature = "file-io")]
 use std::ops::Range;
+#[cfg(feature = "file-io")]
+use std::sync::Arc;
 
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::StructArrayExt;
@@ -34,17 +36,18 @@ use vortex_array::{ArrayRef, IntoArray};
 use super::FileServePlan;
 use super::components::child_struct;
 use super::{
-    COL_RID, InMemoryServePlan, IndexResolution, ResolvedRoles, ResolvedRowIds, sorted_row_ids,
+    COL_RID, InMemoryServePlan, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds,
 };
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
 use crate::store::array::{make_string_array, stamp_is_sorted};
 use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, TermRef};
+use crate::store::schema::{RowId, TermCode};
 
 /// The value column of a reference component's persisted child; the row id
 /// beside it is the name every index child shares ([`COL_RID`]).
-const COL_VAL: &str = "val";
+pub(crate) const COL_VAL: &str = "val";
 const CHILD_COLUMNS: [&str; 2] = [COL_VAL, COL_RID];
 
 /// This index's persisted-child identity table — one `{val, rid}` table per
@@ -174,17 +177,15 @@ pub(crate) fn resolve_in_memory(
     if run.is_empty() {
         return Ok(IndexResolution::Empty);
     }
-    // Row ids of every quad whose indexed component equals the probe term.
-    // They come out in the index's order (the rid column is ordered by value,
-    // not by row), so `sorted_row_ids` puts them back in base row order.
-    let row_ids = sorted_row_ids(
-        rows.unmasked_field_by_name(COL_RID)
-            .map_err(VortexRdfError::Vortex)?
-            .slice(run)
-            .map_err(VortexRdfError::Vortex)?,
-    )?;
+    // The run's rids, decoded and sorted only when a consumer needs them —
+    // a count takes the run's width.
+    let rids = rows
+        .unmasked_field_by_name(COL_RID)
+        .map_err(VortexRdfError::Vortex)?
+        .slice(run)
+        .map_err(VortexRdfError::Vortex)?;
     Ok(IndexResolution::Resolved {
-        row_ids: ResolvedRowIds::Eager(row_ids),
+        row_ids: ResolvedRowIds::Lazy(LazyRowIds::from_ascending_component_run(rids)),
         resolves: probe.resolves,
         // A back-reference index stores no whole quads to serve from.
         serve: None,
@@ -205,12 +206,15 @@ pub(crate) fn resolve_in_memory(
 /// value column, an encoding resolving no probe — falls back to the pushed-down
 /// scan, whose filter answers regardless of order.
 ///
-/// This index stores no whole quads, so every outcome here is an eager row-id
+/// This index stores no whole quads, so every outcome here is a row-id
 /// resolution with no serving plan; the store gathers the matched quads from
-/// the primary columns (point reads of their own, for a small id set).
+/// the primary columns (point reads of their own, for a small id set). The
+/// ids are eager, except a located run's: those stay deferred
+/// ([`LazyRowIds::from_located_run`]) so that a count takes the run's width
+/// and a window reads only its own rows.
 #[cfg(feature = "file-io")]
 pub(crate) async fn resolve_file(
-    file: &crate::store::native_file::NativeStoreFile,
+    file: &Arc<crate::store::native_file::NativeStoreFile>,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
 ) -> Result<IndexResolution<FileServePlan>> {
@@ -232,31 +236,21 @@ pub(crate) async fn resolve_file(
             return Ok(IndexResolution::Empty);
         }
         // The located range is exactly this index's matched rows: the value
-        // column is the one and only constraint.
-        let row_ids = if crate::store::selection::point_sized(range.end - range.start) {
-            super::rid_point_reads(file, name, COL_RID, range.clone()).await?
-        } else {
-            Some(
-                super::scan_located_row_ids(
-                    reader.clone(),
-                    COL_RID,
-                    range,
-                    file.bound_exprs(),
-                    name,
-                )
-                .await?,
-            )
-        };
-        // `None` is a mid-read decline (an unprobeable rid chunk); the scan
-        // below reads the same rows the long way.
-        if let Some(row_ids) = row_ids {
-            return Ok(IndexResolution::Resolved {
-                row_ids: ResolvedRowIds::Eager(row_ids),
-                resolves: probe.resolves,
-                // A back-reference index stores no whole quads to serve from.
-                serve: None,
-            });
-        }
+        // column is the one and only constraint. Its ids are read only when
+        // a consumer needs them.
+        return Ok(IndexResolution::Resolved {
+            row_ids: ResolvedRowIds::Lazy(LazyRowIds::from_located_run(
+                Arc::clone(file),
+                name,
+                reader,
+                COL_RID,
+                range,
+                name,
+            )),
+            resolves: probe.resolves,
+            // A back-reference index stores no whole quads to serve from.
+            serve: None,
+        });
     }
     super::resolve_eager_from_scan(
         reader,
@@ -354,25 +348,29 @@ pub(crate) mod out_of_core {
     use super::CHILD_COLUMNS;
     use crate::error::Result;
     use crate::store::array::{make_string_array, stamp_is_sorted};
+    use crate::store::schema::{CODE_PTYPE, ROW_ID_PTYPE, RowId, TermCode};
 
-    /// The persisted child's struct dtype: sorted values (strings, or u32 codes
-    /// under the Dictionary layout) plus the u32 primary row id.
+    /// The persisted child's struct dtype: sorted values (strings, or codes
+    /// under the Dictionary layout) plus the u64 primary row id.
     pub(crate) fn ref_child_dtype(encoded: bool) -> DType {
-        use vortex_array::dtype::{Nullability, PType};
+        use vortex_array::dtype::Nullability;
         let val = if encoded {
-            DType::Primitive(PType::U32, Nullability::NonNullable)
+            DType::Primitive(CODE_PTYPE, Nullability::NonNullable)
         } else {
             DType::Utf8(Nullability::NonNullable)
         };
         child_struct_dtype(
             &CHILD_COLUMNS,
-            vec![val, DType::Primitive(PType::U32, Nullability::NonNullable)],
+            vec![
+                val,
+                DType::Primitive(ROW_ID_PTYPE, Nullability::NonNullable),
+            ],
         )
     }
 
     /// One chunk of a reference component's persisted child from a window of its
     /// merged `(value, row id)` pairs.
-    pub(crate) fn ref_child_chunk_strings(pairs: &[(String, u32)]) -> Result<ArrayRef> {
+    pub(crate) fn ref_child_chunk_strings(pairs: &[(String, RowId)]) -> Result<ArrayRef> {
         let val = make_string_array(pairs.iter().map(|(v, _)| v.as_str()));
         stamp_is_sorted(&val);
         let rid = PrimitiveArray::from_iter(pairs.iter().map(|(_, rid)| *rid)).into_array();
@@ -380,12 +378,18 @@ pub(crate) mod out_of_core {
     }
 
     /// Code-column variant of [`ref_child_chunk_strings`].
-    pub(crate) fn ref_child_chunk_codes(pairs: &[(u32, u32)]) -> Result<ArrayRef> {
+    pub(crate) fn ref_child_chunk_codes(pairs: &[(TermCode, RowId)]) -> Result<ArrayRef> {
         let val = PrimitiveArray::from_iter(pairs.iter().map(|(code, _)| *code)).into_array();
         stamp_is_sorted(&val);
         let rid = PrimitiveArray::from_iter(pairs.iter().map(|(_, rid)| *rid)).into_array();
         child_struct(&CHILD_COLUMNS, vec![val, rid], pairs.len()).map(|a| a.into_array())
     }
+}
+
+/// The `rid` column of a permutation of the dataset: the row ids of the
+/// positions `perm` lists, in that order.
+fn rid_column(perm: &[usize]) -> ArrayRef {
+    PrimitiveArray::from_iter(perm.iter().map(|&i| super::row_id(i))).into_array()
 }
 
 /// The complete dataset's secondary-index columns in global sorted order —
@@ -399,54 +403,59 @@ pub(crate) struct GlobalReferenceArrays {
 }
 
 impl GlobalReferenceArrays {
-    /// Sort by term strings. Row IDs are the quads' positions in `quads`
+    /// Sort by term strings. Row ids number the quads' positions in `quads`
     /// (the builder must pass the dataset in final row order), so the sort is
-    /// just a u32 permutation — no per-term string copies.
+    /// just a permutation of positions — no per-term string copies — whose
+    /// ties break by position, which is row-id order.
     pub(crate) fn from_quads(quads: &[RawQuad]) -> Self {
-        let perm_by = |term_of: fn(&RawQuad) -> &str| -> Vec<u32> {
-            let mut perm: Vec<u32> = (0..quads.len() as u32).collect();
+        let perm_by = |term_of: fn(&RawQuad) -> &str| -> Vec<usize> {
+            let mut perm: Vec<usize> = (0..quads.len()).collect();
             perm.sort_unstable_by(|&a, &b| {
-                term_of(&quads[a as usize]).cmp(term_of(&quads[b as usize]))
+                term_of(&quads[a]).cmp(term_of(&quads[b])).then(a.cmp(&b))
             });
             perm
         };
         let o_perm = perm_by(|q| &q.o);
+        let (o_val, o_rid) = (
+            make_string_array(o_perm.iter().map(|&i| quads[i].o.as_str())),
+            rid_column(&o_perm),
+        );
+        drop(o_perm);
         let p_perm = perm_by(|q| &q.p);
-        Self::from_arrays(
-            make_string_array(o_perm.iter().map(|&i| quads[i as usize].o.as_str())),
-            o_perm,
-            make_string_array(p_perm.iter().map(|&i| quads[i as usize].p.as_str())),
-            p_perm,
-        )
+        let (p_val, p_rid) = (
+            make_string_array(p_perm.iter().map(|&i| quads[i].p.as_str())),
+            rid_column(&p_perm),
+        );
+        Self::from_arrays(o_val, o_rid, p_val, p_rid)
     }
 
-    /// Dictionary-layout variant: sort the u32 codes.
+    /// Dictionary-layout variant: sort the codes.
     pub(crate) fn from_codes(codes: &QuadCodes) -> Self {
-        let sorted = |column: &[u32]| -> (ArrayRef, Vec<u32>) {
-            let mut pairs: Vec<(u32, u32)> = column
+        let sorted = |column: &[TermCode]| -> (ArrayRef, ArrayRef) {
+            let mut pairs: Vec<(TermCode, RowId)> = column
                 .iter()
                 .enumerate()
-                .map(|(i, &code)| (code, i as u32))
+                .map(|(i, &code)| (code, super::row_id(i)))
                 .collect();
             pairs.sort_unstable();
             (
                 PrimitiveArray::from_iter(pairs.iter().map(|(code, _)| *code)).into_array(),
-                pairs.into_iter().map(|(_, rid)| rid).collect(),
+                PrimitiveArray::from_iter(pairs.iter().map(|(_, rid)| *rid)).into_array(),
             )
         };
-        let (o_val, o_perm) = sorted(&codes.o);
-        let (p_val, p_perm) = sorted(&codes.p);
-        Self::from_arrays(o_val, o_perm, p_val, p_perm)
+        let (o_val, o_rid) = sorted(&codes.o);
+        let (p_val, p_rid) = sorted(&codes.p);
+        Self::from_arrays(o_val, o_rid, p_val, p_rid)
     }
 
-    fn from_arrays(o_val: ArrayRef, o_perm: Vec<u32>, p_val: ArrayRef, p_perm: Vec<u32>) -> Self {
+    fn from_arrays(o_val: ArrayRef, o_rid: ArrayRef, p_val: ArrayRef, p_rid: ArrayRef) -> Self {
         stamp_is_sorted(&o_val);
         stamp_is_sorted(&p_val);
         Self {
             o_val,
-            o_rid: PrimitiveArray::from_iter(o_perm).into_array(),
+            o_rid,
             p_val,
-            p_rid: PrimitiveArray::from_iter(p_perm).into_array(),
+            p_rid,
         }
     }
 
@@ -508,5 +517,51 @@ mod tests {
 
         // Nothing this index covers is bound: declines.
         assert!(choose(QuadPattern::new(None, None, None, None)).is_none());
+    }
+
+    /// Every `{val, rid}` child orders its rows by `(value, row id)`, the
+    /// string-valued ones too: the rids inside one value's run ascend, which
+    /// is what lets a window take the first rows of a located run as the
+    /// first rows in base order.
+    #[test]
+    fn from_quads_breaks_value_ties_by_row_id() {
+        use crate::session::VORTEX_SESSION;
+        use crate::store::array::StrColReader;
+        use vortex_array::VortexSessionExecute;
+        use vortex_array::arrays::VarBinViewArray;
+
+        // Few distinct values over many rows, so every value repeats widely.
+        let quads: Vec<RawQuad> = (0..900u32)
+            .map(|i| RawQuad {
+                s: format!("<http://example.org/s{i:04}>"),
+                p: format!("<http://example.org/p{}>", i % 7),
+                o: format!("\"o{}\"", (i * 5) % 11),
+                g: String::new(),
+            })
+            .collect();
+        let arrays = GlobalReferenceArrays::from_quads(&quads);
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        for (name, val, rid) in [
+            ("o", &arrays.o_val, &arrays.o_rid),
+            ("p", &arrays.p_val, &arrays.p_rid),
+        ] {
+            let val = val.clone().execute::<VarBinViewArray>(&mut ctx).unwrap();
+            let rid = rid.clone().execute::<PrimitiveArray>(&mut ctx).unwrap();
+            let (vals, rids) = (StrColReader::new(&val), rid.as_slice::<RowId>());
+            assert_eq!(rids.len(), quads.len());
+            let mut repeats = 0;
+            for row in 1..rids.len() {
+                let (before, at) = (vals.str_at(row - 1).unwrap(), vals.str_at(row).unwrap());
+                assert!(before <= at, "{name}: values ascend at row {row}");
+                if before == at {
+                    repeats += 1;
+                    assert!(
+                        rids[row - 1] < rids[row],
+                        "{name}: rids ascend within {at} at row {row}"
+                    );
+                }
+            }
+            assert!(repeats > quads.len() / 2, "{name}: values repeat");
+        }
     }
 }

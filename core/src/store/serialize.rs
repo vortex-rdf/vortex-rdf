@@ -105,6 +105,9 @@ impl VortexRdfStore {
         let base_sorted = subject_sorted(&base);
         let (mut raws, base_rows) = self.merged_raw_quads(&base).await?;
         order_for_rebuild(&mut raws, base_rows, base_sorted);
+        // Sorted, so equal quads are adjacent: the written artifact holds
+        // each quad once, as every builder's output does.
+        raws.dedup();
         let (array, components, dict) =
             build_parts_from_raws(&raws, self.layout.strategy(), &self.indexes, true)?;
         Ok((array, components, dict, true))

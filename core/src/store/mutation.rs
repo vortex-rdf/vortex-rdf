@@ -43,6 +43,12 @@ impl VortexRdfStore {
     /// The add that pushes the tail over the auto-compaction thresholds
     /// finishes by folding it into the base ([`compact`]) — on a file-backed
     /// store a rewrite of its source file (watch [`tail_len`](Self::tail_len)).
+    /// If the writer refuses that file as one this process cannot write (a
+    /// read-only store: permission denied, or a read-only filesystem; or a
+    /// directory that takes no new file) it is never rewritten: the batch
+    /// stays in the in-memory tail and the store is returned, and an explicit
+    /// [`compact`] fails with the reason. Any other failure of the compaction
+    /// is returned.
     ///
     /// [`compact`]: Self::compact
     pub async fn add_quads(&self, quads: impl IntoIterator<Item = Quad>) -> Result<Self> {
@@ -111,7 +117,23 @@ impl VortexRdfStore {
         };
         // The add that pushes the tail over the thresholds folds it into the base.
         if appended.should_auto_compact() {
-            return appended.compact().await;
+            match appended.compact().await {
+                Ok(compacted) => return Ok(compacted),
+                // The writer refused the store file (or its directory) as
+                // unwritable by this process, as it does a read-only store: a
+                // file that is never rewritten, so there is nothing to fold
+                // the tail into. The batch stays in the in-memory tail, where
+                // queries see it, and the store is returned as an append
+                // without a compaction is; an explicit `compact()` still
+                // reports why it cannot happen. That refusal comes before
+                // anything is gathered or built, so every later append can
+                // retry for the price of one failed open. A permission error
+                // from later in the rewrite is not it, and is returned.
+                Err(error) if error.is_unwritable() => {
+                    log::debug!("[add_quads] compaction refused, batch kept in the tail: {error}");
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(appended)
     }
@@ -194,9 +216,8 @@ impl VortexRdfStore {
                 },
             ) => {
                 // In memory the matched view's selection maps straight to a
-                // mask — materializing first if the match was served and its
-                // exact ids are still pending (a delete is one of the
-                // consumers that needs them).
+                // mask — materializing first if its exact ids are still pending
+                // (a delete is one of the consumers that needs them).
                 let doomed = doomed.materialized()?.to_mask(base.len());
                 Ok(Self {
                     layout: self.layout.clone(),
@@ -218,7 +239,6 @@ impl VortexRdfStore {
             (
                 QuadsSource::File {
                     path,
-                    dict_max_resident_bytes,
                     file,
                     selection,
                     deleted,
@@ -232,7 +252,6 @@ impl VortexRdfStore {
                     indexes: self.indexes.clone(),
                     quads: QuadsSource::File {
                         path: path.clone(),
-                        dict_max_resident_bytes: *dict_max_resident_bytes,
                         file: file.clone(),
                         // An owner has no pending filter, and deleting doesn't
                         // introduce one — it only widens the tombstones.

@@ -115,8 +115,9 @@ impl VortexRdfStore {
                     // ids; tombstones are applied through the rid column. The
                     // selection may still be pending — the plan never needs it.
                     Some(serve) => serve.decode::<T>(deleted.as_ref()),
-                    // Without a plan the selection is exact (pending ids only
-                    // ever ride alongside one).
+                    // Without a plan the selection is exact (pending ids ride
+                    // alongside one, or on a view that is only counted or
+                    // windowed, never streamed).
                     None => T::decode(
                         &layout,
                         &gather_live(
@@ -210,34 +211,44 @@ impl VortexRdfStore {
                         tail_quads,
                     );
                 }
-                // A tiny exact selection materializes point-by-point through
-                // the file's cached chunk probes — one async item, no scan
-                // machinery. Candidacy (small selection, eq-shaped filter) is
-                // checked synchronously; the fallback scan moves into the
-                // future for the rare mid-fetch decline (an unprobeable
-                // chunk), which reads the same few rows through the scan.
+                // An exact selection the reads by id serve (see `ExactRead`)
+                // materializes as one async item — point reads through the
+                // file's cached chunk probes, or takes at its ids — with no
+                // scan machinery. The choice is made synchronously; the
+                // fallback scan moves into the future for the rare decline (an
+                // unprobeable chunk), which reads the same rows through the
+                // scan. Anything else streams the scan below.
                 let exact = selection.expect_exact();
-                if exact.is_point_sized()
-                    && filter
-                        .as_ref()
-                        .is_none_or(|f| file_scan::eq_code_pairs(f).is_some())
-                {
+                let columns = self.layout.strategy().primary_column_names();
+                let read = file_scan::ExactRead::of(
+                    file,
+                    columns,
+                    filter.as_ref(),
+                    exact,
+                    deleted.as_ref(),
+                )?;
+                if !matches!(read, file_scan::ExactRead::Scan) {
                     let scan =
                         self.restricted_file_scan(file, filter.as_ref(), exact, deleted.as_ref())?;
                     let file = std::sync::Arc::clone(file);
-                    let columns = self.layout.strategy().primary_column_names();
                     let filter = filter.clone();
-                    let selection = exact.clone();
-                    let deleted = deleted.clone();
                     let chunk = async move {
-                        let point = file_scan::file_point_rows(
-                            &file,
-                            columns,
-                            filter.as_ref(),
-                            &selection,
-                            deleted.as_ref(),
-                        );
-                        match file_scan::point_rows_or_scan(point, scan).await {
+                        let by_id = match read {
+                            file_scan::ExactRead::Points(rows) => {
+                                file_scan::file_point_rows(&file, columns, filter.as_ref(), rows)
+                                    .await
+                            }
+                            file_scan::ExactRead::Take(ids) => {
+                                file_scan::take_file_rows(&file, columns, &ids).await
+                            }
+                            file_scan::ExactRead::Scan => Ok(None),
+                        };
+                        let rows = match by_id {
+                            Ok(Some(rows)) => Ok(rows),
+                            Ok(None) => file_scan::read_all_rows(scan).await,
+                            Err(e) => Err(e),
+                        };
+                        match rows {
                             Ok(rows) => T::decode_async(&layout, &rows).await,
                             Err(e) => vec![Err(e)],
                         }
@@ -251,8 +262,8 @@ impl VortexRdfStore {
                 // Same restriction setup as `base_selected_rows`: primary
                 // columns only, with any pending filter/selection applied
                 // (tombstoned rows excluded). Without a serve plan the
-                // selection is exact (pending ids only ever ride alongside
-                // one).
+                // selection is exact (pending ids ride alongside one, or on a
+                // view that is only counted or windowed, never streamed).
                 let scan = self.restricted_file_scan(
                     file,
                     filter.as_ref(),
@@ -360,8 +371,8 @@ impl VortexRdfStore {
 
     /// The decoded chunk stream of `scan`, through `sync` when every chunk
     /// decodes in memory and through `r#async` when the dictionary is
-    /// file-backed — each chunk's codes then resolve with a scan of their
-    /// own, so the decode must await (see [`scan_chunk_stream_async`]).
+    /// file-backed — each chunk's codes then resolve by reading the windows that
+    /// hold them, so the decode must await (see [`scan_chunk_stream_async`]).
     #[cfg(feature = "file-io")]
     fn scan_chunks<T: Send + 'static>(
         &self,
@@ -417,8 +428,8 @@ fn scan_chunk_stream<T: Send + 'static>(
 
 /// The async-decode counterpart of [`scan_chunk_stream`], for reads whose
 /// decode must itself await — a file-backed dictionary resolves each chunk's
-/// codes with a scan of its own, so the decode runs after the chunk stream,
-/// not inside the scan's sync map function.
+/// codes by reading the windows that hold them, so the decode runs after the
+/// chunk stream, not inside the scan's sync map function.
 #[cfg(feature = "file-io")]
 fn scan_chunk_stream_async<T: Send + 'static>(
     scan: ScanBuilder<ArrayRef>,

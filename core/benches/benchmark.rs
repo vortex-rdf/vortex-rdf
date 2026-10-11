@@ -11,7 +11,7 @@
 //!   write-path cross-products measure the same code, so we fix a baseline and
 //!   vary one axis at a time, adding back only the interactions that genuinely
 //!   change behaviour (e.g. Dictionary × index, where the index columns hold
-//!   u32 codes rather than term strings).
+//!   term codes rather than term strings).
 //! * **Match (Group 2)** is a full 18-cell layout × index × source factorial
 //!   (× 8 routing patterns × 2 cache regimes), plus a chained-view pair. Some
 //!   cells are redundant on paper — a bound subject
@@ -25,7 +25,7 @@
 //!   needed: a cold-only suite cannot see caching work at all, and reports an
 //!   improvement that only a resolved probe cache delivers as noise. Opening is
 //!   never inside either measurement — it is its own benchmark (`open_file`).
-//! * **Decode/load (Group 3) and dictionary residency (Group 4)** sweep only
+//! * **Decode/load (Group 3) and dictionary access (Group 4)** sweep only
 //!   the axis each path actually branches on.
 //! * **Mutate (Group 5)** sweeps a star of the same three axes, because an
 //!   append's presence check and a delete's pattern resolution both route
@@ -297,10 +297,8 @@ fn decode_all_literals(bencher: divan::Bencher) {
         });
 }
 
-/// Open a file-backed store. Default and TypedObject read the footer only;
-/// Dictionary also lifts its term dictionary resident when it is under the
-/// residency threshold (the default for a file this size), so the layouts are
-/// worth distinguishing.
+/// Open a file-backed store: the footer (and, under Dictionary, the
+/// dictionary's window bounds), memory-mapped.
 #[divan::bench(args = [Layout::Default, Layout::TypedObject, Layout::Dictionary], sample_count = HEAVY_SAMPLES)]
 fn open_file(bencher: divan::Bencher, layout: &Layout) {
     let layout = *layout;
@@ -329,15 +327,13 @@ fn from_bytes(bencher: divan::Bencher) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// Group 4 — DICTIONARY RESIDENCY (file-backed vs resident term dictionary)
+// Group 4 — DICTIONARY ACCESS (memory-mapped file vs whole-store load)
 //
-// A Dictionary file's term dictionary can be lifted resident at open or left
-// in its dictionary child and reached by scans through the bounded reader
-// (`from_file_with_dict_residency`, byte threshold). The residency axis moves
-// cost between phases: resident pays one contiguous child read at open and
-// then probes/decodes from memory; file-backed opens on footer metadata alone
-// but pays a pruned child scan per cold term probe and a row-index scan per
-// decoded chunk.
+// A Dictionary file opened with `from_file` is memory-mapped: the term
+// dictionary stays in its child and every probe or decode reads the mapped
+// leaves it touches. `from_file_in_memory` loads the whole store, the
+// dictionary lifted into memory (still FSST). The bench ids keep their
+// `resident`/`file_backed` names so the dashboard's history lines up.
 // ══════════════════════════════════════════════════════════════════════════
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -347,12 +343,13 @@ enum DictResidency {
 }
 
 impl DictResidency {
-    /// The `max_resident_bytes` value that forces this residency.
-    fn threshold(self) -> u64 {
+    /// Open the store at `path` under this access mode.
+    async fn open(self, path: &std::path::Path) -> VortexRdfStore {
         match self {
-            Self::Resident => u64::MAX,
-            Self::FileBacked => 0,
+            Self::Resident => VortexRdfStore::from_file_in_memory(path).await,
+            Self::FileBacked => VortexRdfStore::from_file(path).await,
         }
+        .expect("open dictionary store")
     }
 
     fn short(self) -> &'static str {
@@ -399,36 +396,29 @@ fn cached_writer_file(size: usize) -> PathBuf {
 
 fn open_dict_store(residency: DictResidency, size: usize) -> VortexRdfStore {
     let path = cached_writer_file(size);
-    rt().block_on(async {
-        VortexRdfStore::from_file_with_dict_residency(&path, residency.threshold())
-            .await
-            .expect("open dictionary store")
-    })
+    rt().block_on(residency.open(&path))
 }
 
-/// Open cost across the residency axis: resident pays the child read and
-/// dictionary lift, file-backed only the footer reads.
+/// Open cost across the access axis: the load pays every read at open, the
+/// mapped open only the footer and the window bounds.
 #[divan::bench(args = DICT_CONFIGS, sample_count = HEAVY_SAMPLES)]
 fn dict_open(bencher: divan::Bencher, residency: &DictResidency) {
     let residency = *residency;
     bencher
-        .with_inputs(|| (cached_writer_file(bench_size()), residency.threshold()))
-        .bench_refs(|(path, threshold)| {
+        .with_inputs(|| cached_writer_file(bench_size()))
+        .bench_refs(|path| {
             rt().block_on(async {
-                let store = VortexRdfStore::from_file_with_dict_residency(&*path, *threshold)
-                    .await
-                    .expect("open");
+                let store = residency.open(path).await;
                 black_box(store.layout())
             })
         });
 }
 
 /// Cold term → code probes: a fully bound pattern (four dictionary probes) on a
-/// store opened fresh each iteration, so neither the probe memo nor the
-/// file-backed dictionary's chunk cache carries anything over. Resident
-/// probes are in-memory binary searches; file-backed ones binary-search the
-/// term column through chunk leaves fetched on demand, so this cell prices
-/// those first fetches rather than the search over them.
+/// store opened fresh each iteration, so nothing the store holds carries over
+/// (the operating system's page cache does). Resident probes are in-memory
+/// binary searches; file-backed ones pick a window by its bounds and
+/// binary-search its leaf, rebuilt over the mapped segment.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_probe_cold(bencher: divan::Bencher, residency: &DictResidency) {
     let residency = *residency;
@@ -448,11 +438,9 @@ fn dict_probe_cold(bencher: divan::Bencher, residency: &DictResidency) {
 }
 
 /// The same fully bound pattern on one shared store — the steady state of
-/// repeated lookups for the *same* terms. After the first iteration the probe
-/// memo answers every term on both arms, so this cell prices the match
-/// machinery around the dictionary rather than the dictionary itself. The
-/// residency axis shows in [`dict_probe_cold`], which pays the chunk fetches,
-/// and to a much smaller degree in [`dict_probe_distinct`] — not here.
+/// repeated lookups for the *same* terms. No lookup result is kept, so every
+/// iteration searches the dictionary again: in memory on one arm, through the
+/// same windows of the mapped child, their pages warm, on the other.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_probe_warm(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
@@ -469,14 +457,11 @@ fn dict_probe_warm(bencher: divan::Bencher, residency: &DictResidency) {
     });
 }
 
-/// Term→ID probes that always miss the memo: one shared store, so its chunk
-/// cache stays warm, probed with a different subject every iteration. This is
-/// the steady state of a query workload over a large term set — distinct
-/// lookups against a store that has been open a while — and the cell that
-/// prices the search itself: the memo cannot answer it and the chunk fetches
-/// are already paid, so what is left is what residency costs a warm binary
-/// search. The term is built outside the timed closure, as the other probe
-/// cells do.
+/// Term→ID probes for a different subject every iteration, on one shared
+/// store: the steady state of a query workload over a large term set —
+/// distinct lookups against a store that has been open a while — and the cell
+/// that prices the search across windows. The term is built outside the timed
+/// closure, as the other probe cells do.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_probe_distinct(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
@@ -503,11 +488,9 @@ fn dict_probe_distinct(bencher: divan::Bencher, residency: &DictResidency) {
 }
 
 /// Reconstruction of a point result (subject-bound, the ten-odd rows describing
-/// one resource): the chunk's handful of distinct codes stays under the
-/// point-read cap, so a file-backed dictionary resolves them by reading exactly
-/// those rows out of its cached wire chunks instead of scanning. The bound term
-/// is memoized after the first iteration, so this cell prices the decode, not
-/// the probe.
+/// one resource), the subject's probe included: a file-backed dictionary
+/// groups the chunk's handful of distinct codes by window and takes exactly
+/// those rows out of each window it rebuilds.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_decode_point(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
@@ -527,10 +510,9 @@ fn dict_decode_point(bencher: divan::Bencher, residency: &DictResidency) {
 
 /// Reconstruction of a wide matched subset (predicate-bound, one 32nd of the
 /// rows — the predicate vocabulary is 32 terms): resident decodes codes against
-/// the in-memory dictionary. The matched chunk holds far more distinct codes
-/// than the point-read cap admits, so a file-backed dictionary resolves them
-/// with one row-index scan — the bulk path, whose whole-leaf decode is what
-/// wins at this width. [`dict_decode_point`] covers the other side of the cap.
+/// the in-memory dictionary; a file-backed dictionary takes each chunk's many
+/// distinct codes out of the windows holding them. [`dict_decode_point`]
+/// covers a point result.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_decode_matched(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
@@ -559,10 +541,12 @@ fn dict_decode_matched(bencher: divan::Bencher, residency: &DictResidency) {
 // ══════════════════════════════════════════════════════════════════════════
 
 /// A predicate-bound file view narrowed by a `keep` on its subject column:
-/// the namespace range of the first half of the subjects, pushed to the
-/// scan as a range conjunct beside the predicate filter — the shape a
-/// `VALUES`/`FILTER` pushdown takes on a file. Priced with the gather of the
-/// surviving code columns, so the number is what a consumer waits for.
+/// the namespace range of the first half of the subjects — on this sorted
+/// file one run, located in the mapped subject column and intersected with
+/// the view's rows, with the predicate filter left pending beside it — the
+/// shape a `VALUES`/`FILTER` pushdown takes on a file. Priced with the gather
+/// of the surviving code columns, which is where the pending filter is
+/// evaluated, so the number is what a consumer waits for.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn narrow_keep_range(bencher: divan::Bencher, residency: &DictResidency) {
     use vortex_rdf_core::{Keep, QuadColumn};
@@ -638,24 +622,31 @@ fn narrow_exists(bencher: divan::Bencher, residency: &DictResidency) {
     });
 }
 
-/// A term predicate over the whole dictionary, un-memoized: a fresh store
-/// each iteration, so the cell prices the scan of the predicate's domain
-/// (resident: a cursor pass; file-backed: the child's chunks) rather than
-/// the memo hit a repeated predicate gets.
+/// A term predicate over 4,096 candidate codes spread across the dictionary:
+/// the per-query FILTER evaluation (resident: a cursor read per code;
+/// file-backed: the windows holding them).
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn narrow_filter_codes(bencher: divan::Bencher, residency: &DictResidency) {
-    use vortex_rdf_core::TermPredicate;
-    let residency = *residency;
-    let predicate = TermPredicate::parse("str_prefix", "http://").unwrap();
-    bencher
-        .with_inputs(|| open_dict_store(residency, bench_size()))
-        .bench_refs(|store| {
-            rt().block_on(async {
-                let dict = store.dict_reader().expect("dictionary handle");
-                let (truth, unknown) = dict.filter_codes(&predicate).await.expect("filter");
-                black_box((truth.len(), unknown.len()))
-            })
-        });
+    use vortex_rdf_core::{TermPredicate, TextOptions};
+    let store = open_dict_store(*residency, bench_size());
+    // Over `STR()`: an IRI is a text only there, so its candidates are read.
+    let options = TextOptions {
+        as_str: true,
+        ..TextOptions::default()
+    };
+    let predicate = TermPredicate::parse_with("str_prefix", "http://", &options).unwrap();
+    let dict = store.dict_reader().expect("dictionary handle");
+    let step = (dict.len() / 4_096).max(1);
+    let codes: Vec<vortex_rdf_core::TermCode> = (0..dict.len() as vortex_rdf_core::TermCode)
+        .step_by(step)
+        .take(4_096)
+        .collect();
+    bencher.bench(|| {
+        rt().block_on(async {
+            let (passed, undecided) = dict.filter_codes(&predicate, &codes).await.expect("filter");
+            black_box((passed.len(), undecided.len()))
+        })
+    });
 }
 
 /// A batch of 64 subject probes in one `match_many`, gathered: the

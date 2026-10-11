@@ -119,19 +119,21 @@ const turtle = await store.toRdf('turtle');   // any supported format name
 
 ## Term codes (low-level)
 
-Under the default `dictionary` layout, terms are stored as `u32` codes into a sorted term dictionary. `termDict()` is the one door to code↔term translation: it returns an immutable `TermDict` handle, or `undefined` when the store's rows aren't code-addressable (a non-dictionary layout, or added quads pending in the in-memory tail):
+Under the default `dictionary` layout, terms are stored as `u64` codes into a sorted term dictionary. Codes cross into JS as plain numbers, exact up to `Number.MAX_SAFE_INTEGER` (2^53 − 1): `decode` throws for a value that is no such integer, and a code past it throws rather than rounding. `termDict()` is the one door to code↔term translation: it returns an immutable `TermDict` handle, or `undefined` when the store's rows aren't code-addressable (a non-dictionary layout, or added quads pending in the in-memory tail):
 
 ```javascript
 const dict = store.termDict();   // TermDict | undefined
 if (dict) {
   const code = dict.encode('<http://schema.org/name>');  // number | undefined
-  console.log(dict.decode(code));                        // '<http://schema.org/name>'
+  if (code !== undefined) {
+    console.log(dict.decode(code));                      // '<http://schema.org/name>'
+  }
 }
 ```
 
 `decode`/`encode` speak N-Triples term strings — `<iri>`, `_:blank`, `"lit"@lang`, `"lit"^^<dt>`, and `''` for the default graph. The handle is a snapshot: it keeps decoding correctly after the store is mutated, because it retains the dictionary its codes address. It is a wasm-side handle — call `free()` when done (also wired to `Symbol.dispose`, so `using` disposes it automatically).
 
-`matchCodes` is its pattern-matching counterpart: it resolves a pattern to the matched rows' raw term codes — four columnar `Uint32Array`s `{ s, p, o, g }` plus a `length` — without materializing any term strings, and returns `null` under the same conditions `termDict()` returns `undefined`:
+`matchCodes` is its pattern-matching counterpart: it resolves a pattern to the matched rows' raw term codes — four columnar `Float64Array`s `{ s, p, o, g }` of exact integer codes plus a `length` — without materializing any term strings, and returns `null` under the same conditions `termDict()` returns `undefined`:
 
 ```javascript
 const cols = store.matchCodes(null, myPredicate, null, null);
@@ -182,7 +184,7 @@ const vortex = await serializeRdf(turtleText, 'turtle', { layout: 'dictionary' }
 const nquads = await deserializeRdf(vortex, 'nquads');
 ```
 
-`toBytes` writes the same exchange format the CLI and the Python bindings read, so a buffer can be written to disk as a `.vortex` file or handed across bindings.
+`toBytes` writes the same exchange format the CLI and the Python bindings read, so a buffer can be written to disk as a `.vortex` file or handed across bindings. Bytes written by vortex-rdf 0.11 or earlier are refused: `fromBytes` rejects with an error saying so, and the store has to be rebuilt from its RDF source (`serializeRdf`, or the CLI's `serialize`).
 
 A `VortexRdfStore` is a wasm-side handle: call `free()` when you are done with it, or declare it with `using` (`free` is wired to `Symbol.dispose`); an unfreed store is reclaimed only when its JS wrapper is garbage-collected.
 
