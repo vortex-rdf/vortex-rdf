@@ -525,3 +525,74 @@ async fn test_in_memory_residual_reads_through_the_store_probes() {
         );
     }
 }
+
+/// On a sorted Dictionary file, the roles behind a bound subject narrow its
+/// run through the chunk probes, as the in-memory prefix probe narrows it:
+/// every bound prefix of the sort order is one exact row range and leaves no
+/// filter, with and without secondary indexes. The prefix ends at the first
+/// unbound role, whose bound successors stay a filter over the run.
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn test_file_prefix_probe_resolves_bound_prefixes_to_ranges() {
+    let (s, p, o, g) = prefix_terms();
+    for indexes in [
+        vec![],
+        vec![IndexType::SecondaryByCopy],
+        vec![IndexType::SecondaryByReference],
+    ] {
+        let (_dir, path) =
+            write_store_file(prefix_quads(), LayoutStrategy::Dictionary, indexes.clone()).await;
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let label = format!("{indexes:?}");
+        let expect = |view: &VortexRdfStore, range: std::ops::Range<u64>| {
+            assert_eq!(view.debug_selection_range(), Some(range), "{label}");
+            assert_eq!(view.debug_file_filter_pending(), Some(false), "{label}");
+        };
+
+        let by_sp = store
+            .match_pattern(Some(&s), Some(&p), None, None)
+            .await
+            .unwrap();
+        expect(&by_sp, 16..20);
+        assert_eq!(by_sp.size().await.unwrap(), 4, "{label}");
+        for q in by_sp.quads_vec().await.unwrap() {
+            assert_eq!(q.subject.to_string(), s.to_string());
+            assert_eq!(q.predicate, p);
+        }
+        let by_spo = store
+            .match_pattern(Some(&s), Some(&p), Some(&o), None)
+            .await
+            .unwrap();
+        expect(&by_spo, 18..20);
+        assert_eq!(by_spo.size().await.unwrap(), 2, "{label}");
+        let by_spog = store
+            .match_pattern(Some(&s), Some(&p), Some(&o), Some(&g))
+            .await
+            .unwrap();
+        expect(&by_spog, 19..20);
+        assert_eq!(by_spog.quads_vec().await.unwrap().len(), 1, "{label}");
+        let by_spo_default = store
+            .match_pattern(Some(&s), Some(&p), Some(&o), Some(&GraphName::DefaultGraph))
+            .await
+            .unwrap();
+        expect(&by_spo_default, 18..19);
+        // `p1` exists, but not under `s03`: the run narrows to nothing.
+        let s03 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s03").unwrap());
+        let none = store
+            .match_pattern(Some(&s03), Some(&p), None, None)
+            .await
+            .unwrap();
+        assert_eq!(none.size().await.unwrap(), 0, "{label}");
+        assert!(none.quads_vec().await.unwrap().is_empty(), "{label}");
+
+        // An unbound predicate ends the prefix: the object stays a filter
+        // over the subject's run.
+        let by_so = store
+            .match_pattern(Some(&s), None, Some(&o), None)
+            .await
+            .unwrap();
+        assert_eq!(by_so.debug_selection_range(), Some(12..24), "{label}");
+        assert_eq!(by_so.debug_file_filter_pending(), Some(true), "{label}");
+        assert_eq!(by_so.size().await.unwrap(), 6, "{label}");
+    }
+}

@@ -564,20 +564,28 @@ impl VortexRdfStore {
         // first, by binary-searching the subject column's encoded chunks —
         // the file mirror of the in-memory subject fast path. Both index
         // resolvers decline bound-subject patterns, so this takes over an
-        // uncontested route; the subject then leaves the pattern, and the
-        // residual terms ride the narrowed range. Any decline leaves the
-        // pattern intact for the scan path.
+        // uncontested route; the subject then leaves the pattern, the roles
+        // behind it narrow the run the same way (the in-memory prefix probe),
+        // and whatever is still bound rides the narrowed range. Any decline
+        // leaves the pattern intact for the scan path.
         let mut pat = QuadPattern::new(subject, predicate, object, graph);
         let mut subject_range: Option<std::ops::Range<u64>> = None;
         if let Some(subj) = pat.subject
-            && let Some(range) = file_scan::locate_subject_run(file, codes, subj).await?
+            && let Some(mut range) = file_scan::locate_subject_run(file, codes, subj).await?
         {
-            subject_range = Some(range);
             pat.subject = None;
             log::debug!(
                 "[match_pattern] File subject bounded by chunk probe at {:?}",
                 debug::elapsed(t)
             );
+            let answered = file_scan::narrow_subject_run(file, codes, &mut pat, &mut range).await?;
+            if answered > 0 {
+                log::debug!(
+                    "[match_pattern] File prefix of {answered} more roles bounded by chunk probes at {:?}",
+                    debug::elapsed(t)
+                );
+            }
+            subject_range = Some(range);
         }
         // With the subject already resolved to a tiny range, an index
         // resolution for the residual terms is a pessimization (its pushed

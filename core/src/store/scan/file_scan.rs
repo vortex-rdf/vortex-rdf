@@ -627,6 +627,62 @@ pub(crate) async fn locate_subject_run(
         .map_err(VortexRdfError::Vortex)
 }
 
+/// Narrow `run`, a bound subject's rows in a file sorted by `(s, p, o, g)`, by
+/// the roles behind the subject in that order: each bound role whose term has
+/// a code is binary-searched inside the run through its column's chunk probes
+/// and cleared from `pattern` — the file mirror of the in-memory prefix probe.
+/// The first role that is unbound, has no code or whose chunks decline ends
+/// the prefix, as does an empty run. Answers how many roles it cleared.
+pub(crate) async fn narrow_subject_run(
+    file: &NativeStoreFile,
+    codes: &mut PatternCodes,
+    pattern: &mut QuadPattern<'_>,
+    run: &mut Range<u64>,
+) -> Result<usize> {
+    let source = file.segment_source();
+    let session = file.session();
+    let roles = [
+        (pattern.predicate.map(TermRef::Predicate), schema::COL_P),
+        (pattern.object.map(TermRef::Object), schema::COL_O),
+        (pattern.graph.map(TermRef::Graph), schema::COL_G),
+    ];
+    let mut answered = 0;
+    for (term, column) in roles {
+        if run.is_empty() {
+            break;
+        }
+        let Some(term) = term else { break };
+        let Some(chunks) = file.column_chunks(column) else {
+            break;
+        };
+        let Some(needle) = codes
+            .probe_scalar(term)?
+            .and_then(|scalar| u64::try_from(&scalar).ok())
+        else {
+            break;
+        };
+        let Some(narrowed) = chunks
+            .bounds_in(run.clone(), needle, &source, session)
+            .await
+            .map_err(VortexRdfError::Vortex)?
+        else {
+            break;
+        };
+        *run = narrowed;
+        answered += 1;
+    }
+    if answered > 0 {
+        pattern.predicate = None;
+    }
+    if answered > 1 {
+        pattern.object = None;
+    }
+    if answered > 2 {
+        pattern.graph = None;
+    }
+    Ok(answered)
+}
+
 /// The subject column's chunk-probe handle for a file sorted by subject.
 /// `None` declines — an unsorted file, or a column whose chunk shape has no
 /// probe.

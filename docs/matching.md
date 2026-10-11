@@ -260,7 +260,7 @@ Each stage in the code, and where the details are below:
 | Prelude | [`matching.rs:240-283`](../core/src/store/matching.rs#L240-L283 "InMemory is the only variant") | — |
 | 1 · prefix probe | [`matching.rs:285-368`](../core/src/store/matching.rs#L285-L368 "Prefix probe"), [`search_sorted_bounds`](../core/src/store/array.rs#L179) | [§6.1](#61-prefix-probe) |
 | 2 · secondary-index routing | [`matching.rs:370-448`](../core/src/store/matching.rs#L370-L448 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L756) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`matching.rs:450-497`](../core/src/store/matching.rs#L450-L497 "residual column filtering"), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L250), [`mask_for`](../core/src/store/matching.rs#L824) | [§6.3](#63-residual-column-filtering) |
+| 3 · residual column filtering | [`matching.rs:450-497`](../core/src/store/matching.rs#L450-L497 "residual column filtering"), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L250), [`mask_for`](../core/src/store/matching.rs#L832) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`matching.rs:499-514`](../core/src/store/matching.rs#L499-L514 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
@@ -486,7 +486,7 @@ flowchart TD
     F0["<b>Prelude</b> — take the filter, selection and tombstones this view already<br/>carries from earlier matches; every stage below only adds to them"] --> F1
 
     F1{"<b>Stage 1</b><br/>Is the subject bound, on a sorted file, and does it probe as a code?"}
-    F1 -- "yes — binary-search the subject column's encoded chunks for its exact<br/>row range, and drop the subject from the pattern" --> F2
+    F1 -- "yes — binary-search the subject column's encoded chunks for its exact<br/>row range, then each bound role behind it inside that range, and drop<br/>what was answered from the pattern" --> F2
     F1 -- "no — see §7.1 for when it engages" --> F2
 
     F2{"<b>Stage 2</b><br/>Worth asking the indexes?<br/>Only a subject range stage 1 already cut small says no"}
@@ -522,11 +522,11 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`matching.rs:552-562`](../core/src/store/matching.rs#L552-L562 "QuadsSource::File") | — |
-| 1 · subject chunk probe | [`matching.rs:563-581`](../core/src/store/matching.rs#L563-L581 "A bound subject on a sorted file"), [`locate_subject_run`](../core/src/store/scan/file_scan.rs#L607) | [§7.1](#71-subject-chunk-probe) |
-| 2 · secondary-index routing | [`matching.rs:582-598`](../core/src/store/matching.rs#L582-L598 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L780) | [§8](#8-the-index-resolvers) |
-| 3 · pushed-down filter | [`matching.rs:611-715`](../core/src/store/matching.rs#L611-L715 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_scan.rs#L592) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`matching.rs:604-605`](../core/src/store/matching.rs#L604-L605 "keep_serve") and [`matching.rs:717-744`](../core/src/store/matching.rs#L717-L744 "match resolved_selection"), [`row_range_from_pruning`](../core/src/store/scan/file_scan.rs#L971) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
-| 5 · filter at sparse ids | [`matching.rs:746-764`](../core/src/store/matching.rs#L746-L764 "point_filter_ids"), [`point_filter_ids`](../core/src/store/scan/file_scan.rs#L812) | [§7.3](#73-what-ends-up-on-the-view) |
+| 1 · subject chunk probe and prefix | [`matching.rs:563-589`](../core/src/store/matching.rs#L563-L589 "A bound subject on a sorted file"), [`locate_subject_run`](../core/src/store/scan/file_scan.rs#L607), [`narrow_subject_run`](../core/src/store/scan/file_scan.rs#L636) | [§7.1](#71-subject-chunk-probe) |
+| 2 · secondary-index routing | [`matching.rs:590-606`](../core/src/store/matching.rs#L590-L606 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L780) | [§8](#8-the-index-resolvers) |
+| 3 · pushed-down filter | [`matching.rs:619-723`](../core/src/store/matching.rs#L619-L723 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_scan.rs#L592) | [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`matching.rs:612-613`](../core/src/store/matching.rs#L612-L613 "keep_serve") and [`matching.rs:725-752`](../core/src/store/matching.rs#L725-L752 "match resolved_selection"), [`row_range_from_pruning`](../core/src/store/scan/file_scan.rs#L1027) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| 5 · filter at sparse ids | [`matching.rs:754-772`](../core/src/store/matching.rs#L754-L772 "point_filter_ids"), [`point_filter_ids`](../core/src/store/scan/file_scan.rs#L868) | [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
 stage narrows a `RowSelection` directly; here stage 3 can only *describe* the
@@ -550,26 +550,31 @@ file whose `quads_sorted` provenance is false — which, as in
 [§6.1](#61-prefix-probe), no writer of ours produces. Both index resolvers
 decline bound-subject patterns, so this fast path takes an uncontested route.
 
-Unlike its in-memory counterpart it stops at the subject: the residual terms
-ride the narrowed range as filter conjuncts rather than being bounded within it.
+Then, as the in-memory prefix probe does, it narrows the run by the roles
+behind the subject in sort order
+([`narrow_subject_run`](../core/src/store/scan/file_scan.rs#L636)): each bound
+role whose term has a code is binary-searched inside the run through its
+column's chunk probes (`ColumnChunks::bounds_in`) and leaves the pattern. The
+first role that is unbound, has no code or whose chunks decline ends the
+prefix, and whatever is still bound rides the narrowed range as filter
+conjuncts.
 
 **Examples** (Dictionary file): `(ex:alice ? ? ?)` bisects the subject column's
 chunks for `s = 2` and finds `[0, 2)`; the view carries that range and no
-filter. `(ex:alice a ? ?)` finds the same `[0, 2)`, and `p = 4` becomes a
-pushed-down filter evaluated over those two rows when they are read — the
-in-memory path would have narrowed the range to `[0, 1)` instead.
-`(ex:alice foaf:knows ? ?)` likewise carries `[0, 2)` plus `p = 6`, and only
-the read discovers that nothing matches.
+filter. `(ex:alice a ? ?)` then searches `p = 4` inside it and carries `[0, 1)`
+with no filter, as the in-memory path does. `(ex:alice foaf:knows ? ?)`
+narrows to an empty range at match time. `(ex:alice ? "Alice" ?)` stops at the
+unbound predicate: it carries `[0, 2)` plus `o = 1` as a filter.
 
 **Cost.** A handful of binary searches over the chunk extremes and the leaves
-they reach. The first probe of a freshly opened file rebuilds the leaves it
+they reach, and one more search inside the run per answered role. The first probe of a freshly opened file rebuilds the leaves it
 bisects; the column's handle keeps them for later probes
 ([file-format.md §8](file-format.md#8-reading-a-file)).
 
 ### 7.2 Zone-map pruning
 
 When no index resolved anything and no subject range was found,
-[`row_range_from_pruning`](../core/src/store/scan/file_scan.rs#L971) runs one
+[`row_range_from_pruning`](../core/src/store/scan/file_scan.rs#L1027) runs one
 `pruning_evaluation` per filter conjunct over the whole file — statistics only,
 no row data — and collapses the surviving mask to its enclosing contiguous
 range. Interior gaps are kept (the scan's own per-split pruning skips them from
@@ -600,7 +605,7 @@ read touches one zone rather than the file.
   When the selection is exact row ids at most one per `POINT_READ_ROWS` (256)
   rows of the splits holding them, stage 5 reads the filter's columns at those
   ids through the chunk probes, keeps the ids that pass and leaves no filter
-  ([`point_filter_ids`](../core/src/store/scan/file_scan.rs#L812)) — the
+  ([`point_filter_ids`](../core/src/store/scan/file_scan.rs#L868)) — the
   in-memory residual step ([§6.3](#63-residual-column-filtering)) on file. A
   denser selection, or a filter that is not code equalities, keeps the filter.
 - **Selection** — the first of these that applies: an index's row ids folded
@@ -631,7 +636,7 @@ handles like any other narrow selection.
 | Pattern | Filter | Selection | Serve plan |
 |---|---|---|---|
 | `(ex:alice ? ? ?)` | none | `Range [0, 2)` from the chunk probe | none (a subject range) |
-| `(ex:alice a ? ?)` | `p = 4` | `Range [0, 2)` | none |
+| `(ex:alice a ? ?)` | none — the prefix answered `p` | `Range [0, 1)` | none |
 | `(? a ? ?)` | none — the index answered `p` | `Ids [0, 2]`, **eager**: the located run is 2 rows, under `POINT_GATHER_MAX_ROWS`. On the 1M file `P`'s run is 31,776 rows and the ids stay `Pending` | over the `index:posg` run |
 | `(? a ? "")` | `g = 0` | `Ids [0, 2]` | **kept** — on file the plan carries the `g` equality itself; the in-memory twin drops it |
 | `(? ? ? "")` | `g = 0` | `All` — pruning excluded nothing | none |
@@ -759,7 +764,7 @@ second sorted copy of every quad.
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_scan.rs#L913) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/serve.rs#L550)); unlocated: the pushed-down projected+filtered scan of the index child |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_scan.rs#L969) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/serve.rs#L550)); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
 | Dropped when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
 | Tombstones | applied through the plan's `rid` column | applied through the plan's `rid` column |
@@ -857,7 +862,7 @@ and the object of a `TypedObject` store expands into 2–4 residual equalities.
 | `??O?` | OSPG located run → same as above | ref-o located run → same as above | filter `o = code` → pruning envelope |
 | `?PO?` | POSG `(p, o)` windowed location → both resolved, **serve plan** | ref-o located run → ids; `p` read at them by point reads when they are sparse in their splits, else the filter keeps `p` | filter `p ∧ o` → pruning envelope |
 | `?POG` | as above; plan carries `g` too, but its `row_range` is dropped | ref-o ids; `p ∧ g` read at them as above, else the filter keeps them | filter `p ∧ o ∧ g` |
-| `SP??` … `SPOG` | subject range; index routing skipped when the range is < 4096 rows; residual becomes the pushed filter | same | subject range (or pruning envelope) + residual filter |
+| `SP??` … `SPOG` | subject chunk probe, then the prefix behind it → exact `Range`, nothing residual; index routing skipped when the range is < 4096 rows | same | same |
 
 Under the string layouts the subject chunk probe and both indexes' `locate_component_run`
 decline (they need integer probes), so a file match reduces to *pushed-down
@@ -933,6 +938,7 @@ file run) and a rid-only scan of the index child otherwise.
 | 6 | in memory | every residual column typed-bindable ∧ not (single eq over > 4096 rows) ∧ no probe-bound column over a wide selection | typed row loop, else mask scan |
 | 7 | in memory | `unrefined ∧ !narrowed_elsewhere` | keep the serve plan |
 | 8 | file | `s` bound ∧ `quads_sorted` ∧ integer probe ∧ chunk probes resolve | exact subject row range; subject cleared |
+| 8b | file | subject run found ∧ next role in (p, o, g) bound ∧ it has a code and chunk probes | `bounds_in` narrows the run; that role cleared; repeat until a role declines |
 | 9 | file | no subject range ∨ range ≥ 4096 rows | try index routing |
 | 10 | file | no existing filter ∧ existing selection `All` ∧ no subject range | `keep_serve` |
 | 11 | file | resolution `Lazy` ∧ (plan kept ∨ (count or window ∧ located width ∧ no residual ∧ unrestricted view)) | selection stays `Pending` |
@@ -947,9 +953,9 @@ file run) and a rid-only scan of the index child otherwise.
 
 | Constant | Value | Defined in | Meaning |
 |---|---|---|---|
-| `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/matching.rs#L887) | an already-narrowed view below this skips index routing |
+| `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/matching.rs#L895) | an already-narrowed view below this skips index routing |
 | `POINT_GATHER_MAX_ROWS` | 256 | [`selection.rs`](../core/src/store/selection.rs#L489) | runs/selections at or below this are read point-by-point through cached probes (`gather_by_point_reads`, the located-run reads) |
-| `POINT_READ_ROWS` | 256 | [`file_scan.rs`](../core/src/store/scan/file_scan.rs#L804) | exact file row ids at most one per this many rows of the splits holding them check a pending filter by point reads — a point read costs about what a filtered scan spends on this many rows |
+| `POINT_READ_ROWS` | 256 | [`file_scan.rs`](../core/src/store/scan/file_scan.rs#L860) | exact file row ids at most one per this many rows of the splits holding them check a pending filter by point reads — a point read costs about what a filtered scan spends on this many rows |
 | `TYPED_EQ_MAX_ROWS` | 4096 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L238) | selection size above which the typed row loop declines to the vectorized mask scan: always for a lone residual equality, and for any set that binds a column through an encoded-search probe |
 
 ---
@@ -1027,6 +1033,7 @@ that installs a `log` logger sees the same lines; what each one means:
 | `Prepared pattern codes` | [§3](#3-stage-a--prepare_pattern) — the witness is built, bound terms resolved |
 | `Layout proved the pattern unmatchable` | [§4](#4-stage-b--the-provable-emptiness-gate) — a term has no code; the match ends |
 | `In-memory subject bounded by binary search` / `File subject bounded by chunk probe` | [§6.1](#61-prefix-probe) / [§7.1](#71-subject-chunk-probe) |
+| `File prefix of N more roles bounded by chunk probes` | [§7.1](#71-subject-chunk-probe) — `p`, `o`, `g` narrowed inside the subject run |
 | `In-memory prefix of N more roles bounded by binary search` | [§6.1](#61-prefix-probe) — `p`, `o`, `g` narrowed inside the subject run |
 | `… index resolved` (`eager ids` / `served, ids pending` / `ids materialized` on file), `File index located a run (ids pending for a count)`, `… index declined`, `… index proved empty` | [§6.2](#62-secondary-index-routing) / [§8](#8-the-index-resolvers) |
 | `In-memory narrowed by typed residual scan` / `… by mask scan` | [§6.3](#63-residual-column-filtering) — which implementation ran |
