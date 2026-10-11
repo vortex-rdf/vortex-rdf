@@ -128,7 +128,7 @@ async fn test_a_store_file_written_now_carries_the_v2_root_layout() {
     assert_eq!(occurrences(&bytes, LEGACY), 0);
 }
 
-/// Opening the bytes of a store written before 0.12 fails with the
+/// Opening the bytes of a store with the `v1` root layout fails with the
 /// actionable error, under every layout and with or without indexes.
 #[tokio::test]
 async fn test_a_pre_0_12_store_is_refused_from_bytes() {
@@ -253,12 +253,11 @@ fn reference_child(component: &crate::store::indexes::IndexComponent) -> Vec<(Va
         .collect()
 }
 
-/// What a 0.12 writer gives and a 0.12 reader trusts, which a file of 0.11
-/// need not: each quad once, and a reference index's children in
-/// `(val, rid)` order, every row id once and naming the deduplicated rows.
-/// Pinned on a build that deduplicates across spilled runs — the case where
-/// dropping repeats could renumber row ids out from under the children —
-/// under every layout.
+/// What a `v2` writer gives and a `v2` reader trusts: each quad once, and a
+/// reference index's children in `(val, rid)` order, every row id once and
+/// naming the deduplicated rows. Pinned on a build that deduplicates across
+/// spilled runs — the case where dropping repeats could renumber row ids out
+/// from under the children — under every layout.
 #[tokio::test]
 async fn test_a_0_12_build_gives_the_guarantees_the_refusal_protects() {
     // Every quad twice, a whole dataset apart, so the copies sit in different

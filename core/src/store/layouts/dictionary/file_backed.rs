@@ -3,16 +3,15 @@
 //! memory-mapped, so reading a window is slicing its segment out of the map
 //! and rebuilding the FSST array over those bytes; only the terms a call
 //! asks for are decompressed, and nothing read is kept once the call
-//! returns but the kind ranges. The handle holds the child's layout (one flat leaf per FSST
-//! window) and each window's first and last term — read at open from the
-//! child's exact zone maps, or from the leaves of a child written without
-//! them (chunks of uneven length have no uniform zone to record). A child
-//! whose shape a window search
-//! cannot address is not file-backed at all: [`store::open`](crate::store::open)
-//! lifts it resident instead. The policy enum choosing between this and the
-//! resident form is [`DictAccess`](super::access::DictAccess); the module
-//! only compiles with `file-io`, since without a file there is nothing to
-//! leave the terms in.
+//! returns but the kind ranges. The handle holds the child's layout (one
+//! flat leaf per FSST window) and each window's first and last term — read at
+//! open from the child's exact zone maps, or from the leaves of a child
+//! written without them (chunks of uneven length have no uniform zone to
+//! record). A child whose shape a window search cannot address is not
+//! file-backed at all: [`store::open`](crate::store::open) lifts it resident
+//! instead. The policy enum choosing between this and the resident form is
+//! [`DictAccess`](super::access::DictAccess); the module only compiles with
+//! `file-io`, since without a file there is nothing to leave the terms in.
 
 use std::cmp::Ordering;
 use std::ops::Range;
@@ -735,7 +734,7 @@ mod tests {
 
     /// Windows that are each sorted but out of term order across the child
     /// are an invalid dictionary: the open fails with a `Deserialization`
-    /// error, not a silent lift of the child into the resident form.
+    /// error.
     #[tokio::test]
     async fn windows_out_of_term_order_fail_the_open() {
         let terms: Vec<String> = (0..600)

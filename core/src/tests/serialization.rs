@@ -1293,8 +1293,8 @@ async fn test_open_rejects_an_index_version_newer_than_this_version_reads() {
 }
 
 /// A root layout from a `vortex-rdf.store.*` generation this version does not
-/// know was written by a newer vortex-rdf: every open path says so instead of
-/// reporting Vortex's unknown-encoding error.
+/// know was written by a newer vortex-rdf: every open path says so and names
+/// the root layout.
 #[tokio::test]
 async fn test_open_rejects_a_root_layout_from_a_newer_vortex_rdf() {
     let current: &[u8] = container::STORE_LAYOUT_ID.as_bytes();

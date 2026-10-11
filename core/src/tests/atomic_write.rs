@@ -1323,8 +1323,7 @@ mod special_targets {
         .await
     }
 
-    /// `/dev/null` takes the store and is still the device afterwards (as
-    /// root, a rename would have replaced the node; otherwise it is refused).
+    /// `/dev/null` takes the store and remains a character device.
     #[tokio::test]
     async fn test_a_character_device_is_written_through_not_replaced() {
         let device = Path::new("/dev/null");

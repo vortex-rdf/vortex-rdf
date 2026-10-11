@@ -39,8 +39,8 @@ async fn test_from_file_in_memory_loads_the_whole_store() {
         "the dictionary is resident"
     );
     assert_eq!(loaded.indexes(), &[IndexType::SecondaryByCopy]);
-    // Nothing reads the file any more: its bytes are overwritten in place, so
-    // a read of the old file (through a path, a descriptor or a mapping)
+    // The loaded store reads nothing from the file: its bytes are overwritten
+    // in place, so a read of it (through a path, a descriptor or a mapping)
     // would see garbage.
     let length = std::fs::metadata(&path).unwrap().len() as usize;
     std::fs::write(&path, vec![0xA5u8; length]).unwrap();
@@ -80,8 +80,8 @@ async fn test_from_file_is_listed_in_the_process_maps_only_while_mapped() {
 }
 
 /// A store loaded whole never maps its file, whether the open succeeds or
-/// fails: a failing open still names a newer store root (or reports Vortex's
-/// error for bytes that are no store) without a mapping, which a file being
+/// fails: a failing open names a newer store root (or reports Vortex's error
+/// for bytes that are no store) without a mapping, which a file being
 /// rewritten in place could pull out from under the read. A mapped open maps
 /// the file once.
 #[tokio::test]

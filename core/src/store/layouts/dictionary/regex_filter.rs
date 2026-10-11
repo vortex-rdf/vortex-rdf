@@ -26,9 +26,9 @@
 //!
 //! The compiled program is bounded too (`NFA_SIZE_LIMIT`, with a lazy-DFA
 //! cache sized to hold the DFA of the largest such program): counted
-//! repetitions multiply (`(?:a{1000}){5}b` is 5,000 states), and a pattern
-//! over the limit is undecided like any other outside the subset, instead of
-//! costing a candidate time that grows with the program.
+//! repetitions multiply (a nested `{n}{m}` has n times m states), and a
+//! pattern over the limit is undecided like any other outside the subset,
+//! instead of costing a candidate time that grows with the program.
 
 use std::fmt::Write as _;
 
@@ -72,8 +72,8 @@ const MAX_REPEAT: u32 = 1_000;
 /// Largest compiled program the subset takes, in bytes of NFA. Matching costs
 /// O(states) per byte whenever the lazy DFA is not enough, so this bounds a
 /// pattern's cost; the patterns the subset is for are a few dozen states.
-/// Counted repetitions multiply (`(?:a{1000}){5}` is 5,000 states), so the
-/// limit refuses those while a per-count cap cannot.
+/// Counted repetitions multiply (a nested `{n}{m}` has n times m states), so
+/// the limit refuses those while a per-count cap cannot.
 const NFA_SIZE_LIMIT: usize = 1 << 17;
 
 /// The lazy DFA's cache, in bytes: enough to hold the DFA of the largest

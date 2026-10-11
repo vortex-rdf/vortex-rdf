@@ -91,8 +91,8 @@ pub(crate) struct NativeStoreFile {
 /// wholesale at its cap, so over an endless run of new constants a tree's
 /// caches would grow with each one. A tree is therefore retired when the memo
 /// clears: the next reader taken comes from a fresh tree over the same file,
-/// and a view still holding readers of the old tree keeps it alive until it
-/// drops.
+/// and a view still holding readers of the old tree keeps those readers, and
+/// their caches, alive until it drops.
 struct ReaderTree {
     /// How many times the bound tree memo had cleared when this tree was
     /// made.
@@ -717,7 +717,7 @@ mod tests {
     /// The bound tree memo clearing retires the reader tree: up to the cap the
     /// same readers come back; the bind that clears the memo makes the next
     /// root and component readers new ones. A reader a view still holds keeps
-    /// working and keeps its tree alive; once it is dropped nothing does.
+    /// working, and keeps its caches alive until it is dropped.
     #[tokio::test]
     async fn the_reader_tree_is_retired_when_the_bind_memo_clears() {
         use crate::IndexType;

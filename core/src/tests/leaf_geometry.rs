@@ -1,10 +1,9 @@
 //! The leaf geometry of the columns a store writes: how many rows each flat
 //! leaf of a column holds. Vortex coalesces a column to 1 MiB uncompressed
-//! per leaf, so widening the term codes and the row ids from u32 to u64
-//! would halve the rows per leaf of every plain id column; `child_strategy`
-//! writes the id columns at 2 MiB so each keeps the rows per leaf it had as
-//! u32 (262,144 for a plain column), keeps a dictionary's codes at the stock
-//! 1 MiB, and leaves every other column on the stock strategy.
+//! per leaf, which holds 131,072 `u64` values; `child_strategy` writes the id
+//! columns (term codes and row ids) at 2 MiB, 262,144 rows per leaf for a
+//! plain column, keeps a dictionary's codes at the stock 1 MiB, and leaves
+//! every other column on the stock strategy.
 
 use std::sync::Arc;
 

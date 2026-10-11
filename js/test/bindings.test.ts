@@ -238,7 +238,7 @@ describe('a built store holds each quad once', () => {
 // two ids are the same length, so renaming one into the other in a written
 // store moves no offset (a Vortex file has no checksum over its footer): that
 // is how a v1 file is made here.
-describe('stores written before 0.12 are refused', () => {
+describe('stores with the v1 root layout are refused', () => {
     const encode = (text: string) => new TextEncoder().encode(text);
     const current = encode('vortex-rdf.store.v2');
     const legacy = encode('vortex-rdf.store.v1');

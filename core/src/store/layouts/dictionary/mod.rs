@@ -473,9 +473,9 @@ pub(crate) fn unique_codes(chunk: &ArrayRef) -> Result<Vec<TermCode>> {
     Ok(codes)
 }
 
-/// Resolve a chunk's distinct codes to terms with one scan of a file-backed
-/// dictionary, keyed for [`decode_chunk_mapped`] and
-/// [`decode_chunk_mapped_shared`].
+/// Resolve a chunk's distinct codes to terms with one read of the windows of
+/// a file-backed dictionary that hold them, keyed for [`decode_chunk_mapped`]
+/// and [`decode_chunk_mapped_shared`].
 #[cfg(feature = "file-io")]
 pub(crate) async fn resolve_chunk_terms(
     fb: &FileBackedDict,

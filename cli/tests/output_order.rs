@@ -1,6 +1,6 @@
 //! `deserialize` and `match` open their input before they create their output
 //! file: an input that cannot be read leaves an existing output file as it
-//! was, instead of truncating it first.
+//! was.
 
 use std::fs;
 use std::path::{Path, PathBuf};

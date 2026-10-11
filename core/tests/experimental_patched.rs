@@ -1,10 +1,9 @@
 //! `VORTEX_EXPERIMENTAL_PATCHED_ARRAY=1` registers Vortex's experimental
 //! `vortex.patched` array and has its compressor emit it. No core edition
 //! includes it, so no store file may carry one: a store write refuses to start
-//! while the switch is on, rather than failing at the first chunk that holds
-//! such an array, and reads nothing from its input first. Vortex reads the
-//! switch once per process, so this binary holds a single test that sets it
-//! before anything touches Vortex.
+//! while the switch is on and reads nothing from its input first. Vortex reads
+//! the switch once per process, so this binary holds a single test that sets
+//! it before anything touches Vortex.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
