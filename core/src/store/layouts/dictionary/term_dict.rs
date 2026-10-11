@@ -566,18 +566,28 @@ impl TermDictionary {
             .collect()
     }
 
-    /// [`decode`](Self::decode) over a batch, in order, through one cursor
-    /// (so a chunked dictionary keeps its warm chunk cursors across the
-    /// batch); an out-of-range code decodes to `None`.
-    pub(crate) fn decode_many(&self, codes: &[TermCode]) -> Vec<Option<String>> {
+    /// [`decode`](Self::decode) over a batch, in order, handed to
+    /// `visit(position, term)` instead of collected: one cursor serves the
+    /// batch (so a chunked dictionary keeps its warm chunk cursors), and an
+    /// out-of-range code, or a term that is not UTF-8, visits as `None`.
+    pub(crate) fn decode_many_with(
+        &self,
+        codes: &[TermCode],
+        mut visit: impl FnMut(usize, Option<&str>),
+    ) {
         let mut cursor = self.cursor();
-        codes
-            .iter()
-            .map(|&code| {
-                let rank = self.rank_of(code)?;
-                cursor.str_at(rank).ok().map(str::to_owned)
-            })
-            .collect()
+        for (i, &code) in codes.iter().enumerate() {
+            let term = self.rank_of(code).and_then(|rank| cursor.str_at(rank).ok());
+            visit(i, term);
+        }
+    }
+
+    /// [`decode_many_with`](Self::decode_many_with) collected: one owned
+    /// string per decoded position.
+    pub(crate) fn decode_many(&self, codes: &[TermCode]) -> Vec<Option<String>> {
+        let mut terms = vec![None; codes.len()];
+        self.decode_many_with(codes, |i, term| terms[i] = term.map(str::to_owned));
+        terms
     }
 
     /// `predicate` over the candidate `codes` (ascending, unique, inside the
@@ -873,6 +883,14 @@ impl DictSnapshot {
         self.0.decode_many(codes)
     }
 
+    /// [`decode_many`](Self::decode_many) without a `String` per term:
+    /// `visit(i, term)` is called once for each position `i` of `codes`, in
+    /// order, with the spelling borrowed from the cursor (`None` for an
+    /// out-of-range code).
+    pub fn decode_many_with(&self, codes: &[TermCode], visit: impl FnMut(usize, Option<&str>)) {
+        self.0.decode_many_with(codes, visit);
+    }
+
     /// The code of the first term not below `term` in byte order (the
     /// dictionary's size when every term is below it): a present term's own
     /// code, or where an absent one would sort.
@@ -999,6 +1017,30 @@ impl DictReader {
             DictReaderInner::Resident(dict) => Ok(dict.decode_many(codes)),
             #[cfg(feature = "file-io")]
             DictReaderInner::FileBacked(dict) => dict.decode_many_any(codes).await,
+        }
+    }
+
+    /// [`decode_many`](Self::decode_many) without a `String` per term:
+    /// `visit(i, term)` is called once for each position `i` of `codes`, with
+    /// the spelling borrowed for the call (`None` for an out-of-range code).
+    /// Codes may come in any order and repeat. A resident dictionary visits
+    /// in the order of `codes`; a file-backed one visits the out-of-range
+    /// positions first, then reads each distinct code once, in one batch, and
+    /// visits every position holding it, in code order. A file-backed term
+    /// that is not UTF-8 is an error, and positions visited before it stay
+    /// visited.
+    pub async fn decode_many_with(
+        &self,
+        codes: &[TermCode],
+        visit: impl FnMut(usize, Option<&str>),
+    ) -> Result<()> {
+        match &self.0 {
+            DictReaderInner::Resident(dict) => {
+                dict.decode_many_with(codes, visit);
+                Ok(())
+            }
+            #[cfg(feature = "file-io")]
+            DictReaderInner::FileBacked(dict) => dict.decode_many_with(codes, visit).await,
         }
     }
 

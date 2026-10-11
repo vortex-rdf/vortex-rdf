@@ -3,6 +3,7 @@
 //! (`js/src/store.rs::match_payload`). A repeated code is decoded once while a
 //! small cache still holds it, and no per-occurrence term string is built.
 
+use std::ops::Range;
 use std::os::raw::{c_int, c_void};
 
 use pyo3::buffer::{ElementType, PyUntypedBuffer};
@@ -25,6 +26,43 @@ const RECENT_BUCKETS: usize = 256;
 /// Slot sentinel for an empty cache bucket. Code 0 is a legitimate term code,
 /// so emptiness has to be carried by the slot rather than the code.
 const NO_SLOT: usize = usize::MAX;
+
+/// Terms decoded GIL-released, packed into one buffer and indexed by the
+/// position of their code in the batch. A term is a range of `text`; a
+/// position holding none (an out-of-range code) has no range. Positions may
+/// be filled in any order.
+struct PackedTerms {
+    text: String,
+    ranges: Vec<Option<Range<usize>>>,
+}
+
+impl PackedTerms {
+    fn new(len: usize) -> Self {
+        Self {
+            // A short IRI or literal is longer than this, so the buffer
+            // grows at most a few times.
+            text: String::with_capacity(len.saturating_mul(32)),
+            ranges: vec![None; len],
+        }
+    }
+
+    /// Store position `i`'s term, copying its bytes into `text`.
+    fn set(&mut self, i: usize, term: Option<&str>) {
+        self.ranges[i] = term.map(|term| {
+            let start = self.text.len();
+            self.text.push_str(term);
+            start..self.text.len()
+        });
+    }
+
+    fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    fn get(&self, i: usize) -> Option<&str> {
+        self.ranges[i].clone().map(|range| &self.text[range])
+    }
+}
 
 /// An immutable handle on a store's term dictionary, resident or left in
 /// its file. Decodes term codes to their N-Triples strings. A handle on a
@@ -63,10 +101,12 @@ impl TermDict {
     ///
     /// Runs in two phases, because Python objects cannot be built while
     /// detached from the interpreter. The decode loop runs GIL-released and
-    /// produces the distinct terms plus a per-occurrence index into them; the
-    /// GIL is then retaken to build one `PyString` per distinct term and clone
-    /// a reference per occurrence. When nothing was shared those indices are
-    /// the identity, and the strings are built straight from the decode order.
+    /// produces the distinct terms, packed into one buffer ([`PackedTerms`],
+    /// with no `String` per term), plus a per-occurrence index into them; the
+    /// GIL is then retaken to build one `PyString` per distinct term from a
+    /// slice of that buffer and clone a reference per occurrence. When
+    /// nothing was shared those indices are the identity, and the strings are
+    /// built straight from the decode order.
     pub(crate) fn decode_slice(
         &self,
         py: Python<'_>,
@@ -99,24 +139,30 @@ impl TermDict {
                 }
                 // One cursor over the resident terms, or one batched read of
                 // the file-backed child.
-                let decoded = match self.reader.snapshot() {
-                    Some(snapshot) => snapshot.decode_many(&distinct),
-                    None => RUNTIME.block_on(self.reader.decode_many(&distinct))?,
-                };
+                let mut decoded = PackedTerms::new(distinct.len());
+                match self.reader.snapshot() {
+                    Some(snapshot) => {
+                        snapshot.decode_many_with(&distinct, |i, term| decoded.set(i, term));
+                    }
+                    None => RUNTIME.block_on(
+                        self.reader
+                            .decode_many_with(&distinct, |i, term| decoded.set(i, term)),
+                    )?,
+                }
                 Ok((slots, decoded))
             })
             .map_err(store_err)?;
 
-        let build = |term: Option<String>| term.map(|t| PyString::new(py, &t).unbind());
+        let build = |i: usize| decoded.get(i).map(|term| PyString::new(py, term).unbind());
 
         // Nothing was shared, so `slots` is the identity: every string is used
         // exactly once and can be moved straight out, skipping the lookup table
         // and the per-occurrence refcount bump.
         if decoded.len() == slots.len() {
-            return Ok(decoded.into_iter().map(build).collect());
+            return Ok((0..slots.len()).map(build).collect());
         }
 
-        let interned: Vec<Option<Py<PyString>>> = decoded.into_iter().map(build).collect();
+        let interned: Vec<Option<Py<PyString>>> = (0..decoded.len()).map(build).collect();
         Ok(slots
             .into_iter()
             .map(|slot| interned[slot].as_ref().map(|s| s.clone_ref(py)))

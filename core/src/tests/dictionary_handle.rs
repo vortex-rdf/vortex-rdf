@@ -128,6 +128,74 @@ fn tolerated_spellings() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// `decode_many_with` over `codes` collected by position, with how often each
+/// position was visited.
+async fn visited(reader: &DictReader, codes: &[TermCode]) -> (Vec<Option<String>>, Vec<usize>) {
+    let mut terms = vec![None; codes.len()];
+    let mut visits = vec![0usize; codes.len()];
+    reader
+        .decode_many_with(codes, |i, term| {
+            visits[i] += 1;
+            terms[i] = term.map(str::to_owned);
+        })
+        .await
+        .unwrap();
+    (terms, visits)
+}
+
+/// [`visited`] through the snapshot's synchronous visitor.
+fn snapshot_visited(
+    oracle: &DictSnapshot,
+    codes: &[TermCode],
+) -> (Vec<Option<String>>, Vec<usize>) {
+    let mut terms = vec![None; codes.len()];
+    let mut visits = vec![0usize; codes.len()];
+    oracle.decode_many_with(codes, |i, term| {
+        visits[i] += 1;
+        terms[i] = term.map(str::to_owned);
+    });
+    (terms, visits)
+}
+
+/// The visitor delivers every position once with the term `decode_many`
+/// returns for it — any order, repeats, out-of-range codes, empty — through
+/// the reader and through the snapshot's synchronous twin.
+async fn assert_visitor_matches_decode_many(reader: &DictReader, oracle: &DictSnapshot, tag: &str) {
+    let len = reader.len() as TermCode;
+    // A fixed pseudo-random batch: many repeats, a tenth out of range.
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let scattered: Vec<TermCode> = (0..4 * len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % (len + len / 10 + 1)
+        })
+        .collect();
+    let batches: [Vec<TermCode>; 6] = [
+        Vec::new(),
+        vec![len],
+        vec![len + 3, len, u64::MAX],
+        vec![len - 1, 0, 3, 3, len, 1, len + 7, 1, 0],
+        (0..len).rev().collect(),
+        scattered,
+    ];
+    for batch in &batches {
+        let want = reader.decode_many(batch).await.unwrap();
+        let (terms, visits) = visited(reader, batch).await;
+        assert_eq!(terms, want, "{tag}: visitor over {} codes", batch.len());
+        assert!(visits.iter().all(|&n| n == 1), "{tag}: visits {visits:?}");
+        let (terms, visits) = snapshot_visited(oracle, batch);
+        assert_eq!(
+            terms,
+            want,
+            "{tag}: snapshot visitor over {} codes",
+            batch.len()
+        );
+        assert!(visits.iter().all(|&n| n == 1), "{tag}: snapshot visits");
+    }
+}
+
 /// Every method of `reader` answers like the resident `DictSnapshot` of the
 /// same dictionary (`oracle`), over every term and probe.
 async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapshot, tag: &str) {
@@ -175,6 +243,8 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
         want,
         "{tag}: snapshot decode_many"
     );
+
+    assert_visitor_matches_decode_many(reader, oracle, tag).await;
 
     // Byte-order probes: lower bounds and prefix ranges against brute force.
     let probes = probe_spellings(&terms);

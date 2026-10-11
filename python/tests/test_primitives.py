@@ -83,6 +83,51 @@ def test_decode_many_any_order_with_repeats(dictionary):
     assert term_dict.decode_many([]) == []
 
 
+@pytest.fixture(params=["resident", "file-backed"])
+def wide_dictionary(request, tmp_path_factory):
+    """A dictionary of 602 terms (300 subjects, one predicate, 300 literals
+    and the default graph), resident or file-backed, as `(term_dict,
+    spellings)`: the sorted N-Triples spellings, so a term's code is its
+    index."""
+    root = tmp_path_factory.mktemp("wide")
+    source = root / "wide.nt"
+    source.write_text(
+        "".join(
+            f'<http://ex.org/s{i:03}> <http://ex.org/p> "v{i:03}" .\n' for i in range(300)
+        ),
+        encoding="utf-8",
+    )
+    out = root / "wide.vortex"
+    serialize_rdf(source, out, layout="dictionary")
+    spellings = {"", "<http://ex.org/p>"}
+    spellings |= {f"<http://ex.org/s{i:03}>" for i in range(300)}
+    spellings |= {f'"v{i:03}"' for i in range(300)}
+    store = VortexRdfStore(out, in_memory=request.param == "resident")
+    term_dict = store.term_dict()
+    assert term_dict.file_backed == (request.param == "file-backed")
+    return term_dict, sorted(spellings, key=lambda t: t.encode())
+
+
+def test_decode_many_colliding_repeats_unsorted_and_out_of_range(wide_dictionary):
+    """Codes 256 apart share a bucket of the batch's sharing cache, so
+    alternating them repeats codes in the batch the dictionary is asked for;
+    unsorted and out-of-range codes (the first past the end, the last past
+    any dictionary) ride along."""
+    term_dict, spellings = wide_dictionary
+    n = len(term_dict)
+    assert n == len(spellings) == 602
+    codes = [3, 259, 3, 515, 259, n + 1, 3, 515, n, 259, 0, n - 1, 515, 3, 2**63]
+    want = [spellings[c] if c < n else None for c in codes]
+    assert want.count(None) == 3
+    assert term_dict.decode_many(codes) == want
+    assert term_dict.decode_many(array("Q", codes)) == want
+    assert [term_dict.decode(c) for c in codes] == want
+    # Every code, descending, then ascending: nothing lost to the sharing.
+    everything = list(range(n))
+    assert term_dict.decode_many(everything) == spellings
+    assert term_dict.decode_many(everything[::-1]) == spellings[::-1]
+
+
 def test_prefix_range_and_lower_bound(dictionary):
     _, term_dict = dictionary
     terms = _terms(term_dict)

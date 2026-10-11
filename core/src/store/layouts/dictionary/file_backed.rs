@@ -445,26 +445,52 @@ impl FileBackedDict {
         }
     }
 
-    /// Code → term for `codes` in any order, repeats allowed, out-of-range
-    /// codes decoding to `None`: the distinct in-range codes are read once.
+    /// Code → term for `codes` in any order, repeats allowed, handed to
+    /// `visit(position, term)` once per position (`None` for an out-of-range
+    /// code): the positions of the in-range codes are sorted once by code,
+    /// each distinct code is read once through
+    /// [`visit_terms`](Self::visit_terms), and every position holding it is
+    /// visited with the borrowed term — no string is built per term. Out-of-
+    /// range positions are visited first; the rest in code order. A term that
+    /// is not UTF-8 fails the call after the other terms are visited.
+    pub(crate) async fn decode_many_with(
+        &self,
+        codes: &[TermCode],
+        mut visit: impl FnMut(usize, Option<&str>),
+    ) -> Result<()> {
+        let mut sorted: Vec<(TermCode, usize)> = Vec::with_capacity(codes.len());
+        for (i, &code) in codes.iter().enumerate() {
+            if self.0.rank_of(code).is_some() {
+                sorted.push((code, i));
+            } else {
+                visit(i, None);
+            }
+        }
+        sorted.sort_unstable();
+        let groups: Vec<&[(TermCode, usize)]> = sorted.chunk_by(|a, b| a.0 == b.0).collect();
+        let distinct: Vec<TermCode> = groups.iter().map(|group| group[0].0).collect();
+        let mut failure = None;
+        self.visit_terms(&distinct, |j, term| match term {
+            Ok(term) => {
+                for &(_, i) in groups[j] {
+                    visit(i, Some(term));
+                }
+            }
+            Err(e) => {
+                failure.get_or_insert(e);
+            }
+        })
+        .await?;
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// [`decode_many_with`](Self::decode_many_with) collected: one owned
+    /// string per decoded position.
     pub(crate) async fn decode_many_any(&self, codes: &[TermCode]) -> Result<Vec<Option<String>>> {
-        let mut distinct: Vec<TermCode> = codes
-            .iter()
-            .copied()
-            .filter(|&code| self.0.rank_of(code).is_some())
-            .collect();
-        distinct.sort_unstable();
-        distinct.dedup();
-        let terms = self.decode_many(&distinct).await?;
-        Ok(codes
-            .iter()
-            .map(|code| {
-                distinct
-                    .binary_search(code)
-                    .ok()
-                    .map(|i| terms[i].to_string())
-            })
-            .collect())
+        let mut terms = vec![None; codes.len()];
+        self.decode_many_with(codes, |i, term| terms[i] = term.map(str::to_owned))
+            .await?;
+        Ok(terms)
     }
 
     /// The async twin of `TermDictionary::encode_tolerant`.
@@ -996,6 +1022,32 @@ mod tests {
         assert_eq!(any[1].as_deref(), Some(terms[105].as_str()));
         assert_eq!(any[3], None);
         assert_eq!(fbd.debug_windows_rebuilt() - before, 2);
+    }
+
+    /// The visitor delivers each position once, in any order with repeats and
+    /// out-of-range codes, reading each window holding a code once.
+    #[tokio::test]
+    async fn decode_many_with_visits_each_position_once_across_windows() {
+        let (fbd, terms) = windowed_handle(600, 100).await;
+        let codes: [TermCode; 12] = [450, 5, 450, 105, 9999, 5, 599, 0, 105, 600, 450, u64::MAX];
+        let mut got = vec![None; codes.len()];
+        let mut visits = vec![0usize; codes.len()];
+        let before = fbd.debug_windows_rebuilt();
+        fbd.decode_many_with(&codes, |i, term| {
+            visits[i] += 1;
+            got[i] = term.map(str::to_owned);
+        })
+        .await
+        .unwrap();
+        // Windows 0, 1, 4 and 5 hold codes.
+        assert_eq!(fbd.debug_windows_rebuilt() - before, 4);
+        assert!(visits.iter().all(|&n| n == 1), "{visits:?}");
+        let want: Vec<Option<String>> = codes
+            .iter()
+            .map(|&code| terms.get(code as usize).cloned())
+            .collect();
+        assert_eq!(got, want);
+        assert_eq!(fbd.decode_many_any(&codes).await.unwrap(), want);
     }
 
     /// The cache holds at most its budget and evicts the least recently used
