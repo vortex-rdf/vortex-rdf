@@ -393,22 +393,37 @@ impl VortexRdfStore {
                 // Same materialization as above — the scan reads in file row
                 // order, which only the exact ids can restrict.
                 let selection = selection.materialized_async().await?;
-                // A tiny exact selection reads point-by-point through the
-                // file's cached chunk probes, skipping the scan machinery and
-                // its whole-leaf decodes; anything it declines runs the scan.
-                let scan =
-                    self.restricted_file_scan(file, filter.as_ref(), &selection, deleted.as_ref())?;
-                let arr = file_scan::point_rows_or_scan(
-                    file_scan::file_point_rows(
-                        file,
-                        self.layout.strategy().primary_column_names(),
-                        filter.as_ref(),
-                        &selection,
-                        deleted.as_ref(),
-                    ),
-                    scan,
-                )
-                .await?;
+                // An exact selection is read point by point through the file's
+                // cached chunk probes, taken at its ids, or scanned, as
+                // `ExactRead` chooses; a read by id that declines runs the scan.
+                let columns = self.layout.strategy().primary_column_names();
+                let by_id = match file_scan::ExactRead::of(
+                    file,
+                    columns,
+                    filter.as_ref(),
+                    &selection,
+                    deleted.as_ref(),
+                )? {
+                    file_scan::ExactRead::Points(rows) => {
+                        file_scan::file_point_rows(file, columns, filter.as_ref(), rows).await?
+                    }
+                    file_scan::ExactRead::Take(ids) => {
+                        file_scan::take_file_rows(file, columns, &ids).await?
+                    }
+                    file_scan::ExactRead::Scan => None,
+                };
+                let arr = match by_id {
+                    Some(rows) => rows,
+                    None => {
+                        file_scan::read_all_rows(self.restricted_file_scan(
+                            file,
+                            filter.as_ref(),
+                            &selection,
+                            deleted.as_ref(),
+                        )?)
+                        .await?
+                    }
+                };
                 // A scan preserves file row order and this view only narrows
                 // it, so the file's recorded quads_sorted provenance carries
                 // to the materialized rows; the multi-chunk read loses any

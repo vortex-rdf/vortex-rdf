@@ -764,25 +764,21 @@ pub(crate) async fn locate_subject_code_runs(
     Ok(Some(runs))
 }
 
-/// Rows of a small exact file selection, read point-by-point through the
-/// file's cached wire-encoded chunk probes instead of a scan — the file
-/// analogue of the in-memory [`gather_by_point_reads`](super::gather::gather_by_point_reads). A pushed filter of
+/// The rows of `columns` at `rows`, the live rows [`ExactRead`] chose to read
+/// point by point, read through the file's cached wire-encoded chunk probes
+/// instead of a scan — the file analogue of the in-memory
+/// [`gather_by_point_reads`](super::gather::gather_by_point_reads). A pushed filter of
 /// equality conjuncts is applied per row during the read (an eq column's
 /// surviving value is its constant, so only residual columns read twice).
-/// `None` declines — a wide or non-exact selection, a filter that is not an
-/// eq conjunction, a column without a probeable chunk handle — and the
-/// caller keeps its scan path. Chunk fetches are cached on `file`, so warm
-/// repeats touch no segments.
+/// `None` declines — a filter that is not an eq conjunction, a column without
+/// a probeable chunk handle — and the caller keeps its scan path. Chunk
+/// fetches are cached on `file`, so warm repeats touch no segments.
 pub(crate) async fn file_point_rows(
     file: &NativeStoreFile,
     columns: &[&str],
     filter: Option<&Expression>,
-    selection: &RowSelection,
-    deleted: Option<&Mask>,
+    rows: Vec<u64>,
 ) -> Result<Option<ArrayRef>> {
-    let Some(rows) = selection.point_sized_live_rows(deleted) else {
-        return Ok(None);
-    };
     let eqs = match filter {
         None => Vec::new(),
         Some(f) => match eq_code_pairs(f) {
@@ -854,6 +850,30 @@ async fn rows_reading(
     Ok(Some(live))
 }
 
+/// Test hook: how many reads this thread gathered by taking exact ids
+/// ([`take_file_rows`]) — through the chunk probes' leaves, or split by split.
+#[cfg(test)]
+pub(crate) mod take_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CHUNKS: Cell<usize> = const { Cell::new(0) };
+        static SPLITS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Record one gather by take, through the chunk probes or split by split.
+    pub(super) fn note(through_chunks: bool) {
+        let cell = if through_chunks { &CHUNKS } else { &SPLITS };
+        cell.with(|c| c.set(c.get() + 1));
+    }
+
+    /// The gathers by take on this thread so far: `(through the chunk
+    /// probes, split by split)`.
+    pub(crate) fn takes() -> (usize, usize) {
+        (CHUNKS.with(Cell::get), SPLITS.with(Cell::get))
+    }
+}
+
 /// One point read costs about as much as a filtered scan spends on this many
 /// rows: the scan's filter evaluation decodes every row of each split it
 /// touches, a point read one value per column.
@@ -863,8 +883,8 @@ const POINT_READ_ROWS: u64 = 256;
 /// equalities, read point by point through the file's chunk probes — what a
 /// filtered scan of the splits holding them answers, without decoding those
 /// splits. `None` declines — a filter of another shape, a column without
-/// chunk probes, ids dense enough in their splits that the scan costs less
-/// ([`sparse_in_splits`]) — and the caller keeps the filter.
+/// chunk probes, ids more than one per [`POINT_READ_ROWS`] rows of their
+/// splits, where the scan costs less — and the caller keeps the filter.
 pub(crate) async fn point_filter_ids(
     file: &NativeStoreFile,
     filter: &Expression,
@@ -874,7 +894,7 @@ pub(crate) async fn point_filter_ids(
         return Ok(None);
     };
     let splits = file.splits().map_err(VortexRdfError::Vortex)?;
-    if !sparse_in_splits(ids, &splits) {
+    if !Footprint::of(ids, &splits).sparse(POINT_READ_ROWS) {
         return Ok(None);
     }
     let Some(checks) = eqs
@@ -889,26 +909,226 @@ pub(crate) async fn point_filter_ids(
         .map(Buffer::from))
 }
 
-/// Whether reading `ids` (ascending) point by point costs less than scanning
-/// the splits that hold them: at most one id per [`POINT_READ_ROWS`] of those
-/// splits' rows.
-fn sparse_in_splits(ids: &[RowId], splits: &[Range<u64>]) -> bool {
-    let mut touched_rows = 0u64;
-    let mut split = 0;
-    let mut counted = None;
-    for &id in ids {
-        while splits.get(split).is_some_and(|s| s.end <= id) {
-            split += 1;
-        }
-        let Some(range) = splits.get(split) else {
-            break;
-        };
-        if counted != Some(split) {
-            touched_rows += range.end - range.start;
-            counted = Some(split);
+/// A take costs about as much per id as the scan's row mask spends on this
+/// many rows of the splits holding the ids: the mask filters a run-end column
+/// run by run over every split it touches, a take binary-searches the runs at
+/// each id.
+const TAKE_ROWS: u64 = 16;
+
+/// The rows of `columns` at `ids`, the live ids [`ExactRead`] chose to take:
+/// taken at the ids so only what the take kernels touch is decoded, as in the
+/// in-memory gather, where the scan would apply a row mask to every split —
+/// which filters a run-end column run by run. Each column takes from its
+/// chunk probes' leaves when every column has them ([`chunk_take`]), which the
+/// probes resolved once over the mapped segments; otherwise each split's rows
+/// from its first to its last id are projected unmasked and taken. `None`
+/// for no id on the split path, and the caller scans.
+pub(crate) async fn take_file_rows(
+    file: &NativeStoreFile,
+    columns: &[&'static str],
+    ids: &[RowId],
+) -> Result<Option<ArrayRef>> {
+    use vortex_array::IntoArray;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::expr::{root, select};
+    use vortex_array::validity::Validity;
+
+    if let Some(rows) = chunk_take(file, columns, ids).await? {
+        #[cfg(test)]
+        take_hooks::note(true);
+        return Ok(Some(rows));
+    }
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let splits = file.splits().map_err(VortexRdfError::Vortex)?;
+    // The ids grouped by split: the rows from the group's first to past its
+    // last id, and each id's offset in them.
+    let mut groups: Vec<(Range<u64>, Vec<u64>)> = Vec::new();
+    let mut rest = ids;
+    let mut idx = 0;
+    while let Some(&first) = rest.first() {
+        idx += splits[idx..].partition_point(|s| s.end <= first);
+        let end = splits.get(idx).map_or(u64::MAX, |s| s.end);
+        let inside = rest.partition_point(|&id| id < end);
+        let last = rest[inside - 1];
+        groups.push((
+            first..last + 1,
+            rest[..inside].iter().map(|&id| id - first).collect(),
+        ));
+        rest = &rest[inside..];
+        idx += 1;
+    }
+    let reader = file.layout_reader().map_err(VortexRdfError::Vortex)?;
+    let projection = file
+        .bound_exprs()
+        .bind(QUAD_SCOPE, &select(columns, root()), reader.dtype())
+        .map_err(VortexRdfError::Vortex)?;
+    let mut tasks = Vec::with_capacity(groups.len());
+    for (rows, offsets) in groups {
+        let len = (rows.end - rows.start) as usize;
+        let projected = reader
+            .projection_evaluation(&rows, &projection, MaskFuture::new_true(len))
+            .map_err(VortexRdfError::Vortex)?;
+        tasks.push(async move {
+            let indices =
+                PrimitiveArray::new(Buffer::from(offsets), Validity::NonNullable).into_array();
+            projected
+                .await
+                .and_then(|rows| rows.take(indices))
+                .map_err(VortexRdfError::Vortex)
+        });
+    }
+    let chunks = stream::iter(tasks)
+        .buffered(available_parallelism())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<ArrayRef>>>()?;
+    #[cfg(test)]
+    take_hooks::note(false);
+    let dtype = chunks[0].dtype().clone();
+    crate::store::array::chunked_or_single(chunks, dtype).map(Some)
+}
+
+/// `columns` at `ids` (ascending), each taken through its chunk probes
+/// ([`ColumnChunks::take`](vortex_rdf_encoded_search::ColumnChunks::take)),
+/// as one struct. `None` when a column has no chunk probes or a leaf the ids
+/// reach declines its probe.
+async fn chunk_take(
+    file: &NativeStoreFile,
+    columns: &[&'static str],
+    ids: &[RowId],
+) -> Result<Option<ArrayRef>> {
+    use vortex_array::IntoArray;
+    use vortex_array::arrays::StructArray;
+    use vortex_array::dtype::FieldName;
+    use vortex_array::validity::Validity;
+
+    let Some(handles) = columns
+        .iter()
+        .map(|c| file.column_chunks(c))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    let source = file.segment_source();
+    let session = file.session();
+    let mut children = Vec::with_capacity(handles.len());
+    for handle in &handles {
+        match handle
+            .take(ids, &source, session)
+            .await
+            .map_err(VortexRdfError::Vortex)?
+        {
+            Some(child) => children.push(child),
+            None => return Ok(None),
         }
     }
-    (ids.len() as u64).saturating_mul(POINT_READ_ROWS) <= touched_rows
+    let names: Vec<FieldName> = columns.iter().map(|c| FieldName::from(*c)).collect();
+    Ok(Some(
+        StructArray::try_new(names.into(), children, ids.len(), Validity::NonNullable)
+            .map_err(VortexRdfError::Vortex)?
+            .into_array(),
+    ))
+}
+
+/// Exact ids at most this many per split they touch are read point by point:
+/// a take through the chunk probes pays a fixed cost for every leaf it takes
+/// from, which reading this few ids one by one undercuts.
+const POINT_IDS_PER_SPLIT: u64 = 16;
+
+/// How the rows of an exact file selection are read, cheapest first.
+pub(crate) enum ExactRead {
+    /// Point by point through the chunk probes, at these live rows.
+    Points(Vec<u64>),
+    /// Taken at these live ids.
+    Take(Vec<RowId>),
+    /// By the restricted scan.
+    Scan,
+}
+
+impl ExactRead {
+    /// The read of `columns` at `selection`, exact, with `filter` pending and
+    /// `deleted` tombstoned. Point reads serve a point-sized selection, or ids
+    /// at most [`POINT_IDS_PER_SPLIT`] per split they touch, when every column
+    /// has chunk probes and the filter is none or code equalities (checked per
+    /// row); a take serves ids at most one per [`TAKE_ROWS`] rows of their
+    /// splits under no filter; the scan serves the rest.
+    pub(crate) fn of(
+        file: &NativeStoreFile,
+        columns: &[&str],
+        filter: Option<&Expression>,
+        selection: &RowSelection,
+        deleted: Option<&Mask>,
+    ) -> Result<Self> {
+        let pointable = filter.is_none_or(|f| eq_code_pairs(f).is_some())
+            && columns.iter().all(|c| file.column_chunks(c).is_some());
+        if pointable && let Some(rows) = selection.point_sized_live_rows(deleted) {
+            return Ok(ExactRead::Points(rows));
+        }
+        let RowSelection::Ids(ids) = selection else {
+            return Ok(ExactRead::Scan);
+        };
+        let splits = file.splits().map_err(VortexRdfError::Vortex)?;
+        let footprint = Footprint::of(ids, &splits);
+        let live = || -> Vec<RowId> {
+            ids.iter()
+                .copied()
+                .filter(|&id| deleted.is_none_or(|d| !d.value(id as usize)))
+                .collect()
+        };
+        if pointable && footprint.few_per_split(POINT_IDS_PER_SPLIT) {
+            return Ok(ExactRead::Points(live()));
+        }
+        if filter.is_none() && footprint.sparse(TAKE_ROWS) {
+            return Ok(ExactRead::Take(live()));
+        }
+        Ok(ExactRead::Scan)
+    }
+}
+
+/// Where exact ids (ascending) sit among a file's splits: how many ids, how
+/// many splits hold them, and how many rows those splits have.
+struct Footprint {
+    ids: u64,
+    splits: u64,
+    rows: u64,
+}
+
+impl Footprint {
+    fn of(ids: &[RowId], splits: &[Range<u64>]) -> Self {
+        let (mut touched, mut rows) = (0, 0);
+        let mut rest = ids;
+        let mut idx = 0;
+        while let Some(&first) = rest.first() {
+            idx += splits[idx..].partition_point(|s| s.end <= first);
+            let Some(split) = splits.get(idx) else {
+                break;
+            };
+            touched += 1;
+            rows += split.end - split.start;
+            rest = &rest[rest.partition_point(|&id| id < split.end)..];
+            idx += 1;
+        }
+        Footprint {
+            ids: ids.len() as u64,
+            splits: touched,
+            rows,
+        }
+    }
+
+    /// Whether the ids number at most one per `rows_per_id` rows of the splits
+    /// holding them — the density below which reading them by id costs less
+    /// than scanning those splits ([`POINT_READ_ROWS`], [`TAKE_ROWS`]).
+    fn sparse(&self, rows_per_id: u64) -> bool {
+        self.ids.saturating_mul(rows_per_id) <= self.rows
+    }
+
+    /// Whether the ids number at most `per_split` per split holding them.
+    fn few_per_split(&self, per_split: u64) -> bool {
+        self.ids <= per_split.saturating_mul(self.splits)
+    }
 }
 
 /// Read `columns` at `rows` point-by-point through their chunk-probe
@@ -1120,22 +1340,51 @@ mod tests {
     /// rows of the splits they touch; a split holding several counts once,
     /// and an untouched split not at all.
     #[test]
-    fn sparse_in_splits_weighs_ids_against_the_rows_of_their_splits() {
+    fn footprint_weighs_ids_against_the_rows_of_their_splits() {
         let rows = POINT_READ_ROWS;
         let splits = [0..4 * rows, 4 * rows..8 * rows, 8 * rows..9 * rows];
+        let sparse = |ids: &[u64]| Footprint::of(ids, &splits).sparse(POINT_READ_ROWS);
         // Four ids in the first split: exactly one per `rows` of its rows.
-        assert!(sparse_in_splits(&[0, 1, 2, 3], &splits));
-        assert!(!sparse_in_splits(&[0, 1, 2, 3, 4], &splits));
+        assert!(sparse(&[0, 1, 2, 3]));
+        assert!(!sparse(&[0, 1, 2, 3, 4]));
         // A second split adds its rows once, however many ids it holds.
-        assert!(sparse_in_splits(
-            &[0, 1, 4 * rows, 4 * rows + 1, 5 * rows],
-            &splits
-        ));
+        assert!(sparse(&[0, 1, 4 * rows, 4 * rows + 1, 5 * rows]));
         // Only touched splits count: two ids in the small last one.
-        assert!(sparse_in_splits(&[8 * rows], &splits));
-        assert!(!sparse_in_splits(&[8 * rows, 8 * rows + 1], &splits));
-        assert!(sparse_in_splits(&[], &splits));
-        assert!(!sparse_in_splits(&[0], &[]));
+        assert!(sparse(&[8 * rows]));
+        assert!(!sparse(&[8 * rows, 8 * rows + 1]));
+        assert!(sparse(&[]));
+        assert!(!Footprint::of(&[0], &[]).sparse(POINT_READ_ROWS));
+    }
+
+    /// A footprint counts each split holding an id once, with its rows.
+    #[test]
+    fn footprint_counts_touched_splits_and_their_rows() {
+        let splits = [0..100, 100..300, 300..310];
+        let of = |ids: &[u64]| {
+            let f = Footprint::of(ids, &splits);
+            (f.ids, f.splits, f.rows)
+        };
+        assert_eq!(of(&[]), (0, 0, 0));
+        assert_eq!(of(&[5, 7, 99]), (3, 1, 100));
+        assert_eq!(of(&[5, 300, 309]), (3, 2, 110));
+        assert_eq!(of(&[0, 100, 300]), (3, 3, 310));
+    }
+
+    /// Ids are few per split while they number at most `POINT_IDS_PER_SPLIT`
+    /// per split they touch, on average over those splits.
+    #[test]
+    fn footprint_weighs_ids_against_the_splits_they_touch() {
+        let per = POINT_IDS_PER_SPLIT;
+        let splits = [0..10 * per, 10 * per..20 * per, 20 * per..30 * per];
+        let few = |ids: &[u64]| Footprint::of(ids, &splits).few_per_split(per);
+        let first: Vec<u64> = (0..per).collect();
+        assert!(few(&first));
+        let one_more: Vec<u64> = (0..=per).collect();
+        assert!(!few(&one_more));
+        // A second touched split doubles the allowance.
+        let two: Vec<u64> = (0..=per).chain([10 * per, 10 * per + 1]).collect();
+        assert!(few(&two));
+        assert!(few(&[]));
     }
 
     /// A scan of `rows` of `file`, cut into splits of `per_split` rows.

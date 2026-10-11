@@ -99,8 +99,10 @@ order.
 
 Off by default. With it, `ColumnChunks` extends the same treatment to a column
 inside a written Vortex file: it locates one field's flat chunk leaves in a
-layout tree, then answers global bounds queries and point reads by fetching
-only the chunks a binary search over chunk extremes actually touches. Each
+layout tree, then answers global bounds queries, point reads and takes at
+ascending rows by fetching only the chunks a binary search over chunk extremes,
+or the rows, actually touch; a take has each leaf take its rows from its
+array. Each
 fetched chunk is reconstructed in its wire encoding (`SerializedArray::decode`
 rebuilds metadata over the segment buffers — it does not decompress), resolved
 into a probe once, and cached, so repeated queries against a hot file do no

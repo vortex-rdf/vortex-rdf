@@ -1387,3 +1387,63 @@ async fn test_reference_index_counts_with_named_graphs() {
         }
     }
 }
+
+/// Exact ids past the point-read cap but sparse in their splits — a
+/// reference index's object run of 300 rows, one per 333 rows of a
+/// 100,000-row file — are gathered by taking them, not by a scan filtering
+/// every split: from the chunk probes' leaves under the Dictionary layout,
+/// split by split under a string layout, whose columns have no chunk probes.
+/// The rows are the in-memory store's, tombstoned rows dropped.
+#[tokio::test]
+async fn test_reference_index_file_takes_sparse_ids() {
+    use crate::store::scan::file_scan::take_hooks;
+    let quads = graph_modular_quads(100_000, 6, 3, 333, &[GraphName::DefaultGraph]);
+    let o5 = Term::Literal(Literal::new_simple_literal("o5"));
+    let doomed = 5 + 333 * 7;
+    for (layout, through_chunks) in [
+        (LayoutStrategy::Dictionary, true),
+        (LayoutStrategy::Default, false),
+    ] {
+        let (_dir, path) =
+            write_store_file(quads.clone(), layout, vec![IndexType::SecondaryByReference]).await;
+        let file = VortexRdfStore::from_file(&path).await.unwrap();
+        let memory = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+        let deleted = file.delete_quad(&quads[doomed]).await.unwrap();
+        let memory_deleted = memory.delete_quad(&quads[doomed]).await.unwrap();
+        for (store, in_memory, rows) in [(&file, &memory, 301), (&deleted, &memory_deleted, 300)] {
+            let label = format!("{layout:?} {rows}");
+            let matched = store
+                .match_pattern(None, None, Some(&o5), None)
+                .await
+                .unwrap();
+            let (chunks, splits) = take_hooks::takes();
+            let strings = view_strings(&matched).await;
+            let (chunks_after, splits_after) = take_hooks::takes();
+            if through_chunks {
+                assert!(
+                    chunks_after > chunks,
+                    "{label}: taken through the chunk probes"
+                );
+                assert_eq!(splits_after, splits, "{label}");
+            } else {
+                assert!(splits_after > splits, "{label}: taken split by split");
+                assert_eq!(chunks_after, chunks, "{label}");
+            }
+            assert_eq!(
+                strings,
+                expected_strings(&quads, |i| i % 333 == 5 && (rows == 301 || i != doomed)),
+                "{label}"
+            );
+            let in_memory_matched = in_memory
+                .match_pattern(None, None, Some(&o5), None)
+                .await
+                .unwrap();
+            assert_eq!(view_strings(&in_memory_matched).await, strings, "{label}");
+            if through_chunks {
+                let codes = sorted_code_rows(&matched).await;
+                assert_eq!(codes.len(), rows, "{label}");
+                assert_eq!(codes, sorted_code_rows(&in_memory_matched).await, "{label}");
+            }
+        }
+    }
+}

@@ -538,3 +538,65 @@ async fn column_chunks_probe_run_of_dictionaries() {
         }
     }
 }
+
+/// The `u32` values of a taken column array.
+fn taken_u32(array: ArrayRef, session: &VortexSession) -> Vec<u32> {
+    use vortex_array::VortexSessionExecute as _;
+    array
+        .execute::<PrimitiveArray>(&mut session.create_execution_ctx())
+        .unwrap()
+        .as_slice::<u32>()
+        .to_vec()
+}
+
+/// A take at ascending rows answers exactly the values at those rows, each
+/// leaf taking its own — across leaf boundaries, from run-end and
+/// dictionary-coded columns alike; no row, an empty array.
+#[tokio::test(flavor = "multi_thread")]
+async fn column_chunks_take_rows_across_leaves() {
+    let session = writer_session();
+    let data: Vec<u32> = (0..600_000).map(|i| (i / 11) as u32).collect();
+    let chunks: Vec<ArrayRef> = data
+        .chunks(200_000)
+        .map(|c| struct_chunk(&[("s", c)]))
+        .collect();
+    let file = write_file(&session, chunks, None).await;
+    let root = file.footer().layout().clone();
+    let column = ColumnChunks::from_struct_layout(&root, "s").expect("the shape resolves");
+    let source = file.segment_source();
+    let mut rows: Vec<u64> = (0..data.len() as u64).step_by(7919).collect();
+    rows.extend([199_999, 200_000, 399_999, 400_000, data.len() as u64 - 1]);
+    rows.sort_unstable();
+    rows.dedup();
+    let taken = column
+        .take(&rows, &source, &session)
+        .await
+        .unwrap()
+        .expect("all chunks are probeable");
+    let want: Vec<u32> = rows.iter().map(|&r| data[r as usize]).collect();
+    assert_eq!(taken_u32(taken, &session), want);
+    let none = column
+        .take(&[], &source, &session)
+        .await
+        .unwrap()
+        .expect("no row needs no chunk");
+    assert_eq!(none.len(), 0);
+
+    let p: Vec<u32> = (0..9_000).map(|i| (i / 3_000) as u32).collect();
+    let o: Vec<u32> = (0..9_000).map(|i| ((i % 3_000) / 300) as u32).collect();
+    let file = write_file(&session, vec![struct_chunk(&[("p", &p), ("o", &o)])], None).await;
+    let root = file.footer().layout().clone();
+    let source = file.segment_source();
+    let rows: Vec<u64> = (0..9_000u64).step_by(37).chain([8_999]).collect();
+    for (field, data) in [("p", &p), ("o", &o)] {
+        let column =
+            ColumnChunks::from_struct_layout(&root, field).expect("a dict layout resolves");
+        let taken = column
+            .take(&rows, &source, &session)
+            .await
+            .unwrap()
+            .expect("dictionary-coded leaves are probeable");
+        let want: Vec<u32> = rows.iter().map(|&r| data[r as usize]).collect();
+        assert_eq!(taken_u32(taken, &session), want, "{field}");
+    }
+}

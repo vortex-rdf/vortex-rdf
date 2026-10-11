@@ -274,6 +274,44 @@ impl ColumnChunks {
         ))
     }
 
+    /// The values at `rows` (ascending), as one array of the column's dtype:
+    /// each leaf holding some of them takes them from its array in the wire
+    /// encoding — the take kernels, decoding only what they touch — fetching
+    /// (and caching) only those leaves. `Ok(None)` when a leaf the rows reach
+    /// declines its probe.
+    ///
+    /// # Panics
+    /// Panics if a row is `>= self.row_count()`.
+    pub async fn take(
+        &self,
+        rows: &[u64],
+        source: &Arc<dyn SegmentSource>,
+        session: &VortexSession,
+    ) -> VortexResult<Option<ArrayRef>> {
+        use vortex_array::arrays::{ChunkedArray, PrimitiveArray};
+
+        let mut parts = Vec::new();
+        let mut rest = rows;
+        let mut idx = 0;
+        while let Some(&first) = rest.first() {
+            assert!(first < self.row_count, "row {first} out of bounds");
+            idx += self.chunks[idx..].partition_point(|c| c.row_offset + c.row_count <= first);
+            let leaf = &self.chunks[idx];
+            let inside = rest.partition_point(|&row| row < leaf.row_offset + leaf.row_count);
+            let Some(probe) = self.chunk_probe(idx, source, session).await? else {
+                return Ok(None);
+            };
+            let offsets =
+                PrimitiveArray::from_iter(rest[..inside].iter().map(|&row| row - leaf.row_offset));
+            parts.push(probe.array().take(offsets.into_array())?);
+            rest = &rest[inside..];
+        }
+        Ok(Some(match parts.len() {
+            1 => parts.pop().vortex_expect("one part"),
+            _ => ChunkedArray::try_new(parts, self.dtype.clone())?.into_array(),
+        }))
+    }
+
     /// The chunk's resolved probe, fetched through `source` and resolved on
     /// first use; `None` when its encoding declines. A codes leaf is composed
     /// with its dictionary's values before resolution, so the probe reads

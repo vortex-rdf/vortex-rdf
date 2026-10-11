@@ -211,34 +211,44 @@ impl VortexRdfStore {
                         tail_quads,
                     );
                 }
-                // A tiny exact selection materializes point-by-point through
-                // the file's cached chunk probes — one async item, no scan
-                // machinery. Candidacy (small selection, eq-shaped filter) is
-                // checked synchronously; the fallback scan moves into the
-                // future for the rare mid-fetch decline (an unprobeable
-                // chunk), which reads the same few rows through the scan.
+                // An exact selection the reads by id serve (see `ExactRead`)
+                // materializes as one async item — point reads through the
+                // file's cached chunk probes, or takes at its ids — with no
+                // scan machinery. The choice is made synchronously; the
+                // fallback scan moves into the future for the rare decline (an
+                // unprobeable chunk), which reads the same rows through the
+                // scan. Anything else streams the scan below.
                 let exact = selection.expect_exact();
-                if exact.is_point_sized()
-                    && filter
-                        .as_ref()
-                        .is_none_or(|f| file_scan::eq_code_pairs(f).is_some())
-                {
+                let columns = self.layout.strategy().primary_column_names();
+                let read = file_scan::ExactRead::of(
+                    file,
+                    columns,
+                    filter.as_ref(),
+                    exact,
+                    deleted.as_ref(),
+                )?;
+                if !matches!(read, file_scan::ExactRead::Scan) {
                     let scan =
                         self.restricted_file_scan(file, filter.as_ref(), exact, deleted.as_ref())?;
                     let file = std::sync::Arc::clone(file);
-                    let columns = self.layout.strategy().primary_column_names();
                     let filter = filter.clone();
-                    let selection = exact.clone();
-                    let deleted = deleted.clone();
                     let chunk = async move {
-                        let point = file_scan::file_point_rows(
-                            &file,
-                            columns,
-                            filter.as_ref(),
-                            &selection,
-                            deleted.as_ref(),
-                        );
-                        match file_scan::point_rows_or_scan(point, scan).await {
+                        let by_id = match read {
+                            file_scan::ExactRead::Points(rows) => {
+                                file_scan::file_point_rows(&file, columns, filter.as_ref(), rows)
+                                    .await
+                            }
+                            file_scan::ExactRead::Take(ids) => {
+                                file_scan::take_file_rows(&file, columns, &ids).await
+                            }
+                            file_scan::ExactRead::Scan => Ok(None),
+                        };
+                        let rows = match by_id {
+                            Ok(Some(rows)) => Ok(rows),
+                            Ok(None) => file_scan::read_all_rows(scan).await,
+                            Err(e) => Err(e),
+                        };
+                        match rows {
                             Ok(rows) => T::decode_async(&layout, &rows).await,
                             Err(e) => vec![Err(e)],
                         }

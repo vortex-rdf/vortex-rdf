@@ -491,7 +491,11 @@ result is cached.
 **Scans.** A scan read to completion into one array is driven by what its
 splits cost. An index child's row-id scan always runs inline on the calling
 task: zone maps prune almost every split, and a located run is sliced out of
-the row-id column, so there is no work to spread. A row scan — the reads that
+the row-id column, so there is no work to spread. An exact selection of rows
+is first offered to the reads by id: point reads through the chunk probes, or
+takes from their leaves for sparse ids
+([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)).
+A row scan — the reads that
 materialize a view's rows: `code_columns_gathered`, serialization and the
 `from_file_in_memory` load, a compaction's gather — filters and decodes per
 split: one of at most [`MAX_INLINE_SPLITS`](../core/src/store/scan/file_scan.rs#L48)
@@ -594,7 +598,9 @@ open rather than being read around.
 | `DICT_VERSION` | 2 | [`container/mod.rs`](../core/src/io/container/mod.rs#L68) |
 | `INDEX_VERSION` | 1 | [`container/mod.rs`](../core/src/io/container/mod.rs#L72) |
 | `POINT_GATHER_MAX_ROWS` | 256 rows — a located run at most this wide is point-read through the chunk probes | [`selection.rs`](../core/src/store/selection.rs#L489) |
-| `POINT_READ_ROWS` | 256 rows — exact row ids at most one per this many rows of the splits holding them check a pending filter by point reads ([matching.md §7](matching.md#7-the-file-path)) | [`file_scan.rs`](../core/src/store/scan/file_scan.rs#L860) |
+| `POINT_READ_ROWS` | 256 rows — exact row ids at most one per this many rows of the splits holding them check a pending filter by point reads ([matching.md §7](matching.md#7-the-file-path)) | [`file_scan.rs`](../core/src/store/scan/file_scan.rs#L880) |
+| `POINT_IDS_PER_SPLIT` | 16 ids — exact ids at most this many per split they touch are read point by point ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`file_scan.rs`](../core/src/store/scan/file_scan.rs#L1039) |
+| `TAKE_ROWS` | 16 rows — exact ids at most one per this many rows of their splits are taken at their rows rather than scanned | [`file_scan.rs`](../core/src/store/scan/file_scan.rs#L916) |
 | `MAX_INLINE_SPLITS` | 42 splits — a row scan of at most this many runs inline, a larger one is spawned ([§8](#8-reading-a-file)) | [`file_scan.rs`](../core/src/store/scan/file_scan.rs#L48) |
 | `DEFAULT_CHUNK_ROWS` | 100,000 rows per builder chunk (a producer batch size; the writer re-blocks at 8,192) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L62) |
 
