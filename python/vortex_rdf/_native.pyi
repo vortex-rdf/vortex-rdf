@@ -112,7 +112,7 @@ class TermDict:
         which rdflib may read differently (``en-*``, padding whitespace),
         leaves the language-tagged literals undecided. An unknown kind, an
         invalid argument or an option that does not apply to the kind raises
-        ``ValueError``. Nothing is memoized."""
+        ``ValueError``. No verdict is memoized."""
         ...
     def prefix_range(self, prefix: str) -> Tuple[int, int]:
         """The half-open code range ``(lo, hi)`` of the terms whose

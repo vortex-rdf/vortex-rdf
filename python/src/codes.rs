@@ -68,8 +68,9 @@ impl PackedTerms {
 /// its file. Decodes term codes to their N-Triples strings. A handle on a
 /// file-backed dictionary keeps the file's mapping alive.
 ///
-/// A file-backed handle answers every call by reading the dictionary child,
-/// GIL released, on the bindings' runtime; a resident one answers in place.
+/// A file-backed handle answers every call by reading the dictionary child
+/// (through a bounded cache of rebuilt windows), GIL released, on the
+/// bindings' runtime; a resident one answers in place.
 #[pyclass(frozen, module = "vortex_rdf._native")]
 pub struct TermDict {
     pub(crate) reader: DictReader,
@@ -227,7 +228,7 @@ impl TermDict {
     /// every text is undecided for the others, and for one whose compiled
     /// program is large (counted repetitions that multiply). Only the
     /// dictionary windows holding candidates the kind ranges do not decide
-    /// are read; nothing is memoized. `lang_matches` is BCP 47 basic
+    /// are read; no verdict is memoized. `lang_matches` is BCP 47 basic
     /// filtering, decided for `*` and for a range of ASCII letters, digits
     /// and hyphens; any other range, which rdflib may read differently
     /// (`en-*`, padding whitespace), leaves the language-tagged literals

@@ -102,7 +102,7 @@ impl WindowCache {
         }
     }
 
-    /// Window `w`'s chunk, now the most recently used.
+    /// Window `w`'s chunk, marked the most recently used.
     fn get(&mut self, w: usize) -> Option<Arc<TermChunk>> {
         let cached = self.windows.get_mut(&w)?;
         self.clock += 1;

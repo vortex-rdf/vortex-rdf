@@ -245,7 +245,7 @@ row ids are.
 every poll of the chunk stream pulls up to a chunk's worth of quads off the
 heap and builds one struct
 ([`build_struct_array`](../core/src/store/builders/mod.rs#L181), or
-[`dictionary::build_chunk`](../core/src/store/layouts/dictionary/mod.rs#L148)
+[`dictionary::build_chunk`](../core/src/store/layouts/dictionary/mod.rs#L150)
 encoding each term through the term→code map). With indexes the merge runs to
 completion first ([`merge_quads_feeding_indexes`](../core/src/store/builders/sorted_stream.rs#L345)):
 row ids are only known as the merge assigns them, and an index child is a
@@ -306,7 +306,7 @@ is the sorted set of every distinct term of the dataset — subjects, predicates
 objects and graph names in one namespace, the default graph's `""` included. A
 term's code is its position, so code order equals string order and a bound
 term resolves to its code by binary search. The frozen column is
-FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/term_dict.rs#L324)):
+FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/term_dict.rs#L336)):
 one symbol table is trained on the whole column and the terms are compressed in
 independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/term_dict.rs#L55)
 (65,536) terms, each window a self-contained FSST array. The term count must
@@ -314,7 +314,7 @@ fit an `i32`.
 
 Which pipeline built the dictionary decides how its term→code map is held during
 encoding: borrowed from the live quads in memory
-([`from_quads_with_map`](../core/src/store/layouts/dictionary/term_dict.rs#L410)),
+([`from_quads_with_map`](../core/src/store/layouts/dictionary/term_dict.rs#L422)),
 owned when the quads were spilled and cannot be borrowed from
 ([`TermDictionaryBuilder::finish`](../core/src/store/layouts/dictionary/ingest.rs#L70)).
 Either way the map exists only for the build; stores keep the columnar

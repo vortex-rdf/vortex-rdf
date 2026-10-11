@@ -267,7 +267,7 @@ are bare codes and cannot be decoded without it.
 | schema | one column, [`_dict_term`](../core/src/store/layouts/dictionary/term_dict.rs#L47): non-nullable `Utf8` |
 | contents | every distinct term of the dataset — subjects, predicates, objects, graph names and the default graph's `""` in one namespace — sorted, each once |
 | codes | implicit: the term at row *i* has code *i* |
-| size limit | at most `i32::MAX` terms: a conservative cap of the in-memory build ([`from_sorted_column`](../core/src/store/layouts/dictionary/term_dict.rs#L261)), not of the format |
+| size limit | at most `i32::MAX` terms: a conservative cap of the in-memory build ([`from_sorted_column`](../core/src/store/layouts/dictionary/term_dict.rs#L273)), not of the format |
 
 The column is FSST-compressed **at the source**, in independent windows of
 65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/term_dict.rs#L55))
@@ -282,24 +282,29 @@ chunks are not one uniform window (chunks adopted from a foreign file) is
 written without the zone map; readers inspect the layout for it.
 
 **Reading it from a file.** A file store is memory-mapped
-([`from_file`](../core/src/store/open.rs#L176)) and the dictionary stays in
+([`from_file`](../core/src/store/open.rs#L177)) and the dictionary stays in
 its child
-([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L130)).
+([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L236)).
 At open the handle reads the zone table — one small segment — and keeps, per
 window, its leaf and its first and last term; without the zone map it reads
 the bounds from the leaves.
 
 - **term → code** (`encode`, `lower_bound`, `prefix_range`): a binary search
-  over the window bounds picks one window, which is rebuilt over its mapped
-  segment (metadata over the bytes, nothing decompressed) and binary-searched,
-  decompressing one term per step (FSST is not order-preserving). A window's
-  first or last term, and a term falling between windows, read no leaf. A
-  match resolves its bound terms concurrently
+  over the window bounds picks one window, which comes from the window cache
+  (below) and is binary-searched, decompressing one term per step (FSST is not
+  order-preserving). A window's first or last term, and a term falling between
+  windows, read no leaf. A match resolves its bound terms concurrently
   ([matching.md §3](matching.md#3-stage-a--prepare_pattern)).
 - **code → term** (`decode`, `decode_many`, a chunk's distinct codes): the
-  codes are grouped by window; each touched window is rebuilt and only the
-  asked rows are taken out of it and decompressed.
-- Nothing a call reads is kept except the kind ranges; the operating system's
+  codes are grouped by window; each touched window comes from the window cache
+  and only the asked rows are decompressed. A batch in any order, with
+  repeats, reads each distinct code once.
+- **The window cache** holds the windows a file-backed dictionary rebuilt. A
+  window missing from it is rebuilt over its mapped segment (metadata over the
+  bytes, nothing decompressed), its FSST code offsets are unpacked once, and it
+  is kept; a repeated probe or decode of that window skips the rebuild. Its
+  size is bounded per opened file (see the table below).
+- The kind ranges are kept for the handle's lifetime; the operating system's
   page cache holds the pages the reads touched.
 
 A child whose layout shape the window search cannot address is lifted into
@@ -458,12 +463,15 @@ The pattern `(? ? ex:alice ?)` becomes: code of `<http://example.org/alice>`
 **The mapping model.** A file store is memory-mapped (`memmap2`, through
 Vortex's `open_buffer`): a segment read is a slice of the map, so the pages a
 query touches stay in the kernel's page cache — counted as file-backed RSS
-(`RssFile`) and reclaimable — while the process's anonymous memory holds only
-what a call is working on. Residency is the kernel's decision; no segment
-cache sits in between.
+(`RssFile`) and reclaimable — while the process's anonymous memory holds what
+a call is working on and the bounded structures below. Residency is the
+kernel's decision; no segment cache sits in between.
 
 What a file store keeps for its lifetime, and what bounds it. The opened handle
-([`NativeStoreFile`](../core/src/store/native_file.rs#L38)) keeps:
+([`NativeStoreFile`](../core/src/store/native_file.rs#L38)) and the file-backed
+dictionary handle
+([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L236))
+keep:
 
 | Kept | Bound |
 |---|---|
@@ -471,12 +479,8 @@ What a file store keeps for its lifetime, and what bounds it. The opened handle
 | per-column chunk-probe handles with the probes of the leaves they fetched, so a repeated location skips the layout walk and the leaf rebuilds | one handle per column; per fetched leaf, a probe over mapped bytes |
 | pruning envelopes per filter shape | 512 entries, cleared wholesale at the cap |
 | bound filter trees, one per filter shape, so Vortex's identity-keyed reader caches hit | 4,096 entries, cleared wholesale at the cap; a clear retires the reader tree, and the caches go with its readers once no view holds one |
-
-A file-backed dictionary handle
-([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs))
-keeps the dictionary child's reader, the window leaf layouts, the dictionary's
-window bounds ([§5](#5-the-dictionary-child)) and its kind ranges: two terms
-per 65,536-term window and a handful of codes.
+| the dictionary child's reader, the window leaf layouts, the dictionary's window bounds ([§5](#5-the-dictionary-child)) and its kind ranges | two terms per 65,536-term window and a handful of codes |
+| the rebuilt dictionary windows (FSST, code offsets unpacked), so a repeated probe or decode of a window skips the rebuild | [`WINDOW_CACHE_BYTES`](../core/src/store/layouts/dictionary/file_backed.rs#L73) (4 MiB) of window heap per opened file, least recently used evicted; an FSST window of 65,536 terms costs about 256 KiB, so about 16 fit |
 
 Keeps (`VALUES`, FILTER code sets) never become filter expressions, so the
 two memos only see a workload's pattern shapes. No count, decode or predicate
