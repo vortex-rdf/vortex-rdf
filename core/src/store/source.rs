@@ -69,8 +69,8 @@ pub(crate) enum QuadsSource {
     #[cfg(feature = "file-io")]
     /// Quad data read lazily from a Vortex file when a query is executed.
     File {
-        /// The path the file was opened from. An owner's compaction rewrites
-        /// its rows over this file atomically and reopens it
+        /// The absolute path the file was opened from. An owner's compaction
+        /// rewrites its rows over this file atomically and reopens it
         /// (`compaction.rs`); a derived view's compaction never touches it.
         path: PathBuf,
         /// The shared file handle, including its cached schema, metadata, and

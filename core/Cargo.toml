@@ -112,3 +112,7 @@ required-features = ["file-io"]
 [[test]]
 name = "replace_mapped_store"
 required-features = ["file-io"]
+
+[[test]]
+name = "relative_path_compaction"
+required-features = ["file-io"]

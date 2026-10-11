@@ -198,16 +198,18 @@ impl VortexRdfStore {
         path: P,
         access: read::FileAccess,
     ) -> Result<Self> {
-        // Remember the source path before it is consumed below, so compaction
-        // can later rewrite the compacted rows back over it.
-        let source_path = path.as_ref().to_path_buf();
         // Opens the file footer only (schema + layout metadata); no row data
         // is read yet. The handle owns the reader tree, so scans and prunes
         // across this store (and stores derived from it) share decoded
         // zone-map stats instead of re-reading them each time.
         let file = Arc::new(NativeStoreFile::try_new(
-            read::open_vortex_file(path, access).await?,
+            read::open_vortex_file(path.as_ref(), access).await?,
         )?);
+        // The file's absolute path, which compaction rewrites the compacted
+        // rows back over: a later change of the working directory does not
+        // move it.
+        let source_path = std::path::absolute(path.as_ref())
+            .map_err(|e| crate::error::path_error("resolve", path.as_ref(), e))?;
         check_id_columns("quad table", file.dtype())?;
         log::debug!(
             "[open] {} {}",
