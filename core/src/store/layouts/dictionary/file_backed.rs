@@ -172,6 +172,10 @@ struct Windows {
     /// to pin that a call rebuilds only the windows holding its codes.
     #[cfg(test)]
     rebuilt: std::sync::atomic::AtomicUsize,
+    /// Windows asked for since open, hits and misses alike — what the tests
+    /// read to pin that a call asks for no window at all.
+    #[cfg(test)]
+    requested: std::sync::atomic::AtomicUsize,
     /// The code of the first term (see `term_dict::code_base`).
     #[cfg(test)]
     base: TermCode,
@@ -217,6 +221,9 @@ impl Windows {
     /// released, so two tasks missing one window both rebuild it and the
     /// cache keeps the first insert.
     async fn window_chunk(&self, w: usize) -> Result<Arc<TermChunk>> {
+        #[cfg(test)]
+        self.requested
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(chunk) = self.cache().get(w) {
             return Ok(chunk);
         }
@@ -305,6 +312,8 @@ impl FileBackedDict {
             cache: Mutex::new(WindowCache::new(budget)),
             #[cfg(test)]
             rebuilt: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            requested: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             base: super::term_dict::code_base(),
         }))))
@@ -599,6 +608,12 @@ impl FileBackedDict {
     #[cfg(test)]
     pub(crate) fn debug_window_count(&self) -> usize {
         self.0.windows.len()
+    }
+
+    /// Windows asked for since the handle opened, from the cache or not.
+    #[cfg(test)]
+    pub(crate) fn debug_windows_requested(&self) -> usize {
+        self.0.requested.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Bytes the window cache holds.
@@ -942,7 +957,7 @@ mod tests {
     async fn window_search_reads_one_window_at_most() {
         let (fbd, terms) = windowed_handle(600, 100).await;
         for w in 0..6 {
-            let before = fbd.debug_windows_rebuilt();
+            let (before, asked) = (fbd.debug_windows_rebuilt(), fbd.debug_windows_requested());
             assert_eq!(
                 fbd.encode(&terms[w * 100]).await.unwrap(),
                 Some((w * 100) as TermCode)
@@ -952,6 +967,7 @@ mod tests {
                 Some((w * 100 + 99) as TermCode)
             );
             assert_eq!(fbd.debug_windows_rebuilt(), before, "window {w}'s edges");
+            assert_eq!(fbd.debug_windows_requested(), asked, "window {w}'s edges");
             assert_eq!(
                 fbd.encode(&terms[w * 100 + 37]).await.unwrap(),
                 Some((w * 100 + 37) as TermCode)
@@ -961,8 +977,15 @@ mod tests {
                 before + 1,
                 "window {w}'s interior"
             );
+            assert_eq!(
+                fbd.debug_windows_requested(),
+                asked + 1,
+                "window {w}'s interior"
+            );
         }
-        let before = fbd.debug_windows_rebuilt();
+        // Every window is cached by now, so a stray read would be a hit that
+        // moves no rebuild count: the request count is what pins "no leaf".
+        let (before, asked) = (fbd.debug_windows_rebuilt(), fbd.debug_windows_requested());
         let between = format!("{}~", terms[99]);
         assert_eq!(fbd.encode(&between).await.unwrap(), None);
         assert_eq!(fbd.lower_bound(between.as_bytes()).await.unwrap(), 100);
@@ -971,8 +994,10 @@ mod tests {
         assert_eq!(fbd.encode("~").await.unwrap(), None);
         assert_eq!(fbd.lower_bound(b"~").await.unwrap(), 600);
         assert_eq!(fbd.debug_windows_rebuilt(), before);
+        assert_eq!(fbd.debug_windows_requested(), asked);
         let inside = format!("{}~", terms[150]);
         assert_eq!(fbd.lower_bound(inside.as_bytes()).await.unwrap(), 151);
+        assert_eq!(fbd.debug_windows_requested(), asked + 1);
     }
 
     /// A decode rebuilds only the windows holding its codes.
@@ -1544,7 +1569,7 @@ mod tests {
     async fn filter_codes_rebuilds_only_candidate_windows() {
         let (fbd, _) = windowed_handle(600, 100).await;
         fbd.kind_ranges().await.unwrap();
-        let before = fbd.debug_windows_rebuilt();
+        let (before, asked) = (fbd.debug_windows_rebuilt(), fbd.debug_windows_requested());
         // An IRI is a text only under `STR()`.
         let predicate = TermPredicate::parse_with(
             "str_prefix",
@@ -1560,22 +1585,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fbd.debug_windows_rebuilt(), before + 2);
+        assert_eq!(fbd.debug_windows_requested(), asked + 2);
         assert_eq!(passed.as_slice(), &[105, 150]);
         assert!(undecided.is_empty());
 
+        // The windows are cached now: the request count, which a hit moves
+        // as a miss does, is what pins that the next two steps read nothing.
         // A kind test is decided by the kind ranges: nothing is read.
-        let before = fbd.debug_windows_rebuilt();
+        let (before, asked) = (fbd.debug_windows_rebuilt(), fbd.debug_windows_requested());
         let is_iri = TermPredicate::parse("is_iri", "").unwrap();
         let (passed, undecided) = fbd.filter_codes(&is_iri, &[105, 150, 450]).await.unwrap();
         assert_eq!(fbd.debug_windows_rebuilt(), before);
+        assert_eq!(fbd.debug_windows_requested(), asked);
         assert_eq!(passed.as_slice(), &[105, 150, 450]);
         assert!(undecided.is_empty());
 
         // Without `STR()` an IRI has no text: its kind fails it, nothing is read.
-        let before = fbd.debug_windows_rebuilt();
+        let (before, asked) = (fbd.debug_windows_rebuilt(), fbd.debug_windows_requested());
         let plain = TermPredicate::parse("str_prefix", "http://example.org/term/01").unwrap();
         let (passed, undecided) = fbd.filter_codes(&plain, &[105, 150, 450]).await.unwrap();
         assert_eq!(fbd.debug_windows_rebuilt(), before);
+        assert_eq!(fbd.debug_windows_requested(), asked);
         assert!(passed.is_empty() && undecided.is_empty());
     }
 
@@ -1585,7 +1615,7 @@ mod tests {
     async fn filter_codes_refuses_bad_candidates_before_reading() {
         let (fbd, _) = windowed_handle(600, 100).await;
         fbd.kind_ranges().await.unwrap();
-        let before = fbd.debug_windows_rebuilt();
+        let (before, asked) = (fbd.debug_windows_rebuilt(), fbd.debug_windows_requested());
         let predicate = TermPredicate::parse("str_prefix", "http://").unwrap();
         for codes in [
             vec![700u64, 800, 5],
@@ -1602,6 +1632,7 @@ mod tests {
             );
         }
         assert_eq!(fbd.debug_windows_rebuilt(), before);
+        assert_eq!(fbd.debug_windows_requested(), asked);
     }
 
     /// Spellings no writer of this crate produces — a lone `<`, a `<` and a
