@@ -178,10 +178,10 @@ where
 ///
 /// A path that cannot take a store — a missing directory, no permission to
 /// write there, a directory at `path` — is reported before any input is
-/// read, not after the whole ingest, sort and dictionary have run. A device
-/// or a pipe at `path` (`/dev/null`, `/dev/stdout` with a pipe behind it)
-/// takes the store in place, with no temp file and so no all-or-nothing
-/// guarantee.
+/// read, not after the whole ingest, sort and dictionary have run. A
+/// character device or a pipe at `path` (`/dev/null`, `/dev/stdout` with a
+/// pipe behind it) takes the store in place, with no temp file and so no
+/// all-or-nothing guarantee.
 ///
 /// The quads must be canonical, as for [`quads_stream_to_vortex_writer`]:
 /// from [`RawQuad::from_quad`], the parser ([`parse_quads_from_reader`]) or
@@ -265,10 +265,11 @@ where
 /// The replacement gives the path a new inode, so another hard link to the old
 /// file keeps the old store.
 ///
-/// A path that resolves to a device or a pipe (`/dev/null`, or `/dev/stdout`
-/// with a pipe behind it) takes the bytes in place: they are written straight
-/// into it, with no temp file and no rename, and opening a pipe waits for its
-/// reader. Any other file that is not a regular file is refused.
+/// A path that resolves to a character device or a pipe (`/dev/null`, or
+/// `/dev/stdout` with a pipe behind it) takes the bytes in place: they are
+/// written straight into it, with no temp file and no rename, and opening a
+/// pipe waits for its reader. Any other file that is not a regular file is
+/// refused.
 ///
 /// A store written over the file it was opened from
 /// ([`create_over`](Self::create_over)) replaces only that file: the path must
@@ -327,18 +328,18 @@ enum Sink {
         /// The identity `target` must still have when it is replaced.
         opened: Option<FileIdentity>,
     },
-    /// A device or a pipe, written in place.
+    /// A character device or a pipe, written in place.
     InPlace,
 }
 
 #[cfg(feature = "file-io")]
 impl PendingStore {
     /// Check that `path` can take a store and open the file for it: resolve the
-    /// links at `path`; take a device or a pipe in place; refuse a directory,
-    /// any other file that is not a regular file and a store this process
-    /// cannot write; otherwise create the temp file beside the file the store
-    /// will replace (private, for an existing store: see [`create_temp`]) and
-    /// copy that file's permissions onto it.
+    /// links at `path`; take a character device or a pipe in place; refuse a
+    /// directory, any other file that is not a regular file and a store this
+    /// process cannot write; otherwise create the temp file beside the file
+    /// the store will replace (private, for an existing store: see
+    /// [`create_temp`]) and copy that file's permissions onto it.
     pub(crate) async fn create(path: &std::path::Path) -> Result<Self> {
         Self::create_over(path, None).await
     }
@@ -361,8 +362,8 @@ impl PendingStore {
         };
 
         // What the kernel resolves the path to, links included (`/dev/stdout`
-        // is a link to the descriptor): a device or a pipe takes the store in
-        // place.
+        // is a link to the descriptor): a character device or a pipe takes the
+        // store in place.
         if let Ok(meta) = tokio::fs::metadata(path).await
             && is_stream(&meta)
         {
@@ -400,7 +401,7 @@ impl PendingStore {
                     "replace",
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        "it is not a regular file, a device or a pipe",
+                        "it is not a regular file, a character device or a pipe",
                     ),
                 ));
             }
@@ -524,8 +525,8 @@ impl PendingStore {
     }
 }
 
-/// Whether `meta` describes a device or a pipe: a file a store is written
-/// into, not renamed over.
+/// Whether `meta` describes a character device or a pipe: a file a store is
+/// written into, not renamed over.
 #[cfg(feature = "file-io")]
 fn is_stream(meta: &std::fs::Metadata) -> bool {
     #[cfg(unix)]

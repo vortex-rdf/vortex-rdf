@@ -1301,8 +1301,9 @@ mod links_and_permissions {
 
 // ─── Targets that are not regular files (Unix) ─────────────────────────
 
-/// A path that names a device or a pipe is written through in place: a store
-/// is never renamed over one. Any other kind of file is refused, untouched.
+/// A path that names a character device or a pipe is written through in
+/// place: a store is never renamed over one. Any other kind of file is
+/// refused, untouched.
 #[cfg(unix)]
 mod special_targets {
     use super::*;
@@ -1369,7 +1370,8 @@ mod special_targets {
     }
 
     /// A socket cannot take a store: the write is refused with an error that
-    /// names the path, before any input is read, and the socket stays.
+    /// names the path and the kinds of file a store can go to, before any
+    /// input is read, and the socket stays.
     #[tokio::test]
     async fn test_other_special_files_are_refused_and_left_alone() {
         let dir = tempfile::tempdir().unwrap();
@@ -1389,7 +1391,9 @@ mod special_targets {
         assert!(matches!(error, VortexRdfError::Io(_)), "{error}");
         assert!(
             error.to_string().contains(&format!("{socket:?}"))
-                && error.to_string().contains("not a regular file"),
+                && error
+                    .to_string()
+                    .contains("not a regular file, a character device or a pipe"),
             "the error must name the path and say why: {error}"
         );
         assert!(!polled.load(Ordering::SeqCst), "the input was read");
