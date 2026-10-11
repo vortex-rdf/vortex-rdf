@@ -643,18 +643,14 @@ impl ResolvedLayout {
     }
 
     /// [`decode_chunk`](Self::decode_chunk) with the file-backed Dictionary
-    /// case handled: the chunk's distinct codes are resolved to terms by one
-    /// read of the dictionary windows holding them, and the chunk decodes
-    /// against that map. Every other layout (and a resident dictionary) takes
-    /// the sync path unchanged.
+    /// case handled: the chunk's code columns are read once, their distinct
+    /// codes are resolved to terms by one read of the dictionary windows
+    /// holding them, and the chunk decodes against that map. Every other
+    /// layout (and a resident dictionary) takes the sync path unchanged.
     #[cfg(feature = "file-io")]
     pub(crate) async fn decode_chunk_async(&self, chunk: &ArrayRef) -> Vec<Result<Quad>> {
         if let ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) = self {
-            let terms = match dictionary::resolve_chunk_terms(fb, chunk).await {
-                Ok(terms) => terms,
-                Err(e) => return vec![Err(e)],
-            };
-            return dictionary::decode_chunk_mapped(chunk, &terms);
+            return dictionary::decode_chunk_file_backed(fb, chunk).await;
         }
         self.decode_chunk(chunk)
     }
@@ -683,21 +679,17 @@ impl ResolvedLayout {
     }
 
     /// [`decode_chunk_shared`](Self::decode_chunk_shared) with the file-backed
-    /// Dictionary case handled exactly as
-    /// [`decode_chunk_async`](Self::decode_chunk_async) does: one dictionary
-    /// scan resolves the chunk's distinct codes into shared strings, and the
-    /// chunk decodes against that map.
+    /// Dictionary case handled as
+    /// [`decode_chunk_async`](Self::decode_chunk_async) does it: the distinct
+    /// codes resolve into shared strings with one read of the dictionary, and
+    /// the chunk decodes against that map.
     #[cfg(feature = "file-io")]
     pub(crate) async fn decode_chunk_shared_async(
         &self,
         chunk: &ArrayRef,
     ) -> Vec<Result<SharedQuad>> {
         if let ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) = self {
-            let terms = match dictionary::resolve_chunk_terms(fb, chunk).await {
-                Ok(terms) => terms,
-                Err(e) => return vec![Err(e)],
-            };
-            return dictionary::decode_chunk_mapped_shared(chunk, &terms);
+            return dictionary::decode_chunk_shared_file_backed(fb, chunk).await;
         }
         self.decode_chunk_shared(chunk)
     }
