@@ -2,7 +2,7 @@
 //! spelling-tolerant encoder and the byte-order range probes it carries.
 
 use super::*;
-use crate::store::{DictReader, TermPredicate};
+use crate::store::{CaseMap, DictReader, TermPredicate, TextOptions};
 use oxrdf::{BlankNode, Literal};
 
 /// Quads mixing every term kind the dictionary sorts: IRIs, blank nodes,
@@ -61,7 +61,7 @@ async fn memory_dictionary_store(quads: Vec<Quad>) -> VortexRdfStore {
 
 /// Every term of the dictionary, in code order.
 async fn all_terms(reader: &DictReader) -> Vec<String> {
-    let codes: Vec<u32> = (0..reader.len() as u32).collect();
+    let codes: Vec<TermCode> = (0..reader.len() as TermCode).collect();
     reader
         .decode_many(&codes)
         .await
@@ -72,8 +72,8 @@ async fn all_terms(reader: &DictReader) -> Vec<String> {
 }
 
 /// `lower_bound` by brute force over the sorted terms.
-fn brute_lower_bound(terms: &[String], probe: &str) -> u32 {
-    terms.partition_point(|t| t.as_bytes() < probe.as_bytes()) as u32
+fn brute_lower_bound(terms: &[String], probe: &str) -> TermCode {
+    terms.partition_point(|t| t.as_bytes() < probe.as_bytes()) as TermCode
 }
 
 /// The spellings every term is probed with: itself, byte-order neighbours
@@ -134,7 +134,7 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
     assert_eq!(reader.len(), oracle.len(), "{tag}: len");
     let terms = all_terms(reader).await;
     assert_eq!(terms.len(), oracle.len(), "{tag}: term count");
-    for (code, term) in (0u32..).zip(&terms) {
+    for (code, term) in (0u64..).zip(&terms) {
         assert_eq!(
             oracle.decode(code).as_deref(),
             Some(term.as_str()),
@@ -158,9 +158,9 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
     }
     // Out-of-range codes decode to `None`, singly and inside a batch of any
     // order with repeats.
-    let len = reader.len() as u32;
+    let len = reader.len() as TermCode;
     assert_eq!(reader.decode(len).await.unwrap(), None, "{tag}");
-    let batch: Vec<u32> = [len, 3, 0, 3, len - 1, len + 7, 1, 1, 0]
+    let batch: Vec<TermCode> = [len, 3, 0, 3, len - 1, len + 7, 1, 1, 0]
         .into_iter()
         .filter(|&c| c == len || c == len + 7 || c < len)
         .collect();
@@ -193,7 +193,7 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
         let lo = want;
         let hi = terms.partition_point(|t| {
             t.as_bytes() < probe.as_bytes() || t.as_bytes().starts_with(probe.as_bytes())
-        }) as u32;
+        }) as TermCode;
         assert_eq!(
             reader.prefix_range(probe).await.unwrap(),
             (lo, hi),
@@ -216,7 +216,7 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
     batch.push("http://example.org/absent".to_owned());
     batch.push("_:absent".to_owned());
     let batch_refs: Vec<&str> = batch.iter().map(String::as_str).collect();
-    let want: Vec<Option<u32>> = batch_refs
+    let want: Vec<Option<TermCode>> = batch_refs
         .iter()
         .map(|t| oracle.encode_tolerant(t).unwrap())
         .collect();
@@ -285,12 +285,79 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
         ("num_ne", "42"),
     ] {
         let predicate = TermPredicate::parse(kind, arg).unwrap();
-        assert_eq!(
-            reader.filter_codes(&predicate).await.unwrap(),
-            oracle.filter_codes(&predicate),
-            "{tag}: filter_codes {kind} {arg:?}"
+        let all: Vec<TermCode> = (0..oracle.len() as TermCode).collect();
+        let every_third: Vec<TermCode> = all.iter().copied().step_by(3).collect();
+        for codes in [&all, &every_third] {
+            assert_eq!(
+                reader.filter_codes(&predicate, codes).await.unwrap(),
+                oracle.filter_codes(&predicate, codes).unwrap(),
+                "{tag}: filter_codes {kind} {arg:?}"
+            );
+        }
+    }
+
+    // The string kinds read a term's text as `string()` or as `STR()`, with
+    // and without a case wrapper: the file-backed reader reads the windows
+    // holding the candidates and answers as the resident snapshot does.
+    for (kind, arg) in [
+        ("str_prefix", "http://example.org/s0"),
+        ("str_prefix", "object"),
+        ("contains", "\"object\""),
+        ("contains", "\"o\"@de"),
+        ("strstarts", "\"hallo\"@de"),
+        ("strends", "\"3\""),
+        ("strends", "<http://example.org/s00>"),
+        ("regex", "^o"),
+        ("regex", "3$"),
+        ("regex", r"\d"),
+        ("regex", "(?=o)"),
+    ] {
+        for (as_str, case) in [
+            (false, None),
+            (true, None),
+            (false, Some(CaseMap::Lower)),
+            (true, Some(CaseMap::Upper)),
+        ] {
+            let options = TextOptions {
+                as_str,
+                case,
+                ..TextOptions::default()
+            };
+            let predicate = TermPredicate::parse_with(kind, arg, &options).unwrap();
+            let all: Vec<TermCode> = (0..oracle.len() as TermCode).collect();
+            let every_third: Vec<TermCode> = all.iter().copied().step_by(3).collect();
+            for codes in [&all, &every_third] {
+                assert_eq!(
+                    reader.filter_codes(&predicate, codes).await.unwrap(),
+                    oracle.filter_codes(&predicate, codes).unwrap(),
+                    "{tag}: filter_codes {kind} {arg:?} {options:?}"
+                );
+            }
+        }
+    }
+
+    // Candidates must be ascending, unique and inside the dictionary, under
+    // either residency; none at all is two empty answers.
+    let is_iri = TermPredicate::parse("is_iri", "").unwrap();
+    let len = oracle.len() as TermCode;
+    for codes in [vec![3u64, 1], vec![1, 1], vec![0, len], vec![len + 7]] {
+        assert!(
+            matches!(
+                reader.filter_codes(&is_iri, &codes).await,
+                Err(crate::VortexRdfError::InvalidOperation(_))
+            ),
+            "{tag}: filter_codes over {codes:?}"
+        );
+        assert!(
+            matches!(
+                oracle.filter_codes(&is_iri, &codes),
+                Err(crate::VortexRdfError::InvalidOperation(_))
+            ),
+            "{tag}: snapshot filter_codes over {codes:?}"
         );
     }
+    let (passed, undecided) = reader.filter_codes(&is_iri, &[]).await.unwrap();
+    assert!(passed.is_empty() && undecided.is_empty(), "{tag}");
 }
 
 /// A resident reader is the snapshot behind an async surface: every method
@@ -358,6 +425,7 @@ async fn test_kind_ranges_partition_codes() {
     let reader = store.dict_reader().unwrap();
     let terms = all_terms(&reader).await;
     let kinds = reader.kind_ranges().await.unwrap();
+    assert_eq!(kinds.start, 0);
     assert_eq!(kinds.len as usize, terms.len());
     assert_eq!(
         kinds.default_graph,
@@ -373,7 +441,7 @@ async fn test_kind_ranges_partition_codes() {
     assert_eq!(kinds.literals.end, kinds.iris.start);
     assert_eq!(kinds.iris.end, kinds.blanks.start);
     assert_eq!(kinds.blanks.end, kinds.len);
-    for (code, term) in (0u32..).zip(&terms) {
+    for (code, term) in (0u64..).zip(&terms) {
         let expected = match term.as_bytes().first() {
             None => None,
             Some(b'"') => Some(&kinds.literals),
@@ -453,12 +521,8 @@ async fn test_dict_reader_file_backed_matches_resident() {
         vec![IndexType::SecondaryByCopy],
     )
     .await;
-    let resident = VortexRdfStore::from_file_with_dict_residency(&path, u64::MAX)
-        .await
-        .unwrap();
-    let fb = VortexRdfStore::from_file_with_dict_residency(&path, 0)
-        .await
-        .unwrap();
+    let resident = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    let fb = VortexRdfStore::from_file(&path).await.unwrap();
     assert!(fb.debug_dict_file_backed());
     assert!(
         fb.code_read_snapshot().is_none(),
@@ -472,12 +536,14 @@ async fn test_dict_reader_file_backed_matches_resident() {
     assert!(reader.is_file_backed());
     assert!(reader.snapshot().is_none());
     assert_reader_matches_snapshot(&reader, &oracle, "file-backed").await;
-    // Memoized answers (kind ranges, predicates) stay stable on re-ask.
+    // The kind ranges stay stable on re-ask, and a predicate over the
+    // candidates answers the same each time (nothing is memoized).
     assert_eq!(reader.kind_ranges().await.unwrap(), oracle.kind_ranges());
     let literal = TermPredicate::parse("is_literal", "").unwrap();
+    let all: Vec<TermCode> = (0..oracle.len() as TermCode).collect();
     assert_eq!(
-        reader.filter_codes(&literal).await.unwrap(),
-        oracle.filter_codes(&literal)
+        reader.filter_codes(&literal, &all).await.unwrap(),
+        oracle.filter_codes(&literal, &all).unwrap()
     );
 
     // A served and a scanned view's gathered codes decode through the

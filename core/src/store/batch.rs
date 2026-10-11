@@ -11,6 +11,7 @@ use crate::error::Result;
 use crate::store::narrowing::Keep;
 use crate::store::schema::QuadColumn;
 
+use super::IdsNeed;
 use super::VortexRdfStore;
 
 /// One probe of a batch: a pattern (`None` = free, as for
@@ -83,7 +84,9 @@ impl VortexRdfStore {
     /// which stops reading at the cap.
     pub async fn count_many(&self, probes: &[Probe]) -> Result<Vec<usize>> {
         try_join_all(probes.iter().map(|probe| async move {
-            let view = self.run_pattern_and_keeps(probe).await?;
+            let view = self
+                .run_pattern_and_keeps(probe, IdsNeed::CountOrWindow)
+                .await?;
             match probe.limit {
                 // An offset consumes rows before the cap counts them.
                 Some(limit) => Ok(view
@@ -98,22 +101,38 @@ impl VortexRdfStore {
 
     /// One probe's view: its pattern, keeps and window.
     pub async fn run_probe(&self, probe: &Probe) -> Result<Self> {
-        let view = self.run_pattern_and_keeps(probe).await?;
-        if probe.offset == 0 && probe.limit.is_none() {
-            return Ok(view);
-        }
-        view.window(probe.offset, probe.limit.unwrap_or(usize::MAX))
-            .await
+        // A windowed view is only windowed (which resolves what the window
+        // reaches); an unwindowed one is read row by row.
+        let windowed = probe.offset != 0 || probe.limit.is_some();
+        let need = if windowed {
+            IdsNeed::CountOrWindow
+        } else {
+            IdsNeed::Rows
+        };
+        let view = self.run_pattern_and_keeps(probe, need).await?;
+        let view = if windowed {
+            view.window(probe.offset, probe.limit.unwrap_or(usize::MAX))
+                .await?
+        } else {
+            view
+        };
+        // The view leaves the store's hands, and its rows may be streamed.
+        debug_assert!(
+            !view.quads.is_pending_without_plan(),
+            "a probe's view is never pending without a serve plan: only a count or a window holds one"
+        );
+        Ok(view)
     }
 
     /// One probe's view before its window: the pattern and the keeps.
-    async fn run_pattern_and_keeps(&self, probe: &Probe) -> Result<Self> {
+    async fn run_pattern_and_keeps(&self, probe: &Probe, need: IdsNeed) -> Result<Self> {
         let matched = self
-            .match_pattern(
+            .match_pattern_for(
                 probe.subject.as_ref(),
                 probe.predicate.as_ref(),
                 probe.object.as_ref(),
                 probe.graph.as_ref(),
+                need,
             )
             .await?;
         if !probe.narrows() || probe.keeps.is_empty() {

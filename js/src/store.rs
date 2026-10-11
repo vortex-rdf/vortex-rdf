@@ -13,6 +13,7 @@ use vortex_rdf_core::{
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
+use crate::codes::{code_from_js, code_to_js, codes_to_js};
 use crate::error::{js_err, js_err_ctx};
 use crate::ingest::{js_array_to_dictionary_array, js_array_to_quads, js_to_quad_stream};
 use crate::options::{build_array, parse_build_options, parse_format};
@@ -55,7 +56,7 @@ impl VortexRdfStore {
         }
     }
 
-    /// The dictionary for decoding a match's `u32` code columns, or `None` when
+    /// The dictionary for decoding a match's code columns, or `None` when
     /// the code path does not apply. Core's
     /// [`code_read_snapshot`](CoreStore::code_read_snapshot) is the one
     /// "codes are decodable" gate (Dictionary layout, no append tail, resident
@@ -87,8 +88,10 @@ impl VortexRdfStore {
     }
 }
 
-/// An immutable handle on a store's term dictionary, decoding a `u32` term code
-/// to its N-Triples string.
+/// An immutable handle on a store's term dictionary, decoding a term code to
+/// its N-Triples string. Codes are `u64` and cross as JS numbers, checked
+/// both ways (see [`crate::codes`]): exact up to 2^53 − 1, never rounded or
+/// wrapped.
 ///
 /// Handed to the JS lazy read model so that codes produced by one read stay
 /// decodable after the store is mutated — a mutation re-encodes the store
@@ -101,18 +104,35 @@ pub struct TermDict {
 
 #[wasm_bindgen]
 impl TermDict {
-    /// Decode a term code, or `undefined` when it is out of range.
+    /// Decode a term code, or `undefined` when it is out of range. A value
+    /// that is no code — not a number, or a number that is not an integer
+    /// from 0 to 2^53 − 1 — throws. Taken as a `JsValue`, so nothing is
+    /// coerced: `null`, `[]` or `false` never decodes as code 0, nor `true`,
+    /// `'1'` or `[1]` as code 1.
     #[wasm_bindgen(js_name = decode)]
-    pub fn decode(&self, code: u32) -> Option<String> {
-        self.snapshot.decode(code)
+    pub fn decode(&self, code: JsValue) -> Result<Option<String>, JsValue> {
+        let number = code.as_f64().ok_or_else(|| {
+            js_err(format!(
+                "a term code is a number, an integer from 0 to 2^53 - 1 \
+                 (Number.MAX_SAFE_INTEGER), got {}",
+                code.js_typeof().as_string().unwrap_or_default()
+            ))
+        })?;
+        let code = code_from_js(number).map_err(js_err)?;
+        Ok(self.snapshot.decode(code))
     }
 
     /// Encode an N-Triples term string to its code (inverse of
     /// [`decode`](Self::decode)), or `undefined` when this dictionary does
-    /// not hold the term.
+    /// not hold the term. Throws for a code past 2^53 − 1, which no JS number
+    /// holds exactly.
     #[wasm_bindgen(js_name = encode)]
-    pub fn encode(&self, term: &str) -> Option<u32> {
-        self.snapshot.encode(term)
+    pub fn encode(&self, term: &str) -> Result<Option<f64>, JsValue> {
+        self.snapshot
+            .encode(term)
+            .map(code_to_js)
+            .transpose()
+            .map_err(js_err)
     }
 }
 
@@ -326,9 +346,10 @@ impl VortexRdfStore {
         })?
     }
 
-    /// Low-level: resolve a pattern to the matched rows' raw `u32` term codes —
-    /// `{ s, p, o, g }` as `Uint32Array`s plus `length` — with no term strings
-    /// materialized. `null` unless the store's rows are code-addressable
+    /// Low-level: resolve a pattern to the matched rows' raw term codes —
+    /// `{ s, p, o, g }` as `Float64Array`s of exact integer codes plus
+    /// `length` — with no term strings materialized; a code past 2^53 − 1
+    /// throws. `null` unless the store's rows are code-addressable
     /// (Dictionary layout, no pending appends, resident dictionary); decode
     /// codes through [`termDict`](Self::term_dict).
     #[wasm_bindgen(js_name = matchCodes, skip_typescript)]
@@ -390,7 +411,7 @@ fn resolve_now<F: std::future::Future>(future: F) -> Result<F::Output, JsValue> 
 /// Resolve a pattern and pack the matched rows into the columnar payload the JS
 /// lazy read model consumes. Shared by `match` and `getQuads`.
 ///
-/// Dictionary layout (`dict` is `Some`) ships four `u32` code columns plus the
+/// Dictionary layout (`dict` is `Some`) ships four code columns plus the
 /// shared dictionary — no term strings are touched. Other layouts ship packed
 /// N-Triples term columns (`{offsets, bytes}`) filled from
 /// `shared_quad_chunks()`.
@@ -402,7 +423,7 @@ async fn match_payload(
     let matched = pattern.matched(&store).await?;
     let payload = Object::new();
 
-    // Code payload: u32 columns + the shared dictionary.
+    // Code payload: code columns + the shared dictionary.
     if let Some(dict) = dict
         && let Some(n) = set_code_columns(&payload, &matched).await?
     {
@@ -445,19 +466,22 @@ async fn match_payload(
     Ok(payload.into())
 }
 
-/// Set a matched view's four `u32` code columns on `payload` under `s`/`p`/`o`/
-/// `g`, returning the row count — or `None` when codes are not that view's
+/// Set a matched view's four code columns on `payload` under `s`/`p`/`o`/`g`,
+/// as `Float64Array`s of the codes (exact JS numbers, see [`codes_to_js`]),
+/// returning the row count — or `None` when codes are not that view's
 /// vocabulary at all, in which case nothing is set and the caller falls back to
-/// the term path.
+/// the term path. A code past 2^53 − 1 is an error, never a rounded number.
 async fn set_code_columns(payload: &Object, matched: &CoreStore) -> Result<Option<usize>, JsValue> {
     let Some(cols) = matched.code_columns_gathered().await.map_err(js_err)? else {
         return Ok(None);
     };
     for (name, col) in ["s", "p", "o", "g"].iter().zip(cols.iter()) {
-        // Copy into a JS-owned Uint32Array (safe against wasm memory growth,
-        // which would detach a zero-copy view).
-        let ta = js_sys::Uint32Array::new_with_length(col.len() as u32);
-        ta.copy_from(col);
+        let numbers = codes_to_js(col.as_slice()).map_err(js_err)?;
+        // Copy into a JS-owned Float64Array (safe against wasm memory growth,
+        // which would detach a zero-copy view). A wasm32 store holds fewer
+        // rows than a u32 counts, so the length fits.
+        let ta = js_sys::Float64Array::new_with_length(numbers.len() as u32);
+        ta.copy_from(&numbers);
         Reflect::set(payload, &(*name).into(), &ta)?;
     }
     Ok(Some(cols[0].len()))

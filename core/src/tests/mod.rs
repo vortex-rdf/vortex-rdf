@@ -11,6 +11,8 @@ use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use std::sync::OnceLock;
 
 mod adoption;
+#[cfg(feature = "file-io")]
+mod atomic_write;
 mod builders;
 mod dictionary;
 #[cfg(feature = "file-io")]
@@ -24,15 +26,41 @@ mod file_backed;
 mod indexes;
 #[cfg(feature = "file-io")]
 mod indexes_file;
+#[cfg(feature = "file-io")]
+mod leaf_geometry;
+#[cfg(feature = "file-io")]
+mod legacy_store;
+#[cfg(feature = "file-io")]
+mod mapping;
 mod matching;
 mod mutation;
 mod names;
 mod narrowing;
 mod predicates;
 mod roundtrip;
+mod row_limit;
 #[cfg(feature = "file-io")]
 mod serialization;
 mod streaming;
+mod unique_quads;
+mod wide_codes;
+mod wide_row_ids;
+
+const LAYOUTS: [LayoutStrategy; 3] = [
+    LayoutStrategy::Default,
+    LayoutStrategy::TypedObject,
+    LayoutStrategy::Dictionary,
+];
+
+/// Every index set worth building: none, each family alone, both.
+fn index_sets() -> Vec<Indexes> {
+    vec![
+        vec![],
+        vec![IndexType::SecondaryByCopy],
+        vec![IndexType::SecondaryByReference],
+        vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+    ]
+}
 
 fn make_quad(s: &str, p: &str, o_lit: &str, g: GraphName) -> Quad {
     Quad::new(
@@ -74,6 +102,160 @@ async fn write_store_file(
     crate::io::quads_stream_to_vortex_file(quad_stream(quads), &path, layout, indexes)
         .await
         .unwrap();
+    (dir, path)
+}
+
+/// [`modular_quads`] at the stock moduli (three predicates, four objects),
+/// for the unit tests that sit beside the code they cover, outside this
+/// module's tree.
+#[cfg(feature = "file-io")]
+pub(crate) fn modular_quads_for_tests(n: usize) -> Vec<Quad> {
+    modular_quads(n, 3, 4)
+}
+
+/// [`write_store_file`] in the Dictionary layout, for the unit tests that sit
+/// beside the code they cover, outside this module's tree. Keep the `TempDir`
+/// alive for the store's lifetime.
+#[cfg(feature = "file-io")]
+pub(crate) async fn write_store_file_for_tests(
+    quads: Vec<Quad>,
+    indexes: Indexes,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    write_store_file(quads, LayoutStrategy::Dictionary, indexes).await
+}
+
+/// A Dictionary-layout store file holding `quads` out of subject order —
+/// rotated left by `rotate` rows — and written without the sorted stamp: the
+/// shape a foreign writer's file arrives in. Keep the `TempDir` alive for the
+/// store's lifetime.
+#[cfg(feature = "file-io")]
+async fn write_unsorted_store_file(
+    quads: &[Quad],
+    rotate: usize,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    use crate::store::layouts::dictionary::{self, TermDictionary};
+
+    let mut raws: Vec<crate::store::RawQuad> =
+        quads.iter().map(crate::store::RawQuad::from_quad).collect();
+    raws.rotate_left(rotate);
+    let (dict, code_map) = TermDictionary::from_quads_with_map(&raws).unwrap();
+    let codes = dictionary::encode_quads(&raws, &code_map).unwrap();
+    let primary = dictionary::build_code_chunk(&codes, 0..raws.len(), false).unwrap();
+    let parts = crate::store::StoreParts {
+        array: primary,
+        components: Vec::new(),
+        dict: Some(std::sync::Arc::new(dict)),
+        quads_sorted: false,
+    };
+    let mut bytes: Vec<u8> = Vec::new();
+    crate::io::ser::serialize_parts(&parts, &mut bytes)
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unsorted.vortex");
+    std::fs::write(&path, &bytes).unwrap();
+    (dir, path)
+}
+
+/// A Dictionary-layout store file holding `quads` in global `s` order and
+/// stamped sorted, with every column written as `chunk_rows`-row flat leaves:
+/// the multi-leaf columns a large file written by the default strategy has,
+/// at a scale a test can afford (the default strategy writes a 160,000-row
+/// column as one leaf). Keep the `TempDir` alive for the store's lifetime.
+#[cfg(feature = "file-io")]
+async fn write_chunked_store_file(
+    quads: &[Quad],
+    chunk_rows: usize,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    write_chunked_store(quads, chunk_rows, false).await
+}
+
+/// [`write_chunked_store_file`] with the reference index built as well and
+/// its two children written in `chunk_rows`-row flat leaves too — the
+/// multi-leaf `val` and `rid` columns of a large file, so that a located run
+/// can cross a leaf boundary at a scale a test can afford.
+#[cfg(feature = "file-io")]
+async fn write_chunked_reference_store_file(
+    quads: &[Quad],
+    chunk_rows: usize,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    write_chunked_store(quads, chunk_rows, true).await
+}
+
+#[cfg(feature = "file-io")]
+async fn write_chunked_store(
+    quads: &[Quad],
+    chunk_rows: usize,
+    reference_index: bool,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    use crate::io::container::BufferedComponentSource;
+    use crate::store::indexes::secondary_by_reference::GlobalReferenceArrays;
+    use crate::store::layouts::dictionary::{self, TermDictionary};
+    use vortex_array::IntoArray as _;
+    use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
+    use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
+    use vortex_layout::layouts::struct_::StructStrategy;
+
+    let mut raws: Vec<crate::store::RawQuad> =
+        quads.iter().map(crate::store::RawQuad::from_quad).collect();
+    raws.sort_unstable();
+    let (dict, code_map) = TermDictionary::from_quads_with_map(&raws).unwrap();
+    let codes = dictionary::encode_quads(&raws, &code_map).unwrap();
+    let chunks: Vec<vortex_array::ArrayRef> = (0..raws.len())
+        .step_by(chunk_rows)
+        .map(|start| {
+            let end = (start + chunk_rows).min(raws.len());
+            dictionary::build_code_chunk(&codes, start..end, true).unwrap()
+        })
+        .collect();
+    let dtype = chunks[0].dtype().clone();
+    let leaves = ChunkedLayoutStrategy::new(FlatLayoutStrategy::default());
+    let mut components = vec![dict.to_write().unwrap()];
+    if reference_index {
+        // The children's rows are the global `(value, row id)` sort of the
+        // codes, cut into `chunk_rows`-row chunks; each chunk is one flat leaf
+        // of each of its columns.
+        for component in GlobalReferenceArrays::from_codes(&codes)
+            .into_components()
+            .unwrap()
+        {
+            let rows = component.rows().unwrap().clone().into_array();
+            let cut: Vec<vortex_array::ArrayRef> = (0..rows.len())
+                .step_by(chunk_rows)
+                .map(|start| {
+                    rows.slice(start..(start + chunk_rows).min(rows.len()))
+                        .unwrap()
+                })
+                .collect();
+            let mut write = component.to_write().unwrap();
+            write.source = std::sync::Arc::new(BufferedComponentSource::try_new(cut).unwrap());
+            write.strategy = std::sync::Arc::new(StructStrategy::new(
+                std::sync::Arc::new(FlatLayoutStrategy::default()),
+                std::sync::Arc::new(leaves.clone()),
+            ));
+            components.push(write);
+        }
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    crate::io::container::write_store(
+        &crate::session::VORTEX_SESSION,
+        &mut bytes,
+        vortex_array::stream::ArrayStreamAdapter::new(
+            dtype,
+            Box::pin(stream::iter(chunks.into_iter().map(Ok))),
+        ),
+        std::sync::Arc::new(StructStrategy::new(
+            std::sync::Arc::new(FlatLayoutStrategy::default()),
+            std::sync::Arc::new(leaves),
+        )),
+        true,
+        components,
+    )
+    .await
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("chunked.vortex");
+    std::fs::write(&path, &bytes).unwrap();
     (dir, path)
 }
 
@@ -232,10 +414,106 @@ pub(crate) async fn write_dict_only_store(
     .await
 }
 
-/// A `{s, p, o, g}` struct of four identical non-nullable u32 columns
+/// [`write_dict_only_store`] with the dictionary component's descriptor at
+/// `version`, and — when `zoned` is false — no zone maps on the term column,
+/// which is what `TermDictionary::to_write` produces for chunks of uneven
+/// length: a reader finds no window bounds and reads them from each leaf.
+#[cfg(feature = "file-io")]
+pub(crate) async fn write_dict_only_store_as(
+    dict: &crate::store::layouts::dictionary::TermDictionary,
+    version: u32,
+    zoned: bool,
+) -> Vec<u8> {
+    use crate::io::container::{
+        self, BufferedComponentSource, NativeComponentWrite, StoreComponentDescriptor,
+        StoreComponentRole,
+    };
+    let chunks = dict.child_chunks().unwrap();
+    let dtype = chunks[0].dtype().clone();
+    let component = NativeComponentWrite::new(
+        StoreComponentDescriptor {
+            name: container::DICT_COMPONENT_NAME.into(),
+            role: StoreComponentRole::Dictionary,
+            implementation: container::DICT_IMPLEMENTATION.into(),
+            version,
+            required: true,
+            sorted: true,
+            dtype,
+        },
+        std::sync::Arc::new(BufferedComponentSource::try_new(chunks).unwrap()),
+        container::dict_child_strategy(zoned.then(|| dict.uniform_window()).flatten()),
+    )
+    .unwrap();
+    unstamped_store_bytes(vec![bare_code_quad_array(&[0])], vec![component]).await
+}
+
+/// A native store file opened over `bytes` held in memory (no file behind it).
+#[cfg(feature = "file-io")]
+pub(crate) fn open_native_bytes(bytes: Vec<u8>) -> crate::store::native_file::NativeStoreFile {
+    use vortex_file::OpenOptionsSessionExt as _;
+    let file = crate::session::VORTEX_SESSION
+        .open_options()
+        .open_buffer(vortex_buffer::ByteBuffer::from(bytes))
+        .unwrap();
+    crate::store::native_file::NativeStoreFile::try_new(file).unwrap()
+}
+
+/// `path` opened mapped, as a file-backed store opens it: the
+/// [`NativeStoreFile`](crate::store::native_file::NativeStoreFile) around the
+/// opened file.
+#[cfg(feature = "file-io")]
+pub(crate) async fn open_mapped(
+    path: &std::path::Path,
+) -> crate::store::native_file::NativeStoreFile {
+    use crate::io::read::{FileAccess, open_vortex_file};
+    crate::store::native_file::NativeStoreFile::try_new(
+        open_vortex_file(path, FileAccess::Mapped).await.unwrap(),
+    )
+    .unwrap()
+}
+
+/// A mapped Dictionary-layout store file of `n` quads (subject-sorted,
+/// subjects unique) with `indexes`. Keep the `TempDir` alive for the file's
+/// lifetime.
+#[cfg(feature = "file-io")]
+pub(crate) async fn mapped_file(
+    n: usize,
+    indexes: Indexes,
+) -> (
+    tempfile::TempDir,
+    crate::store::native_file::NativeStoreFile,
+) {
+    let (dir, path) = write_store_file_for_tests(modular_quads_for_tests(n), indexes).await;
+    (dir, open_mapped(&path).await)
+}
+
+/// The layout node of a native store file's dictionary-child term column —
+/// the child struct's `_dict_term` field exactly as written: a `Zoned` node
+/// when the column carries zone maps, its chunked (or flat) data otherwise.
+#[cfg(feature = "file-io")]
+pub(crate) fn dict_term_column(
+    native: &crate::store::native_file::NativeStoreFile,
+) -> vortex_layout::LayoutRef {
+    use crate::io::container::DICT_COMPONENT_NAME;
+    use crate::store::layouts::dictionary::term_dict::COL_DICT_TERM;
+    use vortex_layout::LayoutChildType;
+    let child = native
+        .component_layout(DICT_COMPONENT_NAME)
+        .unwrap()
+        .expect("the file carries a dictionary component");
+    (0..child.nslots())
+        .find_map(|i| {
+            matches!(child.slot_type(i), Some(LayoutChildType::Field(ref n)) if n.as_ref() == COL_DICT_TERM)
+                .then(|| child.slot(i).ok().flatten())
+                .flatten()
+        })
+        .expect("the dictionary child has a term column")
+}
+
+/// A `{s, p, o, g}` struct of four identical non-nullable u64 columns
 /// holding `codes` — the Dictionary layout's row shape without a
 /// dictionary to give the codes meaning.
-fn bare_code_quad_array(codes: &[u32]) -> vortex_array::ArrayRef {
+fn bare_code_quad_array(codes: &[TermCode]) -> vortex_array::ArrayRef {
     use vortex_array::IntoArray as _;
     let col = || vortex_buffer::Buffer::from_iter(codes.iter().copied()).into_array();
     vortex_array::arrays::StructArray::try_new(

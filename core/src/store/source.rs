@@ -40,7 +40,8 @@ pub(crate) enum QuadsSource {
         base: ArrayRef,
         /// The base row ids visible through this particular store or derived
         /// view; narrowing a view changes this without rewriting `base`. May
-        /// still be pending on a served match — see `serve`.
+        /// still be pending — on a served match (see `serve`), or on a view
+        /// built only to be counted or windowed (see [`ViewSelection`]).
         selection: ViewSelection,
         /// Secondary-index components held beside `base`, in the same child
         /// schema as a native file's index children; empty for stores built
@@ -68,14 +69,10 @@ pub(crate) enum QuadsSource {
     #[cfg(feature = "file-io")]
     /// Quad data read lazily from a Vortex file when a query is executed.
     File {
-        /// The path the file was opened from. An owner's compaction rewrites
-        /// its rows over this file atomically and reopens it
+        /// The absolute path the file was opened from. An owner's compaction
+        /// rewrites its rows over this file atomically and reopens it
         /// (`compaction.rs`); a derived view's compaction never touches it.
         path: PathBuf,
-        /// The dictionary-residency budget the store was opened with, so a
-        /// compaction's reopen (`from_file_with_dict_residency`) preserves
-        /// the same residency mode.
-        dict_max_resident_bytes: u64,
         /// The shared file handle, including its cached schema, metadata, and
         /// layout reader used by scans and pruning. Every root row is a quad
         /// row (the dictionary and index copies ride as auxiliary children
@@ -86,7 +83,8 @@ pub(crate) enum QuadsSource {
         filter: Option<Expression>,
         /// The file row ids visible through this store or derived view,
         /// typically narrowed by index lookups or pruning. May still be
-        /// pending on a served match — see `serve`.
+        /// pending — on a served match (see `serve`), or on a view built only
+        /// to be counted or windowed (see [`ViewSelection`]).
         selection: ViewSelection,
         /// Rows deleted since the store was opened, one bit per file row
         /// (`None` until something is deleted). Applied by every read path
@@ -109,6 +107,23 @@ impl QuadsSource {
             QuadsSource::InMemory { selection, .. } => selection,
             #[cfg(feature = "file-io")]
             QuadsSource::File { selection, .. } => selection,
+        }
+    }
+
+    /// Whether the selection is still pending with no serve plan to read
+    /// through — the state of a view built only to be counted or windowed
+    /// (`IdsNeed::CountOrWindow`). It is resolved by counting, windowing or
+    /// keeping the view; nothing that reads rows may hold one, so no view a
+    /// caller gets back is in it.
+    pub(crate) fn is_pending_without_plan(&self) -> bool {
+        match self {
+            QuadsSource::InMemory {
+                selection, serve, ..
+            } => matches!(selection, ViewSelection::Pending(_)) && serve.is_none(),
+            #[cfg(feature = "file-io")]
+            QuadsSource::File {
+                selection, serve, ..
+            } => matches!(selection, ViewSelection::Pending(_)) && serve.is_none(),
         }
     }
 

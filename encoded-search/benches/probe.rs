@@ -37,7 +37,7 @@ struct Fixture {
 static FIXTURES: LazyLock<Vec<Fixture>> = LazyLock::new(|| {
     let session = common::session();
     let mut ctx = session.create_execution_ctx();
-    let default = BtrBlocksCompressorBuilder::default().build();
+    let default = BtrBlocksCompressorBuilder::from_session(&session).build();
     let dict = BtrBlocksCompressorBuilder::empty()
         .with_new_scheme(&integer::IntDictScheme as &'static dyn Scheme)
         .build();

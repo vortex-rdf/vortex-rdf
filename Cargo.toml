@@ -6,7 +6,7 @@ members = ["core", "encoded-search", "js", "cli", "python"]
 default-members = ["core", "encoded-search", "js", "cli"]
 
 [workspace.package]
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 rust-version = "1.95"
 authors = ["Julián Rojas <julianandres.rojasmelendez@ugent.be>"]
@@ -18,25 +18,25 @@ keywords = ["rdf", "columnar", "vortex", "semantic-web", "quad-store"]
 categories = ["database-implementations", "encoding", "data-structures"]
 
 [workspace.dependencies]
-vortex-rdf-core = { path = "core", version = "0.11.0" }
-vortex-rdf-encoded-search = { path = "encoded-search", version = "0.11.0" }
-vortex = { version = "0.86.1", default-features = false }
-vortex-array = { version = "0.86.1" }
-vortex-btrblocks = "0.86.1"
-vortex-error = "0.86.1"
-vortex-fastlanes = "0.86.1"
-vortex-io = "0.86.1"
-vortex-runend = "0.86.1"
-vortex-sequence = "0.86.1"
-vortex-sparse = "0.86.1"
-vortex-session = "0.86.1"
-vortex-fsst = "0.86.1"
-vortex-edition = "0.86.1"
-vortex-mask = "0.86.1"
-vortex-file = { version = "0.86.1" }
-vortex-scan = "0.86.1"
-vortex-layout = "0.86.1"
-vortex-buffer = "0.86.1"
+vortex-rdf-core = { path = "core", version = "0.12.0" }
+vortex-rdf-encoded-search = { path = "encoded-search", version = "0.12.0" }
+vortex = { version = "0.88.0", default-features = false }
+vortex-array = { version = "0.88.0" }
+vortex-btrblocks = "0.88.0"
+vortex-error = "0.88.0"
+vortex-fastlanes = "0.88.0"
+vortex-io = "0.88.0"
+vortex-runend = "0.88.0"
+vortex-sequence = "0.88.0"
+vortex-sparse = "0.88.0"
+vortex-session = "0.88.0"
+vortex-fsst = "0.88.0"
+vortex-edition = "0.88.0"
+vortex-mask = "0.88.0"
+vortex-file = { version = "0.88.0" }
+vortex-scan = "0.88.0"
+vortex-layout = "0.88.0"
+vortex-buffer = "0.88.0"
 fastlanes = "0.7"
 self_cell = "1.2"
 divan = { package = "codspeed-divan-compat", version = "5.0.1" }

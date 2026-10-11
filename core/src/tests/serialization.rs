@@ -1,4 +1,4 @@
-//! The vortex-rdf.store.v1 wire contract. Every test here asserts the same
+//! The vortex-rdf.store.v2 wire contract. Every test here asserts the same
 //! contract from a different starting state (tailed, tombstoned,
 //! file-backed, dictionary, locally-sorted multi-chunk): `to_bytes` /
 //! `from_bytes` must carry the store's index components and its sortedness
@@ -360,7 +360,7 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
                 .unwrap(),
         );
         for (family_ix, family) in [CopyFamily::Posg, CopyFamily::Ospg].into_iter().enumerate() {
-            let mut keys: Vec<(CopyKey<String>, u32)> = rows
+            let mut keys: Vec<(CopyKey<String>, crate::store::RowId)> = rows
                 .iter()
                 .enumerate()
                 .map(|(i, q)| {
@@ -369,7 +369,7 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
                         CopyFamily::Posg => CopyKey::posg(&spog),
                         CopyFamily::Ospg => CopyKey::ospg(spog),
                     };
-                    (key, (n * 4 + i) as u32)
+                    (key, (n * 4 + i) as crate::store::RowId)
                 })
                 .collect();
             keys.sort_unstable();
@@ -817,18 +817,26 @@ async fn test_from_parts_retains_dict_children() {
 
 /// Open `bytes` both ways — `from_bytes` over the buffer and `from_file` over
 /// a temp file holding the same bytes — so every open-path contract below
-/// is asserted on each reader.
+/// is asserted on each reader. The directory comes back with the results:
+/// the mapped store reads its file for as long as it lives, and
+/// [`open_in_memory`] opens the same file the third way.
 async fn open_both(
     bytes: &[u8],
 ) -> (
     crate::error::Result<VortexRdfStore>,
     crate::error::Result<VortexRdfStore>,
+    tempfile::TempDir,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store.vortex");
     std::fs::write(&path, bytes).unwrap();
     let from_file = VortexRdfStore::from_file(&path).await;
-    (VortexRdfStore::from_bytes(bytes).await, from_file)
+    (VortexRdfStore::from_bytes(bytes).await, from_file, dir)
+}
+
+/// The file [`open_both`] wrote into `dir`, loaded whole.
+async fn open_in_memory(dir: &tempfile::TempDir) -> crate::error::Result<VortexRdfStore> {
+    VortexRdfStore::from_file_in_memory(dir.path().join("store.vortex")).await
 }
 
 /// A component descriptor of the shape a future change set could write: an
@@ -851,12 +859,211 @@ fn unknown_component(required: bool) -> container::NativeComponentWrite {
     .unwrap()
 }
 
+/// Term-code columns narrower than [`TermCode`] (u32 codes) are refused by
+/// every open path, with an error naming the table, the column and its width:
+/// in the quad table, and in an index child beside u64 quad columns.
+#[tokio::test]
+async fn test_open_refuses_code_columns_narrower_than_u64() {
+    use crate::store::layouts::dictionary::TermDictionary;
+    use vortex_array::IntoArray as _;
+    use vortex_array::arrays::{StructArray, VarBinViewArray};
+    use vortex_array::validity::Validity;
+    use vortex_buffer::Buffer;
+
+    let dict = TermDictionary::from_sorted_column(VarBinViewArray::from_iter_str([
+        "<http://example.org/a>",
+    ]))
+    .unwrap();
+    fn narrow(names: &[&'static str]) -> vortex_array::ArrayRef {
+        let columns: Vec<vortex_array::ArrayRef> = names
+            .iter()
+            .map(|_| Buffer::from_iter([0u32]).into_array())
+            .collect();
+        StructArray::try_new(names.into(), columns, 1, Validity::NonNullable)
+            .unwrap()
+            .into_array()
+    }
+
+    let quads = unstamped_store_bytes(
+        vec![narrow(&["s", "p", "o", "g"])],
+        vec![dict.to_write().unwrap()],
+    )
+    .await;
+    let rows = narrow(&["val", "rid"]);
+    let index = container::NativeComponentWrite::new(
+        container::StoreComponentDescriptor {
+            name: "index:ref-o".into(),
+            role: container::StoreComponentRole::Index,
+            implementation: "secondary-by-reference/o".into(),
+            version: 1,
+            required: false,
+            sorted: true,
+            dtype: rows.dtype().clone(),
+        },
+        std::sync::Arc::new(container::BufferedComponentSource::try_new(vec![rows]).unwrap()),
+        container::default_child_strategy(),
+    )
+    .unwrap();
+    let index_child = unstamped_store_bytes(
+        vec![bare_code_quad_array(&[0])],
+        vec![dict.to_write().unwrap(), index],
+    )
+    .await;
+
+    for (bytes, want) in [
+        (quads, "the quad table column s holds u32 term codes"),
+        (
+            index_child,
+            "the index:ref-o column val holds u32 term codes",
+        ),
+    ] {
+        let (from_bytes, from_file, dir) = open_both(&bytes).await;
+        let in_memory = open_in_memory(&dir).await;
+        for (path, result) in [
+            ("from_bytes", from_bytes),
+            ("from_file", from_file),
+            ("from_file_in_memory", in_memory),
+        ] {
+            let err = result.err().expect("open should fail");
+            assert!(
+                err.to_string().contains(want),
+                "{path}: unexpected error: {err}"
+            );
+            assert!(err.to_string().contains("rebuild"), "{path}: {err}");
+        }
+    }
+}
+
+/// Row-id columns narrower than [`RowId`](crate::store::RowId) (u32 row ids)
+/// are refused by every open path, with an error naming the child, the column
+/// and its width: in a reference and a copy child beside u64 codes, and in a
+/// reference child of the Default layout, whose values are strings.
+#[tokio::test]
+async fn test_open_refuses_row_ids_narrower_than_u64() {
+    use crate::store::layouts::dictionary::TermDictionary;
+    use vortex_array::IntoArray as _;
+    use vortex_array::arrays::{StructArray, VarBinViewArray};
+    use vortex_array::validity::Validity;
+    use vortex_buffer::Buffer;
+
+    let dict = TermDictionary::from_sorted_column(VarBinViewArray::from_iter_str([
+        "<http://example.org/a>",
+    ]))
+    .unwrap();
+    // One index child of `columns` (the last one a u32 `rid`) under `name`.
+    let child = |name: &str, slug: &str, columns: Vec<(&'static str, vortex_array::ArrayRef)>| {
+        let (names, arrays): (Vec<&str>, Vec<vortex_array::ArrayRef>) = columns.into_iter().unzip();
+        let rows = StructArray::try_new(names.as_slice().into(), arrays, 1, Validity::NonNullable)
+            .unwrap()
+            .into_array();
+        container::NativeComponentWrite::new(
+            container::StoreComponentDescriptor {
+                name: name.into(),
+                role: container::StoreComponentRole::Index,
+                implementation: slug.into(),
+                version: 1,
+                required: false,
+                sorted: true,
+                dtype: rows.dtype().clone(),
+            },
+            std::sync::Arc::new(container::BufferedComponentSource::try_new(vec![rows]).unwrap()),
+            container::default_child_strategy(),
+        )
+        .unwrap()
+    };
+    let code = || Buffer::from_iter([0u64]).into_array();
+    let rid = || Buffer::from_iter([0u32]).into_array();
+
+    let dictionary_ref = unstamped_store_bytes(
+        vec![bare_code_quad_array(&[0])],
+        vec![
+            dict.to_write().unwrap(),
+            child(
+                "index:ref-o",
+                "secondary-by-reference/o",
+                vec![("val", code()), ("rid", rid())],
+            ),
+        ],
+    )
+    .await;
+    let dictionary_copy = unstamped_store_bytes(
+        vec![bare_code_quad_array(&[0])],
+        vec![
+            dict.to_write().unwrap(),
+            child(
+                "index:posg",
+                "secondary-by-copy/posg",
+                vec![
+                    ("s", code()),
+                    ("p", code()),
+                    ("o", code()),
+                    ("g", code()),
+                    ("rid", rid()),
+                ],
+            ),
+        ],
+    )
+    .await;
+    let raw = crate::store::RawQuad::canonical(
+        "<http://example.org/a>",
+        "<http://example.org/a>",
+        "<http://example.org/a>",
+        "",
+    )
+    .unwrap();
+    let default_ref = unstamped_store_bytes(
+        vec![
+            crate::store::builders::build_struct_array(&[raw], LayoutStrategy::Default, true)
+                .unwrap(),
+        ],
+        vec![child(
+            "index:ref-o",
+            "secondary-by-reference/o",
+            vec![
+                (
+                    "val",
+                    VarBinViewArray::from_iter_str(["<http://example.org/a>"]).into_array(),
+                ),
+                ("rid", rid()),
+            ],
+        )],
+    )
+    .await;
+
+    for (bytes, want) in [
+        (
+            dictionary_ref,
+            "the index:ref-o column rid holds u32 row ids",
+        ),
+        (
+            dictionary_copy,
+            "the index:posg column rid holds u32 row ids",
+        ),
+        (default_ref, "the index:ref-o column rid holds u32 row ids"),
+    ] {
+        let (from_bytes, from_file, dir) = open_both(&bytes).await;
+        let in_memory = open_in_memory(&dir).await;
+        for (path, result) in [
+            ("from_bytes", from_bytes),
+            ("from_file", from_file),
+            ("from_file_in_memory", in_memory),
+        ] {
+            let err = result.err().expect("open should fail");
+            assert!(
+                err.to_string().contains(want),
+                "{path}: unexpected error: {err}"
+            );
+            assert!(err.to_string().contains("rebuild"), "{path}: {err}");
+        }
+    }
+}
+
 /// Dictionary-dtype rows written without a dictionary component: bare codes
 /// cannot self-describe, and both readers refuse to open them.
 #[tokio::test]
 async fn test_open_rejects_dictionary_rows_without_dictionary_component() {
     let bytes = unstamped_store_bytes(vec![bare_code_quad_array(&[0, 1, 2])], vec![]).await;
-    let (from_bytes, from_file) = open_both(&bytes).await;
+    let (from_bytes, from_file, _dir) = open_both(&bytes).await;
     for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
         let err = result.err().expect("open should fail");
         assert!(
@@ -886,7 +1093,7 @@ async fn test_open_rejects_unknown_dictionary_implementation() {
     dict.descriptor.implementation = "not-a-dictionary-v0".into();
     let bytes = unstamped_store_bytes(vec![parts.array.clone()], vec![dict]).await;
 
-    let (from_bytes, from_file) = open_both(&bytes).await;
+    let (from_bytes, from_file, _dir) = open_both(&bytes).await;
     for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
         let err = result.err().expect("open should fail");
         assert!(
@@ -894,6 +1101,249 @@ async fn test_open_rejects_unknown_dictionary_implementation() {
                 .contains("unsupported dictionary component implementation"),
             "{path}: unexpected error: {err}"
         );
+    }
+}
+
+/// A dictionary component of a version newer than the one this version reads
+/// is rejected at open, with an error that says so, whichever way the store
+/// is opened: a newer writer may lay the child out in a way this reader would
+/// silently misread. The current version, and every older one, still opens.
+#[tokio::test]
+async fn test_open_rejects_a_dictionary_version_newer_than_this_version_reads() {
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(dictionary_test_quads()),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await
+    .unwrap();
+    let parts = VortexRdfStore::from_built(arr)
+        .unwrap()
+        .to_serializable_parts()
+        .await
+        .unwrap();
+    let with_version = |version: u32| {
+        let mut dict = parts.dict.as_ref().unwrap().to_write().unwrap();
+        dict.descriptor.version = version;
+        dict
+    };
+
+    for version in [container::DICT_VERSION, container::DICT_VERSION - 1] {
+        let bytes =
+            unstamped_store_bytes(vec![parts.array.clone()], vec![with_version(version)]).await;
+        let (from_bytes, from_file, _dir) = open_both(&bytes).await;
+        for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
+            assert!(result.is_ok(), "{path}: version {version} must open");
+        }
+    }
+
+    for version in [container::DICT_VERSION + 1, 99, u32::MAX] {
+        let bytes =
+            unstamped_store_bytes(vec![parts.array.clone()], vec![with_version(version)]).await;
+        let (from_bytes, from_file, dir) = open_both(&bytes).await;
+        let in_memory = open_in_memory(&dir).await;
+        for (how, result) in [
+            ("from_bytes", from_bytes),
+            ("from_file", from_file),
+            ("from_file_in_memory", in_memory),
+        ] {
+            let err = result
+                .err()
+                .unwrap_or_else(|| panic!("{how}: version {version} must be refused"));
+            let VortexRdfError::Deserialization(message) = &err else {
+                panic!("{how}: expected a Deserialization error, got {err:?}");
+            };
+            assert!(
+                message.contains(&format!("dictionary component is version {version}"))
+                    && message
+                        .contains(&format!("reads up to version {}", container::DICT_VERSION))
+                    && message.contains("newer vortex-rdf"),
+                "{how}: unexpected error: {message}"
+            );
+        }
+    }
+}
+
+/// Every writer stamps its index children with `INDEX_VERSION`, the number
+/// the open-time ceiling check reads: the streaming file writer behind
+/// `serialize_rdf`, the streaming writer into a sink, compaction of a file
+/// store, and `to_bytes`.
+#[tokio::test]
+async fn test_every_writer_stamps_index_children_with_the_index_version() {
+    let index_versions = |bytes: &[u8]| -> Vec<(String, u32)> {
+        let (_, components) = container::store_metadata_of_bytes(bytes);
+        components
+            .into_iter()
+            .filter(|component| component.role == container::StoreComponentRole::Index)
+            .map(|component| (component.name, component.version))
+            .collect()
+    };
+    for layout in LAYOUTS {
+        for indexes in index_sets().into_iter().filter(|set| !set.is_empty()) {
+            let label = format!("{layout:?} {indexes:?}");
+            let quads = modular_quads(12, 3, 4);
+
+            let (_dir, path) = write_store_file(quads.clone(), layout, indexes.clone()).await;
+            let written = std::fs::read(&path).unwrap();
+            let mut sink: Vec<u8> = Vec::new();
+            crate::io::quads_stream_to_vortex_writer(
+                quad_stream(quads.clone()),
+                &mut sink,
+                layout,
+                indexes.clone(),
+            )
+            .await
+            .unwrap();
+            let compacted = VortexRdfStore::from_file(&path)
+                .await
+                .unwrap()
+                .compact()
+                .await
+                .unwrap();
+            drop(compacted);
+            let built = VortexRdfStore::from_quads(quad_stream(quads), layout, indexes.clone())
+                .await
+                .unwrap()
+                .to_bytes()
+                .await
+                .unwrap();
+
+            for (writer, bytes) in [
+                ("quads_stream_to_vortex_file", written),
+                ("quads_stream_to_vortex_writer", sink),
+                ("compact", std::fs::read(&path).unwrap()),
+                ("to_bytes", built),
+            ] {
+                let versions = index_versions(&bytes);
+                assert!(!versions.is_empty(), "{label}: {writer} wrote no index");
+                for (name, version) in versions {
+                    assert_eq!(
+                        version,
+                        container::INDEX_VERSION,
+                        "{label}: {writer} stamped {name}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// An index child of a version newer than the one this version reads is
+/// rejected at open like the dictionary child, whichever way the store is
+/// opened. The current version still opens.
+#[tokio::test]
+async fn test_open_rejects_an_index_version_newer_than_this_version_reads() {
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(dictionary_test_quads()),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    let parts = VortexRdfStore::from_built(arr)
+        .unwrap()
+        .to_serializable_parts()
+        .await
+        .unwrap();
+    let with_version = |version: u32| {
+        let mut writes = vec![parts.dict.as_ref().unwrap().to_write().unwrap()];
+        for component in &parts.components {
+            let mut write = component.to_write().unwrap();
+            write.descriptor.version = version;
+            writes.push(write);
+        }
+        writes
+    };
+
+    let bytes = unstamped_store_bytes(
+        vec![parts.array.clone()],
+        with_version(container::INDEX_VERSION),
+    )
+    .await;
+    let (from_bytes, from_file, _dir) = open_both(&bytes).await;
+    for (how, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
+        assert!(result.is_ok(), "{how}: the current version must open");
+    }
+
+    for version in [container::INDEX_VERSION + 1, 99, u32::MAX] {
+        let bytes = unstamped_store_bytes(vec![parts.array.clone()], with_version(version)).await;
+        let (from_bytes, from_file, dir) = open_both(&bytes).await;
+        let in_memory = open_in_memory(&dir).await;
+        for (how, result) in [
+            ("from_bytes", from_bytes),
+            ("from_file", from_file),
+            ("from_file_in_memory", in_memory),
+        ] {
+            let err = result
+                .err()
+                .unwrap_or_else(|| panic!("{how}: version {version} must be refused"));
+            let VortexRdfError::Deserialization(message) = &err else {
+                panic!("{how}: expected a Deserialization error, got {err:?}");
+            };
+            assert!(
+                message.contains(&format!("is version {version}"))
+                    && message
+                        .contains(&format!("reads up to version {}", container::INDEX_VERSION))
+                    && message.contains("written by a newer vortex-rdf")
+                    && message.contains("open it with a newer version"),
+                "{how}: unexpected error: {message}"
+            );
+        }
+    }
+}
+
+/// A root layout from a `vortex-rdf.store.*` generation this version does not
+/// know was written by a newer vortex-rdf: every open path says so and names
+/// the root layout.
+#[tokio::test]
+async fn test_open_rejects_a_root_layout_from_a_newer_vortex_rdf() {
+    let current: &[u8] = container::STORE_LAYOUT_ID.as_bytes();
+    let newer: &[u8] = b"vortex-rdf.store.v3";
+    assert_eq!(current.len(), newer.len());
+
+    for layout in [LayoutStrategy::Default, LayoutStrategy::Dictionary] {
+        let built = build_array::<SortedInMemoryBuilder>(
+            quad_stream(modular_quads(12, 3, 4)),
+            layout,
+            vec![IndexType::SecondaryByReference],
+        )
+        .await
+        .unwrap();
+        let mut bytes = VortexRdfStore::from_built(built)
+            .unwrap()
+            .to_bytes()
+            .await
+            .unwrap();
+        let at = bytes
+            .windows(current.len())
+            .position(|window| window == current)
+            .expect("the footer names the root layout");
+        bytes[at..at + newer.len()].copy_from_slice(newer);
+
+        let (from_bytes, from_file, dir) = open_both(&bytes).await;
+        let in_memory = open_in_memory(&dir).await;
+        for (how, result) in [
+            ("from_bytes", from_bytes),
+            ("from_file", from_file),
+            ("from_file_in_memory", in_memory),
+        ] {
+            let err = result
+                .err()
+                .unwrap_or_else(|| panic!("{layout:?}/{how}: a newer root must be refused"));
+            let VortexRdfError::Deserialization(message) = &err else {
+                panic!("{layout:?}/{how}: expected a Deserialization error, got {err:?}");
+            };
+            assert!(
+                message.contains("written by a newer vortex-rdf")
+                    && message.contains("vortex-rdf.store.v3")
+                    && message.contains("open it with a newer version"),
+                "{layout:?}/{how}: unexpected error: {message}"
+            );
+            assert!(
+                !message.contains("Invalid encoding ID"),
+                "{layout:?}/{how}: Vortex's own error leaked: {message}"
+            );
+        }
     }
 }
 
@@ -911,7 +1361,7 @@ async fn test_open_required_unknown_component_rejected_optional_skipped() {
     };
 
     let bytes = unstamped_store_bytes(vec![rows()], vec![unknown_component(true)]).await;
-    let (from_bytes, from_file) = open_both(&bytes).await;
+    let (from_bytes, from_file, _dir) = open_both(&bytes).await;
     for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
         let err = result.err().expect("open should fail");
         assert!(
@@ -922,7 +1372,7 @@ async fn test_open_required_unknown_component_rejected_optional_skipped() {
     }
 
     let bytes = unstamped_store_bytes(vec![rows()], vec![unknown_component(false)]).await;
-    let (from_bytes, from_file) = open_both(&bytes).await;
+    let (from_bytes, from_file, _dir) = open_both(&bytes).await;
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
         let store = result.unwrap_or_else(|e| panic!("{path}: open should succeed: {e}"));
@@ -978,7 +1428,7 @@ async fn test_open_rejects_index_child_with_mismatched_rows() {
         .collect();
     let bytes = unstamped_store_bytes(vec![parts.array.clone()], components).await;
 
-    let (from_bytes, from_file) = open_both(&bytes).await;
+    let (from_bytes, from_file, _dir) = open_both(&bytes).await;
     for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
         let err = result.err().expect("open should fail");
         assert!(
@@ -1103,9 +1553,9 @@ async fn test_written_code_columns_avoid_delta() {
             "{name} carries a delta-encoded column:\n{tree}"
         );
     }
-    // The guard bites: a 32 Ki-row sorted subject column is exactly what the
-    // stock cascade would delta-encode, and it stays on a word-addressable
-    // encoding instead.
+    // A 32 Ki-row sorted subject column is what the stock cascade would
+    // delta-encode; the pinned edition leaves delta out, so it stays on a
+    // word-addressable encoding.
     let quads_tree = &trees[0].1;
     assert!(
         [
@@ -1118,4 +1568,56 @@ async fn test_written_code_columns_avoid_delta() {
         .any(|id| quads_tree.contains(id)),
         "quads tree:\n{quads_tree}"
     );
+}
+
+/// The store's own files keep frame-of-reference on one reference per
+/// array: the pinned core edition the store writes with leaves out the
+/// per-chunk wire form (`fastlanes.for.v2`), which the chunk probes decline.
+/// The guard bites: with that form admitted, some of the fixture's
+/// frame-of-reference arrays take a reference per 1,024 rows.
+#[tokio::test]
+async fn test_written_frame_of_reference_keeps_one_reference() {
+    use vortex::encodings::fastlanes::{FoR, FoRArrayExt as _};
+    use vortex_array::{ArrayRef, IntoArray as _};
+
+    /// `(single, per_chunk)`: the frame-of-reference nodes in `array`'s
+    /// tree with one reference, and with a reference per chunk.
+    fn for_nodes(array: &ArrayRef, counts: &mut (usize, usize)) {
+        if let Some(view) = array.as_opt::<FoR>() {
+            if view.constant_reference().is_some() {
+                counts.0 += 1;
+            } else {
+                counts.1 += 1;
+            }
+        }
+        for child in array.children() {
+            for_nodes(&child, counts);
+        }
+    }
+
+    let graphs: Vec<GraphName> = (0..4)
+        .map(|i| GraphName::NamedNode(NamedNode::new(format!("http://example.org/g{i}")).unwrap()))
+        .collect();
+    let quads = graph_modular_quads(32_768, 5, 32, 1024, &graphs);
+    let store = VortexRdfStore::from_quads(
+        quad_stream(quads),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    let bytes = store.to_bytes().await.unwrap();
+    let adopted = VortexRdfStore::from_bytes_owned(bytes).await.unwrap();
+    let parts = adopted.to_serializable_parts().await.unwrap();
+    let mut counts = (0, 0);
+    for_nodes(&parts.array, &mut counts);
+    for component in &parts.components {
+        for_nodes(&component.rows().unwrap().clone().into_array(), &mut counts);
+    }
+    let (single, per_chunk) = counts;
+    assert_eq!(
+        per_chunk, 0,
+        "{per_chunk} frame-of-reference nodes carry per-chunk references"
+    );
+    assert!(single > 0, "the fixture wrote no frame-of-reference column");
 }

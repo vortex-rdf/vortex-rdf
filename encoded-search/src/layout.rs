@@ -131,6 +131,21 @@ impl ColumnChunks {
         &self.dtype
     }
 
+    /// Number of flat chunk leaves the column is cut into.
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// How many chunk leaves have been fetched so far: those whose probe was
+    /// resolved and those whose encoding declined it.
+    #[doc(hidden)]
+    pub fn fetched_chunks(&self) -> usize {
+        self.chunks
+            .iter()
+            .filter(|chunk| chunk.cell.get().is_some())
+            .count()
+    }
+
     /// Exact global `[lo, hi)` of `needle` in the column, fetching at most
     /// the chunks a binary search over chunk extremes touches (cached
     /// thereafter). Requires the sorted contract. `Ok(None)` when a needed
@@ -293,26 +308,19 @@ impl ColumnChunks {
     }
 }
 
-/// Reports the column's shape and how much of it has been fetched: chunks
-/// whose probe is resolved and cached have already cost a segment read.
+/// Reports the column's shape and how much of it has been fetched: a fetched
+/// chunk has already cost a segment read.
 impl std::fmt::Debug for ColumnChunks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ColumnChunks")
             .field("row_count", &self.row_count)
             .field("dtype", &self.dtype)
-            .field("chunks", &self.chunks.len())
+            .field("chunks", &self.chunk_count())
             .field(
                 "dictionary_coded",
                 &self.chunks.iter().filter(|c| c.dict.is_some()).count(),
             )
-            .field(
-                "fetched",
-                &self
-                    .chunks
-                    .iter()
-                    .filter(|c| c.cell.get().is_some())
-                    .count(),
-            )
+            .field("fetched", &self.fetched_chunks())
             .finish()
     }
 }

@@ -1,6 +1,6 @@
-//! Opening a serialized store: the file and bytes constructors, the
-//! component-roster interpretation every open path shares, and the
-//! dictionary-residency policy `from_file` applies.
+//! Opening a serialized store: the file constructors (memory-mapped, or
+//! loaded whole), the bytes constructors, and the component-roster
+//! interpretation every open path shares.
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::container;
@@ -22,9 +22,45 @@ use vortex_file::OpenOptionsSessionExt as _;
 use std::sync::Arc;
 
 use vortex_array::arrays::StructArray;
+use vortex_array::dtype::DType;
 use vortex_array::{IntoArray, VortexSessionExecute};
 
 use super::VortexRdfStore;
+use super::indexes::COL_RID;
+use super::schema::{CODE_PTYPE, ROW_ID_PTYPE, is_code_column_name};
+
+/// Refuse a table whose id columns are integers of a width other than the
+/// one this version reads: the readers take an integer `s`, `p`, `o`, `g`
+/// (the quad table and the copy index's children) or `val` (the reference
+/// index's) for a `u64` code column ([`TermCode`](super::TermCode)), and an
+/// index child's `rid` for a `u64` row id ([`RowId`](super::RowId)), so a
+/// file with narrower codes or row ids must not open. `table` names the
+/// table in the error.
+pub(super) fn check_id_columns(table: &str, dtype: &DType) -> Result<()> {
+    let DType::Struct(fields, _) = dtype else {
+        return Ok(());
+    };
+    for (name, field) in fields.names().iter().zip(fields.fields()) {
+        let DType::Primitive(ptype, _) = field else {
+            continue;
+        };
+        if is_code_column_name(name.as_ref()) && ptype != CODE_PTYPE {
+            return Err(VortexRdfError::Deserialization(format!(
+                "the {table} column {name} holds {ptype} term codes, but this version of \
+                 vortex-rdf reads {CODE_PTYPE} codes only; rebuild the store from its RDF \
+                 source"
+            )));
+        }
+        if name.as_ref() == COL_RID && ptype != ROW_ID_PTYPE {
+            return Err(VortexRdfError::Deserialization(format!(
+                "the {table} column {name} holds {ptype} row ids, but this version of \
+                 vortex-rdf reads {ROW_ID_PTYPE} row ids only; rebuild the store from its RDF \
+                 source"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// What one entry of a store's component roster means to this version.
 pub(super) enum ComponentKind {
@@ -41,7 +77,8 @@ pub(super) enum ComponentKind {
 
 /// Interpret one component descriptor for every open path (`from_file`,
 /// `from_bytes`, `scanned_index_components`), owning the rejection of a
-/// dictionary child of an unknown implementation and of an *uninterpretable
+/// dictionary child of an unknown implementation or of a version newer than
+/// [`DICT_VERSION`](container::DICT_VERSION), and of an *uninterpretable
 /// required* component: skipping one — a future change set, say — would
 /// silently change query results.
 pub(super) fn classify_component(
@@ -54,9 +91,31 @@ pub(super) fn classify_component(
                 descriptor.implementation, descriptor.version
             )));
         }
+        // Fail closed on a layout this reader was never checked against.
+        if descriptor.version > container::DICT_VERSION {
+            return Err(VortexRdfError::Deserialization(format!(
+                "unsupported dictionary component version: this store's dictionary component \
+                 is version {}, but this version of vortex-rdf reads up to version {}; \
+                 open it with a newer vortex-rdf",
+                descriptor.version,
+                container::DICT_VERSION
+            )));
+        }
         return Ok(ComponentKind::Dict);
     }
     if let Some(known) = crate::store::indexes::known_component(&descriptor.implementation) {
+        // Fail closed on a layout this reader was never checked against.
+        if descriptor.version > container::INDEX_VERSION {
+            return Err(VortexRdfError::Deserialization(format!(
+                "unsupported index component version: this store's component {} is version {}, \
+                 but this version of vortex-rdf reads up to version {}; it was written by a \
+                 newer vortex-rdf, so open it with a newer version of vortex-rdf",
+                descriptor.name,
+                descriptor.version,
+                container::INDEX_VERSION
+            )));
+        }
+        check_id_columns(&descriptor.name, &descriptor.dtype)?;
         return Ok(ComponentKind::Index(known));
     }
     if descriptor.required {
@@ -99,67 +158,68 @@ pub(super) async fn scanned_index_components(
     Ok(components)
 }
 
-/// Default residency ceiling for a Dictionary-layout file's term dictionary:
-/// up to this many bytes of dictionary child (its FSST-compressed size in the
-/// file, known from the footer with no I/O) the dictionary is lifted resident
-/// at open; above it the dictionary stays file-backed and every store keeps a
-/// bounded footprint however large its term set.
-#[cfg(feature = "file-io")]
-const DICT_MAX_RESIDENT_BYTES_DEFAULT: u64 = 512 << 20;
-
-/// The residency ceiling, with the `VORTEX_RDF_DICT_MAX_RESIDENT_BYTES`
-/// environment override (see [`dict_max_resident_bytes_from`]).
-#[cfg(feature = "file-io")]
-fn dict_max_resident_bytes() -> u64 {
-    dict_max_resident_bytes_from(std::env::var_os("VORTEX_RDF_DICT_MAX_RESIDENT_BYTES"))
-}
-
-/// The residency ceiling from the raw environment value: a plain byte count;
-/// unset or unparseable values fall back to
-/// [`DICT_MAX_RESIDENT_BYTES_DEFAULT`].
-#[cfg(feature = "file-io")]
-fn dict_max_resident_bytes_from(raw: Option<std::ffi::OsString>) -> u64 {
-    raw.and_then(|v| v.into_string().ok())
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DICT_MAX_RESIDENT_BYTES_DEFAULT)
-}
-
 impl VortexRdfStore {
-    /// Open a Vortex file lazily; no data is read until queried — except for
-    /// Dictionary-layout files, whose dictionary child is lifted resident
-    /// when its size fits the residency threshold.
+    /// Open a store file memory-mapped (`memmap2`, through Vortex's
+    /// `open_buffer`): a segment read is a slice of the map, so what stays
+    /// in RAM is the kernel's page cache — file-backed, reclaimable RSS —
+    /// never a copy on this process's heap. Only the footer is read up
+    /// front; under the Dictionary layout the dictionary child's per-window
+    /// term bounds are read too.
+    ///
+    /// The file is read in place for the store's lifetime: it must not be
+    /// truncated or rewritten while open. Replacing it by a rename (as
+    /// [`compact`](Self::compact) and the file writers do) is fine on Unix,
+    /// where the mapping keeps the old file; Windows refuses to rename over a
+    /// mapped file.
+    /// Network filesystems are not supported for mapping.
     #[cfg(feature = "file-io")]
     pub async fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
-        Self::from_file_with_dict_residency(path, dict_max_resident_bytes()).await
+        Self::open_file(path, read::FileAccess::Mapped).await
     }
 
-    /// [`from_file`](Self::from_file) with an explicit residency threshold: a
-    /// Dictionary-layout file whose dictionary child exceeds
-    /// `max_resident_bytes` (its size in the file, FSST-compressed) keeps the
-    /// dictionary file-backed — probed and decoded by scans through the
-    /// bounded reader — instead of lifting it into memory.
-    ///
-    /// `from_file` uses the built-in default (overridable through the
-    /// `VORTEX_RDF_DICT_MAX_RESIDENT_BYTES` environment variable); this entry
-    /// pins the choice per open — `0` forces file-backed, `u64::MAX` forces
-    /// resident. On a file-backed store the synchronous dictionary surface
-    /// ([`code_read_snapshot`](Self::code_read_snapshot)) answers `None`;
-    /// queries and reconstruction work unchanged.
+    /// Load a store file whole into memory — quad rows, dictionary and every
+    /// index child — through Vortex's file reader rather than a mapping, so
+    /// the loaded store owns its memory and never reads the file again: the
+    /// explicit "load everything" opt-in (Python's `in_memory=True`). The
+    /// file is opened, then its [`to_serializable_parts`](Self::to_serializable_parts)
+    /// are adopted through [`from_parts`](Self::from_parts).
     #[cfg(feature = "file-io")]
-    pub async fn from_file_with_dict_residency<P: AsRef<std::path::Path>>(
+    pub async fn from_file_in_memory<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        let opened = Self::open_file(path, read::FileAccess::Read).await?;
+        Self::from_parts(opened.to_serializable_parts().await?)
+    }
+
+    /// The open behind both: footer, component roster and resolved layout,
+    /// the file reached through `access`. The dictionary stays in its child —
+    /// unless the child's shape declines the file-backed handle, and holding
+    /// it whole is then the only way to read it at all.
+    #[cfg(feature = "file-io")]
+    async fn open_file<P: AsRef<std::path::Path>>(
         path: P,
-        max_resident_bytes: u64,
+        access: read::FileAccess,
     ) -> Result<Self> {
-        // Remember the source path before it is consumed below, so compaction
-        // can later rewrite the compacted rows back over it.
-        let source_path = path.as_ref().to_path_buf();
         // Opens the file footer only (schema + layout metadata); no row data
-        // is read yet. The returned handle caches its layout reader tree so
-        // later scans/prunes across this store (and stores derived from it)
-        // share decoded zone-map stats instead of re-reading them each time.
+        // is read yet. The handle owns the reader tree, so scans and prunes
+        // across this store (and stores derived from it) share decoded
+        // zone-map stats instead of re-reading them each time.
         let file = Arc::new(NativeStoreFile::try_new(
-            read::open_vortex_file(path).await?,
+            read::open_vortex_file(path.as_ref(), access).await?,
         )?);
+        // The file's absolute path, which compaction rewrites the compacted
+        // rows back over: a later change of the working directory does not
+        // move it.
+        let source_path = std::path::absolute(path.as_ref())
+            .map_err(|e| crate::error::path_error("resolve", path.as_ref(), e))?;
+        check_id_columns("quad table", file.dtype())?;
+        log::debug!(
+            "[open] {} {}",
+            source_path.display(),
+            if file.is_mapped() {
+                "memory-mapped"
+            } else {
+                "through the file reader"
+            }
+        );
         // Interpret the component roster: the dictionary child feeds the
         // layout below, index children map onto the index set, and unknown
         // components are skipped when optional, fatal when required (a
@@ -198,21 +258,11 @@ impl VortexRdfStore {
                                 .to_string(),
                         )
                     })?;
-                let dict_bytes = file
-                    .component_bytes(container::DICT_COMPONENT_NAME)
-                    .map_err(VortexRdfError::Vortex)?
-                    .expect("the dictionary component resolved above");
-                // A dictionary that fits the residency budget is held whole.
-                // A larger one stays in its child, read through the chunk
+                // The dictionary stays in its child, read through the chunk
                 // leaves a probe or decode touches — unless the child's
                 // layout shape declines that handle, and holding it whole is
                 // then the only way to read it at all.
-                let file_backed = if dict_bytes <= max_resident_bytes {
-                    None
-                } else {
-                    FileBackedDict::open(&file)?
-                };
-                let access = match file_backed {
+                let dict_access = match FileBackedDict::open(&file).await? {
                     Some(dict) => DictAccess::FileBacked(dict),
                     // One full scan of the dictionary child — chunks keep
                     // their FSST.
@@ -220,7 +270,7 @@ impl VortexRdfStore {
                         TermDictionary::from_child_reader(reader).await?,
                     )),
                 };
-                ResolvedLayout::Dictionary(access)
+                ResolvedLayout::Dictionary(dict_access)
             }
         };
         // No filter and no selection yet: this view covers all quad rows.
@@ -232,7 +282,6 @@ impl VortexRdfStore {
             indexes,
             quads: QuadsSource::File {
                 path: source_path,
-                dict_max_resident_bytes: max_resident_bytes,
                 file,
                 filter: None,
                 selection: ViewSelection::all(),
@@ -272,13 +321,15 @@ impl VortexRdfStore {
     /// whenever the caller already owns the bytes; `from_bytes` copies a
     /// borrowed slice into one.
     pub async fn from_bytes_owned(bytes: impl Into<vortex_buffer::ByteBuffer>) -> Result<Self> {
+        let bytes: vortex_buffer::ByteBuffer = bytes.into();
         let file = VORTEX_SESSION
             .open_options()
-            .open_buffer(bytes.into())
-            .map_err(VortexRdfError::Vortex)?;
+            .open_buffer(bytes.clone())
+            .map_err(|error| read::open_failure(error, container::newer_root_id(&bytes)))?;
         if !container::is_native_file(&file) {
             return Err(read::unsupported_file_error(&file));
         }
+        check_id_columns("quad table", file.dtype())?;
         // The root scan is the transparent quad child.
         let quads = read::scan_all(&file).await?;
         let root = file.footer().layout();
@@ -333,25 +384,5 @@ impl VortexRdfStore {
         }
         let layout = super::resolved_layout(dict, quads.dtype())?;
         Self::assemble_resident(quads, components, layout)
-    }
-}
-
-#[cfg(all(test, feature = "file-io"))]
-mod tests {
-    use super::{DICT_MAX_RESIDENT_BYTES_DEFAULT, dict_max_resident_bytes_from};
-    use std::ffi::OsString;
-
-    #[test]
-    fn dict_max_resident_bytes_override() {
-        assert_eq!(dict_max_resident_bytes_from(Some(OsString::from("0"))), 0);
-        assert_eq!(dict_max_resident_bytes_from(Some(OsString::from("12"))), 12);
-        assert_eq!(
-            dict_max_resident_bytes_from(Some(OsString::from("nope"))),
-            DICT_MAX_RESIDENT_BYTES_DEFAULT
-        );
-        assert_eq!(
-            dict_max_resident_bytes_from(None),
-            DICT_MAX_RESIDENT_BYTES_DEFAULT
-        );
     }
 }

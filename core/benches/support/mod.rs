@@ -160,7 +160,7 @@ pub fn materialize_quads(size: usize) -> Vec<RawQuad> {
 
 /// Run a quad stream's ingest to the builder's `BuiltArray`: the quad array
 /// plus whatever travels beside it — under the Dictionary layout the array
-/// holds only u32 codes and the term dictionary rides alongside; `from_built`
+/// holds only term codes and the term dictionary rides alongside; `from_built`
 /// is the one constructor that accepts that pair.
 fn ingest(
     quads: impl Stream<Item = Result<RawQuad>> + Unpin + Send + 'static,

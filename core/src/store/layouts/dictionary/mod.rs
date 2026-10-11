@@ -1,5 +1,5 @@
 //! Column-building and decoding logic for [`LayoutStrategy::Dictionary`]:
-//! s/p/o/g stored as u32 codes into a global sorted term dictionary (see
+//! s/p/o/g stored as [`TermCode`]s (`u64`) into a global sorted term dictionary (see
 //! [`term_dict`](self::term_dict)), which travels beside the array in memory
 //! and reaches serialized files as the native container's `dictionary` child
 //! (see `crate::io::container`).
@@ -38,13 +38,14 @@ use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::array::{field_as, stamp_is_sorted};
-use crate::store::schema::{COL_G, COL_O, COL_P, COL_S, PRIMARY_COLUMNS};
+use crate::store::schema::{COL_G, COL_O, COL_P, COL_S, PRIMARY_COLUMNS, TermCode};
 
 pub(crate) mod access;
 #[cfg(feature = "file-io")]
 pub(crate) mod file_backed;
 pub(crate) mod ingest;
 pub mod predicates;
+mod regex_filter;
 pub(crate) mod term_dict;
 
 #[cfg(feature = "file-io")]
@@ -54,23 +55,23 @@ pub use self::ingest::DictionaryQuadSink;
 // wasm32-unknown-unknown.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) use self::ingest::{TermCodeMap, TermDictionaryBuilder};
-pub use self::predicates::{Domain, KindRanges, NumOp, TermPredicate, Verdict};
+pub use self::predicates::{CaseMap, KindRanges, NumOp, TermPredicate, TextOptions, Verdict};
 use self::term_dict::DictCursor;
 pub(crate) use self::term_dict::TermDictionary;
 pub use self::term_dict::{DictReader, DictSnapshot};
 
-/// The primary columns: `s`, `p`, `o`, `g` (all u32 codes).
+/// The primary columns: `s`, `p`, `o`, `g` (all [`TermCode`]s).
 pub(crate) const COLUMNS: &[&str] = &PRIMARY_COLUMNS;
 
-/// Dictionary-encoded quad columns: [`RawQuad`] terms replaced by their u32
+/// Dictionary-encoded quad columns: [`RawQuad`] terms replaced by their
 /// codes in the global sorted term dictionary. Produced by the Dictionary
 /// layout's encoding pass and consumed by index builders, which can work on
 /// codes directly (sorted-dictionary codes preserve lexicographic order).
 pub(crate) struct QuadCodes {
-    pub(crate) s: Vec<u32>,
-    pub(crate) p: Vec<u32>,
-    pub(crate) o: Vec<u32>,
-    pub(crate) g: Vec<u32>,
+    pub(crate) s: Vec<TermCode>,
+    pub(crate) p: Vec<TermCode>,
+    pub(crate) o: Vec<TermCode>,
+    pub(crate) g: Vec<TermCode>,
 }
 
 impl QuadCodes {
@@ -95,7 +96,7 @@ impl QuadCodes {
 /// makes the `get(term)` lookup identical for either.
 ///
 /// [`BorrowedTermCodeMap`]: self::ingest::BorrowedTermCodeMap
-pub(crate) fn code_of<K>(code_map: &HashMap<K, u32>, term: &str) -> Result<u32>
+pub(crate) fn code_of<K>(code_map: &HashMap<K, TermCode>, term: &str) -> Result<TermCode>
 where
     K: Borrow<str> + Eq + Hash,
 {
@@ -108,13 +109,16 @@ where
 }
 
 /// Encode every term of every quad to its dictionary code (see [`code_of`]).
-pub(crate) fn encode_quads<K>(quads: &[RawQuad], code_map: &HashMap<K, u32>) -> Result<QuadCodes>
+pub(crate) fn encode_quads<K>(
+    quads: &[RawQuad],
+    code_map: &HashMap<K, TermCode>,
+) -> Result<QuadCodes>
 where
     K: Borrow<str> + Eq + Hash,
 {
     let start = debug::timer();
-    let encode_column = |term_of: fn(&RawQuad) -> &str| -> Result<Vec<u32>> {
-        let mut codes: Vec<u32> = Vec::with_capacity(quads.len());
+    let encode_column = |term_of: fn(&RawQuad) -> &str| -> Result<Vec<TermCode>> {
+        let mut codes: Vec<TermCode> = Vec::with_capacity(quads.len());
         for q in quads {
             codes.push(code_of(code_map, term_of(q))?);
         }
@@ -136,14 +140,14 @@ where
     Ok(codes)
 }
 
-/// Build a Dictionary-layout StructArray chunk from raw quads: four u32 code
+/// Build a Dictionary-layout StructArray chunk from raw quads: four code
 /// columns encoded against the global dictionary. Secondary indexes are built
 /// separately as components (see
 /// [`build_components_from_codes`](crate::store::builders::build_components_from_codes)),
 /// so nothing else rides here.
 pub(crate) fn build_chunk<K>(
     quads: &[RawQuad],
-    code_map: &HashMap<K, u32>,
+    code_map: &HashMap<K, TermCode>,
     s_sorted: bool,
 ) -> Result<ArrayRef>
 where
@@ -170,7 +174,7 @@ pub(crate) fn build_array(codes: &QuadCodes) -> Result<ArrayRef> {
 }
 
 /// Build a Dictionary-layout chunk for rows `range` of an already encoded
-/// dataset: the four u32 code columns, and nothing else. The term dictionary
+/// dataset: the four code columns, and nothing else. The term dictionary
 /// is *not* a column of the chunk: in memory it lives in the layout
 /// ([`DictAccess`]), and serialized files carry it as the native container's
 /// `dictionary` child.
@@ -213,8 +217,8 @@ pub(crate) fn empty_struct() -> Result<ArrayRef> {
     build_code_chunk(&QuadCodes::empty(), 0..0, false)
 }
 
-/// The four primary code columns of a chunk, as arrays whose `u32` slices the
-/// decoders read. Returned by value: the slices borrow these arrays, so they
+/// The four primary code columns of a chunk, as arrays whose [`TermCode`]
+/// slices the decoders read. Returned by value: the slices borrow these arrays, so they
 /// must outlive the decode.
 fn code_columns(
     chunk: &ArrayRef,
@@ -238,40 +242,41 @@ fn code_columns(
 /// chunked dictionary, one warm chunk cursor) per role — the roles occupy
 /// different regions of the sorted term space.
 trait TermSource {
-    fn str_at(&mut self, role: usize, code: u32) -> Result<&str>;
+    fn str_at(&mut self, role: usize, code: TermCode) -> Result<&str>;
 }
 
-/// Reject a code outside a dictionary of `n_terms` terms.
-fn check_code(code: u32, n_terms: usize) -> Result<()> {
-    if code as usize >= n_terms {
-        return Err(VortexRdfError::Deserialization(format!(
+/// The rank of `code` in a dictionary of `n_terms` terms whose first code
+/// is `base`, or the error for a code outside it.
+fn check_code(code: TermCode, base: TermCode, n_terms: usize) -> Result<usize> {
+    term_dict::code_rank(code, base, n_terms).ok_or_else(|| {
+        VortexRdfError::Deserialization(format!(
             "Term code {} out of dictionary bounds ({})",
             code, n_terms
-        )));
-    }
-    Ok(())
+        ))
+    })
 }
 
 /// Term strings read from a resident dictionary.
 struct DictTerms<'a> {
     cursors: [DictCursor<'a>; 4],
+    base: TermCode,
     n_terms: usize,
 }
 
 impl TermSource for DictTerms<'_> {
-    fn str_at(&mut self, role: usize, code: u32) -> Result<&str> {
-        check_code(code, self.n_terms)?;
-        self.cursors[role].str_at(code as usize)
+    fn str_at(&mut self, role: usize, code: TermCode) -> Result<&str> {
+        let rank = check_code(code, self.base, self.n_terms)?;
+        self.cursors[role].str_at(rank)
     }
 }
 
 /// Term strings read from a pre-resolved map (the file-backed path).
 #[cfg(feature = "file-io")]
-struct MappedTerms<'a>(&'a HashMap<u32, Arc<str>>);
+struct MappedTerms<'a>(&'a HashMap<TermCode, Arc<str>>);
 
 #[cfg(feature = "file-io")]
 impl MappedTerms<'_> {
-    fn get(&self, code: u32) -> Result<&Arc<str>> {
+    fn get(&self, code: TermCode) -> Result<&Arc<str>> {
         self.0.get(&code).ok_or_else(|| {
             VortexRdfError::Deserialization(format!(
                 "Term code {} missing from the chunk's resolved term map",
@@ -283,7 +288,7 @@ impl MappedTerms<'_> {
 
 #[cfg(feature = "file-io")]
 impl TermSource for MappedTerms<'_> {
-    fn str_at(&mut self, _role: usize, code: u32) -> Result<&str> {
+    fn str_at(&mut self, _role: usize, code: TermCode) -> Result<&str> {
         self.get(code).map(|term| &**term)
     }
 }
@@ -305,7 +310,7 @@ const MEMO_MIN_ROWS: usize = 16;
 /// column's cardinality, so a high-cardinality column like subjects cannot
 /// accumulate entries it never reads again.
 struct TermMemo<T> {
-    slots: Vec<Option<(u32, T)>>,
+    slots: Vec<Option<(TermCode, T)>>,
     mask: usize,
 }
 
@@ -325,11 +330,13 @@ impl<T: Clone> TermMemo<T> {
         }
     }
 
-    fn get_or_insert(&mut self, code: u32, decode: impl FnOnce() -> Result<T>) -> Result<T> {
+    fn get_or_insert(&mut self, code: TermCode, decode: impl FnOnce() -> Result<T>) -> Result<T> {
         if self.slots.is_empty() {
             return decode();
         }
-        let slot = &mut self.slots[code as usize & self.mask];
+        // The low bits pick the slot: `mask` is below the slot count, which
+        // is a `usize`, so the masked code fits one on every target.
+        let slot = &mut self.slots[(code & self.mask as TermCode) as usize];
         if let Some((cached, term)) = slot
             && *cached == code
         {
@@ -344,10 +351,10 @@ impl<T: Clone> TermMemo<T> {
 /// Decode a chunk's code columns into quads, reading each distinct code's
 /// term at most once per role (see [`TermMemo`]).
 fn decode_codes(
-    s_codes: &[u32],
-    p_codes: &[u32],
-    o_codes: &[u32],
-    g_codes: &[u32],
+    s_codes: &[TermCode],
+    p_codes: &[TermCode],
+    o_codes: &[TermCode],
+    g_codes: &[TermCode],
     src: &mut impl TermSource,
 ) -> Vec<Result<Quad>> {
     let n = s_codes.len();
@@ -382,13 +389,14 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Resul
     };
     let mut src = DictTerms {
         cursors: [dict.cursor(), dict.cursor(), dict.cursor(), dict.cursor()],
+        base: dict.base(),
         n_terms: dict.len(),
     };
     decode_codes(
-        s_col.as_slice::<u32>(),
-        p_col.as_slice::<u32>(),
-        o_col.as_slice::<u32>(),
-        g_col.as_slice::<u32>(),
+        s_col.as_slice::<TermCode>(),
+        p_col.as_slice::<TermCode>(),
+        o_col.as_slice::<TermCode>(),
+        g_col.as_slice::<TermCode>(),
         &mut src,
     )
 }
@@ -402,7 +410,7 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Resul
 /// [`raw_quads`]: crate::store::layouts::ResolvedLayout::raw_quads
 pub(super) fn decode_code_column<T: Clone + for<'a> From<&'a str>>(
     dict: &TermDictionary,
-    codes: &[u32],
+    codes: &[TermCode],
 ) -> Result<Vec<T>> {
     let mut cursor = dict.cursor();
     let mut memo: TermMemo<T> = TermMemo::new(codes.len());
@@ -410,8 +418,8 @@ pub(super) fn decode_code_column<T: Clone + for<'a> From<&'a str>>(
         .iter()
         .map(|&code| {
             memo.get_or_insert(code, || {
-                check_code(code, dict.len())?;
-                cursor.str_at(code as usize).map(T::from)
+                let rank = check_code(code, dict.base(), dict.len())?;
+                cursor.str_at(rank).map(T::from)
             })
         })
         .collect()
@@ -428,10 +436,10 @@ fn shared_rows(
     dict: &TermDictionary,
 ) -> Result<Vec<crate::common::quad::SharedQuad>> {
     let (s_col, p_col, o_col, g_col) = code_columns(chunk)?;
-    let s = decode_code_column::<Arc<str>>(dict, s_col.as_slice::<u32>())?;
-    let p = decode_code_column::<Arc<str>>(dict, p_col.as_slice::<u32>())?;
-    let o = decode_code_column::<Arc<str>>(dict, o_col.as_slice::<u32>())?;
-    let g = decode_code_column::<Arc<str>>(dict, g_col.as_slice::<u32>())?;
+    let s = decode_code_column::<Arc<str>>(dict, s_col.as_slice::<TermCode>())?;
+    let p = decode_code_column::<Arc<str>>(dict, p_col.as_slice::<TermCode>())?;
+    let o = decode_code_column::<Arc<str>>(dict, o_col.as_slice::<TermCode>())?;
+    let g = decode_code_column::<Arc<str>>(dict, g_col.as_slice::<TermCode>())?;
     Ok(s.into_iter()
         .zip(p)
         .zip(o)
@@ -454,25 +462,25 @@ pub(crate) fn decode_chunk_shared(
 /// The distinct term codes a chunk's four code columns reference, ascending —
 /// what a file-backed dictionary must resolve to decode the chunk.
 #[cfg(feature = "file-io")]
-pub(crate) fn unique_codes(chunk: &ArrayRef) -> Result<Vec<u32>> {
+pub(crate) fn unique_codes(chunk: &ArrayRef) -> Result<Vec<TermCode>> {
     let (s, p, o, g) = code_columns(chunk)?;
-    let mut codes: Vec<u32> = Vec::with_capacity(s.len().saturating_mul(4));
+    let mut codes: Vec<TermCode> = Vec::with_capacity(s.len().saturating_mul(4));
     for col in [&s, &p, &o, &g] {
-        codes.extend_from_slice(col.as_slice::<u32>());
+        codes.extend_from_slice(col.as_slice::<TermCode>());
     }
     codes.sort_unstable();
     codes.dedup();
     Ok(codes)
 }
 
-/// Resolve a chunk's distinct codes to terms with one scan of a file-backed
-/// dictionary, keyed for [`decode_chunk_mapped`] and
-/// [`decode_chunk_mapped_shared`].
+/// Resolve a chunk's distinct codes to terms with one read of the windows of
+/// a file-backed dictionary that hold them, keyed for [`decode_chunk_mapped`]
+/// and [`decode_chunk_mapped_shared`].
 #[cfg(feature = "file-io")]
 pub(crate) async fn resolve_chunk_terms(
     fb: &FileBackedDict,
     chunk: &ArrayRef,
-) -> Result<HashMap<u32, Arc<str>>> {
+) -> Result<HashMap<TermCode, Arc<str>>> {
     let codes = unique_codes(chunk)?;
     let terms = fb.decode_many(&codes).await?;
     Ok(codes.into_iter().zip(terms).collect())
@@ -480,22 +488,22 @@ pub(crate) async fn resolve_chunk_terms(
 
 /// [`decode_chunk`] against a pre-resolved code→term map instead of a
 /// resident dictionary — the file-backed reconstruction path: the caller
-/// resolves the chunk's [`unique_codes`] with one scan and decodes with the
-/// resulting map.
+/// resolves the chunk's [`unique_codes`] with one read of the dictionary
+/// and decodes with the resulting map.
 #[cfg(feature = "file-io")]
 pub(crate) fn decode_chunk_mapped(
     chunk: &ArrayRef,
-    terms: &HashMap<u32, Arc<str>>,
+    terms: &HashMap<TermCode, Arc<str>>,
 ) -> Vec<Result<Quad>> {
     let (s_col, p_col, o_col, g_col) = match code_columns(chunk) {
         Ok(cols) => cols,
         Err(e) => return vec![Err(e)],
     };
     decode_codes(
-        s_col.as_slice::<u32>(),
-        p_col.as_slice::<u32>(),
-        o_col.as_slice::<u32>(),
-        g_col.as_slice::<u32>(),
+        s_col.as_slice::<TermCode>(),
+        p_col.as_slice::<TermCode>(),
+        o_col.as_slice::<TermCode>(),
+        g_col.as_slice::<TermCode>(),
         &mut MappedTerms(terms),
     )
 }
@@ -506,16 +514,16 @@ pub(crate) fn decode_chunk_mapped(
 #[cfg(feature = "file-io")]
 pub(crate) fn decode_chunk_mapped_shared(
     chunk: &ArrayRef,
-    terms: &HashMap<u32, Arc<str>>,
+    terms: &HashMap<TermCode, Arc<str>>,
 ) -> Vec<Result<crate::common::quad::SharedQuad>> {
     let rows = || -> Result<Vec<crate::common::quad::SharedQuad>> {
         let (s_col, p_col, o_col, g_col) = code_columns(chunk)?;
         let terms = MappedTerms(terms);
         let (s, p, o, g) = (
-            s_col.as_slice::<u32>(),
-            p_col.as_slice::<u32>(),
-            o_col.as_slice::<u32>(),
-            g_col.as_slice::<u32>(),
+            s_col.as_slice::<TermCode>(),
+            p_col.as_slice::<TermCode>(),
+            o_col.as_slice::<TermCode>(),
+            g_col.as_slice::<TermCode>(),
         );
         (0..s.len())
             .map(|i| {

@@ -14,8 +14,8 @@ use vortex_array::arrays::{Chunked, Constant, Dict, Primitive, Shared, Slice};
 use vortex_array::dtype::PType;
 use vortex_array::scalar::PValue;
 use vortex_fastlanes::{
-    BitPacked, BitPackedArrayExt as _, BitPackedSlots, Delta, DeltaArrayExt as _, DeltaSlots, FoR,
-    FoRArrayExt as _, FoRSlots,
+    BitPacked, BitPackedArrayExt as _, BitPackedSlots, BitWidthsView, Delta, DeltaArrayExt as _,
+    DeltaSlots, FoR, FoRArrayExt as _, FoRSlots,
 };
 use vortex_runend::{RunEnd, RunEndArrayExt as _, RunEndSlots};
 use vortex_sequence::Sequence;
@@ -84,7 +84,10 @@ pub(crate) fn resolve_node<'a>(arr: &'a ArrayRef) -> Option<Node<'a>> {
     }
 
     if let Some(view) = arr.as_opt::<FoR>() {
-        let reference = u64::try_from(view.reference_scalar()).ok()?;
+        // One reference for the whole array (the `fastlanes.for` wire form).
+        // Per-chunk references (`fastlanes.for.v2`) decline: a needle maps to
+        // a different encoded value in every chunk.
+        let reference = u64::try_from(&view.constant_reference()?).ok()?;
         let child = resolve_node(slot(view.slots(), FoRSlots::ENCODED)?)?;
         return Some(Node::FoR {
             reference,
@@ -93,6 +96,11 @@ pub(crate) fn resolve_node<'a>(arr: &'a ArrayRef) -> Option<Node<'a>> {
     }
 
     if let Some(view) = arr.as_opt::<BitPacked>() {
+        // One bit width for every block; per-block widths (no wire form yet)
+        // decline, since a block's words no longer sit at a fixed stride.
+        let BitWidthsView::Global(bit_width) = view.bit_widths() else {
+            return None;
+        };
         let data = view.data();
         let packed = match dtype.as_ptype() {
             PType::U8 => Words::U8(data.packed_slice::<u8>()),
@@ -120,7 +128,7 @@ pub(crate) fn resolve_node<'a>(arr: &'a ArrayRef) -> Option<Node<'a>> {
         };
         return Some(Node::BitPacked(PackedNode {
             packed,
-            bit_width: usize::from(data.bit_width()),
+            bit_width: usize::from(bit_width),
             offset: usize::from(data.offset()),
             len: arr.len(),
             patches,

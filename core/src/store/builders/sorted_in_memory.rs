@@ -8,6 +8,12 @@
 //! [`sorted_stream`](super::sorted_stream). Only this file's ordering
 //! discipline lives here — the emission machinery it drives belongs to
 //! [`builders`](super).
+//!
+//! Quads are unique and terms are canonical in what this builder emits. The
+//! sort is followed by dropping adjacent repeats, before any column or index
+//! child is built, so the rows, the row ids and every child describe the
+//! same deduplicated dataset. Terms are interned by the spelling the parser
+//! gave them, which is the one canonical spelling of an RDF term.
 
 use super::{
     BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_ROWS, VortexArrayBuilder, build_components,
@@ -46,7 +52,7 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
         // sorted.
         //
         // Dictionary layout interns terms as the stream drains, so the sort
-        // runs over 16-byte coded rows and no `Vec<RawQuad>` (four owned
+        // runs over 32-byte coded rows and no `Vec<RawQuad>` (four owned
         // Strings per quad) ever accumulates.
         let (n, build_start, built);
         if layout == LayoutStrategy::Dictionary {
@@ -89,7 +95,8 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
     }
 }
 
-/// Ingest the full quad stream and sort it globally by (s, p, o, g).
+/// Ingest the full quad stream and sort it globally by (s, p, o, g), keeping
+/// each distinct quad once: equal quads are adjacent after the sort.
 async fn ingest_and_sort(
     mut quads_in: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
 ) -> Result<Vec<RawQuad>> {
@@ -101,9 +108,12 @@ async fn ingest_and_sort(
 
     let sort_start = debug::timer();
     quads.sort_unstable();
+    let ingested = quads.len();
+    quads.dedup();
     log::debug!(
-        "[SortedInMemoryBuilder] Sorted quads in {:?}",
-        debug::elapsed(sort_start)
+        "[SortedInMemoryBuilder] Sorted quads in {:?}, dropped {} repeats",
+        debug::elapsed(sort_start),
+        ingested - quads.len()
     );
 
     Ok(quads)

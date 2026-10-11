@@ -12,7 +12,7 @@ Vortex-RDF is a columnar RDF serialization and a queryable quad store built on t
 ## Key features
 
 - 📊 **Columnar storage**: quads are [Vortex](https://docs.vortex.dev/specs/file-format) arrays, on disk and in memory alike, with the same layout in both.
-- ♻️ **Zero-copy reads**: opening a file is lazy, and pattern filters are pushed down into the scan so only the touched chunks are read.
+- ♻️ **Zero-copy reads**: opening a file memory-maps it and reads only its footer (and, under the Dictionary layout, the dictionary's window bounds), and pattern filters are pushed down into the scan so only the touched chunks are read.
 - 📦 **Adaptive compression**: Vortex picks per-column encodings (FSST, dictionary, run-length, bit-packing, …) and decompresses just in time.
 - ☄️ **Streaming, out-of-core ingestion**: datasets larger than RAM are globally sorted through an external merge sort with bounded memory.
 - 🍀 **RDF 1.1 quads**: named graphs `(s, p, o, g)`, blank nodes, language-tagged and typed literals.
@@ -44,7 +44,7 @@ let quads = parse_quads_from_reader(std::fs::File::open("data.ttl")?, RdfFormat:
 let indexes = vec![IndexType::SecondaryByReference];
 quads_stream_to_vortex_file(quads, "data.vortex".as_ref(), LayoutStrategy::Dictionary, indexes).await?;
 
-// Open it lazily: nothing is read until a query runs
+// Open it memory-mapped: a query reads only the pages it touches
 let store = VortexRdfStore::from_file("data.vortex").await?;
 
 // Match a pattern; the filter is pushed down into the file scan
@@ -126,13 +126,13 @@ for await (const quad of store.match(null, 'http://ex/p', null, null)) {
 
 ## Main concepts overview
 
-- **Column layouts** — `Default` stores the four terms as N-Triples strings; `TypedObject` splits the object into kind/value/datatype/language columns; `Dictionary` stores `u32` codes into one sorted term dictionary, held as the file's `dictionary` child and point-read through its chunk leaves when it stays file-backed. See [docs/file-format.md §4–5](docs/file-format.md#4-the-quad-table).
+- **Column layouts** — `Default` stores the four terms as N-Triples strings; `TypedObject` splits the object into kind/value/datatype/language columns; `Dictionary` stores `u64` codes into one sorted term dictionary of at most `i32::MAX` terms, held as the file's `dictionary` child and read in place from the mapped file, one FSST window at a time. See [docs/file-format.md §4–5](docs/file-format.md#4-the-quad-table).
 - **Secondary indexes** — `SecondaryByCopy` keeps two extra copies of the quads sorted by `(p, o, s, g)` and `(o, s, p, g)`; `SecondaryByReference` keeps sorted `{val, rid}` pairs for predicates and objects. In memory they are binary-searched; in a file, a run is located by a chunk-probe binary search, then range-scanned or point-read. See [docs/file-format.md §6](docs/file-format.md#6-the-index-children) and [docs/matching.md §8](docs/matching.md#8-the-index-resolvers).
-- **Builders** — every build sorts globally by `(s, p, o, g)`: in memory on wasm, out of core (spilling sorted runs to disk) everywhere a filesystem exists. See [docs/serialization.md](docs/serialization.md).
-- **The store** — a base (array or lazily scanned file) plus a view: a row selection, tombstone masks and an append tail; `match_pattern` routes each bound position to the cheapest path (subject prefix probe, index, pushed-down filter, mask scan) and matches the tail independently. See [docs/matching.md](docs/matching.md).
-- **Narrowing beyond a pattern** — `keep` restricts a view to a code set or range per column (a `VALUES` block, a term predicate's codes, a namespace) inside the store; `window`/`size_capped`/`exists` stop a filtered file scan at the first block that fills a `LIMIT` or answers an `ASK`; `match_many` batches probes; `DictReader` serves the dictionary under either residency with `prefix_range`, `filter_codes` and a spelling-tolerant `encode`. See [docs/matching.md §16](docs/matching.md#16-narrowing-beyond-a-pattern).
-- **Mutations & compaction** — additions are accumulated in the `Tail`, deletions are `Tombstone` rows, nothing is rewritten until a compaction rebuilds one sorted, indexed base (automatically once the tail outgrows its thresholds). See [docs/mutations.md](docs/mutations.md).
-- **The `.vortex` container** — one self-describing Vortex file: the quad table, the `dictionary` child and the index children under a `vortex-rdf.store.v1` root, also the byte-exchange format of the bindings. See [docs/file-format.md](docs/file-format.md).
+- **Builders** — every build sorts globally by `(s, p, o, g)`: in memory on wasm, out of core (spilling sorted runs to disk) everywhere a filesystem exists. A built store holds each quad once and each term once, in its canonical spelling. See [docs/serialization.md](docs/serialization.md).
+- **The store** — a base (array or memory-mapped file) plus a view: a row selection, tombstone masks and an append tail; `match_pattern` routes each bound position to the cheapest path (subject prefix probe, index, pushed-down filter, mask scan) and matches the tail independently. See [docs/matching.md](docs/matching.md).
+- **Narrowing beyond a pattern** — `keep` restricts a view to a code set or range per column (a `VALUES` block, a term predicate's codes, a namespace) inside the store; `window`/`size_capped`/`exists` stop a filtered file scan at the first block that fills a `LIMIT` or answers an `ASK`; `match_many` batches probes; `DictReader` serves the dictionary — read in place from a memory-mapped file, or held in memory — with `prefix_range`, candidate `filter_codes` (FILTER predicates over the codes a query produced, including `regex`, `contains`, `strstarts`, `strends`) and a spelling-tolerant `encode`. See [docs/matching.md §16](docs/matching.md#16-narrowing-beyond-a-pattern).
+- **Mutations & compaction** — additions are accumulated in the `Tail`, deletions set tombstone bits, nothing is rewritten until a compaction rebuilds one sorted, indexed base (automatically once the tail outgrows its thresholds). See [docs/mutations.md](docs/mutations.md).
+- **The `.vortex` container** — one self-describing Vortex file: the quad table, the `dictionary` child and the index children under a `vortex-rdf.store.v2` root, also the byte-exchange format of the bindings; files written by vortex-rdf 0.11 or earlier (`vortex-rdf.store.v1`) are refused with an error asking for a rebuild. See [docs/file-format.md](docs/file-format.md).
 
 ## Read more
 

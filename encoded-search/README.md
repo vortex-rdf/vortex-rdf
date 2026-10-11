@@ -8,7 +8,7 @@ Vortex's generic `search_sorted` is correct for every encoding, but it goes
 through the compute kernel machinery: an `ExecutionCtx`, scalar boxing, and —
 for encodings without a specialised kernel — canonicalization of the array
 being searched. When the column is a sorted, non-nullable unsigned integer
-column (a dictionary code column, a row-id column, an index key), that adds significan overhead to answer  queries like "where does value `v` start and end".
+column (a dictionary code column, a row-id column, an index key), that adds significant overhead to queries like "where does value `v` start and end".
 
 This crate resolves such an array once into a borrowed tree of typed probe
 nodes, then answers queries against the compressed representation directly:
@@ -27,6 +27,7 @@ use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_array::session::ArraySession;
 use vortex_array::{IntoArray, VortexSessionExecute};
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
+use vortex_btrblocks::schemes::integer::{BitPackingScheme, RunEndScheme, SequenceScheme};
 use vortex_rdf_encoded_search::SortedProbe;
 use vortex_session::VortexSession;
 
@@ -34,11 +35,16 @@ let session = VortexSession::empty()
     .with::<ArraySession>()
     .with::<ScalarFnSession>();
 let mut ctx = session.create_execution_ctx();
-let compressor = BtrBlocksCompressorBuilder::default().build();
+let compressor = BtrBlocksCompressorBuilder::empty()
+    .with_new_scheme(&RunEndScheme)
+    .with_new_scheme(&SequenceScheme)
+    .with_new_scheme(&BitPackingScheme)
+    .build();
 
-// A sorted column with 11-row runs, compressed into whatever encoding
-// BtrBlocks picks for it (here: run-end, over frame-of-reference
-// bit-packed values and a sequence of run ends).
+// A sorted column with 11-row runs, compressed into whatever encoding the
+// cascade picks for it (here: run-end, with its values a sequence and its
+// run ends bit-packed at 21 bits with one patch: the last run holds only two
+// rows, so the ends are no sequence, and the final end needs a 22nd bit).
 let data: Vec<u32> = (0..2_097_152).map(|i| (i / 11) as u32).collect();
 let canonical = PrimitiveArray::from_iter(data.iter().copied()).into_array();
 let encoded = compressor.compress(&canonical, &mut ctx)?;
@@ -66,11 +72,19 @@ together in one self-referential value.
 
 ## Supported encodings
 
-`Primitive`, `Constant`, `Sequence`, `RunEnd`, `FoR`, `BitPacked` (including
-its patches), `Delta` (FastLanes delta, decoded one 1,024-value block at a
-time on first touch), `Slice`, `Chunked`, and `Dict`, composed arbitrarily; the
-transparent `Shared` wrapper resolves to whatever it wraps. `NodeKind` reports
-the resolved tree's shape for tests and diagnostics.
+`Primitive`, `Constant`, `Sequence`, `RunEnd`, `FoR` (with one reference for
+the whole array), `BitPacked` (with one bit width, including its patches),
+`Delta` (FastLanes delta, decoded one 1,024-value block at a time on first
+touch), `Slice`, `Chunked`, and `Dict`, composed arbitrarily; the transparent
+`Shared` wrapper resolves to whatever it wraps. `NodeKind` reports the resolved
+tree's shape for tests and diagnostics. Frame-of-reference with a reference per
+1,024-value chunk (the `fastlanes.for.v2` wire form) and bit-packing with a
+width per block decline. When its builder allows `fastlanes.for.v2`, BtrBlocks'
+frame-of-reference scheme computes a reference per chunk, and an array whose
+chunk minima differ keeps them (one whose references come out constant is
+still single-reference `fastlanes.for`). `empty()` allows every wire form;
+`from_session` allows those both registered in the session and included in an
+edition it enables, and no Vortex core edition includes `fastlanes.for.v2`.
 
 ## The sortedness contract
 
@@ -105,23 +119,12 @@ cargo add vortex-rdf-encoded-search --features layout
 
 ## Performance
 
-Measured against Vortex 0.85 with [`benches/probe.rs`](./benches/probe.rs) (fastest of 100
-samples, Intel Core Ultra 7 155H, 2026-08). One two-sided `bounds` query on a
-2M-row column, by fixture:
-
-| Fixture | `SortedProbe::bounds` | Vortex `search_sorted` | Decoded `Vec<u32>` (`partition_point`) |
-|---|---|---|---|
-| `runend_2m` | 0.69 µs | 249 µs | 0.08 µs |
-| `for_bitpacked_2m` | 0.39 µs | 14.4 µs | 0.07 µs |
-| `dict_2m` | 0.31 µs | 13.2 µs | 0.07 µs |
-
-The gap against the generic kernel is widest on `runend_2m` (~360×), where
-Vortex has no specialised `search_sorted` kernel and canonicalizes all 2M rows
-on every call; where a kernel does exist it is ~40×. Either way the probe stays
-within 4–9× of a fully decoded binary search while leaving the column
-compressed, and resolving one costs 130–240 ns, once. The figures are refreshed on every new release.
-
-Reproduce with:
+[`benches/probe.rs`](./benches/probe.rs) times one two-sided `bounds` query on
+a 2M-row column per fixture (`runend_2m`, `for_bitpacked_2m`, `dict_2m`)
+against Vortex's `search_sorted` and a `partition_point` over the decoded
+column, plus the one-time cost of resolving a probe. Where an encoding has no
+specialised `search_sorted` kernel (run-end), the generic path canonicalizes
+the whole column on every call; the probe never decodes it.
 
 ```console
 cargo bench -p vortex-rdf-encoded-search --bench probe
@@ -129,8 +132,7 @@ cargo bench -p vortex-rdf-encoded-search --bench probe
 
 ## Compatibility
 
-Each release tracks Vortex new releases. This release is built
-against Vortex `0.85`.
+Built against Vortex `0.88`.
 
 Minimum supported Rust version: 1.95 (edition 2024).
 

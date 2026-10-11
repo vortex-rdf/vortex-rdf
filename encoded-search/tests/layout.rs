@@ -97,7 +97,7 @@ fn dict_strategy<C: LayoutStrategy, V: LayoutStrategy>(
     use vortex_btrblocks::BtrBlocksCompressorBuilder;
     use vortex_layout::layouts::compressed::CompressorPlugin;
     let compressor: Arc<dyn CompressorPlugin> =
-        Arc::new(BtrBlocksCompressorBuilder::default().build());
+        Arc::new(BtrBlocksCompressorBuilder::from_session(&common::session()).build());
     DictStrategy::new(
         codes,
         values,
@@ -228,6 +228,49 @@ async fn column_chunks_decline_unsupported_fields() {
     assert!(ColumnChunks::from_struct_layout(&root, "absent").is_none());
 }
 
+/// A column reports the flat leaves it is cut into and how many a probe has
+/// fetched, and its `Debug` prints the same two numbers.
+#[tokio::test(flavor = "multi_thread")]
+async fn column_chunks_count_their_leaves() {
+    let session = writer_session();
+    let data: Vec<u32> = (0..600_000).map(|i| (i / 11) as u32).collect();
+    let chunks: Vec<ArrayRef> = data
+        .chunks(200_000)
+        .map(|c| struct_chunk(&[("s", c)]))
+        .collect();
+    let file = write_file(&session, chunks, None).await;
+    let root = file.footer().layout().clone();
+    let column = ColumnChunks::from_struct_layout(&root, "s").expect("the shape must resolve");
+    let leaves = column.chunk_count();
+    assert!(
+        leaves >= 3,
+        "the fixture must span several leaves: {leaves}"
+    );
+    assert_eq!(
+        column.fetched_chunks(),
+        0,
+        "nothing is fetched at construction"
+    );
+
+    let source = file.segment_source();
+    column.value_at(0, &source, &session).await.unwrap();
+    assert_eq!(column.fetched_chunks(), 1);
+    column.value_at(1, &source, &session).await.unwrap();
+    assert_eq!(column.fetched_chunks(), 1, "a leaf is fetched once");
+    column
+        .value_at(data.len() as u64 - 1, &source, &session)
+        .await
+        .unwrap();
+    assert_eq!(column.fetched_chunks(), 2);
+    assert_eq!(column.chunk_count(), leaves);
+
+    let debug = format!("{column:?}");
+    assert!(
+        debug.contains(&format!("chunks: {leaves}")) && debug.contains("fetched: 2"),
+        "{debug}"
+    );
+}
+
 /// A zero-row column resolves to a column with no leaves and answers empty
 /// bounds without fetching.
 #[tokio::test(flavor = "multi_thread")]
@@ -292,6 +335,8 @@ async fn column_chunks_decline_unsupported_leaf() {
             .unwrap(),
         None
     );
+    // A leaf whose encoding declined was fetched all the same.
+    assert_eq!((column.chunk_count(), column.fetched_chunks()), (1, 1));
 }
 
 /// Dictionary layouts whose shape the probe does not support decline at

@@ -13,7 +13,6 @@ use futures::{FutureExt as _, StreamExt, stream};
 use oxrdf::NamedOrBlankNode;
 use vortex_array::expr::forms::conjuncts;
 use vortex_array::expr::{BoundExpression, Expression, lit};
-use vortex_array::stream::ArrayStreamExt as _;
 use vortex_array::{ArrayRef, MaskFuture};
 use vortex_buffer::Buffer;
 use vortex_error::VortexExpect as _;
@@ -24,25 +23,133 @@ use vortex_scan::selection::Selection;
 use vortex_scan::strict_sorted_buffer::StrictSortedBuffer;
 
 use crate::error::{Result, VortexRdfError};
-use crate::io::read::available_parallelism;
+use crate::io::read::{available_parallelism, collect_scan, collect_scan_spawned};
 use crate::store::layouts::{Constraints, PatternCodes, QuadPattern, TermRef};
 use crate::store::native_file::NativeStoreFile;
 use crate::store::scan::gather::primitive_from_u64_reads;
-use crate::store::schema;
+use crate::store::schema::{self, RowId, TermCode};
 use crate::store::selection::RowSelection;
 
 /// The bind-memo scope tag for expressions over the quad table's schema
 /// (the transparent root the file scan reads).
 pub(crate) const QUAD_SCOPE: &str = "quads";
 
-/// Run `scan` to completion and materialize every row it yields into one
-/// in-memory array.
+/// How a scan's split futures are driven.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScanDriver {
+    /// Polled on the calling task, by [`collect_scan`].
+    Inline,
+    /// Spawned onto the runtime's workers, by [`collect_scan_spawned`].
+    Spawned,
+}
+
+/// Row scans of up to this many splits run inline: at that size, waking the
+/// workers costs more than the parallel work saves.
+const MAX_INLINE_SPLITS: usize = 42;
+
+/// The limit [`read_all_rows`] applies: [`MAX_INLINE_SPLITS`], or what a test
+/// forced on this thread.
+fn max_inline_splits() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = driver_hooks::forced_limit() {
+        return limit;
+    }
+    MAX_INLINE_SPLITS
+}
+
+/// Test hooks for the driver choice: a per-thread override of the split limit,
+/// and the driver a scan ran under, read off how many of its splits were
+/// spawned.
+#[cfg(test)]
+pub(crate) mod driver_hooks {
+    use std::cell::Cell;
+
+    use super::ScanDriver;
+
+    thread_local! {
+        static LIMIT: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// The limit forced on this thread, if any.
+    pub(super) fn forced_limit() -> Option<usize> {
+        LIMIT.get()
+    }
+
+    /// Forces the split limit to `limit` on this thread until dropped.
+    pub(crate) struct ForcedLimit {
+        previous: Option<usize>,
+    }
+
+    impl ForcedLimit {
+        pub(crate) fn set(limit: usize) -> Self {
+            Self {
+                previous: LIMIT.replace(Some(limit)),
+            }
+        }
+    }
+
+    impl Drop for ForcedLimit {
+        fn drop(&mut self) {
+            LIMIT.set(self.previous);
+        }
+    }
+
+    /// The splits spawned on this thread since the last call.
+    pub(crate) fn take_spawned() -> usize {
+        crate::io::read::spawn_probe::take()
+    }
+
+    /// The driver a scan of `splits` split futures ran under, given how many
+    /// of them were spawned: none is the inline driver, all of them the
+    /// spawned one. Anything between is neither, and fails the test.
+    pub(crate) fn driver_of(splits: usize, spawned: usize) -> ScanDriver {
+        match spawned {
+            0 => ScanDriver::Inline,
+            n if n == splits => ScanDriver::Spawned,
+            n => panic!("{n} of {splits} splits were spawned: neither driver"),
+        }
+    }
+}
+
+/// Run a row scan to completion and materialize every row it yields into one
+/// in-memory array, in the scan's row order.
+///
+/// A scan of at most [`MAX_INLINE_SPLITS`] splits is driven inline: its split
+/// futures are polled on the calling task by [`collect_scan`]. A larger one is
+/// spawned by [`collect_scan_spawned`], `scan.concurrency()` splits per core in
+/// flight. Either driver returns the chunks in split order, whatever the
+/// scan's `ordered` flag says.
+///
+/// The splits are planned here because their count picks the driver. Row
+/// splits do filter and decode work, so a large scan needs the workers; an
+/// index child's row-id scan goes through [`read_index_row_ids`] instead.
 pub(crate) async fn read_all_rows(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRef> {
-    scan.into_array_stream()
-        .map_err(VortexRdfError::Vortex)?
-        .read_all()
-        .await
-        .map_err(VortexRdfError::Vortex)
+    let dtype = scan.dtype().map_err(VortexRdfError::Vortex)?;
+    let window = scan.concurrency() * available_parallelism();
+    let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
+    let driver = if tasks.len() <= max_inline_splits() {
+        ScanDriver::Inline
+    } else {
+        ScanDriver::Spawned
+    };
+    match driver {
+        ScanDriver::Inline => collect_scan(dtype, tasks).await,
+        ScanDriver::Spawned => collect_scan_spawned(dtype, tasks, window).await,
+    }
+}
+
+/// Run an index child's row-id scan to completion and materialize its rows,
+/// always inline, whatever its split count.
+///
+/// Zone maps prune almost every split of such a scan and a located run is
+/// sliced out of the row-id column, so there is no work to spread; the caller
+/// decodes the ids on its own thread. A scan is an index scan because its
+/// caller says so here, not because of its `ordered` flag: any other scan goes
+/// through [`read_all_rows`].
+pub(crate) async fn read_index_row_ids(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRef> {
+    let dtype = scan.dtype().map_err(VortexRdfError::Vortex)?;
+    let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
+    collect_scan(dtype, tasks).await
 }
 
 /// The rows of a point read when it answers, otherwise the rows of `scan` —
@@ -99,18 +206,18 @@ impl RowSelection {
 
 /// The set positions of a tombstone mask as an ascending id list — the sparse
 /// form the scan wants for an exclusion.
-fn deleted_ids(deleted: &Mask) -> StrictSortedBuffer<u64> {
+fn deleted_ids(deleted: &Mask) -> StrictSortedBuffer<RowId> {
     let ids = match deleted.indices() {
-        AllOr::All => Buffer::from_iter(0..deleted.len() as u64),
+        AllOr::All => Buffer::from_iter(0..deleted.len() as RowId),
         AllOr::None => Buffer::empty(),
-        AllOr::Some(indices) => Buffer::from_iter(indices.iter().map(|&i| i as u64)),
+        AllOr::Some(indices) => Buffer::from_iter(indices.iter().map(|&i| i as RowId)),
     };
     StrictSortedBuffer::try_new(ids).vortex_expect("mask indices are ascending and unique")
 }
 
 /// An ascending id list with the tombstoned rows removed — used when a sparse
 /// id selection and the deletions would both want the scan's selection knob.
-fn subtract_deleted(ids: &Buffer<u64>, deleted: &Mask) -> StrictSortedBuffer<u64> {
+fn subtract_deleted(ids: &Buffer<RowId>, deleted: &Mask) -> StrictSortedBuffer<RowId> {
     let ids = Buffer::from_iter(
         ids.iter()
             .copied()
@@ -122,7 +229,7 @@ fn subtract_deleted(ids: &Buffer<u64>, deleted: &Mask) -> StrictSortedBuffer<u64
 /// A [`RowSelection::Ids`] list as the strictly-sorted buffer the scan wants —
 /// ascending and unique is that variant's construction invariant (index
 /// resolutions answer in ascending unique row ids).
-fn strict_ids(ids: &Buffer<u64>) -> StrictSortedBuffer<u64> {
+fn strict_ids(ids: &Buffer<RowId>) -> StrictSortedBuffer<RowId> {
     StrictSortedBuffer::try_new(ids.clone())
         .vortex_expect("a RowSelection id list is ascending and unique")
 }
@@ -338,8 +445,8 @@ pub(crate) async fn first_matching_rows(
     selection: &RowSelection,
     deleted: Option<&Mask>,
     want: usize,
-) -> Result<Buffer<u64>> {
-    let mut ids: Vec<u64> = Vec::new();
+) -> Result<Buffer<RowId>> {
+    let mut ids: Vec<RowId> = Vec::new();
     if want == 0 {
         return Ok(Buffer::from(ids));
     }
@@ -428,19 +535,24 @@ pub(crate) async fn matching_file_rows(
     Ok(Mask::from_indices(row_count as usize, matched))
 }
 
-/// One `u32` column of the file at the rows `selection` covers, in file
-/// order — positions align with `selection.apply`, so a mask over the
-/// result refines the selection (`RowSelection::refine`). Tombstones are
-/// not applied (the read paths apply them).
-pub(crate) async fn read_column_codes(
+/// The positions — within the rows `selection` covers, in file order, as
+/// `selection.apply` aligns them — whose code in `column` passes
+/// `admit`. The column is streamed through the projected scan rather than
+/// materialized: the scan reads several splits per worker ahead of this loop,
+/// so that many chunks of codes are in flight at once, never the whole column.
+/// Tombstones are not applied (the read paths apply them).
+pub(crate) async fn column_positions(
     file: &NativeStoreFile,
     column: &'static str,
     selection: &RowSelection,
-) -> Result<Vec<u32>> {
+    admit: impl Fn(TermCode) -> bool,
+) -> Result<Vec<usize>> {
     use vortex_array::VortexSessionExecute as _;
     use vortex_array::arrays::{PrimitiveArray, StructArray};
     use vortex_array::expr::{root, select};
 
+    #[cfg(test)]
+    file.note_column_stream();
     let mut scan = file.scan().map_err(VortexRdfError::Vortex)?;
     let scope = scan.dtype().map_err(VortexRdfError::Vortex)?;
     scan = scan.with_projection(
@@ -448,13 +560,30 @@ pub(crate) async fn read_column_codes(
             .bind(QUAD_SCOPE, &select(&[column][..], root()), &scope)
             .map_err(VortexRdfError::Vortex)?,
     );
-    let rows = read_all_rows(selection.restrict_scan(scan, None)).await?;
+    let mut chunks = Box::pin(
+        selection
+            .restrict_scan(scan, None)
+            .into_array_stream()
+            .map_err(VortexRdfError::Vortex)?,
+    );
     let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
-    let struct_arr = rows
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let prim = crate::store::array::field_as::<PrimitiveArray>(&struct_arr, column, &mut ctx)?;
-    Ok(prim.as_slice::<u32>().to_vec())
+    let mut positions = Vec::new();
+    let mut offset = 0usize;
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(VortexRdfError::Vortex)?;
+        let struct_arr = chunk
+            .execute::<StructArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?;
+        let prim = crate::store::array::field_as::<PrimitiveArray>(&struct_arr, column, &mut ctx)?;
+        let codes = prim.as_slice::<TermCode>();
+        positions.extend(
+            (0..codes.len())
+                .filter(|&i| admit(codes[i]))
+                .map(|i| offset + i),
+        );
+        offset += codes.len();
+    }
+    Ok(positions)
 }
 
 /// The pushed-down filter for a pattern under `codes`' layout: `AND` of
@@ -496,6 +625,87 @@ pub(crate) async fn locate_subject_run(
         .bounds(needle, &file.segment_source(), file.session())
         .await
         .map_err(VortexRdfError::Vortex)
+}
+
+/// The subject column's chunk-probe handle for a file sorted by subject.
+/// `None` declines — an unsorted file, or a column whose chunk shape has no
+/// probe.
+fn sorted_subject_chunks(
+    file: &NativeStoreFile,
+) -> Option<Arc<vortex_rdf_encoded_search::ColumnChunks>> {
+    if !file.quads_sorted() {
+        return None;
+    }
+    file.column_chunks(schema::COL_S)
+}
+
+/// The exact row range of subject `code` in the sorted subject column — empty,
+/// at the insertion point, for a code the column lacks. `None` declines: a
+/// chunk the search needs has no probe.
+async fn subject_code_bounds(
+    chunks: &vortex_rdf_encoded_search::ColumnChunks,
+    file: &NativeStoreFile,
+    code: TermCode,
+) -> Result<Option<Range<u64>>> {
+    chunks
+        .bounds(code, &file.segment_source(), file.session())
+        .await
+        .map_err(VortexRdfError::Vortex)
+}
+
+/// The exact row range of the rows whose subject code lies in `range`
+/// (`lo <= s < hi`) in a sorted file, by binary search over the subject
+/// column's encoded chunks. The file is sorted by `s`, so those rows are one
+/// run: it starts where the first code `>= lo` does and ends where the first
+/// code `>= hi` does, and each bound is exact for a code the column lacks.
+/// `None` declines — an unsorted file, a column whose chunk shape has no probe
+/// — and the caller keeps the stream.
+pub(crate) async fn locate_subject_code_range(
+    file: &NativeStoreFile,
+    range: Range<TermCode>,
+) -> Result<Option<Range<u64>>> {
+    let Some(chunks) = sorted_subject_chunks(file) else {
+        return Ok(None);
+    };
+    let Some(from) = subject_code_bounds(&chunks, file, range.start).await? else {
+        return Ok(None);
+    };
+    let Some(to) = subject_code_bounds(&chunks, file, range.end).await? else {
+        return Ok(None);
+    };
+    Ok(Some(from.start..to.start.max(from.start)))
+}
+
+/// The rows holding each subject code of `codes` — ascending and unique, as
+/// [`Keep::set`](crate::store::Keep::set) builds them — in a sorted file, as
+/// ascending disjoint runs: a code without rows adds none, and codes whose
+/// rows abut share one run. One binary search per code, over chunks fetched
+/// once for the call. `None` declines as [`locate_subject_code_range`] does.
+pub(crate) async fn locate_subject_code_runs(
+    file: &NativeStoreFile,
+    codes: &[TermCode],
+) -> Result<Option<Vec<Range<u64>>>> {
+    debug_assert!(
+        codes.windows(2).all(|pair| pair[0] < pair[1]),
+        "a set's codes are ascending and unique"
+    );
+    let Some(chunks) = sorted_subject_chunks(file) else {
+        return Ok(None);
+    };
+    let mut runs: Vec<Range<u64>> = Vec::new();
+    for &code in codes {
+        let Some(run) = subject_code_bounds(&chunks, file, code).await? else {
+            return Ok(None);
+        };
+        if run.is_empty() {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(last) if last.end == run.start => last.end = run.end,
+            _ => runs.push(run),
+        }
+    }
+    Ok(Some(runs))
 }
 
 /// Rows of a small exact file selection, read point-by-point through the
@@ -747,7 +957,11 @@ pub(crate) async fn row_range_from_pruning(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Range;
+    use vortex_array::VortexSessionExecute as _;
+    use vortex_array::arrays::{PrimitiveArray, StructArray};
     use vortex_array::expr::{and, eq, get_item, root};
+    use vortex_layout::scan::split_by::SplitBy;
 
     /// Only a conjunction of `field == literal` over root fields decodes to
     /// `(column, code)` pairs; any other shape declines.
@@ -763,5 +977,191 @@ mod tests {
         );
         assert!(eq_code_pairs(&lit(false)).is_none());
         assert!(eq_code_pairs(&eq(get_item("p", root()), lit("x"))).is_none());
+    }
+
+    /// A scan of `rows` of `file`, cut into splits of `per_split` rows.
+    fn scan_of(
+        file: &NativeStoreFile,
+        rows: Range<u64>,
+        per_split: usize,
+        ordered: bool,
+    ) -> ScanBuilder<ArrayRef> {
+        file.scan()
+            .unwrap()
+            .with_row_range(rows)
+            .with_split_by(SplitBy::RowCount(per_split))
+            .with_ordered(ordered)
+    }
+
+    /// The four code columns of `rows`, each in row order.
+    fn quad_codes(rows: ArrayRef) -> Vec<Vec<TermCode>> {
+        let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
+        let rows = rows.execute::<StructArray>(&mut ctx).unwrap();
+        schema::PRIMARY_COLUMNS
+            .iter()
+            .map(|&column| {
+                crate::store::array::field_as::<PrimitiveArray>(&rows, column, &mut ctx)
+                    .unwrap()
+                    .as_slice::<TermCode>()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    /// What `read_all_rows` did with a scan: its split count, how many of
+    /// them it spawned, and the rows it returned.
+    struct Driven {
+        splits: usize,
+        spawned: usize,
+        rows: Vec<Vec<TermCode>>,
+    }
+
+    impl Driven {
+        /// The driver that ran the scan, read off the splits it spawned.
+        fn driver(&self) -> ScanDriver {
+            driver_hooks::driver_of(self.splits, self.spawned)
+        }
+    }
+
+    async fn drive(
+        file: &NativeStoreFile,
+        rows: Range<u64>,
+        per_split: usize,
+        ordered: bool,
+    ) -> Driven {
+        let splits = scan_of(file, rows.clone(), per_split, ordered)
+            .build()
+            .unwrap()
+            .len();
+        driver_hooks::take_spawned();
+        let rows = read_all_rows(scan_of(file, rows, per_split, ordered))
+            .await
+            .unwrap();
+        Driven {
+            splits,
+            spawned: driver_hooks::take_spawned(),
+            rows: quad_codes(rows),
+        }
+    }
+
+    /// The first `n` rows of `columns`.
+    fn head(columns: &[Vec<TermCode>], n: usize) -> Vec<Vec<TermCode>> {
+        columns.iter().map(|c| c[..n].to_vec()).collect()
+    }
+
+    /// `read_all_rows` hands a scan's rows back whole and in row order, split
+    /// after split, under either driver: the same four-split scan is forced
+    /// down each path and must return all four columns identically.
+    #[tokio::test]
+    async fn read_all_rows_keeps_order_on_either_driver() {
+        let (_dir, file) = crate::tests::mapped_file(50, vec![]).await;
+
+        // The whole file in one split is the reference.
+        let whole = drive(&file, 0..50, 50, true).await;
+        assert_eq!((whole.splits, whole.rows[0].len()), (1, 50));
+        // The file is subject-sorted and its subjects are unique, so the
+        // subject codes rise with the row order.
+        let subjects = &whole.rows[0];
+        assert!(
+            subjects.windows(2).all(|pair| pair[0] < pair[1]),
+            "{subjects:?}"
+        );
+
+        // Splits of 16 rows: four futures for the driver to run, the last short.
+        for (limit, driver) in [(4, ScanDriver::Inline), (3, ScanDriver::Spawned)] {
+            let _limit = driver_hooks::ForcedLimit::set(limit);
+            let driven = drive(&file, 0..50, 16, true).await;
+            assert_eq!(driven.splits, 4);
+            assert_eq!(
+                driven.driver(),
+                driver,
+                "limit {limit} on a four-split scan"
+            );
+            assert_eq!(driven.rows, whole.rows, "{driver:?}: rows and order");
+        }
+
+        // An unordered scan is collected in split order as well, by either
+        // driver: the flag relaxes what a caller may rely on, not what it gets.
+        for (limit, driver) in [(4, ScanDriver::Inline), (0, ScanDriver::Spawned)] {
+            let _limit = driver_hooks::ForcedLimit::set(limit);
+            let driven = drive(&file, 0..50, 16, false).await;
+            assert_eq!(driven.driver(), driver, "unordered, limit {limit}");
+            assert_eq!(driven.rows, whole.rows, "unordered, {driver:?}");
+        }
+    }
+
+    /// A scan of at most [`MAX_INLINE_SPLITS`] splits runs inline and one with
+    /// more is spawned, with no limit forced.
+    #[tokio::test]
+    async fn read_all_rows_runs_inline_up_to_the_split_limit() {
+        let limit = MAX_INLINE_SPLITS;
+        let (_dir, file) = crate::tests::mapped_file(limit + 8, vec![]).await;
+        let whole = drive(&file, 0..(limit + 8) as u64, limit + 8, true).await;
+        assert_eq!(whole.driver(), ScanDriver::Inline, "a single split");
+
+        // One row per split.
+        let at = drive(&file, 0..limit as u64, 1, true).await;
+        assert_eq!((at.splits, at.driver()), (limit, ScanDriver::Inline));
+        assert_eq!(at.rows, head(&whole.rows, limit));
+        let over = drive(&file, 0..limit as u64 + 1, 1, true).await;
+        assert_eq!(
+            (over.splits, over.driver()),
+            (limit + 1, ScanDriver::Spawned)
+        );
+        assert_eq!(over.rows, head(&whole.rows, limit + 1));
+    }
+
+    /// A scan above the limit reads with no tokio runtime to spawn onto: it
+    /// runs inline. Driven here by a bare executor on a plain thread.
+    #[tokio::test]
+    async fn read_all_rows_above_the_limit_reads_outside_a_tokio_runtime() {
+        let limit = MAX_INLINE_SPLITS;
+        let (_dir, file) = crate::tests::mapped_file(limit + 8, vec![]).await;
+        let whole = drive(&file, 0..(limit + 8) as u64, limit + 8, true).await;
+        let scan = scan_of(&file, 0..limit as u64 + 1, 1, true);
+        assert_eq!(
+            scan_of(&file, 0..limit as u64 + 1, 1, true)
+                .build()
+                .unwrap()
+                .len(),
+            limit + 1
+        );
+
+        let (rows, spawned) = std::thread::spawn(move || {
+            futures::executor::block_on(async {
+                let rows = read_all_rows(scan).await.unwrap();
+                (quad_codes(rows), driver_hooks::take_spawned())
+            })
+        })
+        .join()
+        .expect("a scan above the limit must not panic without a tokio runtime");
+        assert_eq!(spawned, 0, "no runtime to spawn onto, so nothing spawned");
+        assert_eq!(rows, head(&whole.rows, limit + 1));
+    }
+
+    /// An index child's row-id scan is driven inline however many splits it
+    /// has, where a row scan of the same shape is spawned: the classification
+    /// is the entry point's, not the scan's.
+    #[tokio::test]
+    async fn read_index_row_ids_drives_inline_above_the_split_limit() {
+        let (_dir, file) = crate::tests::mapped_file(50, vec![]).await;
+        let _limit = driver_hooks::ForcedLimit::set(1);
+
+        driver_hooks::take_spawned();
+        let rows = read_index_row_ids(scan_of(&file, 0..50, 16, false))
+            .await
+            .unwrap();
+        assert_eq!(
+            driver_hooks::take_spawned(),
+            0,
+            "no split of it was spawned"
+        );
+        let spawned = drive(&file, 0..50, 16, false).await;
+        assert_eq!(
+            spawned.driver(),
+            ScanDriver::Spawned,
+            "the same scan as a row scan"
+        );
+        assert_eq!(quad_codes(rows), spawned.rows);
     }
 }

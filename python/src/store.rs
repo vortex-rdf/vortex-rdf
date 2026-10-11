@@ -7,22 +7,23 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use vortex_buffer::Buffer;
 use vortex_rdf_core::common::terms::{Pattern, parse_pattern_checked};
-use vortex_rdf_core::{VortexRdfError as CoreError, VortexRdfStore as CoreStore};
+use vortex_rdf_core::{TermCode, VortexRdfError as CoreError, VortexRdfStore as CoreStore};
 
-use crate::codes::{TermDict, U32Column};
+use crate::codes::{TermDict, U64Column};
+use crate::fan_out::fan_out;
 use crate::probes::{parse_keeps, parse_probe, pattern_probe};
 use crate::{RUNTIME, VortexRdfError, parse_err, store_err};
 use vortex_rdf_core::Probe;
 
 /// `(s, p, o, g)` code columns as returned by [`VortexRdfStore::match_codes`].
-type CodeColumns = (U32Column, U32Column, U32Column, U32Column);
+type CodeColumns = (U64Column, U64Column, U64Column, U64Column);
 
-fn code_columns([s, p, o, g]: [Buffer<u32>; 4]) -> CodeColumns {
+fn code_columns([s, p, o, g]: [Buffer<TermCode>; 4]) -> CodeColumns {
     (
-        U32Column { codes: s },
-        U32Column { codes: p },
-        U32Column { codes: o },
-        U32Column { codes: g },
+        U64Column { codes: s },
+        U64Column { codes: p },
+        U64Column { codes: o },
+        U64Column { codes: g },
     )
 }
 
@@ -53,31 +54,6 @@ fn parse_probes(probes: &Bound<'_, PyAny>) -> PyResult<Vec<Probe>> {
         .collect()
 }
 
-/// Run `task` for every probe on the bindings' runtime, one task per probe
-/// so a batch spreads over its workers (an in-memory match is CPU work;
-/// a file-backed one overlaps its reads), and collect the answers in input
-/// order. Called GIL-released.
-fn fan_out<T, F, Fut>(store: &CoreStore, probes: Vec<Probe>, task: F) -> Result<Vec<T>, CoreError>
-where
-    T: Send + 'static,
-    F: Fn(CoreStore, Probe) -> Fut,
-    Fut: std::future::Future<Output = Result<T, CoreError>> + Send + 'static,
-{
-    let handles: Vec<_> = probes
-        .into_iter()
-        .map(|probe| RUNTIME.spawn(task(store.clone(), probe)))
-        .collect();
-    RUNTIME.block_on(async {
-        let mut out = Vec::with_capacity(handles.len());
-        for handle in handles {
-            out.push(handle.await.map_err(|e| {
-                CoreError::InvalidOperation(format!("a batch probe task failed: {e}"))
-            })??);
-        }
-        Ok(out)
-    })
-}
-
 /// One row of [`VortexRdfStore::get_quads`]: subject, predicate, object, graph.
 /// Held as `Py<PyString>` so a term repeated down a column is one Python object
 /// shared by every row that uses it.
@@ -95,7 +71,7 @@ type StringColumns = (
 /// Unwrap decoded columns, raising `VortexRdfError` on anything that cannot
 /// be a valid result.
 ///
-/// A `None` term is a matched row carrying a code the dictionary snapshot
+/// A `None` term is a matched row carrying a code the store's dictionary
 /// cannot resolve; unequal column lengths are a match that produced ragged
 /// columns. Both indicate an inconsistent store, and either would otherwise
 /// surface as a silently wrong result set.
@@ -124,10 +100,15 @@ fn resolve_columns(columns: [Vec<Option<Py<PyString>>>; 4]) -> PyResult<[Vec<Py<
 }
 
 /// A read-only Vortex-RDF store opened from a `.vortex` file or from
-/// native-container bytes. A file open reads only the footer up front and,
-/// under the Dictionary layout, lifts the term dictionary when it fits the
-/// residency budget; each match then scans the file, so one instance is meant
-/// to be kept and queried repeatedly.
+/// native-container bytes. A file is memory-mapped: only the footer (and,
+/// under the Dictionary layout, the dictionary's window bounds) is read up
+/// front, and each query reads the mapped pages it touches. Replace a store's
+/// file by renaming a new one over it, never by truncating or rewriting it in
+/// place (a reader of the mapping would be killed with SIGBUS); `serialize_rdf`
+/// already writes that way (on Windows it fails until the store mapping the
+/// file, and every `TermDict` and `U64Column` taken from it, is dropped). The
+/// mapping lives as long as the store or any of those. One instance is meant to
+/// be kept and queried repeatedly.
 ///
 /// The Python bindings are read-only: stores are built with `serialize_rdf`
 /// (file to file), then opened and queried. There is no in-memory build, RDF
@@ -154,7 +135,7 @@ impl VortexRdfStore {
         &self,
         py: Python<'_>,
         pattern: &Pattern,
-    ) -> PyResult<Option<[Buffer<u32>; 4]>> {
+    ) -> PyResult<Option<[Buffer<TermCode>; 4]>> {
         py.detach(|| -> Result<_, CoreError> {
             RUNTIME.block_on(async { self.matched(pattern).await?.code_columns_gathered().await })
         })
@@ -172,13 +153,13 @@ impl VortexRdfStore {
         py: Python<'_>,
         pattern: &Pattern,
     ) -> PyResult<[Vec<Py<PyString>>; 4]> {
-        if let Some(snapshot) = self.store.code_read_snapshot() {
-            // `code_read_snapshot` reports only that the path can apply; the
-            // match itself still decides, so fall through when it declines.
+        if let Some(reader) = self.store.dict_reader() {
+            // `dict_reader` reports only that the path can apply (a Dictionary
+            // layout), whether the dictionary is in memory or
+            // left in the mapped file; the match itself still decides, so fall
+            // through when it declines.
             if let Some(codes) = self.matched_code_columns(py, pattern)? {
-                let dict = TermDict {
-                    reader: snapshot.into(),
-                };
+                let dict = TermDict { reader };
                 let mut decoded = Vec::with_capacity(4);
                 for column in &codes {
                     decoded.push(dict.decode_slice(py, column.as_slice())?);
@@ -223,24 +204,24 @@ impl VortexRdfStore {
 
 #[pymethods]
 impl VortexRdfStore {
-    /// Open `path`. By default the store stays file-backed and lazy (only the
-    /// footer is read up front). `in_memory=True` loads the whole store into
-    /// memory instead, keeping its columns in their compressed form wherever
-    /// matches can bind them directly and decoding only the remainder —
-    /// every subsequent match skips the per-call file-scan pipeline.
-    /// `max_resident_bytes` overrides the Dictionary layout's
-    /// term-dictionary residency budget (the dictionary child's compressed
-    /// size in bytes).
+    /// Open `path`. A file store is memory-mapped: what stays in RAM is the
+    /// operating system's page cache (counted as file-backed RSS, not
+    /// anonymous memory), and the file must not be modified while open —
+    /// replace its file by renaming a new one over it, never by truncating or
+    /// rewriting it in place (a reader of the mapping would be killed with
+    /// SIGBUS); `serialize_rdf` already writes that way (on Windows it fails
+    /// until the store mapping the file, and every `TermDict` and `U64Column`
+    /// taken from it, is dropped). The mapping lives as long as the store or
+    /// any of those. A file written by vortex-rdf 0.11 or earlier is refused,
+    /// with an error that says to rebuild it from its RDF source.
+    /// `in_memory=True` loads the whole store instead, keeping its columns in
+    /// their compressed form wherever matches can bind them directly; every
+    /// later match then skips the file.
     #[new]
-    #[pyo3(signature = (path, max_resident_bytes=None, in_memory=false))]
-    fn new(
-        py: Python<'_>,
-        path: PathBuf,
-        max_resident_bytes: Option<u64>,
-        in_memory: bool,
-    ) -> PyResult<Self> {
-        // Core reports a missing path as `VortexRdfError::Vortex`, not `Io`,
-        // so the `FileNotFoundError` contract is honoured here.
+    #[pyo3(signature = (path, *, in_memory=false))]
+    fn new(py: Python<'_>, path: PathBuf, in_memory: bool) -> PyResult<Self> {
+        // Core reports a missing path as an I/O error from the open; the
+        // `FileNotFoundError` contract is honoured here with a clear message.
         if !path.is_file() {
             return Err(PyFileNotFoundError::new_err(format!(
                 "no such Vortex file: {}",
@@ -250,19 +231,12 @@ impl VortexRdfStore {
         let store = py
             .detach(|| {
                 RUNTIME.block_on(async {
-                    let store = match max_resident_bytes {
-                        Some(n) => CoreStore::from_file_with_dict_residency(&path, n).await?,
-                        None => CoreStore::from_file(&path).await?,
-                    };
                     if in_memory {
-                        // Round-trip through the serializable parts: rows,
-                        // index components, and the dictionary those rows'
-                        // codes address, exactly what `from_parts`
-                        // reconstructs a store from.
-                        let parts = store.to_serializable_parts().await?;
-                        CoreStore::from_parts(parts)
+                        // The whole store, read through the file reader and
+                        // adopted in memory — nothing reads the file again.
+                        CoreStore::from_file_in_memory(&path).await
                     } else {
-                        Ok(store)
+                        CoreStore::from_file(&path).await
                     }
                 })
             })
@@ -335,11 +309,12 @@ impl VortexRdfStore {
     /// the empty string, which is also how a pattern selects it.
     ///
     /// Served from the term-code columns when the store supports them
-    /// (Dictionary layout, resident dictionary, no append tail), reading terms
-    /// out of the dictionary and sharing one Python string across repeats of a
-    /// code; otherwise from the store's shared-term rows, where a term the
-    /// decoder handed to several rows is likewise one Python string. Both
-    /// paths return the same rows.
+    /// (Dictionary layout), reading terms out of the dictionary — held in
+    /// memory, or read from the mapped file — and usually sharing one Python
+    /// string across repeats of a code (see `TermDict.decode_many`);
+    /// otherwise from the store's shared-term rows, where a term the decoder
+    /// handed to several rows is likewise one Python string. Both paths
+    /// return the same rows.
     #[pyo3(signature = (s=None, p=None, o=None, g=None))]
     fn get_quads(
         &self,
@@ -398,11 +373,13 @@ impl VortexRdfStore {
     /// answering in input order. A probe is an `(s, p, o, g)` tuple of
     /// optional term strings or a dict with keys `s`, `p`, `o`, `g`,
     /// `keep`, `limit`, `offset`. Every probe is parsed before any is
-    /// evaluated, so a malformed one raises `ValueError` first.
+    /// evaluated, so a malformed one raises `ValueError` first. The call
+    /// raises the error of the first failing probe in input order and
+    /// cancels the probes after it.
     fn count_quads_many(&self, py: Python<'_>, probes: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
         let probes = parse_probes(probes)?;
         py.detach(|| {
-            fan_out(&self.store, probes, |store, probe| async move {
+            fan_out(&RUNTIME, &self.store, probes, |store, probe| async move {
                 let counts = store.count_many(std::slice::from_ref(&probe)).await?;
                 Ok(counts[0])
             })
@@ -433,30 +410,29 @@ impl VortexRdfStore {
         Ok((subjects, predicates, objects, graphs))
     }
 
-    /// The store's term dictionary, or `None` when the code path does not
-    /// apply: a non-Dictionary layout, or an append tail whose quads are not
-    /// in the dictionary. A dictionary left in its file (over the residency
-    /// budget) is served through the handle by reading the file on demand;
-    /// `TermDict.file_backed` tells. Pair with [`Self::match_codes`]; decode
-    /// each distinct code once, caching on the Python side.
+    /// The store's term dictionary, or `None` for a non-Dictionary layout. A
+    /// file store's dictionary is read from the mapped file on demand
+    /// (`TermDict.file_backed`); an in-memory one answers in place. Pair with
+    /// [`Self::match_codes`]; decode each distinct code once.
     fn term_dict(&self) -> Option<TermDict> {
         self.store.dict_reader().map(|reader| TermDict { reader })
     }
 
-    /// Match a pattern and return the rows as four zero-copy `u32` term-code
-    /// columns `(s, p, o, g)` decodable through [`Self::term_dict`], or
+    /// Match a pattern and return the rows as four zero-copy `u64` term-code
+    /// columns (`U64Column`) `(s, p, o, g)` decodable through [`Self::term_dict`], or
     /// `None` when the code path does not apply (see `term_dict`). Callers
     /// fall back to [`Self::get_quads`] or [`Self::match_columns`], which
     /// resolve terms on every layout.
     ///
     /// `keep` narrows the match inside the store, before any row is
     /// gathered: a dict from position (`"s"`, `"p"`, `"o"`, `"g"` or 0-3)
-    /// to the codes to keep there — a code set (`U32Column`, u32 buffer or
-    /// int sequence; what `TermDict.filter_codes` or encoded `VALUES`
-    /// yield) or a code range (a `range` with step 1, or `(lo, hi)`; what
-    /// `TermDict.prefix_range` yields). `offset` and `limit` window the
-    /// rows in base order; a filtered file scan stops at the first block
-    /// that fills the window.
+    /// to the codes to keep there — a code set (`U64Column`, a u64 buffer or
+    /// a list of ints; what `TermDict.filter_codes` or encoded `VALUES`
+    /// yield) or a code range (a `range` with step 1, or a 2-tuple
+    /// `(lo, hi)`, the half-open codes `lo <= code < hi`; what
+    /// `TermDict.prefix_range` yields). A 2-tuple is never a set. `offset`
+    /// and `limit` window the rows in base order; a filtered file scan stops
+    /// at the first block that fills the window.
     // The parameters are the Python signature: a pattern and its narrowing.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (s=None, p=None, o=None, g=None, *, keep=None, limit=None, offset=0))]
@@ -492,7 +468,9 @@ impl VortexRdfStore {
     /// [`Self::match_codes`] for a batch of probes in one GIL-released
     /// call, answering in input order (see [`Self::count_quads_many`] for
     /// the probe forms). The probes run concurrently on the bindings'
-    /// runtime; every probe is parsed before any is evaluated.
+    /// runtime; every probe is parsed before any is evaluated. The call
+    /// raises the error of the first failing probe in input order and
+    /// cancels the probes after it.
     fn match_codes_many(
         &self,
         py: Python<'_>,
@@ -504,7 +482,7 @@ impl VortexRdfStore {
         }
         let columns = py
             .detach(|| {
-                fan_out(&self.store, probes, |store, probe| async move {
+                fan_out(&RUNTIME, &self.store, probes, |store, probe| async move {
                     store.run_probe(&probe).await?.code_columns_gathered().await
                 })
             })

@@ -11,7 +11,7 @@ use crate::store::layouts::{LayoutStrategy, ResolvedLayout, dictionary};
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_scan;
 use crate::store::scan::gather::gather_live;
-use crate::store::schema;
+use crate::store::schema::{self, TermCode};
 use crate::store::selection::{RowSelection, ViewSelection};
 
 use vortex_array::arrays::struct_::StructArrayExt;
@@ -45,9 +45,10 @@ impl VortexRdfStore {
     pub(crate) async fn base_size(&self) -> Result<usize> {
         let base = match &self.quads {
             // In-memory patterns resolve to exact row ids at match time —
-            // or, for a served match, to a pending run whose width is known
-            // without decoding it — so the selection alone knows the answer
-            // and no rows are touched. Deletions are only counted out, never
+            // or, for a served match or a view built only to be counted or
+            // windowed, to a pending run whose width is known without
+            // decoding it — so the selection alone knows the answer and no
+            // rows are touched. Deletions are only counted out, never
             // gathered.
             QuadsSource::InMemory {
                 base,
@@ -85,20 +86,27 @@ impl VortexRdfStore {
                 // A located serve plan knows the width of the child run it
                 // serves — exactly the constrained rows — so a pending
                 // selection over one counts from the plan, without the
-                // deferred index-child scan the selection itself would run.
-                // Tombstones are defined over primary row ids the plan does
-                // not hold, and a pending filter's selectivity is unknown, so
-                // either sends the count through the selection.
-                let located = match (selection, serve, filter, deleted) {
-                    (ViewSelection::Pending(_), Some(plan), None, None) => plan.row_range(),
+                // deferred index-child scan the selection itself would run;
+                // a pending located run held without a plan knows its own
+                // width the same way. Tombstones are defined over primary row
+                // ids the plan does not hold, and a pending filter's
+                // selectivity is unknown, so either sends the count through
+                // the selection.
+                let known = match (selection, serve, filter, deleted) {
+                    (ViewSelection::Pending(_), Some(plan), None, None) => plan
+                        .row_range()
+                        .map(|range| (range.end - range.start) as usize),
+                    // A located run held pending for a count: its width.
+                    (ViewSelection::Pending(lazy), None, None, None) => lazy.len_if_known(),
                     _ => None,
                 };
-                if let Some(range) = located {
-                    (range.end - range.start) as usize
+                if let Some(rows) = known {
+                    rows
                 } else {
-                    // A count needs the selection itself, so a served match's
-                    // deferred index-child scan runs here, once, and is
-                    // cached on the view.
+                    // A count needs the selection itself, so a deferred
+                    // resolution's ids (a served match's index-child scan, a
+                    // located run's rids under tombstones) are computed here,
+                    // once, and cached on the view.
                     let selection = selection.materialized_async().await?;
                     match filter {
                         // No filter pending: the selection is exact, minus
@@ -184,7 +192,7 @@ impl VortexRdfStore {
         }
     }
 
-    /// The rows this view selects, as four `u32` term-code columns (`s`, `p`,
+    /// The rows this view selects, as four [`TermCode`] columns (`s`, `p`,
     /// `o`, `g`) — read off the answering index's own columns when the view
     /// carries a serve plan that covers them, else gathered directly from the
     /// base's canonical primitive slices.
@@ -192,12 +200,12 @@ impl VortexRdfStore {
     /// `None` whenever codes cannot be served both cheaply and correctly:
     /// a non-Dictionary layout, a non-empty append tail (its strings are not
     /// in the cached dictionary), a file-backed source, or base columns not
-    /// reachable as canonical non-nullable u32 primitives (e.g. chunked or
+    /// reachable as canonical non-nullable code primitives (e.g. chunked or
     /// wire-compressed). Callers fall back to `selected_rows`.
     ///
     /// A builder-compressed column behind a `vortex.shared` wrapper still
     /// qualifies: its canonical primitive is materialized once into the
-    /// wrapper's one-way cache (`shared_u32_primitive`) and shared zero-copy
+    /// wrapper's one-way cache (`shared_code_primitive`) and shared zero-copy
     /// by every later call and every view over the base — the payload path
     /// pays a first-touch decode instead of losing the buffer-sharing fast
     /// path.
@@ -206,7 +214,7 @@ impl VortexRdfStore {
     /// pipeline that [`code_columns_gathered`](Self::code_columns_gathered) —
     /// the bindings' entry point — otherwise runs; that method tries this fast
     /// path first.
-    pub(crate) fn code_columns(&self) -> Option<[Buffer<u32>; 4]> {
+    pub(crate) fn code_columns(&self) -> Option<[Buffer<TermCode>; 4]> {
         use vortex_array::arrays::Struct;
         if self.layout.strategy() != LayoutStrategy::Dictionary || self.tail_len() != 0 {
             return None;
@@ -236,7 +244,7 @@ impl VortexRdfStore {
         let mut prims: Vec<PrimitiveArray> = Vec::with_capacity(4);
         for name in schema::PRIMARY_COLUMNS {
             let col = struct_arr.unmasked_field_by_name(name).ok()?;
-            prims.push(crate::store::array::shared_u32_primitive(col)?);
+            prims.push(crate::store::array::shared_code_primitive(col)?);
         }
         // No plan (or a plan that declined): codes are gathered by row id, so
         // a served match's pending selection materializes here (the in-memory
@@ -246,21 +254,21 @@ impl VortexRdfStore {
         // zero-copy (a `Buffer` slice is a refcount bump); a tombstone-free id
         // list is a branch-free gather; only tombstoned views pay a
         // per-element liveness test.
-        let column = |prim: &PrimitiveArray| -> Buffer<u32> {
+        let column = |prim: &PrimitiveArray| -> Buffer<TermCode> {
             match (&selection, deleted) {
-                (RowSelection::All, None) => prim.clone().into_buffer::<u32>(),
+                (RowSelection::All, None) => prim.clone().into_buffer::<TermCode>(),
                 (RowSelection::Range(r), None) => prim
                     .clone()
-                    .into_buffer::<u32>()
+                    .into_buffer::<TermCode>()
                     .slice(r.start as usize..r.end as usize),
                 // An index-resolved match without deletes — the bindings'
                 // common payload shape.
                 (RowSelection::Ids(ids), None) => {
-                    let slice = prim.as_slice::<u32>();
+                    let slice = prim.as_slice::<TermCode>();
                     Buffer::from_iter(ids.iter().map(|&i| slice[i as usize]))
                 }
                 (selection, Some(deleted)) => {
-                    let slice = prim.as_slice::<u32>();
+                    let slice = prim.as_slice::<TermCode>();
                     let live = |i: usize| !deleted.value(i);
                     match selection {
                         RowSelection::All => Buffer::from_iter(
@@ -289,7 +297,7 @@ impl VortexRdfStore {
         ])
     }
 
-    /// The rows this view selects as four `u32` term-code columns, gathering
+    /// The rows this view selects as four [`TermCode`] columns, gathering
     /// them when `code_columns`' zero-copy fast path
     /// does not apply.
     ///
@@ -304,7 +312,7 @@ impl VortexRdfStore {
     ///
     /// This is the payload path behind the bindings' code-column reads; they
     /// call it instead of re-implementing the gather.
-    pub async fn code_columns_gathered(&self) -> Result<Option<[Buffer<u32>; 4]>> {
+    pub async fn code_columns_gathered(&self) -> Result<Option<[Buffer<TermCode>; 4]>> {
         if let Some(columns) = self.code_columns() {
             return Ok(Some(columns));
         }
@@ -316,9 +324,10 @@ impl VortexRdfStore {
         let struct_arr = rows
             .execute::<StructArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
-        let column = |name: &str, ctx: &mut vortex_array::ExecutionCtx| -> Result<Buffer<u32>> {
-            Ok(field_as::<PrimitiveArray>(&struct_arr, name, ctx)?.into_buffer::<u32>())
-        };
+        let column =
+            |name: &str, ctx: &mut vortex_array::ExecutionCtx| -> Result<Buffer<TermCode>> {
+                Ok(field_as::<PrimitiveArray>(&struct_arr, name, ctx)?.into_buffer::<TermCode>())
+            };
         Ok(Some([
             column(schema::COL_S, &mut ctx)?,
             column(schema::COL_P, &mut ctx)?,
@@ -459,6 +468,8 @@ impl VortexRdfStore {
     /// Every live quad this view covers, decoded to raw N-Triples term strings
     /// — base rows first (in view order), then tail rows.
     pub(super) async fn live_raw_quads(&self) -> Result<Vec<RawQuad>> {
+        #[cfg(test)]
+        crate::store::test_hooks::note_gather();
         let base = self.base_selected_rows().await?;
         Ok(self.merged_raw_quads(&base).await?.0)
     }

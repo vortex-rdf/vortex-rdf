@@ -23,7 +23,9 @@ impl VortexRdfStore {
     /// different index set. `add_quads` calls this automatically when the tail
     /// outgrows the auto-compaction thresholds; a file-backed store rewrites
     /// its source file (atomically) and stays file-backed, whether compacted
-    /// automatically or explicitly.
+    /// automatically or explicitly. If that file cannot be written (a
+    /// read-only store), `add_quads` keeps the batch in the tail instead, and
+    /// only this explicit call reports the refusal.
     ///
     /// [`compact_with_indexes`]: Self::compact_with_indexes
     pub async fn compact(&self) -> Result<Self> {
@@ -31,7 +33,8 @@ impl VortexRdfStore {
     }
 
     /// Gather this view's live rows into a standalone, owning store, re-sorted
-    /// by (s, p, o, g), with the given secondary indexes rebuilt over them.
+    /// by (s, p, o, g) with each quad once, and the given secondary indexes
+    /// rebuilt over them.
     ///
     /// Physically gathering the rows renumbers them to a fresh `0..n`, so the
     /// source components' `rid` columns — which addressed the old base — cannot
@@ -50,14 +53,17 @@ impl VortexRdfStore {
     ///
     /// A file-backed store stays file-backed: the compacted rows are written
     /// back over its own source file (via a temp file and an atomic rename) and
-    /// the store is reopened from it. An in-memory store returns the in-memory
-    /// rebuild directly.
+    /// the store is reopened from it. A source file the process cannot write is
+    /// never replaced: the compaction fails with `PermissionDenied` and leaves
+    /// it alone, before it has gathered or built anything. On Windows the
+    /// rename is refused while the file is mapped, by this store included, so
+    /// there a file-backed store cannot compact over its own path: the
+    /// compaction fails with the I/O error and the file is left as it was. An
+    /// in-memory store returns the in-memory rebuild directly.
     ///
     /// [`compact`]: Self::compact
     pub async fn compact_with_indexes(&self, indexes: Indexes) -> Result<Self> {
         let unique = unique_indexes(&indexes);
-        let mut raws = self.live_raw_quads().await?;
-        raws.sort_unstable();
         // An OWNING file-backed store stays file-backed: stream the live rows
         // through the sorted builder straight over their own source file (no
         // materialized rebuild — quads, index children, and the dictionary
@@ -68,22 +74,25 @@ impl VortexRdfStore {
         // copy, which the in-memory rebuild below provides.
         #[cfg(feature = "file-io")]
         if self.is_owner()
-            && let QuadsSource::File {
-                path,
-                dict_max_resident_bytes,
-                ..
-            } = &self.quads
+            && let QuadsSource::File { path, file, .. } = &self.quads
         {
-            return Self::stream_compacted_to_file(
-                raws,
-                self.layout.strategy(),
-                unique,
-                path,
-                *dict_max_resident_bytes,
-            )
-            .await;
+            return self
+                .stream_compacted_to_file(unique, path, file.identity())
+                .await;
         }
+        let raws = self.sorted_live_raw_quads().await?;
         Self::from_raw_quads(&raws, self.layout.strategy(), unique, true)
+    }
+
+    /// Every live quad this view covers in (s, p, o, g) order, each once: the
+    /// rows a compaction rebuilds from.
+    async fn sorted_live_raw_quads(&self) -> Result<Vec<RawQuad>> {
+        let mut raws = self.live_raw_quads().await?;
+        raws.sort_unstable();
+        // The compacted store holds each quad once, whatever the rows it was
+        // gathered from carried: equal quads are adjacent after the sort.
+        raws.dedup();
+        Ok(raws)
     }
 
     /// Persist freshly-compacted rows over `path` through the streaming
@@ -91,53 +100,53 @@ impl VortexRdfStore {
     /// after compaction.
     ///
     /// The rows are written to a temporary sibling file and then atomically
-    /// renamed over `path`. Overwriting the file in place would be unsafe
-    /// while a reader still maps the original, and a crash mid-write must
-    /// never leave the only on-disk copy half-written; the rename makes the
-    /// swap atomic and leaves `path` untouched on any earlier failure.
+    /// renamed over `path` ([`PendingStore`], which also writes every other
+    /// store file). Overwriting the file in place would be unsafe
+    /// while a reader still maps the original, and a process that dies
+    /// mid-write would leave a half-written file; the rename makes the swap
+    /// atomic against a process crash (it is not durable against power loss:
+    /// nothing is `fsync`ed first) and leaves `path` untouched on any earlier
+    /// failure.
+    ///
+    /// The writer is prepared *first*, before a quad is gathered: a source
+    /// file the process cannot write, a directory at the path, or a directory
+    /// that takes no new file is refused (`PermissionDenied` and the like)
+    /// before the rows are gathered, sorted or built, so a compaction that
+    /// cannot happen costs a few stats and one failed open.
+    ///
+    /// [`PendingStore`]: crate::io::ser::PendingStore
     #[cfg(feature = "file-io")]
     async fn stream_compacted_to_file(
-        raws: Vec<RawQuad>,
-        strategy: LayoutStrategy,
+        &self,
         indexes: Indexes,
         path: &std::path::Path,
-        dict_max_resident_bytes: u64,
+        opened: Option<crate::io::read::FileIdentity>,
     ) -> Result<Self> {
-        // A sibling temp file keeps the rename on one filesystem (so it is
-        // atomic); the uuid suffix avoids colliding with a temp left behind by
-        // an earlier interrupted compaction.
-        let tmp = path.with_extension(format!("compact-{}.tmp", uuid::Uuid::new_v4()));
+        let pending = crate::io::ser::PendingStore::create_over(path, opened).await?;
+        let raws = self.sorted_live_raw_quads().await?;
         let stream = futures::stream::iter(raws.into_iter().map(Ok::<_, VortexRdfError>));
         // The sorted builder spills merge runs to disk, and compaction rewrites
         // the whole store, so those runs can reach dataset size. Point them at
-        // the store file's own directory — the one volume known to fit the
-        // data, the same placement as the sibling temp file above. The
+        // the directory the writer's temp file is in — beside the file being
+        // replaced, links followed — the one volume known to fit the data,
+        // and the one the finished store is renamed within. (Not `path`'s
+        // directory: a store opened through a link may live elsewhere.) The
         // `VORTEX_RDF_SPILL_DIR` override still outranks this default.
-        let write = async {
-            let built = crate::store::builders::sorted_stream::build_chunk_stream(
-                Box::new(stream),
-                strategy,
-                indexes,
-                DEFAULT_CHUNK_ROWS,
-                path.parent(),
-            )
+        let built = crate::store::builders::sorted_stream::build_chunk_stream(
+            Box::new(stream),
+            self.layout.strategy(),
+            indexes,
+            DEFAULT_CHUNK_ROWS,
+            pending.dir(),
+        )
+        .await?;
+        pending
+            .write(|writer| crate::io::ser::built_stream_to_vortex_writer(built, writer))
             .await?;
-            let writer = crate::io::ser::create_store_file(&tmp).await?;
-            crate::io::ser::built_stream_to_vortex_writer(built, writer).await
-        };
-        if let Err(e) = write.await {
-            // Don't leave a partial temp file behind on a write failure.
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(e);
-        }
-        tokio::fs::rename(&tmp, path).await.map_err(|e| {
-            VortexRdfError::Io(std::io::Error::new(
-                e.kind(),
-                format!("replace {path:?}: {e}"),
-            ))
-        })?;
-        // Reopen with the caller's pinned residency budget, not the default.
-        Self::from_file_with_dict_residency(path, dict_max_resident_bytes).await
+        // Reopen mapped. This store's old mapping keeps the replaced file's
+        // pages until it drops; Windows refuses the rename above while that
+        // mapping lives, and compaction then fails with the I/O error.
+        Self::from_file(path).await
     }
 
     /// Build a fresh owning in-memory store from raw quads under `strategy` —
@@ -160,9 +169,9 @@ impl VortexRdfStore {
     /// Whether `add_quads` should fold the tail into the base now.
     ///
     /// Both in-memory and file-backed bases auto-compact once the tail crosses
-    /// the compaction thresholds. For a file-backed store this rewrites its
-    /// source file in place (see [`compact`](Self::compact)) and keeps it
-    /// file-backed — an append past the threshold performs a disk write.
+    /// the compaction thresholds. For a file-backed store this replaces its
+    /// source file (see [`compact`](Self::compact)) and keeps it file-backed —
+    /// an append past the threshold performs a disk write.
     pub(super) fn should_auto_compact(&self) -> bool {
         let (base_rows, tail) = match (&self.quads, &self.tail) {
             (QuadsSource::InMemory { base, .. }, Some(tail)) => (base.len(), tail),

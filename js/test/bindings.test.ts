@@ -150,6 +150,141 @@ describe('build variants', () => {
     }
 });
 
+// The probe: three RDF triples written eight
+// ways -- "x" four times (twice plain, once typed xsd:string, once through a
+// \u escape), "y"@en twice (@EN and @en), "z" under a subject written two ways.
+const PROBE_NT = [
+    '<http://ex.org/s> <http://ex.org/p> "x" .',
+    '<http://ex.org/s> <http://ex.org/p> "x" .',
+    '<http://ex.org/s> <http://ex.org/p> "x"^^<http://www.w3.org/2001/XMLSchema#string> .',
+    '<http://ex.org/s> <http://ex.org/p> "\\u0078" .',
+    '<http://ex.org/s> <http://ex.org/p> "y"@EN .',
+    '<http://ex.org/s> <http://ex.org/p> "y"@en .',
+    '<http://ex.org/s> <http://ex.org/p> "z" .',
+    '<http://ex.org/\\u0073> <http://ex.org/p> "z" .',
+].join('\n') + '\n';
+
+describe('a built store holds each quad once', () => {
+    const s = df.namedNode('http://ex.org/s');
+    const p = df.namedNode('http://ex.org/p');
+    const xsdString = df.namedNode('http://www.w3.org/2001/XMLSchema#string');
+    const langString = df.namedNode('http://www.w3.org/1999/02/22-rdf-syntax-ns#langString');
+    // A literal the factory would not build: an upper-case language tag.
+    const upperCaseLang = {
+        termType: 'Literal' as const,
+        value: 'y',
+        language: 'EN',
+        datatype: langString,
+    } as unknown as Literal;
+    const spellings = (): Quad[] => [
+        df.quad(s, p, df.literal('x')),
+        df.quad(s, p, df.literal('x')),
+        df.quad(s, p, df.literal('x', xsdString)),
+        df.quad(s, p, upperCaseLang),
+        df.quad(s, p, df.literal('y', 'en')),
+        df.quad(s, p, df.literal('z')),
+        df.quad(s, p, df.literal('z')),
+    ];
+
+    for (const { name, options } of VARIANTS) {
+        describe(name, () => {
+            test('fromString keeps one row per distinct quad', async () => {
+                const store = await VortexRdfStore.fromString(PROBE_NT, 'ntriples', options);
+                expect(await store.size()).toBe(3);
+                expect(store.getQuads().length).toBe(3);
+                expect(store.countQuads(null, null, df.literal('x'), null)).toBe(1);
+                expect(store.countQuads(null, null, df.literal('y', 'en'), null)).toBe(1);
+                expect(store.countQuads(null, p, null, null)).toBe(3);
+
+                const restored = await VortexRdfStore.fromBytes(await store.toBytes());
+                expect(await restored.size()).toBe(3);
+                expect(restored.getQuads().length).toBe(3);
+            });
+
+            test('fromQuads canonicalizes RDF/JS terms before it counts them', async () => {
+                const store = await VortexRdfStore.fromQuads(spellings(), options);
+                expect(await store.size()).toBe(3);
+                expect(store.getQuads().length).toBe(3);
+                expect(store.countQuads(null, null, df.literal('x'), null)).toBe(1);
+
+                const viaStream = await VortexRdfStore.fromQuads(
+                    Readable.from(spellings(), { objectMode: true }),
+                    options,
+                );
+                expect(await viaStream.size()).toBe(3);
+            });
+        });
+    }
+
+    test('the dictionary holds one code per RDF term', async () => {
+        const store = await VortexRdfStore.fromString(PROBE_NT, 'ntriples', { layout: 'dictionary' });
+        const dict = store.termDict()!;
+        const codes = store.matchCodes()!;
+        expect(codes.length).toBe(3);
+        // The subject, the predicate, "x", "y"@en, "z" and the default graph:
+        // six codes in use across the four columns, each a distinct term.
+        const used = new Set([...codes.s, ...codes.p, ...codes.o, ...codes.g]);
+        expect(used.size).toBe(6);
+        expect(new Set([...used].map(code => dict.decode(code))).size).toBe(6);
+        expect(new Set([...used].map(code => dict.decode(code)))).toEqual(new Set([
+            '<http://ex.org/s>', '<http://ex.org/p>', '"x"', '"y"@en', '"z"', '',
+        ]));
+    });
+});
+
+// The vortex-rdf.store.v2 readers rely on guarantees only a v2 writer gives
+// (each quad stored once; reference-index children in (val, rid) order), so a
+// store with the v1 root layout (vortex-rdf 0.11 and earlier) is refused. The
+// two ids are the same length, so renaming one into the other in a written
+// store moves no offset (a Vortex file has no checksum over its footer): that
+// is how a v1 file is made here.
+describe('stores with the v1 root layout are refused', () => {
+    const encode = (text: string) => new TextEncoder().encode(text);
+    const current = encode('vortex-rdf.store.v2');
+    const legacy = encode('vortex-rdf.store.v1');
+    const findAll = (bytes: Uint8Array, needle: Uint8Array): number[] => {
+        const at: number[] = [];
+        for (let i = 0; i + needle.length <= bytes.length; i++) {
+            if (needle.every((byte, k) => bytes[i + k] === byte)) at.push(i);
+        }
+        return at;
+    };
+    const asWrittenBefore012 = (bytes: Uint8Array): Uint8Array => {
+        const copy = bytes.slice();
+        const at = findAll(copy, current);
+        expect(at.length).toBe(1);
+        copy.set(legacy, at[0]);
+        return copy;
+    };
+
+    for (const { name, options } of VARIANTS) {
+        test(`${name}: a store written now carries the v2 root; a v1 one is refused`, async () => {
+            const bytes = await (await VortexRdfStore.fromString(NQUADS, 'nquads', options)).toBytes();
+            expect(findAll(bytes, current).length).toBe(1);
+            expect(findAll(bytes, legacy).length).toBe(0);
+
+            const refused = VortexRdfStore.fromBytes(asWrittenBefore012(bytes));
+            await expect(refused).rejects.toThrow(/written by vortex-rdf 0\.11 or earlier/);
+            await expect(VortexRdfStore.fromBytes(asWrittenBefore012(bytes))).rejects.toThrow(
+                /rebuild it from its RDF source with vortex-rdf 0\.12 or later.*serializeRdf/,
+            );
+            await expect(VortexRdfStore.fromBytes(asWrittenBefore012(bytes))).rejects.toThrow(
+                /^(?!.*(not a vortex-rdf store file|Invalid encoding ID))/s,
+            );
+
+            // The current bytes still open.
+            expect(await (await VortexRdfStore.fromBytes(bytes)).size()).toBe(6);
+        });
+    }
+
+    test('deserializeRdf refuses a v1 file the same way', async () => {
+        const bytes = await serializeRdf(NQUADS, 'nquads');
+        await expect(deserializeRdf(asWrittenBefore012(bytes), 'nquads')).rejects.toThrow(
+            /written by vortex-rdf 0\.11 or earlier/,
+        );
+    });
+});
+
 describe('match returns an RDF/JS Stream<Quad>', () => {
     test('for-await and data/end events both yield the matches', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
@@ -268,7 +403,7 @@ describe('free functions', () => {
 });
 
 describe('lazy terms outliving a dictionary rebuild', () => {
-    // A Dictionary-layout read hands back `u32` term codes plus a handle on the
+    // A Dictionary-layout read hands back term codes plus a handle on the
     // dictionary they index into. Auto-compaction re-encodes the store against a
     // *fresh* dictionary, renumbering every term, so lazy quads that decoded
     // against the live store would silently resolve old codes to other terms.
@@ -665,7 +800,7 @@ describe('matchCodes / termDict gates', () => {
         expect(cols).not.toBeNull();
         expect(cols.length).toBe(3);
         for (const col of [cols.s, cols.p, cols.o, cols.g]) {
-            expect(col).toBeInstanceOf(Uint32Array);
+            expect(col).toBeInstanceOf(Float64Array);
             expect(col.length).toBe(3);
         }
         const quads = store.getQuads(null, p1, null, null);
@@ -716,6 +851,59 @@ describe('matchCodes / termDict gates', () => {
         expect(typeof dict.encode('')).toBe('number');
         const code = dict.encode('<http://example.org/s1>')!;
         expect(dict.decode(code)).toBe('<http://example.org/s1>');
+    });
+
+    // Codes are u64 and cross as JS numbers, exact up to 2^53 - 1. A code
+    // past u32::MAX is a code like any other — out of this dictionary's range
+    // here, never wrapped onto the term 2^32 below it — and what is no code
+    // (negative, fractional, not finite, past 2^53 - 1) is refused.
+    test('TermDict takes codes past u32::MAX without wrapping them', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
+        const dict = store.termDict()!;
+        const code = dict.encode('<http://example.org/s1>')!;
+        expect(dict.decode(code)).toBe('<http://example.org/s1>');
+        expect(dict.decode(2 ** 32 + code)).toBeUndefined();
+        expect(dict.decode(2 ** 40 + code)).toBeUndefined();
+        expect(dict.decode(Number.MAX_SAFE_INTEGER)).toBeUndefined();
+    });
+
+    test('TermDict refuses what is no code', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
+        const dict = store.termDict()!;
+        for (const bad of [-1, -0.5, 1.5, NaN, Infinity, -Infinity, 2 ** 53, 2 ** 64]) {
+            expect(() => dict.decode(bad), `${bad}`).toThrow(/code/);
+        }
+    });
+
+    test('TermDict.decode refuses what is no number instead of coercing it', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
+        const dict = store.termDict()!;
+        // Coerced, `null`, `[]`, `false` and `''` would be code 0, and `true`,
+        // `'1'` and `[1]` code 1: real terms of this dictionary.
+        expect(dict.decode(0)).toBeDefined();
+        expect(dict.decode(1)).toBeDefined();
+        const notNumbers: unknown[] = [null, undefined, [], [1], {}, true, false, '1', '', 1n];
+        for (const bad of notNumbers) {
+            expect(() => dict.decode(bad as number), String(bad)).toThrow(/code/);
+        }
+    });
+
+    test('matchCodes columns are Float64Arrays of exact codes', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', {
+            layout: 'dictionary',
+            indexes: ['secondary-by-reference'],
+        });
+        const dict = store.termDict()!;
+        const cols = store.matchCodes()!;
+        expect(cols.length).toBe(6);
+        for (const col of [cols.s, cols.p, cols.o, cols.g]) {
+            expect(col).toBeInstanceOf(Float64Array);
+            for (const code of col) {
+                expect(Number.isSafeInteger(code)).toBe(true);
+                expect(dict.decode(code)).toBeDefined();
+                expect(dict.encode(dict.decode(code)!)).toBe(code);
+            }
+        }
     });
 });
 

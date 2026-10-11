@@ -1,4 +1,5 @@
 import pathlib
+import re
 import shutil
 from array import array
 
@@ -88,7 +89,7 @@ def test_code_path_matches_decoded_rows(vortex_files):
     for pattern in PATTERNS:
         cols = store.match_codes(**pattern)
         assert cols is not None
-        views = [memoryview(c).cast("I").tolist() for c in cols]
+        views = [memoryview(c).cast("Q").tolist() for c in cols]
         from_codes = sorted(
             tuple(dictionary.decode(code) for code in row) for row in zip(*views)
         )
@@ -101,7 +102,7 @@ def test_encode_inverts_decode(vortex_files):
     cols = store.match_codes()
     assert dictionary is not None and cols is not None
     for col in cols:
-        for code in memoryview(col).cast("I"):
+        for code in memoryview(col).cast("Q"):
             term = dictionary.decode(code)
             assert term is not None
             assert dictionary.encode(term) == code
@@ -117,15 +118,16 @@ def test_code_path_unavailable_on_other_layouts(vortex_files, layout):
     assert store.match_codes() is None
 
 
-def test_u32_column_buffer_is_zero_copy_view(vortex_files):
+def test_u64_column_buffer_is_zero_copy_view(vortex_files):
     store = VortexRdfStore(vortex_files["dictionary"])
     cols = store.match_codes()
     view = memoryview(cols[0])
     assert view.readonly
-    typed = view.cast("I")
+    assert view.nbytes == 8 * len(cols[0])
+    typed = view.cast("Q")
     assert len(typed) == len(cols[0]) == 5
     # Two views over the same column expose identical memory.
-    assert typed.tolist() == memoryview(cols[0]).cast("I").tolist()
+    assert typed.tolist() == memoryview(cols[0]).cast("Q").tolist()
 
 
 def test_in_memory_open_matches_file_backed(vortex_files, layout):
@@ -145,43 +147,81 @@ def test_in_memory_dictionary_keeps_code_path(vortex_files):
     assert cols is not None and len(cols[0]) == 3
 
 
+def test_mapped_bulk_reads_decode_through_the_dictionary_handle(tmp_path):
+    """A default (mapped) open decodes a bulk result through its file-backed
+    dictionary handle, as the in-memory open does: one Python string per
+    distinct term across the whole result. The matched-quads fallback decodes
+    chunk by chunk, so on a file wider than one chunk (100,000 rows) it would
+    hand back one string per chunk for a term spanning them."""
+    rows = 100_100  # past one chunk of the file
+    nt = tmp_path / "wide.nt"
+    nt.write_text(
+        "".join(
+            f"<http://ex.org/s{i}> <http://ex.org/p> <http://ex.org/o{i % 7}> .\n"
+            for i in range(rows)
+        )
+    )
+    path = tmp_path / "wide.vortex"
+    serialize_rdf(nt, path, layout="dictionary")
+
+    # The premise: the file spans more than one chunk. A string-layout store of
+    # the same rows is read by the matched-quads fallback, which decodes chunk
+    # by chunk and so hands back one predicate string per chunk.
+    strings = tmp_path / "wide-strings.vortex"
+    serialize_rdf(nt, strings, layout="default")
+    assert len({id(quad[1]) for quad in VortexRdfStore(strings).get_quads()}) >= 2
+
+    mapped = VortexRdfStore(path)
+    loaded = VortexRdfStore(path, in_memory=True)
+    assert mapped.term_dict().file_backed and not loaded.term_dict().file_backed
+
+    quads = mapped.get_quads()
+    assert len(quads) == rows
+    assert len({id(quad[1]) for quad in quads}) == 1  # the one predicate
+    assert len({id(quad[2]) for quad in quads}) == 7  # the seven objects
+    columns = mapped.match_columns()
+    assert [len({id(term) for term in column}) for column in columns[1:3]] == [1, 7]
+    assert set(quads) == set(loaded.get_quads())
+    assert set(zip(*columns)) == set(quads)
+
+
 def _codes(cols):
-    return [memoryview(col).cast("I").tolist() for col in cols]
+    return [memoryview(col).cast("Q").tolist() for col in cols]
 
 
-def _assert_file_backed_dictionary(fallback, resident):
-    assert fallback.layout() == "dictionary"
+def _assert_file_backed_dictionary(mapped, loaded):
+    assert mapped.layout() == "dictionary"
     # The dictionary stays in the file, but the code path still applies:
     # the handle reads the file on demand.
-    file_backed = fallback.term_dict()
+    file_backed = mapped.term_dict()
     assert file_backed is not None and file_backed.file_backed
-    in_memory = resident.term_dict()
+    in_memory = loaded.term_dict()
     assert in_memory is not None and not in_memory.file_backed
     assert len(file_backed) == len(in_memory)
-    assert _codes(fallback.match_codes(p=NAME)) == _codes(resident.match_codes(p=NAME))
+    assert _codes(mapped.match_codes(p=NAME)) == _codes(loaded.match_codes(p=NAME))
     for pattern in PATTERNS:
-        assert sorted(fallback.get_quads(**pattern)) == sorted(resident.get_quads(**pattern))
-        assert fallback.match_columns(**pattern) == resident.match_columns(**pattern)
-        assert fallback.count_quads(**pattern) == resident.count_quads(**pattern)
+        assert sorted(mapped.get_quads(**pattern)) == sorted(loaded.get_quads(**pattern))
+        assert mapped.match_columns(**pattern) == loaded.match_columns(**pattern)
+        assert mapped.count_quads(**pattern) == loaded.count_quads(**pattern)
 
 
-def test_residency_budget_zero_forces_file_backed_dictionary(vortex_files):
-    """With no residency budget the dictionary stays in the file: the
-    string matchers are served from the shared-term rows, and the code path
-    decodes through a file-backed handle."""
-    resident = VortexRdfStore(vortex_files["dictionary"])
-    fallback = VortexRdfStore(vortex_files["dictionary"], max_resident_bytes=0)
-    _assert_file_backed_dictionary(fallback, resident)
+def test_file_store_dictionary_is_file_backed(vortex_files):
+    """A file store's dictionary stays in the mapped file: the string
+    matchers and the code path both decode through a file-backed handle —
+    answering like the in-memory load."""
+    mapped = VortexRdfStore(vortex_files["dictionary"])
+    loaded = VortexRdfStore(vortex_files["dictionary"], in_memory=True)
+    _assert_file_backed_dictionary(mapped, loaded)
 
 
-def test_residency_env_var(vortex_files, monkeypatch):
-    resident = VortexRdfStore(vortex_files["dictionary"])
-    monkeypatch.setenv("VORTEX_RDF_DICT_MAX_RESIDENT_BYTES", "0")
-    fallback = VortexRdfStore(vortex_files["dictionary"])
-    _assert_file_backed_dictionary(fallback, resident)
-    # An explicit budget overrides the environment.
-    lifted = VortexRdfStore(vortex_files["dictionary"], max_resident_bytes=1 << 30).term_dict()
-    assert lifted is not None and not lifted.file_backed
+def test_residency_knobs_are_gone(vortex_files, monkeypatch):
+    path = vortex_files["dictionary"]
+    with pytest.raises(TypeError):
+        VortexRdfStore(path, max_resident_bytes=0)
+    with pytest.raises(TypeError):
+        VortexRdfStore(path, True)  # in_memory is keyword-only
+    monkeypatch.setenv("VORTEX_RDF_DICT_MAX_RESIDENT_BYTES", str(1 << 40))
+    assert VortexRdfStore(path).term_dict().file_backed
 
 
 def test_indexes_round_trip(vortex_files, indexed_files, layout):
@@ -268,6 +308,24 @@ def test_serialize_format_and_detect_failure(fixture_nt_path, tmp_path):
     assert len(VortexRdfStore(out)) == 5
 
 
+def test_serialize_to_a_missing_directory_fails_and_creates_nothing(fixture_nt_path, tmp_path):
+    missing = tmp_path / "missing"
+    with pytest.raises(FileNotFoundError):
+        serialize_rdf(fixture_nt_path, missing / "out.vortex")
+    assert not missing.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_serialize_onto_a_directory_fails_and_leaves_it_alone(fixture_nt_path, tmp_path):
+    out = tmp_path / "out.vortex"
+    out.mkdir()
+    (out / "keep.txt").write_text("keep")
+    with pytest.raises(OSError, match="is a directory"):
+        serialize_rdf(fixture_nt_path, out)
+    assert [p.name for p in tmp_path.iterdir()] == ["out.vortex"]
+    assert [p.name for p in out.iterdir()] == ["keep.txt"]
+
+
 def test_dictionary_file_is_self_contained(fixture_nt_path, tmp_path):
     out = tmp_path / "dict.vortex"
     serialize_rdf(fixture_nt_path, out, layout="dictionary")
@@ -296,7 +354,7 @@ def test_decode_many_shares_one_object_per_repeated_code(vortex_files):
         ("adjacent", [0, 0, 0, 0, 1, 1, 1, 1]),
         ("scattered", [0, 1, 0, 1, 0, 1, 0, 1]),
     ):
-        terms = dictionary.decode_many(array("I", codes))
+        terms = dictionary.decode_many(array("Q", codes))
         assert [id(t) for t in terms] == [
             id(terms[codes.index(c)]) for c in codes
         ], f"{label}: repeated codes did not share one object"
@@ -314,18 +372,24 @@ def test_term_dict_decode_edges(vortex_files):
 
     assert dictionary.decode(end) is None
     assert dictionary.decode_many([end]) == [None]
-    assert dictionary.decode_many(array("I", [2**31])) == [None]
+    assert dictionary.decode_many(array("Q", [2**63])) == [None]
+    # A u32 buffer is no u64 codes: refused, naming the u64 view.
+    with pytest.raises(ValueError, match=re.escape('cast("Q")')):
+        dictionary.decode_many(array("I", [2**31]))
 
     # Every accepted input shape decodes the same column identically.
-    codes = memoryview(cols[0]).cast("I").tolist()
+    codes = memoryview(cols[0]).cast("Q").tolist()
     expected = [dictionary.decode(c) for c in codes]
     assert dictionary.decode_many(cols[0]) == expected
     assert dictionary.decode_many(memoryview(cols[0])) == expected
-    assert dictionary.decode_many(memoryview(cols[0]).cast("I")) == expected
+    assert dictionary.decode_many(memoryview(cols[0]).cast("Q")) == expected
     assert dictionary.decode_many(codes) == expected
 
-    with pytest.raises(ValueError, match="whole number of u32"):
-        dictionary.decode_many(bytes(5))
+    # The raw view is read as whole u64s: 12 bytes is three u32s, but no
+    # whole number of u64s.
+    for size in (5, 12):
+        with pytest.raises(ValueError, match="whole number of u64"):
+            dictionary.decode_many(bytes(size))
 
     # A plain int list shares one object per repeated code too.
     shared = dictionary.decode_many([0, 0])

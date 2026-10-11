@@ -437,7 +437,7 @@ impl Node<'_> {
                 if needle <= *base {
                     0
                 } else {
-                    ((needle - *base).div_ceil(*multiplier) as usize).min(*len)
+                    clamp_to_len((needle - *base).div_ceil(*multiplier), *len)
                 }
             }
             Node::RunEnd {
@@ -501,9 +501,9 @@ impl Node<'_> {
                 if needle < *base {
                     0
                 } else {
-                    (((needle - *base) / *multiplier) as usize)
-                        .saturating_add(1)
-                        .min(*len)
+                    // `q + 1` values are `<= needle`; saturating keeps a
+                    // quotient of `u64::MAX` past every position.
+                    clamp_to_len(((needle - *base) / *multiplier).saturating_add(1), *len)
                 }
             }
             Node::RunEnd {
@@ -586,6 +586,14 @@ impl Node<'_> {
     }
 }
 
+/// Position `q` among `len` positions, clamped to `len`. A quotient the index
+/// type cannot hold lies past every position: on a 32-bit target a `u64`
+/// quotient above `u32::MAX` clamps rather than wrapping to its low bits.
+/// Generic over the index type so a 64-bit host can test the narrow case.
+fn clamp_to_len<I: TryFrom<u64> + Ord + Copy>(q: u64, len: I) -> I {
+    I::try_from(q).map_or(len, |n| n.min(len))
+}
+
 /// The runs overlapping the window `[offset, offset + len)`, as
 /// `(first_run, run_count)`. Sortedness is asserted for the window only, so
 /// run searches must stay inside these runs — a sliced RunEnd keeps its full
@@ -644,6 +652,26 @@ mod tests {
             assert_eq!(n.upper_bound(needle), hi, "upper({needle})");
         }
         assert_eq!(n.value_at(2), 11);
+    }
+
+    #[test]
+    fn quotients_past_the_index_width_clamp_to_len() {
+        // u32 stands in for a 32-bit target's usize: a quotient past
+        // u32::MAX is past every position, never its low bits.
+        let len = 10u32;
+        for q in [1u64 << 32, (1 << 32) + 3, (1 << 33) + 9, u64::MAX] {
+            assert_eq!(clamp_to_len(q, len), len, "q = {q}");
+        }
+        assert_eq!(clamp_to_len(3, len), 3);
+        assert_eq!(clamp_to_len(u64::from(u32::MAX), len), len);
+        // The upper bound's `q + 1` past u32::MAX clamps too.
+        assert_eq!(
+            clamp_to_len(u64::from(u32::MAX).saturating_add(1), len),
+            len
+        );
+        // The native width.
+        assert_eq!(clamp_to_len(u64::MAX, 7usize), 7);
+        assert_eq!(clamp_to_len(4, 7usize), 4);
     }
 
     #[test]

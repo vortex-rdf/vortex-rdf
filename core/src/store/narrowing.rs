@@ -7,11 +7,12 @@
 //! [`match_pattern`](VortexRdfStore::match_pattern) in either order and is
 //! read through the same paths (`size`, `code_columns_gathered`, `quads`).
 //! Keeps are applied *after* the pattern, never through the pattern
-//! compiler: in memory as a binary search inside a sorted run or a pass over
-//! the selected rows of the column, on file as range or set conjuncts the
-//! scan prunes with its zone maps. Windows and capped counts over a file
-//! view with a pending filter evaluate its splits in file order and stop at
-//! the first split that completes them.
+//! compiler and never as scan expressions: in memory as a binary search
+//! inside a sorted run or a pass over the selected rows of the column, on
+//! file as the located runs of a sorted subject column or else a pass over
+//! the column streamed for the view's rows. Windows and capped counts over a
+//! file view with a pending filter evaluate its splits in file order and stop
+//! at the first split that completes them.
 
 use std::ops::Range;
 
@@ -21,12 +22,12 @@ use vortex_buffer::Buffer;
 
 use crate::debug;
 use crate::error::{Result, VortexRdfError};
-use crate::store::array::{cached_u32_primitive, column_is_sorted, into_struct_array};
+use crate::store::array::{cached_code_primitive, column_is_sorted, into_struct_array};
 use crate::store::layouts::LayoutStrategy;
 use crate::store::probes::StructProbes;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_scan;
-use crate::store::schema::{self, QuadColumn};
+use crate::store::schema::{self, QuadColumn, RowId, TermCode};
 use crate::store::selection::{RowSelection, ViewSelection};
 use crate::store::{QuadsSource, Tail};
 
@@ -37,35 +38,24 @@ use super::VortexRdfStore;
 pub enum Keep {
     /// Any of these codes — ascending and unique, as [`Keep::set`] builds
     /// them.
-    Set(Buffer<u32>),
+    Set(Buffer<TermCode>),
     /// Any code in the half-open range `lo..hi`. Codes rank the dictionary's
     /// spellings in byte order, so a term kind or an IRI namespace is one
     /// such range (see `DictReader::prefix_range`).
-    Range(u32, u32),
+    Range(TermCode, TermCode),
 }
-
-/// A `Keep::Set` of up to this many codes is pushed to a file scan as an
-/// `OR` of equalities (each a zone-prunable conjunct); larger sets go as one
-/// `list_contains` conjunct.
-#[cfg(feature = "file-io")]
-const KEEP_SET_OR_MAX: usize = 32;
-
-/// A `Keep::Set` wider than this is not pushed to the scan as an expression
-/// at all: the column is read for the view's rows and tested in memory.
-#[cfg(feature = "file-io")]
-const KEEP_SET_FILTER_MAX: usize = 4_096;
 
 impl Keep {
     /// The keep admitting exactly `codes` (any order, repeats folded).
-    pub fn set(codes: impl IntoIterator<Item = u32>) -> Self {
-        let mut codes: Vec<u32> = codes.into_iter().collect();
+    pub fn set(codes: impl IntoIterator<Item = TermCode>) -> Self {
+        let mut codes: Vec<TermCode> = codes.into_iter().collect();
         codes.sort_unstable();
         codes.dedup();
         Keep::Set(Buffer::from(codes))
     }
 
     /// The keep admitting every code in `range`.
-    pub fn range(range: Range<u32>) -> Self {
+    pub fn range(range: Range<TermCode>) -> Self {
         Keep::Range(range.start, range.end.max(range.start))
     }
 
@@ -78,7 +68,7 @@ impl Keep {
     }
 
     /// Whether `code` is admitted.
-    pub fn admits(&self, code: u32) -> bool {
+    pub fn admits(&self, code: TermCode) -> bool {
         match self {
             Keep::Set(codes) => codes.as_slice().binary_search(&code).is_ok(),
             Keep::Range(lo, hi) => (*lo..*hi).contains(&code),
@@ -94,18 +84,24 @@ impl Keep {
                 let (Some(&lo), Some(&hi)) = (codes.first(), codes.last()) else {
                     return KeepTest::Range(0, 0);
                 };
-                let span = (hi - lo) as usize + 1;
                 // A bitmap costs a bit per code of the span; worth it while
-                // the span is within 8 bits per member (a byte each).
-                if span <= codes.len().saturating_mul(8) {
-                    let mut bits = vec![0u64; span.div_ceil(64)];
-                    for &code in codes {
-                        let bit = (code - lo) as usize;
-                        bits[bit / 64] |= 1u64 << (bit % 64);
+                // the span is within 8 bits per member (a byte each). A span
+                // wider than a `usize` (on a 32-bit target) takes the sorted
+                // test rather than a wrapped bitmap.
+                let span = usize::try_from(hi - lo)
+                    .ok()
+                    .filter(|&span| span < codes.len().saturating_mul(8));
+                match span {
+                    Some(span) => {
+                        let mut bits = vec![0u64; (span + 1).div_ceil(64)];
+                        for &code in codes {
+                            // At most `span`, so it fits a `usize`.
+                            let bit = (code - lo) as usize;
+                            bits[bit / 64] |= 1u64 << (bit % 64);
+                        }
+                        KeepTest::Bitmap { lo, hi, bits }
                     }
-                    KeepTest::Bitmap { lo, hi, bits }
-                } else {
-                    KeepTest::Sorted(codes)
+                    None => KeepTest::Sorted(codes),
                 }
             }
         }
@@ -115,20 +111,25 @@ impl Keep {
 /// A [`Keep`] as a per-row test: a range compare, a bitmap over a dense set's
 /// span, or a binary search of a sparse one.
 enum KeepTest<'a> {
-    Range(u32, u32),
-    Bitmap { lo: u32, hi: u32, bits: Vec<u64> },
-    Sorted(&'a [u32]),
+    Range(TermCode, TermCode),
+    Bitmap {
+        lo: TermCode,
+        hi: TermCode,
+        bits: Vec<u64>,
+    },
+    Sorted(&'a [TermCode]),
 }
 
 impl KeepTest<'_> {
     #[inline]
-    fn admits(&self, code: u32) -> bool {
+    fn admits(&self, code: TermCode) -> bool {
         match self {
             KeepTest::Range(lo, hi) => (*lo..*hi).contains(&code),
             KeepTest::Bitmap { lo, hi, bits } => {
                 if code < *lo || code > *hi {
                     return false;
                 }
+                // `lo <= code <= hi`, a span the bitmap was sized for.
                 let bit = (code - lo) as usize;
                 bits[bit / 64] & (1u64 << (bit % 64)) != 0
             }
@@ -141,16 +142,17 @@ impl KeepTest<'_> {
 /// its canonical primitive when one is already materialized, else the
 /// store's cached encoded-search probe.
 enum CodeReader<'a> {
-    Slice(&'a [u32]),
+    Slice(&'a [TermCode]),
     Probe(&'a vortex_rdf_encoded_search::OwnedSortedProbe),
 }
 
 impl CodeReader<'_> {
     #[inline]
-    fn code_at(&self, row: usize) -> u32 {
+    fn code_at(&self, row: usize) -> TermCode {
         match self {
             CodeReader::Slice(slice) => slice[row],
-            CodeReader::Probe(probe) => probe.value_at(row) as u32,
+            // A probe reads every width as a u64 — exactly a code.
+            CodeReader::Probe(probe) => probe.value_at(row),
         }
     }
 }
@@ -173,12 +175,16 @@ impl VortexRdfStore {
     /// In memory the keep is a binary search when the selected rows are a
     /// run of the sorted base that `column` orders (a bound prefix of the
     /// `(s, p, o, g)` order, as a subject-bound match leaves), else one pass
-    /// over the selected rows of the column read in place. On file it is a
-    /// range or set conjunct ANDed onto the view's pushed-down filter, so the
-    /// scan's zone maps prune whole blocks it cannot satisfy; a very wide set
-    /// is tested in memory over the column's selected rows instead. A served
-    /// view's deferred row ids materialize first (the index's plan reads a
-    /// run the keep no longer describes).
+    /// over the selected rows of the column read in place. On file, a keep on
+    /// the subject column of a store sorted by it is located: the rows it
+    /// admits are runs of that column, found in the mapped leaf metadata and
+    /// intersected with the view's rows, so nothing is read and a pending
+    /// filter stays pending (a set of more than one code per sixteen rows of
+    /// the view is streamed instead). Any other keep resolves the view's
+    /// rows, streams the column for them through the mapping and tests the
+    /// keep in memory — never pushed to the scan as an expression. A pending
+    /// view's deferred row ids (a served match's, or a run held for a count)
+    /// materialize first.
     ///
     /// [`match_pattern`]: Self::match_pattern
     pub async fn keep(&self, column: QuadColumn, keep: &Keep) -> Result<Self> {
@@ -225,12 +231,29 @@ impl VortexRdfStore {
                 probes,
                 ..
             } => {
-                let selection = selection.materialized()?;
-                let live = match deleted {
-                    None => selection.len(base.len()),
-                    Some(deleted) => selection.live_mask(deleted, base.len()).true_count(),
+                // A located run held pending for this window: only the
+                // window's own rows are decoded, and the run's width is its
+                // live size.
+                let located = match (selection, deleted) {
+                    (ViewSelection::Pending(lazy), None) => match lazy.len_if_known() {
+                        Some(live) => lazy.window(offset, limit)?.map(|ids| (ids, live)),
+                        None => None,
+                    },
+                    _ => None,
                 };
-                let windowed = selection.window(offset, limit, deleted.as_ref(), base.len());
+                let (windowed, live) = if let Some((ids, live)) = located {
+                    (ids_selection(ids), live)
+                } else {
+                    let selection = selection.materialized()?;
+                    let live = match deleted {
+                        None => selection.len(base.len()),
+                        Some(deleted) => selection.live_mask(deleted, base.len()).true_count(),
+                    };
+                    (
+                        selection.window(offset, limit, deleted.as_ref(), base.len()),
+                        live,
+                    )
+                };
                 let taken = windowed.len(base.len());
                 (
                     QuadsSource::InMemory {
@@ -248,7 +271,6 @@ impl VortexRdfStore {
             #[cfg(feature = "file-io")]
             QuadsSource::File {
                 path,
-                dict_max_resident_bytes,
                 file,
                 filter,
                 selection,
@@ -256,47 +278,64 @@ impl VortexRdfStore {
                 ..
             } => {
                 let row_count = file.row_count() as usize;
-                let selection = selection.materialized_async().await?;
-                let (windowed, live) = match filter {
-                    None => {
-                        let live = match deleted {
-                            None => selection.len(row_count),
-                            Some(deleted) => selection.live_mask(deleted, row_count).true_count(),
-                        };
-                        (
-                            selection.window(offset, limit, deleted.as_ref(), row_count),
-                            live,
-                        )
-                    }
-                    Some(filter) => {
-                        // Only the matches the window can reach are
-                        // evaluated; fewer than asked means the base is
-                        // exhausted and their count is its live size.
-                        let want = offset.saturating_add(limit);
-                        let found = file_scan::first_matching_rows(
-                            file,
-                            filter,
-                            &selection,
-                            deleted.as_ref(),
-                            want,
-                        )
-                        .await?;
-                        let live = if found.len() < want {
-                            found.len()
-                        } else {
-                            want
-                        };
-                        (
-                            RowSelection::Ids(found).window(offset, limit, None, row_count),
-                            live,
-                        )
+                // A located run held pending for this window: only the window's
+                // own rows are read, and the run's width is its live size.
+                let located = match (selection, filter, deleted) {
+                    (ViewSelection::Pending(lazy), None, None) => match lazy.len_if_known() {
+                        Some(live) => lazy
+                            .window_async(offset, limit)
+                            .await?
+                            .map(|ids| (ids, live)),
+                        None => None,
+                    },
+                    _ => None,
+                };
+                let (windowed, live) = if let Some((ids, live)) = located {
+                    (ids_selection(ids), live)
+                } else {
+                    let selection = selection.materialized_async().await?;
+                    match filter {
+                        None => {
+                            let live = match deleted {
+                                None => selection.len(row_count),
+                                Some(deleted) => {
+                                    selection.live_mask(deleted, row_count).true_count()
+                                }
+                            };
+                            (
+                                selection.window(offset, limit, deleted.as_ref(), row_count),
+                                live,
+                            )
+                        }
+                        Some(filter) => {
+                            // Only the matches the window can reach are
+                            // evaluated; fewer than asked means the base is
+                            // exhausted and their count is its live size.
+                            let want = offset.saturating_add(limit);
+                            let found = file_scan::first_matching_rows(
+                                file,
+                                filter,
+                                &selection,
+                                deleted.as_ref(),
+                                want,
+                            )
+                            .await?;
+                            let live = if found.len() < want {
+                                found.len()
+                            } else {
+                                want
+                            };
+                            (
+                                RowSelection::Ids(found).window(offset, limit, None, row_count),
+                                live,
+                            )
+                        }
                     }
                 };
                 let taken = windowed.len(row_count);
                 (
                     QuadsSource::File {
                         path: path.clone(),
-                        dict_max_resident_bytes: *dict_max_resident_bytes,
                         file: file.clone(),
                         filter: None,
                         selection: ViewSelection::Exact(windowed),
@@ -352,15 +391,12 @@ impl VortexRdfStore {
                 filter,
                 selection,
                 deleted,
-                serve,
                 ..
             } => match filter {
                 None => self.base_size().await?,
                 Some(filter) => {
-                    // A filter never rides with a served plan; with one the
-                    // selection is already exact, so this never scans an
-                    // index child to count.
-                    debug_assert!(serve.is_none());
+                    // The selection resolves first (a served view's ids come
+                    // from its index child); the filter then counts within it.
                     let selection = selection.materialized_async().await?;
                     file_scan::count_matching_rows_capped(
                         file,
@@ -421,8 +457,8 @@ impl VortexRdfStore {
         else {
             unreachable!("keep routes only InMemory sources here");
         };
-        // A served view's deferred ids are needed now: the plan reads a run
-        // the keep no longer describes.
+        // A pending view's deferred ids are needed now: the keep narrows exact
+        // row ids, and a serve plan's run no longer describes its result.
         let selection = selection.materialized()?;
         let base_len = base.len();
         if selection.is_empty(base_len) {
@@ -503,8 +539,8 @@ impl VortexRdfStore {
         let width = run.len();
         match keep {
             Keep::Range(lo, hi) => {
-                let (start, _) = probe.bounds_in(run.clone(), u64::from(*lo));
-                let (end, _) = probe.bounds_in(start..run.end, u64::from(*hi));
+                let (start, _) = probe.bounds_in(run.clone(), *lo);
+                let (end, _) = probe.bounds_in(start..run.end, *hi);
                 Some(RowSelection::Range(start as u64..end as u64))
             }
             Keep::Set(codes) => {
@@ -516,7 +552,7 @@ impl VortexRdfStore {
                 let mut ids: Vec<u64> = Vec::new();
                 let mut from = run.start;
                 for &code in codes.as_slice() {
-                    let (lo, hi) = probe.bounds_in(from..run.end, u64::from(code));
+                    let (lo, hi) = probe.bounds_in(from..run.end, code);
                     ids.extend(lo as u64..hi as u64);
                     from = hi;
                     if from >= run.end {
@@ -544,9 +580,9 @@ impl VortexRdfStore {
             .unmasked_field_by_name(column.name())
             .map_err(VortexRdfError::Vortex)?;
         let test = keep.test();
-        let cached = cached_u32_primitive(col);
+        let cached = cached_code_primitive(col);
         let reader = match (&cached, probes.by_name(base, column.name())) {
-            (Some(prim), _) => Some(CodeReader::Slice(prim.as_slice::<u32>())),
+            (Some(prim), _) => Some(CodeReader::Slice(prim.as_slice::<TermCode>())),
             (None, Some(probe)) => Some(CodeReader::Probe(probe)),
             (None, None) => None,
         };
@@ -568,7 +604,7 @@ impl VortexRdfStore {
                     .apply(col)?
                     .execute::<PrimitiveArray>(&mut ctx)
                     .map_err(VortexRdfError::Vortex)?;
-                let codes = prim.as_slice::<u32>();
+                let codes = prim.as_slice::<TermCode>();
                 let positions = (0..codes.len()).filter(|&i| test.admits(codes[i]));
                 let mask = vortex_mask::Mask::from_indices(codes.len(), positions);
                 return Ok(selection.clone().refine(&mask));
@@ -581,19 +617,22 @@ impl VortexRdfStore {
         })
     }
 
-    /// The file backend of [`keep`](Self::keep): the keep as a conjunct on
-    /// the view's pushed-down filter (a range as two comparisons, a set as an
-    /// `OR` of equalities or a `list_contains`), narrowed by zone-map
-    /// pruning; a set too wide for an expression is tested in memory over the
-    /// column read for the view's rows.
+    /// The file backend of [`keep`](Self::keep). On a file sorted by subject a
+    /// keep on `s` is first located (see [`keep_located`](Self::keep_located)):
+    /// the rows it admits are runs of the sorted column, found in the mapped
+    /// leaf metadata, so the selection narrows to them and a pending filter
+    /// stays pending. Every other keep — and any the location declines — is
+    /// tested in memory: the view's rows are resolved to exact ids (a pending
+    /// filter evaluated, deferred row ids materialized), the column is
+    /// streamed for them through the mapping and each code is tested. A keep
+    /// never becomes a filter expression: its code list is per query, and
+    /// every distinct expression would pin new entries in Vortex's
+    /// identity-keyed reader caches.
     #[cfg(feature = "file-io")]
     async fn keep_file(&self, column: QuadColumn, keep: &Keep) -> Result<Self> {
-        use vortex_array::expr::and;
-
         let t = debug::timer();
         let QuadsSource::File {
             path,
-            dict_max_resident_bytes,
             file,
             filter,
             selection,
@@ -604,57 +643,47 @@ impl VortexRdfStore {
             unreachable!("keep routes only File sources here");
         };
         let row_count = file.row_count() as usize;
-        // A served view's deferred ids are needed now: the plan reads index
-        // columns the keep does not bind.
         let selection = selection.materialized_async().await?;
         if selection.is_empty(row_count) {
             return Ok(self.empty_view());
         }
-        let (filter, selection) = match keep_conjunct(column, keep) {
-            Some(conjunct) => {
-                // Statistics alone may already bound the rows the conjunct
-                // can hold (a namespace range inside a sorted column).
-                let selection = match file_scan::row_range_from_pruning(file, &conjunct).await? {
-                    Some(range) => selection.intersect_range(range),
-                    None => selection,
-                };
-                let filter = match filter {
-                    Some(existing) => and(existing.clone(), conjunct),
-                    None => conjunct,
-                };
+        let located = match column {
+            QuadColumn::S => Self::keep_located(file, &selection, keep, row_count).await?,
+            _ => None,
+        };
+        let (filter, narrowed) = match located {
+            Some(narrowed) => {
                 log::debug!(
-                    "[keep] {:?} pushed to the file scan as a conjunct at {:?}",
+                    "[keep] {:?} located as runs of the sorted column at {:?}",
                     column,
                     debug::elapsed(t)
                 );
-                (Some(filter), selection)
+                (filter.clone(), narrowed)
             }
             None => {
-                // Too wide a set for an expression: resolve the pending
-                // filter to exact rows, read the column for them, and test
-                // in memory.
                 let selection = match filter {
-                    Some(f) => {
-                        let matched =
-                            file_scan::matching_file_rows(file, Some(f), &selection).await?;
-                        RowSelection::All.refine(&matched)
-                    }
+                    Some(f) => RowSelection::All
+                        .refine(&file_scan::matching_file_rows(file, Some(f), &selection).await?),
                     None => selection,
                 };
-                let codes = file_scan::read_column_codes(file, column.name(), &selection).await?;
                 let test = keep.test();
-                let positions = (0..codes.len()).filter(|&i| test.admits(codes[i]));
-                let mask = vortex_mask::Mask::from_indices(codes.len(), positions);
+                let positions =
+                    file_scan::column_positions(file, column.name(), &selection, |code| {
+                        test.admits(code)
+                    })
+                    .await?;
+                let selected = selection.len(row_count);
+                let narrowed = selection.refine_positions(positions, selected);
                 log::debug!(
                     "[keep] {:?} tested in memory over {} file rows at {:?}",
                     column,
-                    codes.len(),
+                    selected,
                     debug::elapsed(t)
                 );
-                (None, selection.refine(&mask))
+                (None, narrowed)
             }
         };
-        if selection.is_empty(row_count) {
+        if narrowed.is_empty(row_count) {
             return Ok(self.empty_view());
         }
         Ok(Self {
@@ -662,45 +691,73 @@ impl VortexRdfStore {
             indexes: self.indexes.clone(),
             quads: QuadsSource::File {
                 path: path.clone(),
-                dict_max_resident_bytes: *dict_max_resident_bytes,
                 file: file.clone(),
                 filter,
-                selection: ViewSelection::Exact(selection),
+                selection: ViewSelection::Exact(narrowed),
                 deleted: deleted.clone(),
                 serve: None,
             },
             tail: self.tail.clone(),
         })
     }
+
+    /// A keep on the subject column served by located runs: in a file sorted
+    /// by `s` the rows with `lo <= s < hi` are one run, and a set's codes one
+    /// run each, found by binary search over the mapped column's leaf
+    /// metadata — no column is read, no expression bound, and a pending
+    /// filter is left pending beside the narrowed selection. The runs
+    /// intersect `selection`, which stays a range wherever the admitted rows
+    /// are one run of it.
+    ///
+    /// `None` declines to the stream: the file is not sorted by `s`, a chunk
+    /// has no probe, or the set is too large to look up code by code (see
+    /// [`set_is_located`]).
+    #[cfg(feature = "file-io")]
+    async fn keep_located(
+        file: &crate::store::native_file::NativeStoreFile,
+        selection: &RowSelection,
+        keep: &Keep,
+        row_count: usize,
+    ) -> Result<Option<RowSelection>> {
+        Ok(match keep {
+            Keep::Range(lo, hi) => file_scan::locate_subject_code_range(file, *lo..*hi)
+                .await?
+                .map(|run| selection.clone().intersect_range(run)),
+            Keep::Set(codes) if set_is_located(codes.len(), selection.len(row_count)) => {
+                file_scan::locate_subject_code_runs(file, codes.as_slice())
+                    .await?
+                    .map(|runs| selection.clone().intersect_runs(&runs))
+            }
+            Keep::Set(_) => None,
+        })
+    }
 }
 
-/// The keep as a filter conjunct over the quad scan's root: a range as
-/// `col >= lo AND col < hi`, a set as an `OR` of equalities up to
-/// [`KEEP_SET_OR_MAX`] codes or one `list_contains` up to
-/// [`KEEP_SET_FILTER_MAX`]; `None` beyond that.
+/// How many selected rows a code of a set keep on the subject column is worth
+/// when deciding between looking the set up and streaming the column: a
+/// lookup costs two binary searches over the mapped chunk metadata per code,
+/// whatever the selection, while the stream costs a little per selected row
+/// plus a fixed scan, and the two meet near this many rows per code.
 #[cfg(feature = "file-io")]
-fn keep_conjunct(column: QuadColumn, keep: &Keep) -> Option<vortex_array::expr::Expression> {
-    use std::sync::Arc;
-    use vortex_array::dtype::{DType, Nullability, PType};
-    use vortex_array::expr::{and, eq, get_item, gt_eq, list_contains, lit, lt, or_collect, root};
-    use vortex_array::scalar::Scalar;
+const LOCATED_SET_ROWS_PER_CODE: usize = 16;
 
-    let col = || get_item(column.name(), root());
-    match keep {
-        Keep::Range(lo, hi) => Some(and(gt_eq(col(), lit(*lo)), lt(col(), lit(*hi)))),
-        Keep::Set(codes) if codes.len() <= KEEP_SET_OR_MAX => {
-            or_collect(codes.iter().map(|&code| eq(col(), lit(code))))
-        }
-        Keep::Set(codes) if codes.len() <= KEEP_SET_FILTER_MAX => {
-            let list = Scalar::list(
-                Arc::new(DType::Primitive(PType::U32, Nullability::NonNullable)),
-                codes.iter().map(|&code| Scalar::from(code)).collect(),
-                Nullability::NonNullable,
-            );
-            Some(list_contains(lit(list), col()))
-        }
-        Keep::Set(_) => None,
+/// The selection of a window's ids, which are the window itself.
+fn ids_selection(ids: Buffer<RowId>) -> RowSelection {
+    if ids.is_empty() {
+        RowSelection::empty()
+    } else {
+        RowSelection::Ids(ids)
     }
+}
+
+/// Whether a set of `codes` codes on the subject column is looked up code by
+/// code over a selection of `rows` rows rather than streamed: while it has no
+/// more than one code per [`LOCATED_SET_ROWS_PER_CODE`] rows, so the work
+/// stays a fraction of the stream's and a set that is large relative to its
+/// selection streams as every other keep does. Always at least one code.
+#[cfg(feature = "file-io")]
+fn set_is_located(codes: usize, rows: usize) -> bool {
+    codes <= rows.div_ceil(LOCATED_SET_ROWS_PER_CODE)
 }
 
 #[cfg(test)]
@@ -710,7 +767,7 @@ mod tests {
     #[test]
     fn keep_set_sorts_and_dedups() {
         let keep = Keep::set([5, 1, 3, 3, 1]);
-        assert_eq!(keep, Keep::Set(Buffer::from(vec![1u32, 3, 5])));
+        assert_eq!(keep, Keep::Set(Buffer::from(vec![1u64, 3, 5])));
         assert!(keep.admits(3) && !keep.admits(4));
         assert!(Keep::set([]).is_empty());
         assert!(Keep::range(4..4).is_empty());
@@ -732,5 +789,19 @@ mod tests {
         }
         assert!(matches!(dense.test(), KeepTest::Bitmap { .. }));
         assert!(matches!(sparse.test(), KeepTest::Sorted(_)));
+    }
+
+    /// A set is looked up while it has at most one code per sixteen rows of
+    /// the selection, rounded up.
+    #[cfg(feature = "file-io")]
+    #[test]
+    fn located_sets_are_bounded_by_the_selection() {
+        assert!(set_is_located(1, 1));
+        assert!(set_is_located(1, 16));
+        assert!(!set_is_located(2, 16));
+        assert!(set_is_located(2, 17));
+        assert!(set_is_located(500_000, 8_000_000));
+        assert!(!set_is_located(500_001, 8_000_000));
+        assert!(!set_is_located(1, 0));
     }
 }

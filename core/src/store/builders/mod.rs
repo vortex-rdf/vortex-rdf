@@ -29,6 +29,15 @@
 //! true of every build here, but a store that has been appended to loses it,
 //! so it travels as the `s` column's `IsSorted` stamp and is re-read rather
 //! than assumed.
+//!
+//! Quads are unique and terms are canonical in what a build emits. The input
+//! reaches the builders as [`RawQuad`]s the parser (or `RawQuad::from_quad`)
+//! rendered, one spelling per RDF term, so interning a spelling interns the
+//! term; and both sorts drop the repeated quads right after sorting — before
+//! any column, row id or index child is derived from the rows — so the rows
+//! and every child describe the same deduplicated dataset. The rebuilds
+//! (compaction, a mutated store's serialization) sort and drop repeats the
+//! same way before they call [`build_parts_from_raws`].
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
@@ -36,7 +45,8 @@ use crate::store::RawQuad;
 use crate::store::array::chunked_or_single;
 use crate::store::array::stamp_is_sorted;
 use crate::store::indexes::{
-    IndexComponent, IndexType, Indexes, secondary_by_copy, secondary_by_reference, unique_indexes,
+    IndexComponent, IndexType, Indexes, check_indexed_rows, secondary_by_copy,
+    secondary_by_reference, unique_indexes,
 };
 use crate::store::layouts::LayoutStrategy;
 use crate::store::layouts::dictionary::{QuadCodes, TermDictionary};
@@ -66,7 +76,7 @@ fn into_vortex_error(e: VortexRdfError) -> vortex_error::VortexError {
 
 /// A built dataset: the quad array plus whatever layout state cannot be
 /// derived from the array alone — for the Dictionary layout, its term
-/// dictionary (the array holds only u32 code columns; the terms travel
+/// dictionary (the array holds only code columns; the terms travel
 /// beside it and reach serialized files as the native container's
 /// `dictionary` child).
 ///
@@ -132,6 +142,10 @@ pub use sorted_stream::SortedStreamBuilder;
 /// [`build_vortex_stream`](Self::build_vortex_stream) emits it lazily for the
 /// file writer. Both sort globally by (s, p, o, g); which implementation
 /// exists is decided by the target (see the module doc).
+///
+/// The input quads must be canonical (from [`RawQuad::from_quad`], the parser
+/// or [`RawQuad::canonical`]): a builder interns and compares the spelling it
+/// is given and does not parse a term again.
 pub trait VortexArrayBuilder {
     /// Build the complete dataset as a single (possibly chunked) in-memory
     /// array, together with the layout state the array alone cannot carry
@@ -235,6 +249,9 @@ pub(crate) fn build_components(
     indexes: &[IndexType],
     quads: &[RawQuad],
 ) -> Result<Vec<IndexComponent>> {
+    if !unique_indexes(indexes).is_empty() {
+        check_indexed_rows(quads.len() as u64)?;
+    }
     GlobalIndexes::build(
         indexes,
         || secondary_by_copy::GlobalCopyArrays::from_quads(quads),
@@ -244,13 +261,16 @@ pub(crate) fn build_components(
 }
 
 /// Dictionary-layout counterpart of [`build_components`]: the children are
-/// built over the dataset's u32 codes. Sorting codes is order-equivalent to
+/// built over the dataset's codes. Sorting codes is order-equivalent to
 /// sorting the term strings, so the children stay binary-searchable —
 /// queries translate the pattern terms to codes first.
 pub(crate) fn build_components_from_codes(
     indexes: &[IndexType],
     codes: &QuadCodes,
 ) -> Result<Vec<IndexComponent>> {
+    if !unique_indexes(indexes).is_empty() {
+        check_indexed_rows(codes.s.len() as u64)?;
+    }
     GlobalIndexes::build(
         indexes,
         || secondary_by_copy::GlobalCopyArrays::from_codes(codes),
@@ -269,6 +289,10 @@ pub(crate) fn build_components_from_codes(
 /// its code dtypes survive. `sorted` must be `true` only when `raws` is
 /// SPOG-sorted: it stamps the `s` column. The components are globally
 /// sorted whatever the row order.
+///
+/// Like every builder this keeps the rows it is given and numbers the index
+/// children by them, so a caller that sorts them (`sorted`) drops the
+/// repeated quads first, and the store it builds holds each quad once.
 pub(crate) fn build_parts_from_raws(
     raws: &[RawQuad],
     strategy: LayoutStrategy,
@@ -276,6 +300,10 @@ pub(crate) fn build_parts_from_raws(
     sorted: bool,
 ) -> Result<(ArrayRef, Vec<IndexComponent>, Option<Arc<TermDictionary>>)> {
     use crate::store::layouts::dictionary;
+    debug_assert!(
+        !sorted || raws.windows(2).all(|pair| pair[0] < pair[1]),
+        "sorted rows must ascend with each quad once"
+    );
     match strategy {
         LayoutStrategy::Dictionary if raws.is_empty() => Ok((
             dictionary::empty_struct()?,

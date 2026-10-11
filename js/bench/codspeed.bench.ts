@@ -234,8 +234,8 @@ async function benchQuery(triples: Quad[], quads: Quad[]): Promise<void> {
 
 /** readpath::<variant> — the read entry points on the default store for one
  * selective pattern (S), isolating the boundary cost each carries: getQuads
- * (materialized array), match (lazy stream drain), matchCodes (zero-copy u32
- * columns, no term strings). Directly supports read-path tuning.
+ * (materialized array), match (lazy stream drain), matchCodes (code columns
+ * as Float64Arrays, no term strings). Directly supports read-path tuning.
  *
  * The `_decoded` variants additionally read every term's `.value`. They are the
  * only benchmarks in this file that exercise term decoding at all — the others

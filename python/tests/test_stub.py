@@ -66,7 +66,7 @@ def _runtime_methods(cls):
     return names
 
 
-@pytest.mark.parametrize("name", ["VortexRdfStore", "TermDict", "U32Column"])
+@pytest.mark.parametrize("name", ["VortexRdfStore", "TermDict", "U64Column"])
 def test_stub_class_methods_match_runtime(name):
     stub_methods = _stub_classes(_stub_tree())[name]
     cls = getattr(_native, name)

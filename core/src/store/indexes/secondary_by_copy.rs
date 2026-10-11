@@ -27,8 +27,8 @@
 //! columns.
 //!
 //! The copies come in two encodings — term strings (Default and TypedObject
-//! layouts, the object as its full N-Triples term string), or u32 dictionary
-//! codes under the Dictionary layout — and, like the reference index, are
+//! layouts, the object as its full N-Triples term string), or dictionary
+//! codes ([`TermCode`]) under the Dictionary layout — and, like the reference index, are
 //! always sorted over the complete dataset: [`GlobalCopyArrays`] for the
 //! in-memory builders, merged `(sort key, row id)` spill runs for the
 //! out-of-core one, lead column stamped either way. The in-memory resolver
@@ -53,7 +53,7 @@ use crate::store::RawQuad;
 use crate::store::array::{make_string_array, stamp_is_sorted};
 use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout, TermRef};
-use crate::store::schema::{COL_G, COL_O, COL_P, COL_S};
+use crate::store::schema::{COL_G, COL_O, COL_P, COL_S, TermCode};
 
 #[cfg(feature = "file-io")]
 use super::FileServePlan;
@@ -158,7 +158,7 @@ impl CopyFamily {
     /// Row `i`'s sort key as a code tuple — order-equivalent to
     /// [`Self::cmp_quads`] because sorted-dictionary codes are lexicographic
     /// ranks.
-    fn code_key(self, codes: &QuadCodes, i: usize) -> [u32; 4] {
+    fn code_key(self, codes: &QuadCodes, i: usize) -> [TermCode; 4] {
         match self {
             CopyFamily::Posg => [codes.p[i], codes.o[i], codes.s[i], codes.g[i]],
             CopyFamily::Ospg => [codes.o[i], codes.s[i], codes.p[i], codes.g[i]],
@@ -508,13 +508,14 @@ pub(crate) mod out_of_core {
     use super::{CHILD_COLUMNS, CopyFamily, TermColumn};
     use crate::error::Result;
     use crate::store::array::stamp_is_sorted;
+    use crate::store::schema::{CODE_PTYPE, ROW_ID_PTYPE, RowId};
 
-    /// The persisted child's struct dtype: quad components as strings (or u32
-    /// codes under the Dictionary layout) plus the u32 primary row id.
+    /// The persisted child's struct dtype: quad components as strings (or
+    /// codes under the Dictionary layout) plus the u64 primary row id.
     pub(crate) fn copy_child_dtype(encoded: bool) -> DType {
-        use vortex_array::dtype::{Nullability, PType};
+        use vortex_array::dtype::Nullability;
         let term = if encoded {
-            DType::Primitive(PType::U32, Nullability::NonNullable)
+            DType::Primitive(CODE_PTYPE, Nullability::NonNullable)
         } else {
             DType::Utf8(Nullability::NonNullable)
         };
@@ -525,18 +526,20 @@ pub(crate) mod out_of_core {
                 term.clone(),
                 term.clone(),
                 term,
-                DType::Primitive(PType::U32, Nullability::NonNullable),
+                DType::Primitive(ROW_ID_PTYPE, Nullability::NonNullable),
             ],
         )
     }
 
     /// One chunk of a copy family's persisted child from a window of its merged
     /// `(sort key, row id)` entries — plain child column names, lead stamped.
-    /// `V` is the term encoding: `String`, or `u32` codes under the Dictionary
-    /// layout.
+    /// `V` is the term encoding: `String`, or [`TermCode`]s under the
+    /// Dictionary layout.
+    ///
+    /// [`TermCode`]: crate::store::TermCode
     pub(crate) fn copy_child_chunk<V: TermColumn>(
         family: CopyFamily,
-        keys: &[(CopyKey<V>, u32)],
+        keys: &[(CopyKey<V>, RowId)],
     ) -> Result<ArrayRef> {
         let [s_ix, p_ix, o_ix, g_ix] = family.key_positions();
         let col = |ix: usize| V::column(keys.iter().map(|(key, _)| &key.0[ix]));
@@ -564,8 +567,8 @@ pub(crate) mod out_of_core {
 
     /// A quad's terms rearranged into one family's sort-key order, so deriving
     /// `Ord` (and the spill machinery's pair sort) compares by exactly that
-    /// family's comparator. `V` is the term encoding: `String`, or `u32` codes
-    /// under the Dictionary layout.
+    /// family's comparator. `V` is the term encoding: `String`, or
+    /// [`TermCode`](crate::store::TermCode)s under the Dictionary layout.
     ///
     /// Built via [`Self::posg`] / [`Self::ospg`] from an `[s, p, o, g]` tuple;
     /// [`CopyFamily::key_positions`](super::CopyFamily::key_positions) maps the components back out when the sorted
@@ -604,8 +607,8 @@ pub(crate) mod out_of_core {
     }
 }
 
-/// A copy column's term encoding — `String` terms, or `u32` codes under the
-/// Dictionary layout — and the array a column of them assembles into.
+/// A copy column's term encoding — `String` terms, or [`TermCode`]s under
+/// the Dictionary layout — and the array a column of them assembles into.
 pub(crate) trait TermColumn: Clone + Ord {
     fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef
     where
@@ -618,7 +621,7 @@ impl TermColumn for String {
     }
 }
 
-impl TermColumn for u32 {
+impl TermColumn for TermCode {
     fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef {
         PrimitiveArray::from_iter(it.copied()).into_array()
     }
@@ -626,37 +629,37 @@ impl TermColumn for u32 {
 
 // ── build side ───────────────────────────────────────────────────────────────
 
-/// The permutation putting `quads` in `family` order.
-fn string_perm(quads: &[RawQuad], family: CopyFamily) -> Vec<u32> {
-    let mut perm: Vec<u32> = (0..quads.len() as u32).collect();
-    perm.sort_unstable_by(|&a, &b| family.cmp_quads(&quads[a as usize], &quads[b as usize]));
+/// The permutation of positions putting `quads` in `family` order.
+fn string_perm(quads: &[RawQuad], family: CopyFamily) -> Vec<usize> {
+    let mut perm: Vec<usize> = (0..quads.len()).collect();
+    perm.sort_unstable_by(|&a, &b| family.cmp_quads(&quads[a], &quads[b]));
     perm
 }
 
-/// The permutation putting the encoded dataset in `family` order.
-fn code_perm(codes: &QuadCodes, family: CopyFamily) -> Vec<u32> {
-    let mut perm: Vec<u32> = (0..codes.s.len() as u32).collect();
-    perm.sort_unstable_by_key(|&i| family.code_key(codes, i as usize));
+/// The permutation of positions putting the encoded dataset in `family`
+/// order.
+fn code_perm(codes: &QuadCodes, family: CopyFamily) -> Vec<usize> {
+    let mut perm: Vec<usize> = (0..codes.s.len()).collect();
+    perm.sort_unstable_by_key(|&i| family.code_key(codes, i));
     perm
 }
 
 /// One family's five columns (s, p, o, g, rid) over `perm` order; `term_of`
-/// reads row `i`'s term for one component. The row ids are the quads' own
-/// positions: the emission covers the whole dataset, so `perm` already
+/// reads row `i`'s term for one component. The row ids number the quads'
+/// own positions: the emission covers the whole dataset, so `perm` already
 /// addresses the assembled array.
 fn family_columns<'a, V: TermColumn + 'a>(
-    perm: &[u32],
+    perm: &[usize],
     term_of: [&dyn Fn(usize) -> &'a V; 4],
 ) -> [ArrayRef; 5] {
-    let col =
-        |term_of: &dyn Fn(usize) -> &'a V| V::column(perm.iter().map(|&i| term_of(i as usize)));
+    let col = |term_of: &dyn Fn(usize) -> &'a V| V::column(perm.iter().map(|&i| term_of(i)));
     let [s, p, o, g] = term_of;
     [
         col(s),
         col(p),
         col(o),
         col(g),
-        PrimitiveArray::from_iter(perm.iter().copied()).into_array(),
+        PrimitiveArray::from_iter(perm.iter().map(|&i| super::row_id(i))).into_array(),
     ]
 }
 
@@ -669,9 +672,10 @@ pub(crate) struct GlobalCopyArrays {
 }
 
 impl GlobalCopyArrays {
-    /// Sort by term strings. Row IDs are the quads' positions in `quads` (the
-    /// builder must pass the dataset in final row order), so each family is
-    /// just a u32 permutation — no per-term string copies beyond the columns.
+    /// Sort by term strings. Row ids number the quads' positions in `quads`
+    /// (the builder must pass the dataset in final row order), so each family
+    /// is just a permutation of positions — no per-term string copies beyond
+    /// the columns.
     pub(crate) fn from_quads(quads: &[RawQuad]) -> Self {
         Self::build(
             |family| string_perm(quads, family),
@@ -681,7 +685,7 @@ impl GlobalCopyArrays {
         )
     }
 
-    /// Dictionary-layout variant: sort the u32 codes.
+    /// Dictionary-layout variant: sort the codes.
     pub(crate) fn from_codes(codes: &QuadCodes) -> Self {
         Self::build(
             |family| code_perm(codes, family),
@@ -695,7 +699,7 @@ impl GlobalCopyArrays {
     /// `term_of` reads row `i`'s `(s, p, o, g)` terms; each family's lead
     /// column is stamped sorted.
     fn build<'a, V: TermColumn + 'a>(
-        perm_by: impl Fn(CopyFamily) -> Vec<u32>,
+        perm_by: impl Fn(CopyFamily) -> Vec<usize>,
         term_of: [&dyn Fn(usize) -> &'a V; 4],
     ) -> Self {
         let build = |family: CopyFamily| {
