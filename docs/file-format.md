@@ -284,7 +284,7 @@ written without the zone map; readers inspect the layout for it.
 **Reading it from a file.** A file store is memory-mapped
 ([`from_file`](../core/src/store/open.rs#L177)) and the dictionary stays in
 its child
-([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L237)).
+([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L254)).
 At open the handle reads the zone table — one small segment — and keeps, per
 window, its leaf and its first and last term; without the zone map it reads
 the bounds from the leaves.
@@ -472,7 +472,7 @@ kernel's decision; no segment cache sits in between.
 What a file store keeps for its lifetime, and what bounds it. The opened handle
 ([`NativeStoreFile`](../core/src/store/native_file.rs#L38)) and the file-backed
 dictionary handle
-([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L237))
+([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L254))
 keep:
 
 | Kept | Bound |
@@ -482,7 +482,7 @@ keep:
 | pruning envelopes per filter shape | 512 entries, cleared wholesale at the cap |
 | bound filter trees, one per filter shape, so Vortex's identity-keyed reader caches hit | 4,096 entries, cleared wholesale at the cap; a clear retires the reader tree, and the caches go with its readers once no view holds one |
 | the dictionary child's reader, the window leaf layouts, the dictionary's window bounds ([§5](#5-the-dictionary-child)) and its kind ranges | two terms per 65,536-term window and a handful of codes |
-| the rebuilt dictionary windows (FSST, code offsets as 32-bit values), so a repeated probe or decode of a window skips the rebuild | [`WINDOW_CACHE_BYTES`](../core/src/store/layouts/dictionary/file_backed.rs#L73) (4 MiB) per opened file, counting each window's code offsets at 4 bytes each (an upper bound on its heap, since 32-bit offsets are used in place), least recently used evicted; an FSST window of 65,536 terms costs about 256 KiB, so about 16 fit |
+| the rebuilt dictionary windows (FSST, code offsets as 32-bit values), so a repeated probe or decode of a window skips the rebuild | [`WINDOW_CACHE_BYTES`](../core/src/store/layouts/dictionary/file_backed.rs#L76) (4 MiB) per opened file, charging each window its code offsets at 4 bytes each plus [`WINDOW_ENTRY_OVERHEAD`](../core/src/store/layouts/dictionary/file_backed.rs#L82) (4 KiB); least recently used evicted; an FSST window of 65,536 terms is charged about 260 KiB, so about 15 fit. For a memory-mapped file store, which every `from_file` store is, the code bytes are slices of the map, so the charge bounds the heap the cache holds |
 
 Keeps (`VALUES`, FILTER code sets) never become filter expressions, so the
 two memos only see a workload's pattern shapes. No count, decode or predicate

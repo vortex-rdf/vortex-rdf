@@ -66,27 +66,37 @@ struct Window {
     last: Box<[u8]>,
 }
 
-/// What one opened file's window cache may hold: the bytes its windows hold
-/// onto (see [`TermChunk::heap_bytes`]), an upper bound on their heap, least
-/// recently used evicted first. An FSST window of 65,536 terms costs about
-/// 256 KiB (its code offsets, 4 bytes each), so about 16 windows fit.
+/// What one opened file's window cache may hold: the bytes of its windows
+/// (see [`TermChunk::heap_bytes`]) plus [`WINDOW_ENTRY_OVERHEAD`] for each,
+/// least recently used evicted first. An FSST window of 65,536 terms costs
+/// about 256 KiB (its code offsets, 4 bytes each) plus the overhead, so about
+/// 15 windows fit. For a memory-mapped file store, which every `from_file`
+/// store is, a window's code bytes are slices of the map, so the charge
+/// bounds the heap the cache holds.
 const WINDOW_CACHE_BYTES: usize = 4 << 20;
 
-/// The rebuilt windows of one file, by window index, bounded by the bytes of
-/// their chunks. A lookup refreshes a window's recency; an insert
-/// evicts the least recently used windows until the new one fits, and a
-/// window larger than the whole budget is not kept.
+/// What each cached window is charged beyond its chunk's bytes: the symbol
+/// table, the array, the `Arc` and the map entry it takes. It also bounds the
+/// windows a budget admits when they are tiny, to
+/// `WINDOW_CACHE_BYTES / WINDOW_ENTRY_OVERHEAD` (1,024).
+const WINDOW_ENTRY_OVERHEAD: usize = 4 << 10;
+
+/// The rebuilt windows of one file, by window index, bounded by what they are
+/// charged: their chunks' bytes plus [`WINDOW_ENTRY_OVERHEAD`] each. A lookup
+/// refreshes a window's recency; an insert evicts the least recently used
+/// windows until the new one fits, and a window charged more than the whole
+/// budget is not kept. A window evicted while a read still holds it lives
+/// until that read ends.
 struct WindowCache {
     budget: usize,
-    /// Bytes of every cached chunk (see [`TermChunk::heap_bytes`]).
+    /// What every cached window is charged.
     bytes: usize,
     /// The last recency stamp handed out.
     clock: u64,
     windows: HashMap<usize, CachedWindow>,
 }
 
-/// A cached window with its bytes (see [`TermChunk::heap_bytes`]) and the
-/// stamp of its last use.
+/// A cached window with what it is charged and the stamp of its last use.
 struct CachedWindow {
     chunk: Arc<TermChunk>,
     bytes: usize,
@@ -113,12 +123,12 @@ impl WindowCache {
 
     /// Keep `chunk` as window `w`'s entry and return the chunk to use: the
     /// entry already there when another task rebuilt the window first, else
-    /// `chunk` itself (kept unless it exceeds the budget).
+    /// `chunk` itself (kept unless its charge exceeds the budget).
     fn insert(&mut self, w: usize, chunk: Arc<TermChunk>) -> Arc<TermChunk> {
         if let Some(kept) = self.get(w) {
             return kept;
         }
-        let bytes = chunk.heap_bytes();
+        let bytes = chunk.heap_bytes().saturating_add(WINDOW_ENTRY_OVERHEAD);
         if bytes > self.budget {
             return chunk;
         }
@@ -616,7 +626,7 @@ impl FileBackedDict {
         self.0.requested.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Bytes the window cache holds.
+    /// What the window cache's windows are charged.
     #[cfg(test)]
     pub(crate) fn debug_cached_bytes(&self) -> usize {
         self.0.cache().bytes
@@ -882,8 +892,8 @@ mod tests {
     }
 
     /// What one 100-term FSST window costs the cache: its code offsets, one
-    /// `u32` per term plus one.
-    const WINDOW_BYTES: usize = 101 * size_of::<u32>();
+    /// `u32` per term plus one, and the per-entry overhead.
+    const WINDOW_BYTES: usize = 101 * size_of::<u32>() + WINDOW_ENTRY_OVERHEAD;
 
     /// Probe an interior term of window `w` of a handle over 100-term
     /// windows.
@@ -1214,13 +1224,14 @@ mod tests {
         let second = cache.insert(3, chunk());
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(cache.windows.len(), 1);
-        assert_eq!(cache.bytes, first.heap_bytes());
+        assert_eq!(cache.bytes, first.heap_bytes() + WINDOW_ENTRY_OVERHEAD);
     }
 
-    /// An FSST window costs its code offsets, a canonical chunk its
-    /// array; the cache totals them.
+    /// A cached window costs its chunk's bytes (an FSST window its code
+    /// offsets, a canonical chunk its array) and the per-entry overhead; the
+    /// cache totals them.
     #[tokio::test]
-    async fn cached_windows_are_accounted_by_their_heap_bytes() {
+    async fn cached_windows_are_charged_their_bytes_and_an_overhead() {
         let (fbd, terms) = windowed_handle(600, 100).await;
         touch(&fbd, &terms, 0).await;
         assert_eq!(fbd.debug_cached_bytes(), WINDOW_BYTES);
@@ -1232,6 +1243,31 @@ mod tests {
         let plain = VarBinViewArray::from_iter_str(["<a>", "<b>", "<c>"]);
         let nbytes = usize::try_from(plain.nbytes()).unwrap();
         assert_eq!(TermChunk::Canonical(plain).heap_bytes(), nbytes);
+    }
+
+    /// Windows whose offsets cost far less than the per-entry overhead are
+    /// bounded by the overhead: a budget admits `budget / overhead` of them,
+    /// not one per few bytes.
+    #[tokio::test]
+    async fn tiny_windows_are_bounded_by_the_entry_overhead() {
+        // 60 windows of four terms: 20 bytes of offsets each.
+        let (native, _, terms) = windowed_native(240, 4).await;
+        let budget = 3 * WINDOW_ENTRY_OVERHEAD;
+        let fbd = FileBackedDict::open_with_budget(&native, budget)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fbd.debug_window_count(), 60);
+        // The offsets of all sixty fit in the budget many times over, so
+        // only the overhead can bound the cache.
+        assert!(60 * 5 * size_of::<u32>() < budget / 2);
+        for w in 0..60 {
+            let i = w * 4 + 1;
+            assert_eq!(fbd.encode(&terms[i]).await.unwrap(), Some(i as TermCode));
+            assert!(fbd.debug_cached_bytes() <= budget, "after window {w}");
+        }
+        let cached = fbd.debug_cached_windows();
+        assert!(!cached.is_empty() && cached.len() <= 3, "{cached:?}");
     }
 
     /// `encode_many` over terms that cycle through every window, under a

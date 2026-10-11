@@ -124,12 +124,12 @@ impl TermChunk {
         }
     }
 
-    /// What this chunk costs a cache of chunks: an FSST chunk's code offsets
-    /// (one `u32` per term, plus one), whether they are a view of the leaf's
-    /// own buffer or a widened copy, and a canonical chunk's array. That is
-    /// an upper bound on the heap the chunk takes, and the bytes it holds
-    /// onto either way. The leaf's code bytes, which the chunk only
-    /// references, are not counted.
+    /// What this chunk costs a cache of chunks: the bytes it holds onto. An
+    /// FSST chunk costs its code offsets (one `u32` per term, plus one),
+    /// whether they view the leaf's own buffer or are a converted copy; its
+    /// code bytes, which it only references, are not counted. A canonical
+    /// chunk costs its array's `nbytes()`, which counts buffers that are
+    /// slices of a map as well.
     #[cfg(feature = "file-io")]
     pub(super) fn heap_bytes(&self) -> usize {
         match self {
