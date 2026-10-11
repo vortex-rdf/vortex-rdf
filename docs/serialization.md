@@ -36,7 +36,8 @@ flowchart LR
 | Term dictionary | a `TermDictionary` inside the resolved layout | the required `dictionary` child |
 
 A builder hands these back in one of two shapes
-([`builders/mod.rs`](../core/src/store/builders/mod.rs#L77)):
+([`BuiltArray`](../core/src/store/builders/mod.rs#L87) and
+[`BuiltStream`](../core/src/store/builders/mod.rs#L102)):
 
 - **`BuiltArray`** — everything materialized: the quad array, the components,
   the dictionary. What `VortexRdfStore::from_built` adopts.
@@ -50,20 +51,20 @@ A builder hands these back in one of two shapes
 
 | Surface | Call | Pipeline | Produces |
 |---|---|---|---|
-| CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`main.rs`](../cli/src/main.rs#L35)) | out-of-core | file |
+| CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`SerializeArgs`](../cli/src/main.rs#L33)) | out-of-core | file |
 | Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/ser.rs#L192) / [`quads_stream_to_vortex_writer`](../core/src/io/ser.rs#L109) | out-of-core | file / any `VortexWrite` |
 | Rust | [`VortexRdfStore::from_quads`](../core/src/store/mod.rs#L201), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L62) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L42) then [`VortexRdfStore::from_built`](../core/src/store/mod.rs#L249) to name the builder | either | in-memory store |
 | Rust | [`VortexRdfStore::to_bytes`](../core/src/store/serialize.rs#L149) | — (re-serializes a store) | bytes |
 | Rust | [`to_serializable_parts`](../core/src/store/serialize.rs#L128) → [`from_parts`](../core/src/store/mod.rs#L234) | — | in-memory round trip |
-| Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize.rs`](../python/src/serialize.rs#L33)) | out-of-core | file |
+| Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize_rdf`](../python/src/serialize.rs#L33)) | out-of-core | file |
 | Python | `VortexRdfStore(path, in_memory=True)` | — (opens, then lifts through `to_serializable_parts` → `from_parts`) | in-memory store |
 | Python | `store.to_bytes()` / `VortexRdfStore.from_bytes(data)` | — | bytes |
-| JavaScript | `VortexRdfStore.fromQuads(quads \| Stream<Quad>, {layout, indexes})`, `fromString(text, format, options)` ([`store.rs`](../js/src/store.rs#L154)), `serializeRdf(text, format, options)` ([`lib.rs`](../js/src/lib.rs#L32)) | in memory (the only pipeline compiled to wasm) | in-memory store / bytes |
-| JavaScript | `store.toBytes()` / `VortexRdfStore.fromBytes(bytes)`; `deserializeRdf(bytes, format)` ([`lib.rs`](../js/src/lib.rs#L46)) writes RDF text back | — | bytes |
+| JavaScript | `VortexRdfStore.fromQuads(quads \| Stream<Quad>, {layout, indexes})`, `fromString(text, format, options)` ([`fromString`](../js/src/store.rs#L154)), `serializeRdf(text, format, options)` ([`serializeRdf`](../js/src/lib.rs#L32)) | in memory (the only pipeline compiled to wasm) | in-memory store / bytes |
+| JavaScript | `store.toBytes()` / `VortexRdfStore.fromBytes(bytes)`; `deserializeRdf(bytes, format)` ([`deserializeRdf`](../js/src/lib.rs#L46)) writes RDF text back | — | bytes |
 
 Every surface defaults to the `dictionary` layout (the CLI's `--layout`,
 Python's `layout=`, and the JavaScript `BuildOptions`
-([`options.rs`](../js/src/options.rs#L37))) and spells layouts and indexes with
+([`options.rs`](../js/src/options.rs#L37 "LayoutStrategy::Dictionary"))) and spells layouts and indexes with
 the same kebab-case names, which `LayoutStrategy`/`IndexType` parse and print.
 
 ---
@@ -122,7 +123,7 @@ of the same terms is a different quad.
 
 Both pipelines put the rows in global `(s, p, o, g)` order. Which pipeline runs
 is a property of the target
-([`builders/mod.rs`](../core/src/store/builders/mod.rs#L11)):
+([`builders/mod.rs`](../core/src/store/builders/mod.rs#L11 "Which pipeline runs")):
 
 | Target | Builder | Holds |
 |---|---|---|
@@ -267,7 +268,7 @@ whole.
 length, then the archived value) in a per-build temp directory named
 `tmp_vortex_<prefix>_<uuid>` and removed when the stream is dropped.
 The parent directory is resolved in this order
-([`spill.rs`](../core/src/store/builders/spill.rs#L60)): the
+([`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L66)): the
 `VORTEX_RDF_SPILL_DIR` environment variable, a caller-supplied base (compaction
 passes the directory of its temp file: beside the file it replaces, links
 followed), then the OS temp dir.
@@ -275,13 +276,13 @@ followed), then the OS temp dir.
 | Build | Peak memory |
 |---|---|
 | no indexes | heap heads + one chunk (+ the distinct terms under Dictionary) |
-| with indexes | as above, plus each spiller's buffer of up to 100,000 entries, plus the components' compressed segments the writer holds until the quad table finishes ([`write.rs`](../core/src/io/container/write.rs#L98)) |
+| with indexes | as above, plus each spiller's buffer of up to 100,000 entries, plus the components' compressed segments the writer holds until the quad table finishes ([`write_stream`](../core/src/io/container/write.rs#L98)) |
 
 ---
 
 ## 7. Columns, per layout
 
-The layout decides what a `RawQuad` becomes ([`layouts/mod.rs`](../core/src/store/layouts/mod.rs#L53)).
+The layout decides what a `RawQuad` becomes ([`LayoutStrategy`](../core/src/store/layouts/mod.rs#L53)).
 Every layout puts `s` first and stamps it when the rows are sorted.
 
 | Layout | Columns | Term encoding |
@@ -437,25 +438,25 @@ it), and
 (`to_bytes`, the bindings' exchange bytes). On the wire the two are the same
 container.
 
-**Replacing a file.** [`PendingStore`](../core/src/io/ser.rs#L311) is the one
+**Replacing a file.** [`PendingStore`](../core/src/io/ser.rs#L312) is the one
 way a store reaches a path (`write_store_atomically` is its `create` followed
 by its `write`). `create` makes `<store>.write-<uuid>.tmp` beside the file it
 replaces *before* any input is read or any row gathered, so a path that cannot
 take a store (a missing directory, no permission to write there, a directory
 at the path, a store the process cannot write) is reported at once, by a
 serialization and by a compaction alike; then the build fills the temp file and
-`write` renames it over the old one. What the old file was set up as is kept: a symbolic link
-at the path (or a chain of them) is followed and the file it ends at is
-replaced, so a `current -> versions/v3.vortex` setup keeps its link; the temp
-file for an existing store is created private (`0600` on Unix, whatever the
-umask) and the old file's permission bits are set on it before the first byte
-is written, so no byte of a private store is ever in a file others can read
-(a path with no store yet gets the permissions any new file does); a path that
-resolves to a device or a pipe (`/dev/null`, `/dev/stdout` behind a pipe) takes
-the store in place, with no temp file and no all-or-nothing guarantee, and any
-other file that is not a regular file is refused; a
-filesystem that refuses that `chmod` fails the write, with the temp file
-removed and the old store untouched; and a store the process cannot write is
+`write` renames it over the old one. What the old file was set up as is kept:
+a symbolic link at the path (or a chain of them) is followed and the file it
+ends at is replaced, so a `current -> versions/v3.vortex` setup keeps its
+link; the temp file for an existing store is created private (`0600` on Unix,
+whatever the umask) and the old file's permission bits are set on it before
+the first byte is written, so no byte of a private store is ever in a file
+others can read (a path with no store yet gets the permissions any new file
+does); a path that resolves to a character device or a pipe (`/dev/null`,
+`/dev/stdout` behind a pipe) takes the store in place, with no temp file and no
+all-or-nothing guarantee, and any other file that is not a regular file is
+refused; a filesystem that refuses that `chmod` fails the write, with the temp
+file removed and the old store untouched; and a store the process cannot write is
 never replaced (a read-only store signals that it should not be overwritten:
 the rebuild fails with `PermissionDenied`, or the read-only filesystem's error,
 before anything is built, and compaction of such a file fails the same way; an

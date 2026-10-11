@@ -17,12 +17,12 @@ A store never rewrites its data in place to answer a mutation; it follows a
 pattern. The store you built or opened — the **base**: its sorted rows, its
 secondary indexes, its file bytes — stays exactly as it was written, and
 mutations are layered on top of it as two side structures
-([`source.rs`](../core/src/store/source.rs#L35)):
+([`QuadsSource`](../core/src/store/source.rs#L35)):
 
 | Layer | For | Held as |
 |---|---|---|
 | **Tail** | additions | an in-memory array of appended rows beside the base ([`Tail`](../core/src/store/source.rs#L158)) |
-| **Tombstones** | deletions | one bit per base row, `None` until the first delete (the `deleted` fields: [in memory](../core/src/store/source.rs#L56), [file-backed](../core/src/store/source.rs#L92)) |
+| **Tombstones** | deletions | one bit per base row, `None` until the first delete (the `deleted` fields: [in memory](../core/src/store/source.rs#L56 "deleted"), [file-backed](../core/src/store/source.rs#L92 "deleted")) |
 
 ```mermaid
 flowchart LR
@@ -214,7 +214,7 @@ flowchart TD
 - **A file-backed owner stays file-backed**
   ([`stream_compacted_to_file`](../core/src/store/compaction.rs#L119)): the
   writer is prepared first
-  ([`PendingStore::create`](../core/src/io/ser.rs#L342), the one writer every
+  ([`PendingStore::create`](../core/src/io/ser.rs#L343), the one writer every
   path-taking build shares), so a source file the process cannot write (a
   read-only file) is refused with `PermissionDenied` before a quad is
   gathered or built ([`add_quads`'s auto-compaction](#51-auto-compaction)
@@ -231,13 +231,14 @@ flowchart TD
   the temp file is created and again just before the rename, so a link
   retargeted to another store, or a file rebuilt by rename, since the store
   opened fails the compaction (an `InvalidOperation` error, not absorbed by
-  `add_quads`) and leaves that file alone; reopen the store. The sibling placement keeps the rename on one filesystem, so
-  it is atomic; a failed write removes the temp file and leaves the original
-  untouched. On Windows the rename is refused while the file is mapped, by
-  this store included, so there a file-backed store cannot compact over its
-  own path: the compaction fails with the I/O error and the file stays as it
-  was. The builder's spill runs are placed in the temp file's directory
-  ([`dir`](../core/src/io/ser.rs#L491), [`spill.rs`](../core/src/store/builders/spill.rs#L60)):
+  `add_quads`) and leaves that file alone; reopen the store. The sibling
+  placement keeps the rename on one filesystem, so it is atomic; a failed
+  write removes the temp file and leaves the original untouched. On Windows
+  the rename is refused while the file is mapped, by this store included, so
+  there a file-backed store cannot compact over its own path: the compaction
+  fails with the I/O error and the file stays as it was. The builder's spill
+  runs are placed in the temp file's directory
+  ([`dir`](../core/src/io/ser.rs#L492), [`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L66)):
   beside the file being replaced, links followed (a store opened through a
   link spills where the link points, not where the link is), the one volume
   known to fit the data (`VORTEX_RDF_SPILL_DIR` outranks that default).
@@ -276,7 +277,7 @@ batch: the batch stays in the in-memory tail, where matches and counts see it
 like any appended row, and the call returns `Ok` with the store. Only the
 writer's own refusal is absorbed
 ([`is_unwritable`](../core/src/error.rs#L87)): the
-[`PendingStore::create`](../core/src/io/ser.rs#L342) that finds, before a quad
+[`PendingStore::create`](../core/src/io/ser.rs#L343) that finds, before a quad
 is gathered, that the file or its directory cannot be written
 (`PermissionDenied`, or a read-only filesystem). Any other failure of the
 compaction is returned, a permission error from later in the rewrite (a spill
@@ -319,11 +320,11 @@ runs the mutation on the store the view came from.
 
 | Constant | Value | Defined in | Meaning |
 |---|---|---|---|
-| `TAIL_FLATTEN_FLOOR` | 1,024 | [`mutation.rs`](../core/src/store/mutation.rs#L293) | accreted tail chunks are folded into the flat prefix once their rows reach `max(flat_len, TAIL_FLATTEN_FLOOR)` |
-| `TAIL_MAX_CHUNKS` | 64 | [`mutation.rs`](../core/src/store/mutation.rs#L297) | the tail is flattened once it holds more chunks than this, whatever their row counts |
-| `AUTO_COMPACT_TAIL_FLOOR` | 4,096 | [`compaction.rs`](../core/src/store/compaction.rs#L185) | below this many tail rows `add_quads` never compacts |
-| `AUTO_COMPACT_BASE_RATIO` | 10 | [`compaction.rs`](../core/src/store/compaction.rs#L192) | compact once the tail reaches base / 10 |
-| `AUTO_COMPACT_TAIL_CAP` | 100,000 (= `DEFAULT_CHUNK_ROWS`) | [`compaction.rs`](../core/src/store/compaction.rs#L199) | compact once the tail could fill a builder chunk, however large the base |
+| `TAIL_FLATTEN_FLOOR` | 1,024 | [`mutation.rs`](../core/src/store/mutation.rs#L294) | accreted tail chunks are folded into the flat prefix once their rows reach `max(flat_len, TAIL_FLATTEN_FLOOR)` |
+| `TAIL_MAX_CHUNKS` | 64 | [`mutation.rs`](../core/src/store/mutation.rs#L298) | the tail is flattened once it holds more chunks than this, whatever their row counts |
+| `AUTO_COMPACT_TAIL_FLOOR` | 4,096 | [`compaction.rs`](../core/src/store/compaction.rs#L188) | below this many tail rows `add_quads` never compacts |
+| `AUTO_COMPACT_BASE_RATIO` | 10 | [`compaction.rs`](../core/src/store/compaction.rs#L195) | compact once the tail reaches base / 10 |
+| `AUTO_COMPACT_TAIL_CAP` | 100,000 (= `DEFAULT_CHUNK_ROWS`) | [`compaction.rs`](../core/src/store/compaction.rs#L202) | compact once the tail could fill a builder chunk, however large the base |
 
 ---
 

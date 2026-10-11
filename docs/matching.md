@@ -257,11 +257,11 @@ Each stage in the code, and where the details are below:
 
 | Stage | Code | Details |
 |---|---|---|
-| Prelude | [`matching.rs:240-283`](../core/src/store/matching.rs#L240-L283) | — |
-| 1 · prefix probe | [`matching.rs:285-368`](../core/src/store/matching.rs#L285-L368), [`search_sorted_bounds`](../core/src/store/array.rs#L179) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`matching.rs:370-448`](../core/src/store/matching.rs#L370-L448), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L756) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`matching.rs:450-491`](../core/src/store/matching.rs#L450-L491), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L187), [`mask_for`](../core/src/store/matching.rs#L798) | [§6.3](#63-residual-column-filtering) |
-| 4 · finalize | [`matching.rs:493-508`](../core/src/store/matching.rs#L493-L508) | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
+| Prelude | [`matching.rs:240-283`](../core/src/store/matching.rs#L240-L283 "InMemory is the only variant") | — |
+| 1 · prefix probe | [`matching.rs:285-368`](../core/src/store/matching.rs#L285-L368 "Prefix probe"), [`search_sorted_bounds`](../core/src/store/array.rs#L179) | [§6.1](#61-prefix-probe) |
+| 2 · secondary-index routing | [`matching.rs:370-448`](../core/src/store/matching.rs#L370-L448 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L756) | [§6.2](#62-secondary-index-routing) |
+| 3 · residual column filtering | [`matching.rs:450-491`](../core/src/store/matching.rs#L450-L491 "residual column filtering"), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L187), [`mask_for`](../core/src/store/matching.rs#L798) | [§6.3](#63-residual-column-filtering) |
+| 4 · finalize | [`matching.rs:493-508`](../core/src/store/matching.rs#L493-L508 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
 
@@ -516,11 +516,11 @@ Each stage in the code, and where the details are below:
 
 | Stage | Code | Details |
 |---|---|---|
-| Prelude | [`matching.rs:546-556`](../core/src/store/matching.rs#L546-L556) | — |
-| 1 · subject chunk probe | [`matching.rs:557-575`](../core/src/store/matching.rs#L557-L575), [`locate_subject_run`](../core/src/store/scan/file_scan.rs#L607) | [§7.1](#71-subject-chunk-probe) |
-| 2 · secondary-index routing | [`matching.rs:576-592`](../core/src/store/matching.rs#L576-L592), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L780) | [§8](#8-the-index-resolvers) |
-| 3 · pushed-down filter | [`matching.rs:605-709`](../core/src/store/matching.rs#L605-L709), [`build_file_filter`](../core/src/store/scan/file_scan.rs#L592) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`matching.rs:598-599`](../core/src/store/matching.rs#L598-L599) and [`matching.rs:711-752`](../core/src/store/matching.rs#L711-L752), [`row_range_from_pruning`](../core/src/store/scan/file_scan.rs#L890) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| Prelude | [`matching.rs:546-556`](../core/src/store/matching.rs#L546-L556 "QuadsSource::File") | — |
+| 1 · subject chunk probe | [`matching.rs:557-575`](../core/src/store/matching.rs#L557-L575 "A bound subject on a sorted file"), [`locate_subject_run`](../core/src/store/scan/file_scan.rs#L607) | [§7.1](#71-subject-chunk-probe) |
+| 2 · secondary-index routing | [`matching.rs:576-592`](../core/src/store/matching.rs#L576-L592 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L780) | [§8](#8-the-index-resolvers) |
+| 3 · pushed-down filter | [`matching.rs:605-709`](../core/src/store/matching.rs#L605-L709 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_scan.rs#L592) | [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`matching.rs:598-599`](../core/src/store/matching.rs#L598-L599 "keep_serve") and [`matching.rs:711-752`](../core/src/store/matching.rs#L711-L752 "match resolved_selection"), [`row_range_from_pruning`](../core/src/store/scan/file_scan.rs#L890) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
 stage narrows a `RowSelection` directly; here stage 3 can only *describe* the
@@ -706,8 +706,10 @@ supplies a serve plan**.
 
 **In memory:** binary-search the sorted `val` column and slice the paired
 `rid` run: `Lazy` ids, which `sorted_row_ids` puts back in base row order when
-a consumer needs them; a count takes the run's width. Declines when the
-component is absent, unsorted, or probe-incompatible.
+a consumer needs them; a count takes the run's width, and a window cuts its
+own rows out of the run before decoding them (the rows of one value are in row
+id order). Declines when the component is absent, unsorted, or
+probe-incompatible.
 
 **On file:** [`locate_component_run`](../core/src/store/indexes/row_ids.rs#L51)
 binary-searches the value column's chunk probes (sorted child + integer probe
@@ -928,7 +930,7 @@ file run) and a rid-only scan of the index child otherwise.
 | Constant | Value | Defined in | Meaning |
 |---|---|---|---|
 | `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/matching.rs#L861) | an already-narrowed view below this skips index routing |
-| `POINT_GATHER_MAX_ROWS` | 256 | [`selection.rs`](../core/src/store/selection.rs#L488) | runs/selections at or below this are read point-by-point through cached probes (`gather_by_point_reads`, the located-run reads) |
+| `POINT_GATHER_MAX_ROWS` | 256 | [`selection.rs`](../core/src/store/selection.rs#L489) | runs/selections at or below this are read point-by-point through cached probes (`gather_by_point_reads`, the located-run reads) |
 | `TYPED_EQ_MAX_ROWS` | 4096 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L177) | selection size above which the typed row loop declines to the vectorized mask scan: always for a lone residual equality, and for any set that binds a column through an encoded-search probe |
 
 ---
