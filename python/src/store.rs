@@ -311,9 +311,10 @@ impl VortexRdfStore {
     /// Served from the term-code columns when the store supports them
     /// (Dictionary layout), reading terms out of the dictionary — held in
     /// memory, or read from the mapped file — and usually sharing one Python
-    /// string across repeats of a code (see `TermDict.decode_many`); otherwise from the
-    /// store's shared-term rows, where a term the decoder handed to several
-    /// rows is likewise one Python string. Both paths return the same rows.
+    /// string across repeats of a code (see `TermDict.decode_many`);
+    /// otherwise from the store's shared-term rows, where a term the decoder
+    /// handed to several rows is likewise one Python string. Both paths
+    /// return the same rows.
     #[pyo3(signature = (s=None, p=None, o=None, g=None))]
     fn get_quads(
         &self,
@@ -372,7 +373,9 @@ impl VortexRdfStore {
     /// answering in input order. A probe is an `(s, p, o, g)` tuple of
     /// optional term strings or a dict with keys `s`, `p`, `o`, `g`,
     /// `keep`, `limit`, `offset`. Every probe is parsed before any is
-    /// evaluated, so a malformed one raises `ValueError` first.
+    /// evaluated, so a malformed one raises `ValueError` first. The call
+    /// raises the error of the first failing probe in input order and
+    /// cancels the probes after it.
     fn count_quads_many(&self, py: Python<'_>, probes: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
         let probes = parse_probes(probes)?;
         py.detach(|| {
@@ -423,12 +426,13 @@ impl VortexRdfStore {
     ///
     /// `keep` narrows the match inside the store, before any row is
     /// gathered: a dict from position (`"s"`, `"p"`, `"o"`, `"g"` or 0-3)
-    /// to the codes to keep there — a code set (`U64Column`, u64 buffer or
-    /// int sequence; what `TermDict.filter_codes` or encoded `VALUES`
-    /// yield) or a code range (a `range` with step 1, or `(lo, hi)`; what
-    /// `TermDict.prefix_range` yields). `offset` and `limit` window the
-    /// rows in base order; a filtered file scan stops at the first block
-    /// that fills the window.
+    /// to the codes to keep there — a code set (`U64Column`, a u64 buffer or
+    /// a list of ints; what `TermDict.filter_codes` or encoded `VALUES`
+    /// yield) or a code range (a `range` with step 1, or a 2-tuple
+    /// `(lo, hi)`, the half-open codes `lo <= code < hi`; what
+    /// `TermDict.prefix_range` yields). A 2-tuple is never a set. `offset`
+    /// and `limit` window the rows in base order; a filtered file scan stops
+    /// at the first block that fills the window.
     // The parameters are the Python signature: a pattern and its narrowing.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (s=None, p=None, o=None, g=None, *, keep=None, limit=None, offset=0))]
@@ -464,7 +468,9 @@ impl VortexRdfStore {
     /// [`Self::match_codes`] for a batch of probes in one GIL-released
     /// call, answering in input order (see [`Self::count_quads_many`] for
     /// the probe forms). The probes run concurrently on the bindings'
-    /// runtime; every probe is parsed before any is evaluated.
+    /// runtime; every probe is parsed before any is evaluated. The call
+    /// raises the error of the first failing probe in input order and
+    /// cancels the probes after it.
     fn match_codes_many(
         &self,
         py: Python<'_>,

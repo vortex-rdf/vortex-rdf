@@ -225,10 +225,11 @@ class VortexRdfStore:
 
         `keep` narrows the match inside the store: a dict from position
         (``"s"``, ``"p"``, ``"o"``, ``"g"`` or 0-3) to the codes to keep
-        there, a code set (`U64Column`, u64 buffer or int sequence) or a code
-        range (a ``range`` with step 1, or ``(lo, hi)``). `offset` and
-        `limit` window the rows in base order; a filtered file scan stops at
-        the first block that fills the window."""
+        there, a code set (`U64Column`, a u64 buffer or a list of ints) or a
+        code range (a ``range`` with step 1, or a 2-tuple ``(lo, hi)``, the
+        half-open codes ``lo <= code < hi``; a 2-tuple is never a set).
+        `offset` and `limit` window the rows in base order; a filtered file
+        scan stops at the first block that fills the window."""
         ...
     def match_codes_many(
         self, probes: Sequence[_Probe]
@@ -237,7 +238,9 @@ class VortexRdfStore:
         answering in input order. A probe is an ``(s, p, o, g)`` tuple of
         optional term strings or a dict with keys ``s``, ``p``, ``o``,
         ``g``, ``keep``, ``limit``, ``offset``. Every probe is parsed before
-        any is evaluated (``ValueError`` first); the probes run concurrently."""
+        any is evaluated (``ValueError`` first); the probes run concurrently.
+        The call raises the error of the first failing probe in input order
+        and cancels the probes after it."""
         ...
     def count_quads_many(self, probes: Sequence[_Probe]) -> List[int]:
         """`count_quads` for a batch of probes (see `match_codes_many`), in

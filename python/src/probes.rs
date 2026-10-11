@@ -104,7 +104,9 @@ pub(crate) fn parse_keeps(obj: &Bound<'_, PyAny>) -> PyResult<Vec<(QuadColumn, K
     let Ok(dict) = obj.cast::<PyDict>() else {
         return Err(PyValueError::new_err(
             "keep must be a dict mapping a position (\"s\", \"p\", \"o\", \"g\" or 0-3) to a \
-             code set (U64Column, u64 buffer or int sequence) or a code range (range or (lo, hi))",
+             code set (U64Column, a u64 buffer or a list of ints) or a code range (a range \
+             with step 1, or a 2-tuple (lo, hi), the half-open codes lo <= code < hi; a \
+             2-tuple is never a set)",
         ));
     };
     let mut keeps: Vec<(QuadColumn, Keep)> = Vec::with_capacity(dict.len());
@@ -140,9 +142,10 @@ fn parse_position(position: &Bound<'_, PyAny>) -> PyResult<QuadColumn> {
     ))
 }
 
-/// One keep: a `range` with step 1 or a `(lo, hi)` pair of ints is a code
-/// range; a `U64Column`, a u64 buffer or any int sequence is a code set (see
-/// [`extract_u64s`]).
+/// One keep: a `range` with step 1 or a 2-tuple `(lo, hi)` of ints is a code
+/// range, the half-open codes `lo <= code < hi`; a `U64Column`, a u64 buffer
+/// or any other sequence of ints is a code set (see [`extract_u64s`]). A
+/// 2-tuple is never a set.
 fn parse_keep(spec: &Bound<'_, PyAny>) -> PyResult<Keep> {
     let py = spec.py();
     let range_type = py.import("builtins")?.getattr("range")?;
@@ -167,8 +170,9 @@ fn parse_keep(spec: &Bound<'_, PyAny>) -> PyResult<Keep> {
     }
     let codes = extract_u64s(spec).map_err(|e| {
         PyValueError::new_err(format!(
-            "a keep is a code set (U64Column, u64 buffer or sequence of non-negative ints below \
-             2**64) or a code range (range with step 1, or (lo, hi)): {e}"
+            "a keep is a code set (U64Column, a u64 buffer or a list of non-negative ints below \
+             2**64) or a code range (a range with step 1, or a 2-tuple (lo, hi), the half-open \
+             codes lo <= code < hi; a 2-tuple is never a set): {e}"
         ))
     })?;
     Ok(Keep::set(codes))

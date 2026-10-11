@@ -116,7 +116,7 @@ A file store is **memory-mapped**: opening reads only the footer (and, under the
 
 Stores also round-trip through bytes: `store.to_bytes()` serializes to the native container (the same exchange format as the `.vortex` file, the CLI and the JS bindings), and `VortexRdfStore.from_bytes(data)` opens such a buffer — `bytes` or `bytearray` — as a fully in-memory store.
 
-Open stores after forking, or use the `spawn` or `forkserver` start method: batch calls on a store opened before `fork()` hang in the child.
+The bindings start their worker threads on first use. A process that forks after calling into them (opening a store, `serialize_rdf`) leaves the child without them, and batch calls in the child hang. Call into the bindings only after forking, or use the `spawn` or `forkserver` start method.
 
 ## Development
 

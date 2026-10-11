@@ -18,7 +18,7 @@ use crate::{RUNTIME, parse_err, store_err};
 
 /// Buckets in the decode-sharing cache (see [`TermDict::decode_slice`]).
 /// A power of two, so the bucket index is a mask rather than a division; 256
-/// entries keep the table at 2 KiB, small enough to stay cache-resident and to
+/// entries keep the table at 4 KiB, small enough to stay cache-resident and to
 /// zero cheaply for a short column.
 const RECENT_BUCKETS: usize = 256;
 
@@ -53,9 +53,10 @@ impl TermDict {
     /// buffer view cannot cross the GIL release.
     ///
     /// A direct-mapped cache of `RECENT_BUCKETS` entries, indexed by the
-    /// code's low bits (`code & (RECENT_BUCKETS - 1)`), holds the `(code, slot)` most recently
-    /// decoded into each bucket; an occurrence whose bucket holds its own code
-    /// reuses that slot instead of decompressing and allocating again. A hit
+    /// code's low bits (`code & (RECENT_BUCKETS - 1)`), holds the
+    /// `(code, slot)` most recently decoded into each bucket; an occurrence
+    /// whose bucket holds its own code reuses that slot instead of
+    /// decompressing and allocating again. A hit
     /// requires the stored code to match, so a collision — or a column holding
     /// more live terms than there are buckets — costs only a re-decode and
     /// never yields a wrong term.
