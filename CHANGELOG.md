@@ -48,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An in-memory match reads a residual over a probe-read column through the probe the store resolved for its base column, instead of resolving one on every call (core) ([`9e5481d`](https://github.com/vortex-rdf/vortex-rdf/commit/9e5481d8c0965831169c0923a90720dd445e0323) by @julianrojas87)
 - A file match with a bound subject narrows the subject's run by the predicate, object and graph behind it through the chunk probes, as the in-memory prefix probe does, so a bound prefix is an exact row range with no filter (core) ([`28aa669`](https://github.com/vortex-rdf/vortex-rdf/commit/28aa669020495b4634abbaef0f3f3d65865cd8d8) by @julianrojas87)
 - An exact file selection is read point by point through the chunk probes, taken at its ids from the chunk probes' leaves, or scanned, as its size and spread across splits make cheapest, for gathered and streamed reads alike (core) ([`dac4d6a`](https://github.com/vortex-rdf/vortex-rdf/commit/dac4d6a89806c8953ec125ce786af8b991b04f05) by @julianrojas87)
+- A resident dictionary reads a single term — a lookup, a lower bound, a decode — through one scratch buffer with room for usual terms, rather than a buffer per chunk grown term by term (core) ([`9b23447`](https://github.com/vortex-rdf/vortex-rdf/commit/9b234473912684ce60a898446fde52f243c6165d) by @julianrojas87)
 
 ### Removed
 
