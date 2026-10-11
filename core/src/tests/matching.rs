@@ -488,3 +488,40 @@ async fn test_derived_view_does_not_lose_base_rows() {
     assert_eq!(widened.size().await.unwrap(), 5);
     assert_eq!(store.size().await.unwrap(), 10);
 }
+
+/// A residual over an in-memory base reads its probe-bound columns through
+/// the probes the store resolved for its base, so a match resolves none: a
+/// reference index answers `o` of `(?, p, o)` and `p` is read at its rows.
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn test_in_memory_residual_reads_through_the_store_probes() {
+    use crate::store::scan::typed_eq::probe_hooks;
+    let quads = graph_modular_quads(900, 4, 3, 7, &[GraphName::DefaultGraph]);
+    let (_dir, path) = write_store_file(
+        quads.clone(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByReference],
+    )
+    .await;
+    let store = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    for _ in 0..2 {
+        let (cached, resolved) = probe_hooks::binds();
+        let matched = store
+            .match_pattern(None, Some(&p1), Some(&o2), None)
+            .await
+            .unwrap();
+        let (cached_after, resolved_after) = probe_hooks::binds();
+        assert_eq!(resolved_after, resolved, "no probe is resolved per match");
+        assert_eq!(
+            cached_after,
+            cached + 1,
+            "`p` reads through the store's probe"
+        );
+        assert_eq!(
+            view_strings(&matched).await,
+            expected_strings(&quads, |i| i % 21 == 16)
+        );
+    }
+}

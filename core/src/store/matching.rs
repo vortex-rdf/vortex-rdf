@@ -469,7 +469,13 @@ impl VortexRdfStore {
                 Constraints::AlwaysFalse => return Ok(self.empty_view()),
                 Constraints::Eq(eqs) => eqs,
             };
-            match typed_residual_ids(&struct_arr, &selection, base.len(), &eqs) {
+            match typed_residual_ids(
+                &struct_arr,
+                &selection,
+                base.len(),
+                &eqs,
+                Some((base, probes)),
+            ) {
                 Some(ids) => {
                     selection = RowSelection::Ids(ids);
                     narrowed_elsewhere = true;

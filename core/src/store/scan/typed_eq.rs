@@ -12,6 +12,7 @@ use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{PrimitiveArray, StructArray, VarBinView, VarBinViewArray};
 use vortex_array::scalar::Scalar;
 
+use crate::store::probes::StructProbes;
 use crate::store::schema::TermCode;
 use crate::store::selection::RowSelection;
 
@@ -55,8 +56,25 @@ impl Needle {
 /// and the caller falls back to the general mask-scan pipeline.
 enum TypedEq<'a> {
     Code(PrimitiveArray, TermCode),
-    CodeProbe(vortex_rdf_encoded_search::SortedProbe<'a>, TermCode),
+    CodeProbe(ColumnProbe<'a>, TermCode),
     Str(StrEq<'a>),
+}
+
+/// A probe-read column's probe: the one the store resolved for its base, or
+/// one resolved for this scan alone.
+enum ColumnProbe<'a> {
+    Cached(&'a vortex_rdf_encoded_search::SortedProbe<'a>),
+    Resolved(vortex_rdf_encoded_search::SortedProbe<'a>),
+}
+
+impl ColumnProbe<'_> {
+    #[inline]
+    fn value_at(&self, i: usize) -> u64 {
+        match self {
+            ColumnProbe::Cached(probe) => probe.value_at(i),
+            ColumnProbe::Resolved(probe) => probe.value_at(i),
+        }
+    }
 }
 
 /// A string equality probe over a canonical `VarBinView` column, comparing at
@@ -92,9 +110,15 @@ impl<'a> TypedEq<'a> {
     /// already materialized; `canonicalize` additionally materializes one that
     /// is not, which costs a pass over the whole column and is the caller's
     /// call to make. Any other non-nullable unsigned-integer column binds
-    /// through an encoded search probe when its encoding resolves. The mask
+    /// through an encoded search probe: `cached`, the store's probe for the
+    /// column, else one resolved here when its encoding resolves. The mask
     /// scan covers what declines, at selection cost.
-    fn bind_col(col: &'a ArrayRef, needle: &'a Needle, canonicalize: bool) -> Option<TypedEq<'a>> {
+    fn bind_col(
+        col: &'a ArrayRef,
+        needle: &'a Needle,
+        canonicalize: bool,
+        cached: Option<&'a vortex_rdf_encoded_search::SortedProbe<'a>>,
+    ) -> Option<TypedEq<'a>> {
         use crate::store::array::{cached_code_primitive, shared_code_primitive};
         use vortex_array::dtype::DType;
         if col.dtype().is_nullable() {
@@ -112,8 +136,15 @@ impl<'a> TypedEq<'a> {
                 if let Some(prim) = canonical {
                     return Some(TypedEq::Code(prim, *code));
                 }
+                if let Some(probe) = cached {
+                    #[cfg(test)]
+                    probe_hooks::note(true);
+                    return Some(TypedEq::CodeProbe(ColumnProbe::Cached(probe), *code));
+                }
                 let probe = vortex_rdf_encoded_search::SortedProbe::resolve(col)?;
-                Some(TypedEq::CodeProbe(probe, *code))
+                #[cfg(test)]
+                probe_hooks::note(false);
+                Some(TypedEq::CodeProbe(ColumnProbe::Resolved(probe), *code))
             }
             Needle::Str(s) => {
                 if !matches!(col.dtype(), DType::Utf8(_)) {
@@ -129,16 +160,22 @@ impl<'a> TypedEq<'a> {
     }
 
     /// Bind every constraint to its typed column, or `None` if any declines.
+    /// `probes` is the store's probe cache for the base `struct_arr` was taken
+    /// from, when the scan reads one.
     fn bind(
         struct_arr: &'a StructArray,
         eqs: &[(&'static str, Scalar)],
         needles: &'a [Needle],
         canonicalize: bool,
+        probes: Option<(&'a ArrayRef, &'a StructProbes)>,
     ) -> Option<Vec<TypedEq<'a>>> {
         let mut cols = Vec::with_capacity(eqs.len());
         for ((field, _), needle) in eqs.iter().zip(needles) {
             let col = struct_arr.unmasked_field_by_name(field).ok()?;
-            cols.push(TypedEq::bind_col(col, needle, canonicalize)?);
+            let cached = probes
+                .and_then(|(base, probes)| probes.by_name(base, field))
+                .map(|owned| owned.probe());
+            cols.push(TypedEq::bind_col(col, needle, canonicalize, cached)?);
         }
         Some(cols)
     }
@@ -171,6 +208,30 @@ impl<'a> TypedEq<'a> {
     }
 }
 
+/// Test hook: how this thread's typed scans bound their probe-read columns —
+/// through a probe the store had cached, or one resolved for the scan.
+#[cfg(test)]
+pub(crate) mod probe_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CACHED: Cell<usize> = const { Cell::new(0) };
+        static RESOLVED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Record one probe-read column bound from the cache, or resolved.
+    pub(super) fn note(cached: bool) {
+        let cell = if cached { &CACHED } else { &RESOLVED };
+        cell.with(|c| c.set(c.get() + 1));
+    }
+
+    /// The `(cached, resolved)` probe binds on this thread so far.
+    #[cfg(feature = "file-io")]
+    pub(crate) fn binds() -> (usize, usize) {
+        (CACHED.with(Cell::get), RESOLVED.with(Cell::get))
+    }
+}
+
 /// Selection size above which the typed row loop declines to the vectorized
 /// mask scan: always for a lone constraint, and for any set that binds a
 /// column through an encoded-search probe (see [`typed_residual_ids`]).
@@ -182,13 +243,16 @@ const TYPED_EQ_MAX_ROWS: usize = 4_096;
 /// surviving base row ids. Returns `None` when any constraint cannot take the
 /// typed path — the caller then falls back to the general mask scan, whose
 /// per-call pipeline (slice through the optimizer, ConstantArray compares,
-/// BoolArray canonicalization) is the fixed cost this path avoids. The base
-/// counterpart of [`typed_positions`].
+/// BoolArray canonicalization) is the fixed cost this path avoids. A
+/// probe-read column reads through the store's probe from `probes` — the base
+/// `struct_arr` was taken from, with its probe cache — when it holds one, so
+/// the scan resolves nothing. The base counterpart of [`typed_positions`].
 pub(crate) fn typed_residual_ids(
     struct_arr: &StructArray,
     selection: &RowSelection,
     base_len: usize,
     eqs: &[(&'static str, Scalar)],
+    probes: Option<(&ArrayRef, &StructProbes)>,
 ) -> Option<vortex_buffer::Buffer<u64>> {
     // A lone constraint has no conjunction to short-circuit per row, so over
     // a wide selection it goes to the mask scan; two or more slice-bound
@@ -205,7 +269,7 @@ pub(crate) fn typed_residual_ids(
     // on point reads so a store queried only through its fast paths never
     // holds a second copy of its columns.
     let canonicalize = selected.saturating_mul(eqs.len()) >= base_len;
-    let cols = TypedEq::bind(struct_arr, eqs, &needles, canonicalize)?;
+    let cols = TypedEq::bind(struct_arr, eqs, &needles, canonicalize, probes)?;
     // A probe-bound column (no canonical form to reach for) is read per row,
     // so a wide selection over one goes to the mask scan.
     if cols.iter().any(|c| matches!(c, TypedEq::CodeProbe(..))) && wide {
@@ -261,7 +325,7 @@ pub(crate) fn typed_positions(
     ) -> Option<()> {
         // Every row of the chunk is tested, so a compressed column is always
         // worth reading through its canonical form.
-        let cols = TypedEq::bind(sa, eqs, needles, true)?;
+        let cols = TypedEq::bind(sa, eqs, needles, true, None)?;
         if let Some(codes) = TypedEq::code_views(&cols) {
             out.extend(
                 (0..sa.len())
@@ -355,7 +419,7 @@ mod tests {
     fn probe_bound_column_filters_rows() {
         let sa = mixed_struct(1000);
         let eqs = eqs(&[("p", 3), ("o", 10)]);
-        let ids = typed_residual_ids(&sa, &RowSelection::All, 1000, &eqs).unwrap();
+        let ids = typed_residual_ids(&sa, &RowSelection::All, 1000, &eqs, None).unwrap();
         let want: Vec<u64> = (0..1000u64)
             .filter(|i| i % 7 == 3 && i % 11 == 10)
             .collect();
@@ -369,9 +433,9 @@ mod tests {
         let n = (TYPED_EQ_MAX_ROWS as TermCode) * 2;
         let sa = mixed_struct(n);
         let eqs = eqs(&[("p", 3), ("o", 10)]);
-        assert!(typed_residual_ids(&sa, &RowSelection::All, n as usize, &eqs).is_none());
+        assert!(typed_residual_ids(&sa, &RowSelection::All, n as usize, &eqs, None).is_none());
         let narrow = RowSelection::Range(10..90);
-        let ids = typed_residual_ids(&sa, &narrow, n as usize, &eqs).unwrap();
+        let ids = typed_residual_ids(&sa, &narrow, n as usize, &eqs, None).unwrap();
         let want: Vec<u64> = (10..90u64).filter(|i| i % 7 == 3 && i % 11 == 10).collect();
         assert_eq!(ids.as_slice(), &want[..]);
     }
@@ -387,7 +451,7 @@ mod tests {
         assert!(crate::store::array::cached_code_primitive(&o).is_none());
 
         let eqs = eqs(&[("p", 3), ("o", 10)]);
-        let ids = typed_residual_ids(&sa, &RowSelection::All, n as usize, &eqs).unwrap();
+        let ids = typed_residual_ids(&sa, &RowSelection::All, n as usize, &eqs, None).unwrap();
         let want: Vec<u64> = (0..n).filter(|i| i % 7 == 3 && i % 11 == 10).collect();
         assert_eq!(ids.as_slice(), &want[..]);
         assert!(crate::store::array::cached_code_primitive(&o).is_some());
@@ -403,7 +467,7 @@ mod tests {
 
         let eqs = eqs(&[("p", 3), ("o", 10)]);
         let narrow = RowSelection::Range(10..90);
-        let ids = typed_residual_ids(&sa, &narrow, n as usize, &eqs).unwrap();
+        let ids = typed_residual_ids(&sa, &narrow, n as usize, &eqs, None).unwrap();
         let want: Vec<u64> = (10..90u64).filter(|i| i % 7 == 3 && i % 11 == 10).collect();
         assert_eq!(ids.as_slice(), &want[..]);
         assert!(crate::store::array::cached_code_primitive(&o).is_none());
@@ -417,7 +481,7 @@ mod tests {
         let sa =
             StructArray::try_new(["k"].into(), vec![kind], 100, Validity::NonNullable).unwrap();
         let eqs = vec![("k", Scalar::from(2u8))];
-        let ids = typed_residual_ids(&sa, &RowSelection::All, 100, &eqs).unwrap();
+        let ids = typed_residual_ids(&sa, &RowSelection::All, 100, &eqs, None).unwrap();
         let want: Vec<u64> = (0..100u64).filter(|i| i % 3 == 2).collect();
         assert_eq!(ids.as_slice(), &want[..]);
     }
@@ -429,8 +493,9 @@ mod tests {
         let n = (TYPED_EQ_MAX_ROWS as TermCode) * 2;
         let sa = mixed_struct(n);
         let eqs = eqs(&[("p", 3)]);
-        assert!(typed_residual_ids(&sa, &RowSelection::All, n as usize, &eqs).is_none());
-        let ids = typed_residual_ids(&sa, &RowSelection::Range(0..100), n as usize, &eqs).unwrap();
+        assert!(typed_residual_ids(&sa, &RowSelection::All, n as usize, &eqs, None).is_none());
+        let ids =
+            typed_residual_ids(&sa, &RowSelection::Range(0..100), n as usize, &eqs, None).unwrap();
         let want: Vec<u64> = (0..100u64).filter(|i| i % 7 == 3).collect();
         assert_eq!(ids.as_slice(), &want[..]);
     }
@@ -462,17 +527,17 @@ mod tests {
     fn string_column_binds_at_view_level() {
         let sa = string_struct(200);
         let short = vec![("o", Scalar::from("short"))];
-        let ids = typed_residual_ids(&sa, &RowSelection::All, 200, &short).unwrap();
+        let ids = typed_residual_ids(&sa, &RowSelection::All, 200, &short, None).unwrap();
         let want: Vec<u64> = (0..200u64).filter(|i| i % 4 == 0).collect();
         assert_eq!(ids.as_slice(), &want[..]);
 
         let long = vec![("o", Scalar::from(LONG))];
-        let ids = typed_residual_ids(&sa, &RowSelection::All, 200, &long).unwrap();
+        let ids = typed_residual_ids(&sa, &RowSelection::All, 200, &long, None).unwrap();
         let want: Vec<u64> = (0..200u64).filter(|i| i % 4 == 1).collect();
         assert_eq!(ids.as_slice(), &want[..]);
 
         let mixed = vec![("p", Scalar::from(1u64)), ("o", Scalar::from(LONG))];
-        let ids = typed_residual_ids(&sa, &RowSelection::All, 200, &mixed).unwrap();
+        let ids = typed_residual_ids(&sa, &RowSelection::All, 200, &mixed, None).unwrap();
         let want: Vec<u64> = (0..200u64).filter(|i| i % 3 == 1 && i % 4 == 1).collect();
         assert_eq!(ids.as_slice(), &want[..]);
     }
@@ -488,7 +553,7 @@ mod tests {
         assert!(p.dtype().is_nullable());
         let sa = StructArray::try_new(["p"].into(), vec![p], 10, Validity::NonNullable).unwrap();
         let eqs = eqs(&[("p", 1)]);
-        assert!(typed_residual_ids(&sa, &RowSelection::All, 10, &eqs).is_none());
+        assert!(typed_residual_ids(&sa, &RowSelection::All, 10, &eqs, None).is_none());
     }
 
     /// A needle that is neither a code nor a string declines: `Needle`
@@ -497,7 +562,7 @@ mod tests {
     fn non_code_non_string_needle_declines() {
         let sa = mixed_struct(10);
         let eqs = vec![("p", Scalar::from(true))];
-        assert!(typed_residual_ids(&sa, &RowSelection::All, 10, &eqs).is_none());
+        assert!(typed_residual_ids(&sa, &RowSelection::All, 10, &eqs, None).is_none());
     }
 
     fn code_struct(codes: &[TermCode]) -> ArrayRef {
