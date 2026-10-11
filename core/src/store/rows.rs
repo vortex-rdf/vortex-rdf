@@ -319,6 +319,20 @@ impl VortexRdfStore {
         if self.layout.strategy() != LayoutStrategy::Dictionary || self.tail_len() != 0 {
             return Ok(None);
         }
+        // A served file view whose row ids are still deferred reads its codes
+        // off the answering index's run instead of computing the ids and
+        // gathering the primary rows at them.
+        #[cfg(feature = "file-io")]
+        if let QuadsSource::File {
+            selection: ViewSelection::Pending(_),
+            deleted,
+            serve: Some(plan),
+            ..
+        } = &self.quads
+            && let Some(columns) = plan.code_columns(deleted.as_ref()).await?
+        {
+            return Ok(Some(columns));
+        }
         let rows = self.selected_rows().await?;
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let struct_arr = rows

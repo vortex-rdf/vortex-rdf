@@ -287,6 +287,68 @@ async fn test_copy_index_file_locates_dictionary_coded_columns() {
     );
 }
 
+/// The code columns of `view` as sorted `(s, p, o, g)` rows.
+async fn sorted_code_rows(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
+    let [s, p, o, g] = view.code_columns_gathered().await.unwrap().unwrap();
+    let mut rows: Vec<[TermCode; 4]> = (0..s.len()).map(|i| [s[i], p[i], o[i], g[i]]).collect();
+    rows.sort_unstable();
+    rows
+}
+
+/// A served file view whose row ids are still deferred — a located run past
+/// the point-read cap — answers its code columns from the copy family's run,
+/// by a scan of exactly the run: the ids stay unread and no primary row is
+/// gathered. A smaller run, whose ids the match read, gathers its rows. Both
+/// answer the in-memory store's codes, tombstoned rows dropped.
+#[tokio::test]
+async fn test_copy_index_file_serves_code_columns_from_the_run() {
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let o1 = Term::Literal(Literal::new_simple_literal("o1"));
+    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    // 9,000 rows: every run is wider than the point-read cap; 900 rows: the
+    // (p, o) runs are inside it.
+    for rows in [9_000, 900] {
+        let quads = graph_modular_quads(rows, 4, 3, 7, &[GraphName::DefaultGraph]);
+        let (_dir, path) = write_store_file(
+            quads.clone(),
+            LayoutStrategy::Dictionary,
+            vec![IndexType::SecondaryByCopy],
+        )
+        .await;
+        let file = VortexRdfStore::from_file(&path).await.unwrap();
+        let memory = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+        let deleted = file.delete_quad(&quads[1]).await.unwrap();
+        let memory_deleted = memory.delete_quad(&quads[1]).await.unwrap();
+        let patterns: [(Option<&NamedNode>, Option<&Term>); 3] =
+            [(Some(&p1), None), (Some(&p1), Some(&o1)), (None, Some(&o2))];
+        for (p, o) in patterns {
+            for (store, in_memory) in [(&file, &memory), (&deleted, &memory_deleted)] {
+                let served = store.match_pattern(None, p, o, None).await.unwrap();
+                assert!(served.debug_has_serve_plan(), "{rows} {p:?} {o:?}");
+                let pending = served.debug_selection_pending();
+                if rows == 9_000 {
+                    assert!(pending, "{p:?} {o:?}: a wide run defers its ids");
+                }
+                let reads = file.debug_located_rid_reads().unwrap();
+                let codes = sorted_code_rows(&served).await;
+                assert_eq!(
+                    file.debug_located_rid_reads().unwrap(),
+                    reads,
+                    "{rows} {p:?} {o:?}: no row id is read"
+                );
+                if pending {
+                    assert_eq!(served.debug_row_ids_materialized(), Some(false));
+                }
+                let want =
+                    sorted_code_rows(&in_memory.match_pattern(None, p, o, None).await.unwrap())
+                        .await;
+                assert_eq!(codes, want, "{rows} {p:?} {o:?}");
+                assert_eq!(codes.len(), served.size().await.unwrap());
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_copy_index_file_default() {
     run_copy_index_file_test(LayoutStrategy::Default, false).await;

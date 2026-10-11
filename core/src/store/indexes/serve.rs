@@ -178,6 +178,30 @@ impl ServeDecode {
         ))
     }
 
+    /// A chunk's live rows as four code columns, `(s, p, o, g)` — the
+    /// code-payload counterpart of [`decode_columns`](Self::decode_columns)
+    /// for a Dictionary decode layout, whose columns hold codes.
+    #[cfg(feature = "file-io")]
+    fn chunk_code_columns(
+        &self,
+        chunk: &ArrayRef,
+        deleted: Option<&Mask>,
+    ) -> Result<[Buffer<TermCode>; 4]> {
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        let rows = self
+            .chunk_rows(chunk, deleted)?
+            .execute::<StructArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?;
+        let [s, p, o, g] = crate::store::schema::PRIMARY_COLUMNS;
+        let mut column = |name: &str| -> Result<Buffer<TermCode>> {
+            Ok(
+                crate::store::array::field_as::<PrimitiveArray>(&rows, name, &mut ctx)?
+                    .into_buffer::<TermCode>(),
+            )
+        };
+        Ok([column(s)?, column(p)?, column(o)?, column(g)?])
+    }
+
     /// A chunk's live rows as a primary-named `(s, p, o, g)` struct: relabel the
     /// source columns, then drop any whose primary row id is tombstoned.
     fn chunk_rows(&self, chunk: &ArrayRef, deleted: Option<&Mask>) -> Result<ArrayRef> {
@@ -537,6 +561,29 @@ impl FileServePlan {
                 .with_row_range(range)
                 .with_split_by(SplitBy::RowCount(split_rows)),
         ))
+    }
+
+    /// The served rows' four [`TermCode`]s, read off the index child's own
+    /// columns by a scan of exactly the located run, or by the filtered child
+    /// scan when the run is unlocated — the file counterpart of
+    /// [`InMemoryServePlan::code_columns`], for a view whose row ids are still
+    /// deferred. Rows come back in the index's order, as the served stream
+    /// reads them, tombstoned rows dropped via the row-id column. `None`
+    /// declines to the caller's gather path: a non-Dictionary decode layout,
+    /// whose columns hold terms, not codes.
+    pub(crate) async fn code_columns(
+        &self,
+        deleted: Option<&Mask>,
+    ) -> Result<Option<[Buffer<TermCode>; 4]>> {
+        if !matches!(self.decode.decode_layout, ResolvedLayout::Dictionary(_)) {
+            return Ok(None);
+        }
+        let scan = match self.located_run_scan()? {
+            Some(scan) => scan,
+            None => self.projected_filtered_scan()?,
+        };
+        let chunk = crate::store::scan::file_scan::read_all_rows(scan).await?;
+        self.decode.chunk_code_columns(&chunk, deleted).map(Some)
     }
 
     /// Decode the `(s, p, o, g)` rows out of a chunk of this plan's projected
