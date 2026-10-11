@@ -737,6 +737,26 @@ impl VortexRdfStore {
             }
         };
 
+        // Exact ids sparse in their splits check the filter at their own rows
+        // through the chunk probes, as the in-memory path checks a residual at
+        // the selected rows, and no filter is left to the scan: its
+        // evaluation decodes every row of each split the ids touch.
+        let (filter, selection) = match (filter, selection) {
+            (Some(f), ViewSelection::Exact(RowSelection::Ids(ids))) => {
+                match file_scan::point_filter_ids(file, &f, &ids).await? {
+                    Some(kept) => {
+                        log::debug!(
+                            "[match_pattern] File filter checked by point reads at {:?}",
+                            debug::elapsed(t)
+                        );
+                        (None, ViewSelection::Exact(RowSelection::Ids(kept)))
+                    }
+                    None => (Some(f), ViewSelection::Exact(RowSelection::Ids(ids))),
+                }
+            }
+            other => other,
+        };
+
         // Nothing can match: normalize to the canonical empty view. A
         // pending selection's coverage is unknown by design — it may
         // materialize to empty later, which every consumer handles like any

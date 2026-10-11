@@ -281,6 +281,15 @@ impl VortexRdfStore {
         }
     }
 
+    /// Whether this file view carries a filter its next scan evaluates;
+    /// `None` off-file.
+    pub(crate) fn debug_file_filter_pending(&self) -> Option<bool> {
+        match &self.quads {
+            QuadsSource::InMemory { .. } => None,
+            QuadsSource::File { filter, .. } => Some(filter.is_some()),
+        }
+    }
+
     /// Whether this view's selection is pending with no serve plan to read
     /// through: the state only a view built to be counted or windowed may be
     /// in, and none a caller gets back is.

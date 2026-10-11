@@ -586,6 +586,86 @@ async fn test_reference_index_counts_located_runs_from_width() {
     }
 }
 
+/// A residual beside a reference index's row ids is checked at those rows
+/// through the chunk probes when they are sparse in their splits: the view
+/// holds exact ids and no filter, so a count reads nothing more. Ids dense in
+/// their splits keep the pushed-down filter. Every answer agrees with the
+/// in-memory store's.
+#[tokio::test]
+async fn test_reference_index_file_checks_sparse_residual_by_point_reads() {
+    use crate::store::Probe;
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    // (rows, objects, residual point-read): 30,000 rows with each object on
+    // 20 or 21 of them, then 900 rows with each object on ~129.
+    for (rows, o_mod, sparse) in [(30_000, 1_499, true), (900, 7, false)] {
+        let quads = graph_modular_quads(rows, 5, 3, o_mod, &[GraphName::DefaultGraph]);
+        let (_dir, path) = write_store_file(
+            quads.clone(),
+            LayoutStrategy::Dictionary,
+            vec![IndexType::SecondaryByReference],
+        )
+        .await;
+        let file = VortexRdfStore::from_file(&path).await.unwrap();
+        let memory = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+        let want = expected_strings(&quads, |i| i % 3 == 1 && i % o_mod == 2);
+        assert!(!want.is_empty(), "{rows}");
+
+        let matched = file
+            .match_pattern(None, Some(&p1), Some(&o2), None)
+            .await
+            .unwrap();
+        assert_eq!(matched.debug_file_filter_pending(), Some(!sparse), "{rows}");
+        assert_eq!(matched.size().await.unwrap(), want.len(), "{rows}");
+        assert_eq!(view_strings(&matched).await, want, "{rows}");
+        let in_memory = memory
+            .match_pattern(None, Some(&p1), Some(&o2), None)
+            .await
+            .unwrap();
+        assert_eq!(view_strings(&in_memory).await, want, "{rows}");
+        let probe = Probe::new(None, Some(p1.clone()), Some(o2.clone()), None);
+        for store in [&file, &memory] {
+            assert_eq!(
+                store
+                    .count_many(std::slice::from_ref(&probe))
+                    .await
+                    .unwrap(),
+                vec![want.len()],
+                "{rows}"
+            );
+        }
+
+        // A tombstoned match leaves the count and the rows.
+        let doomed = quads
+            .iter()
+            .enumerate()
+            .find(|(i, _)| i % 3 == 1 && i % o_mod == 2)
+            .map(|(i, _)| i)
+            .unwrap();
+        let deleted = file.delete_quad(&quads[doomed]).await.unwrap();
+        let after = deleted
+            .match_pattern(None, Some(&p1), Some(&o2), None)
+            .await
+            .unwrap();
+        assert_eq!(after.size().await.unwrap(), want.len() - 1, "{rows}");
+        assert_eq!(
+            view_strings(&after).await,
+            expected_strings(&quads, |i| i % 3 == 1 && i % o_mod == 2 && i != doomed),
+            "{rows}"
+        );
+
+        // A residual no located row satisfies — a known term, never a
+        // predicate — leaves an empty view.
+        let subject_as_p = NamedNode::new("http://example.org/s00000").unwrap();
+        let none = file
+            .match_pattern(None, Some(&subject_as_p), Some(&o2), None)
+            .await
+            .unwrap();
+        assert_eq!(none.size().await.unwrap(), 0, "{rows}");
+        assert!(view_strings(&none).await.is_empty(), "{rows}");
+    }
+}
+
 /// Every `(offset, limit)` window of the run `(p, o)` on `store`, against the
 /// row path (the unwindowed rows, which the public match computes):
 /// - the window holds the same slice of the rows, and its size is the slice's;

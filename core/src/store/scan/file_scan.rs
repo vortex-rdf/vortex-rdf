@@ -741,18 +741,49 @@ pub(crate) async fn file_point_rows(
     else {
         return Ok(None);
     };
-    let source = file.segment_source();
-    let session = file.session();
 
     // Filter first: a row survives when every eq column reads its code.
+    let Some(checks) = eqs
+        .iter()
+        .map(|(col, code)| {
+            let idx = columns.iter().position(|c| c == col)?;
+            Some((Arc::clone(&handles[idx]), *code))
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    let Some(live) = rows_reading(file, &checks, rows).await? else {
+        return Ok(None);
+    };
+
+    point_read_struct(file, &handles, columns, &live, |col| {
+        eqs.iter().find(|(c, _)| c == col).map(|(_, v)| *v)
+    })
+    .await
+}
+
+/// A column's chunk-probe handle beside the code its rows must read.
+type CodeCheck = (Arc<vortex_rdf_encoded_search::ColumnChunks>, u64);
+
+/// The rows of `rows` at which every check's column reads its code, read
+/// point by point through the chunk probes. `None` when a chunk the reads
+/// reach has no probe.
+async fn rows_reading(
+    file: &NativeStoreFile,
+    checks: &[CodeCheck],
+    rows: Vec<u64>,
+) -> Result<Option<Vec<u64>>> {
+    let source = file.segment_source();
+    let session = file.session();
     let mut live = rows;
-    for (col, code) in &eqs {
-        let Some(idx) = columns.iter().position(|c| c == col) else {
-            return Ok(None);
-        };
+    for (handle, code) in checks {
+        if live.is_empty() {
+            break;
+        }
         let mut kept = Vec::with_capacity(live.len());
         for &row in &live {
-            match handles[idx]
+            match handle
                 .value_at(row, &source, session)
                 .await
                 .map_err(VortexRdfError::Vortex)?
@@ -763,15 +794,65 @@ pub(crate) async fn file_point_rows(
             }
         }
         live = kept;
-        if live.is_empty() {
+    }
+    Ok(Some(live))
+}
+
+/// One point read costs about as much as a filtered scan spends on this many
+/// rows: the scan's filter evaluation decodes every row of each split it
+/// touches, a point read one value per column.
+const POINT_READ_ROWS: u64 = 256;
+
+/// The ids of `ids` whose rows satisfy `filter`, a conjunction of term
+/// equalities, read point by point through the file's chunk probes — what a
+/// filtered scan of the splits holding them answers, without decoding those
+/// splits. `None` declines — a filter of another shape, a column without
+/// chunk probes, ids dense enough in their splits that the scan costs less
+/// ([`sparse_in_splits`]) — and the caller keeps the filter.
+pub(crate) async fn point_filter_ids(
+    file: &NativeStoreFile,
+    filter: &Expression,
+    ids: &Buffer<RowId>,
+) -> Result<Option<Buffer<RowId>>> {
+    let Some(eqs) = eq_code_pairs(filter) else {
+        return Ok(None);
+    };
+    let splits = file.splits().map_err(VortexRdfError::Vortex)?;
+    if !sparse_in_splits(ids, &splits) {
+        return Ok(None);
+    }
+    let Some(checks) = eqs
+        .iter()
+        .map(|(col, code)| Some((file.column_chunks(col)?, *code)))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    Ok(rows_reading(file, &checks, ids.to_vec())
+        .await?
+        .map(Buffer::from))
+}
+
+/// Whether reading `ids` (ascending) point by point costs less than scanning
+/// the splits that hold them: at most one id per [`POINT_READ_ROWS`] of those
+/// splits' rows.
+fn sparse_in_splits(ids: &[RowId], splits: &[Range<u64>]) -> bool {
+    let mut touched_rows = 0u64;
+    let mut split = 0;
+    let mut counted = None;
+    for &id in ids {
+        while splits.get(split).is_some_and(|s| s.end <= id) {
+            split += 1;
+        }
+        let Some(range) = splits.get(split) else {
             break;
+        };
+        if counted != Some(split) {
+            touched_rows += range.end - range.start;
+            counted = Some(split);
         }
     }
-
-    point_read_struct(file, &handles, columns, &live, |col| {
-        eqs.iter().find(|(c, _)| c == col).map(|(_, v)| *v)
-    })
-    .await
+    (ids.len() as u64).saturating_mul(POINT_READ_ROWS) <= touched_rows
 }
 
 /// Read `columns` at `rows` point-by-point through their chunk-probe
@@ -977,6 +1058,28 @@ mod tests {
         );
         assert!(eq_code_pairs(&lit(false)).is_none());
         assert!(eq_code_pairs(&eq(get_item("p", root()), lit("x"))).is_none());
+    }
+
+    /// Ids are sparse while they number at most one per `POINT_READ_ROWS`
+    /// rows of the splits they touch; a split holding several counts once,
+    /// and an untouched split not at all.
+    #[test]
+    fn sparse_in_splits_weighs_ids_against_the_rows_of_their_splits() {
+        let rows = POINT_READ_ROWS;
+        let splits = [0..4 * rows, 4 * rows..8 * rows, 8 * rows..9 * rows];
+        // Four ids in the first split: exactly one per `rows` of its rows.
+        assert!(sparse_in_splits(&[0, 1, 2, 3], &splits));
+        assert!(!sparse_in_splits(&[0, 1, 2, 3, 4], &splits));
+        // A second split adds its rows once, however many ids it holds.
+        assert!(sparse_in_splits(
+            &[0, 1, 4 * rows, 4 * rows + 1, 5 * rows],
+            &splits
+        ));
+        // Only touched splits count: two ids in the small last one.
+        assert!(sparse_in_splits(&[8 * rows], &splits));
+        assert!(!sparse_in_splits(&[8 * rows, 8 * rows + 1], &splits));
+        assert!(sparse_in_splits(&[], &splits));
+        assert!(!sparse_in_splits(&[0], &[]));
     }
 
     /// A scan of `rows` of `file`, cut into splits of `per_split` rows.

@@ -594,6 +594,7 @@ open rather than being read around.
 | `DICT_VERSION` | 2 | [`container/mod.rs`](../core/src/io/container/mod.rs#L68) |
 | `INDEX_VERSION` | 1 | [`container/mod.rs`](../core/src/io/container/mod.rs#L72) |
 | `POINT_GATHER_MAX_ROWS` | 256 rows — a located run at most this wide is point-read through the chunk probes | [`selection.rs`](../core/src/store/selection.rs#L489) |
+| `POINT_READ_ROWS` | 256 rows — exact row ids at most one per this many rows of the splits holding them check a pending filter by point reads ([matching.md §7](matching.md#7-the-file-path)) | [`file_scan.rs`](../core/src/store/scan/file_scan.rs#L804) |
 | `MAX_INLINE_SPLITS` | 42 splits — a row scan of at most this many runs inline, a larger one is spawned ([§8](#8-reading-a-file)) | [`file_scan.rs`](../core/src/store/scan/file_scan.rs#L48) |
 | `DEFAULT_CHUNK_ROWS` | 100,000 rows per builder chunk (a producer batch size; the writer re-blocks at 8,192) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L62) |
 
