@@ -166,12 +166,33 @@ impl ResidentChunks {
     }
 }
 
+impl TermStore {
+    /// Term `i`'s bytes: borrowed from a canonical chunk, or decoded into
+    /// `scratch` from an FSST one. A read of one term at a time passes one
+    /// scratch buffer through all its probes, where a cursor holds a buffer
+    /// per chunk.
+    fn bytes_into<'a>(&'a self, i: usize, scratch: &'a mut Vec<u8>) -> &'a [u8] {
+        let (chunk, local) = match self {
+            TermStore::Single(chunk) => (chunk, i),
+            TermStore::Chunked(c) => {
+                let (k, local) = c.locate(i);
+                (&c.chunks[k], local)
+            }
+        };
+        match chunk {
+            TermChunk::Canonical(a) => StrColReader::new(a).bytes_at(local),
+            TermChunk::Fsst(f) => f.decode_into(local, scratch),
+        }
+    }
+}
+
 /// The frozen, sorted term dictionary in columnar form.
 ///
 /// term → code is a host-side binary search; code → term reads the term at a
-/// position. Both go through [`cursor`](Self::cursor), whose cost depends on
-/// the encoding the terms are held in. Only the kind ranges are kept beyond a
-/// call.
+/// position. A read of one term at a time decodes into a single scratch buffer
+/// ([`TermStore::bytes_into`]), a batch through a [`cursor`](Self::cursor); the
+/// cost of either depends on the encoding the terms are held in. Only the kind
+/// ranges are kept beyond a call.
 pub(crate) struct TermDictionary {
     terms: TermStore,
     /// The kind ranges, computed on first use (a few probes).
@@ -475,7 +496,10 @@ impl TermDictionary {
     /// `None` if the code is out of the dictionary's range.
     pub(crate) fn decode(&self, code: TermCode) -> Option<String> {
         let rank = self.rank_of(code)?;
-        self.cursor().str_at(rank).ok().map(str::to_owned)
+        let mut scratch = Vec::new();
+        buf_as_str(self.terms.bytes_into(rank, &mut scratch))
+            .ok()
+            .map(str::to_owned)
     }
 
     /// Encode a term to its code: its position in the sorted dictionary, or
@@ -483,13 +507,13 @@ impl TermDictionary {
     /// three-way compare per step, returning as soon as the probe hits.
     pub(crate) fn encode(&self, term: &str) -> Option<TermCode> {
         // FSST is not order-preserving, so the search cannot run over the
-        // compressed codes: every probe decodes into the cursor's scratch.
-        let mut cursor = self.cursor();
+        // compressed codes: every probe decodes, into one scratch buffer.
+        let mut scratch = Vec::new();
         let needle = term.as_bytes();
         let (mut lo, mut hi) = (0usize, self.len());
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            match cursor.bytes_at(mid).cmp(needle) {
+            match self.terms.bytes_into(mid, &mut scratch).cmp(needle) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Equal => return Some(self.code_at(mid)),
                 std::cmp::Ordering::Greater => hi = mid,
@@ -504,11 +528,11 @@ impl TermDictionary {
     /// is where `needle` would be inserted, so a present term's code and
     /// the start of a spelling prefix's run both come out of it.
     pub(crate) fn lower_bound(&self, needle: &[u8]) -> TermCode {
-        let mut cursor = self.cursor();
+        let mut scratch = Vec::new();
         let (mut lo, mut hi) = (0usize, self.len());
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if cursor.bytes_at(mid) < needle {
+            if self.terms.bytes_into(mid, &mut scratch) < needle {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -533,8 +557,9 @@ impl TermDictionary {
     /// The code ranges of the term kinds, computed once per dictionary.
     pub(crate) fn kind_ranges(&self) -> &KindRanges {
         self.kinds.get_or_init(|| {
-            let default_graph =
-                (self.len() > 0 && self.cursor().bytes_at(0).is_empty()).then(|| self.code_at(0));
+            let default_graph = (self.len() > 0
+                && self.terms.bytes_into(0, &mut Vec::new()).is_empty())
+            .then(|| self.code_at(0));
             KindRanges {
                 start: self.base(),
                 default_graph,
@@ -691,6 +716,11 @@ const FSST_SYMBOL_LEN: usize = 8;
 /// term's expanded codes silently falls back to the byte-at-a-time tail loop.
 const FSST_DECODE_HEADROOM: usize = 8 * FSST_SYMBOL_LEN;
 
+/// The room a scratch buffer is given when a decode first allocates it: a term
+/// of up to 120 FSST codes, past which only unusually long terms go. The
+/// probes of a search over usual terms then decode into it without growing it.
+const SCRATCH_SEED_BYTES: usize = 1024;
+
 /// FSST-compressed sorted terms, with the pieces a hot lookup needs hoisted
 /// out of the Vortex array.
 pub(super) struct FsstTerms {
@@ -735,12 +765,20 @@ impl FsstTerms {
     /// one 8-byte symbol, and `decompress_into`'s 8-symbols-at-a-time path
     /// only runs while the output has `FSST_DECODE_HEADROOM` bytes of room
     /// left, so a buffer sized exactly to the term would fall back to the
-    /// byte-at-a-time tail loop.
+    /// byte-at-a-time tail loop. A buffer is never given less than
+    /// [`SCRATCH_SEED_BYTES`].
     fn decode_into<'a>(&self, i: usize, scratch: &'a mut Vec<u8>) -> &'a [u8] {
         let (start, end) = (self.offsets[i] as usize, self.offsets[i + 1] as usize);
         let codes = &self.array.codes_bytes()[start..end];
         scratch.clear();
-        scratch.reserve(codes.len() * FSST_SYMBOL_LEN + FSST_DECODE_HEADROOM);
+        let needed = codes.len() * FSST_SYMBOL_LEN + FSST_DECODE_HEADROOM;
+        #[cfg(test)]
+        match scratch.capacity() {
+            0 => scratch_hooks::note_fresh(),
+            capacity if capacity < needed => scratch_hooks::note_regrown(),
+            _ => {}
+        }
+        scratch.reserve(needed.max(SCRATCH_SEED_BYTES));
         let n = self
             .array
             .decompressor()
@@ -750,6 +788,37 @@ impl FsstTerms {
             scratch.set_len(n);
         }
         &scratch[..n]
+    }
+}
+
+/// Test hook: how many FSST reads on this thread found their scratch buffer
+/// unallocated, and so allocated a fresh one.
+#[cfg(test)]
+mod scratch_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FRESH: Cell<usize> = const { Cell::new(0) };
+        static REGROWN: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn note_fresh() {
+        FRESH.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(super) fn note_regrown() {
+        REGROWN.with(|c| c.set(c.get() + 1));
+    }
+
+    /// The fresh scratch buffers this thread's reads allocated so far.
+    pub(super) fn fresh() -> usize {
+        FRESH.with(Cell::get)
+    }
+
+    /// The times this thread's reads found their buffer too small and grew
+    /// it.
+    pub(super) fn regrown() -> usize {
+        REGROWN.with(Cell::get)
     }
 }
 
@@ -1409,6 +1478,51 @@ mod tests {
             assert_eq!(dict.encode(&past_the_longest), None);
             assert_eq!(dict.lower_bound(past_the_longest.as_bytes()), 10);
         }
+    }
+
+    /// A single-term read — an encode, a lower bound, a decode — decodes every
+    /// probe into one scratch buffer, so it allocates one buffer however many
+    /// chunks its binary search crosses.
+    #[test]
+    fn a_single_term_read_allocates_one_scratch() {
+        let terms: Vec<String> = (0..1024)
+            .map(|i| format!("<http://example.org/term/{i:05}>"))
+            .collect();
+        let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
+        let dict = TermDictionary::compress_windowed(plain, 32).unwrap();
+        assert!(matches!(dict.terms, TermStore::Chunked(_)), "32 windows");
+        for (i, term) in terms.iter().enumerate() {
+            let fresh = scratch_hooks::fresh();
+            assert_eq!(dict.encode(term), Some(i as TermCode));
+            assert_eq!(scratch_hooks::fresh() - fresh, 1, "encode {i}");
+            let fresh = scratch_hooks::fresh();
+            assert_eq!(dict.lower_bound(term.as_bytes()), i as TermCode);
+            assert_eq!(scratch_hooks::fresh() - fresh, 1, "lower_bound {i}");
+            let fresh = scratch_hooks::fresh();
+            assert_eq!(dict.decode(i as TermCode).as_deref(), Some(term.as_str()));
+            assert_eq!(scratch_hooks::fresh() - fresh, 1, "decode {i}");
+        }
+    }
+
+    /// A lookup's buffer starts with room for terms of usual length, so the
+    /// probes of a search over such terms — of whatever lengths, in a single
+    /// chunk — never grow it.
+    #[test]
+    fn a_lookup_over_usual_terms_never_regrows_its_scratch() {
+        let terms: Vec<String> = (0..512)
+            .map(|i| format!("<http://example.org/{}/{i:04}>", "x".repeat(i % 90)))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
+        let dict = TermDictionary::compress_windowed(plain, usize::MAX).unwrap();
+        assert!(matches!(dict.terms, TermStore::Single(TermChunk::Fsst(_))));
+        let regrown = scratch_hooks::regrown();
+        for (i, term) in terms.iter().enumerate() {
+            assert_eq!(dict.encode(term), Some(i as TermCode));
+            assert_eq!(dict.lower_bound(term.as_bytes()), i as TermCode);
+        }
+        assert_eq!(scratch_hooks::regrown(), regrown);
     }
 
     /// After every read the scratch holds room for the term's codes expanded
