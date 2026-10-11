@@ -73,6 +73,8 @@ pub(crate) const INDEX_VERSION: u32 = 1;
 
 #[cfg(test)]
 pub(crate) use layout::LegacyStoreLayoutVTable;
+#[cfg(feature = "file-io")]
+pub(crate) use layout::newer_root_id_at;
 #[cfg(all(test, feature = "file-io"))]
 pub(crate) use layout::store_metadata_of_bytes;
 #[cfg(all(test, feature = "file-io"))]

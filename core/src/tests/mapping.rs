@@ -79,6 +79,62 @@ async fn test_from_file_is_listed_in_the_process_maps_only_while_mapped() {
     assert!(!listed(), "the mapping goes with the store");
 }
 
+/// A store loaded whole never maps its file, whether the open succeeds or
+/// fails: a failing open still names a newer store root (or reports Vortex's
+/// error for bytes that are no store) without a mapping, which a file being
+/// rewritten in place could pull out from under the read. A mapped open maps
+/// the file once.
+#[tokio::test]
+async fn test_from_file_in_memory_never_maps_the_file() {
+    use crate::io::container;
+    use crate::io::read::map_probe;
+
+    let (_dir, good) = write_store_file(
+        dictionary_test_quads(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByReference],
+    )
+    .await;
+    let bytes = std::fs::read(&good).unwrap();
+    let mut newer = bytes.clone();
+    let current = container::STORE_LAYOUT_ID.as_bytes();
+    let at = newer
+        .windows(current.len())
+        .position(|window| window == current)
+        .expect("the footer names the root layout");
+    newer[at..at + current.len()].copy_from_slice(b"vortex-rdf.store.v3");
+
+    let dir = tempfile::tempdir().unwrap();
+    let write = |name: &str, contents: &[u8]| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    };
+    let newer = write("newer.vortex", &newer);
+    let garbage = write("garbage.vortex", &[0xA5; 4096]);
+    let empty = write("empty.vortex", &[]);
+
+    map_probe::take();
+    VortexRdfStore::from_file_in_memory(&good).await.unwrap();
+    assert_eq!(map_probe::take(), 0, "a store loaded whole maps nothing");
+
+    for (what, path) in [("newer", &newer), ("garbage", &garbage), ("empty", &empty)] {
+        let error = VortexRdfStore::from_file_in_memory(path)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{what}: must not open"));
+        assert_eq!(map_probe::take(), 0, "{what}: a failed open maps nothing");
+        assert_eq!(
+            error.to_string().contains("written by a newer vortex-rdf"),
+            what == "newer",
+            "{what}: {error}"
+        );
+    }
+
+    VortexRdfStore::from_file(&good).await.unwrap();
+    assert_eq!(map_probe::take(), 1, "a mapped open maps the file once");
+}
+
 /// Compaction replaces a store file by renaming over it: the open, mapped
 /// store keeps reading its own (old) file, a fresh open sees the new one.
 #[cfg(unix)]

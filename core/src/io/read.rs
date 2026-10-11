@@ -173,14 +173,15 @@ pub(crate) fn unsupported_file_error(file: &vortex_file::VortexFile) -> VortexRd
     ))
 }
 
-/// The error for bytes Vortex could not open: the one that says a newer
-/// vortex-rdf wrote them when their root layout is a store root this version
-/// does not know, Vortex's own otherwise.
+/// The error for a file Vortex could not open: the one that says a newer
+/// vortex-rdf wrote it when `newer_root` names a store root this version does
+/// not know ([`newer_root_id`](super::container::newer_root_id)), Vortex's own
+/// otherwise.
 pub(crate) fn open_failure(
     error: vortex_error::VortexError,
-    bytes: &vortex_buffer::ByteBuffer,
+    newer_root: Option<String>,
 ) -> VortexRdfError {
-    match super::container::newer_root_id(bytes) {
+    match newer_root {
         Some(id) => VortexRdfError::Deserialization(format!(
             "this store was written by a newer vortex-rdf (root layout {id}), which this \
              version cannot read; open it with a newer version of vortex-rdf"
@@ -267,6 +268,36 @@ impl std::ops::Deref for OpenedFile {
     }
 }
 
+/// Map `file` read-only. The only place a store file is mapped.
+#[cfg(feature = "file-io")]
+fn map_file(file: &std::fs::File) -> std::io::Result<memmap2::Mmap> {
+    #[cfg(test)]
+    map_probe::note();
+    // SAFETY: a store file is read-only while open; truncating or rewriting
+    // it in place is unsupported (docs/file-format.md §8).
+    unsafe { memmap2::Mmap::map(file) }
+}
+
+/// Test hook: the number of files [`map_file`] has mapped on this thread.
+#[cfg(all(test, feature = "file-io"))]
+pub(crate) mod map_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static MAPPED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Count one mapped file.
+    pub(super) fn note() {
+        MAPPED.set(MAPPED.get() + 1);
+    }
+
+    /// The files mapped on this thread since the last call.
+    pub(crate) fn take() -> usize {
+        MAPPED.take()
+    }
+}
+
 /// Open a Vortex file lazily — no data is read until the returned
 /// `VortexFile` is scanned. The handle caches no reader: the
 /// [`NativeStoreFile`](crate::store::native_file::NativeStoreFile) around it
@@ -292,14 +323,11 @@ pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
     match access {
         FileAccess::Mapped => {
             let identity = file.metadata().ok().as_ref().and_then(FileIdentity::of);
-            // SAFETY: a store file is read-only while open; truncating or
-            // rewriting it in place is unsupported (docs/file-format.md §8).
-            let mmap =
-                unsafe { memmap2::Mmap::map(&file) }.map_err(|e| path_error("map", path, e))?;
+            let mmap = map_file(&file).map_err(|e| path_error("map", path, e))?;
             let bytes = vortex_buffer::ByteBuffer::from(mmap);
             let opened = options
                 .open_buffer(bytes.clone())
-                .map_err(|e| open_failure(e, &bytes))?;
+                .map_err(|e| open_failure(e, super::container::newer_root_id(&bytes)))?;
             Ok(OpenedFile {
                 file: opened,
                 mapped: true,
@@ -310,17 +338,10 @@ pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
             drop(file);
             match options.open_path(path).await {
                 Ok(opened) => Ok(opened.into()),
-                // A mapping reads nothing up front: enough to name a newer
-                // store's root.
-                Err(error) => Err(
-                    match std::fs::File::open(path)
-                        // SAFETY: as above; the mapping only lives for the call.
-                        .and_then(|file| unsafe { memmap2::Mmap::map(&file) })
-                    {
-                        Ok(mmap) => open_failure(error, &vortex_buffer::ByteBuffer::from(mmap)),
-                        Err(_) => VortexRdfError::Vortex(error),
-                    },
-                ),
+                Err(error) => Err(open_failure(
+                    error,
+                    super::container::newer_root_id_at(path).await,
+                )),
             }
         }
     }

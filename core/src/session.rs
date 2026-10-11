@@ -40,14 +40,18 @@ pub(crate) static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
 });
 
 /// A session that reads a layout it has no registration for as a placeholder.
-/// Nothing is read through it: it names the root layout of a file the store
-/// session refused (see [`newer_root_id`](crate::io::container::newer_root_id)).
+/// Nothing is read through it but the footer: it names the root layout of a
+/// file the store session refused (see
+/// [`newer_root_id`](crate::io::container::newer_root_id)), from a buffer or
+/// through positioned reads of a path.
 pub(crate) static FOREIGN_LAYOUT_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = VortexSession::empty()
         .with::<ArraySession>()
         .with::<LayoutSession>()
         .with::<ScalarFnSession>()
         .with::<RuntimeSession>();
+    #[cfg(all(feature = "file-io", not(target_arch = "wasm32")))]
+    let session = session.with_tokio();
     session.allow_unknown();
     session
 });

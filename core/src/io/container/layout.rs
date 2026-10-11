@@ -221,6 +221,25 @@ pub(crate) fn newer_root_id(bytes: &vortex_buffer::ByteBuffer) -> Option<String>
         .open_options()
         .open_buffer(bytes.clone())
         .ok()?;
+    unknown_store_root(&file)
+}
+
+/// [`newer_root_id`] for the file at `path`, whose footer is read through
+/// positioned reads: nothing is mapped.
+#[cfg(feature = "file-io")]
+pub(crate) async fn newer_root_id_at(path: &std::path::Path) -> Option<String> {
+    use vortex_file::OpenOptionsSessionExt as _;
+    let file = crate::session::FOREIGN_LAYOUT_SESSION
+        .open_options()
+        .open_path(path)
+        .await
+        .ok()?;
+    unknown_store_root(&file)
+}
+
+/// The root layout id of `file` when it is a store root this version does not
+/// know.
+fn unknown_store_root(file: &vortex_file::VortexFile) -> Option<String> {
     let id = file.footer().layout().encoding_id().to_string();
     (id.starts_with(STORE_LAYOUT_FAMILY) && id != STORE_LAYOUT_ID && id != LEGACY_STORE_LAYOUT_ID)
         .then_some(id)

@@ -325,7 +325,7 @@ impl VortexRdfStore {
         let file = VORTEX_SESSION
             .open_options()
             .open_buffer(bytes.clone())
-            .map_err(|error| read::open_failure(error, &bytes))?;
+            .map_err(|error| read::open_failure(error, container::newer_root_id(&bytes)))?;
         if !container::is_native_file(&file) {
             return Err(read::unsupported_file_error(&file));
         }
