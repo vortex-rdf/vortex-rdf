@@ -10,6 +10,7 @@ use vortex_rdf_core::common::terms::{Pattern, parse_pattern_checked};
 use vortex_rdf_core::{TermCode, VortexRdfError as CoreError, VortexRdfStore as CoreStore};
 
 use crate::codes::{TermDict, U64Column};
+use crate::fan_out::fan_out;
 use crate::probes::{parse_keeps, parse_probe, pattern_probe};
 use crate::{RUNTIME, VortexRdfError, parse_err, store_err};
 use vortex_rdf_core::Probe;
@@ -51,46 +52,6 @@ fn parse_probes(probes: &Bound<'_, PyAny>) -> PyResult<Vec<Probe>> {
         .try_iter()?
         .map(|probe| parse_probe(&probe?))
         .collect()
-}
-
-/// Run `task` for every probe on the bindings' runtime, one task per probe
-/// so a batch spreads over its workers (an in-memory match is CPU work;
-/// a file-backed one overlaps its reads), and collect the answers in input
-/// order. Called GIL-released.
-///
-/// The first probe to fail ends the call with its error and aborts the probes
-/// still queued or running; a probe that panics re-raises its panic, as it
-/// would from a single call.
-fn fan_out<T, F, Fut>(store: &CoreStore, probes: Vec<Probe>, task: F) -> Result<Vec<T>, CoreError>
-where
-    T: Send + 'static,
-    F: Fn(CoreStore, Probe) -> Fut,
-    Fut: std::future::Future<Output = Result<T, CoreError>> + Send + 'static,
-{
-    RUNTIME.block_on(async {
-        let mut tasks = tokio::task::JoinSet::new();
-        for (index, probe) in probes.into_iter().enumerate() {
-            let answer = task(store.clone(), probe);
-            tasks.spawn(async move { (index, answer.await) });
-        }
-        let mut answers: Vec<Option<T>> = (0..tasks.len()).map(|_| None).collect();
-        // Returning with probes outstanding drops the set, which aborts them.
-        while let Some(joined) = tasks.join_next().await {
-            match joined {
-                Ok((index, answer)) => answers[index] = Some(answer?),
-                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-                Err(error) => {
-                    return Err(CoreError::InvalidOperation(format!(
-                        "a batch probe task failed: {error}"
-                    )));
-                }
-            }
-        }
-        Ok(answers
-            .into_iter()
-            .map(|answer| answer.expect("every probe answered"))
-            .collect())
-    })
 }
 
 /// One row of [`VortexRdfStore::get_quads`]: subject, predicate, object, graph.
@@ -415,7 +376,7 @@ impl VortexRdfStore {
     fn count_quads_many(&self, py: Python<'_>, probes: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
         let probes = parse_probes(probes)?;
         py.detach(|| {
-            fan_out(&self.store, probes, |store, probe| async move {
+            fan_out(&RUNTIME, &self.store, probes, |store, probe| async move {
                 let counts = store.count_many(std::slice::from_ref(&probe)).await?;
                 Ok(counts[0])
             })
@@ -515,7 +476,7 @@ impl VortexRdfStore {
         }
         let columns = py
             .detach(|| {
-                fan_out(&self.store, probes, |store, probe| async move {
+                fan_out(&RUNTIME, &self.store, probes, |store, probe| async move {
                     store.run_probe(&probe).await?.code_columns_gathered().await
                 })
             })
