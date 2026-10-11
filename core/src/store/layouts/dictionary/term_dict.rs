@@ -1408,6 +1408,34 @@ mod tests {
         }
     }
 
+    /// After every read the scratch holds room for the term's codes expanded
+    /// at 8 bytes each plus the headroom `decompress_into`'s block path needs:
+    /// a smaller buffer still decodes, through the byte-at-a-time tail loop,
+    /// so only the capacity shows it.
+    #[test]
+    fn scratch_keeps_the_decoders_block_path_headroom() {
+        let terms = crate::tests::widely_varying_terms();
+        let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
+        let dict = TermDictionary::compress_windowed(plain, usize::MAX).unwrap();
+        let TermStore::Single(chunk @ TermChunk::Fsst(fsst)) = &dict.terms else {
+            panic!("a small dictionary is one FSST chunk");
+        };
+        let mut cursor = chunk.cursor();
+        let order: Vec<usize> = (0..terms.len()).chain((0..terms.len()).rev()).collect();
+        for i in order {
+            assert_eq!(cursor.bytes_at(i), terms[i].as_bytes());
+            let codes = (fsst.offsets[i + 1] - fsst.offsets[i]) as usize;
+            let ChunkCursor::Fsst { scratch, .. } = &cursor else {
+                unreachable!("an FSST chunk gives an FSST cursor");
+            };
+            assert!(
+                scratch.capacity() >= codes * FSST_SYMBOL_LEN + FSST_DECODE_HEADROOM,
+                "term {i}: {codes} code bytes, scratch {}",
+                scratch.capacity()
+            );
+        }
+    }
+
     /// Multi-window compression is invisible to lookups: a dictionary
     /// compressed in many small windows holds independent FSST chunks and
     /// answers exactly like the single-window form — every term, both
@@ -1535,6 +1563,7 @@ mod tests {
     #[cfg(feature = "file-io")]
     #[tokio::test]
     async fn unzoned_dict_child_point_reads_file_backed() {
+        use crate::store::layouts::dictionary::file_backed;
         use crate::store::native_file::NativeStoreFile;
         use vortex_buffer::ByteBuffer;
         use vortex_file::OpenOptionsSessionExt as _;
@@ -1568,6 +1597,14 @@ mod tests {
                 "{term}"
             );
         }
+        // The canonical windows are cached, each charged its array and the
+        // per-entry overhead.
+        assert_eq!(fbd.debug_cached_windows(), [0, 1]);
+        assert!(
+            fbd.debug_cached_bytes() > 2 * file_backed::WINDOW_ENTRY_OVERHEAD,
+            "{}",
+            fbd.debug_cached_bytes()
+        );
         assert_eq!(fbd.encode("<http://absent>").await.unwrap(), None);
         let codes = [0u64, 119, 120, 299];
         let decoded = fbd.decode_many(&codes).await.unwrap();

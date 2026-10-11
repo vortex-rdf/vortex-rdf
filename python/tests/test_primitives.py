@@ -128,6 +128,33 @@ def test_decode_many_colliding_repeats_unsorted_and_out_of_range(wide_dictionary
     assert term_dict.decode_many(everything[::-1]) == spellings[::-1]
 
 
+# The bucket count of the batch's sharing cache (`RECENT_BUCKETS` in
+# `src/codes.rs`): codes this far apart evict one another.
+RECENT_BUCKETS = 256
+
+
+def test_decode_many_shares_strings_when_the_decoded_batch_repeats_a_code(wide_dictionary):
+    """`[3, 3, 3 + RECENT_BUCKETS, 3]` decodes fewer distinct terms than it
+    has occurrences (the second 3 shares the first's slot) while the last 3
+    was evicted by its bucket-mate and is decoded again, so the batch handed
+    to the dictionary repeats code 3: the branch that clones the strings
+    shared between occurrences runs, over repeats inside the decoded batch."""
+    term_dict, spellings = wide_dictionary
+    n = len(term_dict)
+    far = 3 + RECENT_BUCKETS
+    codes = [3, 3, far, 3]
+    got = term_dict.decode_many(codes)
+    assert got == [spellings[3], spellings[3], spellings[far], spellings[3]]
+    # Equal codes give equal strings, and the adjacent repeat is one object.
+    assert got[0] == got[1] == got[3]
+    assert got[0] is got[1]
+    # The same shape with out-of-range codes riding along, as a buffer too.
+    codes = [3, 3, n + 1, far, 3, n, 3, 3, far, far]
+    want = [spellings[c] if c < n else None for c in codes]
+    assert term_dict.decode_many(codes) == want
+    assert term_dict.decode_many(array("Q", codes)) == want
+
+
 def test_prefix_range_and_lower_bound(dictionary):
     _, term_dict = dictionary
     terms = _terms(term_dict)

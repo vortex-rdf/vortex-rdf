@@ -79,7 +79,7 @@ const WINDOW_CACHE_BYTES: usize = 4 << 20;
 /// table, the array, the `Arc` and the map entry it takes. It also bounds the
 /// windows a budget admits when they are tiny, to
 /// `WINDOW_CACHE_BYTES / WINDOW_ENTRY_OVERHEAD` (1,024).
-const WINDOW_ENTRY_OVERHEAD: usize = 4 << 10;
+pub(super) const WINDOW_ENTRY_OVERHEAD: usize = 4 << 10;
 
 /// The rebuilt windows of one file, by window index, bounded by what they are
 /// charged: their chunks' bytes plus [`WINDOW_ENTRY_OVERHEAD`] each. A lookup
@@ -1189,25 +1189,68 @@ mod tests {
         }
     }
 
-    /// A window larger than the whole budget is used but not kept: every
+    /// A window charged more than the whole budget — a budget one byte under
+    /// a window's charge, or a budget of zero — is used but not kept: every
     /// read rebuilds it and answers correctly, and nothing is cached.
     #[tokio::test]
     async fn a_window_past_the_budget_is_used_but_not_kept() {
         let (native, _, terms) = windowed_native(600, 100).await;
-        let fbd = FileBackedDict::open_with_budget(&native, WINDOW_BYTES - 1)
+        for budget in [WINDOW_BYTES - 1, 0] {
+            let fbd = FileBackedDict::open_with_budget(&native, budget)
+                .await
+                .unwrap()
+                .unwrap();
+            for _ in 0..3 {
+                touch(&fbd, &terms, 2).await;
+            }
+            assert_eq!(fbd.debug_windows_rebuilt(), 3, "budget {budget}");
+            let got = fbd.decode_many(&[105, 250]).await.unwrap();
+            assert_eq!(&*got[0], terms[105].as_str());
+            assert_eq!(&*got[1], terms[250].as_str());
+            assert_eq!(fbd.debug_windows_rebuilt(), 5, "budget {budget}");
+            assert!(fbd.debug_cached_windows().is_empty(), "budget {budget}");
+            assert_eq!(fbd.debug_cached_bytes(), 0, "budget {budget}");
+        }
+    }
+
+    /// A window charged exactly the budget fits and is kept; the next one
+    /// evicts it.
+    #[tokio::test]
+    async fn a_window_charged_exactly_the_budget_is_kept() {
+        let (native, _, terms) = windowed_native(600, 100).await;
+        let fbd = FileBackedDict::open_with_budget(&native, WINDOW_BYTES)
             .await
             .unwrap()
             .unwrap();
-        for _ in 0..3 {
-            touch(&fbd, &terms, 2).await;
-        }
-        assert_eq!(fbd.debug_windows_rebuilt(), 3);
-        let got = fbd.decode_many(&[105, 250]).await.unwrap();
-        assert_eq!(&*got[0], terms[105].as_str());
-        assert_eq!(&*got[1], terms[250].as_str());
-        assert_eq!(fbd.debug_windows_rebuilt(), 5);
-        assert!(fbd.debug_cached_windows().is_empty());
-        assert_eq!(fbd.debug_cached_bytes(), 0);
+        touch(&fbd, &terms, 0).await;
+        assert_eq!(fbd.debug_cached_windows(), [0]);
+        assert_eq!(fbd.debug_cached_bytes(), WINDOW_BYTES);
+        touch(&fbd, &terms, 0).await;
+        assert_eq!(fbd.debug_windows_rebuilt(), 1);
+        touch(&fbd, &terms, 1).await;
+        assert_eq!(fbd.debug_cached_windows(), [1]);
+        assert_eq!(fbd.debug_cached_bytes(), WINDOW_BYTES);
+    }
+
+    /// A panic while the cache's lock is held leaves the cache usable: its
+    /// entries are whole, so the next lookup and insert take the poisoned lock
+    /// over.
+    #[tokio::test]
+    async fn a_poisoned_cache_lock_is_recovered() {
+        let (fbd, terms) = windowed_handle(600, 100).await;
+        touch(&fbd, &terms, 0).await;
+        let poisoner = fbd.clone();
+        let result = std::thread::spawn(move || {
+            let _held = poisoner.0.cache.lock().unwrap();
+            panic!("poison the cache");
+        })
+        .join();
+        assert!(result.is_err());
+        assert!(fbd.0.cache.is_poisoned());
+        touch(&fbd, &terms, 0).await;
+        touch(&fbd, &terms, 1).await;
+        assert_eq!(fbd.debug_windows_rebuilt(), 2);
+        assert_eq!(fbd.debug_cached_windows(), [0, 1]);
     }
 
     /// A window two tasks missed together is kept once, and both use the one
@@ -1482,6 +1525,10 @@ mod tests {
             .expect("a chunked child is window-searchable");
         assert_eq!(fbd.debug_window_count(), 6);
         assert_eq!(fbd.len(), 600);
+        // Reading the bounds from the leaves asks for no cached window.
+        assert!(fbd.debug_cached_windows().is_empty());
+        assert_eq!(fbd.debug_cached_bytes(), 0);
+        assert_eq!(fbd.debug_windows_requested(), 0);
         // Every window's bounds are its first and last term, read from the leaf.
         for (w, window) in fbd.0.windows.iter().enumerate() {
             assert_eq!((window.start, window.rows), (w * 100, 100), "window {w}");
