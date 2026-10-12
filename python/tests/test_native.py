@@ -8,8 +8,7 @@ import pytest
 import vortex_rdf
 from vortex_rdf import VortexRdfStore, serialize_rdf
 
-NAME = "<http://xmlns.com/foaf/0.1/name>"
-PATTERNS = ({}, {"p": NAME}, {"s": "<http://ex.org/bob>"}, {"o": '"Bob"@en'})
+from conftest import INDEXES, NAME, PATTERNS, u64s
 
 
 def test_open_len_and_layout(vortex_files, layout):
@@ -62,11 +61,7 @@ def test_count_quads_agrees_with_get_quads(vortex_files, layout, in_memory):
     file-backed store an object pattern is a pushed-down filter it must still
     evaluate -- and has to agree with materializing the same match."""
     store = VortexRdfStore(vortex_files[layout], in_memory=in_memory)
-    for pattern in (
-        {},
-        {"p": NAME},
-        {"s": "<http://ex.org/bob>"},
-        {"o": '"Bob"@en'},
+    for pattern in PATTERNS + (
         {"o": '"Bob"'},
         {"s": "<http://ex.org/bob>", "p": NAME},
         {"s": "<http://ex.org/nobody>"},
@@ -75,34 +70,13 @@ def test_count_quads_agrees_with_get_quads(vortex_files, layout, in_memory):
     assert store.count_quads() == len(store) == 5
 
 
-def test_code_path_matches_decoded_rows(vortex_files):
-    """Decoding the code columns position by position reproduces `get_quads`.
-
-    `get_quads` assembles its rows from those same columns, so this pins the
-    decode-and-zip assembly: columns swapped or misaligned would still yield
-    plausible-looking rows of real terms.
-    """
-    store = VortexRdfStore(vortex_files["dictionary"])
-    dictionary = store.term_dict()
-    assert dictionary is not None and len(dictionary) > 0
-
-    for pattern in PATTERNS:
-        cols = store.match_codes(**pattern)
-        assert cols is not None
-        views = [memoryview(c).cast("Q").tolist() for c in cols]
-        from_codes = sorted(
-            tuple(dictionary.decode(code) for code in row) for row in zip(*views)
-        )
-        assert from_codes == sorted(store.get_quads(**pattern))
-
-
 def test_encode_inverts_decode(vortex_files):
     store = VortexRdfStore(vortex_files["dictionary"])
     dictionary = store.term_dict()
     cols = store.match_codes()
     assert dictionary is not None and cols is not None
     for col in cols:
-        for code in memoryview(col).cast("Q"):
+        for code in u64s(col):
             term = dictionary.decode(code)
             assert term is not None
             assert dictionary.encode(term) == code
@@ -137,14 +111,6 @@ def test_in_memory_open_matches_file_backed(vortex_files, layout):
     assert len(in_memory) == len(file_backed) == 5
     assert sorted(in_memory.get_quads()) == sorted(file_backed.get_quads())
     assert sorted(in_memory.get_quads(p=NAME)) == sorted(file_backed.get_quads(p=NAME))
-
-
-def test_in_memory_dictionary_keeps_code_path(vortex_files):
-    store = VortexRdfStore(vortex_files["dictionary"], in_memory=True)
-    dictionary = store.term_dict()
-    assert dictionary is not None
-    cols = store.match_codes(p=NAME)
-    assert cols is not None and len(cols[0]) == 3
 
 
 def test_mapped_bulk_reads_decode_through_the_dictionary_handle(tmp_path):
@@ -185,10 +151,6 @@ def test_mapped_bulk_reads_decode_through_the_dictionary_handle(tmp_path):
     assert set(zip(*columns)) == set(quads)
 
 
-def _codes(cols):
-    return [memoryview(col).cast("Q").tolist() for col in cols]
-
-
 def _assert_file_backed_dictionary(mapped, loaded):
     assert mapped.layout() == "dictionary"
     # The dictionary stays in the file, but the code path still applies:
@@ -198,7 +160,9 @@ def _assert_file_backed_dictionary(mapped, loaded):
     in_memory = loaded.term_dict()
     assert in_memory is not None and not in_memory.file_backed
     assert len(file_backed) == len(in_memory)
-    assert _codes(mapped.match_codes(p=NAME)) == _codes(loaded.match_codes(p=NAME))
+    assert [u64s(c) for c in mapped.match_codes(p=NAME)] == [
+        u64s(c) for c in loaded.match_codes(p=NAME)
+    ]
     for pattern in PATTERNS:
         assert sorted(mapped.get_quads(**pattern)) == sorted(loaded.get_quads(**pattern))
         assert mapped.match_columns(**pattern) == loaded.match_columns(**pattern)
@@ -226,21 +190,10 @@ def test_residency_knobs_are_gone(vortex_files, monkeypatch):
 
 def test_indexes_round_trip(vortex_files, indexed_files, layout):
     assert VortexRdfStore(vortex_files[layout]).indexes() == []
-    for index in ("secondary-by-copy", "secondary-by-reference"):
+    for index in INDEXES:
         store = VortexRdfStore(indexed_files[(layout, index)])
         assert store.indexes() == [index]
         assert VortexRdfStore.from_bytes(store.to_bytes()).indexes() == [index]
-
-
-@pytest.mark.parametrize("index", ["secondary-by-copy", "secondary-by-reference"])
-def test_indexed_store_agrees_with_unindexed(vortex_files, indexed_files, layout, index):
-    plain = VortexRdfStore(vortex_files[layout])
-    indexed = VortexRdfStore(indexed_files[(layout, index)])
-    assert indexed.layout() == layout
-    assert len(indexed) == len(plain) == 5
-    for pattern in PATTERNS + ({"o": '"Alice"'}, {"s": "<http://ex.org/bob>", "p": NAME}):
-        assert sorted(indexed.get_quads(**pattern)) == sorted(plain.get_quads(**pattern)), pattern
-        assert indexed.count_quads(**pattern) == plain.count_quads(**pattern), pattern
 
 
 def test_blank_node_round_trip(vortex_files):
@@ -378,7 +331,7 @@ def test_term_dict_decode_edges(vortex_files):
         dictionary.decode_many(array("I", [2**31]))
 
     # Every accepted input shape decodes the same column identically.
-    codes = memoryview(cols[0]).cast("Q").tolist()
+    codes = u64s(cols[0])
     expected = [dictionary.decode(c) for c in codes]
     assert dictionary.decode_many(cols[0]) == expected
     assert dictionary.decode_many(memoryview(cols[0])) == expected
@@ -420,7 +373,7 @@ def test_match_columns_transposes_get_quads(vortex_files, layout):
     the re-serializing fallback are covered by the parametrization.
     """
     store = VortexRdfStore(vortex_files[layout])
-    for pattern in ({}, {"p": NAME}, {"s": "<http://ex.org/bob>"}):
+    for pattern in PATTERNS:
         columns = store.match_columns(**pattern)
         rows = store.get_quads(**pattern)
         assert len(columns) == 4
