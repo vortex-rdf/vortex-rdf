@@ -72,7 +72,9 @@ export interface BuildOptions {
  * malformed (`Invalid quad object`) when a term is not of its position's kind
  * or its IRI, blank-node label, language tag or datatype IRI is invalid. A
  * literal is language-tagged when its `language` is non-empty, else typed when
- * its `datatype.value` is, else simple. An absent graph is the default graph.
+ * its `datatype.value` is, else simple. A literal's `datatype`, when present,
+ * is a NamedNode object: a non-object such as a bare IRI string is malformed,
+ * in a quad and in a pattern alike. An absent graph is the default graph.
  */
 export class VortexRdfStore {
     static empty(): VortexRdfStore;
