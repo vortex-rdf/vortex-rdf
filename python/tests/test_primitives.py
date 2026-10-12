@@ -215,11 +215,19 @@ def test_filter_codes_validates_its_arguments(dictionary):
         with pytest.raises(ValueError):
             term_dict.filter_codes("is_iri", "", candidates)
     # A valid list answers alike in every form, as a pair of columns.
-    iri = [c for c, t in enumerate(_terms(term_dict)) if t.startswith("<")]
+    terms = _terms(term_dict)
+    iri = [c for c, t in enumerate(terms) if t.startswith("<")]
     for candidates in forms(iri[:3] + [n - 1]):
         passed, undecided = term_dict.filter_codes("is_iri", "", candidates)
         assert isinstance(passed, U64Column) and isinstance(undecided, U64Column)
         assert (u64s(passed), u64s(undecided)) == (iri[:3], [])
+    # A numeric `!=` passes every IRI and blank node and leaves each string
+    # literal undecided, never passed: comparing a string with a number is the
+    # engine's call.
+    blank = [c for c, t in enumerate(terms) if t.startswith("_:")]
+    strings = sorted(terms.index(t) for t in ('"Alice"', '"Anon"', '"Bob"@en'))
+    passed, undecided = term_dict.filter_codes("num_ne", "42", every)
+    assert (u64s(passed), u64s(undecided)) == (iri + blank, [0] + strings)
 
 
 @pytest.mark.parametrize("api", ["decode", "decode_many"])
