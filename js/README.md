@@ -86,16 +86,16 @@ const n = store.countQuads(null, myPredicate, null, null);
 
 The quads implement the RDF/JS `Quad`/`Term` interface (`.subject.value`, `.equals`, …) and interoperate with foreign RDF/JS terms via `.equals` in both directions. They are lazy views into the producing store, so — unlike a plain data object — don't `structuredClone` them or rely on enumerating own properties.
 
-Test membership of a single quad with `has` (an exact four-component lookup) and read the quad count with `size`; both return promises:
+Test membership of a single quad with `has` (an exact four-component lookup) and read the quad count with `size`; both are synchronous, like `getQuads` and `countQuads`:
 
 ```javascript
-if (await store.has(myQuad)) {
+if (store.has(myQuad)) {
   console.log('present');
 }
-console.log(await store.size());
+console.log(store.size());
 ```
 
-An invalid pattern term or a malformed quad object throws (or rejects) with an `Error`.
+An invalid pattern term, or a malformed quad object given to `has`, throws an `Error`; a malformed quad object given to a mutation or to `fromQuads` rejects with one.
 
 ### Mutation
 

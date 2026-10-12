@@ -57,9 +57,9 @@ export interface BuildOptions {
  * A wasm-side store handle. Every method that fails rejects (or, for the
  * synchronous read family, throws) with an `Error`.
  *
- * Only the pattern-read family — `match`, `getQuads`, `countQuads`,
- * `matchCodes` — is synchronous; `size` and `has` return promises like the
- * builders and mutations.
+ * The read family — `match`, `getQuads`, `countQuads`, `matchCodes`, `size`
+ * and `has` — is synchronous: no read path performs I/O, so there is nothing
+ * to await. The builders, mutations and serializers return promises.
  *
  * A pattern position is a wildcard when it is `null`/`undefined` or an RDF/JS
  * `Variable` term; a bare string is read as a NamedNode IRI; any other value
@@ -86,9 +86,10 @@ export class VortexRdfStore {
     layout(): LayoutStrategy;
     /** The secondary indexes this store was built with (canonical kebab-case names). */
     indexes(): IndexType[];
-    size(): Promise<number>;
-    /** Rejects on a malformed quad object, like addQuad/deleteQuad. */
-    has(quad: Quad): Promise<boolean>;
+    /** Number of quads in the store. */
+    size(): number;
+    /** Whether the quad is in the store. Throws on a malformed quad object (addQuad/deleteQuad reject it). */
+    has(quad: Quad): boolean;
     /** Add one quad in place (a quad already present is ignored, per RDF/JS). */
     addQuad(quad: Quad): Promise<void>;
     /**
@@ -127,7 +128,8 @@ export class VortexRdfStore {
      * a code past `Number.MAX_SAFE_INTEGER` (2^53 - 1) throws rather than
      * rounding. `null` unless the store's rows are code-addressable
      * (Dictionary layout, no pending appends, resident dictionary); decode
-     * codes through `termDict()`.
+     * codes through `termDict()`. An invalid pattern term throws whether or
+     * not the rows are code-addressable.
      */
     matchCodes(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null): { s: Float64Array; p: Float64Array; o: Float64Array; g: Float64Array; length: number } | null;
     /**

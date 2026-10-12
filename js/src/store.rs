@@ -227,17 +227,19 @@ impl VortexRdfStore {
         String::from_utf8(buffer).map_err(|e| js_err_ctx("UTF-8 error", e))
     }
 
+    /// Number of quads in the store. Returns synchronously: no wasm read path
+    /// performs I/O, so there is nothing to await (see `resolve_now`).
     #[wasm_bindgen(skip_typescript)]
-    pub async fn size(&self) -> Result<usize, JsValue> {
-        self.inner.size().await.map_err(js_err)
+    pub fn size(&self) -> Result<usize, JsValue> {
+        resolve_now(self.inner.size())?.map_err(js_err)
     }
 
-    /// Whether the quad is in the store. Rejects on a malformed quad object,
-    /// like `addQuad`/`deleteQuad`.
+    /// Whether the quad is in the store. Returns synchronously; throws on a
+    /// malformed quad object (`addQuad`/`deleteQuad` reject it).
     #[wasm_bindgen(skip_typescript)]
-    pub async fn has(&self, quad_js: JsValue) -> Result<bool, JsValue> {
+    pub fn has(&self, quad_js: JsValue) -> Result<bool, JsValue> {
         let quad = js_to_quad(quad_js).ok_or_else(|| js_err("Invalid quad object"))?;
-        self.inner.contains(&quad).await.map_err(js_err)
+        resolve_now(self.inner.contains(&quad))?.map_err(js_err)
     }
 
     /// The inner store as one owning its rows, ready for in-place mutation;
@@ -351,7 +353,8 @@ impl VortexRdfStore {
     /// `length` — with no term strings materialized; a code past 2^53 − 1
     /// throws. `null` unless the store's rows are code-addressable
     /// (Dictionary layout, no pending appends, resident dictionary); decode
-    /// codes through [`termDict`](Self::term_dict).
+    /// codes through [`termDict`](Self::term_dict). An invalid pattern term
+    /// throws whether or not the rows are code-addressable.
     #[wasm_bindgen(js_name = matchCodes, skip_typescript)]
     pub fn match_codes(
         &self,
@@ -360,12 +363,12 @@ impl VortexRdfStore {
         object: JsValue,
         graph: JsValue,
     ) -> Result<JsValue, JsValue> {
+        let pattern = JsPattern::parse(subject, predicate, object, graph)?;
         // Same gate as `code_path_dict`: without a code-read snapshot the codes
         // would not resolve via `termDict`.
         if self.inner.code_read_snapshot().is_none() {
             return Ok(JsValue::NULL);
         }
-        let pattern = JsPattern::parse(subject, predicate, object, graph)?;
         let matched = resolve_now(pattern.matched(&self.inner))??;
 
         let result = Object::new();
