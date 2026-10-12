@@ -4,14 +4,14 @@
 use futures::channel::mpsc;
 use futures::{Stream, stream};
 use js_sys::Reflect;
-use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use oxrdf::Quad;
 use vortex_rdf_core::{
     BuiltArray, DictionaryQuadSink, Indexes, RawQuad, Result as CoreResult, VortexRdfError,
 };
 use wasm_bindgen::prelude::*;
 
 use crate::error::js_err;
-use crate::terms::js_to_quad;
+use crate::terms::{TermKind, graph, js_to_quad, object, predicate, subject};
 
 #[wasm_bindgen(module = "/js-snippets/pack-quads.js")]
 extern "C" {
@@ -79,9 +79,11 @@ pub(crate) fn js_array_to_quads(quads: js_sys::Array) -> Result<Vec<Quad>, JsVal
     js_array_decode(&quads, |q| q)
 }
 
-/// Decode the buffer [`pack_quads`] produced back into owned quads. Term
-/// construction mirrors [`js_to_quad`]: IRIs, blank-node labels and language
-/// tags are validated; a failure is reported with the quad's index.
+/// Decode the buffer [`pack_quads`] produced back into owned quads. Each term
+/// is built by its position's validated constructor in [`crate::terms`], the
+/// ones the reflection reader [`js_to_quad`] builds through, so both decoders
+/// accept the same terms; a term a constructor rejects is reported with its
+/// quad's index.
 ///
 /// `emit` converts each decoded quad as it is produced, so on the ingest path
 /// the `oxrdf::Quad` is dropped inside the loop and at most one packed chunk's
@@ -123,6 +125,21 @@ fn packed_to_quads_into<T>(
             self.pos = end;
             std::str::from_utf8(s).map_err(|_| js_err("Invalid UTF-8 in quad buffer"))
         }
+        /// One packed term — its tag, then (tags 0–4) its value and (tags
+        /// 3–4) its extra — built by `build` with borrowed strings: `Ok(None)`
+        /// for a tag that names no [`TermKind`] or a term `build` rejects.
+        #[inline]
+        fn term<U>(
+            &mut self,
+            build: impl FnOnce(TermKind, &'a str, &'a str) -> Option<U>,
+        ) -> Result<Option<U>, JsValue> {
+            let Some(kind) = TermKind::from_tag(self.u8()?) else {
+                return Ok(None);
+            };
+            let value = if kind.has_value() { self.str()? } else { "" };
+            let extra = if kind.has_extra() { self.str()? } else { "" };
+            Ok(build(kind, value, extra))
+        }
     }
 
     let invalid = |i: usize| js_err(format!("Invalid quad object at index {}", i));
@@ -130,46 +147,10 @@ fn packed_to_quads_into<T>(
     let n = cur.u32()? as usize;
     out.reserve(n);
     for i in 0..n {
-        // subject: NamedNode | BlankNode
-        let s = match cur.u8()? {
-            0 => NamedOrBlankNode::NamedNode(NamedNode::new(cur.str()?).map_err(|_| invalid(i))?),
-            1 => NamedOrBlankNode::BlankNode(
-                oxrdf::BlankNode::new(cur.str()?).map_err(|_| invalid(i))?,
-            ),
-            _ => return Err(invalid(i)),
-        };
-        // predicate: NamedNode
-        let p = match cur.u8()? {
-            0 => NamedNode::new(cur.str()?).map_err(|_| invalid(i))?,
-            _ => return Err(invalid(i)),
-        };
-        // object: any term
-        let o = match cur.u8()? {
-            0 => Term::NamedNode(NamedNode::new(cur.str()?).map_err(|_| invalid(i))?),
-            1 => Term::BlankNode(oxrdf::BlankNode::new(cur.str()?).map_err(|_| invalid(i))?),
-            2 => Term::Literal(oxrdf::Literal::new_simple_literal(cur.str()?)),
-            3 => {
-                let value = cur.str()?.to_owned();
-                let lang = cur.str()?;
-                Term::Literal(
-                    oxrdf::Literal::new_language_tagged_literal(value, lang)
-                        .map_err(|_| invalid(i))?,
-                )
-            }
-            4 => {
-                let value = cur.str()?.to_owned();
-                let dt = NamedNode::new(cur.str()?).map_err(|_| invalid(i))?;
-                Term::Literal(oxrdf::Literal::new_typed_literal(value, dt))
-            }
-            _ => return Err(invalid(i)),
-        };
-        // graph: NamedNode | BlankNode | DefaultGraph
-        let g = match cur.u8()? {
-            0 => GraphName::NamedNode(NamedNode::new(cur.str()?).map_err(|_| invalid(i))?),
-            1 => GraphName::BlankNode(oxrdf::BlankNode::new(cur.str()?).map_err(|_| invalid(i))?),
-            5 => GraphName::DefaultGraph,
-            _ => return Err(invalid(i)),
-        };
+        let s = cur.term(subject)?.ok_or_else(|| invalid(i))?;
+        let p = cur.term(predicate)?.ok_or_else(|| invalid(i))?;
+        let o = cur.term(object)?.ok_or_else(|| invalid(i))?;
+        let g = cur.term(graph)?.ok_or_else(|| invalid(i))?;
         out.push(emit(Quad::new(s, p, o, g)));
     }
     Ok(())
@@ -220,7 +201,7 @@ fn rdfjs_stream_to_quads(stream_val: JsValue) -> Result<BoxedQuadStream, JsValue
     let tx_data = tx.clone();
     let mut position = 0usize;
     let on_data = Closure::wrap(Box::new(move |quad_js: JsValue| {
-        let item = js_to_quad(quad_js)
+        let item = js_to_quad(&quad_js)
             .as_ref()
             .map(RawQuad::from_quad)
             .ok_or_else(|| {

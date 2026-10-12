@@ -1057,7 +1057,7 @@ describe('term validation and malformed input', () => {
         await expect(VortexRdfStore.fromQuads(42 as any)).rejects.toThrow();
     });
 
-    test('a term of the wrong kind in a quad position is rejected', async () => {
+    test('every quad entry point rejects a malformed term', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
         const cases = [
             { subject: s, predicate: p, object: { termType: 'Variable', value: 'v' } },
@@ -1066,11 +1066,26 @@ describe('term validation and malformed input', () => {
             { subject: s, predicate: p, object: o, graph: { termType: 'Variable', value: 'g' } },
             { subject: s, predicate: p, object: { termType: 'Literal' } },
             { subject: { termType: 'NamedNode', value: 'not an iri' }, predicate: p, object: o },
-        ];
+            // A bare string is a NamedNode only in a pattern, never in a quad.
+            { subject: s, predicate: p, object: 'http://example.org/o' },
+            // An invalid datatype IRI is an error, never a plain literal.
+            {
+                subject: s,
+                predicate: p,
+                object: { termType: 'Literal', value: 'o', datatype: { termType: 'NamedNode', value: 'not an iri' } },
+            },
+            // So is a language that is not a string.
+            { subject: s, predicate: p, object: { termType: 'Literal', value: 'o', language: 42 } },
+        ] as unknown as Quad[];
         for (const quad of cases) {
-            await expect(store.addQuad(quad as unknown as Quad)).rejects.toThrow(/Invalid quad object/);
-            await expect(VortexRdfStore.fromQuads([quad as unknown as Quad])).rejects
-                .toThrow(/Invalid quad object at index 0/);
+            // Soft, so that one run reports every entry point that accepts a case.
+            expect.soft(() => store.has(quad)).toThrow(/Invalid quad object/);
+            await expect.soft(store.addQuad(quad)).rejects.toThrow(/Invalid quad object/);
+            await expect.soft(store.deleteQuad(quad)).rejects.toThrow(/Invalid quad object/);
+            await expect.soft(store.addQuads([quad])).rejects.toThrow(/Invalid quad object at index 0/);
+            await expect.soft(VortexRdfStore.fromQuads([quad])).rejects.toThrow(/Invalid quad object at index 0/);
+            await expect.soft(VortexRdfStore.fromQuads(Readable.from([quad], { objectMode: true }))).rejects
+                .toThrow(/Invalid quad object in RDF\/JS stream at position 0/);
         }
         expect(await store.size()).toBe(6);
     });
@@ -1101,6 +1116,9 @@ describe('term validation and malformed input', () => {
         expect(() => store.match(null, null, null, df.literal('g'))).toThrow(/Invalid graph term/);
         expect(() => store.matchCodes(null, null, null, df.literal('g'))).toThrow(/Invalid graph term/);
         expect(() => store.countQuads(df.namedNode('not an iri'), null, null, null)).toThrow(Error);
+        // An invalid datatype IRI throws instead of matching the plain literal "lit".
+        expect(() => store.countQuads(null, null, df.literal('lit', df.namedNode('not an iri')), null))
+            .toThrow(/Invalid object term/);
     });
 
     test('a Variable term is a wildcard', async () => {

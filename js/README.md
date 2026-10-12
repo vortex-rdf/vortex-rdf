@@ -59,7 +59,7 @@ const store = VortexRdfStore.empty();
 
 ### Querying
 
-`match` implements the RDF/JS [`Source.match`](https://rdf.js.org/stream-spec/#source-interface) contract. It takes a `(subject, predicate, object, graph)` pattern — `null`/`undefined` or an RDF/JS `Variable` for a wildcard position, a bare string for a NamedNode IRI — and returns **synchronously** an RDF/JS `Stream<Quad>`:
+`match` implements the RDF/JS [`Source.match`](https://rdf.js.org/stream-spec/#source-interface) contract. It takes a `(subject, predicate, object, graph)` pattern — `null`/`undefined` or an RDF/JS `Variable` for a wildcard position, a bare string for a NamedNode IRI (in a pattern only, never inside a quad) — and returns **synchronously** an RDF/JS `Stream<Quad>`:
 
 ```javascript
 store.match(null, myPredicate, null, null)
@@ -95,7 +95,7 @@ if (store.has(myQuad)) {
 console.log(store.size());
 ```
 
-An invalid pattern term, or a malformed quad object given to `has`, throws an `Error`; a malformed quad object given to a mutation or to `fromQuads` rejects with one.
+An invalid pattern term, or a malformed quad object given to `has`, throws an `Error`; a malformed quad object given to a mutation or to `fromQuads` rejects with one. Every quad entry point (`has`, `addQuad`, `addQuads`, `deleteQuad`, and `fromQuads` on an array or a stream) validates a quad by one rule: each term must be an RDF/JS term object (a bare string is not one) of its position's kind, and its IRI, blank-node label, language tag or datatype IRI must be valid. An absent graph is the default graph.
 
 ### Mutation
 
