@@ -61,6 +61,18 @@ describe('build variants', () => {
                 expect(store.layout()).toBe(options.layout);
             });
 
+            test('size and has return values, not promises', async () => {
+                const store = await VortexRdfStore.fromString(NQUADS, 'nquads', options);
+                const ex = (name: string) => df.namedNode(`http://example.org/${name}`);
+
+                expect(store.size()).toBe(6);
+                expect(store.has(df.quad(ex('s1'), ex('p1'), ex('o1')))).toBe(true);
+                expect(store.has(df.quad(ex('s2'), ex('p1'), ex('o2'), ex('g1')))).toBe(true);
+                // An exact four-component lookup: the same triple in the
+                // default graph is a different quad.
+                expect(store.has(df.quad(ex('s2'), ex('p1'), ex('o2')))).toBe(false);
+            });
+
             test('matches every quad-position pattern', async () => {
                 const store = await VortexRdfStore.fromString(NQUADS, 'nquads', options);
                 const count = (s: Term | null, p: Term | null, o: Term | null, g: Term | null) => {
@@ -826,6 +838,11 @@ describe('matchCodes / termDict gates', () => {
             expect(store.matchCodes(null, p1, null, null)).toBeNull();
             expect(store.termDict()).toBeUndefined();
         });
+
+        test(`${layout}: matchCodes throws on an invalid pattern instead of returning null`, async () => {
+            const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout });
+            expect(() => store.matchCodes(null, null, null, df.literal('g'))).toThrow(/Invalid graph term/);
+        });
     }
 
     test('a pending append closes the code path', async () => {
@@ -1026,12 +1043,12 @@ describe('term validation and malformed input', () => {
         expect(await store.size()).toBe(6);
     });
 
-    test('addQuad / deleteQuad / has reject a malformed quad object with an Error', async () => {
+    test('addQuad / deleteQuad reject and has throws a malformed quad object as an Error', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
         await expect(store.addQuad({} as any)).rejects.toThrow(/Invalid quad/);
         await expect(store.deleteQuad({} as any)).rejects.toThrow(/Invalid quad/);
-        await expect(store.has({} as any)).rejects.toThrow(/Invalid quad/);
-        await expect(store.has({} as any)).rejects.toBeInstanceOf(Error);
+        expect(() => store.has({} as any)).toThrow(/Invalid quad/);
+        expect(() => store.has({} as any)).toThrow(Error);
         expect(await store.size()).toBe(6);
     });
 
@@ -1072,7 +1089,7 @@ describe('term validation and malformed input', () => {
         const bad = df.quad(df.blankNode('not a label'), df.namedNode('http://example.org/p'), df.literal('o'));
         await expect(store.addQuad(bad)).rejects.toThrow(/Invalid quad object/);
         await expect(VortexRdfStore.fromQuads([bad])).rejects.toThrow(/Invalid quad object at index 0/);
-        await expect(store.has(bad)).rejects.toThrow(/Invalid quad object/);
+        expect(() => store.has(bad)).toThrow(/Invalid quad object/);
     });
 
     test('an invalid pattern term throws instead of matching everything', async () => {
