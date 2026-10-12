@@ -18,16 +18,14 @@ import pytest
 import vortex_rdf
 from vortex_rdf import U64Column, VortexRdfStore
 
+from conftest import u64s
+
 #: Past ``u32::MAX``, and 5 modulo 2**32.
 WIDE = (1 << 32) + 5
 #: The largest u64.
 TOP = (1 << 64) - 1
 #: Out of the u64 range on either side.
 OUT_OF_RANGE = [-1, 1 << 64]
-
-
-def _values(col):
-    return memoryview(col).cast("Q").tolist()
 
 
 @pytest.fixture(params=["resident", "file-backed"])
@@ -45,17 +43,17 @@ def test_u64_column_carries_codes_past_u32():
     col = U64Column([WIDE, 0, TOP, WIDE])
     assert len(col) == 4
     assert memoryview(col).nbytes == 32
-    assert _values(col) == [WIDE, 0, TOP, WIDE]
+    assert u64s(col) == [WIDE, 0, TOP, WIDE]
     # Every accepted input form keeps the values whole.
     for form in (col, memoryview(col).cast("Q"), array("Q", [WIDE, 0, TOP, WIDE]), bytes(memoryview(col))):
-        assert _values(U64Column(form)) == [WIDE, 0, TOP, WIDE]
+        assert u64s(U64Column(form)) == [WIDE, 0, TOP, WIDE]
     # The kernels carry them through.
-    assert _values(col.distinct()) == [WIDE, 0, TOP]
+    assert u64s(col.distinct()) == [WIDE, 0, TOP]
     values, counts = col.value_counts()
-    assert (_values(values), _values(counts)) == ([WIDE, 0, TOP], [2, 1, 1])
-    assert _values(col.take([2, 0, 3])) == [TOP, WIDE, WIDE]
+    assert (u64s(values), u64s(counts)) == ([WIDE, 0, TOP], [2, 1, 1])
+    assert u64s(col.take([2, 0, 3])) == [TOP, WIDE, WIDE]
     left, right = col.join_indices(U64Column([TOP, WIDE, 5]))
-    assert list(zip(_values(left), _values(right))) == [(0, 1), (2, 0), (3, 1)]
+    assert list(zip(u64s(left), u64s(right))) == [(0, 1), (2, 0), (3, 1)]
     # A code that narrows to 5 does not join 5.
     left, _ = U64Column([5]).join_indices([WIDE])
     assert len(left) == 0
@@ -127,19 +125,19 @@ def test_code_inputs_take_u64s_non_negative_i64s_and_raw_bytes(store):
     decoded = term_dict.decode_many(values)
     kept = store.count_quads(keep={"s": values})
     for name, form in forms.items():
-        assert _values(U64Column(form)) == values, name
+        assert u64s(U64Column(form)) == values, name
         assert term_dict.decode_many(form) == decoded, name
         assert store.count_quads(keep={"s": form}) == kept, name
-    assert _values(U64Column(range(WIDE, WIDE + 3))) == [WIDE, WIDE + 1, WIDE + 2]
+    assert u64s(U64Column(range(WIDE, WIDE + 3))) == [WIDE, WIDE + 1, WIDE + 2]
 
 
 def test_code_buffers_read_strided_views_and_either_byte_order():
     values = [WIDE, 2, 3]
-    assert _values(U64Column(memoryview(array("Q", [WIDE, 9, 2, 9, 3]))[::2])) == values
-    assert _values(U64Column(memoryview(array("Q", values[::-1]))[::-1])) == values
+    assert u64s(U64Column(memoryview(array("Q", [WIDE, 9, 2, 9, 3]))[::2])) == values
+    assert u64s(U64Column(memoryview(array("Q", values[::-1]))[::-1])) == values
     for item in (ctypes.c_uint64.__ctype_le__, ctypes.c_uint64.__ctype_be__):
         view = memoryview((item * 3)(*values))
-        assert _values(U64Column(view)) == values, view.format
+        assert u64s(U64Column(view)) == values, view.format
     # A ctypes array exports no strides: refused, pointing at the memoryview.
     with pytest.raises(ValueError, match=re.escape("memoryview(obj)")):
         U64Column((ctypes.c_uint64 * 3)(*values))
