@@ -174,7 +174,7 @@ class QuadStream {
         this._done = false;
         this._promise.then(
             (items) => {
-                this._buffer = Array.isArray(items) ? items : [...items];
+                this._buffer = items;
                 this._emit('readable');
                 if (this._flowing) this._drain();
                 else this._endIfDrained();
