@@ -174,15 +174,23 @@ fn term_parts(val: &JsValue) -> Option<TermParts> {
 }
 
 /// A literal's parts. As in `pack-quads.js`, it is language-tagged when its
-/// `language` is truthy, else typed when its `datatype.value` is, else
-/// simple.
+/// `language` is truthy, else typed when its `datatype` is an object whose
+/// `value` is truthy, else simple. A truthy `datatype` that is not an object,
+/// such as a bare IRI string, makes it no term.
 fn literal_parts(val: &JsValue) -> Option<TermParts> {
     let value = get_prop(val, &KEY_VALUE)?.as_string()?;
     if let Some(language) = literal_extra(get_prop(val, &KEY_LANGUAGE))? {
         return Some((TermKind::LangLiteral, value, language));
     }
-    let datatype = get_prop(val, &KEY_DATATYPE).and_then(|dt| get_prop(&dt, &KEY_VALUE));
-    Some(match literal_extra(datatype)? {
+    let datatype = get_prop(val, &KEY_DATATYPE)?;
+    let iri = if datatype.is_object() {
+        literal_extra(get_prop(&datatype, &KEY_VALUE))?
+    } else if datatype.is_falsy() {
+        None
+    } else {
+        return None;
+    };
+    Some(match iri {
         Some(iri) => (TermKind::TypedLiteral, value, iri),
         None => (TermKind::SimpleLiteral, value, String::new()),
     })

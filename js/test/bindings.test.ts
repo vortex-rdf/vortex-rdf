@@ -1076,6 +1076,12 @@ describe('term validation and malformed input', () => {
             },
             // So is a language that is not a string.
             { subject: s, predicate: p, object: { termType: 'Literal', value: 'o', language: 42 } },
+            // A datatype is a NamedNode, never a bare IRI string.
+            {
+                subject: s,
+                predicate: p,
+                object: { termType: 'Literal', value: '5', datatype: 'http://www.w3.org/2001/XMLSchema#integer' },
+            },
         ] as unknown as Quad[];
         for (const quad of cases) {
             // Soft, so that one run reports every entry point that accepts a case.
@@ -1119,6 +1125,9 @@ describe('term validation and malformed input', () => {
         // An invalid datatype IRI throws instead of matching the plain literal "lit".
         expect(() => store.countQuads(null, null, df.literal('lit', df.namedNode('not an iri')), null))
             .toThrow(/Invalid object term/);
+        // So does a datatype that is a bare IRI string, not a NamedNode.
+        const bareDatatype = { termType: 'Literal', value: '42', datatype: 'http://www.w3.org/2001/XMLSchema#integer' };
+        expect(() => store.countQuads(null, null, bareDatatype as unknown as Term, null)).toThrow(/Invalid object term/);
     });
 
     test('a Variable term is a wildcard', async () => {

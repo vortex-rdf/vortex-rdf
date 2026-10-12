@@ -48,8 +48,13 @@ export function packQuads(quads, start = 0, end = quads.length) {
             case 'BlankNode': ensure(1); buf[pos++] = 1; str(t.value, i); return;
             case 'Literal': {
                 ensure(1);
-                if (t.language) { buf[pos++] = 3; str(t.value, i); str(t.language, i); }
-                else if (t.datatype && t.datatype.value) { buf[pos++] = 4; str(t.value, i); str(t.datatype.value, i); }
+                if (t.language) { buf[pos++] = 3; str(t.value, i); str(t.language, i); return; }
+                // A datatype is a NamedNode object or absent; a truthy
+                // non-object, such as a bare IRI string, is malformed.
+                const dt = t.datatype;
+                if (dt && typeof dt !== 'object') throw invalid(i);
+                const iri = dt && dt.value;
+                if (iri) { buf[pos++] = 4; str(t.value, i); str(iri, i); }
                 else { buf[pos++] = 2; str(t.value, i); }
                 return;
             }
