@@ -65,6 +65,14 @@ export interface BuildOptions {
  * `Variable` term; a bare string is read as a NamedNode IRI; any other value
  * that is not a valid term of that position's kind throws `Invalid <position>
  * term`.
+ *
+ * A quad given to `has`, `addQuad`, `addQuads`, `deleteQuad` or `fromQuads`
+ * holds RDF/JS term objects only: a bare string is a NamedNode in a pattern,
+ * never in a quad. All five validate a quad's terms by one rule, and a quad is
+ * malformed (`Invalid quad object`) when a term is not of its position's kind
+ * or its IRI, blank-node label, language tag or datatype IRI is invalid. A
+ * literal is language-tagged when its `language` is non-empty, else typed when
+ * its `datatype.value` is, else simple. An absent graph is the default graph.
  */
 export class VortexRdfStore {
     static empty(): VortexRdfStore;

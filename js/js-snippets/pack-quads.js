@@ -12,6 +12,9 @@
 //   0=NamedNode 1=BlankNode 2=simple Literal 3=lang Literal 4=typed Literal
 //   5=DefaultGraph, then (tags 0–4) u32 byteLen + UTF-8 value bytes, then for
 //   tag 3 a lang string and for tag 4 a datatype IRI (same u32+bytes shape).
+// The tags are the `TermKind` discriminants in js/src/terms.rs, whose
+// reflection reader (single quads, streams) classifies a term by the rule
+// `term` applies here.
 const ENC = new TextEncoder();
 
 export function packQuads(quads, start = 0, end = quads.length) {
@@ -27,26 +30,27 @@ export function packQuads(quads, start = 0, end = quads.length) {
         buf = nb;
         view = new DataView(buf.buffer);
     };
+    const invalid = (i) => new Error(`Invalid quad object at index ${i}`);
     const u32 = (v) => { ensure(4); view.setUint32(pos, v, true); pos += 4; };
-    const str = (s) => {
+    // A value, language or datatype IRI that is not a string makes the quad
+    // malformed; TextEncoder would throw its own TypeError for it in Node and
+    // stringify it in browsers.
+    const str = (s, i) => {
+        if (typeof s !== 'string') throw invalid(i);
         ensure(4 + s.length * 3); // ≤3 UTF-8 bytes per UTF-16 code unit
         const { written } = ENC.encodeInto(s, buf.subarray(pos + 4));
         view.setUint32(pos, written, true);
         pos += 4 + written;
     };
     const term = (t, i) => {
-        const type = t == null ? undefined : t.termType;
-        if (type !== undefined && type !== 'DefaultGraph' && typeof t.value !== 'string') {
-            throw new Error(`Invalid quad object at index ${i}`);
-        }
-        switch (type) {
-            case 'NamedNode': ensure(1); buf[pos++] = 0; str(t.value); return;
-            case 'BlankNode': ensure(1); buf[pos++] = 1; str(t.value); return;
+        switch (t == null ? undefined : t.termType) {
+            case 'NamedNode': ensure(1); buf[pos++] = 0; str(t.value, i); return;
+            case 'BlankNode': ensure(1); buf[pos++] = 1; str(t.value, i); return;
             case 'Literal': {
                 ensure(1);
-                if (t.language) { buf[pos++] = 3; str(t.value); str(t.language); }
-                else if (t.datatype && t.datatype.value) { buf[pos++] = 4; str(t.value); str(t.datatype.value); }
-                else { buf[pos++] = 2; str(t.value); }
+                if (t.language) { buf[pos++] = 3; str(t.value, i); str(t.language, i); }
+                else if (t.datatype && t.datatype.value) { buf[pos++] = 4; str(t.value, i); str(t.datatype.value, i); }
+                else { buf[pos++] = 2; str(t.value, i); }
                 return;
             }
             case 'DefaultGraph': ensure(1); buf[pos++] = 5; return;
@@ -54,13 +58,13 @@ export function packQuads(quads, start = 0, end = quads.length) {
                 // A missing graph position means the default graph; anything
                 // else is malformed.
                 if (t === undefined || t === null) { ensure(1); buf[pos++] = 5; return; }
-                throw new Error(`Invalid quad object at index ${i}`);
+                throw invalid(i);
         }
     };
     u32(end - start);
     for (let i = start; i < end; i++) {
         const q = quads[i];
-        if (!q) throw new Error(`Invalid quad object at index ${i}`);
+        if (!q) throw invalid(i);
         term(q.subject, i);
         term(q.predicate, i);
         term(q.object, i);

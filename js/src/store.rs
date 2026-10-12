@@ -17,7 +17,7 @@ use crate::codes::{code_from_js, code_to_js, codes_to_js};
 use crate::error::{js_err, js_err_ctx};
 use crate::ingest::{js_array_to_dictionary_array, js_array_to_quads, js_to_quad_stream};
 use crate::options::{build_array, parse_build_options, parse_format};
-use crate::terms::{JsPattern, js_to_quad};
+use crate::terms::{JsPattern, quad_arg};
 
 #[wasm_bindgen(module = "/js-snippets/lazy-rdf.js")]
 extern "C" {
@@ -238,7 +238,7 @@ impl VortexRdfStore {
     /// malformed quad object (`addQuad`/`deleteQuad` reject it).
     #[wasm_bindgen(skip_typescript)]
     pub fn has(&self, quad_js: JsValue) -> Result<bool, JsValue> {
-        let quad = js_to_quad(quad_js).ok_or_else(|| js_err("Invalid quad object"))?;
+        let quad = quad_arg(&quad_js)?;
         resolve_now(self.inner.contains(&quad))?.map_err(js_err)
     }
 
@@ -267,7 +267,7 @@ impl VortexRdfStore {
 
     #[wasm_bindgen(js_name = addQuad, skip_typescript)]
     pub async fn add_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
-        let quad = js_to_quad(quad_js).ok_or_else(|| js_err("Invalid quad object"))?;
+        let quad = quad_arg(&quad_js)?;
         self.mutate(async |s| s.add_quad(quad).await).await
     }
 
@@ -279,7 +279,7 @@ impl VortexRdfStore {
 
     #[wasm_bindgen(js_name = deleteQuad, skip_typescript)]
     pub async fn delete_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
-        let quad = js_to_quad(quad_js).ok_or_else(|| js_err("Invalid quad object"))?;
+        let quad = quad_arg(&quad_js)?;
         self.mutate(async |s| s.delete_quad(&quad).await).await
     }
 

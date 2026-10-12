@@ -99,7 +99,9 @@ Where the stream comes from:
   wasm; an RDF/JS `Stream<Quad>` is drained through its `data`/`end`/`error`
   events into a channel. Under the Dictionary layout an array goes straight
   into the interning sink ([§5](#5-pipeline-a--sorted-in-memory)), so no
-  per-quad strings accumulate.
+  per-quad strings accumulate. Both shapes build each term through the same
+  validated constructors ([`terms.rs`](../js/src/terms.rs)), so they accept
+  and reject the same quads.
 
 **A built store holds each quad once and each term once, in canonical form.**
 Every source above reaches the builders through `oxrdf` values, which render
