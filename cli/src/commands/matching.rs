@@ -3,7 +3,6 @@
 
 use anyhow::{Context, Result, anyhow};
 use log::{debug, info};
-use oxrdfio::RdfFormat;
 use std::fs::File;
 use std::io::{Write, stdout};
 use std::time::Instant;
@@ -13,6 +12,7 @@ use vortex_rdf_core::common::terms::{parse_pattern_checked, parse_quads_from_rea
 use vortex_rdf_core::debug as debug_time;
 use vortex_rdf_core::{LayoutStrategy, VortexRdfStore, export_rdf};
 
+use super::output_format;
 use crate::MatchArgs;
 
 pub async fn run(args: MatchArgs) -> Result<()> {
@@ -20,7 +20,7 @@ pub async fn run(args: MatchArgs) -> Result<()> {
         input,
         output,
         input_format,
-        output_format,
+        output_format: explicit_format,
         subject,
         predicate,
         object,
@@ -44,17 +44,13 @@ pub async fn run(args: MatchArgs) -> Result<()> {
     let (.., graph_node) = parse_pattern_checked(None, None, None, graph.as_deref())
         .context("Invalid --graph pattern (expected <iri>, _:blank, or default)")?;
 
-    let output_format = output_format
-        .or_else(|| detect_format(output.as_deref()))
-        .unwrap_or(RdfFormat::NQuads);
+    let output_format = output_format(explicit_format, output.as_deref());
 
     let is_vortex = input.extension().map(|e| e == "vortex").unwrap_or(false);
 
     let load_start = debug_time::timer();
     let store = if is_vortex {
-        let store = VortexRdfStore::from_file(&input)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let store = VortexRdfStore::from_file(&input).await?;
         debug!(
             "Opened Vortex file in {:?}",
             debug_time::elapsed(load_start)

@@ -2,14 +2,13 @@
 
 use anyhow::{Context, Result};
 use log::info;
-use oxrdfio::RdfFormat;
 use std::fs::File;
 use std::io::{Read, Write, stdin, stdout};
 use std::time::Instant;
 
-use vortex_rdf_core::common::formats::detect_format;
 use vortex_rdf_core::{VortexRdfStore, export_rdf};
 
+use super::output_format;
 use crate::DeserializeArgs;
 
 pub async fn run(args: DeserializeArgs) -> Result<()> {
@@ -20,24 +19,20 @@ pub async fn run(args: DeserializeArgs) -> Result<()> {
     } = args;
 
     let start = Instant::now();
-    let format = format
-        .or_else(|| detect_format(output.as_deref()))
-        .unwrap_or(RdfFormat::NQuads);
+    let format = output_format(format, output.as_deref());
 
     // The input is read before the output file is created, so a store that
     // cannot be opened leaves an existing output file as it was.
     let store = match &input {
-        Some(path) => VortexRdfStore::from_file(path)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?,
+        Some(path) => VortexRdfStore::from_file(path).await?,
         None => {
             let mut buffer = Vec::new();
             stdin()
                 .read_to_end(&mut buffer)
                 .context("Failed to read from stdin")?;
-            VortexRdfStore::from_bytes(&buffer)
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?
+            // The store takes ownership of the buffer, so the bytes are not
+            // copied.
+            VortexRdfStore::from_bytes_owned(buffer).await?
         }
     };
 
