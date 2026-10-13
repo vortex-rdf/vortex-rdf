@@ -469,3 +469,31 @@ def test_pushdown_kernels(benchmark, stores, op):
         benchmark(lambda: subjects.join_indices(subjects))
     else:
         benchmark(getattr(subjects, op))
+
+
+@pytest.mark.benchmark
+@pytest.mark.parametrize("right", ["one_code", "every_code", "sparse"])
+def test_pushdown_join_hashed(benchmark, stores, right):
+    """`join_indices` on its hash path, which `pushdown_kernels[join_indices]`
+    never takes: its column is ascending, so that self-join merges. Here the
+    left column is a full match's predicate column, which is not ascending,
+    joined with one predicate code from the middle of its range, with every
+    predicate code (a `GROUP BY ?p` gathering its groups), and with those
+    codes among 4,096 spread too far apart for a table, so the right side is
+    hashed. Over the cardinality-realistic store, whose predicate codes sit
+    well above 0, as a large store's do."""
+    from vortex_rdf import U64Column
+
+    f = FULL_SCAN_PATTERN
+    predicates = stores["realistic"].match_codes(f.s, f.p, f.o, f.g)[1]
+    values = memoryview(predicates).cast("Q")
+    assert any(a > b for a, b in zip(values, values[1:])), "the column is ascending: it merges"
+    codes = sorted(set(values))
+    if right == "one_code":
+        other = U64Column([codes[len(codes) // 2]])
+    elif right == "every_code":
+        other = U64Column(codes)
+    else:
+        spread = [(1 << 40) + (i << 24) for i in range(4096 - len(codes))]
+        other = U64Column(spread + codes)
+    benchmark(lambda: predicates.join_indices(other))
