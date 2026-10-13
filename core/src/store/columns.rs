@@ -17,24 +17,35 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
+use rustc_hash::FxHashMap;
 use vortex_buffer::Buffer;
 
 use crate::store::schema::TermCode;
 
-/// Whether a direct-mapped table over `[0, max_code]` is the better strategy
-/// for a column of `len` values: the table costs `max_code + 1` slots, so it
-/// wins while it stays within a small multiple of the column's length.
-/// Compared as codes, so a code past what a `usize` holds (on a 32-bit
-/// target) takes the hashed path rather than a wrapped table index: a `true`
-/// answer guarantees `max_code` fits a `usize`.
-fn dense_table_fits(max_code: TermCode, len: usize) -> bool {
+/// Whether a direct-mapped table over the codes `[lo, lo + span]` is the
+/// better strategy for a column of `len` values: the table costs `span + 1`
+/// slots, so it wins while it stays within a small multiple of the column's
+/// length. Compared as codes, so a span past what a `usize` holds (on a
+/// 32-bit target) takes the hashed path rather than a wrapped table index: a
+/// `true` answer guarantees `span` fits a `usize`.
+fn dense_table_fits(span: TermCode, len: usize) -> bool {
     let cutoff = len.saturating_mul(4).max(1 << 16);
-    max_code < TermCode::try_from(cutoff).unwrap_or(TermCode::MAX)
+    span < TermCode::try_from(cutoff).unwrap_or(TermCode::MAX)
 }
 
 /// The largest code in `codes`, or `None` for an empty column.
 fn max_code(codes: &[TermCode]) -> Option<TermCode> {
     codes.iter().copied().max()
+}
+
+/// The smallest and the largest code in `codes`, or `None` for an empty
+/// column.
+fn code_range(codes: &[TermCode]) -> Option<(TermCode, TermCode)> {
+    let (&first, rest) = codes.split_first()?;
+    Some(
+        rest.iter()
+            .fold((first, first), |(lo, hi), &c| (lo.min(c), hi.max(c))),
+    )
 }
 
 /// A row index as the `u64` the index columns carry. Lossless: a `usize` is
@@ -159,22 +170,16 @@ fn is_ascending(codes: &[TermCode]) -> bool {
 }
 
 /// The join of a left column against a [`RightIndex`] of the right one: for
-/// each left row in order, its right matches. A counting pass sizes both
-/// outputs before they are filled.
+/// each left row in order, its right matches. The index is a table over the
+/// right column's code [`Span`] when [`dense_table_fits`] it, else a
+/// [`Hashed`] map of its codes. The kind is picked once, here, and
+/// [`RightIndex::join`] is compiled for each, so its lookup is inlined into
+/// both of the join's passes.
 fn hash_join(left: &[TermCode], right: &[TermCode]) -> (Vec<u64>, Vec<u64>) {
-    let index = RightIndex::build(right);
-    let total = index.match_count(left);
-    let mut out_l = Vec::with_capacity(total);
-    let mut out_r = Vec::with_capacity(total);
-    for (i, &code) in left.iter().enumerate() {
-        let rows = index.rows_for(code);
-        if rows.is_empty() {
-            continue;
-        }
-        out_l.extend(std::iter::repeat_n(row(i), rows.len()));
-        out_r.extend_from_slice(rows);
+    match Span::of(right) {
+        Some(span) => RightIndex::dense(right, span).join(left),
+        None => RightIndex::hashed(right).join(left),
     }
-    (out_l, out_r)
 }
 
 /// Calls `visit(left_run, right_run)`, in order, for each pair of equal-code
@@ -227,63 +232,169 @@ fn merge_join(left: &[TermCode], right: &[TermCode]) -> (Vec<u64>, Vec<u64>) {
     (out_l, out_r)
 }
 
-/// The right column grouped by code: `rows[starts[c]..starts[c+1]]` are the
-/// right row indices holding code `c`, ascending — a CSR layout built with
-/// two counting passes when the code range is dense, or a hash map of
-/// per-code vectors otherwise.
-enum RightIndex {
-    Dense { starts: Vec<usize>, rows: Vec<u64> },
-    Sparse(HashMap<TermCode, Vec<u64>>),
+/// The right column grouped by code: [`Groups`] holds each code's right rows
+/// in a slot of their own, and `slots` finds a code's slot — a table over
+/// the column's code [`Span`], or a [`Hashed`] map of its codes.
+struct RightIndex<S> {
+    slots: S,
+    groups: Groups,
 }
 
-impl RightIndex {
-    fn build(right: &[TermCode]) -> Self {
-        let max = max_code(right).unwrap_or(0);
-        if dense_table_fits(max, right.len()) {
-            // Every code is at most `max`, which fits a `usize` here.
-            let slots = max as usize + 1;
-            let mut starts = vec![0usize; slots + 1];
-            for &c in right {
-                starts[c as usize + 1] += 1;
-            }
-            for i in 0..slots {
-                starts[i + 1] += starts[i];
-            }
-            let mut fill = starts.clone();
-            let mut rows = vec![0u64; right.len()];
-            for (r, &c) in right.iter().enumerate() {
-                let at = &mut fill[c as usize];
-                rows[*at] = row(r);
-                *at += 1;
-            }
-            RightIndex::Dense { starts, rows }
-        } else {
-            let mut map: HashMap<TermCode, Vec<u64>> = HashMap::new();
-            for (r, &c) in right.iter().enumerate() {
-                map.entry(c).or_default().push(row(r));
-            }
-            RightIndex::Sparse(map)
+/// How a [`RightIndex`] finds a code's group: the slot holding the right
+/// rows with that code, or the empty slot for a code the right column lacks.
+trait Slots {
+    fn slot(&self, code: TermCode) -> usize;
+}
+
+/// A slot per code of a right column's span `[min, min + width)`: code
+/// `min + k` is in slot `k`. Every other code is clamped to the empty slot
+/// `width` (a code below `min` wraps past the span), so a miss takes no
+/// branch. The table costs the span, not the largest code: one code, however
+/// large, gets one slot.
+struct Span {
+    min: TermCode,
+    width: usize,
+}
+
+impl Span {
+    /// The span of `codes`, when a table over it fits
+    /// ([`dense_table_fits`]); `None` for a span too wide for one, or an
+    /// empty column.
+    fn of(codes: &[TermCode]) -> Option<Span> {
+        let (min, max) = code_range(codes)?;
+        // `max - min` fits a `usize` when the table fits.
+        dense_table_fits(max - min, codes.len()).then(|| Span {
+            min,
+            width: (max - min) as usize + 1,
+        })
+    }
+}
+
+impl Slots for Span {
+    #[inline]
+    fn slot(&self, code: TermCode) -> usize {
+        // At most `width`, which is a `usize`.
+        code.wrapping_sub(self.min).min(self.width as TermCode) as usize
+    }
+}
+
+/// A slot per distinct code of a right column, numbered in first-seen order
+/// and found through an FxHash map; every other code takes the empty slot,
+/// numbered after them.
+struct Hashed(FxHashMap<TermCode, usize>);
+
+impl Slots for Hashed {
+    #[inline]
+    fn slot(&self, code: TermCode) -> usize {
+        self.0.get(&code).copied().unwrap_or(self.0.len())
+    }
+}
+
+/// Right rows grouped by slot, CSR style: the rows in slot `k` are
+/// `rows[starts[k]..starts[k + 1]]`, ascending. The last slot is the empty
+/// one, where a code the right column lacks is looked up.
+struct Groups {
+    starts: Vec<usize>,
+    rows: Vec<u64>,
+}
+
+impl Groups {
+    /// Groups a column's rows by `row_slots`, the slot of each row in order
+    /// (each below `slots`), with two counting passes; slot `slots` is left
+    /// empty.
+    fn build(slots: usize, row_slots: impl Iterator<Item = usize> + Clone) -> Self {
+        let mut starts = vec![0usize; slots + 2];
+        for k in row_slots.clone() {
+            starts[k + 1] += 1;
         }
+        for k in 0..slots {
+            starts[k + 1] += starts[k];
+        }
+        starts[slots + 1] = starts[slots];
+        let mut fill = starts[..slots].to_vec();
+        let mut rows = vec![0u64; starts[slots]];
+        for (r, k) in row_slots.enumerate() {
+            let at = &mut fill[k];
+            rows[*at] = row(r);
+            *at += 1;
+        }
+        Groups { starts, rows }
     }
 
+    /// The number of rows in slot `k`.
+    #[inline]
+    fn count(&self, k: usize) -> usize {
+        self.starts[k + 1] - self.starts[k]
+    }
+
+    /// The rows in slot `k`, ascending.
+    #[inline]
+    fn rows(&self, k: usize) -> &[u64] {
+        &self.rows[self.starts[k]..self.starts[k + 1]]
+    }
+}
+
+impl RightIndex<Span> {
+    /// A table over `right`'s codes, which `span` covers.
+    fn dense(right: &[TermCode], span: Span) -> Self {
+        // A code's offset from `min` is below `width`, which is a `usize`.
+        let groups = Groups::build(span.width, right.iter().map(|&c| (c - span.min) as usize));
+        RightIndex {
+            slots: span,
+            groups,
+        }
+    }
+}
+
+impl RightIndex<Hashed> {
+    /// A map over `right`'s distinct codes.
+    fn hashed(right: &[TermCode]) -> Self {
+        let mut map = FxHashMap::default();
+        let row_slots: Vec<usize> = right
+            .iter()
+            .map(|&code| {
+                let next = map.len();
+                *map.entry(code).or_insert(next)
+            })
+            .collect();
+        let groups = Groups::build(map.len(), row_slots.iter().copied());
+        RightIndex {
+            slots: Hashed(map),
+            groups,
+        }
+    }
+}
+
+impl<S: Slots> RightIndex<S> {
     /// The number of pairs `left` forms with the indexed column: the rows
     /// holding each left code, summed over the left column.
     fn match_count(&self, left: &[TermCode]) -> usize {
-        left.iter().map(|&code| self.rows_for(code).len()).sum()
+        left.iter()
+            .map(|&code| self.groups.count(self.slots.slot(code)))
+            .sum()
     }
 
+    /// The right rows holding `code`, ascending.
+    #[inline]
     fn rows_for(&self, code: TermCode) -> &[u64] {
-        match self {
-            RightIndex::Dense { starts, rows } => {
-                // A code past the table — or past what a `usize` holds — has
-                // no rows. `starts` has one entry per code plus one.
-                let Some(c) = usize::try_from(code).ok().filter(|&c| c < starts.len() - 1) else {
-                    return &[];
-                };
-                &rows[starts[c]..starts[c + 1]]
+        self.groups.rows(self.slots.slot(code))
+    }
+
+    /// For each left row in order, its right matches. A counting pass sizes
+    /// both outputs before they are filled.
+    fn join(&self, left: &[TermCode]) -> (Vec<u64>, Vec<u64>) {
+        let total = self.match_count(left);
+        let mut out_l = Vec::with_capacity(total);
+        let mut out_r = Vec::with_capacity(total);
+        for (i, &code) in left.iter().enumerate() {
+            let rows = self.rows_for(code);
+            if rows.is_empty() {
+                continue;
             }
-            RightIndex::Sparse(map) => map.get(&code).map_or(&[], Vec::as_slice),
+            out_l.extend(std::iter::repeat_n(row(i), rows.len()));
+            out_r.extend_from_slice(rows);
         }
+        (out_l, out_r)
     }
 }
 
@@ -308,6 +419,21 @@ mod tests {
             }
         }
         (l, r)
+    }
+
+    /// A join's pair columns, `(left_idx, right_idx)`.
+    type Pairs = (Vec<u64>, Vec<u64>);
+
+    /// `left` joined against each right index `right` can take: the hashed
+    /// one, which any column can, and the dense one when `right`'s span fits
+    /// a table. [`hash_join`] picks one of them; both must agree with the
+    /// nested loop.
+    fn index_joins(left: &[TermCode], right: &[TermCode]) -> Vec<(&'static str, Pairs)> {
+        let mut joins = vec![("hashed", RightIndex::hashed(right).join(left))];
+        if let Some(span) = Span::of(right) {
+            joins.push(("dense", RightIndex::dense(right, span).join(left)));
+        }
+        joins
     }
 
     #[test]
@@ -374,6 +500,20 @@ mod tests {
             ), // sparse right
             (vec![7, WIDE, 7], vec![WIDE, 7, WIDE]),    // wide codes, hashed
             (vec![7, WIDE], vec![7, 7, WIDE]),          // wide codes, merged
+            // A dense span starting past 0, probed below it, inside it, in
+            // its gaps (11, 13, 14) and above it.
+            (
+                vec![0, 9, 10, 11, 12, 13, 14, 15, 16, WIDE, TermCode::MAX, 10],
+                vec![12, 10, 15, 10],
+            ),
+            // One wide code: dense, with a one-slot span. The narrow code it
+            // would truncate to (7) and its neighbours miss.
+            (vec![7, WIDE, WIDE - 1, WIDE + 1, 0, WIDE], vec![WIDE]),
+            // Wide codes close together: dense over their span.
+            (
+                vec![WIDE + 2, 7, WIDE, WIDE + 9, 2],
+                vec![WIDE + 2, WIDE, WIDE + 9, WIDE + 2],
+            ),
             (vec![], vec![1]),
             (vec![1, 1, 1], vec![1, 1]),
             (vec![4, 5], vec![6]),
@@ -391,6 +531,10 @@ mod tests {
                 or.as_slice(),
                 "right indices for {l:?} ⋈ {r:?}"
             );
+            for (kind, (jl, jr)) in index_joins(&l, &r) {
+                assert_eq!(jl, ol, "{kind} left indices for {l:?} ⋈ {r:?}");
+                assert_eq!(jr, or, "{kind} right indices for {l:?} ⋈ {r:?}");
+            }
         }
     }
 
@@ -410,6 +554,8 @@ mod tests {
             (vec![9, 2, 2, 1, 2, 9, 1], vec![2, 9, 1, 2, 9, 9]),
             (vec![WIDE, 7, WIDE], vec![7, WIDE, WIDE]),
             (vec![7, 7, WIDE], vec![7, WIDE, WIDE, WIDE]),
+            (vec![9, 12, 0, 12, 16], vec![12, 10, 12]),
+            (vec![WIDE, 7, WIDE], vec![WIDE]),
         ]
     }
 
@@ -420,10 +566,17 @@ mod tests {
         for (l, r) in sizing_cases() {
             let produced = nested_loop(&l, &r).0.len();
             assert_eq!(
-                RightIndex::build(&r).match_count(&l),
+                RightIndex::hashed(&r).match_count(&l),
                 produced,
-                "hash count for {l:?} ⋈ {r:?}"
+                "hashed count for {l:?} ⋈ {r:?}"
             );
+            if let Some(span) = Span::of(&r) {
+                assert_eq!(
+                    RightIndex::dense(&r, span).match_count(&l),
+                    produced,
+                    "dense count for {l:?} ⋈ {r:?}"
+                );
+            }
             if is_ascending(&l) && is_ascending(&r) {
                 assert_eq!(
                     merge_join_len(&l, &r),
@@ -434,13 +587,14 @@ mod tests {
         }
     }
 
-    /// Both paths fill vectors whose capacity is their length, so neither
+    /// Every path fills vectors whose capacity is their length, so none
     /// grows its output by reallocation.
     #[test]
     fn join_outputs_are_allocated_at_their_final_length() {
         for (l, r) in sizing_cases() {
             let (want_l, want_r) = nested_loop(&l, &r);
             let mut paths = vec![("hash", hash_join(&l, &r))];
+            paths.extend(index_joins(&l, &r));
             if is_ascending(&l) && is_ascending(&r) {
                 paths.push(("merge", merge_join(&l, &r)));
             }
@@ -453,18 +607,78 @@ mod tests {
         }
     }
 
-    /// A dense right index probed with a code past its table, or past what
-    /// a `usize` holds, finds no rows.
+    /// A dense right index spans its column's codes: a code below the
+    /// smallest, above the largest or in a gap between them finds no rows,
+    /// as does a code past what a `usize` holds.
     #[test]
-    fn dense_index_misses_codes_past_its_table() {
-        let index = RightIndex::build(&[0, 1, 2]);
-        assert!(matches!(index, RightIndex::Dense { .. }));
-        assert_eq!(index.rows_for(1), &[1]);
-        assert!(index.rows_for(3).is_empty());
-        assert!(index.rows_for(WIDE).is_empty());
-        assert!(index.rows_for(TermCode::MAX).is_empty());
+    fn dense_index_misses_codes_outside_its_column() {
+        let right = [12, 10, 15, 10];
+        let span = Span::of(&right).expect("a narrow span fits a table");
+        assert_eq!((span.min, span.width), (10, 6));
+        let index = RightIndex::dense(&right, span);
+        assert_eq!(index.rows_for(10), &[1, 3]);
+        assert_eq!(index.rows_for(12), &[0]);
+        assert_eq!(index.rows_for(15), &[2]);
+        for code in [0, 9, 11, 13, 14, 16, WIDE, TermCode::MAX] {
+            assert!(index.rows_for(code).is_empty(), "code {code}");
+        }
         assert!(dense_table_fits(65_535, 1));
         assert!(!dense_table_fits(WIDE, 1));
+    }
+
+    /// A span sends every code outside it to its empty slot, including a
+    /// code below its start (which wraps) at either end of the code range.
+    #[test]
+    fn span_clamps_every_miss_to_the_empty_slot() {
+        let span = Span { min: 10, width: 6 };
+        assert_eq!(span.slot(10), 0);
+        assert_eq!(span.slot(15), 5);
+        for code in [0, 9, 16, WIDE, TermCode::MAX] {
+            assert_eq!(span.slot(code), 6, "code {code}");
+        }
+        let top = Span {
+            min: TermCode::MAX,
+            width: 1,
+        };
+        assert_eq!(top.slot(TermCode::MAX), 0);
+        assert_eq!(top.slot(0), 1);
+        assert_eq!(top.slot(TermCode::MAX - 1), 1);
+        let bottom = Span { min: 0, width: 1 };
+        assert_eq!(bottom.slot(0), 0);
+        assert_eq!(bottom.slot(TermCode::MAX), 1);
+    }
+
+    /// Wide codes close together are dense over their span, so a single
+    /// wide code gets a one-slot table; codes far apart are hashed.
+    #[test]
+    fn wide_codes_close_together_are_dense() {
+        let close = Span::of(&[WIDE + 9, WIDE, WIDE + 2]).expect("close codes fit a table");
+        assert_eq!((close.min, close.width), (WIDE, 10));
+        assert!(Span::of(&[7, WIDE]).is_none());
+        assert!(Span::of(&[]).is_none());
+        let one = Span::of(&[WIDE]).expect("one code fits a table");
+        assert_eq!((one.min, one.width), (WIDE, 1));
+        let index = RightIndex::dense(&[WIDE], one);
+        assert_eq!(index.rows_for(WIDE), &[0]);
+        // The narrow code `WIDE` would truncate to, and its neighbours.
+        for code in [7, WIDE - 1, WIDE + 1] {
+            assert!(index.rows_for(code).is_empty(), "code {code}");
+        }
+    }
+
+    /// A hashed right index finds each distinct code's rows, in the right
+    /// column's order, and no rows for a code the column lacks.
+    #[test]
+    fn hashed_index_groups_rows_by_code() {
+        let right = [TermCode::MAX, 1, WIDE, TermCode::MAX, 1];
+        assert!(Span::of(&right).is_none());
+        let index = RightIndex::hashed(&right);
+        assert_eq!(index.rows_for(TermCode::MAX), &[0, 3]);
+        assert_eq!(index.rows_for(1), &[1, 4]);
+        assert_eq!(index.rows_for(WIDE), &[2]);
+        for code in [0, 7, 2, TermCode::MAX - 1] {
+            assert!(index.rows_for(code).is_empty(), "code {code}");
+        }
     }
 
     #[test]
