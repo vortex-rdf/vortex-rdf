@@ -789,6 +789,36 @@ async fn views_of(store: &VortexRdfStore) -> Vec<(&'static str, VortexRdfStore)>
     ]
 }
 
+/// The multi-chunk fixture: 20,000 [`modular_quads`] in a Dictionary-layout
+/// store with no index, built in memory. Its rows fill more than two data
+/// source chunks ([`DATA_SOURCE_BATCH_ROWS`] rows each), so a scan of it
+/// crosses chunk boundaries.
+///
+/// [`DATA_SOURCE_BATCH_ROWS`]: crate::store::read::data_source::DATA_SOURCE_BATCH_ROWS
+async fn multi_chunk_store() -> VortexRdfStore {
+    built_store(
+        modular_quads(20_000, 3, 8),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await
+}
+
+/// [`multi_chunk_store`]'s file, serialized once per process (see
+/// [`cached_store_bytes`]), written into `dir` and opened mapped. Keep `dir`
+/// alive for the store's lifetime.
+#[cfg(feature = "file-io")]
+async fn multi_chunk_file(dir: &tempfile::TempDir) -> VortexRdfStore {
+    static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+    let bytes = cached_store_bytes(&BYTES, || async {
+        multi_chunk_store().await.to_bytes().await.unwrap()
+    })
+    .await;
+    let path = dir.path().join("multi_chunk.vortex");
+    std::fs::write(&path, bytes).unwrap();
+    VortexRdfStore::from_file(&path).await.unwrap()
+}
+
 /// The row tuples of a view's gathered codes, in the order gathered.
 async fn row_list(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
     let cols = view

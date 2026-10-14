@@ -12,7 +12,7 @@ use crate::vortex_scan::{DataSourceRef, ScanRequest};
 use vortex_array::dtype::{DType, FieldPath, Nullability, PType};
 use vortex_array::expr::stats::{Precision, Stat};
 use vortex_array::expr::{
-    Expression, and, eq, get_item, gt_eq, in_list, lit, lt, pack, root, select,
+    Expression, and, cast, eq, get_item, gt_eq, in_list, lit, lt, pack, root, select,
 };
 use vortex_array::scalar::Scalar;
 use vortex_buffer::Buffer;
@@ -43,28 +43,136 @@ fn ordered() -> ScanRequest {
 }
 
 /// What one scan of `source` advertises before it reads: its partition
-/// count, and each partition's row count and byte size.
+/// count, and each partition's row count and byte size. Asserts each
+/// partition's index is its place in the scan's order.
 async fn partition_stats(
     source: &DataSourceRef,
     request: ScanRequest,
 ) -> (Precision<usize>, Vec<(Precision<u64>, Precision<u64>)>) {
     let scan = source.scan(request).await.unwrap();
     let count = scan.partition_count();
-    let partitions = scan
-        .partitions()
-        .map(|partition| {
+    let partitions: Vec<_> = scan.partitions().collect().await;
+    let partitions = partitions
+        .into_iter()
+        .enumerate()
+        .map(|(i, partition)| {
             let partition = partition.unwrap();
+            assert_eq!(partition.index(), i, "partition {i}'s index");
             (partition.row_count(), partition.byte_size())
         })
-        .collect()
-        .await;
+        .collect();
     (count, partitions)
+}
+
+/// Requests over the multi-chunk `store` (see [`multi_chunk_store`]) whose
+/// scans cross the data source's chunk boundaries: a row range across a
+/// boundary and one starting past the first chunk, a selection and a limit
+/// cut mid-chunk, a selection skipping a chunk, an exclusion, a filter with a
+/// limit, and a filter that only the first chunk's rows pass. Each answers
+/// the rows the request picks out of the store's base-ordered codes; its one
+/// partition's count equals them when exact and bounds them otherwise, at
+/// four `u64` codes a row.
+async fn assert_multi_chunk_requests(store: &VortexRdfStore, tag: &str) {
+    use crate::store::read::data_source::DATA_SOURCE_BATCH_ROWS;
+
+    let all = base_ordered_codes(store).await;
+    let batch = DATA_SOURCE_BATCH_ROWS;
+    assert!(all.len() > 2 * batch, "{tag}: more than two chunks' worth");
+    let source = store.data_source().unwrap();
+    let p0 = store
+        .dict_reader()
+        .unwrap()
+        .encode("<http://example.org/p0>")
+        .await
+        .unwrap()
+        .unwrap();
+    let ids = |ids: &[usize]| {
+        StrictSortedBuffer::try_new(Buffer::from_iter(ids.iter().map(|&i| i as u64))).unwrap()
+    };
+    let pick = |ids: &[usize]| ids.iter().map(|&i| all[i]).collect::<Vec<_>>();
+    let sevenths: Vec<usize> = (0..all.len()).step_by(7).collect();
+    let skipping = [5, 10, 2 * batch + 5];
+    let with_p0: Vec<[TermCode; 4]> = all.iter().copied().filter(|r| r[1] == p0).collect();
+    let first_hundred = lt(get_item("s", root()), lit(all[100][0]));
+    let cases = [
+        (
+            "a range across the first boundary",
+            ScanRequest {
+                row_range: Some((batch - 100) as u64..(batch + 100) as u64),
+                ..Default::default()
+            },
+            all[batch - 100..batch + 100].to_vec(),
+        ),
+        (
+            "a range from past the first chunk into the third",
+            ScanRequest {
+                row_range: Some((batch + 10) as u64..(2 * batch + 10) as u64),
+                ..Default::default()
+            },
+            all[batch + 10..2 * batch + 10].to_vec(),
+        ),
+        (
+            "a selection and a limit cut mid-chunk",
+            ScanRequest {
+                selection: Selection::IncludeByIndex(ids(&sevenths)),
+                limit: Some(1_500),
+                ..Default::default()
+            },
+            pick(&sevenths[..1_500]),
+        ),
+        (
+            "a selection skipping the second chunk",
+            ScanRequest {
+                selection: Selection::IncludeByIndex(ids(&skipping)),
+                ..Default::default()
+            },
+            pick(&skipping),
+        ),
+        (
+            "an exclusion",
+            ScanRequest {
+                selection: Selection::ExcludeByIndex(ids(&[3, 4])),
+                ..Default::default()
+            },
+            [&all[..3], &all[5..]].concat(),
+        ),
+        (
+            "a filter and a limit",
+            ScanRequest {
+                filter: Some(eq(get_item("p", root()), lit(p0))),
+                limit: Some(5_000),
+                ..Default::default()
+            },
+            with_p0[..5_000].to_vec(),
+        ),
+        (
+            "a filter only the first chunk passes",
+            filtered(first_hundred),
+            all[..100].to_vec(),
+        ),
+    ];
+    for (case, request, want) in cases {
+        let tag = format!("{tag} {case}");
+        let (count, partitions) = partition_stats(&source, request.clone()).await;
+        assert_eq!(count, Precision::exact(1usize), "{tag}");
+        let [(rows, bytes)] = partitions[..] else {
+            panic!("{tag}: one partition, found {partitions:?}")
+        };
+        match rows {
+            Precision::Exact(n) => assert_eq!(n, want.len() as u64, "{tag}: an exact count"),
+            Precision::Inexact(n) => assert!(n >= want.len() as u64, "{tag}: a bound"),
+            Precision::Absent => panic!("{tag}: a count"),
+        }
+        assert_eq!(bytes, rows.map(|n| n * 32), "{tag}: four u64 codes a row");
+        assert_eq!(scan_codes(&source, request).await, want, "{tag}");
+    }
 }
 
 /// Projection, filter, row window, selection, limit and partition window,
 /// each applied exactly, in the order filter, limit, projection; the
-/// partition's advertised count; a request that does not bind; and the
-/// field statistics.
+/// partition's advertised count; a request that does not bind and a filter
+/// that fails; the field statistics; and the requests that cross chunk
+/// boundaries, on a store of several chunks.
 #[tokio::test]
 async fn test_data_source_request_semantics() {
     let store = built_store(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
@@ -367,6 +475,21 @@ async fn test_data_source_request_semantics() {
     ] {
         assert!(source.scan(request).await.is_err(), "{tag}");
     }
+    // A filter that binds but fails on a chunk's rows (codes past `u8::MAX`
+    // cast to `u8`) ends the partition's stream with the failure as an item.
+    let failing = filtered(eq(
+        cast(
+            get_item("s", root()),
+            DType::Primitive(PType::U8, Nullability::NonNullable),
+        ),
+        lit(0u8),
+    ));
+    let mut partitions = source.scan(failing).await.unwrap().partitions();
+    let mut stream = partitions.next().await.unwrap().unwrap().execute().unwrap();
+    assert!(
+        matches!(stream.next().await, Some(Err(_))),
+        "a filter failing on a chunk is an error item"
+    );
 
     // Field statistics: no nulls, and a code column's uncompressed size; none
     // for a name the dtype lacks or a path into a code column.
@@ -391,6 +514,15 @@ async fn test_data_source_request_semantics() {
             source.field_statistics(&path).await.unwrap().is_empty(),
             "{path}"
         );
+    }
+
+    // The same requests across chunk boundaries: on the multi-chunk store,
+    // built in memory and mapped from its file.
+    assert_multi_chunk_requests(&multi_chunk_store().await, "memory").await;
+    #[cfg(feature = "file-io")]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        assert_multi_chunk_requests(&multi_chunk_file(&dir).await, "mapped").await;
     }
 }
 
