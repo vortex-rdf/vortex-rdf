@@ -26,7 +26,7 @@ use crate::store::array::{cached_code_primitive, column_is_sorted, into_struct_a
 use crate::store::layouts::LayoutStrategy;
 use crate::store::probes::StructProbes;
 #[cfg(feature = "file-io")]
-use crate::store::scan::file_scan;
+use crate::store::scan::{file_filter, file_reads};
 use crate::store::schema::{self, QuadColumn, RowId, TermCode};
 use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{QuadsSource, Tail};
@@ -312,7 +312,7 @@ impl VortexRdfStore {
                             // evaluated; fewer than asked means the base is
                             // exhausted and their count is its live size.
                             let want = offset.saturating_add(limit);
-                            let found = file_scan::first_matching_rows(
+                            let found = file_filter::first_matching_rows(
                                 file,
                                 filter,
                                 &selection,
@@ -398,7 +398,7 @@ impl VortexRdfStore {
                     // The selection resolves first (a served view's ids come
                     // from its index child); the filter then counts within it.
                     let selection = selection.materialized_async().await?;
-                    file_scan::count_matching_rows_capped(
+                    file_filter::count_matching_rows_capped(
                         file,
                         filter,
                         &selection,
@@ -663,12 +663,12 @@ impl VortexRdfStore {
             None => {
                 let selection = match filter {
                     Some(f) => RowSelection::All
-                        .refine(&file_scan::matching_file_rows(file, Some(f), &selection).await?),
+                        .refine(&file_filter::matching_file_rows(file, Some(f), &selection).await?),
                     None => selection,
                 };
                 let test = keep.test();
                 let positions =
-                    file_scan::column_positions(file, column.name(), &selection, |code| {
+                    file_reads::column_positions(file, column.name(), &selection, |code| {
                         test.admits(code)
                     })
                     .await?;
@@ -720,11 +720,11 @@ impl VortexRdfStore {
         row_count: usize,
     ) -> Result<Option<RowSelection>> {
         Ok(match keep {
-            Keep::Range(lo, hi) => file_scan::locate_subject_code_range(file, *lo..*hi)
+            Keep::Range(lo, hi) => file_reads::locate_subject_code_range(file, *lo..*hi)
                 .await?
                 .map(|run| selection.clone().intersect_range(run)),
             Keep::Set(codes) if set_is_located(codes.len(), selection.len(row_count)) => {
-                file_scan::locate_subject_code_runs(file, codes.as_slice())
+                file_reads::locate_subject_code_runs(file, codes.as_slice())
                     .await?
                     .map(|runs| selection.clone().intersect_runs(&runs))
             }

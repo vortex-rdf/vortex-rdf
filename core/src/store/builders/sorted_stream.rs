@@ -28,7 +28,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::io::container::NativeComponentWrite;
 use crate::store::RawQuad;
 use crate::store::array::{chunked_or_single, with_subject_stamp};
-use crate::store::indexes::secondary_by_copy::{self, out_of_core::CopyKey};
+use crate::store::indexes::copy::{self, out_of_core::CopyKey};
 use crate::store::indexes::{
     IndexComponent, IndexType, Indexes, known_component, next_row_id, unique_indexes,
 };
@@ -484,7 +484,7 @@ fn merger_components<V>(
     ref_chunk: RefChunkFn<V>,
 ) -> Result<Vec<NativeComponentWrite>>
 where
-    V: Send + 'static + secondary_by_copy::TermColumn,
+    V: Send + 'static + copy::TermColumn,
     (V, RowId): Ord + Spillable,
     (CopyKey<V>, RowId): Ord + Spillable,
 {
@@ -492,12 +492,10 @@ where
     use crate::io::container::{
         INDEX_VERSION, StoreComponentDescriptor, StoreComponentRole, child_strategy,
     };
-    use crate::store::indexes::secondary_by_copy::CopyFamily;
-    use crate::store::indexes::secondary_by_copy::out_of_core::{
-        copy_child_chunk, copy_child_dtype,
-    };
-    use crate::store::indexes::secondary_by_reference::RefFamily;
-    use crate::store::indexes::secondary_by_reference::out_of_core::ref_child_dtype;
+    use crate::store::indexes::copy::CopyFamily;
+    use crate::store::indexes::copy::out_of_core::{copy_child_chunk, copy_child_dtype};
+    use crate::store::indexes::reference::RefFamily;
+    use crate::store::indexes::reference::out_of_core::ref_child_dtype;
 
     let copy_dtype = copy_child_dtype(encoded);
     let ref_dtype = ref_child_dtype(encoded);
@@ -602,7 +600,7 @@ fn emit_merged_run_chunks(
         chunk_size,
         &guard,
         false,
-        crate::store::indexes::secondary_by_reference::out_of_core::ref_child_chunk_strings,
+        crate::store::indexes::reference::out_of_core::ref_child_chunk_strings,
     )?;
     let (dtype, chunks) = chunk_stream(
         (merged, guard),
@@ -635,7 +633,7 @@ fn emit_merged_run_dict_chunks(
         chunk_size,
         &guard,
         true,
-        crate::store::indexes::secondary_by_reference::out_of_core::ref_child_chunk_codes,
+        crate::store::indexes::reference::out_of_core::ref_child_chunk_codes,
     )?;
     let (dtype, chunks) = chunk_stream(
         (merged, guard),

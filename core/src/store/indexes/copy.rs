@@ -16,7 +16,7 @@
 //! - **`index:ospg`** — quads sorted by (o, s, p, g). Serves object-bound
 //!   patterns by binary search on the child's `o` column.
 //!
-//! Like [`secondary_by_reference`], resolutions answer in *base row ids* (via
+//! Like [`reference`], resolutions answer in *base row ids* (via
 //! each child's `rid` column), so they compose with row selections, tombstones
 //! and chained matches unchanged. What the full copies add over the reference
 //! index is locality: the rows matching a bound predicate/object are a
@@ -38,7 +38,7 @@
 //! equality scan when the probes decline.
 //!
 //! [`IndexType::SecondaryByCopy`]: super::IndexType::SecondaryByCopy
-//! [`secondary_by_reference`]: super::secondary_by_reference
+//! [`reference`]: super::reference
 
 use std::cmp::Ordering;
 
@@ -361,7 +361,7 @@ pub(crate) async fn resolve_file(
     // windowed second-key search inside the lead run. Any probe decline
     // abandons the location wholesale.
     let name = probe.family.component_name();
-    let mut located = super::row_ids::locate_component_run(
+    let mut located = super::file::locate_component_run(
         file,
         name,
         probe.family.child_lead_col(),
@@ -374,7 +374,7 @@ pub(crate) async fn resolve_file(
         && !range.is_empty()
         && let Some((second_col, second_native)) = constraints.get(1)
     {
-        located = super::row_ids::locate_component_run(
+        located = super::file::locate_component_run(
             file,
             name,
             second_col,

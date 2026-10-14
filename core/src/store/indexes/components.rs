@@ -18,16 +18,16 @@
 
 use std::sync::{Arc, OnceLock};
 
-use vortex_array::arrays::StructArray;
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-use vortex_array::dtype::DType;
-use vortex_array::dtype::FieldName;
+use vortex_array::arrays::{PrimitiveArray, StructArray};
+use vortex_array::dtype::{DType, FieldName};
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
+use vortex_buffer::{Buffer, BufferMut};
 
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::array::into_struct_array;
+use crate::store::schema::{ROW_ID_PTYPE, RowId};
 
 use super::{ALL_INDEX_TYPES, IndexType, Indexes};
 
@@ -476,10 +476,77 @@ pub(crate) fn child_struct_dtype(
     )
 }
 
+/// Decode a row-id column into the ascending, unique `Buffer<RowId>` every
+/// index resolution answers in: the base rows its ids name ([`base_row`]).
+///
+/// Sorting is required, not incidental: the ids come out in the index's own
+/// order, and both `Selection::IncludeByIndex` and the selection algebra need
+/// them ascending. They are unique by construction (each index row references
+/// one quad row), so sorting alone suffices.
+///
+/// [`base_row`]: super::base_row
+pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<RowId>> {
+    use vortex_array::builtins::ArrayBuiltins;
+    use vortex_array::dtype::Nullability;
+
+    if row_id_column.is_empty() {
+        return Ok(Buffer::empty());
+    }
+    #[cfg(test)]
+    crate::store::test_hooks::note_decoded_rids(row_id_column.len());
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
+    // A no-op cast for the u64 column every writer here produces.
+    let ids = row_id_column
+        .cast(DType::Primitive(ROW_ID_PTYPE, Nullability::NonNullable))
+        .map_err(VortexRdfError::Vortex)?
+        .execute::<PrimitiveArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?
+        .into_buffer::<RowId>();
+
+    // The freshly-executed buffer is normally uniquely owned, so the sort
+    // runs in place with no copy; a shared buffer (someone else still holds
+    // the execution's output) falls back to one copy.
+    let mut ids = match ids.try_into_mut() {
+        Ok(ids) => ids,
+        Err(ids) => BufferMut::copy_from(ids.as_slice()),
+    };
+    #[cfg(test)]
+    for id in ids.as_mut_slice() {
+        *id = super::base_row(*id);
+    }
+    ids.as_mut_slice().sort_unstable();
+    check_addressable(&ids)?;
+    Ok(ids.freeze())
+}
+
+/// Refuse ascending base rows `ids` whose last one a `usize` cannot hold —
+/// on a 32-bit target (wasm) a row id past `u32::MAX`, which no base there
+/// holds — so that every later use of an id as a position is exact rather
+/// than narrowed onto another row.
+pub(super) fn check_addressable(ids: &[RowId]) -> Result<()> {
+    match ids.last() {
+        Some(&last) => super::row_index(last).map(|_| ()),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use vortex_array::arrays::PrimitiveArray;
+
+    #[test]
+    fn sorted_row_ids_sorts_whole_ids() {
+        // A rid column comes back as ascending ids, past u32::MAX unchanged.
+        let wide: RowId = 1 << 32;
+        let column = PrimitiveArray::from_iter([wide + 5, 1, wide, 3]).into_array();
+        let ids = sorted_row_ids(column).unwrap();
+        assert_eq!(ids.as_slice(), &[1, 3, wide, wide + 5]);
+
+        // An empty column short-circuits to an empty buffer.
+        let empty = PrimitiveArray::from_iter(std::iter::empty::<RowId>()).into_array();
+        assert!(sorted_row_ids(empty).unwrap().is_empty());
+    }
 
     #[test]
     fn check_component_rows_rejects_mismatch() {

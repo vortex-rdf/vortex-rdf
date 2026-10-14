@@ -8,9 +8,9 @@ use crate::store::RawQuad;
 use crate::store::array::{chunked_or_single, field_as, subject_sorted, with_subject_stamp};
 use crate::store::layouts::dictionary::TermDictionary;
 use crate::store::layouts::{LayoutStrategy, ResolvedLayout, dictionary};
-#[cfg(feature = "file-io")]
-use crate::store::scan::file_scan;
 use crate::store::scan::gather::gather_live;
+#[cfg(feature = "file-io")]
+use crate::store::scan::{file_filter, file_reads};
 use crate::store::schema::{self, TermCode};
 use crate::store::view::selection::{RowSelection, ViewSelection};
 
@@ -122,7 +122,7 @@ impl VortexRdfStore {
                         // evaluated (with the tombstoned rows excluded before
                         // counting).
                         Some(f) => {
-                            file_scan::count_matching_rows(file, f, &selection, deleted.as_ref())
+                            file_filter::count_matching_rows(file, f, &selection, deleted.as_ref())
                                 .await?
                         }
                     }
@@ -397,25 +397,25 @@ impl VortexRdfStore {
                 // cached chunk probes, taken at its ids, or scanned, as
                 // `ExactRead` chooses; a read by id that declines runs the scan.
                 let columns = self.layout.strategy().primary_column_names();
-                let by_id = match file_scan::ExactRead::of(
+                let by_id = match file_reads::ExactRead::of(
                     file,
                     columns,
                     filter.as_ref(),
                     &selection,
                     deleted.as_ref(),
                 )? {
-                    file_scan::ExactRead::Points(rows) => {
-                        file_scan::file_point_rows(file, columns, filter.as_ref(), rows).await?
+                    file_reads::ExactRead::Points(rows) => {
+                        file_reads::file_point_rows(file, columns, filter.as_ref(), rows).await?
                     }
-                    file_scan::ExactRead::Take(ids) => {
-                        file_scan::take_file_rows(file, columns, &ids).await?
+                    file_reads::ExactRead::Take(ids) => {
+                        file_reads::take_file_rows(file, columns, &ids).await?
                     }
-                    file_scan::ExactRead::Scan => None,
+                    file_reads::ExactRead::Scan => None,
                 };
                 let arr = match by_id {
                     Some(rows) => rows,
                     None => {
-                        file_scan::read_all_rows(self.restricted_file_scan(
+                        file_reads::read_all_rows(self.restricted_file_scan(
                             file,
                             filter.as_ref(),
                             &selection,
@@ -458,12 +458,12 @@ impl VortexRdfStore {
         let scope = scan.dtype().map_err(VortexRdfError::Vortex)?;
         let memo = file.bound_exprs();
         scan = scan.with_projection(
-            memo.bind(file_scan::QUAD_SCOPE, &select(proj, root()), &scope)
+            memo.bind(file_reads::QUAD_SCOPE, &select(proj, root()), &scope)
                 .map_err(VortexRdfError::Vortex)?,
         );
         if let Some(f) = filter {
             scan = scan.with_filter(
-                memo.bind(file_scan::QUAD_SCOPE, f, &scope)
+                memo.bind(file_reads::QUAD_SCOPE, f, &scope)
                     .map_err(VortexRdfError::Vortex)?,
             );
         }

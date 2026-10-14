@@ -350,8 +350,8 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
     // chunk only: the concatenated child is not globally sorted, so its
     // descriptor must say so — the shape a chunked foreign writer could
     // produce and a reader must not binary-search.
-    use crate::store::indexes::secondary_by_copy::CopyFamily;
-    use crate::store::indexes::secondary_by_copy::out_of_core::{CopyKey, copy_child_chunk};
+    use crate::store::indexes::copy::CopyFamily;
+    use crate::store::indexes::copy::out_of_core::{CopyKey, copy_child_chunk};
     let mut quad_chunks = Vec::new();
     let mut child_chunks: Vec<Vec<vortex_array::ArrayRef>> = vec![Vec::new(), Vec::new()];
     for (n, rows) in raws.chunks(4).enumerate() {
@@ -389,9 +389,7 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
                     required: false,
                     // Per-chunk sorts only: the writer may not claim global order.
                     sorted: false,
-                    dtype: crate::store::indexes::secondary_by_copy::out_of_core::copy_child_dtype(
-                        false,
-                    ),
+                    dtype: crate::store::indexes::copy::out_of_core::copy_child_dtype(false),
                 },
                 std::sync::Arc::new(container::BufferedComponentSource::try_new(chunks).unwrap()),
                 container::default_child_strategy(),

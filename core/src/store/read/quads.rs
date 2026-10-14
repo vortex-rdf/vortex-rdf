@@ -8,7 +8,7 @@ use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 #[cfg(feature = "file-io")]
 use crate::store::layouts::{DictAccess, dictionary};
 #[cfg(feature = "file-io")]
-use crate::store::scan::file_scan;
+use crate::store::scan::file_reads;
 use crate::store::scan::gather::gather_live;
 #[cfg(feature = "file-io")]
 use crate::store::view::selection::point_sized;
@@ -164,13 +164,13 @@ impl VortexRdfStore {
                         let file = std::sync::Arc::clone(file);
                         let chunk = async move {
                             let projection = serve.projection();
-                            let point = file_scan::component_point_chunk(
+                            let point = file_reads::component_point_chunk(
                                 &file,
                                 serve.component(),
                                 &projection,
                                 range,
                             );
-                            match file_scan::point_rows_or_scan(point, scan).await {
+                            match file_reads::point_rows_or_scan(point, scan).await {
                                 Ok(rows) => {
                                     serve
                                         .decode_columns_async::<T>(&rows, deleted.as_ref())
@@ -222,32 +222,32 @@ impl VortexRdfStore {
                 // scan. Anything else streams the scan below.
                 let exact = selection.expect_exact();
                 let columns = self.layout.strategy().primary_column_names();
-                let read = file_scan::ExactRead::of(
+                let read = file_reads::ExactRead::of(
                     file,
                     columns,
                     filter.as_ref(),
                     exact,
                     deleted.as_ref(),
                 )?;
-                if !matches!(read, file_scan::ExactRead::Scan) {
+                if !matches!(read, file_reads::ExactRead::Scan) {
                     let scan =
                         self.restricted_file_scan(file, filter.as_ref(), exact, deleted.as_ref())?;
                     let file = std::sync::Arc::clone(file);
                     let filter = filter.clone();
                     let chunk = async move {
                         let by_id = match read {
-                            file_scan::ExactRead::Points(rows) => {
-                                file_scan::file_point_rows(&file, columns, filter.as_ref(), rows)
+                            file_reads::ExactRead::Points(rows) => {
+                                file_reads::file_point_rows(&file, columns, filter.as_ref(), rows)
                                     .await
                             }
-                            file_scan::ExactRead::Take(ids) => {
-                                file_scan::take_file_rows(&file, columns, &ids).await
+                            file_reads::ExactRead::Take(ids) => {
+                                file_reads::take_file_rows(&file, columns, &ids).await
                             }
-                            file_scan::ExactRead::Scan => Ok(None),
+                            file_reads::ExactRead::Scan => Ok(None),
                         };
                         let rows = match by_id {
                             Ok(Some(rows)) => Ok(rows),
-                            Ok(None) => file_scan::read_all_rows(scan).await,
+                            Ok(None) => file_reads::read_all_rows(scan).await,
                             Err(e) => Err(e),
                         };
                         match rows {

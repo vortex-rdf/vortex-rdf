@@ -189,7 +189,7 @@ async fn write_chunked_store(
     reference_index: bool,
 ) -> (tempfile::TempDir, std::path::PathBuf) {
     use crate::io::container::BufferedComponentSource;
-    use crate::store::indexes::secondary_by_reference::GlobalReferenceArrays;
+    use crate::store::indexes::reference::GlobalReferenceArrays;
     use crate::store::layouts::dictionary::{self, TermDictionary};
     use vortex_array::IntoArray as _;
     use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;

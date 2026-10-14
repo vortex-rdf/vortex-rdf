@@ -6,7 +6,7 @@ use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::builders::build_struct_array;
 #[cfg(feature = "file-io")]
-use crate::store::scan::file_scan;
+use crate::store::scan::file_filter;
 use crate::store::view::selection::RowSelection;
 use crate::store::{QuadsSource, Tail};
 
@@ -269,7 +269,7 @@ impl VortexRdfStore {
 
     /// Evaluate this file view's pending filter and (materialized) selection
     /// to a base-wide mask of matching file rows, via
-    /// [`file_scan::matching_file_rows`].
+    /// [`file_filter::matching_file_rows`].
     #[cfg(feature = "file-io")]
     async fn matching_file_row_mask(&self) -> Result<Mask> {
         let QuadsSource::File {
@@ -283,7 +283,7 @@ impl VortexRdfStore {
         };
         // A served match's pending selection materializes here.
         let selection = selection.materialized_async().await?;
-        file_scan::matching_file_rows(file, filter.as_ref(), &selection).await
+        file_filter::matching_file_rows(file, filter.as_ref(), &selection).await
     }
 }
 
