@@ -17,7 +17,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::store::array::chunked_or_single;
 
 /// The host's available parallelism, read once; 1 on targets that cannot
-/// answer (wasm). Read by [`collect_chunks`] for its in-flight split count and
+/// answer (wasm). Read by [`inline_splits`] for its in-flight split count and
 /// exposed through [`available_parallelism`] to the store's scan and serve
 /// split loops.
 static AVAILABLE_PARALLELISM: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
@@ -33,18 +33,29 @@ pub(crate) fn available_parallelism() -> usize {
     *AVAILABLE_PARALLELISM
 }
 
-/// Drive a scan's per-split futures inline and collect the chunks in split
-/// (row) order — the shared tail of [`scan_all`], [`scan_all_reader`] and
-/// [`scan_reader_chunks`].
+/// A scan's per-split futures driven inline: polled on the calling task, their
+/// results in split (row) order.
 ///
-/// The futures are polled through a `buffered` window — several in flight on
-/// this same task, still no runtime handle — so one split's I/O overlaps
-/// another's decode.
+/// The futures are polled through a `buffered` window of the host's
+/// parallelism — several in flight on this same task, still no runtime
+/// handle — so one split's I/O overlaps another's decode.
+pub(crate) fn inline_splits<F>(
+    tasks: Vec<F>,
+) -> impl futures::Stream<Item = VortexResult<Option<ArrayRef>>> + Unpin
+where
+    F: Future<Output = VortexResult<Option<ArrayRef>>>,
+{
+    futures::stream::iter(tasks).buffered(*AVAILABLE_PARALLELISM)
+}
+
+/// Drive a scan's per-split futures inline ([`inline_splits`]) and collect
+/// the chunks in split (row) order — the shared tail of [`scan_all`],
+/// [`scan_all_reader`] and [`scan_reader_chunks`].
 async fn collect_chunks<F>(tasks: Vec<F>) -> Result<Vec<ArrayRef>>
 where
     F: Future<Output = VortexResult<Option<ArrayRef>>>,
 {
-    drain_chunks(futures::stream::iter(tasks).buffered(*AVAILABLE_PARALLELISM)).await
+    drain_chunks(inline_splits(tasks)).await
 }
 
 /// The non-empty chunks of a stream of per-split results, in stream order.
@@ -63,7 +74,7 @@ where
 
 /// [`collect_chunks`] assembled into one array of `dtype`: the tail of
 /// [`scan_all`], of `read_index_row_ids` and of `read_all_rows` for a scan
-/// within its inline limit.
+/// its driver choice runs inline.
 pub(crate) async fn collect_scan<F>(
     dtype: vortex_array::dtype::DType,
     tasks: Vec<F>,
@@ -74,12 +85,38 @@ where
     chunked_or_single(collect_chunks(tasks).await?, dtype)
 }
 
-/// [`collect_scan`] with each split future spawned onto the session's runtime,
-/// `window` of them in flight. The chunks come back in split order, as the
-/// inline driver returns them.
+/// A scan's per-split futures each spawned onto the session's runtime as the
+/// stream is polled, `window` of them in flight, their results in split order
+/// as [`inline_splits`] yields them.
 ///
-/// With no tokio runtime on the calling thread there is nothing to spawn
-/// onto: the futures run inline and nothing is spawned.
+/// Spawning needs a tokio runtime on the polling thread:
+/// [`ScanDriver::for_row_scan`] picks this driver only where there is one.
+///
+/// [`ScanDriver::for_row_scan`]: crate::store::scan::file_reads::ScanDriver::for_row_scan
+#[cfg(feature = "file-io")]
+pub(crate) fn spawned_splits<F>(
+    tasks: Vec<F>,
+    window: usize,
+) -> impl futures::Stream<Item = VortexResult<Option<ArrayRef>>> + Unpin + Send + 'static
+where
+    F: Future<Output = VortexResult<Option<ArrayRef>>> + Send + 'static,
+{
+    use vortex_io::session::RuntimeSessionExt as _;
+
+    let handle = crate::session::VORTEX_SESSION.handle();
+    futures::stream::iter(tasks)
+        .map(move |task| {
+            #[cfg(test)]
+            spawn_probe::note();
+            handle.spawn(task)
+        })
+        .buffered(window)
+}
+
+/// [`collect_scan`] with each split future spawned onto the session's runtime
+/// ([`spawned_splits`]), `window` of them in flight. The chunks come back in
+/// split order, as the inline driver returns them. Needs a tokio runtime on
+/// the polling thread, as [`spawned_splits`] does.
 #[cfg(feature = "file-io")]
 pub(crate) async fn collect_scan_spawned<F>(
     dtype: vortex_array::dtype::DType,
@@ -89,22 +126,11 @@ pub(crate) async fn collect_scan_spawned<F>(
 where
     F: Future<Output = VortexResult<Option<ArrayRef>>> + Send + 'static,
 {
-    use vortex_io::session::RuntimeSessionExt as _;
-
-    if tokio::runtime::Handle::try_current().is_err() {
-        return collect_scan(dtype, tasks).await;
-    }
-    let handle = crate::session::VORTEX_SESSION.handle();
-    let spawned = futures::stream::iter(tasks).map(move |task| {
-        #[cfg(test)]
-        spawn_probe::note();
-        handle.spawn(task)
-    });
-    chunked_or_single(drain_chunks(spawned.buffered(window)).await?, dtype)
+    chunked_or_single(drain_chunks(spawned_splits(tasks, window)).await?, dtype)
 }
 
-/// Test hook: the number of split futures [`collect_scan_spawned`] has spawned
-/// on this thread. Zero means a scan ran inline.
+/// Test hook: the number of split futures [`spawned_splits`] has spawned on
+/// this thread. Zero means a scan ran inline.
 #[cfg(all(test, feature = "file-io"))]
 pub(crate) mod spawn_probe {
     use std::cell::Cell;
