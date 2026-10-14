@@ -298,6 +298,16 @@ async fn test_data_source_request_semantics() {
             Precision::exact(17u64),
             8,
         ),
+        (
+            "one bare column, limited",
+            ScanRequest {
+                projection: get_item("s", root()),
+                limit: Some(17),
+                ..Default::default()
+            },
+            Precision::exact(17u64),
+            8,
+        ),
         ("filter", filtered(p1_eq()), Precision::inexact(len), 32),
         (
             "selection",

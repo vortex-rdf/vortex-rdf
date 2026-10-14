@@ -180,19 +180,15 @@ impl VortexRdfStore {
     }
 }
 
-/// The uncompressed width of one row of `dtype`, in bytes: the sum of its
-/// fields' primitive widths, or `None` when a field is not a primitive.
+/// The uncompressed width of one value of `dtype`, in bytes: a primitive's
+/// width, or the sum of a struct's field widths; `None` when any part is not
+/// a primitive.
 fn row_width(dtype: &DType) -> Option<u64> {
-    let DType::Struct(fields, _) = dtype else {
-        return None;
-    };
-    fields
-        .fields()
-        .map(|field| match field {
-            DType::Primitive(ptype, _) => Some(ptype.byte_width() as u64),
-            _ => None,
-        })
-        .sum()
+    match dtype {
+        DType::Primitive(ptype, _) => Some(ptype.byte_width() as u64),
+        DType::Struct(fields, _) => fields.fields().map(|field| row_width(&field)).sum(),
+        _ => None,
+    }
 }
 
 /// A source over resident chunks already in their final dtype.
