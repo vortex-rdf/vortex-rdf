@@ -15,6 +15,7 @@ mod adoption;
 mod atomic_write;
 mod builders;
 mod chunks;
+mod data_source;
 mod dictionary;
 #[cfg(feature = "file-io")]
 mod dictionary_file_backed;
@@ -856,8 +857,9 @@ async fn collect_row_chunks(view: &VortexRdfStore, batch: usize) -> Vec<vortex_a
     chunks
 }
 
-/// The `(s, p, o, g)` codes of Dictionary-layout struct chunks, concatenated.
-fn chunk_codes(chunks: &[vortex_array::ArrayRef]) -> Vec<[TermCode; 4]> {
+/// The `names` columns of struct chunks — `u64` codes or row ids —
+/// concatenated: one row per chunk row, its values in the order of `names`.
+fn chunk_columns(chunks: &[vortex_array::ArrayRef], names: &[&str]) -> Vec<Vec<u64>> {
     use crate::store::array::{field_as, into_struct_array};
     use vortex_array::VortexSessionExecute as _;
     use vortex_array::arrays::PrimitiveArray;
@@ -866,20 +868,31 @@ fn chunk_codes(chunks: &[vortex_array::ArrayRef]) -> Vec<[TermCode; 4]> {
     for chunk in chunks {
         let s = into_struct_array(chunk.clone()).unwrap();
         let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
-        let [cs, cp, co, cg] = crate::store::schema::PRIMARY_COLUMNS.map(|name| {
-            field_as::<PrimitiveArray>(&s, name, &mut ctx)
-                .unwrap()
-                .into_buffer::<TermCode>()
-        });
-        for i in 0..cs.len() {
-            rows.push([cs[i], cp[i], co[i], cg[i]]);
+        let columns: Vec<vortex_buffer::Buffer<u64>> = names
+            .iter()
+            .map(|name| {
+                field_as::<PrimitiveArray>(&s, name, &mut ctx)
+                    .unwrap()
+                    .into_buffer::<u64>()
+            })
+            .collect();
+        for i in 0..chunk.len() {
+            rows.push(columns.iter().map(|column| column[i]).collect());
         }
     }
     rows
 }
 
-/// The `s` column strings of string-layout struct chunks, concatenated.
-fn chunk_subjects(chunks: &[vortex_array::ArrayRef]) -> Vec<String> {
+/// The `(s, p, o, g)` codes of Dictionary-layout struct chunks, concatenated.
+fn chunk_codes(chunks: &[vortex_array::ArrayRef]) -> Vec<[TermCode; 4]> {
+    chunk_columns(chunks, &crate::store::schema::PRIMARY_COLUMNS)
+        .into_iter()
+        .map(|r| [r[0], r[1], r[2], r[3]])
+        .collect()
+}
+
+/// The strings of the `name` column of struct chunks, concatenated.
+fn chunk_strings(chunks: &[vortex_array::ArrayRef], name: &str) -> Vec<String> {
     use crate::store::array::{StrColReader, field_as, into_struct_array};
     use vortex_array::VortexSessionExecute as _;
     use vortex_array::arrays::VarBinViewArray;
@@ -888,13 +901,47 @@ fn chunk_subjects(chunks: &[vortex_array::ArrayRef]) -> Vec<String> {
     for chunk in chunks {
         let s = into_struct_array(chunk.clone()).unwrap();
         let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
-        let col = field_as::<VarBinViewArray>(&s, "s", &mut ctx).unwrap();
+        let col = field_as::<VarBinViewArray>(&s, name, &mut ctx).unwrap();
         let reader = StrColReader::new(&col);
         for i in 0..col.len() {
             out.push(reader.str_at(i).unwrap().to_string());
         }
     }
     out
+}
+
+/// The `s` column strings of string-layout struct chunks, concatenated.
+fn chunk_subjects(chunks: &[vortex_array::ArrayRef]) -> Vec<String> {
+    chunk_strings(chunks, "s")
+}
+
+/// Every chunk of every partition of one scan of `source`, in partition
+/// order. Asserts each chunk carries the scan's dtype.
+async fn scan_chunks(
+    source: &crate::vortex_scan::DataSourceRef,
+    request: crate::vortex_scan::ScanRequest,
+) -> Vec<vortex_array::ArrayRef> {
+    let scan = source.scan(request).await.unwrap();
+    let dtype = scan.dtype().clone();
+    let mut partitions = scan.partitions();
+    let mut chunks = Vec::new();
+    while let Some(partition) = partitions.next().await {
+        let mut stream = partition.unwrap().execute().unwrap();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            assert_eq!(chunk.dtype(), &dtype, "a chunk carries its scan's dtype");
+            chunks.push(chunk);
+        }
+    }
+    chunks
+}
+
+/// The `(s, p, o, g)` codes one scan of a Dictionary-layout `source` yields.
+async fn scan_codes(
+    source: &crate::vortex_scan::DataSourceRef,
+    request: crate::vortex_scan::ScanRequest,
+) -> Vec<[TermCode; 4]> {
+    chunk_codes(&scan_chunks(source, request).await)
 }
 
 /// The two-quad dataset the Default and TypedObject probes match over.

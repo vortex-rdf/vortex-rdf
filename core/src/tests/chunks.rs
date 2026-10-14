@@ -174,14 +174,16 @@ async fn test_chunks_read_filtered_file_runs_by_id() {
     }
 }
 
-/// A file view's chunks read with no tokio runtime: a bare executor on a
-/// plain thread polls them, with the split limit forced to zero so the scan
-/// would spawn wherever a runtime were there to spawn onto. Nothing is
-/// spawned, and both exports answer the view's base-ordered codes.
+/// A file view's chunks, and its data source's scan, read with no tokio
+/// runtime: a bare executor on a plain thread polls them, with the split
+/// limit forced to zero so the scan would spawn wherever a runtime were there
+/// to spawn onto. Nothing is spawned, and both exports and the scan answer
+/// the view's base-ordered codes.
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_chunks_read_a_file_outside_a_tokio_runtime() {
     use crate::store::scan::file_reads::driver_hooks;
+    use crate::vortex_scan::ScanRequest;
 
     let (_dir, path) = write_store_file(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
@@ -194,13 +196,15 @@ async fn test_chunks_read_a_file_outside_a_tokio_runtime() {
     let expected = base_ordered_codes(&view).await;
     assert_eq!(expected.len(), 600);
 
-    let (codes, rows, spawned) = std::thread::spawn(move || {
+    let (codes, rows, scanned, spawned) = std::thread::spawn(move || {
         let _limit = driver_hooks::ForcedLimit::set(0);
         futures::executor::block_on(async {
             driver_hooks::take_spawned();
             let (codes, _) = collect_code_chunks(&view, &QuadColumn::ALL, 256).await;
             let rows = chunk_codes(&collect_row_chunks(&view, 256).await);
-            (codes, rows, driver_hooks::take_spawned())
+            let source = view.data_source().unwrap();
+            let scanned = scan_codes(&source, ScanRequest::default()).await;
+            (codes, rows, scanned, driver_hooks::take_spawned())
         })
     })
     .join()
@@ -209,6 +213,7 @@ async fn test_chunks_read_a_file_outside_a_tokio_runtime() {
     let codes: Vec<[TermCode; 4]> = codes.iter().map(|r| [r[0], r[1], r[2], r[3]]).collect();
     assert_eq!(codes, expected, "code_chunks");
     assert_eq!(rows, expected, "row_chunks");
+    assert_eq!(scanned, expected, "the data source's scan");
 }
 
 /// The string layouts stream their native struct rows, the tail last, in the
