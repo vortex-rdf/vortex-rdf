@@ -18,7 +18,7 @@ is the path such an engine takes.
 | A table of quads to scan with projection, filter and limit pushdown | [`data_source`](../core/src/store/read/data_source.rs#L100) on any view, registered with vortex's `VortexTable` |
 | The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L127) |
 | Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L52), [`code_chunks`](../core/src/store/read/chunks.rs#L77) |
-| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L148), [`index_components`](../core/src/store/read/metadata.rs#L262), [`partitions`](../core/src/store/read/metadata.rs#L299) |
+| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L148), [`index_components`](../core/src/store/read/metadata.rs#L262), [`partitions`](../core/src/store/read/metadata.rs#L300) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L258) (from [`dict_reader`](../core/src/store/mod.rs#L278)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
 | When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L139), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L315) |
@@ -111,11 +111,15 @@ The children are **raw**: they do not apply a view's narrowing, tombstones
 or append tail. Use them over a store without tombstones or tail (`compact`
 produces one), or anti-join their `rid` against the view's own rows.
 `None` is returned for a name the store has no child of; the `dictionary`
-table needs a `file-io` or wasm build. An in-memory store's tables read its
-resident children. On file, each child is vortex's own
-`LayoutReaderDataSource` over the child's layout reader, so a scan reads
-only the child's bytes, and it needs a tokio runtime
-([§4](#4-which-runtime-a-read-needs)).
+table needs a `file-io` or wasm build. On a view that a match or a
+narrowing proved empty, the backends differ, as they do for
+`index_components` ([§5](#5-what-a-view-promises-before-it-is-read)). In
+memory, such a view holds no index children, so every `index:…` name
+returns `None` (the `dictionary` table stays). On file, every view serves
+the file's children. An in-memory store's tables read its resident
+children. On file, each child is vortex's own `LayoutReaderDataSource` over
+the child's layout reader, so a scan reads only the child's bytes, and it
+needs a tokio runtime ([§4](#4-which-runtime-a-read-needs)).
 
 ## 3. Rows as columns, without Arrow
 
@@ -170,7 +174,13 @@ Every read is lazy, and a stream's first poll decides how it runs:
 
 - An in-memory view's reads — its data source's scan, `row_chunks`,
   `code_chunks` — and an in-memory store's component tables are CPU work on
-  the polling task, and need no runtime.
+  the polling task, and need no runtime. One exception runs earlier. An
+  adopted store (`from_bytes`, `from_bytes_owned`, `from_file_in_memory`)
+  holds its index children deferred, and `component_data_source`
+  materializes the child it serves when it is called, not at the first
+  poll. For a byte-adopted child that means scanning the buffer and then
+  decoding it. Every view of the store reuses the result, and a failure is
+  the call's error.
 - A file-backed view reads its rows by id or scans the file's splits, as
   it decides at that first poll. A read by id, a scan of at most 42 splits
   ([`MAX_INLINE_SPLITS`](../core/src/store/scan/file_reads.rs#L64)), and a
@@ -211,23 +221,24 @@ is the one way it fails.
 `index_components()` lists the store's index children, each with its
 component name (the one `component_data_source` takes), its `IndexType`, its
 sort order (`Posg`, `Ospg`, or none for the reference pairs), its sortedness
-provenance, and `rows`: the base's row count, since every index child holds
-one row per base quad. It returns a `Result`, and it classifies a child by
-its implementation slug, leaving out one under a slug this version does not
-know. On a view a match or a narrowing proved empty the backends differ: in
-memory the view holds no children and lists none; on file it lists the
-file's children, as every file view does.
+provenance, and `rows: usize`, the base's row count, since every index
+child holds one row per base quad. It returns a `Result`, and it classifies
+a child by its implementation slug, leaving out one under a slug this
+version does not know. On a view a match or a narrowing proved empty the
+backends differ: in memory the view holds no children and lists none; on
+file it lists the file's children, as every file view does.
 
 `partitions(n)` cuts a view into at most `n` views over disjoint,
 contiguous pieces of its base rows, in base order: reading them in turn
 reads the view, and each applies the view's filter and tombstones to its own
-rows only. A served match's row ids are read first, and no partition keeps
-the serve plan. The append tail rides with the last partition, so over a
-sorted base every partition but the last keeps the `Spog` order, and the
-last keeps it only when the view reads no tail row. Sizes are about equal
-*before* filtering; a view selecting no base row is its own one partition.
-Each partition is an ordinary view — `data_source` on each gives an engine
-one source per worker.
+rows only. For `n` = 1 the one partition is the view itself, its serve plan
+and pending selection included. For a larger `n`, a served match's row ids
+are read first and no partition keeps the serve plan. The append tail rides
+with the last partition, so over a sorted base every partition but the last
+keeps the `Spog` order, and the last keeps it only when the view reads no
+tail row. Sizes are about equal *before* filtering; a view selecting no base
+row is its own one partition. Each partition is an ordinary view —
+`data_source` on each gives an engine one source per worker.
 
 ## 6. Narrowing natively
 
