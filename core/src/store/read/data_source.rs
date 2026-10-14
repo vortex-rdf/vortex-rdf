@@ -76,6 +76,10 @@ impl VortexRdfStore {
     /// under the layout's primary struct dtype, every narrowing applied. Its
     /// row count is the [`view_statistics`](Self::view_statistics) count:
     /// exact when that is known without reading, otherwise its upper bound.
+    /// The call does no I/O, but it takes that count through
+    /// `view_statistics`, so it does what that call does: on an in-memory
+    /// view whose selection is a pending index run over a base with
+    /// tombstones, it decodes the run's row ids and caches them on the view.
     /// Under the Dictionary layout its byte size is the rows' uncompressed
     /// width, four `u64` codes a row; a string layout's source has none.
     ///
@@ -91,7 +95,8 @@ impl VortexRdfStore {
     ///
     /// Errors for a Dictionary-layout view with a non-empty append tail: its
     /// tail holds strings whose terms have no code, so the view has no single
-    /// dtype (`compact` the store first).
+    /// dtype (`compact` the store first). Errors, too, where
+    /// `view_statistics` does: when that row-id decode fails.
     pub fn data_source(&self) -> Result<DataSourceRef> {
         if self.layout.strategy() == LayoutStrategy::Dictionary && self.tail_len() != 0 {
             self.ensure_code_view("data_source")?;
