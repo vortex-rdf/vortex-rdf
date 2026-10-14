@@ -66,11 +66,17 @@ async fn assert_chunks_match(view: &VortexRdfStore, tag: &str) -> Precision<u64>
     count
 }
 
-/// In memory, over every index set: each view's chunks and data source scan
-/// are its base-ordered codes, which the source counts exactly, and the
-/// whole store's code chunks are its code columns, not copies of them.
+/// In memory, over every index set, and the multi-chunk store whole: each
+/// view's chunks and data source scan are its base-ordered codes, which the
+/// source counts exactly, and the whole store's code chunks are its code
+/// columns, not copies of them.
 #[tokio::test]
 async fn test_chunks_in_memory_match_gathered() {
+    let count = assert_chunks_match(&multi_chunk_store().await, "memory multi-chunk").await;
+    assert!(
+        matches!(count, Precision::Exact(_)),
+        "multi-chunk: exact in memory"
+    );
     for indexes in [
         vec![],
         vec![IndexType::SecondaryByCopy],
@@ -125,22 +131,27 @@ async fn test_chunks_skip_tombstones() {
     }
 }
 
-/// On every file open and index set, each view's chunks and data source scan
-/// are its base-ordered codes; the source counts them exactly where the
-/// statistics know the count and as a bound while a pushed-down filter is
-/// pending, and the matrix reaches both.
+/// On every file open and index set, and on the multi-chunk store's mapped
+/// file whole, each view's chunks and data source scan are its base-ordered
+/// codes; the source counts them exactly where the statistics know the count
+/// and as a bound while a pushed-down filter is pending, and the matrix
+/// reaches both.
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_chunks_file_backed_match_gathered() {
-    let (mut exact_counts, mut bounds) = (0, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let multi_chunk = multi_chunk_file(&dir).await;
+    let mut counts = vec![assert_chunks_match(&multi_chunk, "mapped multi-chunk").await];
     for (tag, _dir, store) in file_stores().await {
         for (name, view) in views_of(&store).await {
-            match assert_chunks_match(&view, &format!("{tag} {name}")).await {
-                Precision::Exact(_) => exact_counts += 1,
-                _ => bounds += 1,
-            }
+            counts.push(assert_chunks_match(&view, &format!("{tag} {name}")).await);
         }
     }
+    let exact_counts = counts
+        .iter()
+        .filter(|count| matches!(count, Precision::Exact(_)))
+        .count();
+    let bounds = counts.len() - exact_counts;
     assert!(
         exact_counts > 0 && bounds > 0,
         "{exact_counts} exact counts, {bounds} bounds"
