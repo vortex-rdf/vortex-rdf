@@ -14,37 +14,11 @@ async fn row_set(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
     rows
 }
 
-/// The row tuples of a view's gathered codes, in the order gathered.
-async fn row_list(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
-    let cols = view
-        .code_columns_gathered()
-        .await
-        .unwrap()
-        .expect("a Dictionary-layout view without a tail gathers codes");
-    (0..cols[0].len())
-        .map(|i| [cols[0][i], cols[1][i], cols[2][i], cols[3][i]])
-        .collect()
-}
-
-/// The view's rows in base row order: a keep that admits every code drops
-/// the serve plan without dropping a row.
-async fn base_ordered(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
-    let all = Keep::range(0..TermCode::MAX);
-    row_list(&view.keep(QuadColumn::S, &all).await.unwrap()).await
-}
-
 fn brute_keep(rows: &[[TermCode; 4]], column: QuadColumn, keep: &Keep) -> Vec<[TermCode; 4]> {
     rows.iter()
         .copied()
         .filter(|row| keep.admits(row[column.index()]))
         .collect()
-}
-
-fn fixture_quads() -> Vec<Quad> {
-    let g = |name: &str| {
-        GraphName::NamedNode(NamedNode::new(format!("http://example.org/{name}")).unwrap())
-    };
-    graph_modular_quads(3_000, 4, 5, 7, &[GraphName::DefaultGraph, g("g1"), g("g2")])
 }
 
 async fn memory_store(indexes: Indexes) -> VortexRdfStore {
@@ -236,7 +210,7 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
         ),
     ];
     for (view_tag, view) in &views {
-        let rows = base_ordered(view).await;
+        let rows = base_ordered_codes(view).await;
         let n = rows.len();
         for (offset, limit) in [
             (0, 0),
@@ -428,27 +402,6 @@ async fn test_narrowing_gates_and_tails() {
 mod file {
     use super::*;
     use std::ops::Range;
-
-    /// Both open modes of a file store — loaded whole and mapped — with and
-    /// without indexes (the dir guards ride along, shared by both opens).
-    async fn file_stores() -> Vec<(String, std::sync::Arc<tempfile::TempDir>, VortexRdfStore)> {
-        let mut stores = Vec::new();
-        for (tag, indexes) in [
-            ("file/no-index", vec![]),
-            ("file/copy", vec![IndexType::SecondaryByCopy]),
-            ("file/reference", vec![IndexType::SecondaryByReference]),
-        ] {
-            let (dir, path) =
-                write_store_file(fixture_quads(), LayoutStrategy::Dictionary, indexes).await;
-            let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
-            let mapped = VortexRdfStore::from_file(&path).await.unwrap();
-            assert!(mapped.debug_dict_file_backed());
-            let dir = std::sync::Arc::new(dir);
-            stores.push((format!("{tag}/loaded"), std::sync::Arc::clone(&dir), loaded));
-            stores.push((format!("{tag}/mapped"), dir, mapped));
-        }
-        stores
-    }
 
     #[tokio::test]
     async fn test_keep_on_file_matches_brute_force() {

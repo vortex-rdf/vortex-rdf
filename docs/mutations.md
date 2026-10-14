@@ -92,7 +92,7 @@ flowchart TD
   selections are `All`.
 - **Every layout, Dictionary included.** An appended term has no code in the
   base's frozen sorted dictionary, so under the Dictionary layout the tail
-  stores Default-layout N-Triples strings ([`tail_layout`](../core/src/store/mod.rs#L170));
+  stores Default-layout N-Triples strings ([`tail_layout`](../core/src/store/mod.rs#L171));
   under the other layouts it uses the store's own columns. Patterns probe the
   base by code and the tail by string, and a query that touches both unions
   the results.
@@ -102,7 +102,7 @@ flowchart TD
   then unions the two. A base short-circuit (a term with no code in the
   dictionary) never skips the tail, since that term may exist in the tail's
   plain strings.
-- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L188) is the number
+- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L189) is the number
   of physical tail rows — the store's only unindexed, unsorted region, and the
   number to watch when tuning compaction.
 
@@ -155,7 +155,7 @@ flowchart TD
   [`matching_file_row_mask`](../core/src/store/write/mutation.rs#L327) (through
   [`matching_file_rows`](../core/src/store/scan/file_filter.rs#L302)), and on
   every later read the mask is applied **inside the scan**
-  ([`restrict_scan`](../core/src/store/scan/file_reads.rs#L220)) — as an
+  ([`restrict_scan`](../core/src/store/scan/file_reads.rs#L219)) — as an
   `ExcludeByIndex` selection of the deleted ids for an `All` or `Range`
   selection, or subtracted up front from an id list — so it composes with a
   pushed-down filter, whose output carries no row ids to re-align against.
@@ -173,7 +173,7 @@ flowchart TD
 | `compact()` | every live row, base first | every live tail row, then re-sorted with the base |
 
 The rows a rebuild or compaction starts from come from
-[`live_raw_quads`](../core/src/store/read/rows.rs#L556): base rows first (in view
+[`live_raw_quads`](../core/src/store/read/rows.rs#L557): base rows first (in view
 order), then tail rows, tombstones already excluded.
 
 ---
@@ -289,7 +289,7 @@ open of the file and no rebuild (a debug-level log line says so), and every
 later append over the threshold retries the same way, folding the tail as soon
 as the file can be written again. An explicit `compact()` of such a store still
 fails with `PermissionDenied`: it is the call that reports why the tail is not
-being folded, and [`tail_len`](../core/src/store/mod.rs#L188) shows the tail
+being folded, and [`tail_len`](../core/src/store/mod.rs#L189) shows the tail
 growing. The tail then has no bound but memory, and every query mask-scans it,
 so a read-only store is for reading: append to a copy.
 

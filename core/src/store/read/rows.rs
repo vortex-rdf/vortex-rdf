@@ -237,8 +237,9 @@ impl VortexRdfStore {
 
     /// [`code_columns`](Self::code_columns) without the served fast path: the
     /// view's codes gathered from the base's own columns in base row order,
-    /// whatever answered the match. A served match's pending selection
-    /// materializes here. `None` under the same conditions as
+    /// whatever answered the match — the order
+    /// [`code_chunks`](Self::code_chunks) yields. A served match's pending
+    /// selection materializes here. `None` under the same conditions as
     /// `code_columns`, or when a base column is not a canonical code
     /// primitive the shared cache can hand out.
     pub(crate) fn base_code_columns(&self) -> Option<[Buffer<TermCode>; 4]> {
