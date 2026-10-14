@@ -522,7 +522,7 @@ pub(crate) fn dict_term_column(
     native: &crate::store::persist::native_file::NativeStoreFile,
 ) -> vortex_layout::LayoutRef {
     use crate::io::container::DICT_COMPONENT_NAME;
-    use crate::store::layouts::dictionary::term_dict::COL_DICT_TERM;
+    use crate::store::layouts::dictionary::storage::COL_DICT_TERM;
     use vortex_layout::LayoutChildType;
     let child = native
         .component_layout(DICT_COMPONENT_NAME)

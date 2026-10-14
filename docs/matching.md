@@ -1165,9 +1165,9 @@ other one's spelling is read and evaluated. No verdict is memoized. Kinds:
 `contains`, `strstarts`, `strends`, `regex` with `TextOptions` (`case`,
 `as_str`, regex `flags`). Verdicts follow rdflib 7.6, conservatively: a
 candidate passes or fails only where the native rules agree with rdflib, and
-is undecided wherever rdflib may read it differently — rules in
-[`predicates.rs`](../core/src/store/layouts/dictionary/predicates.rs) and
-[`regex_filter.rs`](../core/src/store/layouts/dictionary/regex_filter.rs),
+is undecided wherever rdflib may read it differently — rules in the
+[`predicates`](../core/src/store/layouts/dictionary/predicates/mod.rs) module and its
+[`regex_filter.rs`](../core/src/store/layouts/dictionary/predicates/regex_filter.rs),
 checked against rdflib by `python/tests/test_filter_codes_differential.py`.
 
 ---
@@ -1178,7 +1178,7 @@ checked against rdflib by `python/tests/test_filter_codes_differential.py`.
 |---|---|
 | `match_pattern`, `match_base`, both backends, `match_tail`, `mask_for`, `contains` | [`core/src/store/query/matching.rs`](../core/src/store/query/matching.rs) |
 | Layouts, `QuadPattern`, `PatternCodes`, `Constraints`, `prepare_pattern` | [`core/src/store/layouts/mod.rs`](../core/src/store/layouts/mod.rs) |
-| Dictionary residency and the async prelude | [`core/src/store/layouts/dictionary/access.rs`](../core/src/store/layouts/dictionary/access.rs) |
+| Dictionary residency and the async prelude | [`core/src/store/layouts/dictionary/handles.rs`](../core/src/store/layouts/dictionary/handles.rs) |
 | `RowSelection` / `ViewSelection`, `POINT_GATHER_MAX_ROWS` | [`core/src/store/view/selection.rs`](../core/src/store/view/selection.rs) |
 | Gathering selected rows, point reads through cached probes | [`core/src/store/scan/gather.rs`](../core/src/store/scan/gather.rs) |
 | `IndexResolution`, `ResolvedRowIds`, `LazyRowIds`, planners | [`core/src/store/indexes/mod.rs`](../core/src/store/indexes/mod.rs) |
@@ -1191,8 +1191,8 @@ checked against rdflib by `python/tests/test_filter_codes_differential.py`.
 | Typed residual/tail equality loops | [`core/src/store/scan/typed_eq.rs`](../core/src/store/scan/typed_eq.rs) |
 | `Keep`, `keep`, `window`, `size_capped`, `exists` | [`core/src/store/query/narrowing.rs`](../core/src/store/query/narrowing.rs) |
 | `Probe`, `match_many`, `count_many` | [`core/src/store/query/batch.rs`](../core/src/store/query/batch.rs) |
-| `DictReader`, `DictSnapshot`, `prefix_range`, tolerant `encode` | [`core/src/store/layouts/dictionary/term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs) |
-| `TermPredicate`, `Verdict`, `KindRanges`, the verdict rules, the regex subset | [`core/src/store/layouts/dictionary/predicates.rs`](../core/src/store/layouts/dictionary/predicates.rs), [`regex_filter.rs`](../core/src/store/layouts/dictionary/regex_filter.rs) |
+| `DictReader`, `DictSnapshot`, `prefix_range`, tolerant `encode` | [`core/src/store/layouts/dictionary/handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs) |
+| `TermPredicate`, `Verdict`, `KindRanges`, the verdict rules, the regex subset | [`core/src/store/layouts/dictionary/predicates/mod.rs`](../core/src/store/layouts/dictionary/predicates/mod.rs), [`numeric.rs`](../core/src/store/layouts/dictionary/predicates/numeric.rs), [`literal.rs`](../core/src/store/layouts/dictionary/predicates/literal.rs), [`text.rs`](../core/src/store/layouts/dictionary/predicates/text.rs), [`regex_filter.rs`](../core/src/store/layouts/dictionary/predicates/regex_filter.rs) |
 | The RDF/XSD datatype IRIs the predicates and the TypedObject layout share | [`core/src/common/vocab.rs`](../core/src/common/vocab.rs) |
 | Column kernels (`distinct_first_seen`, `value_counts`, `take`, `equi_join_indices`) | [`core/src/columns.rs`](../core/src/columns.rs) |
 | View state (`QuadsSource`, `Tail`) | [`core/src/store/view/mod.rs`](../core/src/store/view/mod.rs) |

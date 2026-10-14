@@ -42,10 +42,10 @@ pub(crate) mod default;
 pub(crate) mod dictionary;
 pub(crate) mod typed_object;
 
+pub(crate) use self::dictionary::DictAccess;
 use self::dictionary::TermDictionary;
-pub(crate) use self::dictionary::access::DictAccess;
 use self::typed_object::{COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE};
-use crate::store::schema::{CODE_PTYPE, COL_G, COL_O, COL_P, COL_S, TermCode};
+use crate::store::schema::{CODE_PTYPE, COL_G, COL_O, COL_P, COL_S, PRIMARY_COLUMNS, TermCode};
 
 /// Determines the columnar schema used to store RDF quads in the Vortex StructArray.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -185,7 +185,7 @@ impl LayoutStrategy {
         match self {
             LayoutStrategy::Default => default::COLUMNS,
             LayoutStrategy::TypedObject => typed_object::COLUMNS,
-            LayoutStrategy::Dictionary => dictionary::COLUMNS,
+            LayoutStrategy::Dictionary => &PRIMARY_COLUMNS,
         }
     }
 

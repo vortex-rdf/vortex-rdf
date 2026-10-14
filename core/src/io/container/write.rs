@@ -207,7 +207,7 @@ pub(crate) fn dict_child_strategy(
             ZonedLayoutOptions {
                 block_size,
                 aggregate_fns: Some(
-                    crate::store::layouts::dictionary::term_dict::window_bound_aggregates(),
+                    crate::store::layouts::dictionary::storage::window_bound_aggregates(),
                 ),
                 concurrency: std::num::NonZeroUsize::MIN,
             },

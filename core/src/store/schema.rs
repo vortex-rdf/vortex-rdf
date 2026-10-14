@@ -7,7 +7,7 @@
 //! subsystem live with that subsystem instead: the row id every index child
 //! carries in the index hub ([`indexes::COL_RID`]), the reference index's
 //! `val` in [`reference`], the dictionary child's `_dict_term`
-//! in [`term_dict`](crate::store::layouts::dictionary::term_dict), and the
+//! in [`storage`](crate::store::layouts::dictionary::storage), and the
 //! TypedObject layout's split object columns in [`typed_object`].
 //!
 //! [`indexes::COL_RID`]: crate::store::indexes::COL_RID

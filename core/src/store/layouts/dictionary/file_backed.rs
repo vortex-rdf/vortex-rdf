@@ -13,7 +13,7 @@
 //! search cannot address is not file-backed at all:
 //! [`store::persist::open`](crate::store::persist::open) lifts it resident instead. The policy
 //! enum choosing between this and the resident form is
-//! [`DictAccess`](super::access::DictAccess); the module only compiles with
+//! [`DictAccess`](super::handles::DictAccess); the module only compiles with
 //! `file-io`, since without a file there is nothing to leave the terms in.
 
 use std::cmp::Ordering;
@@ -43,11 +43,11 @@ use crate::store::array::StrColReader;
 use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::schema::TermCode;
 
-use super::check_code;
 use super::predicates::{KindRanges, TermPredicate, Verdict};
+use super::storage::{COL_DICT_TERM, TermChunk, chunk_of, window_bound_aggregates};
 use super::term_dict::{
-    COL_DICT_TERM, TermChunk, TermDictionary, check_candidates, chunk_of, code_rank,
-    prefix_successor, rank_code, split_verdicts, window_bound_aggregates,
+    TermDictionary, check_candidates, check_code, code_rank, prefix_successor, rank_code,
+    split_verdicts,
 };
 
 /// A window's first and last term.
@@ -609,7 +609,7 @@ impl FileBackedDict {
     /// Lift the whole dictionary resident — the transient full-column read
     /// behind [`DictAccess::ensure_resident`].
     ///
-    /// [`DictAccess::ensure_resident`]: super::access::DictAccess::ensure_resident
+    /// [`DictAccess::ensure_resident`]: super::handles::DictAccess::ensure_resident
     pub(crate) async fn lift_resident(&self) -> Result<TermDictionary> {
         #[cfg(test)]
         self.0
