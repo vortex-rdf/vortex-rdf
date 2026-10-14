@@ -1389,6 +1389,9 @@ mod tests {
     #[test]
     fn non_literals_and_other_datatypes() {
         assert_eq!(p("num_ne", "5").eval("<http://x>"), Verdict::True);
+        assert_eq!(p("num_ne", "5").eval("_:b"), Verdict::True);
+        // The default graph's empty spelling is no term the predicates speak of.
+        assert_eq!(p("num_ne", "5").eval(""), Verdict::Unknown);
         assert_eq!(p("num_eq", "5").eval("_:b"), Verdict::False);
         assert_eq!(p("num_lt", "5").eval("<http://x>"), Verdict::False);
         // A plain string against an integer orders by datatype IRI
@@ -1399,8 +1402,11 @@ mod tests {
         // "…#string" < "…#unsignedInt".
         let u = typed("5", "http://www.w3.org/2001/XMLSchema#unsignedInt");
         assert_eq!(p("num_lt", &u).eval("\"abc\""), Verdict::True);
-        // Equality against a non-numeric literal is left to the engine.
+        // Equality and inequality against a non-numeric literal, plain or
+        // language-tagged, are left to the engine.
         assert_eq!(p("num_eq", "5").eval("\"abc\""), Verdict::Unknown);
+        assert_eq!(p("num_ne", "5").eval("\"abc\""), Verdict::Unknown);
+        assert_eq!(p("num_ne", "5").eval("\"abc\"@en"), Verdict::Unknown);
         // Same datatype, unparseable lexical: unknown.
         assert_eq!(p("num_lt", "5").eval(&typed("abc", INT)), Verdict::Unknown);
         // Different numeric datatype, unparseable lexical: still unknown —
