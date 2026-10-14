@@ -11,7 +11,9 @@ use crate::vortex_scan::strict_sorted_buffer::StrictSortedBuffer;
 use crate::vortex_scan::{DataSourceRef, ScanRequest};
 use vortex_array::dtype::{DType, FieldPath, Nullability, PType};
 use vortex_array::expr::stats::{Precision, Stat};
-use vortex_array::expr::{Expression, eq, get_item, in_list, lit, pack, root, select};
+use vortex_array::expr::{
+    Expression, and, eq, get_item, gt_eq, in_list, lit, lt, pack, root, select,
+};
 use vortex_array::scalar::Scalar;
 use vortex_buffer::Buffer;
 
@@ -27,6 +29,15 @@ fn field_names(chunk: &vortex_array::ArrayRef) -> Vec<String> {
 fn filtered(filter: Expression) -> ScanRequest {
     ScanRequest {
         filter: Some(filter),
+        ..Default::default()
+    }
+}
+
+/// A scan request for every row in order, which a table split over several
+/// partitions or splits must keep.
+fn ordered() -> ScanRequest {
+    ScanRequest {
+        ordered: true,
         ..Default::default()
     }
 }
@@ -174,6 +185,42 @@ async fn test_data_source_request_semantics() {
         scan_codes(&source, filtered(p1_eq())).await,
         want,
         "an equality filter"
+    );
+
+    // A filter on a column the projection drops: the filter sees the whole
+    // row, and the projection narrows what it keeps.
+    let chunks = scan_chunks(
+        &source,
+        ScanRequest {
+            projection: select(["s"], root()),
+            filter: Some(p1_eq()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(field_names(&chunks[0]), ["s"]);
+    assert_eq!(
+        chunk_columns(&chunks, &["s"]),
+        want.iter().map(|r| vec![r[0]]).collect::<Vec<_>>(),
+        "a filter on a column the projection drops"
+    );
+
+    // A range filter: the rows of one subject prefix run, `s1…`.
+    let (lo, hi) = dict.prefix_range("<http://example.org/s1").await.unwrap();
+    let in_run = and(
+        gt_eq(get_item("s", root()), lit(lo)),
+        lt(get_item("s", root()), lit(hi)),
+    );
+    let want_run: Vec<[TermCode; 4]> = all
+        .iter()
+        .copied()
+        .filter(|r| (lo..hi).contains(&r[0]))
+        .collect();
+    assert!(!want_run.is_empty() && want_run.len() < all.len());
+    assert_eq!(
+        scan_codes(&source, filtered(in_run)).await,
+        want_run,
+        "a range filter"
     );
 
     // `p IN (p1, p3)` as vortex-datafusion emits it, over a non-nullable list
@@ -479,7 +526,7 @@ async fn assert_component_tables(store: &VortexRdfStore, tag: &str) -> usize {
             "{tag}: one row per quad"
         );
         assert_unsized(&table, &tag).await;
-        let chunks = scan_chunks(&table, ScanRequest::default()).await;
+        let chunks = scan_chunks(&table, ordered()).await;
         let rids: Vec<u64> = match child.sort_order {
             // A copy child: the base's quads in the child's order.
             Some(order) => {
@@ -560,7 +607,7 @@ async fn assert_dictionary_component(store: &VortexRdfStore, tag: &str) {
         "{tag}: one row per term"
     );
     assert_unsized(&table, tag).await;
-    let chunks = scan_chunks(&table, ScanRequest::default()).await;
+    let chunks = scan_chunks(&table, ordered()).await;
     assert_eq!(field_names(&chunks[0]), ["_dict_term"], "{tag}");
     let terms = chunk_strings(&chunks, "_dict_term");
     assert!(
