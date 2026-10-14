@@ -119,7 +119,7 @@ impl<'a> TypedEq<'a> {
         canonicalize: bool,
         cached: Option<&'a vortex_rdf_encoded_search::SortedProbe<'a>>,
     ) -> Option<TypedEq<'a>> {
-        use crate::store::array::{cached_code_primitive, shared_code_primitive};
+        use crate::store::resident::{cached_code_primitive, shared_code_primitive};
         use vortex_array::dtype::DType;
         if col.dtype().is_nullable() {
             return None;
@@ -448,13 +448,13 @@ mod tests {
         let n = (TYPED_EQ_MAX_ROWS as TermCode) * 2;
         let sa = wrapped_struct(n);
         let o = sa.unmasked_field_by_name("o").unwrap().clone();
-        assert!(crate::store::array::cached_code_primitive(&o).is_none());
+        assert!(crate::store::resident::cached_code_primitive(&o).is_none());
 
         let eqs = eqs(&[("p", 3), ("o", 10)]);
         let ids = typed_residual_ids(&sa, &RowSelection::All, n as usize, &eqs, None).unwrap();
         let want: Vec<u64> = (0..n).filter(|i| i % 7 == 3 && i % 11 == 10).collect();
         assert_eq!(ids.as_slice(), &want[..]);
-        assert!(crate::store::array::cached_code_primitive(&o).is_some());
+        assert!(crate::store::resident::cached_code_primitive(&o).is_some());
     }
 
     /// A scan reading far fewer values than materializing would decode stays
@@ -470,7 +470,7 @@ mod tests {
         let ids = typed_residual_ids(&sa, &narrow, n as usize, &eqs, None).unwrap();
         let want: Vec<u64> = (10..90u64).filter(|i| i % 7 == 3 && i % 11 == 10).collect();
         assert_eq!(ids.as_slice(), &want[..]);
-        assert!(crate::store::array::cached_code_primitive(&o).is_none());
+        assert!(crate::store::resident::cached_code_primitive(&o).is_none());
     }
 
     /// A canonical narrower unsigned column (TypedObject's kind byte) binds

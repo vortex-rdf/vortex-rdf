@@ -270,7 +270,7 @@ async fn spilled_store_bytes(
     .await
     .unwrap();
     let mut bytes = Vec::new();
-    crate::io::ser::built_stream_to_vortex_writer(built, &mut bytes)
+    crate::io::write::built_stream_to_vortex_writer(built, &mut bytes)
         .await
         .unwrap();
     bytes

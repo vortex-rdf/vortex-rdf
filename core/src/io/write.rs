@@ -9,7 +9,7 @@
 //! trust. Also owns the `quads_stream_to_*` entry points, which run a
 //! builder's chunk stream straight into that writer, and the one way a store
 //! reaches a path on disk: written beside it and renamed into place
-//! ([`write_store_atomically`](crate::io::ser::write_store_atomically)).
+//! ([`write_store_atomically`](crate::io::write::write_store_atomically)).
 //!
 //! Reading these bytes back is [`read`](crate::io::read)'s job,
 //! and the container's own on-disk grammar is

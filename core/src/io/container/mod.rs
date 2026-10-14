@@ -14,7 +14,7 @@
 //! (component descriptors and their JSON stamp), [`layout`] the root layout
 //! vtable and its read-side inspection, [`sources`] the always-compiled
 //! component producers builders construct on every target, and [`write`] the
-//! write strategy, gated like `io::ser`. `ser` assembles a store's parts and drives
+//! write strategy, gated like `io::write`. `io::write` assembles a store's parts and drives
 //! [`write::write_store`]; `read` reads the bytes back.
 
 pub(crate) mod layout;
@@ -28,7 +28,7 @@ pub(crate) mod layout;
 )]
 pub(crate) mod sources;
 pub(crate) mod wire;
-/// Write strategy; gated like `io::ser`.
+/// Write strategy; gated like `io::write`.
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) mod write;
 
@@ -88,13 +88,15 @@ pub(crate) use sources::default_child_strategy;
 pub(crate) use sources::{NativeComponentWrite, child_strategy};
 #[cfg(all(test, feature = "file-io"))]
 pub(crate) use sources::{ONE_MEG, child_strategy_with, id_fields};
-// Consumed only by the write side (`ser` and `IndexComponent::to_write`),
+// Consumed only by the write side (`io::write` and `IndexComponent::to_write`),
 // gated the same way.
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) use sources::BufferedComponentSource;
+#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+pub(crate) use sources::dict_child_strategy;
 pub(crate) use wire::{StoreComponentDescriptor, StoreComponentRole};
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-pub(crate) use write::{dict_child_strategy, write_store};
+pub(crate) use write::write_store;
 
 #[cfg(test)]
 mod tests {

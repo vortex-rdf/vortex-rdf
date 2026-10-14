@@ -148,7 +148,7 @@ async fn write_unsorted_store_file(
         quads_sorted: false,
     };
     let mut bytes: Vec<u8> = Vec::new();
-    crate::io::ser::serialize_parts(&parts, &mut bytes)
+    crate::io::write::serialize_parts(&parts, &mut bytes)
         .await
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
