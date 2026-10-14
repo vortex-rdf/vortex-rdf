@@ -7,7 +7,7 @@ use crate::store::RawQuad;
 use crate::store::builders::build_struct_array;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_scan;
-use crate::store::selection::RowSelection;
+use crate::store::view::selection::RowSelection;
 use crate::store::{QuadsSource, Tail};
 
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
@@ -19,7 +19,7 @@ use vortex_array::arrays::{Chunked, ChunkedArray};
 use vortex_array::{IntoArray, RecursiveCanonical, VortexSessionExecute};
 use vortex_mask::Mask;
 
-use super::VortexRdfStore;
+use crate::store::VortexRdfStore;
 
 impl VortexRdfStore {
     // ── mutations ─────────────────────────────────────────────────────────────

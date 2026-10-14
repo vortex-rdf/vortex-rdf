@@ -13,8 +13,8 @@ use crate::store::{
     QuadsSource,
     indexes::Indexes,
     layouts::{DictAccess, LayoutStrategy, ResolvedLayout, dictionary::FileBackedDict},
-    native_file::NativeStoreFile,
-    selection::ViewSelection,
+    persist::native_file::NativeStoreFile,
+    view::selection::ViewSelection,
 };
 
 use vortex_file::OpenOptionsSessionExt as _;
@@ -25,18 +25,18 @@ use vortex_array::arrays::StructArray;
 use vortex_array::dtype::DType;
 use vortex_array::{IntoArray, VortexSessionExecute};
 
-use super::VortexRdfStore;
-use super::indexes::COL_RID;
-use super::schema::{CODE_PTYPE, ROW_ID_PTYPE, is_code_column_name};
+use crate::store::VortexRdfStore;
+use crate::store::indexes::COL_RID;
+use crate::store::schema::{CODE_PTYPE, ROW_ID_PTYPE, is_code_column_name};
 
 /// Refuse a table whose id columns are integers of a width other than the
 /// one this version reads: the readers take an integer `s`, `p`, `o`, `g`
 /// (the quad table and the copy index's children) or `val` (the reference
-/// index's) for a `u64` code column ([`TermCode`](super::TermCode)), and an
-/// index child's `rid` for a `u64` row id ([`RowId`](super::RowId)), so a
+/// index's) for a `u64` code column ([`TermCode`](crate::store::TermCode)), and an
+/// index child's `rid` for a `u64` row id ([`RowId`](crate::store::RowId)), so a
 /// file with narrower codes or row ids must not open. `table` names the
 /// table in the error.
-pub(super) fn check_id_columns(table: &str, dtype: &DType) -> Result<()> {
+pub(in crate::store) fn check_id_columns(table: &str, dtype: &DType) -> Result<()> {
     let DType::Struct(fields, _) = dtype else {
         return Ok(());
     };
@@ -63,7 +63,7 @@ pub(super) fn check_id_columns(table: &str, dtype: &DType) -> Result<()> {
 }
 
 /// What one entry of a store's component roster means to this version.
-pub(super) enum ComponentKind {
+pub(in crate::store) enum ComponentKind {
     /// The required `dictionary` child (the Dictionary layout's terms).
     Dict,
     /// A known index child: the registry row carrying the identity an
@@ -81,7 +81,7 @@ pub(super) enum ComponentKind {
 /// [`DICT_VERSION`](container::DICT_VERSION), and of an *uninterpretable
 /// required* component: skipping one — a future change set, say — would
 /// silently change query results.
-pub(super) fn classify_component(
+pub(in crate::store) fn classify_component(
     descriptor: &container::StoreComponentDescriptor,
 ) -> Result<ComponentKind> {
     if descriptor.name == container::DICT_COMPONENT_NAME {
@@ -133,7 +133,7 @@ pub(super) fn classify_component(
 /// (canonicalized on its first genuine use, as `from_bytes` adopts its
 /// children), with the descriptor's `sorted` provenance carried across.
 #[cfg(feature = "file-io")]
-pub(super) async fn scanned_index_components(
+pub(in crate::store) async fn scanned_index_components(
     file: &NativeStoreFile,
 ) -> Result<Vec<IndexComponent>> {
     let mut components = Vec::new();
@@ -383,7 +383,7 @@ impl VortexRdfStore {
                 ComponentKind::Skip => {}
             }
         }
-        let layout = super::resolved_layout(dict, quads.dtype())?;
+        let layout = crate::store::resolved_layout(dict, quads.dtype())?;
         Self::assemble_resident(quads, components, layout)
     }
 }

@@ -322,7 +322,7 @@ impl IndexType {
     #[cfg(feature = "file-io")]
     pub(crate) async fn resolve_file(
         self,
-        file: &Arc<crate::store::native_file::NativeStoreFile>,
+        file: &Arc<crate::store::persist::native_file::NativeStoreFile>,
         layout: &ResolvedLayout,
         pattern: QuadPattern<'_>,
         codes: &mut PatternCodes,
@@ -380,7 +380,7 @@ impl ResolvedRoles {
 /// resolutions, `FileServePlan` for file ones), so a resolution can only ever
 /// hand the store a plan its own backend can execute.
 ///
-/// [`RowSelection`]: crate::store::selection::RowSelection
+/// [`RowSelection`]: crate::store::view::selection::RowSelection
 // `Resolved` dwarfs the dataless `Declined`, but the enum is a transient
 // per-match return value that is destructured immediately and never stored
 // in bulk.
@@ -478,7 +478,7 @@ enum LazyRowIdSource {
         /// The owning file handle's bind memo and this child's scope tag —
         /// so the deferred scan binds with the same identity every plan and
         /// eager scan of this component uses (see `BoundExprMemo`).
-        memo: Arc<crate::store::native_file::BoundExprMemo>,
+        memo: Arc<crate::store::persist::native_file::BoundExprMemo>,
         scope: &'static str,
     },
     /// File-backed: a located run of an index child's rid column — read on
@@ -486,7 +486,7 @@ enum LazyRowIdSource {
     /// so a count needs none of it.
     #[cfg(feature = "file-io")]
     LocatedRun {
-        file: Arc<crate::store::native_file::NativeStoreFile>,
+        file: Arc<crate::store::persist::native_file::NativeStoreFile>,
         component: &'static str,
         reader: vortex_layout::LayoutReaderRef,
         rid_column: &'static str,
@@ -534,7 +534,7 @@ impl LazyRowIds {
         reader: vortex_layout::LayoutReaderRef,
         constraints: Vec<(&'static str, Scalar)>,
         rid_column: &'static str,
-        memo: Arc<crate::store::native_file::BoundExprMemo>,
+        memo: Arc<crate::store::persist::native_file::BoundExprMemo>,
         scope: &'static str,
     ) -> Self {
         Self {
@@ -552,7 +552,7 @@ impl LazyRowIds {
     /// Lazy ids over a located run of a file index child.
     #[cfg(feature = "file-io")]
     pub(crate) fn from_located_run(
-        file: Arc<crate::store::native_file::NativeStoreFile>,
+        file: Arc<crate::store::persist::native_file::NativeStoreFile>,
         component: &'static str,
         reader: vortex_layout::LayoutReaderRef,
         rid_column: &'static str,
@@ -779,7 +779,7 @@ pub(crate) fn resolve_indexes_in_memory(
 #[cfg(feature = "file-io")]
 pub(crate) async fn resolve_indexes_file(
     indexes: &[IndexType],
-    file: &Arc<crate::store::native_file::NativeStoreFile>,
+    file: &Arc<crate::store::persist::native_file::NativeStoreFile>,
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,

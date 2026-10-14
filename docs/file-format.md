@@ -174,7 +174,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 On open the layout checks that the child count is `1 + components.len()`,
 that child 0 has the root's row count, and that every component child's dtype
 matches its descriptor ([`deserialize`](../core/src/io/container/layout.rs#L52));
-[`classify_component`](../core/src/store/open.rs#L84) then turns each
+[`classify_component`](../core/src/store/persist/open.rs#L84) then turns each
 descriptor into the dictionary, a known index, or a skip.
 
 ---
@@ -282,7 +282,7 @@ chunks are not one uniform window (chunks adopted from a foreign file) is
 written without the zone map; readers inspect the layout for it.
 
 **Reading it from a file.** A file store is memory-mapped
-([`from_file`](../core/src/store/open.rs#L177)) and the dictionary stays in
+([`from_file`](../core/src/store/persist/open.rs#L177)) and the dictionary stays in
 its child
 ([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L258)).
 At open the handle reads the zone table — one small segment — and keeps, per
@@ -337,7 +337,7 @@ Shared rules:
   `u64` codes under `Dictionary`. `rid` is always a non-nullable `u64`
   ([`RowId`](../core/src/store/schema.rs#L38)), under every layout; a child
   whose `rid` is an integer of any other width is refused at open
-  ([`check_id_columns`](../core/src/store/open.rs#L39)): rebuild such a store
+  ([`check_id_columns`](../core/src/store/persist/open.rs#L39)): rebuild such a store
   from its RDF source.
 - **Row ids do not limit a store.** A `u64` row id numbers more rows than any
   store holds. The builds still number rows with checked arithmetic — up
@@ -470,7 +470,7 @@ a call is working on and the bounded structures below. Residency is the
 kernel's decision; no segment cache sits in between.
 
 What a file store keeps for its lifetime, and what bounds it. The opened handle
-([`NativeStoreFile`](../core/src/store/native_file.rs#L38)) and the file-backed
+([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L38)) and the file-backed
 dictionary handle
 ([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L258))
 keep:
@@ -520,7 +520,7 @@ filesystems are unsupported for mapping.
 ## 9. The in-memory twin
 
 A store in memory holds the same three pieces the file does, in the forms the
-read paths are written against ([`QuadsSource`](../core/src/store/source.rs#L35)):
+read paths are written against ([`QuadsSource`](../core/src/store/view/mod.rs#L37)):
 
 | In the file | In memory |
 |---|---|
@@ -597,7 +597,7 @@ open rather than being read around.
 | `WINDOW_ENTRY_OVERHEAD` | 4 KiB charged per cached window beyond its chunk's bytes | [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs#L82) |
 | `DICT_VERSION` | 2 | [`container/mod.rs`](../core/src/io/container/mod.rs#L68) |
 | `INDEX_VERSION` | 1 | [`container/mod.rs`](../core/src/io/container/mod.rs#L72) |
-| `POINT_GATHER_MAX_ROWS` | 256 rows — a located run at most this wide is point-read through the chunk probes | [`selection.rs`](../core/src/store/selection.rs#L489) |
+| `POINT_GATHER_MAX_ROWS` | 256 rows — a located run at most this wide is point-read through the chunk probes | [`selection.rs`](../core/src/store/view/selection.rs#L489) |
 | `POINT_READ_ROWS` | 256 rows — exact row ids at most one per this many rows of the splits holding them check a pending filter by point reads ([matching.md §7](matching.md#7-the-file-path)) | [`file_scan.rs`](../core/src/store/scan/file_scan.rs#L880) |
 | `POINT_IDS_PER_SPLIT` | 16 ids — exact ids at most this many per split they touch are read point by point ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`file_scan.rs`](../core/src/store/scan/file_scan.rs#L1039) |
 | `TAKE_ROWS` | 16 rows — exact ids at most one per this many rows of their splits are taken at their rows rather than scanned | [`file_scan.rs`](../core/src/store/scan/file_scan.rs#L916) |
@@ -613,12 +613,12 @@ open rather than being read around.
 | Container identity, root layout vtable, component addressing | [`core/src/io/container/mod.rs`](../core/src/io/container/mod.rs), [`layout.rs`](../core/src/io/container/layout.rs) |
 | Inventory descriptors and their JSON codec | [`core/src/io/container/wire.rs`](../core/src/io/container/wire.rs) |
 | Write strategy, component sources | [`core/src/io/container/write.rs`](../core/src/io/container/write.rs), [`sources.rs`](../core/src/io/container/sources.rs) |
-| Opening files (mapped or loaded) and bytes, roster interpretation, scan drivers | [`core/src/store/open.rs`](../core/src/store/open.rs), [`core/src/io/read.rs`](../core/src/io/read.rs) |
-| The opened-file handle and its bounded memos | [`core/src/store/native_file.rs`](../core/src/store/native_file.rs) |
+| Opening files (mapped or loaded) and bytes, roster interpretation, scan drivers | [`core/src/store/persist/open.rs`](../core/src/store/persist/open.rs), [`core/src/io/read.rs`](../core/src/io/read.rs) |
+| The opened-file handle and its bounded memos | [`core/src/store/persist/native_file.rs`](../core/src/store/persist/native_file.rs) |
 | Primary column names | [`core/src/store/schema.rs`](../core/src/store/schema.rs), [`layouts/typed_object.rs`](../core/src/store/layouts/typed_object.rs) |
 | Term dictionary: storage, FSST windows, zone-mapped window bounds, file-backed reads | [`core/src/store/layouts/dictionary/term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`access.rs`](../core/src/store/layouts/dictionary/access.rs), [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs) |
 | Index children: schemas, sort orders, registry, adoption | [`core/src/store/indexes/secondary_by_copy.rs`](../core/src/store/indexes/secondary_by_copy.rs), [`secondary_by_reference.rs`](../core/src/store/indexes/secondary_by_reference.rs), [`components.rs`](../core/src/store/indexes/components.rs) |
 | Chunk probes over wire-encoded leaves | [`encoded-search/src/layout.rs`](../encoded-search/src/layout.rs), [`lib.rs`](../encoded-search/src/lib.rs) |
 | Locating and point-reading index runs on file | [`core/src/store/indexes/row_ids.rs`](../core/src/store/indexes/row_ids.rs), [`scan/gather.rs`](../core/src/store/scan/gather.rs) |
-| In-memory forms: compressed-resident columns, probes, view state | [`core/src/store/array.rs`](../core/src/store/array.rs), [`probes.rs`](../core/src/store/probes.rs), [`source.rs`](../core/src/store/source.rs) |
+| In-memory forms: compressed-resident columns, probes, view state | [`core/src/store/array.rs`](../core/src/store/array.rs), [`probes.rs`](../core/src/store/probes.rs), [`view/mod.rs`](../core/src/store/view/mod.rs) |
 | Session: registered encodings and zone aggregates | [`core/src/session.rs`](../core/src/session.rs) |

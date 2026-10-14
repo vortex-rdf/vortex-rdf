@@ -2,38 +2,24 @@
 // here (or at the crate root), so each has exactly one canonical public path.
 pub(crate) mod array;
 pub(crate) mod builders;
-pub mod columns;
 pub(crate) mod indexes;
 pub(crate) mod layouts;
-#[cfg(feature = "file-io")]
-pub(crate) mod native_file;
+pub(crate) mod persist;
 pub(crate) mod probes;
+pub(crate) mod query;
+pub(crate) mod read;
 pub(crate) mod scan;
 pub(crate) mod schema;
-pub(crate) mod selection;
-pub(crate) mod source;
-
-// [`VortexRdfStore`]'s impl clusters — the struct itself is defined below.
-mod batch;
-mod compaction;
-mod export;
-mod matching;
-mod mutation;
-mod narrowing;
-mod open;
-mod rows;
-mod serialize;
-mod streaming;
 #[cfg(test)]
 pub(crate) mod test_hooks;
+pub(crate) mod view;
+pub(crate) mod write;
 
 pub use builders::{
     BuiltArray, BuiltStream, ChunkStream, SortedInMemoryBuilder, VortexArrayBuilder,
 };
-pub use export::export_rdf;
 // Compiled out on wasm along with the rest of the sorted-stream builder's
 // out-of-core merge (see the module gate in `builders`).
-pub use batch::Probe;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use builders::SortedStreamBuilder;
 pub use indexes::{IndexType, Indexes};
@@ -42,22 +28,24 @@ pub use layouts::dictionary::DictionaryQuadSink;
 pub use layouts::dictionary::{
     CaseMap, DictReader, DictSnapshot, KindRanges, NumOp, TermPredicate, TextOptions, Verdict,
 };
-pub(crate) use matching::IdsNeed;
-pub use narrowing::Keep;
+pub use persist::export::export_rdf;
+pub use query::batch::Probe;
+pub(crate) use query::matching::IdsNeed;
+pub use query::narrowing::Keep;
 pub use schema::{QuadColumn, RowId, TermCode};
 // `RawQuad` lives in `common` (it is pure RDF text — see that module's
 // charter); this re-export makes `store::RawQuad` the path builder consumers
 // use.
 pub use crate::common::quad::{RawQuad, SharedQuad};
 
-pub(crate) use source::{QuadsSource, Tail};
+pub(crate) use view::{QuadsSource, Tail};
 
 use indexes::IndexComponent;
 
 use crate::error::{Result, VortexRdfError};
 use layouts::dictionary::TermDictionary;
 use layouts::{DictAccess, ResolvedLayout};
-use selection::{RowSelection, ViewSelection};
+use view::selection::{RowSelection, ViewSelection};
 
 use std::iter;
 use std::sync::Arc;

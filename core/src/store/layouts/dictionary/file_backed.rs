@@ -11,7 +11,7 @@
 //! of a child written without them (chunks of uneven length have no uniform
 //! zone to record) — and the kind ranges. A child whose shape a window
 //! search cannot address is not file-backed at all:
-//! [`store::open`](crate::store::open) lifts it resident instead. The policy
+//! [`store::persist::open`](crate::store::persist::open) lifts it resident instead. The policy
 //! enum choosing between this and the resident form is
 //! [`DictAccess`](super::access::DictAccess); the module only compiles with
 //! `file-io`, since without a file there is nothing to leave the terms in.
@@ -40,7 +40,7 @@ use crate::io::container::DICT_COMPONENT_NAME;
 use crate::io::read::available_parallelism;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::StrColReader;
-use crate::store::native_file::NativeStoreFile;
+use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::schema::TermCode;
 
 use super::check_code;

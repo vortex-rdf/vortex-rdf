@@ -1681,7 +1681,7 @@ mod tests {
     #[tokio::test]
     async fn unzoned_dict_child_point_reads_file_backed() {
         use crate::store::layouts::dictionary::file_backed;
-        use crate::store::native_file::NativeStoreFile;
+        use crate::store::persist::native_file::NativeStoreFile;
         use vortex_buffer::ByteBuffer;
         use vortex_file::OpenOptionsSessionExt as _;
 

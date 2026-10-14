@@ -605,7 +605,7 @@ mod file {
     /// exact across the retirement, and the memo stays within its cap.
     #[tokio::test]
     async fn test_distinct_constants_retire_the_reader_tree() {
-        let distinct = crate::store::native_file::BIND_MEMO_MAX + 200;
+        let distinct = crate::store::persist::native_file::BIND_MEMO_MAX + 200;
         let quads: Vec<Quad> = (0..distinct)
             .map(|i| {
                 make_quad(
@@ -633,7 +633,7 @@ mod file {
         }
 
         assert!(
-            store.debug_bound_exprs().unwrap() <= crate::store::native_file::BIND_MEMO_MAX,
+            store.debug_bound_exprs().unwrap() <= crate::store::persist::native_file::BIND_MEMO_MAX,
             "the bound tree memo is capped"
         );
         assert!(

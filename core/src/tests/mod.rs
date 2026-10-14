@@ -474,24 +474,26 @@ pub(crate) fn widely_varying_terms() -> Vec<String> {
 
 /// A native store file opened over `bytes` held in memory (no file behind it).
 #[cfg(feature = "file-io")]
-pub(crate) fn open_native_bytes(bytes: Vec<u8>) -> crate::store::native_file::NativeStoreFile {
+pub(crate) fn open_native_bytes(
+    bytes: Vec<u8>,
+) -> crate::store::persist::native_file::NativeStoreFile {
     use vortex_file::OpenOptionsSessionExt as _;
     let file = crate::session::VORTEX_SESSION
         .open_options()
         .open_buffer(vortex_buffer::ByteBuffer::from(bytes))
         .unwrap();
-    crate::store::native_file::NativeStoreFile::try_new(file).unwrap()
+    crate::store::persist::native_file::NativeStoreFile::try_new(file).unwrap()
 }
 
 /// `path` opened mapped, as a file-backed store opens it: the
-/// [`NativeStoreFile`](crate::store::native_file::NativeStoreFile) around the
+/// [`NativeStoreFile`](crate::store::persist::native_file::NativeStoreFile) around the
 /// opened file.
 #[cfg(feature = "file-io")]
 pub(crate) async fn open_mapped(
     path: &std::path::Path,
-) -> crate::store::native_file::NativeStoreFile {
+) -> crate::store::persist::native_file::NativeStoreFile {
     use crate::io::read::{FileAccess, open_vortex_file};
-    crate::store::native_file::NativeStoreFile::try_new(
+    crate::store::persist::native_file::NativeStoreFile::try_new(
         open_vortex_file(path, FileAccess::Mapped).await.unwrap(),
     )
     .unwrap()
@@ -506,7 +508,7 @@ pub(crate) async fn mapped_file(
     indexes: Indexes,
 ) -> (
     tempfile::TempDir,
-    crate::store::native_file::NativeStoreFile,
+    crate::store::persist::native_file::NativeStoreFile,
 ) {
     let (dir, path) = write_store_file_for_tests(modular_quads_for_tests(n), indexes).await;
     (dir, open_mapped(&path).await)
@@ -517,7 +519,7 @@ pub(crate) async fn mapped_file(
 /// when the column carries zone maps, its chunked (or flat) data otherwise.
 #[cfg(feature = "file-io")]
 pub(crate) fn dict_term_column(
-    native: &crate::store::native_file::NativeStoreFile,
+    native: &crate::store::persist::native_file::NativeStoreFile,
 ) -> vortex_layout::LayoutRef {
     use crate::io::container::DICT_COMPONENT_NAME;
     use crate::store::layouts::dictionary::term_dict::COL_DICT_TERM;

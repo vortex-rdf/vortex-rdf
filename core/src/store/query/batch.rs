@@ -8,11 +8,11 @@ use futures::future::try_join_all;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 
 use crate::error::Result;
-use crate::store::narrowing::Keep;
+use crate::store::query::narrowing::Keep;
 use crate::store::schema::QuadColumn;
 
-use super::IdsNeed;
-use super::VortexRdfStore;
+use crate::store::IdsNeed;
+use crate::store::VortexRdfStore;
 
 /// One probe of a batch: a pattern (`None` = free, as for
 /// [`match_pattern`](VortexRdfStore::match_pattern)) with the narrowing to

@@ -17,7 +17,7 @@ use crate::store::layouts::{Constraints, PatternCodes, QuadPattern, ResolvedLayo
 use crate::store::scan::file_scan;
 use crate::store::scan::typed_eq::{typed_positions, typed_residual_ids};
 use crate::store::schema;
-use crate::store::selection::{RowSelection, ViewSelection};
+use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{QuadsSource, Tail};
 
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
@@ -36,7 +36,7 @@ use vortex_mask::Mask;
 #[cfg(feature = "file-io")]
 use vortex_array::expr::and;
 
-use super::VortexRdfStore;
+use crate::store::VortexRdfStore;
 
 /// What the caller of a match will do with the view's selection — whether a
 /// located index run may leave its row ids unread without a serve plan.
@@ -205,7 +205,7 @@ impl VortexRdfStore {
     /// pattern unmatchable (e.g. a term absent from the dictionary), read off
     /// the prelude's role cache: such a pattern needs no search, and no scan
     /// machinery, whichever backend holds the rows.
-    pub(super) async fn prepared_codes(
+    pub(in crate::store) async fn prepared_codes(
         &self,
         pattern: QuadPattern<'_>,
     ) -> Result<Option<PatternCodes>> {
