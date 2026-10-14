@@ -243,6 +243,12 @@ impl DataSource for VortexRdfDataSource {
                 .row_mask(&(0..1))
                 .mask()
                 .value(0);
+        // A partition sizes its rows only where the source sizes its own: at
+        // the width of a projected row.
+        let width = match self.byte_size {
+            Precision::Absent => None,
+            _ => row_width(&dtype),
+        };
         let partition = wanted.then(|| ViewPartition {
             rows: self.rows.clone(),
             dtype: dtype.clone(),
@@ -254,7 +260,7 @@ impl DataSource for VortexRdfDataSource {
                 limit: request.limit,
             }),
             row_count: self.row_count,
-            byte_size: self.byte_size,
+            row_width: width,
         });
         Ok(Box::new(ViewScan { dtype, partition }))
     }
@@ -323,8 +329,10 @@ struct ViewPartition {
     rows: Rows,
     dtype: DType,
     plan: Arc<RequestPlan>,
+    /// The source's row count.
     row_count: Precision<u64>,
-    byte_size: Precision<u64>,
+    /// The bytes of one projected row, when the partition reports a size.
+    row_width: Option<u64>,
 }
 
 impl Partition for ViewPartition {
@@ -352,8 +360,12 @@ impl Partition for ViewPartition {
         rows
     }
 
+    /// The partition's [`row_count`](Self::row_count) of projected rows.
     fn byte_size(&self) -> Precision<u64> {
-        self.byte_size
+        match self.row_width {
+            Some(width) => self.row_count().map(|n| n.saturating_mul(width)),
+            None => Precision::Absent,
+        }
     }
 
     fn execute(self: Box<Self>) -> VortexResult<SendableArrayStream> {

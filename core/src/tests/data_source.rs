@@ -32,19 +32,22 @@ fn filtered(filter: Expression) -> ScanRequest {
 }
 
 /// What one scan of `source` advertises before it reads: its partition
-/// count, and each partition's row count.
-async fn partition_counts(
+/// count, and each partition's row count and byte size.
+async fn partition_stats(
     source: &DataSourceRef,
     request: ScanRequest,
-) -> (Precision<usize>, Vec<Precision<u64>>) {
+) -> (Precision<usize>, Vec<(Precision<u64>, Precision<u64>)>) {
     let scan = source.scan(request).await.unwrap();
     let count = scan.partition_count();
-    let rows = scan
+    let partitions = scan
         .partitions()
-        .map(|partition| partition.unwrap().row_count())
+        .map(|partition| {
+            let partition = partition.unwrap();
+            (partition.row_count(), partition.byte_size())
+        })
         .collect()
         .await;
-    (count, rows)
+    (count, partitions)
 }
 
 /// `view`'s source scans to its base-ordered codes under a non-nullable
@@ -280,10 +283,11 @@ async fn test_data_source_request_semantics() {
         .collect();
     assert_eq!(both, want_both, "a range, a selection and a limit together");
 
-    // The one partition's count: exact under a row window or a limit, a
-    // bound while a filter or a selection has rows to test.
-    for (tag, request, rows) in [
-        ("whole", ScanRequest::default(), Precision::exact(len)),
+    // The one partition's count, exact under a row window or a limit and a
+    // bound while a filter or a selection has rows to test, and its byte
+    // size: that count of rows of the projected width.
+    for (tag, request, rows, width) in [
+        ("whole", ScanRequest::default(), Precision::exact(len), 32),
         (
             "row range",
             ScanRequest {
@@ -291,6 +295,7 @@ async fn test_data_source_request_semantics() {
                 ..Default::default()
             },
             Precision::exact(2_850u64),
+            32,
         ),
         (
             "limit",
@@ -299,8 +304,19 @@ async fn test_data_source_request_semantics() {
                 ..Default::default()
             },
             Precision::exact(17u64),
+            32,
         ),
-        ("filter", filtered(p1_eq()), Precision::inexact(len)),
+        (
+            "one column, limited",
+            ScanRequest {
+                projection: select(["s"], root()),
+                limit: Some(17),
+                ..Default::default()
+            },
+            Precision::exact(17u64),
+            8,
+        ),
+        ("filter", filtered(p1_eq()), Precision::inexact(len), 32),
         (
             "selection",
             ScanRequest {
@@ -308,11 +324,15 @@ async fn test_data_source_request_semantics() {
                 ..Default::default()
             },
             Precision::inexact(len),
+            32,
         ),
     ] {
         assert_eq!(
-            partition_counts(&source, request).await,
-            (Precision::exact(1usize), vec![rows]),
+            partition_stats(&source, request).await,
+            (
+                Precision::exact(1usize),
+                vec![(rows, rows.map(|n| n * width))]
+            ),
             "{tag}"
         );
     }
@@ -335,7 +355,7 @@ async fn test_data_source_request_semantics() {
         ),
     ] {
         assert_eq!(
-            partition_counts(&source, request.clone()).await,
+            partition_stats(&source, request.clone()).await,
             (Precision::exact(0usize), vec![]),
             "{tag}"
         );
@@ -458,6 +478,7 @@ async fn assert_component_tables(store: &VortexRdfStore, tag: &str) -> usize {
             Some(base.len() as u64),
             "{tag}: one row per quad"
         );
+        assert_unsized(&table, &tag).await;
         let chunks = scan_chunks(&table, ScanRequest::default()).await;
         let rids: Vec<u64> = match child.sort_order {
             // A copy child: the base's quads in the child's order.
@@ -514,6 +535,16 @@ async fn assert_component_tables(store: &VortexRdfStore, tag: &str) -> usize {
     children.len()
 }
 
+/// A child's table reports no byte size, and neither do its partitions.
+async fn assert_unsized(table: &DataSourceRef, tag: &str) {
+    assert_eq!(table.byte_size(), Precision::Absent, "{tag}: no byte size");
+    let (_, partitions) = partition_stats(table, ScanRequest::default()).await;
+    assert!(
+        partitions.iter().all(|(_, bytes)| bytes.is_absent()),
+        "{tag}: no partition byte size in {partitions:?}"
+    );
+}
+
 /// The `dictionary` child's table: `{_dict_term}`, one strictly sorted row
 /// per term, row i the term of code i.
 #[cfg(feature = "file-io")]
@@ -528,6 +559,7 @@ async fn assert_dictionary_component(store: &VortexRdfStore, tag: &str) {
         Some(dict.len() as u64),
         "{tag}: one row per term"
     );
+    assert_unsized(&table, tag).await;
     let chunks = scan_chunks(&table, ScanRequest::default()).await;
     assert_eq!(field_names(&chunks[0]), ["_dict_term"], "{tag}");
     let terms = chunk_strings(&chunks, "_dict_term");
