@@ -117,6 +117,63 @@ async fn test_chunks_take_sparse_file_ids() {
     assert_eq!(row_rows, expected, "row_chunks");
 }
 
+/// A subject run on a sorted file whose bound role past a gap in the
+/// `(s, p, o, g)` order stays a pending filter — `<s> ?p "plain"`, and
+/// `GRAPH <g> { <s> <p2> ?o }` — is point-sized, so its code chunks read it
+/// by id even when they project only an unbound role. With the split limit
+/// forced to zero a scan would spawn its splits; nothing spawns, and the
+/// chunks are the view's base-ordered codes.
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn test_chunks_read_filtered_file_runs_by_id() {
+    use crate::store::scan::file_reads::driver_hooks;
+
+    let (_dir, path) =
+        write_store_file(term_kind_quads(), LayoutStrategy::Dictionary, vec![]).await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s").unwrap());
+    let p2 = NamedNode::new("http://example.org/p2").unwrap();
+    let plain = Term::Literal(Literal::new_simple_literal("plain"));
+    let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
+    let views = [
+        (
+            "<s> ?p \"plain\"",
+            store
+                .match_pattern(Some(&s), None, Some(&plain), None)
+                .await
+                .unwrap(),
+            QuadColumn::P,
+            1,
+        ),
+        (
+            "GRAPH <g> { <s> <p2> ?o }",
+            store
+                .match_pattern(Some(&s), Some(&p2), None, Some(&g))
+                .await
+                .unwrap(),
+            QuadColumn::O,
+            2,
+        ),
+    ];
+    for (tag, view, column, rows) in views {
+        let expected: Vec<Vec<TermCode>> = base_ordered_codes(&view)
+            .await
+            .iter()
+            .map(|row| vec![row[column.index()]])
+            .collect();
+        assert_eq!(expected.len(), rows, "{tag}");
+        let _limit = driver_hooks::ForcedLimit::set(0);
+        driver_hooks::take_spawned();
+        let (codes, _) = collect_code_chunks(&view, &[column], 256).await;
+        assert_eq!(
+            driver_hooks::take_spawned(),
+            0,
+            "{tag}: read by id, not scanned"
+        );
+        assert_eq!(codes, expected, "{tag}");
+    }
+}
+
 /// A file view's chunks read with no tokio runtime: a bare executor on a
 /// plain thread polls them, with the split limit forced to zero so the scan
 /// would spawn wherever a runtime were there to spawn onto. Nothing is

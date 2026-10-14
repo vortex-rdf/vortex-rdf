@@ -68,10 +68,12 @@ impl VortexRdfStore {
     /// ([`dict_reader`](Self::dict_reader) decodes them).
     ///
     /// In memory the buffers are slices of the base's own code columns —
-    /// zero-copy for a contiguous selection without tombstones; on file only
-    /// `columns` are read. Errors: `batch_rows == 0`, no columns, or a view
-    /// whose rows are not code-addressable (a string layout, or a Dictionary
-    /// view with a non-empty tail).
+    /// zero-copy for a contiguous selection without tombstones. On file the
+    /// scan, and a read by id with no filter pending, read only `columns`; a
+    /// read by id under a pending filter reads every primary column. Errors:
+    /// `batch_rows == 0`, no columns, or a view whose rows are not
+    /// code-addressable (a string layout, or a Dictionary view with a
+    /// non-empty tail).
     pub fn code_chunks(
         &self,
         columns: &[QuadColumn],
@@ -174,9 +176,16 @@ impl VortexRdfStore {
                 ..
             } => {
                 let selection = selection.materialized_async().await?;
+                // A read by id checks a pending filter on the columns it
+                // reads, so under one it reads every primary column; the
+                // requested ones are picked out of each chunk by name.
+                let by_id_columns = match filter {
+                    Some(_) => self.layout.strategy().primary_column_names(),
+                    None => &names[..],
+                };
                 if let Some(rows) = Self::exact_rows_by_id(
                     file,
-                    &names,
+                    by_id_columns,
                     filter.as_ref(),
                     &selection,
                     deleted.as_ref(),
