@@ -517,3 +517,63 @@ async fn codes_past_u32_survive_mutation_rebuilds() {
     quads.pop();
     check_store(&shrunk, &quads, "deleted and compacted").await;
 }
+
+/// `code_chunks` and `row_chunks` of `store`, built or opened under the
+/// [`BASE`] guard, over the whole store, an index-served predicate match and
+/// a subject run: each export answers the gathered codes in base row order,
+/// and every code it yields is at least the base.
+async fn check_chunk_exports(store: &VortexRdfStore, label: &str) {
+    let name = iri("name");
+    let alice = subject("alice");
+    let views = [
+        ("whole", store.clone()),
+        (
+            "predicate",
+            store
+                .match_pattern(None, Some(&name), None, None)
+                .await
+                .unwrap(),
+        ),
+        (
+            "subject",
+            store
+                .match_pattern(Some(&alice), None, None, None)
+                .await
+                .unwrap(),
+        ),
+    ];
+    for (tag, view) in &views {
+        let expected = base_ordered_codes(view).await;
+        assert!(!expected.is_empty(), "{label} {tag}");
+        let (codes, _) = collect_code_chunks(view, &QuadColumn::ALL, 2).await;
+        assert!(
+            codes.iter().flatten().all(|&code| code >= BASE),
+            "{label} {tag}: a code_chunks code fits 32 bits"
+        );
+        let codes: Vec<[TermCode; 4]> = codes.iter().map(|r| [r[0], r[1], r[2], r[3]]).collect();
+        assert_eq!(codes, expected, "{label} {tag}: code_chunks");
+        let rows = chunk_codes(&collect_row_chunks(view, 2).await);
+        assert!(
+            rows.iter().flatten().all(|&code| code >= BASE),
+            "{label} {tag}: a row_chunks code fits 32 bits"
+        );
+        assert_eq!(rows, expected, "{label} {tag}: row_chunks");
+    }
+}
+
+/// The chunk exports carry codes past `u32::MAX` unchanged: on an in-memory
+/// build, and on its file opened mapped, loaded whole and adopted from its
+/// bytes.
+#[tokio::test]
+async fn codes_past_u32_through_the_chunk_exports() {
+    let _base = CodeBase::set(BASE);
+    let built = built_store(dataset(), LayoutStrategy::Dictionary, indexes()).await;
+    check_chunk_exports(&built, "built in memory").await;
+    #[cfg(feature = "file-io")]
+    {
+        let (_dir, path) = write_store_file(dataset(), LayoutStrategy::Dictionary, indexes()).await;
+        for (open, store) in reopened_stores(&path).await {
+            check_chunk_exports(&store, open).await;
+        }
+    }
+}

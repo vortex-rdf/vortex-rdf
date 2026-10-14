@@ -158,7 +158,6 @@ pub(crate) async fn read_all_rows(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRe
 /// driver is [`ScanDriver::for_row_scan`]'s, as for [`read_all_rows`] —
 /// [`inline_splits`] polls the split futures as the stream is polled,
 /// [`spawned_splits`] spawns them, `scan.concurrency()` per core in flight.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn stream_rows(
     scan: ScanBuilder<ArrayRef>,
 ) -> Result<BoxStream<'static, Result<ArrayRef>>> {

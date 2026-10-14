@@ -14,6 +14,7 @@ mod adoption;
 #[cfg(feature = "file-io")]
 mod atomic_write;
 mod builders;
+mod chunks;
 mod dictionary;
 #[cfg(feature = "file-io")]
 mod dictionary_file_backed;
@@ -618,6 +619,237 @@ fn graph_modular_quads(
             )
         })
         .collect()
+}
+
+/// 3,000 quads `s{i:04} p{i % 5} "o{i % 7}"` cycling through the default
+/// graph, `g1` and `g2`: the dataset of the suites that check narrowed views
+/// and their exports against the gathered codes. Subjects are unique, so a
+/// bound subject matches one row.
+fn fixture_quads() -> Vec<Quad> {
+    let g = |name: &str| {
+        GraphName::NamedNode(NamedNode::new(format!("http://example.org/{name}")).unwrap())
+    };
+    graph_modular_quads(3_000, 4, 5, 7, &[GraphName::DefaultGraph, g("g1"), g("g2")])
+}
+
+/// `n` quads `tail{i} p9 "late"` in the default graph, terms
+/// [`fixture_quads`] lacks: rows to append into a tail.
+fn appended_quads(n: usize) -> Vec<Quad> {
+    (0..n)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/tail{i}"),
+                "http://example.org/p9",
+                "late",
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect()
+}
+
+/// The three opens of the store file at `path`, each beside its tag: mapped
+/// (`from_file`, a Dictionary layout's dictionary file-backed), loaded whole
+/// (`from_file_in_memory`) and adopted from its bytes (`from_bytes_owned`).
+#[cfg(feature = "file-io")]
+async fn reopened_stores(path: &std::path::Path) -> [(&'static str, VortexRdfStore); 3] {
+    [
+        ("mapped", VortexRdfStore::from_file(path).await.unwrap()),
+        (
+            "loaded",
+            VortexRdfStore::from_file_in_memory(path).await.unwrap(),
+        ),
+        (
+            "bytes",
+            VortexRdfStore::from_bytes_owned(std::fs::read(path).unwrap())
+                .await
+                .unwrap(),
+        ),
+    ]
+}
+
+/// [`fixture_quads`] written as a Dictionary-layout file with no index, the
+/// copy index and the reference index, each file opened every way
+/// [`reopened_stores`] opens it. Each store is tagged `file/<index>/<open>`
+/// and comes beside its file's dir guard; keep the guard alive for the
+/// store's lifetime.
+#[cfg(feature = "file-io")]
+async fn file_stores() -> Vec<(String, std::sync::Arc<tempfile::TempDir>, VortexRdfStore)> {
+    let mut stores = Vec::new();
+    for (tag, indexes) in [
+        ("file/no-index", vec![]),
+        ("file/copy", vec![IndexType::SecondaryByCopy]),
+        ("file/reference", vec![IndexType::SecondaryByReference]),
+    ] {
+        let (dir, path) =
+            write_store_file(fixture_quads(), LayoutStrategy::Dictionary, indexes).await;
+        let dir = std::sync::Arc::new(dir);
+        for (open, store) in reopened_stores(&path).await {
+            assert_eq!(
+                store.dict_reader().unwrap().is_file_backed(),
+                open == "mapped",
+                "{tag}/{open}: only the mapped open keeps its dictionary in the file"
+            );
+            stores.push((format!("{tag}/{open}"), std::sync::Arc::clone(&dir), store));
+        }
+    }
+    stores
+}
+
+/// The views of a [`fixture_quads`] Dictionary-layout store the planner
+/// suites check: the whole store, a bound subject, an index-eligible
+/// predicate and object, a subject keep, a window, two chained patterns and
+/// an empty window.
+async fn views_of(store: &VortexRdfStore) -> Vec<(&'static str, VortexRdfStore)> {
+    let s = subject_node(17, 4);
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let o3 = Term::Literal(Literal::new_simple_literal("o3"));
+    let dict = store.dict_reader().unwrap();
+    let (lo, hi) = dict.prefix_range("<http://example.org/s1").await.unwrap();
+    let predicate = store
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    let chained = predicate
+        .match_pattern(None, None, Some(&o3), None)
+        .await
+        .unwrap();
+    vec![
+        ("whole", store.clone()),
+        (
+            "subject",
+            store
+                .match_pattern(Some(&s), None, None, None)
+                .await
+                .unwrap(),
+        ),
+        ("predicate", predicate),
+        (
+            "object",
+            store
+                .match_pattern(None, None, Some(&o3), None)
+                .await
+                .unwrap(),
+        ),
+        (
+            "keep",
+            store
+                .keep(QuadColumn::S, &Keep::range(lo..hi))
+                .await
+                .unwrap(),
+        ),
+        ("window", store.window(100, 250).await.unwrap()),
+        ("chained", chained),
+        ("empty", store.window(10_000, 5).await.unwrap()),
+    ]
+}
+
+/// The row tuples of a view's gathered codes, in the order gathered.
+async fn row_list(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
+    let cols = view
+        .code_columns_gathered()
+        .await
+        .unwrap()
+        .expect("a Dictionary-layout view without a tail gathers codes");
+    (0..cols[0].len())
+        .map(|i| [cols[0][i], cols[1][i], cols[2][i], cols[3][i]])
+        .collect()
+}
+
+/// The view's rows in base row order: a keep that admits every code drops
+/// any serve plan without dropping a row.
+async fn base_ordered_codes(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
+    let all = Keep::range(0..TermCode::MAX);
+    row_list(&view.keep(QuadColumn::S, &all).await.unwrap()).await
+}
+
+/// Every chunk [`code_chunks`](VortexRdfStore::code_chunks) yields for
+/// `view` over `columns` at `batch` rows, as rows in the requested column
+/// order, beside each chunk's row count. Asserts one buffer per requested
+/// column, all of one length.
+async fn collect_code_chunks(
+    view: &VortexRdfStore,
+    columns: &[QuadColumn],
+    batch: usize,
+) -> (Vec<Vec<TermCode>>, Vec<usize>) {
+    let mut stream = view.code_chunks(columns, batch).unwrap();
+    let mut rows = Vec::new();
+    let mut sizes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.unwrap();
+        assert_eq!(
+            chunk.len(),
+            columns.len(),
+            "one buffer per requested column"
+        );
+        let n = chunk[0].len();
+        assert!(
+            chunk.iter().all(|b| b.len() == n),
+            "column buffers agree in length"
+        );
+        sizes.push(n);
+        for i in 0..n {
+            rows.push(chunk.iter().map(|b| b[i]).collect());
+        }
+    }
+    (rows, sizes)
+}
+
+/// Every chunk [`row_chunks`](VortexRdfStore::row_chunks) yields for `view`
+/// at `batch` rows. Asserts each holds at least one row and at most `batch`.
+async fn collect_row_chunks(view: &VortexRdfStore, batch: usize) -> Vec<vortex_array::ArrayRef> {
+    let mut stream = view.row_chunks(batch).unwrap();
+    let mut chunks = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.unwrap();
+        assert!(
+            !chunk.is_empty() && chunk.len() <= batch,
+            "chunk of {} rows under batch {batch}",
+            chunk.len()
+        );
+        chunks.push(chunk);
+    }
+    chunks
+}
+
+/// The `(s, p, o, g)` codes of Dictionary-layout struct chunks, concatenated.
+fn chunk_codes(chunks: &[vortex_array::ArrayRef]) -> Vec<[TermCode; 4]> {
+    use crate::store::array::{field_as, into_struct_array};
+    use vortex_array::VortexSessionExecute as _;
+    use vortex_array::arrays::PrimitiveArray;
+
+    let mut rows = Vec::new();
+    for chunk in chunks {
+        let s = into_struct_array(chunk.clone()).unwrap();
+        let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
+        let [cs, cp, co, cg] = crate::store::schema::PRIMARY_COLUMNS.map(|name| {
+            field_as::<PrimitiveArray>(&s, name, &mut ctx)
+                .unwrap()
+                .into_buffer::<TermCode>()
+        });
+        for i in 0..cs.len() {
+            rows.push([cs[i], cp[i], co[i], cg[i]]);
+        }
+    }
+    rows
+}
+
+/// The `s` column strings of string-layout struct chunks, concatenated.
+fn chunk_subjects(chunks: &[vortex_array::ArrayRef]) -> Vec<String> {
+    use crate::store::array::{StrColReader, field_as, into_struct_array};
+    use vortex_array::VortexSessionExecute as _;
+    use vortex_array::arrays::VarBinViewArray;
+
+    let mut out = Vec::new();
+    for chunk in chunks {
+        let s = into_struct_array(chunk.clone()).unwrap();
+        let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
+        let col = field_as::<VarBinViewArray>(&s, "s", &mut ctx).unwrap();
+        let reader = StrColReader::new(&col);
+        for i in 0..col.len() {
+            out.push(reader.str_at(i).unwrap().to_string());
+        }
+    }
+    out
 }
 
 /// The two-quad dataset the Default and TypedObject probes match over.

@@ -1,6 +1,6 @@
 //! Low-level helpers over Vortex arrays: string-array construction, canonical
-//! string-column access, sortedness statistics, sorted-column binary search,
-//! and mask conversion.
+//! string-column access, sortedness statistics, chunk assembly and slicing,
+//! sorted-column binary search, and mask conversion.
 
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
@@ -133,6 +133,25 @@ pub(crate) fn chunked_or_single(mut chunks: Vec<ArrayRef>, dtype: DType) -> Resu
             .map_err(VortexRdfError::Vortex)?
             .into_array()),
     }
+}
+
+/// `rows` cut into slices of at most `batch_rows` rows, in row order: the
+/// array itself when it fits, no slice for an empty array.
+pub(crate) fn rechunk(rows: ArrayRef, batch_rows: usize) -> Result<Vec<ArrayRef>> {
+    let len = rows.len();
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if len <= batch_rows {
+        return Ok(vec![rows]);
+    }
+    (0..len)
+        .step_by(batch_rows)
+        .map(|start| {
+            rows.slice(start..(start + batch_rows).min(len))
+                .map_err(VortexRdfError::Vortex)
+        })
+        .collect()
 }
 
 /// `arr` as a `StructArray`: a plain downcast when it already is one, else

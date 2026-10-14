@@ -34,6 +34,7 @@ pub use persist::export::export_rdf;
 pub use query::batch::Probe;
 pub(crate) use query::matching::IdsNeed;
 pub use query::narrowing::Keep;
+pub use read::chunks::{CodeChunkStream, RowChunkStream};
 pub use schema::{QuadColumn, RowId, TermCode};
 // `RawQuad` lives in `common` (it is pure RDF text — see that module's
 // charter); this re-export makes `store::RawQuad` the path builder consumers
