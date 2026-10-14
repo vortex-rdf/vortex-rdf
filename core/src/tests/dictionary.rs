@@ -142,14 +142,7 @@ async fn test_dictionary_decode_survives_memo_slot_collisions() {
 #[tokio::test]
 async fn test_dictionary_match_and_mutations() {
     let quads = dictionary_test_quads();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
 
     // Subject match: hits the IsSorted binary-search fast path on the TermCode column.
     let s3 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s03").unwrap());
@@ -172,24 +165,12 @@ async fn test_dictionary_match_and_mutations() {
     // Terms absent from the dictionary match nothing (both routing paths).
     let missing_s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/nope").unwrap());
     assert_eq!(
-        store
-            .match_pattern(Some(&missing_s), None, None, None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
+        matched_size(&store, Some(&missing_s), None, None, None).await,
         0
     );
     let missing_p = NamedNode::new("http://example.org/nope").unwrap();
     assert_eq!(
-        store
-            .match_pattern(None, Some(&missing_p), None, None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
+        matched_size(&store, None, Some(&missing_p), None, None).await,
         0
     );
 
@@ -279,24 +260,12 @@ async fn test_dictionary_layout_secondary_index_compatibility() {
     // Terms absent from the dictionary match nothing through the index paths.
     let missing_o = Term::Literal(Literal::new_simple_literal("nope"));
     assert_eq!(
-        store
-            .match_pattern(None, None, Some(&missing_o), None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
+        matched_size(&store, None, None, Some(&missing_o), None).await,
         0
     );
     let missing_p = NamedNode::new("http://example.org/nope").unwrap();
     assert_eq!(
-        store
-            .match_pattern(None, Some(&missing_p), None, None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
+        matched_size(&store, None, Some(&missing_p), None, None).await,
         0
     );
 }
@@ -308,14 +277,12 @@ async fn test_dictionary_sorted_with_secondary_index() {
     // the subject binary-search range, the remaining bound terms are tested
     // as the residual over that range.
     let quads = dictionary_test_quads();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
+    let store = built_store(
+        quads.clone(),
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByReference],
     )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    .await;
 
     let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
     assert_eq!(quad_strings(&decoded), quad_strings(&quads));
@@ -335,13 +302,7 @@ async fn test_dictionary_sorted_with_secondary_index() {
     // s + o with an object that exists but not on that subject.
     let o0 = Term::Literal(Literal::new_simple_literal("object 0"));
     assert_eq!(
-        store
-            .match_pattern(Some(&s5), None, Some(&o0), None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
+        matched_size(&store, Some(&s5), None, Some(&o0), None).await,
         0
     );
 }
@@ -369,14 +330,7 @@ async fn test_dictionary_empty_dataset() {
 /// identically and would otherwise go unnoticed.
 #[tokio::test]
 async fn test_built_dictionary_terms_are_fsst() {
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(fsst_dictionary_quads()),
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(fsst_dictionary_quads(), LayoutStrategy::Dictionary, vec![]).await;
     assert_dictionary_terms_fsst(&store, "built");
 }
 
@@ -387,14 +341,7 @@ async fn test_built_dictionary_terms_are_fsst() {
 #[tokio::test]
 async fn test_code_read_snapshot_gate() {
     let quads = dictionary_test_quads();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
     assert!(store.code_read_snapshot().is_some());
 
     // An append opens a string tail whose rows have no codes in the cached
@@ -420,11 +367,7 @@ async fn test_code_read_snapshot_gate() {
     assert!(compacted.code_read_snapshot().is_some());
 
     // Non-Dictionary layouts have no codes at all.
-    let arr =
-        build_array::<SortedInMemoryBuilder>(quad_stream(quads), LayoutStrategy::Default, vec![])
-            .await
-            .unwrap();
-    let string_store = VortexRdfStore::from_built(arr).unwrap();
+    let string_store = built_store(quads, LayoutStrategy::Default, vec![]).await;
     assert!(string_store.code_read_snapshot().is_none());
 }
 
@@ -435,14 +378,12 @@ async fn test_code_read_snapshot_gate() {
 #[tokio::test]
 async fn test_code_read_snapshot_survives_from_bytes() {
     let quads = dictionary_test_quads();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
+    let store = built_store(
+        quads.clone(),
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByCopy],
     )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    .await;
     let adopted = VortexRdfStore::from_bytes(&store.to_bytes().await.unwrap())
         .await
         .unwrap();

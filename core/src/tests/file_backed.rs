@@ -189,13 +189,7 @@ async fn test_file_backed_subject_metadata_range_for_missing_subject() {
         .unwrap();
     assert_eq!(row_range, Some(0..0));
     assert_eq!(
-        store
-            .match_pattern(Some(&missing), None, None, None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
+        matched_size(&store, Some(&missing), None, None, None).await,
         0
     );
 }
@@ -258,14 +252,12 @@ async fn test_file_backed_subject_chunk_probe_matches_memory() {
     )
     .await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads),
+    let memory = built_store(
+        quads,
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByCopy],
     )
-    .await
-    .unwrap();
-    let memory = VortexRdfStore::from_built(arr).unwrap();
+    .await;
 
     // Engagement, pinned directly: the exact 3-row run for a mid subject.
     let mid = subject_node(777, 4);
@@ -357,14 +349,12 @@ async fn test_file_backed_subject_chunk_probe_chained() {
     )
     .await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads),
+    let memory = built_store(
+        quads,
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByCopy],
     )
-    .await
-    .unwrap();
-    let memory = VortexRdfStore::from_built(arr).unwrap();
+    .await;
 
     let p = NamedNode::new("http://example.org/p2").unwrap();
     let s = subject_node(444, 4);

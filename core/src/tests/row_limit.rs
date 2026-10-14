@@ -130,17 +130,15 @@ async fn in_memory_index_builds_refuse_row_ids_past_the_top() {
             build_array::<SortedInMemoryBuilder>(quad_stream(quads(LIMIT + 1)), layout, indexes())
                 .await;
         assert_refused(over, &label);
-        let at = build_array::<SortedInMemoryBuilder>(quad_stream(quads(LIMIT)), layout, indexes())
-            .await
-            .unwrap();
-        assert_reads_back(&VortexRdfStore::from_built(at).unwrap(), LIMIT, &label).await;
-        let unindexed =
-            build_array::<SortedInMemoryBuilder>(quad_stream(quads(LIMIT + 1)), layout, vec![])
-                .await
-                .unwrap();
+        assert_reads_back(
+            &built_store(quads(LIMIT), layout, indexes()).await,
+            LIMIT,
+            &label,
+        )
+        .await;
         assert_eq!(
-            VortexRdfStore::from_built(unindexed)
-                .unwrap()
+            built_store(quads(LIMIT + 1), layout, vec![])
+                .await
                 .size()
                 .await
                 .unwrap(),

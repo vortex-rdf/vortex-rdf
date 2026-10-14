@@ -101,10 +101,7 @@ async fn test_fixtures_match_regenerated_stores() {
             vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
         ),
     ] {
-        let arr = build_array::<SortedInMemoryBuilder>(quad_stream(quads.clone()), layout, indexes)
-            .await
-            .unwrap();
-        let regenerated = VortexRdfStore::from_built(arr).unwrap();
+        let regenerated = built_store(quads.clone(), layout, indexes).await;
         let bytes = regenerated.to_bytes().await.unwrap();
         if std::env::var_os("VORTEX_RDF_REGEN_FIXTURES").is_some() {
             let path =

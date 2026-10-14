@@ -304,11 +304,7 @@ async fn row_ids_past_u32_round_trip_in_memory() {
     for layout in LAYOUTS {
         for indexes in single_index_sets() {
             let label = format!("{layout:?} {indexes:?}");
-            let built =
-                build_array::<SortedInMemoryBuilder>(quad_stream(quads.clone()), layout, indexes)
-                    .await
-                    .unwrap();
-            let store = VortexRdfStore::from_built(built).unwrap();
+            let store = built_store(quads.clone(), layout, indexes).await;
             check_adoptions(&store, &quads, &label).await;
         }
     }
@@ -439,14 +435,7 @@ async fn reference_children_keep_val_rid_order_across_u32_max() {
     let quads = dataset();
     for layout in LAYOUTS {
         let label = format!("{layout:?}");
-        let built = build_array::<SortedInMemoryBuilder>(
-            quad_stream(quads.clone()),
-            layout,
-            vec![IndexType::SecondaryByReference],
-        )
-        .await
-        .unwrap();
-        let store = VortexRdfStore::from_built(built).unwrap();
+        let store = built_store(quads.clone(), layout, vec![IndexType::SecondaryByReference]).await;
         let parts = store.to_serializable_parts().await.unwrap();
         assert_eq!(
             check_children(&parts, STRADDLE, &format!("{label}: in memory")),

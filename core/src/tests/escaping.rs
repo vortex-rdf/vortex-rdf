@@ -51,10 +51,7 @@ fn escaped_literal_quads() -> Vec<Quad> {
 async fn run_escaped_literal_roundtrip(layout: LayoutStrategy, indexes: Vec<IndexType>) {
     let quads = escaped_literal_quads();
 
-    let arr = build_array::<SortedInMemoryBuilder>(quad_stream(quads.clone()), layout, indexes)
-        .await
-        .expect("build failed");
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(quads.clone(), layout, indexes).await;
 
     let decoded = store.quads_vec().await.unwrap();
     assert_eq!(decoded.len(), quads.len());

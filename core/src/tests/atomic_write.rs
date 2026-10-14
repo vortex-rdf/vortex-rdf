@@ -998,13 +998,7 @@ mod links_and_permissions {
         let appended_subject =
             NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s00100").unwrap());
         assert_eq!(
-            appended
-                .match_pattern(Some(&appended_subject), None, None, None)
-                .await
-                .unwrap()
-                .size()
-                .await
-                .unwrap(),
+            matched_size(&appended, Some(&appended_subject), None, None, None).await,
             1
         );
         let p0 = NamedNode::new("http://example.org/p0").unwrap();
@@ -1014,13 +1008,7 @@ mod links_and_permissions {
             .filter(|quad| quad.predicate == p0)
             .count();
         assert_eq!(
-            appended
-                .match_pattern(None, Some(&p0), None, None)
-                .await
-                .unwrap()
-                .size()
-                .await
-                .unwrap(),
+            matched_size(&appended, None, Some(&p0), None, None).await,
             expected_p0
         );
         assert_eq!(crate::store::test_hooks::gathers(), gathered);

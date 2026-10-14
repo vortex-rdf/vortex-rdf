@@ -300,6 +300,35 @@ async fn build_array<B: VortexArrayBuilder>(
     B::build_vortex_array(Box::new(quads), layout, indexes).await
 }
 
+/// The store [`SortedInMemoryBuilder`] builds from `quads` — [`build_array`]
+/// and [`VortexRdfStore::from_built`] in one call, for the tests that never
+/// look at the built array itself.
+async fn built_store(quads: Vec<Quad>, layout: LayoutStrategy, indexes: Indexes) -> VortexRdfStore {
+    let built = build_array::<SortedInMemoryBuilder>(quad_stream(quads), layout, indexes)
+        .await
+        .unwrap();
+    VortexRdfStore::from_built(built).unwrap()
+}
+
+/// The number of quads `store` holds for the pattern `(s, p, o, g)`: a
+/// [`match_pattern`](VortexRdfStore::match_pattern) and its
+/// [`size`](VortexRdfStore::size), both unwrapped.
+async fn matched_size(
+    store: &VortexRdfStore,
+    s: Option<&NamedOrBlankNode>,
+    p: Option<&NamedNode>,
+    o: Option<&Term>,
+    g: Option<&GraphName>,
+) -> usize {
+    store
+        .match_pattern(s, p, o, g)
+        .await
+        .unwrap()
+        .size()
+        .await
+        .unwrap()
+}
+
 /// The quad-row column names `layout` builds — what a schema assertion
 /// expects the primary struct to carry and nothing else.
 fn primary_columns(layout: LayoutStrategy) -> &'static [&'static str] {

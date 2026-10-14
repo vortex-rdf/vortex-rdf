@@ -345,10 +345,7 @@ const EXPORT_LAYOUTS: [LayoutStrategy; 3] = [
 async fn test_export_nquads_fast_path_matches_oxrdf() {
     let quads = export_test_quads();
     for layout in EXPORT_LAYOUTS {
-        let arr = build_array::<SortedInMemoryBuilder>(quad_stream(quads.clone()), layout, vec![])
-            .await
-            .unwrap();
-        let store = VortexRdfStore::from_built(arr).unwrap();
+        let store = built_store(quads.clone(), layout, vec![]).await;
 
         let stored: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
         let mut exported = Vec::new();
@@ -375,14 +372,7 @@ async fn test_export_ntriples_fast_path_and_named_graph_refusal() {
         .filter(|q| q.graph_name == GraphName::DefaultGraph)
         .cloned()
         .collect();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(default_graph_only.clone()),
-        LayoutStrategy::Default,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(default_graph_only.clone(), LayoutStrategy::Default, vec![]).await;
     let stored: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
     let mut exported = Vec::new();
     crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NTriples)
@@ -395,11 +385,7 @@ async fn test_export_ntriples_fast_path_and_named_graph_refusal() {
 
     // A named graph cannot be represented in N-Triples: refuse, as the
     // structured path would.
-    let arr =
-        build_array::<SortedInMemoryBuilder>(quad_stream(quads), LayoutStrategy::Default, vec![])
-            .await
-            .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(quads, LayoutStrategy::Default, vec![]).await;
     let mut exported = Vec::new();
     assert!(
         crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NTriples)
@@ -457,10 +443,7 @@ async fn tombstoned_and_tailed(store: VortexRdfStore) -> VortexRdfStore {
 async fn test_export_skips_tombstones_and_includes_tail() {
     let quads = export_test_quads();
     for layout in EXPORT_LAYOUTS {
-        let arr = build_array::<SortedInMemoryBuilder>(quad_stream(quads.clone()), layout, vec![])
-            .await
-            .unwrap();
-        let store = tombstoned_and_tailed(VortexRdfStore::from_built(arr).unwrap()).await;
+        let store = tombstoned_and_tailed(built_store(quads.clone(), layout, vec![]).await).await;
         let stored = store.quads_vec().await.unwrap();
         assert_eq!(stored.len(), quads.len(), "{layout:?}");
         let mut exported = Vec::new();
@@ -531,14 +514,7 @@ async fn test_export_reparses_to_the_same_quads() {
     ];
 
     for format in [oxrdfio::RdfFormat::NQuads, oxrdfio::RdfFormat::TriG] {
-        let arr = build_array::<SortedInMemoryBuilder>(
-            quad_stream(quads.clone()),
-            LayoutStrategy::Default,
-            vec![],
-        )
-        .await
-        .unwrap();
-        let store = VortexRdfStore::from_built(arr).unwrap();
+        let store = built_store(quads.clone(), LayoutStrategy::Default, vec![]).await;
         let mut exported = Vec::new();
         crate::export_rdf(store, &mut exported, format)
             .await
