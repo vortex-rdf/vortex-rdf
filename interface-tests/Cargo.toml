@@ -1,0 +1,27 @@
+# A workspace of its own: the DataFusion dependency tree stays out of the main
+# workspace's build and test surface (`cargo test --workspace`), and CI runs
+# this crate in a job of its own, `--locked` against this crate's own
+# Cargo.lock. A version bump of the main workspace bumps `version` here too
+# and refreshes that lock.
+[workspace]
+
+[package]
+name = "vortex-rdf-interface-tests"
+description = "Conformance tests for the interfaces an external query engine reads vortex-rdf through, driven by vortex's DataFusion integration"
+version = "0.12.1"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+
+[dependencies]
+vortex-rdf-core = { path = "../core" }
+vortex-datafusion = "0.88.0"
+vortex-arrow = "0.88.0"
+vortex-array = "0.88.0"
+vortex-buffer = { version = "0.88.0", features = ["arrow"] }
+datafusion = { version = "55.0.0", default-features = false, features = ["sql", "nested_expressions"] }
+futures = "0.3.33"
+oxrdf = "0.3.3"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros"] }
+tempfile = "3"
