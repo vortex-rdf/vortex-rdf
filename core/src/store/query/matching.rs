@@ -13,9 +13,9 @@ use crate::store::indexes::{
     InMemoryServePlan, IndexResolution, LazyRowIds, ResolvedRowIds, resolve_indexes_in_memory,
 };
 use crate::store::layouts::{Constraints, PatternCodes, QuadPattern, ResolvedLayout, TermRef};
-#[cfg(feature = "file-io")]
-use crate::store::scan::file_scan;
 use crate::store::scan::typed_eq::{typed_positions, typed_residual_ids};
+#[cfg(feature = "file-io")]
+use crate::store::scan::{file_filter, file_reads};
 use crate::store::schema;
 use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{QuadsSource, Tail};
@@ -571,14 +571,15 @@ impl VortexRdfStore {
         let mut pat = QuadPattern::new(subject, predicate, object, graph);
         let mut subject_range: Option<std::ops::Range<u64>> = None;
         if let Some(subj) = pat.subject
-            && let Some(mut range) = file_scan::locate_subject_run(file, codes, subj).await?
+            && let Some(mut range) = file_reads::locate_subject_run(file, codes, subj).await?
         {
             pat.subject = None;
             log::debug!(
                 "[match_pattern] File subject bounded by chunk probe at {:?}",
                 debug::elapsed(t)
             );
-            let answered = file_scan::narrow_subject_run(file, codes, &mut pat, &mut range).await?;
+            let answered =
+                file_reads::narrow_subject_run(file, codes, &mut pat, &mut range).await?;
             if answered > 0 {
                 log::debug!(
                     "[match_pattern] File prefix of {answered} more roles bounded by chunk probes at {:?}",
@@ -635,7 +636,7 @@ impl VortexRdfStore {
                 serve,
             } => {
                 let pat = resolves.clear(pat);
-                let residual = file_scan::build_file_filter(pat, codes)?;
+                let residual = file_reads::build_file_filter(pat, codes)?;
                 let serve = keep_serve.then_some(serve).flatten();
                 let selection = match row_ids {
                     // With the plan kept, the resolution is the view's sole
@@ -711,7 +712,7 @@ impl VortexRdfStore {
                     "[match_pattern] File index declined at {:?}",
                     debug::elapsed(t)
                 );
-                (file_scan::build_file_filter(pat, codes)?, None, None)
+                (file_reads::build_file_filter(pat, codes)?, None, None)
             }
         };
         // Combine with whatever filter this view already carried
@@ -735,7 +736,7 @@ impl VortexRdfStore {
                 ViewSelection::Exact(match (&subject_range, &filter) {
                     (Some(_), _) => apply_subject(existing),
                     (None, Some(f)) => {
-                        let pruned = file_scan::row_range_from_pruning(file, f).await?;
+                        let pruned = file_filter::row_range_from_pruning(file, f).await?;
                         log::debug!(
                             "[match_pattern] File narrowed by zone-map pruning (range: {}) at {:?}",
                             pruned.is_some(),
@@ -757,7 +758,7 @@ impl VortexRdfStore {
         // evaluation decodes every row of each split the ids touch.
         let (filter, selection) = match (filter, selection) {
             (Some(f), ViewSelection::Exact(RowSelection::Ids(ids))) => {
-                match file_scan::point_filter_ids(file, &f, &ids).await? {
+                match file_reads::point_filter_ids(file, &f, &ids).await? {
                     Some(kept) => {
                         log::debug!(
                             "[match_pattern] File filter checked by point reads at {:?}",

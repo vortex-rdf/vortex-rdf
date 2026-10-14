@@ -4,10 +4,11 @@
 //! `typed_eq` is the in-memory half — typed residual-equality fast paths over
 //! a base's columns: slice compares where a code column is canonical,
 //! encoded-search point reads where it is not, view-level compares for string
-//! columns. `file_scan` is the file-backed half — per-split filter evaluation,
-//! statistics-only pruning envelopes, pushed-down filter construction, row and
-//! component gathers through the file's cached column-chunk probes, and the
-//! translation of a [`RowSelection`] onto vortex's scan knobs. `gather` turns
+//! columns. `file_filter` and `file_reads` are the file-backed half —
+//! per-split filter evaluation and statistics-only pruning envelopes in
+//! `file_filter`; pushed-down filter construction, row and component gathers
+//! through the file's cached column-chunk probes, and the translation of a
+//! [`RowSelection`] onto vortex's scan knobs in `file_reads`. `gather` turns
 //! a selection into rows out of an in-memory base (tombstone-aware, with the
 //! point-read path small selections take). The point-read
 //! paths on both sides are gated on selection width, declining to the
@@ -18,6 +19,8 @@
 //! [`RowSelection`]: super::view::selection::RowSelection
 
 #[cfg(feature = "file-io")]
-pub(crate) mod file_scan;
+pub(crate) mod file_filter;
+#[cfg(feature = "file-io")]
+pub(crate) mod file_reads;
 pub(crate) mod gather;
 pub(crate) mod typed_eq;

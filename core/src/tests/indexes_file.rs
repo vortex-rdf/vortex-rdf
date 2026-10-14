@@ -1396,7 +1396,7 @@ async fn test_reference_index_counts_with_named_graphs() {
 /// The rows are the in-memory store's, tombstoned rows dropped.
 #[tokio::test]
 async fn test_reference_index_file_takes_sparse_ids() {
-    use crate::store::scan::file_scan::take_hooks;
+    use crate::store::scan::file_reads::take_hooks;
     let quads = graph_modular_quads(100_000, 6, 3, 333, &[GraphName::DefaultGraph]);
     let o5 = Term::Literal(Literal::new_simple_literal("o5"));
     let doomed = 5 + 333 * 7;
