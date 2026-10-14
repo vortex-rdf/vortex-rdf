@@ -284,7 +284,7 @@ written without the zone map; readers inspect the layout for it.
 **Reading it from a file.** A file store is memory-mapped
 ([`from_file`](../core/src/store/open.rs#L177)) and the dictionary stays in
 its child
-([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L254)).
+([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L258)).
 At open the handle reads the zone table — one small segment — and keeps, per
 window, its leaf and its first and last term; without the zone map it reads
 the bounds from the leaves.
@@ -472,7 +472,7 @@ kernel's decision; no segment cache sits in between.
 What a file store keeps for its lifetime, and what bounds it. The opened handle
 ([`NativeStoreFile`](../core/src/store/native_file.rs#L38)) and the file-backed
 dictionary handle
-([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L254))
+([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L258))
 keep:
 
 | Kept | Bound |

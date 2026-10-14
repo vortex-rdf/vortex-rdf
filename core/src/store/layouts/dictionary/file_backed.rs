@@ -186,6 +186,10 @@ struct Windows {
     /// read to pin that a call asks for no window at all.
     #[cfg(test)]
     requested: std::sync::atomic::AtomicUsize,
+    /// Whole-dictionary lifts since open — what the tests read to pin that a
+    /// read lifts no dictionary at all.
+    #[cfg(test)]
+    lifted: std::sync::atomic::AtomicUsize,
     /// The code of the first term (see `term_dict::code_base`).
     #[cfg(test)]
     base: TermCode,
@@ -324,6 +328,8 @@ impl FileBackedDict {
             rebuilt: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             requested: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            lifted: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             base: super::term_dict::code_base(),
         }))))
@@ -605,6 +611,10 @@ impl FileBackedDict {
     ///
     /// [`DictAccess::ensure_resident`]: super::access::DictAccess::ensure_resident
     pub(crate) async fn lift_resident(&self) -> Result<TermDictionary> {
+        #[cfg(test)]
+        self.0
+            .lifted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TermDictionary::from_child_reader(self.0.reader.clone()).await
     }
 
@@ -624,6 +634,13 @@ impl FileBackedDict {
     #[cfg(test)]
     pub(crate) fn debug_windows_requested(&self) -> usize {
         self.0.requested.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whole-dictionary lifts ([`lift_resident`](Self::lift_resident)) since
+    /// the handle opened.
+    #[cfg(test)]
+    pub(crate) fn debug_lifts(&self) -> usize {
+        self.0.lifted.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// What the window cache's windows are charged.

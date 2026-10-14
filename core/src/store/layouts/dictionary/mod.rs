@@ -501,52 +501,58 @@ async fn resolve_chunk_terms(fb: &FileBackedDict, columns: [&[TermCode]; 4]) -> 
     Ok(codes.into_iter().zip(terms).collect())
 }
 
+/// A chunk decoded against a file-backed dictionary: the chunk's code columns
+/// are read once, their distinct codes are resolved to terms (see
+/// [`resolve_chunk_terms`]), and `rows` decodes the columns against the
+/// resulting map. A failure to read the columns or to resolve their codes is
+/// the chunk's one `Err`.
+#[cfg(feature = "file-io")]
+async fn decode_resolved<T>(
+    fb: &FileBackedDict,
+    chunk: &ArrayRef,
+    rows: impl FnOnce([&[TermCode]; 4], MappedTerms<'_>) -> Vec<Result<T>>,
+) -> Vec<Result<T>> {
+    let (s_col, p_col, o_col, g_col) = match code_columns(chunk) {
+        Ok(cols) => cols,
+        Err(e) => return vec![Err(e)],
+    };
+    let columns = [
+        s_col.as_slice::<TermCode>(),
+        p_col.as_slice::<TermCode>(),
+        o_col.as_slice::<TermCode>(),
+        g_col.as_slice::<TermCode>(),
+    ];
+    match resolve_chunk_terms(fb, columns).await {
+        Ok(terms) => rows(columns, MappedTerms(&terms)),
+        Err(e) => vec![Err(e)],
+    }
+}
+
 /// [`decode_chunk`] against a file-backed dictionary instead of a resident
-/// one: the chunk's code columns are read once, their distinct codes are
-/// resolved to terms (see [`resolve_chunk_terms`]), and the rows decode
-/// against the resulting map.
+/// one: the rows decode against the chunk's resolved terms (see
+/// [`decode_resolved`]).
 #[cfg(feature = "file-io")]
 pub(crate) async fn decode_chunk_file_backed(
     fb: &FileBackedDict,
     chunk: &ArrayRef,
 ) -> Vec<Result<Quad>> {
-    let (s_col, p_col, o_col, g_col) = match code_columns(chunk) {
-        Ok(cols) => cols,
-        Err(e) => return vec![Err(e)],
-    };
-    let s = s_col.as_slice::<TermCode>();
-    let p = p_col.as_slice::<TermCode>();
-    let o = o_col.as_slice::<TermCode>();
-    let g = g_col.as_slice::<TermCode>();
-    let terms = match resolve_chunk_terms(fb, [s, p, o, g]).await {
-        Ok(terms) => terms,
-        Err(e) => return vec![Err(e)],
-    };
-    decode_codes(s, p, o, g, &mut MappedTerms(&terms))
+    decode_resolved(fb, chunk, |[s, p, o, g], mut terms| {
+        decode_codes(s, p, o, g, &mut terms)
+    })
+    .await
 }
 
-/// [`decode_chunk_file_backed`] with shared-string terms: the resolved map
-/// holds one `Arc<str>` per distinct code, so every row's term is a lookup
-/// and a reference-count bump, and each role's [`TermMemo`] skips the lookup
-/// for a code that repeats.
+/// The rows of a chunk's code columns read from its resolved `terms`: each
+/// role's [`TermMemo`] skips the lookup for a code that repeats, `term` turns
+/// each looked-up string into a row's term, and `quad` assembles the row
+/// from its four terms. A code missing from the map fails the whole chunk.
 #[cfg(feature = "file-io")]
-pub(crate) async fn decode_chunk_shared_file_backed(
-    fb: &FileBackedDict,
-    chunk: &ArrayRef,
-) -> Vec<Result<crate::common::quad::SharedQuad>> {
-    let (s_col, p_col, o_col, g_col) = match code_columns(chunk) {
-        Ok(cols) => cols,
-        Err(e) => return vec![Err(e)],
-    };
-    let s = s_col.as_slice::<TermCode>();
-    let p = p_col.as_slice::<TermCode>();
-    let o = o_col.as_slice::<TermCode>();
-    let g = g_col.as_slice::<TermCode>();
-    let terms = match resolve_chunk_terms(fb, [s, p, o, g]).await {
-        Ok(terms) => terms,
-        Err(e) => return vec![Err(e)],
-    };
-    let terms = MappedTerms(&terms);
+fn mapped_rows<R, T>(
+    [s, p, o, g]: [&[TermCode]; 4],
+    terms: MappedTerms<'_>,
+    term: impl Fn(&Arc<str>) -> R,
+    quad: impl Fn([R; 4]) -> T,
+) -> Vec<Result<T>> {
     let n = s.len();
     let (mut sm, mut pm, mut om, mut gm) = (
         TermMemo::new(n),
@@ -554,13 +560,13 @@ pub(crate) async fn decode_chunk_shared_file_backed(
         TermMemo::new(n),
         TermMemo::new(n),
     );
-    let mut row = |i: usize| -> Result<crate::common::quad::SharedQuad> {
-        Ok(crate::common::quad::SharedQuad {
-            s: Arc::clone(sm.get_or_insert(s[i], || terms.get(s[i]))?),
-            p: Arc::clone(pm.get_or_insert(p[i], || terms.get(p[i]))?),
-            o: Arc::clone(om.get_or_insert(o[i], || terms.get(o[i]))?),
-            g: Arc::clone(gm.get_or_insert(g[i], || terms.get(g[i]))?),
-        })
+    let mut row = |i: usize| -> Result<T> {
+        Ok(quad([
+            term(sm.get_or_insert(s[i], || terms.get(s[i]))?),
+            term(pm.get_or_insert(p[i], || terms.get(p[i]))?),
+            term(om.get_or_insert(o[i], || terms.get(o[i]))?),
+            term(gm.get_or_insert(g[i], || terms.get(g[i]))?),
+        ]))
     };
     let mut rows = Vec::with_capacity(n);
     for i in 0..n {
@@ -570,6 +576,42 @@ pub(crate) async fn decode_chunk_shared_file_backed(
         }
     }
     rows
+}
+
+/// [`decode_chunk_file_backed`] with shared-string terms: the resolved map
+/// holds one `Arc<str>` per distinct code, so every row's term is a lookup
+/// and a reference-count bump (see [`mapped_rows`]).
+#[cfg(feature = "file-io")]
+pub(crate) async fn decode_chunk_shared_file_backed(
+    fb: &FileBackedDict,
+    chunk: &ArrayRef,
+) -> Vec<Result<crate::common::quad::SharedQuad>> {
+    decode_resolved(fb, chunk, |columns, terms| {
+        mapped_rows(columns, terms, Arc::clone, |[s, p, o, g]| {
+            crate::common::quad::SharedQuad { s, p, o, g }
+        })
+    })
+    .await
+}
+
+/// [`decode_chunk_file_backed`] into [`RawQuad`]s: every row's terms are
+/// copied out of the resolved map as owned N-Triples strings (see
+/// [`mapped_rows`]), so the chunk reads only the dictionary windows holding
+/// its codes.
+#[cfg(feature = "file-io")]
+pub(crate) async fn decode_chunk_raw_file_backed(
+    fb: &FileBackedDict,
+    chunk: &ArrayRef,
+) -> Vec<Result<RawQuad>> {
+    decode_resolved(fb, chunk, |columns, terms| {
+        mapped_rows(
+            columns,
+            terms,
+            |term| String::from(&**term),
+            |[s, p, o, g]| RawQuad { s, p, o, g },
+        )
+    })
+    .await
 }
 
 #[cfg(all(test, feature = "file-io"))]
@@ -663,8 +705,8 @@ mod tests {
         for quads in [&all[..], &all[..7]] {
             let n = quads.len();
             let (dict, chunk) = skewed_chunk(quads);
-            let layout =
-                ResolvedLayout::Dictionary(DictAccess::FileBacked(file_backed(&dict).await));
+            let fb = file_backed(&dict).await;
+            let layout = ResolvedLayout::Dictionary(DictAccess::FileBacked(fb.clone()));
 
             let (decoded, reads) = code_column_reads(layout.decode_chunk_async(&chunk)).await;
             assert_eq!(reads, 1, "{n} quads");
@@ -684,6 +726,14 @@ mod tests {
                 .map(|row| row.unwrap())
                 .collect();
             assert_eq!(shared, want, "{n} shared quads");
+
+            let (raw, reads) = code_column_reads(decode_chunk_raw_file_backed(&fb, &chunk)).await;
+            assert_eq!(reads, 1, "{n} raw quads");
+            let raw: Vec<RawQuad> = raw.into_iter().map(|row| row.unwrap()).collect();
+            let want = ResolvedLayout::Dictionary(DictAccess::Resident(Arc::new(dict)))
+                .raw_quads(&chunk)
+                .unwrap();
+            assert!(raw == want, "{n} raw quads");
         }
     }
 

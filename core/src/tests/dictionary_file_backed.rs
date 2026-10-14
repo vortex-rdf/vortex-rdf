@@ -210,6 +210,47 @@ async fn test_file_backed_dictionary_serializes_and_mutates() {
     assert!(!compacted.contains(&doomed).await.unwrap());
 }
 
+/// An N-Quads export of a file-backed store reads each scan chunk's terms
+/// from the dictionary windows holding them: over several scan splits it
+/// never lifts the whole dictionary, and it writes the bytes the whole-store
+/// load of the same file writes.
+#[tokio::test]
+async fn export_of_a_file_backed_store_never_lifts_the_dictionary() {
+    let graphs = [
+        GraphName::DefaultGraph,
+        GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap()),
+    ];
+    let quads = graph_modular_quads(1_000, 4, 3, 7, &graphs);
+    let (_dir, path) = write_chunked_store_file(&quads, 256).await;
+    let splits = crate::tests::open_mapped(&path)
+        .await
+        .splits()
+        .unwrap()
+        .len();
+    assert!(splits >= 3, "the fixture spans {splits} scan splits");
+
+    let fb = VortexRdfStore::from_file(&path).await.unwrap();
+    assert!(fb.debug_dict_file_backed());
+    let mut exported = Vec::new();
+    crate::export_rdf(fb.clone(), &mut exported, oxrdfio::RdfFormat::NQuads)
+        .await
+        .unwrap();
+    assert_eq!(
+        fb.debug_dict_lifts(),
+        Some(0),
+        "the export over {splits} scan splits lifted the dictionary"
+    );
+
+    let resident = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
+    let mut want = Vec::new();
+    crate::export_rdf(resident, &mut want, oxrdfio::RdfFormat::NQuads)
+        .await
+        .unwrap();
+    let want = String::from_utf8(want).unwrap();
+    assert_eq!(want.lines().count(), quads.len());
+    assert_eq!(String::from_utf8(exported).unwrap(), want);
+}
+
 /// Pins the rows-only read path's dictionary contract: a tombstoned,
 /// *indexed* owner (compacting nothing) must answer `code_columns_gathered`
 /// with codes addressing the store's own dictionary — the one its

@@ -6,6 +6,8 @@ use crate::error::Result;
 use crate::error::VortexRdfError;
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 #[cfg(feature = "file-io")]
+use crate::store::layouts::{DictAccess, dictionary};
+#[cfg(feature = "file-io")]
 use crate::store::scan::file_scan;
 use crate::store::scan::gather::gather_live;
 #[cfg(feature = "file-io")]
@@ -355,13 +357,7 @@ impl VortexRdfStore {
                     move |chunk| raw_chunk(&sync_layout, &chunk),
                     move |chunk| {
                         let layout = layout.clone();
-                        async move {
-                            match layout.raw_quads_async(&chunk).await {
-                                Ok(raws) => raws.into_iter().map(Ok).collect(),
-                                Err(e) => vec![Err(e)],
-                            }
-                        }
-                        .boxed()
+                        async move { raw_chunk_async(&layout, &chunk).await }.boxed()
                     },
                     tail_raws,
                 )
@@ -398,6 +394,19 @@ fn raw_chunk(layout: &ResolvedLayout, rows: &ArrayRef) -> Vec<Result<RawQuad>> {
     match layout.raw_quads(rows) {
         Ok(raws) => raws.into_iter().map(Ok).collect(),
         Err(e) => vec![Err(e)],
+    }
+}
+
+/// [`raw_chunk`] with the file-backed Dictionary case handled: the chunk's
+/// distinct codes resolve to terms with one read of the dictionary windows
+/// holding them (see [`dictionary::decode_chunk_raw_file_backed`]).
+#[cfg(feature = "file-io")]
+async fn raw_chunk_async(layout: &ResolvedLayout, rows: &ArrayRef) -> Vec<Result<RawQuad>> {
+    match layout {
+        ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) => {
+            dictionary::decode_chunk_raw_file_backed(fb, rows).await
+        }
+        _ => raw_chunk(layout, rows),
     }
 }
 
