@@ -2,13 +2,12 @@
 
 use anyhow::{Context, Result};
 use log::info;
-use std::fs::File;
-use std::io::{Read, Write, stdin, stdout};
+use std::io::{Read, stdin};
 use std::time::Instant;
 
-use vortex_rdf_core::{VortexRdfStore, export_rdf};
+use vortex_rdf_core::VortexRdfStore;
 
-use super::output_format;
+use super::{export_to_output, output_format};
 use crate::DeserializeArgs;
 
 pub async fn run(args: DeserializeArgs) -> Result<()> {
@@ -36,13 +35,13 @@ pub async fn run(args: DeserializeArgs) -> Result<()> {
         }
     };
 
-    let writer: Box<dyn Write> = match &output {
-        Some(p) => Box::new(File::create(p).context("Failed to create output file")?),
-        None => Box::new(stdout()),
-    };
-    export_rdf(store, writer, format)
-        .await
-        .context("Failed to export RDF from Vortex")?;
+    export_to_output(
+        store,
+        output.as_deref(),
+        format,
+        "Failed to export RDF from Vortex",
+    )
+    .await?;
     info!("Deserialization took {:?}", start.elapsed());
 
     Ok(())

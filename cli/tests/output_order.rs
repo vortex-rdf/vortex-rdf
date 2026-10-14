@@ -1,6 +1,7 @@
-//! `deserialize` and `match` open their input before they create their output
-//! file: an input that cannot be read leaves an existing output file as it
-//! was.
+//! How `deserialize` and `match` treat their output file. They open their
+//! input before they create it: an input that cannot be read leaves an
+//! existing output file as it was. And an output that cannot be written is
+//! reported, not swallowed.
 
 mod common;
 
@@ -58,6 +59,28 @@ fn an_unreadable_input_leaves_the_output_file_alone() {
                 .unwrap()
                 .contains("http://example.org/s"),
             "{action} wrote nothing"
+        );
+    }
+}
+
+/// `/dev/full` opens for writing and fails every write with ENOSPC. The export
+/// is one line, which a buffered writer holds until its final flush: the error
+/// of that flush must still end the command in failure.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_output_that_cannot_be_written_is_reported() {
+    let scratch = Scratch::new("unwritable");
+    let rdf = scratch.file("data.nt", TRIPLE);
+    let store = scratch.path("data.vortex");
+    assert!(run("serialize", &rdf, &store).status.success());
+
+    for action in ["deserialize", "match"] {
+        let result = run(action, &store, Path::new("/dev/full"));
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "{action} succeeded: {result:?}");
+        assert!(
+            stderr.contains("No space left on device"),
+            "{action} did not report the write error: {stderr}"
         );
     }
 }
