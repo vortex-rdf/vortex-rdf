@@ -12,7 +12,7 @@
 //! Term codes are dictionary ranks, so a column's values are dense in a
 //! known range; when that range is small enough relative to the column, a
 //! direct-mapped table beats hashing. Each kernel picks between the two by
-//! [`dense_table_fits`].
+//! `dense_table_fits`.
 
 use std::collections::HashMap;
 use std::ops::Range;
