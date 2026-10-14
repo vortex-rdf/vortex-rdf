@@ -15,8 +15,8 @@ is the path such an engine takes.
 
 | What the engine needs | What it calls |
 |---|---|
-| A table of quads to scan with projection, filter and limit pushdown | [`data_source`](../core/src/store/read/data_source.rs#L95) on any view, registered with vortex's `VortexTable` |
-| The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L122) |
+| A table of quads to scan with projection, filter and limit pushdown | [`data_source`](../core/src/store/read/data_source.rs#L100) on any view, registered with vortex's `VortexTable` |
+| The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L127) |
 | Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L52), [`code_chunks`](../core/src/store/read/chunks.rs#L77) |
 | Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L148), [`index_components`](../core/src/store/read/metadata.rs#L262), [`partitions`](../core/src/store/read/metadata.rs#L299) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L258) (from [`dict_reader`](../core/src/store/mod.rs#L278)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
@@ -31,8 +31,12 @@ is the path such an engine takes.
 `data_source()` wraps **any** view — the whole store, a `match_pattern`
 result, a `keep`, a `window`, a partition — as a
 [`vortex_scan::DataSource`](https://docs.rs/vortex-scan). The call is
-synchronous and reads nothing. The source is a snapshot: it holds the view,
-and the view holds its base immutably.
+synchronous and does no I/O. It takes its row count from
+`view_statistics()` ([§5](#5-what-a-view-promises-before-it-is-read)), so it
+does what that call does: on an in-memory view whose selection is a pending
+index run over a base with tombstones, it decodes the run's row ids and
+caches them on the view. The source is a snapshot: it holds the view, and
+the view holds its base immutably.
 
 **Dtype.** The layout's primary struct, non-nullable: `{s, p, o, g}` of
 `UInt64` codes (`TermCode`) under the Dictionary layout, of `utf8`
@@ -44,9 +48,12 @@ every base this crate writes — with the view's narrowing applied: the
 pattern, keeps, windows and tombstones. A view an index served
 (`view_statistics().served_component`) is read in base order too; its row
 ids materialize on the first poll. Under a string layout the append tail's
-live rows follow the base. A Dictionary-layout view with a non-empty tail
-has no source (`data_source` errors): its tail holds terms without codes,
-so `compact` first ([§7](#7-snapshots-and-mutation)).
+live rows follow the base.
+
+**Errors.** `data_source` errors for a Dictionary-layout view with a
+non-empty tail, which has no source: its tail holds terms without codes, so
+`compact` first ([§7](#7-snapshots-and-mutation)). It also errors where
+`view_statistics` does, when the row-id decode above fails.
 
 **The scan request.**
 
