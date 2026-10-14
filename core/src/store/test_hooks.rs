@@ -244,6 +244,16 @@ impl VortexRdfStore {
         )
     }
 
+    /// How many times the file-backed dictionary was lifted whole into memory
+    /// since the file opened (shared by every view of the file); `None` for a
+    /// resident dictionary or another layout.
+    pub(crate) fn debug_dict_lifts(&self) -> Option<usize> {
+        match &self.layout {
+            ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) => Some(fb.debug_lifts()),
+            _ => None,
+        }
+    }
+
     /// Whether this store reads a memory-mapped file: `Some(true)` for a
     /// mapped open, `Some(false)` for a file read through Vortex's reader,
     /// `None` for an in-memory store.
