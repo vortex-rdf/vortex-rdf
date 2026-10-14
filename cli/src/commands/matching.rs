@@ -4,15 +4,14 @@
 use anyhow::{Context, Result, anyhow};
 use log::{debug, info};
 use std::fs::File;
-use std::io::{Write, stdout};
 use std::time::Instant;
 
 use vortex_rdf_core::common::formats::detect_format;
 use vortex_rdf_core::common::terms::{parse_pattern_checked, parse_quads_from_reader};
 use vortex_rdf_core::debug as debug_time;
-use vortex_rdf_core::{LayoutStrategy, VortexRdfStore, export_rdf};
+use vortex_rdf_core::{LayoutStrategy, VortexRdfStore};
 
-use super::output_format;
+use super::{export_to_output, output_format};
 use crate::MatchArgs;
 
 pub async fn run(args: MatchArgs) -> Result<()> {
@@ -92,13 +91,13 @@ pub async fn run(args: MatchArgs) -> Result<()> {
 
     // The output file is created once the input has been read and matched, so
     // a failure before that leaves an existing output file as it was.
-    let writer: Box<dyn Write> = match &output {
-        Some(p) => Box::new(File::create(p).context("Failed to create output file")?),
-        None => Box::new(stdout()),
-    };
-    export_rdf(filtered, writer, output_format)
-        .await
-        .context("Failed to export filtered results")?;
+    export_to_output(
+        filtered,
+        output.as_deref(),
+        output_format,
+        "Failed to export filtered results",
+    )
+    .await?;
 
     info!("Full matching operation took {:?}", start.elapsed());
 

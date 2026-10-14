@@ -571,7 +571,7 @@ and compaction model in full is [mutations.md](mutations.md).
 
 ### 11.3 Back to RDF text
 
-The reverse direction is [`export_rdf`](../core/src/store/export.rs#L18) (the
+The reverse direction is [`export_rdf`](../core/src/store/export.rs#L24) (the
 CLI's `deserialize`, the bindings' `toRdf`): N-Triples and N-Quads are written
 straight from the raw term columns — the strings *are* the serialization — while
 every other format decodes to `oxrdf` terms and drives the `oxrdfio` serializer.

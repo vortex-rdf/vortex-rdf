@@ -15,6 +15,12 @@ use std::io::Write;
 /// Serialize the store as `format` into `writer`, streaming quads
 /// sequentially. N-Triples and N-Quads are written straight from the store's
 /// raw columns; every other format goes through oxrdfio's serializer.
+///
+/// The writer receives each quad as several small writes, and it is neither
+/// buffered nor flushed here. Wrap one whose every write is a system call (a
+/// `File`, `Stdout`) in a [`BufWriter`](std::io::BufWriter), pass it by `&mut`,
+/// and flush it once the export returns: a `BufWriter` dropped unflushed
+/// discards the error of its last write.
 pub async fn export_rdf<W: Write>(
     store: VortexRdfStore,
     writer: W,
