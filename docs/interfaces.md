@@ -8,7 +8,10 @@ view is exposed as a vortex `DataSource`, what the store's persisted children
 look like as tables, how rows stream out without Arrow, which runtime a read
 needs, what a view promises about itself before it is read, and which
 identities tell the engine when its cached codes and plans stop applying.
-Nothing here depends on DataFusion.
+Nothing here depends on DataFusion; the conformance crate
+([`interface-tests/tests/datafusion.rs`](../interface-tests/tests/datafusion.rs))
+drives every interface through vortex's own DataFusion integration, which
+is the path such an engine takes.
 
 | What the engine needs | What it calls |
 |---|---|
@@ -133,7 +136,9 @@ code columns are `UInt64` (a canonical column converts without a copy) and
 whose `utf8` columns are `Utf8View`; `to_arrow_schema(source.dtype())`
 gives the matching schema, and `RecordBatch::from(struct_array)` the batch.
 The DataFusion integration does exactly this to every chunk a `DataSource`
-partition emits. The two encodings an engine builds *from* codes:
+partition emits. The conformance crate's
+[`tests/arrow.rs`](../interface-tests/tests/arrow.rs) shows the recipe,
+including the two encodings an engine builds *from* codes:
 
 - **Codes as ids.** `Int64` is the zero-copy id form: a `code_chunks`
   buffer reinterprets as an Arrow `Int64` column without a copy
@@ -286,6 +291,32 @@ chunk to a `RecordBatch`. It reports one partition to DataFusion; set
 `target_partitions` to 1 when the scan's order must survive into the
 results, or use `partitions(n)` and register one table per piece.
 
+**Integer literals.** SQL parses a bare integer (`WHERE p = 5`) as an
+`Int64` literal. DataFusion's coercion and simplification turn its
+comparison with a `UInt64` code column back into one against a `UInt64`
+literal, so the scan node receives `$.p = 5u64`. A range arrives the same
+way, an `IN` of more than three values as an `in_list` of `UInt64` values,
+and a shorter one as `OR`ed equalities.
+
+The suite ([`tests/datafusion.rs`](../interface-tests/tests/datafusion.rs))
+checks, on in-memory, byte-adopted and file-backed stores (mapped, and
+loaded whole): `COUNT(*)` against `size`, the whole table and projections
+against `code_chunks`, equality, `IN`, range and conjunction filters
+against brute force, bare integer literals on every code column (their
+counts against brute force, their predicates on the plan's scan node),
+limits with and without filters, `ORDER BY` on the base order, `DISTINCT`,
+a view as its own table and a join between two views, the `index:posg`
+child's order and `rid`s, the `dictionary` child's rows and a term-level
+`LIKE` over it, and a string layout's `Utf8View` columns.
+[`examples/datafusion_table.rs`](../interface-tests/examples/datafusion_table.rs)
+is the starting point: run it with
+`cargo run --manifest-path interface-tests/Cargo.toml --example datafusion_table`.
+
+The crate is a workspace of its own, so the DataFusion dependency tree
+stays out of `cargo test --workspace`. CI runs it in the `interface-tests`
+job, `--locked` against the crate's own `Cargo.lock`, and
+`scripts/ci-check.sh` mirrors that job.
+
 ## 9. Source map
 
 | Concern | File |
@@ -297,3 +328,4 @@ results, or use `partitions(n)` and register one table per piece.
 | `RowSelection::split` | [`core/src/store/view/selection.rs`](../core/src/store/view/selection.rs) |
 | `DictReader`, `DictSnapshot`, `dictionary_id`, `filter_codes` | [`core/src/store/layouts/dictionary/handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs), [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs) |
 | `vortex_session`, the `vortex_scan` re-export | [`core/src/lib.rs`](../core/src/lib.rs) |
+| Conformance through DataFusion, the Arrow recipe, the example | [`interface-tests/Cargo.toml`](../interface-tests/Cargo.toml), [`tests/datafusion.rs`](../interface-tests/tests/datafusion.rs), [`tests/arrow.rs`](../interface-tests/tests/arrow.rs), [`examples/datafusion_table.rs`](../interface-tests/examples/datafusion_table.rs) |
