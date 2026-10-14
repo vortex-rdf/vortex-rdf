@@ -107,7 +107,7 @@ pub struct BuiltStream {
     pub(crate) components: Vec<crate::io::container::NativeComponentWrite>,
     /// Whether the chunks are in global `(s, p, o, g)` order; written as the
     /// root's `quads_sorted` (see `WireMetadata::quads_sorted`).
-    // Read by the serializer (`io::ser`), which is compiled in under
+    // Read by the serializer (`io::write`), which is compiled in under
     // `file-io` and on wasm32.
     #[cfg_attr(
         not(any(feature = "file-io", target_arch = "wasm32")),
@@ -130,6 +130,8 @@ pub(crate) mod sorted_in_memory;
 pub(crate) mod sorted_stream;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod spill;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) mod stream_indexes;
 
 pub use sorted_in_memory::SortedInMemoryBuilder;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

@@ -244,7 +244,7 @@ impl VortexRdfStore {
         let mut prims: Vec<PrimitiveArray> = Vec::with_capacity(4);
         for name in schema::PRIMARY_COLUMNS {
             let col = struct_arr.unmasked_field_by_name(name).ok()?;
-            prims.push(crate::store::array::shared_code_primitive(col)?);
+            prims.push(crate::store::resident::shared_code_primitive(col)?);
         }
         // No plan (or a plan that declined): codes are gathered by row id, so
         // a served match's pending selection materializes here (the in-memory

@@ -6,9 +6,8 @@ use crate::error::Result;
 use crate::error::VortexRdfError;
 use crate::store::QuadsSource;
 use crate::store::RawQuad;
-use crate::store::builders::{DEFAULT_CHUNK_ROWS, build_parts_from_raws};
+use crate::store::builders::DEFAULT_CHUNK_ROWS;
 use crate::store::indexes::{Indexes, unique_indexes};
-use crate::store::layouts::LayoutStrategy;
 
 use crate::store::VortexRdfStore;
 
@@ -114,7 +113,7 @@ impl VortexRdfStore {
     /// before the rows are gathered, sorted or built, so a compaction that
     /// cannot happen costs a few stats and one failed open.
     ///
-    /// [`PendingStore`]: crate::io::ser::PendingStore
+    /// [`PendingStore`]: crate::io::write::PendingStore
     #[cfg(feature = "file-io")]
     async fn stream_compacted_to_file(
         &self,
@@ -122,7 +121,7 @@ impl VortexRdfStore {
         path: &std::path::Path,
         opened: Option<crate::io::read::FileIdentity>,
     ) -> Result<Self> {
-        let pending = crate::io::ser::PendingStore::create_over(path, opened).await?;
+        let pending = crate::io::write::PendingStore::create_over(path, opened).await?;
         let raws = self.sorted_live_raw_quads().await?;
         let stream = futures::stream::iter(raws.into_iter().map(Ok::<_, VortexRdfError>));
         // The sorted builder spills merge runs to disk, and compaction rewrites
@@ -141,29 +140,12 @@ impl VortexRdfStore {
         )
         .await?;
         pending
-            .write(|writer| crate::io::ser::built_stream_to_vortex_writer(built, writer))
+            .write(|writer| crate::io::write::built_stream_to_vortex_writer(built, writer))
             .await?;
         // Reopen mapped. This store's old mapping keeps the replaced file's
         // pages until it drops; Windows refuses the rename above while that
         // mapping lives, and compaction then fails with the I/O error.
         Self::from_file(path).await
-    }
-
-    /// Build a fresh owning in-memory store from raw quads under `strategy` —
-    /// the shared back half of compaction (see [`build_parts_from_raws`]).
-    /// `sorted` must be `true` only when `raws` is SPOG-sorted.
-    fn from_raw_quads(
-        raws: &[RawQuad],
-        strategy: LayoutStrategy,
-        indexes: Indexes,
-        sorted: bool,
-    ) -> Result<Self> {
-        let (base, components, dict) = build_parts_from_raws(raws, strategy, &indexes, sorted)?;
-        let layout = crate::store::resolved_layout(dict, base.dtype())?;
-        // Compress like every other construction — a compacted store carries
-        // the same resident form a freshly built one does.
-        let (base, components) = crate::store::compress_built_parts(base, components)?;
-        Self::assemble_resident(base, components, layout)
     }
 
     /// Whether `add_quads` should fold the tail into the base now.

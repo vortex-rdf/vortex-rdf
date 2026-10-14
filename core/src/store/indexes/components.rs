@@ -346,27 +346,27 @@ impl IndexComponent {
     /// This component in searchable form: rows materialized, integer
     /// children kept compressed wherever the encoded search probes bind them
     /// and decoded to canonical primitives otherwise (see
-    /// [`array::with_searchable_int_children`]), so the sorted probes bind
+    /// [`resident::with_searchable_int_children`]), so the sorted probes bind
     /// the value and `rid` columns directly instead of running the generic
     /// search kernel per call. The adoption step of a store loaded wholesale
     /// into memory.
     ///
-    /// [`array::with_searchable_int_children`]: crate::store::array::with_searchable_int_children
+    /// [`resident::with_searchable_int_children`]: crate::store::resident::with_searchable_int_children
     pub(crate) fn into_searchable(self) -> Result<Self> {
-        self.rebuilt(crate::store::array::with_searchable_int_children)
+        self.rebuilt(crate::store::resident::with_searchable_int_children)
     }
 
     /// This component with its integer children compressed into
     /// probe-supported encodings — the construction-side counterpart of
     /// [`into_searchable`](Self::into_searchable): a builder's canonical
     /// emission compresses here (see
-    /// [`array::with_compressed_int_children`]), without the base's payload
+    /// [`resident::with_compressed_int_children`]), without the base's payload
     /// wrapper (components never serve code columns). The sorted probes bind
     /// the compressed columns directly.
     ///
-    /// [`array::with_compressed_int_children`]: crate::store::array::with_compressed_int_children
+    /// [`resident::with_compressed_int_children`]: crate::store::resident::with_compressed_int_children
     pub(crate) fn into_compressed(self) -> Result<Self> {
-        self.rebuilt(|rows| crate::store::array::with_compressed_int_children(rows, false))
+        self.rebuilt(|rows| crate::store::resident::with_compressed_int_children(rows, false))
     }
 
     /// The cached encoded-search probe over the component's `column`, or

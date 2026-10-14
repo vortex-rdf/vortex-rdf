@@ -1,5 +1,5 @@
 //! The native container codec: the `vortex-rdf.store.v2` grammar
-//! (`container`), the write driver over it (`ser`), and read-side file
+//! (`container`), the write driver over it (`write`), and read-side file
 //! access (`read`). Textual RDF conversion lives outside this module:
 //! parsing in `common::terms`, export in `store::persist::export` (re-exported at the
 //! crate root as `export_rdf`); the opened-store runtime handle lives
@@ -13,7 +13,7 @@ pub(crate) mod read;
 /// wasm, whose bindings exchange file bytes. `container::write` is gated the
 /// same way.
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-pub(crate) mod ser;
+pub(crate) mod write;
 
 #[cfg(feature = "file-io")]
-pub use ser::{quads_stream_to_vortex_file, quads_stream_to_vortex_writer};
+pub use write::{quads_stream_to_vortex_file, quads_stream_to_vortex_writer};

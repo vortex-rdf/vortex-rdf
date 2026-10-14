@@ -272,7 +272,7 @@ are bare codes and cannot be decoded without it.
 The column is FSST-compressed **at the source**, in independent windows of
 65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage.rs#L41))
 that share one symbol table trained on the whole column. The child is written
-through its own strategy ([`dict_child_strategy`](../core/src/io/container/write.rs#L194)):
+through its own strategy ([`dict_child_strategy`](../core/src/io/container/sources.rs#L360)):
 a Struct over a Zoned layout whose data is a Chunked layout of Flat leaves,
 **one leaf per window, written verbatim** — no sampling, no re-encoding. The
 zone map holds **one zone per window** with the exact aggregates
@@ -620,5 +620,5 @@ open rather than being read around.
 | Index children: schemas, sort orders, registry, adoption | [`core/src/store/indexes/copy.rs`](../core/src/store/indexes/copy.rs), [`reference.rs`](../core/src/store/indexes/reference.rs), [`components.rs`](../core/src/store/indexes/components.rs) |
 | Chunk probes over wire-encoded leaves | [`encoded-search/src/layout.rs`](../encoded-search/src/layout.rs), [`lib.rs`](../encoded-search/src/lib.rs) |
 | Locating and point-reading index runs on file | [`core/src/store/indexes/file.rs`](../core/src/store/indexes/file.rs), [`scan/gather.rs`](../core/src/store/scan/gather.rs) |
-| In-memory forms: compressed-resident columns, probes, view state | [`core/src/store/array.rs`](../core/src/store/array.rs), [`probes.rs`](../core/src/store/probes.rs), [`view/mod.rs`](../core/src/store/view/mod.rs) |
+| In-memory forms: compressed-resident columns, probes, view state | [`core/src/store/resident.rs`](../core/src/store/resident.rs), [`probes.rs`](../core/src/store/probes.rs), [`view/mod.rs`](../core/src/store/view/mod.rs) |
 | Session: registered encodings and zone aggregates | [`core/src/session.rs`](../core/src/session.rs) |

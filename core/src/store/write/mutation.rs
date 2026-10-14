@@ -24,6 +24,59 @@ use crate::store::VortexRdfStore;
 impl VortexRdfStore {
     // ── mutations ─────────────────────────────────────────────────────────────
 
+    /// This store as one that owns its rows and can be mutated — cheaply when it
+    /// already is an owner, otherwise an independent, compacted copy.
+    ///
+    /// A view derived from `match_pattern` shares a base it does not own, so it
+    /// cannot be mutated in place. This turns such a view into an owner by
+    /// compacting, rebuilding its declared indexes
+    /// ([`compact_with_indexes`]) so mutating a match result yields an
+    /// independent store that is still indexed. An owner is returned as a
+    /// cheap clone, preserving its tombstones and indexes, so repeated
+    /// in-place deletes stay cheap and keep their indexes.
+    ///
+    /// [`compact_with_indexes`]: Self::compact_with_indexes
+    pub async fn owned(&self) -> Result<Self> {
+        if self.is_owner() {
+            Ok(self.clone())
+        } else {
+            self.compact_with_indexes(self.indexes.clone()).await
+        }
+    }
+
+    /// Whether this store owns its rows, as opposed to being a window onto
+    /// someone else's.
+    ///
+    /// Only an owner may be mutated: a narrowed view's rows are a subset of a
+    /// base it shares, so mutating it would either silently discard the rows
+    /// outside the view or write through to data it doesn't own. A view that
+    /// happens to select everything (an unconstrained `match_pattern`) covers
+    /// exactly the same rows as the store it came from, so it counts as an
+    /// owner — mutating it is indistinguishable from mutating that store.
+    pub(in crate::store) fn is_owner(&self) -> bool {
+        // A narrowed tail marks a view just as a narrowed base does — a match
+        // may cover all base rows yet only some of the tail's.
+        let tail_owned = self
+            .tail
+            .as_ref()
+            .is_none_or(|tail| matches!(tail.selection, RowSelection::All));
+        tail_owned && self.quads.is_unrefined()
+    }
+
+    /// Err unless this store owns its rows — the gate every mutation takes;
+    /// see [`is_owner`](Self::is_owner).
+    fn ensure_owner(&self, operation: &str) -> Result<()> {
+        if self.is_owner() {
+            return Ok(());
+        }
+        Err(VortexRdfError::InvalidOperation(format!(
+            "{operation} is not supported on a store derived from match_pattern: its rows are a \
+             view onto a larger base, so mutating it would either silently drop the rows outside \
+             the view or write through to data it does not own. Call owned() for an \
+             independent copy to mutate, or call the mutation on the store the view came from."
+        )))
+    }
+
     /// Append a single quad — [`add_quads`] with a batch of one; prefer the
     /// batch form when adding several.
     ///

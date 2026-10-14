@@ -248,7 +248,7 @@ where
         .await
         .unwrap();
         let mut bytes: Vec<u8> = Vec::new();
-        crate::io::ser::built_stream_to_vortex_writer(built, &mut bytes)
+        crate::io::write::built_stream_to_vortex_writer(built, &mut bytes)
             .await
             .unwrap();
         check(
