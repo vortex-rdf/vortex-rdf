@@ -298,6 +298,7 @@ pub(crate) fn resolve_in_memory(
             CHILD_PRIMARY,
             COL_RID,
             copy_decode_layout(layout),
+            component.name,
             rows.clone().into_array(),
             run,
             component.probes_arc(),

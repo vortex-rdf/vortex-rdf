@@ -282,6 +282,8 @@ impl ServeDecode {
 #[derive(Clone)]
 pub(crate) struct InMemoryServePlan {
     decode: ServeDecode,
+    /// The serving component's name (`index:posg`, `index:ospg`).
+    component: &'static str,
     /// The index component's rows, in child schema.
     array: ArrayRef,
     range: Range<usize>,
@@ -292,22 +294,29 @@ pub(crate) struct InMemoryServePlan {
 }
 
 impl InMemoryServePlan {
-    /// A plan serving the contiguous `range` of an in-memory index
-    /// component's rows.
+    /// A plan serving the contiguous `range` of the rows `array` of the
+    /// in-memory index component named `component`.
     pub(crate) fn new(
         primary_columns: [&'static str; 4],
         rid_column: &'static str,
         decode_layout: ResolvedLayout,
+        component: &'static str,
         array: ArrayRef,
         range: Range<usize>,
         probes: Arc<crate::store::probes::StructProbes>,
     ) -> Self {
         Self {
             decode: ServeDecode::new(primary_columns, rid_column, decode_layout),
+            component,
             array,
             range,
             probes,
         }
+    }
+
+    /// The serving component's name.
+    pub(crate) fn component(&self) -> &'static str {
+        self.component
     }
 
     /// The served rows' four [`TermCode`]s, read straight off the index

@@ -14,7 +14,8 @@ use crate::store::layouts::dictionary::TermDictionary;
 use crate::store::layouts::{DictAccess, LayoutStrategy, ResolvedLayout};
 use crate::store::view::selection::ViewSelection;
 use crate::store::{
-    QuadsSource, RawQuad, StoreParts, VortexRdfStore, array, probes, resident, schema,
+    QuadsSource, RawQuad, StoreParts, VortexRdfStore, array, next_generation, probes, resident,
+    schema,
 };
 
 use std::iter;
@@ -178,6 +179,7 @@ impl VortexRdfStore {
         Ok(Self {
             layout,
             indexes,
+            generation: next_generation(),
             quads: QuadsSource::InMemory {
                 base,
                 selection: ViewSelection::all(),
@@ -208,6 +210,7 @@ impl VortexRdfStore {
         Self {
             layout: ResolvedLayout::Default,
             indexes: vec![],
+            generation: next_generation(),
             quads: QuadsSource::InMemory {
                 base: quads,
                 selection: ViewSelection::all(),

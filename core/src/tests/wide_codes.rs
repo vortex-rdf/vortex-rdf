@@ -4,7 +4,8 @@
 //! hold, and every path that takes or returns a code — the build's code map,
 //! the written code columns, matches through each index, keeps, batched
 //! probes, mutation and compaction rebuilds, the dictionary handles under
-//! both residencies, and the column kernels — has to carry them unchanged.
+//! both residencies, the view statistics' code bounds and the column kernels
+//! — has to carry them unchanged.
 //! A code narrowed anywhere on the way lands below the base, where no term
 //! is, so a truncation fails loudly instead of answering with another term.
 
@@ -304,6 +305,39 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         expected(quads, |q| q.graph_name == g1),
         "{label}: graph match"
     );
+
+    // ── the code bounds of the view statistics ──────────────────────────
+    let whole = store.view_statistics().unwrap();
+    if whole.file_backed {
+        // On file, a pushed-down equality bounds its column by its code:
+        // the graph match, which no index answers.
+        let g1_code = code(store, &terms, "<http://example.org/g1>").await;
+        let stats = by_graph.view_statistics().unwrap();
+        assert!(stats.pending_filter, "{label}: the graph is filtered");
+        assert_eq!(
+            stats.code_bounds[QuadColumn::G.index()],
+            Some((g1_code, g1_code)),
+            "{label}: a pushed-down equality's bound"
+        );
+    } else {
+        // In memory, a run of the sorted base is bounded by its first and
+        // last subject codes: the whole base, and one subject's run.
+        let last_subject = code(store, &terms, "_:b1").await;
+        assert_eq!(
+            whole.code_bounds[QuadColumn::S.index()],
+            Some((alice_code, last_subject)),
+            "{label}: the whole base's bound"
+        );
+        let run = store
+            .match_pattern(Some(&alice), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            run.view_statistics().unwrap().code_bounds[QuadColumn::S.index()],
+            Some((alice_code, alice_code)),
+            "{label}: a subject run's bound"
+        );
+    }
 
     // ── keeps: sets, ranges, and the narrowed code admitting nothing ────
     let kept = store

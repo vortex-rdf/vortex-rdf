@@ -32,6 +32,9 @@ use super::storage::{DictCursor, TermChunk, TermStore};
 /// cost of either depends on the encoding the terms are held in. Only the kind
 /// ranges are kept beyond a call.
 pub(crate) struct TermDictionary {
+    /// The identity of this dictionary (see
+    /// [`DictReader::dictionary_id`](crate::DictReader::dictionary_id)).
+    id: u64,
     pub(super) terms: TermStore,
     /// The kind ranges, computed on first use (a few probes).
     kinds: OnceLock<KindRanges>,
@@ -80,15 +83,30 @@ pub(super) fn check_code(code: TermCode, base: TermCode, n_terms: usize) -> Resu
     })
 }
 
+/// The next dictionary identity (see
+/// [`DictReader::dictionary_id`](crate::DictReader::dictionary_id)), from one
+/// process-wide counter shared by resident and file-backed dictionaries.
+pub(crate) fn next_dictionary_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 impl TermDictionary {
-    /// Wrap the held terms.
+    /// Wrap the held terms, under a new identity.
     pub(super) fn new(terms: TermStore) -> Self {
         Self {
+            id: next_dictionary_id(),
             terms,
             kinds: OnceLock::new(),
             #[cfg(test)]
             base: code_base(),
         }
+    }
+
+    /// This dictionary's identity.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     /// The code of the first term: 0 outside the tests' code-base hook.
