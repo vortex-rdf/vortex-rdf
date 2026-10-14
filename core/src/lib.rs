@@ -63,6 +63,23 @@ pub use store::{
     SharedQuad, SortOrder, SortedInMemoryBuilder, StoreParts, TermCode, TermPredicate, TextOptions,
     Verdict, ViewStatistics, VortexArrayBuilder, VortexRdfStore, export_rdf,
 };
+
+/// The vortex scan interface a store's data sources implement:
+/// [`VortexRdfStore::data_source`] and
+/// [`component_data_source`](VortexRdfStore::component_data_source) return
+/// its `DataSourceRef`, and a consumer builds its `ScanRequest`s from this
+/// copy, the version the store was compiled against.
+pub use vortex_scan;
+
+/// The vortex session this crate registers its store layout, encodings and
+/// write editions in: the session a consumer hands to vortex's own
+/// integrations (its DataFusion table provider) beside a
+/// [`data_source`](VortexRdfStore::data_source), and the one that opens this
+/// crate's files through vortex's own reader.
+pub fn vortex_session() -> &'static vortex_session::VortexSession {
+    &session::VORTEX_SESSION
+}
+
 // Compiled out on wasm along with the rest of the sorted-stream builder's
 // out-of-core merge (see the module gate in `store::builders`).
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

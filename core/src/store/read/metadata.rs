@@ -72,8 +72,9 @@ pub enum SelectionKind {
 }
 
 /// What a view promises about its rows before they are read, for the order
-/// [`row_chunks`](VortexRdfStore::row_chunks) and
-/// [`code_chunks`](VortexRdfStore::code_chunks) produce: the base's rows in
+/// [`row_chunks`](VortexRdfStore::row_chunks),
+/// [`code_chunks`](VortexRdfStore::code_chunks) and
+/// [`data_source`](VortexRdfStore::data_source) produce: the base's rows in
 /// base row order, whatever answered the match, then the tail's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewStatistics {
@@ -110,7 +111,9 @@ pub struct ViewStatistics {
 /// One of a store's index children.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexComponentInfo {
-    /// The child's component name (`index:posg`, `index:ref-o`, …).
+    /// The child's component name (`index:posg`, `index:ref-o`, …), the
+    /// name [`component_data_source`](VortexRdfStore::component_data_source)
+    /// takes.
     pub name: &'static str,
     /// The index the child belongs to.
     pub index: IndexType,
