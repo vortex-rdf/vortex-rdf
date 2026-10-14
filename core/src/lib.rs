@@ -45,6 +45,7 @@
 //! });
 //! ```
 
+pub mod columns;
 pub mod common;
 pub mod debug;
 pub mod error;
@@ -54,7 +55,6 @@ mod session;
 pub mod store;
 
 pub use error::{Result, VortexRdfError};
-pub use store::columns;
 
 pub use store::{
     BuiltArray, BuiltStream, CaseMap, ChunkStream, DictReader, DictSnapshot, DictionaryQuadSink,

@@ -12,10 +12,10 @@
 //! point-read path small selections take). The point-read
 //! paths on both sides are gated on selection width, declining to the
 //! vectorized mask pipeline above it. The row-set algebra itself stays in
-//! [`selection`](super::selection); what lives here is its execution against
+//! [`selection`](super::view::selection); what lives here is its execution against
 //! a backend.
 //!
-//! [`RowSelection`]: super::selection::RowSelection
+//! [`RowSelection`]: super::view::selection::RowSelection
 
 #[cfg(feature = "file-io")]
 pub(crate) mod file_scan;

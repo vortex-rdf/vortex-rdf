@@ -28,10 +28,10 @@ use crate::store::probes::StructProbes;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_scan;
 use crate::store::schema::{self, QuadColumn, RowId, TermCode};
-use crate::store::selection::{RowSelection, ViewSelection};
+use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{QuadsSource, Tail};
 
-use super::VortexRdfStore;
+use crate::store::VortexRdfStore;
 
 /// Which term codes a [`keep`](VortexRdfStore::keep) admits in a column.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -714,7 +714,7 @@ impl VortexRdfStore {
     /// [`set_is_located`]).
     #[cfg(feature = "file-io")]
     async fn keep_located(
-        file: &crate::store::native_file::NativeStoreFile,
+        file: &crate::store::persist::native_file::NativeStoreFile,
         selection: &RowSelection,
         keep: &Keep,
         row_count: usize,

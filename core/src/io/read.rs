@@ -2,7 +2,7 @@
 //! native root, and materializing whole files or auxiliary children on any
 //! target. The opened-store runtime handle the store's file-backed query
 //! paths drive lives store-side, in
-//! [`store::native_file`](crate::store::native_file), beside the scan
+//! [`store::persist::native_file`](crate::store::persist::native_file), beside the scan
 //! machinery that defines its memo semantics; the wire format itself (layout
 //! VTable, descriptors, write strategy) lives in
 //! [`container`](super::container).
@@ -301,7 +301,7 @@ pub(crate) mod map_probe {
 
 /// Open a Vortex file lazily — no data is read until the returned
 /// `VortexFile` is scanned. The handle caches no reader: the
-/// [`NativeStoreFile`](crate::store::native_file::NativeStoreFile) around it
+/// [`NativeStoreFile`](crate::store::persist::native_file::NativeStoreFile) around it
 /// owns the reader tree.
 ///
 /// Both modes reach the file through `File::open` first, so a path that

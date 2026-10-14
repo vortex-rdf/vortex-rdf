@@ -422,7 +422,7 @@ async fn test_file_backed_dictionary_serves_wide_run() {
     let served = fb.match_pattern(None, Some(&p1), None, None).await.unwrap();
     assert!(served.debug_has_serve_plan());
     assert_eq!(served.size().await.unwrap(), 300);
-    assert!(served.size().await.unwrap() > crate::store::selection::POINT_GATHER_MAX_ROWS);
+    assert!(served.size().await.unwrap() > crate::store::view::selection::POINT_GATHER_MAX_ROWS);
     let want = expected_strings(&quads, |i| i % 3 == 1);
     assert_eq!(view_strings(&served).await, want);
     assert_eq!(

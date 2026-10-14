@@ -214,7 +214,7 @@ pub(crate) fn resolve_in_memory(
 /// and a window reads only its own rows.
 #[cfg(feature = "file-io")]
 pub(crate) async fn resolve_file(
-    file: &Arc<crate::store::native_file::NativeStoreFile>,
+    file: &Arc<crate::store::persist::native_file::NativeStoreFile>,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
 ) -> Result<IndexResolution<FileServePlan>> {
@@ -290,7 +290,7 @@ enum Located<'a> {
 /// shared front half of [`resolve_file`] and the test hook `debug_located_run`.
 #[cfg(feature = "file-io")]
 async fn locate<'a>(
-    file: &crate::store::native_file::NativeStoreFile,
+    file: &crate::store::persist::native_file::NativeStoreFile,
     pattern: QuadPattern<'a>,
     codes: &mut PatternCodes,
 ) -> Result<Located<'a>> {
@@ -325,7 +325,7 @@ async fn locate<'a>(
 /// from results.
 #[cfg(all(test, feature = "file-io"))]
 pub(crate) async fn debug_located_run(
-    file: &crate::store::native_file::NativeStoreFile,
+    file: &crate::store::persist::native_file::NativeStoreFile,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
 ) -> Result<Option<Range<u64>>> {
