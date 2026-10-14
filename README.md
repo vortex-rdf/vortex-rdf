@@ -34,6 +34,7 @@ Vortex-RDF is a columnar RDF serialization and a queryable quad store built on t
 ```rust no_run
 use oxrdf::NamedNode;
 use oxrdfio::RdfFormat;
+use std::io::{BufWriter, Write};
 use vortex_rdf_core::{IndexType, LayoutStrategy, VortexRdfStore, export_rdf};
 use vortex_rdf_core::{common::terms::parse_quads_from_reader, io::quads_stream_to_vortex_file};
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -52,8 +53,10 @@ let knows = NamedNode::new("http://xmlns.com/foaf/0.1/knows")?;
 let matched = store.match_pattern(None, Some(&knows), None, None).await?;
 println!("{} matches", matched.size().await?);
 
-// Export the matches back to textual RDF
-export_rdf(matched, std::fs::File::create("knows.nq")?, RdfFormat::NQuads).await?;
+// Export the matches back to textual RDF; the writer is the caller's to buffer and flush
+let mut out = BufWriter::new(std::fs::File::create("knows.nq")?);
+export_rdf(matched, &mut out, RdfFormat::NQuads).await?;
+out.flush()?;
 # Ok::<(), Box<dyn std::error::Error>>(()) })?; Ok(()) }
 ```
 
