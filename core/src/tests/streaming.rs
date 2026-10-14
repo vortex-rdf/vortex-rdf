@@ -118,8 +118,9 @@ async fn test_shared_quads_match_quads_vec_on_served_view() {
         .match_pattern(None, Some(&p0), None, None)
         .await
         .unwrap();
-    assert!(
-        served.debug_has_serve_plan(),
+    assert_eq!(
+        served_component(&served),
+        Some("index:posg"),
         "the P match must be index-served"
     );
     let rows = assert_shared_matches_quads(&served, "served").await;
@@ -163,8 +164,9 @@ async fn test_shared_quads_match_quads_vec_on_views() {
         .match_pattern(None, Some(&p0), None, None)
         .await
         .unwrap();
-    assert!(
-        served.debug_has_serve_plan(),
+    assert_eq!(
+        served_component(&served),
+        Some("index:posg"),
         "the P match must be index-served"
     );
     let views = [

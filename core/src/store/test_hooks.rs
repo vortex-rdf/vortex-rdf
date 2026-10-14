@@ -1,7 +1,11 @@
-//! Test hooks on [`VortexRdfStore`]: read-only accessors over the store's
-//! internal state, so tests assert which mechanism answered a query (a
-//! serve plan, a deferred selection, a prefix-probe range, a retained wire
-//! encoding) rather than only the result.
+//! Test hooks on [`VortexRdfStore`]: read-only accessors over internal state
+//! no public API reports, so tests assert which mechanism answered a query
+//! (a located run, a deferred selection's row ids, a prefix-probe range, a
+//! retained wire encoding) rather than only the result. What a planner can
+//! observe — the serving component, the selection kind, the sort order, a
+//! pending filter, the dictionary's residency — is asserted through
+//! [`view_statistics`](VortexRdfStore::view_statistics) and
+//! [`dict_reader`](VortexRdfStore::dict_reader).
 
 use std::ops::Range;
 
@@ -136,22 +140,6 @@ pub(crate) fn gathers() -> usize {
 use oxrdf::NamedOrBlankNode;
 
 impl VortexRdfStore {
-    /// Whether this view carries an index serving plan for `quads()`.
-    pub(crate) fn debug_has_serve_plan(&self) -> bool {
-        match &self.quads {
-            QuadsSource::InMemory { serve, .. } => serve.is_some(),
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { serve, .. } => serve.is_some(),
-        }
-    }
-
-    /// Whether this view's base selection is still pending — a served match,
-    /// or a run held for a count, whose exact row ids no consumer has needed
-    /// yet.
-    pub(crate) fn debug_selection_pending(&self) -> bool {
-        matches!(self.quads.view_selection(), ViewSelection::Pending(_))
-    }
-
     /// Whether a pending selection's row ids have been computed: `false` for
     /// a still-deferred resolution, `None` when the selection is not pending
     /// at all.
@@ -221,29 +209,10 @@ impl VortexRdfStore {
             QuadsSource::File { .. } => true,
         }
     }
-
-    /// Whether an in-memory base's `s` column carries the sorted stamp;
-    /// false for a file-backed store.
-    pub(crate) fn debug_base_subject_sorted(&self) -> bool {
-        match &self.quads {
-            QuadsSource::InMemory { base, .. } => array::subject_sorted(base),
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { .. } => false,
-        }
-    }
 }
 
 #[cfg(feature = "file-io")]
 impl VortexRdfStore {
-    /// Whether the dictionary was left in its file child (a file-backed
-    /// dictionary is only built over a child whose windows can be searched).
-    pub(crate) fn debug_dict_file_backed(&self) -> bool {
-        matches!(
-            &self.layout,
-            ResolvedLayout::Dictionary(DictAccess::FileBacked(_))
-        )
-    }
-
     /// How many times the file-backed dictionary was lifted whole into memory
     /// since the file opened (shared by every view of the file); `None` for a
     /// resident dictionary or another layout.
@@ -288,15 +257,6 @@ impl VortexRdfStore {
         match &self.quads {
             QuadsSource::InMemory { .. } => None,
             QuadsSource::File { file, .. } => Some(file.debug_column_streams()),
-        }
-    }
-
-    /// Whether this file view carries a filter its next scan evaluates;
-    /// `None` off-file.
-    pub(crate) fn debug_file_filter_pending(&self) -> Option<bool> {
-        match &self.quads {
-            QuadsSource::InMemory { .. } => None,
-            QuadsSource::File { filter, .. } => Some(filter.is_some()),
         }
     }
 

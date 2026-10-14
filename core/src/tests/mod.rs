@@ -331,6 +331,23 @@ async fn matched_size(
         .unwrap()
 }
 
+/// The index child that answers `view`'s reads from its own columns, if any:
+/// the [`served_component`](ViewStatistics::served_component) of its
+/// statistics. Taking the statistics of an in-memory view that carries
+/// tombstones decodes a pending run's row ids, so a test of laziness asks a
+/// view without any.
+fn served_component(view: &VortexRdfStore) -> Option<&'static str> {
+    view.view_statistics().unwrap().served_component
+}
+
+/// Whether `view`'s base selection is an index run whose row ids no consumer
+/// has needed yet: its statistics' [`selection`](ViewStatistics::selection)
+/// is [`SelectionKind::PendingIndexRun`]. The note on [`served_component`]
+/// about tombstones applies.
+fn selection_pending(view: &VortexRdfStore) -> bool {
+    view.view_statistics().unwrap().selection == SelectionKind::PendingIndexRun
+}
+
 /// The quad-row column names `layout` builds — what a schema assertion
 /// expects the primary struct to carry and nothing else.
 fn primary_columns(layout: LayoutStrategy) -> &'static [&'static str] {

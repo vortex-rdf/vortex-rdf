@@ -199,7 +199,7 @@ async fn test_unstamped_owner_to_bytes_records_unsorted() {
     );
 
     let reread = VortexRdfStore::from_bytes(&bytes).await.unwrap();
-    assert!(!reread.debug_base_subject_sorted());
+    assert_eq!(reread.view_statistics().unwrap().sort_order, None);
     assert_eq!(reread.size().await.unwrap(), 12);
     let s07 = subject_node(7, 2);
     assert_eq!(
@@ -488,8 +488,9 @@ async fn test_from_parts_adopts_searchable_children() {
         store.debug_base_probe_resolvable(),
         "from_parts must leave every sorted column probe-bindable"
     );
-    assert!(
-        store.debug_base_subject_sorted(),
+    assert_eq!(
+        store.view_statistics().unwrap().sort_order,
+        Some(SortOrder::Spog),
         "the sorted build's subject stamp must survive the re-encoding"
     );
     for name in ["index:posg", "index:ospg"] {
@@ -518,10 +519,13 @@ async fn test_from_parts_adopts_searchable_children() {
         v
     };
     let adopted = unstamped_store(&quads_unsorted);
-    assert!(
-        !VortexRdfStore::from_parts(adopted.to_serializable_parts().await.unwrap())
+    assert_eq!(
+        VortexRdfStore::from_parts(adopted.to_serializable_parts().await.unwrap())
             .unwrap()
-            .debug_base_subject_sorted(),
+            .view_statistics()
+            .unwrap()
+            .sort_order,
+        None,
         "rows with no sorted provenance must stay unstamped through adoption"
     );
 }
