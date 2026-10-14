@@ -572,14 +572,7 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
 /// still resolve through the compressed form.
 #[tokio::test]
 async fn test_dictionary_terms_stay_fsst_through_bytes() {
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(fsst_dictionary_quads()),
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(fsst_dictionary_quads(), LayoutStrategy::Dictionary, vec![]).await;
 
     let bytes = store.to_bytes().await.unwrap();
     let reread = VortexRdfStore::from_bytes(&bytes).await.unwrap();

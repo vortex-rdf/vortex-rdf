@@ -36,14 +36,11 @@ async fn run_quads_vec_matches_stream(store: VortexRdfStore, kind: &str) {
 
 #[tokio::test]
 async fn test_quads_vec_matches_stream_collection() {
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(dictionary_test_quads()),
-        LayoutStrategy::Dictionary,
-        vec![],
+    run_quads_vec_matches_stream(
+        built_store(dictionary_test_quads(), LayoutStrategy::Dictionary, vec![]).await,
+        "in memory",
     )
-    .await
-    .unwrap();
-    run_quads_vec_matches_stream(VortexRdfStore::from_built(arr).unwrap(), "in memory").await;
+    .await;
 }
 
 #[cfg(feature = "file-io")]
@@ -67,14 +64,7 @@ async fn test_shared_quads_match_quads_vec_across_layouts() {
         LayoutStrategy::TypedObject,
         LayoutStrategy::Dictionary,
     ] {
-        let arr = build_array::<SortedInMemoryBuilder>(
-            quad_stream(dictionary_test_quads()),
-            layout,
-            vec![],
-        )
-        .await
-        .unwrap();
-        let store = VortexRdfStore::from_built(arr).unwrap();
+        let store = built_store(dictionary_test_quads(), layout, vec![]).await;
         assert_shared_matches_quads(&store, &format!("{layout:?}")).await;
         let p0 = NamedNode::new("http://example.org/p0").unwrap();
         let matched = store
@@ -89,14 +79,7 @@ async fn test_shared_quads_match_quads_vec_across_layouts() {
 /// and shared: rows carrying the same predicate or graph hold one allocation.
 #[tokio::test]
 async fn test_shared_quads_share_repeated_terms() {
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(modular_quads(64, 3, 4)),
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(modular_quads(64, 3, 4), LayoutStrategy::Dictionary, vec![]).await;
     let rows = store.shared_quads_vec().await.unwrap();
     assert_eq!(rows.len(), 64);
     for a in &rows {
@@ -123,14 +106,12 @@ async fn test_shared_quads_share_repeated_terms() {
 #[tokio::test]
 async fn test_shared_quads_match_quads_vec_on_served_view() {
     let quads = modular_quads(64, 3, 4);
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
+    let store = built_store(
+        quads.clone(),
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByCopy],
     )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    .await;
 
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
     let served = store
@@ -209,14 +190,7 @@ async fn test_shared_quads_match_quads_vec_on_views() {
 /// were decoded with.
 #[tokio::test]
 async fn test_shared_quads_survive_compaction() {
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(dictionary_test_quads()),
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(dictionary_test_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let held = store.shared_quads_vec().await.unwrap();
     let before = shared_tuple_rows(&held);
 

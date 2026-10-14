@@ -42,13 +42,7 @@ async fn test_file_backed_delete_keeps_indexes() {
     // The index still routes the lookup after the delete, and the
     // tombstoned rows must not come back.
     assert_eq!(
-        after
-            .match_pattern(None, None, Some(&object0), None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
+        matched_size(&after, None, None, Some(&object0), None).await,
         0
     );
     // Predicate p0 (i even: 0,2,4,6,8,10) had rows 0 and 6 tombstoned.
@@ -71,13 +65,7 @@ async fn test_file_backed_delete_keeps_indexes() {
     // s05 is object "object 2" (5 % 3); that lookup now returns one fewer.
     let object2 = Term::Literal(Literal::new_simple_literal("object 2"));
     assert_eq!(
-        after2
-            .match_pattern(None, None, Some(&object2), None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
+        matched_size(&after2, None, None, Some(&object2), None).await,
         3,
     );
 
@@ -391,14 +379,7 @@ async fn test_file_with_both_index_kinds() {
     let file = VortexRdfStore::from_file(&path).await.unwrap();
     assert_eq!(file.indexes(), both.as_slice());
 
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
-        LayoutStrategy::Default,
-        both.clone(),
-    )
-    .await
-    .unwrap();
-    let memory = VortexRdfStore::from_built(arr).unwrap();
+    let memory = built_store(quads.clone(), LayoutStrategy::Default, both.clone()).await;
     assert_eq!(memory.indexes(), both.as_slice());
 
     let adopted = VortexRdfStore::from_bytes(&file.to_bytes().await.unwrap())

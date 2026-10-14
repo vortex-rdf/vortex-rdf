@@ -51,12 +51,8 @@ fn as_written_before_0_12(mut bytes: Vec<u8>) -> Vec<u8> {
 
 /// The serialized bytes of a store built from [`modular_quads`].
 async fn store_bytes(layout: LayoutStrategy, indexes: Indexes) -> Vec<u8> {
-    let built =
-        build_array::<SortedInMemoryBuilder>(quad_stream(modular_quads(12, 3, 4)), layout, indexes)
-            .await
-            .unwrap();
-    VortexRdfStore::from_built(built)
-        .unwrap()
+    built_store(modular_quads(12, 3, 4), layout, indexes)
+        .await
         .to_bytes()
         .await
         .unwrap()

@@ -71,14 +71,12 @@ async fn test_duplicate_index_requests_are_deduplicated() {
 async fn test_in_memory_derived_view_keeps_indexes() {
     let quads = modular_quads(24, 3, 4);
 
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
+    let store = built_store(
+        quads.clone(),
         LayoutStrategy::Default,
         vec![IndexType::SecondaryByReference],
     )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    .await;
     assert_eq!(store.indexes(), &vec![IndexType::SecondaryByReference]);
 
     // Match on the object index: 24 quads over 4 objects ⇒ 6 rows.
@@ -120,14 +118,12 @@ async fn test_in_memory_derived_view_keeps_indexes() {
 async fn test_compact_with_indexes_rebuilds() {
     let quads = modular_quads(24, 3, 4);
 
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
+    let store = built_store(
+        quads.clone(),
         LayoutStrategy::Default,
         vec![IndexType::SecondaryByReference],
     )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    .await;
 
     // A view over the object index: i = 1, 5, 9, 13, 17, 21 ⇒ 6 rows.
     let object = Term::Literal(Literal::new_simple_literal("object 1"));
@@ -151,14 +147,7 @@ async fn test_compact_with_indexes_rebuilds() {
 
     // Re-indexing from nothing: an empty set drops every index,
     // and a store built without indexes gains one it never had.
-    let bare = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
-        LayoutStrategy::Default,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let bare = VortexRdfStore::from_built(bare).unwrap();
+    let bare = built_store(quads.clone(), LayoutStrategy::Default, vec![]).await;
     assert!(bare.indexes().is_empty());
     assert!(
         bare.compact_with_indexes(vec![])
@@ -186,14 +175,7 @@ async fn test_compact_with_indexes_rebuilds() {
 async fn run_compact_with_indexes_layout(layout: LayoutStrategy) {
     let quads = modular_quads(24, 3, 4);
 
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
-        layout,
-        vec![IndexType::SecondaryByReference],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(quads.clone(), layout, vec![IndexType::SecondaryByReference]).await;
 
     let object = Term::Literal(Literal::new_simple_literal("object 1"));
     let indexed = store
@@ -222,13 +204,7 @@ async fn run_compact_with_indexes_layout(layout: LayoutStrategy) {
         ]
     );
     assert_eq!(
-        indexed
-            .match_pattern(None, None, Some(&object), None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
+        matched_size(&indexed, None, None, Some(&object), None).await,
         6,
     );
 
@@ -269,14 +245,7 @@ async fn test_compact_with_indexes_default() {
 /// silently lost its indexes.
 async fn run_compact_to_empty_keeps_indexes(layout: LayoutStrategy) {
     let quads = modular_quads(8, 3, 4);
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
-        layout,
-        vec![IndexType::SecondaryByReference],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(quads.clone(), layout, vec![IndexType::SecondaryByReference]).await;
 
     // A pattern nothing matches: the view is empty, and so is its compaction.
     let absent = Term::Literal(Literal::new_simple_literal("no such object"));
@@ -294,13 +263,7 @@ async fn run_compact_to_empty_keeps_indexes(layout: LayoutStrategy) {
     // than erroring or falling back.
     let object = Term::Literal(Literal::new_simple_literal("object 1"));
     assert_eq!(
-        empty
-            .match_pattern(None, None, Some(&object), None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
+        matched_size(&empty, None, None, Some(&object), None).await,
         0,
     );
 }
@@ -327,14 +290,7 @@ async fn test_compact_to_empty_keeps_indexes_typed_object() {
 #[tokio::test]
 async fn test_compact_with_indexes_typed_object_routes_every_object_kind() {
     let quads = term_kind_quads();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
-        LayoutStrategy::TypedObject,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(quads.clone(), LayoutStrategy::TypedObject, vec![]).await;
     assert!(store.indexes().is_empty());
 
     let indexed = store
@@ -373,14 +329,12 @@ async fn test_compact_with_indexes_typed_object() {
 async fn test_delete_keeps_indexes_usable() {
     let quads = modular_quads(12, 2, 3);
 
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
+    let store = built_store(
+        quads.clone(),
         LayoutStrategy::Default,
         vec![IndexType::SecondaryByReference],
     )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    .await;
 
     // Drop one quad: subject s0, which also carries object "object 0".
     let after = store.delete_quad(&quads[0]).await.unwrap();
@@ -793,14 +747,12 @@ pub(super) async fn run_copy_index_serving_script(
 #[tokio::test]
 async fn test_in_memory_copy_index_serving() {
     let (quads, graphs) = copy_index_script_dataset();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
+    let store = built_store(
+        quads.clone(),
         LayoutStrategy::Default,
         vec![IndexType::SecondaryByCopy],
     )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    .await;
     run_copy_index_serving_script(
         store,
         &quads,
@@ -824,14 +776,12 @@ async fn test_in_memory_copy_index_serving() {
 #[tokio::test]
 async fn test_built_store_compresses_resident_form() {
     let quads = modular_quads(200, 4, 8);
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
+    let store = built_store(
+        quads.clone(),
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByCopy],
     )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    .await;
 
     assert!(
         !store.debug_base_int_children_canonical(),
@@ -889,14 +839,12 @@ async fn test_built_store_compresses_resident_form() {
 #[tokio::test]
 async fn test_code_columns_serves_from_the_answering_index() {
     let quads = graph_modular_quads(30, 2, 3, 5, &[GraphName::DefaultGraph]);
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
+    let store = built_store(
+        quads.clone(),
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByCopy],
     )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    .await;
 
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     let matched = store

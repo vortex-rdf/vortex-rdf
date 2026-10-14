@@ -202,13 +202,7 @@ async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
             ("PO", Some(&p1), Some(&o1), 2),
         ] {
             assert_eq!(
-                store
-                    .match_pattern(None, pp, po, None)
-                    .await
-                    .unwrap()
-                    .size()
-                    .await
-                    .unwrap(),
+                matched_size(&store, None, pp, po, None).await,
                 want,
                 "{layout:?}: {tag}"
             );
@@ -249,13 +243,7 @@ async fn test_sorted_stream_empty_dataset() {
             assert_eq!(store.size().await.unwrap(), 0, "{layout:?}/{indexes:?}");
             let p = NamedNode::new("http://example.org/p0").unwrap();
             assert_eq!(
-                store
-                    .match_pattern(None, Some(&p), None, None)
-                    .await
-                    .unwrap()
-                    .size()
-                    .await
-                    .unwrap(),
+                matched_size(&store, None, Some(&p), None, None).await,
                 0,
                 "{layout:?}/{indexes:?}"
             );

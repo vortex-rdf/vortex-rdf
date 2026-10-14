@@ -732,14 +732,7 @@ async fn test_compaction_after_appends_holds_each_quad_once() {
     for layout in LAYOUTS {
         for indexes in index_sets() {
             let who = format!("{layout:?} / {indexes:?}");
-            let built = build_array::<SortedInMemoryBuilder>(
-                quad_stream(base.clone()),
-                layout,
-                indexes.clone(),
-            )
-            .await
-            .unwrap();
-            let store = VortexRdfStore::from_built(built).unwrap();
+            let store = built_store(base.clone(), layout, indexes.clone()).await;
             let tailed = store.add_quads(appended.clone()).await.unwrap();
             assert_eq!(
                 tailed.tail_len(),
