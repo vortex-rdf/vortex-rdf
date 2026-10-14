@@ -292,10 +292,11 @@ impl VortexRdfStore {
     /// tombstones and applies them to its own rows; the append tail goes with
     /// the last, so over a sorted base every partition but the last keeps the
     /// `Spog` [`sort_order`](ViewStatistics::sort_order), and the last keeps
-    /// it only when the view reads no tail row. A served match's row ids are
-    /// read first, and no partition keeps the serve plan. Pieces are about
-    /// equal before filtering, not after; a view selecting no base row is its
-    /// own one partition.
+    /// it only when the view reads no tail row. For `n` = 1 the one partition
+    /// is the view itself, its serve plan and pending selection included; for
+    /// a larger `n`, a served match's row ids are read first and no partition
+    /// keeps the serve plan. Pieces are about equal before filtering, not
+    /// after; a view selecting no base row is its own one partition.
     pub async fn partitions(&self, n: NonZeroUsize) -> Result<Vec<Self>> {
         let n = n.get();
         if n == 1 {
