@@ -215,20 +215,12 @@ impl VortexRdfStore {
     /// the bindings' entry point — otherwise runs; that method tries this fast
     /// path first.
     pub(crate) fn code_columns(&self) -> Option<[Buffer<TermCode>; 4]> {
-        use vortex_array::arrays::Struct;
         if self.layout.strategy() != LayoutStrategy::Dictionary || self.tail_len() != 0 {
             return None;
         }
         // Without `file-io`, InMemory is the only variant.
         #[allow(irrefutable_let_patterns)]
-        let QuadsSource::InMemory {
-            base,
-            selection,
-            deleted,
-            serve,
-            ..
-        } = &self.quads
-        else {
+        let QuadsSource::InMemory { deleted, serve, .. } = &self.quads else {
             return None;
         };
         // Served fast path: the answering index's own columns already hold
@@ -240,6 +232,31 @@ impl VortexRdfStore {
         {
             return Some(columns);
         }
+        self.base_code_columns()
+    }
+
+    /// [`code_columns`](Self::code_columns) without the served fast path: the
+    /// view's codes gathered from the base's own columns in base row order,
+    /// whatever answered the match. A served match's pending selection
+    /// materializes here. `None` under the same conditions as
+    /// `code_columns`, or when a base column is not a canonical code
+    /// primitive the shared cache can hand out.
+    pub(crate) fn base_code_columns(&self) -> Option<[Buffer<TermCode>; 4]> {
+        use vortex_array::arrays::Struct;
+        if self.layout.strategy() != LayoutStrategy::Dictionary || self.tail_len() != 0 {
+            return None;
+        }
+        // Without `file-io`, InMemory is the only variant.
+        #[allow(irrefutable_let_patterns)]
+        let QuadsSource::InMemory {
+            base,
+            selection,
+            deleted,
+            ..
+        } = &self.quads
+        else {
+            return None;
+        };
         let struct_arr = base.clone().try_downcast::<Struct>().ok()?;
         let mut prims: Vec<PrimitiveArray> = Vec::with_capacity(4);
         for name in schema::PRIMARY_COLUMNS {
@@ -396,22 +413,14 @@ impl VortexRdfStore {
                 // An exact selection is read point by point through the file's
                 // cached chunk probes, taken at its ids, or scanned, as
                 // `ExactRead` chooses; a read by id that declines runs the scan.
-                let columns = self.layout.strategy().primary_column_names();
-                let by_id = match file_reads::ExactRead::of(
+                let by_id = Self::exact_rows_by_id(
                     file,
-                    columns,
+                    self.layout.strategy().primary_column_names(),
                     filter.as_ref(),
                     &selection,
                     deleted.as_ref(),
-                )? {
-                    file_reads::ExactRead::Points(rows) => {
-                        file_reads::file_point_rows(file, columns, filter.as_ref(), rows).await?
-                    }
-                    file_reads::ExactRead::Take(ids) => {
-                        file_reads::take_file_rows(file, columns, &ids).await?
-                    }
-                    file_reads::ExactRead::Scan => None,
-                };
+                )
+                .await?;
                 let arr = match by_id {
                     Some(rows) => rows,
                     None => {
@@ -436,6 +445,32 @@ impl VortexRdfStore {
         }
     }
 
+    /// The rows of `columns` at an exact file `selection` with `filter`
+    /// pending and `deleted` tombstoned, read by id as
+    /// [`ExactRead`](file_reads::ExactRead) chooses: point by point through
+    /// the file's cached chunk probes ([`file_reads::file_point_rows`]), or
+    /// taken at the ids ([`file_reads::take_file_rows`]). `None` when
+    /// `ExactRead` leaves the selection to the scan, or a read by id
+    /// declines; the caller then scans.
+    #[cfg(feature = "file-io")]
+    pub(in crate::store) async fn exact_rows_by_id(
+        file: &crate::store::persist::native_file::NativeStoreFile,
+        columns: &[&'static str],
+        filter: Option<&Expression>,
+        selection: &RowSelection,
+        deleted: Option<&Mask>,
+    ) -> Result<Option<ArrayRef>> {
+        match file_reads::ExactRead::of(file, columns, filter, selection, deleted)? {
+            file_reads::ExactRead::Points(rows) => {
+                file_reads::file_point_rows(file, columns, filter, rows).await
+            }
+            file_reads::ExactRead::Take(ids) => {
+                file_reads::take_file_rows(file, columns, &ids).await
+            }
+            file_reads::ExactRead::Scan => Ok(None),
+        }
+    }
+
     /// The scan every unserved file read starts from: the layout's primary
     /// columns only (index columns are internal and never surfaced), with the
     /// restrictions the view accumulated via `match_pattern` applied — a
@@ -449,7 +484,26 @@ impl VortexRdfStore {
         selection: &RowSelection,
         deleted: Option<&Mask>,
     ) -> Result<ScanBuilder<ArrayRef>> {
-        let proj = self.layout.strategy().primary_column_names();
+        Self::restricted_file_scan_projected(
+            file,
+            self.layout.strategy().primary_column_names(),
+            filter,
+            selection,
+            deleted,
+        )
+    }
+
+    /// [`restricted_file_scan`](Self::restricted_file_scan) projecting only
+    /// `columns` — primary column names, in the order the chunks carry them —
+    /// so the scan decodes no column the caller does not read.
+    #[cfg(feature = "file-io")]
+    pub(in crate::store) fn restricted_file_scan_projected(
+        file: &crate::store::persist::native_file::NativeStoreFile,
+        columns: &[&'static str],
+        filter: Option<&Expression>,
+        selection: &RowSelection,
+        deleted: Option<&Mask>,
+    ) -> Result<ScanBuilder<ArrayRef>> {
         let mut scan = file.scan().map_err(VortexRdfError::Vortex)?;
         // The scan's scope (the quad-source root dtype) is what filters and
         // projections bind against — read it before the projection replaces
@@ -458,7 +512,7 @@ impl VortexRdfStore {
         let scope = scan.dtype().map_err(VortexRdfError::Vortex)?;
         let memo = file.bound_exprs();
         scan = scan.with_projection(
-            memo.bind(file_reads::QUAD_SCOPE, &select(proj, root()), &scope)
+            memo.bind(file_reads::QUAD_SCOPE, &select(columns, root()), &scope)
                 .map_err(VortexRdfError::Vortex)?,
         );
         if let Some(f) = filter {

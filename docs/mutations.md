@@ -155,7 +155,7 @@ flowchart TD
   [`matching_file_row_mask`](../core/src/store/write/mutation.rs#L327) (through
   [`matching_file_rows`](../core/src/store/scan/file_filter.rs#L302)), and on
   every later read the mask is applied **inside the scan**
-  ([`restrict_scan`](../core/src/store/scan/file_reads.rs#L183)) — as an
+  ([`restrict_scan`](../core/src/store/scan/file_reads.rs#L220)) — as an
   `ExcludeByIndex` selection of the deleted ids for an `All` or `Range`
   selection, or subtracted up front from an id list — so it composes with a
   pushed-down filter, whose output carries no row ids to re-align against.
@@ -173,7 +173,7 @@ flowchart TD
 | `compact()` | every live row, base first | every live tail row, then re-sorted with the base |
 
 The rows a rebuild or compaction starts from come from
-[`live_raw_quads`](../core/src/store/read/rows.rs#L502): base rows first (in view
+[`live_raw_quads`](../core/src/store/read/rows.rs#L556): base rows first (in view
 order), then tail rows, tombstones already excluded.
 
 ---

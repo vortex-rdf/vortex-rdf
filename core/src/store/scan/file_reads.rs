@@ -7,7 +7,8 @@ use std::future::Future;
 use std::ops::Range;
 use std::sync::Arc;
 
-use futures::{StreamExt, stream};
+use futures::stream::BoxStream;
+use futures::{StreamExt, future, stream};
 use oxrdf::NamedOrBlankNode;
 use vortex_array::expr::forms::conjuncts;
 use vortex_array::expr::{Expression, and_collect, eq, get_item, lit, root};
@@ -21,7 +22,9 @@ use vortex_scan::selection::Selection;
 use vortex_scan::strict_sorted_buffer::StrictSortedBuffer;
 
 use crate::error::{Result, VortexRdfError};
-use crate::io::read::{available_parallelism, collect_scan, collect_scan_spawned};
+use crate::io::read::{
+    available_parallelism, collect_scan, collect_scan_spawned, inline_splits, spawned_splits,
+};
 use crate::store::layouts::{Constraints, PatternCodes, QuadPattern, TermRef};
 use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::scan::gather::primitive_from_u64_reads;
@@ -35,18 +38,33 @@ pub(crate) const QUAD_SCOPE: &str = "quads";
 /// How a scan's split futures are driven.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScanDriver {
-    /// Polled on the calling task, by [`collect_scan`].
+    /// Polled on the calling task ([`inline_splits`]).
     Inline,
-    /// Spawned onto the runtime's workers, by [`collect_scan_spawned`].
+    /// Spawned onto the runtime's workers ([`spawned_splits`]).
     Spawned,
+}
+
+impl ScanDriver {
+    /// The driver for a row scan of `splits` split futures, the one rule
+    /// [`read_all_rows`] and [`stream_rows`] share: inline up to
+    /// [`MAX_INLINE_SPLITS`], spawned above it — and inline whatever the
+    /// count on a thread with no tokio runtime, which has nothing to spawn
+    /// onto.
+    pub(crate) fn for_row_scan(splits: usize) -> Self {
+        if splits <= max_inline_splits() || tokio::runtime::Handle::try_current().is_err() {
+            ScanDriver::Inline
+        } else {
+            ScanDriver::Spawned
+        }
+    }
 }
 
 /// Row scans of up to this many splits run inline: at that size, waking the
 /// workers costs more than the parallel work saves.
 const MAX_INLINE_SPLITS: usize = 42;
 
-/// The limit [`read_all_rows`] applies: [`MAX_INLINE_SPLITS`], or what a test
-/// forced on this thread.
+/// The limit [`ScanDriver::for_row_scan`] applies: [`MAX_INLINE_SPLITS`], or
+/// what a test forced on this thread.
 fn max_inline_splits() -> usize {
     #[cfg(test)]
     if let Some(limit) = driver_hooks::forced_limit() {
@@ -112,11 +130,12 @@ pub(crate) mod driver_hooks {
 /// Run a row scan to completion and materialize every row it yields into one
 /// in-memory array, in the scan's row order.
 ///
-/// A scan of at most [`MAX_INLINE_SPLITS`] splits is driven inline: its split
-/// futures are polled on the calling task by [`collect_scan`]. A larger one is
-/// spawned by [`collect_scan_spawned`], `scan.concurrency()` splits per core in
-/// flight. Either driver returns the chunks in split order, whatever the
-/// scan's `ordered` flag says.
+/// [`ScanDriver::for_row_scan`] picks the driver from the split count. Inline,
+/// the split futures are polled on the calling task by [`collect_scan`];
+/// spawned, they run on the runtime's workers through
+/// [`collect_scan_spawned`], `scan.concurrency()` splits per core in flight.
+/// Either driver returns the chunks in split order, whatever the scan's
+/// `ordered` flag says.
 ///
 /// The splits are planned here because their count picks the driver. Row
 /// splits do filter and decode work, so a large scan needs the workers; an
@@ -125,15 +144,33 @@ pub(crate) async fn read_all_rows(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRe
     let dtype = scan.dtype().map_err(VortexRdfError::Vortex)?;
     let window = scan.concurrency() * available_parallelism();
     let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
-    let driver = if tasks.len() <= max_inline_splits() {
-        ScanDriver::Inline
-    } else {
-        ScanDriver::Spawned
-    };
-    match driver {
+    match ScanDriver::for_row_scan(tasks.len()) {
         ScanDriver::Inline => collect_scan(dtype, tasks).await,
         ScanDriver::Spawned => collect_scan_spawned(dtype, tasks, window).await,
     }
+}
+
+/// [`read_all_rows`]' rows as a stream of the scan's chunks: one chunk per
+/// split that keeps a row, in split order, the splits that keep none
+/// dropped, and a split's error as one error item.
+///
+/// The splits are planned here, so a planning error is the `Err`; the
+/// driver is [`ScanDriver::for_row_scan`]'s, as for [`read_all_rows`] —
+/// [`inline_splits`] polls the split futures as the stream is polled,
+/// [`spawned_splits`] spawns them, `scan.concurrency()` per core in flight.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn stream_rows(
+    scan: ScanBuilder<ArrayRef>,
+) -> Result<BoxStream<'static, Result<ArrayRef>>> {
+    let window = scan.concurrency() * available_parallelism();
+    let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
+    let splits = match ScanDriver::for_row_scan(tasks.len()) {
+        ScanDriver::Inline => inline_splits(tasks).boxed(),
+        ScanDriver::Spawned => spawned_splits(tasks, window).boxed(),
+    };
+    Ok(splits
+        .filter_map(|split| future::ready(split.map_err(VortexRdfError::Vortex).transpose()))
+        .boxed())
 }
 
 /// Run an index child's row-id scan to completion and materialize its rows,
@@ -1044,6 +1081,17 @@ mod tests {
             .collect()
     }
 
+    /// The four code columns of `chunks`, each concatenated in chunk order.
+    fn chunk_codes(chunks: Vec<ArrayRef>) -> Vec<Vec<TermCode>> {
+        let mut columns = vec![Vec::new(); schema::PRIMARY_COLUMNS.len()];
+        for chunk in chunks {
+            for (column, codes) in columns.iter_mut().zip(quad_codes(chunk)) {
+                column.extend(codes);
+            }
+        }
+        columns
+    }
+
     /// What `read_all_rows` did with a scan: its split count, how many of
     /// them it spawned, and the rows it returned.
     struct Driven {
@@ -1065,18 +1113,50 @@ mod tests {
         per_split: usize,
         ordered: bool,
     ) -> Driven {
-        let splits = scan_of(file, rows.clone(), per_split, ordered)
-            .build()
-            .unwrap()
-            .len();
+        drive_scan(|| scan_of(file, rows.clone(), per_split, ordered)).await
+    }
+
+    /// [`drive`] over the scans `scan` builds, one to count the splits and
+    /// one to read.
+    async fn drive_scan(scan: impl Fn() -> ScanBuilder<ArrayRef>) -> Driven {
+        let splits = scan().build().unwrap().len();
         driver_hooks::take_spawned();
-        let rows = read_all_rows(scan_of(file, rows, per_split, ordered))
-            .await
-            .unwrap();
+        let rows = read_all_rows(scan()).await.unwrap();
         Driven {
             splits,
             spawned: driver_hooks::take_spawned(),
             rows: quad_codes(rows),
+        }
+    }
+
+    /// What `stream_rows` yielded for a scan: its split count, how many of
+    /// them it spawned, each chunk's row count, and the rows.
+    struct Streamed {
+        splits: usize,
+        spawned: usize,
+        chunk_rows: Vec<usize>,
+        rows: Vec<Vec<TermCode>>,
+    }
+
+    impl Streamed {
+        /// The driver that ran the scan, read off the splits it spawned.
+        fn driver(&self) -> ScanDriver {
+            driver_hooks::driver_of(self.splits, self.spawned)
+        }
+    }
+
+    /// [`drive_scan`] through `stream_rows`, its chunks collected.
+    async fn stream_scan(scan: impl Fn() -> ScanBuilder<ArrayRef>) -> Streamed {
+        use futures::TryStreamExt as _;
+
+        let splits = scan().build().unwrap().len();
+        driver_hooks::take_spawned();
+        let chunks: Vec<ArrayRef> = stream_rows(scan()).unwrap().try_collect().await.unwrap();
+        Streamed {
+            splits,
+            spawned: driver_hooks::take_spawned(),
+            chunk_rows: chunks.iter().map(|chunk| chunk.len()).collect(),
+            rows: chunk_codes(chunks),
         }
     }
 
@@ -1173,6 +1253,88 @@ mod tests {
         .expect("a scan above the limit must not panic without a tokio runtime");
         assert_eq!(spawned, 0, "no runtime to spawn onto, so nothing spawned");
         assert_eq!(rows, head(&whole.rows, limit + 1));
+    }
+
+    /// `stream_rows` yields `read_all_rows`' rows chunk by chunk, one chunk
+    /// per split that keeps a row, in split order, under the driver
+    /// `read_all_rows` picks for the same scan: inline at the split limit,
+    /// spawned above it, and inline above it on a thread with no tokio
+    /// runtime to spawn onto.
+    #[tokio::test]
+    async fn stream_rows_matches_read_all_rows_under_every_driver() {
+        let (_dir, file) = crate::tests::mapped_file(50, vec![]).await;
+        let whole = drive(&file, 0..50, 50, true).await;
+        // Row 20's subject: the subjects are unique, so of the four 16-row
+        // splits only the second keeps a row under this filter.
+        let scope = file.scan().unwrap().dtype().unwrap();
+        let filter = file
+            .bound_exprs()
+            .bind(
+                QUAD_SCOPE,
+                &eq(get_item(schema::COL_S, root()), lit(whole.rows[0][20])),
+                &scope,
+            )
+            .unwrap();
+        let scan = |filter: Option<&vortex_array::expr::BoundExpression>| {
+            let scan = scan_of(&file, 0..50, 16, true);
+            match filter {
+                Some(filter) => scan.with_filter(filter.clone()),
+                None => scan,
+            }
+        };
+
+        for (limit, driver) in [(4, ScanDriver::Inline), (3, ScanDriver::Spawned)] {
+            let _limit = driver_hooks::ForcedLimit::set(limit);
+            for (tag, filter, chunk_rows) in [
+                ("unfiltered", None, vec![16, 16, 16, 2]),
+                ("filtered", Some(&filter), vec![1]),
+            ] {
+                let read = drive_scan(|| scan(filter)).await;
+                let streamed = stream_scan(|| scan(filter)).await;
+                assert_eq!(read.driver(), driver, "{tag}: read, limit {limit}");
+                assert_eq!(
+                    (streamed.splits, streamed.driver()),
+                    (4, driver),
+                    "{tag}: streamed, limit {limit}"
+                );
+                assert_eq!(streamed.chunk_rows, chunk_rows, "{tag}, {driver:?}: chunks");
+                assert_eq!(
+                    streamed.rows, read.rows,
+                    "{tag}, {driver:?}: rows and order"
+                );
+            }
+        }
+        let row_20: Vec<Vec<TermCode>> = whole.rows.iter().map(|column| vec![column[20]]).collect();
+        assert_eq!(
+            drive_scan(|| scan(Some(&filter))).await.rows,
+            row_20,
+            "the filter keeps row 20 alone"
+        );
+
+        let no_runtime = scan(None);
+        let (chunk_rows, rows, spawned) = std::thread::spawn(move || {
+            use futures::TryStreamExt as _;
+
+            let _limit = driver_hooks::ForcedLimit::set(0);
+            futures::executor::block_on(async {
+                let chunks: Vec<ArrayRef> = stream_rows(no_runtime)
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                let chunk_rows: Vec<usize> = chunks.iter().map(|chunk| chunk.len()).collect();
+                (
+                    chunk_rows,
+                    chunk_codes(chunks),
+                    driver_hooks::take_spawned(),
+                )
+            })
+        })
+        .join()
+        .expect("a streamed scan must not panic without a tokio runtime");
+        assert_eq!(spawned, 0, "no runtime to spawn onto, so nothing spawned");
+        assert_eq!(chunk_rows, [16, 16, 16, 2]);
+        assert_eq!(rows, whole.rows);
     }
 
     /// An index child's row-id scan is driven inline however many splits it
