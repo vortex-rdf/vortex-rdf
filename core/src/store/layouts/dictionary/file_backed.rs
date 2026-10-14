@@ -162,6 +162,10 @@ impl WindowCache {
 /// What a [`FileBackedDict`] holds: the child's layout metadata, the
 /// per-window bounds and the bounded cache of rebuilt windows.
 struct Windows {
+    /// The identity of this dictionary (see
+    /// [`DictReader::dictionary_id`](crate::DictReader::dictionary_id)): one
+    /// per open, shared by every clone of the handle.
+    id: u64,
     /// The dictionary child's layout reader, for the transient whole-column
     /// lift (serialization, compaction).
     reader: vortex_layout::LayoutReaderRef,
@@ -317,6 +321,7 @@ impl FileBackedDict {
             start += rows;
         }
         Ok(Some(Self(Arc::new(Windows {
+            id: super::term_dict::next_dictionary_id(),
             reader,
             windows,
             starts,
@@ -333,6 +338,11 @@ impl FileBackedDict {
             #[cfg(test)]
             base: super::term_dict::code_base(),
         }))))
+    }
+
+    /// This dictionary's identity.
+    pub(crate) fn id(&self) -> u64 {
+        self.0.id
     }
 
     /// Number of terms.

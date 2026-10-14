@@ -771,26 +771,6 @@ async fn open_in_memory(dir: &tempfile::TempDir) -> crate::error::Result<VortexR
     VortexRdfStore::from_file_in_memory(dir.path().join("store.vortex")).await
 }
 
-/// A component descriptor of the shape a future change set could write: an
-/// index child with an implementation slug this version does not know.
-fn unknown_component(required: bool) -> container::NativeComponentWrite {
-    let rows = bare_code_quad_array(&[1, 2, 3]);
-    container::NativeComponentWrite::new(
-        container::StoreComponentDescriptor {
-            name: "index:future".into(),
-            role: container::StoreComponentRole::Index,
-            implementation: "future-index-v1".into(),
-            version: 1,
-            required,
-            sorted: false,
-            dtype: rows.dtype().clone(),
-        },
-        std::sync::Arc::new(container::BufferedComponentSource::try_new(vec![rows]).unwrap()),
-        container::default_child_strategy(),
-    )
-    .unwrap()
-}
-
 /// Term-code columns narrower than [`TermCode`] (u32 codes) are refused by
 /// every open path, with an error naming the table, the column and its width:
 /// in the quad table, and in an index child beside u64 quad columns.
@@ -1272,7 +1252,11 @@ async fn test_open_required_unknown_component_rejected_optional_skipped() {
         crate::store::builders::build_struct_array(&raws, LayoutStrategy::Default, false).unwrap()
     };
 
-    let bytes = unstamped_store_bytes(vec![rows()], vec![unknown_component(true)]).await;
+    let bytes = unstamped_store_bytes(
+        vec![rows()],
+        vec![unknown_component("index:future", "future-index-v1", true)],
+    )
+    .await;
     let (from_bytes, from_file, _dir) = open_both(&bytes).await;
     for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
         let err = result.err().expect("open should fail");
@@ -1283,7 +1267,11 @@ async fn test_open_required_unknown_component_rejected_optional_skipped() {
         );
     }
 
-    let bytes = unstamped_store_bytes(vec![rows()], vec![unknown_component(false)]).await;
+    let bytes = unstamped_store_bytes(
+        vec![rows()],
+        vec![unknown_component("index:future", "future-index-v1", false)],
+    )
+    .await;
     let (from_bytes, from_file, _dir) = open_both(&bytes).await;
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {

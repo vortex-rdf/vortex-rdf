@@ -35,6 +35,9 @@ pub use query::batch::Probe;
 pub(crate) use query::matching::IdsNeed;
 pub use query::narrowing::Keep;
 pub use read::chunks::{CodeChunkStream, RowChunkStream};
+pub use read::metadata::{
+    IndexComponentInfo, RowCountHint, SelectionKind, SortOrder, ViewStatistics,
+};
 pub use schema::{QuadColumn, RowId, TermCode};
 // `RawQuad` lives in `common` (it is pure RDF text — see that module's
 // charter); this re-export makes `store::RawQuad` the path builder consumers
@@ -42,6 +45,15 @@ pub use schema::{QuadColumn, RowId, TermCode};
 pub use crate::common::quad::{RawQuad, SharedQuad};
 
 pub(crate) use view::{QuadsSource, Tail};
+
+/// The next store generation (see [`VortexRdfStore::generation`]), from one
+/// process-wide counter: two stores share a generation only when one was
+/// derived from the other without a change to its data.
+pub(crate) fn next_generation() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 use indexes::IndexComponent;
 
@@ -83,6 +95,9 @@ pub struct VortexRdfStore {
     ///
     /// [`compact_with_indexes`]: Self::compact_with_indexes
     indexes: Indexes,
+    /// The identity of the data behind this view: see
+    /// [`generation`](Self::generation).
+    generation: u64,
     /// Rows appended since construction ([`add_quads`]), kept outside the base
     /// so appending never rewrites it — which is what lets the base's indexes
     /// and tombstones survive an append. `None` until something is appended.
@@ -121,7 +136,7 @@ impl VortexRdfStore {
     /// view would otherwise run pointless lookups just to intersect with
     /// nothing. No serve plan carries across — a plan is only valid while its
     /// row run is exactly the selection.
-    fn empty_view(&self) -> Self {
+    pub(crate) fn empty_view(&self) -> Self {
         let quads = match &self.quads {
             QuadsSource::InMemory {
                 base,
@@ -159,6 +174,7 @@ impl VortexRdfStore {
         Self {
             layout: self.layout.clone(),
             indexes: vec![],
+            generation: self.generation,
             quads,
             tail,
         }

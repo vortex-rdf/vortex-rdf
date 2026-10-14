@@ -53,9 +53,9 @@ A builder hands these back in one of two shapes
 |---|---|---|---|
 | CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`SerializeArgs`](../cli/src/main.rs#L33)) | out-of-core | file |
 | Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L192) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L109) | out-of-core | file / any `VortexWrite` |
-| Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L100), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L60) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L42) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L148) to name the builder | either | in-memory store |
+| Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L101), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L60) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L42) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L149) to name the builder | either | in-memory store |
 | Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L149) | — (re-serializes a store) | bytes |
-| Rust | [`to_serializable_parts`](../core/src/store/persist/serialize.rs#L128) → [`from_parts`](../core/src/store/construct.rs#L133) | — | in-memory round trip |
+| Rust | [`to_serializable_parts`](../core/src/store/persist/serialize.rs#L128) → [`from_parts`](../core/src/store/construct.rs#L134) | — | in-memory round trip |
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize_rdf`](../python/src/serialize.rs#L33)) | out-of-core | file |
 | Python | `VortexRdfStore(path, in_memory=True)` | — (opens, then lifts through `to_serializable_parts` → `from_parts`) | in-memory store |
 | Python | `store.to_bytes()` / `VortexRdfStore.from_bytes(data)` | — | bytes |
@@ -485,9 +485,9 @@ inode stays alive for the mapping.
 ## 10. Adopting a build in memory
 
 A build that is queried in place, without a file, skips the writer:
-[`from_built`](../core/src/store/construct.rs#L148) turns a `BuiltArray` into the
+[`from_built`](../core/src/store/construct.rs#L149) turns a `BuiltArray` into the
 store's *compressed-resident* form
-([`compress_built_parts`](../core/src/store/construct.rs#L62)):
+([`compress_built_parts`](../core/src/store/construct.rs#L63)):
 
 - every non-nullable `u64` code child and row-id child of the base and of
   each component is re-encoded from the bounds the build already
@@ -503,7 +503,7 @@ store's *compressed-resident* form
   ([`StructProbes::warm`](../core/src/store/probes.rs#L43)), so no query pays the
   encoding-tree walk.
 
-The other in-memory constructor, [`from_parts`](../core/src/store/construct.rs#L133),
+The other in-memory constructor, [`from_parts`](../core/src/store/construct.rs#L134),
 adopts a store's split parts (the bindings' round trip): it keeps each integer
 child's existing encoding wherever a probe binds it and decodes only the ones
 that decline. Opening serialized bytes in memory is
@@ -550,7 +550,7 @@ quad, sort, drop repeated quads, and rebuild:
   the store is then reopened memory-mapped. On Windows that rename is refused
   while the file is mapped, by this store included, so there a file-backed
   store cannot compact over its own path ([mutations.md §5](mutations.md#5-compaction)).
-- **An in-memory store** rebuilds through [`from_raw_quads`](../core/src/store/construct.rs#L226)
+- **An in-memory store** rebuilds through [`from_raw_quads`](../core/src/store/construct.rs#L229)
   (a fresh dictionary under Dictionary, components over the whole set) and
   adopts the result exactly as `from_built` does.
 
@@ -565,8 +565,8 @@ quad, sort, drop repeated quads, and rebuild:
 
 Between compactions the tail accretes as chunks and is flattened once the
 accreted rows rival the flat prefix (floor 1,024) or 64 chunks pile up
-([`TAIL_FLATTEN_FLOOR`](../core/src/store/write/mutation.rs#L347),
-[`TAIL_MAX_CHUNKS`](../core/src/store/write/mutation.rs#L351)). The tail, tombstone
+([`TAIL_FLATTEN_FLOOR`](../core/src/store/write/mutation.rs#L350),
+[`TAIL_MAX_CHUNKS`](../core/src/store/write/mutation.rs#L354)). The tail, tombstone
 and compaction model in full is [mutations.md](mutations.md).
 
 ### 11.3 Back to RDF text

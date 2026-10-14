@@ -175,6 +175,12 @@ impl DictSnapshot {
         self.0.len() == 0
     }
 
+    /// The identity of the snapshot's dictionary (see
+    /// [`DictReader::dictionary_id`]).
+    pub fn dictionary_id(&self) -> u64 {
+        self.0.id()
+    }
+
     /// [`encode`](Self::encode) tolerant of spelling: an IRI with or without
     /// angle brackets, a literal with escape variants, an `xsd:string`
     /// typing, an upper-case language tag, or a default-graph spelling
@@ -297,6 +303,21 @@ impl DictReader {
     /// Whether the dictionary holds no terms.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// The identity of the dictionary this handle reads: the same for every
+    /// view of one store, whose codes are one vocabulary, and a new one for
+    /// the dictionary a build, an open or a `compact` makes, so a consumer
+    /// that caches codes knows when they stop applying. Equal ids promise
+    /// equal codes; dictionaries under different ids may still hold the same
+    /// terms. Resident and file-backed dictionaries are numbered by one
+    /// process-wide counter, and an id is never persisted.
+    pub fn dictionary_id(&self) -> u64 {
+        match &self.0 {
+            DictReaderInner::Resident(dict) => dict.id(),
+            #[cfg(feature = "file-io")]
+            DictReaderInner::FileBacked(dict) => dict.id(),
+        }
     }
 
     /// The synchronous [`DictSnapshot`] of a resident dictionary, `None`

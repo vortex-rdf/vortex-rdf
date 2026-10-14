@@ -8,7 +8,7 @@ use crate::store::builders::build_struct_array;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_filter;
 use crate::store::view::selection::RowSelection;
-use crate::store::{QuadsSource, Tail};
+use crate::store::{QuadsSource, Tail, next_generation};
 
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use std::collections::HashSet;
@@ -160,6 +160,7 @@ impl VortexRdfStore {
         let appended = Self {
             layout: self.layout.clone(),
             indexes: self.indexes.clone(),
+            generation: next_generation(),
             quads: self.quads.clone(),
             tail: Some(Tail {
                 rows,
@@ -275,6 +276,7 @@ impl VortexRdfStore {
                 Ok(Self {
                     layout: self.layout.clone(),
                     indexes: self.indexes.clone(),
+                    generation: next_generation(),
                     quads: QuadsSource::InMemory {
                         base: base.clone(),
                         selection: selection.clone(),
@@ -303,6 +305,7 @@ impl VortexRdfStore {
                 Ok(Self {
                     layout: self.layout.clone(),
                     indexes: self.indexes.clone(),
+                    generation: next_generation(),
                     quads: QuadsSource::File {
                         path: path.clone(),
                         file: file.clone(),

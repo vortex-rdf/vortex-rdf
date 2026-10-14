@@ -34,6 +34,7 @@ mod legacy_store;
 #[cfg(feature = "file-io")]
 mod mapping;
 mod matching;
+mod metadata;
 mod mutation;
 mod names;
 mod narrowing;
@@ -429,6 +430,33 @@ async fn unstamped_store_bytes(
     .await
     .unwrap();
     bytes
+}
+
+/// A component of the shape a future change set could write: an optional
+/// (unless `required`) index child named `name` under the implementation slug
+/// `slug`, holding three bare code rows.
+#[cfg(feature = "file-io")]
+fn unknown_component(
+    name: &str,
+    slug: &str,
+    required: bool,
+) -> crate::io::container::NativeComponentWrite {
+    use crate::io::container;
+    let rows = bare_code_quad_array(&[1, 2, 3]);
+    container::NativeComponentWrite::new(
+        container::StoreComponentDescriptor {
+            name: name.into(),
+            role: container::StoreComponentRole::Index,
+            implementation: slug.into(),
+            version: 1,
+            required,
+            sorted: false,
+            dtype: rows.dtype().clone(),
+        },
+        std::sync::Arc::new(container::BufferedComponentSource::try_new(vec![rows]).unwrap()),
+        container::default_child_strategy(),
+    )
+    .unwrap()
 }
 
 /// A minimal native Dictionary-layout file: a one-row zero-code quad child

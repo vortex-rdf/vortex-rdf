@@ -281,6 +281,7 @@ impl VortexRdfStore {
         Ok(Self {
             layout,
             indexes,
+            generation: crate::store::next_generation(),
             quads: QuadsSource::File {
                 path: source_path,
                 file,
