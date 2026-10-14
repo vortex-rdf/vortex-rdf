@@ -1,8 +1,8 @@
-//! The vortex `DataSource` over store views and component tables: a view's
-//! source scans to its base-ordered codes on every backend and advertises its
-//! statistics' count, a scan request's projection, filter, row window,
-//! selection, limit and partition window apply exactly, and a store's
-//! children read as plain tables.
+//! The vortex `DataSource` over store views and component tables: a scan
+//! request's projection, filter, row window, selection, limit and partition
+//! window apply exactly, a store's children read as plain tables, and the
+//! crate's session opens its files. A view's default scan on every backend
+//! is checked beside the chunk exports, in `tests/chunks.rs`.
 
 use super::*;
 use crate::store::{SortOrder, TermCode};
@@ -59,71 +59,6 @@ async fn partition_stats(
         .collect()
         .await;
     (count, partitions)
-}
-
-/// `view`'s source scans to its base-ordered codes under a non-nullable
-/// struct dtype, and advertises its statistics' count (exact, or as the
-/// upper bound) and four `u64` codes a row as its byte size. The source and
-/// the statistics are taken before anything reads the view. Returns the
-/// count the source advertises.
-async fn assert_source_matches(view: &VortexRdfStore, tag: &str) -> Precision<u64> {
-    let source = view.data_source().unwrap();
-    let hint = view.view_statistics().unwrap().rows;
-    let expected = base_ordered_codes(view).await;
-    assert!(
-        matches!(source.dtype(), DType::Struct(_, Nullability::NonNullable)),
-        "{tag}: a non-nullable struct dtype"
-    );
-    let rows = match hint.exact {
-        Some(n) => {
-            assert_eq!(n, expected.len(), "{tag}: an exact count");
-            Precision::exact(n as u64)
-        }
-        None => {
-            assert!(hint.upper_bound >= expected.len(), "{tag}: a bound");
-            Precision::inexact(hint.upper_bound as u64)
-        }
-    };
-    assert_eq!(source.row_count(), rows, "{tag}: the statistics' count");
-    assert_eq!(
-        source.byte_size(),
-        rows.map(|n| n * 32),
-        "{tag}: four u64 codes a row"
-    );
-    assert_eq!(
-        scan_codes(&source, ScanRequest::default()).await,
-        expected,
-        "{tag}: default scan"
-    );
-    rows
-}
-
-/// In memory, over every index set: each view's source, tombstoned views'
-/// included, scans to its base-ordered codes and counts them exactly.
-#[tokio::test]
-async fn test_data_source_in_memory_matches_gathered() {
-    let quads = fixture_quads();
-    for indexes in [
-        vec![],
-        vec![IndexType::SecondaryByCopy],
-        vec![IndexType::SecondaryByReference],
-    ] {
-        let store = built_store(quads.clone(), LayoutStrategy::Dictionary, indexes.clone()).await;
-        let mut deleted = store.clone();
-        for quad in quads.iter().step_by(11).take(30) {
-            deleted = deleted.delete_quad(quad).await.unwrap();
-        }
-        for (state, base) in [("live", &store), ("tombstoned", &deleted)] {
-            for (name, view) in views_of(base).await {
-                let tag = format!("memory {indexes:?} {state} {name}");
-                let rows = assert_source_matches(&view, &tag).await;
-                assert!(
-                    matches!(rows, Precision::Exact(_)),
-                    "{tag}: exact in memory"
-                );
-            }
-        }
-    }
 }
 
 /// Projection, filter, row window, selection, limit and partition window,
@@ -449,28 +384,6 @@ async fn test_data_source_request_semantics() {
     }
 }
 
-/// On every file open and index set, each view's source scans to its
-/// base-ordered codes and counts them exactly where the statistics know the
-/// count, as a bound while a pushed-down filter is pending; the matrix
-/// reaches both.
-#[cfg(feature = "file-io")]
-#[tokio::test]
-async fn test_data_source_file_backed() {
-    let (mut exact_counts, mut bounds) = (0, 0);
-    for (tag, _dir, store) in file_stores().await {
-        for (name, view) in views_of(&store).await {
-            match assert_source_matches(&view, &format!("{tag} {name}")).await {
-                Precision::Exact(_) => exact_counts += 1,
-                _ => bounds += 1,
-            }
-        }
-    }
-    assert!(
-        exact_counts > 0 && bounds > 0,
-        "{exact_counts} exact counts, {bounds} bounds"
-    );
-}
-
 /// The store's children as plain tables, built in memory and on every file
 /// open: a name the store has no child of has none; every child
 /// [`index_components`](VortexRdfStore::index_components) lists is a table of
@@ -623,53 +536,6 @@ async fn assert_dictionary_component(store: &VortexRdfStore, tag: &str) {
         .map(|term| term.expect("every code below the length has a term"))
         .collect();
     assert_eq!(decoded, terms, "{tag}: row i is the term of code i");
-}
-
-/// A string layout's source carries its utf8 columns, the tail's rows after
-/// the base's, and advertises no byte size; a Dictionary view with a tail
-/// has no source.
-#[tokio::test]
-async fn test_data_source_string_layouts() {
-    let appended = appended_quads(40);
-    for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
-        let store = built_store(fixture_quads(), layout, vec![])
-            .await
-            .add_quads(appended.clone())
-            .await
-            .unwrap();
-        let expected: Vec<String> = store
-            .quads_vec()
-            .await
-            .unwrap()
-            .iter()
-            .map(|q| q.subject.to_string())
-            .collect();
-        let source = store.data_source().unwrap();
-        assert_eq!(
-            source.row_count().as_exact(),
-            Some(expected.len() as u64),
-            "{layout:?}"
-        );
-        assert_eq!(
-            source.byte_size(),
-            Precision::Absent,
-            "{layout:?}: string columns have no fixed width"
-        );
-        let chunks = scan_chunks(&source, ScanRequest::default()).await;
-        assert_eq!(chunk_subjects(&chunks), expected, "{layout:?}");
-    }
-    let tailed = built_store(fixture_quads(), LayoutStrategy::Dictionary, vec![])
-        .await
-        .add_quads(appended)
-        .await
-        .unwrap();
-    assert!(
-        matches!(
-            tailed.data_source(),
-            Err(VortexRdfError::InvalidOperation(_))
-        ),
-        "a tailed Dictionary view has no source"
-    );
 }
 
 /// The session [`vortex_session`](crate::vortex_session) hands out opens a

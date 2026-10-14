@@ -1,13 +1,23 @@
-//! Chunked exports — `row_chunks` and `code_chunks` — against the whole-view
-//! reads, on every backend, over narrowed, served, tombstoned and tailed
-//! views.
+//! Chunked exports — `row_chunks`, `code_chunks` and the data source's scan
+//! over them — against the whole-view reads, on every backend, over
+//! narrowed, served, tombstoned and tailed views.
 
 use super::*;
 use crate::store::{QuadColumn, TermCode};
+use crate::vortex_scan::ScanRequest;
+use vortex_array::dtype::{DType, Nullability};
+use vortex_array::expr::stats::Precision;
 
 /// Both exports of `view` agree with its base-ordered codes at several
-/// batch sizes, and a column subset comes in the requested order.
-async fn assert_chunks_match(view: &VortexRdfStore, tag: &str) {
+/// batch sizes, and a column subset comes in the requested order. Its data
+/// source scans to the same codes under a non-nullable struct dtype, and
+/// advertises its statistics' count (exact, or as the upper bound) and four
+/// `u64` codes a row as its byte size; the source and the statistics are
+/// taken before anything reads the view. Returns the count the source
+/// advertises.
+async fn assert_chunks_match(view: &VortexRdfStore, tag: &str) -> Precision<u64> {
+    let source = view.data_source().unwrap();
+    let hint = view.view_statistics().unwrap().rows;
     let expected = base_ordered_codes(view).await;
     for batch in [1, 7, 256, 100_000] {
         let (rows, sizes) = collect_code_chunks(view, &QuadColumn::ALL, batch).await;
@@ -27,11 +37,38 @@ async fn assert_chunks_match(view: &VortexRdfStore, tag: &str) {
     let (rows, _) = collect_code_chunks(view, &[QuadColumn::O, QuadColumn::S], 1_000).await;
     let want: Vec<Vec<TermCode>> = expected.iter().map(|r| vec![r[2], r[0]]).collect();
     assert_eq!(rows, want, "{tag}: a column subset in the requested order");
+
+    assert!(
+        matches!(source.dtype(), DType::Struct(_, Nullability::NonNullable)),
+        "{tag}: a non-nullable struct dtype"
+    );
+    let count = match hint.exact {
+        Some(n) => {
+            assert_eq!(n, expected.len(), "{tag}: an exact count");
+            Precision::exact(n as u64)
+        }
+        None => {
+            assert!(hint.upper_bound >= expected.len(), "{tag}: a bound");
+            Precision::inexact(hint.upper_bound as u64)
+        }
+    };
+    assert_eq!(source.row_count(), count, "{tag}: the statistics' count");
+    assert_eq!(
+        source.byte_size(),
+        count.map(|n| n * 32),
+        "{tag}: four u64 codes a row"
+    );
+    assert_eq!(
+        scan_codes(&source, ScanRequest::default()).await,
+        expected,
+        "{tag}: the data source's scan"
+    );
+    count
 }
 
-/// In memory, over every index set: each view's chunks are its base-ordered
-/// codes, and the whole store's code chunks are its code columns, not
-/// copies of them.
+/// In memory, over every index set: each view's chunks and data source scan
+/// are its base-ordered codes, which the source counts exactly, and the
+/// whole store's code chunks are its code columns, not copies of them.
 #[tokio::test]
 async fn test_chunks_in_memory_match_gathered() {
     for indexes in [
@@ -41,7 +78,12 @@ async fn test_chunks_in_memory_match_gathered() {
     ] {
         let store = built_store(fixture_quads(), LayoutStrategy::Dictionary, indexes.clone()).await;
         for (name, view) in views_of(&store).await {
-            assert_chunks_match(&view, &format!("memory {indexes:?} {name}")).await;
+            let tag = format!("memory {indexes:?} {name}");
+            let count = assert_chunks_match(&view, &tag).await;
+            assert!(
+                matches!(count, Precision::Exact(_)),
+                "{tag}: exact in memory"
+            );
         }
         let [s, ..] = store.code_columns_gathered().await.unwrap().unwrap();
         let mut chunks = store.code_chunks(&[QuadColumn::S], usize::MAX).unwrap();
@@ -55,33 +97,54 @@ async fn test_chunks_in_memory_match_gathered() {
     }
 }
 
+/// In memory, over every index set, the views of a store with tombstones:
+/// the exports and the data source's scan skip the deleted rows, and the
+/// source counts the live ones exactly.
 #[tokio::test]
 async fn test_chunks_skip_tombstones() {
     let quads = fixture_quads();
-    let store = built_store(
-        quads.clone(),
-        LayoutStrategy::Dictionary,
+    for indexes in [
+        vec![],
         vec![IndexType::SecondaryByCopy],
-    )
-    .await;
-    let mut deleted = store.clone();
-    for quad in quads.iter().step_by(7).take(50) {
-        deleted = deleted.delete_quad(quad).await.unwrap();
-    }
-    assert_eq!(deleted.size().await.unwrap(), quads.len() - 50);
-    for (name, view) in views_of(&deleted).await {
-        assert_chunks_match(&view, &format!("tombstoned {name}")).await;
+        vec![IndexType::SecondaryByReference],
+    ] {
+        let store = built_store(quads.clone(), LayoutStrategy::Dictionary, indexes.clone()).await;
+        let mut deleted = store.clone();
+        for quad in quads.iter().step_by(7).take(50) {
+            deleted = deleted.delete_quad(quad).await.unwrap();
+        }
+        assert_eq!(deleted.size().await.unwrap(), quads.len() - 50);
+        for (name, view) in views_of(&deleted).await {
+            let tag = format!("tombstoned {indexes:?} {name}");
+            let count = assert_chunks_match(&view, &tag).await;
+            assert!(
+                matches!(count, Precision::Exact(_)),
+                "{tag}: exact in memory"
+            );
+        }
     }
 }
 
+/// On every file open and index set, each view's chunks and data source scan
+/// are its base-ordered codes; the source counts them exactly where the
+/// statistics know the count and as a bound while a pushed-down filter is
+/// pending, and the matrix reaches both.
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_chunks_file_backed_match_gathered() {
+    let (mut exact_counts, mut bounds) = (0, 0);
     for (tag, _dir, store) in file_stores().await {
         for (name, view) in views_of(&store).await {
-            assert_chunks_match(&view, &format!("{tag} {name}")).await;
+            match assert_chunks_match(&view, &format!("{tag} {name}")).await {
+                Precision::Exact(_) => exact_counts += 1,
+                _ => bounds += 1,
+            }
         }
     }
+    assert!(
+        exact_counts > 0 && bounds > 0,
+        "{exact_counts} exact counts, {bounds} bounds"
+    );
 }
 
 /// A file view of exact ids past the point-read cap and sparse in their
@@ -183,7 +246,6 @@ async fn test_chunks_read_filtered_file_runs_by_id() {
 #[tokio::test]
 async fn test_chunks_read_a_file_outside_a_tokio_runtime() {
     use crate::store::scan::file_reads::driver_hooks;
-    use crate::vortex_scan::ScanRequest;
 
     let (_dir, path) = write_store_file(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
@@ -216,8 +278,31 @@ async fn test_chunks_read_a_file_outside_a_tokio_runtime() {
     assert_eq!(scanned, expected, "the data source's scan");
 }
 
+/// The data source of a string-layout `view` whose subjects, in the order
+/// `quads()` decodes them, are `expected`: it counts them exactly, reports no
+/// byte size, and its scan carries the same utf8 rows.
+async fn assert_string_source(view: &VortexRdfStore, expected: &[String], tag: &str) {
+    let source = view.data_source().unwrap();
+    assert_eq!(
+        source.row_count(),
+        Precision::exact(expected.len() as u64),
+        "{tag}"
+    );
+    assert_eq!(
+        source.byte_size(),
+        Precision::Absent,
+        "{tag}: string columns have no fixed width"
+    );
+    let chunks = scan_chunks(&source, ScanRequest::default()).await;
+    assert_eq!(
+        chunk_subjects(&chunks),
+        expected,
+        "{tag}: the data source's scan"
+    );
+}
+
 /// The string layouts stream their native struct rows, the tail last, in the
-/// order `quads()` decodes them.
+/// order `quads()` decodes them, through the chunks and the data source.
 #[tokio::test]
 async fn test_chunks_string_layouts_include_tail() {
     let quads = fixture_quads();
@@ -248,6 +333,7 @@ async fn test_chunks_string_layouts_include_tail() {
             ),
             "no codes under {layout:?}"
         );
+        assert_string_source(&tailed, &expected, &format!("{layout:?}")).await;
     }
     #[cfg(feature = "file-io")]
     {
@@ -271,11 +357,12 @@ async fn test_chunks_string_layouts_include_tail() {
             expected,
             "file-backed Default with a tail"
         );
+        assert_string_source(&tailed, &expected, "file-backed Default with a tail").await;
     }
 }
 
 /// The gates: a zero batch, no columns, and a Dictionary view whose tail
-/// holds terms without codes.
+/// holds terms without codes, which has no chunks and no data source.
 #[tokio::test]
 async fn test_chunks_gates() {
     let store = built_store(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
@@ -292,4 +379,8 @@ async fn test_chunks_gates() {
         "a tailed Dictionary view has no single dtype"
     );
     assert!(refused(tailed.code_chunks(&QuadColumn::ALL, 10).map(drop)));
+    assert!(
+        refused(tailed.data_source().map(drop)),
+        "a tailed Dictionary view has no source"
+    );
 }
