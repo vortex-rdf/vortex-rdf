@@ -32,7 +32,7 @@
 
 use std::fmt::Write as _;
 
-use super::predicates::Verdict;
+use super::Verdict;
 
 /// The class shorthands, spelled out on ASCII as Rust class items. One table
 /// serves both uses, wrapped in `[ ]` where a shorthand stands alone
