@@ -64,7 +64,7 @@ async fn test_dictionary_quad_sink_matches_sorted_in_memory_builder() {
         .match_pattern(None, Some(&p0), None, None)
         .await
         .unwrap();
-    assert!(served.debug_has_serve_plan());
+    assert_eq!(served_component(&served), Some("index:posg"));
     assert_eq!(
         view_strings(&served).await,
         view_strings(
@@ -433,7 +433,7 @@ async fn test_code_read_snapshot_survives_from_bytes() {
         .match_pattern(None, Some(&p0), None, None)
         .await
         .unwrap();
-    assert!(matched.debug_has_serve_plan());
+    assert_eq!(served_component(&matched), Some("index:posg"));
     let matched_codes = matched.code_columns_gathered().await.unwrap().unwrap();
     assert_eq!(
         decode_rows(&matched_codes),

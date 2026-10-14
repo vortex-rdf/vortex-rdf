@@ -223,8 +223,9 @@ async fn run_compact_with_indexes_layout(layout: LayoutStrategy) {
         .match_pattern(None, Some(&predicate), None, None)
         .await
         .unwrap();
-    assert!(
-        served.debug_has_serve_plan(),
+    assert_eq!(
+        served_component(&served),
+        Some("index:posg"),
         "{layout:?}: a rebuilt copy index must serve the predicate match"
     );
     assert_eq!(
@@ -446,8 +447,8 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
         "predicate match mismatch for builder={builder_name} layout={layout_name} indexes={index_name}",
     );
     assert_eq!(
-        by_pred.debug_has_serve_plan(),
-        expect_served,
+        served_component(&by_pred),
+        expect_served.then_some("index:posg"),
         "predicate serve plan mismatch for builder={builder_name} layout={layout_name} indexes={index_name}",
     );
 
@@ -462,8 +463,8 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
         "object match mismatch for builder={builder_name} layout={layout_name} indexes={index_name}",
     );
     assert_eq!(
-        by_obj.debug_has_serve_plan(),
-        expect_served,
+        served_component(&by_obj),
+        expect_served.then_some("index:ospg"),
         "object serve plan mismatch for builder={builder_name} layout={layout_name} indexes={index_name}",
     );
 
@@ -593,8 +594,8 @@ pub(super) async fn run_copy_index_serving_script(
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
-    assert!(by_p.debug_has_serve_plan());
-    assert_eq!(by_p.debug_selection_pending(), expect.served_pending);
+    assert_eq!(served_component(&by_p), Some("index:posg"));
+    assert_eq!(selection_pending(&by_p), expect.served_pending);
     assert_eq!(by_p.size().await.unwrap(), 10);
     assert_eq!(
         view_strings(&by_p).await,
@@ -612,8 +613,8 @@ pub(super) async fn run_copy_index_serving_script(
         .match_pattern(None, None, Some(&o2), None)
         .await
         .unwrap();
-    assert!(by_o.debug_has_serve_plan());
-    assert_eq!(by_o.debug_selection_pending(), expect.served_pending);
+    assert_eq!(served_component(&by_o), Some("index:ospg"));
+    assert_eq!(selection_pending(&by_o), expect.served_pending);
     assert_eq!(by_o.size().await.unwrap(), 6);
     assert_eq!(
         view_strings(&by_o).await,
@@ -628,8 +629,8 @@ pub(super) async fn run_copy_index_serving_script(
         .match_pattern(None, Some(&p1), Some(&o1), None)
         .await
         .unwrap();
-    assert!(by_po.debug_has_serve_plan());
-    assert_eq!(by_po.debug_selection_pending(), expect.served_pending);
+    assert_eq!(served_component(&by_po), Some("index:posg"));
+    assert_eq!(selection_pending(&by_po), expect.served_pending);
     assert_eq!(by_po.size().await.unwrap(), 2);
     assert_eq!(
         view_strings(&by_po).await,
@@ -642,9 +643,12 @@ pub(super) async fn run_copy_index_serving_script(
         .match_pattern(None, Some(&p2), None, Some(&graphs[0]))
         .await
         .unwrap();
-    assert_eq!(by_pg.debug_has_serve_plan(), expect.residual_graph_served);
     assert_eq!(
-        by_pg.debug_selection_pending(),
+        served_component(&by_pg),
+        expect.residual_graph_served.then_some("index:posg")
+    );
+    assert_eq!(
+        selection_pending(&by_pg),
         expect.residual_graph_served && expect.served_pending
     );
     assert_eq!(by_pg.size().await.unwrap(), 5);
@@ -659,8 +663,8 @@ pub(super) async fn run_copy_index_serving_script(
         .match_pattern(None, None, Some(&o1), None)
         .await
         .unwrap();
-    assert!(!chained.debug_has_serve_plan());
-    assert!(!chained.debug_selection_pending());
+    assert_eq!(served_component(&chained), None);
+    assert!(!selection_pending(&chained));
     assert_eq!(
         view_strings(&chained).await,
         expected_strings(quads, |i| i % 3 == 1 && i % 5 == 1)
@@ -681,10 +685,7 @@ pub(super) async fn run_copy_index_serving_script(
         .match_pattern(None, Some(&subject_as_p), None, None)
         .await
         .unwrap();
-    assert_eq!(
-        zero.debug_selection_pending(),
-        expect.never_predicate_pending
-    );
+    assert_eq!(selection_pending(&zero), expect.never_predicate_pending);
     assert_eq!(view_strings(&zero).await, Vec::<String>::new());
     assert_eq!(zero.size().await.unwrap(), 0);
 
@@ -703,7 +704,7 @@ pub(super) async fn run_copy_index_serving_script(
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
-    assert!(by_p_tailed.debug_has_serve_plan());
+    assert_eq!(served_component(&by_p_tailed), Some("index:posg"));
     assert_eq!(by_p_tailed.size().await.unwrap(), 11);
     let mut want = expected_strings(quads, |i| i % 3 == 1);
     want.push(appended.to_string());
@@ -717,7 +718,7 @@ pub(super) async fn run_copy_index_serving_script(
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
-    assert!(by_p_after.debug_has_serve_plan());
+    assert_eq!(served_component(&by_p_after), Some("index:posg"));
     assert_eq!(by_p_after.size().await.unwrap(), 9);
     assert_eq!(
         view_strings(&by_p_after).await,
@@ -851,7 +852,7 @@ async fn test_code_columns_serves_from_the_answering_index() {
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
-    assert!(matched.debug_selection_pending());
+    assert!(selection_pending(&matched));
 
     let cols = matched
         .code_columns()

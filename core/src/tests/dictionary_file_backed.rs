@@ -33,7 +33,7 @@ async fn test_file_backed_dictionary_shared_quads_match_resident() {
     .await;
     let resident = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
     let fb = VortexRdfStore::from_file(&path).await.unwrap();
-    assert!(fb.debug_dict_file_backed());
+    assert!(fb.dict_reader().unwrap().is_file_backed());
 
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
     let served = |store: &VortexRdfStore| {
@@ -75,8 +75,11 @@ async fn assert_file_backed_matches_resident(
     assert!(fb.dictionary_snapshot().is_none(), "{tag}");
     // A file open must actually stay file-backed: the written child's shape
     // is window-searchable, so it never falls back to the resident arm.
-    assert!(fb.debug_dict_file_backed(), "{tag}");
-    assert!(!resident.debug_dict_file_backed(), "{tag}");
+    assert!(fb.dict_reader().expect(tag).is_file_backed(), "{tag}");
+    assert!(
+        !resident.dict_reader().expect(tag).is_file_backed(),
+        "{tag}"
+    );
     // The code-read gate includes residency: no snapshot, no code decoding.
     assert!(fb.code_read_snapshot().is_none(), "{tag}");
     // The resident open hands one out, and it translates codes both ways.
@@ -158,10 +161,10 @@ async fn test_file_backed_dictionary_serves_from_copy_index() {
     // store (the equality above would hold even off the fallback path).
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
     let matched = fb.match_pattern(None, Some(&p0), None, None).await.unwrap();
-    assert!(matched.debug_has_serve_plan());
+    assert_eq!(served_component(&matched), Some("index:posg"));
     // The located run is small, so its ids resolved eagerly by rid point
     // reads at match time — no deferred rid scan remains.
-    assert!(!matched.debug_selection_pending());
+    assert!(!selection_pending(&matched));
     let served: Vec<Quad> = matched.quads().unwrap().try_collect().await.unwrap();
     assert_eq!(served.len(), 4);
 }
@@ -230,7 +233,7 @@ async fn export_of_a_file_backed_store_never_lifts_the_dictionary() {
     assert!(splits >= 3, "the fixture spans {splits} scan splits");
 
     let fb = VortexRdfStore::from_file(&path).await.unwrap();
-    assert!(fb.debug_dict_file_backed());
+    assert!(fb.dict_reader().unwrap().is_file_backed());
     let mut exported = Vec::new();
     crate::export_rdf(fb.clone(), &mut exported, oxrdfio::RdfFormat::NQuads)
         .await
@@ -413,14 +416,14 @@ async fn test_file_backed_dictionary_serves_wide_run() {
     .await;
     let resident = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
     let fb = VortexRdfStore::from_file(&path).await.unwrap();
-    assert!(fb.debug_dict_file_backed());
-    assert!(!resident.debug_dict_file_backed());
+    assert!(fb.dict_reader().unwrap().is_file_backed());
+    assert!(!resident.dict_reader().unwrap().is_file_backed());
 
     // 300 rows per predicate: past the point-read cap, so the run is read
     // by range.
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     let served = fb.match_pattern(None, Some(&p1), None, None).await.unwrap();
-    assert!(served.debug_has_serve_plan());
+    assert_eq!(served_component(&served), Some("index:posg"));
     assert_eq!(served.size().await.unwrap(), 300);
     assert!(served.size().await.unwrap() > crate::store::view::selection::POINT_GATHER_MAX_ROWS);
     let want = expected_strings(&quads, |i| i % 3 == 1);
@@ -545,7 +548,7 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
     );
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    assert!(!store.debug_dict_file_backed());
+    assert!(!store.dict_reader().unwrap().is_file_backed());
     assert!(store.dictionary_snapshot().is_some());
     assert_eq!(view_strings(&store).await, quad_strings(&quads));
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
@@ -560,7 +563,7 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
     let empty_file = crate::tests::open_mapped(&empty_path).await;
     assert!(FileBackedDict::open(&empty_file).await.unwrap().is_none());
     let empty = VortexRdfStore::from_file(&empty_path).await.unwrap();
-    assert!(!empty.debug_dict_file_backed());
+    assert!(!empty.dict_reader().unwrap().is_file_backed());
     assert!(empty.dictionary_snapshot().is_some());
     assert_eq!(empty.size().await.unwrap(), 0);
 }
@@ -724,9 +727,9 @@ async fn test_unzoned_dictionary_child_opens_mapped() {
     assert_eq!(descriptor.version, container::DICT_VERSION);
     assert!(!dict_term_column(&native).is::<Zoned>());
     let mapped = VortexRdfStore::from_file(&path).await.unwrap();
-    assert!(mapped.debug_dict_file_backed());
-    let loaded = VortexRdfStore::from_bytes(&bytes).await.unwrap();
     let reader = mapped.dict_reader().unwrap();
+    assert!(reader.is_file_backed());
+    let loaded = VortexRdfStore::from_bytes(&bytes).await.unwrap();
     let oracle = loaded.code_read_snapshot().unwrap();
     assert_eq!(reader.len(), oracle.len());
     assert!(!oracle.is_empty());

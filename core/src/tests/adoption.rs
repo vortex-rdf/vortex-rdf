@@ -55,8 +55,9 @@ async fn test_dictionary_fixture_adopts() {
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
-    assert!(
-        served.debug_has_serve_plan(),
+    assert_eq!(
+        served_component(&served),
+        Some("index:posg"),
         "a P match routes through the index"
     );
     assert_eq!(

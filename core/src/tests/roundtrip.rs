@@ -248,7 +248,7 @@ async fn test_unstamped_base_rebuild_sorts_fully() {
     let quads = modular_quads(12, 3, 4);
     let reversed: Vec<Quad> = quads.iter().rev().cloned().collect();
     let base = unstamped_store(&reversed);
-    assert!(!base.debug_base_subject_sorted());
+    assert_eq!(base.view_statistics().unwrap().sort_order, None);
 
     let appended = vec![
         make_quad(
@@ -267,8 +267,9 @@ async fn test_unstamped_base_rebuild_sorts_fully() {
     let tailed = base.add_quads(appended.clone()).await.unwrap();
     let rebuilt =
         VortexRdfStore::from_parts(tailed.to_serializable_parts().await.unwrap()).unwrap();
-    assert!(
-        rebuilt.debug_base_subject_sorted(),
+    assert_eq!(
+        rebuilt.view_statistics().unwrap().sort_order,
+        Some(SortOrder::Spog),
         "a rebuild over an unstamped base must sort and stamp its rows"
     );
 

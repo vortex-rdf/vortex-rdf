@@ -366,7 +366,7 @@ async fn test_file_backed_subject_chunk_probe_chained() {
         .match_pattern(Some(&s), None, None, None)
         .await
         .unwrap();
-    assert!(!got.debug_has_serve_plan());
+    assert_eq!(served_component(&got), None);
     let want = memory
         .match_pattern(None, Some(&p), None, None)
         .await

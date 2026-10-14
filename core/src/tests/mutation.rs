@@ -405,8 +405,9 @@ async fn test_code_columns_skips_tombstoned_rows_in_memory() {
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
-    assert!(
-        !by_predicate.debug_has_serve_plan(),
+    assert_eq!(
+        served_component(&by_predicate),
+        None,
         "a reference index resolves to row ids, never a serve plan"
     );
 
@@ -426,8 +427,9 @@ async fn test_code_columns_skips_tombstoned_rows_in_memory() {
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
-    assert!(
-        served.debug_has_serve_plan(),
+    assert_eq!(
+        served_component(&served),
+        Some("index:posg"),
         "a by-copy index serves the predicate match"
     );
 
@@ -938,8 +940,8 @@ async fn run_file_backed_compaction(index: IndexType) {
         .await
         .unwrap();
     assert_eq!(
-        by_p.debug_has_serve_plan(),
-        by_copy,
+        served_component(&by_p),
+        by_copy.then_some("index:posg"),
         "a copy index serves the predicate match from its sorted copy"
     );
     let mut expected: Vec<Quad> = quads

@@ -127,7 +127,7 @@ async fn test_copy_index_file_serving_wide_located_run_stays_pending() {
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
-    assert!(by_p.debug_has_serve_plan());
+    assert_eq!(served_component(&by_p), Some("index:posg"));
     // POSG order puts p1's run right after p0's 10,000 rows.
     assert_eq!(
         by_p.debug_serve_row_range(),
@@ -135,7 +135,7 @@ async fn test_copy_index_file_serving_wide_located_run_stays_pending() {
         "the run must be located for the range scan to serve it"
     );
     assert!(
-        by_p.debug_selection_pending(),
+        selection_pending(&by_p),
         "a 10,000-row run exceeds the point-read cap and must stay deferred"
     );
     assert_eq!(by_p.size().await.unwrap(), 10_000);
@@ -166,7 +166,7 @@ async fn test_copy_index_file_serving_wide_located_run_stays_pending() {
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
-    assert!(by_p_after.debug_has_serve_plan());
+    assert_eq!(served_component(&by_p_after), Some("index:posg"));
     assert_eq!(by_p_after.size().await.unwrap(), 9_999);
     assert_eq!(
         view_strings(&by_p_after).await,
@@ -201,9 +201,9 @@ async fn test_copy_index_file_locates_dictionary_coded_columns() {
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
-    assert!(by_p.debug_has_serve_plan());
+    assert_eq!(served_component(&by_p), Some("index:posg"));
     assert_eq!(by_p.debug_serve_row_range(), Some(3_000..6_000));
-    assert!(by_p.debug_selection_pending());
+    assert!(selection_pending(&by_p));
     assert_eq!(by_p.size().await.unwrap(), 3_000);
     assert_eq!(
         view_strings(&by_p).await,
@@ -229,7 +229,7 @@ async fn test_copy_index_file_locates_dictionary_coded_columns() {
         .match_pattern(None, Some(&p1), Some(&o1), None)
         .await
         .unwrap();
-    assert!(by_po.debug_has_serve_plan());
+    assert_eq!(served_component(&by_po), Some("index:posg"));
     assert_eq!(by_po.debug_serve_row_range(), Some(3_429..3_858));
     assert_eq!(by_po.size().await.unwrap(), 429);
     assert_eq!(
@@ -243,7 +243,7 @@ async fn test_copy_index_file_locates_dictionary_coded_columns() {
         .match_pattern(None, None, Some(&o2), None)
         .await
         .unwrap();
-    assert!(by_o.debug_has_serve_plan());
+    assert_eq!(served_component(&by_o), Some("index:ospg"));
     assert_eq!(by_o.debug_serve_row_range(), Some(2_572..3_858));
     assert_eq!(by_o.size().await.unwrap(), 1_286);
     assert_eq!(
@@ -258,7 +258,7 @@ async fn test_copy_index_file_locates_dictionary_coded_columns() {
         .match_pattern(None, Some(&subject_as_p), None, None)
         .await
         .unwrap();
-    assert!(!zero.debug_selection_pending());
+    assert!(!selection_pending(&zero));
     assert_eq!(zero.size().await.unwrap(), 0);
 
     // A tombstone inside a served run leaves every split through the rid
@@ -307,13 +307,20 @@ async fn test_copy_index_file_serves_code_columns_from_the_run() {
         let memory = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
         let deleted = file.delete_quad(&quads[1]).await.unwrap();
         let memory_deleted = memory.delete_quad(&quads[1]).await.unwrap();
-        let patterns: [(Option<&NamedNode>, Option<&Term>); 3] =
-            [(Some(&p1), None), (Some(&p1), Some(&o1)), (None, Some(&o2))];
-        for (p, o) in patterns {
+        let patterns: [(Option<&NamedNode>, Option<&Term>, &str); 3] = [
+            (Some(&p1), None, "index:posg"),
+            (Some(&p1), Some(&o1), "index:posg"),
+            (None, Some(&o2), "index:ospg"),
+        ];
+        for (p, o, component) in patterns {
             for (store, in_memory) in [(&file, &memory), (&deleted, &memory_deleted)] {
                 let served = store.match_pattern(None, p, o, None).await.unwrap();
-                assert!(served.debug_has_serve_plan(), "{rows} {p:?} {o:?}");
-                let pending = served.debug_selection_pending();
+                assert_eq!(
+                    served_component(&served),
+                    Some(component),
+                    "{rows} {p:?} {o:?}"
+                );
+                let pending = selection_pending(&served);
                 if rows == 9_000 {
                     assert!(pending, "{p:?} {o:?}: a wide run defers its ids");
                 }
@@ -450,7 +457,7 @@ async fn run_reference_index_file_test(layout: LayoutStrategy, located: bool) {
         expected_strings(&quads, |i| i % 7 == 2)
     );
     // This index serves no quads: the reads gather the primary columns.
-    assert!(!by_o.debug_has_serve_plan());
+    assert_eq!(served_component(&by_o), None);
 
     // Predicate-bound: 300 rows — a located run past the cap, whose ids come
     // from the range-restricted rid scan.
@@ -573,7 +580,7 @@ async fn test_reference_index_counts_located_runs_from_width() {
             .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
             .await
             .unwrap();
-        assert!(counted.debug_selection_pending());
+        assert!(selection_pending(&counted));
         assert_eq!(counted.size().await.unwrap(), 300);
         assert_eq!(
             counted.debug_row_ids_materialized(),
@@ -604,7 +611,7 @@ async fn test_reference_index_counts_located_runs_from_width() {
             .match_pattern(None, Some(&p1), None, None)
             .await
             .unwrap();
-        assert!(!matched.debug_selection_pending());
+        assert!(!selection_pending(&matched));
         let all = matched.code_columns_gathered().await.unwrap().unwrap();
         for (offset, limit) in [(0usize, 5usize), (7, 20), (295, 10), (300, 3)] {
             let windowed = store
@@ -658,7 +665,12 @@ async fn test_reference_index_file_checks_sparse_residual_by_point_reads() {
             .match_pattern(None, Some(&p1), Some(&o2), None)
             .await
             .unwrap();
-        assert_eq!(matched.debug_file_filter_pending(), Some(!sparse), "{rows}");
+        let stats = matched.view_statistics().unwrap();
+        assert_eq!(
+            (stats.file_backed, stats.pending_filter),
+            (true, !sparse),
+            "{rows}"
+        );
         assert_eq!(matched.size().await.unwrap(), want.len(), "{rows}");
         assert_eq!(view_strings(&matched).await, want, "{rows}");
         let in_memory = memory
@@ -912,14 +924,14 @@ async fn test_reference_index_pending_run_composes() {
             .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
             .await
             .unwrap();
-        assert!(pending.debug_selection_pending());
+        assert!(selection_pending(&pending));
         // A residual term keeps the run's ids from staying pending: the
         // filter over them needs the ids.
         let residual = store
             .match_pattern_for(None, Some(&p1), Some(&o2), None, IdsNeed::CountOrWindow)
             .await
             .unwrap();
-        assert!(!residual.debug_selection_pending());
+        assert!(!selection_pending(&residual));
         let o_code = all[2][0];
         let kept_rows: Vec<usize> = (0..all[2].len()).filter(|&i| all[2][i] == o_code).collect();
         assert!(kept_rows.len() > 1 && kept_rows.len() < all[2].len());
@@ -1316,11 +1328,7 @@ async fn test_reference_index_counts_with_named_graphs() {
                     .match_pattern_for(None, p, o, graph, IdsNeed::CountOrWindow)
                     .await
                     .unwrap();
-                assert_eq!(
-                    counted.debug_selection_pending(),
-                    graph.is_none(),
-                    "{label}"
-                );
+                assert_eq!(selection_pending(&counted), graph.is_none(), "{label}");
                 assert_eq!(counted.size().await.unwrap(), want, "{label}");
                 let probe = Probe::new(None, p.cloned(), o.cloned(), graph.cloned());
                 let before = store.debug_located_rid_reads();

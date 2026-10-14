@@ -593,17 +593,16 @@ async fn test_dict_reader_file_backed_matches_resident() {
     .await;
     let resident = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
     let fb = VortexRdfStore::from_file(&path).await.unwrap();
-    assert!(fb.debug_dict_file_backed());
+    let reader = fb
+        .dict_reader()
+        .expect("file-backed dictionaries get a handle");
+    assert!(reader.is_file_backed());
     assert!(
         fb.code_read_snapshot().is_none(),
         "the sync snapshot stays resident-only"
     );
 
     let oracle = resident.code_read_snapshot().unwrap();
-    let reader = fb
-        .dict_reader()
-        .expect("file-backed dictionaries get a handle");
-    assert!(reader.is_file_backed());
     assert!(reader.snapshot().is_none());
     assert_reader_matches_snapshot(&reader, &oracle, "file-backed").await;
     // The kind ranges stay stable on re-ask, and a predicate over the

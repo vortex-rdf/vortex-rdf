@@ -342,8 +342,9 @@ async fn test_index_served_matches_ignore_the_repeats() {
             .match_pattern(None, Some(&p), None, None)
             .await
             .unwrap();
-        assert!(
-            served.debug_has_serve_plan(),
+        assert_eq!(
+            served_component(&served),
+            Some("index:posg"),
             "{layout:?}: P is index-served"
         );
         assert_eq!(

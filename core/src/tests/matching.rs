@@ -155,7 +155,7 @@ pub(super) async fn run_subject_range_then_index_routing_above_gate(
         .await
         .unwrap();
     assert_eq!(above.debug_selection_range(), None);
-    assert!(!above.debug_has_serve_plan());
+    assert_eq!(served_component(&above), None);
     assert_eq!(
         view_strings(&above).await,
         expected_strings(quads, |i| quads[i].subject == s0 && quads[i].object == o5)
@@ -166,7 +166,7 @@ pub(super) async fn run_subject_range_then_index_routing_above_gate(
         .await
         .unwrap();
     assert_eq!(below.debug_selection_range(), None);
-    assert!(!below.debug_has_serve_plan());
+    assert_eq!(served_component(&below), None);
     assert_eq!(
         view_strings(&below).await,
         expected_strings(quads, |i| quads[i].subject == s1 && quads[i].object == o5)
@@ -390,7 +390,7 @@ async fn test_prefix_probe_declines_an_unstamped_base() {
     let mut quads = prefix_quads();
     quads.reverse();
     let store = unstamped_store(&quads);
-    assert!(!store.debug_base_subject_sorted());
+    assert_eq!(store.view_statistics().unwrap().sort_order, None);
 
     let by_s = store
         .match_pattern(Some(&s), None, None, None)
@@ -495,7 +495,12 @@ async fn test_file_prefix_probe_resolves_bound_prefixes_to_ranges() {
         let label = format!("{indexes:?}");
         let expect = |view: &VortexRdfStore, range: std::ops::Range<u64>| {
             assert_eq!(view.debug_selection_range(), Some(range), "{label}");
-            assert_eq!(view.debug_file_filter_pending(), Some(false), "{label}");
+            let stats = view.view_statistics().unwrap();
+            assert_eq!(
+                (stats.file_backed, stats.pending_filter),
+                (true, false),
+                "{label}"
+            );
         };
 
         let by_sp = store
@@ -541,7 +546,12 @@ async fn test_file_prefix_probe_resolves_bound_prefixes_to_ranges() {
             .await
             .unwrap();
         assert_eq!(by_so.debug_selection_range(), Some(12..24), "{label}");
-        assert_eq!(by_so.debug_file_filter_pending(), Some(true), "{label}");
+        let stats = by_so.view_statistics().unwrap();
+        assert_eq!(
+            (stats.file_backed, stats.pending_filter),
+            (true, true),
+            "{label}"
+        );
         assert_eq!(by_so.size().await.unwrap(), 6, "{label}");
     }
 }
