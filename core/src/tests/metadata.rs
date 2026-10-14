@@ -274,18 +274,33 @@ async fn test_view_statistics_in_memory() {
     );
 
     // The tail is counted after the base, and a string layout has no codes.
-    let strings = built_store(quads.clone(), LayoutStrategy::Default, vec![])
-        .await
-        .add_quads(appended_quads(7))
-        .await
-        .unwrap();
+    // The tail's rows follow the base unsorted: a view that reads any of
+    // them has no sort order, one that reads none keeps the base's.
+    let base = built_store(quads.clone(), LayoutStrategy::Default, vec![]).await;
+    let strings = base.add_quads(appended_quads(7)).await.unwrap();
+    assert_eq!(
+        base.view_statistics().unwrap().sort_order,
+        Some(SortOrder::Spog),
+        "a sorted base without a tail"
+    );
     let stats = strings.view_statistics().unwrap();
     assert_eq!(stats.tail_rows, 7);
     assert_eq!(stats.rows, RowCountHint::exact(quads.len() + 7));
-    assert_eq!(stats.sort_order, Some(SortOrder::Spog), "the base's order");
+    assert_eq!(stats.sort_order, None, "a sorted base with a tail");
     assert_eq!(
         stats.code_bounds, [None; 4],
         "no codes under a string layout"
+    );
+    let base_rows_only = strings
+        .match_pattern(Some(&subject_node(17, 4)), None, None, None)
+        .await
+        .unwrap()
+        .view_statistics()
+        .unwrap();
+    assert_eq!(
+        (base_rows_only.tail_rows, base_rows_only.sort_order),
+        (0, Some(SortOrder::Spog)),
+        "a tailed store's view that reads no tail row"
     );
 }
 
@@ -338,6 +353,19 @@ async fn test_view_statistics_file_backed() {
     assert_eq!(
         whole.code_bounds, [None; 4],
         "bounds that would need a read"
+    );
+    // The tail's rows follow the file's sorted rows unsorted.
+    assert_eq!(
+        whole.sort_order,
+        Some(SortOrder::Spog),
+        "a sorted file without a tail"
+    );
+    let tailed = store.add_quads(appended_quads(3)).await.unwrap();
+    let stats = tailed.view_statistics().unwrap();
+    assert_eq!(
+        (stats.tail_rows, stats.sort_order),
+        (3, None),
+        "a sorted file with a tail"
     );
     // Unindexed, a predicate match pushes a filter down: the rows it still
     // has to test bound the count, and its code bounds the column.
@@ -538,6 +566,14 @@ async fn test_partitions_in_memory() {
     assert_eq!(sizes.iter().sum::<usize>(), quads.len() + 7);
     assert_eq!(parts[3].tail_size(), 7, "the tail rides with the last");
     assert!(parts[..3].iter().all(|p| p.tail_size() == 0));
+    // Only the last partition reads tail rows, so only it loses the base's
+    // order.
+    let orders: Vec<Option<SortOrder>> = parts
+        .iter()
+        .map(|p| p.view_statistics().unwrap().sort_order)
+        .collect();
+    let spog = Some(SortOrder::Spog);
+    assert_eq!(orders, [spog, spog, spog, None]);
     let expected: Vec<String> = strings
         .quads_vec()
         .await

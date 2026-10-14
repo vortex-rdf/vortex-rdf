@@ -79,9 +79,10 @@ pub enum SelectionKind {
 pub struct ViewStatistics {
     /// The row count, base and tail, exact or bounded.
     pub rows: RowCountHint,
-    /// The order the base's rows come out in, when it is a known sort:
-    /// `Spog` over a globally sorted base. The tail's rows follow them in
-    /// append order.
+    /// The order the view's rows come out in, when it is a known sort:
+    /// `Spog` for a view over a globally sorted base that reads no tail row.
+    /// A view that reads any has none, since the tail's rows follow the
+    /// base's in append order.
     pub sort_order: Option<SortOrder>,
     /// Per column (`s`, `p`, `o`, `g`), the inclusive code range the base's
     /// rows are known to lie in (a pushed-down equality's code, a subject
@@ -189,7 +190,7 @@ impl VortexRdfStore {
                 }
                 ViewStatistics {
                     rows: row_count_hint(live, false, base_len, tail_rows),
-                    sort_order: sorted.then_some(SortOrder::Spog),
+                    sort_order: (sorted && tail_rows == 0).then_some(SortOrder::Spog),
                     code_bounds,
                     selection: selection_kind(selection),
                     served_component: serve.as_ref().map(|plan| plan.component()),
@@ -238,7 +239,7 @@ impl VortexRdfStore {
                 }
                 ViewStatistics {
                     rows: row_count_hint(live, filter.is_some(), base_len, tail_rows),
-                    sort_order: file.quads_sorted().then_some(SortOrder::Spog),
+                    sort_order: (file.quads_sorted() && tail_rows == 0).then_some(SortOrder::Spog),
                     code_bounds,
                     selection: selection_kind(selection),
                     served_component: serve.as_ref().map(|plan| plan.component()),
@@ -286,9 +287,12 @@ impl VortexRdfStore {
     /// of its base rows, in base row order, so reading the partitions in
     /// turn reads the view. Each keeps the view's pushed-down filter and
     /// tombstones and applies them to its own rows; the append tail goes with
-    /// the last. A served match's row ids are read first, and no partition
-    /// keeps the serve plan. Pieces are about equal before filtering, not
-    /// after; a view selecting no base row is its own one partition.
+    /// the last, so over a sorted base every partition but the last keeps the
+    /// `Spog` [`sort_order`](ViewStatistics::sort_order), and the last keeps
+    /// it only when the view reads no tail row. A served match's row ids are
+    /// read first, and no partition keeps the serve plan. Pieces are about
+    /// equal before filtering, not after; a view selecting no base row is its
+    /// own one partition.
     pub async fn partitions(&self, n: NonZeroUsize) -> Result<Vec<Self>> {
         let n = n.get();
         if n == 1 {
