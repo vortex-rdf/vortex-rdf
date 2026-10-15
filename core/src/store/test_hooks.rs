@@ -398,7 +398,14 @@ impl VortexRdfStore {
         let Some(mut codes) = self.prepared_codes(pattern).await? else {
             return Ok(None);
         };
-        crate::store::indexes::reference::debug_located_run(file, pattern, &mut codes).await
+        crate::store::indexes::file::debug_located_run(
+            crate::IndexType::SecondaryByReference,
+            file,
+            &self.layout,
+            pattern,
+            &mut codes,
+        )
+        .await
     }
 }
 
