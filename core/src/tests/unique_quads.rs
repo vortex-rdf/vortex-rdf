@@ -237,26 +237,6 @@ where
 
     #[cfg(feature = "file-io")]
     {
-        // The in-memory builder's chunk stream, written out the way the wasm
-        // bindings serialize it.
-        let built = crate::store::builders::sorted_in_memory::build_chunk_stream(
-            Box::new(raw_stream(DATASET)),
-            layout,
-            indexes.clone(),
-            3,
-        )
-        .await
-        .unwrap();
-        let mut bytes: Vec<u8> = Vec::new();
-        crate::io::write::built_stream_to_vortex_writer(built, &mut bytes)
-            .await
-            .unwrap();
-        check(
-            tag("SortedInMemoryBuilder chunk stream, from bytes"),
-            VortexRdfStore::from_bytes(&bytes).await.unwrap(),
-        )
-        .await;
-
         let mut bytes: Vec<u8> = Vec::new();
         quads_stream_to_vortex_writer(raw_stream(DATASET), &mut bytes, layout, indexes.clone())
             .await

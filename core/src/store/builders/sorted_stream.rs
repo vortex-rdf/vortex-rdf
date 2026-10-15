@@ -64,10 +64,14 @@ impl VortexArrayBuilder for SortedStreamBuilder {
     ) -> Result<BuiltArray> {
         build_array(quad_stream, layout, indexes, DEFAULT_CHUNK_ROWS).await
     }
+}
 
-    /// After the (blocking) run-sort phase, merged chunks are built on demand
-    /// as the file writer polls.
-    async fn build_vortex_stream(
+impl SortedStreamBuilder {
+    /// The dataset as a lazy chunk stream for the file writer. After the
+    /// (blocking) run-sort phase, merged chunks are built on demand as the
+    /// writer polls.
+    #[cfg(feature = "file-io")]
+    pub(crate) async fn build_vortex_stream(
         quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,

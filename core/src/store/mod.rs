@@ -17,9 +17,7 @@ pub(crate) mod test_hooks;
 pub(crate) mod view;
 pub(crate) mod write;
 
-pub use builders::{
-    BuiltArray, BuiltStream, ChunkStream, SortedInMemoryBuilder, VortexArrayBuilder,
-};
+pub use builders::{BuiltArray, SortedInMemoryBuilder, VortexArrayBuilder};
 // Compiled out on wasm along with the rest of the sorted-stream builder's
 // out-of-core merge (see the module gate in `builders`).
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
