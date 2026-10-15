@@ -27,6 +27,8 @@ use vortex_buffer::Buffer;
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout};
+#[cfg(feature = "file-io")]
+use crate::store::persist::native_file::ChildReader;
 use crate::store::schema::RowId;
 
 pub(crate) mod components;
@@ -455,16 +457,13 @@ enum LazyRowIdSource {
     Component { rids: ArrayRef, ascending: bool },
     /// File-backed: the rid-only pushed-down scan of the index child
     /// ([`scan_index_row_ids`]) the eager path would have run at match time.
+    /// The child binds through its file's memo under its own name, so the
+    /// deferred scan binds with the same identity every plan and eager scan
+    /// of this component uses (see `BoundExprMemo`).
     #[cfg(feature = "file-io")]
     IndexChild {
-        reader: vortex_layout::LayoutReaderRef,
+        child: ChildReader,
         constraints: Vec<(&'static str, Scalar)>,
-        rid_column: &'static str,
-        /// The owning file handle's bind memo and this child's scope tag —
-        /// so the deferred scan binds with the same identity every plan and
-        /// eager scan of this component uses (see `BoundExprMemo`).
-        memo: Arc<crate::store::persist::native_file::BoundExprMemo>,
-        scope: &'static str,
     },
     /// File-backed: a located run of an index child's rid column — read on
     /// first need through [`read_located_rids`]; its width is known up front,
@@ -472,11 +471,8 @@ enum LazyRowIdSource {
     #[cfg(feature = "file-io")]
     LocatedRun {
         file: Arc<crate::store::persist::native_file::NativeStoreFile>,
-        component: &'static str,
-        reader: vortex_layout::LayoutReaderRef,
-        rid_column: &'static str,
+        child: ChildReader,
         range: Range<u64>,
-        scope: &'static str,
     },
 }
 
@@ -516,21 +512,12 @@ impl LazyRowIds {
     /// Lazy ids scanned from a file's index child on first need.
     #[cfg(feature = "file-io")]
     pub(crate) fn from_index_child_scan(
-        reader: vortex_layout::LayoutReaderRef,
+        child: ChildReader,
         constraints: Vec<(&'static str, Scalar)>,
-        rid_column: &'static str,
-        memo: Arc<crate::store::persist::native_file::BoundExprMemo>,
-        scope: &'static str,
     ) -> Self {
         Self {
             cell: Arc::new(OnceLock::new()),
-            source: LazyRowIdSource::IndexChild {
-                reader,
-                constraints,
-                rid_column,
-                memo,
-                scope,
-            },
+            source: LazyRowIdSource::IndexChild { child, constraints },
         }
     }
 
@@ -538,22 +525,12 @@ impl LazyRowIds {
     #[cfg(feature = "file-io")]
     pub(crate) fn from_located_run(
         file: Arc<crate::store::persist::native_file::NativeStoreFile>,
-        component: &'static str,
-        reader: vortex_layout::LayoutReaderRef,
-        rid_column: &'static str,
+        child: ChildReader,
         range: Range<u64>,
-        scope: &'static str,
     ) -> Self {
         Self {
             cell: Arc::new(OnceLock::new()),
-            source: LazyRowIdSource::LocatedRun {
-                file,
-                component,
-                reader,
-                rid_column,
-                range,
-                scope,
-            },
+            source: LazyRowIdSource::LocatedRun { file, child, range },
         }
     }
 
@@ -572,15 +549,7 @@ impl LazyRowIds {
         offset: usize,
         limit: usize,
     ) -> Result<Option<Buffer<RowId>>> {
-        let LazyRowIdSource::LocatedRun {
-            file,
-            component,
-            reader,
-            rid_column,
-            range,
-            scope,
-        } = &self.source
-        else {
+        let LazyRowIdSource::LocatedRun { file, child, range } = &self.source else {
             return Ok(None);
         };
         let width = range.end - range.start;
@@ -590,9 +559,7 @@ impl LazyRowIds {
             return Ok(Some(Buffer::empty()));
         }
         let rows = range.start + start..range.start + end;
-        Ok(Some(
-            read_located_rids(file, component, reader, rid_column, rows, scope).await?,
-        ))
+        Ok(Some(read_located_rids(file, child, rows).await?))
     }
 
     /// The ids of rows `offset..offset + limit` of an in-memory run whose rids
@@ -641,22 +608,11 @@ impl LazyRowIds {
         }
         let ids = match &self.source {
             LazyRowIdSource::Component { rids, .. } => sorted_row_ids(rids.clone())?,
-            LazyRowIdSource::IndexChild {
-                reader,
-                constraints,
-                rid_column,
-                memo,
-                scope,
-            } => scan_index_row_ids(reader.clone(), constraints, rid_column, memo, scope).await?,
-            LazyRowIdSource::LocatedRun {
-                file,
-                component,
-                reader,
-                rid_column,
-                range,
-                scope,
-            } => {
-                read_located_rids(file, component, reader, rid_column, range.clone(), scope).await?
+            LazyRowIdSource::IndexChild { child, constraints } => {
+                scan_index_row_ids(child, constraints).await?
+            }
+            LazyRowIdSource::LocatedRun { file, child, range } => {
+                read_located_rids(file, child, range.clone()).await?
             }
         };
         Ok(self.cell.get_or_init(|| ids).clone())

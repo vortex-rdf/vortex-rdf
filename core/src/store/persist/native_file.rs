@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use vortex_array::ArrayRef;
-use vortex_array::expr::{BoundExpression, Expression};
+use vortex_array::expr::{BoundExpression, Expression, root, select};
 use vortex_error::VortexResult;
 use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_layout::{LayoutReaderRef, LayoutRef};
@@ -228,6 +228,47 @@ impl<K: std::hash::Hash + Eq, V: Clone> BoundedMemo<K, V> {
 /// Entry cap on [`NativeStoreFile::pruning_envelopes`] — sized for a query
 /// workload's distinct filter shapes, not for arbitrary term churn.
 const PRUNING_MEMO_MAX: usize = 512;
+
+/// One index child of the file, as the index readers use it: the child's
+/// reader, its `sorted` provenance, and the file's bind memo, through which
+/// every expression over the child binds under the child's name — so the
+/// eager scans, the deferred row-id sources and the serve plans of one child
+/// all hand its reader the same bound-tree identities (see
+/// [`BoundExprMemo`]). Taken by name through
+/// [`NativeStoreFile::child_reader`].
+#[derive(Clone)]
+pub(crate) struct ChildReader {
+    /// The component name: the child's bind scope, and the key of its
+    /// columns' chunk-probe handles on the file.
+    pub(crate) name: &'static str,
+    /// Whether the child's rows are globally sorted by its sort keys (the
+    /// descriptor's provenance), so a run of them can be located by binary
+    /// search.
+    pub(crate) sorted: bool,
+    /// The child's reader, from the reader tree current when it was taken.
+    pub(crate) reader: LayoutReaderRef,
+    memo: Arc<BoundExprMemo>,
+}
+
+impl ChildReader {
+    /// `expr` bound against the child's dtype through the file's memo.
+    pub(crate) fn bind(&self, expr: &Expression) -> crate::error::Result<BoundExpression> {
+        Ok(self.memo.bind(self.name, expr, self.reader.dtype())?)
+    }
+
+    /// A scan of the child projecting just `columns`. Restrictions — a
+    /// filter, a row range — are the caller's to add.
+    pub(crate) fn scan(
+        &self,
+        columns: &[&'static str],
+    ) -> crate::error::Result<ScanBuilder<ArrayRef>> {
+        let projection = self.bind(&select(columns, root()))?;
+        Ok(
+            ScanBuilder::new(crate::session::VORTEX_SESSION.clone(), self.reader.clone())
+                .with_projection(projection),
+        )
+    }
+}
 
 impl std::ops::Deref for NativeStoreFile {
     type Target = vortex_file::VortexFile;
@@ -485,6 +526,20 @@ impl NativeStoreFile {
                 .expect("the reader was just initialized above")
                 .clone(),
         )))
+    }
+
+    /// An index child's [`ChildReader`], by name: its reader from the
+    /// current tree ([`component_reader`](Self::component_reader)), its
+    /// descriptor's `sorted` provenance, and the handle's bind memo.
+    pub(crate) fn child_reader(&self, name: &'static str) -> VortexResult<Option<ChildReader>> {
+        Ok(self
+            .component_reader(name)?
+            .map(|(descriptor, reader)| ChildReader {
+                name,
+                sorted: descriptor.sorted,
+                reader,
+                memo: Arc::clone(&self.bound_exprs),
+            }))
     }
 
     /// The current reader tree: the one made for the bound tree memo's

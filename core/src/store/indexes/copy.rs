@@ -336,10 +336,9 @@ pub(crate) async fn resolve_file(
     };
     // The store's index set says this index exists, but be graceful when the
     // family's child is absent (a foreign writer could omit one family).
-    let Some((descriptor, reader)) = file.component_reader(probe.family.identity().name)? else {
+    let Some(child) = file.child_reader(probe.family.identity().name)? else {
         return Ok(IndexResolution::Declined);
     };
-    let sorted = descriptor.sorted;
     // Term absent from the dictionary ⇒ the pattern provably matches nothing.
     let Some(lead_native) = codes.probe_scalar(probe.lead)? else {
         return Ok(IndexResolution::Empty);
@@ -357,29 +356,21 @@ pub(crate) async fn resolve_file(
     // lead search over the whole child, then — for a prefix probe — the
     // windowed second-key search inside the lead run. Any probe decline
     // abandons the location wholesale.
-    let name = probe.family.identity().name;
     let mut located = super::file::locate_component_run(
         file,
-        name,
+        &child,
         probe.family.child_lead_col(),
         &constraints[0].1,
         None,
-        sorted,
     )
     .await?;
     if let Some(range) = located.clone()
         && !range.is_empty()
         && let Some((second_col, second_native)) = constraints.get(1)
     {
-        located = super::file::locate_component_run(
-            file,
-            name,
-            second_col,
-            second_native,
-            Some(range),
-            sorted,
-        )
-        .await?;
+        located =
+            super::file::locate_component_run(file, &child, second_col, second_native, Some(range))
+                .await?;
     }
     // A located empty run proves the combination absent — the short-circuit
     // the deferred path gives up.
@@ -393,30 +384,25 @@ pub(crate) async fn resolve_file(
     // scan (which a count or chained match would then pay).
     let deferred = || {
         ResolvedRowIds::Lazy(LazyRowIds::from_index_child_scan(
-            reader.clone(),
+            child.clone(),
             constraints.clone(),
-            COL_RID,
-            file.bound_exprs().clone(),
-            name,
         ))
     };
     let row_ids = match &located {
         Some(range) if crate::store::view::selection::point_sized(range.end - range.start) => {
-            super::rid_point_reads(file, name, COL_RID, range.clone())
+            super::rid_point_reads(file, &child, range.clone())
                 .await?
                 .map_or_else(deferred, ResolvedRowIds::Eager)
         }
         _ => deferred(),
     };
     match build_serve_plan(
-        reader.clone(),
+        child.clone(),
         layout,
         pattern.graph,
         &constraints,
         codes,
-        name,
         located,
-        file.bound_exprs(),
     )? {
         // A serving resolution reads the matched quads straight from the
         // copy columns — point reads over a located run, or the pushed-down
@@ -429,17 +415,7 @@ pub(crate) async fn resolve_file(
         // No plan (a bound residual term with no dictionary code — see
         // `build_serve_plan`): fall back to the eager scan, whose ids the
         // store will actually need.
-        None => {
-            super::resolve_eager_from_scan(
-                reader,
-                &constraints,
-                COL_RID,
-                probe.resolves,
-                file.bound_exprs(),
-                name,
-            )
-            .await
-        }
+        None => super::resolve_eager_from_scan(&child, &constraints, probe.resolves).await,
     }
 }
 
@@ -456,16 +432,13 @@ pub(crate) async fn resolve_file(
 /// single equality. The copy index declines subject-bound patterns, so the
 /// subject never appears here.
 #[cfg(feature = "file-io")]
-#[allow(clippy::too_many_arguments)]
 fn build_serve_plan(
-    reader: vortex_layout::LayoutReaderRef,
+    child: crate::store::persist::native_file::ChildReader,
     layout: &ResolvedLayout,
     graph: Option<&oxrdf::GraphName>,
     constraints: &[(&'static str, Scalar)],
     codes: &mut PatternCodes,
-    component: &'static str,
     row_range: Option<std::ops::Range<u64>>,
-    memo: &std::sync::Arc<crate::store::persist::native_file::BoundExprMemo>,
 ) -> Result<Option<FileServePlan>> {
     let mut constraints = constraints.to_vec();
     if let Some(graph) = graph {
@@ -483,11 +456,9 @@ fn build_serve_plan(
         CHILD_PRIMARY,
         COL_RID,
         copy_decode_layout(layout),
-        reader,
+        child,
         constraints,
-        component,
         row_range,
-        memo.clone(),
     )))
 }
 
