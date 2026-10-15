@@ -92,7 +92,7 @@ Where the stream comes from:
   drives an `oxrdfio` parser and converts each parsed quad on the spot, so no
   second copy of the terms outlives the conversion. Formats: N-Triples,
   N-Quads, Turtle, TriG, N3, RDF/XML, JSON-LD — named through
-  [`format_from_name`](../core/src/common/formats.rs#L20) (`"nt"`, `"ttl"`,
+  [`format_from_name`](../core/src/common/formats.rs#L42) (`"nt"`, `"ttl"`,
   `"xml"`, …) or detected from the file extension.
 - **RDF/JS quads** ([`ingest.rs`](../js/src/ingest.rs)) — an array is packed
   host-side into one length-prefixed buffer per 65,536 quads and decoded inside
@@ -284,7 +284,7 @@ followed), then the OS temp dir.
 
 ## 7. Columns, per layout
 
-The layout decides what a `RawQuad` becomes ([`LayoutStrategy`](../core/src/store/layouts/mod.rs#L53)).
+The layout decides what a `RawQuad` becomes ([`LayoutStrategy`](../core/src/store/layouts/mod.rs#L55)).
 Every layout puts `s` first and stamps it when the rows are sorted.
 
 | Layout | Columns | Term encoding |
@@ -293,7 +293,7 @@ Every layout puts `s` first and stamps it when the rows are sorted.
 | `TypedObject` | `s`, `p`, `o_kind` (`u8`), `o_value` (`Utf8`), `o_datatype` (nullable `Utf8`), `o_lang` (nullable `Utf8`), `g` | as `Default`, with the object decomposed |
 | `Dictionary` | `s`, `p`, `o`, `g` — non-nullable `u64` | codes into one sorted dictionary |
 
-**TypedObject decomposition** ([`decompose_object`](../core/src/store/layouts/typed_object.rs#L77)):
+**TypedObject decomposition** ([`decompose_object`](../core/src/store/layouts/typed_object.rs#L70)):
 
 | `o_kind` | Object | `o_value` | `o_datatype` | `o_lang` |
 |---|---|---|---|---|
@@ -340,7 +340,7 @@ Term columns use the layout's encoding — strings under `Default` and
 `TypedObject` (a `TypedObject` object is recomposed to its full N-Triples term
 for the index), `u64` codes under `Dictionary` — and `rid` is always the `u64`
 position of the quad in the sorted primary rows
-([`RowId`](../core/src/store/schema.rs#L38)).
+([`RowId`](../core/src/store/schema.rs#L37)).
 
 **Row ids never wrap.** A `u64` row id numbers more rows than any store holds,
 so row ids do not limit a store. Every build still numbers rows with checked
@@ -494,7 +494,7 @@ store's *compressed-resident* form
   knows —
   `Constant` for a single-valued column, `RunEnd` for a sorted column with few
   runs, bit-packed at the observed width otherwise
-  ([`with_compressed_int_children`](../core/src/store/resident.rs#L106)); the
+  ([`with_compressed_int_children`](../core/src/store/resident.rs#L87)); the
   `IsSorted` stamps carry across;
 - the base's compressed columns are wrapped in a `vortex.shared` node, so the
   match fast paths probe the compressed source while the code-column payload

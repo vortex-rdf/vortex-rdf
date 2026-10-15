@@ -3,7 +3,29 @@
 //! named rather than passed, so every binding's format argument funnels
 //! through them and accepts the same spellings.
 
-use oxrdfio::RdfFormat;
+use oxrdfio::{JsonLdProfileSet, RdfFormat};
+
+/// Every accepted format name with the format it denotes, each long spelling
+/// before its aliases.
+const FORMAT_NAMES: [(&str, RdfFormat); 12] = [
+    ("ntriples", RdfFormat::NTriples),
+    ("nt", RdfFormat::NTriples),
+    ("nquads", RdfFormat::NQuads),
+    ("nq", RdfFormat::NQuads),
+    ("turtle", RdfFormat::Turtle),
+    ("ttl", RdfFormat::Turtle),
+    ("trig", RdfFormat::TriG),
+    ("n3", RdfFormat::N3),
+    ("rdfxml", RdfFormat::RdfXml),
+    ("rdf", RdfFormat::RdfXml),
+    ("xml", RdfFormat::RdfXml),
+    (
+        "jsonld",
+        RdfFormat::JsonLd {
+            profile: JsonLdProfileSet::empty(),
+        },
+    ),
+];
 
 /// Infer the RDF format from a path's extension. `None` when there is no
 /// path, no extension, or the extension names no format oxrdfio knows — the
@@ -18,27 +40,26 @@ pub fn detect_format(path: Option<&std::path::Path>) -> Option<RdfFormat> {
 /// [`RdfFormat`]. `None` for an unrecognized name. The name table behind
 /// every string-typed format parameter (the JS bindings' `RdfFormatName`).
 pub fn format_from_name(name: &str) -> Option<RdfFormat> {
-    Some(match name.to_lowercase().as_str() {
-        "nt" | "ntriples" => RdfFormat::NTriples,
-        "nq" | "nquads" => RdfFormat::NQuads,
-        "ttl" | "turtle" => RdfFormat::Turtle,
-        "trig" => RdfFormat::TriG,
-        "n3" => RdfFormat::N3,
-        "rdf" | "rdfxml" | "xml" => RdfFormat::RdfXml,
-        "jsonld" => RdfFormat::JsonLd {
-            profile: Default::default(),
-        },
-        _ => return None,
-    })
+    let name = name.to_lowercase();
+    FORMAT_NAMES
+        .iter()
+        .find(|(spelling, _)| *spelling == name)
+        .map(|(_, format)| *format)
 }
 
 /// Every name [`format_from_name`] accepts, long spelling before its aliases
 /// — the list "unsupported format" errors quote.
 pub fn supported_format_names() -> &'static [&'static str] {
-    &[
-        "ntriples", "nt", "nquads", "nq", "turtle", "ttl", "trig", "n3", "rdfxml", "rdf", "xml",
-        "jsonld",
-    ]
+    const NAMES: [&str; FORMAT_NAMES.len()] = {
+        let mut names = [""; FORMAT_NAMES.len()];
+        let mut i = 0;
+        while i < names.len() {
+            names[i] = FORMAT_NAMES[i].0;
+            i += 1;
+        }
+        names
+    };
+    &NAMES
 }
 
 #[cfg(test)]

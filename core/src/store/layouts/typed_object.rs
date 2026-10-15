@@ -14,17 +14,10 @@ use crate::common::vocab::XSD_STRING;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
-use crate::store::array::{StrColReader, field_as, make_nullable_string_array, make_string_array};
-use crate::store::schema::{COL_G, COL_P, COL_S};
-
-/// The term kind tag — its presence in a schema is what marks the layout.
-pub(crate) const COL_O_KIND: &str = "o_kind";
-/// The object's lexical value: IRI string, blank node id, or literal value.
-pub(crate) const COL_O_VALUE: &str = "o_value";
-/// The literal datatype IRI — null unless the object is a typed literal.
-pub(crate) const COL_O_DATATYPE: &str = "o_datatype";
-/// The literal language tag — null unless the object is a language literal.
-pub(crate) const COL_O_LANG: &str = "o_lang";
+use crate::store::array::{StrColReader, field_as, make_string_array};
+use crate::store::schema::{
+    COL_G, COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE, COL_P, COL_S,
+};
 
 /// The primary columns:
 /// `s`, `p`, `o_kind`, `o_value`, `o_datatype`, `o_lang`, `g`.
@@ -64,8 +57,8 @@ pub(crate) fn build_columns(quads: &[RawQuad]) -> Result<Vec<ArrayRef>> {
         make_string_array(quads.iter().map(|q| q.p.as_str())),
         PrimitiveArray::from_iter(kinds).into_array(),
         make_string_array(values.iter().map(String::as_str)),
-        make_nullable_string_array(datatypes),
-        make_nullable_string_array(langs),
+        VarBinViewArray::from_iter_nullable_str(datatypes).into_array(),
+        VarBinViewArray::from_iter_nullable_str(langs).into_array(),
         make_string_array(quads.iter().map(|q| q.g.as_str())),
     ])
 }
@@ -125,16 +118,6 @@ fn compose_object(
     }
 }
 
-/// A nullable string column, or `None` when it cannot be read as one — every
-/// row then reads as null.
-fn nullable_str_col(
-    struct_arr: &StructArray,
-    name: &str,
-    ctx: &mut ExecutionCtx,
-) -> Option<VarBinViewArray> {
-    field_as::<VarBinViewArray>(struct_arr, name, ctx).ok()
-}
-
 /// The four object sub-columns of a chunk, executed to their canonical
 /// arrays.
 struct ObjectColumns {
@@ -146,13 +129,14 @@ struct ObjectColumns {
 
 impl ObjectColumns {
     /// Load the sub-columns of `struct_arr`. `o_kind` and `o_value` are
-    /// required; the nullable `o_datatype`/`o_lang` fall back to all-null.
+    /// required; the nullable `o_datatype`/`o_lang` read as all-null when
+    /// they cannot be read as string columns.
     fn load(struct_arr: &StructArray, ctx: &mut ExecutionCtx) -> Result<Self> {
         Ok(Self {
             kind: field_as::<PrimitiveArray>(struct_arr, COL_O_KIND, ctx)?,
             value: field_as::<VarBinViewArray>(struct_arr, COL_O_VALUE, ctx)?,
-            datatype: nullable_str_col(struct_arr, COL_O_DATATYPE, ctx),
-            lang: nullable_str_col(struct_arr, COL_O_LANG, ctx),
+            datatype: field_as::<VarBinViewArray>(struct_arr, COL_O_DATATYPE, ctx).ok(),
+            lang: field_as::<VarBinViewArray>(struct_arr, COL_O_LANG, ctx).ok(),
         })
     }
 

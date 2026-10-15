@@ -27,10 +27,14 @@ pub(crate) struct RdfStoreLayoutVTable;
 
 pub(super) type RdfStoreLayout = Layout<RdfStoreLayoutVTable>;
 
+/// The root's persisted state: whether the quad rows are in global
+/// `(s, p, o, g)` order (the meaning is defined on `WireMetadata::quads_sorted`;
+/// a materialized read restores the subject sorted stamp from it), and the
+/// component inventory in child order.
 #[derive(Clone, Debug)]
 pub(crate) struct RdfStoreLayoutData {
-    pub(super) quads_sorted: bool,
-    pub(super) components: Arc<[StoreComponentDescriptor]>,
+    pub(crate) quads_sorted: bool,
+    pub(crate) components: Arc<[StoreComponentDescriptor]>,
 }
 
 impl VTable for RdfStoreLayoutVTable {
@@ -190,13 +194,6 @@ impl VTable for LegacyStoreLayoutVTable {
     }
 }
 
-/// Whether the quad rows are recorded in global `(s, p, o, g)` order (the
-/// meaning is defined on `WireMetadata::quads_sorted`); a materialized read
-/// restores the subject sorted stamp from it.
-pub(crate) fn quads_sorted(layout: &RdfStoreLayout) -> bool {
-    layout.data().quads_sorted
-}
-
 /// Register the store layout, and the `v1` root so that its files can be
 /// refused, in a session. Called once from the `VORTEX_SESSION` initializer on
 /// every target: reading requires it.
@@ -258,11 +255,6 @@ pub(crate) fn is_legacy_file(file: &vortex_file::VortexFile) -> bool {
     file.footer().layout().encoding_id().as_ref() == LEGACY_STORE_LAYOUT_ID
 }
 
-/// The persisted component inventory of a native root.
-pub(crate) fn store_components(layout: &RdfStoreLayout) -> &[StoreComponentDescriptor] {
-    &layout.data().components
-}
-
 /// A named auxiliary child of a native root, with its descriptor.
 pub(crate) fn store_component(
     layout: &RdfStoreLayout,
@@ -289,7 +281,7 @@ pub(crate) fn store_metadata_of_bytes(bytes: &[u8]) -> (bool, Vec<StoreComponent
         .expect("valid Vortex bytes");
     assert!(is_native_file(&file), "not a native store file");
     let typed = file.footer().layout().as_::<RdfStoreLayoutVTable>();
-    (quads_sorted(typed), typed.data().components.to_vec())
+    (typed.data().quads_sorted, typed.data().components.to_vec())
 }
 
 /// On-disk byte size of a layout subtree: the sum of its segments' lengths
