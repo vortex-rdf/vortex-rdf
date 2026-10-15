@@ -165,7 +165,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 | `components[i]` | describes child `i + 1` ([`StoreComponentDescriptor`](../core/src/io/container/wire.rs#L128)) |
 | `name` | the child's identity; non-empty, unique, never `quad-source` |
 | `role` | `dictionary`, `index`, `change-set` (reserved for future delta components) or `other` |
-| `implementation` | the slug a reader interprets the columns through — the key of the registry behind [`known_component`](../core/src/store/indexes/components.rs#L64) |
+| `implementation` | the slug a reader interprets the columns through — the key of the registry behind [`known_component`](../core/src/store/indexes/components.rs#L60) |
 | `version` | the implementation's version, positive; a dictionary or index child above the version a reader reads (`DICT_VERSION`, `INDEX_VERSION`) fails the open ([§3](#3-the-store-root-vortex-rdfstorev2)) |
 | `required` | a reader that cannot interpret a required component **must fail the open**; an unknown optional component is skipped |
 | `sorted` | the writer's provenance that the sort-key columns are *globally* sorted — a reader may binary-search the child only when this is set; absent means false |
@@ -282,7 +282,7 @@ chunks are not one uniform window (chunks adopted from a foreign file) is
 written without the zone map; readers inspect the layout for it.
 
 **Reading it from a file.** A file store is memory-mapped
-([`from_file`](../core/src/store/persist/open.rs#L209)) and the dictionary stays in
+([`from_file`](../core/src/store/persist/open.rs#L214)) and the dictionary stays in
 its child
 ([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L243)).
 At open the handle reads the zone table — one small segment — and keeps, per
@@ -342,15 +342,15 @@ Shared rules:
 - **Row ids do not limit a store.** A `u64` row id numbers more rows than any
   store holds. The builds still number rows with checked arithmetic — up
   front for the in-memory builds
-  ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L110)), row by row
-  in the out-of-core merge ([`next_row_id`](../core/src/store/indexes/mod.rs#L124))
+  ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L111)), row by row
+  in the out-of-core merge ([`next_row_id`](../core/src/store/indexes/mod.rs#L125))
   — and refuse a store whose ids would run past the last one with a
   serialization error, rather than let an id wrap.
 - **`rid` is the quad's row id in the quad table.** That is what lets a match
   resolved through an index compose with row selections, tombstones and
   further matches without renumbering anything ([matching.md §1](matching.md#1-what-a-match-produces)).
 - **One row per quad.** A child whose row count differs from the quad table's
-  fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L77)).
+  fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L72)).
 - **A bound graph is never a sort key**, and neither index answers a
   bound-subject pattern — the sorted quad table is the better path there.
 - **A `{val, rid}` child is ordered by `(val, rid)`**: inside one value's run
@@ -369,7 +369,7 @@ row ids.
 On a file-backed store an index child is never lifted into memory. Under the
 `Dictionary` layout its run is located by binary-searching the child's
 encoded chunks through the chunk probes of [§4](#4-the-quad-table)
-([`locate_component_run`](../core/src/store/indexes/file.rs#L37)): a
+([`locate_component_run`](../core/src/store/indexes/file.rs#L36)): a
 located run of at most `POINT_GATHER_MAX_ROWS` rows is point-read, a wider
 one is read as a scan of exactly that row range. A run the probes cannot
 locate — a string-keyed child under the other layouts — is answered by a
@@ -598,9 +598,9 @@ open rather than being read around.
 | `DICT_VERSION` | 2 | [`container/mod.rs`](../core/src/io/container/mod.rs#L68) |
 | `INDEX_VERSION` | 1 | [`container/mod.rs`](../core/src/io/container/mod.rs#L72) |
 | `POINT_GATHER_MAX_ROWS` | 256 rows — a located run at most this wide is point-read through the chunk probes | [`selection.rs`](../core/src/store/view/selection.rs#L522) |
-| `POINT_READ_ROWS` | 256 rows — exact row ids at most one per this many rows of the splits holding them check a pending filter by point reads ([matching.md §7](matching.md#7-the-file-path)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L615) |
-| `POINT_IDS_PER_SPLIT` | 16 ids — exact ids at most this many per split they touch are read point by point ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L767) |
-| `TAKE_ROWS` | 16 rows — exact ids at most one per this many rows of their splits are taken at their rows rather than scanned | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L651) |
+| `POINT_READ_ROWS` | 256 rows — exact row ids at most one per this many rows of the splits holding them check a pending filter by point reads ([matching.md §7](matching.md#7-the-file-path)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L614) |
+| `POINT_IDS_PER_SPLIT` | 16 ids — exact ids at most this many per split they touch are read point by point ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L766) |
+| `TAKE_ROWS` | 16 rows — exact ids at most one per this many rows of their splits are taken at their rows rather than scanned | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L650) |
 | `MAX_INLINE_SPLITS` | 42 splits — a row scan of at most this many runs inline, a larger one is spawned ([§8](#8-reading-a-file)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L64) |
 | `DEFAULT_CHUNK_ROWS` | 100,000 rows per builder chunk (a producer batch size; the writer re-blocks at 8,192) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L60) |
 

@@ -11,10 +11,11 @@ use crate::io::container::{
     child_strategy,
 };
 use crate::store::RawQuad;
+use crate::store::indexes::components::{ComponentIdentity, TermColumn};
+use crate::store::indexes::copy::CopyFamily;
 use crate::store::indexes::copy::out_of_core::{CopyKey, copy_child_chunk, copy_child_dtype};
-use crate::store::indexes::copy::{CopyFamily, TermColumn};
 use crate::store::indexes::reference::RefFamily;
-use crate::store::indexes::reference::out_of_core::ref_child_dtype;
+use crate::store::indexes::reference::out_of_core::{ref_child_chunk, ref_child_dtype};
 use crate::store::indexes::{IndexType, next_row_id};
 use crate::store::schema::RowId;
 
@@ -154,28 +155,23 @@ where
     Ok((merged, spillers.into_mergers()?))
 }
 
-/// A window of one reference family's merged entries, as one child chunk.
-type RefChunkFn<V> = fn(&[RefEntry<V>]) -> Result<ArrayRef>;
-
 /// Each family's child as a native component write streaming its chunks off
 /// its merger, in windows of `chunk_size` entries — no lockstep with the quad
 /// stream, no materialization. `encoded` says whether the entries hold
-/// dictionary codes (else term strings), which picks the child dtypes;
-/// `ref_chunk` builds a reference child chunk for that encoding. Every pull
-/// holds the run guard, so the run files outlive their readers.
+/// dictionary codes (else term strings), which picks the child dtypes. Every
+/// pull holds the run guard, so the run files outlive their readers.
 pub(super) fn merger_components<V>(
     mergers: IndexMergers<V>,
     chunk_size: usize,
     guard: &Arc<TempRunsGuard>,
     encoded: bool,
-    ref_chunk: RefChunkFn<V>,
 ) -> Result<Vec<NativeComponentWrite>>
 where
     V: TermColumn + Send + 'static,
     RefEntry<V>: Ord + Spillable,
     CopyEntry<V>: Ord + Spillable,
 {
-    let mut families: Vec<(&'static str, &'static str, DType, PullFn)> = Vec::new();
+    let mut families: Vec<(&'static ComponentIdentity, DType, PullFn)> = Vec::new();
     if let Some((posg, ospg)) = mergers.copies {
         let dtype = copy_child_dtype(encoded);
         for (family, mut merger) in [(CopyFamily::Posg, posg), (CopyFamily::Ospg, ospg)] {
@@ -184,37 +180,27 @@ where
                     copy_child_chunk(family, keys)
                 })
             });
-            families.push((
-                family.component_name(),
-                family.component_slug(),
-                dtype.clone(),
-                pull,
-            ));
+            families.push((family.identity(), dtype.clone(), pull));
         }
     }
     if let Some((o, p)) = mergers.refs {
         let dtype = ref_child_dtype(encoded);
         for (family, mut merger) in [(RefFamily::Object, o), (RefFamily::Predicate, p)] {
             let pull = pull_fn(guard, move |n| {
-                chunk_of(merger.next_batch(n)?, n, ref_chunk)
+                chunk_of(merger.next_batch(n)?, n, ref_child_chunk)
             });
-            families.push((
-                family.component_name(),
-                family.component_slug(),
-                dtype.clone(),
-                pull,
-            ));
+            families.push((family.identity(), dtype.clone(), pull));
         }
     }
     families
         .into_iter()
-        .map(|(name, slug, dtype, pull)| {
+        .map(|(identity, dtype, pull)| {
             let strategy = child_strategy(&dtype);
             Ok(NativeComponentWrite::new(
                 StoreComponentDescriptor {
-                    name: name.into(),
+                    name: identity.name.into(),
                     role: StoreComponentRole::Index,
-                    implementation: slug.into(),
+                    implementation: identity.slug.into(),
                     version: INDEX_VERSION,
                     required: false,
                     // The merger emits the family in its global sort order.

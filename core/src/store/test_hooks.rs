@@ -210,7 +210,7 @@ impl VortexRdfStore {
         let component = self
             .in_memory_components()?
             .iter()
-            .find(|c| c.name == name)?;
+            .find(|c| c.identity.name == name)?;
         Some(debug_int_children_canonical(component.rows().ok()?))
     }
 
@@ -329,7 +329,7 @@ impl VortexRdfStore {
     pub(crate) fn debug_index_component_materialized(&self, name: &str) -> Option<bool> {
         self.in_memory_components()?
             .iter()
-            .find(|c| c.name == name)
+            .find(|c| c.identity.name == name)
             .map(|c| c.is_materialized())
     }
 

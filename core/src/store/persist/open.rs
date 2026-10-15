@@ -6,7 +6,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::io::container;
 use crate::io::read;
 use crate::session::VORTEX_SESSION;
-use crate::store::indexes::{IndexComponent, KnownComponent};
+use crate::store::indexes::{ComponentIdentity, DeferredSource, IndexComponent, adopt_component};
 use crate::store::layouts::dictionary::TermDictionary;
 #[cfg(feature = "file-io")]
 use crate::store::{
@@ -69,7 +69,7 @@ pub(in crate::store) enum ComponentKind {
     /// A known index child: the registry row carrying the identity an
     /// in-memory [`IndexComponent`](crate::store::indexes::IndexComponent)
     /// adopts and the index type it makes queryable.
-    Index(KnownComponent),
+    Index(&'static ComponentIdentity),
     /// An optional component this version does not interpret — ignoring it
     /// cannot change query results.
     Skip,
@@ -136,7 +136,12 @@ pub(in crate::store) fn classify_component(
 #[cfg(feature = "file-io")]
 fn index_children(
     components: &[container::StoreComponentDescriptor],
-) -> Result<Vec<(KnownComponent, &container::StoreComponentDescriptor)>> {
+) -> Result<
+    Vec<(
+        &'static ComponentIdentity,
+        &container::StoreComponentDescriptor,
+    )>,
+> {
     let mut children = Vec::new();
     for descriptor in components {
         if let ComponentKind::Index(known) = classify_component(descriptor)? {
@@ -180,9 +185,9 @@ pub(in crate::store) async fn scanned_index_components(
             continue;
         };
         let scanned = read::scan_all_reader(reader).await?;
-        components.push(crate::store::indexes::adopt_scanned_component(
-            &known,
-            scanned,
+        components.push(adopt_component(
+            known,
+            DeferredSource::Scanned(scanned),
             descriptor.sorted,
             file.row_count(),
         )?);
@@ -380,10 +385,10 @@ impl VortexRdfStore {
                     // genuine use — an index probe, serialization — so a
                     // load pays nothing for index children it never touches.
                     // Sound here because this reader sits over the buffer
-                    // the file was opened from (see `adopt_component_reader`).
-                    components.push(crate::store::indexes::adopt_component_reader(
-                        &known,
-                        reader,
+                    // the file was opened from (see `DeferredSource::Reader`).
+                    components.push(adopt_component(
+                        known,
+                        DeferredSource::Reader(reader),
                         descriptor.sorted,
                         quads.len() as u64,
                     )?);

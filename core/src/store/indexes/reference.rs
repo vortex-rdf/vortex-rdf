@@ -34,9 +34,10 @@ use vortex_array::{ArrayRef, IntoArray};
 
 #[cfg(feature = "file-io")]
 use super::FileServePlan;
-use super::components::child_struct;
+use super::components::{ComponentIdentity, IndexComponent, components_from};
 use super::{
-    COL_RID, InMemoryServePlan, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds,
+    COL_RID, InMemoryServePlan, IndexResolution, IndexType, LazyRowIds, ResolvedRoles,
+    ResolvedRowIds,
 };
 use crate::error::Result;
 use crate::store::RawQuad;
@@ -51,26 +52,27 @@ pub(crate) const COL_VAL: &str = "val";
 const CHILD_COLUMNS: [&str; 2] = [COL_VAL, COL_RID];
 
 /// This index's persisted-child identity table — one `{val, rid}` table per
-/// covered family — feeding every generic loop in the hub (the slug registry
-/// and the roster it builds); see
+/// covered family, in [`RefFamily`] order — feeding every generic loop in the
+/// hub (the slug registry and the roster it builds); see
 /// [`IndexType::component_identities`](super::IndexType::component_identities).
-/// Built from the [`RefFamily`] accessors so each name keeps exactly one
-/// spelling.
-pub(crate) const IDENTITIES: [super::ComponentIdentity; 2] = [
-    super::ComponentIdentity {
-        name: RefFamily::Object.component_name(),
-        slug: RefFamily::Object.component_slug(),
+/// Each family reaches its row through [`RefFamily::identity`], so each name
+/// keeps exactly one spelling.
+pub(crate) static IDENTITIES: [ComponentIdentity; 2] = [
+    ComponentIdentity {
+        name: "index:ref-o",
+        slug: "secondary-by-reference/o",
+        index: IndexType::SecondaryByReference,
     },
-    super::ComponentIdentity {
-        name: RefFamily::Predicate.component_name(),
-        slug: RefFamily::Predicate.component_slug(),
+    ComponentIdentity {
+        name: "index:ref-p",
+        slug: "secondary-by-reference/p",
+        index: IndexType::SecondaryByReference,
     },
 ];
 
 /// One of the two quad components this index covers, named after it. Each
-/// family owns one `{val, rid}` component — its name and implementation slug
-/// — so the association is stated once here (and in the [`IDENTITIES`] rows
-/// built from these accessors) instead of at every roster site.
+/// family owns one `{val, rid}` component — its [`IDENTITIES`] row — so the
+/// association is stated once there instead of at every roster site.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RefFamily {
     /// Object values.
@@ -80,19 +82,12 @@ pub(crate) enum RefFamily {
 }
 
 impl RefFamily {
-    /// The persisted child's component name.
-    pub(crate) const fn component_name(self) -> &'static str {
+    /// The persisted child's identity: its component name, implementation
+    /// slug and owning index.
+    pub(crate) const fn identity(self) -> &'static ComponentIdentity {
         match self {
-            RefFamily::Object => "index:ref-o",
-            RefFamily::Predicate => "index:ref-p",
-        }
-    }
-
-    /// The persisted child's implementation slug.
-    pub(crate) const fn component_slug(self) -> &'static str {
-        match self {
-            RefFamily::Object => "secondary-by-reference/o",
-            RefFamily::Predicate => "secondary-by-reference/p",
+            RefFamily::Object => &IDENTITIES[0],
+            RefFamily::Predicate => &IDENTITIES[1],
         }
     }
 }
@@ -143,7 +138,7 @@ fn choose<'a>(pattern: QuadPattern<'a>) -> Option<RefProbe<'a>> {
 /// (`IndexComponent::sorted` — per-chunk sorted data is not
 /// binary-searchable).
 pub(crate) fn resolve_in_memory(
-    components: &[super::IndexComponent],
+    components: &[IndexComponent],
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
 ) -> Result<IndexResolution<InMemoryServePlan>> {
@@ -153,8 +148,7 @@ pub(crate) fn resolve_in_memory(
     };
     // Route through the index only when the family's component exists and is
     // globally sorted — the writer's provenance, not a stamp inspection.
-    let Some(component) =
-        super::IndexComponent::find_sorted(components, probe.family.component_name())
+    let Some(component) = IndexComponent::find_sorted(components, probe.family.identity().name)
     else {
         return Ok(IndexResolution::Declined);
     };
@@ -171,7 +165,7 @@ pub(crate) fn resolve_in_memory(
     // Binary search bounds the run of rows equal to the probe — through the
     // component's cached probe when the column resolves one; an empty run
     // means the term is present in the schema but absent from the data.
-    let Some(run) = super::component_probe_run(component, COL_VAL, &native, None)? else {
+    let Some(run) = component.probe_run(COL_VAL, &native, None)? else {
         return Ok(IndexResolution::Declined);
     };
     if run.is_empty() {
@@ -293,7 +287,7 @@ async fn locate<'a>(
     let Some(probe) = choose(pattern) else {
         return Ok(Located::Declined);
     };
-    let name = probe.family.component_name();
+    let name = probe.family.identity().name;
     let Some((descriptor, reader)) = file.component_reader(name)? else {
         return Ok(Located::Declined);
     };
@@ -337,11 +331,11 @@ pub(crate) mod out_of_core {
     use vortex_array::dtype::DType;
     use vortex_array::{ArrayRef, IntoArray};
 
-    use super::super::components::{child_struct, child_struct_dtype};
+    use super::super::components::{TermColumn, child_struct, child_struct_dtype};
     use super::CHILD_COLUMNS;
     use crate::error::Result;
-    use crate::store::array::{make_string_array, stamp_is_sorted};
-    use crate::store::schema::{CODE_PTYPE, ROW_ID_PTYPE, RowId, TermCode};
+    use crate::store::array::stamp_is_sorted;
+    use crate::store::schema::{CODE_PTYPE, ROW_ID_PTYPE, RowId};
 
     /// The persisted child's struct dtype: sorted values (strings, or codes
     /// under the Dictionary layout) plus the u64 primary row id.
@@ -362,17 +356,12 @@ pub(crate) mod out_of_core {
     }
 
     /// One chunk of a reference component's persisted child from a window of its
-    /// merged `(value, row id)` pairs.
-    pub(crate) fn ref_child_chunk_strings(pairs: &[(String, RowId)]) -> Result<ArrayRef> {
-        let val = make_string_array(pairs.iter().map(|(v, _)| v.as_str()));
-        stamp_is_sorted(&val);
-        let rid = PrimitiveArray::from_iter(pairs.iter().map(|(_, rid)| *rid)).into_array();
-        child_struct(&CHILD_COLUMNS, vec![val, rid], pairs.len()).map(|a| a.into_array())
-    }
-
-    /// Code-column variant of [`ref_child_chunk_strings`].
-    pub(crate) fn ref_child_chunk_codes(pairs: &[(TermCode, RowId)]) -> Result<ArrayRef> {
-        let val = PrimitiveArray::from_iter(pairs.iter().map(|(code, _)| *code)).into_array();
+    /// merged `(value, row id)` pairs, value column stamped sorted. `V` is the
+    /// value encoding: `String`, or [`TermCode`]s under the Dictionary layout.
+    ///
+    /// [`TermCode`]: crate::store::TermCode
+    pub(crate) fn ref_child_chunk<V: TermColumn>(pairs: &[(V, RowId)]) -> Result<ArrayRef> {
+        let val = V::column(pairs.iter().map(|(v, _)| v));
         stamp_is_sorted(&val);
         let rid = PrimitiveArray::from_iter(pairs.iter().map(|(_, rid)| *rid)).into_array();
         child_struct(&CHILD_COLUMNS, vec![val, rid], pairs.len()).map(|a| a.into_array())
@@ -455,29 +444,20 @@ impl GlobalReferenceArrays {
     /// This index's two persisted children, each a `{val, rid}` table over the
     /// whole dataset. Globally sorted by construction, so both are handed over
     /// with that provenance.
-    pub(crate) fn into_components(self) -> Result<Vec<super::IndexComponent>> {
+    pub(crate) fn into_components(self) -> Result<Vec<IndexComponent>> {
         let Self {
             o_val,
             o_rid,
             p_val,
             p_rid,
         } = self;
-        [
-            (RefFamily::Object, o_val, o_rid),
-            (RefFamily::Predicate, p_val, p_rid),
-        ]
-        .into_iter()
-        .map(|(family, val, rid)| {
-            let len = val.len();
-            let rows = child_struct(&CHILD_COLUMNS, vec![val, rid], len)?;
-            Ok(super::IndexComponent::built(
-                family.component_name(),
-                family.component_slug(),
-                rows,
-                true,
-            ))
-        })
-        .collect()
+        components_from(
+            &CHILD_COLUMNS,
+            [
+                (RefFamily::Object.identity(), vec![o_val, o_rid]),
+                (RefFamily::Predicate.identity(), vec![p_val, p_rid]),
+            ],
+        )
     }
 }
 
@@ -499,13 +479,13 @@ mod tests {
         // Object preferred over predicate when both are bound.
         let probe = choose(QuadPattern::new(None, Some(&p), Some(&o), None)).unwrap();
         assert_eq!(probe.resolves, ResolvedRoles::Object);
-        assert_eq!(probe.family.component_name(), "index:ref-o");
+        assert_eq!(probe.family.identity().name, "index:ref-o");
         assert_eq!(probe.lead.to_string(), o.to_string());
 
         // Predicate-only patterns use the predicate side.
         let probe = choose(QuadPattern::new(None, Some(&p), None, None)).unwrap();
         assert_eq!(probe.resolves, ResolvedRoles::Predicate);
-        assert_eq!(probe.family.component_name(), "index:ref-p");
+        assert_eq!(probe.family.identity().name, "index:ref-p");
         assert_eq!(probe.lead.to_string(), p.to_string());
 
         // Nothing this index covers is bound: declines.

@@ -53,7 +53,7 @@ A builder hands these back in one of two shapes
 |---|---|---|---|
 | CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`SerializeArgs`](../cli/src/main.rs#L33)) | out-of-core | file |
 | Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L145) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L60) | out-of-core | file / any `VortexWrite` |
-| Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L78), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L62) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L37) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L129) to name the builder | either | in-memory store |
+| Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L78), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L59) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L37) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L129) to name the builder | either | in-memory store |
 | Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L169) | — (re-serializes a store) | bytes |
 | Rust | [`to_serializable_parts`](../core/src/store/persist/serialize.rs#L110) → [`from_parts`](../core/src/store/construct.rs#L111) | — | in-memory round trip |
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize_rdf`](../python/src/serialize.rs#L33)) | out-of-core | file |
@@ -195,7 +195,7 @@ time (the wasm array path).
 
 ## 6. Pipeline B — sorted out of core
 
-[`SortedStreamBuilder`](../core/src/store/builders/sorted_stream.rs#L59) is an
+[`SortedStreamBuilder`](../core/src/store/builders/sorted_stream.rs#L56) is an
 external merge sort: peak memory is bounded by the chunk size (plus the
 distinct terms, under the Dictionary layout), not by the dataset.
 
@@ -237,13 +237,13 @@ spilled and merged as they are, never deduplicated — are unique because their
 row ids are.
 
 **Phase 3 — emission.** Without indexes the merge is lazy
-([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L174)):
+([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L171)):
 every poll of the chunk stream pulls up to a chunk's worth of quads off the
 heap and builds one struct
 ([`build_struct_array`](../core/src/store/builders/mod.rs#L166), or
 [`dictionary::build_chunk`](../core/src/store/layouts/dictionary/codec.rs#L126)
 encoding each term through the term→code map). With indexes the merge runs to
-completion first ([`merge_feeding_indexes`](../core/src/store/builders/stream_indexes.rs#L127)):
+completion first ([`merge_feeding_indexes`](../core/src/store/builders/stream_indexes.rs#L128)):
 row ids are only known as the merge assigns them, and an index child is a
 *globally* sorted table over those ids, so it needs a second external sort.
 Each merged quad's terms (strings, or codes under Dictionary) are pushed into
@@ -322,7 +322,7 @@ dictionary alone.
 
 Indexes never ride inside the quad rows: a builder emits primary-only rows plus
 one *component* per requested family, and that is the only form index data ever
-takes — in memory as an [`IndexComponent`](../core/src/store/indexes/components.rs#L168),
+takes — in memory as an [`IndexComponent`](../core/src/store/indexes/components.rs#L154),
 in a file as an auxiliary child.
 
 | Index | Children | Columns | Sorted by |
@@ -343,8 +343,8 @@ than let an id wrap onto row 0:
 
 | Where | Check | Refusal |
 |---|---|---|
-| in-memory builds, compaction's in-memory rebuild, `to_bytes` of a store with a tail | the row count, before any id is assigned ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L110)) | `Serialization`: the store *would exceed* `u64::MAX` quads |
-| the out-of-core merge, a file-backed compaction | each row as the merge numbers it ([`next_row_id`](../core/src/store/indexes/mod.rs#L124)); a refused file build leaves no file | the same |
+| in-memory builds, compaction's in-memory rebuild, `to_bytes` of a store with a tail | the row count, before any id is assigned ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L111)) | `Serialization`: the store *would exceed* `u64::MAX` quads |
+| the out-of-core merge, a file-backed compaction | each row as the merge numbers it ([`next_row_id`](../core/src/store/indexes/mod.rs#L125)); a refused file build leaves no file | the same |
 
 Opening a file whose index children record row ids of another width is
 refused with a deserialization error that says to rebuild the store
@@ -352,7 +352,7 @@ refused with a deserialization error that says to rebuild the store
 
 **In memory** ([`build_components`](../core/src/store/builders/mod.rs#L236)) each
 family is a permutation of the complete sorted dataset: sort the row ids by the
-family's comparator ([`CopyFamily::cmp_quads`](../core/src/store/indexes/copy.rs#L141),
+family's comparator ([`CopyFamily::cmp_quads`](../core/src/store/indexes/copy.rs#L150),
 or the code tuple under Dictionary), then gather the columns through that
 permutation — the permutation itself is the `rid` column. The lead sort column
 is stamped `IsSorted`.
@@ -494,7 +494,7 @@ store's *compressed-resident* form (through
   match fast paths probe the compressed source while the code-column payload
   path decodes the canonical primitive once into the wrapper's cache;
 - the encoded-search probes over every column are resolved up front
-  ([`StructProbes::warm`](../core/src/store/probes.rs#L43)), so no query pays the
+  ([`StructProbes::warm`](../core/src/store/probes.rs#L53)), so no query pays the
   encoding-tree walk.
 
 The other in-memory constructor, [`from_parts`](../core/src/store/construct.rs#L111),

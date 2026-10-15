@@ -53,6 +53,29 @@ fn split_start_mask(
     }
 }
 
+/// Narrow `mask` over `range` by each conjunct's statistics-only pruning —
+/// zone maps and footer stats, no row data read — stopping once nothing
+/// survives (further conjuncts can't un-prune rows). The pruning phase both
+/// the per-split filter evaluation ([`evaluate_filter_split`]) and the
+/// file-wide envelope ([`row_range_from_pruning`]) run.
+async fn prune_mask(
+    reader: &Arc<dyn LayoutReader>,
+    conjuncts: &[BoundExpression],
+    range: &Range<u64>,
+    mut mask: Mask,
+) -> Result<Mask> {
+    for conjunct in conjuncts {
+        if mask.all_false() {
+            break;
+        }
+        let pruned = reader
+            .pruning_evaluation(range, conjunct, mask.clone())?
+            .await?;
+        mask = mask.bitand(&pruned);
+    }
+    Ok(mask)
+}
+
 /// Evaluate a filter over one file split, threading a narrowing mask through the
 /// two phases the layout reader exposes — cheap zone-map/stats pruning first,
 /// then real per-conjunct filter evaluation for whatever survives. Returns the
@@ -64,24 +87,13 @@ async fn evaluate_filter_split(
     range: &Range<u64>,
     start_mask: Mask,
 ) -> Result<Mask> {
-    let bound = filter_conjuncts;
-    let mut mask = start_mask;
     // Phase 1: prune using zone-map/footer stats only — no I/O beyond the
-    // cached stats tables. Each conjunct narrows the mask; stop once nothing
-    // survives.
-    for conjunct in bound {
-        if mask.all_false() {
-            return Ok(mask);
-        }
-        let pruned = reader
-            .pruning_evaluation(range, conjunct, mask.clone())?
-            .await?;
-        mask = mask.bitand(&pruned);
-    }
+    // cached stats tables ([`prune_mask`]).
+    let mut mask = prune_mask(&reader, filter_conjuncts, range, start_mask).await?;
     // Phase 2: for whatever the stats couldn't rule out, read and evaluate each
     // conjunct for real, threading the narrowing mask so later conjuncts see
     // fewer rows.
-    for conjunct in bound {
+    for conjunct in filter_conjuncts {
         if mask.all_false() {
             return Ok(mask);
         }
@@ -356,25 +368,19 @@ pub(crate) async fn row_range_from_pruning(
     }
 
     // Start from "everything might match" and narrow it down using only
-    // statistics (zone maps / footer stats) — no row data is read here.
+    // statistics (zone maps / footer stats) — no row data is read here. Each
+    // conjunct's prunability is evaluated over the *entire* file in one call:
+    // the zoned reader vectorizes this over all its zones and the file-stats
+    // wrapper checks footer-level bounds first.
     let reader = file.layout_reader()?;
-    let mut mask = Mask::new_true(len);
-    for conjunct in conjuncts(filter) {
-        // Once nothing can match, further conjuncts can't un-prune rows.
-        if mask.all_false() {
-            break;
-        }
-        let conjunct = file
-            .bound_exprs()
-            .bind(QUAD_SCOPE, &conjunct, reader.dtype())?;
-        // Evaluate this conjunct's prunability over the *entire* file in one
-        // call: the zoned reader vectorizes this over all its zones and the
-        // file-stats wrapper checks footer-level bounds first.
-        let pruned = reader
-            .pruning_evaluation(&(0..row_count), &conjunct, mask.clone())?
-            .await?;
-        mask = mask.bitand(&pruned);
-    }
+    let bound: Vec<BoundExpression> = conjuncts(filter)
+        .iter()
+        .map(|conjunct| {
+            file.bound_exprs()
+                .bind(QUAD_SCOPE, conjunct, reader.dtype())
+        })
+        .collect::<vortex_error::VortexResult<_>>()?;
+    let mask = prune_mask(&reader, &bound, &(0..row_count), Mask::new_true(len)).await?;
 
     // Collapse the surviving mask to its enclosing contiguous range: the
     // first and last set bit. Interior gaps of non-matching rows are kept

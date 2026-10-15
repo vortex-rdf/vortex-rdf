@@ -16,11 +16,12 @@
 //! persisted-child model and the slug registry), both re-exported here so
 //! callers see one `indexes::` surface.
 
+#[cfg(feature = "file-io")]
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use vortex_array::ArrayRef;
-use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
+#[cfg(feature = "file-io")]
 use vortex_array::scalar::Scalar;
 use vortex_buffer::Buffer;
 
@@ -35,12 +36,12 @@ pub(crate) mod file;
 pub(crate) mod reference;
 pub(crate) mod serve;
 
-pub(crate) use components::{
-    ComponentIdentity, IndexComponent, KnownComponent, adopt_component_reader,
-    indexes_from_components, known_component, sorted_row_ids,
-};
 #[cfg(feature = "file-io")]
-pub(crate) use components::{adopt_scanned_component, check_component_rows};
+pub(crate) use components::check_component_rows;
+pub(crate) use components::{
+    ComponentIdentity, DeferredSource, IndexComponent, adopt_component, indexes_from_components,
+    known_component, sorted_row_ids,
+};
 #[cfg(feature = "file-io")]
 pub(crate) use file::{
     FileServePlan, read_located_rids, resolve_eager_from_scan, rid_point_reads, scan_index_row_ids,
@@ -258,25 +259,15 @@ impl std::str::FromStr for IndexType {
 }
 
 /// Every [`IndexType`], in declaration = preference order — what the slug
-/// registry scans and what [`IndexType::preference_rank`] indexes into.
-/// Adding a variant fails to compile at that exhaustive match until the
-/// variant is listed here too.
+/// registry scans and what the in-memory index set
+/// ([`indexes_from_components`]) is filtered out of, in this order.
 pub(crate) const ALL_INDEX_TYPES: [IndexType; 2] =
     [IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
 
 impl IndexType {
-    /// This variant's position in [`ALL_INDEX_TYPES`] — the resolution
-    /// preference order, as a sort key.
-    pub(crate) const fn preference_rank(self) -> usize {
-        match self {
-            IndexType::SecondaryByCopy => 0,
-            IndexType::SecondaryByReference => 1,
-        }
-    }
-
-    /// This index's persisted-child identities — the const table every generic
-    /// loop is parameterized by: the slug registry ([`known_component`]) and
-    /// the roster-to-index-set fold ([`indexes_from_components`]). The
+    /// This index's persisted-child identities — the static table every
+    /// generic loop is parameterized by: the slug registry
+    /// ([`known_component`]) and the components each leaf builds. The
     /// exhaustive match is the compile-fail anchor for those loops: a new
     /// variant answers here once and flows into all of them.
     pub(crate) const fn component_identities(self) -> &'static [ComponentIdentity] {
@@ -690,59 +681,6 @@ impl LazyRowIds {
     }
 }
 
-/// Binary-search a component's sorted `column` for the `[lo, hi)` run of rows
-/// equal to `native`, searched `within` a row range whose slice of the column
-/// is itself sorted (the whole component, or a lead run for a prefix probe) —
-/// the probe step shared by the in-memory resolvers.
-///
-/// `None` when the column is missing or the probe can't cast to its dtype
-/// (the resolver declines and the store falls back to a mask scan); an empty
-/// range when the probed term is absent from the data.
-fn sorted_probe_run(
-    rows: &StructArray,
-    column: &'static str,
-    native: &Scalar,
-    within: Range<usize>,
-) -> Result<Option<Range<usize>>> {
-    use crate::store::array::search_sorted_bounds;
-
-    let Ok(col) = rows.unmasked_field_by_name(column) else {
-        return Ok(None);
-    };
-    let Ok(scalar) = native.cast(col.dtype()) else {
-        return Ok(None);
-    };
-    let run = col.slice(within.clone())?;
-    let (lo, hi) = search_sorted_bounds(&run, &scalar)?;
-    Ok(Some(within.start + lo..within.start + hi))
-}
-
-/// [`sorted_probe_run`] through a component's cached probe when its column
-/// resolves one (skipping the per-call slice + encoding-tree walk): a full
-/// search on the whole column, or a windowed search inside a lead run —
-/// window-only, exactly like the slice-then-search path. String-valued
-/// components (whose probe scalars are not integers) and probe-declined
-/// encodings fall back to the per-call search.
-fn component_probe_run(
-    component: &IndexComponent,
-    column: &'static str,
-    native: &Scalar,
-    within: Option<Range<usize>>,
-) -> Result<Option<Range<usize>>> {
-    if let Some(owned) = component.probe(column)
-        && let Ok(needle) = u64::try_from(native)
-    {
-        let (lo, hi) = match within {
-            None => owned.bounds(needle),
-            Some(range) => owned.bounds_in(range, needle),
-        };
-        return Ok(Some(lo..hi));
-    }
-    let rows = component.rows()?;
-    let within = within.unwrap_or(0..rows.len());
-    sorted_probe_run(rows, column, native, within)
-}
-
 /// Resolve the pattern against the configured indexes over an in-memory array,
 /// returning the first index whose outcome isn't `Declined` (indexes are tried
 /// in declaration = preference order). `Declined` when none apply, so the store
@@ -821,7 +759,7 @@ mod tests {
             for identity in index.component_identities() {
                 let known = known_component(identity.slug).expect("declared slug is known");
                 assert_eq!(known.index, index);
-                assert_eq!(known.identity.name, identity.name);
+                assert_eq!(known.name, identity.name);
             }
         }
 

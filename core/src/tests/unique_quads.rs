@@ -382,13 +382,18 @@ fn child_row_ids(component: &crate::store::indexes::IndexComponent) -> Vec<crate
 fn assert_children_describe_exactly(built: &BuiltArray, rows: usize, who: &str) {
     for component in &built.components {
         let mut ids = child_row_ids(component);
-        assert_eq!(ids.len(), rows, "{who}: {} child rows", component.name);
+        assert_eq!(
+            ids.len(),
+            rows,
+            "{who}: {} child rows",
+            component.identity.name
+        );
         ids.sort_unstable();
         assert_eq!(
             ids,
             (0..rows as crate::store::RowId).collect::<Vec<_>>(),
             "{who}: {} child row ids are the deduplicated rows, once each",
-            component.name
+            component.identity.name
         );
     }
 }

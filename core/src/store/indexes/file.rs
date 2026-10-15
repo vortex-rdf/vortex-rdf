@@ -33,7 +33,6 @@ use crate::store::schema::{RowId, TermCode};
 /// `Ok(None)` declines the location (the caller keeps its pushed-down scan):
 /// a child not globally sorted, a probe value that is not an integer (string
 /// value columns), or a column whose chunks resolve no probe.
-#[cfg(feature = "file-io")]
 pub(crate) async fn locate_component_run(
     file: &crate::store::persist::native_file::NativeStoreFile,
     component: &str,
@@ -68,7 +67,6 @@ pub(crate) async fn locate_component_run(
 ///
 /// `rid_column` comes from the calling index — the hub names no index's
 /// columns.
-#[cfg(feature = "file-io")]
 pub(crate) async fn rid_point_reads(
     file: &crate::store::persist::native_file::NativeStoreFile,
     component: &str,
@@ -103,7 +101,6 @@ pub(crate) async fn rid_point_reads(
 /// `>= probe AND <= probe` range pair (see vortex's
 /// `stats/rewrite/builtins.rs`) while evaluating a single conjunct. Output
 /// order is irrelevant: the ids are sorted afterwards.
-#[cfg(feature = "file-io")]
 pub(crate) async fn scan_index_row_ids(
     reader: vortex_layout::LayoutReaderRef,
     value_constraints: &[(&'static str, Scalar)],
@@ -134,7 +131,6 @@ pub(crate) async fn scan_index_row_ids(
 /// constraints select, so re-testing the value columns would only re-read and
 /// re-compare them. A resolver whose location covers only *some* of its
 /// constraints must keep [`scan_index_row_ids`], whose filter tests them all.
-#[cfg(feature = "file-io")]
 pub(crate) async fn scan_located_row_ids(
     reader: vortex_layout::LayoutReaderRef,
     rid_column: &'static str,
@@ -157,7 +153,6 @@ pub(crate) async fn scan_located_row_ids(
 ///
 /// `range` is not empty: an empty run or window reads nothing at all, so its
 /// caller answers it without asking.
-#[cfg(feature = "file-io")]
 pub(crate) async fn read_located_rids(
     file: &crate::store::persist::native_file::NativeStoreFile,
     component: &'static str,
@@ -182,7 +177,6 @@ pub(crate) async fn read_located_rids(
 
 /// A rid-only scan of an index child: just the row-id column. Restrictions — a
 /// filter, a row range — are the caller's to add.
-#[cfg(feature = "file-io")]
 fn rid_scan(
     reader: vortex_layout::LayoutReaderRef,
     rid_column: &'static str,
@@ -199,7 +193,6 @@ fn rid_scan(
 /// Run a rid-only scan and decode its row-id column into the ascending,
 /// unique buffer every index resolution answers in. The scan is driven inline
 /// by `file_reads::read_index_row_ids`.
-#[cfg(feature = "file-io")]
 async fn read_scanned_row_ids(
     scan: vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>,
     rid_column: &'static str,
@@ -219,7 +212,6 @@ async fn read_scanned_row_ids(
 /// tail of the file resolvers whenever no serving plan defers the ids (a
 /// back-reference child, or a copy resolution that couldn't build its plan):
 /// `Empty` when the scan proves the probe matches nothing.
-#[cfg(feature = "file-io")]
 pub(crate) async fn resolve_eager_from_scan(
     reader: vortex_layout::LayoutReaderRef,
     constraints: &[(&'static str, Scalar)],
@@ -251,7 +243,6 @@ pub(crate) async fn resolve_eager_from_scan(
 /// exactly this type, so a file view can never hold an in-memory plan.
 ///
 /// [`InMemoryServePlan`]: super::InMemoryServePlan
-#[cfg(feature = "file-io")]
 #[derive(Clone)]
 pub(crate) struct FileServePlan {
     decode: ServeDecode,
@@ -289,18 +280,15 @@ pub(crate) struct FileServePlan {
 /// The fewest rows a located run's scan split carries: below this the
 /// per-split overhead (a spawned task, its segment requests, one decode
 /// call) outweighs what spreading the decode buys.
-#[cfg(feature = "file-io")]
 const SERVE_SPLIT_MIN_ROWS: u64 = 1024;
 
 /// Rows per split for a located run of `rows`: enough splits to hand every
 /// worker a couple, never fewer than [`SERVE_SPLIT_MIN_ROWS`] rows each.
-#[cfg(feature = "file-io")]
 fn run_split_rows(rows: u64) -> usize {
     let workers = crate::io::read::available_parallelism() as u64;
     rows.div_ceil(2 * workers).max(SERVE_SPLIT_MIN_ROWS) as usize
 }
 
-#[cfg(feature = "file-io")]
 impl FileServePlan {
     /// A plan serving a file's index columns by a pushed-down scan filtered to
     /// the rows where every `constraints` equality holds — or, over a located
@@ -482,7 +470,6 @@ mod tests {
     /// Both rid scans, the located run and the pushed-down equality, spawn
     /// nothing with the split limit at zero; a control row scan of the file
     /// spawns all of its splits.
-    #[cfg(feature = "file-io")]
     #[tokio::test]
     async fn index_row_id_scans_drive_inline_whatever_the_limit() {
         use crate::IndexType;

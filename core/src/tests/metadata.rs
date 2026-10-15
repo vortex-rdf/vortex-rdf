@@ -472,7 +472,7 @@ async fn test_index_components_classify_children_by_slug() {
         .built
         .components
         .iter()
-        .find(|c| c.name == "index:ospg")
+        .find(|c| c.identity.name == "index:ospg")
         .unwrap()
         .to_write()
         .unwrap();

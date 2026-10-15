@@ -84,11 +84,68 @@ async fn test_file_backed_delete_keeps_indexes() {
 /// located run (sorted dictionary-code copies) point-reads its small runs'
 /// ids at match time and proves an empty run there, an unlocated one leaves
 /// the rid scan pending until a consumer needs it.
+///
+/// Graph-bound patterns first: a bound predicate, or predicate and object,
+/// with a graph is still served by the copy family, the graph riding the
+/// plan's filter instead of a located range; unknown graphs and tombstones
+/// inside a served graph run answer exactly.
 async fn run_copy_index_file_test(layout: LayoutStrategy, located: bool) {
     let (quads, graphs) = copy_index_script_dataset();
     let (_dir, path) =
         write_store_file(quads.clone(), layout, vec![IndexType::SecondaryByCopy]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
+
+    // Predicate and graph — the serving script asserts the rest of this
+    // shape: a graph is never a sort key of the copies, so the plan filters
+    // the child instead of reading a located run.
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let by_pg = store
+        .match_pattern(None, Some(&p1), None, Some(&graphs[1]))
+        .await
+        .unwrap();
+    assert_eq!(
+        by_pg.debug_serve_row_range(),
+        None,
+        "a graph term keeps the located run off the plan"
+    );
+
+    // Predicate, object and graph: i ≡ 1 (mod 15) in g0 (even i) → 16.
+    let o1 = Term::Literal(Literal::new_simple_literal("o1"));
+    let by_pog = store
+        .match_pattern(None, Some(&p1), Some(&o1), Some(&graphs[0]))
+        .await
+        .unwrap();
+    assert_eq!(served_component(&by_pog), Some("index:posg"));
+    assert_eq!(by_pog.debug_serve_row_range(), None);
+    assert_eq!(selection_pending(&by_pog), !located);
+    assert_eq!(by_pog.size().await.unwrap(), 1);
+    assert_eq!(
+        view_strings(&by_pog).await,
+        expected_strings(&quads, |i| i % 15 == 1 && i % 2 == 0)
+    );
+
+    // A graph the store never saw matches nothing.
+    let unknown = GraphName::NamedNode(NamedNode::new("http://example.org/nope").unwrap());
+    let none = store
+        .match_pattern(None, Some(&p1), None, Some(&unknown))
+        .await
+        .unwrap();
+    assert_eq!(none.size().await.unwrap(), 0);
+    assert_eq!(view_strings(&none).await, Vec::<String>::new());
+
+    // A tombstone inside the served graph run leaves it.
+    let deleted = store.delete_quad(&quads[7]).await.unwrap();
+    let after = deleted
+        .match_pattern(None, Some(&p1), None, Some(&graphs[1]))
+        .await
+        .unwrap();
+    assert_eq!(served_component(&after), Some("index:posg"));
+    assert_eq!(after.size().await.unwrap(), 4);
+    assert_eq!(
+        view_strings(&after).await,
+        expected_strings(&quads, |i| i % 3 == 1 && i % 2 == 1 && i != 7)
+    );
+
     run_copy_index_serving_script(
         store,
         &quads,
