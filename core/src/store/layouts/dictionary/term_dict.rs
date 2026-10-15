@@ -6,8 +6,8 @@
 //! Because codes are sorted ranks, code comparisons are order-isomorphic to
 //! string comparisons and term → code lookup is a binary search — no HashMap
 //! is needed on the query side, and the terms stay in their compact columnar
-//! form (see [`TermStore`]: FSST-compressed windows as built and written,
-//! plaintext `VarBinViewArray` when a producer wrote them that way).
+//! form (see [`ResidentChunks`]: FSST-compressed windows as built and
+//! written, plaintext `VarBinViewArray` when a producer wrote them that way).
 //!
 //! [`LayoutStrategy::Dictionary`]: crate::store::layouts::LayoutStrategy::Dictionary
 
@@ -23,20 +23,20 @@ use crate::store::array::buf_as_str;
 use crate::store::schema::TermCode;
 
 use super::predicates::{KindRanges, TermPredicate, Verdict};
-use super::storage::{DictCursor, TermChunk, TermStore};
+use super::storage::{DictCursor, ResidentChunks};
 
 /// The frozen, sorted term dictionary in columnar form.
 ///
 /// term → code is a host-side binary search; code → term reads the term at a
 /// position. A read of one term at a time decodes into a single scratch buffer
-/// ([`TermStore::bytes_into`]), a batch through a [`cursor`](Self::cursor); the
-/// cost of either depends on the encoding the terms are held in. Only the kind
-/// ranges are kept beyond a call.
+/// ([`ResidentChunks::bytes_into`]), a batch through a [`cursor`](Self::cursor);
+/// the cost of either depends on the encoding the terms are held in. Only the
+/// kind ranges are kept beyond a call.
 pub(crate) struct TermDictionary {
     /// The identity of this dictionary (see
     /// [`DictReader::dictionary_id`](crate::DictReader::dictionary_id)).
     id: u64,
-    pub(super) terms: TermStore,
+    pub(super) terms: ResidentChunks,
     /// The terms' codes.
     code_space: CodeSpace,
     /// The kind ranges, computed on first use (a few probes).
@@ -149,15 +149,11 @@ pub(crate) fn next_dictionary_id() -> u64 {
 
 impl TermDictionary {
     /// Wrap the held terms, under a new identity.
-    pub(super) fn new(terms: TermStore) -> Self {
-        let len = match &terms {
-            TermStore::Single(c) => c.len(),
-            TermStore::Chunked(c) => c.len,
-        };
+    pub(super) fn new(terms: ResidentChunks) -> Self {
         Self {
             id: next_dictionary_id(),
+            code_space: CodeSpace::new(terms.len()),
             terms,
-            code_space: CodeSpace::new(len),
             kinds: OnceLock::new(),
         }
     }
@@ -196,13 +192,7 @@ impl TermDictionary {
     /// into, so callers needing several terms at once (a quad's four roles)
     /// must take one cursor per role.
     pub(super) fn cursor(&self) -> DictCursor<'_> {
-        match &self.terms {
-            TermStore::Single(c) => DictCursor::Single(c.cursor()),
-            TermStore::Chunked(c) => DictCursor::Chunked {
-                store: c,
-                cursors: c.chunks.iter().map(TermChunk::cursor).collect(),
-            },
-        }
+        self.terms.cursor()
     }
 
     /// Decode a code back to its term string (canonical N-Triples form), or
@@ -474,7 +464,7 @@ mod tests {
             .collect();
         let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
         let dict = TermDictionary::compress_windowed(plain, 32).unwrap();
-        assert!(matches!(dict.terms, TermStore::Chunked(_)), "32 windows");
+        assert_eq!(dict.term_chunks().len(), 32, "32 windows");
         for (i, term) in terms.iter().enumerate() {
             let fresh = scratch_hooks::fresh();
             assert_eq!(dict.encode(term), Some(i as TermCode));
@@ -500,7 +490,8 @@ mod tests {
             .collect();
         let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
         let dict = TermDictionary::compress_windowed(plain, usize::MAX).unwrap();
-        assert!(matches!(dict.terms, TermStore::Single(TermChunk::Fsst(_))));
+        let chunks = dict.term_chunks();
+        assert!(chunks.len() == 1 && chunks[0].is::<vortex_fsst::FSST>());
         let regrown = scratch_hooks::regrown();
         for (i, term) in terms.iter().enumerate() {
             assert_eq!(dict.encode(term), Some(i as TermCode));

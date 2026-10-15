@@ -9,10 +9,10 @@
 //!
 //! [`LayoutStrategy::Dictionary`]: super::LayoutStrategy::Dictionary
 
-pub(crate) mod codec;
+mod codec;
 #[cfg(feature = "file-io")]
 pub(crate) mod file_backed;
-pub(crate) mod handles;
+mod handles;
 pub(crate) mod ingest;
 pub mod predicates;
 pub(crate) mod storage;

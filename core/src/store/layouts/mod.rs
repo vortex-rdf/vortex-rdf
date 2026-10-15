@@ -761,11 +761,11 @@ impl ResolvedLayout {
 
     /// [`raw_quads`](Self::raw_quads) with the file-backed Dictionary case
     /// handled: the whole dictionary is lifted resident transiently, then the
-    /// sync decode runs unchanged. Its one caller decodes a whole base at once
-    /// (`base_raw_quads`, behind compaction and serialization), which touches
+    /// sync decode runs unchanged. Its one caller, `base_raw_quads`, serves
+    /// whole-base reads only (compaction, serialization, `selected_rows`'
+    /// Dictionary tail re-encode, the raw stream's in-memory arm), which touch
     /// most of the dictionary anyway; a file scan's chunks decode through
-    /// [`decode_chunk_raw_file_backed`](dictionary::decode_chunk_raw_file_backed)
-    /// instead.
+    /// [`decode_chunk_raw_file_backed`](dictionary::decode_chunk_raw_file_backed).
     #[cfg(feature = "file-io")]
     pub(crate) async fn raw_quads_async(&self, rows: &ArrayRef) -> Result<Vec<RawQuad>> {
         if let ResolvedLayout::Dictionary(access) = self

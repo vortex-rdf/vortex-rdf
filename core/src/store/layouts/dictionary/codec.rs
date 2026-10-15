@@ -32,9 +32,9 @@ use crate::common::terms::{parse_graph_name, parse_named_node, parse_object, par
 use crate::debug;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
-use crate::store::RawQuad;
 use crate::store::array::{field_as, stamp_is_sorted};
 use crate::store::schema::{COL_G, COL_O, COL_P, COL_S, PRIMARY_COLUMNS, TermCode};
+use crate::store::{RawQuad, SharedQuad};
 
 #[cfg(feature = "file-io")]
 use super::file_backed::FileBackedDict;
@@ -195,43 +195,110 @@ pub(crate) fn empty_struct() -> Result<ArrayRef> {
     build_code_chunk(&QuadCodes::empty(), 0..0, false)
 }
 
-/// The four primary code columns of a chunk, as arrays whose [`TermCode`]
-/// slices the decoders read. Returned by value: the slices borrow these arrays, so they
-/// must outlive the decode.
-fn code_columns(
-    chunk: &ArrayRef,
-) -> Result<(
-    PrimitiveArray,
-    PrimitiveArray,
-    PrimitiveArray,
-    PrimitiveArray,
-)> {
+/// The four primary code columns of a chunk in `[s, p, o, g]` order, as the
+/// arrays whose [`TermCode`] slices the decoders read (see [`code_slices`]).
+/// Returned by value: the slices borrow these arrays, so they must outlive
+/// the decode.
+fn code_columns(chunk: &ArrayRef) -> Result<[PrimitiveArray; 4]> {
     #[cfg(all(test, feature = "file-io"))]
     tests::CODE_COLUMN_READS.with(|reads| reads.set(reads.get() + 1));
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let struct_arr = chunk.clone().execute::<StructArray>(&mut ctx)?;
     let mut col = |name: &str| field_as::<PrimitiveArray>(&struct_arr, name, &mut ctx);
-    Ok((col(COL_S)?, col(COL_P)?, col(COL_O)?, col(COL_G)?))
+    Ok([col(COL_S)?, col(COL_P)?, col(COL_O)?, col(COL_G)?])
 }
 
-/// Where a decode reads a code's term string from: the four roles are asked
+/// The code slices of [`code_columns`]' arrays, in the same order.
+fn code_slices(columns: &[PrimitiveArray; 4]) -> [&[TermCode]; 4] {
+    columns
+        .each_ref()
+        .map(|column| column.as_slice::<TermCode>())
+}
+
+/// Where a decode reads a code's term from: the four roles are asked
 /// separately so a dictionary-backed source can keep one cursor (and, for a
 /// chunked dictionary, one warm chunk cursor) per role — the roles occupy
 /// different regions of the sorted term space.
 trait TermSource {
+    /// A term as [`decode_rows_shared`] holds it from row to row.
+    type Shared: SharedTerm;
+
+    /// The term with `code`, read for `role`.
     fn str_at(&mut self, role: usize, code: TermCode) -> Result<&str>;
+
+    /// [`str_at`](Self::str_at) as a [`Shared`](Self::Shared) term.
+    fn shared_at(&mut self, role: usize, code: TermCode) -> Result<Self::Shared>;
 }
 
-/// Term strings read from a resident dictionary.
+/// A term [`decode_rows_shared`] holds: a shared string, or a borrow of one.
+trait SharedTerm: Clone + AsRef<str> {
+    /// The term as a shared string: itself, or a reference-count bump of the
+    /// borrowed one.
+    fn into_shared(self) -> Arc<str>;
+}
+
+impl SharedTerm for Arc<str> {
+    fn into_shared(self) -> Arc<str> {
+        self
+    }
+}
+
+#[cfg(feature = "file-io")]
+impl SharedTerm for &Arc<str> {
+    fn into_shared(self) -> Arc<str> {
+        Arc::clone(self)
+    }
+}
+
+/// A row of four term strings, built from the terms [`decode_rows_shared`]
+/// holds: a [`SharedQuad`] shares them, a [`RawQuad`] copies them out.
+trait StringRow {
+    fn from_terms<T: SharedTerm>(terms: [T; 4]) -> Self;
+}
+
+impl StringRow for SharedQuad {
+    fn from_terms<T: SharedTerm>([s, p, o, g]: [T; 4]) -> Self {
+        SharedQuad {
+            s: s.into_shared(),
+            p: p.into_shared(),
+            o: o.into_shared(),
+            g: g.into_shared(),
+        }
+    }
+}
+
+impl StringRow for RawQuad {
+    fn from_terms<T: SharedTerm>(terms: [T; 4]) -> Self {
+        let [s, p, o, g] = terms.each_ref().map(|term| String::from(term.as_ref()));
+        RawQuad { s, p, o, g }
+    }
+}
+
+/// Term strings read from a resident dictionary, one cursor per role.
 struct DictTerms<'a> {
     cursors: [DictCursor<'a>; 4],
     code_space: CodeSpace,
 }
 
+impl<'a> DictTerms<'a> {
+    fn new(dict: &'a TermDictionary) -> Self {
+        Self {
+            cursors: std::array::from_fn(|_| dict.cursor()),
+            code_space: dict.code_space(),
+        }
+    }
+}
+
 impl TermSource for DictTerms<'_> {
+    type Shared = Arc<str>;
+
     fn str_at(&mut self, role: usize, code: TermCode) -> Result<&str> {
         let rank = check_code(code, self.code_space)?;
         self.cursors[role].str_at(rank)
+    }
+
+    fn shared_at(&mut self, role: usize, code: TermCode) -> Result<Arc<str>> {
+        self.str_at(role, code).map(Arc::from)
     }
 }
 
@@ -242,7 +309,7 @@ impl TermSource for DictTerms<'_> {
 type ChunkTerms = FxHashMap<TermCode, Arc<str>>;
 
 /// Term strings read from a chunk's resolved [`ChunkTerms`] (the file-backed
-/// path).
+/// path): a string decode holds borrows of the map's shared strings.
 #[cfg(feature = "file-io")]
 struct MappedTerms<'a>(&'a ChunkTerms);
 
@@ -259,9 +326,15 @@ impl<'a> MappedTerms<'a> {
 }
 
 #[cfg(feature = "file-io")]
-impl TermSource for MappedTerms<'_> {
+impl<'a> TermSource for MappedTerms<'a> {
+    type Shared = &'a Arc<str>;
+
     fn str_at(&mut self, _role: usize, code: TermCode) -> Result<&str> {
         self.get(code).map(|term| &**term)
+    }
+
+    fn shared_at(&mut self, _role: usize, code: TermCode) -> Result<&'a Arc<str>> {
+        self.get(code)
     }
 }
 
@@ -320,15 +393,12 @@ impl<T: Clone> TermMemo<T> {
     }
 }
 
-/// Decode a chunk's code columns into quads, reading each distinct code's
-/// term at most once per role (see [`TermMemo`]).
-fn decode_codes(
-    s_codes: &[TermCode],
-    p_codes: &[TermCode],
-    o_codes: &[TermCode],
-    g_codes: &[TermCode],
-    src: &mut impl TermSource,
-) -> Vec<Result<Quad>> {
+/// `cols` — a chunk's `[s, p, o, g]` code columns — decoded into quads
+/// through `src`, each distinct code's term read and parsed at most once per
+/// role (see [`TermMemo`]). A row whose terms fail to read or parse is an
+/// `Err` at that row's position, the other rows decoding normally.
+fn decode_rows(cols: [&[TermCode]; 4], src: &mut impl TermSource) -> Vec<Result<Quad>> {
+    let [s_codes, p_codes, o_codes, g_codes] = cols;
     let n = s_codes.len();
     let (mut sm, mut pm, mut om, mut gm) = (
         TermMemo::new(n),
@@ -352,24 +422,61 @@ fn decode_codes(
         .collect()
 }
 
+/// `cols` decoded into rows of term strings through `src` — [`SharedQuad`]s
+/// or [`RawQuad`]s (see [`StringRow`]). Each distinct code's term is read at
+/// most once per role (see [`TermMemo`]) and held as a
+/// [`Shared`](TermSource::Shared) term, so a code repeating down a column
+/// reaches every row repeating it without another read and nothing is parsed
+/// into oxrdf terms. Any failure is the chunk's one `Err`.
+fn decode_rows_shared<S: TermSource, R: StringRow>(
+    [s, p, o, g]: [&[TermCode]; 4],
+    src: &mut S,
+) -> Vec<Result<R>> {
+    let n = s.len();
+    let (mut sm, mut pm, mut om, mut gm) = (
+        TermMemo::new(n),
+        TermMemo::new(n),
+        TermMemo::new(n),
+        TermMemo::new(n),
+    );
+    let mut row = |i: usize| -> Result<R> {
+        Ok(R::from_terms([
+            sm.get_or_insert(s[i], || src.shared_at(0, s[i]))?,
+            pm.get_or_insert(p[i], || src.shared_at(1, p[i]))?,
+            om.get_or_insert(o[i], || src.shared_at(2, o[i]))?,
+            gm.get_or_insert(g[i], || src.shared_at(3, g[i]))?,
+        ]))
+    };
+    let mut rows = Vec::with_capacity(n);
+    for i in 0..n {
+        match row(i) {
+            Ok(quad) => rows.push(Ok(quad)),
+            Err(e) => return vec![Err(e)],
+        }
+    }
+    rows
+}
+
 /// Decode a Dictionary-layout StructArray chunk into Quads using the given
-/// (store-cached) dictionary.
+/// (store-cached) dictionary (see [`decode_rows`]).
 pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Result<Quad>> {
-    let (s_col, p_col, o_col, g_col) = match code_columns(chunk) {
-        Ok(cols) => cols,
+    let columns = match code_columns(chunk) {
+        Ok(columns) => columns,
         Err(e) => return vec![Err(e)],
     };
-    let mut src = DictTerms {
-        cursors: [dict.cursor(), dict.cursor(), dict.cursor(), dict.cursor()],
-        code_space: dict.code_space(),
+    decode_rows(code_slices(&columns), &mut DictTerms::new(dict))
+}
+
+/// [`decode_chunk`] with shared-string terms (see [`decode_rows_shared`]).
+pub(crate) fn decode_chunk_shared(
+    chunk: &ArrayRef,
+    dict: &TermDictionary,
+) -> Vec<Result<SharedQuad>> {
+    let columns = match code_columns(chunk) {
+        Ok(columns) => columns,
+        Err(e) => return vec![Err(e)],
     };
-    decode_codes(
-        s_col.as_slice::<TermCode>(),
-        p_col.as_slice::<TermCode>(),
-        o_col.as_slice::<TermCode>(),
-        g_col.as_slice::<TermCode>(),
-        &mut src,
-    )
+    decode_rows_shared(code_slices(&columns), &mut DictTerms::new(dict))
 }
 
 /// Decode one role's code column to owned term strings, reading each distinct
@@ -394,40 +501,6 @@ pub(in crate::store::layouts) fn decode_code_column<T: Clone + for<'a> From<&'a 
             })
         })
         .collect()
-}
-
-/// The rows of a Dictionary-layout chunk as [`SharedQuad`]s: each role's
-/// codes decoded through [`decode_code_column`] with `Arc<str>` terms, so a
-/// code repeating down a column is decoded once and shared by reference
-/// count — and nothing is parsed into oxrdf terms.
-///
-/// [`SharedQuad`]: crate::common::quad::SharedQuad
-fn shared_rows(
-    chunk: &ArrayRef,
-    dict: &TermDictionary,
-) -> Result<Vec<crate::common::quad::SharedQuad>> {
-    let (s_col, p_col, o_col, g_col) = code_columns(chunk)?;
-    let s = decode_code_column::<Arc<str>>(dict, s_col.as_slice::<TermCode>())?;
-    let p = decode_code_column::<Arc<str>>(dict, p_col.as_slice::<TermCode>())?;
-    let o = decode_code_column::<Arc<str>>(dict, o_col.as_slice::<TermCode>())?;
-    let g = decode_code_column::<Arc<str>>(dict, g_col.as_slice::<TermCode>())?;
-    Ok(s.into_iter()
-        .zip(p)
-        .zip(o)
-        .zip(g)
-        .map(|(((s, p), o), g)| crate::common::quad::SharedQuad { s, p, o, g })
-        .collect())
-}
-
-/// [`decode_chunk`] with shared-string terms (see [`shared_rows`]).
-pub(crate) fn decode_chunk_shared(
-    chunk: &ArrayRef,
-    dict: &TermDictionary,
-) -> Vec<Result<crate::common::quad::SharedQuad>> {
-    match shared_rows(chunk, dict) {
-        Ok(rows) => rows.into_iter().map(Ok).collect(),
-        Err(e) => vec![Err(e)],
-    }
 }
 
 /// The distinct codes of a chunk's four code columns, ascending — what a
@@ -463,27 +536,22 @@ async fn resolve_chunk_terms(fb: &FileBackedDict, columns: [&[TermCode]; 4]) -> 
 
 /// A chunk decoded against a file-backed dictionary: the chunk's code columns
 /// are read once, their distinct codes are resolved to terms (see
-/// [`resolve_chunk_terms`]), and `rows` decodes the columns against the
+/// [`resolve_chunk_terms`]), and `rows` decodes the same columns against the
 /// resulting map. A failure to read the columns or to resolve their codes is
 /// the chunk's one `Err`.
 #[cfg(feature = "file-io")]
 async fn decode_resolved<T>(
     fb: &FileBackedDict,
     chunk: &ArrayRef,
-    rows: impl FnOnce([&[TermCode]; 4], MappedTerms<'_>) -> Vec<Result<T>>,
+    rows: impl FnOnce([&[TermCode]; 4], &mut MappedTerms<'_>) -> Vec<Result<T>>,
 ) -> Vec<Result<T>> {
-    let (s_col, p_col, o_col, g_col) = match code_columns(chunk) {
-        Ok(cols) => cols,
+    let columns = match code_columns(chunk) {
+        Ok(columns) => columns,
         Err(e) => return vec![Err(e)],
     };
-    let columns = [
-        s_col.as_slice::<TermCode>(),
-        p_col.as_slice::<TermCode>(),
-        o_col.as_slice::<TermCode>(),
-        g_col.as_slice::<TermCode>(),
-    ];
-    match resolve_chunk_terms(fb, columns).await {
-        Ok(terms) => rows(columns, MappedTerms(&terms)),
+    let cols = code_slices(&columns);
+    match resolve_chunk_terms(fb, cols).await {
+        Ok(terms) => rows(cols, &mut MappedTerms(&terms)),
         Err(e) => vec![Err(e)],
     }
 }
@@ -496,82 +564,30 @@ pub(crate) async fn decode_chunk_file_backed(
     fb: &FileBackedDict,
     chunk: &ArrayRef,
 ) -> Vec<Result<Quad>> {
-    decode_resolved(fb, chunk, |[s, p, o, g], mut terms| {
-        decode_codes(s, p, o, g, &mut terms)
-    })
-    .await
-}
-
-/// The rows of a chunk's code columns read from its resolved `terms`: each
-/// role's [`TermMemo`] skips the lookup for a code that repeats, `term` turns
-/// each looked-up string into a row's term, and `quad` assembles the row
-/// from its four terms. A code missing from the map fails the whole chunk.
-#[cfg(feature = "file-io")]
-fn mapped_rows<R, T>(
-    [s, p, o, g]: [&[TermCode]; 4],
-    terms: MappedTerms<'_>,
-    term: impl Fn(&Arc<str>) -> R,
-    quad: impl Fn([R; 4]) -> T,
-) -> Vec<Result<T>> {
-    let n = s.len();
-    let (mut sm, mut pm, mut om, mut gm) = (
-        TermMemo::new(n),
-        TermMemo::new(n),
-        TermMemo::new(n),
-        TermMemo::new(n),
-    );
-    let mut row = |i: usize| -> Result<T> {
-        Ok(quad([
-            term(sm.get_or_insert(s[i], || terms.get(s[i]))?),
-            term(pm.get_or_insert(p[i], || terms.get(p[i]))?),
-            term(om.get_or_insert(o[i], || terms.get(o[i]))?),
-            term(gm.get_or_insert(g[i], || terms.get(g[i]))?),
-        ]))
-    };
-    let mut rows = Vec::with_capacity(n);
-    for i in 0..n {
-        match row(i) {
-            Ok(quad) => rows.push(Ok(quad)),
-            Err(e) => return vec![Err(e)],
-        }
-    }
-    rows
+    decode_resolved(fb, chunk, |cols, terms| decode_rows(cols, terms)).await
 }
 
 /// [`decode_chunk_file_backed`] with shared-string terms: the resolved map
 /// holds one `Arc<str>` per distinct code, so every row's term is a lookup
-/// and a reference-count bump (see [`mapped_rows`]).
+/// and a reference-count bump (see [`decode_rows_shared`]).
 #[cfg(feature = "file-io")]
 pub(crate) async fn decode_chunk_shared_file_backed(
     fb: &FileBackedDict,
     chunk: &ArrayRef,
-) -> Vec<Result<crate::common::quad::SharedQuad>> {
-    decode_resolved(fb, chunk, |columns, terms| {
-        mapped_rows(columns, terms, Arc::clone, |[s, p, o, g]| {
-            crate::common::quad::SharedQuad { s, p, o, g }
-        })
-    })
-    .await
+) -> Vec<Result<SharedQuad>> {
+    decode_resolved(fb, chunk, |cols, terms| decode_rows_shared(cols, terms)).await
 }
 
-/// [`decode_chunk_file_backed`] into [`RawQuad`]s: every row's terms are
-/// copied out of the resolved map as owned N-Triples strings (see
-/// [`mapped_rows`]), so the chunk reads only the dictionary windows holding
-/// its codes.
+/// [`decode_chunk_file_backed`] into [`RawQuad`]s: the chunk reads only the
+/// dictionary windows holding its distinct codes (see [`decode_resolved`]),
+/// and every row's terms are copied out of the resolved map as owned
+/// N-Triples strings (see [`decode_rows_shared`]).
 #[cfg(feature = "file-io")]
 pub(crate) async fn decode_chunk_raw_file_backed(
     fb: &FileBackedDict,
     chunk: &ArrayRef,
 ) -> Vec<Result<RawQuad>> {
-    decode_resolved(fb, chunk, |columns, terms| {
-        mapped_rows(
-            columns,
-            terms,
-            |term| String::from(&**term),
-            |[s, p, o, g]| RawQuad { s, p, o, g },
-        )
-    })
-    .await
+    decode_resolved(fb, chunk, |cols, terms| decode_rows_shared(cols, terms)).await
 }
 
 #[cfg(all(test, feature = "file-io"))]
@@ -689,11 +705,16 @@ mod tests {
 
             let (raw, reads) = code_column_reads(decode_chunk_raw_file_backed(&fb, &chunk)).await;
             assert_eq!(reads, 1, "{n} raw quads");
-            let raw: Vec<RawQuad> = raw.into_iter().map(|row| row.unwrap()).collect();
-            let want = ResolvedLayout::Dictionary(DictAccess::Resident(Arc::new(dict)))
-                .raw_quads(&chunk)
-                .unwrap();
-            assert!(raw == want, "{n} raw quads");
+            let terms = |q: RawQuad| [q.s, q.p, q.o, q.g];
+            let raw: Vec<[String; 4]> = raw.into_iter().map(|row| terms(row.unwrap())).collect();
+            let want: Vec<[String; 4]> =
+                ResolvedLayout::Dictionary(DictAccess::Resident(Arc::new(dict)))
+                    .raw_quads(&chunk)
+                    .unwrap()
+                    .into_iter()
+                    .map(terms)
+                    .collect();
+            assert_eq!(raw, want, "{n} raw quads");
         }
     }
 
@@ -731,13 +752,8 @@ mod tests {
         }
 
         let (_, chunk) = skewed_chunk(&skewed_quads());
-        let (s, p, o, g) = code_columns(&chunk).unwrap();
-        let columns = [
-            s.as_slice::<TermCode>(),
-            p.as_slice::<TermCode>(),
-            o.as_slice::<TermCode>(),
-            g.as_slice::<TermCode>(),
-        ];
+        let arrays = code_columns(&chunk).unwrap();
+        let columns = code_slices(&arrays);
         let distinct = distinct_codes(columns);
         assert_eq!(distinct, sorted_set(&columns));
         // The skip rule leaves the sort far fewer than the 4n codes.
