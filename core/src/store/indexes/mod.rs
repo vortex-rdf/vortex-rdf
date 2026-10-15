@@ -623,7 +623,7 @@ impl LazyRowIds {
         if start >= end {
             return Ok(Some(Buffer::empty()));
         }
-        let window = rids.slice(start..end).map_err(VortexRdfError::Vortex)?;
+        let window = rids.slice(start..end)?;
         Ok(Some(sorted_row_ids(window)?))
     }
 
@@ -712,7 +712,7 @@ fn sorted_probe_run(
     let Ok(scalar) = native.cast(col.dtype()) else {
         return Ok(None);
     };
-    let run = col.slice(within.clone()).map_err(VortexRdfError::Vortex)?;
+    let run = col.slice(within.clone())?;
     let (lo, hi) = search_sorted_bounds(&run, &scalar)?;
     Ok(Some(within.start + lo..within.start + hi))
 }

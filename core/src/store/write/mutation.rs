@@ -142,14 +142,11 @@ impl VortexRdfStore {
                     chunks[1..].iter().map(|c| c.len()).sum::<usize>() + fresh_rows.len();
                 chunks.push(fresh_rows);
                 let n_chunks = chunks.len();
-                let combined = ChunkedArray::try_new(chunks, dtype)
-                    .map_err(VortexRdfError::Vortex)?
-                    .into_array();
+                let combined = ChunkedArray::try_new(chunks, dtype)?.into_array();
                 if accreted >= flat_len.max(TAIL_FLATTEN_FLOOR) || n_chunks > TAIL_MAX_CHUNKS {
                     let mut ctx = VORTEX_SESSION.create_execution_ctx();
                     combined
-                        .execute::<RecursiveCanonical>(&mut ctx)
-                        .map_err(VortexRdfError::Vortex)?
+                        .execute::<RecursiveCanonical>(&mut ctx)?
                         .0
                         .into_array()
                 } else {

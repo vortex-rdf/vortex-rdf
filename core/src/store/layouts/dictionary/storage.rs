@@ -84,11 +84,7 @@ impl TermChunk {
     pub(super) fn from_wire(chunk: ArrayRef, ctx: &mut vortex_array::ExecutionCtx) -> Result<Self> {
         match chunk.try_downcast::<FSST>() {
             Ok(fsst) => Ok(TermChunk::Fsst(FsstTerms::new(fsst)?)),
-            Err(other) => Ok(TermChunk::Canonical(
-                other
-                    .execute::<VarBinViewArray>(ctx)
-                    .map_err(VortexRdfError::Vortex)?,
-            )),
+            Err(other) => Ok(TermChunk::Canonical(other.execute::<VarBinViewArray>(ctx)?)),
         }
     }
 
@@ -269,10 +265,9 @@ impl TermDictionary {
         let len = plain.len();
         let array = plain.into_array();
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let compressor = fsst_train_compressor(&array, &mut ctx).map_err(VortexRdfError::Vortex)?;
+        let compressor = fsst_train_compressor(&array, &mut ctx)?;
         if len <= window {
-            let fsst =
-                fsst_compress(&array, &compressor, &mut ctx).map_err(VortexRdfError::Vortex)?;
+            let fsst = fsst_compress(&array, &compressor, &mut ctx)?;
             let terms = FsstTerms::new(fsst)?;
             log::debug!(
                 "[Dictionary] FSST-compressed {} terms in {:?}",
@@ -292,13 +287,10 @@ impl TermDictionary {
             // The view copies share the parent's data buffers, so this is
             // per-window view headers, not a copy of the terms.
             let piece = array
-                .slice(at..end)
-                .map_err(VortexRdfError::Vortex)?
-                .execute::<VarBinViewArray>(&mut ctx)
-                .map_err(VortexRdfError::Vortex)?
+                .slice(at..end)?
+                .execute::<VarBinViewArray>(&mut ctx)?
                 .into_array();
-            let fsst =
-                fsst_compress(&piece, &compressor, &mut ctx).map_err(VortexRdfError::Vortex)?;
+            let fsst = fsst_compress(&piece, &compressor, &mut ctx)?;
             starts.push(at);
             chunks.push(TermChunk::Fsst(FsstTerms::new(fsst)?));
             at = end;
@@ -350,8 +342,7 @@ impl FsstTerms {
         let offsets = array
             .codes_offsets()
             .clone()
-            .execute::<PrimitiveArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
+            .execute::<PrimitiveArray>(&mut ctx)?;
         // 32-bit offsets are viewed as they are. A foreign writer may store
         // them in any other integer width, which is converted to `u32` in a
         // copy; the macro covers every width, so its `u32` arm casts
@@ -512,15 +503,8 @@ impl TermDictionary {
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let mut chunks = Vec::new();
         for chunk in scan_reader_chunks(reader).await? {
-            let struct_arr = chunk
-                .execute::<StructArray>(&mut ctx)
-                .map_err(VortexRdfError::Vortex)?;
-            chunks.push(
-                struct_arr
-                    .unmasked_field_by_name(COL_DICT_TERM)
-                    .map_err(VortexRdfError::Vortex)?
-                    .clone(),
-            );
+            let struct_arr = chunk.execute::<StructArray>(&mut ctx)?;
+            chunks.push(struct_arr.unmasked_field_by_name(COL_DICT_TERM)?.clone());
         }
         Self::from_term_chunks(chunks, &mut ctx)
     }
@@ -587,7 +571,7 @@ impl TermDictionary {
                 sorted: true,
                 dtype,
             },
-            Arc::new(BufferedComponentSource::try_new(chunks).map_err(VortexRdfError::Vortex)?),
+            Arc::new(BufferedComponentSource::try_new(chunks)?),
             container::dict_child_strategy(self.uniform_window()),
         )
         .map_err(VortexRdfError::Vortex)

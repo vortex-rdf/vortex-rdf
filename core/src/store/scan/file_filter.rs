@@ -74,10 +74,8 @@ async fn evaluate_filter_split(
             return Ok(mask);
         }
         let pruned = reader
-            .pruning_evaluation(range, conjunct, mask.clone())
-            .map_err(VortexRdfError::Vortex)?
-            .await
-            .map_err(VortexRdfError::Vortex)?;
+            .pruning_evaluation(range, conjunct, mask.clone())?
+            .await?;
         mask = mask.bitand(&pruned);
     }
     // Phase 2: for whatever the stats couldn't rule out, read and evaluate each
@@ -88,10 +86,8 @@ async fn evaluate_filter_split(
             return Ok(mask);
         }
         mask = reader
-            .filter_evaluation(range, conjunct, MaskFuture::ready(mask))
-            .map_err(VortexRdfError::Vortex)?
-            .await
-            .map_err(VortexRdfError::Vortex)?;
+            .filter_evaluation(range, conjunct, MaskFuture::ready(mask))?
+            .await?;
     }
     Ok(mask)
 }
@@ -115,7 +111,7 @@ fn filter_split_tasks(
 ) -> Result<Vec<SplitTask>> {
     // The cached layout reader tree — reused across every split task below,
     // so zone-map stats are looked up once, not once per split.
-    let reader = file.layout_reader().map_err(VortexRdfError::Vortex)?;
+    let reader = file.layout_reader()?;
     // Split the filter into its top-level AND-ed conditions (the struct
     // layout can only prune a single-field expression at a time) and bind
     // them through the handle's memo: one bound identity per shape, shared
@@ -127,14 +123,13 @@ fn filter_split_tasks(
             file.bound_exprs()
                 .bind(QUAD_SCOPE, conjunct, reader.dtype())
         })
-        .collect::<vortex_error::VortexResult<_>>()
-        .map_err(VortexRdfError::Vortex)?;
+        .collect::<vortex_error::VortexResult<_>>()?;
     // Translate the view's selection into the two knobs the split loop
     // understands: the bounds it iterates and the per-split starting mask
     // (see `split_start_mask`).
     let (mask_selection, bounds) = split_bounds(selection, file.row_count());
 
-    let splits = file.splits().map_err(VortexRdfError::Vortex)?;
+    let splits = file.splits()?;
     let ranges: Vec<Range<u64>> = splits
         .iter()
         .filter_map(|split| {
@@ -362,7 +357,7 @@ pub(crate) async fn row_range_from_pruning(
 
     // Start from "everything might match" and narrow it down using only
     // statistics (zone maps / footer stats) — no row data is read here.
-    let reader = file.layout_reader().map_err(VortexRdfError::Vortex)?;
+    let reader = file.layout_reader()?;
     let mut mask = Mask::new_true(len);
     for conjunct in conjuncts(filter) {
         // Once nothing can match, further conjuncts can't un-prune rows.
@@ -371,16 +366,13 @@ pub(crate) async fn row_range_from_pruning(
         }
         let conjunct = file
             .bound_exprs()
-            .bind(QUAD_SCOPE, &conjunct, reader.dtype())
-            .map_err(VortexRdfError::Vortex)?;
+            .bind(QUAD_SCOPE, &conjunct, reader.dtype())?;
         // Evaluate this conjunct's prunability over the *entire* file in one
         // call: the zoned reader vectorizes this over all its zones and the
         // file-stats wrapper checks footer-level bounds first.
         let pruned = reader
-            .pruning_evaluation(&(0..row_count), &conjunct, mask.clone())
-            .map_err(VortexRdfError::Vortex)?
-            .await
-            .map_err(VortexRdfError::Vortex)?;
+            .pruning_evaluation(&(0..row_count), &conjunct, mask.clone())?
+            .await?;
         mask = mask.bitand(&pruned);
     }
 

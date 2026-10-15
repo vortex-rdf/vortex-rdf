@@ -579,9 +579,7 @@ impl VortexRdfStore {
         column: QuadColumn,
         keep: &Keep,
     ) -> Result<RowSelection> {
-        let col = struct_arr
-            .unmasked_field_by_name(column.name())
-            .map_err(VortexRdfError::Vortex)?;
+        let col = struct_arr.unmasked_field_by_name(column.name())?;
         let test = keep.test();
         let cached = cached_code_primitive(col);
         let reader = match (&cached, probes.by_name(base, column.name())) {
@@ -603,10 +601,7 @@ impl VortexRdfStore {
                 use vortex_array::VortexSessionExecute as _;
                 use vortex_array::arrays::PrimitiveArray;
                 let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
-                let prim = selection
-                    .apply(col)?
-                    .execute::<PrimitiveArray>(&mut ctx)
-                    .map_err(VortexRdfError::Vortex)?;
+                let prim = selection.apply(col)?.execute::<PrimitiveArray>(&mut ctx)?;
                 let codes = prim.as_slice::<TermCode>();
                 let positions = (0..codes.len()).filter(|&i| test.admits(codes[i]));
                 let mask = vortex_mask::Mask::from_indices(codes.len(), positions);

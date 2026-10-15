@@ -157,8 +157,7 @@ where
         built.quads_sorted,
         components,
     )
-    .await
-    .map_err(VortexRdfError::Vortex)?;
+    .await?;
 
     // A shutdown failure is writer I/O, not an encoding problem — surface it
     // through the `Io` variant.

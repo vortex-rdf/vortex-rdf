@@ -129,9 +129,7 @@ pub(crate) fn with_subject_stamp(rows: ArrayRef, sorted: bool) -> Result<ArrayRe
 pub(crate) fn chunked_or_single(mut chunks: Vec<ArrayRef>, dtype: DType) -> Result<ArrayRef> {
     match chunks.len() {
         1 => Ok(chunks.pop().expect("length checked above")),
-        _ => Ok(ChunkedArray::try_new(chunks, dtype)
-            .map_err(VortexRdfError::Vortex)?
-            .into_array()),
+        _ => Ok(ChunkedArray::try_new(chunks, dtype)?.into_array()),
     }
 }
 
@@ -175,8 +173,7 @@ pub(crate) fn field_as<T: Executable>(
     ctx: &mut ExecutionCtx,
 ) -> Result<T> {
     struct_arr
-        .unmasked_field_by_name(name)
-        .map_err(VortexRdfError::Vortex)?
+        .unmasked_field_by_name(name)?
         .clone()
         .execute::<T>(ctx)
         .map_err(VortexRdfError::Vortex)
@@ -205,12 +202,8 @@ pub(crate) fn search_sorted_bounds(
     let index_of = |result: SearchResult| match result {
         SearchResult::Found(i) | SearchResult::NotFound(i) => i,
     };
-    let lo = arr
-        .search_sorted(probe, SearchSortedSide::Left)
-        .map_err(VortexRdfError::Vortex)?;
-    let hi = arr
-        .search_sorted(probe, SearchSortedSide::Right)
-        .map_err(VortexRdfError::Vortex)?;
+    let lo = arr.search_sorted(probe, SearchSortedSide::Left)?;
+    let hi = arr.search_sorted(probe, SearchSortedSide::Right)?;
     Ok((index_of(lo), index_of(hi)))
 }
 
@@ -219,9 +212,7 @@ pub(crate) fn bool_array_to_mask(arr: ArrayRef) -> Result<Mask> {
     // Canonicalize to a concrete boolean array, then reinterpret its packed
     // bit buffer directly as a Mask (no per-bit conversion loop).
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let bool_arr = arr
-        .execute::<BoolArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
+    let bool_arr = arr.execute::<BoolArray>(&mut ctx)?;
     Ok(Mask::from_buffer(bool_arr.into_bit_buffer()))
 }
 

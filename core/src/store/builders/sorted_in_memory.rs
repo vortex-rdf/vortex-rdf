@@ -17,7 +17,7 @@
 
 use super::{
     BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_ROWS, VortexArrayBuilder, build_components,
-    build_components_from_codes, build_struct_array, into_vortex_error, make_empty_struct,
+    build_components_from_codes, build_struct_array, make_empty_struct,
 };
 use crate::error::Result;
 use crate::store::RawQuad;
@@ -158,8 +158,7 @@ pub(crate) async fn build_chunk_stream(
                 return None;
             }
             let end = (offset + chunk_size).min(quads.len());
-            let chunk =
-                build_struct_array(&quads[offset..end], layout, true).map_err(into_vortex_error);
+            let chunk = build_struct_array(&quads[offset..end], layout, true).map_err(Into::into);
             Some((chunk, (quads, layout, end)))
         },
     );
@@ -217,8 +216,7 @@ fn emit_dict_chunks(
             return None;
         }
         let end = (offset + chunk_size).min(n);
-        let chunk =
-            dictionary::build_code_chunk(&codes, offset..end, true).map_err(into_vortex_error);
+        let chunk = dictionary::build_code_chunk(&codes, offset..end, true).map_err(Into::into);
         Some((chunk, (codes, end)))
     });
 

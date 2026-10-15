@@ -141,10 +141,7 @@ pub(in crate::store) async fn scanned_index_components(
         let ComponentKind::Index(known) = classify_component(descriptor)? else {
             continue;
         };
-        let Some((_, reader)) = file
-            .component_reader(&descriptor.name)
-            .map_err(VortexRdfError::Vortex)?
-        else {
+        let Some((_, reader)) = file.component_reader(&descriptor.name)? else {
             continue;
         };
         let scanned = read::scan_all_reader(reader).await?;
@@ -229,10 +226,7 @@ impl VortexRdfStore {
         let mut indexes: Indexes = Vec::new();
         for descriptor in file.components() {
             if let ComponentKind::Index(known) = classify_component(descriptor)? {
-                if let Some(child) = file
-                    .component_layout(&descriptor.name)
-                    .map_err(VortexRdfError::Vortex)?
-                {
+                if let Some(child) = file.component_layout(&descriptor.name)? {
                     crate::store::indexes::check_component_rows(
                         &descriptor.name,
                         child.row_count(),
@@ -251,8 +245,7 @@ impl VortexRdfStore {
                 // The roster loop above already classified (and so
                 // implementation-checked) the dictionary descriptor.
                 let (_, reader) = file
-                    .component_reader(container::DICT_COMPONENT_NAME)
-                    .map_err(VortexRdfError::Vortex)?
+                    .component_reader(container::DICT_COMPONENT_NAME)?
                     .ok_or_else(|| {
                         VortexRdfError::Deserialization(
                             "Dictionary-layout store file carries no dictionary component"
@@ -337,10 +330,7 @@ impl VortexRdfStore {
         let root = file.footer().layout();
         let typed = root.as_::<container::RdfStoreLayoutVTable>();
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let quads = quads
-            .execute::<StructArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?
-            .into_array();
+        let quads = quads.execute::<StructArray>(&mut ctx)?.into_array();
         // Restore the subject stamp from the file's recorded provenance,
         // through the same helper every materializing read path uses.
         let quads = crate::store::array::with_subject_stamp(quads, container::quads_sorted(typed))?;
@@ -348,20 +338,16 @@ impl VortexRdfStore {
         let mut components: Vec<IndexComponent> = Vec::new();
         let mut dict = None;
         for descriptor in container::store_components(typed) {
-            let Some((_, child)) = container::store_component(typed, &descriptor.name)
-                .map_err(VortexRdfError::Vortex)?
-            else {
+            let Some((_, child)) = container::store_component(typed, &descriptor.name)? else {
                 continue;
             };
             let kind = classify_component(descriptor)?;
-            let reader = child
-                .new_reader(
-                    descriptor.name.as_str().into(),
-                    file.segment_source(),
-                    file.session(),
-                    &Default::default(),
-                )
-                .map_err(VortexRdfError::Vortex)?;
+            let reader = child.new_reader(
+                descriptor.name.as_str().into(),
+                file.segment_source(),
+                file.session(),
+                &Default::default(),
+            )?;
             match kind {
                 ComponentKind::Dict => {
                     dict = Some(Arc::new(TermDictionary::from_child_reader(reader).await?));

@@ -275,16 +275,10 @@ impl FileBackedDict {
 
     /// [`open`](Self::open) with a window cache of `budget` bytes.
     async fn open_with_budget(native: &NativeStoreFile, budget: usize) -> Result<Option<Self>> {
-        let Some((_, reader)) = native
-            .component_reader(DICT_COMPONENT_NAME)
-            .map_err(VortexRdfError::Vortex)?
-        else {
+        let Some((_, reader)) = native.component_reader(DICT_COMPONENT_NAME)? else {
             return Ok(None);
         };
-        let Some(child) = native
-            .component_layout(DICT_COMPONENT_NAME)
-            .map_err(VortexRdfError::Vortex)?
-        else {
+        let Some(child) = native.component_layout(DICT_COMPONENT_NAME)? else {
             return Ok(None);
         };
         let Some((leaves, zones)) = term_column(&child) else {
@@ -776,20 +770,15 @@ async fn zone_bounds(
         return Ok(None);
     }
     let windows = leaves.len();
-    let reader = zones
-        .table
-        .new_reader(
-            "dictionary-zones".into(),
-            Arc::clone(source),
-            &VORTEX_SESSION,
-            &Default::default(),
-        )
-        .map_err(VortexRdfError::Vortex)?;
+    let reader = zones.table.new_reader(
+        "dictionary-zones".into(),
+        Arc::clone(source),
+        &VORTEX_SESSION,
+        &Default::default(),
+    )?;
     let table = crate::io::read::scan_all_reader(reader).await?;
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let table = table
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
+    let table = table.execute::<StructArray>(&mut ctx)?;
     let aggregates = window_bound_aggregates();
     let Some(maxes) = bound_column(&table, &aggregates[0].to_string(), &mut ctx)? else {
         return Ok(None);
@@ -814,15 +803,10 @@ fn bound_column(
     let Ok(column) = table.unmasked_field_by_name(name) else {
         return Ok(None);
     };
-    if !column.all_valid(ctx).map_err(VortexRdfError::Vortex)? {
+    if !column.all_valid(ctx)? {
         return Ok(None);
     }
-    Ok(Some(
-        column
-            .clone()
-            .execute::<VarBinViewArray>(ctx)
-            .map_err(VortexRdfError::Vortex)?,
-    ))
+    Ok(Some(column.clone().execute::<VarBinViewArray>(ctx)?))
 }
 
 /// Each window's bounds read from its own leaf — the fallback for a term
@@ -864,15 +848,11 @@ async fn rebuild_leaf(
     let flat = layout
         .as_opt::<Flat>()
         .expect("term leaves are validated flat at open");
-    let segment = source
-        .request(flat.segment_id())
-        .await
-        .map_err(VortexRdfError::Vortex)?;
+    let segment = source.request(flat.segment_id()).await?;
     let parts = match flat.array_tree().cloned() {
         Some(tree) => SerializedArray::from_flatbuffer_and_segment(tree, segment),
         None => SerializedArray::try_from(segment),
-    }
-    .map_err(VortexRdfError::Vortex)?;
+    }?;
     parts
         .decode(flat.dtype(), rows, flat.array_ctx(), &VORTEX_SESSION)
         .map_err(VortexRdfError::Vortex)

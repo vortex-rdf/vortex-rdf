@@ -209,10 +209,7 @@ fn code_columns(
     #[cfg(all(test, feature = "file-io"))]
     tests::CODE_COLUMN_READS.with(|reads| reads.set(reads.get() + 1));
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let struct_arr = chunk
-        .clone()
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
+    let struct_arr = chunk.clone().execute::<StructArray>(&mut ctx)?;
     let mut col = |name: &str| field_as::<PrimitiveArray>(&struct_arr, name, &mut ctx);
     Ok((col(COL_S)?, col(COL_P)?, col(COL_O)?, col(COL_G)?))
 }

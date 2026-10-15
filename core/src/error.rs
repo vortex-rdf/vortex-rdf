@@ -33,6 +33,17 @@ pub enum VortexRdfError {
     InvalidOperation(String),
 }
 
+/// This crate's error as the vortex error a stream or `DataSource` reports. A
+/// wrapped [`VortexError`] passes through unchanged.
+impl From<VortexRdfError> for VortexError {
+    fn from(e: VortexRdfError) -> Self {
+        match e {
+            VortexRdfError::Vortex(v) => v,
+            other => vortex_error::vortex_err!("vortex-rdf: {other}"),
+        }
+    }
+}
+
 /// Whether an I/O error of this kind says a file cannot be written by this
 /// process: the permission is denied, or the filesystem is read-only. Both
 /// mean "do not write this store", and neither goes away by trying again.
