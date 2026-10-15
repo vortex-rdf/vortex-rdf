@@ -92,7 +92,7 @@ flowchart TD
   selections are `All`.
 - **Every layout, Dictionary included.** An appended term has no code in the
   base's frozen sorted dictionary, so under the Dictionary layout the tail
-  stores Default-layout N-Triples strings ([`tail_layout`](../core/src/store/mod.rs#L187));
+  stores Default-layout N-Triples strings ([`tail_layout`](../core/src/store/mod.rs#L185));
   under the other layouts it uses the store's own columns. Patterns probe the
   base by code and the tail by string, and a query that touches both unions
   the results.
@@ -102,7 +102,7 @@ flowchart TD
   then unions the two. A base short-circuit (a term with no code in the
   dictionary) never skips the tail, since that term may exist in the tail's
   plain strings.
-- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L205) is the number
+- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L203) is the number
   of physical tail rows — the store's only unindexed, unsorted region, and the
   number to watch when tuning compaction.
 
@@ -222,7 +222,7 @@ flowchart TD
   `<store>.write-<uuid>.tmp` exists before the work starts (a process killed
   meanwhile leaves it behind, and nothing removes it later). The sorted rows
   are then streamed through the out-of-core builder
-  ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L150))
+  ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L154))
   into it
   ([`built_stream_to_vortex_writer`](../core/src/io/write.rs#L139)), which is
   then renamed over the original path, and the store is reopened
@@ -245,7 +245,7 @@ flowchart TD
 - **An in-memory store**, and any *derived view* of a file (whose rows are a
   subset of a file other readers share), rebuilds in memory through
   [`from_raw_quads`](../core/src/store/construct.rs#L229) →
-  [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L289) and adopts
+  [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L284) and adopts
   the result in the same compressed-resident form a freshly built store has
   ([serialization.md §10](serialization.md#10-adopting-a-build-in-memory)).
 
@@ -289,7 +289,7 @@ open of the file and no rebuild (a debug-level log line says so), and every
 later append over the threshold retries the same way, folding the tail as soon
 as the file can be written again. An explicit `compact()` of such a store still
 fails with `PermissionDenied`: it is the call that reports why the tail is not
-being folded, and [`tail_len`](../core/src/store/mod.rs#L205) shows the tail
+being folded, and [`tail_len`](../core/src/store/mod.rs#L203) shows the tail
 growing. The tail then has no bound but memory, and every query mask-scans it,
 so a read-only store is for reading: append to a copy.
 

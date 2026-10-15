@@ -2,8 +2,9 @@
 //! built or serialized from.
 //!
 //! This hub owns everything the two pipelines share — the
-//! [`VortexArrayBuilder`] contract and its two products ([`BuiltArray`],
-//! [`BuiltStream`]), primary chunk assembly, the sortedness stamps a build is
+//! [`VortexArrayBuilder`] contract and its products ([`BuiltArray`], and the
+//! crate-private `BuiltStream` the file writer consumes), primary chunk
+//! assembly, the sortedness stamps a build is
 //! allowed to claim, and the globally-sorted index emission
 //! ([`build_components`]). A leaf (`sorted_in_memory`, `sorted_stream`)
 //! contributes only its memory profile; `spill` backs the out-of-core one.
@@ -63,7 +64,7 @@ pub(crate) const DEFAULT_CHUNK_ROWS: usize = 100_000;
 /// A stream of StructArray chunks ready for consumption by the Vortex file
 /// writer. Items use `VortexResult` because the writer polls the stream
 /// directly; builder errors are converted through the `From<VortexRdfError> for VortexError` impl.
-pub type ChunkStream = stream::BoxStream<'static, vortex_error::VortexResult<ArrayRef>>;
+pub(crate) type ChunkStream = stream::BoxStream<'static, vortex_error::VortexResult<ArrayRef>>;
 
 /// A built dataset: the quad array plus whatever layout state cannot be
 /// derived from the array alone — for the Dictionary layout, its term
@@ -90,8 +91,12 @@ pub struct BuiltArray {
 /// stream of primary-only quad chunks, the index children riding beside it as
 /// writable components, and the dictionary the serializer writes as the
 /// `dictionary` child.
-pub struct BuiltStream {
+pub(crate) struct BuiltStream {
     /// The schema dtype shared by every chunk.
+    #[cfg_attr(
+        not(any(feature = "file-io", target_arch = "wasm32")),
+        allow(dead_code)
+    )]
     pub dtype: DType,
     /// The lazy stream of primary-only quad chunks.
     pub chunks: ChunkStream,
@@ -131,10 +136,10 @@ pub use sorted_stream::SortedStreamBuilder;
 
 /// A build pipeline from a quad stream to store parts:
 /// [`build_vortex_array`](Self::build_vortex_array) materializes the dataset
-/// (for [`VortexRdfStore::from_built`](crate::VortexRdfStore::from_built)),
-/// [`build_vortex_stream`](Self::build_vortex_stream) emits it lazily for the
-/// file writer. Both sort globally by (s, p, o, g); which implementation
-/// exists is decided by the target (see the module doc).
+/// (for [`VortexRdfStore::from_built`](crate::VortexRdfStore::from_built)).
+/// Both implementations sort globally by (s, p, o, g); which one exists is
+/// decided by the target (see the module doc). The lazy chunk stream for the
+/// file writer is [`SortedStreamBuilder`]'s alone.
 ///
 /// The input quads must be canonical (from [`RawQuad::from_quad`], the parser
 /// or [`RawQuad::canonical`]): a builder interns and compares the spelling it
@@ -148,16 +153,6 @@ pub trait VortexArrayBuilder {
         layout: LayoutStrategy,
         indexes: Indexes,
     ) -> impl Future<Output = Result<BuiltArray>> + Send;
-
-    /// Produce the schema dtype and a lazily-evaluated stream of StructArray
-    /// chunks, for feeding directly into the Vortex file writer, so that
-    /// writing a file needs only O(chunk) memory for the column arrays
-    /// instead of O(dataset).
-    fn build_vortex_stream(
-        quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
-        layout: LayoutStrategy,
-        indexes: Indexes,
-    ) -> impl Future<Output = Result<BuiltStream>> + Send;
 }
 
 /// Build one StructArray chunk of primary quad columns for the given layout.
@@ -336,6 +331,7 @@ pub(crate) fn assemble_chunks(chunks: Vec<ArrayRef>) -> Result<ArrayRef> {
 /// An empty StructArray with the given layout's primary schema. Building from
 /// an empty quad slice yields every column empty but with the correct dtype,
 /// so this is just the regular build path with no rows.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn make_empty_struct(layout: LayoutStrategy) -> Result<ArrayRef> {
     if layout == LayoutStrategy::Dictionary {
         return crate::store::layouts::dictionary::empty_struct();

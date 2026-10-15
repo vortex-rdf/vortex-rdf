@@ -1,17 +1,16 @@
-//! The builders: chunk-boundary behaviour of both sorted builders, the
+//! The builders: chunk-boundary behaviour of the streaming builder, the
 //! spill-and-merge path of the streaming one, the file writer's ordering,
 //! and the sorted stamp a build leaves on its subject column.
 
 use super::*;
-use crate::store::builders::{sorted_in_memory, sorted_stream};
+use crate::store::builders::sorted_stream;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 
-/// The chunk-boundary harness every builder shares: chunk_size 3 over the 10
-/// given quads must split as [3, 3, 3, 1] from both builders, whatever
-/// the `layout`. Hands back each builder's collected chunks — plus the
-/// dictionary the stream carried beside them, for the Dictionary layout —
-/// for the callers' layout-specific follow-up assertions.
+/// The chunk-boundary harness: chunk_size 3 over the 10 given quads must
+/// split as [3, 3, 3, 1], whatever the `layout`. Hands back the collected
+/// chunks — plus the dictionary the stream carried beside them, for the
+/// Dictionary layout — for the callers' layout-specific follow-up assertions.
 async fn run_chunk_boundary_builders(
     layout: LayoutStrategy,
     quads: &[Quad],
@@ -21,29 +20,17 @@ async fn run_chunk_boundary_builders(
     Option<std::sync::Arc<crate::store::layouts::dictionary::TermDictionary>>,
 )> {
     let mut out = Vec::new();
-    for (name, result) in [
-        (
-            "sorted_in_memory",
-            sorted_in_memory::build_chunk_stream(
-                Box::new(quad_stream(quads.to_vec())),
-                layout,
-                vec![],
-                3,
-            )
-            .await,
-        ),
-        (
-            "sorted_stream",
-            sorted_stream::build_chunk_stream(
-                Box::new(quad_stream(quads.to_vec())),
-                layout,
-                vec![],
-                3,
-                None,
-            )
-            .await,
-        ),
-    ] {
+    for (name, result) in [(
+        "sorted_stream",
+        sorted_stream::build_chunk_stream(
+            Box::new(quad_stream(quads.to_vec())),
+            layout,
+            vec![],
+            3,
+            None,
+        )
+        .await,
+    )] {
         let built = result.unwrap_or_else(|e| panic!("{name}: {e}"));
         let dict = built.dict.clone();
         let chunks: Vec<_> = built
@@ -62,7 +49,7 @@ async fn run_chunk_boundary_builders(
 
 #[tokio::test]
 async fn test_default_streaming_chunk_boundaries() {
-    // Quads fed in REVERSE subject order; both sorted builders must emit
+    // Quads fed in REVERSE subject order; the builder must emit
     // globally sorted output across chunk boundaries.
     let quads: Vec<Quad> = (0..10)
         .rev()

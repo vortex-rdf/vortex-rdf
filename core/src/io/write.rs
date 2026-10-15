@@ -3,7 +3,7 @@
 //! Packs a store's parts — the primary quad table plus each index
 //! component's and the dictionary's own
 //! [`NativeComponentWrite`](crate::io::container::NativeComponentWrite) —
-//! into a [`BuiltStream`] and drives
+//! into a [`BuiltStream`](crate::store::builders::BuiltStream) and drives
 //! [`write_store`](crate::io::container::write_store) over it, carrying
 //! each part's sortedness provenance onto the descriptors a reader will
 //! trust. Also owns the `quads_stream_to_*` entry points, which run a
@@ -31,7 +31,7 @@ use crate::error::path_error;
 #[cfg(feature = "file-io")]
 use crate::io::read::FileIdentity;
 #[cfg(feature = "file-io")]
-use crate::store::builders::{SortedStreamBuilder, VortexArrayBuilder};
+use crate::store::builders::SortedStreamBuilder;
 #[cfg(feature = "file-io")]
 use crate::store::{Indexes, RawQuad};
 #[cfg(feature = "file-io")]
