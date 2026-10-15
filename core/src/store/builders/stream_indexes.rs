@@ -1,14 +1,21 @@
-//! The index side of the out-of-core build: the quad merge's first pass,
-//! which assigns row ids and spills each requested index family's entries as
-//! sorted runs, and the native components that stream each family off its
-//! own merger beside the quad chunks.
+//! The index side of the out-of-core build: each requested family's
+//! `(key, row id)` entries spilled as the quad merge assigns row ids, then
+//! streamed off their own merger as native components beside the quad
+//! chunks.
 
-use super::spill::{MergedSink, Run, RunMerger, RunSpiller, RunWriter, Spillable, TempRunsGuard};
+use super::spill::{MergedSink, RunMerger, RunSpiller, Spillable, TempRunsGuard};
 use crate::error::Result;
-use crate::io::container::NativeComponentWrite;
+use crate::io::container::sources::{PullComponentSource, PullFn};
+use crate::io::container::{
+    INDEX_VERSION, NativeComponentWrite, StoreComponentDescriptor, StoreComponentRole,
+    child_strategy,
+};
 use crate::store::RawQuad;
-use crate::store::indexes::copy::{self, out_of_core::CopyKey};
-use crate::store::indexes::next_row_id;
+use crate::store::indexes::copy::out_of_core::{CopyKey, copy_child_chunk, copy_child_dtype};
+use crate::store::indexes::copy::{CopyFamily, TermColumn};
+use crate::store::indexes::reference::RefFamily;
+use crate::store::indexes::reference::out_of_core::ref_child_dtype;
+use crate::store::indexes::{IndexType, next_row_id};
 use crate::store::schema::RowId;
 
 use std::path::Path;
@@ -17,132 +24,145 @@ use std::sync::Arc;
 use vortex_array::ArrayRef;
 use vortex_array::dtype::DType;
 
-/// The two `SecondaryByReference` mergers of a build: (objects, predicates).
-type RefMergers<V> = (RunMerger<(V, RowId)>, RunMerger<(V, RowId)>);
-/// The two `SecondaryByCopy` mergers of a build: (POSG keys, OSPG keys).
-type CopyMergers<V> = (
-    RunMerger<(CopyKey<V>, RowId)>,
-    RunMerger<(CopyKey<V>, RowId)>,
-);
+/// One of each child of a family.
+type Pair<T> = (T, T);
+/// A reference-index entry: the value and its primary row id.
+type RefEntry<V> = (V, RowId);
+/// A copy-index entry: the family's sort key and its primary row id.
+type CopyEntry<V> = (CopyKey<V>, RowId);
 
-/// The external-sort mergers for one build's secondary indexes, present only
-/// for the index types the build requested. `V` is the term encoding: strings,
-/// or dictionary codes ([`TermCode`](crate::store::schema::TermCode)).
-pub(super) struct IndexMergers<V> {
-    ref_pairs: Option<RefMergers<V>>,
-    copy_keys: Option<CopyMergers<V>>,
+/// The spillers of a build's requested index families, fed one quad at a
+/// time as the merge assigns row ids. `V` is the term encoding: strings, or
+/// dictionary codes ([`TermCode`](crate::store::schema::TermCode)).
+struct IndexSpillers<V> {
+    /// `SecondaryByReference`: (objects, predicates).
+    refs: Option<Pair<RunSpiller<RefEntry<V>>>>,
+    /// `SecondaryByCopy`: (POSG keys, OSPG keys).
+    copies: Option<Pair<RunSpiller<CopyEntry<V>>>>,
 }
 
-/// First pass of the indexed pipeline: run the K-way quad merge to completion,
-/// collecting merged quads (each distinct quad once, so `rid` counts the
-/// deduplicated rows) — in memory when there is a single input run (the
-/// dataset already fit once), else spilled to `merged.bin` — while feeding
-/// each requested index family's spiller with that quad's terms encoded by
-/// `term_of`: `(value, row id)` pairs for the reference index, full
-/// [`CopyKey`]s for the copy index. Only the terms the requested families
-/// consume are encoded. Returns the merged quads and the per-family mergers,
-/// ready to stream entries in global sort order.
-pub(super) fn merge_quads_feeding_indexes<V>(
-    mut merger: RunMerger<RawQuad>,
-    temp_dir: &Path,
-    pair_capacity: usize,
-    want_ref: bool,
-    want_copy: bool,
-    mut term_of: impl FnMut(&str) -> Result<V>,
-) -> Result<(Run<RawQuad>, IndexMergers<V>)>
+/// The mergers [`IndexSpillers`] finish into, each streaming its family's
+/// entries in global sort order.
+pub(super) struct IndexMergers<V> {
+    refs: Option<Pair<RunMerger<RefEntry<V>>>>,
+    copies: Option<Pair<RunMerger<CopyEntry<V>>>>,
+}
+
+impl<V> IndexSpillers<V>
 where
     V: Clone,
-    (V, RowId): Ord + Spillable,
-    (CopyKey<V>, RowId): Ord + Spillable,
+    RefEntry<V>: Ord + Spillable,
+    CopyEntry<V>: Ord + Spillable,
 {
-    let mut merged = if merger.run_count() <= 1 {
-        MergedSink::Memory(Vec::new())
-    } else {
-        let path = temp_dir.join("merged.bin");
-        MergedSink::File {
-            writer: RunWriter::create(&path)?,
-            path,
+    /// Spillers for the families `indexes` need, their runs under `dir` in
+    /// windows of `capacity` entries.
+    fn new(indexes: &[IndexType], dir: &Path, capacity: usize) -> Self {
+        Self {
+            refs: indexes.contains(&IndexType::SecondaryByReference).then(|| {
+                (
+                    RunSpiller::new(dir, "idx_o", capacity),
+                    RunSpiller::new(dir, "idx_p", capacity),
+                )
+            }),
+            copies: indexes.contains(&IndexType::SecondaryByCopy).then(|| {
+                (
+                    RunSpiller::new(dir, "idx_posg", capacity),
+                    RunSpiller::new(dir, "idx_ospg", capacity),
+                )
+            }),
         }
-    };
-    let mut o_spill =
-        want_ref.then(|| RunSpiller::<(V, RowId)>::new(temp_dir, "idx_o", pair_capacity));
-    let mut p_spill =
-        want_ref.then(|| RunSpiller::<(V, RowId)>::new(temp_dir, "idx_p", pair_capacity));
-    let mut posg_spill = want_copy
-        .then(|| RunSpiller::<(CopyKey<V>, RowId)>::new(temp_dir, "idx_posg", pair_capacity));
-    let mut ospg_spill = want_copy
-        .then(|| RunSpiller::<(CopyKey<V>, RowId)>::new(temp_dir, "idx_ospg", pair_capacity));
+    }
 
-    // Rows are numbered as the merge emits them, so the count is unknown up
-    // front: each id is a checked increment, refusing the store at the first
-    // row past the last u64 row id rather than wrapping.
-    let mut rows: u64 = 0;
-    while let Some(quad) = merger.next()? {
-        let rid = next_row_id(&mut rows)?;
-        if want_copy {
+    /// Push `quad` at row `rid`, its terms encoded by `term_of`; only the
+    /// terms the requested families consume are encoded.
+    fn push(
+        &mut self,
+        quad: &RawQuad,
+        rid: RowId,
+        term_of: &mut impl FnMut(&str) -> Result<V>,
+    ) -> Result<()> {
+        if let Some((posg, ospg)) = self.copies.as_mut() {
             let spog = [
                 term_of(&quad.s)?,
                 term_of(&quad.p)?,
                 term_of(&quad.o)?,
                 term_of(&quad.g)?,
             ];
-            if let Some(spiller) = posg_spill.as_mut() {
-                spiller.push((CopyKey::posg(&spog), rid))?;
+            posg.push((CopyKey::posg(&spog), rid))?;
+            // The reference entries clone the two terms they share with the
+            // copy keys, so the OSPG key, built last, takes the whole tuple
+            // by value.
+            if let Some((o, p)) = self.refs.as_mut() {
+                o.push((spog[2].clone(), rid))?;
+                p.push((spog[1].clone(), rid))?;
             }
-            // The reference pairs clone the two terms they share with the
-            // copy keys, so the OSPG constructor — consumed last — can take
-            // the whole tuple by value.
-            if let Some(spiller) = o_spill.as_mut() {
-                spiller.push((spog[2].clone(), rid))?;
-            }
-            if let Some(spiller) = p_spill.as_mut() {
-                spiller.push((spog[1].clone(), rid))?;
-            }
-            if let Some(spiller) = ospg_spill.as_mut() {
-                spiller.push((CopyKey::ospg(spog), rid))?;
-            }
-        } else if want_ref {
-            if let Some(spiller) = o_spill.as_mut() {
-                spiller.push((term_of(&quad.o)?, rid))?;
-            }
-            if let Some(spiller) = p_spill.as_mut() {
-                spiller.push((term_of(&quad.p)?, rid))?;
-            }
+            ospg.push((CopyKey::ospg(spog), rid))?;
+        } else if let Some((o, p)) = self.refs.as_mut() {
+            o.push((term_of(&quad.o)?, rid))?;
+            p.push((term_of(&quad.p)?, rid))?;
         }
-        merged.push(quad)?;
+        Ok(())
     }
-    let merged = merged.finish()?;
-    log::debug!(
-        "[SortedStreamBuilder] Merged {} quads; index pair runs written",
-        rows
-    );
 
-    let ref_pairs = match (o_spill, p_spill) {
-        (Some(o), Some(p)) => Some((o.into_merger()?, p.into_merger()?)),
-        _ => None,
-    };
-    let copy_keys = match (posg_spill, ospg_spill) {
-        (Some(posg), Some(ospg)) => Some((posg.into_merger()?, ospg.into_merger()?)),
-        _ => None,
-    };
-    Ok((
-        merged,
-        IndexMergers {
-            ref_pairs,
-            copy_keys,
-        },
-    ))
+    fn into_mergers(self) -> Result<IndexMergers<V>> {
+        Ok(IndexMergers {
+            refs: self.refs.map(finish_pair).transpose()?,
+            copies: self.copies.map(finish_pair).transpose()?,
+        })
+    }
 }
 
-/// A window of one reference component's merged pairs, as one child chunk.
-type RefChunkFn<V> = fn(&[(V, RowId)]) -> Result<ArrayRef>;
+/// Both spillers of a family finished into their mergers.
+fn finish_pair<T: Ord + Spillable>(pair: Pair<RunSpiller<T>>) -> Result<Pair<RunMerger<T>>> {
+    Ok((pair.0.into_merger()?, pair.1.into_merger()?))
+}
 
-/// Turn a build's spill-run mergers into native component writes: each family
-/// streams its child's chunks straight off its merger — no lockstep zip with
-/// the quad stream, no materialization. The temp-run guard is shared with the
-/// quad stream so the run files outlive every reader. `encoded` says whether
-/// the entries hold dictionary codes (else term strings), which picks the
-/// child dtypes; `ref_chunk` builds a reference child chunk for that encoding.
+/// First pass of the indexed pipeline: run the K-way quad merge to
+/// completion — into memory when there is a single input run (the dataset
+/// already fit once), else into `merged.bin` under `dir` — while the
+/// spillers of the families `indexes` requests take each quad's terms,
+/// encoded by `term_of`. The merge yields each distinct quad once, so the row
+/// ids it assigns number the deduplicated rows. Returns the merged quads as a
+/// single-run merger and the per-family mergers.
+pub(super) fn merge_feeding_indexes<V>(
+    mut merger: RunMerger<RawQuad>,
+    dir: &Path,
+    capacity: usize,
+    indexes: &[IndexType],
+    mut term_of: impl FnMut(&str) -> Result<V>,
+) -> Result<(RunMerger<RawQuad>, IndexMergers<V>)>
+where
+    V: Clone,
+    RefEntry<V>: Ord + Spillable,
+    CopyEntry<V>: Ord + Spillable,
+{
+    let mut merged = MergedSink::create(dir, merger.run_count() <= 1)?;
+    let mut spillers = IndexSpillers::new(indexes, dir, capacity);
+    // Rows are numbered as the merge emits them, so the count is unknown up
+    // front: each id is a checked increment, refusing the store at the first
+    // row past the last row id rather than wrapping.
+    let mut rows: u64 = 0;
+    while let Some(quad) = merger.next()? {
+        spillers.push(&quad, next_row_id(&mut rows)?, &mut term_of)?;
+        merged.push(quad)?;
+    }
+    log::debug!(
+        "[SortedStreamBuilder] Merged {} quads; index entry runs written",
+        rows
+    );
+    let merged = RunMerger::new(vec![merged.finish()?])?;
+    Ok((merged, spillers.into_mergers()?))
+}
+
+/// A window of one reference family's merged entries, as one child chunk.
+type RefChunkFn<V> = fn(&[RefEntry<V>]) -> Result<ArrayRef>;
+
+/// Each family's child as a native component write streaming its chunks off
+/// its merger, in windows of `chunk_size` entries — no lockstep with the quad
+/// stream, no materialization. `encoded` says whether the entries hold
+/// dictionary codes (else term strings), which picks the child dtypes;
+/// `ref_chunk` builds a reference child chunk for that encoding. Every pull
+/// holds the run guard, so the run files outlive their readers.
 pub(super) fn merger_components<V>(
     mergers: IndexMergers<V>,
     chunk_size: usize,
@@ -151,100 +171,85 @@ pub(super) fn merger_components<V>(
     ref_chunk: RefChunkFn<V>,
 ) -> Result<Vec<NativeComponentWrite>>
 where
-    V: Send + 'static + copy::TermColumn,
-    (V, RowId): Ord + Spillable,
-    (CopyKey<V>, RowId): Ord + Spillable,
+    V: TermColumn + Send + 'static,
+    RefEntry<V>: Ord + Spillable,
+    CopyEntry<V>: Ord + Spillable,
 {
-    use crate::io::container::sources::PullComponentSource;
-    use crate::io::container::{
-        INDEX_VERSION, StoreComponentDescriptor, StoreComponentRole, child_strategy,
-    };
-    use crate::store::indexes::copy::CopyFamily;
-    use crate::store::indexes::copy::out_of_core::{copy_child_chunk, copy_child_dtype};
-    use crate::store::indexes::reference::RefFamily;
-    use crate::store::indexes::reference::out_of_core::ref_child_dtype;
-
-    let copy_dtype = copy_child_dtype(encoded);
-    let ref_dtype = ref_child_dtype(encoded);
-
-    let mut components = Vec::new();
-    let mut push = |name: &str,
-                    slug: &str,
-                    dtype: DType,
-                    mut pull: Box<dyn FnMut(usize) -> Result<Option<ArrayRef>> + Send>|
-     -> Result<()> {
-        let guard = Arc::clone(guard);
-        let mut emitted = false;
-        let pull_fn: crate::io::container::sources::PullFn = Box::new(move |n| {
-            let _hold_runs = &guard;
-            match pull(n) {
-                Ok(Some(chunk)) => {
-                    emitted = true;
-                    Ok(Some(chunk))
-                }
-                // The child strategy needs at least one (possibly empty)
-                // chunk to write a schema-complete component.
-                Ok(None) if !emitted => {
-                    emitted = true;
-                    Ok(pull(0)?)
-                }
-                Ok(None) => Ok(None),
-                Err(e) => Err(e.into()),
-            }
-        });
-        components.push(NativeComponentWrite::new(
-            StoreComponentDescriptor {
-                name: name.into(),
-                role: StoreComponentRole::Index,
-                implementation: slug.into(),
-                version: INDEX_VERSION,
-                required: false,
-                // The merger emits each family in its global sort order.
-                sorted: true,
-                dtype: dtype.clone(),
-            },
-            Arc::new(PullComponentSource::new(dtype.clone(), chunk_size, pull_fn)),
-            child_strategy(&dtype),
-        )?);
-        Ok(())
-    };
-
-    if let Some((posg, ospg)) = mergers.copy_keys {
-        for (family, merger) in [(CopyFamily::Posg, posg), (CopyFamily::Ospg, ospg)] {
-            let mut merger = merger;
-            push(
+    let mut families: Vec<(&'static str, &'static str, DType, PullFn)> = Vec::new();
+    if let Some((posg, ospg)) = mergers.copies {
+        let dtype = copy_child_dtype(encoded);
+        for (family, mut merger) in [(CopyFamily::Posg, posg), (CopyFamily::Ospg, ospg)] {
+            let pull = pull_fn(guard, move |n| {
+                chunk_of(merger.next_batch(n)?, n, |keys| {
+                    copy_child_chunk(family, keys)
+                })
+            });
+            families.push((
                 family.component_name(),
                 family.component_slug(),
-                copy_dtype.clone(),
-                Box::new(move |n| {
-                    let batch = merger.next_batch(n)?;
-                    if batch.is_empty() && n > 0 {
-                        return Ok(None);
-                    }
-                    copy_child_chunk(family, &batch).map(Some)
-                }),
-            )?;
+                dtype.clone(),
+                pull,
+            ));
         }
     }
-    if let Some((o_pairs, p_pairs)) = mergers.ref_pairs {
-        for (family, merger) in [
-            (RefFamily::Object, o_pairs),
-            (RefFamily::Predicate, p_pairs),
-        ] {
-            let mut merger = merger;
-            push(
+    if let Some((o, p)) = mergers.refs {
+        let dtype = ref_child_dtype(encoded);
+        for (family, mut merger) in [(RefFamily::Object, o), (RefFamily::Predicate, p)] {
+            let pull = pull_fn(guard, move |n| {
+                chunk_of(merger.next_batch(n)?, n, ref_chunk)
+            });
+            families.push((
                 family.component_name(),
                 family.component_slug(),
-                ref_dtype.clone(),
-                Box::new(move |n| {
-                    let batch = merger.next_batch(n)?;
-                    if batch.is_empty() && n > 0 {
-                        return Ok(None);
-                    }
-                    ref_chunk(&batch).map(Some)
-                }),
-            )?;
+                dtype.clone(),
+                pull,
+            ));
         }
     }
-    Ok(components)
+    families
+        .into_iter()
+        .map(|(name, slug, dtype, pull)| {
+            let strategy = child_strategy(&dtype);
+            Ok(NativeComponentWrite::new(
+                StoreComponentDescriptor {
+                    name: name.into(),
+                    role: StoreComponentRole::Index,
+                    implementation: slug.into(),
+                    version: INDEX_VERSION,
+                    required: false,
+                    // The merger emits the family in its global sort order.
+                    sorted: true,
+                    dtype: dtype.clone(),
+                },
+                Arc::new(PullComponentSource::new(dtype, chunk_size, pull)),
+                strategy,
+            )?)
+        })
+        .collect()
+}
+
+/// `batch`, a window of a family's merged entries, as one child chunk;
+/// `None` once a non-empty pull came back empty (a zero-row pull builds the
+/// empty chunk).
+fn chunk_of<T>(
+    batch: Vec<T>,
+    n: usize,
+    chunk: impl FnOnce(&[T]) -> Result<ArrayRef>,
+) -> Result<Option<ArrayRef>> {
+    if batch.is_empty() && n > 0 {
+        return Ok(None);
+    }
+    chunk(&batch).map(Some)
+}
+
+/// `pull` as the writer's [`PullFn`], holding the run guard.
+fn pull_fn(
+    guard: &Arc<TempRunsGuard>,
+    mut pull: impl FnMut(usize) -> Result<Option<ArrayRef>> + Send + 'static,
+) -> PullFn {
+    let guard = Arc::clone(guard);
+    Box::new(move |n| {
+        let _hold_runs = &guard;
+        Ok(pull(n)?)
+    })
 }

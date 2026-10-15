@@ -49,32 +49,22 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
         // Dictionary layout interns terms as the stream drains, so the sort
         // runs over 32-byte coded rows and no `Vec<RawQuad>` (four owned
         // Strings per quad) ever accumulates.
-        let (n, build_start, built);
-        if layout == LayoutStrategy::Dictionary {
+        let built = if layout == LayoutStrategy::Dictionary {
             let interner = InterningQuadBuilder::from_stream(quad_stream).await?;
-            build_start = debug::timer();
-            built = finish_interned(interner, &indexes)?;
-            n = built.array.len();
+            finish_interned(interner, &indexes)?
         } else {
             let quads = ingest_and_sort(quad_stream).await?;
-            n = quads.len();
-            build_start = debug::timer();
-            built = BuiltArray {
+            BuiltArray {
                 array: build_struct_array(&quads, layout, true)?,
                 components: build_components(&indexes, &quads)?,
                 dict: None,
-            };
+            }
         };
         log::debug!(
-            "[SortedInMemoryBuilder] Constructed StructArray in {:?}",
-            debug::elapsed(build_start)
-        );
-        log::debug!(
-            "[SortedInMemoryBuilder] Completed serialization of {} quads in {:?}",
-            n,
+            "[SortedInMemoryBuilder] Built {} quads in {:?}",
+            built.array.len(),
             debug::elapsed(start)
         );
-
         Ok(built)
     }
 }

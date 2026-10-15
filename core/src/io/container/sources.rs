@@ -78,7 +78,9 @@ impl NativeComponentSource for BufferedComponentSource {
     }
 }
 
-/// A pull closure yielding one component chunk per call (`Ok(None)` = end).
+/// A pull closure yielding one component chunk of at most the given rows per
+/// call, `Ok(None)` once exhausted; a zero-row pull yields the empty chunk of
+/// the component's dtype.
 // Constructed only by the out-of-core builder, which is compiled out on
 // wasm32-unknown-unknown.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -122,14 +124,28 @@ impl NativeComponentSource for PullComponentSource {
                 vortex_error::vortex_err!("a pull-backed component source replays only once")
             })?;
         let batch_rows = self.batch_rows;
-        let stream = futures::stream::unfold(Some(pull), move |state| async move {
-            let mut pull = state?;
-            match pull(batch_rows) {
-                Ok(Some(chunk)) => Some((Ok(chunk), Some(pull))),
-                Ok(None) => None,
-                Err(e) => Some((Err(e), None)),
-            }
-        });
+        // At least one chunk is emitted: the child strategy needs one,
+        // possibly empty, to write a schema-complete component, so an empty
+        // component contributes its zero-row pull.
+        let stream =
+            futures::stream::unfold((Some(pull), false), move |(state, emitted)| async move {
+                let mut pull = state?;
+                match pull(batch_rows) {
+                    Ok(Some(chunk)) => Some((Ok(chunk), (Some(pull), true))),
+                    Ok(None) if !emitted => {
+                        let empty = pull(0).and_then(|chunk| {
+                            chunk.ok_or_else(|| {
+                                vortex_error::vortex_err!(
+                                    "a zero-row pull must yield an empty chunk"
+                                )
+                            })
+                        });
+                        Some((empty, (None, true)))
+                    }
+                    Ok(None) => None,
+                    Err(e) => Some((Err(e), (None, true))),
+                }
+            });
         Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
             self.dtype.clone(),
             stream,
