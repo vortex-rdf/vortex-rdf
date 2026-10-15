@@ -8,9 +8,7 @@ use crate::common::terms::{LiteralForm, split_literal};
 use crate::common::vocab::{RDF_LANG_STRING, XSD, XSD_STRING};
 
 use super::Verdict;
-use super::numeric::{
-    Num, NumKind, numeric_kind, parse_decimal, parse_float, parse_integer, parse_number,
-};
+use super::numeric::{Num, digits_value, numeric_kind, parse_number};
 
 /// A literal spelling split into its parts, borrowed from the spelling.
 pub(super) struct LiteralView<'a> {
@@ -79,15 +77,10 @@ impl<'a> LiteralView<'a> {
     /// `NaN`) its own, more lenient parser may still accept, so that one is
     /// left to it.
     pub(super) fn parses_unbounded(&self) -> bool {
-        let (Some(dt), Some(lexical)) = (self.datatype, self.lexical()) else {
-            return false;
-        };
-        match numeric_kind(dt) {
-            Some(NumKind::Int(..)) => parse_integer(&lexical).is_some(),
-            Some(NumKind::Decimal) => parse_decimal(&lexical).is_some(),
-            Some(NumKind::Float) => parse_float(&lexical).is_some(),
-            None => false,
-        }
+        self.datatype.and_then(numeric_kind).is_some_and(|kind| {
+            self.lexical()
+                .is_some_and(|lexical| parse_number(&lexical, kind.unbounded()).is_some())
+        })
     }
 
     /// Whether this is an `xsd:long` or `xsd:unsignedLong` whose lexical form
@@ -98,9 +91,7 @@ impl<'a> LiteralView<'a> {
             return false;
         };
         (local == "long" || local == "unsignedLong")
-            && self
-                .lexical()
-                .is_some_and(|lexical| parse_integer(&lexical).is_some())
+            && self.parses_unbounded()
             && self.number().is_none()
     }
 }
@@ -183,12 +174,8 @@ fn unescape_lexical(raw: &str) -> Option<Cow<'_, str>> {
     Some(Cow::Owned(out))
 }
 
+/// The character spelled by the next `len` hex digits of `chars`.
 fn hex_char(chars: &mut std::str::Chars<'_>, len: usize) -> Option<char> {
-    let mut v: u32 = 0;
-    for _ in 0..len {
-        v = v
-            .checked_mul(16)?
-            .checked_add(chars.next()?.to_digit(16)?)?;
-    }
-    char::from_u32(v)
+    let v = digits_value((0..len).map(|_| chars.next()?.to_digit(16)), 16)?;
+    char::from_u32(u32::try_from(v).ok()?)
 }

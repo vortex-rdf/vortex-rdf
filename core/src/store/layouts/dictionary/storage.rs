@@ -22,7 +22,7 @@ use crate::debug;
 use crate::error::{Result, VortexRdfError};
 use crate::io::read::scan_reader_chunks;
 use crate::session::VORTEX_SESSION;
-use crate::store::array::{StrColReader, buf_as_str};
+use crate::store::array::{StrColReader, trusted_str};
 
 use super::term_dict::TermDictionary;
 
@@ -303,10 +303,10 @@ impl TermDictionary {
             chunks
         };
         log::debug!(
-            "[Dictionary] FSST-compressed {} terms into {} windows in {:?}",
+            "[Dictionary] FSST-compressed {} terms in {:?} (windows: {})",
             len,
-            chunks.len(),
-            debug::elapsed(start)
+            debug::elapsed(start),
+            chunks.len()
         );
         Ok(Self::new(ResidentChunks::new(chunks)))
     }
@@ -454,11 +454,12 @@ pub(super) enum ChunkCursor<'a> {
 
 impl ChunkCursor<'_> {
     /// Term `local` as a `&str`, borrowed from the cursor like
-    /// [`bytes_at`](Self::bytes_at).
+    /// [`bytes_at`](Self::bytes_at); trusted to be UTF-8, as the column's
+    /// dtype declares (see [`trusted_str`]).
     #[cfg(feature = "file-io")]
     #[inline]
-    pub(super) fn str_at(&mut self, local: usize) -> Result<&str> {
-        buf_as_str(self.bytes_at(local))
+    pub(super) fn str_at(&mut self, local: usize) -> &str {
+        trusted_str(self.bytes_at(local))
     }
 
     #[inline]
@@ -471,9 +472,14 @@ impl ChunkCursor<'_> {
 }
 
 impl DictCursor<'_> {
+    /// Term `i`'s bytes: a one-chunk column reads its one chunk cursor
+    /// directly; otherwise `i` is mapped to its chunk's cursor.
     #[inline]
     pub(super) fn bytes_at(&mut self, i: usize) -> &[u8] {
-        let (chunk, local) = self.store.locate(i);
+        if self.rest.is_empty() {
+            return self.first.bytes_at(i);
+        }
+        let (chunk, local) = chunk_of(&self.store.starts, i);
         let cursor = match chunk {
             0 => &mut self.first,
             k => &mut self.rest[k - 1],
@@ -481,9 +487,12 @@ impl DictCursor<'_> {
         cursor.bytes_at(local)
     }
 
+    /// Term `i` as a `&str`, borrowed from the cursor like
+    /// [`bytes_at`](Self::bytes_at); trusted to be UTF-8, as the column's
+    /// dtype declares (see [`trusted_str`]).
     #[inline]
-    pub(super) fn str_at(&mut self, i: usize) -> Result<&str> {
-        buf_as_str(self.bytes_at(i))
+    pub(super) fn str_at(&mut self, i: usize) -> &str {
+        trusted_str(self.bytes_at(i))
     }
 }
 
@@ -769,7 +778,7 @@ mod tests {
             let mut cursor = dict.cursor();
             let order: Vec<usize> = (0..n).chain((0..n).rev()).chain([0, 9, 1, 5, 9]).collect();
             for &i in &order {
-                assert_eq!(cursor.str_at(i).unwrap(), terms[i], "window {window}: {i}");
+                assert_eq!(cursor.str_at(i), terms[i], "window {window}: {i}");
             }
             let codes: Vec<TermCode> = order.iter().map(|&i| i as TermCode).collect();
             let decoded = dict.decode_many(&codes);

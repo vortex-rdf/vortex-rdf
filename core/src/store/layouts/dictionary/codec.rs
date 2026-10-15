@@ -294,7 +294,7 @@ impl TermSource for DictTerms<'_> {
 
     fn str_at(&mut self, role: usize, code: TermCode) -> Result<&str> {
         let rank = check_code(code, self.code_space)?;
-        self.cursors[role].str_at(rank)
+        Ok(self.cursors[role].str_at(rank))
     }
 
     fn shared_at(&mut self, role: usize, code: TermCode) -> Result<Arc<str>> {
@@ -497,7 +497,7 @@ pub(in crate::store::layouts) fn decode_code_column<T: Clone + for<'a> From<&'a 
         .map(|&code| {
             memo.get_or_insert(code, || {
                 let rank = check_code(code, dict.code_space())?;
-                cursor.str_at(rank).map(T::from)
+                Ok(T::from(cursor.str_at(rank)))
             })
         })
         .collect()

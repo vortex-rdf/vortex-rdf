@@ -143,7 +143,19 @@ pub enum NumOp {
     Ne,
 }
 
+/// Every numeric operator: `parse` finds a `num_*` kind's operator here by
+/// its [`kind`](NumOp::kind).
+const NUM_OPS: [NumOp; 6] = [
+    NumOp::Lt,
+    NumOp::Le,
+    NumOp::Gt,
+    NumOp::Ge,
+    NumOp::Eq,
+    NumOp::Ne,
+];
+
 impl NumOp {
+    /// The `num_*` predicate kind of this operator.
     fn kind(self) -> &'static str {
         match self {
             NumOp::Lt => "num_lt",
@@ -157,15 +169,14 @@ impl NumOp {
 
     /// The verdict for an ordering `ord` of the term against the constant.
     fn apply(self, ord: Ordering) -> Verdict {
-        let holds = match self {
+        Verdict::from(match self {
             NumOp::Lt => ord == Ordering::Less,
             NumOp::Le => ord != Ordering::Greater,
             NumOp::Gt => ord == Ordering::Greater,
             NumOp::Ge => ord != Ordering::Less,
             NumOp::Eq => ord == Ordering::Equal,
             NumOp::Ne => ord != Ordering::Equal,
-        };
-        if holds { Verdict::True } else { Verdict::False }
+        })
     }
 
     fn is_equality(self) -> bool {
@@ -202,6 +213,16 @@ pub enum TermPredicate {
     /// (and `regex`), read on the term's text under the [`TextOptions`] it
     /// was parsed with.
     Text(TextPredicate),
+}
+
+/// `f` on the literal `spelling` parses to; `False` for a spelling of
+/// another kind (a type error), `Unknown` for a literal that does not parse.
+fn on_literal(kind: Kind, spelling: &str, f: impl FnOnce(&LiteralView<'_>) -> Verdict) -> Verdict {
+    match LiteralView::parse(spelling) {
+        Some(lit) => f(&lit),
+        None if kind != Kind::Literal => Verdict::False,
+        None => Verdict::Unknown,
+    }
 }
 
 impl TermPredicate {
@@ -268,28 +289,20 @@ impl TermPredicate {
                 }
                 TermPredicate::LangMatches(arg.to_owned())
             }
-            "num_lt" | "num_le" | "num_gt" | "num_ge" | "num_eq" | "num_ne" => {
-                let op = match kind {
-                    "num_lt" => NumOp::Lt,
-                    "num_le" => NumOp::Le,
-                    "num_gt" => NumOp::Gt,
-                    "num_ge" => NumOp::Ge,
-                    "num_eq" => NumOp::Eq,
-                    _ => NumOp::Ne,
+            other => {
+                let Some(op) = NUM_OPS.into_iter().find(|op| op.kind() == other) else {
+                    return Err(invalid(format!(
+                        "unknown term predicate kind {other:?}; expected one of is_literal, \
+                         is_iri, is_blank, datatype, lang, lang_matches, num_lt, num_le, num_gt, \
+                         num_ge, num_eq, num_ne, str_prefix, contains, strstarts, strends, regex"
+                    )));
                 };
                 let number = Number::parse(arg).ok_or_else(|| {
                     invalid(format!(
-                        "{kind} predicate needs a numeric constant, got {arg:?}"
+                        "{other} predicate needs a numeric constant, got {arg:?}"
                     ))
                 })?;
                 TermPredicate::Num(op, number)
-            }
-            other => {
-                return Err(invalid(format!(
-                    "unknown term predicate kind {other:?}; expected one of is_literal, is_iri, \
-                     is_blank, datatype, lang, lang_matches, num_lt, num_le, num_gt, num_ge, \
-                     num_eq, num_ne, str_prefix, contains, strstarts, strends, regex"
-                )));
             }
         };
         Ok(predicate)
@@ -307,26 +320,19 @@ impl TermPredicate {
             TermPredicate::IsLiteral => Verdict::from(kind == Kind::Literal),
             TermPredicate::IsIri => Verdict::from(kind == Kind::Iri),
             TermPredicate::IsBlank => Verdict::from(kind == Kind::Blank),
-            TermPredicate::Datatype(dt) => match LiteralView::parse(spelling) {
-                Some(lit) => Verdict::from(lit.effective_datatype() == dt),
-                // `datatype()` of a non-literal is a type error.
-                None if kind != Kind::Literal => Verdict::False,
-                None => Verdict::Unknown,
-            },
-            TermPredicate::Lang(tag) => match LiteralView::parse(spelling) {
-                Some(lit) => Verdict::from(lit.lang.unwrap_or("") == tag),
-                None if kind != Kind::Literal => Verdict::False,
-                None => Verdict::Unknown,
-            },
-            TermPredicate::LangMatches(range) => match LiteralView::parse(spelling) {
-                Some(lit) => match lit.lang {
-                    Some(tag) => lang_matches(tag, range),
-                    // `langMatches("", range)` is false for every range.
-                    None => Verdict::False,
-                },
-                None if kind != Kind::Literal => Verdict::False,
-                None => Verdict::Unknown,
-            },
+            // `datatype()`, `lang()` and `langMatches()` of a non-literal are
+            // type errors.
+            TermPredicate::Datatype(dt) => on_literal(kind, spelling, |lit| {
+                Verdict::from(lit.effective_datatype() == dt)
+            }),
+            TermPredicate::Lang(tag) => on_literal(kind, spelling, |lit| {
+                Verdict::from(lit.lang.unwrap_or("") == tag)
+            }),
+            TermPredicate::LangMatches(range) => on_literal(kind, spelling, |lit| match lit.lang {
+                Some(tag) => lang_matches(tag, range),
+                // `langMatches("", range)` is false for every range.
+                None => Verdict::False,
+            }),
             TermPredicate::Num(op, number) => {
                 if kind != Kind::Literal {
                     // Comparing a non-literal is a type error; `=` and `!=`
@@ -336,10 +342,7 @@ impl TermPredicate {
                         _ => Verdict::False,
                     };
                 }
-                let Some(lit) = LiteralView::parse(spelling) else {
-                    return Verdict::Unknown;
-                };
-                number.compare(op, &lit)
+                on_literal(kind, spelling, |lit| number.compare(*op, lit))
             }
             TermPredicate::Text(text) => text.eval(spelling, kind),
         }

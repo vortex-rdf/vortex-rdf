@@ -42,11 +42,11 @@ use crate::store::array::StrColReader;
 use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::schema::TermCode;
 
-use super::predicates::{KindRanges, TermPredicate, Verdict};
+use super::predicates::{KindRanges, TermPredicate};
 use super::storage::{COL_DICT_TERM, TermChunk, chunk_of, window_bound_aggregates};
 use super::term_dict::{
-    CodeSpace, TermDictionary, check_candidates, check_code, find_by, lower_bound_by,
-    prefix_range_from, prefix_successor, split_verdicts, tolerant_fallback,
+    CodeSpace, TermDictionary, check_candidates, check_code, find_by, kind_verdicts,
+    lower_bound_by, prefix_range_from, prefix_successor, split_verdicts, tolerant_fallback,
 };
 
 /// A window's first and last term.
@@ -377,7 +377,7 @@ impl FileBackedDict {
     async fn visit_terms(
         &self,
         codes: &[TermCode],
-        mut visit: impl FnMut(usize, Result<&str>),
+        mut visit: impl FnMut(usize, &str),
     ) -> Result<()> {
         // Each window's run is found by a partition point, so a list out of
         // order would leave a code before its window's start (wrapping
@@ -422,18 +422,9 @@ impl FileBackedDict {
         };
         check_code(max, self.0.code_space)?;
         let mut terms = Vec::with_capacity(codes.len());
-        let mut failure = None;
-        self.visit_terms(codes, |_, term| match term {
-            Ok(term) => terms.push(Arc::from(term)),
-            Err(e) => {
-                failure.get_or_insert(e);
-            }
-        })
-        .await?;
-        match failure {
-            Some(e) => Err(e),
-            None => Ok(terms),
-        }
+        self.visit_terms(codes, |_, term| terms.push(Arc::from(term)))
+            .await?;
+        Ok(terms)
     }
 
     /// Code → term for `codes` in any order, repeats allowed, handed to
@@ -460,28 +451,12 @@ impl FileBackedDict {
         sorted.sort_unstable();
         let groups: Vec<&[(TermCode, usize)]> = sorted.chunk_by(|a, b| a.0 == b.0).collect();
         let distinct: Vec<TermCode> = groups.iter().map(|group| group[0].0).collect();
-        let mut failure = None;
-        self.visit_terms(&distinct, |j, term| match term {
-            Ok(term) => {
-                for &(_, i) in groups[j] {
-                    visit(i, Some(term));
-                }
-            }
-            Err(e) => {
-                failure.get_or_insert(e);
+        self.visit_terms(&distinct, |j, term| {
+            for &(_, i) in groups[j] {
+                visit(i, Some(term));
             }
         })
-        .await?;
-        failure.map_or(Ok(()), Err)
-    }
-
-    /// [`decode_many_with`](Self::decode_many_with) collected: one owned
-    /// string per decoded position.
-    pub(crate) async fn decode_many_any(&self, codes: &[TermCode]) -> Result<Vec<Option<String>>> {
-        let mut terms = vec![None; codes.len()];
-        self.decode_many_with(codes, |i, term| terms[i] = term.map(str::to_owned))
-            .await?;
-        Ok(terms)
+        .await
     }
 
     /// The async twin of `TermDictionary::encode_tolerant`.
@@ -547,24 +522,10 @@ impl FileBackedDict {
     ) -> Result<(Buffer<TermCode>, Buffer<TermCode>)> {
         check_candidates(codes, self.0.code_space)?;
         let kinds = self.kind_ranges().await?;
-        // Undecided until a verdict is set: a candidate no branch below reaches
-        // stays undecided rather than silently failing.
-        let mut verdicts = vec![Verdict::Unknown; codes.len()];
-        let (mut read_at, mut read) = (Vec::new(), Vec::new());
-        for (i, &code) in codes.iter().enumerate() {
-            match predicate.kind_verdict(kinds.kind_of_code(code)) {
-                Some(verdict) => verdicts[i] = verdict,
-                None => {
-                    read_at.push(i);
-                    read.push(code);
-                }
-            }
-        }
+        let (mut verdicts, read_at) = kind_verdicts(predicate, &kinds, codes);
+        let read: Vec<TermCode> = read_at.iter().map(|&at| codes[at]).collect();
         self.visit_terms(&read, |j, spelling| {
-            verdicts[read_at[j]] = match spelling {
-                Ok(spelling) => predicate.eval(spelling),
-                Err(_) => Verdict::Unknown,
-            };
+            verdicts[read_at[j]] = predicate.eval(spelling);
         })
         .await?;
         Ok(split_verdicts(codes, &verdicts))
@@ -864,6 +825,11 @@ mod tests {
         (fbd, terms)
     }
 
+    /// The public handle on `fbd`, which shares its window cache.
+    fn reader(fbd: &FileBackedDict) -> crate::DictReader {
+        super::super::handles::DictAccess::FileBacked(fbd.clone()).reader()
+    }
+
     /// What one 100-term FSST window costs the cache: its code offsets, one
     /// `u32` per term plus one, and the per-entry overhead.
     const WINDOW_BYTES: usize = 101 * size_of::<u32>() + WINDOW_ENTRY_OVERHEAD;
@@ -1034,7 +1000,10 @@ mod tests {
             }
         }
         assert_eq!(fbd.debug_windows_rebuilt() - before, 2);
-        let any = fbd.decode_many_any(&[450, 105, 450, 9999]).await.unwrap();
+        let any = reader(&fbd)
+            .decode_many(&[450, 105, 450, 9999])
+            .await
+            .unwrap();
         assert_eq!(any[0].as_deref(), Some(terms[450].as_str()));
         assert_eq!(any[1].as_deref(), Some(terms[105].as_str()));
         assert_eq!(any[3], None);
@@ -1100,7 +1069,7 @@ mod tests {
             assert!(decoded.iter().zip(&terms).all(|(got, want)| &**got == want));
             // Any order, repeats included.
             let scattered: Vec<TermCode> = [9, 0, 5, 9, 15, 2, 1, 5, 7, 12, 3, 9].into();
-            let got = fbd.decode_many_any(&scattered).await.unwrap();
+            let got = reader(&fbd).decode_many(&scattered).await.unwrap();
             for (code, term) in scattered.iter().zip(&got) {
                 assert_eq!(term.as_deref(), Some(terms[*code as usize].as_str()));
             }
@@ -1130,7 +1099,7 @@ mod tests {
             .map(|&code| terms.get(code as usize).cloned())
             .collect();
         assert_eq!(got, want);
-        assert_eq!(fbd.decode_many_any(&codes).await.unwrap(), want);
+        assert_eq!(reader(&fbd).decode_many(&codes).await.unwrap(), want);
     }
 
     /// The cache holds at most its budget and evicts the least recently used
