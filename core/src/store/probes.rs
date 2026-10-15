@@ -30,11 +30,21 @@ impl StructProbes {
         Arc::new(Self::default())
     }
 
-    /// The resolved probe for `base`'s `idx`-th struct child, resolving all
-    /// children on first use. `None` for a child whose encoding declines, a
-    /// non-struct base, or a base other than the one first resolved.
-    pub(crate) fn child(&self, base: &ArrayRef, idx: usize) -> Option<&Arc<OwnedSortedProbe>> {
-        Some(&self.cells(base)?.get(idx)?.1).and_then(Option::as_ref)
+    /// The cache's answer for `base`'s `idx`-th struct child, resolving all
+    /// children on first use: `Some(Some(probe))` for a resolved probe,
+    /// `Some(None)` for a child whose encoding declines (or one `base` lacks),
+    /// and `None` for a base other than the one first resolved — whose
+    /// children the cache cannot answer for.
+    pub(crate) fn child(
+        &self,
+        base: &ArrayRef,
+        idx: usize,
+    ) -> Option<Option<&Arc<OwnedSortedProbe>>> {
+        Some(
+            self.cells(base)?
+                .get(idx)
+                .and_then(|(_, probe)| probe.as_ref()),
+        )
     }
 
     /// Resolve `base`'s children now; later lookups against the same base
@@ -44,8 +54,9 @@ impl StructProbes {
         let _ = self.cells(base);
     }
 
-    /// The resolved probe for `base`'s child named `name`; `None` exactly as
-    /// for [`Self::child`].
+    /// The resolved probe for `base`'s child named `name`; `None` for a child
+    /// whose encoding declines or a name `base` lacks, and for a base other
+    /// than the one first resolved.
     pub(crate) fn by_name(&self, base: &ArrayRef, name: &str) -> Option<&Arc<OwnedSortedProbe>> {
         self.cells(base)?
             .iter()
@@ -85,29 +96,35 @@ impl StructProbes {
 mod tests {
     use super::*;
     use vortex_array::IntoArray;
-    use vortex_array::arrays::StructArray;
+    use vortex_array::arrays::{StructArray, VarBinViewArray};
     use vortex_array::validity::Validity;
     use vortex_buffer::Buffer;
 
-    fn u32_struct(values: impl IntoIterator<Item = u32>) -> ArrayRef {
-        let s = Buffer::from_iter(values).into_array();
-        let len = s.len();
-        StructArray::try_new(["s"].into(), vec![s], len, Validity::NonNullable)
+    /// A four-row struct of a u32 `s`, whose encoding resolves a probe, and a
+    /// Utf8 `o`, whose encoding resolves none.
+    fn mixed_struct() -> ArrayRef {
+        let s = Buffer::from_iter(0..4u32).into_array();
+        let o = VarBinViewArray::from_iter_str(["a", "b", "c", "d"]).into_array();
+        StructArray::try_new(["s", "o"].into(), vec![s, o], 4, Validity::NonNullable)
             .unwrap()
             .into_array()
     }
 
-    /// The cells resolve for the first base only; every other base looks up
-    /// as a miss.
+    /// The cells resolve for the first base only — a probe for a child whose
+    /// encoding resolves one, the cache's own decline (`Some(None)`) for one
+    /// whose encoding does not — and every other base looks up as a miss
+    /// (`None`).
     #[test]
     fn cells_decline_a_different_base() {
-        let a = u32_struct(0..4);
-        let b = u32_struct(0..4);
+        let a = mixed_struct();
+        let b = mixed_struct();
         let probes = StructProbes::new();
         probes.warm(&a);
         assert!(probes.cells(&a).is_some());
-        assert!(probes.child(&a, 0).is_some());
+        assert!(probes.child(&a, 0).flatten().is_some());
+        assert!(matches!(probes.child(&a, 1), Some(None)));
         assert!(probes.by_name(&a, "s").is_some());
+        assert!(probes.by_name(&a, "o").is_none());
         assert!(probes.cells(&b).is_none());
         assert!(probes.child(&b, 0).is_none());
         assert!(probes.by_name(&b, "s").is_none());

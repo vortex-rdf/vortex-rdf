@@ -254,7 +254,7 @@ fn check_children(parts: &StoreParts, base: RowId, label: &str) -> usize {
         "{label}: index children"
     );
     for component in &parts.built.components {
-        let who = format!("{label} / {}", component.name);
+        let who = format!("{label} / {}", component.identity.name);
         let rows = component.rows().unwrap();
         let rid: PrimitiveArray = field_as(rows, "rid", &mut ctx).unwrap();
         let rids: &[RowId] = rid.as_slice::<RowId>();
@@ -265,7 +265,7 @@ fn check_children(parts: &StoreParts, base: RowId, label: &str) -> usize {
             (base..base + N as RowId).collect::<BTreeSet<_>>(),
             "{who}: every row id once, numbered from the base"
         );
-        if !component.name.starts_with("index:ref-") {
+        if !component.identity.name.starts_with("index:ref-") {
             continue;
         }
         let val = rows.unmasked_field_by_name("val").unwrap();

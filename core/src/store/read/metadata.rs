@@ -11,7 +11,7 @@ use vortex_mask::Mask;
 use crate::error::Result;
 use crate::store::array::subject_sorted;
 use crate::store::indexes::copy::CopyFamily;
-use crate::store::indexes::{IndexType, KnownComponent, known_component};
+use crate::store::indexes::{ComponentIdentity, IndexType};
 use crate::store::schema::{QuadColumn, TermCode};
 use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{LayoutStrategy, QuadsSource, VortexRdfStore};
@@ -260,10 +260,10 @@ impl VortexRdfStore {
     /// the store holds them, each classified by its implementation slug: a
     /// child under a slug this version does not know is not listed.
     pub fn index_components(&self) -> Result<Vec<IndexComponentInfo>> {
-        let info = |known: KnownComponent, sorted: bool, rows: usize| IndexComponentInfo {
-            name: known.identity.name,
-            index: known.index,
-            sort_order: sort_order_of(known.identity.name),
+        let info = |identity: &ComponentIdentity, sorted: bool, rows: usize| IndexComponentInfo {
+            name: identity.name,
+            index: identity.index,
+            sort_order: sort_order_of(identity.name),
             sorted,
             rows,
         };
@@ -272,15 +272,16 @@ impl VortexRdfStore {
                 base, components, ..
             } => components
                 .iter()
-                .filter_map(|c| Some(info(known_component(c.slug)?, c.sorted, base.len())))
+                .map(|c| info(c.identity, c.sorted, base.len()))
                 .collect(),
             #[cfg(feature = "file-io")]
             QuadsSource::File { file, .. } => file
                 .components()
                 .iter()
                 .filter_map(|descriptor| {
-                    let known = known_component(&descriptor.implementation)?;
-                    Some(info(known, descriptor.sorted, file.row_count() as usize))
+                    let identity =
+                        crate::store::indexes::known_component(&descriptor.implementation)?;
+                    Some(info(identity, descriptor.sorted, file.row_count() as usize))
                 })
                 .collect(),
         })
@@ -412,5 +413,5 @@ fn sort_order_of(name: &str) -> Option<SortOrder> {
         (CopyFamily::Ospg, SortOrder::Ospg),
     ]
     .into_iter()
-    .find_map(|(family, order)| (family.component_name() == name).then_some(order))
+    .find_map(|(family, order)| (family.identity().name == name).then_some(order))
 }

@@ -2,11 +2,13 @@
 //! slice/take pipeline and the point-read path small selections take
 //! through encoded search probes.
 
-use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::struct_::StructArrayExt;
+use vortex_array::arrays::{PrimitiveArray, Struct, StructArray};
 use vortex_array::dtype::PType;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray};
 use vortex_mask::Mask;
+use vortex_rdf_encoded_search::SortedProbe;
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::probes::StructProbes;
@@ -54,47 +56,61 @@ pub(crate) fn gather_by_point_reads(
     deleted: Option<&Mask>,
     probes: Option<&StructProbes>,
 ) -> Result<Option<ArrayRef>> {
-    use vortex_array::arrays::struct_::StructArrayExt;
-    use vortex_array::arrays::{Struct, StructArray};
-    use vortex_rdf_encoded_search::SortedProbe;
-
     let Some(live) = selection.point_sized_live_rows(deleted) else {
         return Ok(None);
     };
     let live: Vec<usize> = live.into_iter().map(|i| i as usize).collect();
-    let Ok(struct_arr) = base.clone().try_downcast::<Struct>() else {
+    let Some(fields) = base.dtype().as_struct_fields_opt() else {
         return Ok(None);
     };
-    let names = struct_arr.names().clone();
-    let mut children = Vec::with_capacity(names.len());
-    for (idx, name) in names.iter().enumerate() {
-        let Ok(child) = struct_arr.unmasked_field_by_name(name.as_ref()) else {
-            return Ok(None);
-        };
-        // The store's cached probe first (resolution walks the encoding tree
-        // — the fixed cost this path exists to avoid); a transient base
-        // (tail, served rows) resolves per call.
-        let cached = probes.and_then(|p| p.child(base, idx));
-        let local;
-        let probe = match cached {
-            Some(owned) => owned.probe(),
-            None => {
-                let Some(resolved) = SortedProbe::resolve(child) else {
-                    return Ok(None);
-                };
-                local = resolved;
-                &local
-            }
-        };
-        let reads = live.iter().map(|&i| probe.value_at(i));
-        let Some(gathered) = primitive_from_u64_reads(child.dtype().as_ptype(), reads) else {
-            return Ok(None);
-        };
-        children.push(gathered);
-    }
+    let names = fields.names().clone();
+    let Some(children) = point_read_columns(base, names.iter().map(AsRef::as_ref), &live, probes)
+    else {
+        return Ok(None);
+    };
     let rows =
         StructArray::try_new(names, children, live.len(), Validity::NonNullable)?.into_array();
     Ok(Some(rows))
+}
+
+/// The `names` columns of the struct `array`, in that order, each read point
+/// by point at `positions` through its encoded-search probe into a canonical
+/// primitive — the loop behind every in-memory point read: a small
+/// selection's gather ([`gather_by_point_reads`]) and an index serve plan's
+/// small run. `None` declines: a non-struct `array`, a name it lacks, or a
+/// column (e.g. a string column) no probe resolves.
+///
+/// Each probe comes from `probes` when that cache holds `array`'s resolutions
+/// (resolution walks the encoding tree, the fixed cost this path exists to
+/// avoid) — a column it declined declines the read — and is resolved per
+/// call otherwise (a transient base: a tail, served rows).
+pub(crate) fn point_read_columns<'n>(
+    array: &ArrayRef,
+    names: impl IntoIterator<Item = &'n str>,
+    positions: &[usize],
+    probes: Option<&StructProbes>,
+) -> Option<Vec<ArrayRef>> {
+    let struct_arr = array.clone().try_downcast::<Struct>().ok()?;
+    let names = names.into_iter();
+    let mut children = Vec::with_capacity(names.size_hint().0);
+    for name in names {
+        let idx = struct_arr
+            .names()
+            .iter()
+            .position(|field| field.as_ref() == name)?;
+        let child = struct_arr.unmasked_field(idx);
+        let local;
+        let probe = match probes.and_then(|p| p.child(array, idx)) {
+            Some(cached) => cached?.probe(),
+            None => {
+                local = SortedProbe::resolve(child)?;
+                &local
+            }
+        };
+        let reads = positions.iter().map(|&i| probe.value_at(i));
+        children.push(primitive_from_u64_reads(child.dtype().as_ptype(), reads)?);
+    }
+    Some(children)
 }
 
 /// A primitive column of `ptype` built from point reads widened to `u64`.
@@ -116,8 +132,7 @@ pub(crate) fn primitive_from_u64_reads(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vortex_array::arrays::struct_::StructArrayExt;
-    use vortex_array::arrays::{Primitive, Struct, StructArray, VarBinViewArray};
+    use vortex_array::arrays::{Primitive, VarBinViewArray};
     use vortex_buffer::Buffer;
 
     /// A five-row canonical u32 struct whose `s` column is the row id.
@@ -153,7 +168,9 @@ mod tests {
         assert_eq!(column_u32(&rows, "p"), vec![0, 0]);
     }
 
-    /// A child no probe resolves (a string column) declines the whole read.
+    /// A child no probe resolves (a string column) declines the whole read —
+    /// resolved per call without a cache, and as the cache's own decline
+    /// (`Some(None)`) with the base's warmed one.
     #[test]
     fn gather_by_point_reads_declines_string_child() {
         let s = Buffer::from_iter(0..3u32).into_array();
@@ -164,6 +181,15 @@ mod tests {
         let selection = RowSelection::Ids(Buffer::from_iter([0u64, 2]));
         assert!(
             gather_by_point_reads(&base, &selection, None, None)
+                .unwrap()
+                .is_none()
+        );
+
+        let probes = StructProbes::new();
+        probes.warm(&base);
+        assert!(matches!(probes.child(&base, 1), Some(None)));
+        assert!(
+            gather_by_point_reads(&base, &selection, None, Some(&probes))
                 .unwrap()
                 .is_none()
         );

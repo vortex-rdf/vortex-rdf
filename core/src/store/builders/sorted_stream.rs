@@ -30,9 +30,6 @@ use super::{
 use crate::error::Result;
 use crate::store::RawQuad;
 use crate::store::array::{chunked_or_single, with_subject_stamp};
-use crate::store::indexes::reference::out_of_core::{
-    ref_child_chunk_codes, ref_child_chunk_strings,
-};
 use crate::store::indexes::{IndexComponent, Indexes, unique_indexes};
 use crate::store::layouts::dictionary::{TermCodeMap, TermDictionary, TermDictionaryBuilder};
 use crate::store::layouts::{LayoutStrategy, dictionary};
@@ -229,8 +226,7 @@ pub(crate) async fn build_chunk_stream(
                     merge_feeding_indexes(merger, guard.path(), chunk_size, &unique, |term| {
                         dictionary::code_of(code_map, term)
                     })?;
-                let components =
-                    merger_components(mergers, chunk_size, &guard, true, ref_child_chunk_codes)?;
+                let components = merger_components(mergers, chunk_size, &guard, true)?;
                 (merged, components)
             }
             Encoding::Strings(_) => {
@@ -238,8 +234,7 @@ pub(crate) async fn build_chunk_stream(
                     merge_feeding_indexes(merger, guard.path(), chunk_size, &unique, |term| {
                         Ok(term.to_string())
                     })?;
-                let components =
-                    merger_components(mergers, chunk_size, &guard, false, ref_child_chunk_strings)?;
+                let components = merger_components(mergers, chunk_size, &guard, false)?;
                 (merged, components)
             }
         }

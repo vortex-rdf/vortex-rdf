@@ -277,10 +277,10 @@ async fn test_a_0_12_build_gives_the_guarantees_the_refusal_protects() {
         for component in built
             .components
             .iter()
-            .filter(|c| c.name.starts_with("index:ref-"))
+            .filter(|c| c.identity.name.starts_with("index:ref-"))
         {
             let pairs = reference_child(component);
-            let who = format!("{layout:?} / {}", component.name);
+            let who = format!("{layout:?} / {}", component.identity.name);
             assert_eq!(pairs.len(), 24, "{who}: one record per quad");
             assert!(
                 pairs.windows(2).all(|pair| pair[0] < pair[1]),

@@ -46,11 +46,11 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::{ArrayRef, IntoArray};
 
-use super::components::child_struct;
-use super::{COL_RID, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds};
+use super::components::{ComponentIdentity, IndexComponent, TermColumn, components_from};
+use super::{COL_RID, IndexResolution, IndexType, LazyRowIds, ResolvedRoles, ResolvedRowIds};
 use crate::error::Result;
 use crate::store::RawQuad;
-use crate::store::array::{make_string_array, stamp_is_sorted};
+use crate::store::array::stamp_is_sorted;
 use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout, TermRef};
 use crate::store::schema::{COL_G, COL_O, COL_P, COL_S, TermCode};
@@ -81,35 +81,44 @@ const CHILD_COLUMNS: [&str; 5] = [COL_S, COL_P, COL_O, COL_G, COL_RID];
 const CHILD_PRIMARY: [&str; 4] = [COL_S, COL_P, COL_O, COL_G];
 
 /// This index's persisted-child identity table — one differently-sorted quad
-/// table per family — feeding every generic loop in the hub (the slug
-/// registry and the roster it builds); see
-/// [`IndexType::component_identities`](super::IndexType::component_identities). Built
-/// from the [`CopyFamily`] accessors so each name keeps exactly one spelling.
-pub(crate) const IDENTITIES: [super::ComponentIdentity; 2] = [
-    super::ComponentIdentity {
-        name: CopyFamily::Posg.component_name(),
-        slug: CopyFamily::Posg.component_slug(),
+/// table per family, in [`CopyFamily`] order — feeding every generic loop in
+/// the hub (the slug registry and the roster it builds); see
+/// [`IndexType::component_identities`](super::IndexType::component_identities).
+/// Each family reaches its row through [`CopyFamily::identity`], so each name
+/// keeps exactly one spelling.
+pub(crate) static IDENTITIES: [ComponentIdentity; 2] = [
+    ComponentIdentity {
+        name: "index:posg",
+        slug: "secondary-by-copy/posg",
+        index: IndexType::SecondaryByCopy,
     },
-    super::ComponentIdentity {
-        name: CopyFamily::Ospg.component_name(),
-        slug: CopyFamily::Ospg.component_slug(),
+    ComponentIdentity {
+        name: "index:ospg",
+        slug: "secondary-by-copy/ospg",
+        index: IndexType::SecondaryByCopy,
     },
 ];
 
 impl CopyFamily {
-    /// The persisted child's component name.
-    pub(crate) const fn component_name(self) -> &'static str {
+    /// The persisted child's identity: its component name, implementation
+    /// slug and owning index.
+    pub(crate) const fn identity(self) -> &'static ComponentIdentity {
         match self {
-            CopyFamily::Posg => "index:posg",
-            CopyFamily::Ospg => "index:ospg",
+            CopyFamily::Posg => &IDENTITIES[0],
+            CopyFamily::Ospg => &IDENTITIES[1],
         }
     }
 
-    /// The persisted child's implementation slug.
-    pub(crate) const fn component_slug(self) -> &'static str {
+    /// Where each quad component (s, p, o, g) sits inside this family's
+    /// [`CopyKey`] tuple, which stores the components in sort-key order.
+    /// Compiled where the out-of-core builder is.
+    ///
+    /// [`CopyKey`]: out_of_core::CopyKey
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn key_positions(self) -> [usize; 4] {
         match self {
-            CopyFamily::Posg => "secondary-by-copy/posg",
-            CopyFamily::Ospg => "secondary-by-copy/ospg",
+            CopyFamily::Posg => [2, 0, 1, 3],
+            CopyFamily::Ospg => [1, 2, 0, 3],
         }
     }
 
@@ -219,7 +228,7 @@ fn choose<'a>(pattern: QuadPattern<'a>) -> Option<CopyProbe<'a>> {
 /// also what makes the second column sorted within each lead run and the
 /// prefix search valid.
 pub(crate) fn resolve_in_memory(
-    components: &[super::IndexComponent],
+    components: &[IndexComponent],
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
@@ -231,8 +240,7 @@ pub(crate) fn resolve_in_memory(
     // Route through the index only when the family's component exists and its
     // sort keys are globally sorted — the writer's provenance, not a stamp
     // inspection.
-    let Some(component) =
-        super::IndexComponent::find_sorted(components, probe.family.component_name())
+    let Some(component) = IndexComponent::find_sorted(components, probe.family.identity().name)
     else {
         return Ok(IndexResolution::Declined);
     };
@@ -249,8 +257,7 @@ pub(crate) fn resolve_in_memory(
     // Binary search bounds the run of rows whose lead component equals the
     // probe — through the component's cached probe when the column resolves
     // one.
-    let Some(mut run) =
-        super::component_probe_run(component, probe.family.child_lead_col(), &lead_native, None)?
+    let Some(mut run) = component.probe_run(probe.family.child_lead_col(), &lead_native, None)?
     else {
         return Ok(IndexResolution::Declined);
     };
@@ -263,12 +270,8 @@ pub(crate) fn resolve_in_memory(
         let Some(second_native) = codes.probe_scalar(second_term)? else {
             return Ok(IndexResolution::Empty);
         };
-        let Some(narrowed) = super::component_probe_run(
-            component,
-            probe.family.child_second_col(),
-            &second_native,
-            Some(run),
-        )?
+        let Some(narrowed) =
+            component.probe_run(probe.family.child_second_col(), &second_native, Some(run))?
         else {
             return Ok(IndexResolution::Declined);
         };
@@ -294,7 +297,7 @@ pub(crate) fn resolve_in_memory(
             CHILD_PRIMARY,
             COL_RID,
             copy_decode_layout(layout),
-            component.name,
+            component.identity.name,
             rows.clone().into_array(),
             run,
             component.probes_arc(),
@@ -333,7 +336,7 @@ pub(crate) async fn resolve_file(
     };
     // The store's index set says this index exists, but be graceful when the
     // family's child is absent (a foreign writer could omit one family).
-    let Some((descriptor, reader)) = file.component_reader(probe.family.component_name())? else {
+    let Some((descriptor, reader)) = file.component_reader(probe.family.identity().name)? else {
         return Ok(IndexResolution::Declined);
     };
     let sorted = descriptor.sorted;
@@ -354,7 +357,7 @@ pub(crate) async fn resolve_file(
     // lead search over the whole child, then — for a prefix probe — the
     // windowed second-key search inside the lead run. Any probe decline
     // abandons the location wholesale.
-    let name = probe.family.component_name();
+    let name = probe.family.identity().name;
     let mut located = super::file::locate_component_run(
         file,
         name,
@@ -498,8 +501,8 @@ pub(crate) mod out_of_core {
     use vortex_array::dtype::DType;
     use vortex_array::{ArrayRef, IntoArray};
 
-    use super::super::components::{child_struct, child_struct_dtype};
-    use super::{CHILD_COLUMNS, CopyFamily, TermColumn};
+    use super::super::components::{TermColumn, child_struct, child_struct_dtype};
+    use super::{CHILD_COLUMNS, CopyFamily};
     use crate::error::Result;
     use crate::store::array::stamp_is_sorted;
     use crate::store::schema::{CODE_PTYPE, ROW_ID_PTYPE, RowId};
@@ -548,17 +551,6 @@ pub(crate) mod out_of_core {
         child_struct(&CHILD_COLUMNS, columns, keys.len()).map(|a| a.into_array())
     }
 
-    impl CopyFamily {
-        /// Where each quad component (s, p, o, g) sits inside this family's
-        /// [`CopyKey`] tuple, which stores the components in sort-key order.
-        pub(super) fn key_positions(self) -> [usize; 4] {
-            match self {
-                CopyFamily::Posg => [2, 0, 1, 3],
-                CopyFamily::Ospg => [1, 2, 0, 3],
-            }
-        }
-    }
-
     /// A quad's terms rearranged into one family's sort-key order, so deriving
     /// `Ord` (and the spill machinery's pair sort) compares by exactly that
     /// family's comparator. `V` is the term encoding: `String`, or
@@ -598,26 +590,6 @@ pub(crate) mod out_of_core {
             let [s, p, o, g] = spog;
             Self([o, s, p, g])
         }
-    }
-}
-
-/// A copy column's term encoding — `String` terms, or [`TermCode`]s under
-/// the Dictionary layout — and the array a column of them assembles into.
-pub(crate) trait TermColumn: Clone + Ord {
-    fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef
-    where
-        Self: 'a;
-}
-
-impl TermColumn for String {
-    fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef {
-        make_string_array(it.map(String::as_str))
-    }
-}
-
-impl TermColumn for TermCode {
-    fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef {
-        PrimitiveArray::from_iter(it.copied()).into_array()
     }
 }
 
@@ -711,21 +683,15 @@ impl GlobalCopyArrays {
     /// This index's two persisted children, one sorted quad copy per family.
     /// Globally sorted by construction, so both are handed over with that
     /// provenance.
-    pub(crate) fn into_components(self) -> Result<Vec<super::IndexComponent>> {
+    pub(crate) fn into_components(self) -> Result<Vec<IndexComponent>> {
         let Self { posg, ospg } = self;
-        [(CopyFamily::Posg, posg), (CopyFamily::Ospg, ospg)]
-            .into_iter()
-            .map(|(family, columns)| {
-                let len = columns[0].len();
-                let rows = child_struct(&CHILD_COLUMNS, columns.to_vec(), len)?;
-                Ok(super::IndexComponent::built(
-                    family.component_name(),
-                    family.component_slug(),
-                    rows,
-                    true,
-                ))
-            })
-            .collect()
+        components_from(
+            &CHILD_COLUMNS,
+            [
+                (CopyFamily::Posg.identity(), Vec::from(posg)),
+                (CopyFamily::Ospg.identity(), Vec::from(ospg)),
+            ],
+        )
     }
 }
 

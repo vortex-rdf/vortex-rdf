@@ -42,7 +42,7 @@ use vortex_mask::Mask;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
-use crate::store::scan::gather::primitive_from_u64_reads;
+use crate::store::scan::gather::point_read_columns;
 use crate::store::schema::{RowId, TermCode};
 use crate::store::view::selection::point_sized;
 
@@ -51,7 +51,7 @@ use crate::store::view::selection::point_sized;
 /// row id, and the layout the projected columns decode through. Acquisition
 /// differs per backend; everything after it lives here, once.
 #[derive(Clone)]
-pub(crate) struct ServeDecode {
+pub(super) struct ServeDecode {
     /// The source column for each primary `(s, p, o, g)` component, in that
     /// order — the index's own columns holding the whole quad.
     pub(super) primary_columns: [&'static str; 4],
@@ -68,7 +68,7 @@ impl ServeDecode {
     /// The decode tail of a plan whose index columns `primary_columns` hold
     /// the quad, `rid_column` its primary row id, decoded through
     /// `decode_layout`.
-    pub(crate) fn new(
+    pub(super) fn new(
         primary_columns: [&'static str; 4],
         rid_column: &'static str,
         decode_layout: ResolvedLayout,
@@ -83,7 +83,7 @@ impl ServeDecode {
     /// Decode the `(s, p, o, g)` rows out of a chunk of the plan's projected
     /// index columns, dropping rows tombstoned in `deleted` via the row-id
     /// column.
-    pub(crate) fn decode_columns<T: ChunkDecode>(
+    pub(super) fn decode_columns<T: ChunkDecode>(
         &self,
         chunk: &ArrayRef,
         deleted: Option<&Mask>,
@@ -99,7 +99,7 @@ impl ServeDecode {
     /// where each chunk's codes are resolved by reading the dictionary
     /// windows that hold them.
     #[cfg(feature = "file-io")]
-    pub(crate) async fn decode_columns_async<T: ChunkDecode>(
+    pub(super) async fn decode_columns_async<T: ChunkDecode>(
         &self,
         chunk: &ArrayRef,
         deleted: Option<&Mask>,
@@ -149,7 +149,7 @@ impl ServeDecode {
 
     /// A small run's live rows as a primary-named `(s, p, o, g)` canonical
     /// struct, read point-by-point at the run's global positions through the
-    /// component's cached probes — no slice, no per-call probe resolution.
+    /// component's cached probes ([`point_read_columns`]) — no slice.
     /// `Ok(None)` declines (a wide run, or a column — e.g. a string copy —
     /// whose encoding resolves no probe); the caller keeps the slice path.
     fn point_read_run_rows(
@@ -163,18 +163,10 @@ impl ServeDecode {
             return Ok(None);
         };
         let live: Vec<usize> = live.unwrap_or_else(|| range.collect());
-        let mut children = Vec::with_capacity(4);
-        for name in self.primary_columns {
-            let Some(probe) = probes.by_name(array, name) else {
-                return Ok(None);
-            };
-            let reads = live.iter().map(|&pos| probe.value_at(pos));
-            let Some(child) = primitive_from_u64_reads(probe.array().dtype().as_ptype(), reads)
-            else {
-                return Ok(None);
-            };
-            children.push(child);
-        }
+        let Some(children) = point_read_columns(array, self.primary_columns, &live, Some(probes))
+        else {
+            return Ok(None);
+        };
         Ok(Some(
             StructArray::try_new(
                 FieldNames::from(crate::store::schema::PRIMARY_COLUMNS),
@@ -190,7 +182,7 @@ impl ServeDecode {
     /// code-payload counterpart of [`decode_columns`](Self::decode_columns)
     /// for a Dictionary decode layout, whose columns hold codes.
     #[cfg(feature = "file-io")]
-    pub(crate) fn chunk_code_columns(
+    pub(super) fn chunk_code_columns(
         &self,
         chunk: &ArrayRef,
         deleted: Option<&Mask>,

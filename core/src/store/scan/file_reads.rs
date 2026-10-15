@@ -328,7 +328,6 @@ pub(crate) fn build_file_filter(
 /// The conjunction of `column == value` equalities over root fields — the
 /// filter shape every pushed-down index probe and serve scan uses. `None`
 /// for an empty constraint set.
-#[cfg(feature = "file-io")]
 pub(crate) fn eq_conjunction(
     constraints: impl IntoIterator<Item = (&'static str, Scalar)>,
 ) -> Option<Expression> {

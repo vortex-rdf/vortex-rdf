@@ -500,6 +500,16 @@ mod tests {
         assert_eq!(ids.as_slice(), &want[..]);
     }
 
+    /// An id selection tests exactly the rows it names.
+    #[test]
+    fn id_selection_tests_named_rows_only() {
+        let sa = mixed_struct(100);
+        let eqs = eqs(&[("p", 3)]);
+        let selection = RowSelection::Ids(Buffer::from_iter([3u64, 4, 10, 17, 99]));
+        let ids = typed_residual_ids(&sa, &selection, 100, &eqs, None).unwrap();
+        assert_eq!(ids.as_slice(), &[3u64, 10, 17]);
+    }
+
     const LONG: &str = "a string longer than the twelve inline view bytes";
 
     /// A struct of {canonical code `p`, Utf8 `o`} whose strings mix the

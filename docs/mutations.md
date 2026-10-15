@@ -145,7 +145,7 @@ flowchart TD
   for mask-based refinement); every *read* path does.
   [`RowSelection::live_mask`](../core/src/store/view/selection.rs#L346) answers
   "which of this selection's own rows are not tombstoned", and the in-memory
-  reads all go through [`gather_live`](../core/src/store/scan/gather.rs#L22)
+  reads all go through [`gather_live`](../core/src/store/scan/gather.rs#L24)
   — the single place a view becomes rows — so applying the mask cannot be
   forgotten by one of them. [`size`](../core/src/store/read/rows.rs#L38) counts
   the live bits without gathering; the tail applies its own mask through
@@ -153,7 +153,7 @@ flowchart TD
 - **File-backed stores** tombstone the same way (a file cannot be rewritten
   on delete). The doomed set is evaluated to a file-wide mask by
   [`matching_file_row_mask`](../core/src/store/write/mutation.rs#L327) (through
-  [`matching_file_rows`](../core/src/store/scan/file_filter.rs#L297)), and on
+  [`matching_file_rows`](../core/src/store/scan/file_filter.rs#L309)), and on
   every later read the mask is applied **inside the scan**
   ([`restrict_scan`](../core/src/store/scan/file_reads.rs#L219)) — as an
   `ExcludeByIndex` selection of the deleted ids for an `All` or `Range`
@@ -222,7 +222,7 @@ flowchart TD
   `<store>.write-<uuid>.tmp` exists before the work starts (a process killed
   meanwhile leaves it behind, and nothing removes it later). The sorted rows
   are then streamed through the out-of-core builder
-  ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L174))
+  ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L171))
   into it
   ([`built_stream_to_vortex_writer`](../core/src/io/write.rs#L92)), which is
   then renamed over the original path, and the store is reopened
