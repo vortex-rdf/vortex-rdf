@@ -145,13 +145,15 @@ async fn write_unsorted_store_file(
     let codes = dictionary::encode_quads(&raws, &code_map).unwrap();
     let primary = dictionary::build_code_chunk(&codes, 0..raws.len(), false).unwrap();
     let parts = crate::store::StoreParts {
-        array: primary,
-        components: Vec::new(),
-        dict: Some(std::sync::Arc::new(dict)),
+        built: crate::store::BuiltArray {
+            array: primary,
+            components: Vec::new(),
+            dict: Some(std::sync::Arc::new(dict)),
+        },
         quads_sorted: false,
     };
     let mut bytes: Vec<u8> = Vec::new();
-    crate::io::write::serialize_parts(&parts, &mut bytes)
+    crate::io::write::built_stream_to_vortex_writer(parts.into_stream().unwrap(), &mut bytes)
         .await
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
