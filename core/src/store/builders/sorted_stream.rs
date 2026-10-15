@@ -24,9 +24,9 @@ use super::spill::{Run, RunMerger, RunSpiller, TempRunsGuard};
 use super::stream_indexes::{IndexMergers, merge_quads_feeding_indexes, merger_components};
 use super::{
     BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_ROWS, VortexArrayBuilder, assemble_chunks,
-    build_struct_array, into_vortex_error, make_empty_struct,
+    build_struct_array, make_empty_struct,
 };
-use crate::error::{Result, VortexRdfError};
+use crate::error::Result;
 use crate::store::RawQuad;
 use crate::store::array::{chunked_or_single, with_subject_stamp};
 use crate::store::indexes::{IndexComponent, IndexType, Indexes, known_component, unique_indexes};
@@ -94,11 +94,7 @@ pub(crate) async fn build_array(
     let start = debug::timer();
 
     let built = build_chunk_stream(quad_stream, layout, indexes.clone(), chunk_size, None).await?;
-    let chunks: Vec<ArrayRef> = built
-        .chunks
-        .try_collect()
-        .await
-        .map_err(VortexRdfError::Vortex)?;
+    let chunks: Vec<ArrayRef> = built.chunks.try_collect().await?;
 
     // Materialize each streamed component child as one canonical struct in
     // child schema. Sortedness is the descriptor's provenance — the mergers
@@ -109,17 +105,9 @@ pub(crate) async fn build_array(
         let Some(known) = known_component(&component.descriptor.implementation) else {
             continue;
         };
-        let arrays: Vec<ArrayRef> = component
-            .source
-            .open()
-            .map_err(VortexRdfError::Vortex)?
-            .try_collect()
-            .await
-            .map_err(VortexRdfError::Vortex)?;
+        let arrays: Vec<ArrayRef> = component.source.open()?.try_collect().await?;
         let part = chunked_or_single(arrays, component.descriptor.dtype.clone())?;
-        let array = part
-            .execute::<StructArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
+        let array = part.execute::<StructArray>(&mut ctx)?;
         components.push(IndexComponent::built(
             known.identity.name,
             known.identity.slug,
@@ -306,7 +294,7 @@ fn chunk_stream<S: Send + 'static>(
             match chunk {
                 Ok(None) => None,
                 Ok(Some(c)) => Some((Ok(c), (source, pull, build))),
-                Err(e) => Some((Err(into_vortex_error(e)), (source, pull, build))),
+                Err(e) => Some((Err(e.into()), (source, pull, build))),
             }
         },
     );

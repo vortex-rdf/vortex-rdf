@@ -422,10 +422,7 @@ fn scan_chunk_stream<T: Send + 'static>(
     decode: impl Fn(ArrayRef) -> Vec<Result<T>> + Send + Sync + 'static,
     tail_quads: Vec<Result<T>>,
 ) -> Result<Box<dyn Stream<Item = Vec<Result<T>>> + Unpin + Send + 'static>> {
-    let stream = scan
-        .map(move |chunk| Ok(decode(chunk)))
-        .into_stream()
-        .map_err(VortexRdfError::Vortex)?;
+    let stream = scan.map(move |chunk| Ok(decode(chunk))).into_stream()?;
     let chunk_stream = stream
         .map(|chunk_res| match chunk_res {
             Err(e) => vec![Err(VortexRdfError::Vortex(e))],
@@ -445,7 +442,7 @@ fn scan_chunk_stream_async<T: Send + 'static>(
     mut decode: impl FnMut(ArrayRef) -> BoxFuture<'static, Vec<Result<T>>> + Send + 'static,
     tail_quads: Vec<Result<T>>,
 ) -> Result<Box<dyn Stream<Item = Vec<Result<T>>> + Unpin + Send + 'static>> {
-    let stream = scan.into_stream().map_err(VortexRdfError::Vortex)?;
+    let stream = scan.into_stream()?;
     let chunk_stream = stream
         .then(move |chunk_res| match chunk_res {
             Err(e) => future::ready(vec![Err(VortexRdfError::Vortex(e))]).boxed(),

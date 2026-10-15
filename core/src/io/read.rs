@@ -65,7 +65,7 @@ where
 {
     let mut chunks = Vec::new();
     while let Some(chunk) = results.next().await {
-        if let Some(chunk) = chunk.map_err(VortexRdfError::Vortex)? {
+        if let Some(chunk) = chunk? {
             chunks.push(chunk);
         }
     }
@@ -158,8 +158,8 @@ pub(crate) mod spawn_probe {
 /// resolve synchronously) be read on wasm and in no-file-io builds.
 pub(crate) async fn scan_all(file: &vortex_file::VortexFile) -> Result<ArrayRef> {
     let dtype = file.dtype().clone();
-    let scan = file.scan().map_err(VortexRdfError::Vortex)?;
-    let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
+    let scan = file.scan()?;
+    let tasks = scan.build()?;
     collect_scan(dtype, tasks).await
 }
 
@@ -180,7 +180,7 @@ pub(crate) async fn scan_reader_chunks(
         crate::session::VORTEX_SESSION.clone(),
         reader,
     );
-    let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
+    let tasks = scan.build()?;
     collect_chunks(tasks).await
 }
 

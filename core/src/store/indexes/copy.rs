@@ -48,7 +48,7 @@ use vortex_array::{ArrayRef, IntoArray};
 
 use super::components::child_struct;
 use super::{COL_RID, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds};
-use crate::error::{Result, VortexRdfError};
+use crate::error::Result;
 use crate::store::RawQuad;
 use crate::store::array::{make_string_array, stamp_is_sorted};
 use crate::store::layouts::dictionary::QuadCodes;
@@ -282,11 +282,7 @@ pub(crate) fn resolve_in_memory(
     // row order. Handed back lazily: the serving plan below answers reads
     // without the ids, so the decode+sort runs only if a consumer needs the
     // selection itself.
-    let rids = rows
-        .unmasked_field_by_name(COL_RID)
-        .map_err(VortexRdfError::Vortex)?
-        .slice(run.clone())
-        .map_err(VortexRdfError::Vortex)?;
+    let rids = rows.unmasked_field_by_name(COL_RID)?.slice(run.clone())?;
     Ok(IndexResolution::Resolved {
         row_ids: ResolvedRowIds::Lazy(LazyRowIds::from_component_run(rids)),
         resolves: probe.resolves,
@@ -337,10 +333,7 @@ pub(crate) async fn resolve_file(
     };
     // The store's index set says this index exists, but be graceful when the
     // family's child is absent (a foreign writer could omit one family).
-    let Some((descriptor, reader)) = file
-        .component_reader(probe.family.component_name())
-        .map_err(VortexRdfError::Vortex)?
-    else {
+    let Some((descriptor, reader)) = file.component_reader(probe.family.component_name())? else {
         return Ok(IndexResolution::Declined);
     };
     let sorted = descriptor.sorted;

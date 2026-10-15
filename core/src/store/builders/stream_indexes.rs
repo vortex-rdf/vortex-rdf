@@ -3,9 +3,8 @@
 //! sorted runs, and the native components that stream each family off its
 //! own merger beside the quad chunks.
 
-use super::into_vortex_error;
 use super::spill::{MergedSink, Run, RunMerger, RunSpiller, RunWriter, Spillable, TempRunsGuard};
-use crate::error::{Result, VortexRdfError};
+use crate::error::Result;
 use crate::io::container::NativeComponentWrite;
 use crate::store::RawQuad;
 use crate::store::indexes::copy::{self, out_of_core::CopyKey};
@@ -187,29 +186,26 @@ where
                 // chunk to write a schema-complete component.
                 Ok(None) if !emitted => {
                     emitted = true;
-                    pull(0).map_err(into_vortex_error)
+                    Ok(pull(0)?)
                 }
                 Ok(None) => Ok(None),
-                Err(e) => Err(into_vortex_error(e)),
+                Err(e) => Err(e.into()),
             }
         });
-        components.push(
-            NativeComponentWrite::new(
-                StoreComponentDescriptor {
-                    name: name.into(),
-                    role: StoreComponentRole::Index,
-                    implementation: slug.into(),
-                    version: INDEX_VERSION,
-                    required: false,
-                    // The merger emits each family in its global sort order.
-                    sorted: true,
-                    dtype: dtype.clone(),
-                },
-                Arc::new(PullComponentSource::new(dtype.clone(), chunk_size, pull_fn)),
-                child_strategy(&dtype),
-            )
-            .map_err(VortexRdfError::Vortex)?,
-        );
+        components.push(NativeComponentWrite::new(
+            StoreComponentDescriptor {
+                name: name.into(),
+                role: StoreComponentRole::Index,
+                implementation: slug.into(),
+                version: INDEX_VERSION,
+                required: false,
+                // The merger emits each family in its global sort order.
+                sorted: true,
+                dtype: dtype.clone(),
+            },
+            Arc::new(PullComponentSource::new(dtype.clone(), chunk_size, pull_fn)),
+            child_strategy(&dtype),
+        )?);
         Ok(())
     };
 

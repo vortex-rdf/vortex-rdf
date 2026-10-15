@@ -181,8 +181,7 @@ impl ServeDecode {
                 children,
                 live.len(),
                 Validity::NonNullable,
-            )
-            .map_err(VortexRdfError::Vortex)?
+            )?
             .into_array(),
         ))
     }
@@ -199,8 +198,7 @@ impl ServeDecode {
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let rows = self
             .chunk_rows(chunk, deleted)?
-            .execute::<StructArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
+            .execute::<StructArray>(&mut ctx)?;
         let [s, p, o, g] = crate::store::schema::PRIMARY_COLUMNS;
         let mut column = |name: &str| -> Result<Buffer<TermCode>> {
             Ok(
@@ -215,10 +213,7 @@ impl ServeDecode {
     /// source columns, then drop any whose primary row id is tombstoned.
     fn chunk_rows(&self, chunk: &ArrayRef, deleted: Option<&Mask>) -> Result<ArrayRef> {
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let struct_arr = chunk
-            .clone()
-            .execute::<StructArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
+        let struct_arr = chunk.clone().execute::<StructArray>(&mut ctx)?;
         let col = |name: &'static str| {
             struct_arr
                 .unmasked_field_by_name(name)
@@ -232,8 +227,7 @@ impl ServeDecode {
             vec![col(s)?, col(p)?, col(o)?, col(g)?],
             len,
             Validity::NonNullable,
-        )
-        .map_err(VortexRdfError::Vortex)?
+        )?
         .into_array();
         // Point-read the run through the component probes when it is small
         // enough (`gather_by_point_reads` gates on `POINT_GATHER_MAX_ROWS`);
@@ -253,9 +247,7 @@ impl ServeDecode {
         };
         // Tombstones are defined over primary row ids; the rid column says which
         // primary row each served row mirrors.
-        let rid_col = col(self.rid_column)?
-            .execute::<PrimitiveArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
+        let rid_col = col(self.rid_column)?.execute::<PrimitiveArray>(&mut ctx)?;
         let mut positions = Vec::with_capacity(len);
         for (position, &rid) in rid_col.as_slice::<RowId>().iter().enumerate() {
             if !deleted.value(super::row_index(super::base_row(rid))?) {

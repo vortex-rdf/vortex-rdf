@@ -141,9 +141,9 @@ pub(crate) mod driver_hooks {
 /// splits do filter and decode work, so a large scan needs the workers; an
 /// index child's row-id scan goes through [`read_index_row_ids`] instead.
 pub(crate) async fn read_all_rows(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRef> {
-    let dtype = scan.dtype().map_err(VortexRdfError::Vortex)?;
+    let dtype = scan.dtype()?;
     let window = scan.concurrency() * available_parallelism();
-    let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
+    let tasks = scan.build()?;
     match ScanDriver::for_row_scan(tasks.len()) {
         ScanDriver::Inline => collect_scan(dtype, tasks).await,
         ScanDriver::Spawned => collect_scan_spawned(dtype, tasks, window).await,
@@ -162,7 +162,7 @@ pub(crate) fn stream_rows(
     scan: ScanBuilder<ArrayRef>,
 ) -> Result<BoxStream<'static, Result<ArrayRef>>> {
     let window = scan.concurrency() * available_parallelism();
-    let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
+    let tasks = scan.build()?;
     let splits = match ScanDriver::for_row_scan(tasks.len()) {
         ScanDriver::Inline => inline_splits(tasks).boxed(),
         ScanDriver::Spawned => spawned_splits(tasks, window).boxed(),
@@ -181,8 +181,8 @@ pub(crate) fn stream_rows(
 /// caller says so here, not because of its `ordered` flag: any other scan goes
 /// through [`read_all_rows`].
 pub(crate) async fn read_index_row_ids(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRef> {
-    let dtype = scan.dtype().map_err(VortexRdfError::Vortex)?;
-    let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
+    let dtype = scan.dtype()?;
+    let tasks = scan.build()?;
     collect_scan(dtype, tasks).await
 }
 
@@ -286,27 +286,20 @@ pub(crate) async fn column_positions(
 
     #[cfg(test)]
     file.note_column_stream();
-    let mut scan = file.scan().map_err(VortexRdfError::Vortex)?;
-    let scope = scan.dtype().map_err(VortexRdfError::Vortex)?;
-    scan = scan.with_projection(
-        file.bound_exprs()
-            .bind(QUAD_SCOPE, &select(&[column][..], root()), &scope)
-            .map_err(VortexRdfError::Vortex)?,
-    );
-    let mut chunks = Box::pin(
-        selection
-            .restrict_scan(scan, None)
-            .into_array_stream()
-            .map_err(VortexRdfError::Vortex)?,
-    );
+    let mut scan = file.scan()?;
+    let scope = scan.dtype()?;
+    scan = scan.with_projection(file.bound_exprs().bind(
+        QUAD_SCOPE,
+        &select(&[column][..], root()),
+        &scope,
+    )?);
+    let mut chunks = Box::pin(selection.restrict_scan(scan, None).into_array_stream()?);
     let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
     let mut positions = Vec::new();
     let mut offset = 0usize;
     while let Some(chunk) = chunks.next().await {
-        let chunk = chunk.map_err(VortexRdfError::Vortex)?;
-        let struct_arr = chunk
-            .execute::<StructArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
+        let chunk = chunk?;
+        let struct_arr = chunk.execute::<StructArray>(&mut ctx)?;
         let prim = crate::store::array::field_as::<PrimitiveArray>(&struct_arr, column, &mut ctx)?;
         let codes = prim.as_slice::<TermCode>();
         positions.extend(
@@ -410,8 +403,7 @@ pub(crate) async fn narrow_subject_run(
         };
         let Some(narrowed) = chunks
             .bounds_in(run.clone(), needle, &source, session)
-            .await
-            .map_err(VortexRdfError::Vortex)?
+            .await?
         else {
             break;
         };
@@ -582,11 +574,7 @@ async fn rows_reading(
         }
         let mut kept = Vec::with_capacity(live.len());
         for &row in &live {
-            match handle
-                .value_at(row, &source, session)
-                .await
-                .map_err(VortexRdfError::Vortex)?
-            {
+            match handle.value_at(row, &source, session).await? {
                 Some(v) if v == *code => kept.push(row),
                 Some(_) => {}
                 None => return Ok(None),
@@ -640,7 +628,7 @@ pub(crate) async fn point_filter_ids(
     let Some(eqs) = eq_code_pairs(filter) else {
         return Ok(None);
     };
-    let splits = file.splits().map_err(VortexRdfError::Vortex)?;
+    let splits = file.splits()?;
     if !Footprint::of(ids, &splits).sparse(POINT_READ_ROWS) {
         return Ok(None);
     }
@@ -688,7 +676,7 @@ pub(crate) async fn take_file_rows(
     if ids.is_empty() {
         return Ok(None);
     }
-    let splits = file.splits().map_err(VortexRdfError::Vortex)?;
+    let splits = file.splits()?;
     // The ids grouped by split: the rows from the group's first to past its
     // last id, and each id's offset in them.
     let mut groups: Vec<(Range<u64>, Vec<u64>)> = Vec::new();
@@ -706,17 +694,15 @@ pub(crate) async fn take_file_rows(
         rest = &rest[inside..];
         idx += 1;
     }
-    let reader = file.layout_reader().map_err(VortexRdfError::Vortex)?;
-    let projection = file
-        .bound_exprs()
-        .bind(QUAD_SCOPE, &select(columns, root()), reader.dtype())
-        .map_err(VortexRdfError::Vortex)?;
+    let reader = file.layout_reader()?;
+    let projection =
+        file.bound_exprs()
+            .bind(QUAD_SCOPE, &select(columns, root()), reader.dtype())?;
     let mut tasks = Vec::with_capacity(groups.len());
     for (rows, offsets) in groups {
         let len = (rows.end - rows.start) as usize;
-        let projected = reader
-            .projection_evaluation(&rows, &projection, MaskFuture::new_true(len))
-            .map_err(VortexRdfError::Vortex)?;
+        let projected =
+            reader.projection_evaluation(&rows, &projection, MaskFuture::new_true(len))?;
         tasks.push(async move {
             let indices =
                 PrimitiveArray::new(Buffer::from(offsets), Validity::NonNullable).into_array();
@@ -763,19 +749,14 @@ async fn chunk_take(
     let session = file.session();
     let mut children = Vec::with_capacity(handles.len());
     for handle in &handles {
-        match handle
-            .take(ids, &source, session)
-            .await
-            .map_err(VortexRdfError::Vortex)?
-        {
+        match handle.take(ids, &source, session).await? {
             Some(child) => children.push(child),
             None => return Ok(None),
         }
     }
     let names: Vec<FieldName> = columns.iter().map(|c| FieldName::from(*c)).collect();
     Ok(Some(
-        StructArray::try_new(names.into(), children, ids.len(), Validity::NonNullable)
-            .map_err(VortexRdfError::Vortex)?
+        StructArray::try_new(names.into(), children, ids.len(), Validity::NonNullable)?
             .into_array(),
     ))
 }
@@ -817,7 +798,7 @@ impl ExactRead {
         let RowSelection::Ids(ids) = selection else {
             return Ok(ExactRead::Scan);
         };
-        let splits = file.splits().map_err(VortexRdfError::Vortex)?;
+        let splits = file.splits()?;
         let footprint = Footprint::of(ids, &splits);
         let live = || -> Vec<RowId> {
             ids.iter()
@@ -903,11 +884,7 @@ async fn point_read_struct(
             Some(v) => values.extend(std::iter::repeat_n(v, rows.len())),
             None => {
                 for &row in rows {
-                    match handle
-                        .value_at(row, &source, session)
-                        .await
-                        .map_err(VortexRdfError::Vortex)?
-                    {
+                    match handle.value_at(row, &source, session).await? {
                         Some(v) => values.push(v),
                         None => return Ok(None),
                     }
@@ -922,8 +899,7 @@ async fn point_read_struct(
     }
     let names: Vec<FieldName> = columns.iter().map(|c| FieldName::from(*c)).collect();
     Ok(Some(
-        StructArray::try_new(names.into(), children, rows.len(), Validity::NonNullable)
-            .map_err(VortexRdfError::Vortex)?
+        StructArray::try_new(names.into(), children, rows.len(), Validity::NonNullable)?
             .into_array(),
     ))
 }

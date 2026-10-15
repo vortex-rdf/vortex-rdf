@@ -92,9 +92,8 @@ pub(crate) fn gather_by_point_reads(
         };
         children.push(gathered);
     }
-    let rows = StructArray::try_new(names, children, live.len(), Validity::NonNullable)
-        .map_err(VortexRdfError::Vortex)?
-        .into_array();
+    let rows =
+        StructArray::try_new(names, children, live.len(), Validity::NonNullable)?.into_array();
     Ok(Some(rows))
 }
 

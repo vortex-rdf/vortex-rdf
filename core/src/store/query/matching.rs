@@ -2,7 +2,7 @@
 //! over the base and the tail.
 
 use crate::debug;
-use crate::error::{Result, VortexRdfError};
+use crate::error::Result;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{
     bool_array_to_mask, column_is_sorted, into_struct_array, search_sorted_bounds,
@@ -834,30 +834,21 @@ impl VortexRdfStore {
     /// the typed comparison paths this is the fallback for.
     fn mask_for(array: &ArrayRef, eqs: &[(&'static str, Scalar)]) -> Result<ArrayRef> {
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let struct_arr = array
-            .clone()
-            .execute::<StructArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
+        let struct_arr = array.clone().execute::<StructArray>(&mut ctx)?;
 
         // AND together one equality comparison per constrained column.
         let mut mask: Option<ArrayRef> = None;
         for (field, value) in eqs {
-            let col = struct_arr
-                .unmasked_field_by_name(field)
-                .map_err(VortexRdfError::Vortex)?;
+            let col = struct_arr.unmasked_field_by_name(field)?;
             // Cast the scalar to the column's dtype (so numeric columns like
             // `o_kind` compare against a scalar of matching type/nullability).
-            let scalar = value.cast(col.dtype()).map_err(VortexRdfError::Vortex)?;
+            let scalar = value.cast(col.dtype())?;
             // Broadcast the scalar to a constant column and compare element-wise.
             let rhs = ConstantArray::new(scalar, col.len()).into_array();
-            let m = col
-                .binary(rhs, Operator::Eq)
-                .map_err(VortexRdfError::Vortex)?;
+            let m = col.binary(rhs, Operator::Eq)?;
             // Fold this column's mask into the running AND of all constraints.
             mask = Some(match mask.take() {
-                Some(prev) => prev
-                    .binary(m, Operator::And)
-                    .map_err(VortexRdfError::Vortex)?,
+                Some(prev) => prev.binary(m, Operator::And)?,
                 None => m,
             });
         }

@@ -1,7 +1,7 @@
 //! The row/code read surface: sizes, gathered rows, code columns, and the
 //! selected-rows plumbing the serialization and compaction paths share.
 
-use crate::error::{Result, VortexRdfError};
+use crate::error::Result;
 use crate::session::VORTEX_SESSION;
 use crate::store::QuadsSource;
 use crate::store::RawQuad;
@@ -353,9 +353,7 @@ impl VortexRdfStore {
         }
         let rows = self.selected_rows().await?;
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let struct_arr = rows
-            .execute::<StructArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
+        let struct_arr = rows.execute::<StructArray>(&mut ctx)?;
         let column =
             |name: &str, ctx: &mut vortex_array::ExecutionCtx| -> Result<Buffer<TermCode>> {
                 Ok(field_as::<PrimitiveArray>(&struct_arr, name, ctx)?.into_buffer::<TermCode>())
@@ -505,22 +503,20 @@ impl VortexRdfStore {
         selection: &RowSelection,
         deleted: Option<&Mask>,
     ) -> Result<ScanBuilder<ArrayRef>> {
-        let mut scan = file.scan().map_err(VortexRdfError::Vortex)?;
+        let mut scan = file.scan()?;
         // The scan's scope (the quad-source root dtype) is what filters and
         // projections bind against — read it before the projection replaces
         // it. Binding goes through the handle's memo so a repeated shape
         // keeps one identity (see `BoundExprMemo`).
-        let scope = scan.dtype().map_err(VortexRdfError::Vortex)?;
+        let scope = scan.dtype()?;
         let memo = file.bound_exprs();
-        scan = scan.with_projection(
-            memo.bind(file_reads::QUAD_SCOPE, &select(columns, root()), &scope)
-                .map_err(VortexRdfError::Vortex)?,
-        );
+        scan = scan.with_projection(memo.bind(
+            file_reads::QUAD_SCOPE,
+            &select(columns, root()),
+            &scope,
+        )?);
         if let Some(f) = filter {
-            scan = scan.with_filter(
-                memo.bind(file_reads::QUAD_SCOPE, f, &scope)
-                    .map_err(VortexRdfError::Vortex)?,
-            );
+            scan = scan.with_filter(memo.bind(file_reads::QUAD_SCOPE, f, &scope)?);
         }
         Ok(selection.restrict_scan(scan, deleted))
     }

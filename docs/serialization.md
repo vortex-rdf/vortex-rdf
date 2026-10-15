@@ -36,8 +36,8 @@ flowchart LR
 | Term dictionary | a `TermDictionary` inside the resolved layout | the required `dictionary` child |
 
 A builder hands these back in one of two shapes
-([`BuiltArray`](../core/src/store/builders/mod.rs#L86) and
-[`BuiltStream`](../core/src/store/builders/mod.rs#L101)):
+([`BuiltArray`](../core/src/store/builders/mod.rs#L78) and
+[`BuiltStream`](../core/src/store/builders/mod.rs#L93)):
 
 - **`BuiltArray`** — everything materialized: the quad array, the components,
   the dictionary. What `VortexRdfStore::from_built` adopts.
@@ -52,7 +52,7 @@ A builder hands these back in one of two shapes
 | Surface | Call | Pipeline | Produces |
 |---|---|---|---|
 | CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`SerializeArgs`](../cli/src/main.rs#L33)) | out-of-core | file |
-| Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L192) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L109) | out-of-core | file / any `VortexWrite` |
+| Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L191) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L109) | out-of-core | file / any `VortexWrite` |
 | Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L101), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L60) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L42) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L149) to name the builder | either | in-memory store |
 | Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L149) | — (re-serializes a store) | bytes |
 | Rust | [`to_serializable_parts`](../core/src/store/persist/serialize.rs#L128) → [`from_parts`](../core/src/store/construct.rs#L134) | — | in-memory round trip |
@@ -174,7 +174,7 @@ flowchart TD
 
 **String layouts.** The stream is drained into a `Vec<RawQuad>`, sorted, stripped
 of its adjacent repeats, and built into one struct of primary columns through
-[`build_struct_array`](../core/src/store/builders/mod.rs#L182); the requested
+[`build_struct_array`](../core/src/store/builders/mod.rs#L174); the requested
 index families are sorted over that same vector ([§8](#8-secondary-indexes-at-build-time)).
 
 **Dictionary layout.** Terms are interned as they arrive
@@ -243,13 +243,13 @@ spilled and merged as they are, never deduplicated — are unique because their
 row ids are.
 
 **Phase 3 — emission.** Without indexes the merge is lazy
-([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L162)):
+([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L150)):
 every poll of the chunk stream pulls up to a chunk's worth of quads off the
 heap and builds one struct
-([`build_struct_array`](../core/src/store/builders/mod.rs#L182), or
+([`build_struct_array`](../core/src/store/builders/mod.rs#L174), or
 [`dictionary::build_chunk`](../core/src/store/layouts/dictionary/codec.rs#L126)
 encoding each term through the term→code map). With indexes the merge runs to
-completion first ([`merge_quads_feeding_indexes`](../core/src/store/builders/stream_indexes.rs#L46)):
+completion first ([`merge_quads_feeding_indexes`](../core/src/store/builders/stream_indexes.rs#L45)):
 row ids are only known as the merge assigns them, and an index child is a
 *globally* sorted table over those ids, so it needs a second external sort.
 Each merged quad's terms (strings, or codes under Dictionary) are pushed into
@@ -308,7 +308,7 @@ is the sorted set of every distinct term of the dataset — subjects, predicates
 objects and graph names in one namespace, the default graph's `""` included. A
 term's code is its position, so code order equals string order and a bound
 term resolves to its code by binary search. The frozen column is
-FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/storage.rs#L258)):
+FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/storage.rs#L254)):
 one symbol table is trained on the whole column and the terms are compressed in
 independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage.rs#L41)
 (65,536) terms, each window a self-contained FSST array. The term count must
@@ -356,7 +356,7 @@ Opening a file whose index children record row ids of another width is
 refused with a deserialization error that says to rebuild the store
 ([file-format.md §6](file-format.md#6-the-index-children)).
 
-**In memory** ([`build_components`](../core/src/store/builders/mod.rs#L249)) each
+**In memory** ([`build_components`](../core/src/store/builders/mod.rs#L241)) each
 family is a permutation of the complete sorted dataset: sort the row ids by the
 family's comparator ([`CopyFamily::cmp_quads`](../core/src/store/indexes/copy.rs#L141),
 or the code tuple under Dictionary), then gather the columns through that
@@ -432,7 +432,7 @@ flowchart TD
 
 Two drivers feed this: [`built_stream_to_vortex_writer`](../core/src/io/write.rs#L139)
 for a builder's chunk stream (files, compaction; a file is written by
-[`write_store_atomically`](../core/src/io/write.rs#L231) beside its path and renamed
+[`write_store_atomically`](../core/src/io/write.rs#L230) beside its path and renamed
 into place, so a failed write leaves no partial file and the previous store
 untouched, and on Unix a store that has the old file mapped keeps reading
 it), and
@@ -440,7 +440,7 @@ it), and
 (`to_bytes`, the bindings' exchange bytes). On the wire the two are the same
 container.
 
-**Replacing a file.** [`PendingStore`](../core/src/io/write.rs#L312) is the one
+**Replacing a file.** [`PendingStore`](../core/src/io/write.rs#L311) is the one
 way a store reaches a path (`write_store_atomically` is its `create` followed
 by its `write`). `create` makes `<store>.write-<uuid>.tmp` beside the file it
 replaces *before* any input is read or any row gathered, so a path that cannot
@@ -494,7 +494,7 @@ store's *compressed-resident* form
   knows —
   `Constant` for a single-valued column, `RunEnd` for a sorted column with few
   runs, bit-packed at the observed width otherwise
-  ([`with_compressed_int_children`](../core/src/store/resident.rs#L115)); the
+  ([`with_compressed_int_children`](../core/src/store/resident.rs#L106)); the
   `IsSorted` stamps carry across;
 - the base's compressed columns are wrapped in a `vortex.shared` node, so the
   match fast paths probe the compressed source while the code-column payload
@@ -565,8 +565,8 @@ quad, sort, drop repeated quads, and rebuild:
 
 Between compactions the tail accretes as chunks and is flattened once the
 accreted rows rival the flat prefix (floor 1,024) or 64 chunks pile up
-([`TAIL_FLATTEN_FLOOR`](../core/src/store/write/mutation.rs#L350),
-[`TAIL_MAX_CHUNKS`](../core/src/store/write/mutation.rs#L354)). The tail, tombstone
+([`TAIL_FLATTEN_FLOOR`](../core/src/store/write/mutation.rs#L347),
+[`TAIL_MAX_CHUNKS`](../core/src/store/write/mutation.rs#L351)). The tail, tombstone
 and compaction model in full is [mutations.md](mutations.md).
 
 ### 11.3 Back to RDF text

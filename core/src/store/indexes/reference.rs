@@ -38,7 +38,7 @@ use super::components::child_struct;
 use super::{
     COL_RID, InMemoryServePlan, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds,
 };
-use crate::error::{Result, VortexRdfError};
+use crate::error::Result;
 use crate::store::RawQuad;
 use crate::store::array::{make_string_array, stamp_is_sorted};
 use crate::store::layouts::dictionary::QuadCodes;
@@ -179,11 +179,7 @@ pub(crate) fn resolve_in_memory(
     }
     // The run's rids, decoded and sorted only when a consumer needs them —
     // a count takes the run's width.
-    let rids = rows
-        .unmasked_field_by_name(COL_RID)
-        .map_err(VortexRdfError::Vortex)?
-        .slice(run)
-        .map_err(VortexRdfError::Vortex)?;
+    let rids = rows.unmasked_field_by_name(COL_RID)?.slice(run)?;
     Ok(IndexResolution::Resolved {
         row_ids: ResolvedRowIds::Lazy(LazyRowIds::from_ascending_component_run(rids)),
         resolves: probe.resolves,
@@ -298,10 +294,7 @@ async fn locate<'a>(
         return Ok(Located::Declined);
     };
     let name = probe.family.component_name();
-    let Some((descriptor, reader)) = file
-        .component_reader(name)
-        .map_err(VortexRdfError::Vortex)?
-    else {
+    let Some((descriptor, reader)) = file.component_reader(name)? else {
         return Ok(Located::Declined);
     };
     let Some(native) = codes.probe_scalar(probe.lead)? else {

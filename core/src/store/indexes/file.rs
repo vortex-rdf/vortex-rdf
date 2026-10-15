@@ -83,11 +83,7 @@ pub(crate) async fn rid_point_reads(
     // A point-read run is at most `POINT_GATHER_MAX_ROWS` wide.
     let mut ids = Vec::with_capacity((range.end - range.start) as usize);
     for row in range {
-        match chunks
-            .value_at(row, &source, session)
-            .await
-            .map_err(VortexRdfError::Vortex)?
-        {
+        match chunks.value_at(row, &source, session).await? {
             Some(rid) => ids.push(super::base_row(rid)),
             None => return Ok(None),
         }
@@ -120,9 +116,7 @@ pub(crate) async fn scan_index_row_ids(
     let Some(filter) = eq_conjunction(value_constraints.iter().cloned()) else {
         return Ok(Buffer::empty());
     };
-    let filter = memo
-        .bind(scope, &filter, reader.dtype())
-        .map_err(VortexRdfError::Vortex)?;
+    let filter = memo.bind(scope, &filter, reader.dtype())?;
 
     read_scanned_row_ids(
         rid_scan(reader, rid_column, memo, scope)?.with_filter(filter),
@@ -195,9 +189,7 @@ fn rid_scan(
     memo: &crate::store::persist::native_file::BoundExprMemo,
     scope: &'static str,
 ) -> Result<vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>> {
-    let projection = memo
-        .bind(scope, &select([rid_column], root()), reader.dtype())
-        .map_err(VortexRdfError::Vortex)?;
+    let projection = memo.bind(scope, &select([rid_column], root()), reader.dtype())?;
     Ok(
         vortex_layout::scan::scan_builder::ScanBuilder::new(VORTEX_SESSION.clone(), reader)
             .with_projection(projection),
@@ -219,15 +211,8 @@ async fn read_scanned_row_ids(
     }
 
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let struct_arr = arr
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    sorted_row_ids(
-        struct_arr
-            .unmasked_field_by_name(rid_column)
-            .cloned()
-            .map_err(VortexRdfError::Vortex)?,
-    )
+    let struct_arr = arr.execute::<StructArray>(&mut ctx)?;
+    sorted_row_ids(struct_arr.unmasked_field_by_name(rid_column).cloned()?)
 }
 
 /// An eager file resolution off the rid-only pushed-down scan — the shared
@@ -363,14 +348,8 @@ impl FileServePlan {
         let filter = eq_conjunction(self.constraints.iter().cloned())
             .expect("a serve plan constrains at least one column");
         let scope = self.reader.dtype();
-        let bound_projection = self
-            .memo
-            .bind(self.component, &projection, scope)
-            .map_err(VortexRdfError::Vortex)?;
-        let bound_filter = self
-            .memo
-            .bind(self.component, &filter, scope)
-            .map_err(VortexRdfError::Vortex)?;
+        let bound_projection = self.memo.bind(self.component, &projection, scope)?;
+        let bound_filter = self.memo.bind(self.component, &filter, scope)?;
         Ok(self
             .bound
             .get_or_init(|| (bound_projection, bound_filter))

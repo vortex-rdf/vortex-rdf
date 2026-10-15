@@ -34,7 +34,7 @@ use vortex_array::scalar::ScalarValue;
 use vortex_array::stats::StatsSet;
 use vortex_array::stream::{ArrayStreamAdapter, ArrayStreamExt, SendableArrayStream};
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute as _};
-use vortex_error::{VortexError, VortexResult, vortex_err};
+use vortex_error::VortexResult;
 use vortex_mask::Mask;
 use vortex_scan::selection::Selection;
 use vortex_scan::{
@@ -42,7 +42,7 @@ use vortex_scan::{
     PartitionStream, ScanRequest,
 };
 
-use crate::error::{Result, VortexRdfError};
+use crate::error::Result;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::rechunk;
 use crate::store::{LayoutStrategy, QuadsSource, VortexRdfStore};
@@ -143,10 +143,7 @@ impl VortexRdfStore {
             #[cfg(feature = "file-io")]
             QuadsSource::File { file, .. } => {
                 use vortex_layout::scan::layout::LayoutReaderDataSource;
-                let Some((_, reader)) = file
-                    .component_reader(name)
-                    .map_err(VortexRdfError::Vortex)?
-                else {
+                let Some((_, reader)) = file.component_reader(name)? else {
                     return Ok(None);
                 };
                 Ok(Some(Arc::new(LayoutReaderDataSource::new(
@@ -374,15 +371,12 @@ impl Partition for ViewPartition {
             rows, dtype, plan, ..
         } = *self;
         let chunks: BoxStream<'static, Result<ArrayRef>> = match rows {
-            Rows::View(store) => store
-                .row_chunks(DATA_SOURCE_BATCH_ROWS)
-                .map_err(to_vortex)?,
+            Rows::View(store) => store.row_chunks(DATA_SOURCE_BATCH_ROWS)?,
             Rows::Chunks(chunks) => {
                 let pieces: Vec<ArrayRef> = chunks
                     .iter()
                     .map(|c| rechunk(c.clone(), DATA_SOURCE_BATCH_ROWS))
-                    .collect::<Result<Vec<_>>>()
-                    .map_err(to_vortex)?
+                    .collect::<Result<Vec<_>>>()?
                     .into_iter()
                     .flatten()
                     .collect();
@@ -402,7 +396,7 @@ impl Partition for ViewPartition {
                 }
                 let chunk = match chunks.next().await? {
                     Ok(chunk) => chunk,
-                    Err(e) => return Some((Err(to_vortex(e)), (chunks, state))),
+                    Err(e) => return Some((Err(e.into()), (chunks, state))),
                 };
                 match state.apply(chunk) {
                     Ok(Some(out)) => return Some((Ok(out), (chunks, state))),
@@ -498,13 +492,5 @@ impl RequestState {
             return Ok(None);
         }
         Ok(Some(chunk.apply_bound(&self.plan.projection)?))
-    }
-}
-
-/// This crate's error as the vortex error a [`DataSource`] reports.
-fn to_vortex(e: VortexRdfError) -> VortexError {
-    match e {
-        VortexRdfError::Vortex(v) => v,
-        other => vortex_err!("vortex-rdf: {other}"),
     }
 }

@@ -275,9 +275,7 @@ impl IndexComponent {
                     }
                 };
                 let mut ctx = VORTEX_SESSION.create_execution_ctx();
-                let executed = scanned
-                    .execute::<StructArray>(&mut ctx)
-                    .map_err(VortexRdfError::Vortex)?;
+                let executed = scanned.execute::<StructArray>(&mut ctx)?;
                 Ok(deferred.cell.get_or_init(|| executed))
             }
         }
@@ -309,9 +307,7 @@ impl IndexComponent {
                 sorted: self.sorted,
                 dtype: array.dtype().clone(),
             },
-            Arc::new(
-                BufferedComponentSource::try_new(vec![array]).map_err(VortexRdfError::Vortex)?,
-            ),
+            Arc::new(BufferedComponentSource::try_new(vec![array])?),
             strategy,
         )
         .map_err(VortexRdfError::Vortex)
@@ -497,10 +493,8 @@ pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<RowId>> {
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     // A no-op cast for the u64 column every writer here produces.
     let ids = row_id_column
-        .cast(DType::Primitive(ROW_ID_PTYPE, Nullability::NonNullable))
-        .map_err(VortexRdfError::Vortex)?
-        .execute::<PrimitiveArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?
+        .cast(DType::Primitive(ROW_ID_PTYPE, Nullability::NonNullable))?
+        .execute::<PrimitiveArray>(&mut ctx)?
         .into_buffer::<RowId>();
 
     // The freshly-executed buffer is normally uniquely owned, so the sort

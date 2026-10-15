@@ -720,10 +720,7 @@ impl ResolvedLayout {
     /// this layout's term dictionary.
     pub(crate) fn raw_quads(&self, rows: &ArrayRef) -> Result<Vec<RawQuad>> {
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let struct_arr = rows
-            .clone()
-            .execute::<StructArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
+        let struct_arr = rows.clone().execute::<StructArray>(&mut ctx)?;
         let (s, p, o, g) = match self {
             ResolvedLayout::Default => (
                 read_string_column(&struct_arr, COL_S)?,

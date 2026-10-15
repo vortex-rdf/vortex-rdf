@@ -62,16 +62,8 @@ pub(crate) const DEFAULT_CHUNK_ROWS: usize = 100_000;
 
 /// A stream of StructArray chunks ready for consumption by the Vortex file
 /// writer. Items use `VortexResult` because the writer polls the stream
-/// directly; builder errors are converted via `into_vortex_error`.
+/// directly; builder errors are converted through the `From<VortexRdfError> for VortexError` impl.
 pub type ChunkStream = stream::BoxStream<'static, vortex_error::VortexResult<ArrayRef>>;
-
-/// Convert a builder error into a `VortexError` for use inside a [`ChunkStream`].
-fn into_vortex_error(e: VortexRdfError) -> vortex_error::VortexError {
-    match e {
-        VortexRdfError::Vortex(v) => v,
-        other => vortex_error::vortex_err!("{}", other),
-    }
-}
 
 /// A built dataset: the quad array plus whatever layout state cannot be
 /// derived from the array alone — for the Dictionary layout, its term

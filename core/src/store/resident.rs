@@ -9,7 +9,7 @@
 //! canonical code primitive a slice-bound read path needs — decoding into the
 //! shared wrapper's cache, or only if some earlier read already did.
 
-use crate::error::{Result, VortexRdfError};
+use crate::error::Result;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{column_is_sorted, stamp_is_sorted};
 use crate::store::schema;
@@ -48,16 +48,12 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
         return Ok(rows);
     }
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let struct_arr = rows
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
+    let struct_arr = rows.execute::<StructArray>(&mut ctx)?;
     let names = struct_arr.names().clone();
     let mut children = Vec::with_capacity(names.len());
     let mut changed = false;
     for name in names.iter() {
-        let child = struct_arr
-            .unmasked_field_by_name(name.as_ref())
-            .map_err(VortexRdfError::Vortex)?;
+        let child = struct_arr.unmasked_field_by_name(name.as_ref())?;
         let decode = child.dtype().is_int()
             && !child.dtype().is_nullable()
             && vortex_rdf_encoded_search::SortedProbe::resolve(child).is_none();
@@ -68,8 +64,7 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
         let sorted = column_is_sorted(child);
         let canonical = child
             .clone()
-            .execute::<PrimitiveArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?
+            .execute::<PrimitiveArray>(&mut ctx)?
             .into_array();
         if sorted {
             stamp_is_sorted(&canonical);
@@ -81,11 +76,7 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
         return Ok(struct_arr.into_array());
     }
     let len = struct_arr.len();
-    Ok(
-        StructArray::try_new(names, children, len, Validity::NonNullable)
-            .map_err(VortexRdfError::Vortex)?
-            .into_array(),
-    )
+    Ok(StructArray::try_new(names, children, len, Validity::NonNullable)?.into_array())
 }
 
 /// Compress a built struct's integer columns — the `u64` code columns
@@ -121,15 +112,11 @@ pub(crate) fn with_compressed_int_children(rows: ArrayRef, payload_lazy: bool) -
         return Ok(rows);
     }
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let struct_arr = rows
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
+    let struct_arr = rows.execute::<StructArray>(&mut ctx)?;
     let names = struct_arr.names().clone();
     let mut children = Vec::with_capacity(names.len());
     for name in names.iter() {
-        let child = struct_arr
-            .unmasked_field_by_name(name.as_ref())
-            .map_err(VortexRdfError::Vortex)?;
+        let child = struct_arr.unmasked_field_by_name(name.as_ref())?;
         let sorted = column_is_sorted(child);
         let Some(mut encoded) = compress_int_child(child, sorted, &mut ctx)? else {
             children.push(child.clone());
@@ -144,11 +131,7 @@ pub(crate) fn with_compressed_int_children(rows: ArrayRef, payload_lazy: bool) -
         children.push(encoded);
     }
     let len = struct_arr.len();
-    Ok(
-        StructArray::try_new(names, children, len, Validity::NonNullable)
-            .map_err(VortexRdfError::Vortex)?
-            .into_array(),
-    )
+    Ok(StructArray::try_new(names, children, len, Validity::NonNullable)?.into_array())
 }
 
 /// A base child as a canonical non-nullable code primitive
@@ -258,9 +241,7 @@ fn compress_int_child(
             return Ok(None);
         }
         return Ok(Some(
-            ChunkedArray::try_new(out, child.dtype().clone())
-                .map_err(VortexRdfError::Vortex)?
-                .into_array(),
+            ChunkedArray::try_new(out, child.dtype().clone())?.into_array(),
         ));
     }
     let Ok(prim) = child.clone().try_downcast::<Primitive>() else {
@@ -313,7 +294,7 @@ fn compress_int_column(
         return Ok(ConstantArray::new(min, values.len()).into_array());
     }
     if sorted && runs * 4 <= values.len() {
-        let re = RunEnd::encode(prim.clone().into_array(), ctx).map_err(VortexRdfError::Vortex)?;
+        let re = RunEnd::encode(prim.clone().into_array(), ctx)?;
         return Ok(re.into_array());
     }
     // At most 64, so the narrowing to u8 is exact.
@@ -321,7 +302,6 @@ fn compress_int_column(
     if u32::from(bit_width) >= u64::BITS {
         return Ok(prim.clone().into_array());
     }
-    let packed = BitPacked::encode(&prim.clone().into_array(), bit_width, ctx)
-        .map_err(VortexRdfError::Vortex)?;
+    let packed = BitPacked::encode(&prim.clone().into_array(), bit_width, ctx)?;
     Ok(packed.into_array())
 }
