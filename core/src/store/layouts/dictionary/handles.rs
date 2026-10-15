@@ -322,21 +322,19 @@ impl DictReader {
         match &self.0 {
             DictAccess::Resident(dict) => Ok(dict.decode(code)),
             #[cfg(feature = "file-io")]
-            DictAccess::FileBacked(dict) => {
-                Ok(dict.decode_many_any(&[code]).await?.pop().flatten())
-            }
+            DictAccess::FileBacked(_) => Ok(self.decode_many(&[code]).await?.pop().flatten()),
         }
     }
 
     /// [`decode`](Self::decode) over a batch, in order: any order and
     /// repeats are fine (a file-backed dictionary reads each distinct code
-    /// once, in one batch).
+    /// once, in one batch). [`decode_many_with`](Self::decode_many_with)
+    /// collected, one owned string per position.
     pub async fn decode_many(&self, codes: &[TermCode]) -> Result<Vec<Option<String>>> {
-        match &self.0 {
-            DictAccess::Resident(dict) => Ok(dict.decode_many(codes)),
-            #[cfg(feature = "file-io")]
-            DictAccess::FileBacked(dict) => dict.decode_many_any(codes).await,
-        }
+        let mut terms = vec![None; codes.len()];
+        self.decode_many_with(codes, |i, term| terms[i] = term.map(str::to_owned))
+            .await?;
+        Ok(terms)
     }
 
     /// [`decode_many`](Self::decode_many) without a `String` per term:

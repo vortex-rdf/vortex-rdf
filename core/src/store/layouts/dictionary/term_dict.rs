@@ -19,7 +19,7 @@ use vortex_buffer::Buffer;
 
 use crate::common::terms::canonical_spelling;
 use crate::error::{Result, VortexRdfError};
-use crate::store::array::buf_as_str;
+use crate::store::array::trusted_str;
 use crate::store::schema::TermCode;
 
 use super::predicates::{KindRanges, TermPredicate, Verdict};
@@ -200,9 +200,7 @@ impl TermDictionary {
     pub(crate) fn decode(&self, code: TermCode) -> Option<String> {
         let rank = self.rank_of(code)?;
         let mut scratch = Vec::new();
-        buf_as_str(self.terms.bytes_into(rank, &mut scratch))
-            .ok()
-            .map(str::to_owned)
+        Some(trusted_str(self.terms.bytes_into(rank, &mut scratch)).to_owned())
     }
 
     /// Encode a term to its code: its position in the sorted dictionary, or
@@ -289,7 +287,7 @@ impl TermDictionary {
     ) {
         let mut cursor = self.cursor();
         for (i, &code) in codes.iter().enumerate() {
-            let term = self.rank_of(code).and_then(|rank| cursor.str_at(rank).ok());
+            let term = self.rank_of(code).map(|rank| cursor.str_at(rank));
             visit(i, term);
         }
     }
@@ -313,22 +311,14 @@ impl TermDictionary {
         codes: &[TermCode],
     ) -> Result<(Buffer<TermCode>, Buffer<TermCode>)> {
         check_candidates(codes, self.code_space)?;
-        let kinds = self.kind_ranges();
+        let (mut verdicts, read) = kind_verdicts(predicate, self.kind_ranges(), codes);
         let mut cursor = self.cursor();
-        let verdicts: Vec<Verdict> = codes
-            .iter()
-            .map(
-                |&code| match predicate.kind_verdict(kinds.kind_of_code(code)) {
-                    Some(verdict) => verdict,
-                    // In range: the candidates were checked above.
-                    None => match self.rank_of(code).map(|rank| cursor.str_at(rank)) {
-                        Some(Ok(spelling)) => predicate.eval(spelling),
-                        // A term that is not UTF-8 is nothing the rules speak of.
-                        _ => Verdict::Unknown,
-                    },
-                },
-            )
-            .collect();
+        for at in read {
+            // In range: the candidates were checked above.
+            if let Some(rank) = self.rank_of(codes[at]) {
+                verdicts[at] = predicate.eval(cursor.str_at(rank));
+            }
+        }
         Ok(split_verdicts(codes, &verdicts))
     }
 }
@@ -429,6 +419,31 @@ pub(super) fn check_candidates(codes: &[TermCode], code_space: CodeSpace) -> Res
         }
     }
     Ok(())
+}
+
+/// The partition step of a candidate evaluation: the verdict each of the
+/// candidate `codes` gets from its kind ([`TermPredicate::kind_verdict`]),
+/// `Unknown` where only its spelling decides, beside the positions in
+/// `codes` of those undecided candidates, ascending — the ones to read.
+pub(super) fn kind_verdicts(
+    predicate: &TermPredicate,
+    kinds: &KindRanges,
+    codes: &[TermCode],
+) -> (Vec<Verdict>, Vec<usize>) {
+    let mut read = Vec::new();
+    let verdicts = codes
+        .iter()
+        .enumerate()
+        .map(|(at, &code)| {
+            predicate
+                .kind_verdict(kinds.kind_of_code(code))
+                .unwrap_or_else(|| {
+                    read.push(at);
+                    Verdict::Unknown
+                })
+        })
+        .collect();
+    (verdicts, read)
 }
 
 /// The candidates' verdicts as `(passed, undecided)`, both ascending

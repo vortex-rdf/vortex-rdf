@@ -221,15 +221,21 @@ pub(crate) fn bool_array_to_mask(arr: ArrayRef) -> Result<Mask> {
 ///
 /// The check is kept as a `debug_assert`, so the test suite (which runs debug)
 /// still fails loudly if a non-UTF-8 column ever reaches this, while release
-/// builds skip the second walk. The `Result` is retained so the decode call
-/// sites — which `?` on genuinely fallible neighbours — stay uniform.
+/// builds skip the second walk.
 #[inline]
-pub(crate) fn buf_as_str(buf: &[u8]) -> Result<&str> {
+pub(crate) fn trusted_str(buf: &[u8]) -> &str {
     debug_assert!(
         std::str::from_utf8(buf).is_ok(),
         "string column value is not valid UTF-8, but its dtype claims Utf8"
     );
     // SAFETY: `buf` is the bytes of a value in a `Utf8`-dtyped vortex column,
     // which vortex validates as UTF-8 when the array is constructed (see above).
-    Ok(unsafe { std::str::from_utf8_unchecked(buf) })
+    unsafe { std::str::from_utf8_unchecked(buf) }
+}
+
+/// [`trusted_str`] as a `Result`, so the decode call sites — which `?` on
+/// genuinely fallible neighbours — stay uniform.
+#[inline]
+pub(crate) fn buf_as_str(buf: &[u8]) -> Result<&str> {
+    Ok(trusted_str(buf))
 }
