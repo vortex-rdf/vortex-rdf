@@ -1,32 +1,29 @@
 //! In-memory construction of a [`VortexRdfStore`]: the constructors from a
 //! quad stream, a builder's output, [`StoreParts`] and compaction's raw
-//! quads, the empty store, and the layout, compression and assembly steps
-//! they share.
+//! quads, the empty store, and the layout, adoption and assembly steps they
+//! share.
 
 use crate::error::{Result, VortexRdfError};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::store::builders::SortedInMemoryBuilder;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use crate::store::builders::SortedStreamBuilder;
-use crate::store::builders::{BuiltArray, VortexArrayBuilder, build_parts_from_raws};
+use crate::store::builders::{
+    BuiltArray, VortexArrayBuilder, build_parts_from_raws, build_struct_array,
+};
 use crate::store::indexes::{IndexComponent, Indexes};
 use crate::store::layouts::dictionary::TermDictionary;
 use crate::store::layouts::{DictAccess, LayoutStrategy, ResolvedLayout};
 use crate::store::view::selection::ViewSelection;
 use crate::store::{
-    QuadsSource, RawQuad, StoreParts, VortexRdfStore, array, next_generation, probes, resident,
-    schema,
+    QuadsSource, RawQuad, StoreParts, VortexRdfStore, next_generation, probes, resident,
 };
 
-use std::iter;
 use std::sync::Arc;
 
 use futures::Stream;
 
-use vortex_array::arrays::StructArray;
-use vortex_array::dtype::FieldNames;
-use vortex_array::validity::Validity;
-use vortex_array::{ArrayRef, IntoArray};
+use vortex_array::ArrayRef;
 
 /// The layout an in-memory construction (`from_parts`, `from_built`,
 /// `from_bytes`, compaction's `from_raw_quads`) resolves to: a dictionary
@@ -50,26 +47,6 @@ pub(super) fn resolved_layout(
             LayoutStrategy::Default => Ok(ResolvedLayout::Default),
         },
     }
-}
-
-/// The compressed-resident form every in-memory construction produces: the
-/// base's code columns and each component's integer children are
-/// re-encoded into probe-supported encodings (see
-/// [`with_compressed_int_children`](resident::with_compressed_int_children)),
-/// with the base additionally payload-wrapped so the code-column read path
-/// keeps its zero-copy fast path. Shared by the builder adoption
-/// (`from_built`) and compaction's rebuild (`from_raw_quads`) — the two
-/// places canonical built columns become a store.
-fn compress_built_parts(
-    base: ArrayRef,
-    components: Vec<IndexComponent>,
-) -> Result<(ArrayRef, Vec<IndexComponent>)> {
-    let base = resident::with_compressed_int_children(base, true)?;
-    let components = components
-        .into_iter()
-        .map(IndexComponent::into_compressed)
-        .collect::<Result<Vec<_>>>()?;
-    Ok((base, components))
 }
 
 impl VortexRdfStore {
@@ -132,32 +109,69 @@ impl VortexRdfStore {
     /// paths search every bound role on that basis. Rows sorted by subject
     /// alone must not carry it.
     pub fn from_parts(parts: StoreParts) -> Result<Self> {
-        let layout = resolved_layout(parts.dict, parts.array.dtype())?;
-        let base = resident::with_searchable_int_children(parts.array)?;
-        let components = parts
-            .components
-            .into_iter()
-            .map(IndexComponent::into_searchable)
-            .collect::<Result<Vec<_>>>()?;
-        Self::assemble_resident(base, components, layout)
+        Self::adopt(
+            parts.built,
+            resident::with_searchable_int_children,
+            IndexComponent::into_searchable,
+        )
     }
 
     /// Build from a builder's output: the primary quad array plus whatever the
     /// builder carries beside it — the Dictionary layout's term dictionary and
     /// the requested indexes' components, both adopted as they are. Nothing is
     /// re-derived or split out of the rows.
+    ///
+    /// The store holds them in the compressed-resident form: the base's code
+    /// columns and each component's integer children are re-encoded into
+    /// probe-supported encodings (see `with_compressed_int_children`), with
+    /// the base additionally payload-wrapped so the code-column read path
+    /// keeps its zero-copy fast path.
     pub fn from_built(built: BuiltArray) -> Result<Self> {
+        Self::adopt(
+            built,
+            |base| resident::with_compressed_int_children(base, true),
+            IndexComponent::into_compressed,
+        )
+    }
+
+    /// Build a fresh owning in-memory store from raw quads under `strategy` —
+    /// the shared back half of compaction (see [`build_parts_from_raws`]),
+    /// adopted like any build ([`from_built`](Self::from_built)). `sorted`
+    /// must be `true` only when `raws` is SPOG-sorted.
+    pub(super) fn from_raw_quads(
+        raws: &[RawQuad],
+        strategy: LayoutStrategy,
+        indexes: Indexes,
+        sorted: bool,
+    ) -> Result<Self> {
+        Self::from_built(build_parts_from_raws(raws, strategy, &indexes, sorted)?)
+    }
+
+    /// The one adoption step of [`from_parts`](Self::from_parts) and
+    /// [`from_built`](Self::from_built): resolve the layout from `built`'s
+    /// dictionary and dtype, put the base through `encode_base` and every
+    /// component through `encode_component`, and assemble the store.
+    fn adopt(
+        built: BuiltArray,
+        encode_base: impl FnOnce(ArrayRef) -> Result<ArrayRef>,
+        encode_component: impl FnMut(IndexComponent) -> Result<IndexComponent>,
+    ) -> Result<Self> {
         let layout = resolved_layout(built.dict, built.array.dtype())?;
-        let (base, components) = compress_built_parts(built.array, built.components)?;
+        let base = encode_base(built.array)?;
+        let components = built
+            .components
+            .into_iter()
+            .map(encode_component)
+            .collect::<Result<Vec<_>>>()?;
         Self::assemble_resident(base, components, layout)
     }
 
     /// Assemble a store from an already-split primary base plus its
     /// components — the shared tail of every in-memory construction path.
     ///
-    /// Callers own the resident form of what they pass: construction sites
-    /// compress first ([`compress_built_parts`]), the adoption site keeps
-    /// wire encodings selectively
+    /// Callers own the resident form of what they pass: [`adopt`](Self::adopt)
+    /// compresses a build and keeps an adopted store's wire encodings
+    /// selectively
     /// ([`with_searchable_int_children`](resident::with_searchable_int_children));
     /// this assembler transforms nothing.
     pub(super) fn assemble_resident(
@@ -194,49 +208,9 @@ impl VortexRdfStore {
 
     /// Create an empty in-memory store with Default layout.
     pub fn empty() -> Self {
-        // Build one empty string column and reuse it for all four fields —
-        // they're all zero-length anyway, so there's nothing to distinguish.
-        let e = array::make_string_array(iter::empty::<&str>());
-
-        let quads = StructArray::try_new(
-            FieldNames::from(schema::PRIMARY_COLUMNS),
-            vec![e.clone(), e.clone(), e.clone(), e],
-            0,
-            Validity::NonNullable,
-        )
-        .expect("empty StructArray")
-        .into_array();
-
-        Self {
-            layout: ResolvedLayout::Default,
-            indexes: vec![],
-            generation: next_generation(),
-            quads: QuadsSource::InMemory {
-                base: quads,
-                selection: ViewSelection::all(),
-                components: Arc::from(Vec::new()),
-                deleted: None,
-                probes: probes::StructProbes::new(),
-                serve: None,
-            },
-            tail: None,
-        }
-    }
-
-    /// Build a fresh owning in-memory store from raw quads under `strategy` —
-    /// the shared back half of compaction (see [`build_parts_from_raws`]).
-    /// `sorted` must be `true` only when `raws` is SPOG-sorted.
-    pub(super) fn from_raw_quads(
-        raws: &[RawQuad],
-        strategy: LayoutStrategy,
-        indexes: Indexes,
-        sorted: bool,
-    ) -> Result<Self> {
-        let (base, components, dict) = build_parts_from_raws(raws, strategy, &indexes, sorted)?;
-        let layout = resolved_layout(dict, base.dtype())?;
-        // Compress like every other construction — a compacted store carries
-        // the same resident form a freshly built one does.
-        let (base, components) = compress_built_parts(base, components)?;
-        Self::assemble_resident(base, components, layout)
+        let base = build_struct_array(&[], LayoutStrategy::Default, false)
+            .expect("the empty Default-layout chunk builds");
+        Self::assemble_resident(base, Vec::new(), ResolvedLayout::Default)
+            .expect("an empty base assembles")
     }
 }

@@ -147,11 +147,11 @@ impl VortexRdfStore {
 
     /// The rows this view selects, base and tail combined, as a single
     /// in-memory array of primary columns only — the rows-only counterpart
-    /// of serialization's `selected_parts`: no index components are
-    /// materialized, rebuilt, or split off, because none ride in the result
-    /// (in memory they live beside the base, on disk as index children;
-    /// serialize through [`to_serializable_parts`](Self::to_serializable_parts)
-    /// to get them beside the rows).
+    /// of [`to_serializable_parts`](Self::to_serializable_parts): no index
+    /// components are materialized, rebuilt, or split off, because none ride
+    /// in the result (in memory they live beside the base, on disk as index
+    /// children; serialize through `to_serializable_parts` to get them
+    /// beside the rows).
     ///
     /// Without a tail the base's selected live rows are the whole answer, in
     /// the store's own vocabulary: under the Dictionary layout a tombstone

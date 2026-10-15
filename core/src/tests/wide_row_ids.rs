@@ -249,8 +249,11 @@ enum Val {
 fn check_children(parts: &StoreParts, base: RowId, label: &str) -> usize {
     let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
     let mut straddling = 0;
-    assert!(!parts.components.is_empty(), "{label}: index children");
-    for component in &parts.components {
+    assert!(
+        !parts.built.components.is_empty(),
+        "{label}: index children"
+    );
+    for component in &parts.built.components {
         let who = format!("{label} / {}", component.name);
         let rows = component.rows().unwrap();
         let rid: PrimitiveArray = field_as(rows, "rid", &mut ctx).unwrap();

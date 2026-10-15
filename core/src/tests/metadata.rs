@@ -469,6 +469,7 @@ async fn test_index_components_classify_children_by_slug() {
     .await
     .unwrap();
     let ospg = parts
+        .built
         .components
         .iter()
         .find(|c| c.name == "index:ospg")
@@ -476,7 +477,7 @@ async fn test_index_components_classify_children_by_slug() {
         .to_write()
         .unwrap();
     let foreign = unknown_component("index:posg", "secondary-by-copy/posg-v2", false);
-    let bytes = unstamped_store_bytes(vec![parts.array.clone()], vec![foreign, ospg]).await;
+    let bytes = unstamped_store_bytes(vec![parts.built.array.clone()], vec![foreign, ospg]).await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store.vortex");
     std::fs::write(&path, &bytes).unwrap();

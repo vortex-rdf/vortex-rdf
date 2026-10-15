@@ -23,8 +23,8 @@
 use super::spill::{Run, RunMerger, RunSpiller, TempRunsGuard};
 use super::stream_indexes::{IndexMergers, merge_quads_feeding_indexes, merger_components};
 use super::{
-    BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_ROWS, VortexArrayBuilder, assemble_chunks,
-    build_struct_array, make_empty_struct,
+    BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_ROWS, VortexArrayBuilder,
+    build_struct_array,
 };
 use crate::error::Result;
 use crate::store::RawQuad;
@@ -97,15 +97,21 @@ pub(crate) async fn build_array(
 
     let start = debug::timer();
 
-    let built = build_chunk_stream(quad_stream, layout, indexes.clone(), chunk_size, None).await?;
-    let chunks: Vec<ArrayRef> = built.chunks.try_collect().await?;
+    let BuiltStream {
+        dtype,
+        chunks,
+        components: writes,
+        dict,
+        ..
+    } = build_chunk_stream(quad_stream, layout, indexes.clone(), chunk_size, None).await?;
+    let chunks: Vec<ArrayRef> = chunks.try_collect().await?;
 
     // Materialize each streamed component child as one canonical struct in
     // child schema. Sortedness is the descriptor's provenance — the mergers
     // emit each family in its global sort order — not an inspection.
     let mut components: Vec<IndexComponent> = Vec::new();
     let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
-    for component in built.components {
+    for component in writes {
         let Some(known) = known_component(&component.descriptor.implementation) else {
             continue;
         };
@@ -119,7 +125,7 @@ pub(crate) async fn build_array(
             component.descriptor.sorted,
         ));
     }
-    let assembled = assemble_chunks(chunks)?;
+    let assembled = chunked_or_single(chunks, dtype)?;
     // Correct by construction for this builder: every emission is a window
     // of the global merge, so the s column is globally sorted — the stamp
     // the store's adoption reads back.
@@ -132,7 +138,7 @@ pub(crate) async fn build_array(
     Ok(BuiltArray {
         array: result,
         components,
-        dict: built.dict,
+        dict,
     })
 }
 
@@ -235,7 +241,7 @@ pub(crate) async fn build_chunk_stream(
                 chunk_size,
                 |(merger, _guard), n| merger.next_batch(n),
                 move |buf| build_struct_array(buf, layout, true),
-                || make_empty_struct(layout),
+                || build_struct_array(&[], layout, false),
             )?;
             Ok(BuiltStream {
                 dtype,
@@ -329,7 +335,7 @@ fn emit_merged_run_chunks(
         chunk_size,
         |(merged, _guard), n| merged.next_batch(n),
         move |buf| build_struct_array(buf, layout, true),
-        || make_empty_struct(layout),
+        || build_struct_array(&[], layout, false),
     )?;
     Ok(BuiltStream {
         dtype,
@@ -362,7 +368,7 @@ fn emit_merged_run_dict_chunks(
         chunk_size,
         |(merged, _guard), n| merged.next_batch(n),
         move |buf| dictionary::build_chunk(buf, &code_map, true),
-        dictionary::empty_struct,
+        || build_struct_array(&[], LayoutStrategy::Dictionary, false),
     )?;
     Ok(BuiltStream {
         dtype,
@@ -388,7 +394,7 @@ fn emit_dict_chunks(
         chunk_size,
         |(merger, _guard), n| merger.next_batch(n),
         move |buf| dictionary::build_chunk(buf, &code_map, true),
-        dictionary::empty_struct,
+        || build_struct_array(&[], LayoutStrategy::Dictionary, false),
     )?;
     Ok(BuiltStream {
         dtype,

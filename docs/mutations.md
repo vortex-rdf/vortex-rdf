@@ -92,7 +92,7 @@ flowchart TD
   selections are `All`.
 - **Every layout, Dictionary included.** An appended term has no code in the
   base's frozen sorted dictionary, so under the Dictionary layout the tail
-  stores Default-layout N-Triples strings ([`tail_layout`](../core/src/store/mod.rs#L185));
+  stores Default-layout N-Triples strings ([`tail_layout`](../core/src/store/mod.rs#L179));
   under the other layouts it uses the store's own columns. Patterns probe the
   base by code and the tail by string, and a query that touches both unions
   the results.
@@ -102,7 +102,7 @@ flowchart TD
   then unions the two. A base short-circuit (a term with no code in the
   dictionary) never skips the tail, since that term may exist in the tail's
   plain strings.
-- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L203) is the number
+- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L197) is the number
   of physical tail rows — the store's only unindexed, unsorted region, and the
   number to watch when tuning compaction.
 
@@ -208,13 +208,13 @@ flowchart TD
     F3 --> F4["reopen it memory-mapped"]
     O -- "no" --> L2["live_raw_quads(), sort_unstable, dedup"]
     L2 --> M1["build_parts_from_raws: rows, components,<br/>fresh dictionary under Dictionary"]
-    M1 --> M2["compress_built_parts → an owning in-memory store"]
+    M1 --> M2["from_built → an owning in-memory store"]
 ```
 
 - **A file-backed owner stays file-backed**
   ([`stream_compacted_to_file`](../core/src/store/write/compaction.rs#L118)): the
   writer is prepared first
-  ([`PendingStore::create`](../core/src/io/write.rs#L342), the one writer every
+  ([`PendingStore::create`](../core/src/io/write.rs#L296), the one writer every
   path-taking build shares), so a source file the process cannot write (a
   read-only file) is refused with `PermissionDenied` before a quad is
   gathered or built ([`add_quads`'s auto-compaction](#51-auto-compaction)
@@ -222,9 +222,9 @@ flowchart TD
   `<store>.write-<uuid>.tmp` exists before the work starts (a process killed
   meanwhile leaves it behind, and nothing removes it later). The sorted rows
   are then streamed through the out-of-core builder
-  ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L154))
+  ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L160))
   into it
-  ([`built_stream_to_vortex_writer`](../core/src/io/write.rs#L139)), which is
+  ([`built_stream_to_vortex_writer`](../core/src/io/write.rs#L92)), which is
   then renamed over the original path, and the store is reopened
   memory-mapped. Only the file the store opened is replaced: the file's
   device and inode are recorded at open and checked against the path before
@@ -238,13 +238,13 @@ flowchart TD
   there a file-backed store cannot compact over its own path: the compaction
   fails with the I/O error and the file stays as it was. The builder's spill
   runs are placed in the temp file's directory
-  ([`dir`](../core/src/io/write.rs#L491), [`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L67)):
+  ([`dir`](../core/src/io/write.rs#L445), [`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L67)):
   beside the file being replaced, links followed (a store opened through a
   link spills where the link points, not where the link is), the one volume
   known to fit the data (`VORTEX_RDF_SPILL_DIR` outranks that default).
 - **An in-memory store**, and any *derived view* of a file (whose rows are a
   subset of a file other readers share), rebuilds in memory through
-  [`from_raw_quads`](../core/src/store/construct.rs#L229) →
+  [`from_raw_quads`](../core/src/store/construct.rs#L141) →
   [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L284) and adopts
   the result in the same compressed-resident form a freshly built store has
   ([serialization.md §10](serialization.md#10-adopting-a-build-in-memory)).
@@ -277,7 +277,7 @@ batch: the batch stays in the in-memory tail, where matches and counts see it
 like any appended row, and the call returns `Ok` with the store. Only the
 writer's own refusal is absorbed
 ([`is_unwritable`](../core/src/error.rs#L98)): the
-[`PendingStore::create`](../core/src/io/write.rs#L342) that finds, before a quad
+[`PendingStore::create`](../core/src/io/write.rs#L296) that finds, before a quad
 is gathered, that the file or its directory cannot be written
 (`PermissionDenied`, or a read-only filesystem). Any other failure of the
 compaction is returned, a permission error from later in the rewrite (a spill
@@ -289,7 +289,7 @@ open of the file and no rebuild (a debug-level log line says so), and every
 later append over the threshold retries the same way, folding the tail as soon
 as the file can be written again. An explicit `compact()` of such a store still
 fails with `PermissionDenied`: it is the call that reports why the tail is not
-being folded, and [`tail_len`](../core/src/store/mod.rs#L203) shows the tail
+being folded, and [`tail_len`](../core/src/store/mod.rs#L197) shows the tail
 growing. The tail then has no bound but memory, and every query mask-scans it,
 so a read-only store is for reading: append to a copy.
 

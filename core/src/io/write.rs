@@ -1,12 +1,12 @@
 //! The write side of the native store container.
 //!
-//! Packs a store's parts — the primary quad table plus each index
-//! component's and the dictionary's own
-//! [`NativeComponentWrite`](crate::io::container::NativeComponentWrite) —
-//! into a [`BuiltStream`](crate::store::builders::BuiltStream) and drives
-//! [`write_store`](crate::io::container::write_store) over it, carrying
-//! each part's sortedness provenance onto the descriptors a reader will
-//! trust. Also owns the `quads_stream_to_*` entry points, which run a
+//! Drives [`write_store`](crate::io::container::write_store) over a
+//! [`BuiltStream`](crate::store::builders::BuiltStream) — the primary quad
+//! chunks plus each index component's and the dictionary's own
+//! [`NativeComponentWrite`](crate::io::container::NativeComponentWrite),
+//! from a builder or from a store's parts — carrying each part's sortedness
+//! provenance onto the descriptors a reader will trust. Also owns the
+//! `quads_stream_to_*` entry points, which run a
 //! builder's chunk stream straight into that writer, and the one way a store
 //! reaches a path on disk: written beside it and renamed into place
 //! ([`write_store_atomically`](crate::io::write::write_store_atomically)).
@@ -17,15 +17,13 @@
 
 use crate::error::{Result, VortexRdfError};
 
-use crate::debug;
 use crate::io::container::{self, child_strategy};
-use crate::store::LayoutStrategy;
-use crate::store::StoreParts;
 use crate::store::builders::BuiltStream;
-use futures::StreamExt as _;
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_io::VortexWrite;
 
+#[cfg(feature = "file-io")]
+use crate::debug;
 #[cfg(feature = "file-io")]
 use crate::error::path_error;
 #[cfg(feature = "file-io")]
@@ -33,56 +31,9 @@ use crate::io::read::FileIdentity;
 #[cfg(feature = "file-io")]
 use crate::store::builders::SortedStreamBuilder;
 #[cfg(feature = "file-io")]
-use crate::store::{Indexes, RawQuad};
+use crate::store::{Indexes, LayoutStrategy, RawQuad};
 #[cfg(feature = "file-io")]
 use futures::Stream;
-
-/// Serialize a store's split parts — the primary quad array, its in-memory
-/// index components, and (for the Dictionary layout) the term dictionary —
-/// as a native store file. Sortedness provenance is carried faithfully: the
-/// root's `quads_sorted` (see `WireMetadata::quads_sorted`) is
-/// `parts.quads_sorted`, and each index child records its component's
-/// `sorted` flag.
-///
-/// Precondition: a Dictionary-layout primary comes with its dictionary
-/// (`to_serializable_parts` always pairs them).
-pub(crate) async fn serialize_parts<W: VortexWrite + Unpin + Send>(
-    parts: &StoreParts,
-    writer: W,
-) -> Result<()> {
-    refuse_experimental_patches()?;
-    let start = debug::timer();
-
-    let primary = parts.array.clone();
-    debug_assert!(
-        !matches!(
-            LayoutStrategy::from_dtype(primary.dtype()),
-            LayoutStrategy::Dictionary
-        ) || parts.dict.is_some(),
-        "to_serializable_parts always pairs a Dictionary primary with its dictionary"
-    );
-
-    let mut components = Vec::with_capacity(parts.components.len());
-    for component in &parts.components {
-        components.push(component.to_write()?);
-    }
-
-    let dtype = primary.dtype().clone();
-    let built = BuiltStream {
-        dtype,
-        chunks: futures::stream::once(async move { Ok(primary) }).boxed(),
-        components,
-        quads_sorted: parts.quads_sorted,
-        dict: parts.dict.clone(),
-    };
-    built_stream_to_vortex_writer(built, writer).await?;
-
-    log::debug!(
-        "[ser::serialize_parts] Vortex writing took {:?}",
-        debug::elapsed(start)
-    );
-    Ok(())
-}
 
 /// Stream quads directly into a native store file as compressed chunks.
 ///
@@ -131,11 +82,13 @@ where
 
 /// Drive an already-built chunk stream into `writer`: the primary chunks as
 /// the transparent root child, each component and the dictionary as
-/// auxiliary children. The one writer tail — `serialize_parts` wraps a
-/// store's single primary array in it, `quads_stream_to_vortex_writer` (the
-/// streaming entry point) feeds it a builder's stream, and compaction a
-/// stream it built with its own spill-directory placement. The memory bound
-/// is `RdfStoreWriteStrategy::write_stream`'s.
+/// auxiliary children. The one writer tail — `to_bytes` feeds it a store's
+/// parts as one chunk (`StoreParts::into_stream`),
+/// `quads_stream_to_vortex_writer` (the streaming entry point) a builder's
+/// stream, and compaction a stream it built with its own spill-directory
+/// placement — so every write refuses here while the experimental
+/// patched-array switch is on ([`refuse_experimental_patches`]). The memory
+/// bound is `RdfStoreWriteStrategy::write_stream`'s.
 pub(crate) async fn built_stream_to_vortex_writer<W>(
     built: BuiltStream,
     mut writer: W,
@@ -143,6 +96,7 @@ pub(crate) async fn built_stream_to_vortex_writer<W>(
 where
     W: VortexWrite + Unpin + Send,
 {
+    refuse_experimental_patches()?;
     let mut components = built.components;
     if let Some(dict) = &built.dict {
         components.push(dict.to_write()?);
