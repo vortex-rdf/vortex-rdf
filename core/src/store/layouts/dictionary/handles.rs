@@ -21,7 +21,7 @@ use super::predicates::{KindRanges, TermPredicate};
 use super::term_dict::TermDictionary;
 
 /// How a resolved Dictionary layout reaches its term dictionary: the
-/// *residency* axis, sitting above `TermStore`'s encoding axis.
+/// *residency* axis, sitting above `ResidentChunks`' encoding axis.
 ///
 /// `Resident` holds the whole dictionary in memory; `FileBacked` leaves the
 /// terms in the file's scannable dictionary child and reads them on demand,

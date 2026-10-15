@@ -1,7 +1,7 @@
-//! How a resident [`TermDictionary`] holds its sorted terms ([`TermStore`])
-//! and reads them (the cursors), how one is built (FSST compression) or
-//! adopted from a written term column, and the dictionary child's read and
-//! write sides, its zone-map bounds included.
+//! How a resident [`TermDictionary`] holds its sorted terms
+//! ([`ResidentChunks`]) and reads them (the cursors), how one is built (FSST
+//! compression) or adopted from a written term column, and the dictionary
+//! child's read and write sides, its zone-map bounds included.
 
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 use std::sync::Arc;
@@ -40,33 +40,26 @@ pub(crate) const COL_DICT_TERM: &str = "_dict_term";
 /// shared symbol table every window carries.
 const DICT_CHUNK_ROWS: usize = 64 * 1024;
 
-/// How a dictionary's sorted terms are held in memory.
+/// How a dictionary's sorted terms are held in memory: the column as one or
+/// more chunks (compressed in windows, or read back from a serialized
+/// dictionary child), with a cumulative-start table mapping a global term
+/// index to (chunk, local index). Always at least one chunk; an empty column
+/// is one empty chunk.
 ///
 /// The dictionary is *built* FSST-compressed (see [`TermDictionary::compress`])
-/// and written out that way, so an FSST chunk is the normal case. A
+/// and written out that way, so an FSST chunk is the normal case, and a large
+/// dictionary stays FSST-compressed through the resident lift. A
 /// [`TermChunk::Canonical`] chunk covers every other encoding: Vortex picks a
 /// column's encoding when it writes, by sampling, and the selector is free to
 /// choose something other than FSST — so a dictionary read back from a file
 /// or IPC stream may arrive in any encoding, and the read path has to be
 /// total over that. Anything that is not FSST is canonicalized to plaintext
 /// on open.
-pub(super) enum TermStore {
-    /// One term chunk holding the whole column.
-    Single(TermChunk),
-    /// A multi-chunk term column (compressed in windows, or read back from a
-    /// serialized dictionary child), each chunk kept in the encoding it was
-    /// written in, so a large dictionary stays FSST-compressed through the
-    /// resident lift.
-    Chunked(ResidentChunks),
-}
-
-/// The chunks of a multi-chunk resident term column, with a cumulative-start
-/// table mapping a global term index to (chunk, local index).
 pub(super) struct ResidentChunks {
-    pub(super) chunks: Vec<TermChunk>,
+    chunks: Vec<TermChunk>,
     /// `starts[i]` = global index of chunk i's first term; ascending.
     starts: Vec<usize>,
-    pub(super) len: usize,
+    len: usize,
 }
 
 /// One chunk of a term column, in the encoding it is held in.
@@ -140,28 +133,60 @@ pub(super) fn chunk_of(starts: &[usize], i: usize) -> (usize, usize) {
 }
 
 impl ResidentChunks {
-    /// The chunk holding global index `i`, and `i` local to it.
+    /// The column `chunks` concatenate to, in order: at least one chunk.
+    fn new(chunks: Vec<TermChunk>) -> Self {
+        debug_assert!(!chunks.is_empty(), "a term column holds at least one chunk");
+        let mut starts = Vec::with_capacity(chunks.len());
+        let mut len = 0usize;
+        for chunk in &chunks {
+            starts.push(len);
+            len += chunk.len();
+        }
+        Self {
+            chunks,
+            starts,
+            len,
+        }
+    }
+
+    /// Number of terms.
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The chunk holding global index `i`, and `i` local to it. A
+    /// one-chunk column answers without searching the start table.
+    #[inline]
     fn locate(&self, i: usize) -> (usize, usize) {
+        if self.chunks.len() == 1 {
+            return (0, i);
+        }
         chunk_of(&self.starts, i)
     }
-}
 
-impl TermStore {
     /// Term `i`'s bytes: borrowed from a canonical chunk, or decoded into
     /// `scratch` from an FSST one. A read of one term at a time passes one
     /// scratch buffer through all its probes, where a cursor holds a buffer
     /// per chunk.
     pub(super) fn bytes_into<'a>(&'a self, i: usize, scratch: &'a mut Vec<u8>) -> &'a [u8] {
-        let (chunk, local) = match self {
-            TermStore::Single(chunk) => (chunk, i),
-            TermStore::Chunked(c) => {
-                let (k, local) = c.locate(i);
-                (&c.chunks[k], local)
-            }
-        };
-        match chunk {
+        let (chunk, local) = self.locate(i);
+        match &self.chunks[chunk] {
             TermChunk::Canonical(a) => StrColReader::new(a).bytes_at(local),
             TermChunk::Fsst(f) => f.decode_into(local, scratch),
+        }
+    }
+
+    /// A fresh cursor over the terms: one chunk cursor per chunk, each with
+    /// its own scratch.
+    pub(super) fn cursor(&self) -> DictCursor<'_> {
+        let (first, rest) = self
+            .chunks
+            .split_first()
+            .expect("a term column holds at least one chunk");
+        DictCursor {
+            store: self,
+            first: first.cursor(),
+            rest: rest.iter().map(TermChunk::cursor).collect(),
         }
     }
 }
@@ -170,9 +195,9 @@ impl TermDictionary {
     /// A dictionary of no terms, held canonical: there is nothing to train
     /// FSST on.
     pub(crate) fn empty() -> Self {
-        Self::new(TermStore::Single(TermChunk::Canonical(
+        Self::new(ResidentChunks::new(vec![TermChunk::Canonical(
             VarBinViewArray::from_iter_str(std::iter::empty::<&str>()),
-        )))
+        )]))
     }
 
     /// Build from already-sorted unique term strings. The column is
@@ -218,24 +243,10 @@ impl TermDictionary {
             }
             adopted.push(TermChunk::from_wire(chunk, ctx)?);
         }
-        let store = match adopted.len() {
-            0 => return Ok(Self::empty()),
-            1 => TermStore::Single(adopted.pop().expect("length checked above")),
-            _ => {
-                let mut starts = Vec::with_capacity(adopted.len());
-                let mut len = 0usize;
-                for chunk in &adopted {
-                    starts.push(len);
-                    len += chunk.len();
-                }
-                TermStore::Chunked(ResidentChunks {
-                    chunks: adopted,
-                    starts,
-                    len,
-                })
-            }
-        };
-        Ok(Self::new(store))
+        if adopted.is_empty() {
+            return Ok(Self::empty());
+        }
+        Ok(Self::new(ResidentChunks::new(adopted)))
     }
 
     /// FSST-compress a plaintext term column.
@@ -259,53 +270,45 @@ impl TermDictionary {
     /// exercise the multi-window path without building 64 Ki terms.
     pub(super) fn compress_windowed(plain: VarBinViewArray, window: usize) -> Result<Self> {
         if plain.is_empty() {
-            return Ok(Self::new(TermStore::Single(TermChunk::Canonical(plain))));
+            return Ok(Self::new(ResidentChunks::new(vec![TermChunk::Canonical(
+                plain,
+            )])));
         }
         let start = debug::timer();
         let len = plain.len();
         let array = plain.into_array();
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let compressor = fsst_train_compressor(&array, &mut ctx)?;
-        if len <= window {
+        let chunks = if len <= window {
+            // One window: the column compresses as it is, unsliced.
             let fsst = fsst_compress(&array, &compressor, &mut ctx)?;
-            let terms = FsstTerms::new(fsst)?;
-            log::debug!(
-                "[Dictionary] FSST-compressed {} terms in {:?}",
-                terms.len(),
-                debug::elapsed(start)
-            );
-            return Ok(Self::new(TermStore::Single(TermChunk::Fsst(terms))));
-        }
-        let windows = len.div_ceil(window);
-        let mut chunks = Vec::with_capacity(windows);
-        let mut starts = Vec::with_capacity(windows);
-        let mut at = 0usize;
-        while at < len {
-            let end = (at + window).min(len);
-            // Canonicalize the window before compressing: `fsst_compress`
-            // requires a VarBinView, not the lazy wrapper `slice` returns.
-            // The view copies share the parent's data buffers, so this is
-            // per-window view headers, not a copy of the terms.
-            let piece = array
-                .slice(at..end)?
-                .execute::<VarBinViewArray>(&mut ctx)?
-                .into_array();
-            let fsst = fsst_compress(&piece, &compressor, &mut ctx)?;
-            starts.push(at);
-            chunks.push(TermChunk::Fsst(FsstTerms::new(fsst)?));
-            at = end;
-        }
+            vec![TermChunk::Fsst(FsstTerms::new(fsst)?)]
+        } else {
+            let mut chunks = Vec::with_capacity(len.div_ceil(window));
+            let mut at = 0usize;
+            while at < len {
+                let end = (at + window).min(len);
+                // Canonicalize the window before compressing: `fsst_compress`
+                // requires a VarBinView, not the lazy wrapper `slice` returns.
+                // The view copies share the parent's data buffers, so this is
+                // per-window view headers, not a copy of the terms.
+                let piece = array
+                    .slice(at..end)?
+                    .execute::<VarBinViewArray>(&mut ctx)?
+                    .into_array();
+                let fsst = fsst_compress(&piece, &compressor, &mut ctx)?;
+                chunks.push(TermChunk::Fsst(FsstTerms::new(fsst)?));
+                at = end;
+            }
+            chunks
+        };
         log::debug!(
             "[Dictionary] FSST-compressed {} terms into {} windows in {:?}",
             len,
             chunks.len(),
             debug::elapsed(start)
         );
-        Ok(Self::new(TermStore::Chunked(ResidentChunks {
-            chunks,
-            starts,
-            len,
-        })))
+        Ok(Self::new(ResidentChunks::new(chunks)))
     }
 }
 
@@ -413,13 +416,13 @@ pub(super) mod scratch_hooks {
     }
 
     /// The fresh scratch buffers this thread's reads allocated so far.
-    pub(crate) fn fresh() -> usize {
+    pub(in crate::store::layouts::dictionary) fn fresh() -> usize {
         FRESH.with(Cell::get)
     }
 
     /// The times this thread's reads found their buffer too small and grew
     /// it.
-    pub(crate) fn regrown() -> usize {
+    pub(in crate::store::layouts::dictionary) fn regrown() -> usize {
         REGROWN.with(Cell::get)
     }
 }
@@ -430,16 +433,14 @@ pub(super) mod scratch_hooks {
 /// FSST read decodes into the cursor's own scratch buffer, so the borrow ends
 /// at the next call. Callers needing several terms simultaneously — decoding a
 /// quad's four roles — take one cursor per role.
-pub(super) enum DictCursor<'a> {
-    /// A cursor over a [`TermStore::Single`] store's one chunk.
-    Single(ChunkCursor<'a>),
-    /// A cursor over a [`TermStore::Chunked`] store.
-    Chunked {
-        store: &'a ResidentChunks,
-        /// One cursor per chunk, each with its own scratch, so a read maps
-        /// the global index to its chunk and delegates.
-        cursors: Vec<ChunkCursor<'a>>,
-    },
+pub(super) struct DictCursor<'a> {
+    store: &'a ResidentChunks,
+    /// The first chunk's cursor, held inline: a one-chunk column's cursor
+    /// allocates nothing until a read grows its scratch.
+    first: ChunkCursor<'a>,
+    /// One cursor per further chunk, each with its own scratch, so a read
+    /// maps the global index to its chunk and delegates.
+    rest: Vec<ChunkCursor<'a>>,
 }
 
 /// A cursor over one [`TermChunk`].
@@ -472,13 +473,12 @@ impl ChunkCursor<'_> {
 impl DictCursor<'_> {
     #[inline]
     pub(super) fn bytes_at(&mut self, i: usize) -> &[u8] {
-        match self {
-            DictCursor::Single(c) => c.bytes_at(i),
-            DictCursor::Chunked { store, cursors } => {
-                let (chunk, local) = store.locate(i);
-                cursors[chunk].bytes_at(local)
-            }
-        }
+        let (chunk, local) = self.store.locate(i);
+        let cursor = match chunk {
+            0 => &mut self.first,
+            k => &mut self.rest[k - 1],
+        };
+        cursor.bytes_at(local)
     }
 
     #[inline]
@@ -514,10 +514,7 @@ impl TermDictionary {
 impl TermDictionary {
     /// The held term chunks as arrays, each in its stored encoding.
     pub(crate) fn term_chunks(&self) -> Vec<ArrayRef> {
-        match &self.terms {
-            TermStore::Single(c) => vec![c.array()],
-            TermStore::Chunked(c) => c.chunks.iter().map(TermChunk::array).collect(),
-        }
+        self.terms.chunks.iter().map(TermChunk::array).collect()
     }
 }
 
@@ -597,29 +594,25 @@ impl TermDictionary {
             .map_err(VortexRdfError::Vortex)
             .map(|a| a.into_array())
         };
-        match &self.terms {
-            TermStore::Single(c) => Ok(vec![wrap(c.array())?]),
-            TermStore::Chunked(c) => c.chunks.iter().map(|chunk| wrap(chunk.array())).collect(),
-        }
+        self.terms
+            .chunks
+            .iter()
+            .map(|chunk| wrap(chunk.array()))
+            .collect()
     }
 
     /// The window every held chunk but the last fills — the zone length the
     /// dictionary child is written with — or `None` when the chunks are not
     /// one uniform window (chunks adopted from a foreign file), which then
-    /// go without a zone map. An empty dictionary has none.
+    /// go without a zone map. A single chunk is its own window; an empty
+    /// dictionary has none.
     pub(crate) fn uniform_window(&self) -> Option<std::num::NonZeroUsize> {
-        match &self.terms {
-            TermStore::Single(chunk) => std::num::NonZeroUsize::new(chunk.len()),
-            TermStore::Chunked(c) => {
-                let (last, rest) = c.chunks.split_last()?;
-                let window = rest.first().map_or(last.len(), TermChunk::len);
-                let uniform =
-                    rest.iter().all(|chunk| chunk.len() == window) && last.len() <= window;
-                uniform
-                    .then(|| std::num::NonZeroUsize::new(window))
-                    .flatten()
-            }
-        }
+        let (last, rest) = self.terms.chunks.split_last()?;
+        let window = rest.first().map_or(last.len(), TermChunk::len);
+        let uniform = rest.iter().all(|chunk| chunk.len() == window) && last.len() <= window;
+        uniform
+            .then(|| std::num::NonZeroUsize::new(window))
+            .flatten()
     }
 }
 
@@ -642,11 +635,13 @@ mod tests {
             .collect();
         let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
         let dict = TermDictionary::compress_windowed(plain, 100).unwrap();
-        let TermStore::Chunked(chunks) = &dict.terms else {
-            panic!("a dictionary above the window size must be chunked");
-        };
+        assert_eq!(
+            dict.terms.chunks.len(),
+            3,
+            "a window of 100 cuts 300 terms in 3"
+        );
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        for chunk in &chunks.chunks {
+        for chunk in &dict.terms.chunks {
             let TermChunk::Fsst(fsst) = chunk else {
                 panic!("a built dictionary holds FSST chunks");
             };
@@ -745,7 +740,7 @@ mod tests {
         let terms: Vec<String> = (0..8).map(|i| format!("<http://e.org/{i}>")).collect();
         let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
         let dict = TermDictionary::compress_windowed(plain, usize::MAX).unwrap();
-        let TermStore::Single(TermChunk::Fsst(original)) = &dict.terms else {
+        let [TermChunk::Fsst(original)] = &dict.terms.chunks[..] else {
             panic!("a small dictionary is one FSST chunk");
         };
         // Every stored offset must fit the narrowest width tried.
@@ -801,7 +796,7 @@ mod tests {
         let terms = crate::tests::widely_varying_terms();
         let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
         let dict = TermDictionary::compress_windowed(plain, usize::MAX).unwrap();
-        let TermStore::Single(chunk @ TermChunk::Fsst(fsst)) = &dict.terms else {
+        let [chunk @ TermChunk::Fsst(fsst)] = &dict.terms.chunks[..] else {
             panic!("a small dictionary is one FSST chunk");
         };
         let mut cursor = chunk.cursor();
@@ -831,19 +826,12 @@ mod tests {
             .collect();
         let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
         let windowed = TermDictionary::compress_windowed(plain.clone(), 64).unwrap();
-        match &windowed.terms {
-            TermStore::Chunked(c) => {
-                assert_eq!(c.chunks.len(), 1_000usize.div_ceil(64));
-                assert_eq!(c.len, 1_000);
-                assert!(c.chunks.iter().all(|ch| matches!(ch, TermChunk::Fsst(_))));
-            }
-            _ => panic!("a dictionary above the window size must be chunked"),
-        }
+        let c = &windowed.terms;
+        assert_eq!(c.chunks.len(), 1_000usize.div_ceil(64));
+        assert_eq!(c.len, 1_000);
+        assert!(c.chunks.iter().all(|ch| matches!(ch, TermChunk::Fsst(_))));
         let single = TermDictionary::compress_windowed(plain, usize::MAX).unwrap();
-        assert!(matches!(
-            single.terms,
-            TermStore::Single(TermChunk::Fsst(_))
-        ));
+        assert!(matches!(single.terms.chunks[..], [TermChunk::Fsst(_)]));
         for (i, term) in terms.iter().enumerate() {
             assert_eq!(windowed.encode(term), Some(i as TermCode), "{term}");
             assert_eq!(
@@ -869,10 +857,7 @@ mod tests {
 
         let single =
             TermDictionary::from_term_chunks(vec![plain.clone().into_array()], &mut ctx).unwrap();
-        assert!(matches!(
-            single.terms,
-            TermStore::Single(TermChunk::Canonical(_))
-        ));
+        assert!(matches!(single.terms.chunks[..], [TermChunk::Canonical(_)]));
 
         let column = plain.into_array();
         let pieces = vec![
@@ -880,19 +865,15 @@ mod tests {
             column.slice(120..300).unwrap(),
         ];
         let chunked = TermDictionary::from_term_chunks(pieces, &mut ctx).unwrap();
-        match &chunked.terms {
-            TermStore::Chunked(c) => {
-                assert_eq!(c.chunks.len(), 2);
-                assert_eq!(c.starts, vec![0, 120]);
-                assert_eq!(c.len, 300);
-                assert!(
-                    c.chunks
-                        .iter()
-                        .all(|ch| matches!(ch, TermChunk::Canonical(_)))
-                );
-            }
-            _ => panic!("a two-chunk column must adopt chunked"),
-        }
+        let c = &chunked.terms;
+        assert_eq!(c.chunks.len(), 2);
+        assert_eq!(c.starts, vec![0, 120]);
+        assert_eq!(c.len, 300);
+        assert!(
+            c.chunks
+                .iter()
+                .all(|ch| matches!(ch, TermChunk::Canonical(_)))
+        );
 
         for (i, term) in terms.iter().enumerate() {
             for d in [&single, &chunked] {
