@@ -23,7 +23,10 @@ The local `js-tests` mirror trades exactness for wall clock: it builds with
 build's wall clock and buys no memory headroom) and caps `CARGO_BUILD_JOBS`
 (default 4; export it to override) so a cold wasm build's rustc fan-out doesn't
 exhaust memory. The tests therefore run against an unoptimized wasm binary — CI
-stays the source of truth for the exact artifact that ships.
+stays the source of truth for the exact artifact that ships. The local
+`interface-tests` mirror caps `CARGO_BUILD_JOBS` the same way (default 4;
+export it to override), since a cold build compiles DataFusion's dependency
+tree.
 
 Node's version is pinned once in [`.tool-versions`](.tool-versions); every
 workflow reads it via `node-version-file`, and mise and asdf pick it up natively,

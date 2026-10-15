@@ -50,13 +50,19 @@ passed+=(rust-tests)
 
 # --- interface-tests job ---
 # The DataFusion conformance crate is its own workspace (interface-tests/),
-# checked against its own lock file.
-info "cargo fmt --manifest-path interface-tests/Cargo.toml --check"
-cargo fmt --manifest-path interface-tests/Cargo.toml --check
-info "cargo clippy --manifest-path interface-tests/Cargo.toml --all-targets --locked -- -D warnings"
-cargo clippy --manifest-path interface-tests/Cargo.toml --all-targets --locked -- -D warnings
-info "cargo test --manifest-path interface-tests/Cargo.toml --locked"
-cargo test --manifest-path interface-tests/Cargo.toml --locked
+# checked against its own lock file. CARGO_BUILD_JOBS is capped as in the
+# js-tests block below: a cold build compiles DataFusion's dependency tree,
+# and one rustc per core exhausts memory on a small machine. Override by
+# exporting CARGO_BUILD_JOBS yourself.
+(
+  export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
+  info "cargo fmt --manifest-path interface-tests/Cargo.toml --check"
+  cargo fmt --manifest-path interface-tests/Cargo.toml --check
+  info "cargo clippy --manifest-path interface-tests/Cargo.toml --all-targets --locked -- -D warnings"
+  cargo clippy --manifest-path interface-tests/Cargo.toml --all-targets --locked -- -D warnings
+  info "cargo test --manifest-path interface-tests/Cargo.toml --locked"
+  cargo test --manifest-path interface-tests/Cargo.toml --locked
+)
 passed+=(interface-tests)
 
 # --- python-tests job ---
