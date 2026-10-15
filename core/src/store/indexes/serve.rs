@@ -279,18 +279,17 @@ pub(crate) struct InMemoryServePlan {
 
 impl InMemoryServePlan {
     /// A plan serving the contiguous `range` of the rows `array` of the
-    /// in-memory index component named `component`.
-    pub(crate) fn new(
-        primary_columns: [&'static str; 4],
-        rid_column: &'static str,
-        decode_layout: ResolvedLayout,
+    /// in-memory index component named `component`, decoded through
+    /// `decode`.
+    pub(super) fn new(
+        decode: ServeDecode,
         component: &'static str,
         array: ArrayRef,
         range: Range<usize>,
         probes: Arc<crate::store::probes::StructProbes>,
     ) -> Self {
         Self {
-            decode: ServeDecode::new(primary_columns, rid_column, decode_layout),
+            decode,
             component,
             array,
             range,

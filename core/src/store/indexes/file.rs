@@ -1,8 +1,9 @@
-//! The file-backed side of the index hub: the readers (point reads through
-//! cached chunk probes, rid-only pushed-down scans) that produce a
-//! resolution's ascending, unique `Buffer<RowId>` of base rows from an index
-//! child, and [`FileServePlan`], which reads a resolved view's quads out of
-//! the child's own columns.
+//! The file-backed side of the index hub: the one file resolver every
+//! index's probe runs through ([`resolve_file`]), the readers it and the
+//! deferred ids use (point reads through cached chunk probes, rid-only
+//! pushed-down scans) to produce a resolution's ascending, unique
+//! `Buffer<RowId>` of base rows from an index child, and [`FileServePlan`],
+//! which reads a resolved view's quads out of the child's own columns.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -17,11 +18,12 @@ use vortex_layout::scan::split_by::SplitBy;
 use vortex_mask::Mask;
 
 use super::components::{check_addressable, sorted_row_ids};
+use super::resolve::IndexProbe;
 use super::serve::ServeDecode;
-use super::{COL_RID, IndexResolution, ResolvedRoles, ResolvedRowIds};
+use super::{COL_RID, IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds};
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
-use crate::store::layouts::{ChunkDecode, ResolvedLayout};
+use crate::store::layouts::{ChunkDecode, PatternCodes, ResolvedLayout};
 use crate::store::persist::native_file::{ChildReader, NativeStoreFile};
 use crate::store::scan::file_reads::eq_conjunction;
 use crate::store::schema::{RowId, TermCode};
@@ -35,7 +37,7 @@ use crate::store::schema::{RowId, TermCode};
 /// `Ok(None)` declines the location (the caller keeps its pushed-down scan):
 /// a child not globally sorted, a probe value that is not an integer (string
 /// value columns), or a column whose chunks resolve no probe.
-pub(crate) async fn locate_component_run(
+async fn locate_component_run(
     file: &NativeStoreFile,
     child: &ChildReader,
     column: &str,
@@ -65,7 +67,7 @@ pub(crate) async fn locate_component_run(
 /// base row order — the file counterpart of slicing an in-memory rid run.
 /// `Ok(None)` when the rid column's chunks decline (the caller keeps its
 /// scan); rids are unique by construction, so sorting alone suffices.
-pub(crate) async fn rid_point_reads(
+async fn rid_point_reads(
     file: &NativeStoreFile,
     child: &ChildReader,
     range: Range<u64>,
@@ -170,11 +172,10 @@ async fn read_scanned_row_ids(scan: ScanBuilder<ArrayRef>) -> Result<Buffer<RowI
     sorted_row_ids(struct_arr.unmasked_field_by_name(COL_RID).cloned()?)
 }
 
-/// An eager file resolution off the rid-only pushed-down scan — the shared
-/// tail of the file resolvers whenever no serving plan defers the ids (a
-/// back-reference child, or a copy resolution that couldn't build its plan):
-/// `Empty` when the scan proves the probe matches nothing.
-pub(crate) async fn resolve_eager_from_scan(
+/// An eager file resolution off the rid-only pushed-down scan — the file
+/// resolver's answer for a non-serving probe whose ids no located run of
+/// ascending rids defers: `Empty` when the scan proves it matches nothing.
+async fn resolve_eager_from_scan(
     child: &ChildReader,
     constraints: &[(&'static str, Scalar)],
     resolves: ResolvedRoles,
@@ -187,6 +188,173 @@ pub(crate) async fn resolve_eager_from_scan(
         row_ids: ResolvedRowIds::Eager(row_ids),
         resolves,
         serve: None,
+    })
+}
+
+/// Resolve `probe` against a file's index children — the file counterpart of
+/// `resolve::resolve_in_memory`, reaching the probed child's columns through
+/// their cached chunk probes (the file mirror of the in-memory binary search)
+/// or, failing that, a pushed-down scan, whose filter answers regardless of
+/// sortedness.
+///
+/// On a globally sorted child the keys' rows are one contiguous run, located
+/// key by key, each search windowed to the run of the keys before it; a
+/// located empty run proves the pattern matches nothing. What answers the
+/// row ids then depends on the probe:
+/// - A serving probe's ids are deferred to a rid-only scan filtered by its
+///   keys — except a small located run's, which rid point reads resolve now,
+///   a handful of cached-chunk accesses — and a [`FileServePlan`] reads the
+///   matched quads from the child: the located run, or the rows its keys and
+///   residual terms filter.
+/// - A non-serving probe whose rids ascend keeps a located run's ids deferred
+///   ([`LazyRowIds::from_located_run`]), so that a count takes the run's
+///   width and a window reads only its own rows.
+/// - Any other non-serving resolution answers eager ids off the pushed-down
+///   scan ([`resolve_eager_from_scan`]).
+///
+/// `Declined` when the probed child is absent (a foreign writer could omit
+/// one); `Empty` when a key or residual term is absent from the dictionary.
+pub(super) async fn resolve_file(
+    probe: IndexProbe<'_>,
+    file: &Arc<NativeStoreFile>,
+    codes: &mut PatternCodes,
+) -> Result<IndexResolution<FileServePlan>> {
+    let (child, keys, located) = match locate(file, &probe, codes).await? {
+        Located::Declined => return Ok(IndexResolution::Declined),
+        Located::Absent => return Ok(IndexResolution::Empty),
+        Located::Run { child, keys, range } => (child, keys, range),
+    };
+    // A located empty run proves the keys' combination absent from the data
+    // — the short-circuit a scan reaches only after reading it.
+    if located.as_ref().is_some_and(Range::is_empty) {
+        return Ok(IndexResolution::Empty);
+    }
+    let Some(decode) = probe.serve else {
+        return match located {
+            // The located range is exactly the keys' rows. Its ids are read
+            // only when a consumer needs them.
+            Some(range) if probe.rids_ascend => Ok(IndexResolution::Resolved {
+                row_ids: ResolvedRowIds::Lazy(LazyRowIds::from_located_run(
+                    Arc::clone(file),
+                    child,
+                    range,
+                )),
+                resolves: probe.resolves,
+                serve: None,
+            }),
+            _ => resolve_eager_from_scan(&child, &keys, probe.resolves).await,
+        };
+    };
+    // The plan filters on every bound term the child holds: the keys, then
+    // the residual terms. A residual term absent from the dictionary matches
+    // nothing.
+    let mut constraints = keys.clone();
+    for &(column, term) in &probe.residual {
+        let Some(native) = codes.probe_scalar(term)? else {
+            return Ok(IndexResolution::Empty);
+        };
+        constraints.push((column, native));
+    }
+    // A small located run resolves its row ids NOW by rid point reads — a
+    // handful of cached-chunk accesses — instead of deferring a whole child
+    // scan (which a count or chained match would then pay).
+    let point_read = match &located {
+        Some(range) if crate::store::view::selection::point_sized(range.end - range.start) => {
+            rid_point_reads(file, &child, range.clone()).await?
+        }
+        _ => None,
+    };
+    let row_ids = match point_read {
+        Some(ids) => ResolvedRowIds::Eager(ids),
+        None => ResolvedRowIds::Lazy(LazyRowIds::from_index_child_scan(child.clone(), keys)),
+    };
+    // A located range is exactly the constrained rows only when the location
+    // covered every constraint: it searched the keys, so a residual term —
+    // never a sort key — demotes the range back to the filter scan.
+    let row_range = if probe.residual.is_empty() {
+        located
+    } else {
+        None
+    };
+    Ok(IndexResolution::Resolved {
+        row_ids,
+        resolves: probe.resolves,
+        // A serving resolution reads the matched quads straight from the
+        // child's columns — point reads or a range scan over a located run,
+        // or the pushed-down filter scan.
+        serve: Some(FileServePlan::new(decode, child, constraints, row_range)),
+    })
+}
+
+/// The file resolver's front half: the probed child, the keys as its native
+/// probe values, and the run of child rows they select when the child's
+/// cached chunk probes locate it.
+enum Located {
+    /// The probed child is absent (a foreign writer could omit one).
+    Declined,
+    /// A key's term is absent from the dictionary: nothing can match.
+    Absent,
+    /// The probe applies; `range` is the keys' run when located, `None` when
+    /// the location declined (an unsorted child, a string value column, a
+    /// chunk resolving no probe) and the pushed-down scan answers instead.
+    Run {
+        child: ChildReader,
+        keys: Vec<(&'static str, Scalar)>,
+        range: Option<Range<u64>>,
+    },
+}
+
+/// Open `probe`'s child, translate its keys and locate their run through the
+/// child's chunk probes: the first key over the whole child, each later one
+/// windowed to the run before it. A declined search abandons the location
+/// wholesale, and an empty run ends it — no later key can widen it. The
+/// shared front half of [`resolve_file`] and the test hook
+/// `debug_located_run`.
+async fn locate(
+    file: &NativeStoreFile,
+    probe: &IndexProbe<'_>,
+    codes: &mut PatternCodes,
+) -> Result<Located> {
+    let Some(child) = file.child_reader(probe.identity.name)? else {
+        return Ok(Located::Declined);
+    };
+    let mut keys = Vec::with_capacity(probe.keys.len());
+    for &(column, term) in &probe.keys {
+        let Some(native) = codes.probe_scalar(term)? else {
+            return Ok(Located::Absent);
+        };
+        keys.push((column, native));
+    }
+    let mut range = None;
+    for (column, native) in &keys {
+        range = locate_component_run(file, &child, column, native, range).await?;
+        match &range {
+            Some(run) if !run.is_empty() => {}
+            _ => break,
+        }
+    }
+    Ok(Located::Run { child, keys, range })
+}
+
+/// Test-only hook exposing the run [`resolve_file`] locates when `index`
+/// resolves `pattern` — `None` when the index declines the pattern, its
+/// child is absent, a key's term is absent, or the location declines and
+/// the resolution falls back to its pushed-down scan — so tests can assert
+/// engagement instead of inferring it from results.
+#[cfg(test)]
+pub(crate) async fn debug_located_run(
+    index: super::IndexType,
+    file: &NativeStoreFile,
+    layout: &ResolvedLayout,
+    pattern: crate::store::layouts::QuadPattern<'_>,
+    codes: &mut PatternCodes,
+) -> Result<Option<Range<u64>>> {
+    let Some(probe) = index.choose(pattern, layout) else {
+        return Ok(None);
+    };
+    Ok(match locate(file, &probe, codes).await? {
+        Located::Run { range, .. } => range,
+        Located::Declined | Located::Absent => None,
     })
 }
 
@@ -246,21 +414,19 @@ fn run_split_rows(rows: u64) -> usize {
 }
 
 impl FileServePlan {
-    /// A plan serving a file's index columns by a pushed-down scan filtered to
-    /// the rows where every `constraints` equality holds — or, over a located
-    /// `row_range`, by point reads (a small run) or a range-restricted scan
-    /// split across the workers (a wide one) — see
-    /// [`Self::located_run_scan`].
-    pub(crate) fn new(
-        primary_columns: [&'static str; 4],
-        rid_column: &'static str,
-        decode_layout: ResolvedLayout,
+    /// A plan serving a file's index columns, decoded through `decode`, by a
+    /// pushed-down scan filtered to the rows where every `constraints`
+    /// equality holds — or, over a located `row_range`, by point reads (a
+    /// small run) or a range-restricted scan split across the workers (a wide
+    /// one) — see [`Self::located_run_scan`].
+    fn new(
+        decode: ServeDecode,
         child: ChildReader,
         constraints: Vec<(&'static str, Scalar)>,
         row_range: Option<Range<u64>>,
     ) -> Self {
         Self {
-            decode: ServeDecode::new(primary_columns, rid_column, decode_layout),
+            decode,
             child,
             constraints,
             bound: Arc::new(std::sync::OnceLock::new()),

@@ -2,8 +2,9 @@
 //! quad columns, one per sort order, each paired with the primary row IDs it
 //! permutes — the classic triple-store permutation indexes (POS/OSP) adapted
 //! to quads. This module owns both halves of the index's lifecycle — building
-//! the copy columns at write time, and executing lookups against them at query
-//! time (`resolve_in_memory` / `resolve_file`).
+//! the copy columns at write time, and choosing the probe a pattern runs
+//! against them at query time (`choose`), which one shared resolver per
+//! backend executes.
 //!
 //! The two families are:
 //!
@@ -43,23 +44,18 @@
 use std::cmp::Ordering;
 
 use vortex_array::arrays::PrimitiveArray;
-use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::{ArrayRef, IntoArray};
 
 use super::components::{ComponentIdentity, IndexComponent, TermColumn, components_from};
-use super::{COL_RID, IndexResolution, IndexType, LazyRowIds, ResolvedRoles, ResolvedRowIds};
+use super::resolve::IndexProbe;
+use super::serve::ServeDecode;
+use super::{COL_RID, IndexType, ResolvedRoles};
 use crate::error::Result;
 use crate::store::RawQuad;
 use crate::store::array::stamp_is_sorted;
 use crate::store::layouts::dictionary::QuadCodes;
-use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout, TermRef};
+use crate::store::layouts::{QuadPattern, ResolvedLayout, TermRef};
 use crate::store::schema::{COL_G, COL_O, COL_P, COL_S, TermCode};
-
-#[cfg(feature = "file-io")]
-use super::FileServePlan;
-use super::InMemoryServePlan;
-#[cfg(feature = "file-io")]
-use vortex_array::scalar::Scalar;
 
 /// One of the two sorted copy families this index maintains, named after its
 /// sort order. Each family owns five columns: the four quad components plus
@@ -175,133 +171,66 @@ impl CopyFamily {
     }
 }
 
-/// The family, probe terms, and resolved component(s) this index would use for
-/// a pattern shape, independent of any backend — the shared front half of both
-/// resolvers.
+/// The probe this index runs for a pattern shape — its family's child, the
+/// sort keys and terms to search, and the component(s) a hit resolves —
+/// independent of any backend: the shared front half of both resolvers.
 ///
 /// A bound subject declines the index: the primary `s` column (binary-searched
 /// or zone-pruned) is the better access path there. A bound predicate *and*
 /// object take the POSG family's (p, o) prefix, resolving both components in
-/// one probe. `None` when nothing this index covers is bound.
-struct CopyProbe<'a> {
-    family: CopyFamily,
-    lead: TermRef<'a>,
-    second: Option<TermRef<'a>>,
-    resolves: ResolvedRoles,
-}
-
-fn choose<'a>(pattern: QuadPattern<'a>) -> Option<CopyProbe<'a>> {
+/// one probe. A bound graph is never a sort key of the copies, so it rides as
+/// a residual term the file serve plan filters on. The copies hold whole
+/// quads, so the probe serves reads from its family's columns; a run's rids
+/// follow the family's sort order, not row order. `None` when nothing this
+/// index covers is bound.
+pub(super) fn choose<'a>(
+    pattern: QuadPattern<'a>,
+    layout: &ResolvedLayout,
+) -> Option<IndexProbe<'a>> {
     if pattern.subject.is_some() {
         return None;
     }
-    match (pattern.predicate, pattern.object) {
-        (Some(predicate), Some(object)) => Some(CopyProbe {
-            family: CopyFamily::Posg,
-            lead: TermRef::Predicate(predicate),
-            second: Some(TermRef::Object(object)),
-            resolves: ResolvedRoles::PredicateObject,
-        }),
-        (Some(predicate), None) => Some(CopyProbe {
-            family: CopyFamily::Posg,
-            lead: TermRef::Predicate(predicate),
-            second: None,
-            resolves: ResolvedRoles::Predicate,
-        }),
-        (None, Some(object)) => Some(CopyProbe {
-            family: CopyFamily::Ospg,
-            lead: TermRef::Object(object),
-            second: None,
-            resolves: ResolvedRoles::Object,
-        }),
-        (None, None) => None,
-    }
-}
-
-/// Resolve a pattern against this index's in-memory component.
-///
-/// Binary-searches the chosen family's lead column for the probe term — and,
-/// for a (p, o) prefix probe, the object column within the resulting run — and
-/// slices out the paired row ids. Declines (so the store falls back to a mask
-/// scan) when the family's component is absent, probe-incompatible, or not
-/// globally sorted (`IndexComponent::sorted` — per-chunk sorted data is not
-/// binary-searchable). Global sortedness by the family's full comparator is
-/// also what makes the second column sorted within each lead run and the
-/// prefix search valid.
-pub(crate) fn resolve_in_memory(
-    components: &[IndexComponent],
-    layout: &ResolvedLayout,
-    pattern: QuadPattern<'_>,
-    codes: &mut PatternCodes,
-) -> Result<IndexResolution<InMemoryServePlan>> {
-    // Pick the family and probe(s) for this pattern shape, or decline it.
-    let Some(probe) = choose(pattern) else {
-        return Ok(IndexResolution::Declined);
+    let (family, lead, second, resolves) = match (pattern.predicate, pattern.object) {
+        (Some(predicate), Some(object)) => (
+            CopyFamily::Posg,
+            TermRef::Predicate(predicate),
+            Some(TermRef::Object(object)),
+            ResolvedRoles::PredicateObject,
+        ),
+        (Some(predicate), None) => (
+            CopyFamily::Posg,
+            TermRef::Predicate(predicate),
+            None,
+            ResolvedRoles::Predicate,
+        ),
+        (None, Some(object)) => (
+            CopyFamily::Ospg,
+            TermRef::Object(object),
+            None,
+            ResolvedRoles::Object,
+        ),
+        (None, None) => return None,
     };
-    // Route through the index only when the family's component exists and its
-    // sort keys are globally sorted — the writer's provenance, not a stamp
-    // inspection.
-    let Some(component) = IndexComponent::find_sorted(components, probe.family.identity().name)
-    else {
-        return Ok(IndexResolution::Declined);
-    };
-    // Translate the term to the value columns' native probe value (a string,
-    // or a dictionary code). Absent from the dictionary ⇒ nothing can match.
-    // The probe terms are the pattern's own predicate/object, so this reads
-    // the match's resolution cache (no second dictionary search).
-    let Some(lead_native) = codes.probe_scalar(probe.lead)? else {
-        return Ok(IndexResolution::Empty);
-    };
-    // First genuine use of a `from_bytes`-adopted component: this is where a
-    // deferred child canonicalizes.
-    let rows = component.rows()?;
-    // Binary search bounds the run of rows whose lead component equals the
-    // probe — through the component's cached probe when the column resolves
-    // one.
-    let Some(mut run) = component.probe_run(probe.family.child_lead_col(), &lead_native, None)?
-    else {
-        return Ok(IndexResolution::Declined);
-    };
-    if run.is_empty() {
-        return Ok(IndexResolution::Empty);
-    }
-    // Prefix probe: narrow the run by the second sort key, which is sorted
-    // within the run by the family's comparator.
-    if let Some(second_term) = probe.second {
-        let Some(second_native) = codes.probe_scalar(second_term)? else {
-            return Ok(IndexResolution::Empty);
-        };
-        let Some(narrowed) =
-            component.probe_run(probe.family.child_second_col(), &second_native, Some(run))?
-        else {
-            return Ok(IndexResolution::Declined);
-        };
-        if narrowed.is_empty() {
-            return Ok(IndexResolution::Empty);
-        }
-        run = narrowed;
-    }
-    // Row ids of every quad in the matched run — the rid slice comes out in
-    // the family's order, so materializing decodes and re-sorts it into base
-    // row order. Handed back lazily: the serving plan below answers reads
-    // without the ids, so the decode+sort runs only if a consumer needs the
-    // selection itself.
-    let rids = rows.unmasked_field_by_name(COL_RID)?.slice(run.clone())?;
-    Ok(IndexResolution::Resolved {
-        row_ids: ResolvedRowIds::Lazy(LazyRowIds::from_component_run(rids)),
-        resolves: probe.resolves,
-        // The matched quads are the contiguous matched run of this family's
-        // component, so a read can slice them straight from it instead of
-        // gathering the primary columns at the row ids (see
-        // `InMemoryServePlan`).
-        serve: Some(InMemoryServePlan::new(
+    // The lead key, then — for a prefix probe — the second sort key, which
+    // the family's comparator sorts within each lead run.
+    let mut keys = Vec::with_capacity(2);
+    keys.push((family.child_lead_col(), lead));
+    keys.extend(second.map(|term| (family.child_second_col(), term)));
+    Some(IndexProbe {
+        identity: family.identity(),
+        keys,
+        residual: pattern
+            .graph
+            .map(|graph| (COL_G, TermRef::Graph(graph)))
+            .into_iter()
+            .collect(),
+        resolves,
+        serve: Some(ServeDecode::new(
             CHILD_PRIMARY,
             COL_RID,
             copy_decode_layout(layout),
-            component.identity.name,
-            rows.clone().into_array(),
-            run,
-            component.probes_arc(),
         )),
+        rids_ascend: false,
     })
 }
 
@@ -314,152 +243,6 @@ fn copy_decode_layout(layout: &ResolvedLayout) -> ResolvedLayout {
         ResolvedLayout::Dictionary(dict) => ResolvedLayout::Dictionary(dict.clone()),
         _ => ResolvedLayout::Default,
     }
-}
-
-/// Resolve a pattern against this index's copy columns in a file-backed store
-/// — the file counterpart of [`resolve_in_memory`]. On a globally sorted
-/// family the matched run is located first by binary search over the child's
-/// cached chunk probes (the in-memory search's file mirror, including the
-/// windowed second-key probe); a small run's row ids then come from rid point
-/// reads instead of a deferred child scan, and the serve plan carries the
-/// range so reads point-read it too. Anything the probes decline falls back
-/// to the pushed-down scan, whose filter answers regardless of sortedness.
-#[cfg(feature = "file-io")]
-pub(crate) async fn resolve_file(
-    file: &crate::store::persist::native_file::NativeStoreFile,
-    layout: &ResolvedLayout,
-    pattern: QuadPattern<'_>,
-    codes: &mut PatternCodes,
-) -> Result<IndexResolution<FileServePlan>> {
-    let Some(probe) = choose(pattern) else {
-        return Ok(IndexResolution::Declined);
-    };
-    // The store's index set says this index exists, but be graceful when the
-    // family's child is absent (a foreign writer could omit one family).
-    let Some(child) = file.child_reader(probe.family.identity().name)? else {
-        return Ok(IndexResolution::Declined);
-    };
-    // Term absent from the dictionary ⇒ the pattern provably matches nothing.
-    let Some(lead_native) = codes.probe_scalar(probe.lead)? else {
-        return Ok(IndexResolution::Empty);
-    };
-    let mut constraints: Vec<(&'static str, Scalar)> =
-        vec![(probe.family.child_lead_col(), lead_native)];
-    if let Some(second_term) = probe.second {
-        let Some(second_native) = codes.probe_scalar(second_term)? else {
-            return Ok(IndexResolution::Empty);
-        };
-        constraints.push((probe.family.child_second_col(), second_native));
-    }
-
-    // Locate the matched run through the child's cached chunk probes: the
-    // lead search over the whole child, then — for a prefix probe — the
-    // windowed second-key search inside the lead run. Any probe decline
-    // abandons the location wholesale.
-    let mut located = super::file::locate_component_run(
-        file,
-        &child,
-        probe.family.child_lead_col(),
-        &constraints[0].1,
-        None,
-    )
-    .await?;
-    if let Some(range) = located.clone()
-        && !range.is_empty()
-        && let Some((second_col, second_native)) = constraints.get(1)
-    {
-        located =
-            super::file::locate_component_run(file, &child, second_col, second_native, Some(range))
-                .await?;
-    }
-    // A located empty run proves the combination absent — the short-circuit
-    // the deferred path gives up.
-    if let Some(range) = &located
-        && range.is_empty()
-    {
-        return Ok(IndexResolution::Empty);
-    }
-    // A small located run resolves its row ids NOW by rid point reads — a
-    // handful of cached-chunk accesses — instead of deferring a whole child
-    // scan (which a count or chained match would then pay).
-    let deferred = || {
-        ResolvedRowIds::Lazy(LazyRowIds::from_index_child_scan(
-            child.clone(),
-            constraints.clone(),
-        ))
-    };
-    let row_ids = match &located {
-        Some(range) if crate::store::view::selection::point_sized(range.end - range.start) => {
-            super::rid_point_reads(file, &child, range.clone())
-                .await?
-                .map_or_else(deferred, ResolvedRowIds::Eager)
-        }
-        _ => deferred(),
-    };
-    match build_serve_plan(
-        child.clone(),
-        layout,
-        pattern.graph,
-        &constraints,
-        codes,
-        located,
-    )? {
-        // A serving resolution reads the matched quads straight from the
-        // copy columns — point reads over a located run, or the pushed-down
-        // filter scan.
-        Some(plan) => Ok(IndexResolution::Resolved {
-            row_ids,
-            resolves: probe.resolves,
-            serve: Some(plan),
-        }),
-        // No plan (a bound residual term with no dictionary code — see
-        // `build_serve_plan`): fall back to the eager scan, whose ids the
-        // store will actually need.
-        None => super::resolve_eager_from_scan(&child, &constraints, probe.resolves).await,
-    }
-}
-
-/// Build the [`FileServePlan`] letting the store stream a resolved pattern's
-/// quads from this index's own copy columns, or `None` when a bound graph has
-/// no dictionary code (the pattern matches nothing — a case `match_pattern`
-/// already short-circuits before resolving, so this is only a safety fallback
-/// to the row-id path).
-///
-/// `constraints` are the probe's term equalities on the family's sort-key
-/// columns (predicate and/or object); a bound graph adds one more on the `g`
-/// column. The copies store each component as one full term, so — unlike the
-/// primary layout's split TypedObject columns — even the object probes as a
-/// single equality. The copy index declines subject-bound patterns, so the
-/// subject never appears here.
-#[cfg(feature = "file-io")]
-fn build_serve_plan(
-    child: crate::store::persist::native_file::ChildReader,
-    layout: &ResolvedLayout,
-    graph: Option<&oxrdf::GraphName>,
-    constraints: &[(&'static str, Scalar)],
-    codes: &mut PatternCodes,
-    row_range: Option<std::ops::Range<u64>>,
-) -> Result<Option<FileServePlan>> {
-    let mut constraints = constraints.to_vec();
-    if let Some(graph) = graph {
-        let Some(scalar) = codes.probe_scalar(TermRef::Graph(graph))? else {
-            return Ok(None);
-        };
-        constraints.push((COL_G, scalar));
-    }
-    // A located range is exactly the constrained rows only when the probes
-    // covered every constraint: the location searched the sort keys (lead,
-    // then second), so a bound graph — never a sort key here — demotes the
-    // range back to the filter scan.
-    let row_range = if graph.is_none() { row_range } else { None };
-    Ok(Some(FileServePlan::new(
-        CHILD_PRIMARY,
-        COL_RID,
-        copy_decode_layout(layout),
-        child,
-        constraints,
-        row_range,
-    )))
 }
 
 /// The emission surface of the out-of-core builder (compiled out on
@@ -685,33 +468,49 @@ mod tests {
         let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s").unwrap());
         let p = NamedNode::new("http://example.org/p").unwrap();
         let o = Term::Literal(Literal::new_simple_literal("o"));
+        let g = oxrdf::GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
+        let layout = ResolvedLayout::Default;
+        let terms = |pairs: &[(&'static str, TermRef<'_>)]| -> Vec<(&'static str, String)> {
+            pairs.iter().map(|(c, t)| (*c, t.to_string())).collect()
+        };
 
         // A bound subject declines: the primary sorted `s` column is the
         // better access path than this index.
-        assert!(choose(QuadPattern::new(Some(&s), Some(&p), Some(&o), None)).is_none());
+        let spo = QuadPattern::new(Some(&s), Some(&p), Some(&o), None);
+        assert!(choose(spo, &layout).is_none());
 
         // Predicate and object bound: (p, o) prefix probe on the POSG family,
-        // resolving both components.
-        let probe = choose(QuadPattern::new(None, Some(&p), Some(&o), None)).unwrap();
-        assert_eq!(probe.family, CopyFamily::Posg);
+        // resolving both components. Every probe serves reads from its
+        // family's copy, whose rids follow the family's order.
+        let probe = choose(QuadPattern::new(None, Some(&p), Some(&o), None), &layout).unwrap();
+        assert_eq!(probe.identity.name, CopyFamily::Posg.identity().name);
         assert_eq!(probe.resolves, ResolvedRoles::PredicateObject);
-        assert_eq!(probe.lead.to_string(), p.to_string());
-        assert_eq!(probe.second.map(|t| t.to_string()), Some(o.to_string()));
+        assert_eq!(
+            terms(&probe.keys),
+            [(COL_P, p.to_string()), (COL_O, o.to_string())]
+        );
+        assert!(probe.residual.is_empty());
+        assert!(probe.serve.is_some() && !probe.rids_ascend);
 
         // Predicate-only patterns probe the POSG lead alone.
-        let probe = choose(QuadPattern::new(None, Some(&p), None, None)).unwrap();
-        assert_eq!(probe.family, CopyFamily::Posg);
+        let probe = choose(QuadPattern::new(None, Some(&p), None, None), &layout).unwrap();
+        assert_eq!(probe.identity.name, CopyFamily::Posg.identity().name);
         assert_eq!(probe.resolves, ResolvedRoles::Predicate);
-        assert!(probe.second.is_none());
+        assert_eq!(terms(&probe.keys), [(COL_P, p.to_string())]);
 
         // Object-only patterns probe the OSPG lead.
-        let probe = choose(QuadPattern::new(None, None, Some(&o), None)).unwrap();
-        assert_eq!(probe.family, CopyFamily::Ospg);
+        let probe = choose(QuadPattern::new(None, None, Some(&o), None), &layout).unwrap();
+        assert_eq!(probe.identity.name, CopyFamily::Ospg.identity().name);
         assert_eq!(probe.resolves, ResolvedRoles::Object);
-        assert!(probe.second.is_none());
+        assert_eq!(terms(&probe.keys), [(COL_O, o.to_string())]);
+
+        // A bound graph is never a sort key: it rides as a residual term.
+        let probe = choose(QuadPattern::new(None, Some(&p), None, Some(&g)), &layout).unwrap();
+        assert_eq!(terms(&probe.keys), [(COL_P, p.to_string())]);
+        assert_eq!(terms(&probe.residual), [(COL_G, g.to_string())]);
 
         // Nothing this index covers is bound: declines.
-        assert!(choose(QuadPattern::new(None, None, None, None)).is_none());
+        assert!(choose(QuadPattern::new(None, None, None, Some(&g)), &layout).is_none());
     }
 
     #[test]

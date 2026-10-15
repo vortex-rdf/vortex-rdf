@@ -363,7 +363,7 @@ impl IndexComponent {
     /// Binary-search the component's sorted `column` for the `[lo, hi)` run
     /// of rows equal to `native`, searched over the whole column or `within`
     /// a row range whose slice of the column is itself sorted (a lead run for
-    /// a prefix probe) — the probe step of the in-memory resolvers.
+    /// a prefix probe) — the probe step of the in-memory resolver.
     ///
     /// Through the column's cached probe when it resolves one, skipping the
     /// per-call slice and encoding-tree walk: a full search on the whole
@@ -406,7 +406,7 @@ impl IndexComponent {
     }
 
     /// Look a component up by name, gated on its sortedness provenance — the
-    /// shared front gate of the in-memory resolvers: absent and
+    /// front gate of the in-memory resolver: absent and
     /// not-globally-sorted both mean the index declines (per-chunk-sorted
     /// rows are not binary-searchable).
     pub(crate) fn find_sorted<'a>(

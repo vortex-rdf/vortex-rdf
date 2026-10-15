@@ -369,10 +369,10 @@ impl VortexRdfStore {
 
         // ── Secondary-index routing ───────────────────────────────
         // Ask the configured indexes to resolve the rest of the pattern
-        // to exact base row ids — each index owns its own search over
-        // its component's columns (e.g. a binary search of the sorted
-        // `val`/`rid` pair for a bound object). The store just folds the
-        // ids it hands back into the selection.
+        // to exact base row ids — each index picks its probe, which the
+        // in-memory resolver runs over the component's columns (e.g. a
+        // binary search of the sorted `val`/`rid` pair for a bound object).
+        // The store just folds the ids it hands back into the selection.
         // …but only while there is enough left to narrow. Resolving a
         // component costs O(rows matching *that component*), regardless
         // of how few rows the view still holds, so once a fast path has
@@ -404,9 +404,9 @@ impl VortexRdfStore {
                     pat = resolves.clear(pat);
                     serve = candidate;
                     match row_ids {
-                        // Only the file resolvers answer with ids they
-                        // already computed: both in-memory resolvers hand
-                        // their run back as a recipe.
+                        // Only the file resolver answers with ids it
+                        // already computed: the in-memory resolver hands
+                        // every run back as a recipe.
                         #[cfg(feature = "file-io")]
                         ResolvedRowIds::Eager(_) => {
                             unreachable!("an in-memory resolution is always lazy")
@@ -597,8 +597,8 @@ impl VortexRdfStore {
             .as_ref()
             .is_none_or(|r| (r.end - r.start) as usize >= INDEX_ROUTING_MIN_ROWS);
         // Ask the configured indexes to resolve this pattern to exact
-        // row ids — each index owns its own scan over its columns. A
-        // resolved component is then left out of the pushed-down filter:
+        // row ids — each index picks its probe, the file resolver runs it.
+        // A resolved component is then left out of the pushed-down filter:
         // the row ids already are exactly its matches, so re-filtering
         // them would only re-read and re-compare that column.
         let resolution = if worth_indexing {
