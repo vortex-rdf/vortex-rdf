@@ -104,14 +104,10 @@ impl DictAccess {
         }
     }
 
-    /// A residency-agnostic handle on the dictionary: the resident one, or
-    /// a clone of the file-backed handle (an `Arc` bump).
+    /// A residency-agnostic handle on the dictionary: a clone of this
+    /// access (an `Arc` bump).
     pub(crate) fn reader(&self) -> DictReader {
-        match self {
-            DictAccess::Resident(dict) => DictReader::resident(Arc::clone(dict)),
-            #[cfg(feature = "file-io")]
-            DictAccess::FileBacked(fb) => DictReader::file_backed(fb.clone()),
-        }
+        DictReader(self.clone())
     }
 
     /// The whole dictionary in memory, lifting a file-backed one with a single
@@ -127,11 +123,33 @@ impl DictAccess {
         }
     }
 
-    /// Whether reconstruction must decode through the file (async) rather
-    /// than the resident dictionary.
-    #[cfg(feature = "file-io")]
+    /// Whether the terms are read from the file on demand, so reconstruction
+    /// must decode through the file (async) rather than the resident
+    /// dictionary.
     pub(crate) fn is_file_backed(&self) -> bool {
-        matches!(self, DictAccess::FileBacked(_))
+        match self {
+            DictAccess::Resident(_) => false,
+            #[cfg(feature = "file-io")]
+            DictAccess::FileBacked(_) => true,
+        }
+    }
+
+    /// The identity of the dictionary (see [`DictReader::dictionary_id`]).
+    pub(crate) fn id(&self) -> u64 {
+        match self {
+            DictAccess::Resident(dict) => dict.id(),
+            #[cfg(feature = "file-io")]
+            DictAccess::FileBacked(dict) => dict.id(),
+        }
+    }
+
+    /// Number of terms.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            DictAccess::Resident(dict) => dict.len(),
+            #[cfg(feature = "file-io")]
+            DictAccess::FileBacked(dict) => dict.len(),
+        }
     }
 }
 
@@ -255,49 +273,25 @@ impl DictSnapshot {
 /// were produced with; a file-backed reader additionally keeps the store's
 /// file handle alive.
 #[derive(Clone)]
-pub struct DictReader(DictReaderInner);
-
-#[derive(Clone)]
-enum DictReaderInner {
-    Resident(Arc<TermDictionary>),
-    #[cfg(feature = "file-io")]
-    FileBacked(FileBackedDict),
-}
+pub struct DictReader(DictAccess);
 
 impl From<DictSnapshot> for DictReader {
     /// The resident handle on a snapshot's dictionary.
     fn from(snapshot: DictSnapshot) -> Self {
-        Self::resident(snapshot.0)
+        Self(DictAccess::Resident(snapshot.0))
     }
 }
 
 impl DictReader {
-    pub(crate) fn resident(dict: Arc<TermDictionary>) -> Self {
-        Self(DictReaderInner::Resident(dict))
-    }
-
-    #[cfg(feature = "file-io")]
-    pub(crate) fn file_backed(dict: FileBackedDict) -> Self {
-        Self(DictReaderInner::FileBacked(dict))
-    }
-
     /// Whether the terms are read from the file on demand (`true`) or held
     /// in memory (`false`).
     pub fn is_file_backed(&self) -> bool {
-        match &self.0 {
-            DictReaderInner::Resident(_) => false,
-            #[cfg(feature = "file-io")]
-            DictReaderInner::FileBacked(_) => true,
-        }
+        self.0.is_file_backed()
     }
 
     /// Number of terms in the dictionary.
     pub fn len(&self) -> usize {
-        match &self.0 {
-            DictReaderInner::Resident(dict) => dict.len(),
-            #[cfg(feature = "file-io")]
-            DictReaderInner::FileBacked(dict) => dict.len(),
-        }
+        self.0.len()
     }
 
     /// Whether the dictionary holds no terms.
@@ -313,30 +307,22 @@ impl DictReader {
     /// terms. Resident and file-backed dictionaries are numbered by one
     /// process-wide counter, and an id is never persisted.
     pub fn dictionary_id(&self) -> u64 {
-        match &self.0 {
-            DictReaderInner::Resident(dict) => dict.id(),
-            #[cfg(feature = "file-io")]
-            DictReaderInner::FileBacked(dict) => dict.id(),
-        }
+        self.0.id()
     }
 
     /// The synchronous [`DictSnapshot`] of a resident dictionary, `None`
     /// when the terms are file-backed.
     pub fn snapshot(&self) -> Option<DictSnapshot> {
-        match &self.0 {
-            DictReaderInner::Resident(dict) => Some(DictSnapshot(Arc::clone(dict))),
-            #[cfg(feature = "file-io")]
-            DictReaderInner::FileBacked(_) => None,
-        }
+        self.0.resident().map(|dict| DictSnapshot(Arc::clone(dict)))
     }
 
     /// The N-Triples string for `code`, or `None` when the code is out of
     /// range.
     pub async fn decode(&self, code: TermCode) -> Result<Option<String>> {
         match &self.0 {
-            DictReaderInner::Resident(dict) => Ok(dict.decode(code)),
+            DictAccess::Resident(dict) => Ok(dict.decode(code)),
             #[cfg(feature = "file-io")]
-            DictReaderInner::FileBacked(dict) => {
+            DictAccess::FileBacked(dict) => {
                 Ok(dict.decode_many_any(&[code]).await?.pop().flatten())
             }
         }
@@ -347,9 +333,9 @@ impl DictReader {
     /// once, in one batch).
     pub async fn decode_many(&self, codes: &[TermCode]) -> Result<Vec<Option<String>>> {
         match &self.0 {
-            DictReaderInner::Resident(dict) => Ok(dict.decode_many(codes)),
+            DictAccess::Resident(dict) => Ok(dict.decode_many(codes)),
             #[cfg(feature = "file-io")]
-            DictReaderInner::FileBacked(dict) => dict.decode_many_any(codes).await,
+            DictAccess::FileBacked(dict) => dict.decode_many_any(codes).await,
         }
     }
 
@@ -368,12 +354,12 @@ impl DictReader {
         visit: impl FnMut(usize, Option<&str>),
     ) -> Result<()> {
         match &self.0 {
-            DictReaderInner::Resident(dict) => {
+            DictAccess::Resident(dict) => {
                 dict.decode_many_with(codes, visit);
                 Ok(())
             }
             #[cfg(feature = "file-io")]
-            DictReaderInner::FileBacked(dict) => dict.decode_many_with(codes, visit).await,
+            DictAccess::FileBacked(dict) => dict.decode_many_with(codes, visit).await,
         }
     }
 
@@ -381,9 +367,9 @@ impl DictReader {
     /// [`DictSnapshot::encode_tolerant`]).
     pub async fn encode(&self, term: &str) -> Result<Option<TermCode>> {
         match &self.0 {
-            DictReaderInner::Resident(dict) => dict.encode_tolerant(term),
+            DictAccess::Resident(dict) => dict.encode_tolerant(term),
             #[cfg(feature = "file-io")]
-            DictReaderInner::FileBacked(dict) => dict.encode_tolerant(term).await,
+            DictAccess::FileBacked(dict) => dict.encode_tolerant(term).await,
         }
     }
 
@@ -391,27 +377,27 @@ impl DictReader {
     /// dictionary overlaps the lookups' reads).
     pub async fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<TermCode>>> {
         match &self.0 {
-            DictReaderInner::Resident(dict) => dict.encode_many(terms),
+            DictAccess::Resident(dict) => dict.encode_many(terms),
             #[cfg(feature = "file-io")]
-            DictReaderInner::FileBacked(dict) => dict.encode_many(terms).await,
+            DictAccess::FileBacked(dict) => dict.encode_many(terms).await,
         }
     }
 
     /// See [`DictSnapshot::lower_bound`].
     pub async fn lower_bound(&self, term: &str) -> Result<TermCode> {
         match &self.0 {
-            DictReaderInner::Resident(dict) => Ok(dict.lower_bound(term.as_bytes())),
+            DictAccess::Resident(dict) => Ok(dict.lower_bound(term.as_bytes())),
             #[cfg(feature = "file-io")]
-            DictReaderInner::FileBacked(dict) => dict.lower_bound(term.as_bytes()).await,
+            DictAccess::FileBacked(dict) => dict.lower_bound(term.as_bytes()).await,
         }
     }
 
     /// See [`DictSnapshot::prefix_range`].
     pub async fn prefix_range(&self, prefix: &str) -> Result<(TermCode, TermCode)> {
         let range = match &self.0 {
-            DictReaderInner::Resident(dict) => dict.prefix_range(prefix),
+            DictAccess::Resident(dict) => dict.prefix_range(prefix),
             #[cfg(feature = "file-io")]
-            DictReaderInner::FileBacked(dict) => dict.prefix_range(prefix).await?,
+            DictAccess::FileBacked(dict) => dict.prefix_range(prefix).await?,
         };
         Ok((range.start, range.end))
     }
@@ -419,9 +405,9 @@ impl DictReader {
     /// See [`DictSnapshot::kind_ranges`].
     pub async fn kind_ranges(&self) -> Result<KindRanges> {
         match &self.0 {
-            DictReaderInner::Resident(dict) => Ok(dict.kind_ranges().clone()),
+            DictAccess::Resident(dict) => Ok(dict.kind_ranges().clone()),
             #[cfg(feature = "file-io")]
-            DictReaderInner::FileBacked(dict) => dict.kind_ranges().await,
+            DictAccess::FileBacked(dict) => dict.kind_ranges().await,
         }
     }
 
@@ -433,9 +419,9 @@ impl DictReader {
         codes: &[TermCode],
     ) -> Result<(Buffer<TermCode>, Buffer<TermCode>)> {
         match &self.0 {
-            DictReaderInner::Resident(dict) => dict.filter_codes(predicate, codes),
+            DictAccess::Resident(dict) => dict.filter_codes(predicate, codes),
             #[cfg(feature = "file-io")]
-            DictReaderInner::FileBacked(dict) => dict.filter_codes(predicate, codes).await,
+            DictAccess::FileBacked(dict) => dict.filter_codes(predicate, codes).await,
         }
     }
 }

@@ -599,12 +599,7 @@ mod file {
     /// multi-split keep checks below.
     #[tokio::test]
     async fn test_keeps_on_a_multi_split_file() {
-        let (_dir, path) = write_store_file(
-            modular_quads(160_000, 3, 8),
-            LayoutStrategy::Dictionary,
-            vec![],
-        )
-        .await;
+        let (_dir, path) = multi_window_dictionary_file().await;
         let opened = crate::tests::open_mapped(&path).await;
         assert!(
             opened.splits().unwrap().len() > 1,

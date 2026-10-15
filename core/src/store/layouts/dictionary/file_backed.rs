@@ -34,7 +34,6 @@ use vortex_layout::layouts::zoned::Zoned;
 use vortex_layout::segments::SegmentSource;
 use vortex_layout::{LayoutChildType, LayoutRef};
 
-use crate::common::terms::canonical_spelling;
 use crate::error::{Result, VortexRdfError};
 use crate::io::container::DICT_COMPONENT_NAME;
 use crate::io::read::available_parallelism;
@@ -46,8 +45,8 @@ use crate::store::schema::TermCode;
 use super::predicates::{KindRanges, TermPredicate, Verdict};
 use super::storage::{COL_DICT_TERM, TermChunk, chunk_of, window_bound_aggregates};
 use super::term_dict::{
-    TermDictionary, check_candidates, check_code, code_rank, prefix_successor, rank_code,
-    split_verdicts,
+    CodeSpace, TermDictionary, check_candidates, check_code, find_by, lower_bound_by,
+    prefix_range_from, prefix_successor, split_verdicts, tolerant_fallback,
 };
 
 /// A window's first and last term.
@@ -172,8 +171,8 @@ struct Windows {
     windows: Vec<Window>,
     /// `starts[i]` = `windows[i].start`, ascending (for [`chunk_of`]).
     starts: Vec<usize>,
-    /// Number of terms.
-    len: usize,
+    /// The terms' codes.
+    code_space: CodeSpace,
     /// Where the leaves' segments are read from — over a mapped file, the map.
     source: Arc<dyn SegmentSource>,
     /// The kind ranges (three code ranges and the default graph's code),
@@ -194,35 +193,17 @@ struct Windows {
     /// read lifts no dictionary at all.
     #[cfg(test)]
     lifted: std::sync::atomic::AtomicUsize,
-    /// The code of the first term (see `term_dict::code_base`).
-    #[cfg(test)]
-    base: TermCode,
 }
 
 impl Windows {
-    /// The code of the first term: 0 outside the tests' code-base hook.
-    #[inline]
-    fn base(&self) -> TermCode {
-        #[cfg(test)]
-        {
-            self.base
-        }
-        #[cfg(not(test))]
-        {
-            0
-        }
-    }
-
-    /// The rank of `code`, or `None` when no term has that code.
-    #[inline]
-    fn rank_of(&self, code: TermCode) -> Option<usize> {
-        code_rank(code, self.base(), self.len)
-    }
-
-    /// The code of the term at `rank`.
-    #[inline]
-    fn code_at(&self, rank: usize) -> TermCode {
-        rank_code(rank, self.base())
+    /// The window holding `needle`'s lower bound: the first whose last term
+    /// is not below `needle`, with its index — `None` when every term is
+    /// below `needle`.
+    fn locate(&self, needle: &[u8]) -> Option<(usize, &Window)> {
+        let w = self
+            .windows
+            .partition_point(|window| &*window.last < needle);
+        self.windows.get(w).map(|window| (w, window))
     }
 
     /// The cache's guard. Every entry is complete when it is inserted, so a
@@ -319,7 +300,7 @@ impl FileBackedDict {
             reader,
             windows,
             starts,
-            len: start,
+            code_space: CodeSpace::new(start),
             source,
             kinds: OnceLock::new(),
             cache: Mutex::new(WindowCache::new(budget)),
@@ -329,8 +310,6 @@ impl FileBackedDict {
             requested: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             lifted: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            base: super::term_dict::code_base(),
         }))))
     }
 
@@ -341,70 +320,52 @@ impl FileBackedDict {
 
     /// Number of terms.
     pub(crate) fn len(&self) -> usize {
-        self.0.len
+        self.0.code_space.len()
     }
 
     /// Term → code: the window whose bounds enclose `term`, then a binary
-    /// search of that one window (through the window cache) — none at all
-    /// for a window's first or last term, or a term falling between two
-    /// windows.
+    /// search of the inside of that one window (through the window cache) —
+    /// none at all for a window's first or last term, or a term falling
+    /// between two windows.
     pub(crate) async fn encode(&self, term: &str) -> Result<Option<TermCode>> {
         let inner = &*self.0;
         let needle = term.as_bytes();
-        let w = inner
-            .windows
-            .partition_point(|window| &*window.last < needle);
-        let Some(window) = inner.windows.get(w) else {
+        let Some((w, window)) = inner.locate(needle) else {
             return Ok(None);
         };
+        let code_at = |local: usize| inner.code_space.code_at(window.start + local);
         match needle.cmp(&*window.first) {
             Ordering::Less => return Ok(None),
-            Ordering::Equal => return Ok(Some(inner.code_at(window.start))),
+            Ordering::Equal => return Ok(Some(code_at(0))),
             Ordering::Greater => {}
         }
         if needle == &*window.last {
-            return Ok(Some(inner.code_at(window.start + window.rows - 1)));
+            return Ok(Some(code_at(window.rows - 1)));
         }
+        // first < needle < last: a hit lies strictly inside.
         let chunk = inner.window_chunk(w).await?;
         let mut cursor = chunk.cursor();
-        let (mut lo, mut hi) = (1, window.rows - 1);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            match cursor.bytes_at(mid).cmp(needle) {
-                Ordering::Less => lo = mid + 1,
-                Ordering::Equal => return Ok(Some(inner.code_at(window.start + mid))),
-                Ordering::Greater => hi = mid,
-            }
-        }
-        Ok(None)
+        Ok(find_by(1..window.rows - 1, |local| {
+            cursor.bytes_at(local).cmp(needle)
+        })
+        .map(code_at))
     }
 
     /// The code of the first term not below `needle` in byte order (the
     /// term count when every term is below it).
     pub(crate) async fn lower_bound(&self, needle: &[u8]) -> Result<TermCode> {
         let inner = &*self.0;
-        let w = inner
-            .windows
-            .partition_point(|window| &*window.last < needle);
-        let Some(window) = inner.windows.get(w) else {
-            return Ok(inner.code_at(inner.len));
+        let Some((w, window)) = inner.locate(needle) else {
+            return Ok(inner.code_space.code_end());
         };
         if needle <= &*window.first {
-            return Ok(inner.code_at(window.start));
+            return Ok(inner.code_space.code_at(window.start));
         }
         // first < needle <= last: the bound lies inside, past the first term.
         let chunk = inner.window_chunk(w).await?;
         let mut cursor = chunk.cursor();
-        let (mut lo, mut hi) = (1, window.rows - 1);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if cursor.bytes_at(mid) < needle {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        Ok(inner.code_at(window.start + lo))
+        let local = lower_bound_by(1..window.rows - 1, |local| cursor.bytes_at(local) < needle);
+        Ok(inner.code_space.code_at(window.start + local))
     }
 
     /// Visit the terms of `codes` (strictly ascending and inside the
@@ -423,11 +384,11 @@ impl FileBackedDict {
         // `rank - window.start`) or a run of nothing (a loop that never
         // advances).
         let inner = &*self.0;
-        check_candidates(codes, inner.base(), inner.len)?;
+        check_candidates(codes, inner.code_space)?;
         // Every candidate is inside the dictionary (checked above), so its
         // offset from the first code is a rank below the term count: exact
         // as a `usize`.
-        let base = inner.base();
+        let base = inner.code_space.base();
         let rank = |code: TermCode| (code - base) as usize;
         let mut at = 0;
         while at < codes.len() {
@@ -459,7 +420,7 @@ impl FileBackedDict {
         let Some(&max) = codes.last() else {
             return Ok(Vec::new());
         };
-        check_code(max, self.0.base(), self.len())?;
+        check_code(max, self.0.code_space)?;
         let mut terms = Vec::with_capacity(codes.len());
         let mut failure = None;
         self.visit_terms(codes, |_, term| match term {
@@ -490,7 +451,7 @@ impl FileBackedDict {
     ) -> Result<()> {
         let mut sorted: Vec<(TermCode, usize)> = Vec::with_capacity(codes.len());
         for (i, &code) in codes.iter().enumerate() {
-            if self.0.rank_of(code).is_some() {
+            if self.0.code_space.rank_of(code).is_some() {
                 sorted.push((code, i));
             } else {
                 visit(i, None);
@@ -528,11 +489,10 @@ impl FileBackedDict {
         if let Some(code) = self.encode(term).await? {
             return Ok(Some(code));
         }
-        let canonical = canonical_spelling(term)?;
-        if canonical == term {
-            return Ok(None);
+        match tolerant_fallback(term)? {
+            Some(canonical) => self.encode(&canonical).await,
+            None => Ok(None),
         }
-        self.encode(&canonical).await
     }
 
     /// [`encode_tolerant`](Self::encode_tolerant) over a batch, in order.
@@ -547,10 +507,10 @@ impl FileBackedDict {
     pub(crate) async fn prefix_range(&self, prefix: &str) -> Result<Range<TermCode>> {
         let lo = self.lower_bound(prefix.as_bytes()).await?;
         let hi = match prefix_successor(prefix.as_bytes()) {
-            Some(successor) => self.lower_bound(&successor).await?,
-            None => self.0.code_at(self.len()),
+            Some(successor) => Some(self.lower_bound(&successor).await?),
+            None => None,
         };
-        Ok(lo..hi.max(lo))
+        Ok(prefix_range_from(lo, hi, self.0.code_space.code_end()))
     }
 
     /// The kind ranges, computed once per handle (a few window searches;
@@ -559,20 +519,20 @@ impl FileBackedDict {
         if let Some(kinds) = self.0.kinds.get() {
             return Ok(kinds.clone());
         }
-        let default_graph = self
+        let code_space = self.0.code_space;
+        let first_is_empty = self
             .0
             .windows
             .first()
-            .filter(|window| window.first.is_empty())
-            .map(|_| self.0.code_at(0));
-        let kinds = KindRanges {
-            start: self.0.base(),
-            default_graph,
-            literals: self.prefix_range("\"").await?,
-            iris: self.prefix_range("<").await?,
-            blanks: self.prefix_range("_:").await?,
-            len: self.0.code_at(self.len()),
-        };
+            .is_some_and(|window| window.first.is_empty());
+        let kinds = KindRanges::new(
+            code_space.base(),
+            first_is_empty,
+            self.prefix_range("\"").await?,
+            self.prefix_range("<").await?,
+            self.prefix_range("_:").await?,
+            code_space.code_end(),
+        );
         Ok(self.0.kinds.get_or_init(|| kinds).clone())
     }
 
@@ -585,7 +545,7 @@ impl FileBackedDict {
         predicate: &TermPredicate,
         codes: &[TermCode],
     ) -> Result<(Buffer<TermCode>, Buffer<TermCode>)> {
-        check_candidates(codes, self.0.base(), self.len())?;
+        check_candidates(codes, self.0.code_space)?;
         let kinds = self.kind_ranges().await?;
         // Undecided until a verdict is set: a candidate no branch below reaches
         // stays undecided rather than silently failing.
@@ -632,6 +592,12 @@ impl FileBackedDict {
     #[cfg(test)]
     pub(crate) fn debug_window_count(&self) -> usize {
         self.0.windows.len()
+    }
+
+    /// The rank of each window's first term, ascending.
+    #[cfg(test)]
+    pub(crate) fn debug_window_starts(&self) -> Vec<usize> {
+        self.0.starts.clone()
     }
 
     /// Windows asked for since the handle opened, from the cache or not.
