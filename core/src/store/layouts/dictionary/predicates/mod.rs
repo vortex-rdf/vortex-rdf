@@ -64,6 +64,27 @@ pub struct KindRanges {
 }
 
 impl KindRanges {
+    /// The ranges of a dictionary whose codes run from `start` up to `len`,
+    /// and whose first term is the default graph's `""` when
+    /// `first_is_empty`.
+    pub(super) fn new(
+        start: TermCode,
+        first_is_empty: bool,
+        literals: Range<TermCode>,
+        iris: Range<TermCode>,
+        blanks: Range<TermCode>,
+        len: TermCode,
+    ) -> Self {
+        Self {
+            start,
+            default_graph: first_is_empty.then_some(start),
+            literals,
+            iris,
+            blanks,
+            len,
+        }
+    }
+
     /// The codes in none of the three kind ranges, ascending from `start` —
     /// a foreign writer's spellings, and the default graph's `""`.
     pub fn gaps(&self) -> impl Iterator<Item = TermCode> + '_ {

@@ -402,6 +402,123 @@ async fn test_file_backed_dictionary_probe_parity() {
     assert!(fb.decode_many(&[]).await.unwrap().is_empty());
 }
 
+/// A file-backed reader answers every lookup as the resident reader of the
+/// same file does, on a dictionary of three or more windows. The probes are
+/// each window's first two, middle and last two terms (a window's search
+/// runs strictly between its first and last term), the absent spelling
+/// sorting right after each (between two windows after a window's last term,
+/// past every term after the dictionary's last), one between the default
+/// graph and the first literal, and a prefix of each probe.
+#[tokio::test]
+async fn lookups_agree_with_a_resident_oracle_across_window_edges() {
+    let (_dir, path) = multi_window_dictionary_file().await;
+    let starts = FileBackedDict::open(&crate::tests::open_mapped(&path).await)
+        .await
+        .unwrap()
+        .expect("the written dictionary child is window-searchable")
+        .debug_window_starts();
+    assert!(starts.len() >= 3);
+
+    let oracle = VortexRdfStore::from_file_in_memory(&path)
+        .await
+        .unwrap()
+        .dict_reader()
+        .unwrap();
+    let fb = VortexRdfStore::from_file(&path)
+        .await
+        .unwrap()
+        .dict_reader()
+        .unwrap();
+    assert!(fb.is_file_backed());
+    assert!(!oracle.is_file_backed());
+    let len = oracle.len();
+    assert_eq!(fb.len(), len);
+    let kinds = oracle.kind_ranges().await.unwrap();
+    assert_eq!(fb.kind_ranges().await.unwrap(), kinds);
+
+    // Each window's first two, middle and last two terms.
+    let ends = starts.iter().skip(1).copied().chain([len]);
+    let codes: Vec<TermCode> = starts
+        .iter()
+        .zip(ends)
+        .flat_map(|(&start, end)| {
+            [
+                start,
+                start + 1,
+                start + (end - start) / 2,
+                end - 2,
+                end - 1,
+            ]
+        })
+        .map(|rank| kinds.start + rank as TermCode)
+        .collect();
+    let present: Vec<String> = oracle
+        .decode_many(&codes)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(Option::unwrap)
+        .collect();
+    // The fixture's terms close with `>` or `"` and nothing stored extends
+    // them, so `~` before the closing byte spells the absent term sorting
+    // right after.
+    let after = |term: &str| {
+        let (head, close) = term.split_at(term.len() - 1);
+        format!("{head}~{close}")
+    };
+    for (&code, term) in codes.iter().zip(&present).filter(|(_, t)| !t.is_empty()) {
+        assert_eq!(oracle.lower_bound(&after(term)).await.unwrap(), code + 1);
+    }
+    let mut probes = present.clone();
+    probes.extend(present.iter().filter(|t| !t.is_empty()).map(|t| after(t)));
+    probes.push("!".to_string());
+    let prefixes: Vec<String> = probes
+        .iter()
+        .filter(|t| !t.is_empty())
+        .map(|t| t[..t.len() - 1].to_string())
+        .collect();
+
+    for probe in &probes {
+        assert_eq!(
+            fb.encode(probe).await.map_err(|e| e.to_string()),
+            oracle.encode(probe).await.map_err(|e| e.to_string()),
+            "encode {probe:?}"
+        );
+        assert_eq!(
+            fb.lower_bound(probe).await.unwrap(),
+            oracle.lower_bound(probe).await.unwrap(),
+            "lower_bound {probe:?}"
+        );
+    }
+    for prefix in probes.iter().chain(&prefixes) {
+        assert_eq!(
+            fb.prefix_range(prefix).await.unwrap(),
+            oracle.prefix_range(prefix).await.unwrap(),
+            "prefix_range {prefix:?}"
+        );
+    }
+
+    // In any order, repeated, and one past the last code.
+    let mut batch: Vec<TermCode> = codes.iter().rev().copied().collect();
+    batch.extend([codes[0], kinds.len]);
+    assert_eq!(
+        fb.decode_many(&batch).await.unwrap(),
+        oracle.decode_many(&batch).await.unwrap()
+    );
+    for (kind, arg) in [
+        ("is_iri", ""),
+        ("str_prefix", "http://example.org/s1"),
+        ("str_prefix", "object"),
+    ] {
+        let predicate = TermPredicate::parse(kind, arg).unwrap();
+        assert_eq!(
+            fb.filter_codes(&predicate, &codes).await.unwrap(),
+            oracle.filter_codes(&predicate, &codes).await.unwrap(),
+            "{kind}({arg})"
+        );
+    }
+}
+
 /// A copy-served run wider than the point-read cap on a file-backed
 /// dictionary is decoded chunk by chunk through the async term resolution,
 /// agreeing row for row with the resident open of the same file.

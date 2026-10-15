@@ -280,6 +280,33 @@ where
     cell.get_or_init(|| bytes)
 }
 
+/// A Dictionary-layout store file of `modular_quads(160_000, 3, 8)`, without
+/// indexes, in a fresh temp dir: about 160,012 terms, so a dictionary of
+/// three 65,536-term windows, and rows past one scan split. Serialized once
+/// per process (see [`cached_store_bytes`]). Keep the `TempDir` alive for the
+/// file's lifetime.
+#[cfg(feature = "file-io")]
+async fn multi_window_dictionary_file() -> (tempfile::TempDir, std::path::PathBuf) {
+    static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+    let bytes = cached_store_bytes(&BYTES, || async {
+        let mut bytes: Vec<u8> = Vec::new();
+        quads_stream_to_vortex_writer(
+            quad_stream(modular_quads(160_000, 3, 8)),
+            &mut bytes,
+            LayoutStrategy::Dictionary,
+            vec![],
+        )
+        .await
+        .unwrap();
+        bytes
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.vortex");
+    std::fs::write(&path, bytes).unwrap();
+    (dir, path)
+}
+
 fn quad_stream(
     quads: Vec<Quad>,
 ) -> impl futures::Stream<Item = crate::error::Result<crate::store::RawQuad>> + Unpin + Send + 'static

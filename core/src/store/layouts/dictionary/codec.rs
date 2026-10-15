@@ -39,7 +39,7 @@ use crate::store::schema::{COL_G, COL_O, COL_P, COL_S, PRIMARY_COLUMNS, TermCode
 #[cfg(feature = "file-io")]
 use super::file_backed::FileBackedDict;
 use super::storage::DictCursor;
-use super::term_dict::{TermDictionary, check_code};
+use super::term_dict::{CodeSpace, TermDictionary, check_code};
 
 /// Dictionary-encoded quad columns: [`RawQuad`] terms replaced by their
 /// codes in the global sorted term dictionary. Produced by the Dictionary
@@ -225,13 +225,12 @@ trait TermSource {
 /// Term strings read from a resident dictionary.
 struct DictTerms<'a> {
     cursors: [DictCursor<'a>; 4],
-    base: TermCode,
-    n_terms: usize,
+    code_space: CodeSpace,
 }
 
 impl TermSource for DictTerms<'_> {
     fn str_at(&mut self, role: usize, code: TermCode) -> Result<&str> {
-        let rank = check_code(code, self.base, self.n_terms)?;
+        let rank = check_code(code, self.code_space)?;
         self.cursors[role].str_at(rank)
     }
 }
@@ -362,8 +361,7 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Resul
     };
     let mut src = DictTerms {
         cursors: [dict.cursor(), dict.cursor(), dict.cursor(), dict.cursor()],
-        base: dict.base(),
-        n_terms: dict.len(),
+        code_space: dict.code_space(),
     };
     decode_codes(
         s_col.as_slice::<TermCode>(),
@@ -391,7 +389,7 @@ pub(in crate::store::layouts) fn decode_code_column<T: Clone + for<'a> From<&'a 
         .iter()
         .map(|&code| {
             memo.get_or_insert(code, || {
-                let rank = check_code(code, dict.base(), dict.len())?;
+                let rank = check_code(code, dict.code_space())?;
                 cursor.str_at(rank).map(T::from)
             })
         })
