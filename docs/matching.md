@@ -259,7 +259,7 @@ Each stage in the code, and where the details are below:
 |---|---|---|
 | Prelude | [`matching.rs:240-283`](../core/src/store/query/matching.rs#L240-L283 "InMemory is the only variant") | — |
 | 1 · prefix probe | [`matching.rs:285-368`](../core/src/store/query/matching.rs#L285-L368 "Prefix probe"), [`search_sorted_bounds`](../core/src/store/array.rs#L178) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`matching.rs:370-448`](../core/src/store/query/matching.rs#L370-L448 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L688) | [§6.2](#62-secondary-index-routing) |
+| 2 · secondary-index routing | [`matching.rs:370-448`](../core/src/store/query/matching.rs#L370-L448 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L644) | [§6.2](#62-secondary-index-routing) |
 | 3 · residual column filtering | [`matching.rs:450-497`](../core/src/store/query/matching.rs#L450-L497 "residual column filtering"), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L250), [`mask_for`](../core/src/store/query/matching.rs#L835) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`matching.rs:499-514`](../core/src/store/query/matching.rs#L499-L514 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
@@ -523,7 +523,7 @@ Each stage in the code, and where the details are below:
 |---|---|---|
 | Prelude | [`matching.rs:553-563`](../core/src/store/query/matching.rs#L553-L563 "QuadsSource::File") | — |
 | 1 · subject chunk probe and prefix | [`matching.rs:564-591`](../core/src/store/query/matching.rs#L564-L591 "A bound subject on a sorted file"), [`locate_subject_run`](../core/src/store/scan/file_reads.rs#L346), [`narrow_subject_run`](../core/src/store/scan/file_reads.rs#L375) | [§7.1](#71-subject-chunk-probe) |
-| 2 · secondary-index routing | [`matching.rs:592-608`](../core/src/store/query/matching.rs#L592-L608 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L712) | [§8](#8-the-index-resolvers) |
+| 2 · secondary-index routing | [`matching.rs:592-608`](../core/src/store/query/matching.rs#L592-L608 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L668) | [§8](#8-the-index-resolvers) |
 | 3 · pushed-down filter | [`matching.rs:621-725`](../core/src/store/query/matching.rs#L621-L725 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_reads.rs#L318) | [§7.3](#73-what-ends-up-on-the-view) |
 | 4 · selection and serve plan | [`matching.rs:614-615`](../core/src/store/query/matching.rs#L614-L615 "keep_serve") and [`matching.rs:727-754`](../core/src/store/query/matching.rs#L727-L754 "match resolved_selection"), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L349) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 | 5 · filter at sparse ids | [`matching.rs:756-774`](../core/src/store/query/matching.rs#L756-L774 "point_filter_ids"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L622) | [§7.3](#73-what-ends-up-on-the-view) |
@@ -683,13 +683,13 @@ comparator makes the second column sorted inside each lead run). It returns:
   re-sorted only on demand) and **always a serve plan** over the matched run.
 
 **On file:** locates the run by binary-searching the child's cached chunk probes
-([`locate_component_run`](../core/src/store/indexes/file.rs#L36): lead,
+([`locate_component_run`](../core/src/store/indexes/file.rs#L38): lead,
 then a windowed second-key search), integers only. Then:
 
 | Located run | Row ids |
 |---|---|
 | empty | `IndexResolution::Empty` |
-| ≤ 256 rows (`POINT_GATHER_MAX_ROWS`) | **Eager**, via [`rid_point_reads`](../core/src/store/indexes/file.rs#L70) |
+| ≤ 256 rows (`POINT_GATHER_MAX_ROWS`) | **Eager**, via [`rid_point_reads`](../core/src/store/indexes/file.rs#L68) |
 | wider, or unlocated | **Lazy** — a deferred rid-only pushed-down scan |
 
 The serve plan is built from *every* bound non-subject component (p, o, **g**).
@@ -731,15 +731,15 @@ own rows out of the run before decoding them (the rows of one value are in row
 id order). Declines when the component is absent, unsorted, or
 probe-incompatible.
 
-**On file:** [`locate_component_run`](../core/src/store/indexes/file.rs#L36)
+**On file:** [`locate_component_run`](../core/src/store/indexes/file.rs#L38)
 binary-searches the value column's chunk probes (sorted child + integer probe
 required). A located run's ids are `Lazy`
-([`read_located_rids`](../core/src/store/indexes/file.rs#L156)): a count
+([`read_located_rids`](../core/src/store/indexes/file.rs#L139)): a count
 takes the run's width, a window reads only its own rows, and materialized, a
-run ≤ 256 rows uses [`rid_point_reads`](../core/src/store/indexes/file.rs#L70)
+run ≤ 256 rows uses [`rid_point_reads`](../core/src/store/indexes/file.rs#L68)
 and a wider one a rid-only scan restricted to the range — neither pays filter
 evaluation. Anything the probes decline falls back to
-[`scan_index_row_ids`](../core/src/store/indexes/file.rs#L104), an eager
+[`scan_index_row_ids`](../core/src/store/indexes/file.rs#L101), an eager
 pushed-down `val == probe` scan that answers whatever the order.
 
 **Example.** For the running example `index:ref-o` holds
@@ -764,7 +764,7 @@ second sorted copy of every quad.
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_reads.rs#L911) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/file.rs#L400)); unlocated: the pushed-down projected+filtered scan of the index child |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_reads.rs#L911) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/file.rs#L343)); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
 | Dropped when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
 | Tombstones | applied through the plan's `rid` column | applied through the plan's `rid` column |
@@ -910,7 +910,7 @@ The match's decisions show up here
 | `quads()` / `quads_vec()` | decode the plan's run (in memory: slice or point reads; file: point reads ≤ 256 rows, else a range scan of the located run (`located_run_scan`); a projected+filtered scan of the child only when the run was not located) — the pending ids are never touched | gather the selection from the primaries; on file, read it by id or scan it as `ExactRead` chooses (below) |
 | `shared_quads_vec()` / `shared_quad_chunks()` | as `quads()`, through the plan's shared-term decode twins — one `Arc<str>` per distinct term of a chunk, handed to every row repeating it | the same gather or restricted scan, decoded to shared terms |
 | `size()` | in memory a lazy component run knows its width without decoding; on file a located plan's run width answers outright when no filter or tombstones apply, otherwise the ids materialize (then filter masks are counted if a filter is pending) | selection length — a located reference run held for a count answers with its width — or `count_matching_rows` over the filter |
-| `code_columns()` / `code_columns_gathered()` | read the four `u64` code columns straight off the index's own columns: in memory a run of at most 256 rows through its probes, on file a run whose ids are still deferred through the plan's scan ([`code_columns`](../core/src/store/indexes/file.rs#L426)) | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views), on file read by id or scanned as `ExactRead` chooses |
+| `code_columns()` / `code_columns_gathered()` | read the four `u64` code columns straight off the index's own columns: in memory a run of at most 256 rows through its probes, on file a run whose ids are still deferred through the plan's scan ([`code_columns`](../core/src/store/indexes/file.rs#L367)) | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views), on file read by id or scanned as `ExactRead` chooses |
 | `raw_quad_chunks()` | plan deliberately ignored (it reorders rows; the N-Triples export is order-insignificant) | restricted scan in base row order |
 
 An exact file selection is read the cheapest way

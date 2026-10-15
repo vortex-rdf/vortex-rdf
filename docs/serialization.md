@@ -343,8 +343,8 @@ than let an id wrap onto row 0:
 
 | Where | Check | Refusal |
 |---|---|---|
-| in-memory builds, compaction's in-memory rebuild, `to_bytes` of a store with a tail | the row count, before any id is assigned ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L111)) | `Serialization`: the store *would exceed* `u64::MAX` quads |
-| the out-of-core merge, a file-backed compaction | each row as the merge numbers it ([`next_row_id`](../core/src/store/indexes/mod.rs#L125)); a refused file build leaves no file | the same |
+| in-memory builds, compaction's in-memory rebuild, `to_bytes` of a store with a tail | the row count, before any id is assigned ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L113)) | `Serialization`: the store *would exceed* `u64::MAX` quads |
+| the out-of-core merge, a file-backed compaction | each row as the merge numbers it ([`next_row_id`](../core/src/store/indexes/mod.rs#L127)); a refused file build leaves no file | the same |
 
 Opening a file whose index children record row ids of another width is
 refused with a deserialization error that says to rebuild the store

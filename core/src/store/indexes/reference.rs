@@ -208,16 +208,15 @@ pub(crate) async fn resolve_file(
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
 ) -> Result<IndexResolution<FileServePlan>> {
-    let (probe, reader, name, native, located) = match locate(file, pattern, codes).await? {
+    let (probe, child, native, located) = match locate(file, pattern, codes).await? {
         Located::Declined => return Ok(IndexResolution::Declined),
         Located::Absent => return Ok(IndexResolution::Empty),
         Located::Run {
             probe,
-            reader,
-            name,
+            child,
             native,
             range,
-        } => (probe, reader, name, native, range),
+        } => (probe, child, native, range),
     };
     if let Some(range) = located {
         // A located empty run proves the term absent from the data — the
@@ -231,26 +230,15 @@ pub(crate) async fn resolve_file(
         return Ok(IndexResolution::Resolved {
             row_ids: ResolvedRowIds::Lazy(LazyRowIds::from_located_run(
                 Arc::clone(file),
-                name,
-                reader,
-                COL_RID,
+                child,
                 range,
-                name,
             )),
             resolves: probe.resolves,
             // A back-reference index stores no whole quads to serve from.
             serve: None,
         });
     }
-    super::resolve_eager_from_scan(
-        reader,
-        &[(COL_VAL, native)],
-        COL_RID,
-        probe.resolves,
-        file.bound_exprs(),
-        name,
-    )
-    .await
+    super::resolve_eager_from_scan(&child, &[(COL_VAL, native)], probe.resolves).await
 }
 
 /// The file resolver's prelude: the probe a pattern shape chooses, its
@@ -268,8 +256,7 @@ enum Located<'a> {
     /// a chunk resolving no probe) and the pushed-down scan answers instead.
     Run {
         probe: RefProbe<'a>,
-        reader: vortex_layout::LayoutReaderRef,
-        name: &'static str,
+        child: crate::store::persist::native_file::ChildReader,
         native: vortex_array::scalar::Scalar,
         range: Option<Range<u64>>,
     },
@@ -287,20 +274,16 @@ async fn locate<'a>(
     let Some(probe) = choose(pattern) else {
         return Ok(Located::Declined);
     };
-    let name = probe.family.identity().name;
-    let Some((descriptor, reader)) = file.component_reader(name)? else {
+    let Some(child) = file.child_reader(probe.family.identity().name)? else {
         return Ok(Located::Declined);
     };
     let Some(native) = codes.probe_scalar(probe.lead)? else {
         return Ok(Located::Absent);
     };
-    let range =
-        super::file::locate_component_run(file, name, COL_VAL, &native, None, descriptor.sorted)
-            .await?;
+    let range = super::file::locate_component_run(file, &child, COL_VAL, &native, None).await?;
     Ok(Located::Run {
         probe,
-        reader,
-        name,
+        child,
         native,
         range,
     })
