@@ -313,6 +313,32 @@ impl IndexComponent {
         .map_err(VortexRdfError::Vortex)
     }
 
+    /// The inverse of [`to_write`](Self::to_write): the write's streamed
+    /// chunks executed to one struct in child schema, under the registry
+    /// identity of its implementation slug and with the descriptor's `sorted`
+    /// provenance. A foreign slug is an error.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub(crate) async fn from_write(
+        write: &crate::io::container::NativeComponentWrite,
+    ) -> Result<Self> {
+        use futures::TryStreamExt as _;
+
+        let implementation = &write.descriptor.implementation;
+        let known = known_component(implementation).ok_or_else(|| {
+            VortexRdfError::Deserialization(format!(
+                "unknown index component implementation: {implementation}"
+            ))
+        })?;
+        let chunks: Vec<ArrayRef> = write.source.open()?.try_collect().await?;
+        let rows = crate::store::array::chunked_or_single(chunks, write.descriptor.dtype.clone())?;
+        Ok(Self::built(
+            known.identity.name,
+            known.identity.slug,
+            into_struct_array(rows)?,
+            write.descriptor.sorted,
+        ))
+    }
+
     /// Whether the rows have been canonicalized yet (a test-hook probe).
     #[cfg(all(test, feature = "file-io"))]
     pub(crate) fn is_materialized(&self) -> bool {

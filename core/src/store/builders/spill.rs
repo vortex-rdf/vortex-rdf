@@ -165,23 +165,6 @@ impl<T: Spillable> Run<T> {
             RunInner::File(reader) => reader.next(),
         }
     }
-
-    /// Pull up to `n` items off the run (fewer at the end of the data).
-    pub(crate) fn next_batch(&mut self, n: usize) -> Result<Vec<T>> {
-        pull_batch(n, || self.next())
-    }
-}
-
-/// Pull up to `n` items off `next` (fewer once it yields `None`).
-fn pull_batch<T>(n: usize, mut next: impl FnMut() -> Result<Option<T>>) -> Result<Vec<T>> {
-    let mut batch = Vec::with_capacity(n.min(4096));
-    while batch.len() < n {
-        match next()? {
-            Some(item) => batch.push(item),
-            None => break,
-        }
-    }
-    Ok(batch)
 }
 
 /// Sequential rkyv reader over a spill file.
@@ -430,14 +413,21 @@ impl<T: Ord + Spillable> RunMerger<T> {
 
     /// Pull up to `n` items off the merge (fewer at the end of the data).
     pub(crate) fn next_batch(&mut self, n: usize) -> Result<Vec<T>> {
-        pull_batch(n, || self.next())
+        let mut batch = Vec::with_capacity(n.min(4096));
+        while batch.len() < n {
+            match self.next()? {
+                Some(item) => batch.push(item),
+                None => break,
+            }
+        }
+        Ok(batch)
     }
 }
 
-/// Where [`merge_quads_feeding_indexes`] puts the merged quads: straight into
+/// Where [`merge_feeding_indexes`] puts the merged quads: straight into
 /// memory when the merge had a single input run, otherwise into a spill file.
 ///
-/// [`merge_quads_feeding_indexes`]: super::stream_indexes::merge_quads_feeding_indexes
+/// [`merge_feeding_indexes`]: super::stream_indexes::merge_feeding_indexes
 pub(super) enum MergedSink {
     Memory(Vec<RawQuad>),
     File {
@@ -447,6 +437,18 @@ pub(super) enum MergedSink {
 }
 
 impl MergedSink {
+    /// An in-memory sink, or a writer to `merged.bin` under `dir`.
+    pub(super) fn create(dir: &Path, in_memory: bool) -> Result<Self> {
+        if in_memory {
+            return Ok(MergedSink::Memory(Vec::new()));
+        }
+        let path = dir.join("merged.bin");
+        Ok(MergedSink::File {
+            writer: RunWriter::create(&path)?,
+            path,
+        })
+    }
+
     pub(super) fn push(&mut self, quad: RawQuad) -> Result<()> {
         match self {
             MergedSink::Memory(quads) => {

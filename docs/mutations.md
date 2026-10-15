@@ -222,7 +222,7 @@ flowchart TD
   `<store>.write-<uuid>.tmp` exists before the work starts (a process killed
   meanwhile leaves it behind, and nothing removes it later). The sorted rows
   are then streamed through the out-of-core builder
-  ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L160))
+  ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L174))
   into it
   ([`built_stream_to_vortex_writer`](../core/src/io/write.rs#L92)), which is
   then renamed over the original path, and the store is reopened
