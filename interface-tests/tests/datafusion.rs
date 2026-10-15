@@ -18,10 +18,21 @@ async fn predicate_code(store: &VortexRdfStore, i: usize) -> TermCode {
         .expect("a predicate the store holds")
 }
 
+/// Whether vortex's printed scan `filter` holds `code` as a `u64` literal:
+/// the token `{code}u64` with no digit before it, so `12` is not found
+/// inside `1512u64`, nor `6` in another literal's `u64` suffix.
+fn has_u64_literal(filter: &str, code: TermCode) -> bool {
+    let token = format!("{code}u64");
+    filter
+        .match_indices(&token)
+        .any(|(at, _)| !filter[..at].ends_with(|c: char| c.is_ascii_digit()))
+}
+
 /// Bare integer literals against the `UInt64` code columns, which DataFusion
 /// parses as `Int64`: on every column, `=`, `IN` (inlined into `OR`s up to
-/// three values, an `IN` list above) and a range count what brute force over
-/// `code_chunks` counts, and each predicate reaches the scan node.
+/// three values, vortex's `list.contains` above) and a range count what brute
+/// force over `code_chunks` counts, and each predicate reaches the scan node
+/// with every literal as a `u64`.
 async fn bare_literals_reach_the_scan(ctx: &SessionContext, all: &[Vec<TermCode>], tag: &str) {
     for (i, column) in ["s", "p", "o", "g"].into_iter().enumerate() {
         let mut codes: Vec<TermCode> = all.iter().map(|r| r[i]).collect();
@@ -33,31 +44,40 @@ async fn bare_literals_reach_the_scan(ctx: &SessionContext, all: &[Vec<TermCode>
             all.iter().filter(|r| keep(r[i])).count() as i64
         };
         let cases = [
-            (format!("{column} = {mid}"), vec![mid], brute(&|c| c == mid)),
+            (
+                format!("{column} = {mid}"),
+                vec![mid],
+                brute(&|c| c == mid),
+                None,
+            ),
             (
                 format!("{column} IN ({lo}, {mid})"),
                 vec![lo, mid],
                 brute(&|c| c == lo || c == mid),
+                None,
             ),
             (
                 format!("{column} IN ({lo}, {mid}, {hi}, {absent})"),
                 vec![lo, mid, hi, absent],
                 brute(&|c| [lo, mid, hi].contains(&c)),
+                Some("vortex.list.contains("),
             ),
             (
                 format!("{column} >= {lo} AND {column} < {mid}"),
                 vec![lo, mid],
                 brute(&|c| lo <= c && c < mid),
+                None,
             ),
         ];
-        for (predicate, literals, expected) in cases {
+        for (predicate, literals, expected, operator) in cases {
             let sql = format!("SELECT COUNT(*) FROM quads WHERE {predicate}");
             assert_eq!(count(ctx, &sql).await, expected, "{tag}: {sql}");
             let filter = scan_filter(ctx, &sql).await.unwrap_or_default();
             let reference = format!("$.{column}");
             assert!(
                 filter.contains(&reference)
-                    && literals.iter().all(|v| filter.contains(&v.to_string())),
+                    && operator.is_none_or(|op| filter.contains(op))
+                    && literals.iter().all(|&v| has_u64_literal(&filter, v)),
                 "{tag}: {sql} reaches the scan node as `{filter}`"
             );
         }
@@ -255,41 +275,43 @@ async fn run_component_suite(store: &VortexRdfStore, tag: &str) {
             "{tag}: rid addresses the base row"
         );
     }
-    if let Some(dict) = store.component_data_source("dictionary").unwrap() {
-        register(&ctx, "dictionary", dict);
-        let len = store.dict_reader().unwrap().len() as i64;
-        assert_eq!(
-            count(&ctx, "SELECT COUNT(*) FROM dictionary").await,
-            len,
-            "{tag}: one row per term"
-        );
-        let first = strings(
-            &ctx,
-            "SELECT _dict_term FROM dictionary ORDER BY _dict_term LIMIT 1",
-        )
-        .await;
-        let code0 = store
-            .dict_reader()
-            .unwrap()
-            .decode(0)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(first, [code0], "{tag}: row 0 is code 0");
-        // A term-level filter against the term column, joined back on codes
-        // through the rank: the planner's decode-by-join.
-        let literals = count(
-            &ctx,
-            "SELECT COUNT(*) FROM dictionary WHERE _dict_term LIKE '\"%'",
-        )
-        .await;
-        let kinds = store.dict_reader().unwrap().kind_ranges().await.unwrap();
-        assert_eq!(
-            literals as TermCode,
-            kinds.literals.end - kinds.literals.start,
-            "{tag}: literal count"
-        );
-    }
+    let dict = store
+        .component_data_source("dictionary")
+        .unwrap()
+        .expect("a Dictionary store's term table in a file-io build");
+    register(&ctx, "dictionary", dict);
+    let len = store.dict_reader().unwrap().len() as i64;
+    assert_eq!(
+        count(&ctx, "SELECT COUNT(*) FROM dictionary").await,
+        len,
+        "{tag}: one row per term"
+    );
+    let first = strings(
+        &ctx,
+        "SELECT _dict_term FROM dictionary ORDER BY _dict_term LIMIT 1",
+    )
+    .await;
+    let code0 = store
+        .dict_reader()
+        .unwrap()
+        .decode(0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, [code0], "{tag}: row 0 is code 0");
+    // A term-level filter against the term column, joined back on codes
+    // through the rank: the planner's decode-by-join.
+    let literals = count(
+        &ctx,
+        "SELECT COUNT(*) FROM dictionary WHERE _dict_term LIKE '\"%'",
+    )
+    .await;
+    let kinds = store.dict_reader().unwrap().kind_ranges().await.unwrap();
+    assert_eq!(
+        literals as TermCode,
+        kinds.literals.end - kinds.literals.start,
+        "{tag}: literal count"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
