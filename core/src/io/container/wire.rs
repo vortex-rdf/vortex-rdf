@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use vortex_array::dtype::{DType, Nullability, PType, StructFields};
 use vortex_error::{VortexResult, vortex_bail, vortex_ensure_eq};
 
@@ -102,8 +102,29 @@ fn dtype_to_wire_fields(dtype: &DType) -> VortexResult<Vec<WireField>> {
         .collect()
 }
 
+/// A component dtype on the wire: its `fields` list in the kind vocabulary.
+mod wire_fields {
+    use super::{DType, Deserialize, Deserializer, Serialize, Serializer, WireField};
+
+    pub(super) fn serialize<S: Serializer>(
+        dtype: &DType,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        super::dtype_to_wire_fields(dtype)
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<DType, D::Error> {
+        Vec::<WireField>::deserialize(deserializer)
+            .map(|fields| super::wire_fields_to_dtype(&fields))
+    }
+}
+
 /// Descriptor of one auxiliary child, as persisted in the root metadata.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct StoreComponentDescriptor {
     pub(crate) name: String,
     pub(crate) role: StoreComponentRole,
@@ -120,7 +141,10 @@ pub(crate) struct StoreComponentDescriptor {
     /// may only binary-search it when this is set. Stamping per-chunk-sorted
     /// data as sorted corrupts query results, so absent/false is the safe
     /// default.
+    #[serde(default)]
     pub(crate) sorted: bool,
+    /// The column shape, written as `fields` in the kind vocabulary.
+    #[serde(rename = "fields", with = "wire_fields")]
     pub(crate) dtype: DType,
 }
 
@@ -162,18 +186,6 @@ pub(super) fn validate_components<'a>(
 }
 
 #[derive(Serialize, Deserialize)]
-struct WireComponent {
-    name: String,
-    role: StoreComponentRole,
-    implementation: String,
-    version: u32,
-    required: bool,
-    #[serde(default)]
-    sorted: bool,
-    fields: Vec<WireField>,
-}
-
-#[derive(Serialize, Deserialize)]
 struct WireMetadata {
     version: u32,
     /// Whether the quad rows are in GLOBAL `(s, p, o, g)` order — the
@@ -184,7 +196,7 @@ struct WireMetadata {
     /// record sortedness, and a false claim corrupts matches.
     #[serde(default)]
     quads_sorted: bool,
-    components: Vec<WireComponent>,
+    components: Vec<StoreComponentDescriptor>,
 }
 
 pub(super) fn encode_store_metadata(
@@ -194,20 +206,7 @@ pub(super) fn encode_store_metadata(
     let wire = WireMetadata {
         version: STORE_METADATA_VERSION,
         quads_sorted,
-        components: components
-            .iter()
-            .map(|c| {
-                Ok(WireComponent {
-                    name: c.name.clone(),
-                    role: c.role,
-                    implementation: c.implementation.clone(),
-                    version: c.version,
-                    required: c.required,
-                    sorted: c.sorted,
-                    fields: dtype_to_wire_fields(&c.dtype)?,
-                })
-            })
-            .collect::<VortexResult<Vec<_>>>()?,
+        components: components.to_vec(),
     };
     serde_json::to_vec(&wire).map_err(|e| vortex_error::vortex_err!("{e}"))
 }
@@ -225,20 +224,6 @@ pub(super) fn decode_store_metadata(
         STORE_METADATA_VERSION,
         "unsupported vortex-rdf store metadata version"
     );
-    let quads_sorted = wire.quads_sorted;
-    let components: Vec<StoreComponentDescriptor> = wire
-        .components
-        .into_iter()
-        .map(|c| StoreComponentDescriptor {
-            dtype: wire_fields_to_dtype(&c.fields),
-            name: c.name,
-            role: c.role,
-            implementation: c.implementation,
-            version: c.version,
-            required: c.required,
-            sorted: c.sorted,
-        })
-        .collect();
-    validate_components(&components)?;
-    Ok((quads_sorted, components))
+    validate_components(&wire.components)?;
+    Ok((wire.quads_sorted, wire.components))
 }

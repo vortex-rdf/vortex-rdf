@@ -92,7 +92,7 @@ per-chunk frame-of-reference (`fastlanes.for.v2`), is never written.
 ## 3. The store root: `vortex-rdf.store.v2`
 
 The root layout is registered in the crate's Vortex session on every target
-([`register`](../core/src/io/container/layout.rs#L203)); its stable
+([`register`](../core/src/io/container/layout.rs#L200)); its stable
 id is [`STORE_LAYOUT_ID`](../core/src/io/container/mod.rs#L43). A file whose
 root has any other id is refused as "not a vortex-rdf store file".
 
@@ -136,7 +136,7 @@ Two kinds of child:
 
 ### 3.1 The inventory
 
-The root's metadata is a JSON document ([`WireMetadata`](../core/src/io/container/wire.rs#L177))
+The root's metadata is a JSON document ([`WireMetadata`](../core/src/io/container/wire.rs#L189))
 carried inside the Layout flatbuffer, so it is read with the footer:
 
 ```json
@@ -162,7 +162,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 |---|---|
 | `version` | the metadata grammar; readers reject any value but `1` |
 | `quads_sorted` | the writer's provenance that the quad rows are in **global `(s, p, o, g)` order** — the only thing a reader may restore the subject `IsSorted` stamp from, since Vortex statistics do not record sortedness |
-| `components[i]` | describes child `i + 1` ([`StoreComponentDescriptor`](../core/src/io/container/wire.rs#L107)) |
+| `components[i]` | describes child `i + 1` ([`StoreComponentDescriptor`](../core/src/io/container/wire.rs#L128)) |
 | `name` | the child's identity; non-empty, unique, never `quad-source` |
 | `role` | `dictionary`, `index`, `change-set` (reserved for future delta components) or `other` |
 | `implementation` | the slug a reader interprets the columns through — the key of the registry behind [`known_component`](../core/src/store/indexes/components.rs#L64) |
@@ -173,7 +173,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 
 On open the layout checks that the child count is `1 + components.len()`,
 that child 0 has the root's row count, and that every component child's dtype
-matches its descriptor ([`deserialize`](../core/src/io/container/layout.rs#L52));
+matches its descriptor ([`deserialize`](../core/src/io/container/layout.rs#L56));
 [`classify_component`](../core/src/store/persist/open.rs#L84) then turns each
 descriptor into the dictionary, a known index, or a skip.
 
@@ -282,7 +282,7 @@ chunks are not one uniform window (chunks adopted from a foreign file) is
 written without the zone map; readers inspect the layout for it.
 
 **Reading it from a file.** A file store is memory-mapped
-([`from_file`](../core/src/store/persist/open.rs#L174)) and the dictionary stays in
+([`from_file`](../core/src/store/persist/open.rs#L209)) and the dictionary stays in
 its child
 ([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L262)).
 At open the handle reads the zone table — one small segment — and keeps, per
@@ -335,7 +335,7 @@ Shared rules:
 - **Term encoding follows the layout**: `Utf8` strings under `Default` and
   `TypedObject` (a `TypedObject` object appears as its full N-Triples term),
   `u64` codes under `Dictionary`. `rid` is always a non-nullable `u64`
-  ([`RowId`](../core/src/store/schema.rs#L38)), under every layout; a child
+  ([`RowId`](../core/src/store/schema.rs#L37)), under every layout; a child
   whose `rid` is an integer of any other width is refused at open
   ([`check_id_columns`](../core/src/store/persist/open.rs#L39)): rebuild such a store
   from its RDF source.
@@ -470,7 +470,7 @@ a call is working on and the bounded structures below. Residency is the
 kernel's decision; no segment cache sits in between.
 
 What a file store keeps for its lifetime, and what bounds it. The opened handle
-([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L38)) and the file-backed
+([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L37)) and the file-backed
 dictionary handle
 ([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L262))
 keep:

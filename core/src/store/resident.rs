@@ -15,7 +15,10 @@ use crate::store::array::{column_is_sorted, stamp_is_sorted};
 use crate::store::schema;
 use crate::store::schema::CODE_PTYPE;
 
-use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
+use vortex_array::arrays::StructArray;
+use vortex_array::arrays::struct_::StructArrayExt;
+use vortex_array::validity::Validity;
+use vortex_array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 
 /// Keep a base struct's integer children (the Dictionary layout's term
 /// codes, TypedObject's kind column) in their compressed form wherever the
@@ -40,43 +43,21 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 ///
 /// [`search_sorted_bounds`]: crate::store::array::search_sorted_bounds
 pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
-    use vortex_array::arrays::struct_::StructArrayExt;
-    use vortex_array::arrays::{PrimitiveArray, StructArray};
-    use vortex_array::validity::Validity;
+    use vortex_array::arrays::PrimitiveArray;
 
-    if rows.dtype().is_nullable() {
-        return Ok(rows);
-    }
-    let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let struct_arr = rows.execute::<StructArray>(&mut ctx)?;
-    let names = struct_arr.names().clone();
-    let mut children = Vec::with_capacity(names.len());
-    let mut changed = false;
-    for name in names.iter() {
-        let child = struct_arr.unmasked_field_by_name(name.as_ref())?;
+    map_struct_children(rows, |child, ctx| {
         let decode = child.dtype().is_int()
             && !child.dtype().is_nullable()
             && vortex_rdf_encoded_search::SortedProbe::resolve(child).is_none();
         if !decode {
-            children.push(child.clone());
-            continue;
+            return Ok(None);
         }
-        let sorted = column_is_sorted(child);
-        let canonical = child
-            .clone()
-            .execute::<PrimitiveArray>(&mut ctx)?
-            .into_array();
-        if sorted {
+        let canonical = child.clone().execute::<PrimitiveArray>(ctx)?.into_array();
+        if column_is_sorted(child) {
             stamp_is_sorted(&canonical);
         }
-        children.push(canonical);
-        changed = true;
-    }
-    if !changed {
-        return Ok(struct_arr.into_array());
-    }
-    let len = struct_arr.len();
-    Ok(StructArray::try_new(names, children, len, Validity::NonNullable)?.into_array())
+        Ok(Some(canonical))
+    })
 }
 
 /// Compress a built struct's integer columns — the `u64` code columns
@@ -104,23 +85,12 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
 /// array the payload path reads; components never serve payloads and skip
 /// the wrapper.
 pub(crate) fn with_compressed_int_children(rows: ArrayRef, payload_lazy: bool) -> Result<ArrayRef> {
-    use vortex_array::arrays::struct_::StructArrayExt;
-    use vortex_array::arrays::{Primitive, SharedArray, StructArray};
-    use vortex_array::validity::Validity;
+    use vortex_array::arrays::{Primitive, SharedArray};
 
-    if rows.dtype().is_nullable() {
-        return Ok(rows);
-    }
-    let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let struct_arr = rows.execute::<StructArray>(&mut ctx)?;
-    let names = struct_arr.names().clone();
-    let mut children = Vec::with_capacity(names.len());
-    for name in names.iter() {
-        let child = struct_arr.unmasked_field_by_name(name.as_ref())?;
+    map_struct_children(rows, |child, ctx| {
         let sorted = column_is_sorted(child);
-        let Some(mut encoded) = compress_int_child(child, sorted, &mut ctx)? else {
-            children.push(child.clone());
-            continue;
+        let Some(mut encoded) = compress_int_child(child, sorted, ctx)? else {
+            return Ok(None);
         };
         if payload_lazy && !encoded.is::<Primitive>() {
             encoded = SharedArray::new(encoded).into_array();
@@ -128,7 +98,37 @@ pub(crate) fn with_compressed_int_children(rows: ArrayRef, payload_lazy: bool) -
         if sorted {
             stamp_is_sorted(&encoded);
         }
-        children.push(encoded);
+        Ok(Some(encoded))
+    })
+}
+
+/// `rows` executed to a struct, each child replaced by the array `f` returns
+/// for it or kept where `f` returns `None`; the executed struct itself when
+/// `f` keeps every child. A nullable struct passes through untouched.
+fn map_struct_children(
+    rows: ArrayRef,
+    mut f: impl FnMut(&ArrayRef, &mut ExecutionCtx) -> Result<Option<ArrayRef>>,
+) -> Result<ArrayRef> {
+    if rows.dtype().is_nullable() {
+        return Ok(rows);
+    }
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
+    let struct_arr = rows.execute::<StructArray>(&mut ctx)?;
+    let names = struct_arr.names().clone();
+    let mut children = Vec::with_capacity(names.len());
+    let mut changed = false;
+    for name in names.iter() {
+        let child = struct_arr.unmasked_field_by_name(name.as_ref())?;
+        match f(child, &mut ctx)? {
+            Some(replacement) => {
+                children.push(replacement);
+                changed = true;
+            }
+            None => children.push(child.clone()),
+        }
+    }
+    if !changed {
+        return Ok(struct_arr.into_array());
     }
     let len = struct_arr.len();
     Ok(StructArray::try_new(names, children, len, Validity::NonNullable)?.into_array())

@@ -128,6 +128,44 @@ pub(in crate::store) fn classify_component(
     Ok(ComponentKind::Skip)
 }
 
+/// The known index children of a component roster, each with its
+/// descriptor, in roster order. Every entry is classified
+/// ([`classify_component`]), so a dictionary of an unknown implementation or
+/// an uninterpretable required component fails here; the dictionary and
+/// skippable components are left out.
+#[cfg(feature = "file-io")]
+fn index_children(
+    components: &[container::StoreComponentDescriptor],
+) -> Result<Vec<(KnownComponent, &container::StoreComponentDescriptor)>> {
+    let mut children = Vec::new();
+    for descriptor in components {
+        if let ComponentKind::Index(known) = classify_component(descriptor)? {
+            children.push((known, descriptor));
+        }
+    }
+    Ok(children)
+}
+
+/// The index set `file`'s roster makes queryable, each index child's row
+/// count checked against the quad table's.
+#[cfg(feature = "file-io")]
+fn index_types(file: &NativeStoreFile) -> Result<Indexes> {
+    let mut indexes: Indexes = Vec::new();
+    for (known, descriptor) in index_children(file.components())? {
+        if let Some(child) = file.component_layout(&descriptor.name)? {
+            crate::store::indexes::check_component_rows(
+                &descriptor.name,
+                child.row_count(),
+                file.row_count(),
+            )?;
+        }
+        if !indexes.contains(&known.index) {
+            indexes.push(known.index);
+        }
+    }
+    Ok(indexes)
+}
+
 /// Lift an unrefined file view's index children into in-memory components:
 /// each child is scanned whole and adopted as a deferred component
 /// (canonicalized on its first genuine use, as `from_bytes` adopts its
@@ -137,10 +175,7 @@ pub(in crate::store) async fn scanned_index_components(
     file: &NativeStoreFile,
 ) -> Result<Vec<IndexComponent>> {
     let mut components = Vec::new();
-    for descriptor in file.components() {
-        let ComponentKind::Index(known) = classify_component(descriptor)? else {
-            continue;
-        };
+    for (known, descriptor) in index_children(file.components())? {
         let Some((_, reader)) = file.component_reader(&descriptor.name)? else {
             continue;
         };
@@ -223,26 +258,12 @@ impl VortexRdfStore {
         // components are skipped when optional, fatal when required (a
         // skipped required component — a future change set, say — would
         // silently change query results).
-        let mut indexes: Indexes = Vec::new();
-        for descriptor in file.components() {
-            if let ComponentKind::Index(known) = classify_component(descriptor)? {
-                if let Some(child) = file.component_layout(&descriptor.name)? {
-                    crate::store::indexes::check_component_rows(
-                        &descriptor.name,
-                        child.row_count(),
-                        file.row_count(),
-                    )?;
-                }
-                if !indexes.contains(&known.index) {
-                    indexes.push(known.index);
-                }
-            }
-        }
+        let indexes = index_types(&file)?;
         let layout = match LayoutStrategy::from_dtype(file.dtype()) {
             LayoutStrategy::Default => ResolvedLayout::Default,
             LayoutStrategy::TypedObject => ResolvedLayout::TypedObject,
             LayoutStrategy::Dictionary => {
-                // The roster loop above already classified (and so
+                // `index_types` above already classified (and so
                 // implementation-checked) the dictionary descriptor.
                 let (_, reader) = file
                     .component_reader(container::DICT_COMPONENT_NAME)?
@@ -333,11 +354,11 @@ impl VortexRdfStore {
         let quads = quads.execute::<StructArray>(&mut ctx)?.into_array();
         // Restore the subject stamp from the file's recorded provenance,
         // through the same helper every materializing read path uses.
-        let quads = crate::store::array::with_subject_stamp(quads, container::quads_sorted(typed))?;
+        let quads = crate::store::array::with_subject_stamp(quads, typed.data().quads_sorted)?;
 
         let mut components: Vec<IndexComponent> = Vec::new();
         let mut dict = None;
-        for descriptor in container::store_components(typed) {
+        for descriptor in typed.data().components.iter() {
             let Some((_, child)) = container::store_component(typed, &descriptor.name)? else {
                 continue;
             };

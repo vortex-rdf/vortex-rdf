@@ -283,13 +283,13 @@ valid.
   re-takes the dictionary handle after the compaction.
 - The persisted children ([§2](#2-the-persisted-children-as-tables)) are
   the base's, untouched by tombstones and tails.
-- A store opened by [`from_file`](../core/src/store/persist/open.rs#L174)
+- A store opened by [`from_file`](../core/src/store/persist/open.rs#L209)
   reads its memory-mapped file in place, and so does every view, data
   source, partition and stream derived from it: the file must not be
   truncated or rewritten while any of them lives. Replacing it by a rename
   (as `compact` and the file writers do) is fine on Unix, where the mapping
   keeps the old file; Windows refuses to rename over a mapped file.
-  [`from_file_in_memory`](../core/src/store/persist/open.rs#L185) loads the
+  [`from_file_in_memory`](../core/src/store/persist/open.rs#L220) loads the
   file whole instead and never reads it again.
 
 ## 8. Through DataFusion

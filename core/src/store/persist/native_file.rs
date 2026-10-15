@@ -19,8 +19,7 @@ use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_layout::{LayoutReaderRef, LayoutRef};
 
 use crate::io::container::{
-    RdfStoreLayoutVTable, StoreComponentDescriptor, is_native_file, quads_sorted, store_component,
-    store_components,
+    RdfStoreLayoutVTable, StoreComponentDescriptor, is_native_file, store_component,
 };
 use crate::io::read::{FileIdentity, OpenedFile, unsupported_file_error};
 
@@ -251,8 +250,8 @@ impl NativeStoreFile {
             return Err(unsupported_file_error(&file));
         }
         let typed = file.footer().layout().as_::<RdfStoreLayoutVTable>();
-        let components = store_components(typed).to_vec();
-        let quads_sorted = quads_sorted(typed);
+        let components = typed.data().components.to_vec();
+        let quads_sorted = typed.data().quads_sorted;
         let readers = Mutex::new(Arc::new(ReaderTree::new(&file, components.len(), 0)));
         Ok(Self {
             file,

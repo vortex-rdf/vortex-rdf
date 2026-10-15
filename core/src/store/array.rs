@@ -62,13 +62,6 @@ pub(crate) fn make_string_array(values: impl IntoIterator<Item = impl AsRef<str>
     VarBinViewArray::from_iter_str(values).into_array()
 }
 
-/// Build a nullable Vortex string array for optional fields (e.g. o_datatype, o_lang).
-pub(crate) fn make_nullable_string_array(
-    values: impl IntoIterator<Item = Option<String>>,
-) -> ArrayRef {
-    VarBinViewArray::from_iter_nullable_str(values).into_array()
-}
-
 /// Stamp the exact `IsSorted` statistic on an array.
 ///
 /// On a base's `s` column the stamp asserts more than that column's order: it

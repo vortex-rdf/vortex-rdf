@@ -1,4 +1,5 @@
-//! The column names that define the serialized format.
+//! The column names that define the serialized format: the four primary quad
+//! columns and the TypedObject layout's split object columns.
 //!
 //! These are contract, not policy: a name change here changes what a written
 //! file means, so they live in one place, and a child that carries a primary
@@ -6,13 +7,11 @@
 //! constants rather than its own spelling. Column names owned by a single
 //! subsystem live with that subsystem instead: the row id every index child
 //! carries in the index hub ([`indexes::COL_RID`]), the reference index's
-//! `val` in [`reference`], the dictionary child's `_dict_term`
-//! in [`storage`](crate::store::layouts::dictionary::storage), and the
-//! TypedObject layout's split object columns in [`typed_object`].
+//! `val` in [`reference`], and the dictionary child's `_dict_term`
+//! in [`storage`](crate::store::layouts::dictionary::storage).
 //!
 //! [`indexes::COL_RID`]: crate::store::indexes::COL_RID
 //! [`reference`]: crate::store::indexes::reference
-//! [`typed_object`]: crate::store::layouts::typed_object
 
 use vortex_array::dtype::{DType, Nullability, PType};
 
@@ -75,8 +74,8 @@ pub(crate) fn is_id_field(name: &str, dtype: &DType) -> bool {
 
 /// The subject column — first in every layout. Whether its rows are globally
 /// sorted is per-store provenance
-/// ([`quads_sorted`](crate::io::container::layout::quads_sorted)), not a
-/// property of the name.
+/// ([`quads_sorted`](crate::io::container::layout::RdfStoreLayoutData::quads_sorted)),
+/// not a property of the name.
 pub(crate) const COL_S: &str = "s";
 /// The predicate column.
 pub(crate) const COL_P: &str = "p";
@@ -88,19 +87,34 @@ pub(crate) const COL_G: &str = "g";
 /// The four primary columns in emission order.
 pub(crate) const PRIMARY_COLUMNS: [&str; 4] = [COL_S, COL_P, COL_O, COL_G];
 
+/// TypedObject: the term kind tag — its presence in a schema is what marks
+/// the layout.
+pub(crate) const COL_O_KIND: &str = "o_kind";
+/// TypedObject: the object's lexical value: IRI string, blank node id, or
+/// literal value.
+pub(crate) const COL_O_VALUE: &str = "o_value";
+/// TypedObject: the literal datatype IRI — null unless the object is a typed
+/// literal.
+pub(crate) const COL_O_DATATYPE: &str = "o_datatype";
+/// TypedObject: the literal language tag — null unless the object is a
+/// language literal.
+pub(crate) const COL_O_LANG: &str = "o_lang";
+
 /// One of the four primary quad columns, by role — how the narrowing
 /// surface ([`keep`](crate::store::VortexRdfStore::keep)) and the code
-/// payloads name a column.
+/// payloads name a column. The discriminant is the column's position in
+/// `(s, p, o, g)` order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum QuadColumn {
     /// The subject.
-    S,
+    S = 0,
     /// The predicate.
-    P,
+    P = 1,
     /// The object.
-    O,
+    O = 2,
     /// The graph name.
-    G,
+    G = 3,
 }
 
 impl QuadColumn {
@@ -115,12 +129,7 @@ impl QuadColumn {
 
     /// The column's position in `(s, p, o, g)` order.
     pub fn index(self) -> usize {
-        match self {
-            QuadColumn::S => 0,
-            QuadColumn::P => 1,
-            QuadColumn::O => 2,
-            QuadColumn::G => 3,
-        }
+        self as usize
     }
 
     /// The column at `index` in `(s, p, o, g)` order, `None` past the fourth.
