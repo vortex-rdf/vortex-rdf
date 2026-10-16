@@ -1082,7 +1082,7 @@ mod tests {
     }
 
     /// The four code columns of `chunks`, each concatenated in chunk order.
-    fn chunk_codes(chunks: Vec<ArrayRef>) -> Vec<Vec<TermCode>> {
+    fn chunk_code_columns(chunks: Vec<ArrayRef>) -> Vec<Vec<TermCode>> {
         let mut columns = vec![Vec::new(); schema::PRIMARY_COLUMNS.len()];
         for chunk in chunks {
             for (column, codes) in columns.iter_mut().zip(quad_codes(chunk)) {
@@ -1156,7 +1156,7 @@ mod tests {
             splits,
             spawned: driver_hooks::take_spawned(),
             chunk_rows: chunks.iter().map(|chunk| chunk.len()).collect(),
-            rows: chunk_codes(chunks),
+            rows: chunk_code_columns(chunks),
         }
     }
 
@@ -1325,7 +1325,7 @@ mod tests {
                 let chunk_rows: Vec<usize> = chunks.iter().map(|chunk| chunk.len()).collect();
                 (
                     chunk_rows,
-                    chunk_codes(chunks),
+                    chunk_code_columns(chunks),
                     driver_hooks::take_spawned(),
                 )
             })

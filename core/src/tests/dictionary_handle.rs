@@ -637,24 +637,9 @@ async fn test_dict_reader_file_backed_matches_resident() {
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("{tag}: codes are the store's vocabulary"));
-        let decoded: Vec<Vec<Option<String>>> = futures::future::try_join_all(
-            columns.iter().map(|col| reader.decode_many(col.as_slice())),
-        )
-        .await
-        .unwrap();
-        let mut got: Vec<String> = (0..columns[0].len())
-            .map(|row| {
-                let term = |col: usize| decoded[col][row].clone().unwrap();
-                let g = term(3);
-                let g = if g.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {g}")
-                };
-                format!("{} {} {}{}", term(0), term(1), term(2), g)
-            })
-            .collect();
+        let mut got = decoded_rows(&columns, &reader).await;
         got.sort();
-        assert_eq!(got, view_strings(&view).await, "{tag}");
+        let held = view.quads_vec().await.unwrap();
+        assert_eq!(got, expected_rows(&held, |_| true), "{tag}");
     }
 }

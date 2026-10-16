@@ -390,7 +390,7 @@ async fn test_code_columns_skips_tombstoned_rows_in_memory() {
     // Row 4: s01 p1 "object 0".
     let deleted = store.delete_quad(&quads[4]).await.unwrap();
     assert_eq!(deleted.size().await.unwrap(), 11);
-    let dict = deleted.code_read_snapshot().unwrap();
+    let dict = deleted.dict_reader().unwrap();
 
     let s1 = subject_node(1, 2);
     let by_subject = deleted
@@ -423,7 +423,7 @@ async fn test_code_columns_skips_tombstoned_rows_in_memory() {
     .delete_quad(&quads[4])
     .await
     .unwrap();
-    let served_dict = served_deleted.code_read_snapshot().unwrap();
+    let served_dict = served_deleted.dict_reader().unwrap();
     let served = served_deleted
         .match_pattern(None, Some(&p1), None, None)
         .await
@@ -440,22 +440,12 @@ async fn test_code_columns_skips_tombstoned_rows_in_memory() {
         ("row ids", &by_predicate, &dict, 3),
         ("served, tombstoned", &served, &served_dict, 3),
     ] {
-        let [s, p, o, g] = view
+        let cols = view
             .code_columns()
             .unwrap_or_else(|| panic!("{tag}: the in-memory fast path must serve codes"));
-        assert_eq!(s.len(), live, "{tag}");
-        let decoded: Vec<(String, String, String, String)> = (0..s.len())
-            .map(|i| {
-                (
-                    dict.decode(s[i]).unwrap(),
-                    dict.decode(p[i]).unwrap(),
-                    dict.decode(o[i]).unwrap(),
-                    dict.decode(g[i]).unwrap(),
-                )
-            })
-            .collect();
+        assert_eq!(cols[0].len(), live, "{tag}");
         assert_eq!(
-            decoded,
+            decoded_rows(&cols, dict).await,
             tuple_rows(&view.quads_vec().await.unwrap()),
             "{tag}: codes must decode to the surviving rows"
         );

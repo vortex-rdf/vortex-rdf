@@ -98,48 +98,23 @@ async fn assert_file_backed_matches_resident(
     let default_g = GraphName::DefaultGraph;
     let absent = NamedNode::new("http://example.org/absent").unwrap();
 
-    // Full reconstruction.
-    assert_eq!(
-        matched_strings(&fb, None, None, None, None).await,
-        matched_strings(&resident, None, None, None, None).await,
-        "{tag}: full scan"
-    );
+    // Full reconstruction, then one pattern per family: subject / predicate /
+    // object / graph bound and multi-role.
+    let patterns: [Pattern<'_>; 7] = [
+        ("full scan", None, None, None, None),
+        ("subject-bound", Some(&s3), None, None, None),
+        ("predicate-bound", None, Some(&p0), None, None),
+        ("object-bound", None, None, Some(&o1), None),
+        ("graph-bound", None, None, None, Some(&g)),
+        ("default-graph-bound", None, None, None, Some(&default_g)),
+        ("predicate+object", None, Some(&p0), Some(&o1), None),
+    ];
+    assert_patterns_agree(&resident, &[(tag, &fb)], &patterns).await;
     assert_eq!(fb.size().await.unwrap(), quads.len(), "{tag}");
 
-    // One pattern per family: subject / predicate / object / graph bound,
-    // multi-role, fully bound, and a term absent from the dictionary.
-    assert_eq!(
-        matched_strings(&fb, Some(&s3), None, None, None).await,
-        matched_strings(&resident, Some(&s3), None, None, None).await,
-        "{tag}: subject-bound"
-    );
-    assert_eq!(
-        matched_strings(&fb, None, Some(&p0), None, None).await,
-        matched_strings(&resident, None, Some(&p0), None, None).await,
-        "{tag}: predicate-bound"
-    );
-    assert_eq!(
-        matched_strings(&fb, None, None, Some(&o1), None).await,
-        matched_strings(&resident, None, None, Some(&o1), None).await,
-        "{tag}: object-bound"
-    );
-    assert_eq!(
-        matched_strings(&fb, None, None, None, Some(&g)).await,
-        matched_strings(&resident, None, None, None, Some(&g)).await,
-        "{tag}: graph-bound"
-    );
-    assert_eq!(
-        matched_strings(&fb, None, None, None, Some(&default_g)).await,
-        matched_strings(&resident, None, None, None, Some(&default_g)).await,
-        "{tag}: default-graph-bound"
-    );
-    assert_eq!(
-        matched_strings(&fb, None, Some(&p0), Some(&o1), None).await,
-        matched_strings(&resident, None, Some(&p0), Some(&o1), None).await,
-        "{tag}: predicate+object"
-    );
     let q0 = &quads[3];
     assert!(fb.contains(q0).await.unwrap(), "{tag}: contains");
+    // A term absent from the dictionary matches nothing.
     let empty = matched_strings(&fb, None, Some(&absent), None, None).await;
     assert!(empty.is_empty(), "{tag}: absent term matches nothing");
     (dir, fb, resident)
@@ -286,27 +261,9 @@ async fn test_tombstoned_indexed_codes_address_the_stores_dictionary() {
     let reader = deleted
         .dict_reader()
         .expect("a tombstoned Dictionary view keeps its dictionary handle");
-    let decoded: Vec<Vec<Option<String>>> =
-        futures::future::try_join_all(cols.iter().map(|col| reader.decode_many(col.as_slice())))
-            .await
-            .unwrap();
-    let got: std::collections::BTreeSet<[String; 4]> = (0..cols[0].len())
-        .map(|i| {
-            [0, 1, 2, 3].map(|c| {
-                decoded[c][i]
-                    .clone()
-                    .expect("returned codes address the store's dictionary")
-            })
-        })
-        .collect();
-    let expected: std::collections::BTreeSet<[String; 4]> = quads[1..]
-        .iter()
-        .map(|q| {
-            let raw = crate::store::RawQuad::from_quad(q);
-            [raw.s, raw.p, raw.o, raw.g]
-        })
-        .collect();
-    assert_eq!(got, expected);
+    let mut got = decoded_rows(&cols, &reader).await;
+    got.sort();
+    assert_eq!(got, expected_rows(&quads, |i| i > 0));
 }
 
 /// Direct probe parity at multi-chunk scale: every sampled term must resolve
@@ -316,34 +273,26 @@ async fn test_tombstoned_indexed_codes_address_the_stores_dictionary() {
 async fn test_file_backed_dictionary_probe_parity() {
     // Enough unique terms to spread the dictionary across several chunk
     // leaves, so the probe's binary search genuinely crosses between them.
-    // Serialized once per process (see `cached_store_bytes`).
+    // Serialized once per process (see `cached_store_file`).
     static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
-    let bytes = cached_store_bytes(&BYTES, || async {
-        let quads: Vec<Quad> = (0..20_000)
-            .map(|i| {
-                make_quad(
-                    &format!("http://example.org/s{i:06}"),
-                    &format!("http://example.org/p{}", i % 3),
-                    &format!("object {i:06}"),
-                    GraphName::DefaultGraph,
-                )
-            })
-            .collect();
-        let mut bytes: Vec<u8> = Vec::new();
-        quads_stream_to_vortex_writer(
-            quad_stream(quads),
-            &mut bytes,
-            LayoutStrategy::Dictionary,
-            vec![],
-        )
-        .await
-        .unwrap();
-        bytes
-    })
+    let (_dir, path) = cached_store_file(
+        &BYTES,
+        || {
+            (0..20_000)
+                .map(|i| {
+                    make_quad(
+                        &format!("http://example.org/s{i:06}"),
+                        &format!("http://example.org/p{}", i % 3),
+                        &format!("object {i:06}"),
+                        GraphName::DefaultGraph,
+                    )
+                })
+                .collect()
+        },
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
     .await;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("probe.vortex");
-    std::fs::write(&path, bytes).unwrap();
 
     // The reference answers, from a whole-store load of the same file.
     let resident = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
@@ -654,9 +603,7 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
     )
     .await
     .unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("flat.vortex");
-    std::fs::write(&path, &bytes).unwrap();
+    let (_dir, path) = temp_store_file(&bytes);
 
     let outer = crate::tests::open_mapped(&path).await;
     assert!(
@@ -832,9 +779,7 @@ async fn test_unzoned_dictionary_child_opens_mapped() {
         .collect();
     let (dict, _code_map) = TermDictionary::from_quads_with_map(&raws).unwrap();
     let bytes = write_dict_only_store_as(&dict, container::DICT_VERSION, false).await;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("unzoned.vortex");
-    std::fs::write(&path, &bytes).unwrap();
+    let (_dir, path) = temp_store_file(&bytes);
     let native = crate::tests::open_mapped(&path).await;
     let descriptor = native
         .components()
@@ -894,9 +839,7 @@ async fn test_child_without_zone_maps_reads_bounds_from_leaves() {
     )
     .unwrap();
     let bytes = unstamped_store_bytes(vec![bare_code_quad_array(&[0])], vec![unzoned]).await;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("unzoned-shape.vortex");
-    std::fs::write(&path, &bytes).unwrap();
+    let (_dir, path) = temp_store_file(&bytes);
     let native = crate::tests::open_mapped(&path).await;
     assert!(!dict_term_column(&native).is::<Zoned>());
     let fb = FileBackedDict::open(&native)

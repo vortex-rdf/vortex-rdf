@@ -429,9 +429,7 @@ async fn row_ids_past_u32_round_trip_through_a_file() {
             }
             assert!(rid_columns >= 2, "{label}: index children");
 
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("store.vortex");
-            std::fs::write(&path, &bytes).unwrap();
+            let (_dir, path) = temp_store_file(&bytes);
             let mapped = VortexRdfStore::from_file(&path).await.unwrap();
             check_children(&mapped.to_serializable_parts().await.unwrap(), BASE, &label);
             check_store(&mapped, &quads, &format!("{label}: mapped")).await;
@@ -518,9 +516,7 @@ async fn reference_children_keep_val_rid_order_across_u32_max() {
             vec![IndexType::SecondaryByReference],
         )
         .await;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("store.vortex");
-        std::fs::write(&path, &bytes).unwrap();
+        let (_dir, path) = temp_store_file(&bytes);
         let mapped = VortexRdfStore::from_file(&path).await.unwrap();
         check_store(&mapped, &quads, "straddling file").await;
         super::indexes_file::assert_windows_read_only_their_rows(

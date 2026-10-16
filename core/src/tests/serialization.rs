@@ -653,13 +653,6 @@ async fn test_from_bytes_and_from_parts_answer_every_pattern_like_from_built() {
     let o = Term::Literal(Literal::new_simple_literal("object 7"));
     let g = GraphName::DefaultGraph;
 
-    type Pattern<'a> = (
-        &'a str,
-        Option<&'a NamedOrBlankNode>,
-        Option<&'a NamedNode>,
-        Option<&'a Term>,
-        Option<&'a GraphName>,
-    );
     let patterns: [Pattern<'_>; 10] = [
         ("S", Some(&s), None, None, None),
         ("S absent", Some(&s_absent), None, None, None),
@@ -672,22 +665,12 @@ async fn test_from_bytes_and_from_parts_answer_every_pattern_like_from_built() {
         ("SPOG", Some(&s), Some(&p), Some(&o), Some(&g)),
         ("full", None, None, None, None),
     ];
-    for (name, ps, pp, po, pg) in patterns {
-        let want = canonical.match_pattern(ps, pp, po, pg).await.unwrap();
-        for (kind, store) in [("lean", &lean), ("resident", &resident)] {
-            let got = store.match_pattern(ps, pp, po, pg).await.unwrap();
-            assert_eq!(
-                got.size().await.unwrap(),
-                want.size().await.unwrap(),
-                "size diverged on [{name}] ({kind})"
-            );
-            assert_eq!(
-                view_strings(&got).await,
-                view_strings(&want).await,
-                "results diverged on [{name}] ({kind})"
-            );
-        }
-    }
+    assert_patterns_agree(
+        &canonical,
+        &[("lean", &lean), ("resident", &resident)],
+        &patterns,
+    )
+    .await;
 
     // The subject run itself: 4 quads per subject by construction.
     let s_view = lean
@@ -731,22 +714,18 @@ async fn test_from_parts_retains_dict_children() {
     let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s02500").unwrap());
     let p = NamedNode::new("http://example.org/p4").unwrap();
     let o = Term::Literal(Literal::new_simple_literal("object 7"));
-    for (name, ps, pp, po) in [
-        ("O", None, None, Some(&o)),
-        ("PO", None, Some(&p), Some(&o)),
-        ("SPO", Some(&s), Some(&p), Some(&o)),
-        ("SO", Some(&s), None, Some(&o)),
-    ] {
-        let want = canonical.match_pattern(ps, pp, po, None).await.unwrap();
-        for (kind, store) in [("lean", &lean), ("resident", &resident)] {
-            let got = store.match_pattern(ps, pp, po, None).await.unwrap();
-            assert_eq!(
-                view_strings(&got).await,
-                view_strings(&want).await,
-                "results diverged on [{name}] ({kind})"
-            );
-        }
-    }
+    let patterns: [Pattern<'_>; 4] = [
+        ("O", None, None, Some(&o), None),
+        ("PO", None, Some(&p), Some(&o), None),
+        ("SPO", Some(&s), Some(&p), Some(&o), None),
+        ("SO", Some(&s), None, Some(&o), None),
+    ];
+    assert_patterns_agree(
+        &canonical,
+        &[("lean", &lean), ("resident", &resident)],
+        &patterns,
+    )
+    .await;
 }
 
 // ─── Open errors ───────────────────────────────────────────────────────
@@ -763,9 +742,7 @@ async fn open_both(
     crate::error::Result<VortexRdfStore>,
     tempfile::TempDir,
 ) {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("store.vortex");
-    std::fs::write(&path, bytes).unwrap();
+    let (dir, path) = temp_store_file(bytes);
     let from_file = VortexRdfStore::from_file(&path).await;
     (VortexRdfStore::from_bytes(bytes).await, from_file, dir)
 }

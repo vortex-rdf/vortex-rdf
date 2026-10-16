@@ -218,7 +218,11 @@ async fn test_data_source_request_semantics() {
     )
     .await;
     let swapped: Vec<[TermCode; 4]> = all.iter().map(|r| [r[0], r[3], r[2], r[1]]).collect();
-    assert_eq!(chunk_codes(&chunks), swapped, "a pack renames and reorders");
+    assert_eq!(
+        chunk_code_rows(&chunks),
+        swapped,
+        "a pack renames and reorders"
+    );
 
     // A filter on a code column.
     let p1_eq = || eq(get_item("p", root()), lit(p1));
@@ -521,8 +525,8 @@ async fn test_data_source_request_semantics() {
     assert_multi_chunk_requests(&multi_chunk_store().await, "memory").await;
     #[cfg(feature = "file-io")]
     {
-        let dir = tempfile::tempdir().unwrap();
-        assert_multi_chunk_requests(&multi_chunk_file(&dir).await, "mapped").await;
+        let (_dir, mapped) = multi_chunk_file().await;
+        assert_multi_chunk_requests(&mapped, "mapped").await;
     }
 }
 

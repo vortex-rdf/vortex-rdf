@@ -295,8 +295,7 @@ async fn test_unstamped_base_rebuild_sorts_fully() {
         .map(crate::store::RawQuad::from_quad)
         .collect();
     union.sort();
-    let union: Vec<(String, String, String, String)> =
-        union.into_iter().map(|r| (r.s, r.p, r.o, r.g)).collect();
+    let union: Vec<Row> = union.into_iter().map(|r| (r.s, r.p, r.o, r.g)).collect();
     assert_eq!(
         tuple_rows(&got),
         union,

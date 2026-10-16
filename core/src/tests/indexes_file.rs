@@ -352,8 +352,7 @@ async fn test_copy_index_file_locates_dictionary_coded_columns() {
 
 /// The code columns of `view` as sorted `(s, p, o, g)` rows.
 async fn sorted_code_rows(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
-    let [s, p, o, g] = view.code_columns_gathered().await.unwrap().unwrap();
-    let mut rows: Vec<[TermCode; 4]> = (0..s.len()).map(|i| [s[i], p[i], o[i], g[i]]).collect();
+    let mut rows = row_list(view).await;
     rows.sort_unstable();
     rows
 }
@@ -471,24 +470,20 @@ async fn test_file_with_both_index_kinds() {
 
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
-    for (tag, p, o) in [
-        ("P", Some(&p1), None),
-        ("O", None, Some(&o1)),
-        ("PO", Some(&p1), Some(&o1)),
-    ] {
-        let want = view_strings(&memory.match_pattern(None, p, o, None).await.unwrap()).await;
-        assert!(!want.is_empty(), "{tag}");
-        assert_eq!(
-            view_strings(&file.match_pattern(None, p, o, None).await.unwrap()).await,
-            want,
-            "{tag}: file"
-        );
-        assert_eq!(
-            view_strings(&adopted.match_pattern(None, p, o, None).await.unwrap()).await,
-            want,
-            "{tag}: adopted"
-        );
+    let patterns: [Pattern<'_>; 3] = [
+        ("P", None, Some(&p1), None, None),
+        ("O", None, None, Some(&o1), None),
+        ("PO", None, Some(&p1), Some(&o1), None),
+    ];
+    for &(tag, s, p, o, g) in &patterns {
+        assert!(matched_size(&memory, s, p, o, g).await > 0, "{tag}");
     }
+    assert_patterns_agree(
+        &memory,
+        &[("file", &file), ("adopted", &adopted)],
+        &patterns,
+    )
+    .await;
 }
 
 // ─── SecondaryByReference on a file ────────────────────────────────────
