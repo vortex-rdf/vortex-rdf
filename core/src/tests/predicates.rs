@@ -596,7 +596,8 @@ async fn predicate_store() -> VortexRdfStore {
         "_:b0".to_string(),
         "_:ab".to_string(),
     ] {
-        let term = crate::common::terms::parse_term(&spelling).unwrap();
+        let term =
+            crate::common::terms::term(&spelling, crate::common::terms::Trust::Stored).unwrap();
         quads.push(Quad::new(
             s.clone(),
             p.clone(),

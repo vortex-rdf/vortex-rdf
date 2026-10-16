@@ -197,9 +197,11 @@ fn test_decode_chunk_reports_chunk_failure_as_single_err() {
 /// A row whose term fails to parse is reported at its own position, with the
 /// rows around it decoded: an object string in no term form under the
 /// layouts that store the object spelling, an unknown `o_kind` under the
-/// typed layout.
-#[test]
-fn test_decode_chunk_reports_bad_row_at_its_position() {
+/// typed layout. The typed layout stores no object spelling, so it meets
+/// that object string at build instead: `from_quads` refuses it with the
+/// parser's error.
+#[tokio::test]
+async fn test_decode_chunk_reports_bad_row_at_its_position() {
     use vortex_array::IntoArray as _;
     use vortex_array::arrays::PrimitiveArray;
 
@@ -208,6 +210,17 @@ fn test_decode_chunk_reports_bad_row_at_its_position() {
         .map(crate::store::RawQuad::from_quad)
         .collect();
     let bad = raws_with_bad_object();
+    let built = VortexRdfStore::from_quads(
+        futures::stream::iter(bad.clone().into_iter().map(Ok)),
+        LayoutStrategy::TypedObject,
+        vec![],
+    )
+    .await;
+    match built.err() {
+        Some(VortexRdfError::Deserialization(m))
+            if m == "invalid term \"bogus\": not an IRI, blank node or literal" => {}
+        other => panic!("{other:?}"),
+    }
     let typed = {
         let (chunk, resolved) = chunk_for(LayoutStrategy::TypedObject, &good);
         let kinds = PrimitiveArray::from_iter([2u8, 9, 2]).into_array();
