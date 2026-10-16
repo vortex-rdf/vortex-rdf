@@ -46,7 +46,7 @@ pub(crate) use self::dictionary::DictAccess;
 use self::dictionary::TermDictionary;
 use crate::store::schema::{
     CODE_PTYPE, COL_G, COL_O, COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE, COL_P, COL_S,
-    PRIMARY_COLUMNS, TermCode,
+    PRIMARY_COLUMNS, QuadColumn, TermCode,
 };
 
 /// Determines the columnar schema used to store RDF quads in the Vortex StructArray.
@@ -234,15 +234,6 @@ pub(crate) enum ResolvedLayout {
     Dictionary(DictAccess),
 }
 
-/// One of the four term positions of a quad pattern.
-#[derive(Clone, Copy)]
-enum Role {
-    S,
-    P,
-    O,
-    G,
-}
-
 /// A quad pattern: the four term positions, each bound or free.
 ///
 /// Travels as one value because every stage of a match needs all four together
@@ -324,12 +315,13 @@ impl std::fmt::Display for TermRef<'_> {
 }
 
 impl TermRef<'_> {
-    fn role(&self) -> Role {
+    /// The column the term's role occupies.
+    fn role(&self) -> QuadColumn {
         match self {
-            TermRef::Subject(_) => Role::S,
-            TermRef::Predicate(_) => Role::P,
-            TermRef::Object(_) => Role::O,
-            TermRef::Graph(_) => Role::G,
+            TermRef::Subject(_) => QuadColumn::S,
+            TermRef::Predicate(_) => QuadColumn::P,
+            TermRef::Object(_) => QuadColumn::O,
+            TermRef::Graph(_) => QuadColumn::G,
         }
     }
 
@@ -435,7 +427,7 @@ impl PatternCodes {
         term: TermRef<'_>,
         f: impl FnOnce(&str) -> Option<TermCode>,
     ) -> Option<TermCode> {
-        let role = term.role() as usize;
+        let role = term.role().index();
         if let Some(cached) = self.roles[role] {
             return cached;
         }
@@ -452,6 +444,15 @@ impl PatternCodes {
         &self.scratch
     }
 
+    /// Whether this witness probes with the rendered term itself rather than
+    /// a dictionary code: the `Default` and `TypedObject` layouts.
+    fn probes_by_string(&self) -> bool {
+        matches!(
+            self.resolver,
+            CodeResolver::Default | CodeResolver::TypedObject
+        )
+    }
+
     /// The dictionary code for `term`'s role: the role cache first (the
     /// prelude seeded every bound role), then a resident dictionary's binary
     /// search for a witness that can run one synchronously.
@@ -463,7 +464,7 @@ impl PatternCodes {
     /// must be an error — silently answering `None` would fabricate an empty
     /// match result.
     fn code(&mut self, term: TermRef<'_>) -> Result<Option<TermCode>> {
-        if let Some(cached) = self.roles[term.role() as usize] {
+        if let Some(cached) = self.roles[term.role().index()] {
             return Ok(cached);
         }
         let CodeResolver::Resident(dict) = &self.resolver else {
@@ -488,10 +489,7 @@ impl PatternCodes {
     /// and a single render per bound term however many stages and indexes ask
     /// for the same probe.
     pub(crate) fn probe_scalar(&mut self, term: TermRef<'_>) -> Result<Option<Scalar>> {
-        if matches!(
-            self.resolver,
-            CodeResolver::Default | CodeResolver::TypedObject
-        ) {
+        if self.probes_by_string() {
             return Ok(Some(Scalar::from(self.render(term))));
         }
         Ok(self.code(term)?.map(Scalar::from))
@@ -509,89 +507,40 @@ impl PatternCodes {
     /// A role the prelude left unresolved answers `false`, deferring to the
     /// constraint path rather than fabricating an empty result.
     pub(crate) fn provably_empty(&self, pattern: QuadPattern<'_>) -> bool {
-        if matches!(
-            self.resolver,
-            CodeResolver::Default | CodeResolver::TypedObject
-        ) {
-            return false;
-        }
-        [
-            (Role::S, pattern.subject.is_some()),
-            (Role::P, pattern.predicate.is_some()),
-            (Role::O, pattern.object.is_some()),
-            (Role::G, pattern.graph.is_some()),
-        ]
-        .into_iter()
-        .any(|(role, bound)| bound && matches!(self.roles[role as usize], Some(None)))
+        !self.probes_by_string()
+            && pattern
+                .bound_roles()
+                .any(|term| matches!(self.roles[term.role().index()], Some(None)))
     }
 
     /// Compile a quad pattern into per-column equality constraints — the
     /// layout-specific term → (column, scalar) mapping, the single source of
     /// truth consumed by both the in-memory mask scan and the pushed-down
-    /// file filter.
+    /// file filter. Bound terms compile in `s`, `p`, `o`, `g` order: the
+    /// rendered term per string column, the object's typed sub-columns under
+    /// `TypedObject`, and under the Dictionary layout (either residency) the
+    /// term's code — a term absent from the dictionary cannot match any quad.
     pub(crate) fn constraints(&mut self, pattern: QuadPattern<'_>) -> Result<Constraints> {
-        let QuadPattern {
-            subject,
-            predicate,
-            object,
-            graph,
-        } = pattern;
+        let typed_object = matches!(self.resolver, CodeResolver::TypedObject);
         let mut eqs: Vec<(&'static str, Scalar)> = Vec::new();
-        match self.resolver {
-            CodeResolver::Default => {
-                if let Some(s) = subject {
-                    eqs.push((COL_S, Scalar::from(self.render(TermRef::Subject(s)))));
+        for term in pattern.bound_roles() {
+            if typed_object && let TermRef::Object(object) = term {
+                let (kind, value, dt, lang) = typed_object::decompose_object(object);
+                eqs.push((COL_O_KIND, Scalar::from(kind)));
+                eqs.push((COL_O_VALUE, Scalar::from(value.as_str())));
+                if let Some(dt_str) = dt {
+                    eqs.push((COL_O_DATATYPE, Scalar::from(dt_str.as_str())));
                 }
-                if let Some(p) = predicate {
-                    eqs.push((COL_P, Scalar::from(self.render(TermRef::Predicate(p)))));
+                if let Some(lang_str) = lang {
+                    eqs.push((COL_O_LANG, Scalar::from(lang_str.as_str())));
                 }
-                if let Some(o) = object {
-                    eqs.push((COL_O, Scalar::from(self.render(TermRef::Object(o)))));
+            } else if self.probes_by_string() {
+                eqs.push((term.role().name(), Scalar::from(self.render(term))));
+            } else {
+                match self.code(term)? {
+                    Some(code) => eqs.push((term.role().name(), Scalar::from(code))),
+                    None => return Ok(Constraints::AlwaysFalse),
                 }
-                if let Some(g) = graph {
-                    eqs.push((COL_G, Scalar::from(self.render(TermRef::Graph(g)))));
-                }
-            }
-            CodeResolver::TypedObject => {
-                if let Some(s) = subject {
-                    eqs.push((COL_S, Scalar::from(self.render(TermRef::Subject(s)))));
-                }
-                if let Some(p) = predicate {
-                    eqs.push((COL_P, Scalar::from(self.render(TermRef::Predicate(p)))));
-                }
-                if let Some(o) = object {
-                    let (kind, value, dt, lang) = typed_object::decompose_object(o);
-                    eqs.push((COL_O_KIND, Scalar::from(kind)));
-                    eqs.push((COL_O_VALUE, Scalar::from(value.as_str())));
-                    if let Some(dt_str) = dt {
-                        eqs.push((COL_O_DATATYPE, Scalar::from(dt_str.as_str())));
-                    }
-                    if let Some(lang_str) = lang {
-                        eqs.push((COL_O_LANG, Scalar::from(lang_str.as_str())));
-                    }
-                }
-                if let Some(g) = graph {
-                    eqs.push((COL_G, Scalar::from(self.render(TermRef::Graph(g)))));
-                }
-            }
-            // Dictionary witness (either residency): resolve every bound term
-            // to its code — a term absent from the dictionary cannot match
-            // any quad.
-            _ => {
-                macro_rules! bind {
-                    ($opt:expr, $ctor:expr, $field:expr) => {
-                        if let Some(term) = $opt {
-                            match self.code($ctor(term))? {
-                                Some(code) => eqs.push(($field, Scalar::from(code))),
-                                None => return Ok(Constraints::AlwaysFalse),
-                            }
-                        }
-                    };
-                }
-                bind!(subject, TermRef::Subject, COL_S);
-                bind!(predicate, TermRef::Predicate, COL_P);
-                bind!(object, TermRef::Object, COL_O);
-                bind!(graph, TermRef::Graph, COL_G);
             }
         }
         Ok(Constraints::Eq(eqs))

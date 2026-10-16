@@ -2,16 +2,26 @@
 //! Vortex file — together with the [`ViewSelection`], tombstones, index
 //! components and serve plan that determine which base rows a view exposes)
 //! and [`Tail`] (rows appended since construction, held apart from the base).
+//! A derived view is built from its parent's source through the constructors
+//! here ([`QuadsSource::in_memory_with`], [`QuadsSource::with_selection`],
+//! …), never field by field.
 
 pub(crate) mod selection;
 
 use std::sync::Arc;
 
-use vortex_array::ArrayRef;
+use vortex_array::arrays::chunked::ChunkedArrayExt;
+use vortex_array::arrays::{Chunked, ChunkedArray};
+use vortex_array::dtype::DType;
+use vortex_array::{ArrayRef, IntoArray, RecursiveCanonical, VortexSessionExecute};
 use vortex_mask::Mask;
 
 use crate::error::Result;
+use crate::session::VORTEX_SESSION;
+use crate::store::RawQuad;
+use crate::store::array::subject_sorted;
 use crate::store::indexes::{InMemoryServePlan, IndexComponent};
+use crate::store::layouts::ResolvedLayout;
 use crate::store::probes::StructProbes;
 use crate::store::scan::gather::gather_live;
 use crate::store::view::selection::{RowSelection, ViewSelection};
@@ -118,26 +128,249 @@ impl QuadsSource {
     /// keeping the view; nothing that reads rows may hold one, so no view a
     /// caller gets back is in it.
     pub(crate) fn is_pending_without_plan(&self) -> bool {
-        match self {
-            QuadsSource::InMemory {
-                selection, serve, ..
-            } => matches!(selection, ViewSelection::Pending(_)) && serve.is_none(),
-            #[cfg(feature = "file-io")]
-            QuadsSource::File {
-                selection, serve, ..
-            } => matches!(selection, ViewSelection::Pending(_)) && serve.is_none(),
-        }
+        matches!(self.view_selection(), ViewSelection::Pending(_))
+            && self.served_component().is_none()
     }
 
     /// Whether this source still covers every base row: no pushed-down
     /// filter and an all-rows selection.
     pub(crate) fn is_unrefined(&self) -> bool {
-        let unfiltered = match self {
-            QuadsSource::InMemory { .. } => true,
+        !self.has_filter() && self.view_selection().is_all()
+    }
+
+    /// The number of base rows: the in-memory array's length, or the file's
+    /// row count.
+    pub(crate) fn base_len(&self) -> usize {
+        match self {
+            QuadsSource::InMemory { base, .. } => base.len(),
             #[cfg(feature = "file-io")]
-            QuadsSource::File { filter, .. } => filter.is_none(),
+            QuadsSource::File { file, .. } => file.row_count() as usize,
+        }
+    }
+
+    /// The tombstones, one bit per base row; `None` until something is
+    /// deleted.
+    pub(crate) fn deleted(&self) -> Option<&Mask> {
+        match self {
+            QuadsSource::InMemory { deleted, .. } => deleted.as_ref(),
+            #[cfg(feature = "file-io")]
+            QuadsSource::File { deleted, .. } => deleted.as_ref(),
+        }
+    }
+
+    /// The base's struct dtype — the layout's primary columns.
+    pub(crate) fn dtype(&self) -> &DType {
+        match self {
+            QuadsSource::InMemory { base, .. } => base.dtype(),
+            #[cfg(feature = "file-io")]
+            QuadsSource::File { file, .. } => file.dtype(),
+        }
+    }
+
+    /// Whether the base is read from a file.
+    pub(crate) fn is_file_backed(&self) -> bool {
+        match self {
+            QuadsSource::InMemory { .. } => false,
+            #[cfg(feature = "file-io")]
+            QuadsSource::File { .. } => true,
+        }
+    }
+
+    /// Whether the base's rows are in global `(s, p, o, g)` order: an
+    /// in-memory base's subject stamp, or the file's recorded
+    /// `quads_sorted` provenance.
+    pub(crate) fn subject_sorted(&self) -> bool {
+        match self {
+            QuadsSource::InMemory { base, .. } => subject_sorted(base),
+            #[cfg(feature = "file-io")]
+            QuadsSource::File { file, .. } => file.quads_sorted(),
+        }
+    }
+
+    /// Whether a pushed-down file filter is still to be evaluated; never for
+    /// an in-memory source, whose matches resolve to exact row ids.
+    pub(crate) fn has_filter(&self) -> bool {
+        match self {
+            QuadsSource::InMemory { .. } => false,
+            #[cfg(feature = "file-io")]
+            QuadsSource::File { filter, .. } => filter.is_some(),
+        }
+    }
+
+    /// The file a file-backed source reads; `None` in memory.
+    #[cfg(feature = "file-io")]
+    pub(crate) fn file(&self) -> Option<&NativeStoreFile> {
+        match self {
+            QuadsSource::InMemory { .. } => None,
+            QuadsSource::File { file, .. } => Some(file),
+        }
+    }
+
+    /// The pushed-down filter of a file-backed source; `None` in memory or
+    /// when nothing is left to filter.
+    #[cfg(feature = "file-io")]
+    pub(crate) fn filter(&self) -> Option<&Expression> {
+        match self {
+            QuadsSource::InMemory { .. } => None,
+            QuadsSource::File { filter, .. } => filter.as_ref(),
+        }
+    }
+
+    /// The index component whose serve plan answers this view's reads, if
+    /// any.
+    pub(crate) fn served_component(&self) -> Option<&'static str> {
+        match self {
+            QuadsSource::InMemory { serve, .. } => serve.as_ref().map(|plan| plan.component()),
+            #[cfg(feature = "file-io")]
+            QuadsSource::File { serve, .. } => serve.as_ref().map(|plan| plan.component()),
+        }
+    }
+
+    /// The exact selection, running a pending resolution's deferred ids
+    /// (cached for every later consumer and every clone of the view):
+    /// synchronously in memory, where they never take I/O, and through the
+    /// index child's deferred read on file.
+    pub(crate) async fn materialized_selection(&self) -> Result<RowSelection> {
+        match self {
+            QuadsSource::InMemory { selection, .. } => selection.materialized(),
+            #[cfg(feature = "file-io")]
+            QuadsSource::File { selection, .. } => selection.materialized_async().await,
+        }
+    }
+
+    /// This in-memory source under `selection`, its reads served by `serve`:
+    /// the same base, components, tombstones and probes.
+    #[inline]
+    #[cfg_attr(not(feature = "file-io"), allow(irrefutable_let_patterns))]
+    pub(crate) fn in_memory_with(
+        &self,
+        selection: ViewSelection,
+        serve: Option<InMemoryServePlan>,
+    ) -> Self {
+        let QuadsSource::InMemory {
+            base,
+            components,
+            deleted,
+            probes,
+            ..
+        } = self
+        else {
+            unreachable!("in_memory_with is only called on an in-memory source");
         };
-        unfiltered && self.view_selection().is_all()
+        QuadsSource::InMemory {
+            base: base.clone(),
+            selection,
+            components: Arc::clone(components),
+            deleted: deleted.clone(),
+            probes: Arc::clone(probes),
+            serve,
+        }
+    }
+
+    /// This file source under `filter` and `selection`, its reads served by
+    /// `serve`: the same path, file handle and tombstones.
+    #[inline]
+    #[cfg(feature = "file-io")]
+    pub(crate) fn file_with(
+        &self,
+        filter: Option<Expression>,
+        selection: ViewSelection,
+        serve: Option<FileServePlan>,
+    ) -> Self {
+        let QuadsSource::File {
+            path,
+            file,
+            deleted,
+            ..
+        } = self
+        else {
+            unreachable!("file_with is only called on a file source");
+        };
+        QuadsSource::File {
+            path: path.clone(),
+            file: Arc::clone(file),
+            filter,
+            selection,
+            deleted: deleted.clone(),
+            serve,
+        }
+    }
+
+    /// This source under `selection`, with no serve plan; a file source keeps
+    /// its filter. A pending `selection` keeps its deferred ids but no plan,
+    /// which only a view built to be counted or windowed may hold (see
+    /// [`is_pending_without_plan`](Self::is_pending_without_plan)).
+    #[inline]
+    pub(crate) fn with_selection(&self, selection: ViewSelection) -> Self {
+        match self {
+            QuadsSource::InMemory { .. } => self.in_memory_with(selection, None),
+            #[cfg(feature = "file-io")]
+            QuadsSource::File { filter, .. } => self.file_with(filter.clone(), selection, None),
+        }
+    }
+
+    /// This source with its pushed-down filter dropped (a no-op in memory).
+    pub(crate) fn without_filter(self) -> Self {
+        match self {
+            QuadsSource::InMemory { .. } => self,
+            #[cfg(feature = "file-io")]
+            QuadsSource::File {
+                path,
+                file,
+                selection,
+                deleted,
+                serve,
+                ..
+            } => QuadsSource::File {
+                path,
+                file,
+                filter: None,
+                selection,
+                deleted,
+                serve,
+            },
+        }
+    }
+
+    /// This source with the base rows `doomed` sets folded into its
+    /// tombstones, under the same selection and with no serve plan. The base
+    /// (or file) and the components are shared untouched: tombstoning never
+    /// renumbers base rows, so the components' row ids stay valid.
+    ///
+    /// Only an owner's source takes tombstones: every base row selected and
+    /// no filter pending ([`is_unrefined`](Self::is_unrefined)), so there is
+    /// no plan to drop and no filter to keep. A served pending view would
+    /// lose its plan and be left pending without one, and a filtered file
+    /// view would keep a filter the delete has no use for; the delete that
+    /// calls this is owner-gated.
+    pub(crate) fn with_tombstones(&self, doomed: Mask) -> Self {
+        debug_assert!(
+            self.is_unrefined(),
+            "only an owner's source (every row selected, no filter) takes tombstones"
+        );
+        let mut source = self.with_selection(self.view_selection().clone());
+        match &mut source {
+            QuadsSource::InMemory { deleted, .. } => {
+                *deleted = Some(union_deleted(deleted.as_ref(), doomed));
+            }
+            #[cfg(feature = "file-io")]
+            QuadsSource::File { deleted, .. } => {
+                *deleted = Some(union_deleted(deleted.as_ref(), doomed));
+            }
+        }
+        source
+    }
+
+    /// This source selecting no base row, with no serve plan and (in memory)
+    /// no index components; a file source keeps its filter.
+    pub(crate) fn emptied(&self) -> Self {
+        let mut source = self.with_selection(ViewSelection::Exact(RowSelection::empty()));
+        match &mut source {
+            QuadsSource::InMemory { components, .. } => *components = Arc::from(Vec::new()),
+            #[cfg(feature = "file-io")]
+            QuadsSource::File { .. } => {}
+        }
+        source
     }
 }
 
@@ -146,12 +379,13 @@ impl QuadsSource {
 /// Queries run the base's own paths and a mask scan over the tail and union
 /// the two.
 ///
-/// The rows are a single contiguous StructArray in the store's own primary
-/// layout, except under the Dictionary layout, where they are Default-layout
-/// N-Triples strings: an appended term has no code in the sorted dictionary,
-/// so the tail keeps terms verbatim and patterns probe the base by code and
-/// the tail by string. The tail is folded into the base — re-sorted,
-/// re-encoded, re-indexed — by `compact_with_indexes`.
+/// The rows are a single contiguous StructArray in `layout`: the store's own
+/// primary layout, except under the Dictionary layout, where they are
+/// Default-layout N-Triples strings (see [`layout_for`](Self::layout_for)):
+/// an appended term has no code in the sorted dictionary, so the tail keeps
+/// terms verbatim and patterns probe the base by code and the tail by
+/// string. The tail is folded into the base — re-sorted, re-encoded,
+/// re-indexed — by `compact_with_indexes`.
 ///
 /// Selection and tombstones mirror the base's, in tail-local row ids
 /// (`0..rows.len()`): views narrow `selection`, deletes set bits in `deleted`,
@@ -160,11 +394,8 @@ impl QuadsSource {
 pub(crate) struct Tail {
     /// The appended rows. Appends accrete as chunks of a ChunkedArray and are
     /// folded flat once the accreted rows outgrow the flatten policy
-    /// ([`mutation::TAIL_FLATTEN_FLOOR`], [`mutation::TAIL_MAX_CHUNKS`]), so
-    /// scans see at most a bounded chunk count.
-    ///
-    /// [`mutation::TAIL_FLATTEN_FLOOR`]: crate::store::write::mutation::TAIL_FLATTEN_FLOOR
-    /// [`mutation::TAIL_MAX_CHUNKS`]: crate::store::write::mutation::TAIL_MAX_CHUNKS
+    /// ([`TAIL_FLATTEN_FLOOR`], [`TAIL_MAX_CHUNKS`]), so scans see at most a
+    /// bounded chunk count.
     pub(crate) rows: ArrayRef,
     /// The tail rows visible through this store or derived view, in tail-local
     /// ids.
@@ -172,15 +403,83 @@ pub(crate) struct Tail {
     /// Tail rows deleted since they were appended, one bit per tail row
     /// (`None` until something is deleted).
     pub(crate) deleted: Option<Mask>,
+    /// The layout `rows` are stored in: [`layout_for`](Self::layout_for) the
+    /// store's.
+    pub(crate) layout: ResolvedLayout,
 }
 
+/// Tail flatten policy: appended chunks are folded into the flat first chunk
+/// once their row count reaches `max(flat_len, TAIL_FLATTEN_FLOOR)` — so the
+/// tail is rewritten geometrically, not on every add, and a small tail never
+/// flattens below this floor.
+pub(crate) const TAIL_FLATTEN_FLOOR: usize = 1_024;
+/// Tail flatten policy: appended chunks are folded into the flat first chunk
+/// once the tail holds more than this many chunks, whatever their row counts,
+/// so tail scans (which visit every chunk) stay dense.
+pub(crate) const TAIL_MAX_CHUNKS: usize = 64;
+
 impl Tail {
+    /// The layout a tail beside a base in `base` stores its rows in: the
+    /// base's own, except under the Dictionary layout, where an appended term
+    /// has no code in the sorted dictionary, so the tail holds Default-layout
+    /// strings instead — patterns probe the base by code and the tail by
+    /// string.
+    pub(crate) fn layout_for(base: &ResolvedLayout) -> ResolvedLayout {
+        match base {
+            ResolvedLayout::Dictionary(_) => ResolvedLayout::Default,
+            other => other.clone(),
+        }
+    }
+
+    /// A tail of fresh `rows` in `layout`, every row visible and none
+    /// deleted.
+    pub(crate) fn new(rows: ArrayRef, layout: ResolvedLayout) -> Tail {
+        Tail {
+            rows,
+            selection: RowSelection::All,
+            deleted: None,
+            layout,
+        }
+    }
+
     /// The same rows and tombstones under a different `selection`.
     pub(crate) fn with_selection(&self, selection: RowSelection) -> Tail {
         Tail {
             rows: self.rows.clone(),
             selection,
             deleted: self.deleted.clone(),
+            layout: self.layout.clone(),
+        }
+    }
+
+    /// How many tail rows this view selects that are not tombstoned.
+    pub(crate) fn live_len(&self) -> usize {
+        self.selection
+            .live_len(self.deleted.as_ref(), self.rows.len())
+    }
+
+    /// This tail narrowed to its `limit` live rows after skipping `offset`,
+    /// in tail order.
+    pub(crate) fn window(&self, offset: usize, limit: usize) -> Tail {
+        self.with_selection(self.selection.window(
+            offset,
+            limit,
+            self.deleted.as_ref(),
+            self.rows.len(),
+        ))
+    }
+
+    /// This tail with the tail rows `doomed` selects (tail-local ids, as a
+    /// matched view's tail selection is) folded into its tombstones.
+    pub(crate) fn tombstoned(&self, doomed: &RowSelection) -> Tail {
+        Tail {
+            rows: self.rows.clone(),
+            selection: self.selection.clone(),
+            deleted: Some(union_deleted(
+                self.deleted.as_ref(),
+                doomed.to_mask(self.rows.len()),
+            )),
+            layout: self.layout.clone(),
         }
     }
 
@@ -188,5 +487,54 @@ impl Tail {
     /// order.
     pub(crate) fn live_rows(&self) -> Result<ArrayRef> {
         gather_live(&self.rows, &self.selection, self.deleted.as_ref(), None)
+    }
+
+    /// The tail rows visible through this store, decoded to raw quads in
+    /// tail order. Never needs the async dictionary path: under the
+    /// Dictionary layout the tail already holds N-Triples strings.
+    pub(crate) fn raw_quads(&self) -> Result<Vec<RawQuad>> {
+        self.layout.raw_quads(&self.live_rows()?)
+    }
+
+    /// A tail of this tail's live rows followed by `fresh`, every row
+    /// visible. The fresh rows join the tail as one more chunk of a
+    /// ChunkedArray accumulator; the accreted suffix is folded into the flat
+    /// prefix per [`TAIL_FLATTEN_FLOOR`]/[`TAIL_MAX_CHUNKS`]. Renumbering the
+    /// old tail's ids on flatten is safe: views of the pre-append store keep
+    /// the old tail, and an owner's selections are `All`.
+    pub(crate) fn append(&self, fresh: ArrayRef) -> Result<Tail> {
+        let old = self.live_rows()?;
+        let dtype = old.dtype().clone();
+        let mut chunks = match old.clone().try_downcast::<Chunked>() {
+            Ok(ch) => ch.chunks(),
+            Err(_) => vec![old],
+        };
+        let flat_len = chunks[0].len();
+        let accreted: usize = chunks[1..].iter().map(|c| c.len()).sum::<usize>() + fresh.len();
+        chunks.push(fresh);
+        let n_chunks = chunks.len();
+        let combined = ChunkedArray::try_new(chunks, dtype)?.into_array();
+        let rows = if accreted >= flat_len.max(TAIL_FLATTEN_FLOOR) || n_chunks > TAIL_MAX_CHUNKS {
+            let mut ctx = VORTEX_SESSION.create_execution_ctx();
+            combined
+                .execute::<RecursiveCanonical>(&mut ctx)?
+                .0
+                .into_array()
+        } else {
+            combined
+        };
+        // Gathering the live rows above dropped any tombstoned tail rows
+        // already.
+        Ok(Tail::new(rows, self.layout.clone()))
+    }
+}
+
+/// Fold a freshly-doomed set of rows into existing tombstones, shared by the
+/// base's delete path ([`QuadsSource::with_tombstones`]) and the tail's
+/// ([`Tail::tombstoned`]).
+fn union_deleted(existing: Option<&Mask>, doomed: Mask) -> Mask {
+    match existing {
+        Some(existing) => existing | &doomed,
+        None => doomed,
     }
 }

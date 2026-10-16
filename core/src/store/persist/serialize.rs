@@ -110,11 +110,7 @@ impl VortexRdfStore {
     pub async fn to_serializable_parts(&self) -> Result<StoreParts> {
         let base = self.base_selected_rows().await?;
         let owner_shaped = self.quads.is_unrefined();
-        let tombstoned = match &self.quads {
-            QuadsSource::InMemory { deleted, .. } => deleted.is_some(),
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { deleted, .. } => deleted.is_some(),
-        };
+        let tombstoned = self.quads.deleted().is_some();
         let rebuild =
             self.tail.is_some() || (owner_shaped && tombstoned && !self.indexes.is_empty());
         if rebuild {

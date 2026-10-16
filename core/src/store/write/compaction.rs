@@ -4,6 +4,7 @@
 use crate::error::Result;
 #[cfg(feature = "file-io")]
 use crate::error::VortexRdfError;
+#[cfg(feature = "file-io")]
 use crate::store::QuadsSource;
 use crate::store::RawQuad;
 use crate::store::builders::DEFAULT_CHUNK_ROWS;
@@ -155,13 +156,9 @@ impl VortexRdfStore {
     /// source file (see [`compact`](Self::compact)) and keeps it file-backed —
     /// an append past the threshold performs a disk write.
     pub(in crate::store) fn should_auto_compact(&self) -> bool {
-        let (base_rows, tail) = match (&self.quads, &self.tail) {
-            (QuadsSource::InMemory { base, .. }, Some(tail)) => (base.len(), tail),
-            #[cfg(feature = "file-io")]
-            (QuadsSource::File { file, .. }, Some(tail)) => (file.row_count() as usize, tail),
-            _ => return false,
-        };
-        tail_needs_compaction(base_rows, tail.rows.len())
+        self.tail
+            .as_ref()
+            .is_some_and(|tail| tail_needs_compaction(self.quads.base_len(), tail.rows.len()))
     }
 }
 

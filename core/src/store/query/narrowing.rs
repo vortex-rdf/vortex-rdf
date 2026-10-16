@@ -1,7 +1,8 @@
 //! Narrowing a view beyond a pattern: keeping only the rows whose code in
-//! one column falls in a set or range ([`Keep`]), windowing the rows, and
-//! capped counts — the restrictions a query engine pushes below a pattern
-//! (`VALUES`, `FILTER` on a term predicate, `LIMIT`/`OFFSET`, `ASK`).
+//! one column falls in a set or range ([`Keep`]) and windowing the rows —
+//! the restrictions a query engine pushes below a pattern (`VALUES`,
+//! `FILTER` on a term predicate, `LIMIT`/`OFFSET`); the capped counts behind
+//! `ASK` live with the other counts, in `read/count.rs`.
 //!
 //! Every narrowing is an ordinary derived view: it composes with
 //! [`match_pattern`](VortexRdfStore::match_pattern) in either order and is
@@ -10,9 +11,9 @@
 //! compiler and never as scan expressions: in memory as a binary search
 //! inside a sorted run or a pass over the selected rows of the column, on
 //! file as the located runs of a sorted subject column or else a pass over
-//! the column streamed for the view's rows. Windows and capped counts over a
-//! file view with a pending filter evaluate its splits in file order and stop
-//! at the first split that completes them.
+//! the column streamed for the view's rows. A window over a file view with a
+//! pending filter evaluates its splits in file order and stops at the first
+//! split that fills it.
 
 use std::ops::Range;
 
@@ -21,16 +22,15 @@ use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_buffer::Buffer;
 
 use crate::debug;
-use crate::error::{Result, VortexRdfError};
+use crate::error::Result;
+use crate::store::QuadsSource;
 use crate::store::array::{column_is_sorted, into_struct_array};
-use crate::store::layouts::LayoutStrategy;
 use crate::store::probes::StructProbes;
 use crate::store::resident::cached_code_primitive;
 #[cfg(feature = "file-io")]
 use crate::store::scan::{file_filter, file_reads};
 use crate::store::schema::{self, QuadColumn, RowId, TermCode};
 use crate::store::view::selection::{RowSelection, ViewSelection};
-use crate::store::{QuadsSource, Tail};
 
 use crate::store::VortexRdfStore;
 
@@ -223,13 +223,11 @@ impl VortexRdfStore {
     /// the index's order does not share).
     pub async fn window(&self, offset: usize, limit: usize) -> Result<Self> {
         let t = debug::timer();
-        let (quads, base_live, base_taken) = match &self.quads {
+        let (windowed, base_live, base_taken) = match &self.quads {
             QuadsSource::InMemory {
                 base,
                 selection,
-                components,
                 deleted,
-                probes,
                 ..
             } => {
                 // A located run held pending for this window: only the
@@ -246,32 +244,17 @@ impl VortexRdfStore {
                     (ids_selection(ids), live)
                 } else {
                     let selection = selection.materialized()?;
-                    let live = match deleted {
-                        None => selection.len(base.len()),
-                        Some(deleted) => selection.live_mask(deleted, base.len()).true_count(),
-                    };
+                    let live = selection.live_len(deleted.as_ref(), base.len());
                     (
                         selection.window(offset, limit, deleted.as_ref(), base.len()),
                         live,
                     )
                 };
                 let taken = windowed.len(base.len());
-                (
-                    QuadsSource::InMemory {
-                        base: base.clone(),
-                        selection: ViewSelection::Exact(windowed),
-                        components: std::sync::Arc::clone(components),
-                        deleted: deleted.clone(),
-                        probes: std::sync::Arc::clone(probes),
-                        serve: None,
-                    },
-                    live,
-                    taken,
-                )
+                (windowed, live, taken)
             }
             #[cfg(feature = "file-io")]
             QuadsSource::File {
-                path,
                 file,
                 filter,
                 selection,
@@ -297,12 +280,7 @@ impl VortexRdfStore {
                     let selection = selection.materialized_async().await?;
                     match filter {
                         None => {
-                            let live = match deleted {
-                                None => selection.len(row_count),
-                                Some(deleted) => {
-                                    selection.live_mask(deleted, row_count).true_count()
-                                }
-                            };
+                            let live = selection.live_len(deleted.as_ref(), row_count);
                             (
                                 selection.window(offset, limit, deleted.as_ref(), row_count),
                                 live,
@@ -334,113 +312,29 @@ impl VortexRdfStore {
                     }
                 };
                 let taken = windowed.len(row_count);
-                (
-                    QuadsSource::File {
-                        path: path.clone(),
-                        file: file.clone(),
-                        filter: None,
-                        selection: ViewSelection::Exact(windowed),
-                        deleted: deleted.clone(),
-                        serve: None,
-                    },
-                    live,
-                    taken,
-                )
+                (windowed, live, taken)
             }
         };
+        // The window is a position range over base order with the filter it
+        // resolved applied, so the view carries exact ids, no filter and no
+        // plan.
+        let quads = self
+            .quads
+            .with_selection(ViewSelection::Exact(windowed))
+            .without_filter();
         // Whatever the base could not fill falls to the tail: the offset it
         // did not consume, the limit it did not take.
         let tail = self.tail.as_ref().map(|tail| {
-            let tail_offset = offset.saturating_sub(base_live);
-            let tail_limit = limit.saturating_sub(base_taken);
-            Tail {
-                rows: tail.rows.clone(),
-                selection: tail.selection.window(
-                    tail_offset,
-                    tail_limit,
-                    tail.deleted.as_ref(),
-                    tail.rows.len(),
-                ),
-                deleted: tail.deleted.clone(),
-            }
+            tail.window(
+                offset.saturating_sub(base_live),
+                limit.saturating_sub(base_taken),
+            )
         });
         log::debug!(
             "[window] offset {offset} limit {limit}: {base_taken} base rows at {:?}",
             debug::elapsed(t)
         );
-        Ok(Self {
-            layout: self.layout.clone(),
-            indexes: self.indexes.clone(),
-            generation: self.generation,
-            quads,
-            tail,
-        })
-    }
-
-    /// `min(size, limit)`, stopping as soon as `limit` rows are known to
-    /// exist: a file view with a pending filter evaluates its splits in file
-    /// order and stops at the first that reaches the cap (an in-memory view
-    /// knows its size without reading rows). Available on every layout.
-    pub async fn size_capped(&self, limit: usize) -> Result<usize> {
-        if limit == 0 {
-            return Ok(0);
-        }
-        let base = match &self.quads {
-            QuadsSource::InMemory { .. } => self.base_size().await?,
-            #[cfg(feature = "file-io")]
-            QuadsSource::File {
-                file,
-                filter,
-                selection,
-                deleted,
-                ..
-            } => match filter {
-                None => self.base_size().await?,
-                Some(filter) => {
-                    // The selection resolves first (a served view's ids come
-                    // from its index child); the filter then counts within it.
-                    let selection = selection.materialized_async().await?;
-                    file_filter::count_matching_rows_capped(
-                        file,
-                        filter,
-                        &selection,
-                        deleted.as_ref(),
-                        limit,
-                    )
-                    .await?
-                }
-            },
-        };
-        if base >= limit {
-            return Ok(limit);
-        }
-        Ok((base + self.tail_size()).min(limit))
-    }
-
-    /// Whether the view holds any quad — [`size_capped`](Self::size_capped)
-    /// of one, so a filtered file view reads only up to its first match.
-    pub async fn exists(&self) -> Result<bool> {
-        Ok(self.size_capped(1).await? > 0)
-    }
-
-    /// Err unless this view's rows are code-addressable: the Dictionary
-    /// layout with an empty append tail.
-    pub(in crate::store) fn ensure_code_view(&self, operation: &str) -> Result<()> {
-        if self.layout.strategy() != LayoutStrategy::Dictionary {
-            return Err(VortexRdfError::InvalidOperation(format!(
-                "{operation} needs the Dictionary layout: this store's {:?} layout stores terms \
-                 as strings, which have no codes to keep",
-                self.layout.strategy()
-            )));
-        }
-        if self.tail_len() != 0 {
-            return Err(VortexRdfError::InvalidOperation(format!(
-                "{operation} needs an empty append tail: the {} appended rows hold terms the \
-                 dictionary has no codes for; compact() the store first",
-                self.tail_len()
-            )));
-        }
-        Ok(())
+        Ok(self.derived(quads, tail))
     }
 
     /// The in-memory backend of [`keep`](Self::keep).
@@ -451,8 +345,6 @@ impl VortexRdfStore {
         let QuadsSource::InMemory {
             base,
             selection,
-            components,
-            deleted,
             probes,
             ..
         } = &self.quads
@@ -492,20 +384,10 @@ impl VortexRdfStore {
         if narrowed.is_empty(base_len) {
             return Ok(self.empty_view());
         }
-        Ok(Self {
-            layout: self.layout.clone(),
-            indexes: self.indexes.clone(),
-            generation: self.generation,
-            quads: QuadsSource::InMemory {
-                base: base.clone(),
-                selection: ViewSelection::Exact(narrowed),
-                components: std::sync::Arc::clone(components),
-                deleted: deleted.clone(),
-                probes: std::sync::Arc::clone(probes),
-                serve: None,
-            },
-            tail: self.tail.clone(),
-        })
+        Ok(self.derived(
+            self.quads.with_selection(ViewSelection::Exact(narrowed)),
+            self.tail.clone(),
+        ))
     }
 
     /// The keep by binary search, when the selection is a run of the sorted
@@ -630,11 +512,9 @@ impl VortexRdfStore {
     async fn keep_file(&self, column: QuadColumn, keep: &Keep) -> Result<Self> {
         let t = debug::timer();
         let QuadsSource::File {
-            path,
             file,
             filter,
             selection,
-            deleted,
             ..
         } = &self.quads
         else {
@@ -684,20 +564,11 @@ impl VortexRdfStore {
         if narrowed.is_empty(row_count) {
             return Ok(self.empty_view());
         }
-        Ok(Self {
-            layout: self.layout.clone(),
-            indexes: self.indexes.clone(),
-            generation: self.generation,
-            quads: QuadsSource::File {
-                path: path.clone(),
-                file: file.clone(),
-                filter,
-                selection: ViewSelection::Exact(narrowed),
-                deleted: deleted.clone(),
-                serve: None,
-            },
-            tail: self.tail.clone(),
-        })
+        Ok(self.derived(
+            self.quads
+                .file_with(filter, ViewSelection::Exact(narrowed), None),
+            self.tail.clone(),
+        ))
     }
 
     /// A keep on the subject column served by located runs: in a file sorted

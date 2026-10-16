@@ -4,12 +4,10 @@
 //! the identity of the data behind it.
 
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 
 use vortex_mask::Mask;
 
 use crate::error::Result;
-use crate::store::array::subject_sorted;
 use crate::store::indexes::copy::CopyFamily;
 use crate::store::indexes::{ComponentIdentity, IndexType};
 use crate::store::schema::{QuadColumn, TermCode};
@@ -147,36 +145,44 @@ impl VortexRdfStore {
     /// run's row ids; that decode is the one way it fails.
     pub fn view_statistics(&self) -> Result<ViewStatistics> {
         let tail_rows = self.tail_size();
-        let dictionary = self.layout.strategy() == LayoutStrategy::Dictionary;
-        Ok(match &self.quads {
+        let filtered = self.quads.has_filter();
+        // The base count without reading: an exact selection's live rows, a
+        // run's width (its live rows under tombstones only in memory, where
+        // its ids are read).
+        let live = self.quads.live_len_if_known()?;
+        Ok(ViewStatistics {
+            rows: row_count_hint(live, filtered, self.quads.base_len(), tail_rows),
+            sort_order: (self.quads.subject_sorted() && tail_rows == 0).then_some(SortOrder::Spog),
+            code_bounds: self.code_bounds(),
+            selection: selection_kind(self.quads.view_selection()),
+            served_component: self.quads.served_component(),
+            pending_filter: filtered,
+            tombstones: self.quads.deleted().map_or(0, Mask::true_count),
+            tail_rows,
+            file_backed: self.quads.is_file_backed(),
+            generation: self.generation,
+        })
+    }
+
+    /// The [`code_bounds`](ViewStatistics::code_bounds) of this view: only a
+    /// Dictionary layout has codes, and only in the base.
+    fn code_bounds(&self) -> [Option<(TermCode, TermCode)>; 4] {
+        let mut code_bounds = [None; 4];
+        if self.layout.strategy() != LayoutStrategy::Dictionary {
+            return code_bounds;
+        }
+        match &self.quads {
             QuadsSource::InMemory {
                 base,
                 selection,
                 deleted,
                 probes,
-                serve,
                 ..
             } => {
                 let base_len = base.len();
-                let live = match (selection, deleted) {
-                    (ViewSelection::Exact(sel), _) => {
-                        Some(live_rows(sel, deleted.as_ref(), base_len))
-                    }
-                    (ViewSelection::Pending(lazy), None) => lazy.len_if_known(),
-                    // A run's live rows under tombstones: its ids, read in
-                    // memory.
-                    (ViewSelection::Pending(_), Some(_)) => Some(live_rows(
-                        &selection.materialized()?,
-                        deleted.as_ref(),
-                        base_len,
-                    )),
-                };
-                let sorted = subject_sorted(base);
-                let mut code_bounds = [None; 4];
                 // A contiguous, tombstone-free run of a sorted base: the
                 // subject column's first and last codes bound the view.
-                if dictionary
-                    && sorted
+                if self.quads.subject_sorted()
                     && deleted.is_none()
                     && let ViewSelection::Exact(sel) = selection
                     && let Some(run) = match sel {
@@ -191,47 +197,11 @@ impl VortexRdfStore {
                     code_bounds[QuadColumn::S.index()] =
                         Some((probe.value_at(run.start), probe.value_at(run.end - 1)));
                 }
-                ViewStatistics {
-                    rows: row_count_hint(live, false, base_len, tail_rows),
-                    sort_order: (sorted && tail_rows == 0).then_some(SortOrder::Spog),
-                    code_bounds,
-                    selection: selection_kind(selection),
-                    served_component: serve.as_ref().map(|plan| plan.component()),
-                    pending_filter: false,
-                    tombstones: deleted.as_ref().map_or(0, Mask::true_count),
-                    tail_rows,
-                    file_backed: false,
-                    generation: self.generation,
-                }
             }
             #[cfg(feature = "file-io")]
-            QuadsSource::File {
-                file,
-                filter,
-                selection,
-                deleted,
-                serve,
-                ..
-            } => {
-                let base_len = file.row_count() as usize;
-                let live = match (selection, deleted) {
-                    (ViewSelection::Exact(sel), _) => {
-                        Some(live_rows(sel, deleted.as_ref(), base_len))
-                    }
-                    // A run's width is known from its range; its live rows
-                    // only once its ids are read.
-                    (ViewSelection::Pending(lazy), None) => lazy.len_if_known().or_else(|| {
-                        serve
-                            .as_ref()
-                            .and_then(|plan| plan.row_range())
-                            .map(|r| usize::try_from(r.end - r.start).unwrap_or(usize::MAX))
-                    }),
-                    (ViewSelection::Pending(_), Some(_)) => None,
-                };
-                let mut code_bounds = [None; 4];
+            QuadsSource::File { filter, .. } => {
                 // The pushed-down equalities bound their columns exactly.
-                if dictionary
-                    && let Some(filter) = filter
+                if let Some(filter) = filter
                     && let Some(pairs) = crate::store::scan::file_reads::eq_code_pairs(filter)
                 {
                     for (column, code) in pairs {
@@ -240,20 +210,9 @@ impl VortexRdfStore {
                         }
                     }
                 }
-                ViewStatistics {
-                    rows: row_count_hint(live, filter.is_some(), base_len, tail_rows),
-                    sort_order: (file.quads_sorted() && tail_rows == 0).then_some(SortOrder::Spog),
-                    code_bounds,
-                    selection: selection_kind(selection),
-                    served_component: serve.as_ref().map(|plan| plan.component()),
-                    pending_filter: filter.is_some(),
-                    tombstones: deleted.as_ref().map_or(0, Mask::true_count),
-                    tail_rows,
-                    file_backed: true,
-                    generation: self.generation,
-                }
             }
-        })
+        }
+        code_bounds
     }
 
     /// The store's index children (see [`IndexComponentInfo`]), in the order
@@ -303,18 +262,11 @@ impl VortexRdfStore {
         if n == 1 {
             return Ok(vec![self.clone()]);
         }
-        let pieces = match &self.quads {
-            QuadsSource::InMemory {
-                base, selection, ..
-            } => selection.materialized()?.split(n, base.len()),
-            #[cfg(feature = "file-io")]
-            QuadsSource::File {
-                file, selection, ..
-            } => selection
-                .materialized_async()
-                .await?
-                .split(n, file.row_count() as usize),
-        };
+        let pieces = self
+            .quads
+            .materialized_selection()
+            .await?
+            .split(n, self.quads.base_len());
         if pieces.is_empty() {
             return Ok(vec![self.clone()]);
         }
@@ -330,44 +282,7 @@ impl VortexRdfStore {
                         tail.with_selection(RowSelection::empty())
                     }
                 });
-                let quads = match &self.quads {
-                    QuadsSource::InMemory {
-                        base,
-                        components,
-                        deleted,
-                        probes,
-                        ..
-                    } => QuadsSource::InMemory {
-                        base: base.clone(),
-                        selection: ViewSelection::Exact(piece),
-                        components: Arc::clone(components),
-                        deleted: deleted.clone(),
-                        probes: Arc::clone(probes),
-                        serve: None,
-                    },
-                    #[cfg(feature = "file-io")]
-                    QuadsSource::File {
-                        path,
-                        file,
-                        filter,
-                        deleted,
-                        ..
-                    } => QuadsSource::File {
-                        path: path.clone(),
-                        file: file.clone(),
-                        filter: filter.clone(),
-                        selection: ViewSelection::Exact(piece),
-                        deleted: deleted.clone(),
-                        serve: None,
-                    },
-                };
-                Self {
-                    layout: self.layout.clone(),
-                    indexes: self.indexes.clone(),
-                    generation: self.generation,
-                    quads,
-                    tail,
-                }
+                self.derived(self.quads.with_selection(ViewSelection::Exact(piece)), tail)
             })
             .collect())
     }
@@ -395,14 +310,6 @@ fn selection_kind(selection: &ViewSelection) -> SelectionKind {
         ViewSelection::Exact(RowSelection::Range(_)) => SelectionKind::Range,
         ViewSelection::Exact(RowSelection::Ids(_)) => SelectionKind::Ids,
         ViewSelection::Pending(_) => SelectionKind::PendingIndexRun,
-    }
-}
-
-/// The rows `selection` covers out of `base_len`, less the tombstoned ones.
-fn live_rows(selection: &RowSelection, deleted: Option<&Mask>, base_len: usize) -> usize {
-    match deleted {
-        None => selection.len(base_len),
-        Some(deleted) => selection.live_mask(deleted, base_len).true_count(),
     }
 }
 

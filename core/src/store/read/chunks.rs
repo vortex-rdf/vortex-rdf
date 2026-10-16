@@ -27,7 +27,7 @@ use crate::store::array::{field_as, into_struct_array, rechunk};
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_reads::stream_rows;
 use crate::store::schema::{QuadColumn, TermCode};
-use crate::store::{LayoutStrategy, QuadsSource, VortexRdfStore};
+use crate::store::{QuadsSource, VortexRdfStore};
 
 /// A view's rows as struct chunks in the layout's primary dtype, each of at
 /// most the requested `batch_rows` rows.
@@ -51,9 +51,7 @@ impl VortexRdfStore {
     /// store first).
     pub fn row_chunks(&self, batch_rows: usize) -> Result<RowChunkStream> {
         check_batch(batch_rows)?;
-        if self.layout.strategy() == LayoutStrategy::Dictionary && self.tail_len() != 0 {
-            self.ensure_code_view("row_chunks")?;
-        }
+        self.ensure_no_dictionary_tail("row_chunks")?;
         let store = self.clone();
         Ok(lazy(
             async move { store.row_chunk_source(batch_rows).await },

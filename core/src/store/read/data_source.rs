@@ -45,7 +45,7 @@ use vortex_scan::{
 use crate::error::Result;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::rechunk;
-use crate::store::{LayoutStrategy, QuadsSource, VortexRdfStore};
+use crate::store::{QuadsSource, VortexRdfStore};
 
 /// The most rows a chunk of a partition's stream holds, DataFusion's default
 /// batch size: gathered rows, rows read by id and an in-memory child's rows
@@ -98,9 +98,7 @@ impl VortexRdfStore {
     /// dtype (`compact` the store first). Errors, too, where
     /// `view_statistics` does: when that row-id decode fails.
     pub fn data_source(&self) -> Result<DataSourceRef> {
-        if self.layout.strategy() == LayoutStrategy::Dictionary && self.tail_len() != 0 {
-            self.ensure_code_view("data_source")?;
-        }
+        self.ensure_no_dictionary_tail("data_source")?;
         let dtype = self.primary_dtype();
         let (row_count, byte_size) = self.row_count_hint(&dtype)?;
         Ok(Arc::new(VortexRdfDataSource {
@@ -157,11 +155,7 @@ impl VortexRdfStore {
     /// The struct dtype of this view's rows: the base's, which a string
     /// layout's tail shares.
     fn primary_dtype(&self) -> DType {
-        match &self.quads {
-            QuadsSource::InMemory { base, .. } => base.dtype().clone(),
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { file, .. } => file.dtype().clone(),
-        }
+        self.quads.dtype().clone()
     }
 
     /// The row count and byte size this view's source advertises: the

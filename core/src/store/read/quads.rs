@@ -97,7 +97,7 @@ impl VortexRdfStore {
         // after whatever the base yields.
         let tail_quads: Vec<Result<T>> = match &self.tail {
             None => vec![],
-            Some(tail) => T::decode(&self.tail_layout(), &tail.live_rows()?),
+            Some(tail) => T::decode(&tail.layout, &tail.live_rows()?),
         };
         match &self.quads {
             QuadsSource::InMemory {
@@ -307,7 +307,7 @@ impl VortexRdfStore {
         // so this never needs the async dictionary path.
         let tail_raws: Vec<Result<RawQuad>> = match &self.tail {
             None => vec![],
-            Some(tail) => raw_chunk(&self.tail_layout(), &tail.live_rows()?),
+            Some(tail) => raw_chunk(&tail.layout, &tail.live_rows()?),
         };
         match &self.quads {
             QuadsSource::InMemory {
