@@ -2,6 +2,7 @@
 //! and statistics-only pruning envelopes. Pure functions of a
 //! [`NativeStoreFile`] and a filter expression — no store state.
 
+use std::borrow::Borrow;
 use std::ops::{BitAnd, Range};
 use std::sync::Arc;
 
@@ -55,21 +56,24 @@ fn split_start_mask(
 
 /// Narrow `mask` over `range` by each conjunct's statistics-only pruning —
 /// zone maps and footer stats, no row data read — stopping once nothing
-/// survives (further conjuncts can't un-prune rows). The pruning phase both
-/// the per-split filter evaluation ([`evaluate_filter_split`]) and the
+/// survives (further conjuncts can't un-prune rows). A conjunct is taken
+/// from `conjuncts` only when the loop reaches it, so an iterator that binds
+/// as it yields binds none past the one that left nothing. The pruning phase
+/// both the per-split filter evaluation ([`evaluate_filter_split`]) and the
 /// file-wide envelope ([`row_range_from_pruning`]) run.
-async fn prune_mask(
+async fn prune_mask<B: Borrow<BoundExpression>>(
     reader: &Arc<dyn LayoutReader>,
-    conjuncts: &[BoundExpression],
+    conjuncts: impl IntoIterator<Item = Result<B>>,
     range: &Range<u64>,
     mut mask: Mask,
 ) -> Result<Mask> {
-    for conjunct in conjuncts {
-        if mask.all_false() {
+    let mut conjuncts = conjuncts.into_iter();
+    while !mask.all_false() {
+        let Some(conjunct) = conjuncts.next() else {
             break;
-        }
+        };
         let pruned = reader
-            .pruning_evaluation(range, conjunct, mask.clone())?
+            .pruning_evaluation(range, conjunct?.borrow(), mask.clone())?
             .await?;
         mask = mask.bitand(&pruned);
     }
@@ -88,8 +92,11 @@ async fn evaluate_filter_split(
     start_mask: Mask,
 ) -> Result<Mask> {
     // Phase 1: prune using zone-map/footer stats only — no I/O beyond the
-    // cached stats tables ([`prune_mask`]).
-    let mut mask = prune_mask(&reader, filter_conjuncts, range, start_mask).await?;
+    // cached stats tables ([`prune_mask`]). The conjuncts are yielded by
+    // index: a closure over a borrowed item is higher-ranked, which the
+    // futures holding it across the awaits cannot be proven `Send` for.
+    let bound = (0..filter_conjuncts.len()).map(|i| Ok(&filter_conjuncts[i]));
+    let mut mask = prune_mask(&reader, bound, range, start_mask).await?;
     // Phase 2: for whatever the stats couldn't rule out, read and evaluate each
     // conjunct for real, threading the narrowing mask so later conjuncts see
     // fewer rows.
@@ -371,16 +378,18 @@ pub(crate) async fn row_range_from_pruning(
     // statistics (zone maps / footer stats) — no row data is read here. Each
     // conjunct's prunability is evaluated over the *entire* file in one call:
     // the zoned reader vectorizes this over all its zones and the file-stats
-    // wrapper checks footer-level bounds first.
+    // wrapper checks footer-level bounds first. A conjunct binds (through
+    // the handle's memo) only when the pruning reaches it, so one that
+    // already proves nothing matches leaves the rest unbound; they are
+    // yielded by index, as in `evaluate_filter_split`.
     let reader = file.layout_reader()?;
-    let bound: Vec<BoundExpression> = conjuncts(filter)
-        .iter()
-        .map(|conjunct| {
-            file.bound_exprs()
-                .bind(QUAD_SCOPE, conjunct, reader.dtype())
-        })
-        .collect::<vortex_error::VortexResult<_>>()?;
-    let mask = prune_mask(&reader, &bound, &(0..row_count), Mask::new_true(len)).await?;
+    let parts = conjuncts(filter);
+    let bound = (0..parts.len()).map(|i| -> Result<BoundExpression> {
+        Ok(file
+            .bound_exprs()
+            .bind(QUAD_SCOPE, &parts[i], reader.dtype())?)
+    });
+    let mask = prune_mask(&reader, bound, &(0..row_count), Mask::new_true(len)).await?;
 
     // Collapse the surviving mask to its enclosing contiguous range: the
     // first and last set bit. Interior gaps of non-matching rows are kept

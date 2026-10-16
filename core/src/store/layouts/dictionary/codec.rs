@@ -283,7 +283,7 @@ struct DictTerms<'a> {
 impl<'a> DictTerms<'a> {
     fn new(dict: &'a TermDictionary) -> Self {
         Self {
-            cursors: std::array::from_fn(|_| dict.cursor()),
+            cursors: [dict.cursor(), dict.cursor(), dict.cursor(), dict.cursor()],
             code_space: dict.code_space(),
         }
     }

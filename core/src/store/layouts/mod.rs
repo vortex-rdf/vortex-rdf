@@ -21,7 +21,9 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "file-io")]
 use futures::FutureExt as _;
+#[cfg(feature = "file-io")]
 use futures::future::{self, BoxFuture};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use vortex_array::arrays::struct_::StructArray;
@@ -721,13 +723,13 @@ pub(crate) trait ChunkDecode: Sized + Send + 'static {
 
     /// [`decode`](Self::decode), through
     /// [`decode_file_backed`](Self::decode_file_backed) when the dictionary
-    /// is file-backed; every other layout (and a resident dictionary) decodes
-    /// without suspending.
+    /// is file-backed — how a file view's chunks decode; every other layout
+    /// (and a resident dictionary) decodes without suspending.
+    #[cfg(feature = "file-io")]
     fn decode_async<'a>(
         layout: &'a ResolvedLayout,
         chunk: &'a ArrayRef,
     ) -> BoxFuture<'a, Vec<Result<Self>>> {
-        #[cfg(feature = "file-io")]
         if let ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) = layout {
             return Self::decode_file_backed(fb, chunk);
         }
