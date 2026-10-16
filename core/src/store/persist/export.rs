@@ -44,13 +44,9 @@ async fn write_raw<W: Write>(
     mut writer: W,
     format: RdfFormat,
 ) -> error::Result<()> {
-    let decode_start = debug::timer();
-    // The raw chunk stream (in-memory, or the lazy file-backed scan).
-    let mut chunks = store.raw_quad_chunks().await?;
-    log::debug!(
-        "[export_rdf] Raw chunk stream setup took {:?}",
-        debug::elapsed(decode_start)
-    );
+    // The raw chunk stream (in-memory, or the lazy file-backed scan). Its read
+    // is set up on the first poll, so the loop's timing below includes it.
+    let mut chunks = store.raw_quad_chunks();
 
     let write_start = debug::timer();
     let named_graphs = format == RdfFormat::NQuads;
@@ -71,7 +67,7 @@ async fn write_raw<W: Write>(
         }
     }
     log::debug!(
-        "[export_rdf] Raw write loop took {:?}",
+        "[export_rdf] Raw read and write loop took {:?}",
         debug::elapsed(write_start)
     );
     Ok(())
@@ -85,12 +81,9 @@ async fn write_structured<W: Write>(
     writer: W,
     format: RdfFormat,
 ) -> error::Result<()> {
-    let decode_start = debug::timer();
+    // The quad stream's read is set up on the first poll, so the loop's
+    // timing below includes it.
     let mut quads_stream = store.quads()?;
-    log::debug!(
-        "[export_rdf] Quad stream setup took {:?}",
-        debug::elapsed(decode_start)
-    );
 
     let write_start = debug::timer();
     let mut rdf_serializer = RdfSerializer::from_format(format).for_writer(writer);
@@ -107,7 +100,7 @@ async fn write_structured<W: Write>(
         .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
 
     log::debug!(
-        "[export_rdf] Serialization/write loop took {:?}",
+        "[export_rdf] Structured read and write loop took {:?}",
         debug::elapsed(write_start)
     );
 

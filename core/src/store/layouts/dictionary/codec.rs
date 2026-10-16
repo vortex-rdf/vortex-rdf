@@ -672,11 +672,13 @@ mod tests {
     }
 
     /// A file-backed chunk decode executes the chunk's code columns once,
-    /// whichever row representation it produces, and decodes the rows the
-    /// resident dictionary decodes — for a chunk long enough to memoize its
-    /// roles and for one too short to.
+    /// whichever row representation it produces, lifts no dictionary, and
+    /// decodes the rows the resident dictionary decodes — for a chunk long
+    /// enough to memoize its roles and for one too short to.
     #[tokio::test]
     async fn a_file_backed_chunk_decode_reads_the_code_columns_once() {
+        use crate::store::layouts::ChunkDecode;
+
         let all = skewed_quads();
         for quads in [&all[..], &all[..7]] {
             let n = quads.len();
@@ -684,8 +686,9 @@ mod tests {
             let fb = file_backed(&dict).await;
             let layout = ResolvedLayout::Dictionary(DictAccess::FileBacked(fb.clone()));
 
-            let (decoded, reads) = code_column_reads(layout.decode_chunk_async(&chunk)).await;
+            let (decoded, reads) = code_column_reads(Quad::decode_async(&layout, &chunk)).await;
             assert_eq!(reads, 1, "{n} quads");
+            assert_eq!(fb.debug_lifts(), 0, "{n} quads");
             let decoded: Vec<Quad> = decoded.into_iter().map(|row| row.unwrap()).collect();
             let want: Vec<Quad> = decode_chunk(&chunk, &dict)
                 .into_iter()
@@ -694,8 +697,10 @@ mod tests {
             assert_eq!(decoded.len(), n);
             assert_eq!(decoded, want, "{n} quads");
 
-            let (shared, reads) = code_column_reads(layout.decode_chunk_shared_async(&chunk)).await;
+            let (shared, reads) =
+                code_column_reads(SharedQuad::decode_async(&layout, &chunk)).await;
             assert_eq!(reads, 1, "{n} shared quads");
+            assert_eq!(fb.debug_lifts(), 0, "{n} shared quads");
             let shared: Vec<SharedQuad> = shared.into_iter().map(|row| row.unwrap()).collect();
             let want: Vec<SharedQuad> = decode_chunk_shared(&chunk, &dict)
                 .into_iter()
@@ -703,8 +708,9 @@ mod tests {
                 .collect();
             assert_eq!(shared, want, "{n} shared quads");
 
-            let (raw, reads) = code_column_reads(decode_chunk_raw_file_backed(&fb, &chunk)).await;
+            let (raw, reads) = code_column_reads(RawQuad::decode_async(&layout, &chunk)).await;
             assert_eq!(reads, 1, "{n} raw quads");
+            assert_eq!(fb.debug_lifts(), 0, "{n} raw quads");
             let terms = |q: RawQuad| [q.s, q.p, q.o, q.g];
             let raw: Vec<[String; 4]> = raw.into_iter().map(|row| terms(row.unwrap())).collect();
             let want: Vec<[String; 4]> =

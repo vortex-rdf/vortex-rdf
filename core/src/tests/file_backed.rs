@@ -241,9 +241,12 @@ fn probe_path_quads(n_subjects: usize) -> Vec<Quad> {
 /// The fast path engages on a sorted Dictionary file — the debug hook
 /// reports the exact run — and every subject-bound shape answers exactly
 /// like the in-memory store over the same quads: first/mid/last subjects,
-/// absent subjects, and [S]/[SP]/[SPO]/[SG] residual composition.
+/// absent subjects, and [S]/[SP]/[SPO]/[SG] residual composition. Each
+/// view's few rows decode point by point through the chunk probes, with no
+/// row scan.
 #[tokio::test]
 async fn test_file_backed_subject_chunk_probe_matches_memory() {
+    use crate::store::scan::file_reads::scan_hooks;
     let quads = probe_path_quads(2000);
     let (_dir, path) = write_store_file(
         quads.clone(),
@@ -280,8 +283,15 @@ async fn test_file_backed_subject_chunk_probe_matches_memory() {
         ] {
             let got = store.match_pattern(Some(&s), pp, po, pg).await.unwrap();
             let want = memory.match_pattern(Some(&s), pp, po, pg).await.unwrap();
+            let scans = scan_hooks::scans();
+            let got = view_strings(&got).await;
             assert_eq!(
-                view_strings(&got).await,
+                scan_hooks::scans(),
+                scans,
+                "scanned on subject {s} pattern ({pp:?}, {po:?}, {pg:?})"
+            );
+            assert_eq!(
+                got,
                 view_strings(&want).await,
                 "diverged on subject {s} pattern ({pp:?}, {po:?}, {pg:?})"
             );

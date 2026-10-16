@@ -459,10 +459,9 @@ impl VortexRdfStore {
                 use vortex_array::arrays::PrimitiveArray;
                 let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
                 let prim = selection.apply(col)?.execute::<PrimitiveArray>(&mut ctx)?;
-                let codes = prim.as_slice::<TermCode>();
-                let positions = (0..codes.len()).filter(|&i| test.admits(codes[i]));
-                let mask = vortex_mask::Mask::from_indices(codes.len(), positions);
-                return Ok(selection.clone().refine(&mask));
+                return Ok(selection
+                    .clone()
+                    .refine(&keep_mask(prim.as_slice::<TermCode>(), &test)));
             }
         };
         Ok(RowSelection::from_ids(Buffer::from(ids)))
@@ -572,6 +571,14 @@ impl VortexRdfStore {
             Keep::Set(_) => None,
         })
     }
+}
+
+/// The positions of `codes` the keep admits, as a mask over them.
+fn keep_mask(codes: &[TermCode], test: &KeepTest<'_>) -> vortex_mask::Mask {
+    vortex_mask::Mask::from_indices(
+        codes.len(),
+        (0..codes.len()).filter(|&i| test.admits(codes[i])),
+    )
 }
 
 /// How many selected rows a code of a set keep on the subject column is worth

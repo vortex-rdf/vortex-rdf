@@ -21,10 +21,8 @@
 
 use std::sync::Arc;
 
-#[cfg(feature = "file-io")]
 use futures::FutureExt as _;
-#[cfg(feature = "file-io")]
-use futures::future::BoxFuture;
+use futures::future::{self, BoxFuture};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use vortex_array::arrays::struct_::StructArray;
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
@@ -43,6 +41,8 @@ pub(crate) mod dictionary;
 pub(crate) mod typed_object;
 
 pub(crate) use self::dictionary::DictAccess;
+#[cfg(feature = "file-io")]
+use self::dictionary::FileBackedDict;
 use self::dictionary::TermDictionary;
 use crate::store::schema::{
     CODE_PTYPE, COL_G, COL_O, COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE, COL_P, COL_S,
@@ -574,36 +574,24 @@ impl ResolvedLayout {
     /// chunk-level failure (execution, a required column missing or of the
     /// wrong type) is returned as a single `Err` element; a row whose terms
     /// fail to parse is an `Err` at that row's position, the other rows
-    /// decoding normally. The shared-string and async variants below follow
-    /// the same contract.
+    /// decoding normally. The shared-string variant below and every
+    /// [`ChunkDecode`] follow the same contract.
     pub(crate) fn decode_chunk(&self, chunk: &ArrayRef) -> Vec<Result<Quad>> {
         match self {
             ResolvedLayout::Default => default::decode_chunk(chunk),
             ResolvedLayout::TypedObject => typed_object::decode_chunk(chunk),
             ResolvedLayout::Dictionary(access) => match access.resident() {
                 Some(dict) => dictionary::decode_chunk(chunk, dict),
-                // Defensive: the read paths route file-backed stores through
-                // `decode_chunk_async`, which resolves each chunk's codes with
-                // a scan; reaching here means one of them didn't.
+                // Defensive: the read paths decode a file-backed store's
+                // chunks through `ChunkDecode::decode_async`, which resolves
+                // each chunk's codes with a read of the dictionary; reaching
+                // here means one of them didn't.
                 None => vec![Err(VortexRdfError::Deserialization(
                     "a file-backed dictionary decodes chunks through the async read path"
                         .to_string(),
                 ))],
             },
         }
-    }
-
-    /// [`decode_chunk`](Self::decode_chunk) with the file-backed Dictionary
-    /// case handled: the chunk's code columns are read once, their distinct
-    /// codes are resolved to terms by one read of the dictionary windows
-    /// holding them, and the chunk decodes against that map. Every other
-    /// layout (and a resident dictionary) takes the sync path unchanged.
-    #[cfg(feature = "file-io")]
-    pub(crate) async fn decode_chunk_async(&self, chunk: &ArrayRef) -> Vec<Result<Quad>> {
-        if let ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) = self {
-            return dictionary::decode_chunk_file_backed(fb, chunk).await;
-        }
-        self.decode_chunk(chunk)
     }
 
     /// [`decode_chunk`](Self::decode_chunk) into [`SharedQuad`]s — terms as
@@ -627,22 +615,6 @@ impl ResolvedLayout {
                 ))],
             },
         }
-    }
-
-    /// [`decode_chunk_shared`](Self::decode_chunk_shared) with the file-backed
-    /// Dictionary case handled as
-    /// [`decode_chunk_async`](Self::decode_chunk_async) does it: the distinct
-    /// codes resolve into shared strings with one read of the dictionary, and
-    /// the chunk decodes against that map.
-    #[cfg(feature = "file-io")]
-    pub(crate) async fn decode_chunk_shared_async(
-        &self,
-        chunk: &ArrayRef,
-    ) -> Vec<Result<SharedQuad>> {
-        if let ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) = self {
-            return dictionary::decode_chunk_shared_file_backed(fb, chunk).await;
-        }
-        self.decode_chunk_shared(chunk)
     }
 
     /// Prepare `pattern` for the synchronous match core: pre-resolve every
@@ -710,13 +682,12 @@ impl ResolvedLayout {
 
     /// [`raw_quads`](Self::raw_quads) with the file-backed Dictionary case
     /// handled: the whole dictionary is lifted resident transiently, then the
-    /// sync decode runs unchanged. Its one caller, `base_raw_quads`, serves
+    /// sync decode runs unchanged. Its one caller, `merged_raw_quads`, serves
     /// whole-base reads only (compaction, serialization, `selected_rows`'
-    /// Dictionary tail re-encode, the raw stream's in-memory arm), which touch
-    /// most of the dictionary anyway; a file scan's chunks decode through
-    /// [`decode_chunk_raw_file_backed`](dictionary::decode_chunk_raw_file_backed).
-    #[cfg(feature = "file-io")]
+    /// Dictionary tail re-encode), which touch most of the dictionary anyway;
+    /// every chunk a read streams decodes through [`ChunkDecode`] instead.
     pub(crate) async fn raw_quads_async(&self, rows: &ArrayRef) -> Result<Vec<RawQuad>> {
+        #[cfg(feature = "file-io")]
         if let ResolvedLayout::Dictionary(access) = self
             && access.is_file_backed()
         {
@@ -728,31 +699,53 @@ impl ResolvedLayout {
     }
 }
 
-/// The two row representations a chunk decodes into: owned oxrdf [`Quad`]s,
-/// or [`SharedQuad`]s whose terms are shared strings. Each pipeline over
-/// chunks — the serve plans, the point-read fast paths, the sync and async
-/// scan streams — is written once against this trait for both.
+/// The row representations a chunk decodes into: owned oxrdf [`Quad`]s,
+/// [`SharedQuad`]s whose terms are shared strings, or [`RawQuad`]s holding
+/// each term's N-Triples string. Each pipeline over chunks — the serve plans,
+/// the reads by id, the scan streams, the raw export stream — is written once
+/// against this trait for all three.
 pub(crate) trait ChunkDecode: Sized + Send + 'static {
-    /// [`ResolvedLayout::decode_chunk`] into this representation.
+    /// `chunk`'s rows through `layout`, under
+    /// [`ResolvedLayout::decode_chunk`]'s error convention; a file-backed
+    /// dictionary is a chunk-level error.
     fn decode(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>>;
-    /// [`ResolvedLayout::decode_chunk_async`] into this representation.
+
+    /// `chunk`'s rows against the file-backed dictionary `fb`: the chunk's
+    /// code columns are read once and their distinct codes resolve to terms
+    /// with one read of the dictionary windows holding them.
     #[cfg(feature = "file-io")]
+    fn decode_file_backed<'a>(
+        fb: &'a FileBackedDict,
+        chunk: &'a ArrayRef,
+    ) -> BoxFuture<'a, Vec<Result<Self>>>;
+
+    /// [`decode`](Self::decode), through
+    /// [`decode_file_backed`](Self::decode_file_backed) when the dictionary
+    /// is file-backed; every other layout (and a resident dictionary) decodes
+    /// without suspending.
     fn decode_async<'a>(
         layout: &'a ResolvedLayout,
         chunk: &'a ArrayRef,
-    ) -> BoxFuture<'a, Vec<Result<Self>>>;
+    ) -> BoxFuture<'a, Vec<Result<Self>>> {
+        #[cfg(feature = "file-io")]
+        if let ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) = layout {
+            return Self::decode_file_backed(fb, chunk);
+        }
+        future::ready(Self::decode(layout, chunk)).boxed()
+    }
 }
 
 impl ChunkDecode for Quad {
     fn decode(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>> {
         layout.decode_chunk(chunk)
     }
+
     #[cfg(feature = "file-io")]
-    fn decode_async<'a>(
-        layout: &'a ResolvedLayout,
+    fn decode_file_backed<'a>(
+        fb: &'a FileBackedDict,
         chunk: &'a ArrayRef,
     ) -> BoxFuture<'a, Vec<Result<Self>>> {
-        layout.decode_chunk_async(chunk).boxed()
+        dictionary::decode_chunk_file_backed(fb, chunk).boxed()
     }
 }
 
@@ -760,12 +753,30 @@ impl ChunkDecode for SharedQuad {
     fn decode(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>> {
         layout.decode_chunk_shared(chunk)
     }
+
     #[cfg(feature = "file-io")]
-    fn decode_async<'a>(
-        layout: &'a ResolvedLayout,
+    fn decode_file_backed<'a>(
+        fb: &'a FileBackedDict,
         chunk: &'a ArrayRef,
     ) -> BoxFuture<'a, Vec<Result<Self>>> {
-        layout.decode_chunk_shared_async(chunk).boxed()
+        dictionary::decode_chunk_shared_file_backed(fb, chunk).boxed()
+    }
+}
+
+impl ChunkDecode for RawQuad {
+    fn decode(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>> {
+        match layout.raw_quads(chunk) {
+            Ok(raws) => raws.into_iter().map(Ok).collect(),
+            Err(e) => vec![Err(e)],
+        }
+    }
+
+    #[cfg(feature = "file-io")]
+    fn decode_file_backed<'a>(
+        fb: &'a FileBackedDict,
+        chunk: &'a ArrayRef,
+    ) -> BoxFuture<'a, Vec<Result<Self>>> {
+        dictionary::decode_chunk_raw_file_backed(fb, chunk).boxed()
     }
 }
 
