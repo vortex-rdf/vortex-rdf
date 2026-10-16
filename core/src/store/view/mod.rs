@@ -21,7 +21,7 @@ use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::array::subject_sorted;
 use crate::store::indexes::{InMemoryServePlan, IndexComponent};
-use crate::store::layouts::ResolvedLayout;
+use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 use crate::store::probes::StructProbes;
 use crate::store::scan::gather::gather_live;
 use crate::store::view::selection::{RowSelection, ViewSelection};
@@ -223,6 +223,16 @@ impl QuadsSource {
             QuadsSource::InMemory { serve, .. } => serve.as_ref().map(|plan| plan.component()),
             #[cfg(feature = "file-io")]
             QuadsSource::File { serve, .. } => serve.as_ref().map(|plan| plan.component()),
+        }
+    }
+
+    /// The serve plan answering a file-backed source's reads, if any; `None`
+    /// in memory.
+    #[cfg(feature = "file-io")]
+    pub(crate) fn file_serve(&self) -> Option<&FileServePlan> {
+        match self {
+            QuadsSource::InMemory { .. } => None,
+            QuadsSource::File { serve, .. } => serve.as_ref(),
         }
     }
 
@@ -532,6 +542,16 @@ impl Tail {
     /// order.
     pub(crate) fn live_rows(&self) -> Result<ArrayRef> {
         gather_live(&self.rows, &self.selection, self.deleted.as_ref(), None)
+    }
+
+    /// The tail rows visible through this store decoded to `T`, in tail
+    /// order, a gather failure as one `Err` element — synchronously, as for
+    /// [`raw_quads`](Self::raw_quads).
+    pub(crate) fn decode<T: ChunkDecode>(&self) -> Vec<Result<T>> {
+        match self.live_rows() {
+            Ok(rows) => T::decode(&self.layout, &rows),
+            Err(e) => vec![Err(e)],
+        }
     }
 
     /// The tail rows visible through this store, decoded to raw quads in

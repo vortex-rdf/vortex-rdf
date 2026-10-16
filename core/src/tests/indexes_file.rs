@@ -146,6 +146,24 @@ async fn run_copy_index_file_test(layout: LayoutStrategy, located: bool) {
         expected_strings(&quads, |i| i % 3 == 1 && i % 2 == 1 && i != 7)
     );
 
+    // A located run inside the point-read cap is read point by point through
+    // the component's chunk probes, with no row scan; an unlocated one scans
+    // the child under the plan's filter.
+    {
+        use crate::store::scan::file_reads::scan_hooks;
+        let by_p = store
+            .match_pattern(None, Some(&p1), None, None)
+            .await
+            .unwrap();
+        assert_eq!(by_p.debug_serve_row_range().is_some(), located);
+        let scans = scan_hooks::scans();
+        assert_eq!(
+            view_strings(&by_p).await,
+            expected_strings(&quads, |i| i % 3 == 1)
+        );
+        assert_eq!(scan_hooks::scans() > scans, !located, "{layout:?}");
+    }
+
     run_copy_index_serving_script(
         store,
         &quads,
@@ -1456,10 +1474,28 @@ async fn test_reference_index_counts_with_named_graphs() {
 /// 100,000-row file — are gathered by taking them, not by a scan filtering
 /// every split: from the chunk probes' leaves under the Dictionary layout,
 /// split by split under a string layout, whose columns have no chunk probes.
-/// The rows are the in-memory store's, tombstoned rows dropped.
+/// The `quads` stream and the N-Quads export's raw stream take them as
+/// `quads_vec` does, none of them runs a row scan, and the export lifts no
+/// dictionary. The rows are the in-memory store's, tombstoned rows dropped.
 #[tokio::test]
 async fn test_reference_index_file_takes_sparse_ids() {
-    use crate::store::scan::file_reads::take_hooks;
+    use crate::store::scan::file_reads::{scan_hooks, take_hooks};
+
+    /// `view`'s N-Quads export, as sorted lines.
+    async fn export_lines(view: &VortexRdfStore) -> Vec<String> {
+        let mut out = Vec::new();
+        crate::export_rdf(view.clone(), &mut out, oxrdfio::RdfFormat::NQuads)
+            .await
+            .unwrap();
+        let mut lines: Vec<String> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.sort();
+        lines
+    }
+
     let quads = graph_modular_quads(100_000, 6, 3, 333, &[GraphName::DefaultGraph]);
     let o5 = Term::Literal(Literal::new_simple_literal("o5"));
     let doomed = 5 + 333 * 7;
@@ -1474,34 +1510,49 @@ async fn test_reference_index_file_takes_sparse_ids() {
         let deleted = file.delete_quad(&quads[doomed]).await.unwrap();
         let memory_deleted = memory.delete_quad(&quads[doomed]).await.unwrap();
         for (store, in_memory, rows) in [(&file, &memory, 301), (&deleted, &memory_deleted, 300)] {
-            let label = format!("{layout:?} {rows}");
             let matched = store
                 .match_pattern(None, None, Some(&o5), None)
                 .await
                 .unwrap();
-            let (chunks, splits) = take_hooks::takes();
-            let strings = view_strings(&matched).await;
-            let (chunks_after, splits_after) = take_hooks::takes();
-            if through_chunks {
-                assert!(
-                    chunks_after > chunks,
-                    "{label}: taken through the chunk probes"
-                );
-                assert_eq!(splits_after, splits, "{label}");
-            } else {
-                assert!(splits_after > splits, "{label}: taken split by split");
-                assert_eq!(chunks_after, chunks, "{label}");
-            }
-            assert_eq!(
-                strings,
-                expected_strings(&quads, |i| i % 333 == 5 && (rows == 301 || i != doomed)),
-                "{label}"
-            );
+            let want = expected_strings(&quads, |i| i % 333 == 5 && (rows == 301 || i != doomed));
             let in_memory_matched = in_memory
                 .match_pattern(None, None, Some(&o5), None)
                 .await
                 .unwrap();
-            assert_eq!(view_strings(&in_memory_matched).await, strings, "{label}");
+            let want_lines = export_lines(&in_memory_matched).await;
+            assert_eq!(want_lines.len(), rows, "{layout:?} {rows}");
+            for read in ["quads_vec", "quads", "export"] {
+                let label = format!("{layout:?} {rows} {read}");
+                let (chunks, splits) = take_hooks::takes();
+                let scans = scan_hooks::scans();
+                let (got, expected) = match read {
+                    "quads_vec" => (view_strings(&matched).await, &want),
+                    "quads" => {
+                        let decoded: Vec<Quad> =
+                            matched.quads().unwrap().try_collect().await.unwrap();
+                        (quad_strings(&decoded), &want)
+                    }
+                    _ => (export_lines(&matched).await, &want_lines),
+                };
+                let (chunks_after, splits_after) = take_hooks::takes();
+                if through_chunks {
+                    assert!(
+                        chunks_after > chunks,
+                        "{label}: taken through the chunk probes"
+                    );
+                    assert_eq!(splits_after, splits, "{label}");
+                } else {
+                    assert!(splits_after > splits, "{label}: taken split by split");
+                    assert_eq!(chunks_after, chunks, "{label}");
+                }
+                assert_eq!(scan_hooks::scans(), scans, "{label}: no row scan");
+                assert_eq!(&got, expected, "{label}");
+            }
+            let label = format!("{layout:?} {rows}");
+            if through_chunks {
+                assert_eq!(matched.debug_dict_lifts(), Some(0), "{label}: no lift");
+            }
+            assert_eq!(view_strings(&in_memory_matched).await, want, "{label}");
             if through_chunks {
                 let codes = sorted_code_rows(&matched).await;
                 assert_eq!(codes.len(), rows, "{label}");

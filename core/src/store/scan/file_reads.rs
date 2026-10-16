@@ -127,6 +127,28 @@ pub(crate) mod driver_hooks {
     }
 }
 
+/// Test hook: how many row scans this thread ran, collected whole
+/// ([`read_all_rows`]) or streamed ([`stream_rows`], the quad decode's scan
+/// stream) — what a read by id ([`ExactRead`]) runs none of.
+#[cfg(test)]
+pub(crate) mod scan_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SCANS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Record one row scan.
+    pub(crate) fn note() {
+        SCANS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// The row scans run on this thread so far.
+    pub(crate) fn scans() -> usize {
+        SCANS.with(Cell::get)
+    }
+}
+
 /// Run a row scan to completion and materialize every row it yields into one
 /// in-memory array, in the scan's row order.
 ///
@@ -141,6 +163,8 @@ pub(crate) mod driver_hooks {
 /// splits do filter and decode work, so a large scan needs the workers; an
 /// index child's row-id scan goes through [`read_index_row_ids`] instead.
 pub(crate) async fn read_all_rows(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRef> {
+    #[cfg(test)]
+    scan_hooks::note();
     let dtype = scan.dtype()?;
     let window = scan.concurrency() * available_parallelism();
     let tasks = scan.build()?;
@@ -161,6 +185,8 @@ pub(crate) async fn read_all_rows(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRe
 pub(crate) fn stream_rows(
     scan: ScanBuilder<ArrayRef>,
 ) -> Result<BoxStream<'static, Result<ArrayRef>>> {
+    #[cfg(test)]
+    scan_hooks::note();
     let window = scan.concurrency() * available_parallelism();
     let tasks = scan.build()?;
     let splits = match ScanDriver::for_row_scan(tasks.len()) {

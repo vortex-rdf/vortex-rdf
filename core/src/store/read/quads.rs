@@ -1,39 +1,50 @@
 //! Quad streaming: the chunk-granularity decode stream behind `quads`,
-//! `quads_vec` and their shared-term twins.
+//! `quads_vec`, their shared-term twins and the raw export stream — one
+//! pipeline for every row representation ([`ChunkDecode`]).
+
+use futures::stream::BoxStream;
+use futures::{Stream, StreamExt, stream};
+use oxrdf::Quad;
 
 use crate::error::Result;
+use crate::store::layouts::ChunkDecode;
+use crate::store::scan::gather::gather_live;
+use crate::store::{QuadsSource, RawQuad, SharedQuad, Tail, VortexRdfStore};
+
 #[cfg(feature = "file-io")]
 use crate::error::VortexRdfError;
-use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 #[cfg(feature = "file-io")]
-use crate::store::layouts::{DictAccess, dictionary};
+use crate::store::indexes::FileServePlan;
+#[cfg(feature = "file-io")]
+use crate::store::layouts::ResolvedLayout;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_reads;
-use crate::store::scan::gather::gather_live;
 #[cfg(feature = "file-io")]
 use crate::store::view::selection::point_sized;
-use crate::store::{QuadsSource, RawQuad, SharedQuad};
-
 #[cfg(feature = "file-io")]
 use futures::FutureExt as _;
 #[cfg(feature = "file-io")]
 use futures::future::{self, BoxFuture};
-use futures::{Stream, StreamExt, stream};
-use oxrdf::Quad;
-
+#[cfg(feature = "file-io")]
 use vortex_array::ArrayRef;
 #[cfg(feature = "file-io")]
 use vortex_layout::scan::scan_builder::ScanBuilder;
+#[cfg(feature = "file-io")]
+use vortex_mask::Mask;
 
-use crate::store::VortexRdfStore;
+/// A view's rows as decoded chunks.
+type Chunks<T> = BoxStream<'static, Vec<Result<T>>>;
 
 impl VortexRdfStore {
     // ── quads streaming ───────────────────────────────────────────────────────
 
-    /// Stream every quad this view covers, one at a time.
+    /// Stream every quad this view covers, one at a time: the base's rows (in
+    /// the serving index's order for a served view, else in base row order),
+    /// then the tail's live rows. Nothing is read until the first poll, and a
+    /// failure to set the read up arrives as the stream's first item.
     pub fn quads(&self) -> Result<Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + '_>> {
         Ok(Box::new(
-            self.decoded_chunks::<Quad>()?.flat_map(stream::iter),
+            self.chunk_stream::<Quad>(true).flat_map(stream::iter),
         ))
     }
 
@@ -60,19 +71,36 @@ impl VortexRdfStore {
 
     /// The chunk-granularity stream of [`SharedQuad`]s behind
     /// [`shared_quads_vec`](Self::shared_quads_vec): each item is one decoded
-    /// chunk (a scan split, the in-memory base, or the tail), so a consumer
-    /// converting whole batches — a binding interning each distinct term
-    /// once — takes them without per-quad stream overhead. A chunk-level
-    /// scan error arrives as a one-element `vec![Err(..)]`.
+    /// chunk (a scan split, a read by id, the in-memory base, or the tail),
+    /// so a consumer converting whole batches — a binding interning each
+    /// distinct term once — takes them without per-quad stream overhead. A
+    /// chunk-level error, or a failure to set the read up, arrives as a
+    /// one-element `vec![Err(..)]`.
     pub fn shared_quad_chunks(
         &self,
     ) -> Result<Box<dyn Stream<Item = Vec<Result<SharedQuad>>> + Unpin + Send + '_>> {
-        self.decoded_chunks::<SharedQuad>()
+        Ok(Box::new(self.chunk_stream::<SharedQuad>(true)))
+    }
+
+    /// The raw-text counterpart of
+    /// [`shared_quad_chunks`](Self::shared_quad_chunks): each item is one
+    /// chunk of this view's quads decoded to [`RawQuad`]s — every term in the
+    /// exact N-Triples string form the columns store. The N-Triples/N-Quads
+    /// export fast path streams these and writes the strings verbatim,
+    /// skipping the oxrdf parse → re-escape round trip [`quads`](Self::quads)
+    /// pays per term.
+    ///
+    /// A serve plan is deliberately not consulted here: it reorders rows for
+    /// read locality, and this stream reads every view in base row order — a
+    /// served view's pending selection materializes, and its rows are read as
+    /// an unserved view's are.
+    pub(in crate::store) fn raw_quad_chunks(&self) -> BoxStream<'_, Vec<Result<RawQuad>>> {
+        self.chunk_stream::<RawQuad>(false)
     }
 
     /// Collect every decoded chunk, then flatten into one exactly-sized `Vec`.
     async fn decoded_vec<T: ChunkDecode>(&self) -> Result<Vec<T>> {
-        let chunks: Vec<Vec<Result<T>>> = self.decoded_chunks::<T>()?.collect().await;
+        let chunks: Vec<Vec<Result<T>>> = self.chunk_stream::<T>(true).collect().await;
         let total = chunks.iter().map(Vec::len).sum();
         let mut rows = Vec::with_capacity(total);
         for chunk in chunks {
@@ -83,55 +111,73 @@ impl VortexRdfStore {
         Ok(rows)
     }
 
-    /// The decode-granularity stream behind [`quads`](Self::quads),
-    /// [`quads_vec`](Self::quads_vec) and their shared-term twins: each item
-    /// is one decoded chunk (a scan split, the in-memory base, or the tail),
-    /// so consumers that want whole batches can take them without paying
-    /// per-quad stream overhead. A chunk-level scan error arrives as a
-    /// one-element `vec![Err(..)]`.
-    fn decoded_chunks<T: ChunkDecode>(
-        &self,
-    ) -> Result<Box<dyn Stream<Item = Vec<Result<T>>> + Unpin + Send + '_>> {
-        let layout = self.layout.clone();
+    /// The one chunk stream behind every read above:
+    /// [`decoded_chunks`](Self::decoded_chunks) built on the first poll, a
+    /// build failure as one error chunk. `serve` says whether a serve plan,
+    /// when the view carries one, answers the read.
+    fn chunk_stream<T: ChunkDecode>(&self, serve: bool) -> BoxStream<'_, Vec<Result<T>>> {
+        stream::once(self.decoded_chunks::<T>(serve))
+            .flat_map(|built| match built {
+                Ok(chunks) => chunks,
+                Err(e) => stream::iter([vec![Err(e)]]).boxed(),
+            })
+            .boxed()
+    }
+
+    /// This view's rows as decoded chunks: the base's, then the tail's live
+    /// rows as one more chunk. Tombstones are applied on every path.
+    ///
+    /// With `serve`, a served view reads its plan's run: in memory a slice or
+    /// point reads of the component's run; on file point reads for a
+    /// point-sized located run, a row-count-split scan for a wide one, the
+    /// plan's filter scan for an unlocated one. Every other read is in base
+    /// row order, over exact row ids (a served view's pending selection
+    /// materializes first): in memory the selected rows are gathered into one
+    /// chunk; on file a selection the reads by id serve
+    /// ([`ExactRead`](file_reads::ExactRead)) is one chunk, and anything else
+    /// streams the restricted scan split by split.
+    async fn decoded_chunks<T: ChunkDecode>(&self, serve: bool) -> Result<Chunks<T>> {
         // Tail rows are in memory and few: decode them eagerly, to be appended
         // after whatever the base yields.
-        let tail_quads: Vec<Result<T>> = match &self.tail {
-            None => vec![],
-            Some(tail) => T::decode(&tail.layout, &tail.live_rows()?),
-        };
+        let tail: Vec<Result<T>> = self.tail.as_ref().map_or_else(Vec::new, Tail::decode);
         match &self.quads {
             QuadsSource::InMemory {
                 base,
                 selection,
                 deleted,
                 probes,
-                serve,
+                serve: plan,
                 ..
             } => {
-                // The data is already in memory. Decode the base rows up front,
-                // then hand back a simple iterator wrapped as a stream.
-                let mut quads = match serve {
+                // The data is already in memory: the base decodes as one
+                // chunk, the tail's rows appended to it.
+                let mut quads = match plan {
                     // A served view reads the matched quads straight from the
                     // copy family's contiguous run in `base` (a plain slice),
                     // instead of gathering the primary columns at scattered row
                     // ids; tombstones are applied through the rid column. The
                     // selection may still be pending — the plan never needs it.
-                    Some(serve) => serve.decode::<T>(deleted.as_ref()),
-                    // Without a plan the selection is exact (pending ids ride
-                    // alongside one, or on a view that is only counted or
-                    // windowed, never streamed).
-                    None => T::decode(
-                        &layout,
-                        &gather_live(
-                            base,
-                            selection.expect_exact(),
-                            deleted.as_ref(),
-                            Some(probes),
-                        )?,
-                    ),
+                    Some(plan) if serve => plan.decode::<T>(deleted.as_ref()),
+                    _ => {
+                        let materialized;
+                        let selection = match plan {
+                            // Base row order needs exact row ids: a served
+                            // match's pending selection materializes here.
+                            Some(_) => {
+                                materialized = selection.materialized()?;
+                                &materialized
+                            }
+                            // Without a plan the selection is exact (pending
+                            // ids ride alongside one, or on a view that is only
+                            // counted or windowed, never streamed).
+                            None => selection.expect_exact(),
+                        };
+                        let rows = gather_live(base, selection, deleted.as_ref(), Some(probes))?;
+                        T::decode_async(&self.layout, &rows).await
+                    }
                 };
-                quads.extend(tail_quads);
-                Ok(Box::new(stream::iter([quads])))
+                quads.extend(tail);
+                Ok(stream::iter([quads]).boxed())
             }
             #[cfg(feature = "file-io")]
             QuadsSource::File {
@@ -139,7 +185,7 @@ impl VortexRdfStore {
                 filter,
                 selection,
                 deleted,
-                serve,
+                serve: plan,
                 ..
             } => {
                 // A served view streams from the answering index's own columns
@@ -150,305 +196,189 @@ impl VortexRdfStore {
                 // (see `FileServePlan`); tombstones are applied through its rid
                 // column. The store executes the plan without knowing which
                 // index produced it.
-                if let Some(serve) = serve {
+                if let Some(plan) = plan
+                    && serve
+                {
                     // A small located run reads point-by-point through the
-                    // component's cached chunk probes — one async item, no
-                    // scan machinery; the moved-in filter scan handles the
-                    // rare mid-fetch decline.
-                    if let Some(range) = serve.row_range()
+                    // component's cached chunk probes — one chunk, no scan
+                    // machinery; the filter scan handles the rare mid-fetch
+                    // decline.
+                    if let Some(range) = plan.row_range()
                         && point_sized(range.end - range.start)
                     {
-                        let scan = serve.projected_filtered_scan()?;
-                        let serve = serve.clone();
-                        let deleted = deleted.clone();
-                        let file = std::sync::Arc::clone(file);
-                        let chunk = async move {
-                            let projection = serve.projection();
-                            let point = file_reads::component_point_chunk(
-                                &file,
-                                serve.component(),
-                                &projection,
-                                range,
-                            );
-                            match file_reads::point_rows_or_scan(point, scan).await {
-                                Ok(rows) => {
-                                    serve
-                                        .decode_columns_async::<T>(&rows, deleted.as_ref())
-                                        .await
-                                }
-                                Err(e) => vec![Err(e)],
-                            }
-                        };
-                        return Ok(Box::new(
-                            stream::once(chunk)
-                                .chain(stream::iter([tail_quads]))
-                                .boxed(),
-                        ));
-                    }
-                    let serve = serve.clone();
-                    let deleted = deleted.clone();
-                    // A wide located run scans exactly its rows, split by
-                    // row count so the decode below spreads over the
-                    // runtime's workers; an unlocated one keeps the
-                    // pushed-down filter scan (see
-                    // `FileServePlan::located_run_scan`).
-                    let scan = match serve.located_run_scan()? {
-                        Some(scan) => scan,
-                        None => serve.projected_filtered_scan()?,
-                    };
-                    let (sync_serve, sync_deleted) = (serve.clone(), deleted.clone());
-                    return self.scan_chunks(
-                        scan,
-                        move |chunk| sync_serve.decode_columns::<T>(&chunk, sync_deleted.as_ref()),
-                        move |chunk| {
-                            let serve = serve.clone();
-                            let deleted = deleted.clone();
-                            async move {
-                                serve
-                                    .decode_columns_async::<T>(&chunk, deleted.as_ref())
+                        let scan = plan.projected_filtered_scan()?;
+                        let projection = plan.projection();
+                        let point = file_reads::component_point_chunk(
+                            file,
+                            plan.component(),
+                            &projection,
+                            range,
+                        );
+                        let chunk = match file_reads::point_rows_or_scan(point, scan).await {
+                            Ok(rows) => {
+                                plan.decode_columns_async::<T>(&rows, deleted.as_ref())
                                     .await
                             }
-                            .boxed()
-                        },
-                        tail_quads,
-                    );
+                            Err(e) => vec![Err(e)],
+                        };
+                        return Ok(with_tail(stream::iter([chunk]), tail));
+                    }
+                    // A wide located run scans exactly its rows, split by
+                    // row count so the decode spreads over the runtime's
+                    // workers; an unlocated one keeps the pushed-down filter
+                    // scan (see `FileServePlan::located_run_scan`).
+                    let scan = match plan.located_run_scan()? {
+                        Some(scan) => scan,
+                        None => plan.projected_filtered_scan()?,
+                    };
+                    let decoder = ServedDecoder {
+                        plan: plan.clone(),
+                        deleted: deleted.clone(),
+                    };
+                    return self.scan_chunks(scan, decoder, tail);
                 }
-                // An exact selection the reads by id serve (see `ExactRead`)
-                // materializes as one async item — point reads through the
-                // file's cached chunk probes, or takes at its ids — with no
-                // scan machinery. The choice is made synchronously; the
-                // fallback scan moves into the future for the rare decline (an
-                // unprobeable chunk), which reads the same rows through the
-                // scan. Anything else streams the scan below.
-                let exact = selection.expect_exact();
+                let materialized;
+                let selection = match plan {
+                    // Base row order needs exact row ids: a served match's
+                    // pending selection materializes here (running the
+                    // deferred index-child read once, cached on the view).
+                    Some(_) => {
+                        materialized = selection.materialized_async().await?;
+                        &materialized
+                    }
+                    // Without a plan the selection is exact (pending ids ride
+                    // alongside one, or on a view that is only counted or
+                    // windowed, never streamed).
+                    None => selection.expect_exact(),
+                };
+                // An exact selection the reads by id serve (see `ExactRead`) —
+                // point reads through the file's cached chunk probes, or takes
+                // at its ids — decodes as one chunk, with no scan machinery.
+                // Anything else, and a read by id that declines (an
+                // unprobeable chunk), streams the restricted scan: primary
+                // columns only, with the pending filter and the selection
+                // applied, tombstoned rows excluded.
                 let columns = self.layout.strategy().primary_column_names();
-                let read = file_reads::ExactRead::of(
+                let chunk = match Self::exact_rows_by_id(
                     file,
                     columns,
                     filter.as_ref(),
-                    exact,
+                    selection,
                     deleted.as_ref(),
-                )?;
-                if !matches!(read, file_reads::ExactRead::Scan) {
-                    let scan =
-                        self.restricted_file_scan(file, filter.as_ref(), exact, deleted.as_ref())?;
-                    let file = std::sync::Arc::clone(file);
-                    let filter = filter.clone();
-                    let chunk = async move {
-                        let by_id = match read {
-                            file_reads::ExactRead::Points(rows) => {
-                                file_reads::file_point_rows(&file, columns, filter.as_ref(), rows)
-                                    .await
-                            }
-                            file_reads::ExactRead::Take(ids) => {
-                                file_reads::take_file_rows(&file, columns, &ids).await
-                            }
-                            file_reads::ExactRead::Scan => Ok(None),
-                        };
-                        let rows = match by_id {
-                            Ok(Some(rows)) => Ok(rows),
-                            Ok(None) => file_reads::read_all_rows(scan).await,
-                            Err(e) => Err(e),
-                        };
-                        match rows {
-                            Ok(rows) => T::decode_async(&layout, &rows).await,
-                            Err(e) => vec![Err(e)],
-                        }
-                    };
-                    return Ok(Box::new(
-                        stream::once(chunk)
-                            .chain(stream::iter([tail_quads]))
-                            .boxed(),
-                    ));
-                }
-                // Same restriction setup as `base_selected_rows`: primary
-                // columns only, with any pending filter/selection applied
-                // (tombstoned rows excluded). Without a serve plan the
-                // selection is exact (pending ids ride alongside one, or on a
-                // view that is only counted or windowed, never streamed).
-                let scan = self.restricted_file_scan(
-                    file,
-                    filter.as_ref(),
-                    selection.expect_exact(),
-                    deleted.as_ref(),
-                )?;
-                let sync_layout = layout.clone();
-                self.scan_chunks(
-                    scan,
-                    move |chunk| T::decode(&sync_layout, &chunk),
-                    move |chunk| {
-                        let layout = layout.clone();
-                        async move { T::decode_async(&layout, &chunk).await }.boxed()
-                    },
-                    tail_quads,
                 )
-            }
-        }
-    }
-
-    /// The raw-text counterpart of
-    /// [`shared_quad_chunks`](Self::shared_quad_chunks): each
-    /// item is one chunk of this view's quads decoded to [`RawQuad`]s — every
-    /// term in the exact N-Triples string form the columns store. The
-    /// N-Triples/N-Quads export fast path streams these and writes the
-    /// strings verbatim, skipping the oxrdf parse → re-escape round trip
-    /// [`quads`](Self::quads) pays per term.
-    ///
-    /// A serve plan is deliberately not consulted here: it reorders rows for
-    /// read locality, and this stream's consumers are order-insignificant
-    /// line formats — the restricted scan answers every file view with the
-    /// same quads in base row order.
-    pub(in crate::store) async fn raw_quad_chunks(
-        &self,
-    ) -> Result<Box<dyn Stream<Item = Vec<Result<RawQuad>>> + Unpin + Send + '_>> {
-        // Tail rows are in memory and few: decode them eagerly, to be
-        // appended after whatever the base yields. Under the Dictionary
-        // layout the tail already holds N-Triples strings (Default layout),
-        // so this never needs the async dictionary path.
-        let tail_raws: Vec<Result<RawQuad>> = match &self.tail {
-            None => vec![],
-            Some(tail) => raw_chunk(&tail.layout, &tail.live_rows()?),
-        };
-        match &self.quads {
-            QuadsSource::InMemory {
-                base,
-                selection,
-                deleted,
-                probes,
-                ..
-            } => {
-                // This stream reads in base row order, which only exact row
-                // ids can produce — a served match's pending selection
-                // materializes here.
-                let rows = gather_live(
-                    base,
-                    &selection.materialized()?,
-                    deleted.as_ref(),
-                    Some(probes),
-                )?;
-                // `base_raw_quads` routes through the async decode when the
-                // dictionary is file-backed, exactly like the other
-                // raws-consuming paths (serialization, compaction).
-                let mut raws: Vec<Result<RawQuad>> = match self.base_raw_quads(&rows).await {
-                    Ok(raws) => raws.into_iter().map(Ok).collect(),
+                .await
+                {
+                    Ok(Some(rows)) => T::decode_async(&self.layout, &rows).await,
+                    Ok(None) => {
+                        let scan = self.restricted_file_scan(
+                            file,
+                            filter.as_ref(),
+                            selection,
+                            deleted.as_ref(),
+                        )?;
+                        return self.scan_chunks(scan, self.layout.clone(), tail);
+                    }
                     Err(e) => vec![Err(e)],
                 };
-                raws.extend(tail_raws);
-                Ok(Box::new(stream::iter([raws])))
-            }
-            #[cfg(feature = "file-io")]
-            QuadsSource::File {
-                file,
-                filter,
-                selection,
-                deleted,
-                ..
-            } => {
-                // As for the in-memory arm: base row order needs the exact
-                // ids, so a pending selection materializes (running the
-                // deferred index-child scan once, cached on the view).
-                let selection = selection.materialized_async().await?;
-                let scan =
-                    self.restricted_file_scan(file, filter.as_ref(), &selection, deleted.as_ref())?;
-                let layout = self.layout.clone();
-                let sync_layout = layout.clone();
-                self.scan_chunks(
-                    scan,
-                    move |chunk| raw_chunk(&sync_layout, &chunk),
-                    move |chunk| {
-                        let layout = layout.clone();
-                        async move { raw_chunk_async(&layout, &chunk).await }.boxed()
-                    },
-                    tail_raws,
-                )
+                Ok(with_tail(stream::iter([chunk]), tail))
             }
         }
     }
 
-    /// The decoded chunk stream of `scan`, through `sync` when every chunk
-    /// decodes in memory and through `r#async` when the dictionary is
-    /// file-backed — each chunk's codes then resolve by reading the windows that
-    /// hold them, so the decode must await (see [`scan_chunk_stream_async`]).
+    /// `scan`'s chunks decoded through `decoder`, then the tail's chunk. The
+    /// decode runs inside the scan's split tasks (via the scan's map
+    /// function), so decoding runs concurrently across the runtime's workers
+    /// instead of serially at the stream consumer — except under a
+    /// file-backed dictionary, whose chunk decode awaits a read of the
+    /// dictionary windows holding the chunk's codes, so it runs after the
+    /// scan's stream. A chunk's read error is one error chunk.
     #[cfg(feature = "file-io")]
-    fn scan_chunks<T: Send + 'static>(
+    fn scan_chunks<T: ChunkDecode>(
         &self,
         scan: ScanBuilder<ArrayRef>,
-        sync: impl Fn(ArrayRef) -> Vec<Result<T>> + Send + Sync + 'static,
-        r#async: impl FnMut(ArrayRef) -> BoxFuture<'static, Vec<Result<T>>> + Send + 'static,
+        decoder: impl ChunkDecoder<T>,
         tail: Vec<Result<T>>,
-    ) -> Result<Box<dyn Stream<Item = Vec<Result<T>>> + Unpin + Send + 'static>> {
+    ) -> Result<Chunks<T>> {
+        #[cfg(test)]
+        file_reads::scan_hooks::note();
         let file_backed_dictionary =
             matches!(&self.layout, ResolvedLayout::Dictionary(access) if access.is_file_backed());
-        if file_backed_dictionary {
-            scan_chunk_stream_async(scan, r#async, tail)
+        let chunks: Chunks<T> = if file_backed_dictionary {
+            scan.into_stream()?
+                .then(move |chunk| match chunk {
+                    Ok(chunk) => decoder.decode_async(chunk),
+                    Err(e) => future::ready(vec![Err(VortexRdfError::Vortex(e))]).boxed(),
+                })
+                .boxed()
         } else {
-            scan_chunk_stream(scan, sync, tail)
+            scan.map(move |chunk| Ok(decoder.decode(&chunk)))
+                .into_stream()?
+                .map(|chunk| match chunk {
+                    Ok(rows) => rows,
+                    Err(e) => vec![Err(VortexRdfError::Vortex(e))],
+                })
+                .boxed()
+        };
+        Ok(with_tail(chunks, tail))
+    }
+}
+
+/// `chunks` followed by the tail's one chunk.
+#[cfg(feature = "file-io")]
+fn with_tail<T: Send + 'static>(
+    chunks: impl Stream<Item = Vec<Result<T>>> + Send + 'static,
+    tail: Vec<Result<T>>,
+) -> Chunks<T> {
+    chunks.chain(stream::iter([tail])).boxed()
+}
+
+/// How a file read's scanned chunks decode into `T` rows: synchronously
+/// inside the scan's split tasks, or awaiting a file-backed dictionary.
+#[cfg(feature = "file-io")]
+trait ChunkDecoder<T>: Clone + Send + Sync + 'static {
+    /// `chunk`'s rows, decoded without suspending.
+    fn decode(&self, chunk: &ArrayRef) -> Vec<Result<T>>;
+    /// `chunk`'s rows, resolving a file-backed dictionary's codes with a read
+    /// of its child.
+    fn decode_async(&self, chunk: ArrayRef) -> BoxFuture<'static, Vec<Result<T>>>;
+}
+
+/// Chunks of the quad table's primary columns.
+#[cfg(feature = "file-io")]
+impl<T: ChunkDecode> ChunkDecoder<T> for ResolvedLayout {
+    fn decode(&self, chunk: &ArrayRef) -> Vec<Result<T>> {
+        T::decode(self, chunk)
+    }
+
+    fn decode_async(&self, chunk: ArrayRef) -> BoxFuture<'static, Vec<Result<T>>> {
+        let layout = self.clone();
+        async move { T::decode_async(&layout, &chunk).await }.boxed()
+    }
+}
+
+/// Chunks of a serving index child's projected columns, the view's
+/// tombstones applied through the child's rid column.
+#[cfg(feature = "file-io")]
+#[derive(Clone)]
+struct ServedDecoder {
+    plan: FileServePlan,
+    deleted: Option<Mask>,
+}
+
+#[cfg(feature = "file-io")]
+impl<T: ChunkDecode> ChunkDecoder<T> for ServedDecoder {
+    fn decode(&self, chunk: &ArrayRef) -> Vec<Result<T>> {
+        self.plan.decode_columns::<T>(chunk, self.deleted.as_ref())
+    }
+
+    fn decode_async(&self, chunk: ArrayRef) -> BoxFuture<'static, Vec<Result<T>>> {
+        let served = self.clone();
+        async move {
+            served
+                .plan
+                .decode_columns_async::<T>(&chunk, served.deleted.as_ref())
+                .await
         }
-    }
-}
-
-/// One chunk decoded to raw quads through `layout`, a chunk-level decode
-/// error carried as a one-element error chunk (the same convention as
-/// `VortexRdfStore::decoded_chunks`).
-fn raw_chunk(layout: &ResolvedLayout, rows: &ArrayRef) -> Vec<Result<RawQuad>> {
-    match layout.raw_quads(rows) {
-        Ok(raws) => raws.into_iter().map(Ok).collect(),
-        Err(e) => vec![Err(e)],
-    }
-}
-
-/// [`raw_chunk`] with the file-backed Dictionary case handled: the chunk's
-/// distinct codes resolve to terms with one read of the dictionary windows
-/// holding them (see [`dictionary::decode_chunk_raw_file_backed`]).
-#[cfg(feature = "file-io")]
-async fn raw_chunk_async(layout: &ResolvedLayout, rows: &ArrayRef) -> Vec<Result<RawQuad>> {
-    match layout {
-        ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) => {
-            dictionary::decode_chunk_raw_file_backed(fb, rows).await
-        }
-        _ => raw_chunk(layout, rows),
-    }
-}
-
-/// The boxed, error-mapped, tail-chained stream every file pipeline in
-/// `VortexRdfStore::decoded_chunks` (and its raw twin) returns. `decode` runs
-/// inside the scan's spawned split tasks (via the scan's map function), so
-/// decoding runs concurrently across the runtime's workers instead of
-/// serially at the stream consumer. Each polled item is one decoded chunk; a
-/// per-chunk scan error becomes a one-element error chunk.
-#[cfg(feature = "file-io")]
-fn scan_chunk_stream<T: Send + 'static>(
-    scan: ScanBuilder<ArrayRef>,
-    decode: impl Fn(ArrayRef) -> Vec<Result<T>> + Send + Sync + 'static,
-    tail_quads: Vec<Result<T>>,
-) -> Result<Box<dyn Stream<Item = Vec<Result<T>>> + Unpin + Send + 'static>> {
-    let stream = scan.map(move |chunk| Ok(decode(chunk))).into_stream()?;
-    let chunk_stream = stream
-        .map(|chunk_res| match chunk_res {
-            Err(e) => vec![Err(VortexRdfError::Vortex(e))],
-            Ok(quads) => quads,
-        })
-        .chain(stream::iter([tail_quads]));
-    Ok(Box::new(chunk_stream))
-}
-
-/// The async-decode counterpart of [`scan_chunk_stream`], for reads whose
-/// decode must itself await — a file-backed dictionary resolves each chunk's
-/// codes by reading the windows that hold them, so the decode runs after the
-/// chunk stream, not inside the scan's sync map function.
-#[cfg(feature = "file-io")]
-fn scan_chunk_stream_async<T: Send + 'static>(
-    scan: ScanBuilder<ArrayRef>,
-    mut decode: impl FnMut(ArrayRef) -> BoxFuture<'static, Vec<Result<T>>> + Send + 'static,
-    tail_quads: Vec<Result<T>>,
-) -> Result<Box<dyn Stream<Item = Vec<Result<T>>> + Unpin + Send + 'static>> {
-    let stream = scan.into_stream()?;
-    let chunk_stream = stream
-        .then(move |chunk_res| match chunk_res {
-            Err(e) => future::ready(vec![Err(VortexRdfError::Vortex(e))]).boxed(),
-            Ok(chunk) => decode(chunk),
-        })
         .boxed()
-        .chain(stream::iter([tail_quads]));
-    Ok(Box::new(chunk_stream))
+    }
 }

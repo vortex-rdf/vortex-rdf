@@ -227,13 +227,9 @@ impl VortexRdfStore {
         // off the answering index's run instead of computing the ids and
         // gathering the primary rows at them.
         #[cfg(feature = "file-io")]
-        if let QuadsSource::File {
-            selection: ViewSelection::Pending(_),
-            deleted,
-            serve: Some(plan),
-            ..
-        } = &self.quads
-            && let Some(columns) = plan.code_columns(deleted.as_ref()).await?
+        if let ViewSelection::Pending(_) = self.quads.view_selection()
+            && let Some(plan) = self.quads.file_serve()
+            && let Some(columns) = plan.code_columns(self.quads.deleted()).await?
         {
             return Ok(Some(columns));
         }
@@ -407,26 +403,14 @@ impl VortexRdfStore {
         Ok(selection.restrict_scan(scan, deleted))
     }
 
-    /// The base rows decoded to raw quads, through the async path when the
-    /// dictionary is file-backed (only possible on a file-io build).
-    pub(in crate::store) async fn base_raw_quads(&self, rows: &ArrayRef) -> Result<Vec<RawQuad>> {
-        #[cfg(feature = "file-io")]
-        {
-            self.layout.raw_quads_async(rows).await
-        }
-        #[cfg(not(feature = "file-io"))]
-        {
-            self.layout.raw_quads(rows)
-        }
-    }
-
-    /// The given base rows decoded to raw quads, followed by the tail's live
-    /// rows, and how many of the result came from the base.
+    /// The given base rows decoded to raw quads (lifting a file-backed
+    /// dictionary resident for the decode), followed by the tail's live rows,
+    /// and how many of the result came from the base.
     pub(in crate::store) async fn merged_raw_quads(
         &self,
         base: &ArrayRef,
     ) -> Result<(Vec<RawQuad>, usize)> {
-        let mut raws = self.base_raw_quads(base).await?;
+        let mut raws = self.layout.raw_quads_async(base).await?;
         let base_rows = raws.len();
         if let Some(tail) = &self.tail {
             raws.extend(tail.raw_quads()?);
