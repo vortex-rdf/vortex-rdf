@@ -57,7 +57,6 @@ const DATASET_LINES: usize = 14;
 const DATASET_DISTINCT: usize = 7;
 
 const ALL_INDEXES: [IndexType; 2] = [IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
-type Row = (String, String, String, String);
 
 fn row(q: &RawQuad) -> Row {
     (q.s.clone(), q.p.clone(), q.o.clone(), q.g.clone())
@@ -92,7 +91,7 @@ async fn distinct_terms(text: &'static str) -> BTreeSet<String> {
 
 /// A quad pattern in the spelling the columns store: each of subject,
 /// predicate, object and graph bound (`Some`) or free (`None`).
-type Pattern = (
+type RawPattern = (
     Option<&'static str>,
     Option<&'static str>,
     Option<&'static str>,
@@ -105,7 +104,7 @@ type Pattern = (
 /// predicate and object, by subject, by graph, and unconstrained. With an
 /// index built, the object, predicate and predicate-object ones are the ones
 /// it serves.
-const PATTERNS: &[Pattern] = &[
+const PATTERNS: &[RawPattern] = &[
     (None, None, None, None),
     (None, None, Some("\"x\""), None),
     (None, None, Some("\"y\"@en"), None),
@@ -126,7 +125,7 @@ const PATTERNS: &[Pattern] = &[
 ];
 
 /// Whether `quad` is an answer to a pattern, by plain string comparison.
-fn answers(quad: &Row, (s, p, o, g): &Pattern) -> bool {
+fn answers(quad: &Row, (s, p, o, g): &RawPattern) -> bool {
     let free_or_equal =
         |bound: &Option<&str>, field: &String| bound.is_none_or(|b| b == field.as_str());
     free_or_equal(s, &quad.0)

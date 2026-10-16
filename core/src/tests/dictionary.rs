@@ -372,8 +372,8 @@ async fn test_code_read_snapshot_gate() {
 }
 
 /// A store adopted from its own bytes hands out a code-read snapshot, and
-/// the codes its rows and its matched views gather decode against that
-/// snapshot to exactly the quads it was built from.
+/// the codes its rows and its matched views gather decode, through a reader
+/// on that snapshot's dictionary, to exactly the quads it was built from.
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_code_read_snapshot_survives_from_bytes() {
@@ -387,44 +387,20 @@ async fn test_code_read_snapshot_survives_from_bytes() {
     let adopted = VortexRdfStore::from_bytes(&store.to_bytes().await.unwrap())
         .await
         .unwrap();
-    let dict = adopted
+    let snapshot = adopted
         .code_read_snapshot()
         .expect("an adopted Dictionary store is code-readable");
-
-    let decode_rows = |cols: &[vortex_buffer::Buffer<TermCode>; 4]| -> Vec<String> {
-        let mut rows: Vec<String> = (0..cols[0].len())
-            .map(|i| {
-                let term = |c: &vortex_buffer::Buffer<TermCode>| {
-                    dict.decode(c[i])
-                        .expect("codes address the adopted dictionary")
-                };
-                format!(
-                    "{} {} {} {}",
-                    term(&cols[0]),
-                    term(&cols[1]),
-                    term(&cols[2]),
-                    term(&cols[3])
-                )
-            })
-            .collect();
-        rows.sort();
-        rows
-    };
-    let raw_rows = |keep: &dyn Fn(&Quad) -> bool| -> Vec<String> {
-        let mut rows: Vec<String> = quads
-            .iter()
-            .filter(|q| keep(q))
-            .map(|q| {
-                let r = crate::store::RawQuad::from_quad(q);
-                format!("{} {} {} {}", r.s, r.p, r.o, r.g)
-            })
-            .collect();
-        rows.sort();
-        rows
-    };
+    let dict = adopted.dict_reader().unwrap();
+    assert_eq!(
+        dict.dictionary_id(),
+        snapshot.dictionary_id(),
+        "the snapshot and the reader are handles on one dictionary"
+    );
 
     let gathered = adopted.code_columns_gathered().await.unwrap().unwrap();
-    assert_eq!(decode_rows(&gathered), raw_rows(&|_| true));
+    let mut rows = decoded_rows(&gathered, &dict).await;
+    rows.sort();
+    assert_eq!(rows, expected_rows(&quads, |_| true));
 
     // The gather the bindings pair with the snapshot: a served match's
     // codes, read off the answering index.
@@ -435,8 +411,7 @@ async fn test_code_read_snapshot_survives_from_bytes() {
         .unwrap();
     assert_eq!(served_component(&matched), Some("index:posg"));
     let matched_codes = matched.code_columns_gathered().await.unwrap().unwrap();
-    assert_eq!(
-        decode_rows(&matched_codes),
-        raw_rows(&|q| q.predicate == p0.as_ref())
-    );
+    let mut rows = decoded_rows(&matched_codes, &dict).await;
+    rows.sort();
+    assert_eq!(rows, expected_rows(&quads, |i| quads[i].predicate == p0));
 }

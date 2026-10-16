@@ -21,7 +21,6 @@ async fn assert_chunks_match(view: &VortexRdfStore, tag: &str) -> Precision<u64>
     let expected = base_ordered_codes(view).await;
     for batch in [1, 7, 256, 100_000] {
         let (rows, sizes) = collect_code_chunks(view, &QuadColumn::ALL, batch).await;
-        let rows: Vec<[TermCode; 4]> = rows.iter().map(|r| [r[0], r[1], r[2], r[3]]).collect();
         assert_eq!(rows, expected, "{tag}: code_chunks at batch {batch}");
         assert!(
             sizes.iter().all(|&n| n > 0 && n <= batch),
@@ -29,13 +28,13 @@ async fn assert_chunks_match(view: &VortexRdfStore, tag: &str) -> Precision<u64>
         );
         let chunks = collect_row_chunks(view, batch).await;
         assert_eq!(
-            chunk_codes(&chunks),
+            chunk_code_rows(&chunks),
             expected,
             "{tag}: row_chunks at batch {batch}"
         );
     }
     let (rows, _) = collect_code_chunks(view, &[QuadColumn::O, QuadColumn::S], 1_000).await;
-    let want: Vec<Vec<TermCode>> = expected.iter().map(|r| vec![r[2], r[0]]).collect();
+    let want: Vec<[TermCode; 2]> = expected.iter().map(|r| [r[2], r[0]]).collect();
     assert_eq!(rows, want, "{tag}: a column subset in the requested order");
 
     assert!(
@@ -139,8 +138,7 @@ async fn test_chunks_skip_tombstones() {
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_chunks_file_backed_match_gathered() {
-    let dir = tempfile::tempdir().unwrap();
-    let multi_chunk = multi_chunk_file(&dir).await;
+    let (_multi_dir, multi_chunk) = multi_chunk_file().await;
     let mut counts = vec![assert_chunks_match(&multi_chunk, "mapped multi-chunk").await];
     for (tag, _dir, store) in file_stores().await {
         for (name, view) in views_of(&store).await {
@@ -182,11 +180,10 @@ async fn test_chunks_take_sparse_file_ids() {
     let (through_chunks, _) = take_hooks::takes();
     let (rows, _) = collect_code_chunks(&view, &QuadColumn::ALL, 256).await;
     let (after_codes, _) = take_hooks::takes();
-    let row_rows = chunk_codes(&collect_row_chunks(&view, 256).await);
+    let row_rows = chunk_code_rows(&collect_row_chunks(&view, 256).await);
     let (after_rows, _) = take_hooks::takes();
     assert_eq!(after_codes, through_chunks + 1, "code_chunks takes its ids");
     assert_eq!(after_rows, after_codes + 1, "row_chunks takes its ids");
-    let rows: Vec<[TermCode; 4]> = rows.iter().map(|r| [r[0], r[1], r[2], r[3]]).collect();
     assert_eq!(rows, expected, "code_chunks");
     assert_eq!(row_rows, expected, "row_chunks");
 }
@@ -230,10 +227,10 @@ async fn test_chunks_read_filtered_file_runs_by_id() {
         ),
     ];
     for (tag, view, column, rows) in views {
-        let expected: Vec<Vec<TermCode>> = base_ordered_codes(&view)
+        let expected: Vec<[TermCode; 1]> = base_ordered_codes(&view)
             .await
             .iter()
-            .map(|row| vec![row[column.index()]])
+            .map(|row| [row[column.index()]])
             .collect();
         assert_eq!(expected.len(), rows, "{tag}");
         let _limit = driver_hooks::ForcedLimit::set(0);
@@ -274,7 +271,7 @@ async fn test_chunks_read_a_file_outside_a_tokio_runtime() {
         futures::executor::block_on(async {
             driver_hooks::take_spawned();
             let (codes, _) = collect_code_chunks(&view, &QuadColumn::ALL, 256).await;
-            let rows = chunk_codes(&collect_row_chunks(&view, 256).await);
+            let rows = chunk_code_rows(&collect_row_chunks(&view, 256).await);
             let source = view.data_source().unwrap();
             let scanned = scan_codes(&source, ScanRequest::default()).await;
             (codes, rows, scanned, driver_hooks::take_spawned())
@@ -283,7 +280,6 @@ async fn test_chunks_read_a_file_outside_a_tokio_runtime() {
     .join()
     .expect("a chunk stream must not panic without a tokio runtime");
     assert_eq!(spawned, 0, "no runtime to spawn onto, so nothing spawned");
-    let codes: Vec<[TermCode; 4]> = codes.iter().map(|r| [r[0], r[1], r[2], r[3]]).collect();
     assert_eq!(codes, expected, "code_chunks");
     assert_eq!(rows, expected, "row_chunks");
     assert_eq!(scanned, expected, "the data source's scan");

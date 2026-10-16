@@ -1449,9 +1449,7 @@ mod tests {
         let bytes =
             crate::tests::write_dict_only_store_as(&d, crate::io::container::DICT_VERSION, false)
                 .await;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("unzoned-windows.vortex");
-        std::fs::write(&path, &bytes).unwrap();
+        let (_dir, path) = crate::tests::temp_store_file(&bytes);
         let native = crate::tests::open_mapped(&path).await;
         let descriptor = native
             .components()

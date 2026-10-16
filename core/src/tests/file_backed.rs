@@ -18,39 +18,31 @@ async fn test_file_backed_non_contiguous_predicate_matches() {
     const N: usize = 3 * 8192;
     const CLUSTER: usize = 64;
 
-    // Serialized once per process (see `cached_store_bytes`).
+    // Serialized once per process (see `cached_store_file`).
     static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
-    let bytes = cached_store_bytes(&BYTES, || async {
-        let quads: Vec<Quad> = (0..N)
-            .map(|i| {
-                let p = if !(CLUSTER..N - CLUSTER).contains(&i) {
-                    "http://example.org/pAAA"
-                } else {
-                    "http://example.org/pMMM"
-                };
-                make_quad(
-                    &format!("http://example.org/s{:06}", i),
-                    p,
-                    "o",
-                    GraphName::DefaultGraph,
-                )
-            })
-            .collect();
-        let mut bytes: Vec<u8> = Vec::new();
-        quads_stream_to_vortex_writer(
-            quad_stream(quads),
-            &mut bytes,
-            LayoutStrategy::Default,
-            vec![],
-        )
-        .await
-        .unwrap();
-        bytes
-    })
+    let (_dir, path) = cached_store_file(
+        &BYTES,
+        || {
+            (0..N)
+                .map(|i| {
+                    let p = if !(CLUSTER..N - CLUSTER).contains(&i) {
+                        "http://example.org/pAAA"
+                    } else {
+                        "http://example.org/pMMM"
+                    };
+                    make_quad(
+                        &format!("http://example.org/s{:06}", i),
+                        p,
+                        "o",
+                        GraphName::DefaultGraph,
+                    )
+                })
+                .collect()
+        },
+        LayoutStrategy::Default,
+        vec![],
+    )
     .await;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("noncontig.vortex");
-    std::fs::write(&path, bytes).unwrap();
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let p_rare = NamedNode::new("http://example.org/pAAA").unwrap();
@@ -83,36 +75,17 @@ async fn test_file_backed_non_contiguous_predicate_matches() {
 async fn test_file_backed_chained_subject_then_object_index() {
     const N: usize = 3 * 8192;
 
-    // Serialized once per process (see `cached_store_bytes`); this shape
+    // Serialized once per process (see `cached_store_file`); this shape
     // (reference index, modular predicates) cannot share the non-contiguous
     // fixture's file.
     static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
-    let bytes = cached_store_bytes(&BYTES, || async {
-        let quads: Vec<Quad> = (0..N)
-            .map(|i| {
-                make_quad(
-                    &format!("http://example.org/s{:06}", i),
-                    &format!("http://example.org/p{}", i % 3),
-                    &format!("o{}", i % 5),
-                    GraphName::DefaultGraph,
-                )
-            })
-            .collect();
-        let mut bytes: Vec<u8> = Vec::new();
-        quads_stream_to_vortex_writer(
-            quad_stream(quads),
-            &mut bytes,
-            LayoutStrategy::Default,
-            vec![IndexType::SecondaryByReference],
-        )
-        .await
-        .unwrap();
-        bytes
-    })
+    let (_dir, path) = cached_store_file(
+        &BYTES,
+        || graph_modular_quads(N, 6, 3, 5, &[GraphName::DefaultGraph]),
+        LayoutStrategy::Default,
+        vec![IndexType::SecondaryByReference],
+    )
     .await;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("chained.vortex");
-    std::fs::write(&path, bytes).unwrap();
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
 

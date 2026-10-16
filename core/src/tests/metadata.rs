@@ -478,9 +478,7 @@ async fn test_index_components_classify_children_by_slug() {
         .unwrap();
     let foreign = unknown_component("index:posg", "secondary-by-copy/posg-v2", false);
     let bytes = unstamped_store_bytes(vec![parts.built.array.clone()], vec![foreign, ospg]).await;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("store.vortex");
-    std::fs::write(&path, &bytes).unwrap();
+    let (_dir, path) = temp_store_file(&bytes);
     let want = roster(&[IndexType::SecondaryByCopy], quads.len())
         .into_iter()
         .filter(|child| child.name == "index:ospg")

@@ -810,26 +810,9 @@ async fn test_built_store_compresses_resident_form() {
     let cols = matched
         .code_columns()
         .expect("compressed base still serves codes through its shared wrappers");
-    let dict = matched.code_read_snapshot().unwrap();
-    let mut got: Vec<String> = (0..cols[0].len())
-        .map(|i| {
-            format!(
-                "{} {} {}",
-                dict.decode(cols[0][i]).unwrap(),
-                dict.decode(cols[1][i]).unwrap(),
-                dict.decode(cols[2][i]).unwrap()
-            )
-        })
-        .collect();
+    let mut got = decoded_rows(&cols, &matched.dict_reader().unwrap()).await;
     got.sort();
-    let mut want: Vec<String> = quads
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| i % 4 == 1)
-        .map(|(_, q)| format!("{} {} {}", q.subject, q.predicate, q.object))
-        .collect();
-    want.sort();
-    assert_eq!(got, want);
+    assert_eq!(got, expected_rows(&quads, |i| i % 4 == 1));
 }
 
 /// The bindings' code-column read on a served in-memory match: `code_columns`
@@ -862,26 +845,9 @@ async fn test_code_columns_serves_from_the_answering_index() {
         Some(false),
         "a served code read must not materialize the resolution's row ids"
     );
-    let dict = matched.code_read_snapshot().unwrap();
-    let mut got: Vec<String> = (0..cols[0].len())
-        .map(|i| {
-            format!(
-                "{} {} {}",
-                dict.decode(cols[0][i]).unwrap(),
-                dict.decode(cols[1][i]).unwrap(),
-                dict.decode(cols[2][i]).unwrap()
-            )
-        })
-        .collect();
+    let mut got = decoded_rows(&cols, &matched.dict_reader().unwrap()).await;
     got.sort();
-    let mut want: Vec<String> = quads
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| i % 3 == 1)
-        .map(|(_, q)| format!("{} {} {}", q.subject, q.predicate, q.object))
-        .collect();
-    want.sort();
-    assert_eq!(got, want);
+    assert_eq!(got, expected_rows(&quads, |i| i % 3 == 1));
 }
 
 /// A window of an in-memory reference index's located run decodes exactly its
