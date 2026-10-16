@@ -2,7 +2,8 @@
 //! one column falls in a set or range ([`Keep`]) and windowing the rows —
 //! the restrictions a query engine pushes below a pattern (`VALUES`,
 //! `FILTER` on a term predicate, `LIMIT`/`OFFSET`); the capped counts behind
-//! `ASK` live with the other counts, in `read/count.rs`.
+//! `ASK` live with the other counts, in `read/count.rs`. The empty view, which
+//! a keep or a match that provably selects nothing returns, lives here too.
 //!
 //! Every narrowing is an ordinary derived view: it composes with
 //! [`match_pattern`](VortexRdfStore::match_pattern) in either order and is
@@ -29,7 +30,7 @@ use crate::store::probes::StructProbes;
 use crate::store::resident::cached_code_primitive;
 #[cfg(feature = "file-io")]
 use crate::store::scan::{file_filter, file_reads};
-use crate::store::schema::{self, QuadColumn, RowId, TermCode};
+use crate::store::schema::{self, QuadColumn, TermCode};
 use crate::store::view::selection::{RowSelection, ViewSelection};
 
 use crate::store::VortexRdfStore;
@@ -223,98 +224,17 @@ impl VortexRdfStore {
     /// the index's order does not share).
     pub async fn window(&self, offset: usize, limit: usize) -> Result<Self> {
         let t = debug::timer();
-        let (windowed, base_live, base_taken) = match &self.quads {
-            QuadsSource::InMemory {
-                base,
-                selection,
-                deleted,
-                ..
-            } => {
-                // A located run held pending for this window: only the
-                // window's own rows are decoded, and the run's width is its
-                // live size.
-                let located = match (selection, deleted) {
-                    (ViewSelection::Pending(lazy), None) => match lazy.len_if_known() {
-                        Some(live) => lazy.window(offset, limit)?.map(|ids| (ids, live)),
-                        None => None,
-                    },
-                    _ => None,
-                };
-                let (windowed, live) = if let Some((ids, live)) = located {
-                    (ids_selection(ids), live)
-                } else {
-                    let selection = selection.materialized()?;
-                    let live = selection.live_len(deleted.as_ref(), base.len());
-                    (
-                        selection.window(offset, limit, deleted.as_ref(), base.len()),
-                        live,
-                    )
-                };
-                let taken = windowed.len(base.len());
-                (windowed, live, taken)
-            }
-            #[cfg(feature = "file-io")]
-            QuadsSource::File {
-                file,
-                filter,
-                selection,
-                deleted,
-                ..
-            } => {
-                let row_count = file.row_count() as usize;
-                // A located run held pending for this window: only the window's
-                // own rows are read, and the run's width is its live size.
-                let located = match (selection, filter, deleted) {
-                    (ViewSelection::Pending(lazy), None, None) => match lazy.len_if_known() {
-                        Some(live) => lazy
-                            .window_async(offset, limit)
-                            .await?
-                            .map(|ids| (ids, live)),
-                        None => None,
-                    },
-                    _ => None,
-                };
-                let (windowed, live) = if let Some((ids, live)) = located {
-                    (ids_selection(ids), live)
-                } else {
-                    let selection = selection.materialized_async().await?;
-                    match filter {
-                        None => {
-                            let live = selection.live_len(deleted.as_ref(), row_count);
-                            (
-                                selection.window(offset, limit, deleted.as_ref(), row_count),
-                                live,
-                            )
-                        }
-                        Some(filter) => {
-                            // Only the matches the window can reach are
-                            // evaluated; fewer than asked means the base is
-                            // exhausted and their count is its live size.
-                            let want = offset.saturating_add(limit);
-                            let found = file_filter::first_matching_rows(
-                                file,
-                                filter,
-                                &selection,
-                                deleted.as_ref(),
-                                want,
-                            )
-                            .await?;
-                            let live = if found.len() < want {
-                                found.len()
-                            } else {
-                                want
-                            };
-                            (
-                                RowSelection::Ids(found).window(offset, limit, None, row_count),
-                                live,
-                            )
-                        }
-                    }
-                };
-                let taken = windowed.len(row_count);
-                (windowed, live, taken)
+        // A located run held pending for this window reads only the window's
+        // own rows, and its width is the base's live size; any other view
+        // windows its materialized selection.
+        let (windowed, base_live) = match self.quads.located_window(offset, limit).await? {
+            Some(located) => located,
+            None => {
+                let selection = self.quads.materialized_selection().await?;
+                self.base_window(&selection, offset, limit).await?
             }
         };
+        let base_taken = windowed.len(self.quads.base_len());
         // The window is a position range over base order with the filter it
         // resolved applied, so the view carries exact ids, no filter and no
         // plan.
@@ -335,6 +255,61 @@ impl VortexRdfStore {
             debug::elapsed(t)
         );
         Ok(self.derived(quads, tail))
+    }
+
+    /// The base's window over its exact `selection`, and the base's live row
+    /// count as far as the window needs it: a position range over the
+    /// selection, stepping over tombstones, with the selection's live row
+    /// count — or, under a pending file filter, the window of the first
+    /// matches, evaluated only as far as the window reaches, with their count
+    /// (at most `offset + limit`).
+    async fn base_window(
+        &self,
+        selection: &RowSelection,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(RowSelection, usize)> {
+        let base_len = self.quads.base_len();
+        let deleted = self.quads.deleted();
+        #[cfg(feature = "file-io")]
+        if let (Some(file), Some(filter)) = (self.quads.file(), self.quads.filter()) {
+            // Only the matches the window can reach are evaluated; fewer than
+            // asked means the base is exhausted and their count is its live
+            // size.
+            let want = offset.saturating_add(limit);
+            let found =
+                file_filter::first_matching_rows(file, filter, selection, deleted, want).await?;
+            let live = if found.len() < want {
+                found.len()
+            } else {
+                want
+            };
+            return Ok((
+                RowSelection::Ids(found).window(offset, limit, None, base_len),
+                live,
+            ));
+        }
+        let live = selection.live_len(deleted, base_len);
+        Ok((selection.window(offset, limit, deleted, base_len), live))
+    }
+
+    /// An empty view of this store: same base (and tail), selecting no row of
+    /// either.
+    ///
+    /// Scans over it plan no work and `size()` answers 0 without touching the
+    /// data. Indexes and components are dropped: chained matches on an empty
+    /// view would otherwise run pointless lookups just to intersect with
+    /// nothing. No serve plan carries across — a plan is only valid while its
+    /// row run is exactly the selection.
+    pub(crate) fn empty_view(&self) -> Self {
+        let tail = self
+            .tail
+            .as_ref()
+            .map(|tail| tail.with_selection(RowSelection::empty()));
+        Self {
+            indexes: vec![],
+            ..self.derived(self.quads.emptied(), tail)
+        }
     }
 
     /// The in-memory backend of [`keep`](Self::keep).
@@ -490,11 +465,7 @@ impl VortexRdfStore {
                 return Ok(selection.clone().refine(&mask));
             }
         };
-        Ok(if ids.is_empty() {
-            RowSelection::empty()
-        } else {
-            RowSelection::Ids(Buffer::from(ids))
-        })
+        Ok(RowSelection::from_ids(Buffer::from(ids)))
     }
 
     /// The file backend of [`keep`](Self::keep). On a file sorted by subject a
@@ -610,15 +581,6 @@ impl VortexRdfStore {
 /// plus a fixed scan, and the two meet near this many rows per code.
 #[cfg(feature = "file-io")]
 const LOCATED_SET_ROWS_PER_CODE: usize = 16;
-
-/// The selection of a window's ids, which are the window itself.
-fn ids_selection(ids: Buffer<RowId>) -> RowSelection {
-    if ids.is_empty() {
-        RowSelection::empty()
-    } else {
-        RowSelection::Ids(ids)
-    }
-}
 
 /// Whether a set of `codes` codes on the subject column is looked up code by
 /// code over a selection of `rows` rows rather than streamed: while it has no

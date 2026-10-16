@@ -9,10 +9,9 @@ use crate::store::array::{
 };
 #[cfg(feature = "file-io")]
 use crate::store::indexes::resolve_indexes_file;
-use crate::store::indexes::{
-    InMemoryServePlan, IndexResolution, LazyRowIds, ResolvedRowIds, resolve_indexes_in_memory,
-};
+use crate::store::indexes::{IndexResolution, ResolvedRowIds, resolve_indexes_in_memory};
 use crate::store::layouts::{Constraints, PatternCodes, QuadPattern, TermRef};
+use crate::store::probes::StructProbes;
 use crate::store::scan::typed_eq::{typed_positions, typed_residual_ids};
 #[cfg(feature = "file-io")]
 use crate::store::scan::{file_filter, file_reads};
@@ -33,7 +32,11 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_mask::Mask;
 
 #[cfg(feature = "file-io")]
-use vortex_array::expr::and;
+use crate::store::persist::native_file::NativeStoreFile;
+#[cfg(feature = "file-io")]
+use std::ops::Range;
+#[cfg(feature = "file-io")]
+use vortex_array::expr::{Expression, and};
 
 use crate::store::VortexRdfStore;
 
@@ -85,15 +88,14 @@ impl VortexRdfStore {
         graph: Option<&GraphName>,
         need: IdsNeed,
     ) -> Result<Self> {
-        let mut matched = self
-            .match_base(subject, predicate, object, graph, need)
-            .await?;
+        let pattern = QuadPattern::new(subject, predicate, object, graph);
+        let mut matched = self.match_base(pattern, need).await?;
         // The tail is matched independently of whatever the base concluded —
         // deliberately after any base short-circuit: a term the base's
         // dictionary has never seen proves nothing about rows appended since
         // (the tail stores strings precisely so such a term can still match).
         if let Some(tail) = &self.tail {
-            matched.tail = Some(Self::match_tail(tail, subject, predicate, object, graph).await?);
+            matched.tail = Some(Self::match_tail(tail, pattern).await?);
         }
         debug_assert!(
             need == IdsNeed::CountOrWindow || !matched.quads.is_pending_without_plan(),
@@ -107,13 +109,7 @@ impl VortexRdfStore {
     /// is small, unsorted, and unindexed, so a scan over its (already few)
     /// selected rows is the right plan; the surviving positions refine the
     /// tail-local selection exactly as base matches refine the base's.
-    async fn match_tail(
-        tail: &Tail,
-        subject: Option<&NamedOrBlankNode>,
-        predicate: Option<&NamedNode>,
-        object: Option<&Term>,
-        graph: Option<&GraphName>,
-    ) -> Result<Tail> {
+    async fn match_tail(tail: &Tail, pattern: QuadPattern<'_>) -> Result<Tail> {
         let t = debug::timer();
         let carry = |selection: RowSelection| tail.with_selection(selection);
         if tail.selection.is_empty(tail.rows.len()) {
@@ -122,7 +118,6 @@ impl VortexRdfStore {
         // The tail's layouts store plain strings (see `Tail::layout_for`), so
         // this prelude resolves nothing and never suspends — but the witness
         // is still minted by it, like every probe surface.
-        let pattern = QuadPattern::new(subject, predicate, object, graph);
         let mut codes = tail.layout.prepare_pattern(pattern).await?;
         let eqs = match codes.constraints(pattern)? {
             // The tail's string layouts never compile to AlwaysFalse (see
@@ -157,18 +152,11 @@ impl VortexRdfStore {
 
     /// Match the pattern against the base alone, composing its restrictions
     /// into a derived view (the tail carries over untouched; `match_pattern`
-    /// narrows it separately).
-    async fn match_base(
-        &self,
-        subject: Option<&NamedOrBlankNode>,
-        predicate: Option<&NamedNode>,
-        object: Option<&Term>,
-        graph: Option<&GraphName>,
-        need: IdsNeed,
-    ) -> Result<Self> {
+    /// narrows it separately). `need` is the caller's use of the view, which
+    /// decides whether a resolution's ids may stay deferred.
+    async fn match_base(&self, pattern: QuadPattern<'_>, need: IdsNeed) -> Result<Self> {
         let t = debug::timer();
 
-        let pattern = QuadPattern::new(subject, predicate, object, graph);
         let Some(mut codes) = self.prepared_codes(pattern).await? else {
             log::debug!(
                 "[match_pattern] Layout proved the pattern unmatchable at {:?}",
@@ -182,14 +170,9 @@ impl VortexRdfStore {
         );
 
         match &self.quads {
-            QuadsSource::InMemory { .. } => {
-                self.match_base_in_memory(subject, predicate, object, graph, &mut codes, need, t)
-            }
+            QuadsSource::InMemory { .. } => self.match_base_in_memory(pattern, &mut codes, need, t),
             #[cfg(feature = "file-io")]
-            QuadsSource::File { .. } => {
-                self.match_base_file(subject, predicate, object, graph, &mut codes, need, t)
-                    .await
-            }
+            QuadsSource::File { .. } => self.match_base_file(pattern, &mut codes, need, t).await,
         }
     }
 
@@ -208,26 +191,25 @@ impl VortexRdfStore {
         Ok((!codes.provably_empty(pattern)).then_some(codes))
     }
 
-    /// The in-memory backend of [`match_base`](Self::match_base): every
-    /// search below runs against the base array and answers in base row ids.
-    /// Those ids are computed here, except for the cases that do not need
-    /// them — a lazy index resolution that is the view's sole restriction
-    /// leaves them pending (`LazyRowIds`) when it serves the view's reads, or
-    /// when the caller only counts or windows the view (`need`), for the first
-    /// consumer that reads through the selection and not the plan.
+    /// The in-memory backend of [`match_base`](Self::match_base): the prefix
+    /// probe ([`prefix_probe`](Self::prefix_probe)), secondary-index routing
+    /// and the residual column filter
+    /// ([`residual_narrow`](Self::residual_narrow)), each narrowing the
+    /// selection in base row ids. Those ids are computed here, except for the
+    /// cases that do not need them — a lazy index resolution that is the
+    /// view's sole restriction leaves them pending (`LazyRowIds`) when it
+    /// serves the view's reads, or when the caller only counts or windows the
+    /// view (`need`), for the first consumer that reads through the selection
+    /// and not the plan.
     ///
     /// Tombstones are deliberately not consulted here: they are applied by
     /// every read path instead, so matching may name deleted rows without the
     /// result ever showing them. Keeping them out also keeps the mask scan's
     /// positions aligned with `selection.apply`, which is what `refine` maps
     /// back through.
-    #[allow(clippy::too_many_arguments)]
     fn match_base_in_memory(
         &self,
-        subject: Option<&NamedOrBlankNode>,
-        predicate: Option<&NamedNode>,
-        object: Option<&Term>,
-        graph: Option<&GraphName>,
+        pattern: QuadPattern<'_>,
         codes: &mut PatternCodes,
         need: IdsNeed,
         t: Option<Instant>,
@@ -254,38 +236,158 @@ impl VortexRdfStore {
         // downcast; the execute arm of `into_struct_array` is a fallback
         // for a non-struct base.
         let struct_arr = into_struct_array(base.clone())?;
+        let base_len = base.len();
 
         // A chained match folds this pattern's restrictions into the
         // previous ones, so a still-pending selection materializes here —
         // chaining is one of the consumers the deferral exists for.
-        let mut selection = selection.materialized()?;
+        let selection = selection.materialized()?;
         // A serving index's plan reads exactly a contiguous row run, so
         // it is only valid when that run *is* the whole result: the view
         // must start unrestricted and nothing but the serving index's
         // own resolution may narrow it (no subject range, no mask scan).
         let unrefined = matches!(selection, RowSelection::All);
-        let mut narrowed_elsewhere = false;
 
         // The components still to be resolved. Each fast path below
         // clears the one it answers, since its ids already satisfy it.
-        let mut pat = QuadPattern::new(subject, predicate, object, graph);
-        let mut serve: Option<InMemoryServePlan> = None;
-        // A lazy resolution whose exact ids stay deferred — a serve-attached
-        // one, or any when the caller only counts or windows the view — set
-        // only when that resolution is this view's sole restriction, and
-        // becoming the view's `Pending` selection below.
-        let mut pending: Option<LazyRowIds> = None;
+        let mut pat = pattern;
+        let (selection, prefix_narrowed) =
+            Self::prefix_probe(&struct_arr, base, probes, codes, &mut pat, selection, t)?;
 
-        // ── Prefix probe over the (s, p, o, g) order ──────────────
-        // The base's rows are in (s, p, o, g) order whenever its `s`
-        // column carries the sorted stamp (see `stamp_is_sorted`), so a
-        // pattern bound on a prefix of that order — the subject, then the
-        // predicate within its run, and so on — is one contiguous row
-        // run, found by nested binary search instead of a scan. The
-        // subject searches the whole column, every further role only the
-        // run the previous one left; each answered role is cleared from
-        // the pattern, and the first the probes cannot answer ends the
-        // prefix, leaving whatever is still bound to the stages below.
+        // ── Secondary-index routing ───────────────────────────────
+        // Ask the configured indexes to resolve the rest of the pattern
+        // to exact base row ids — each index picks its probe, which the
+        // in-memory resolver runs over the component's columns (e.g. a
+        // binary search of the sorted `val`/`rid` pair for a bound object).
+        // The store just folds the ids it hands back into the selection.
+        // …but only while there is enough left to narrow. Resolving a
+        // component costs O(rows matching *that component*), regardless
+        // of how few rows the view still holds, so once a fast path has
+        // cut the view to a handful of rows, filtering those rows
+        // column-wise is cheaper. Nothing is lost by skipping: a view
+        // that something else narrowed already discards any serving plan.
+        // A pattern the prefix probe answered in full leaves the indexes
+        // nothing to resolve at all.
+        let worth_indexing = !prefix_narrowed || selection.len(base_len) >= INDEX_ROUTING_MIN_ROWS;
+        let mut resolved = None;
+        if !selection.is_empty(base_len) && pat.any_bound() && worth_indexing {
+            match resolve_indexes_in_memory(&self.indexes, components, &self.layout, pat, codes)? {
+                // The probed term is absent from the data — nothing matches.
+                IndexResolution::Empty => {
+                    log::debug!(
+                        "[match_pattern] In-memory index proved empty at {:?}",
+                        debug::elapsed(t)
+                    );
+                    return Ok(self.empty_view());
+                }
+                // Fold the resolution into the selection below, and hold onto
+                // any serving plan the index handed back to decide whether it
+                // still describes exactly the result.
+                IndexResolution::Resolved {
+                    row_ids,
+                    resolves,
+                    serve,
+                } => {
+                    pat = resolves.clear(pat);
+                    resolved = Some((row_ids, serve));
+                }
+                // No index accelerates this pattern: whatever is still
+                // bound falls to the mask scan below.
+                IndexResolution::Declined => {
+                    log::debug!(
+                        "[match_pattern] In-memory index declined at {:?}",
+                        debug::elapsed(t)
+                    );
+                }
+            }
+        }
+
+        // An in-memory resolution is always lazy. A serve-attached one keeps
+        // its ids deferred when it is this view's sole restriction (the view
+        // started unrestricted, no prefix narrowed it and nothing residual is
+        // left to check) — reads go through the plan, so decoding and sorting
+        // the run's rids can wait for a consumer that needs the selection. So
+        // does a sole run the caller only counts or windows: its width is the
+        // count. Anything narrower, or read row by row without a plan, needs
+        // them now; a deferred resolution *is* then the whole selection,
+        // pending until a consumer needs the ids.
+        let sole = unrefined && !prefix_narrowed && !pat.any_bound();
+        let (selection, serve) = match resolved {
+            Some((row_ids, serve)) => {
+                let defer = sole && (serve.is_some() || need == IdsNeed::CountOrWindow);
+                let selection = fold_row_ids(selection, row_ids, defer)?;
+                log::debug!(
+                    "[match_pattern] In-memory index resolved at {:?}",
+                    debug::elapsed(t)
+                );
+                (selection, serve)
+            }
+            None => (ViewSelection::Exact(selection), None),
+        };
+
+        // ── Fallback: residual column filtering ───────────────────
+        // Whatever no fast path answered is compared column-wise. Only
+        // the rows this view already selects are compared, so a chained
+        // match still pays for its own row count, not the base's.
+        // Skipped entirely when the fast paths resolved every component:
+        // `mask_for` would return `None` without reading a row, but its
+        // arguments — `selection.apply` (a slice pushed through the
+        // array optimizer) and a struct canonicalization — are exactly
+        // the per-call cost this gate saves. (A pending selection never
+        // reaches it: the deferral left nothing bound.)
+        let (selection, residual_narrowed) = match selection {
+            ViewSelection::Exact(exact) if !exact.is_empty(base_len) && pat.any_bound() => {
+                let Some(narrowed) =
+                    Self::residual_narrow(&struct_arr, base, probes, exact, pat, codes, t)?
+                else {
+                    return Ok(self.empty_view());
+                };
+                (ViewSelection::Exact(narrowed), true)
+            }
+            selection => (selection, false),
+        };
+
+        // Keep the serving plan only if the serving index's resolution
+        // is the sole thing that narrowed this view — otherwise its
+        // contiguous run over-covers the actual selection.
+        let serve = if unrefined && !prefix_narrowed && !residual_narrowed {
+            serve
+        } else {
+            None
+        };
+
+        log::debug!(
+            "[match_pattern] In-memory view built (serve: {}, pending ids: {}) at {:?}",
+            serve.is_some(),
+            matches!(selection, ViewSelection::Pending(_)),
+            debug::elapsed(t)
+        );
+        Ok(self.derived(
+            self.quads.in_memory_with(selection, serve),
+            self.tail.clone(),
+        ))
+    }
+
+    /// The prefix probe over the base's `(s, p, o, g)` order: `selection`
+    /// narrowed to the one contiguous row run of the pattern's bound prefix
+    /// of that order, by nested binary search instead of a scan, and whether
+    /// a bound subject narrowed it.
+    ///
+    /// The base's rows are in that order whenever its `s` column carries the
+    /// sorted stamp (see `stamp_is_sorted`). The subject searches the whole
+    /// column, every further role only the run the previous one left; each
+    /// answered role is cleared from `pat`, and the first the probes cannot
+    /// answer ends the prefix, leaving whatever is still bound to the stages
+    /// behind it.
+    fn prefix_probe(
+        struct_arr: &StructArray,
+        base: &ArrayRef,
+        probes: &StructProbes,
+        codes: &mut PatternCodes,
+        pat: &mut QuadPattern<'_>,
+        mut selection: RowSelection,
+        t: Option<Instant>,
+    ) -> Result<(RowSelection, bool)> {
         if let Some(subj) = pat.subject
             && let Ok(s_col) = struct_arr.unmasked_field_by_name(schema::COL_S)
             && column_is_sorted(s_col)
@@ -304,7 +406,6 @@ impl VortexRdfStore {
             };
             selection = selection.intersect_range(lo as u64..hi as u64);
             pat.subject = None;
-            narrowed_elsewhere = true;
             log::debug!(
                 "[match_pattern] In-memory subject bounded by binary search at {:?}",
                 debug::elapsed(t)
@@ -359,177 +460,75 @@ impl VortexRdfStore {
                     );
                 }
             }
+            return Ok((selection, true));
         }
+        Ok((selection, false))
+    }
 
-        // ── Secondary-index routing ───────────────────────────────
-        // Ask the configured indexes to resolve the rest of the pattern
-        // to exact base row ids — each index picks its probe, which the
-        // in-memory resolver runs over the component's columns (e.g. a
-        // binary search of the sorted `val`/`rid` pair for a bound object).
-        // The store just folds the ids it hands back into the selection.
-        // …but only while there is enough left to narrow. Resolving a
-        // component costs O(rows matching *that component*), regardless
-        // of how few rows the view still holds, so once a fast path has
-        // cut the view to a handful of rows, filtering those rows
-        // column-wise is cheaper. Nothing is lost by skipping: a view
-        // that something else narrowed already discards any serving plan.
-        // A pattern the prefix probe answered in full leaves the indexes
-        // nothing to resolve at all.
-        let worth_indexing =
-            !narrowed_elsewhere || selection.len(base.len()) >= INDEX_ROUTING_MIN_ROWS;
-        if !selection.is_empty(base.len()) && pat.any_bound() && worth_indexing {
-            match resolve_indexes_in_memory(&self.indexes, components, &self.layout, pat, codes)? {
-                // The probed term is absent from the data — nothing matches.
-                IndexResolution::Empty => {
-                    log::debug!(
-                        "[match_pattern] In-memory index proved empty at {:?}",
-                        debug::elapsed(t)
-                    );
-                    return Ok(self.empty_view());
-                }
-                // Fold the resolution into the selection, and hold onto any
-                // serving plan the index handed back to decide below
-                // whether it still describes exactly the result.
-                IndexResolution::Resolved {
-                    row_ids,
-                    resolves,
-                    serve: candidate,
-                } => {
-                    pat = resolves.clear(pat);
-                    serve = candidate;
-                    match row_ids {
-                        // Only the file resolver answers with ids it
-                        // already computed: the in-memory resolver hands
-                        // every run back as a recipe.
-                        #[cfg(feature = "file-io")]
-                        ResolvedRowIds::Eager(_) => {
-                            unreachable!("an in-memory resolution is always lazy")
-                        }
-                        // A serve-attached resolution keeps its ids deferred
-                        // when it is this view's sole restriction and nothing
-                        // residual is left to check — reads go through the
-                        // plan, so decoding and sorting the run's rids can
-                        // wait for a consumer that needs the selection. So
-                        // does a run the caller only counts or windows: its
-                        // width is the count. Anything narrower, or read row
-                        // by row without a plan, needs them now.
-                        ResolvedRowIds::Lazy(lazy) => {
-                            if unrefined
-                                && !narrowed_elsewhere
-                                && !pat.any_bound()
-                                && (serve.is_some() || need == IdsNeed::CountOrWindow)
-                            {
-                                pending = Some(lazy);
-                            } else {
-                                selection = selection.intersect_ids(lazy.materialized()?);
-                            }
-                        }
-                    }
-                    log::debug!(
-                        "[match_pattern] In-memory index resolved at {:?}",
-                        debug::elapsed(t)
-                    );
-                }
-                // No index accelerates this pattern: whatever is still
-                // bound falls to the mask scan below.
-                IndexResolution::Declined => {
-                    log::debug!(
-                        "[match_pattern] In-memory index declined at {:?}",
-                        debug::elapsed(t)
-                    );
-                }
-            }
-        }
-
-        // ── Fallback: residual column filtering ───────────────────
-        // Whatever no fast path answered is compared column-wise. Only
-        // the rows this view already selects are compared, so a chained
-        // match still pays for its own row count, not the base's.
-        // Skipped entirely when the fast paths resolved every component:
-        // `mask_for` would return `None` without reading a row, but its
-        // arguments — `selection.apply` (a slice pushed through the
-        // array optimizer) and a struct canonicalization — are exactly
-        // the per-call cost this gate saves.
-        if !selection.is_empty(base.len()) && pat.any_bound() {
-            // Typed fast path: residual equalities over canonical u32
-            // code columns (Dictionary layout) become direct slice
-            // loops yielding exact base ids — no slice/compare/mask
-            // pipeline. Rows outside the selection are never tested,
-            // so the ids are already the intersection.
-            // The residual binds a subset of the roles the caller's gate
-            // already resolved to codes, so the unmatchable arm cannot fire
-            // here — it stays for totality.
-            let eqs = match codes.constraints(pat)? {
-                Constraints::AlwaysFalse => return Ok(self.empty_view()),
-                Constraints::Eq(eqs) => eqs,
-            };
+    /// The residual column filter: `selection` narrowed to its rows matching
+    /// every role the fast paths left bound in `pat`, compared column-wise
+    /// over those rows only. `None` when the residual compiles to
+    /// `AlwaysFalse`.
+    fn residual_narrow(
+        struct_arr: &StructArray,
+        base: &ArrayRef,
+        probes: &StructProbes,
+        selection: RowSelection,
+        pat: QuadPattern<'_>,
+        codes: &mut PatternCodes,
+        t: Option<Instant>,
+    ) -> Result<Option<RowSelection>> {
+        // The residual binds a subset of the roles the caller's gate
+        // already resolved to codes, so the unmatchable arm cannot fire
+        // here — it stays for totality.
+        let eqs = match codes.constraints(pat)? {
+            Constraints::AlwaysFalse => return Ok(None),
+            Constraints::Eq(eqs) => eqs,
+        };
+        // Typed fast path: residual equalities over canonical code columns
+        // (Dictionary layout) become direct slice loops yielding exact
+        // base ids — no slice/compare/mask pipeline — and a probe-bound
+        // column reads through the store's own probe. Rows outside the
+        // selection are never tested, so the ids are already the
+        // intersection.
+        Ok(Some(
             match typed_residual_ids(
-                &struct_arr,
+                struct_arr,
                 &selection,
                 base.len(),
                 &eqs,
                 Some((base, probes)),
             ) {
                 Some(ids) => {
-                    selection = RowSelection::Ids(ids);
-                    narrowed_elsewhere = true;
                     log::debug!(
                         "[match_pattern] In-memory narrowed by typed residual scan at {:?}",
                         debug::elapsed(t)
                     );
+                    RowSelection::Ids(ids)
                 }
                 None => {
                     let mask = Self::mask_for(&selection.apply(base)?, &eqs)?;
-                    selection = selection.refine(&bool_array_to_mask(mask)?);
-                    narrowed_elsewhere = true;
+                    let narrowed = selection.refine(&bool_array_to_mask(mask)?);
                     log::debug!(
                         "[match_pattern] In-memory narrowed by mask scan at {:?}",
                         debug::elapsed(t)
                     );
+                    narrowed
                 }
-            }
-        }
-
-        // Keep the serving plan only if the serving index's resolution
-        // is the sole thing that narrowed this view — otherwise its
-        // contiguous run over-covers the actual selection.
-        let serve = if unrefined && !narrowed_elsewhere {
-            serve
-        } else {
-            None
-        };
-        // A deferred resolution *is* the whole selection (the deferral
-        // condition made it the sole restriction; a served one also kept
-        // `serve`, a counted or windowed one has no plan), so it stays
-        // pending until a consumer needs the ids.
-        let selection = match pending {
-            Some(lazy) => ViewSelection::Pending(lazy),
-            None => ViewSelection::Exact(selection),
-        };
-
-        log::debug!(
-            "[match_pattern] In-memory view built (serve: {}, pending ids: {}) at {:?}",
-            serve.is_some(),
-            matches!(selection, ViewSelection::Pending(_)),
-            debug::elapsed(t)
-        );
-        Ok(self.derived(
-            self.quads.in_memory_with(selection, serve),
-            self.tail.clone(),
+            },
         ))
     }
 
     /// The file backend of [`match_base`](Self::match_base): restrictions
-    /// compose into the derived view — index-resolved row ids, a pushed-down
-    /// filter, a pruned row range — and no data is read until the next scan.
+    /// compose into the derived view — the subject's located run
+    /// ([`locate_subject`](Self::locate_subject)), index-resolved row ids, a
+    /// pushed-down filter, a pruned row range — and no data is read until the
+    /// next scan, except a lazy resolution's ids when they cannot stay
+    /// deferred and the point reads that check a pending filter at sparse ids.
     #[cfg(feature = "file-io")]
-    #[allow(clippy::too_many_arguments)]
     async fn match_base_file(
         &self,
-        subject: Option<&NamedOrBlankNode>,
-        predicate: Option<&NamedNode>,
-        object: Option<&Term>,
-        graph: Option<&GraphName>,
+        pattern: QuadPattern<'_>,
         codes: &mut PatternCodes,
         need: IdsNeed,
         t: Option<Instant>,
@@ -545,32 +544,14 @@ impl VortexRdfStore {
         };
         // A bound subject on a sorted file resolves to its exact row range
         // first, by binary-searching the subject column's encoded chunks —
-        // the file mirror of the in-memory subject fast path. Both index
-        // resolvers decline bound-subject patterns, so this takes over an
+        // the file mirror of the in-memory subject fast path. Each index's
+        // `choose` declines bound-subject patterns, so this takes over an
         // uncontested route; the subject then leaves the pattern, the roles
         // behind it narrow the run the same way (the in-memory prefix probe),
         // and whatever is still bound rides the narrowed range. Any decline
         // leaves the pattern intact for the scan path.
-        let mut pat = QuadPattern::new(subject, predicate, object, graph);
-        let mut subject_range: Option<std::ops::Range<u64>> = None;
-        if let Some(subj) = pat.subject
-            && let Some(mut range) = file_reads::locate_subject_run(file, codes, subj).await?
-        {
-            pat.subject = None;
-            log::debug!(
-                "[match_pattern] File subject bounded by chunk probe at {:?}",
-                debug::elapsed(t)
-            );
-            let answered =
-                file_reads::narrow_subject_run(file, codes, &mut pat, &mut range).await?;
-            if answered > 0 {
-                log::debug!(
-                    "[match_pattern] File prefix of {answered} more roles bounded by chunk probes at {:?}",
-                    debug::elapsed(t)
-                );
-            }
-            subject_range = Some(range);
-        }
+        let mut pat = pattern;
+        let subject_range = Self::locate_subject(file, codes, &mut pat, t).await?;
         // With the subject already resolved to a tiny range, an index
         // resolution for the residual terms is a pessimization (its pushed
         // scan costs O(rows matching that component)) — the same routing
@@ -619,72 +600,54 @@ impl VortexRdfStore {
                 serve,
             } => {
                 let pat = resolves.clear(pat);
+                // Built before the ids fold: a run held for a count needs
+                // nothing residual left to filter.
                 let residual = file_reads::build_file_filter(pat, codes)?;
                 let serve = keep_serve.then_some(serve).flatten();
-                let selection = match row_ids {
-                    // With the plan kept, the resolution is the view's sole
-                    // id restriction, so its deferred ids *are* the
-                    // selection — left pending until a consumer needs them
-                    // (a count, a chained match, a delete, a base-order
-                    // gather); reads stream through the plan without them.
-                    ResolvedRowIds::Lazy(lazy) if serve.is_some() => {
-                        log::debug!(
-                            "[match_pattern] File index resolved (served, ids pending) at {:?}",
-                            debug::elapsed(t)
-                        );
-                        ViewSelection::Pending(lazy)
-                    }
-                    // A located run the caller only counts or windows: its
-                    // width is the count, and a window reads only its own
-                    // rows — provided nothing else restricts this view and
-                    // nothing residual is left to filter.
-                    ResolvedRowIds::Lazy(lazy)
-                        if need == IdsNeed::CountOrWindow
-                            && keep_serve
-                            && residual.is_none()
-                            && lazy.len_if_known().is_some() =>
-                    {
-                        log::debug!(
-                            "[match_pattern] File index located a run (ids pending for a count) at {:?}",
-                            debug::elapsed(t)
-                        );
-                        ViewSelection::Pending(lazy)
-                    }
-                    // No plan kept (this view was already restricted): the
-                    // ids are needed now — run the deferred scan and fold
-                    // it exactly as an eager resolution would be.
-                    ResolvedRowIds::Lazy(lazy) => {
-                        let selection = ViewSelection::Exact(apply_subject(
-                            existing_selection
-                                .materialized_async()
-                                .await?
-                                .intersect_ids(lazy.materialized_async().await?),
-                        ));
-                        log::debug!(
-                            "[match_pattern] File index resolved (ids materialized) at {:?}",
-                            debug::elapsed(t)
-                        );
-                        selection
-                    }
-                    // An index answered with exact ids: fold them into the
-                    // selection, which drops it to `Ids` — narrowing
-                    // whatever a previous match had established (a range,
-                    // or an earlier lookup's ids) without ever setting two
-                    // restrictions at once.
-                    ResolvedRowIds::Eager(ids) => {
-                        let selection = ViewSelection::Exact(apply_subject(
-                            existing_selection
-                                .materialized_async()
-                                .await?
-                                .intersect_ids(ids),
-                        ));
-                        log::debug!(
-                            "[match_pattern] File index resolved (eager ids) at {:?}",
-                            debug::elapsed(t)
-                        );
-                        selection
-                    }
+                // With the plan kept, the resolution is the view's sole id
+                // restriction, so its deferred ids *are* the selection — left
+                // pending until a consumer needs them (a count, a chained
+                // match, a delete, a base-order gather); reads stream through
+                // the plan without them. So are the ids of a located run the
+                // caller only counts or windows: its width is the count, and
+                // a window reads only its own rows — provided nothing else
+                // restricts this view and nothing residual is left to filter.
+                // Any other lazy resolution runs its deferred read now, and
+                // folds exactly as an eager one's ids do.
+                let defer = serve.is_some()
+                    || (need == IdsNeed::CountOrWindow
+                        && keep_serve
+                        && residual.is_none()
+                        && match &row_ids {
+                            ResolvedRowIds::Lazy(lazy) => lazy.len_if_known().is_some(),
+                            ResolvedRowIds::Eager(_) => false,
+                        });
+                let eager = matches!(row_ids, ResolvedRowIds::Eager(_));
+                // A chained match materializes a still-pending selection to
+                // fold into; a deferral only ever meets the unrefined one.
+                let existing = existing_selection.materialized_async().await?;
+                // A file run's ids take I/O: when they cannot stay deferred
+                // they are read here, into the run's shared cell, where the
+                // fold finds them.
+                if !defer && let ResolvedRowIds::Lazy(lazy) = &row_ids {
+                    lazy.materialized_async().await?;
+                }
+                let selection = match fold_row_ids(existing, row_ids, defer)? {
+                    ViewSelection::Exact(exact) => ViewSelection::Exact(apply_subject(exact)),
+                    pending => pending,
                 };
+                log::debug!(
+                    "[match_pattern] File index {} at {:?}",
+                    match (&selection, serve.is_some()) {
+                        (ViewSelection::Pending(_), true) => "resolved (served, ids pending)",
+                        (ViewSelection::Pending(_), false) => {
+                            "located a run (ids pending for a count)"
+                        }
+                        (ViewSelection::Exact(_), _) if eager => "resolved (eager ids)",
+                        (ViewSelection::Exact(_), _) => "resolved (ids materialized)",
+                    },
+                    debug::elapsed(t)
+                );
                 (residual, Some(selection), serve)
             }
             // No index applies: the residual pattern (the subject already
@@ -710,26 +673,14 @@ impl VortexRdfStore {
             Some(selection) => selection,
             // No index involved: the subject's exact range narrows directly
             // (a zone envelope could only be wider), else narrow using
-            // zone-map statistics. One full-range pruning evaluation on the
-            // cached layout reader replaces any per-split probing. (A
-            // chained match materializes a still-pending selection to fold
-            // into — exactly one of the consumers the deferral is for.)
+            // zone-map statistics. (A chained match materializes a
+            // still-pending selection to fold into — exactly one of the
+            // consumers the deferral is for.)
             None => {
                 let existing = existing_selection.materialized_async().await?;
                 ViewSelection::Exact(match (&subject_range, &filter) {
                     (Some(_), _) => apply_subject(existing),
-                    (None, Some(f)) => {
-                        let pruned = file_filter::row_range_from_pruning(file, f).await?;
-                        log::debug!(
-                            "[match_pattern] File narrowed by zone-map pruning (range: {}) at {:?}",
-                            pruned.is_some(),
-                            debug::elapsed(t)
-                        );
-                        match pruned {
-                            Some(range) => existing.intersect_range(range),
-                            None => existing,
-                        }
-                    }
+                    (None, Some(f)) => Self::prune_by_filter(file, existing, f, t).await?,
                     (None, None) => existing,
                 })
             }
@@ -787,6 +738,63 @@ impl VortexRdfStore {
             self.quads.file_with(filter, selection, serve),
             self.tail.clone(),
         ))
+    }
+
+    /// A bound subject's exact row run in a sorted file: the subject column's
+    /// encoded chunks binary-searched through their cached chunk probes, then
+    /// the run narrowed by the roles behind the subject in sort order through
+    /// their columns' chunk probes — the file mirror of the in-memory prefix
+    /// probe. The subject and every answered role leave `pat`. `None`, with
+    /// `pat` intact, when no subject is bound or the location declines.
+    #[cfg(feature = "file-io")]
+    async fn locate_subject(
+        file: &NativeStoreFile,
+        codes: &mut PatternCodes,
+        pat: &mut QuadPattern<'_>,
+        t: Option<Instant>,
+    ) -> Result<Option<Range<u64>>> {
+        let Some(subject) = pat.subject else {
+            return Ok(None);
+        };
+        let Some(mut range) = file_reads::locate_subject_run(file, codes, subject).await? else {
+            return Ok(None);
+        };
+        pat.subject = None;
+        log::debug!(
+            "[match_pattern] File subject bounded by chunk probe at {:?}",
+            debug::elapsed(t)
+        );
+        let answered = file_reads::narrow_subject_run(file, codes, pat, &mut range).await?;
+        if answered > 0 {
+            log::debug!(
+                "[match_pattern] File prefix of {answered} more roles bounded by chunk probes at {:?}",
+                debug::elapsed(t)
+            );
+        }
+        Ok(Some(range))
+    }
+
+    /// `existing` narrowed to the envelope zone-map pruning collapses
+    /// `filter` to: one full-range pruning evaluation on the cached layout
+    /// reader, statistics only, in place of any per-split probing. Left as it
+    /// is when the statistics exclude nothing.
+    #[cfg(feature = "file-io")]
+    async fn prune_by_filter(
+        file: &NativeStoreFile,
+        existing: RowSelection,
+        filter: &Expression,
+        t: Option<Instant>,
+    ) -> Result<RowSelection> {
+        let pruned = file_filter::row_range_from_pruning(file, filter).await?;
+        log::debug!(
+            "[match_pattern] File narrowed by zone-map pruning (range: {}) at {:?}",
+            pruned.is_some(),
+            debug::elapsed(t)
+        );
+        Ok(match pruned {
+            Some(range) => existing.intersect_range(range),
+            None => existing,
+        })
     }
 
     // ── pattern matching helpers ─────────────────────────────────────────────
@@ -849,6 +857,29 @@ impl VortexRdfStore {
             .await?;
         matched.exists().await
     }
+}
+
+/// `existing` narrowed by an index resolution's row ids: a lazy resolution
+/// the caller may leave unread (`defer`) becomes the view's pending
+/// selection, its ids computed by the first consumer that needs them; any
+/// other lazy one's ids, like an eager resolution's, are intersected into
+/// `existing`, which they can only narrow. Synchronous, as the in-memory
+/// match is: an in-memory run's ids are computed here, while the file match
+/// reads a file run's (they take I/O) before folding, so they are found
+/// computed.
+fn fold_row_ids(
+    existing: RowSelection,
+    row_ids: ResolvedRowIds,
+    defer: bool,
+) -> Result<ViewSelection> {
+    Ok(match row_ids {
+        ResolvedRowIds::Lazy(lazy) if defer => ViewSelection::Pending(lazy),
+        ResolvedRowIds::Lazy(lazy) => {
+            ViewSelection::Exact(existing.intersect_ids(lazy.materialized()?))
+        }
+        #[cfg(feature = "file-io")]
+        ResolvedRowIds::Eager(ids) => ViewSelection::Exact(existing.intersect_ids(ids)),
+    })
 }
 
 /// Selection size below which an *already narrowed* view should skip secondary

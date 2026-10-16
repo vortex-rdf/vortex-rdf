@@ -590,7 +590,9 @@ impl LazyRowIds {
     /// The ids, computing (and caching) them on first call — the synchronous
     /// form for in-memory sources (a file child's ids take I/O, and every
     /// consumer of a file view's selection is already async; see
-    /// [`materialized_async`](Self::materialized_async)).
+    /// [`materialized_async`](Self::materialized_async)). A file child's ids
+    /// that `materialized_async` has already read are returned from the
+    /// cache, which is how the file match folds them.
     pub(crate) fn materialized(&self) -> Result<Buffer<RowId>> {
         if let Some(ids) = self.cell.get() {
             return Ok(ids.clone());

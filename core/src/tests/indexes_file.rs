@@ -614,9 +614,10 @@ async fn test_reference_index_file_typed_object() {
 }
 
 /// A reference-index count over a located run (predicate-only or
-/// object-only, nothing residual) is the run's width: no row id is read.
-/// `limit` caps it; a window reads only the rows it takes, in base order;
-/// a residual or tombstones send the count through the ids.
+/// object-only, nothing residual) is the run's width: no row id is read — on
+/// file the located-rid-read hook stays at 0. `limit` caps it; a window reads
+/// only the rows it takes, in base order; a residual or tombstones send the
+/// count through the ids.
 #[tokio::test]
 async fn test_reference_index_counts_located_runs_from_width() {
     use crate::store::{IdsNeed, Probe};
@@ -627,10 +628,16 @@ async fn test_reference_index_counts_located_runs_from_width() {
         vec![IndexType::SecondaryByReference],
     )
     .await;
-    for store in [
-        VortexRdfStore::from_file(&path).await.unwrap(),
-        VortexRdfStore::from_file_in_memory(&path).await.unwrap(),
+    for (store, on_file) in [
+        (VortexRdfStore::from_file(&path).await.unwrap(), true),
+        (
+            VortexRdfStore::from_file_in_memory(&path).await.unwrap(),
+            false,
+        ),
     ] {
+        // The rid rows read from located runs: none on the freshly opened
+        // file, and no hook in memory, which has no file.
+        let no_rid_reads = on_file.then_some(0);
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
         let o2 = Term::Literal(Literal::new_simple_literal("o2"));
         let counted = store
@@ -643,6 +650,11 @@ async fn test_reference_index_counts_located_runs_from_width() {
             counted.debug_row_ids_materialized(),
             Some(false),
             "a count reads no row id"
+        );
+        assert_eq!(
+            store.debug_located_rid_reads(),
+            no_rid_reads,
+            "size() reads no row id"
         );
         let by_p = Probe::new(None, Some(p1.clone()), None, None);
         let by_o = Probe::new(None, None, Some(o2.clone()), None);
@@ -662,6 +674,11 @@ async fn test_reference_index_counts_located_runs_from_width() {
                 .await
                 .unwrap(),
             vec![10, 129]
+        );
+        assert_eq!(
+            store.debug_located_rid_reads(),
+            no_rid_reads,
+            "the count of a window(0, 10) probe reads no row id"
         );
         // The public match still computes its ids: its rows may be streamed.
         let matched = store

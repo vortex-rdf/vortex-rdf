@@ -559,8 +559,8 @@ quad, sort, drop repeated quads, and rebuild:
 
 Between compactions the tail accretes as chunks and is flattened once the
 accreted rows rival the flat prefix (floor 1,024) or 64 chunks pile up
-([`TAIL_FLATTEN_FLOOR`](../core/src/store/view/mod.rs#L415),
-[`TAIL_MAX_CHUNKS`](../core/src/store/view/mod.rs#L419)). The tail, tombstone
+([`TAIL_FLATTEN_FLOOR`](../core/src/store/view/mod.rs#L460),
+[`TAIL_MAX_CHUNKS`](../core/src/store/view/mod.rs#L464)). The tail, tombstone
 and compaction model in full is [mutations.md](mutations.md).
 
 ### 11.3 Back to RDF text

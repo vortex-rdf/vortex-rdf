@@ -238,6 +238,51 @@ impl QuadsSource {
         }
     }
 
+    /// The `limit` rows after skipping `offset` of a located run held
+    /// pending for a window (`IdsNeed::CountOrWindow`), read without the
+    /// run's other ids, and the run's width as the base's live size. In
+    /// memory a run whose rids ascend cuts the window out of its rid column
+    /// before decoding ([`LazyRowIds::window`]); on file a located run reads
+    /// only the window's rows of the child's rid column
+    /// ([`LazyRowIds::window_async`]). `None` for any other view — an exact
+    /// selection, a run of unknown width or whose rids do not ascend,
+    /// tombstones, a pending file filter — whose window is cut from its
+    /// materialized selection instead.
+    ///
+    /// [`LazyRowIds::window`]: crate::store::indexes::LazyRowIds::window
+    /// [`LazyRowIds::window_async`]: crate::store::indexes::LazyRowIds::window_async
+    pub(crate) async fn located_window(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<(RowSelection, usize)>> {
+        let located = match self {
+            QuadsSource::InMemory {
+                selection: ViewSelection::Pending(lazy),
+                deleted: None,
+                ..
+            } => match lazy.len_if_known() {
+                Some(live) => lazy.window(offset, limit)?.map(|ids| (ids, live)),
+                None => None,
+            },
+            #[cfg(feature = "file-io")]
+            QuadsSource::File {
+                selection: ViewSelection::Pending(lazy),
+                filter: None,
+                deleted: None,
+                ..
+            } => match lazy.len_if_known() {
+                Some(live) => lazy
+                    .window_async(offset, limit)
+                    .await?
+                    .map(|ids| (ids, live)),
+                None => None,
+            },
+            _ => None,
+        };
+        Ok(located.map(|(ids, live)| (RowSelection::from_ids(ids), live)))
+    }
+
     /// This in-memory source under `selection`, its reads served by `serve`:
     /// the same base, components, tombstones and probes.
     #[inline]
