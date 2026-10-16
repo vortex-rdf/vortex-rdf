@@ -88,7 +88,7 @@ literals go through `oxrdf`'s `Display`, which escapes them.
 
 Where the stream comes from:
 
-- **RDF text** — [`parse_quads_from_reader`](../core/src/common/terms.rs#L410)
+- **RDF text** — [`parse_quads_from_reader`](../core/src/common/terms.rs#L372)
   drives an `oxrdfio` parser and converts each parsed quad on the spot, so no
   second copy of the terms outlives the conversion. Formats: N-Triples,
   N-Quads, Turtle, TriG, N3, RDF/XML, JSON-LD — named through
@@ -287,7 +287,7 @@ Every layout puts `s` first and stamps it when the rows are sorted.
 | `TypedObject` | `s`, `p`, `o_kind` (`u8`), `o_value` (`Utf8`), `o_datatype` (nullable `Utf8`), `o_lang` (nullable `Utf8`), `g` | as `Default`, with the object decomposed |
 | `Dictionary` | `s`, `p`, `o`, `g` — non-nullable `u64` | codes into one sorted dictionary |
 
-**TypedObject decomposition** ([`decompose_object`](../core/src/store/layouts/typed_object.rs#L70)):
+**TypedObject decomposition** ([`decompose_object`](../core/src/store/layouts/typed_object.rs#L67)):
 
 | `o_kind` | Object | `o_value` | `o_datatype` | `o_lang` |
 |---|---|---|---|---|

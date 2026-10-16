@@ -259,14 +259,33 @@ mod tests {
             with(ok.0, ok.1, "\"x\"^^<not an iri>", ok.3),
             "bad datatype"
         );
-        let message = RawQuad::canonical("<bad iri>", ok.1, ok.2, ok.3)
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(
-            message.contains("subject"),
-            "the position is named: {message}"
-        );
+        // The position is named ahead of the term parser's own message.
+        for (quad, prefix) in [
+            (
+                ["<bad iri>", ok.1, ok.2, ok.3],
+                "quad subject: invalid IRI \"bad iri\": ",
+            ),
+            (
+                [ok.0, "_:b", ok.2, ok.3],
+                "quad predicate: invalid IRI \"_:b\": ",
+            ),
+            (
+                [ok.0, ok.1, "\"unterminated", ok.3],
+                "quad object: malformed literal \"\\\"unterminated\"",
+            ),
+            (
+                [ok.0, ok.1, ok.2, "_:a b"],
+                "quad graph: invalid blank node \"_:a b\": ",
+            ),
+        ] {
+            let [s, p, o, g] = quad;
+            match RawQuad::canonical(s, p, o, g).err() {
+                Some(crate::error::VortexRdfError::Deserialization(message)) => {
+                    assert!(message.starts_with(prefix), "{quad:?}: {message:?}")
+                }
+                other => panic!("{quad:?}: {other:?}"),
+            }
+        }
     }
 
     /// The constructor renders exactly what the other two sources of

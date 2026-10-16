@@ -9,7 +9,7 @@ use vortex_array::arrays::struct_::StructArray;
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 use vortex_array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 
-use crate::common::terms::{parse_graph_name, parse_named_node, parse_subject, parse_term};
+use crate::common::terms::{Trust, graph_name, named_node, subject, term};
 use crate::common::vocab::XSD_STRING;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
@@ -42,10 +42,7 @@ pub(crate) fn build_columns(quads: &[RawQuad]) -> Result<Vec<ArrayRef>> {
     let mut langs: Vec<Option<String>> = Vec::with_capacity(n);
 
     for q in quads {
-        let term = parse_term(&q.o).ok_or_else(|| {
-            VortexRdfError::Deserialization(format!("Cannot parse object string: {}", q.o))
-        })?;
-        let (kind, value, dt, lang) = decompose_object(&term);
+        let (kind, value, dt, lang) = decompose_object(&term(&q.o, Trust::Stored)?);
         kinds.push(kind);
         values.push(value);
         datatypes.push(dt);
@@ -93,10 +90,10 @@ fn compose_object(
     datatype: Option<&str>,
     lang: Option<&str>,
 ) -> Result<Term> {
-    // Trusted-input decode path — see `parse_named_node`: the sub-columns
+    // Trusted decode, as for `Trust::Stored` spellings: the sub-columns
     // were decomposed from already-validated terms at build time, so the
     // checked constructors' re-validation (a full `oxiri::Iri::parse` per
-    // IRI) is skipped, matching `parse_term`.
+    // IRI) is skipped.
     match kind {
         0 => Ok(Term::NamedNode(NamedNode::new_unchecked(value))),
         1 => Ok(Term::BlankNode(BlankNode::new_unchecked(value))),
@@ -229,11 +226,12 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
 
     (0..n)
         .map(|i| {
-            let subject = parse_subject(subjects.str_at(i)?)?;
-            let predicate = parse_named_node(predicates.str_at(i)?)?;
-            let object = objects.term_at(i)?;
-            let graph_name = parse_graph_name(graphs.str_at(i)?)?;
-            Ok(Quad::new(subject, predicate, object, graph_name))
+            Ok(Quad::new(
+                subject(subjects.str_at(i)?, Trust::Stored)?,
+                named_node(predicates.str_at(i)?, Trust::Stored)?,
+                objects.term_at(i)?,
+                graph_name(graphs.str_at(i)?, Trust::Stored)?,
+            ))
         })
         .collect()
 }
