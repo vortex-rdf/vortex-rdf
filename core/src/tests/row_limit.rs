@@ -120,11 +120,7 @@ fn a_row_id_past_the_index_width_is_refused_not_narrowed() {
 #[tokio::test]
 async fn in_memory_index_builds_refuse_row_ids_past_the_top() {
     let _base = RowIdBase::set(TOP);
-    for layout in [
-        LayoutStrategy::Default,
-        LayoutStrategy::TypedObject,
-        LayoutStrategy::Dictionary,
-    ] {
+    for layout in LAYOUTS {
         let label = format!("{layout:?}");
         let over =
             build_array::<SortedInMemoryBuilder>(quad_stream(quads(LIMIT + 1)), layout, indexes())

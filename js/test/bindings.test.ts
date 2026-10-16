@@ -28,6 +28,20 @@ const NQUADS = [
     '<http://example.org/s4> <http://example.org/p4> "hola"@es .',
 ].join('\n') + '\n';
 
+/** A quad no term of `NQUADS` appears in: absent from any store built from it. */
+const NEW_QUAD = df.quad(
+    df.namedNode('http://example.org/s9'),
+    df.namedNode('http://example.org/p9'),
+    df.literal('new'),
+);
+
+/** The first quad of `NQUADS`: present in any store built from it. */
+const EXISTING_QUAD = df.quad(
+    df.namedNode('http://example.org/s1'),
+    df.namedNode('http://example.org/p1'),
+    df.namedNode('http://example.org/o1'),
+);
+
 /** Every build variant reachable from JS, in the canonical kebab-case
  *  vocabulary — the only spellings accepted, and what `layout()` reports. */
 const VARIANTS: { name: string; options: BuildOptions }[] = [
@@ -660,14 +674,9 @@ describe('adding quads', () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
         // Every term here is absent from the dictionary built at load time;
         // the quad lands in the string tail and must still be found by match.
-        const quad = df.quad(
-            df.namedNode('http://example.org/s9'),
-            df.namedNode('http://example.org/p9'),
-            df.literal('new'),
-        );
-        await store.addQuad(quad);
+        await store.addQuad(NEW_QUAD);
         expect(await store.size()).toBe(7);
-        expect(await store.has(quad)).toBe(true);
+        expect(await store.has(NEW_QUAD)).toBe(true);
         const matched = store.getQuads(null, df.namedNode('http://example.org/p9'), null, null);
         expect(matched.length).toBe(1);
         // Decoded values must be correct: appended terms live in the string tail,
@@ -683,48 +692,28 @@ describe('adding quads', () => {
         // are re-encoded against a fresh dictionary).
         const restored = await VortexRdfStore.fromBytes(await store.toBytes());
         expect(await restored.size()).toBe(7);
-        expect(await restored.has(quad)).toBe(true);
+        expect(await restored.has(NEW_QUAD)).toBe(true);
     });
 
     test('Default layout supports addQuad', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'default' });
-        const quad = df.quad(
-            df.namedNode('http://example.org/s9'),
-            df.namedNode('http://example.org/p9'),
-            df.literal('new'),
-        );
-        await store.addQuad(quad);
+        await store.addQuad(NEW_QUAD);
         expect(await store.size()).toBe(7);
-        expect(await store.has(quad)).toBe(true);
+        expect(await store.has(NEW_QUAD)).toBe(true);
     });
 
     test('addQuad ignores a quad already present (RDF/JS set semantics)', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
-        const quad = df.quad(
-            df.namedNode('http://example.org/s1'),
-            df.namedNode('http://example.org/p1'),
-            df.namedNode('http://example.org/o1'),
-        );
-        expect(await store.has(quad)).toBe(true);
-        await store.addQuad(quad);
+        expect(await store.has(EXISTING_QUAD)).toBe(true);
+        await store.addQuad(EXISTING_QUAD);
         expect(await store.size()).toBe(6);
     });
 
     test('addQuads appends a batch, skipping duplicates', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
-        const fresh = df.quad(
-            df.namedNode('http://example.org/s9'),
-            df.namedNode('http://example.org/p9'),
-            df.literal('new'),
-        );
-        const existing = df.quad(
-            df.namedNode('http://example.org/s1'),
-            df.namedNode('http://example.org/p1'),
-            df.namedNode('http://example.org/o1'),
-        );
-        await store.addQuads([fresh, fresh, existing]);
+        await store.addQuads([NEW_QUAD, NEW_QUAD, EXISTING_QUAD]);
         expect(await store.size()).toBe(7);
-        expect(await store.has(fresh)).toBe(true);
+        expect(await store.has(NEW_QUAD)).toBe(true);
     });
 });
 
@@ -848,11 +837,7 @@ describe('matchCodes / termDict gates', () => {
     test('a pending append closes the code path', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
         expect(store.matchCodes(null, p1, null, null)).not.toBeNull();
-        await store.addQuad(df.quad(
-            df.namedNode('http://example.org/s9'),
-            df.namedNode('http://example.org/p9'),
-            df.literal('new'),
-        ));
+        await store.addQuad(NEW_QUAD);
         expect(store.matchCodes(null, p1, null, null)).toBeNull();
         expect(store.termDict()).toBeUndefined();
         // The term path still answers.
@@ -925,11 +910,6 @@ describe('matchCodes / termDict gates', () => {
 });
 
 describe('deleteQuad tombstones a base row', () => {
-    const target = df.quad(
-        df.namedNode('http://example.org/s1'),
-        df.namedNode('http://example.org/p1'),
-        df.namedNode('http://example.org/o1'),
-    );
     const p1 = df.namedNode('http://example.org/p1');
     const s1 = df.namedNode('http://example.org/s1');
 
@@ -945,19 +925,19 @@ describe('deleteQuad tombstones a base row', () => {
     for (const { name, options } of LAYOUTS) {
         test(name, async () => {
             const store = await VortexRdfStore.fromString(NQUADS, 'nquads', options);
-            await store.deleteQuad(target);
+            await store.deleteQuad(EXISTING_QUAD);
             expect(await store.size()).toBe(5);
-            expect(await store.has(target)).toBe(false);
+            expect(await store.has(EXISTING_QUAD)).toBe(false);
             expect(store.countQuads(null, p1, null, null)).toBe(2);
             expect(store.getQuads(s1, null, null, null).length).toBe(1);
 
             // Deleting an absent quad is a no-op.
-            await store.deleteQuad(target);
+            await store.deleteQuad(EXISTING_QUAD);
             expect(await store.size()).toBe(5);
 
             const restored = await VortexRdfStore.fromBytes(await store.toBytes());
             expect(await restored.size()).toBe(5);
-            expect(await restored.has(target)).toBe(false);
+            expect(await restored.has(EXISTING_QUAD)).toBe(false);
             expect(restored.countQuads(null, p1, null, null)).toBe(2);
         });
     }
@@ -1013,11 +993,7 @@ describe('graph and blank-node terms', () => {
 });
 
 describe('term validation and malformed input', () => {
-    const good = df.quad(
-        df.namedNode('http://example.org/s9'),
-        df.namedNode('http://example.org/p9'),
-        df.literal('new'),
-    );
+    const good = NEW_QUAD;
     const s = { termType: 'NamedNode', value: 'http://example.org/s' };
     const p = { termType: 'NamedNode', value: 'http://example.org/p' };
     const o = { termType: 'Literal', value: 'o' };

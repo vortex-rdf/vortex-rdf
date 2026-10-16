@@ -66,20 +66,12 @@ async fn test_multiple_append() {
     assert_eq!(matched_s5.size().await.unwrap(), 1);
 }
 
-/// Appends land in the tail, never the base — so the base's secondary
-/// indexes survive an add, and queries union the base's fast paths with a
-/// tail scan.
-#[tokio::test]
-async fn test_add_quads_keeps_indexes() {
-    let quads = modular_quads(12, 2, 3);
-
-    let store = built_store(
-        quads.clone(),
-        LayoutStrategy::Default,
-        vec![IndexType::SecondaryByReference],
-    )
-    .await;
-
+/// The append scenario both backends answer alike. `store` holds `quads`
+/// (`modular_quads(12, 2, 3)`) under the Default layout with a reference
+/// index. Two quads are appended — one under an existing object, one under
+/// terms the base has never seen — then matched, narrowed, tombstoned and
+/// compacted, while `store` itself stays as it was.
+async fn run_append_script(store: &VortexRdfStore, quads: &[Quad]) {
     let added = store
         .add_quads([
             make_quad(
@@ -122,6 +114,11 @@ async fn test_add_quads_keeps_indexes() {
     assert_eq!(matched_size(&added, None, Some(&p9), None, None).await, 1);
     let s90 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s90").unwrap());
     assert_eq!(matched_size(&added, Some(&s90), None, None, None).await, 1);
+    let object9 = Term::Literal(Literal::new_simple_literal("object 9"));
+    assert_eq!(
+        matched_size(&added, None, None, Some(&object9), None).await,
+        1
+    );
 
     // Chained matches narrow base and tail together: of the five
     // "object 0" rows, p0 holds on base rows 0 and 6, and on s90.
@@ -139,15 +136,58 @@ async fn test_add_quads_keeps_indexes() {
         .unwrap();
     assert_eq!(deleted_tail.size().await.unwrap(), 13);
     assert_eq!(
+        matched_size(&deleted_tail, Some(&s90), None, None, None).await,
+        0
+    );
+    assert_eq!(
         matched_size(&deleted_tail, None, None, Some(&object), None).await,
         4
     );
+    // The same match read as quads, on a fresh view: no `size()` has cached
+    // its row ids.
+    let remaining = deleted_tail
+        .match_pattern(None, None, Some(&object), None)
+        .await
+        .unwrap();
+    assert_eq!(subjects_of(&remaining).await.len(), 4);
     let deleted_base = deleted_tail.delete_quad(&quads[0]).await.unwrap();
     assert_eq!(deleted_base.size().await.unwrap(), 12);
     assert_eq!(
         matched_size(&deleted_base, None, None, Some(&object), None).await,
         3
     );
+
+    // A base delete hits the base (a tombstone mask over it) with the tail
+    // still in place.
+    let deleted = added.delete_quad(&quads[0]).await.unwrap();
+    assert_eq!(deleted.size().await.unwrap(), 13);
+
+    // Compaction folds the tail and the tombstone into the base.
+    let compacted = deleted
+        .compact_with_indexes(vec![IndexType::SecondaryByReference])
+        .await
+        .unwrap();
+    assert_eq!(compacted.size().await.unwrap(), 13);
+    assert_eq!(compacted.indexes(), &[IndexType::SecondaryByReference]);
+    assert_eq!(
+        matched_size(&compacted, None, None, Some(&object9), None).await,
+        1
+    );
+}
+
+/// Appends land in the tail, never the base — so the base's secondary
+/// indexes survive an add, and queries union the base's fast paths with a
+/// tail scan.
+#[tokio::test]
+async fn test_add_quads_keeps_indexes() {
+    let quads = modular_quads(12, 2, 3);
+    let store = built_store(
+        quads.clone(),
+        LayoutStrategy::Default,
+        vec![IndexType::SecondaryByReference],
+    )
+    .await;
+    run_append_script(&store, &quads).await;
 }
 
 /// One quad in its own subject run, under a predicate the base never
@@ -1130,98 +1170,20 @@ async fn test_compaction_folds_tail_and_sorts() {
 
 /// File-backed stores append the same way: the file is untouched by the
 /// append (the tail lives in memory beside it) and queries union the
-/// pushed-down scan with the tail scan.
+/// pushed-down scan with the tail scan. The script's compaction folds the
+/// tail into the source file, rewritten in place.
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_file_backed_add_quads() {
     let quads = modular_quads(12, 2, 3);
-
     let (_dir, path) = write_store_file(
         quads.clone(),
         LayoutStrategy::Default,
         vec![IndexType::SecondaryByReference],
     )
     .await;
-
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let added = store
-        .add_quads([
-            make_quad(
-                "http://example.org/s90",
-                "http://example.org/p0",
-                "object 0",
-                GraphName::DefaultGraph,
-            ),
-            make_quad(
-                "http://example.org/s91",
-                "http://example.org/p9",
-                "object 9",
-                GraphName::DefaultGraph,
-            ),
-        ])
-        .await
-        .unwrap();
-    assert_eq!(added.size().await.unwrap(), 14);
-    assert_eq!(added.indexes(), &[IndexType::SecondaryByReference]);
-    assert_eq!(
-        store.size().await.unwrap(),
-        12,
-        "the file view is untouched"
-    );
-
-    // Index-routed file lookup + tail scan union.
-    let object = Term::Literal(Literal::new_simple_literal("object 0"));
-    let subjects = subjects_of(
-        &added
-            .match_pattern(None, None, Some(&object), None)
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(subjects.len(), 5);
-    assert!(subjects.contains(&"<http://example.org/s90>".to_string()));
-    // A term only the tail knows.
-    let object9 = Term::Literal(Literal::new_simple_literal("object 9"));
-    assert_eq!(
-        matched_size(&added, None, None, Some(&object9), None).await,
-        1
-    );
-
-    // A tail row is tombstoned in the tail, with the file untouched.
-    let s90 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s90").unwrap());
-    let tail_deleted = added
-        .delete_matching(Some(&s90), None, None, None)
-        .await
-        .unwrap();
-    assert_eq!(tail_deleted.size().await.unwrap(), 13);
-    assert_eq!(
-        matched_size(&tail_deleted, Some(&s90), None, None, None).await,
-        0
-    );
-    assert_eq!(
-        subjects_of(
-            &tail_deleted
-                .match_pattern(None, None, Some(&object), None)
-                .await
-                .unwrap()
-        )
-        .await
-        .len(),
-        4
-    );
-
-    // Deletes hit base (tombstone mask over the file) and tail alike.
-    let deleted = added.delete_quad(&quads[0]).await.unwrap();
-    assert_eq!(deleted.size().await.unwrap(), 13);
-
-    // Compaction folds the tail into the source file (rewritten in place)
-    // and stays file-backed.
-    let compacted = deleted
-        .compact_with_indexes(vec![IndexType::SecondaryByReference])
-        .await
-        .unwrap();
-    assert_eq!(compacted.size().await.unwrap(), 13);
-    assert_eq!(compacted.indexes(), &[IndexType::SecondaryByReference]);
+    run_append_script(&store, &quads).await;
     assert_eq!(
         VortexRdfStore::from_file(&path)
             .await
@@ -1231,10 +1193,6 @@ async fn test_file_backed_add_quads() {
             .unwrap(),
         13,
         "compaction rewrites the source file"
-    );
-    assert_eq!(
-        matched_size(&compacted, None, None, Some(&object9), None).await,
-        1
     );
 }
 

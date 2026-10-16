@@ -70,11 +70,7 @@ async fn test_quads_vec_matches_stream_collection_file_backed() {
 /// quads.
 #[tokio::test]
 async fn test_shared_quads_match_quads_vec_across_layouts() {
-    for layout in [
-        LayoutStrategy::Default,
-        LayoutStrategy::TypedObject,
-        LayoutStrategy::Dictionary,
-    ] {
+    for layout in LAYOUTS {
         let store = built_store(dictionary_test_quads(), layout, vec![]).await;
         assert_shared_matches_quads(&store, &format!("{layout:?}")).await;
         let p0 = NamedNode::new("http://example.org/p0").unwrap();

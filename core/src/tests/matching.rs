@@ -39,11 +39,7 @@ async fn test_term_kinds_match_under_every_layout() {
             _ => None,
         })
         .unwrap();
-    for layout in [
-        LayoutStrategy::Default,
-        LayoutStrategy::TypedObject,
-        LayoutStrategy::Dictionary,
-    ] {
+    for layout in LAYOUTS {
         for indexes in [vec![], vec![IndexType::SecondaryByCopy]] {
             let tag = format!("{layout:?} {indexes:?}");
             let store = built_store(quads.clone(), layout, indexes).await;

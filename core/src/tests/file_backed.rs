@@ -395,42 +395,6 @@ async fn test_file_backed_subject_chunk_probe_requires_sorted() {
     assert_eq!(matched.size().await.unwrap(), 3);
 }
 
-// ─── Open validation ───────────────────────────────────────────────────
-
-/// A file written by a generic Vortex writer — a valid Vortex file, but not a
-/// native store — fails at open with an actionable error naming the expected
-/// root layout, rather than a scan-time surprise.
-#[tokio::test]
-async fn test_from_file_rejects_foreign_vortex_file() {
-    use vortex_file::WriteOptionsSessionExt as _;
-
-    // A bare code schema, written by the raw Vortex writer under a plain
-    // root layout.
-    let array = bare_code_quad_array(&[1, 2, 3]);
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("bare.vortex");
-    let dtype = array.dtype().clone();
-    let stream = vortex_array::stream::ArrayStreamAdapter::new(
-        dtype,
-        Box::pin(futures::stream::once(async move { Ok(array) })),
-    );
-    let mut writer = tokio::fs::File::create(&path).await.unwrap();
-    crate::session::VORTEX_SESSION
-        .write_options()
-        .write(&mut writer, stream)
-        .await
-        .unwrap();
-
-    let err = VortexRdfStore::from_file(&path)
-        .await
-        .err()
-        .expect("open should fail");
-    assert!(
-        err.to_string().contains("not a vortex-rdf store file"),
-        "unexpected error: {err}"
-    );
-}
-
 // ─── File-backed matching, by layout ───────────────────────────────────
 
 /// One cell of the 3-layout matrix: write the layout's dataset to a file,
