@@ -16,12 +16,12 @@ is the path such an engine takes.
 | What the engine needs | What it calls |
 |---|---|
 | A table of quads to scan with projection, filter and limit pushdown | [`data_source`](../core/src/store/read/data_source.rs#L100) on any view, registered with vortex's `VortexTable` |
-| The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L127) |
-| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L52), [`code_chunks`](../core/src/store/read/chunks.rs#L77) |
-| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L148), [`index_components`](../core/src/store/read/metadata.rs#L262), [`partitions`](../core/src/store/read/metadata.rs#L301) |
-| Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L276) (from [`dict_reader`](../core/src/store/mod.rs#L270)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
+| The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L125) |
+| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L52), [`code_chunks`](../core/src/store/read/chunks.rs#L75) |
+| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L146), [`index_components`](../core/src/store/read/metadata.rs#L221), [`partitions`](../core/src/store/read/metadata.rs#L260) |
+| Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L276) (from [`dict_reader`](../core/src/store/mod.rs#L276)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
-| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L139), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L309) |
+| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L137), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L309) |
 | The session to hand vortex's integrations | [`vortex_session`](../core/src/lib.rs#L79), with [`vortex_scan`](../core/src/lib.rs#L72) re-exported |
 
 ---

@@ -90,6 +90,19 @@ impl ViewSelection {
         }
     }
 
+    /// The live rows this selection covers out of `base_len`, when known
+    /// without reading: an exact selection's rows less the `deleted`
+    /// tombstones, or a pending run's width while nothing is tombstoned
+    /// ([`LazyRowIds::len_if_known`]).
+    pub(crate) fn len_if_known(&self, deleted: Option<&Mask>, base_len: usize) -> Option<usize> {
+        match self {
+            ViewSelection::Exact(selection) => Some(selection.live_len(deleted, base_len)),
+            ViewSelection::Pending(lazy) => {
+                deleted.is_none().then(|| lazy.len_if_known()).flatten()
+            }
+        }
+    }
+
     /// The already-exact selection, for consumers that structurally cannot
     /// meet a pending one: a pending selection rides with a serve plan or sits
     /// on a view that is only counted or windowed, and these consumers run on
@@ -135,6 +148,15 @@ impl RowSelection {
                 usize::try_from(range.end.saturating_sub(range.start)).unwrap_or(usize::MAX)
             }
             RowSelection::Ids(ids) => ids.len(),
+        }
+    }
+
+    /// How many base rows this selection covers that the `deleted`
+    /// tombstones leave live.
+    pub(crate) fn live_len(&self, deleted: Option<&Mask>, base_len: usize) -> usize {
+        match deleted {
+            None => self.len(base_len),
+            Some(deleted) => self.live_mask(deleted, base_len).true_count(),
         }
     }
 

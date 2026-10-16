@@ -2,7 +2,6 @@
 //! — its row ids, indexes, and file handle — is never rewritten in place.
 
 use crate::error::{Result, VortexRdfError};
-use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::builders::build_struct_array;
 #[cfg(feature = "file-io")]
@@ -12,11 +11,8 @@ use crate::store::{QuadsSource, Tail, next_generation};
 
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use std::collections::HashSet;
-use std::sync::Arc;
 
-use vortex_array::arrays::chunked::ChunkedArrayExt;
-use vortex_array::arrays::{Chunked, ChunkedArray};
-use vortex_array::{IntoArray, RecursiveCanonical, VortexSessionExecute};
+#[cfg(feature = "file-io")]
 use vortex_mask::Mask;
 
 use crate::store::VortexRdfStore;
@@ -121,50 +117,18 @@ impl VortexRdfStore {
             return Ok(self.clone());
         }
 
-        let fresh_rows = build_struct_array(&fresh, self.tail_layout().strategy(), false)?;
-        let rows = match &self.tail {
-            None => fresh_rows,
-            // The fresh rows join the tail as one more chunk of a
-            // ChunkedArray accumulator; the accreted suffix is folded into
-            // the flat prefix per `TAIL_FLATTEN_FLOOR`/`TAIL_MAX_CHUNKS`.
-            // Renumbering the old tail's ids on flatten is safe: views of the
-            // pre-append store keep the old tail, and an owner's selections
-            // are `All`.
-            Some(tail) => {
-                let old = tail.live_rows()?;
-                let dtype = old.dtype().clone();
-                let mut chunks = match old.clone().try_downcast::<Chunked>() {
-                    Ok(ch) => ch.chunks(),
-                    Err(_) => vec![old],
-                };
-                let flat_len = chunks[0].len();
-                let accreted: usize =
-                    chunks[1..].iter().map(|c| c.len()).sum::<usize>() + fresh_rows.len();
-                chunks.push(fresh_rows);
-                let n_chunks = chunks.len();
-                let combined = ChunkedArray::try_new(chunks, dtype)?.into_array();
-                if accreted >= flat_len.max(TAIL_FLATTEN_FLOOR) || n_chunks > TAIL_MAX_CHUNKS {
-                    let mut ctx = VORTEX_SESSION.create_execution_ctx();
-                    combined
-                        .execute::<RecursiveCanonical>(&mut ctx)?
-                        .0
-                        .into_array()
-                } else {
-                    combined
-                }
-            }
+        let layout = Tail::layout_for(&self.layout);
+        let fresh_rows = build_struct_array(&fresh, layout.strategy(), false)?;
+        let tail = match &self.tail {
+            None => Tail::new(fresh_rows, layout),
+            // The fresh rows join the tail as one more chunk, flattened per
+            // the tail's policy (see `Tail::append`).
+            Some(tail) => tail.append(fresh_rows)?,
         };
+        // An append changes the data: a new generation over the same base.
         let appended = Self {
-            layout: self.layout.clone(),
-            indexes: self.indexes.clone(),
             generation: next_generation(),
-            quads: self.quads.clone(),
-            tail: Some(Tail {
-                rows,
-                selection: RowSelection::All,
-                // Gathering above dropped any tombstoned tail rows already.
-                deleted: None,
-            }),
+            ..self.derived(self.quads.clone(), Some(tail))
         };
         // The add that pushes the tail over the thresholds folds it into the base.
         if appended.should_auto_compact() {
@@ -233,91 +197,30 @@ impl VortexRdfStore {
         // tail selection is already exact tail-local ids, so it folds into
         // the tail's own deleted mask the same way.
         let tail = match (&self.tail, &doomed.tail) {
-            (Some(tail), Some(doomed_tail)) => Some(Tail {
-                rows: tail.rows.clone(),
-                selection: tail.selection.clone(),
-                deleted: Some(union_deleted(
-                    tail.deleted.as_ref(),
-                    doomed_tail.selection.to_mask(tail.rows.len()),
-                )),
-            }),
+            (Some(tail), Some(doomed_tail)) => Some(tail.tombstoned(&doomed_tail.selection)),
             (tail, _) => tail.clone(),
         };
 
         // Fold the doomed rows into a base-wide tombstone mask. The matcher
         // doesn't consult the existing tombstones, so the doomed set may name
         // rows already deleted; the union absorbs that. Either way the base
-        // (or file) and its secondary indexes are left untouched.
-        //
-        // The catch-all arm is only reachable with the file backend compiled
-        // in; without it, the in-memory arm alone is exhaustive.
-        #[cfg_attr(not(feature = "file-io"), allow(unreachable_patterns))]
-        match (&self.quads, &doomed.quads) {
-            (
-                QuadsSource::InMemory {
-                    base,
-                    selection,
-                    components,
-                    deleted,
-                    probes,
-                    ..
-                },
-                QuadsSource::InMemory {
-                    selection: doomed, ..
-                },
-            ) => {
-                // In memory the matched view's selection maps straight to a
-                // mask — materializing first if its exact ids are still pending
-                // (a delete is one of the consumers that needs them).
-                let doomed = doomed.materialized()?.to_mask(base.len());
-                Ok(Self {
-                    layout: self.layout.clone(),
-                    indexes: self.indexes.clone(),
-                    generation: next_generation(),
-                    quads: QuadsSource::InMemory {
-                        base: base.clone(),
-                        selection: selection.clone(),
-                        // Tombstoning never renumbers base rows, so the
-                        // components' rid currency survives the delete.
-                        components: Arc::clone(components),
-                        deleted: Some(union_deleted(deleted.as_ref(), doomed)),
-                        probes: Arc::clone(probes),
-                        serve: None,
-                    },
-                    tail,
-                })
+        // (or file) and its secondary indexes are left untouched, and an
+        // owner's filter stays absent: deleting only widens the tombstones.
+        let doomed = match &doomed.quads {
+            // In memory the matched view's selection maps straight to a
+            // mask — materializing first if its exact ids are still pending
+            // (a delete is one of the consumers that needs them).
+            QuadsSource::InMemory { selection, .. } => {
+                selection.materialized()?.to_mask(self.quads.base_len())
             }
             #[cfg(feature = "file-io")]
-            (
-                QuadsSource::File {
-                    path,
-                    file,
-                    selection,
-                    deleted,
-                    ..
-                },
-                QuadsSource::File { .. },
-            ) => {
-                let doomed = doomed.matching_file_row_mask().await?;
-                Ok(Self {
-                    layout: self.layout.clone(),
-                    indexes: self.indexes.clone(),
-                    generation: next_generation(),
-                    quads: QuadsSource::File {
-                        path: path.clone(),
-                        file: file.clone(),
-                        // An owner has no pending filter, and deleting doesn't
-                        // introduce one — it only widens the tombstones.
-                        filter: None,
-                        selection: selection.clone(),
-                        deleted: Some(union_deleted(deleted.as_ref(), doomed)),
-                        serve: None,
-                    },
-                    tail,
-                })
-            }
-            _ => unreachable!("a store only ever derives a view of its own backend"),
-        }
+            QuadsSource::File { .. } => doomed.matching_file_row_mask().await?,
+        };
+        // A delete changes the data: a new generation over the same base.
+        Ok(Self {
+            generation: next_generation(),
+            ..self.derived(self.quads.with_tombstones(doomed), tail)
+        })
     }
 
     /// Evaluate this file view's pending filter and (materialized) selection
@@ -337,24 +240,5 @@ impl VortexRdfStore {
         // A served match's pending selection materializes here.
         let selection = selection.materialized_async().await?;
         file_filter::matching_file_rows(file, filter.as_ref(), &selection).await
-    }
-}
-
-/// Tail flatten policy: appended chunks are folded into the flat first chunk
-/// once their row count reaches `max(flat_len, TAIL_FLATTEN_FLOOR)` — so the
-/// tail is rewritten geometrically, not on every add, and a small tail never
-/// flattens below this floor.
-pub(crate) const TAIL_FLATTEN_FLOOR: usize = 1_024;
-/// Tail flatten policy: appended chunks are folded into the flat first chunk
-/// once the tail holds more than this many chunks, whatever their row counts,
-/// so tail scans (which visit every chunk) stay dense.
-pub(crate) const TAIL_MAX_CHUNKS: usize = 64;
-
-/// Fold a freshly-doomed set of base rows into a store's existing tombstones,
-/// shared by both backends' delete paths.
-fn union_deleted(existing: Option<&Mask>, doomed: Mask) -> Mask {
-    match existing {
-        Some(existing) => existing | &doomed,
-        None => doomed,
     }
 }

@@ -12,7 +12,7 @@ use crate::store::indexes::resolve_indexes_file;
 use crate::store::indexes::{
     InMemoryServePlan, IndexResolution, LazyRowIds, ResolvedRowIds, resolve_indexes_in_memory,
 };
-use crate::store::layouts::{Constraints, PatternCodes, QuadPattern, ResolvedLayout, TermRef};
+use crate::store::layouts::{Constraints, PatternCodes, QuadPattern, TermRef};
 use crate::store::scan::typed_eq::{typed_positions, typed_residual_ids};
 #[cfg(feature = "file-io")]
 use crate::store::scan::{file_filter, file_reads};
@@ -21,7 +21,6 @@ use crate::store::view::selection::{RowSelection, ViewSelection};
 use crate::store::{QuadsSource, Tail};
 
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
-use std::sync::Arc;
 use web_time::Instant;
 
 use vortex_array::arrays::StructArray;
@@ -94,10 +93,7 @@ impl VortexRdfStore {
         // dictionary has never seen proves nothing about rows appended since
         // (the tail stores strings precisely so such a term can still match).
         if let Some(tail) = &self.tail {
-            matched.tail = Some(
-                Self::match_tail(&self.tail_layout(), tail, subject, predicate, object, graph)
-                    .await?,
-            );
+            matched.tail = Some(Self::match_tail(tail, subject, predicate, object, graph).await?);
         }
         debug_assert!(
             need == IdsNeed::CountOrWindow || !matched.quads.is_pending_without_plan(),
@@ -106,13 +102,12 @@ impl VortexRdfStore {
         Ok(matched)
     }
 
-    /// Narrow a tail to the rows matching the pattern — the tail counterpart
-    /// of the base's mask-scan fallback. A tail is small, unsorted, and
-    /// unindexed, so a scan over its (already few) selected rows is the right
-    /// plan; the surviving positions refine the tail-local selection exactly
-    /// as base matches refine the base's.
+    /// Narrow a tail to the rows matching the pattern, under the tail's own
+    /// layout — the tail counterpart of the base's mask-scan fallback. A tail
+    /// is small, unsorted, and unindexed, so a scan over its (already few)
+    /// selected rows is the right plan; the surviving positions refine the
+    /// tail-local selection exactly as base matches refine the base's.
     async fn match_tail(
-        layout: &ResolvedLayout,
         tail: &Tail,
         subject: Option<&NamedOrBlankNode>,
         predicate: Option<&NamedNode>,
@@ -124,14 +119,14 @@ impl VortexRdfStore {
         if tail.selection.is_empty(tail.rows.len()) {
             return Ok(carry(tail.selection.clone()));
         }
-        // The tail's layouts store plain strings (see `tail_layout`), so this
-        // prelude resolves nothing and never suspends — but the witness is
-        // still minted by it, like every probe surface.
+        // The tail's layouts store plain strings (see `Tail::layout_for`), so
+        // this prelude resolves nothing and never suspends — but the witness
+        // is still minted by it, like every probe surface.
         let pattern = QuadPattern::new(subject, predicate, object, graph);
-        let mut codes = layout.prepare_pattern(pattern).await?;
+        let mut codes = tail.layout.prepare_pattern(pattern).await?;
         let eqs = match codes.constraints(pattern)? {
             // The tail's string layouts never compile to AlwaysFalse (see
-            // `tail_layout`); the arm stays for totality.
+            // `Tail::layout_for`); the arm stays for totality.
             Constraints::AlwaysFalse => return Ok(carry(RowSelection::empty())),
             Constraints::Eq(eqs) => eqs,
         };
@@ -243,7 +238,6 @@ impl VortexRdfStore {
             base,
             selection,
             components,
-            deleted,
             probes,
             ..
         } = &self.quads
@@ -519,20 +513,10 @@ impl VortexRdfStore {
             matches!(selection, ViewSelection::Pending(_)),
             debug::elapsed(t)
         );
-        Ok(Self {
-            layout: self.layout.clone(),
-            indexes: self.indexes.clone(),
-            generation: self.generation,
-            quads: QuadsSource::InMemory {
-                base: base.clone(),
-                selection,
-                components: Arc::clone(components),
-                deleted: deleted.clone(),
-                probes: Arc::clone(probes),
-                serve,
-            },
-            tail: self.tail.clone(),
-        })
+        Ok(self.derived(
+            self.quads.in_memory_with(selection, serve),
+            self.tail.clone(),
+        ))
     }
 
     /// The file backend of [`match_base`](Self::match_base): restrictions
@@ -551,11 +535,9 @@ impl VortexRdfStore {
         t: Option<Instant>,
     ) -> Result<Self> {
         let QuadsSource::File {
-            path,
             file,
             filter: existing_filter,
             selection: existing_selection,
-            deleted: existing_deleted,
             ..
         } = &self.quads
         else {
@@ -797,24 +779,14 @@ impl VortexRdfStore {
         // Build the new, more-restricted file view; no data has been
         // read yet — restrictions are only applied on the next scan.
         // The file (and thus its index columns) is shared, so the
-        // indexes stay usable for further chained matches.
-        Ok(Self {
-            layout: self.layout.clone(),
-            indexes: self.indexes.clone(),
-            generation: self.generation,
-            quads: QuadsSource::File {
-                path: path.clone(),
-                file: file.clone(),
-                filter,
-                selection,
-                // Tombstones are a property of the base file, not of the
-                // pattern, so they carry across the match unchanged; the
-                // read paths apply them (see `restrict_scan`).
-                deleted: existing_deleted.clone(),
-                serve,
-            },
-            tail: self.tail.clone(),
-        })
+        // indexes stay usable for further chained matches. Tombstones are a
+        // property of the base file, not of the pattern, so they carry
+        // across the match unchanged; the read paths apply them (see
+        // `restrict_scan`).
+        Ok(self.derived(
+            self.quads.file_with(filter, selection, serve),
+            self.tail.clone(),
+        ))
     }
 
     // ── pattern matching helpers ─────────────────────────────────────────────
@@ -822,8 +794,9 @@ impl VortexRdfStore {
     /// Build an in-memory boolean mask (one bit per row of `array`, in its own
     /// order) marking which of its rows satisfy `eqs` — the per-column
     /// equalities a pattern compiled to under the layout of `array`'s rows
-    /// (the store's own for the base, [`Self::tail_layout`] for the tail,
-    /// which stores strings under a Dictionary-encoded base).
+    /// (the store's own for the base, the tail's own for the tail, which
+    /// stores strings under a Dictionary-encoded base: see
+    /// [`Tail::layout_for`]).
     ///
     /// The mask is positional, so it only means anything against the array it
     /// was computed over: callers holding a view must translate it back to base

@@ -520,7 +520,7 @@ filesystems are unsupported for mapping.
 ## 9. The in-memory twin
 
 A store in memory holds the same three pieces the file does, in the forms the
-read paths are written against ([`QuadsSource`](../core/src/store/view/mod.rs#L37)):
+read paths are written against ([`QuadsSource`](../core/src/store/view/mod.rs#L47)):
 
 | In the file | In memory |
 |---|---|
@@ -597,7 +597,7 @@ open rather than being read around.
 | `WINDOW_ENTRY_OVERHEAD` | 4 KiB charged per cached window beyond its chunk's bytes | [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs#L81) |
 | `DICT_VERSION` | 2 | [`container/mod.rs`](../core/src/io/container/mod.rs#L68) |
 | `INDEX_VERSION` | 1 | [`container/mod.rs`](../core/src/io/container/mod.rs#L72) |
-| `POINT_GATHER_MAX_ROWS` | 256 rows — a located run at most this wide is point-read through the chunk probes | [`selection.rs`](../core/src/store/view/selection.rs#L522) |
+| `POINT_GATHER_MAX_ROWS` | 256 rows — a located run at most this wide is point-read through the chunk probes | [`selection.rs`](../core/src/store/view/selection.rs#L544) |
 | `POINT_READ_ROWS` | 256 rows — exact row ids at most one per this many rows of the splits holding them check a pending filter by point reads ([matching.md §7](matching.md#7-the-file-path)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L614) |
 | `POINT_IDS_PER_SPLIT` | 16 ids — exact ids at most this many per split they touch are read point by point ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L766) |
 | `TAKE_ROWS` | 16 rows — exact ids at most one per this many rows of their splits are taken at their rows rather than scanned | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L650) |

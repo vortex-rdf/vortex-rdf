@@ -1,4 +1,4 @@
-//! The row/code read surface: sizes, gathered rows, code columns, and the
+//! The row/code read surface: gathered rows, code columns, and the
 //! selected-rows plumbing the serialization and compaction paths share.
 
 use crate::error::Result;
@@ -7,12 +7,14 @@ use crate::store::QuadsSource;
 use crate::store::RawQuad;
 use crate::store::array::{chunked_or_single, field_as, subject_sorted, with_subject_stamp};
 use crate::store::layouts::dictionary::TermDictionary;
-use crate::store::layouts::{LayoutStrategy, ResolvedLayout, dictionary};
-use crate::store::scan::gather::gather_live;
+use crate::store::layouts::{ResolvedLayout, dictionary};
 #[cfg(feature = "file-io")]
-use crate::store::scan::{file_filter, file_reads};
+use crate::store::scan::file_reads;
+use crate::store::scan::gather::gather_live;
 use crate::store::schema::{self, TermCode};
-use crate::store::view::selection::{RowSelection, ViewSelection};
+use crate::store::view::selection::RowSelection;
+#[cfg(feature = "file-io")]
+use crate::store::view::selection::ViewSelection;
 
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{PrimitiveArray, StructArray};
@@ -29,122 +31,6 @@ use vortex_mask::Mask;
 use crate::store::VortexRdfStore;
 
 impl VortexRdfStore {
-    /// Number of quads in the store.
-    ///
-    /// For a file-backed store with a pending `match_pattern` filter, this
-    /// counts matching rows from the filter masks alone — only the columns the
-    /// filter references are read, and no rows are projected or decoded.
-    /// `file.row_count()` alone would report the unfiltered total.
-    pub async fn size(&self) -> Result<usize> {
-        Ok(self.base_size().await? + self.tail_size())
-    }
-
-    /// [`size`](Self::size) for the base alone — the rows the selection (and
-    /// a pending file filter) cover, minus tombstones; the tail's rows are
-    /// [`tail_size`](Self::tail_size).
-    pub(crate) async fn base_size(&self) -> Result<usize> {
-        let base = match &self.quads {
-            // In-memory patterns resolve to exact row ids at match time —
-            // or, for a served match or a view built only to be counted or
-            // windowed, to a pending run whose width is known without
-            // decoding it — so the selection alone knows the answer and no
-            // rows are touched. Deletions are only counted out, never
-            // gathered.
-            QuadsSource::InMemory {
-                base,
-                selection,
-                deleted: None,
-                ..
-            } => match selection {
-                ViewSelection::Exact(selection) => selection.len(base.len()),
-                ViewSelection::Pending(lazy) => match lazy.len_if_known() {
-                    Some(len) => len,
-                    None => lazy.materialized()?.len(),
-                },
-            },
-            // Tombstones ask liveness per selected row, so a pending
-            // selection materializes — a count is one of the consumers the
-            // deferred ids exist for.
-            QuadsSource::InMemory {
-                base,
-                selection,
-                deleted: Some(deleted),
-                ..
-            } => selection
-                .materialized()?
-                .live_mask(deleted, base.len())
-                .true_count(),
-            #[cfg(feature = "file-io")]
-            QuadsSource::File {
-                file,
-                filter,
-                selection,
-                deleted,
-                serve,
-                ..
-            } => {
-                // A located serve plan knows the width of the child run it
-                // serves — exactly the constrained rows — so a pending
-                // selection over one counts from the plan, without the
-                // deferred index-child scan the selection itself would run;
-                // a pending located run held without a plan knows its own
-                // width the same way. Tombstones are defined over primary row
-                // ids the plan does not hold, and a pending filter's
-                // selectivity is unknown, so either sends the count through
-                // the selection.
-                let known = match (selection, serve, filter, deleted) {
-                    (ViewSelection::Pending(_), Some(plan), None, None) => plan
-                        .row_range()
-                        .map(|range| (range.end - range.start) as usize),
-                    // A located run held pending for a count: its width.
-                    (ViewSelection::Pending(lazy), None, None, None) => lazy.len_if_known(),
-                    _ => None,
-                };
-                if let Some(rows) = known {
-                    rows
-                } else {
-                    // A count needs the selection itself, so a deferred
-                    // resolution's ids (a served match's index-child scan, a
-                    // located run's rids under tombstones) are computed here,
-                    // once, and cached on the view.
-                    let selection = selection.materialized_async().await?;
-                    match filter {
-                        // No filter pending: the selection is exact, minus
-                        // whatever the tombstones have removed from it.
-                        None => match deleted {
-                            None => selection.len(file.row_count() as usize),
-                            Some(d) => selection
-                                .live_mask(d, file.row_count() as usize)
-                                .true_count(),
-                        },
-                        // A filter is pending: its selectivity is unknown
-                        // ahead of time, so the rows actually have to be
-                        // evaluated (with the tombstoned rows excluded before
-                        // counting).
-                        Some(f) => {
-                            file_filter::count_matching_rows(file, f, &selection, deleted.as_ref())
-                                .await?
-                        }
-                    }
-                }
-            }
-        };
-        Ok(base)
-    }
-
-    /// The tail's contribution to [`size`](Self::size): its selection is
-    /// always exact (tail matches are resolved eagerly), minus its own
-    /// tombstones.
-    pub(crate) fn tail_size(&self) -> usize {
-        self.tail.as_ref().map_or(0, |tail| match &tail.deleted {
-            None => tail.selection.len(tail.rows.len()),
-            Some(deleted) => tail
-                .selection
-                .live_mask(deleted, tail.rows.len())
-                .true_count(),
-        })
-    }
-
     /// The rows this view selects, base and tail combined, as a single
     /// in-memory array of primary columns only — the rows-only counterpart
     /// of [`to_serializable_parts`](Self::to_serializable_parts): no index
@@ -215,7 +101,7 @@ impl VortexRdfStore {
     /// the bindings' entry point — otherwise runs; that method tries this fast
     /// path first.
     pub(crate) fn code_columns(&self) -> Option<[Buffer<TermCode>; 4]> {
-        if self.layout.strategy() != LayoutStrategy::Dictionary || self.tail_len() != 0 {
+        if !self.is_code_view() {
             return None;
         }
         // Without `file-io`, InMemory is the only variant.
@@ -244,7 +130,7 @@ impl VortexRdfStore {
     /// primitive the shared cache can hand out.
     pub(crate) fn base_code_columns(&self) -> Option<[Buffer<TermCode>; 4]> {
         use vortex_array::arrays::Struct;
-        if self.layout.strategy() != LayoutStrategy::Dictionary || self.tail_len() != 0 {
+        if !self.is_code_view() {
             return None;
         }
         // Without `file-io`, InMemory is the only variant.
@@ -334,7 +220,7 @@ impl VortexRdfStore {
         if let Some(columns) = self.code_columns() {
             return Ok(Some(columns));
         }
-        if self.layout.strategy() != LayoutStrategy::Dictionary || self.tail_len() != 0 {
+        if !self.is_code_view() {
             return Ok(None);
         }
         // A served file view whose row ids are still deferred reads its codes
@@ -543,7 +429,7 @@ impl VortexRdfStore {
         let mut raws = self.base_raw_quads(base).await?;
         let base_rows = raws.len();
         if let Some(tail) = &self.tail {
-            raws.extend(self.tail_layout().raw_quads(&tail.live_rows()?)?);
+            raws.extend(tail.raw_quads()?);
         }
         Ok((raws, base_rows))
     }

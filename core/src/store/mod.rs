@@ -53,8 +53,9 @@ pub(crate) fn next_generation() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+use crate::error::{Result, VortexRdfError};
 use layouts::ResolvedLayout;
-use view::selection::{RowSelection, ViewSelection};
+use view::selection::RowSelection;
 
 use std::sync::Arc;
 
@@ -120,6 +121,21 @@ pub struct StoreParts {
 }
 
 impl VortexRdfStore {
+    /// A view over the same data as this store — its layout, indexes and
+    /// [`generation`](Self::generation) — reading `quads` and `tail`: the one
+    /// constructor every derived view goes through. A mutation, whose data
+    /// differs, takes a fresh generation over it.
+    #[inline]
+    pub(crate) fn derived(&self, quads: QuadsSource, tail: Option<Tail>) -> Self {
+        Self {
+            layout: self.layout.clone(),
+            indexes: self.indexes.clone(),
+            generation: self.generation,
+            quads,
+            tail,
+        }
+    }
+
     /// An empty view of this store: same base (and tail), selecting no row of
     /// either.
     ///
@@ -129,58 +145,48 @@ impl VortexRdfStore {
     /// nothing. No serve plan carries across — a plan is only valid while its
     /// row run is exactly the selection.
     pub(crate) fn empty_view(&self) -> Self {
-        let quads = match &self.quads {
-            QuadsSource::InMemory {
-                base,
-                deleted,
-                probes,
-                ..
-            } => QuadsSource::InMemory {
-                base: base.clone(),
-                selection: ViewSelection::Exact(RowSelection::empty()),
-                components: Arc::from(Vec::new()),
-                deleted: deleted.clone(),
-                probes: Arc::clone(probes),
-                serve: None,
-            },
-            #[cfg(feature = "file-io")]
-            QuadsSource::File {
-                path,
-                file,
-                filter,
-                deleted,
-                ..
-            } => QuadsSource::File {
-                path: path.clone(),
-                file: file.clone(),
-                filter: filter.clone(),
-                selection: ViewSelection::Exact(RowSelection::empty()),
-                deleted: deleted.clone(),
-                serve: None,
-            },
-        };
         let tail = self
             .tail
             .as_ref()
             .map(|tail| tail.with_selection(RowSelection::empty()));
         Self {
-            layout: self.layout.clone(),
             indexes: vec![],
-            generation: self.generation,
-            quads,
-            tail,
+            ..self.derived(self.quads.emptied(), tail)
         }
     }
 
-    /// The layout the tail's rows are stored in: the store's own, except under
-    /// the Dictionary layout, where an appended term has no code in the sorted
-    /// dictionary, so the tail holds Default-layout strings instead — patterns
-    /// probe the base by code and the tail by string.
-    fn tail_layout(&self) -> ResolvedLayout {
-        match &self.layout {
-            ResolvedLayout::Dictionary(_) => ResolvedLayout::Default,
-            other => other.clone(),
+    /// Whether this view's rows are code-addressable: the Dictionary layout
+    /// with an empty append tail (tail rows hold terms as strings, which have
+    /// no codes in the dictionary).
+    pub(crate) fn is_code_view(&self) -> bool {
+        self.layout.strategy() == LayoutStrategy::Dictionary && self.tail_len() == 0
+    }
+
+    /// Err unless this view's rows are code-addressable
+    /// ([`is_code_view`](Self::is_code_view)).
+    pub(in crate::store) fn ensure_code_view(&self, operation: &str) -> Result<()> {
+        if self.layout.strategy() != LayoutStrategy::Dictionary {
+            return Err(VortexRdfError::InvalidOperation(format!(
+                "{operation} needs the Dictionary layout: this store's {:?} layout stores terms \
+                 as strings, which have no codes to keep",
+                self.layout.strategy()
+            )));
         }
+        self.ensure_no_dictionary_tail(operation)
+    }
+
+    /// Err for a Dictionary-layout view with a non-empty append tail, whose
+    /// rows have no single dtype: the tail holds terms the dictionary has no
+    /// codes for. Every other view passes.
+    pub(in crate::store) fn ensure_no_dictionary_tail(&self, operation: &str) -> Result<()> {
+        if self.layout.strategy() == LayoutStrategy::Dictionary && self.tail_len() != 0 {
+            return Err(VortexRdfError::InvalidOperation(format!(
+                "{operation} needs an empty append tail: the {} appended rows hold terms the \
+                 dictionary has no codes for; compact() the store first",
+                self.tail_len()
+            )));
+        }
+        Ok(())
     }
 
     // ── ownership & compaction policy ────────────────────────────────────────
@@ -252,7 +258,7 @@ impl VortexRdfStore {
     /// Decoding codes against anything less than all three yields silently
     /// wrong terms, so bindings take this gate as a whole.
     pub fn code_read_snapshot(&self) -> Option<DictSnapshot> {
-        if self.tail_len() != 0 {
+        if !self.is_code_view() {
             return None;
         }
         self.dictionary_snapshot()
@@ -268,11 +274,8 @@ impl VortexRdfStore {
     ///
     /// [`code_columns_gathered`]: Self::code_columns_gathered
     pub fn dict_reader(&self) -> Option<DictReader> {
-        if self.tail_len() != 0 {
-            return None;
-        }
         match &self.layout {
-            ResolvedLayout::Dictionary(access) => Some(access.reader()),
+            ResolvedLayout::Dictionary(access) if self.is_code_view() => Some(access.reader()),
             _ => None,
         }
     }

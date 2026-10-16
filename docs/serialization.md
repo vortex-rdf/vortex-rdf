@@ -54,7 +54,7 @@ A builder hands these back in one of two shapes
 | CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`SerializeArgs`](../cli/src/main.rs#L33)) | out-of-core | file |
 | Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L145) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L60) | out-of-core | file / any `VortexWrite` |
 | Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L78), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L59) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L37) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L129) to name the builder | either | in-memory store |
-| Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L169) | — (re-serializes a store) | bytes |
+| Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L165) | — (re-serializes a store) | bytes |
 | Rust | [`to_serializable_parts`](../core/src/store/persist/serialize.rs#L110) → [`from_parts`](../core/src/store/construct.rs#L111) | — | in-memory round trip |
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize_rdf`](../python/src/serialize.rs#L33)) | out-of-core | file |
 | Python | `VortexRdfStore(path, in_memory=True)` | — (opens, then lifts through `to_serializable_parts` → `from_parts`) | in-memory store |
@@ -533,11 +533,11 @@ quad once even when the rows it was gathered from did not.
 
 ### 11.2 Compaction
 
-[`compact`](../core/src/store/write/compaction.rs#L30) /
-[`compact_with_indexes`](../core/src/store/write/compaction.rs#L64) gather every live
+[`compact`](../core/src/store/write/compaction.rs#L31) /
+[`compact_with_indexes`](../core/src/store/write/compaction.rs#L65) gather every live
 quad, sort, drop repeated quads, and rebuild:
 
-- **A file-backed owner stays file-backed** ([`stream_compacted_to_file`](../core/src/store/write/compaction.rs#L118)):
+- **A file-backed owner stays file-backed** ([`stream_compacted_to_file`](../core/src/store/write/compaction.rs#L119)):
   the sorted rows are streamed through `SortedStreamBuilder` — spilling beside
   the store file, not in the OS temp dir — into a sibling temp file
   `<store>.write-<uuid>.tmp`, which is atomically renamed over the original;
@@ -549,7 +549,7 @@ quad, sort, drop repeated quads, and rebuild:
   adopts the result exactly as `from_built` does.
 
 `add_quads` compacts automatically when the tail crosses a threshold
-([`tail_needs_compaction`](../core/src/store/write/compaction.rs#L188)):
+([`tail_needs_compaction`](../core/src/store/write/compaction.rs#L185)):
 
 | Trigger | Value |
 |---|---|
@@ -559,8 +559,8 @@ quad, sort, drop repeated quads, and rebuild:
 
 Between compactions the tail accretes as chunks and is flattened once the
 accreted rows rival the flat prefix (floor 1,024) or 64 chunks pile up
-([`TAIL_FLATTEN_FLOOR`](../core/src/store/write/mutation.rs#L347),
-[`TAIL_MAX_CHUNKS`](../core/src/store/write/mutation.rs#L351)). The tail, tombstone
+([`TAIL_FLATTEN_FLOOR`](../core/src/store/view/mod.rs#L415),
+[`TAIL_MAX_CHUNKS`](../core/src/store/view/mod.rs#L419)). The tail, tombstone
 and compaction model in full is [mutations.md](mutations.md).
 
 ### 11.3 Back to RDF text
