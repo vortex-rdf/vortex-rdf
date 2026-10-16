@@ -182,11 +182,7 @@ fn test_decode_chunk_reports_chunk_failure_as_single_err() {
         .iter()
         .map(crate::store::RawQuad::from_quad)
         .collect();
-    for layout in [
-        LayoutStrategy::Default,
-        LayoutStrategy::TypedObject,
-        LayoutStrategy::Dictionary,
-    ] {
+    for layout in LAYOUTS {
         let (chunk, resolved) = chunk_for(layout, &raws);
         let decoded = resolved.decode_chunk(&drop_graph_column(&chunk));
         assert_eq!(decoded.len(), 1, "{layout:?}: one error for the chunk");
@@ -343,37 +339,59 @@ fn oxrdf_reference(quads: &[Quad], format: oxrdfio::RdfFormat) -> String {
     String::from_utf8(reference).unwrap()
 }
 
-/// The three layouts whose raw chunk decoding the export fast path reads
-/// through: verbatim string columns, the typed object columns, and codes
-/// against the dictionary.
-const EXPORT_LAYOUTS: [LayoutStrategy; 3] = [
-    LayoutStrategy::Default,
-    LayoutStrategy::TypedObject,
-    LayoutStrategy::Dictionary,
-];
-
-/// The N-Quads export fast path writes the store's raw term strings
-/// verbatim; this pins it byte-for-byte against oxrdfio's serializer over
-/// terms that exercise escaping, tags, datatypes, blank nodes, and a named
-/// graph, under every layout's raw chunk decoding.
-#[tokio::test]
-async fn test_export_nquads_fast_path_matches_oxrdf() {
+/// Pins the N-Quads export fast path on `store`, which holds
+/// [`export_test_quads`]: as it stands, and again with its second quad
+/// tombstoned and a quad appended to the tail, where the export must skip the
+/// deleted row and include the tail row. Each view must read the same rows
+/// through `quads()` and `quads_vec()` and export the bytes oxrdfio's
+/// serializer gives for them. The reference follows the store's own row order,
+/// so what this pins is the byte-level escaping rather than the build's
+/// ordering. A failure names the store's layout and the view.
+async fn assert_export_matches_oxrdf(store: VortexRdfStore) {
+    let layout = store.layout();
     let quads = export_test_quads();
-    for layout in EXPORT_LAYOUTS {
-        let store = built_store(quads.clone(), layout, vec![]).await;
-
-        let stored: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
+    let appended = make_quad(
+        "http://example.org/s9",
+        "http://example.org/p",
+        "appended",
+        GraphName::DefaultGraph,
+    );
+    let edited = store
+        .delete_quad(&quads[1])
+        .await
+        .unwrap()
+        .add_quad(appended)
+        .await
+        .unwrap();
+    for (cell, store) in [("as written", store), ("tombstoned and tailed", edited)] {
+        // Both hold as many quads as were written: the edit drops one, adds one.
+        let stored = store.quads_vec().await.unwrap();
+        assert_eq!(stored.len(), quads.len(), "{layout:?} {cell}");
+        let streamed: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
+        assert_eq!(streamed, stored, "{layout:?} {cell}");
         let mut exported = Vec::new();
         crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NQuads)
             .await
             .unwrap();
-        // The reference follows the store's own row order, so what this pins
-        // is the byte-level escaping rather than the build's ordering.
         assert_eq!(
             String::from_utf8(exported).unwrap(),
             oxrdf_reference(&stored, oxrdfio::RdfFormat::NQuads),
-            "{layout:?}"
+            "{layout:?} {cell}"
         );
+    }
+}
+
+/// The N-Quads export fast path writes the store's raw term strings
+/// verbatim; this pins it byte-for-byte against oxrdfio's serializer over
+/// terms that exercise escaping, tags, datatypes, blank nodes, and a named
+/// graph, under every layout's raw chunk decoding — and, with a tombstoned
+/// base row and an append tail, skipping the deleted row and including the
+/// tail row.
+#[tokio::test]
+async fn test_export_nquads_fast_path_matches_oxrdf() {
+    for layout in LAYOUTS {
+        let store = built_store(export_test_quads(), layout, vec![]).await;
+        assert_export_matches_oxrdf(store).await;
     }
 }
 
@@ -411,87 +429,15 @@ async fn test_export_ntriples_fast_path_and_named_graph_refusal() {
 
 /// The fast path's file arm: the raw chunk stream over a scan must produce
 /// the same bytes as the in-memory arm under every layout — the file-backed
-/// dictionary's codes resolved through the async read path included.
+/// dictionary's codes resolved through the async read path included — with
+/// the tombstone and the tail held in memory beside the file.
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_export_nquads_fast_path_file_backed() {
-    let quads = export_test_quads();
-    for layout in EXPORT_LAYOUTS {
-        let (_dir, path) = write_store_file(quads.clone(), layout, vec![]).await;
-
+    for layout in LAYOUTS {
+        let (_dir, path) = write_store_file(export_test_quads(), layout, vec![]).await;
         let store = VortexRdfStore::from_file(&path).await.unwrap();
-        let stored: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
-        let mut exported = Vec::new();
-        crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NQuads)
-            .await
-            .unwrap();
-        assert_eq!(
-            String::from_utf8(exported).unwrap(),
-            oxrdf_reference(&stored, oxrdfio::RdfFormat::NQuads),
-            "{layout:?}"
-        );
-    }
-}
-
-/// `store` with one base quad tombstoned and one quad appended to the tail.
-async fn tombstoned_and_tailed(store: VortexRdfStore) -> VortexRdfStore {
-    let quads = export_test_quads();
-    let appended = make_quad(
-        "http://example.org/s9",
-        "http://example.org/p",
-        "appended",
-        GraphName::DefaultGraph,
-    );
-    store
-        .delete_quad(&quads[1])
-        .await
-        .unwrap()
-        .add_quad(appended)
-        .await
-        .unwrap()
-}
-
-/// The export over a store with a tombstoned base row and an append tail
-/// skips the deleted row and includes the tail row, under every layout's
-/// raw chunk decoding.
-#[tokio::test]
-async fn test_export_skips_tombstones_and_includes_tail() {
-    let quads = export_test_quads();
-    for layout in EXPORT_LAYOUTS {
-        let store = tombstoned_and_tailed(built_store(quads.clone(), layout, vec![]).await).await;
-        let stored = store.quads_vec().await.unwrap();
-        assert_eq!(stored.len(), quads.len(), "{layout:?}");
-        let mut exported = Vec::new();
-        crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NQuads)
-            .await
-            .unwrap();
-        assert_eq!(
-            String::from_utf8(exported).unwrap(),
-            oxrdf_reference(&stored, oxrdfio::RdfFormat::NQuads),
-            "{layout:?}"
-        );
-    }
-}
-
-/// The file arm of the same: tombstone and tail over a file-backed store.
-#[cfg(feature = "file-io")]
-#[tokio::test]
-async fn test_export_skips_tombstones_and_includes_tail_file_backed() {
-    let quads = export_test_quads();
-    for layout in EXPORT_LAYOUTS {
-        let (_dir, path) = write_store_file(quads.clone(), layout, vec![]).await;
-        let store = tombstoned_and_tailed(VortexRdfStore::from_file(&path).await.unwrap()).await;
-        let stored = store.quads_vec().await.unwrap();
-        assert_eq!(stored.len(), quads.len(), "{layout:?}");
-        let mut exported = Vec::new();
-        crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NQuads)
-            .await
-            .unwrap();
-        assert_eq!(
-            String::from_utf8(exported).unwrap(),
-            oxrdf_reference(&stored, oxrdfio::RdfFormat::NQuads),
-            "{layout:?}"
-        );
+        assert_export_matches_oxrdf(store).await;
     }
 }
 

@@ -4,8 +4,6 @@
 
 use super::*;
 use crate::store::builders::sorted_stream;
-use vortex_array::VortexSessionExecute;
-use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 
 /// The chunk-boundary harness: chunk_size 3 over the 10 given quads must
 /// split as [3, 3, 3, 1], whatever the `layout`. Hands back the collected
@@ -200,11 +198,7 @@ async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
 /// still declares the requested index set, under every layout.
 #[tokio::test]
 async fn test_sorted_stream_empty_dataset() {
-    for layout in [
-        LayoutStrategy::Default,
-        LayoutStrategy::TypedObject,
-        LayoutStrategy::Dictionary,
-    ] {
+    for layout in LAYOUTS {
         for indexes in [
             vec![],
             vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
@@ -274,22 +268,6 @@ async fn test_writer_sorts_reversed_input() {
     assert_eq!(decoded[24].object.to_string(), "\"object value 24\"");
 }
 
-/// Whether a built array's `s` column carries the IsSorted stamp — the
-/// binary-search fast path's sole license, so the builder tests assert on it
-/// directly.
-fn assert_subject_stamp(arr: vortex_array::ArrayRef, expect_sorted: bool, name: &str) {
-    use vortex_array::expr::stats::{Precision, Stat, StatsProvider};
-
-    let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
-    let struct_arr = arr.execute::<StructArray>(&mut ctx).unwrap();
-    let s_col = struct_arr.unmasked_field_by_name("s").unwrap();
-    let is_sorted = match s_col.statistics().get(Stat::IsSorted) {
-        Precision::Exact(sc) | Precision::Inexact(sc) => bool::try_from(&sc).unwrap_or(false),
-        Precision::Absent => false,
-    };
-    assert_eq!(is_sorted, expect_sorted, "{name}: IsSorted stat mismatch");
-}
-
 /// Reverse-subject-order quads, so only a genuinely sorting builder may end
 /// up with a sorted `s` column.
 fn reverse_order_quads() -> Vec<Quad> {
@@ -298,7 +276,8 @@ fn reverse_order_quads() -> Vec<Quad> {
     quads
 }
 
-/// Both sorted builders stamp the `s` column sorted — the streaming one
+/// Both sorted builders stamp the `s` column sorted, and the stamp is the
+/// binary-search fast path's sole license. The streaming builder stamps it
 /// after materializing several chunks into one array.
 #[tokio::test]
 async fn test_sorted_builders_stamp_is_sorted() {
@@ -311,7 +290,10 @@ async fn test_sorted_builders_stamp_is_sorted() {
     )
     .await
     .unwrap();
-    assert_subject_stamp(sorted.array, true, "sorted_in_memory");
+    assert!(
+        crate::store::array::subject_sorted(&sorted.array),
+        "sorted_in_memory: no IsSorted stamp on s"
+    );
 
     let streamed = sorted_stream::build_array(
         Box::new(quad_stream(quads)),
@@ -321,5 +303,8 @@ async fn test_sorted_builders_stamp_is_sorted() {
     )
     .await
     .unwrap();
-    assert_subject_stamp(streamed.array, true, "sorted_stream");
+    assert!(
+        crate::store::array::subject_sorted(&streamed.array),
+        "sorted_stream: no IsSorted stamp on s"
+    );
 }

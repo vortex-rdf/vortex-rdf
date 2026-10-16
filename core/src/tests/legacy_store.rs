@@ -183,38 +183,6 @@ async fn test_a_pre_0_12_store_is_refused_from_a_file() {
     }
 }
 
-/// A file that is not a store at all keeps the generic error, now naming the
-/// `v2` root: the legacy message is for the `v1` root only.
-#[tokio::test]
-async fn test_a_foreign_root_keeps_the_generic_error() {
-    use vortex_file::WriteOptionsSessionExt as _;
-
-    let array = bare_code_quad_array(&[1, 2, 3]);
-    let dtype = array.dtype().clone();
-    let stream = vortex_array::stream::ArrayStreamAdapter::new(
-        dtype,
-        Box::pin(futures::stream::once(async move { Ok(array) })),
-    );
-    let mut bytes: Vec<u8> = Vec::new();
-    crate::session::VORTEX_SESSION
-        .write_options()
-        .write(&mut bytes, stream)
-        .await
-        .unwrap();
-
-    let message = VortexRdfStore::from_bytes(&bytes)
-        .await
-        .err()
-        .expect("open should fail")
-        .to_string();
-    assert!(
-        message.contains("not a vortex-rdf store file")
-            && message.contains("expected the vortex-rdf.store.v2 root layout")
-            && !message.contains("0.11"),
-        "{message}"
-    );
-}
-
 // ─── The guarantees the refusal protects ───────────────────────────────
 
 /// One `val` of a reference index child: a term code under the Dictionary

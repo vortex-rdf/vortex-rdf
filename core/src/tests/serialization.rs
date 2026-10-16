@@ -11,58 +11,6 @@ use crate::store::schema;
 
 // ─── Wire round-trips ──────────────────────────────────────────────────
 
-/// A tailed store's `to_bytes` rebuilds its index components over the
-/// merged rows, so the round-tripped store keeps its index set under the
-/// Dictionary layout (fresh dictionary, code components) and the string
-/// layouts alike.
-#[tokio::test]
-async fn test_tailed_store_serialization_keeps_indexes() {
-    for layout in [LayoutStrategy::Dictionary, LayoutStrategy::Default] {
-        let quads = modular_quads(12, 3, 4);
-        let store = built_store(
-            quads.clone(),
-            layout,
-            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
-        )
-        .await;
-
-        // Tail with a brand-new term (no code in the cached dictionary).
-        let added = store
-            .add_quads([make_quad(
-                "http://example.org/s99",
-                "http://example.org/p1",
-                "fresh object",
-                GraphName::DefaultGraph,
-            )])
-            .await
-            .unwrap();
-
-        let bytes = added.to_bytes().await.unwrap();
-        let reread = VortexRdfStore::from_bytes(&bytes).await.unwrap();
-        assert_eq!(
-            reread.indexes(),
-            &[IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
-            "{layout:?}: a tailed store's serialization must keep its indexes"
-        );
-        assert_eq!(reread.size().await.unwrap(), 13);
-
-        // The rebuilt components actually answer: p1 is on base rows 1, 4,
-        // 7, 10 plus the appended s99.
-        let p1 = NamedNode::new("http://example.org/p1").unwrap();
-        let matched = reread
-            .match_pattern(None, Some(&p1), None, None)
-            .await
-            .unwrap();
-        assert_eq!(matched.size().await.unwrap(), 5, "{layout:?}");
-        let fresh = Term::Literal(Literal::new_simple_literal("fresh object"));
-        assert_eq!(
-            matched_size(&reread, None, None, Some(&fresh), None).await,
-            1,
-            "{layout:?}: the tail row survives the round-trip"
-        );
-    }
-}
-
 /// A mutated owner's serialization keeps BOTH provenance channels: tombstones
 /// must not silently drop the index children (they are rebuilt over the
 /// surviving rows) nor the subject sortedness (a gather preserves row
@@ -532,34 +480,38 @@ async fn test_from_parts_adopts_searchable_children() {
 
 /// Serializing a store that carries an append tail emits its rows in sorted
 /// order: the artifact claims `quads_sorted`, and a reader keeps the subject
-/// fast path without compacting first.
+/// fast path without compacting first. The index components are rebuilt over
+/// the merged rows, so the round-tripped store keeps its index set under the
+/// Dictionary layout (fresh dictionary, code components) and the string
+/// layouts alike, and the rebuilt components answer for the base rows and the
+/// tail's.
 #[tokio::test]
-async fn test_tailed_serialization_restores_sorted_order() {
-    for layout in [
-        LayoutStrategy::Default,
-        LayoutStrategy::TypedObject,
-        LayoutStrategy::Dictionary,
-    ] {
-        for indexes in [
-            vec![],
-            vec![IndexType::SecondaryByReference],
-            vec![IndexType::SecondaryByCopy],
-            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
-        ] {
-            // A subject that sorts BEFORE the tail's own position in the
-            // base, so an appended-at-the-end row must move to claim order.
-            let appended = make_quad(
+async fn test_tailed_serialization_sorts_and_keeps_indexes() {
+    for layout in LAYOUTS {
+        for indexes in index_sets() {
+            // `front` has a subject that sorts BEFORE the tail's own position
+            // in the base, so an appended-at-the-end row must move to claim
+            // order; its predicate and object are new to the base. `back`
+            // sorts after every base row, under a predicate the base carries,
+            // with a brand-new object (no code in the cached dictionary).
+            let front = make_quad(
                 "http://example.org/s00",
                 "http://example.org/p9",
                 "object 9",
                 GraphName::DefaultGraph,
             );
+            let back = make_quad(
+                "http://example.org/s99",
+                "http://example.org/p1",
+                "fresh object",
+                GraphName::DefaultGraph,
+            );
             let tailed = built_store(modular_quads(12, 3, 4), layout, indexes.clone())
                 .await
-                .add_quad(appended.clone())
+                .add_quads([front, back])
                 .await
                 .unwrap();
-            assert_eq!(tailed.size().await.unwrap(), 13);
+            assert_eq!(tailed.size().await.unwrap(), 14);
 
             let bytes = tailed.to_bytes().await.unwrap();
             let (quads_sorted, _) = container::store_metadata_of_bytes(&bytes);
@@ -569,8 +521,12 @@ async fn test_tailed_serialization_restores_sorted_order() {
             );
 
             let reread = VortexRdfStore::from_bytes(&bytes).await.unwrap();
-            assert_eq!(reread.size().await.unwrap(), 13);
-            assert_eq!(reread.indexes(), indexes.as_slice(), "{layout:?}");
+            assert_eq!(reread.size().await.unwrap(), 14);
+            assert_eq!(
+                reread.indexes(),
+                indexes.as_slice(),
+                "{layout:?}/{indexes:?}: a tailed store's serialization must keep its indexes"
+            );
             let subjects: Vec<String> = reread
                 .quads()
                 .unwrap()
@@ -594,6 +550,21 @@ async fn test_tailed_serialization_restores_sorted_order() {
                 matched_size(&reread, Some(&s), Some(&p), None, None).await,
                 1,
                 "{layout:?}/{indexes:?}: the appended row survives the reorder"
+            );
+            // The rebuilt components actually answer: p1 is on base rows 1,
+            // 4, 7, 10 plus the appended s99, and the tail's fresh object
+            // survives the round-trip.
+            let p1 = NamedNode::new("http://example.org/p1").unwrap();
+            assert_eq!(
+                matched_size(&reread, None, Some(&p1), None, None).await,
+                5,
+                "{layout:?}/{indexes:?}"
+            );
+            let fresh = Term::Literal(Literal::new_simple_literal("fresh object"));
+            assert_eq!(
+                matched_size(&reread, None, None, Some(&fresh), None).await,
+                1,
+                "{layout:?}/{indexes:?}: the tail row survives the round-trip"
             );
         }
     }
@@ -1321,12 +1292,15 @@ async fn test_open_rejects_index_child_with_mismatched_rows() {
 }
 
 /// A generic Vortex writer's output — a valid Vortex file under a plain root
-/// layout — is not a store, and `from_bytes` says so by naming the expected
-/// root layout.
+/// layout — is not a store: every open path says so with the generic error
+/// naming the expected `v2` root layout, rather than a scan-time surprise, and
+/// the legacy-store message (for the `v1` root only) does not apply.
 #[tokio::test]
-async fn test_from_bytes_rejects_foreign_vortex_bytes() {
+async fn test_open_rejects_foreign_vortex_bytes() {
     use vortex_file::WriteOptionsSessionExt as _;
 
+    // A bare code schema, written by the raw Vortex writer under a plain
+    // root layout.
     let array = bare_code_quad_array(&[1, 2, 3]);
     let dtype = array.dtype().clone();
     let stream = vortex_array::stream::ArrayStreamAdapter::new(
@@ -1340,14 +1314,24 @@ async fn test_from_bytes_rejects_foreign_vortex_bytes() {
         .await
         .unwrap();
 
-    let err = VortexRdfStore::from_bytes(&bytes)
-        .await
-        .err()
-        .expect("open should fail");
-    assert!(
-        err.to_string().contains("not a vortex-rdf store file"),
-        "unexpected error: {err}"
-    );
+    let (from_bytes, from_file, dir) = open_both(&bytes).await;
+    let in_memory = open_in_memory(&dir).await;
+    for (how, result) in [
+        ("from_bytes", from_bytes),
+        ("from_file", from_file),
+        ("from_file_in_memory", in_memory),
+    ] {
+        let message = result
+            .err()
+            .unwrap_or_else(|| panic!("{how}: open should fail"))
+            .to_string();
+        assert!(
+            message.contains("not a vortex-rdf store file")
+                && message.contains("expected the vortex-rdf.store.v2 root layout")
+                && !message.contains("0.11"),
+            "{how}: unexpected error: {message}"
+        );
+    }
 }
 
 /// `StoreParts::into_stream` requires a Dictionary-layout primary to come

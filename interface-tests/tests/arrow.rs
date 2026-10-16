@@ -14,7 +14,7 @@ use futures::StreamExt as _;
 use vortex_array::VortexSessionExecute as _;
 use vortex_arrow::ArrowSessionExt as _;
 use vortex_rdf_core::{IndexType, LayoutStrategy, QuadColumn, TermCode, vortex_session};
-use vortex_rdf_interface_tests::{memory_store, modular_quads, view_codes};
+use vortex_rdf_interface_tests::{arrow_schema, memory_store, modular_quads, view_codes};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn row_chunks_convert_to_record_batches() {
@@ -24,13 +24,7 @@ async fn row_chunks_convert_to_record_batches() {
         vec![IndexType::SecondaryByCopy],
     )
     .await;
-    let source = store.data_source().unwrap();
-    let schema = Arc::new(
-        vortex_session()
-            .arrow()
-            .to_arrow_schema(source.dtype())
-            .unwrap(),
-    );
+    let schema = arrow_schema(&store.data_source().unwrap());
     assert!(
         schema
             .fields()

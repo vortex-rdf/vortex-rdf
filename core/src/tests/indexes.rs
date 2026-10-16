@@ -12,11 +12,7 @@ use super::*;
 /// single `o` column each child's `val` column shares its dtype.
 #[tokio::test]
 async fn test_duplicate_index_requests_are_deduplicated() {
-    for layout in [
-        LayoutStrategy::Default,
-        LayoutStrategy::TypedObject,
-        LayoutStrategy::Dictionary,
-    ] {
+    for layout in LAYOUTS {
         let arr = build_array::<SortedInMemoryBuilder>(
             quad_stream(two_quads()),
             layout,

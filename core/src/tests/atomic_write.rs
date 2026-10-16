@@ -46,11 +46,7 @@ const BOTH_INDEXES: [IndexType; 2] = [IndexType::SecondaryByCopy, IndexType::Sec
 /// file and no temp file.
 #[tokio::test]
 async fn test_failed_build_leaves_nothing_at_a_fresh_path() {
-    for layout in [
-        LayoutStrategy::Default,
-        LayoutStrategy::TypedObject,
-        LayoutStrategy::Dictionary,
-    ] {
+    for layout in LAYOUTS {
         for indexes in [vec![], BOTH_INDEXES.to_vec()] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("store.vortex");
