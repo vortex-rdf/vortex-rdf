@@ -140,6 +140,15 @@ impl RowSelection {
         RowSelection::Range(0..0)
     }
 
+    /// `Ids(ids)`, or the canonical empty selection for an empty list.
+    pub(crate) fn from_ids(ids: Buffer<RowId>) -> Self {
+        if ids.is_empty() {
+            RowSelection::empty()
+        } else {
+            RowSelection::Ids(ids)
+        }
+    }
+
     /// How many base rows this selection covers.
     pub(crate) fn len(&self, base_len: usize) -> usize {
         match self {
@@ -294,11 +303,7 @@ impl RowSelection {
                 Buffer::from_iter(ids.iter().copied().filter(live).skip(offset).take(limit))
             }
         };
-        if ids.is_empty() {
-            RowSelection::empty()
-        } else {
-            RowSelection::Ids(ids)
-        }
+        Self::from_ids(ids)
     }
 
     /// `Range(range)`, or the canonical empty selection for an empty one.

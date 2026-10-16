@@ -55,7 +55,6 @@ pub(crate) fn next_generation() -> u64 {
 
 use crate::error::{Result, VortexRdfError};
 use layouts::ResolvedLayout;
-use view::selection::RowSelection;
 
 use std::sync::Arc;
 
@@ -87,6 +86,7 @@ pub struct VortexRdfStore {
     /// zero, as [`compact_with_indexes`] does — invalidates those ids; it
     /// rebuilds the index set over the new order.
     ///
+    /// [`RowSelection`]: view::selection::RowSelection
     /// [`compact_with_indexes`]: Self::compact_with_indexes
     indexes: Indexes,
     /// The identity of the data behind this view: see
@@ -133,25 +133,6 @@ impl VortexRdfStore {
             generation: self.generation,
             quads,
             tail,
-        }
-    }
-
-    /// An empty view of this store: same base (and tail), selecting no row of
-    /// either.
-    ///
-    /// Scans over it plan no work and `size()` answers 0 without touching the
-    /// data. Indexes and components are dropped: chained matches on an empty
-    /// view would otherwise run pointless lookups just to intersect with
-    /// nothing. No serve plan carries across — a plan is only valid while its
-    /// row run is exactly the selection.
-    pub(crate) fn empty_view(&self) -> Self {
-        let tail = self
-            .tail
-            .as_ref()
-            .map(|tail| tail.with_selection(RowSelection::empty()));
-        Self {
-            indexes: vec![],
-            ..self.derived(self.quads.emptied(), tail)
         }
     }
 
