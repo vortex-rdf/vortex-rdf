@@ -74,7 +74,7 @@ flowchart TD
 - **Set semantics.** A quad equal to one already in the store, or to an
   earlier quad of the batch, is skipped: an in-batch `HashSet` catches the
   latter, and each remaining quad is checked with
-  [`contains`](../core/src/store/query/matching.rs#L849) — one fully bound
+  [`contains`](../core/src/store/query/matching.rs#L850) — one fully bound
   `match_pattern` over base and tail ([matching.md §9](matching.md#9-the-tail)).
 - **Accretion.** Each batch joins the tail as one more chunk of a chunked
   accumulator; the accreted chunks are folded into the flat first chunk
@@ -153,7 +153,7 @@ flowchart TD
 - **File-backed stores** tombstone the same way (a file cannot be rewritten
   on delete). The doomed set is evaluated to a file-wide mask by
   [`matching_file_row_mask`](../core/src/store/write/mutation.rs#L230) (through
-  [`matching_file_rows`](../core/src/store/scan/file_filter.rs#L309)), and on
+  [`matching_file_rows`](../core/src/store/scan/file_filter.rs#L316)), and on
   every later read the mask is applied **inside the scan**
   ([`restrict_scan`](../core/src/store/scan/file_reads.rs#L245)) — as an
   `ExcludeByIndex` selection of the deleted ids for an `All` or `Range`

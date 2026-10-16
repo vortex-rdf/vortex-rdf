@@ -174,11 +174,19 @@ impl VortexRdfStore {
     /// selectively
     /// ([`with_searchable_int_children`](resident::with_searchable_int_children));
     /// this assembler transforms nothing.
+    ///
+    /// A Dictionary `layout` must hold its dictionary resident: an in-memory
+    /// view decodes its rows without suspending, through that dictionary
+    /// ([`in_memory_chunk`](Self::in_memory_chunk)).
     pub(super) fn assemble_resident(
         base: ArrayRef,
         components: Vec<IndexComponent>,
         layout: ResolvedLayout,
     ) -> Result<Self> {
+        debug_assert!(
+            !matches!(&layout, ResolvedLayout::Dictionary(access) if access.is_file_backed()),
+            "an in-memory store's dictionary is resident"
+        );
         let components: Arc<[IndexComponent]> = components.into();
         // The queryable index set follows the component roster, exactly as
         // the file path follows its child roster.

@@ -157,11 +157,14 @@ impl ResidentChunks {
     /// The chunk holding global index `i`, and `i` local to it. A
     /// one-chunk column answers without searching the start table.
     #[inline]
-    fn locate(&self, i: usize) -> (usize, usize) {
-        if self.chunks.len() == 1 {
-            return (0, i);
+    fn locate(&self, i: usize) -> (&TermChunk, usize) {
+        match self.chunks.as_slice() {
+            [only] => (only, i),
+            chunks => {
+                let (chunk, local) = chunk_of(&self.starts, i);
+                (&chunks[chunk], local)
+            }
         }
-        chunk_of(&self.starts, i)
     }
 
     /// Term `i`'s bytes: borrowed from a canonical chunk, or decoded into
@@ -169,15 +172,15 @@ impl ResidentChunks {
     /// scratch buffer through all its probes, where a cursor holds a buffer
     /// per chunk.
     pub(super) fn bytes_into<'a>(&'a self, i: usize, scratch: &'a mut Vec<u8>) -> &'a [u8] {
-        let (chunk, local) = self.locate(i);
-        match &self.chunks[chunk] {
-            TermChunk::Canonical(a) => StrColReader::new(a).bytes_at(local),
-            TermChunk::Fsst(f) => f.decode_into(local, scratch),
+        match self.locate(i) {
+            (TermChunk::Canonical(a), local) => StrColReader::new(a).bytes_at(local),
+            (TermChunk::Fsst(f), local) => f.decode_into(local, scratch),
         }
     }
 
     /// A fresh cursor over the terms: one chunk cursor per chunk, each with
-    /// its own scratch.
+    /// its own scratch. A one-chunk column's cursor holds no further chunk
+    /// cursors, so taking one builds nothing beyond the first.
     pub(super) fn cursor(&self) -> DictCursor<'_> {
         let (first, rest) = self
             .chunks
@@ -186,7 +189,11 @@ impl ResidentChunks {
         DictCursor {
             store: self,
             first: first.cursor(),
-            rest: rest.iter().map(TermChunk::cursor).collect(),
+            rest: if rest.is_empty() {
+                Vec::new()
+            } else {
+                rest.iter().map(TermChunk::cursor).collect()
+            },
         }
     }
 }

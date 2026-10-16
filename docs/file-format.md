@@ -267,7 +267,7 @@ are bare codes and cannot be decoded without it.
 | schema | one column, [`_dict_term`](../core/src/store/layouts/dictionary/storage.rs#L33): non-nullable `Utf8` |
 | contents | every distinct term of the dataset — subjects, predicates, objects, graph names and the default graph's `""` in one namespace — sorted, each once |
 | codes | implicit: the term at row *i* has code *i* |
-| size limit | at most `i32::MAX` terms: a conservative cap of the in-memory build ([`from_sorted_column`](../core/src/store/layouts/dictionary/storage.rs#L216)), not of the format |
+| size limit | at most `i32::MAX` terms: a conservative cap of the in-memory build ([`from_sorted_column`](../core/src/store/layouts/dictionary/storage.rs#L223)), not of the format |
 
 The column is FSST-compressed **at the source**, in independent windows of
 65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage.rs#L41))

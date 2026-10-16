@@ -192,6 +192,20 @@ async fn test_file_backed_subject_metadata_range_for_missing_subject() {
         matched_size(&store, Some(&missing), None, None, None).await,
         0
     );
+
+    // An append's presence check, a fully bound pattern, on the missing
+    // subject: its subject conjunct alone proves the envelope empty, so the
+    // envelope binds that conjunct and none of the three after it.
+    let fresh = VortexRdfStore::from_file(&path).await.unwrap();
+    let absent = make_quad(
+        "http://example.org/s99",
+        "http://example.org/p0",
+        "object 0",
+        GraphName::DefaultGraph,
+    );
+    let bound = fresh.debug_bound_exprs().unwrap();
+    assert!(!fresh.contains(&absent).await.unwrap());
+    assert_eq!(fresh.debug_bound_exprs().unwrap(), bound + 1);
 }
 
 /// A file view's `size()` counts its pending filter's rows minus the

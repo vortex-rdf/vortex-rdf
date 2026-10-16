@@ -83,34 +83,46 @@ pub(crate) fn gather_by_point_reads(
 /// Each probe comes from `probes` when that cache holds `array`'s resolutions
 /// (resolution walks the encoding tree, the fixed cost this path exists to
 /// avoid) — a column it declined declines the read — and is resolved per
-/// call otherwise (a transient base: a tail, served rows).
+/// call otherwise (a transient base: a tail, served rows), the only case
+/// that takes the struct apart for its children.
 pub(crate) fn point_read_columns<'n>(
     array: &ArrayRef,
     names: impl IntoIterator<Item = &'n str>,
     positions: &[usize],
     probes: Option<&StructProbes>,
 ) -> Option<Vec<ArrayRef>> {
-    let struct_arr = array.clone().try_downcast::<Struct>().ok()?;
+    let fields = array.dtype().as_struct_fields_opt()?;
     let names = names.into_iter();
     let mut children = Vec::with_capacity(names.size_hint().0);
+    let mut parts = None;
     for name in names {
-        let idx = struct_arr
+        let idx = fields
             .names()
             .iter()
             .position(|field| field.as_ref() == name)?;
-        let child = struct_arr.unmasked_field(idx);
-        let local;
-        let probe = match probes.and_then(|p| p.child(array, idx)) {
-            Some(cached) => cached?.probe(),
+        let column = match probes.and_then(|p| p.child(array, idx)) {
+            Some(cached) => {
+                let cached = cached?;
+                read_points(cached.probe(), cached.array(), positions)
+            }
             None => {
-                local = SortedProbe::resolve(child)?;
-                &local
+                if parts.is_none() {
+                    parts = Some(array.clone().try_downcast::<Struct>().ok()?);
+                }
+                let child = parts.as_ref()?.unmasked_field(idx);
+                read_points(&SortedProbe::resolve(child)?, child, positions)
             }
         };
-        let reads = positions.iter().map(|&i| probe.value_at(i));
-        children.push(primitive_from_u64_reads(child.dtype().as_ptype(), reads)?);
+        children.push(column?);
     }
     Some(children)
+}
+
+/// `column` read point by point at `positions` through its `probe` into a
+/// canonical primitive (see [`primitive_from_u64_reads`]).
+fn read_points(probe: &SortedProbe, column: &ArrayRef, positions: &[usize]) -> Option<ArrayRef> {
+    let reads = positions.iter().map(|&i| probe.value_at(i));
+    primitive_from_u64_reads(column.dtype().as_ptype(), reads)
 }
 
 /// A primitive column of `ptype` built from point reads widened to `u64`.

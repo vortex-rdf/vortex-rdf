@@ -269,7 +269,7 @@ impl VortexRdfStore {
         // A pattern the prefix probe answered in full leaves the indexes
         // nothing to resolve at all.
         let worth_indexing = !prefix_narrowed || selection.len(base_len) >= INDEX_ROUTING_MIN_ROWS;
-        let mut resolved = None;
+        let (mut resolved, mut serve) = (None, None);
         if !selection.is_empty(base_len) && pat.any_bound() && worth_indexing {
             match resolve_indexes_in_memory(&self.indexes, components, &self.layout, pat, codes)? {
                 // The probed term is absent from the data — nothing matches.
@@ -286,10 +286,11 @@ impl VortexRdfStore {
                 IndexResolution::Resolved {
                     row_ids,
                     resolves,
-                    serve,
+                    serve: plan,
                 } => {
                     pat = resolves.clear(pat);
-                    resolved = Some((row_ids, serve));
+                    resolved = Some(row_ids);
+                    serve = plan;
                 }
                 // No index accelerates this pattern: whatever is still
                 // bound falls to the mask scan below.
@@ -312,17 +313,17 @@ impl VortexRdfStore {
         // them now; a deferred resolution *is* then the whole selection,
         // pending until a consumer needs the ids.
         let sole = unrefined && !prefix_narrowed && !pat.any_bound();
-        let (selection, serve) = match resolved {
-            Some((row_ids, serve)) => {
+        let selection = match resolved {
+            Some(row_ids) => {
                 let defer = sole && (serve.is_some() || need == IdsNeed::CountOrWindow);
                 let selection = fold_row_ids(selection, row_ids, defer)?;
                 log::debug!(
                     "[match_pattern] In-memory index resolved at {:?}",
                     debug::elapsed(t)
                 );
-                (selection, serve)
+                selection
             }
-            None => (ViewSelection::Exact(selection), None),
+            None => ViewSelection::Exact(selection),
         };
 
         // ── Fallback: residual column filtering ───────────────────

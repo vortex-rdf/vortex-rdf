@@ -7,8 +7,12 @@ use super::*;
 
 /// `quads_vec` (the exact-size materialization) must yield the same quads,
 /// in the same order, as one-at-a-time stream collection — for the plain
-/// store, a matched view, and a mutated store with a tail.
-async fn run_quads_vec_matches_stream(store: VortexRdfStore, kind: &str) {
+/// store, a matched view, and a mutated store with a tail — building
+/// `streams` chunk streams for it: none in memory, where the view decodes
+/// as one chunk, and one on file.
+async fn run_quads_vec_matches_stream(store: VortexRdfStore, kind: &str, streams: usize) {
+    use crate::store::read::quads::chunk_stream_hooks;
+
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
     let extra = make_quad(
         "http://example.org/tail-subject",
@@ -29,7 +33,13 @@ async fn run_quads_vec_matches_stream(store: VortexRdfStore, kind: &str) {
     ];
     for (tag, view) in views {
         let streamed: Vec<Quad> = view.quads().unwrap().try_collect().await.unwrap();
+        let built = chunk_stream_hooks::streams();
         let collected = view.quads_vec().await.unwrap();
+        assert_eq!(
+            chunk_stream_hooks::streams() - built,
+            streams,
+            "{kind}: {tag}: chunk streams quads_vec built"
+        );
         assert_eq!(collected, streamed, "{kind}: {tag}");
     }
 }
@@ -39,6 +49,7 @@ async fn test_quads_vec_matches_stream_collection() {
     run_quads_vec_matches_stream(
         built_store(dictionary_test_quads(), LayoutStrategy::Dictionary, vec![]).await,
         "in memory",
+        0,
     )
     .await;
 }
@@ -49,7 +60,7 @@ async fn test_quads_vec_matches_stream_collection_file_backed() {
     let (_dir, path) =
         write_store_file(dictionary_test_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    run_quads_vec_matches_stream(store, "file").await;
+    run_quads_vec_matches_stream(store, "file", 1).await;
 }
 
 // ─── Shared-term reads ─────────────────────────────────────────────────
