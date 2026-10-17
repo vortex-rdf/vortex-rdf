@@ -67,7 +67,7 @@ impl DictAccess {
             DictAccess::Resident(dict) => {
                 let mut codes = PatternCodes::resident(Arc::clone(dict));
                 for term in pattern.bound_roles() {
-                    codes.resolve(term, |t| dict.encode(t));
+                    codes.resolve(term, |t| dict.encode_exact(t));
                 }
                 Ok(codes)
             }
@@ -81,7 +81,7 @@ impl DictAccess {
             DictAccess::FileBacked(fb) => {
                 let rendered: Vec<String> = pattern.bound_roles().map(|t| t.to_string()).collect();
                 let resolved =
-                    futures::future::join_all(rendered.iter().map(|t| fb.encode(t))).await;
+                    futures::future::join_all(rendered.iter().map(|t| fb.encode_exact(t))).await;
                 let mut codes = PatternCodes::preresolved();
                 for (term, code) in pattern.bound_roles().zip(resolved) {
                     let code = code?;
@@ -153,8 +153,8 @@ impl DictAccess {
     }
 }
 
-/// An immutable handle on a Dictionary-layout store's term dictionary, taken
-/// with [`VortexRdfStore::code_read_snapshot`](crate::store::VortexRdfStore::code_read_snapshot).
+/// An immutable handle on a Dictionary-layout store's resident term
+/// dictionary, taken with [`DictReader::snapshot`].
 ///
 /// Cloning is an `Arc` bump, and the snapshot retains only the dictionary — not
 /// the store or its quad columns.
@@ -175,11 +175,16 @@ impl DictSnapshot {
         self.0.decode(code)
     }
 
-    /// Encode an N-Triples term string to its code (its position in the
-    /// sorted dictionary), or `None` when this dictionary does not hold the
-    /// term. The inverse of [`decode`](Self::decode); a binary search over
-    /// the dictionary.
-    pub fn encode(&self, term: &str) -> Option<TermCode> {
+    /// Encode a term to its code (its position in the sorted dictionary), or
+    /// `None` when this dictionary does not hold the term. The inverse of
+    /// [`decode`](Self::decode); a binary search over the dictionary.
+    ///
+    /// Tolerant of spelling: an IRI with or without angle brackets, a literal
+    /// with escape variants, an `xsd:string` typing, an upper-case language
+    /// tag, or a default-graph spelling (`""`, `default`, `[]`) all resolve
+    /// to the code of the stored form. Malformed input is an
+    /// [`InvalidInput`](crate::VortexRdfError::InvalidInput) error.
+    pub fn encode(&self, term: &str) -> Result<Option<TermCode>> {
         self.0.encode(term)
     }
 
@@ -199,16 +204,7 @@ impl DictSnapshot {
         self.0.id()
     }
 
-    /// [`encode`](Self::encode) tolerant of spelling: an IRI with or without
-    /// angle brackets, a literal with escape variants, an `xsd:string`
-    /// typing, an upper-case language tag, or a default-graph spelling
-    /// (`""`, `default`, `[]`) all resolve to the code of the stored form
-    /// (see [`canonical_spelling`](crate::common::terms::canonical_spelling)). Malformed input is an error.
-    pub fn encode_tolerant(&self, term: &str) -> Result<Option<TermCode>> {
-        self.0.encode_tolerant(term)
-    }
-
-    /// [`encode_tolerant`](Self::encode_tolerant) over a batch, in order.
+    /// [`encode`](Self::encode) over a batch, in order.
     pub fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<TermCode>>> {
         self.0.encode_many(terms)
     }
@@ -274,13 +270,6 @@ impl DictSnapshot {
 /// file handle alive.
 #[derive(Clone)]
 pub struct DictReader(DictAccess);
-
-impl From<DictSnapshot> for DictReader {
-    /// The resident handle on a snapshot's dictionary.
-    fn from(snapshot: DictSnapshot) -> Self {
-        Self(DictAccess::Resident(snapshot.0))
-    }
-}
 
 impl DictReader {
     /// Whether the terms are read from the file on demand (`true`) or held
@@ -362,12 +351,12 @@ impl DictReader {
     }
 
     /// The code of `term`, tolerant of spelling (see
-    /// [`DictSnapshot::encode_tolerant`]).
+    /// [`DictSnapshot::encode`]).
     pub async fn encode(&self, term: &str) -> Result<Option<TermCode>> {
         match &self.0 {
-            DictAccess::Resident(dict) => dict.encode_tolerant(term),
+            DictAccess::Resident(dict) => dict.encode(term),
             #[cfg(feature = "file-io")]
-            DictAccess::FileBacked(dict) => dict.encode_tolerant(term).await,
+            DictAccess::FileBacked(dict) => dict.encode(term).await,
         }
     }
 

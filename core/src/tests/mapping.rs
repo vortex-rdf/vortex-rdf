@@ -35,7 +35,7 @@ async fn test_from_file_in_memory_loads_the_whole_store() {
     let loaded = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
     assert_eq!(loaded.debug_file_mapped(), None, "the rows live in memory");
     assert!(
-        loaded.code_read_snapshot().is_some(),
+        !loaded.dict_reader().unwrap().is_file_backed(),
         "the dictionary is resident"
     );
     assert_eq!(loaded.indexes(), &[IndexType::SecondaryByCopy]);

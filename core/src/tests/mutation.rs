@@ -349,7 +349,7 @@ async fn test_selected_rows_on_tailed_dictionary_store() {
     );
     let tailed = store.add_quad(novel.clone()).await.unwrap();
     assert!(
-        tailed.code_read_snapshot().is_none(),
+        tailed.dict_reader().is_none(),
         "a tailed store's codes address no cached dictionary"
     );
 

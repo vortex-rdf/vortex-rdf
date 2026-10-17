@@ -194,7 +194,7 @@ impl TermDict {
     /// `ValueError`.
     fn encode(&self, py: Python<'_>, term: &str) -> PyResult<Option<TermCode>> {
         if let Some(snapshot) = self.reader.snapshot() {
-            return snapshot.encode_tolerant(term).map_err(py_err);
+            return snapshot.encode(term).map_err(py_err);
         }
         py.detach(|| RUNTIME.block_on(self.reader.encode(term)))
             .map_err(py_err)

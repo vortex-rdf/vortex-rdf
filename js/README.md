@@ -131,7 +131,7 @@ if (dict) {
 }
 ```
 
-`decode`/`encode` speak N-Triples term strings — `<iri>`, `_:blank`, `"lit"@lang`, `"lit"^^<dt>`, and `''` for the default graph. The handle is a snapshot: it keeps decoding correctly after the store is mutated, because it retains the dictionary its codes address. It is a wasm-side handle — call `free()` when done (also wired to `Symbol.dispose`, so `using` disposes it automatically).
+`decode`/`encode` speak N-Triples term strings — `<iri>`, `_:blank`, `"lit"@lang`, `"lit"^^<dt>`, and `''` for the default graph. `encode` also takes the variant spellings of those — an IRI without angle brackets, an `xsd:string`-typed literal, an upper-case language tag, `default` or `[]` for the default graph — and returns the stored form's code; a malformed term throws. The handle is a snapshot: it keeps decoding correctly after the store is mutated, because it retains the dictionary its codes address. It is a wasm-side handle — call `free()` when done (also wired to `Symbol.dispose`, so `using` disposes it automatically).
 
 `matchCodes` is its pattern-matching counterpart: it resolves a pattern to the matched rows' raw term codes — four columnar `Float64Array`s `{ s, p, o, g }` of exact integer codes plus a `length` — without materializing any term strings, and returns `null` under the same conditions `termDict()` returns `undefined`:
 

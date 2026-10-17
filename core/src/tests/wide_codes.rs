@@ -221,7 +221,11 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
 
     // A resident dictionary also answers through its snapshot.
     if let Some(snapshot) = reader.snapshot() {
-        assert_eq!(snapshot.encode(&terms[1]), Some(BASE + 1), "{label}");
+        assert_eq!(
+            snapshot.encode(&terms[1]).unwrap(),
+            Some(BASE + 1),
+            "{label}"
+        );
         assert_eq!(snapshot.encode_many(&refs).unwrap(), encoded, "{label}");
         assert_eq!(
             snapshot.decode(BASE + 1).as_deref(),
@@ -229,7 +233,7 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         );
         assert_eq!(snapshot.decode(TermCode::from((BASE + 1) as u32)), None);
         assert_eq!(
-            snapshot.encode_tolerant("http://example.org/bob").unwrap(),
+            snapshot.encode("http://example.org/bob").unwrap(),
             Some(code(store, &terms, "<http://example.org/bob>").await)
         );
         assert_eq!(snapshot.decode_many(&probe), decoded, "{label}");

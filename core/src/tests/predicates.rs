@@ -625,7 +625,7 @@ async fn predicate_store() -> VortexRdfStore {
 #[tokio::test]
 async fn filter_codes_matches_eval() {
     let store = predicate_store().await;
-    let dict = store.code_read_snapshot().unwrap();
+    let dict = store.dict_reader().unwrap().snapshot().unwrap();
     let terms: Vec<String> = (0..dict.len() as TermCode)
         .map(|c| dict.decode(c).unwrap())
         .collect();
@@ -765,9 +765,9 @@ fn malformed_spellings_are_never_true() {
 #[tokio::test]
 async fn filter_codes_leaves_wide_longs_undecided() {
     let store = predicate_store().await;
-    let dict = store.code_read_snapshot().unwrap();
+    let dict = store.dict_reader().unwrap().snapshot().unwrap();
     let all: Vec<TermCode> = (0..dict.len() as TermCode).collect();
-    let code = |spelling: String| dict.encode(&spelling).expect(&spelling);
+    let code = |spelling: String| dict.encode(&spelling).unwrap().expect(&spelling);
     let wide = [
         code(typed("99999999999999999999", "long")),
         code(typed("-1", "unsignedLong")),
@@ -798,7 +798,7 @@ async fn filter_codes_leaves_wide_longs_undecided() {
 #[tokio::test]
 async fn filter_codes_rejects_bad_candidates() {
     let store = predicate_store().await;
-    let dict = store.code_read_snapshot().unwrap();
+    let dict = store.dict_reader().unwrap().snapshot().unwrap();
     let predicate = TermPredicate::parse("is_iri", "").unwrap();
     let len = dict.len() as TermCode;
     for codes in [vec![3u64, 1], vec![1, 1], vec![0, len]] {

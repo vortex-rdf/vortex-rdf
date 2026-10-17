@@ -671,7 +671,7 @@ async fn test_builders_intern_the_spelling_they_are_given() {
         );
         if layout == LayoutStrategy::Dictionary {
             // The subject, the predicate, "x" and the default graph.
-            assert_eq!(store.code_read_snapshot().unwrap().len(), 4);
+            assert_eq!(store.dict_reader().unwrap().len(), 4);
         }
     }
 }

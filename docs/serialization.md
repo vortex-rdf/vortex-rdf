@@ -59,7 +59,7 @@ A builder hands these back in one of two shapes
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize_rdf`](../python/src/serialize.rs#L33)) | out-of-core | file |
 | Python | `VortexRdfStore(path, in_memory=True)` | — (opens, then lifts through `to_serializable_parts` → `from_parts`) | in-memory store |
 | Python | `store.to_bytes()` / `VortexRdfStore.from_bytes(data)` | — | bytes |
-| JavaScript | `VortexRdfStore.fromQuads(quads \| Stream<Quad>, {layout, indexes})`, `fromString(text, format, options)` ([`fromString`](../js/src/store.rs#L154)), `serializeRdf(text, format, options)` ([`serializeRdf`](../js/src/lib.rs#L35)) | in memory (the only pipeline compiled to wasm) | in-memory store / bytes |
+| JavaScript | `VortexRdfStore.fromQuads(quads \| Stream<Quad>, {layout, indexes})`, `fromString(text, format, options)` ([`fromString`](../js/src/store.rs#L164)), `serializeRdf(text, format, options)` ([`serializeRdf`](../js/src/lib.rs#L35)) | in memory (the only pipeline compiled to wasm) | in-memory store / bytes |
 | JavaScript | `store.toBytes()` / `VortexRdfStore.fromBytes(bytes)`; `deserializeRdf(bytes, format)` ([`deserializeRdf`](../js/src/lib.rs#L49)) writes RDF text back | — | bytes |
 
 Every surface defaults to the `dictionary` layout (the CLI's `--layout`,

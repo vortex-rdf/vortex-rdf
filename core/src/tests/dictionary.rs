@@ -115,7 +115,7 @@ async fn test_dictionary_decode_survives_memo_slot_collisions() {
     let store = VortexRdfStore::from_built(arr).unwrap();
     // ~2000 subjects + 2000 objects + 7 predicates + 4 graphs: far past the
     // memo's slot count, so distinct codes share slots.
-    assert!(store.dictionary_snapshot().unwrap().0.len() > 1024);
+    assert!(store.dict_reader().unwrap().len() > 1024);
 
     let decoded = store.quads_vec().await.unwrap();
     assert_eq!(quad_strings(&decoded), quad_strings(&quads));
@@ -334,19 +334,19 @@ async fn test_built_dictionary_terms_are_fsst() {
     assert_dictionary_terms_fsst(&store, "built");
 }
 
-/// `code_read_snapshot` is the one "codes are decodable" gate the frontends
-/// share: Dictionary layout, empty append tail, resident dictionary — all
-/// three, or `None`. The residency term is covered beside the file-backed
-/// suite (`dictionary_file_backed`); this exercises the layout and tail terms.
+/// `dict_reader` is the one "codes are decodable" gate the frontends share:
+/// Dictionary layout and an empty append tail — both, or `None`. Residency is
+/// no term of it: a file-backed dictionary answers through the handle (see
+/// `dictionary_file_backed`); this exercises the layout and tail terms.
 #[tokio::test]
-async fn test_code_read_snapshot_gate() {
+async fn test_dict_reader_gate_with_a_held_dictionary() {
     let quads = dictionary_test_quads();
     let store = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
-    assert!(store.code_read_snapshot().is_some());
+    assert!(store.dict_reader().is_some());
 
     // An append opens a string tail whose rows have no codes in the cached
-    // dictionary: the gate closes even though `dictionary_snapshot` alone
-    // still answers — exactly the difference that makes the gate the safe
+    // dictionary: the gate closes even though the resident dictionary is
+    // still held — exactly the difference that makes the gate the safe
     // predicate for code-typed reads.
     let tailed = store
         .add_quad(make_quad(
@@ -358,25 +358,25 @@ async fn test_code_read_snapshot_gate() {
         .await
         .unwrap();
     assert_ne!(tailed.tail_len(), 0);
-    assert!(tailed.dictionary_snapshot().is_some());
-    assert!(tailed.code_read_snapshot().is_none());
+    assert!(tailed.debug_dictionary_snapshot().is_some());
+    assert!(tailed.dict_reader().is_none());
 
     // Folding the tail back into the base reopens the gate.
     let compacted = tailed.compact().await.unwrap();
     assert_eq!(compacted.tail_len(), 0);
-    assert!(compacted.code_read_snapshot().is_some());
+    assert!(compacted.dict_reader().is_some());
 
     // Non-Dictionary layouts have no codes at all.
     let string_store = built_store(quads, LayoutStrategy::Default, vec![]).await;
-    assert!(string_store.code_read_snapshot().is_none());
+    assert!(string_store.dict_reader().is_none());
 }
 
-/// A store adopted from its own bytes hands out a code-read snapshot, and
-/// the codes its rows and its matched views gather decode, through a reader
-/// on that snapshot's dictionary, to exactly the quads it was built from.
+/// A store adopted from its own bytes hands out a dictionary reader with a
+/// resident snapshot, and the codes its rows and its matched views gather
+/// decode, through that reader, to exactly the quads it was built from.
 #[cfg(feature = "file-io")]
 #[tokio::test]
-async fn test_code_read_snapshot_survives_from_bytes() {
+async fn test_dict_reader_survives_from_bytes() {
     let quads = dictionary_test_quads();
     let store = built_store(
         quads.clone(),
@@ -387,10 +387,12 @@ async fn test_code_read_snapshot_survives_from_bytes() {
     let adopted = VortexRdfStore::from_bytes(&store.to_bytes().await.unwrap())
         .await
         .unwrap();
-    let snapshot = adopted
-        .code_read_snapshot()
-        .expect("an adopted Dictionary store is code-readable");
-    let dict = adopted.dict_reader().unwrap();
+    let dict = adopted
+        .dict_reader()
+        .expect("an adopted Dictionary store hands out a dictionary reader");
+    let snapshot = dict
+        .snapshot()
+        .expect("an adopted Dictionary store holds its dictionary resident");
     assert_eq!(
         dict.dictionary_id(),
         snapshot.dictionary_id(),

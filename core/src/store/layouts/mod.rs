@@ -478,7 +478,7 @@ impl PatternCodes {
             )));
         };
         let dict = Arc::clone(dict);
-        Ok(self.resolve(term, |s| dict.encode(s)))
+        Ok(self.resolve(term, |s| dict.encode_exact(s)))
     }
 
     /// Scalar for probing a term column — the primary `s` column, a secondary

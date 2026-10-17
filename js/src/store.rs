@@ -56,14 +56,20 @@ impl VortexRdfStore {
         }
     }
 
+    /// The store's dictionary as a snapshot, or `None` when the code path
+    /// does not apply. Core's [`dict_reader`](CoreStore::dict_reader) is the
+    /// one "codes are decodable" gate (Dictionary layout, no append tail — see
+    /// its doc for why anything less decodes to wrong terms), and a snapshot
+    /// needs the dictionary resident, as every dictionary in this build is.
+    fn dict_snapshot(&self) -> Option<DictSnapshot> {
+        self.inner.dict_reader()?.snapshot()
+    }
+
     /// The dictionary for decoding a match's code columns, or `None` when
-    /// the code path does not apply. Core's
-    /// [`code_read_snapshot`](CoreStore::code_read_snapshot) is the one
-    /// "codes are decodable" gate (Dictionary layout, no append tail, resident
-    /// dictionary — see its doc for why anything less decodes to wrong terms);
+    /// the code path does not apply (see [`dict_snapshot`](Self::dict_snapshot));
     /// reads it declines fall back to the always-correct term path.
     fn code_path_dict(&self) -> Option<JsValue> {
-        let snapshot = self.inner.code_read_snapshot()?;
+        let snapshot = self.dict_snapshot()?;
         Some(self.dict_view(snapshot))
     }
 
@@ -122,14 +128,18 @@ impl TermDict {
         Ok(self.snapshot.decode(code))
     }
 
-    /// Encode an N-Triples term string to its code (inverse of
-    /// [`decode`](Self::decode)), or `undefined` when this dictionary does
-    /// not hold the term. Throws for a code past 2^53 − 1, which no JS number
-    /// holds exactly.
+    /// Encode a term to its code (inverse of [`decode`](Self::decode)), or
+    /// `undefined` when this dictionary does not hold the term. Tolerant of
+    /// spelling: an IRI with or without angle brackets, a literal with escape
+    /// variants, an `xsd:string` typing, an upper-case language tag, or
+    /// `default`/`[]` for the default graph all find the stored form's code.
+    /// Throws for a malformed term, and for a code past 2^53 − 1, which no JS
+    /// number holds exactly.
     #[wasm_bindgen(js_name = encode)]
     pub fn encode(&self, term: &str) -> Result<Option<f64>, JsValue> {
         self.snapshot
             .encode(term)
+            .map_err(js_err)?
             .map(code_to_js)
             .transpose()
             .map_err(js_err)
@@ -364,9 +374,9 @@ impl VortexRdfStore {
         graph: JsValue,
     ) -> Result<JsValue, JsValue> {
         let pattern = JsPattern::parse(subject, predicate, object, graph)?;
-        // Same gate as `code_path_dict`: without a code-read snapshot the codes
-        // would not resolve via `termDict`.
-        if self.inner.code_read_snapshot().is_none() {
+        // Same gate as `code_path_dict`: without a dictionary snapshot the
+        // codes would not resolve via `termDict`.
+        if self.dict_snapshot().is_none() {
             return Ok(JsValue::NULL);
         }
         let matched = resolve_now(pattern.matched(&self.inner))??;
@@ -383,13 +393,13 @@ impl VortexRdfStore {
     /// dictionary — the one door to code↔term translation (`decode`/`encode`
     /// of N-Triples term strings: `<iri>`, `_:blank`, `"lit"@lang`,
     /// `"lit"^^<dt>`, or `""` for the default graph). `undefined` short of
-    /// core's code-read gate ([`code_read_snapshot`](CoreStore::code_read_snapshot):
-    /// Dictionary layout, no append tail, resident dictionary). The handle
-    /// keeps decoding correctly after the store is mutated, because it retains
-    /// the dictionary its codes address.
+    /// core's [`dict_reader`](CoreStore::dict_reader) gate and a resident
+    /// snapshot (Dictionary layout, no append tail, resident dictionary). The
+    /// handle keeps decoding correctly after the store is mutated, because it
+    /// retains the dictionary its codes address.
     #[wasm_bindgen(js_name = termDict, skip_typescript)]
     pub fn term_dict(&self) -> Option<TermDict> {
-        let snapshot = self.inner.code_read_snapshot()?;
+        let snapshot = self.dict_snapshot()?;
         Some(TermDict { snapshot })
     }
 }

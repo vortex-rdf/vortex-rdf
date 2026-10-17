@@ -42,7 +42,7 @@ impl VortexRdfStore {
     /// Without a tail the base's selected live rows are the whole answer, in
     /// the store's own vocabulary: under the Dictionary layout a tombstone
     /// never re-encodes, so the codes stay addressed to the cached dictionary
-    /// ([`code_read_snapshot`](Self::code_read_snapshot) hands it out). With
+    /// ([`dict_reader`](Self::dict_reader) hands it out). With
     /// a tail the layouts diverge:
     /// - a Dictionary view must re-encode base and tail together against a
     ///   *fresh* dictionary (the tail's terms have no codes in the cached one)

@@ -35,7 +35,7 @@ async fn test_default_fixture_adopts() {
 
 /// The Dictionary fixture opens with both index families, decodes to its
 /// quads, serves a predicate match through its by-copy index, and hands out
-/// a code-read snapshot holding every distinct term.
+/// a resident dictionary snapshot holding every distinct term.
 #[tokio::test]
 async fn test_dictionary_fixture_adopts() {
     let quads = dictionary_test_quads();
@@ -66,7 +66,8 @@ async fn test_dictionary_fixture_adopts() {
     );
 
     let snapshot = store
-        .code_read_snapshot()
+        .dict_reader()
+        .and_then(|reader| reader.snapshot())
         .expect("a resident, untailed Dictionary store hands out a snapshot");
     let terms: std::collections::BTreeSet<String> = tuple_rows(&quads)
         .into_iter()
@@ -74,7 +75,11 @@ async fn test_dictionary_fixture_adopts() {
         .collect();
     assert_eq!(snapshot.len(), terms.len());
     for (code, term) in terms.iter().enumerate() {
-        assert_eq!(snapshot.encode(term), Some(code as TermCode), "{term}");
+        assert_eq!(
+            snapshot.encode(term).unwrap(),
+            Some(code as TermCode),
+            "{term}"
+        );
         assert_eq!(
             snapshot.decode(code as TermCode).as_deref(),
             Some(term.as_str())

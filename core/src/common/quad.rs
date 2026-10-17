@@ -101,8 +101,8 @@ impl RawQuad {
     /// one a parser produced.
     ///
     /// Each position takes the tolerant spellings of
-    /// [`canonical_spelling`](crate::common::terms::canonical_spelling) — an IRI
-    /// with or without angle brackets, a blank node, a literal with escapes, an
+    /// [`DictSnapshot::encode`](crate::DictSnapshot::encode) — an IRI with or
+    /// without angle brackets, a blank node, a literal with escapes, an
     /// explicit `xsd:string` type or an upper-case language tag, the default
     /// graph as `""`, `default` or `[]` — and must hold a term its position can
     /// (no literal subject, predicate or graph, no blank predicate). `"x"`,

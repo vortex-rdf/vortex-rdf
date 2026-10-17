@@ -203,9 +203,10 @@ impl TermDictionary {
         Some(trusted_str(self.terms.bytes_into(rank, &mut scratch)).to_owned())
     }
 
-    /// Encode a term to its code: its position in the sorted dictionary, or
-    /// `None` when the dictionary does not hold it (see [`find_by`]).
-    pub(crate) fn encode(&self, term: &str) -> Option<TermCode> {
+    /// Encode a term to its code exactly as spelled: its position in the
+    /// sorted dictionary, or `None` when the dictionary does not hold that
+    /// spelling (see [`find_by`]).
+    pub(crate) fn encode_exact(&self, term: &str) -> Option<TermCode> {
         // FSST is not order-preserving, so the search cannot run over the
         // compressed codes: every probe decodes, into one scratch buffer.
         let mut scratch = Vec::new();
@@ -219,9 +220,9 @@ impl TermDictionary {
     /// The code of the first term not below `needle` in byte order — the
     /// dictionary's size when every term is below it (see
     /// [`lower_bound_by`]), with the same per-probe decode as
-    /// [`encode`](Self::encode). The position is where `needle` would be
-    /// inserted, so a present term's code and the start of a spelling
-    /// prefix's run both come out of it.
+    /// [`encode_exact`](Self::encode_exact). The position is where `needle`
+    /// would be inserted, so a present term's code and the start of a
+    /// spelling prefix's run both come out of it.
     pub(crate) fn lower_bound(&self, needle: &[u8]) -> TermCode {
         let mut scratch = Vec::new();
         let rank = lower_bound_by(0..self.len(), |i| {
@@ -256,23 +257,21 @@ impl TermDictionary {
         })
     }
 
-    /// [`encode`](Self::encode) tolerant of spelling: the exact lookup first,
-    /// then the lookup of the spelling [`tolerant_fallback`] gives. A term
-    /// absent under both is absent from the dictionary; malformed input is
-    /// an error rather than an absence.
-    pub(crate) fn encode_tolerant(&self, term: &str) -> Result<Option<TermCode>> {
-        if let Some(code) = self.encode(term) {
+    /// Encode a term to its code, tolerant of spelling: the exact lookup
+    /// ([`encode_exact`](Self::encode_exact)) first, then the lookup of the
+    /// spelling [`tolerant_fallback`] gives. A term absent under both is
+    /// absent from the dictionary; malformed input is an error rather than
+    /// an absence.
+    pub(crate) fn encode(&self, term: &str) -> Result<Option<TermCode>> {
+        if let Some(code) = self.encode_exact(term) {
             return Ok(Some(code));
         }
-        Ok(tolerant_fallback(term)?.and_then(|canonical| self.encode(&canonical)))
+        Ok(tolerant_fallback(term)?.and_then(|canonical| self.encode_exact(&canonical)))
     }
 
-    /// [`encode_tolerant`](Self::encode_tolerant) over a batch, in order.
+    /// [`encode`](Self::encode) over a batch, in order.
     pub(crate) fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<TermCode>>> {
-        terms
-            .iter()
-            .map(|term| self.encode_tolerant(term))
-            .collect()
+        terms.iter().map(|term| self.encode(term)).collect()
     }
 
     /// [`decode`](Self::decode) over a batch, in order, handed to
@@ -483,7 +482,7 @@ mod tests {
         assert_eq!(dict.term_chunks().len(), 32, "32 windows");
         for (i, term) in terms.iter().enumerate() {
             let fresh = scratch_hooks::fresh();
-            assert_eq!(dict.encode(term), Some(i as TermCode));
+            assert_eq!(dict.encode_exact(term), Some(i as TermCode));
             assert_eq!(scratch_hooks::fresh() - fresh, 1, "encode {i}");
             let fresh = scratch_hooks::fresh();
             assert_eq!(dict.lower_bound(term.as_bytes()), i as TermCode);
@@ -510,7 +509,7 @@ mod tests {
         assert!(chunks.len() == 1 && chunks[0].is::<vortex_fsst::FSST>());
         let regrown = scratch_hooks::regrown();
         for (i, term) in terms.iter().enumerate() {
-            assert_eq!(dict.encode(term), Some(i as TermCode));
+            assert_eq!(dict.encode_exact(term), Some(i as TermCode));
             assert_eq!(dict.lower_bound(term.as_bytes()), i as TermCode);
         }
         assert_eq!(scratch_hooks::regrown(), regrown);
