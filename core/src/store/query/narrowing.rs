@@ -171,7 +171,7 @@ impl VortexRdfStore {
     ///
     /// Requires the Dictionary layout with an empty append tail (codes are
     /// the store's vocabulary only then, as for
-    /// [`code_read_snapshot`](Self::code_read_snapshot)); anything else is an
+    /// [`dict_reader`](Self::dict_reader)); anything else is an
     /// `InvalidOperation` error.
     ///
     /// In memory the keep is a binary search when the selected rows are a

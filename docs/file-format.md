@@ -289,7 +289,7 @@ At open the handle reads the zone table — one small segment — and keeps, per
 window, its leaf and its first and last term; without the zone map it reads
 the bounds from the leaves.
 
-- **term → code** (`encode`, `lower_bound`, `prefix_range`): a binary search
+- **term → code** (`encode_exact`, `lower_bound`, `prefix_range`): a binary search
   over the window bounds picks one window, which comes from the window cache
   (below) and is binary-searched, decompressing one term per step (FSST is not
   order-preserving). A window's first or last term, and a term falling between

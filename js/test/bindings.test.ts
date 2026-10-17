@@ -857,6 +857,26 @@ describe('matchCodes / termDict gates', () => {
         expect(dict.decode(code)).toBe('<http://example.org/s1>');
     });
 
+    test('TermDict.encode takes variant spellings and throws on a malformed one', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
+        const dict = store.termDict()!;
+        // Each variant finds the code of the stored form it spells.
+        const spellings: [string, string][] = [
+            ['http://example.org/s1', '<http://example.org/s1>'],
+            ['"hola"@ES', '"hola"@es'],
+            ['"lit"^^<http://www.w3.org/2001/XMLSchema#string>', '"lit"'],
+            ['default', ''],
+        ];
+        for (const [variant, stored] of spellings) {
+            const code = dict.encode(stored);
+            expect(code, stored).toBeDefined();
+            expect(dict.encode(variant), variant).toBe(code);
+        }
+        // An absent variant is still `undefined`; a malformed term throws.
+        expect(dict.encode('http://example.org/nope')).toBeUndefined();
+        expect(() => dict.encode('"unterminated')).toThrow(/Invalid input/);
+    });
+
     // Codes are u64 and cross as JS numbers, exact up to 2^53 - 1. A code
     // past u32::MAX is a code like any other — out of this dictionary's range
     // here, never wrapped onto the term 2^32 below it — and what is no code

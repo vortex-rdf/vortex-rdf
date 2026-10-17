@@ -56,8 +56,6 @@ pub(crate) fn next_generation() -> u64 {
 use crate::error::{Result, VortexRdfError};
 use layouts::ResolvedLayout;
 
-use std::sync::Arc;
-
 /// An RDF quad store over a Vortex array or file. A store is a base (in
 /// memory or a file) plus a view over it — a row selection, tombstones, and an
 /// append tail — and the layout and secondary indexes the base was built
@@ -199,61 +197,28 @@ impl VortexRdfStore {
         self.layout.strategy()
     }
 
-    /// An immutable handle on this store's term dictionary, or `None` when the
-    /// store is not Dictionary-layout or the dictionary is not resident.
+    /// The one door to this store's term dictionary: a [`DictReader`] under
+    /// either residency, which translates the codes
+    /// [`code_columns_gathered`](Self::code_columns_gathered) serves. Taking a
+    /// handle is O(1) and retains only the dictionary — not the store, nor its
+    /// quad columns. Hand it to any consumer that holds term codes: see
+    /// [`DictSnapshot`] for why the store itself is the wrong thing to decode
+    /// against.
     ///
-    /// Taking a snapshot is O(1) and retains only the dictionary — not the
-    /// store, nor its quad columns. Crate-internal: the public accessor is
-    /// [`code_read_snapshot`](Self::code_read_snapshot), which additionally
-    /// gates on the codes this store's arrays serve being decodable.
-    pub(crate) fn dictionary_snapshot(&self) -> Option<DictSnapshot> {
-        match &self.layout {
-            ResolvedLayout::Dictionary(access) => {
-                access.resident().map(|dict| DictSnapshot(Arc::clone(dict)))
-            }
-            _ => None,
-        }
-    }
-
-    /// An immutable handle on this store's term dictionary ([`DictSnapshot`]),
-    /// gated on the codes this store's arrays serve being decodable against
-    /// it — the one public dictionary accessor, and the one implementation of
-    /// the code-read invariant, for every frontend that pairs a code-typed
-    /// read
-    /// (`code_columns`/[`code_columns_gathered`](Self::code_columns_gathered))
-    /// with a decode handle. Taking a snapshot is O(1) and retains only the
-    /// dictionary — not the store, nor its quad columns. Hand it to any
-    /// consumer that holds term codes: see [`DictSnapshot`] for why the store
-    /// itself is the wrong thing to decode against.
-    ///
-    /// `Some` requires all three of:
+    /// `Some` requires both:
     /// - Dictionary layout — no other layout has codes at all;
     /// - an empty append tail — tail rows store terms as *strings* (an
     ///   appended term has no code in the sorted dictionary), so a tailed
-    ///   view's rows are not fully code-addressable and gathering them
+    ///   view's rows are not fully code-addressable, and gathering them
     ///   re-encodes against a fresh dictionary this handle would not be (see
-    ///   `selected_rows`'s contract);
-    /// - a resident dictionary — a file-backed one has no in-memory snapshot
-    ///   to hand out.
+    ///   `selected_rows`'s contract).
     ///
-    /// Decoding codes against anything less than all three yields silently
-    /// wrong terms, so bindings take this gate as a whole.
-    pub fn code_read_snapshot(&self) -> Option<DictSnapshot> {
-        if !self.is_code_view() {
-            return None;
-        }
-        self.dictionary_snapshot()
-    }
-
-    /// A handle on this store's term dictionary under either residency
-    /// ([`DictReader`]), gated like
-    /// [`code_read_snapshot`](Self::code_read_snapshot) — a Dictionary layout
-    /// and an empty tail — but not on residency: a file-backed dictionary
-    /// answers through the handle by reading its child on demand, where the
-    /// snapshot is `None`. The codes [`code_columns_gathered`] serves are
-    /// decodable against it either way.
-    ///
-    /// [`code_columns_gathered`]: Self::code_columns_gathered
+    /// A view that fails either has codes this dictionary does not address,
+    /// and decoding them against it yields silently wrong terms, so bindings
+    /// take this gate as a whole. A file-backed dictionary answers through
+    /// the handle by reading its child on demand;
+    /// [`DictReader::snapshot`] is the synchronous [`DictSnapshot`] of a
+    /// resident one.
     pub fn dict_reader(&self) -> Option<DictReader> {
         match &self.layout {
             ResolvedLayout::Dictionary(access) if self.is_code_view() => Some(access.reader()),

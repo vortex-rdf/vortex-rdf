@@ -69,22 +69,26 @@ async fn assert_file_backed_matches_resident(
     let resident = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
     let fb = VortexRdfStore::from_file(&path).await.unwrap();
 
-    // Residency is observable through the sync dictionary surface: a
-    // file-backed dictionary has no snapshot and no sync code translation.
-    assert!(resident.dictionary_snapshot().is_some(), "{tag}");
-    assert!(fb.dictionary_snapshot().is_none(), "{tag}");
     // A file open must actually stay file-backed: the written child's shape
     // is window-searchable, so it never falls back to the resident arm.
-    assert!(fb.dict_reader().expect(tag).is_file_backed(), "{tag}");
+    let fb_reader = fb.dict_reader().expect(tag);
+    assert!(fb_reader.is_file_backed(), "{tag}");
     assert!(
         !resident.dict_reader().expect(tag).is_file_backed(),
         "{tag}"
     );
-    // The code-read gate includes residency: no snapshot, no code decoding.
-    assert!(fb.code_read_snapshot().is_none(), "{tag}");
+    // Residency is observable through the sync dictionary surface: a
+    // file-backed dictionary has no snapshot and no sync code translation.
+    assert!(fb_reader.snapshot().is_none(), "{tag}");
     // The resident open hands one out, and it translates codes both ways.
-    let snapshot = resident.code_read_snapshot().expect(tag);
-    let code = snapshot.encode("<http://example.org/p0>").expect(tag);
+    let snapshot = resident
+        .dict_reader()
+        .and_then(|reader| reader.snapshot())
+        .expect(tag);
+    let code = snapshot
+        .encode("<http://example.org/p0>")
+        .unwrap()
+        .expect(tag);
     assert_eq!(
         snapshot.decode(code).as_deref(),
         Some("<http://example.org/p0>"),
@@ -296,7 +300,7 @@ async fn test_file_backed_dictionary_probe_parity() {
 
     // The reference answers, from a whole-store load of the same file.
     let resident = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
-    let dict = resident.dictionary_snapshot().unwrap().0;
+    let dict = resident.dict_reader().unwrap().snapshot().unwrap().0;
 
     // The probe target, built exactly as `from_file` does file-backed: the
     // dictionary child's layout, with each window's bounds read at open.
@@ -315,16 +319,16 @@ async fn test_file_backed_dictionary_probe_parity() {
         .collect();
     for &code in &sample {
         let term = dict.decode(code).unwrap();
-        assert_eq!(fb.encode(&term).await.unwrap(), Some(code), "{term}");
-        assert_eq!(fb.encode(&term).await.unwrap(), Some(code), "{term}");
+        assert_eq!(fb.encode_exact(&term).await.unwrap(), Some(code), "{term}");
+        assert_eq!(fb.encode_exact(&term).await.unwrap(), Some(code), "{term}");
 
         // A control character sorts immediately after the stored term, so
         // the search lands on it and must still report absent.
         let absent = format!("{term}\u{1}");
-        assert_eq!(fb.encode(&absent).await.unwrap(), None, "{absent}");
+        assert_eq!(fb.encode_exact(&absent).await.unwrap(), None, "{absent}");
     }
     // Above every stored term: the search runs off the end.
-    assert_eq!(fb.encode("\u{10FFFF}").await.unwrap(), None);
+    assert_eq!(fb.encode_exact("\u{10FFFF}").await.unwrap(), None);
 
     // code → term parity in one window and across many.
     for k in [64usize, 300] {
@@ -530,7 +534,7 @@ async fn test_file_backed_dictionary_rejects_below_first_term() {
     let (_dir, path) = write_store_file(quads, LayoutStrategy::Dictionary, vec![]).await;
 
     let resident = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
-    let dict = resident.dictionary_snapshot().unwrap().0;
+    let dict = resident.dict_reader().unwrap().snapshot().unwrap().0;
     let first_term = dict.decode(0).unwrap();
     assert!(
         first_term.as_str() > "!",
@@ -543,9 +547,9 @@ async fn test_file_backed_dictionary_rejects_below_first_term() {
         .unwrap()
         .expect("the dictionary child's chunk shape must resolve");
 
-    assert_eq!(fb.encode("!").await.unwrap(), None);
+    assert_eq!(fb.encode_exact("!").await.unwrap(), None);
     // And row 0 itself still resolves.
-    assert_eq!(fb.encode(&first_term).await.unwrap(), Some(0));
+    assert_eq!(fb.encode_exact(&first_term).await.unwrap(), Some(0));
 }
 
 /// A dictionary child whose layout shape cannot be point-read — one flat
@@ -613,7 +617,7 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     assert!(!store.dict_reader().unwrap().is_file_backed());
-    assert!(store.dictionary_snapshot().is_some());
+    assert!(store.dict_reader().unwrap().snapshot().is_some());
     assert_eq!(view_strings(&store).await, quad_strings(&quads));
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
     assert_eq!(
@@ -628,7 +632,7 @@ async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
     assert!(FileBackedDict::open(&empty_file).await.unwrap().is_none());
     let empty = VortexRdfStore::from_file(&empty_path).await.unwrap();
     assert!(!empty.dict_reader().unwrap().is_file_backed());
-    assert!(empty.dictionary_snapshot().is_some());
+    assert!(empty.dict_reader().unwrap().snapshot().is_some());
     assert_eq!(empty.size().await.unwrap(), 0);
 }
 
@@ -759,10 +763,10 @@ async fn test_large_dictionary_child_lift_keeps_fsst() {
     // Probe parity across chunk boundaries, both directions.
     for code in (0..len as TermCode).step_by(7919) {
         let term = dict.decode(code).unwrap();
-        assert_eq!(lifted.encode(&term), Some(code), "{term}");
+        assert_eq!(lifted.encode_exact(&term), Some(code), "{term}");
         assert_eq!(lifted.decode(code).as_deref(), Some(term.as_str()));
     }
-    assert_eq!(lifted.encode("\u{10FFFF}"), None);
+    assert_eq!(lifted.encode_exact("\u{10FFFF}"), None);
 }
 
 /// A dictionary child written without zone maps — a term column with no
@@ -792,7 +796,7 @@ async fn test_unzoned_dictionary_child_opens_mapped() {
     let reader = mapped.dict_reader().unwrap();
     assert!(reader.is_file_backed());
     let loaded = VortexRdfStore::from_bytes(&bytes).await.unwrap();
-    let oracle = loaded.code_read_snapshot().unwrap();
+    let oracle = loaded.dict_reader().unwrap().snapshot().unwrap();
     assert_eq!(reader.len(), oracle.len());
     assert!(!oracle.is_empty());
     for code in 0..oracle.len() as TermCode {
@@ -848,11 +852,14 @@ async fn test_child_without_zone_maps_reads_bounds_from_leaves() {
         .expect("a chunked child is point-readable");
     for i in (0..20_000).step_by(997).chain([0, 19_999]) {
         assert_eq!(
-            fb.encode(&terms[i]).await.unwrap(),
+            fb.encode_exact(&terms[i]).await.unwrap(),
             Some(i as TermCode),
             "{}",
             terms[i]
         );
     }
-    assert_eq!(fb.encode("\"object value 0099999\"").await.unwrap(), None);
+    assert_eq!(
+        fb.encode_exact("\"object value 0099999\"").await.unwrap(),
+        None
+    );
 }

@@ -793,12 +793,16 @@ mod tests {
                 assert_eq!(term.as_deref(), Some(terms[i].as_str()), "window {window}");
             }
             for (i, term) in terms.iter().enumerate() {
-                assert_eq!(dict.encode(term), Some(i as TermCode), "window {window}");
+                assert_eq!(
+                    dict.encode_exact(term),
+                    Some(i as TermCode),
+                    "window {window}"
+                );
                 assert_eq!(dict.lower_bound(term.as_bytes()), i as TermCode);
                 assert_eq!(dict.decode(i as TermCode).as_deref(), Some(term.as_str()));
             }
             let past_the_longest = format!("{}~", terms[9]);
-            assert_eq!(dict.encode(&past_the_longest), None);
+            assert_eq!(dict.encode_exact(&past_the_longest), None);
             assert_eq!(dict.lower_bound(past_the_longest.as_bytes()), 10);
         }
     }
@@ -849,14 +853,14 @@ mod tests {
         let single = TermDictionary::compress_windowed(plain, usize::MAX).unwrap();
         assert!(matches!(single.terms.chunks[..], [TermChunk::Fsst(_)]));
         for (i, term) in terms.iter().enumerate() {
-            assert_eq!(windowed.encode(term), Some(i as TermCode), "{term}");
+            assert_eq!(windowed.encode_exact(term), Some(i as TermCode), "{term}");
             assert_eq!(
                 windowed.decode(i as TermCode).as_deref(),
                 Some(term.as_str())
             );
-            assert_eq!(single.encode(term), Some(i as TermCode));
+            assert_eq!(single.encode_exact(term), Some(i as TermCode));
         }
-        assert_eq!(windowed.encode("<http://absent>"), None);
+        assert_eq!(windowed.encode_exact("<http://absent>"), None);
         assert_eq!(windowed.decode(1_000), None);
     }
 
@@ -893,11 +897,11 @@ mod tests {
 
         for (i, term) in terms.iter().enumerate() {
             for d in [&single, &chunked] {
-                assert_eq!(d.encode(term), Some(i as TermCode), "{term}");
+                assert_eq!(d.encode_exact(term), Some(i as TermCode), "{term}");
                 assert_eq!(d.decode(i as TermCode).as_deref(), Some(term.as_str()));
             }
         }
-        assert_eq!(chunked.encode("<http://absent>"), None);
+        assert_eq!(chunked.encode_exact("<http://absent>"), None);
         assert_eq!(chunked.decode(300), None);
     }
 
@@ -927,7 +931,7 @@ mod tests {
         let reread = crate::store::VortexRdfStore::from_bytes(&bytes)
             .await
             .unwrap();
-        let snapshot = reread.dictionary_snapshot().unwrap();
+        let snapshot = reread.dict_reader().unwrap().snapshot().unwrap();
         for (i, term) in terms.iter().enumerate() {
             assert_eq!(
                 snapshot.decode(i as TermCode).as_deref(),
@@ -973,7 +977,7 @@ mod tests {
             .expect("an unzoned chunked child is point-readable");
         for (i, term) in terms.iter().enumerate() {
             assert_eq!(
-                fbd.encode(term).await.unwrap(),
+                fbd.encode_exact(term).await.unwrap(),
                 Some(i as TermCode),
                 "{term}"
             );
@@ -986,7 +990,7 @@ mod tests {
             "{}",
             fbd.debug_cached_bytes()
         );
-        assert_eq!(fbd.encode("<http://absent>").await.unwrap(), None);
+        assert_eq!(fbd.encode_exact("<http://absent>").await.unwrap(), None);
         let codes = [0u64, 119, 120, 299];
         let decoded = fbd.decode_many(&codes).await.unwrap();
         for (code, term) in codes.iter().zip(&decoded) {

@@ -219,7 +219,7 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
             "{tag}: encode {term}"
         );
         assert_eq!(
-            oracle.encode(term),
+            oracle.encode(term).unwrap(),
             Some(code),
             "{tag}: oracle encode {term}"
         );
@@ -288,7 +288,7 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
     let batch_refs: Vec<&str> = batch.iter().map(String::as_str).collect();
     let want: Vec<Option<TermCode>> = batch_refs
         .iter()
-        .map(|t| oracle.encode_tolerant(t).unwrap())
+        .map(|t| oracle.encode(t).unwrap())
         .collect();
     assert_eq!(
         reader.encode_many(&batch_refs).await.unwrap(),
@@ -310,14 +310,14 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
 
     // Tolerated spellings resolve to the stored form's code.
     for (variant, stored) in tolerated_spellings() {
-        let want = oracle.encode(stored);
+        let want = oracle.encode(stored).unwrap();
         assert_eq!(
             reader.encode(variant).await.unwrap(),
             want,
             "{tag}: tolerant {variant:?}"
         );
         assert_eq!(
-            oracle.encode_tolerant(variant).unwrap(),
+            oracle.encode(variant).unwrap(),
             want,
             "{tag}: snapshot tolerant {variant:?}"
         );
@@ -328,7 +328,7 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
             "{tag}: {malformed:?} must be an error"
         );
         assert!(
-            oracle.encode_tolerant(malformed).is_err(),
+            oracle.encode(malformed).is_err(),
             "{tag}: snapshot {malformed:?}"
         );
     }
@@ -440,13 +440,13 @@ async fn test_dict_reader_resident_matches_snapshot() {
     let snapshot = reader
         .snapshot()
         .expect("resident readers carry a snapshot");
-    assert_eq!(snapshot.len(), store.code_read_snapshot().unwrap().len());
+    assert_eq!(snapshot.len(), reader.len());
     assert_reader_matches_snapshot(&reader, &snapshot, "resident").await;
 }
 
-/// The handle is gated like the code snapshot: never on a string layout, and
-/// not while a tail holds quads outside the dictionary; compaction restores
-/// it.
+/// The handle is gated on the layout and the tail: never on a string layout,
+/// and not while a tail holds quads outside the dictionary; compaction
+/// restores it.
 #[tokio::test]
 async fn test_dict_reader_gates_on_layout_and_tail() {
     let strings = VortexRdfStore::from_quads(
@@ -473,7 +473,6 @@ async fn test_dict_reader_gates_on_layout_and_tail() {
         .unwrap();
     assert_ne!(tailed.tail_len(), 0);
     assert!(tailed.dict_reader().is_none(), "a tail disables the handle");
-    assert!(tailed.code_read_snapshot().is_none());
     let compacted = tailed.compact().await.unwrap();
     let reader = compacted
         .dict_reader()
@@ -554,29 +553,23 @@ async fn test_kind_ranges_partition_codes() {
     );
 }
 
-/// The resident encoder's memo serves the tolerant path too: a variant
-/// spelling resolves the same before and after its stored form was looked
-/// up, and absent terms stay absent either way.
+/// A variant spelling resolves the same before and after its stored form was
+/// looked up, and absent terms stay absent either way.
 #[tokio::test]
-async fn test_encode_tolerant_memo_agrees() {
+async fn test_encode_variant_spellings_agree_with_the_stored_form() {
     let store = memory_dictionary_store(mixed_kind_quads()).await;
-    let snapshot = store.code_read_snapshot().unwrap();
+    let snapshot = store.dict_reader().unwrap().snapshot().unwrap();
     for (variant, stored) in tolerated_spellings() {
-        let first = snapshot.encode_tolerant(variant).unwrap();
-        let exact = snapshot.encode(stored);
-        let again = snapshot.encode_tolerant(variant).unwrap();
-        assert_eq!(first, exact, "{variant:?}");
-        assert_eq!(again, exact, "{variant:?}");
-        assert!(exact.is_some(), "{stored:?} is in the fixture");
+        let first = snapshot.encode(variant).unwrap();
+        let stored_code = snapshot.encode(stored).unwrap();
+        let again = snapshot.encode(variant).unwrap();
+        assert_eq!(first, stored_code, "{variant:?}");
+        assert_eq!(again, stored_code, "{variant:?}");
+        assert!(stored_code.is_some(), "{stored:?} is in the fixture");
     }
-    assert_eq!(
-        snapshot
-            .encode_tolerant("http://example.org/absent")
-            .unwrap(),
-        None
-    );
-    assert_eq!(snapshot.encode_tolerant("\"absent\"@fr").unwrap(), None);
-    assert_eq!(snapshot.encode_tolerant("_:absent").unwrap(), None);
+    assert_eq!(snapshot.encode("http://example.org/absent").unwrap(), None);
+    assert_eq!(snapshot.encode("\"absent\"@fr").unwrap(), None);
+    assert_eq!(snapshot.encode("_:absent").unwrap(), None);
 }
 
 /// A file-backed reader answers every method like the resident open of the
@@ -597,13 +590,12 @@ async fn test_dict_reader_file_backed_matches_resident() {
         .dict_reader()
         .expect("file-backed dictionaries get a handle");
     assert!(reader.is_file_backed());
+
+    let oracle = resident.dict_reader().unwrap().snapshot().unwrap();
     assert!(
-        fb.code_read_snapshot().is_none(),
+        reader.snapshot().is_none(),
         "the sync snapshot stays resident-only"
     );
-
-    let oracle = resident.code_read_snapshot().unwrap();
-    assert!(reader.snapshot().is_none());
     assert_reader_matches_snapshot(&reader, &oracle, "file-backed").await;
     // The kind ranges stay stable on re-ask, and a predicate over the
     // candidates answers the same each time (nothing is memoized).

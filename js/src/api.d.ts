@@ -177,9 +177,12 @@ export class TermDict {
      */
     decode(code: number): string | undefined;
     /**
-     * Encode an N-Triples term string to its code (inverse of `decode`), or
-     * `undefined` when the term is absent. Throws for a code past
-     * `Number.MAX_SAFE_INTEGER`, which no number holds exactly.
+     * Encode a term to its code (inverse of `decode`), or `undefined` when the
+     * term is absent. Tolerant of spelling: an IRI with or without angle
+     * brackets, a literal with escape variants, an `xsd:string` typing, an
+     * upper-case language tag, or `'default'` / `'[]'` for the default graph
+     * all find the stored form's code. Throws for a malformed term, and for a
+     * code past `Number.MAX_SAFE_INTEGER`, which no number holds exactly.
      */
     encode(term: string): number | undefined;
     /** Release the wasm-side handle (also invoked by `Symbol.dispose`). */

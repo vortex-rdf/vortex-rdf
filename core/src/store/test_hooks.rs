@@ -16,14 +16,13 @@ use vortex_array::arrays::{Struct, StructArray};
 use crate::error::Result;
 use crate::store::array;
 use crate::store::indexes::IndexComponent;
+use crate::store::layouts::ResolvedLayout;
 #[cfg(feature = "file-io")]
-use crate::store::layouts::QuadPattern;
-#[cfg(feature = "file-io")]
-use crate::store::layouts::{DictAccess, ResolvedLayout};
+use crate::store::layouts::{DictAccess, QuadPattern};
 #[cfg(feature = "file-io")]
 use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::view::selection::{RowSelection, ViewSelection};
-use crate::store::{QuadsSource, RowId, TermCode, VortexRdfStore};
+use crate::store::{DictSnapshot, QuadsSource, RowId, TermCode, VortexRdfStore};
 
 pub(crate) use crate::store::view::{TAIL_FLATTEN_FLOOR, TAIL_MAX_CHUNKS};
 
@@ -184,6 +183,17 @@ impl VortexRdfStore {
     /// appended.
     pub(crate) fn debug_tail_rows(&self) -> Option<&ArrayRef> {
         self.tail.as_ref().map(|tail| &tail.rows)
+    }
+
+    /// The resident dictionary as a snapshot, whatever the append tail:
+    /// [`dict_reader`](VortexRdfStore::dict_reader) withholds a tailed view's
+    /// dictionary, whose codes the view's rows do not address. `None` for
+    /// another layout or a file-backed dictionary.
+    pub(crate) fn debug_dictionary_snapshot(&self) -> Option<DictSnapshot> {
+        match &self.layout {
+            ResolvedLayout::Dictionary(access) => access.reader().snapshot(),
+            _ => None,
+        }
     }
 
     /// Whether every non-nullable integer child of an in-memory base is a

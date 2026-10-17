@@ -1165,7 +1165,7 @@ fn fsst_dictionary_quads() -> Vec<Quad> {
 
 /// Every chunk of `store`'s held term column is FSST-encoded.
 fn assert_dictionary_terms_fsst(store: &VortexRdfStore, when: &str) {
-    let dict = store.dictionary_snapshot().unwrap().0;
+    let dict = store.dict_reader().unwrap().snapshot().unwrap().0;
     for chunk in dict.term_chunks() {
         assert_eq!(
             chunk.encoding_id().to_string(),

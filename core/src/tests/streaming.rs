@@ -219,8 +219,13 @@ async fn test_shared_quads_survive_compaction() {
         .unwrap();
     let probe = "<http://example.org/p0>";
     assert_ne!(
-        store.code_read_snapshot().unwrap().encode(probe),
-        compacted.code_read_snapshot().unwrap().encode(probe),
+        store.dict_reader().unwrap().encode(probe).await.unwrap(),
+        compacted
+            .dict_reader()
+            .unwrap()
+            .encode(probe)
+            .await
+            .unwrap(),
         "compaction must have renumbered the dictionary"
     );
     assert_eq!(compacted.size().await.unwrap(), 11);

@@ -307,7 +307,7 @@ pub(crate) fn quad_from_terms(s: &str, p: &str, o: &str, g: &str) -> Result<Quad
 /// `[]`) as the empty string the `g` column stores. Malformed input is an
 /// error; a dictionary that holds the term under *some* spelling holds it
 /// under this one.
-pub fn canonical_spelling(spelling: &str) -> Result<String> {
+pub(crate) fn canonical_spelling(spelling: &str) -> Result<String> {
     if is_default_graph_spelling(spelling) {
         return Ok(String::new());
     }

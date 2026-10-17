@@ -323,11 +323,11 @@ impl FileBackedDict {
         self.0.code_space.len()
     }
 
-    /// Term → code: the window whose bounds enclose `term`, then a binary
-    /// search of the inside of that one window (through the window cache) —
-    /// none at all for a window's first or last term, or a term falling
-    /// between two windows.
-    pub(crate) async fn encode(&self, term: &str) -> Result<Option<TermCode>> {
+    /// Term → code, exactly as spelled: the window whose bounds enclose
+    /// `term`, then a binary search of the inside of that one window (through
+    /// the window cache) — none at all for a window's first or last term, or
+    /// a term falling between two windows.
+    pub(crate) async fn encode_exact(&self, term: &str) -> Result<Option<TermCode>> {
         let inner = &*self.0;
         let needle = term.as_bytes();
         let Some((w, window)) = inner.locate(needle) else {
@@ -459,20 +459,21 @@ impl FileBackedDict {
         .await
     }
 
-    /// The async twin of `TermDictionary::encode_tolerant`.
-    pub(crate) async fn encode_tolerant(&self, term: &str) -> Result<Option<TermCode>> {
-        if let Some(code) = self.encode(term).await? {
+    /// The async twin of `TermDictionary::encode`: tolerant of spelling, the
+    /// exact lookup first.
+    pub(crate) async fn encode(&self, term: &str) -> Result<Option<TermCode>> {
+        if let Some(code) = self.encode_exact(term).await? {
             return Ok(Some(code));
         }
         match tolerant_fallback(term)? {
-            Some(canonical) => self.encode(&canonical).await,
+            Some(canonical) => self.encode_exact(&canonical).await,
             None => Ok(None),
         }
     }
 
-    /// [`encode_tolerant`](Self::encode_tolerant) over a batch, in order.
+    /// [`encode`](Self::encode) over a batch, in order.
     pub(crate) async fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<TermCode>>> {
-        futures::stream::iter(terms.iter().map(|term| self.encode_tolerant(term)))
+        futures::stream::iter(terms.iter().map(|term| self.encode(term)))
             .buffered(available_parallelism().max(4))
             .try_collect()
             .await
@@ -838,7 +839,10 @@ mod tests {
     /// windows.
     async fn touch(fbd: &FileBackedDict, terms: &[String], w: usize) {
         let i = w * 100 + 37;
-        assert_eq!(fbd.encode(&terms[i]).await.unwrap(), Some(i as TermCode));
+        assert_eq!(
+            fbd.encode_exact(&terms[i]).await.unwrap(),
+            Some(i as TermCode)
+        );
     }
 
     /// Windows that are each sorted but out of term order across the child
@@ -883,7 +887,7 @@ mod tests {
         assert_eq!(fbd.len(), 600);
         for (i, term) in terms.iter().enumerate() {
             assert_eq!(
-                fbd.encode(term).await.unwrap(),
+                fbd.encode_exact(term).await.unwrap(),
                 Some(i as TermCode),
                 "{term}"
             );
@@ -896,7 +900,7 @@ mod tests {
                 .zip(&terms)
                 .all(|(got, want)| &**got == want.as_str())
         );
-        assert_eq!(fbd.encode("<http://zzz>").await.unwrap(), None);
+        assert_eq!(fbd.encode_exact("<http://zzz>").await.unwrap(), None);
     }
 
     /// A window's first and last term are answered from the bounds alone, an
@@ -908,17 +912,17 @@ mod tests {
         for w in 0..6 {
             let (before, asked) = (fbd.debug_windows_rebuilt(), fbd.debug_windows_requested());
             assert_eq!(
-                fbd.encode(&terms[w * 100]).await.unwrap(),
+                fbd.encode_exact(&terms[w * 100]).await.unwrap(),
                 Some((w * 100) as TermCode)
             );
             assert_eq!(
-                fbd.encode(&terms[w * 100 + 99]).await.unwrap(),
+                fbd.encode_exact(&terms[w * 100 + 99]).await.unwrap(),
                 Some((w * 100 + 99) as TermCode)
             );
             assert_eq!(fbd.debug_windows_rebuilt(), before, "window {w}'s edges");
             assert_eq!(fbd.debug_windows_requested(), asked, "window {w}'s edges");
             assert_eq!(
-                fbd.encode(&terms[w * 100 + 37]).await.unwrap(),
+                fbd.encode_exact(&terms[w * 100 + 37]).await.unwrap(),
                 Some((w * 100 + 37) as TermCode)
             );
             assert_eq!(
@@ -936,11 +940,11 @@ mod tests {
         // moves no rebuild count: the request count is what pins "no leaf".
         let (before, asked) = (fbd.debug_windows_rebuilt(), fbd.debug_windows_requested());
         let between = format!("{}~", terms[99]);
-        assert_eq!(fbd.encode(&between).await.unwrap(), None);
+        assert_eq!(fbd.encode_exact(&between).await.unwrap(), None);
         assert_eq!(fbd.lower_bound(between.as_bytes()).await.unwrap(), 100);
-        assert_eq!(fbd.encode("!").await.unwrap(), None);
+        assert_eq!(fbd.encode_exact("!").await.unwrap(), None);
         assert_eq!(fbd.lower_bound(b"!").await.unwrap(), 0);
-        assert_eq!(fbd.encode("~").await.unwrap(), None);
+        assert_eq!(fbd.encode_exact("~").await.unwrap(), None);
         assert_eq!(fbd.lower_bound(b"~").await.unwrap(), 600);
         assert_eq!(fbd.debug_windows_rebuilt(), before);
         assert_eq!(fbd.debug_windows_requested(), asked);
@@ -973,16 +977,16 @@ mod tests {
         let (fbd, terms) = windowed_handle(600, 100).await;
         let before = fbd.debug_windows_rebuilt();
         for _ in 0..3 {
-            assert_eq!(fbd.encode(&terms[137]).await.unwrap(), Some(137));
+            assert_eq!(fbd.encode_exact(&terms[137]).await.unwrap(), Some(137));
         }
         assert_eq!(fbd.debug_windows_rebuilt() - before, 1);
-        assert_eq!(fbd.encode(&terms[142]).await.unwrap(), Some(142));
+        assert_eq!(fbd.encode_exact(&terms[142]).await.unwrap(), Some(142));
         let inside = format!("{}~", terms[150]);
         assert_eq!(fbd.lower_bound(inside.as_bytes()).await.unwrap(), 151);
         assert_eq!(fbd.debug_windows_rebuilt() - before, 1);
 
         fbd.debug_clear_cache();
-        assert_eq!(fbd.encode(&terms[137]).await.unwrap(), Some(137));
+        assert_eq!(fbd.encode_exact(&terms[137]).await.unwrap(), Some(137));
         assert_eq!(fbd.debug_windows_rebuilt() - before, 2);
     }
 
@@ -1050,14 +1054,14 @@ mod tests {
             let (native, d) = native_over(&terms, window).await;
             let fbd = FileBackedDict::open(&native).await.unwrap().unwrap();
             for (i, term) in terms.iter().enumerate() {
-                assert_eq!(fbd.encode(term).await.unwrap(), Some(i as TermCode));
+                assert_eq!(fbd.encode_exact(term).await.unwrap(), Some(i as TermCode));
                 assert_eq!(
                     fbd.lower_bound(term.as_bytes()).await.unwrap(),
                     i as TermCode
                 );
             }
             let past_the_longest = format!("{}~", terms[9]);
-            assert_eq!(fbd.encode(&past_the_longest).await.unwrap(), None);
+            assert_eq!(fbd.encode_exact(&past_the_longest).await.unwrap(), None);
             assert_eq!(
                 fbd.lower_bound(past_the_longest.as_bytes()).await.unwrap(),
                 d.lower_bound(past_the_longest.as_bytes())
@@ -1248,7 +1252,10 @@ mod tests {
         assert!(60 * 5 * size_of::<u32>() < budget / 2);
         for w in 0..60 {
             let i = w * 4 + 1;
-            assert_eq!(fbd.encode(&terms[i]).await.unwrap(), Some(i as TermCode));
+            assert_eq!(
+                fbd.encode_exact(&terms[i]).await.unwrap(),
+                Some(i as TermCode)
+            );
             assert!(fbd.debug_cached_bytes() <= budget, "after window {w}");
         }
         let cached = fbd.debug_cached_windows();
@@ -1421,17 +1428,24 @@ mod tests {
         assert_eq!(fbd.debug_window_count(), 4);
         // Eight edge terms (a window's first and last) read no leaf.
         for i in (0..4).flat_map(|w| [w * 100, w * 100 + 99]) {
-            assert_eq!(fbd.encode(&terms[i]).await.unwrap(), Some(i as TermCode));
+            assert_eq!(
+                fbd.encode_exact(&terms[i]).await.unwrap(),
+                Some(i as TermCode)
+            );
         }
         assert_eq!(fbd.debug_windows_rebuilt(), 0);
         // Every term finds its own code; each window is rebuilt once.
         for (i, term) in terms.iter().enumerate() {
-            assert_eq!(fbd.encode(term).await.unwrap(), Some(i as TermCode), "{i}");
+            assert_eq!(
+                fbd.encode_exact(term).await.unwrap(),
+                Some(i as TermCode),
+                "{i}"
+            );
         }
         assert_eq!(fbd.debug_windows_rebuilt(), 4);
         // A near miss — the last byte changed — is absent, not a neighbour.
         let near = format!("{}?", &terms[150][..terms[150].len() - 1]);
-        assert_eq!(fbd.encode(&near).await.unwrap(), None);
+        assert_eq!(fbd.encode_exact(&near).await.unwrap(), None);
         assert_eq!(fbd.lower_bound(near.as_bytes()).await.unwrap(), 151);
     }
 
@@ -1485,13 +1499,16 @@ mod tests {
         // The edge terms are answered from the bounds read at open.
         for code in (0..6).flat_map(|w| [w * 100, w * 100 + 99]) {
             let term = column.str_at(code).unwrap();
-            assert_eq!(fbd.encode(term).await.unwrap(), Some(code as TermCode));
+            assert_eq!(
+                fbd.encode_exact(term).await.unwrap(),
+                Some(code as TermCode)
+            );
         }
         assert_eq!(fbd.debug_windows_rebuilt(), 0);
         for code in 0..600 {
             let term = column.str_at(code).unwrap();
             assert_eq!(
-                fbd.encode(term).await.unwrap(),
+                fbd.encode_exact(term).await.unwrap(),
                 Some(code as TermCode),
                 "{term}"
             );
@@ -1503,9 +1520,11 @@ mod tests {
         for (code, term) in decoded.iter().enumerate() {
             assert_eq!(&**term, column.str_at(code).unwrap(), "code {code}");
         }
-        assert_eq!(fbd.encode("<http://zzz>").await.unwrap(), None);
+        assert_eq!(fbd.encode_exact("<http://zzz>").await.unwrap(), None);
         assert_eq!(
-            fbd.encode("<http://example.org/term/0100>~").await.unwrap(),
+            fbd.encode_exact("<http://example.org/term/0100>~")
+                .await
+                .unwrap(),
             None
         );
     }
