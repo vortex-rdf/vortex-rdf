@@ -51,12 +51,8 @@ fn as_written_before_0_12(mut bytes: Vec<u8>) -> Vec<u8> {
 
 /// The serialized bytes of a store built from [`modular_quads`].
 async fn store_bytes(layout: LayoutStrategy, indexes: Indexes) -> Vec<u8> {
-    let built =
-        build_array::<SortedInMemoryBuilder>(quad_stream(modular_quads(12, 3, 4)), layout, indexes)
-            .await
-            .unwrap();
-    VortexRdfStore::from_built(built)
-        .unwrap()
+    built_store(modular_quads(12, 3, 4), layout, indexes)
+        .await
         .to_bytes()
         .await
         .unwrap()
@@ -187,38 +183,6 @@ async fn test_a_pre_0_12_store_is_refused_from_a_file() {
     }
 }
 
-/// A file that is not a store at all keeps the generic error, now naming the
-/// `v2` root: the legacy message is for the `v1` root only.
-#[tokio::test]
-async fn test_a_foreign_root_keeps_the_generic_error() {
-    use vortex_file::WriteOptionsSessionExt as _;
-
-    let array = bare_code_quad_array(&[1, 2, 3]);
-    let dtype = array.dtype().clone();
-    let stream = vortex_array::stream::ArrayStreamAdapter::new(
-        dtype,
-        Box::pin(futures::stream::once(async move { Ok(array) })),
-    );
-    let mut bytes: Vec<u8> = Vec::new();
-    crate::session::VORTEX_SESSION
-        .write_options()
-        .write(&mut bytes, stream)
-        .await
-        .unwrap();
-
-    let message = VortexRdfStore::from_bytes(&bytes)
-        .await
-        .err()
-        .expect("open should fail")
-        .to_string();
-    assert!(
-        message.contains("not a vortex-rdf store file")
-            && message.contains("expected the vortex-rdf.store.v2 root layout")
-            && !message.contains("0.11"),
-        "{message}"
-    );
-}
-
 // ─── The guarantees the refusal protects ───────────────────────────────
 
 /// One `val` of a reference index child: a term code under the Dictionary
@@ -281,10 +245,10 @@ async fn test_a_0_12_build_gives_the_guarantees_the_refusal_protects() {
         for component in built
             .components
             .iter()
-            .filter(|c| c.name.starts_with("index:ref-"))
+            .filter(|c| c.identity.name.starts_with("index:ref-"))
         {
             let pairs = reference_child(component);
-            let who = format!("{layout:?} / {}", component.name);
+            let who = format!("{layout:?} / {}", component.identity.name);
             assert_eq!(pairs.len(), 24, "{who}: one record per quad");
             assert!(
                 pairs.windows(2).all(|pair| pair[0] < pair[1]),

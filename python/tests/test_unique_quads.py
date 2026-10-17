@@ -10,7 +10,7 @@ import pytest
 
 from vortex_rdf import VortexRdfStore, serialize_rdf
 
-from conftest import INDEXES, LAYOUTS
+from conftest import INDEXES, LAYOUTS, u64_rows
 
 # Three RDF triples under eight spellings: "x" four times (twice plain, once
 # typed xsd:string, once through a \u escape), "y"@en twice (@EN and @en),
@@ -102,5 +102,5 @@ def test_dictionary_holds_one_code_per_rdf_term(tmp_path, probe_nt, indexes):
     # The columns carry those same codes: three rows, each term code in use.
     columns = store.match_codes()
     assert columns is not None
-    rows = list(zip(*(memoryview(column).cast("Q").tolist() for column in columns)))
+    rows = u64_rows(columns)
     assert len(rows) == len(set(rows)) == 3

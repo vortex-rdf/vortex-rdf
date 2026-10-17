@@ -16,6 +16,7 @@ use rkyv::util::AlignedVec;
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 
 use crate::error::{Result, VortexRdfError};
+use crate::store::RawQuad;
 
 /// Environment variable overriding where spill directories are created — the
 /// escape hatch for putting out-of-core runs on a specific volume. The OS
@@ -164,23 +165,6 @@ impl<T: Spillable> Run<T> {
             RunInner::File(reader) => reader.next(),
         }
     }
-
-    /// Pull up to `n` items off the run (fewer at the end of the data).
-    pub(crate) fn next_batch(&mut self, n: usize) -> Result<Vec<T>> {
-        pull_batch(n, || self.next())
-    }
-}
-
-/// Pull up to `n` items off `next` (fewer once it yields `None`).
-fn pull_batch<T>(n: usize, mut next: impl FnMut() -> Result<Option<T>>) -> Result<Vec<T>> {
-    let mut batch = Vec::with_capacity(n.min(4096));
-    while batch.len() < n {
-        match next()? {
-            Some(item) => batch.push(item),
-            None => break,
-        }
-    }
-    Ok(batch)
 }
 
 /// Sequential rkyv reader over a spill file.
@@ -209,34 +193,15 @@ impl<T: Spillable> RunReader<T> {
             return Ok(None);
         }
 
-        // A truncated record is a corrupt spill file — a format-level
-        // `Deserialization` failure — while any other read error is plain
-        // filesystem I/O.
         let mut len_bytes = [0u8; 4];
         len_bytes[0] = first_len_byte[0];
-        self.reader.read_exact(&mut len_bytes[1..]).map_err(|e| {
-            if e.kind() == ErrorKind::UnexpectedEof {
-                VortexRdfError::Deserialization(
-                    "Unexpected EOF while reading spill record length".to_string(),
-                )
-            } else {
-                VortexRdfError::Io(e)
-            }
-        })?;
+        read_exact_or_corrupt(&mut self.reader, &mut len_bytes[1..], "length")?;
 
         let len = u32::from_le_bytes(len_bytes) as usize;
         // Resize without clearing: `read_exact` overwrites all `len` bytes, so
         // the zero-fill only ever pays for the growth delta.
         self.payload.resize(len, 0);
-        self.reader.read_exact(&mut self.payload).map_err(|e| {
-            if e.kind() == ErrorKind::UnexpectedEof {
-                VortexRdfError::Deserialization(
-                    "Unexpected EOF while reading spill record payload".to_string(),
-                )
-            } else {
-                VortexRdfError::Io(e)
-            }
-        })?;
+        read_exact_or_corrupt(&mut self.reader, &mut self.payload, "payload")?;
 
         // SAFETY: spill files are produced by this process using the matching
         // rkyv serializer and consumed immediately; we don't accept external
@@ -245,6 +210,22 @@ impl<T: Spillable> RunReader<T> {
             .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
         Ok(Some(item))
     }
+}
+
+/// `read_exact` of one spill record's `what` (its length or its payload)
+/// into `buf`. A truncated record is a corrupt spill file — a format-level
+/// `Deserialization` failure — while any other read error is plain
+/// filesystem I/O.
+fn read_exact_or_corrupt(reader: &mut impl Read, buf: &mut [u8], what: &str) -> Result<()> {
+    reader.read_exact(buf).map_err(|e| {
+        if e.kind() == ErrorKind::UnexpectedEof {
+            VortexRdfError::Deserialization(format!(
+                "Unexpected EOF while reading spill record {what}"
+            ))
+        } else {
+            VortexRdfError::Io(e)
+        }
+    })
 }
 
 /// External sort of `T`s: buffers items up to a capacity, spills each full
@@ -432,7 +413,61 @@ impl<T: Ord + Spillable> RunMerger<T> {
 
     /// Pull up to `n` items off the merge (fewer at the end of the data).
     pub(crate) fn next_batch(&mut self, n: usize) -> Result<Vec<T>> {
-        pull_batch(n, || self.next())
+        let mut batch = Vec::with_capacity(n.min(4096));
+        while batch.len() < n {
+            match self.next()? {
+                Some(item) => batch.push(item),
+                None => break,
+            }
+        }
+        Ok(batch)
+    }
+}
+
+/// Where [`merge_feeding_indexes`] puts the merged quads: straight into
+/// memory when the merge had a single input run, otherwise into a spill file.
+///
+/// [`merge_feeding_indexes`]: super::stream_indexes::merge_feeding_indexes
+pub(super) enum MergedSink {
+    Memory(Vec<RawQuad>),
+    File {
+        writer: RunWriter<RawQuad>,
+        path: PathBuf,
+    },
+}
+
+impl MergedSink {
+    /// An in-memory sink, or a writer to `merged.bin` under `dir`.
+    pub(super) fn create(dir: &Path, in_memory: bool) -> Result<Self> {
+        if in_memory {
+            return Ok(MergedSink::Memory(Vec::new()));
+        }
+        let path = dir.join("merged.bin");
+        Ok(MergedSink::File {
+            writer: RunWriter::create(&path)?,
+            path,
+        })
+    }
+
+    pub(super) fn push(&mut self, quad: RawQuad) -> Result<()> {
+        match self {
+            MergedSink::Memory(quads) => {
+                quads.push(quad);
+                Ok(())
+            }
+            MergedSink::File { writer, .. } => writer.push(&quad),
+        }
+    }
+
+    /// Close the sink and hand back the merged quads as a readable run.
+    pub(super) fn finish(self) -> Result<Run<RawQuad>> {
+        match self {
+            MergedSink::Memory(quads) => Ok(Run::memory(quads)),
+            MergedSink::File { writer, path } => {
+                writer.finish()?;
+                Run::file(&path)
+            }
+        }
     }
 }
 

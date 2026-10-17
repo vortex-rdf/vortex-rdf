@@ -12,11 +12,7 @@ use super::*;
 /// single `o` column each child's `val` column shares its dtype.
 #[tokio::test]
 async fn test_duplicate_index_requests_are_deduplicated() {
-    for layout in [
-        LayoutStrategy::Default,
-        LayoutStrategy::TypedObject,
-        LayoutStrategy::Dictionary,
-    ] {
+    for layout in LAYOUTS {
         let arr = build_array::<SortedInMemoryBuilder>(
             quad_stream(two_quads()),
             layout,
@@ -71,14 +67,12 @@ async fn test_duplicate_index_requests_are_deduplicated() {
 async fn test_in_memory_derived_view_keeps_indexes() {
     let quads = modular_quads(24, 3, 4);
 
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
+    let store = built_store(
+        quads.clone(),
         LayoutStrategy::Default,
         vec![IndexType::SecondaryByReference],
     )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    .await;
     assert_eq!(store.indexes(), &vec![IndexType::SecondaryByReference]);
 
     // Match on the object index: 24 quads over 4 objects ⇒ 6 rows.
@@ -120,14 +114,12 @@ async fn test_in_memory_derived_view_keeps_indexes() {
 async fn test_compact_with_indexes_rebuilds() {
     let quads = modular_quads(24, 3, 4);
 
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
+    let store = built_store(
+        quads.clone(),
         LayoutStrategy::Default,
         vec![IndexType::SecondaryByReference],
     )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    .await;
 
     // A view over the object index: i = 1, 5, 9, 13, 17, 21 ⇒ 6 rows.
     let object = Term::Literal(Literal::new_simple_literal("object 1"));
@@ -151,14 +143,7 @@ async fn test_compact_with_indexes_rebuilds() {
 
     // Re-indexing from nothing: an empty set drops every index,
     // and a store built without indexes gains one it never had.
-    let bare = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
-        LayoutStrategy::Default,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let bare = VortexRdfStore::from_built(bare).unwrap();
+    let bare = built_store(quads.clone(), LayoutStrategy::Default, vec![]).await;
     assert!(bare.indexes().is_empty());
     assert!(
         bare.compact_with_indexes(vec![])
@@ -186,14 +171,7 @@ async fn test_compact_with_indexes_rebuilds() {
 async fn run_compact_with_indexes_layout(layout: LayoutStrategy) {
     let quads = modular_quads(24, 3, 4);
 
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
-        layout,
-        vec![IndexType::SecondaryByReference],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(quads.clone(), layout, vec![IndexType::SecondaryByReference]).await;
 
     let object = Term::Literal(Literal::new_simple_literal("object 1"));
     let indexed = store
@@ -222,13 +200,7 @@ async fn run_compact_with_indexes_layout(layout: LayoutStrategy) {
         ]
     );
     assert_eq!(
-        indexed
-            .match_pattern(None, None, Some(&object), None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
+        matched_size(&indexed, None, None, Some(&object), None).await,
         6,
     );
 
@@ -247,8 +219,9 @@ async fn run_compact_with_indexes_layout(layout: LayoutStrategy) {
         .match_pattern(None, Some(&predicate), None, None)
         .await
         .unwrap();
-    assert!(
-        served.debug_has_serve_plan(),
+    assert_eq!(
+        served_component(&served),
+        Some("index:posg"),
         "{layout:?}: a rebuilt copy index must serve the predicate match"
     );
     assert_eq!(
@@ -269,14 +242,7 @@ async fn test_compact_with_indexes_default() {
 /// silently lost its indexes.
 async fn run_compact_to_empty_keeps_indexes(layout: LayoutStrategy) {
     let quads = modular_quads(8, 3, 4);
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
-        layout,
-        vec![IndexType::SecondaryByReference],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(quads.clone(), layout, vec![IndexType::SecondaryByReference]).await;
 
     // A pattern nothing matches: the view is empty, and so is its compaction.
     let absent = Term::Literal(Literal::new_simple_literal("no such object"));
@@ -294,13 +260,7 @@ async fn run_compact_to_empty_keeps_indexes(layout: LayoutStrategy) {
     // than erroring or falling back.
     let object = Term::Literal(Literal::new_simple_literal("object 1"));
     assert_eq!(
-        empty
-            .match_pattern(None, None, Some(&object), None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
+        matched_size(&empty, None, None, Some(&object), None).await,
         0,
     );
 }
@@ -327,14 +287,7 @@ async fn test_compact_to_empty_keeps_indexes_typed_object() {
 #[tokio::test]
 async fn test_compact_with_indexes_typed_object_routes_every_object_kind() {
     let quads = term_kind_quads();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
-        LayoutStrategy::TypedObject,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(quads.clone(), LayoutStrategy::TypedObject, vec![]).await;
     assert!(store.indexes().is_empty());
 
     let indexed = store
@@ -373,14 +326,12 @@ async fn test_compact_with_indexes_typed_object() {
 async fn test_delete_keeps_indexes_usable() {
     let quads = modular_quads(12, 2, 3);
 
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
+    let store = built_store(
+        quads.clone(),
         LayoutStrategy::Default,
         vec![IndexType::SecondaryByReference],
     )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    .await;
 
     // Drop one quad: subject s0, which also carries object "object 0".
     let after = store.delete_quad(&quads[0]).await.unwrap();
@@ -492,8 +443,8 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
         "predicate match mismatch for builder={builder_name} layout={layout_name} indexes={index_name}",
     );
     assert_eq!(
-        by_pred.debug_has_serve_plan(),
-        expect_served,
+        served_component(&by_pred),
+        expect_served.then_some("index:posg"),
         "predicate serve plan mismatch for builder={builder_name} layout={layout_name} indexes={index_name}",
     );
 
@@ -508,8 +459,8 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
         "object match mismatch for builder={builder_name} layout={layout_name} indexes={index_name}",
     );
     assert_eq!(
-        by_obj.debug_has_serve_plan(),
-        expect_served,
+        served_component(&by_obj),
+        expect_served.then_some("index:ospg"),
         "object serve plan mismatch for builder={builder_name} layout={layout_name} indexes={index_name}",
     );
 
@@ -639,8 +590,8 @@ pub(super) async fn run_copy_index_serving_script(
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
-    assert!(by_p.debug_has_serve_plan());
-    assert_eq!(by_p.debug_selection_pending(), expect.served_pending);
+    assert_eq!(served_component(&by_p), Some("index:posg"));
+    assert_eq!(selection_pending(&by_p), expect.served_pending);
     assert_eq!(by_p.size().await.unwrap(), 10);
     assert_eq!(
         view_strings(&by_p).await,
@@ -658,8 +609,8 @@ pub(super) async fn run_copy_index_serving_script(
         .match_pattern(None, None, Some(&o2), None)
         .await
         .unwrap();
-    assert!(by_o.debug_has_serve_plan());
-    assert_eq!(by_o.debug_selection_pending(), expect.served_pending);
+    assert_eq!(served_component(&by_o), Some("index:ospg"));
+    assert_eq!(selection_pending(&by_o), expect.served_pending);
     assert_eq!(by_o.size().await.unwrap(), 6);
     assert_eq!(
         view_strings(&by_o).await,
@@ -674,8 +625,8 @@ pub(super) async fn run_copy_index_serving_script(
         .match_pattern(None, Some(&p1), Some(&o1), None)
         .await
         .unwrap();
-    assert!(by_po.debug_has_serve_plan());
-    assert_eq!(by_po.debug_selection_pending(), expect.served_pending);
+    assert_eq!(served_component(&by_po), Some("index:posg"));
+    assert_eq!(selection_pending(&by_po), expect.served_pending);
     assert_eq!(by_po.size().await.unwrap(), 2);
     assert_eq!(
         view_strings(&by_po).await,
@@ -688,9 +639,12 @@ pub(super) async fn run_copy_index_serving_script(
         .match_pattern(None, Some(&p2), None, Some(&graphs[0]))
         .await
         .unwrap();
-    assert_eq!(by_pg.debug_has_serve_plan(), expect.residual_graph_served);
     assert_eq!(
-        by_pg.debug_selection_pending(),
+        served_component(&by_pg),
+        expect.residual_graph_served.then_some("index:posg")
+    );
+    assert_eq!(
+        selection_pending(&by_pg),
         expect.residual_graph_served && expect.served_pending
     );
     assert_eq!(by_pg.size().await.unwrap(), 5);
@@ -705,8 +659,8 @@ pub(super) async fn run_copy_index_serving_script(
         .match_pattern(None, None, Some(&o1), None)
         .await
         .unwrap();
-    assert!(!chained.debug_has_serve_plan());
-    assert!(!chained.debug_selection_pending());
+    assert_eq!(served_component(&chained), None);
+    assert!(!selection_pending(&chained));
     assert_eq!(
         view_strings(&chained).await,
         expected_strings(quads, |i| i % 3 == 1 && i % 5 == 1)
@@ -727,10 +681,7 @@ pub(super) async fn run_copy_index_serving_script(
         .match_pattern(None, Some(&subject_as_p), None, None)
         .await
         .unwrap();
-    assert_eq!(
-        zero.debug_selection_pending(),
-        expect.never_predicate_pending
-    );
+    assert_eq!(selection_pending(&zero), expect.never_predicate_pending);
     assert_eq!(view_strings(&zero).await, Vec::<String>::new());
     assert_eq!(zero.size().await.unwrap(), 0);
 
@@ -749,7 +700,7 @@ pub(super) async fn run_copy_index_serving_script(
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
-    assert!(by_p_tailed.debug_has_serve_plan());
+    assert_eq!(served_component(&by_p_tailed), Some("index:posg"));
     assert_eq!(by_p_tailed.size().await.unwrap(), 11);
     let mut want = expected_strings(quads, |i| i % 3 == 1);
     want.push(appended.to_string());
@@ -763,7 +714,7 @@ pub(super) async fn run_copy_index_serving_script(
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
-    assert!(by_p_after.debug_has_serve_plan());
+    assert_eq!(served_component(&by_p_after), Some("index:posg"));
     assert_eq!(by_p_after.size().await.unwrap(), 9);
     assert_eq!(
         view_strings(&by_p_after).await,
@@ -793,14 +744,12 @@ pub(super) async fn run_copy_index_serving_script(
 #[tokio::test]
 async fn test_in_memory_copy_index_serving() {
     let (quads, graphs) = copy_index_script_dataset();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
+    let store = built_store(
+        quads.clone(),
         LayoutStrategy::Default,
         vec![IndexType::SecondaryByCopy],
     )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    .await;
     run_copy_index_serving_script(
         store,
         &quads,
@@ -824,14 +773,12 @@ async fn test_in_memory_copy_index_serving() {
 #[tokio::test]
 async fn test_built_store_compresses_resident_form() {
     let quads = modular_quads(200, 4, 8);
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
+    let store = built_store(
+        quads.clone(),
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByCopy],
     )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    .await;
 
     assert!(
         !store.debug_base_int_children_canonical(),
@@ -859,26 +806,9 @@ async fn test_built_store_compresses_resident_form() {
     let cols = matched
         .code_columns()
         .expect("compressed base still serves codes through its shared wrappers");
-    let dict = matched.code_read_snapshot().unwrap();
-    let mut got: Vec<String> = (0..cols[0].len())
-        .map(|i| {
-            format!(
-                "{} {} {}",
-                dict.decode(cols[0][i]).unwrap(),
-                dict.decode(cols[1][i]).unwrap(),
-                dict.decode(cols[2][i]).unwrap()
-            )
-        })
-        .collect();
+    let mut got = decoded_rows(&cols, &matched.dict_reader().unwrap()).await;
     got.sort();
-    let mut want: Vec<String> = quads
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| i % 4 == 1)
-        .map(|(_, q)| format!("{} {} {}", q.subject, q.predicate, q.object))
-        .collect();
-    want.sort();
-    assert_eq!(got, want);
+    assert_eq!(got, expected_rows(&quads, |i| i % 4 == 1));
 }
 
 /// The bindings' code-column read on a served in-memory match: `code_columns`
@@ -889,21 +819,19 @@ async fn test_built_store_compresses_resident_form() {
 #[tokio::test]
 async fn test_code_columns_serves_from_the_answering_index() {
     let quads = graph_modular_quads(30, 2, 3, 5, &[GraphName::DefaultGraph]);
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
+    let store = built_store(
+        quads.clone(),
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByCopy],
     )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    .await;
 
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     let matched = store
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
-    assert!(matched.debug_selection_pending());
+    assert!(selection_pending(&matched));
 
     let cols = matched
         .code_columns()
@@ -913,26 +841,9 @@ async fn test_code_columns_serves_from_the_answering_index() {
         Some(false),
         "a served code read must not materialize the resolution's row ids"
     );
-    let dict = matched.code_read_snapshot().unwrap();
-    let mut got: Vec<String> = (0..cols[0].len())
-        .map(|i| {
-            format!(
-                "{} {} {}",
-                dict.decode(cols[0][i]).unwrap(),
-                dict.decode(cols[1][i]).unwrap(),
-                dict.decode(cols[2][i]).unwrap()
-            )
-        })
-        .collect();
+    let mut got = decoded_rows(&cols, &matched.dict_reader().unwrap()).await;
     got.sort();
-    let mut want: Vec<String> = quads
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| i % 3 == 1)
-        .map(|(_, q)| format!("{} {} {}", q.subject, q.predicate, q.object))
-        .collect();
-    want.sort();
-    assert_eq!(got, want);
+    assert_eq!(got, expected_rows(&quads, |i| i % 3 == 1));
 }
 
 /// A window of an in-memory reference index's located run decodes exactly its

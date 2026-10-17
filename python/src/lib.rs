@@ -22,7 +22,9 @@ pyo3::create_exception!(
     _native,
     VortexRdfError,
     pyo3::exceptions::PyException,
-    "Raised when a Vortex-RDF store operation fails."
+    "Raised when a Vortex-RDF store operation fails: a store that does not read, an operation \
+     the store refuses. An invalid argument raises ValueError instead, and an I/O failure \
+     OSError."
 );
 
 /// Shared runtime for all blocking native calls. Created lazily so a process
@@ -34,19 +36,17 @@ pub(crate) static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| 
         .expect("failed to create tokio runtime for vortex_rdf._native")
 });
 
-/// Store/IO failures: IO errors surface as `OSError` subclasses so Python
-/// callers get `FileNotFoundError` etc.; everything else raises the package's
-/// `VortexRdfError`.
-pub(crate) fn store_err(e: CoreError) -> PyErr {
+/// A core error as the Python exception it raises: an invalid argument (a
+/// malformed term, an unknown name, predicate kind or option, candidate codes
+/// out of order) is a `ValueError`; an I/O failure is the `OSError` subclass
+/// its kind names (`FileNotFoundError`, `PermissionError`, …); everything
+/// else raises the package's `VortexRdfError`.
+pub(crate) fn py_err(e: CoreError) -> PyErr {
     match e {
+        CoreError::InvalidInput(_) => PyValueError::new_err(e.to_string()),
         CoreError::Io(io) => io.into(),
         other => VortexRdfError::new_err(other.to_string()),
     }
-}
-
-/// Malformed N-Triples term strings and other bad arguments are `ValueError`s.
-pub(crate) fn parse_err(e: CoreError) -> PyErr {
-    PyValueError::new_err(e.to_string())
 }
 
 #[pymodule]

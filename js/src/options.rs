@@ -1,11 +1,8 @@
 //! Build-time options: resolving the JS `BuildOptions` object into core
-//! strategies, the RDF format-name table, and the single place the builder is
-//! monomorphized.
+//! strategies, and the single place the builder is monomorphized.
 
 use futures::Stream;
 use js_sys::Reflect;
-use oxrdfio::RdfFormat;
-use vortex_rdf_core::common::formats::{format_from_name, supported_format_names};
 use vortex_rdf_core::{
     BuiltArray, IndexType, Indexes, LayoutStrategy, RawQuad, Result as CoreResult,
     SortedInMemoryBuilder, VortexArrayBuilder,
@@ -13,15 +10,6 @@ use vortex_rdf_core::{
 use wasm_bindgen::prelude::*;
 
 use crate::error::{js_err, js_err_ctx};
-
-pub(crate) fn parse_format(format_name: &str) -> Result<RdfFormat, JsValue> {
-    format_from_name(format_name).ok_or_else(|| {
-        js_err(format!(
-            "unknown RDF format {format_name:?}; expected one of: {}",
-            supported_format_names().join(", ")
-        ))
-    })
-}
 
 /// Build-time configuration resolved from the JS `BuildOptions` object.
 pub(crate) struct BuildConfig {

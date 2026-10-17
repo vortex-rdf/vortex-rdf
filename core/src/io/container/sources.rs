@@ -78,7 +78,9 @@ impl NativeComponentSource for BufferedComponentSource {
     }
 }
 
-/// A pull closure yielding one component chunk per call (`Ok(None)` = end).
+/// A pull closure yielding one component chunk of at most the given rows per
+/// call, `Ok(None)` once exhausted; a zero-row pull yields the empty chunk of
+/// the component's dtype.
 // Constructed only by the out-of-core builder, which is compiled out on
 // wasm32-unknown-unknown.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -122,14 +124,28 @@ impl NativeComponentSource for PullComponentSource {
                 vortex_error::vortex_err!("a pull-backed component source replays only once")
             })?;
         let batch_rows = self.batch_rows;
-        let stream = futures::stream::unfold(Some(pull), move |state| async move {
-            let mut pull = state?;
-            match pull(batch_rows) {
-                Ok(Some(chunk)) => Some((Ok(chunk), Some(pull))),
-                Ok(None) => None,
-                Err(e) => Some((Err(e), None)),
-            }
-        });
+        // At least one chunk is emitted: the child strategy needs one,
+        // possibly empty, to write a schema-complete component, so an empty
+        // component contributes its zero-row pull.
+        let stream =
+            futures::stream::unfold((Some(pull), false), move |(state, emitted)| async move {
+                let mut pull = state?;
+                match pull(batch_rows) {
+                    Ok(Some(chunk)) => Some((Ok(chunk), (Some(pull), true))),
+                    Ok(None) if !emitted => {
+                        let empty = pull(0).and_then(|chunk| {
+                            chunk.ok_or_else(|| {
+                                vortex_error::vortex_err!(
+                                    "a zero-row pull must yield an empty chunk"
+                                )
+                            })
+                        });
+                        Some((empty, (None, true)))
+                    }
+                    Ok(None) => None,
+                    Err(e) => Some((Err(e), (None, true))),
+                }
+            });
         Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
             self.dtype.clone(),
             stream,
@@ -198,7 +214,7 @@ fn store_compressor() -> vortex_btrblocks::BtrBlocksCompressorBuilder {
 /// [`store_compressor`] — what every store child's columns are written with
 /// except its id columns (see [`child_strategy`]); the dictionary child
 /// instead passes its pre-compressed chunks through
-/// `write::dict_child_strategy`.
+/// `dict_child_strategy`.
 pub(crate) fn default_child_strategy() -> Arc<dyn vortex_layout::LayoutStrategy> {
     vortex_file::WriteStrategyBuilder::from_session(&crate::session::VORTEX_SESSION)
         .with_btrblocks_builder(store_compressor())
@@ -345,5 +361,43 @@ fn id_column_strategy(
             block_size_target: None,
             canonicalize: false,
         },
+    ))
+}
+
+/// The dictionary child's strategy: every chunk the source emits is written
+/// verbatim as one flat leaf under a chunked node — no sampling, no
+/// re-encoding. The chunks are the source's self-contained FSST windows
+/// (`TermDictionary::compress`), so the leaves are the granularity the
+/// file-backed dictionary reads. With `zone_rows` (the window length) the
+/// term column is zoned one zone per window, recording each window's exact
+/// first and last term (`vortex.min()`/`vortex.max()`); `None` — chunks of
+/// uneven length — writes no zone map.
+#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+pub(crate) fn dict_child_strategy(
+    zone_rows: Option<std::num::NonZeroUsize>,
+) -> Arc<dyn vortex_layout::LayoutStrategy> {
+    use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
+    use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
+    use vortex_layout::layouts::struct_::StructStrategy;
+    use vortex_layout::layouts::zoned::writer::{ZonedLayoutOptions, ZonedStrategy};
+
+    let leaves = ChunkedLayoutStrategy::new(FlatLayoutStrategy::default());
+    let terms: Arc<dyn vortex_layout::LayoutStrategy> = match zone_rows {
+        Some(block_size) => Arc::new(ZonedStrategy::new(
+            leaves,
+            FlatLayoutStrategy::default(),
+            ZonedLayoutOptions {
+                block_size,
+                aggregate_fns: Some(
+                    crate::store::layouts::dictionary::storage::window_bound_aggregates(),
+                ),
+                concurrency: std::num::NonZeroUsize::MIN,
+            },
+        )),
+        None => Arc::new(leaves),
+    };
+    Arc::new(StructStrategy::new(
+        Arc::new(FlatLayoutStrategy::default()),
+        terms,
     ))
 }

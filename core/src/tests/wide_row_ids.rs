@@ -5,12 +5,14 @@
 //! stores or reads one: the in-memory index builds, the out-of-core merge's
 //! spilled `(key, rid)` runs, the written `rid` columns, located-run counts
 //! and windows, the copy index's served reads under tombstones, chained
-//! matches, compaction, `to_bytes` and `from_parts`.
+//! matches, the partitions of a match, compaction, `to_bytes` and
+//! `from_parts`.
 //!
 //! An id narrowed to 32 bits anywhere on the way lands below the base, where
 //! the readers' subtraction fails loudly, instead of naming another row.
 
 use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 
 use super::*;
 use crate::store::array::{StrColReader, field_as};
@@ -64,11 +66,29 @@ fn rows_where(quads: &[Quad], keep: impl Fn(usize) -> bool) -> Vec<String> {
     expected_strings(quads, keep)
 }
 
+/// The quads of `view`'s at most `n` partitions, read in turn, as strings.
+async fn partition_strings(view: &VortexRdfStore, n: usize) -> Vec<String> {
+    let parts = view
+        .partitions(NonZeroUsize::new(n).unwrap())
+        .await
+        .unwrap();
+    assert!(
+        !parts.is_empty() && parts.len() <= n,
+        "{} parts",
+        parts.len()
+    );
+    let mut rows = Vec::new();
+    for part in &parts {
+        rows.extend(part.quads_vec().await.unwrap().iter().map(Quad::to_string));
+    }
+    rows
+}
+
 /// Every row-id-reading surface of `store`, which holds [`dataset`] and was
 /// built or opened under the guard: index matches (served from a copy, or
-/// gathered by a reference's ids), a graph scan, counts and windows of an
-/// index run, a match chained onto an index match, and tombstones over index
-/// matches.
+/// gathered by a reference's ids), a graph scan, a match chained onto an
+/// index match, the matches' partitions, counts and windows of an index run,
+/// and tombstones over index matches.
 async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
     let p1 = iri("p1");
     let o2 = Term::Literal(Literal::new_simple_literal("o2"));
@@ -114,6 +134,23 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         .await
         .unwrap();
     assert_eq!(view_strings(&chained).await, both_rows, "{label}: chained");
+
+    // ── partitions of the index matches ──────────────────────────────────
+    // A partition reads its piece of a match's ids in base row order, the
+    // order of the sorted strings (the subjects are unique), so the
+    // partitions read in turn are the match.
+    for (tag, view, rows) in [
+        ("predicate", &by_p, p_rows.clone()),
+        ("object", &by_o, rows_where(quads, |i| i % 7 == 2)),
+        ("both", &both, both_rows.clone()),
+        ("chained", &chained, both_rows.clone()),
+    ] {
+        assert_eq!(
+            partition_strings(view, 4).await,
+            rows,
+            "{label}: partitions of the {tag} match"
+        );
+    }
 
     // ── counts and windows of the index runs ─────────────────────────────
     let probe_p = Probe::new(None, Some(p1.clone()), None, None);
@@ -164,6 +201,11 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         rows_where(quads, |i| i % 3 == 1 && live(i)),
         "{label}: by predicate after deletes"
     );
+    assert_eq!(
+        partition_strings(&by_p, 4).await,
+        rows_where(quads, |i| i % 3 == 1 && live(i)),
+        "{label}: partitions of the predicate match after deletes"
+    );
     let by_o = deleted
         .match_pattern(None, None, Some(&o2), None)
         .await
@@ -207,9 +249,12 @@ enum Val {
 fn check_children(parts: &StoreParts, base: RowId, label: &str) -> usize {
     let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
     let mut straddling = 0;
-    assert!(!parts.components.is_empty(), "{label}: index children");
-    for component in &parts.components {
-        let who = format!("{label} / {}", component.name);
+    assert!(
+        !parts.built.components.is_empty(),
+        "{label}: index children"
+    );
+    for component in &parts.built.components {
+        let who = format!("{label} / {}", component.identity.name);
         let rows = component.rows().unwrap();
         let rid: PrimitiveArray = field_as(rows, "rid", &mut ctx).unwrap();
         let rids: &[RowId] = rid.as_slice::<RowId>();
@@ -220,7 +265,7 @@ fn check_children(parts: &StoreParts, base: RowId, label: &str) -> usize {
             (base..base + N as RowId).collect::<BTreeSet<_>>(),
             "{who}: every row id once, numbered from the base"
         );
-        if !component.name.starts_with("index:ref-") {
+        if !component.identity.name.starts_with("index:ref-") {
             continue;
         }
         let val = rows.unmasked_field_by_name("val").unwrap();
@@ -270,7 +315,7 @@ async fn spilled_store_bytes(
     .await
     .unwrap();
     let mut bytes = Vec::new();
-    crate::io::ser::built_stream_to_vortex_writer(built, &mut bytes)
+    crate::io::write::built_stream_to_vortex_writer(built, &mut bytes)
         .await
         .unwrap();
     bytes
@@ -304,11 +349,7 @@ async fn row_ids_past_u32_round_trip_in_memory() {
     for layout in LAYOUTS {
         for indexes in single_index_sets() {
             let label = format!("{layout:?} {indexes:?}");
-            let built =
-                build_array::<SortedInMemoryBuilder>(quad_stream(quads.clone()), layout, indexes)
-                    .await
-                    .unwrap();
-            let store = VortexRdfStore::from_built(built).unwrap();
+            let store = built_store(quads.clone(), layout, indexes).await;
             check_adoptions(&store, &quads, &label).await;
         }
     }
@@ -388,9 +429,7 @@ async fn row_ids_past_u32_round_trip_through_a_file() {
             }
             assert!(rid_columns >= 2, "{label}: index children");
 
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("store.vortex");
-            std::fs::write(&path, &bytes).unwrap();
+            let (_dir, path) = temp_store_file(&bytes);
             let mapped = VortexRdfStore::from_file(&path).await.unwrap();
             check_children(&mapped.to_serializable_parts().await.unwrap(), BASE, &label);
             check_store(&mapped, &quads, &format!("{label}: mapped")).await;
@@ -439,14 +478,7 @@ async fn reference_children_keep_val_rid_order_across_u32_max() {
     let quads = dataset();
     for layout in LAYOUTS {
         let label = format!("{layout:?}");
-        let built = build_array::<SortedInMemoryBuilder>(
-            quad_stream(quads.clone()),
-            layout,
-            vec![IndexType::SecondaryByReference],
-        )
-        .await
-        .unwrap();
-        let store = VortexRdfStore::from_built(built).unwrap();
+        let store = built_store(quads.clone(), layout, vec![IndexType::SecondaryByReference]).await;
         let parts = store.to_serializable_parts().await.unwrap();
         assert_eq!(
             check_children(&parts, STRADDLE, &format!("{label}: in memory")),
@@ -484,9 +516,7 @@ async fn reference_children_keep_val_rid_order_across_u32_max() {
             vec![IndexType::SecondaryByReference],
         )
         .await;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("store.vortex");
-        std::fs::write(&path, &bytes).unwrap();
+        let (_dir, path) = temp_store_file(&bytes);
         let mapped = VortexRdfStore::from_file(&path).await.unwrap();
         check_store(&mapped, &quads, "straddling file").await;
         super::indexes_file::assert_windows_read_only_their_rows(

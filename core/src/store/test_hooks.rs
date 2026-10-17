@@ -1,24 +1,30 @@
-//! Test hooks on [`VortexRdfStore`]: read-only accessors over the store's
-//! internal state, so tests assert which mechanism answered a query (a
-//! serve plan, a deferred selection, a prefix-probe range, a retained wire
-//! encoding) rather than only the result.
+//! Test hooks on [`VortexRdfStore`]: read-only accessors over internal state
+//! no public API reports, so tests assert which mechanism answered a query
+//! (a located run, a deferred selection's row ids, a prefix-probe range, a
+//! retained wire encoding) rather than only the result. What a planner can
+//! observe — the serving component, the selection kind, the sort order, a
+//! pending filter, the dictionary's residency — is asserted through
+//! [`view_statistics`](VortexRdfStore::view_statistics) and
+//! [`dict_reader`](VortexRdfStore::dict_reader).
 
 use std::ops::Range;
 
 use vortex_array::ArrayRef;
-use vortex_array::arrays::StructArray;
+use vortex_array::arrays::{Struct, StructArray};
 
 #[cfg(feature = "file-io")]
 use crate::error::Result;
 use crate::store::array;
+use crate::store::indexes::IndexComponent;
+use crate::store::layouts::ResolvedLayout;
 #[cfg(feature = "file-io")]
-use crate::store::layouts::QuadPattern;
+use crate::store::layouts::{DictAccess, QuadPattern};
 #[cfg(feature = "file-io")]
-use crate::store::layouts::{DictAccess, ResolvedLayout};
-use crate::store::selection::{RowSelection, ViewSelection};
-use crate::store::{QuadsSource, RowId, TermCode, VortexRdfStore};
+use crate::store::persist::native_file::NativeStoreFile;
+use crate::store::view::selection::{RowSelection, ViewSelection};
+use crate::store::{DictSnapshot, QuadsSource, RowId, TermCode, VortexRdfStore};
 
-pub(crate) use crate::store::mutation::{TAIL_FLATTEN_FLOOR, TAIL_MAX_CHUNKS};
+pub(crate) use crate::store::view::{TAIL_FLATTEN_FLOOR, TAIL_MAX_CHUNKS};
 
 thread_local! {
     /// How many times this thread gathered a store's live rows into raw quads
@@ -136,20 +142,22 @@ pub(crate) fn gathers() -> usize {
 use oxrdf::NamedOrBlankNode;
 
 impl VortexRdfStore {
-    /// Whether this view carries an index serving plan for `quads()`.
-    pub(crate) fn debug_has_serve_plan(&self) -> bool {
+    /// The in-memory base; `None` for a file-backed store.
+    fn in_memory_base(&self) -> Option<&ArrayRef> {
         match &self.quads {
-            QuadsSource::InMemory { serve, .. } => serve.is_some(),
+            QuadsSource::InMemory { base, .. } => Some(base),
             #[cfg(feature = "file-io")]
-            QuadsSource::File { serve, .. } => serve.is_some(),
+            QuadsSource::File { .. } => None,
         }
     }
 
-    /// Whether this view's base selection is still pending — a served match,
-    /// or a run held for a count, whose exact row ids no consumer has needed
-    /// yet.
-    pub(crate) fn debug_selection_pending(&self) -> bool {
-        matches!(self.quads.view_selection(), ViewSelection::Pending(_))
+    /// The in-memory index components; `None` for a file-backed store.
+    fn in_memory_components(&self) -> Option<&[IndexComponent]> {
+        match &self.quads {
+            QuadsSource::InMemory { components, .. } => Some(components),
+            #[cfg(feature = "file-io")]
+            QuadsSource::File { .. } => None,
+        }
     }
 
     /// Whether a pending selection's row ids have been computed: `false` for
@@ -177,33 +185,35 @@ impl VortexRdfStore {
         self.tail.as_ref().map(|tail| &tail.rows)
     }
 
+    /// The resident dictionary as a snapshot, whatever the append tail:
+    /// [`dict_reader`](VortexRdfStore::dict_reader) withholds a tailed view's
+    /// dictionary, whose codes the view's rows do not address. `None` for
+    /// another layout or a file-backed dictionary.
+    pub(crate) fn debug_dictionary_snapshot(&self) -> Option<DictSnapshot> {
+        match &self.layout {
+            ResolvedLayout::Dictionary(access) => access.reader().snapshot(),
+            _ => None,
+        }
+    }
+
     /// Whether every non-nullable integer child of an in-memory base is a
     /// canonical primitive (adoption decoded everything, or the children
     /// were built canonical). Vacuously true for a file-backed store, whose
     /// base is not held in memory.
     pub(crate) fn debug_base_int_children_canonical(&self) -> bool {
-        use vortex_array::arrays::Struct;
-        match &self.quads {
-            QuadsSource::InMemory { base, .. } => match base.clone().try_downcast::<Struct>() {
-                Ok(struct_arr) => debug_int_children_canonical(&struct_arr),
-                Err(_) => false,
-            },
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { .. } => true,
-        }
+        self.in_memory_base().is_none_or(|base| {
+            as_struct(base).is_some_and(|base| debug_int_children_canonical(&base))
+        })
     }
 
     /// Whether the named in-memory component's rows hold canonical integer
     /// children. `None` when this store holds no such in-memory component.
     pub(crate) fn debug_index_component_int_children_canonical(&self, name: &str) -> Option<bool> {
-        match &self.quads {
-            QuadsSource::InMemory { components, .. } => {
-                let component = components.iter().find(|c| c.name == name)?;
-                Some(debug_int_children_canonical(component.rows().ok()?))
-            }
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { .. } => None,
-        }
+        let component = self
+            .in_memory_components()?
+            .iter()
+            .find(|c| c.identity.name == name)?;
+        Some(debug_int_children_canonical(component.rows().ok()?))
     }
 
     /// Whether every sorted-stamped child of an in-memory base resolves an
@@ -211,83 +221,47 @@ impl VortexRdfStore {
     /// false only when a bounds search on some child would fall through to
     /// the generic kernel. Vacuously true for a file-backed store.
     pub(crate) fn debug_base_probe_resolvable(&self) -> bool {
-        use vortex_array::arrays::Struct;
-        match &self.quads {
-            QuadsSource::InMemory { base, .. } => match base.clone().try_downcast::<Struct>() {
-                Ok(struct_arr) => debug_sorted_children_probe_resolvable(&struct_arr),
-                Err(_) => false,
-            },
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { .. } => true,
-        }
-    }
-
-    /// Whether an in-memory base's `s` column carries the sorted stamp;
-    /// false for a file-backed store.
-    pub(crate) fn debug_base_subject_sorted(&self) -> bool {
-        match &self.quads {
-            QuadsSource::InMemory { base, .. } => array::subject_sorted(base),
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { .. } => false,
-        }
+        self.in_memory_base().is_none_or(|base| {
+            as_struct(base).is_some_and(|base| debug_sorted_children_probe_resolvable(&base))
+        })
     }
 }
 
 #[cfg(feature = "file-io")]
 impl VortexRdfStore {
-    /// Whether the dictionary was left in its file child (a file-backed
-    /// dictionary is only built over a child whose windows can be searched).
-    pub(crate) fn debug_dict_file_backed(&self) -> bool {
-        matches!(
-            &self.layout,
-            ResolvedLayout::Dictionary(DictAccess::FileBacked(_))
-        )
+    /// How many times the file-backed dictionary was lifted whole into memory
+    /// since the file opened (shared by every view of the file); `None` for a
+    /// resident dictionary or another layout.
+    pub(crate) fn debug_dict_lifts(&self) -> Option<usize> {
+        match &self.layout {
+            ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) => Some(fb.debug_lifts()),
+            _ => None,
+        }
     }
 
     /// Whether this store reads a memory-mapped file: `Some(true)` for a
     /// mapped open, `Some(false)` for a file read through Vortex's reader,
     /// `None` for an in-memory store.
     pub(crate) fn debug_file_mapped(&self) -> Option<bool> {
-        match &self.quads {
-            QuadsSource::InMemory { .. } => None,
-            QuadsSource::File { file, .. } => Some(file.is_mapped()),
-        }
+        self.quads.file().map(NativeStoreFile::is_mapped)
     }
 
     /// How many (scope, filter shape) trees the file handle has bound;
     /// `None` off-file.
     pub(crate) fn debug_bound_exprs(&self) -> Option<usize> {
-        match &self.quads {
-            QuadsSource::InMemory { .. } => None,
-            QuadsSource::File { file, .. } => Some(file.debug_bound_exprs()),
-        }
+        self.quads.file().map(NativeStoreFile::debug_bound_exprs)
     }
 
     /// The file's current quad-table root reader; `None` off-file. A test
     /// holds it weakly to see whether a reader tree outlives its retirement.
     pub(crate) fn debug_root_reader(&self) -> Option<vortex_layout::LayoutReaderRef> {
-        match &self.quads {
-            QuadsSource::InMemory { .. } => None,
-            QuadsSource::File { file, .. } => file.layout_reader().ok(),
-        }
+        self.quads.file()?.layout_reader().ok()
     }
 
     /// How many times a keep has streamed a quad column through a scan on
     /// this file handle (shared by every view of the file); `None` off-file.
     pub(crate) fn debug_column_streams(&self) -> Option<usize> {
-        match &self.quads {
-            QuadsSource::InMemory { .. } => None,
-            QuadsSource::File { file, .. } => Some(file.debug_column_streams()),
-        }
-    }
-
-    /// Whether this file view carries a filter its next scan evaluates;
-    /// `None` off-file.
-    pub(crate) fn debug_file_filter_pending(&self) -> Option<bool> {
-        match &self.quads {
-            QuadsSource::InMemory { .. } => None,
-            QuadsSource::File { filter, .. } => Some(filter.is_some()),
-        }
+        self.quads.file().map(NativeStoreFile::debug_column_streams)
     }
 
     /// Whether this view's selection is pending with no serve plan to read
@@ -305,21 +279,18 @@ impl VortexRdfStore {
         component: &str,
         column: &str,
     ) -> Option<(u64, usize)> {
-        match &self.quads {
-            QuadsSource::InMemory { .. } => None,
-            QuadsSource::File { file, .. } => file
-                .component_column_chunks(component, column)
-                .map(|chunks| (chunks.row_count(), chunks.chunk_count())),
-        }
+        self.quads
+            .file()?
+            .component_column_chunks(component, column)
+            .map(|chunks| (chunks.row_count(), chunks.chunk_count()))
     }
 
     /// How many row ids reads of located index-child runs have asked for on
     /// this file handle (shared by every view of the file); `None` off-file.
     pub(crate) fn debug_located_rid_reads(&self) -> Option<usize> {
-        match &self.quads {
-            QuadsSource::InMemory { .. } => None,
-            QuadsSource::File { file, .. } => Some(file.debug_located_rid_reads()),
-        }
+        self.quads
+            .file()
+            .map(NativeStoreFile::debug_located_rid_reads)
     }
 
     /// The exact row range the located-run kernel computes for the subject
@@ -329,38 +300,30 @@ impl VortexRdfStore {
         &self,
         range: Range<TermCode>,
     ) -> Result<Option<Range<u64>>> {
-        use crate::store::scan::file_scan;
-        let QuadsSource::File { file, .. } = &self.quads else {
+        use crate::store::scan::file_reads;
+        let Some(file) = self.quads.file() else {
             return Ok(None);
         };
-        file_scan::locate_subject_code_range(file, range).await
+        file_reads::locate_subject_code_range(file, range).await
     }
 
     /// Whether one named integer child of an in-memory base is a canonical
     /// primitive. `None` when the base has no such child or is not in memory.
     pub(crate) fn debug_base_child_int_canonical(&self, name: &str) -> Option<bool> {
+        use vortex_array::arrays::Primitive;
         use vortex_array::arrays::struct_::StructArrayExt;
-        use vortex_array::arrays::{Primitive, Struct};
-        match &self.quads {
-            QuadsSource::InMemory { base, .. } => {
-                let struct_arr = base.clone().try_downcast::<Struct>().ok()?;
-                let child = struct_arr.unmasked_field_by_name(name).ok()?;
-                child.dtype().is_int().then(|| child.is::<Primitive>())
-            }
-            QuadsSource::File { .. } => None,
-        }
+        let base = as_struct(self.in_memory_base()?)?;
+        let child = base.unmasked_field_by_name(name).ok()?;
+        child.dtype().is_int().then(|| child.is::<Primitive>())
     }
 
     /// Whether the named in-memory index component has canonicalized its
     /// rows yet; `None` when this store holds no such component.
     pub(crate) fn debug_index_component_materialized(&self, name: &str) -> Option<bool> {
-        match &self.quads {
-            QuadsSource::InMemory { components, .. } => components
-                .iter()
-                .find(|c| c.name == name)
-                .map(|c| c.is_materialized()),
-            QuadsSource::File { .. } => None,
-        }
+        self.in_memory_components()?
+            .iter()
+            .find(|c| c.identity.name == name)
+            .map(|c| c.is_materialized())
     }
 
     /// The index-child row range a file view's serve plan located for its
@@ -379,16 +342,16 @@ impl VortexRdfStore {
         &self,
         subject: &NamedOrBlankNode,
     ) -> Result<Option<Range<u64>>> {
-        use crate::store::scan::file_scan;
-        let QuadsSource::File { file, .. } = &self.quads else {
+        use crate::store::scan::{file_filter, file_reads};
+        let Some(file) = self.quads.file() else {
             return Ok(None);
         };
         let pattern = QuadPattern::new(Some(subject), None, None, None);
         let Some(mut codes) = self.prepared_codes(pattern).await? else {
             return Ok(Some(0..0));
         };
-        match file_scan::build_file_filter(pattern, &mut codes)? {
-            Some(filter) => file_scan::row_range_from_pruning(file, &filter).await,
+        match file_reads::build_file_filter(pattern, &mut codes)? {
+            Some(filter) => file_filter::row_range_from_pruning(file, &filter).await,
             None => Ok(None),
         }
     }
@@ -400,8 +363,8 @@ impl VortexRdfStore {
         &self,
         subject: &NamedOrBlankNode,
     ) -> Result<Option<Range<u64>>> {
-        use crate::store::scan::file_scan;
-        let QuadsSource::File { file, .. } = &self.quads else {
+        use crate::store::scan::file_reads;
+        let Some(file) = self.quads.file() else {
             return Ok(None);
         };
         let Some(mut codes) = self
@@ -410,7 +373,7 @@ impl VortexRdfStore {
         else {
             return Ok(None);
         };
-        file_scan::locate_subject_run(file, &mut codes, subject).await
+        file_reads::locate_subject_run(file, &mut codes, subject).await
     }
 
     /// The index-child run the reference index's file resolution locates for
@@ -421,16 +384,27 @@ impl VortexRdfStore {
         predicate: Option<&oxrdf::NamedNode>,
         object: Option<&oxrdf::Term>,
     ) -> Result<Option<Range<u64>>> {
-        let QuadsSource::File { file, .. } = &self.quads else {
+        let Some(file) = self.quads.file() else {
             return Ok(None);
         };
         let pattern = QuadPattern::new(None, predicate, object, None);
         let Some(mut codes) = self.prepared_codes(pattern).await? else {
             return Ok(None);
         };
-        crate::store::indexes::secondary_by_reference::debug_located_run(file, pattern, &mut codes)
-            .await
+        crate::store::indexes::file::debug_located_run(
+            crate::IndexType::SecondaryByReference,
+            file,
+            &self.layout,
+            pattern,
+            &mut codes,
+        )
+        .await
     }
+}
+
+/// `base` as a struct; `None` for a base that is not a canonical struct.
+fn as_struct(base: &ArrayRef) -> Option<StructArray> {
+    base.clone().try_downcast::<Struct>().ok()
 }
 
 /// Whether every non-nullable integer child of `struct_arr` is a canonical

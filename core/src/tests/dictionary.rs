@@ -64,7 +64,7 @@ async fn test_dictionary_quad_sink_matches_sorted_in_memory_builder() {
         .match_pattern(None, Some(&p0), None, None)
         .await
         .unwrap();
-    assert!(served.debug_has_serve_plan());
+    assert_eq!(served_component(&served), Some("index:posg"));
     assert_eq!(
         view_strings(&served).await,
         view_strings(
@@ -115,7 +115,7 @@ async fn test_dictionary_decode_survives_memo_slot_collisions() {
     let store = VortexRdfStore::from_built(arr).unwrap();
     // ~2000 subjects + 2000 objects + 7 predicates + 4 graphs: far past the
     // memo's slot count, so distinct codes share slots.
-    assert!(store.dictionary_snapshot().unwrap().0.len() > 1024);
+    assert!(store.dict_reader().unwrap().len() > 1024);
 
     let decoded = store.quads_vec().await.unwrap();
     assert_eq!(quad_strings(&decoded), quad_strings(&quads));
@@ -142,14 +142,7 @@ async fn test_dictionary_decode_survives_memo_slot_collisions() {
 #[tokio::test]
 async fn test_dictionary_match_and_mutations() {
     let quads = dictionary_test_quads();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
 
     // Subject match: hits the IsSorted binary-search fast path on the TermCode column.
     let s3 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s03").unwrap());
@@ -172,24 +165,12 @@ async fn test_dictionary_match_and_mutations() {
     // Terms absent from the dictionary match nothing (both routing paths).
     let missing_s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/nope").unwrap());
     assert_eq!(
-        store
-            .match_pattern(Some(&missing_s), None, None, None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
+        matched_size(&store, Some(&missing_s), None, None, None).await,
         0
     );
     let missing_p = NamedNode::new("http://example.org/nope").unwrap();
     assert_eq!(
-        store
-            .match_pattern(None, Some(&missing_p), None, None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
+        matched_size(&store, None, Some(&missing_p), None, None).await,
         0
     );
 
@@ -279,24 +260,12 @@ async fn test_dictionary_layout_secondary_index_compatibility() {
     // Terms absent from the dictionary match nothing through the index paths.
     let missing_o = Term::Literal(Literal::new_simple_literal("nope"));
     assert_eq!(
-        store
-            .match_pattern(None, None, Some(&missing_o), None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
+        matched_size(&store, None, None, Some(&missing_o), None).await,
         0
     );
     let missing_p = NamedNode::new("http://example.org/nope").unwrap();
     assert_eq!(
-        store
-            .match_pattern(None, Some(&missing_p), None, None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
+        matched_size(&store, None, Some(&missing_p), None, None).await,
         0
     );
 }
@@ -308,14 +277,12 @@ async fn test_dictionary_sorted_with_secondary_index() {
     // the subject binary-search range, the remaining bound terms are tested
     // as the residual over that range.
     let quads = dictionary_test_quads();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
+    let store = built_store(
+        quads.clone(),
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByReference],
     )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    .await;
 
     let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
     assert_eq!(quad_strings(&decoded), quad_strings(&quads));
@@ -335,13 +302,7 @@ async fn test_dictionary_sorted_with_secondary_index() {
     // s + o with an object that exists but not on that subject.
     let o0 = Term::Literal(Literal::new_simple_literal("object 0"));
     assert_eq!(
-        store
-            .match_pattern(Some(&s5), None, Some(&o0), None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
+        matched_size(&store, Some(&s5), None, Some(&o0), None).await,
         0
     );
 }
@@ -369,37 +330,23 @@ async fn test_dictionary_empty_dataset() {
 /// identically and would otherwise go unnoticed.
 #[tokio::test]
 async fn test_built_dictionary_terms_are_fsst() {
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(fsst_dictionary_quads()),
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(fsst_dictionary_quads(), LayoutStrategy::Dictionary, vec![]).await;
     assert_dictionary_terms_fsst(&store, "built");
 }
 
-/// `code_read_snapshot` is the one "codes are decodable" gate the frontends
-/// share: Dictionary layout, empty append tail, resident dictionary — all
-/// three, or `None`. The residency term is covered beside the file-backed
-/// suite (`dictionary_file_backed`); this exercises the layout and tail terms.
+/// `dict_reader` is the one "codes are decodable" gate the frontends share:
+/// Dictionary layout and an empty append tail — both, or `None`. Residency is
+/// no term of it: a file-backed dictionary answers through the handle (see
+/// `dictionary_file_backed`); this exercises the layout and tail terms.
 #[tokio::test]
-async fn test_code_read_snapshot_gate() {
+async fn test_dict_reader_gate_with_a_held_dictionary() {
     let quads = dictionary_test_quads();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
-    assert!(store.code_read_snapshot().is_some());
+    let store = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+    assert!(store.dict_reader().is_some());
 
     // An append opens a string tail whose rows have no codes in the cached
-    // dictionary: the gate closes even though `dictionary_snapshot` alone
-    // still answers — exactly the difference that makes the gate the safe
+    // dictionary: the gate closes even though the resident dictionary is
+    // still held — exactly the difference that makes the gate the safe
     // predicate for code-typed reads.
     let tailed = store
         .add_quad(make_quad(
@@ -411,79 +358,51 @@ async fn test_code_read_snapshot_gate() {
         .await
         .unwrap();
     assert_ne!(tailed.tail_len(), 0);
-    assert!(tailed.dictionary_snapshot().is_some());
-    assert!(tailed.code_read_snapshot().is_none());
+    assert!(tailed.debug_dictionary_snapshot().is_some());
+    assert!(tailed.dict_reader().is_none());
 
     // Folding the tail back into the base reopens the gate.
     let compacted = tailed.compact().await.unwrap();
     assert_eq!(compacted.tail_len(), 0);
-    assert!(compacted.code_read_snapshot().is_some());
+    assert!(compacted.dict_reader().is_some());
 
     // Non-Dictionary layouts have no codes at all.
-    let arr =
-        build_array::<SortedInMemoryBuilder>(quad_stream(quads), LayoutStrategy::Default, vec![])
-            .await
-            .unwrap();
-    let string_store = VortexRdfStore::from_built(arr).unwrap();
-    assert!(string_store.code_read_snapshot().is_none());
+    let string_store = built_store(quads, LayoutStrategy::Default, vec![]).await;
+    assert!(string_store.dict_reader().is_none());
 }
 
-/// A store adopted from its own bytes hands out a code-read snapshot, and
-/// the codes its rows and its matched views gather decode against that
-/// snapshot to exactly the quads it was built from.
+/// A store adopted from its own bytes hands out a dictionary reader with a
+/// resident snapshot, and the codes its rows and its matched views gather
+/// decode, through that reader, to exactly the quads it was built from.
 #[cfg(feature = "file-io")]
 #[tokio::test]
-async fn test_code_read_snapshot_survives_from_bytes() {
+async fn test_dict_reader_survives_from_bytes() {
     let quads = dictionary_test_quads();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
+    let store = built_store(
+        quads.clone(),
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByCopy],
     )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    .await;
     let adopted = VortexRdfStore::from_bytes(&store.to_bytes().await.unwrap())
         .await
         .unwrap();
     let dict = adopted
-        .code_read_snapshot()
-        .expect("an adopted Dictionary store is code-readable");
-
-    let decode_rows = |cols: &[vortex_buffer::Buffer<TermCode>; 4]| -> Vec<String> {
-        let mut rows: Vec<String> = (0..cols[0].len())
-            .map(|i| {
-                let term = |c: &vortex_buffer::Buffer<TermCode>| {
-                    dict.decode(c[i])
-                        .expect("codes address the adopted dictionary")
-                };
-                format!(
-                    "{} {} {} {}",
-                    term(&cols[0]),
-                    term(&cols[1]),
-                    term(&cols[2]),
-                    term(&cols[3])
-                )
-            })
-            .collect();
-        rows.sort();
-        rows
-    };
-    let raw_rows = |keep: &dyn Fn(&Quad) -> bool| -> Vec<String> {
-        let mut rows: Vec<String> = quads
-            .iter()
-            .filter(|q| keep(q))
-            .map(|q| {
-                let r = crate::store::RawQuad::from_quad(q);
-                format!("{} {} {} {}", r.s, r.p, r.o, r.g)
-            })
-            .collect();
-        rows.sort();
-        rows
-    };
+        .dict_reader()
+        .expect("an adopted Dictionary store hands out a dictionary reader");
+    let snapshot = dict
+        .snapshot()
+        .expect("an adopted Dictionary store holds its dictionary resident");
+    assert_eq!(
+        dict.dictionary_id(),
+        snapshot.dictionary_id(),
+        "the snapshot and the reader are handles on one dictionary"
+    );
 
     let gathered = adopted.code_columns_gathered().await.unwrap().unwrap();
-    assert_eq!(decode_rows(&gathered), raw_rows(&|_| true));
+    let mut rows = decoded_rows(&gathered, &dict).await;
+    rows.sort();
+    assert_eq!(rows, expected_rows(&quads, |_| true));
 
     // The gather the bindings pair with the snapshot: a served match's
     // codes, read off the answering index.
@@ -492,10 +411,9 @@ async fn test_code_read_snapshot_survives_from_bytes() {
         .match_pattern(None, Some(&p0), None, None)
         .await
         .unwrap();
-    assert!(matched.debug_has_serve_plan());
+    assert_eq!(served_component(&matched), Some("index:posg"));
     let matched_codes = matched.code_columns_gathered().await.unwrap().unwrap();
-    assert_eq!(
-        decode_rows(&matched_codes),
-        raw_rows(&|q| q.predicate == p0.as_ref())
-    );
+    let mut rows = decoded_rows(&matched_codes, &dict).await;
+    rows.sort();
+    assert_eq!(rows, expected_rows(&quads, |i| quads[i].predicate == p0));
 }

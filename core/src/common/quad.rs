@@ -101,13 +101,15 @@ impl RawQuad {
     /// one a parser produced.
     ///
     /// Each position takes the tolerant spellings of
-    /// [`canonical_spelling`](crate::common::terms::canonical_spelling) — an IRI
-    /// with or without angle brackets, a blank node, a literal with escapes, an
+    /// [`DictSnapshot::encode`](crate::DictSnapshot::encode) — an IRI with or
+    /// without angle brackets, a blank node, a literal with escapes, an
     /// explicit `xsd:string` type or an upper-case language tag, the default
     /// graph as `""`, `default` or `[]` — and must hold a term its position can
     /// (no literal subject, predicate or graph, no blank predicate). `"x"`,
     /// `"x"^^<…#string>` and `"\u0078"` give the same quad, and `"y"@EN` gives
-    /// `"y"@en`. A malformed spelling is an error naming the position.
+    /// `"y"@en`. A malformed spelling is an
+    /// [`InvalidInput`](crate::VortexRdfError::InvalidInput) error naming the
+    /// position.
     pub fn canonical(s: &str, p: &str, o: &str, g: &str) -> Result<Self> {
         crate::common::terms::canonical_raw_quad(s, p, o, g)
     }
@@ -259,14 +261,33 @@ mod tests {
             with(ok.0, ok.1, "\"x\"^^<not an iri>", ok.3),
             "bad datatype"
         );
-        let message = RawQuad::canonical("<bad iri>", ok.1, ok.2, ok.3)
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(
-            message.contains("subject"),
-            "the position is named: {message}"
-        );
+        // The position is named ahead of the term parser's own message.
+        for (quad, prefix) in [
+            (
+                ["<bad iri>", ok.1, ok.2, ok.3],
+                "quad subject: invalid IRI \"bad iri\": ",
+            ),
+            (
+                [ok.0, "_:b", ok.2, ok.3],
+                "quad predicate: invalid IRI \"_:b\": ",
+            ),
+            (
+                [ok.0, ok.1, "\"unterminated", ok.3],
+                "quad object: malformed literal \"\\\"unterminated\"",
+            ),
+            (
+                [ok.0, ok.1, ok.2, "_:a b"],
+                "quad graph: invalid blank node \"_:a b\": ",
+            ),
+        ] {
+            let [s, p, o, g] = quad;
+            match RawQuad::canonical(s, p, o, g).err() {
+                Some(crate::error::VortexRdfError::InvalidInput(message)) => {
+                    assert!(message.starts_with(prefix), "{quad:?}: {message:?}")
+                }
+                other => panic!("{quad:?}: {other:?}"),
+            }
+        }
     }
 
     /// The constructor renders exactly what the other two sources of

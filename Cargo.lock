@@ -4159,7 +4159,6 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "oxrdf",
- "oxrdfio",
  "vortex-rdf-core",
  "wasm-bindgen",
  "wasm-bindgen-futures",

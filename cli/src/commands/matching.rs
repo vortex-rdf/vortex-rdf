@@ -1,26 +1,62 @@
 //! The `match` arm (named `matching` because `match` is a keyword): filter a
 //! store by a quad pattern and export the matches as RDF text.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use log::{debug, info};
-use oxrdfio::RdfFormat;
 use std::fs::File;
-use std::io::{Write, stdout};
 use std::time::Instant;
 
-use vortex_rdf_core::common::formats::detect_format;
-use vortex_rdf_core::common::terms::{parse_pattern_checked, parse_quads_from_reader};
+use vortex_rdf_core::common::terms::parse_quads_from_reader;
 use vortex_rdf_core::debug as debug_time;
-use vortex_rdf_core::{LayoutStrategy, VortexRdfStore, export_rdf};
+use vortex_rdf_core::{LayoutStrategy, Probe, VortexRdfError, VortexRdfStore};
 
+use super::{export_to_output, input_format, output_format};
 use crate::MatchArgs;
+
+/// What each pattern flag accepts, keyed by the position core names at the
+/// head of a refusal (`pattern subject: …`): the context a refused flag is
+/// reported under.
+const FLAG_HINTS: [(&str, &str); 4] = [
+    (
+        "pattern subject:",
+        "Invalid --subject pattern (expected <iri>, an IRI, or _:blank)",
+    ),
+    (
+        "pattern predicate:",
+        "Invalid --predicate pattern (expected <iri> or an IRI)",
+    ),
+    (
+        "pattern object:",
+        "Invalid --object pattern (expected <iri>, _:blank, \"literal\", \
+         \"literal\"@lang, or \"literal\"^^<datatype>)",
+    ),
+    (
+        "pattern graph:",
+        "Invalid --graph pattern (expected <iri>, _:blank, or default)",
+    ),
+];
+
+/// `error`, a refused pattern, under the hint of the flag it names.
+fn flag_error(error: VortexRdfError) -> anyhow::Error {
+    let hint = match &error {
+        VortexRdfError::InvalidInput(message) => FLAG_HINTS
+            .iter()
+            .find(|(position, _)| message.starts_with(position))
+            .map(|(_, hint)| *hint),
+        _ => None,
+    };
+    match hint {
+        Some(hint) => anyhow::Error::new(error).context(hint),
+        None => error.into(),
+    }
+}
 
 pub async fn run(args: MatchArgs) -> Result<()> {
     let MatchArgs {
         input,
         output,
-        input_format,
-        output_format,
+        input_format: explicit_input,
+        output_format: explicit_format,
         subject,
         predicate,
         object,
@@ -29,43 +65,30 @@ pub async fn run(args: MatchArgs) -> Result<()> {
 
     let start = Instant::now();
 
-    // Pattern arguments are user-typed, so they take core's validating
-    // `parse_pattern_checked` rather than the store's trusted decode path.
-    // Core reports the first invalid slot without naming it, so each slot
-    // goes through it alone to keep the failing flag in the error.
-    let (subject_node, ..) = parse_pattern_checked(subject.as_deref(), None, None, None)
-        .context("Invalid --subject pattern (expected <iri>, an IRI, or _:blank)")?;
-    let (_, predicate_node, ..) = parse_pattern_checked(None, predicate.as_deref(), None, None)
-        .context("Invalid --predicate pattern (expected <iri> or an IRI)")?;
-    let (.., object_node, _) = parse_pattern_checked(None, None, object.as_deref(), None).context(
-        "Invalid --object pattern (expected <iri>, _:blank, \"literal\", \
-         \"literal\"@lang, or \"literal\"^^<datatype>)",
-    )?;
-    let (.., graph_node) = parse_pattern_checked(None, None, None, graph.as_deref())
-        .context("Invalid --graph pattern (expected <iri>, _:blank, or default)")?;
+    // Pattern arguments are user-typed, so `Probe::parse` validates them
+    // rather than the store's trusted decode path.
+    let probe = Probe::parse(
+        subject.as_deref(),
+        predicate.as_deref(),
+        object.as_deref(),
+        graph.as_deref(),
+    )
+    .map_err(flag_error)?;
 
-    let output_format = output_format
-        .or_else(|| detect_format(output.as_deref()))
-        .unwrap_or(RdfFormat::NQuads);
+    let output_format = output_format(explicit_format, output.as_deref());
 
     let is_vortex = input.extension().map(|e| e == "vortex").unwrap_or(false);
 
     let load_start = debug_time::timer();
     let store = if is_vortex {
-        let store = VortexRdfStore::from_file(&input)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let store = VortexRdfStore::from_file(&input).await?;
         debug!(
             "Opened Vortex file in {:?}",
             debug_time::elapsed(load_start)
         );
         store
     } else {
-        let input_format = input_format
-            .or_else(|| detect_format(Some(input.as_path())))
-            .ok_or_else(|| {
-                anyhow!("Could not detect RDF format. Please specify it with --input-format")
-            })?;
+        let input_format = input_format(explicit_input, Some(input.as_path()), "--input-format")?;
 
         let reader = Box::new(File::open(&input).context("Failed to open input file")?);
         let quads_stream = parse_quads_from_reader(reader, input_format);
@@ -81,12 +104,7 @@ pub async fn run(args: MatchArgs) -> Result<()> {
 
     let match_start = debug_time::timer();
     let filtered = store
-        .match_pattern(
-            subject_node.as_ref(),
-            predicate_node.as_ref(),
-            object_node.as_ref(),
-            graph_node.as_ref(),
-        )
+        .run_probe(&probe)
         .await
         .context("Failed to match pattern")?;
     debug!(
@@ -96,13 +114,13 @@ pub async fn run(args: MatchArgs) -> Result<()> {
 
     // The output file is created once the input has been read and matched, so
     // a failure before that leaves an existing output file as it was.
-    let writer: Box<dyn Write> = match &output {
-        Some(p) => Box::new(File::create(p).context("Failed to create output file")?),
-        None => Box::new(stdout()),
-    };
-    export_rdf(filtered, writer, output_format)
-        .await
-        .context("Failed to export filtered results")?;
+    export_to_output(
+        filtered,
+        output.as_deref(),
+        output_format,
+        "Failed to export filtered results",
+    )
+    .await?;
 
     info!("Full matching operation took {:?}", start.elapsed());
 

@@ -25,7 +25,10 @@ export type LayoutStrategy = 'default' | 'typed-object' | 'dictionary';
  */
 export type IndexType = 'secondary-by-reference' | 'secondary-by-copy';
 
-/** RDF syntaxes accepted for parsing and emitted for serialization. */
+/**
+ * RDF syntaxes accepted for parsing and emitted for serialization. Any other
+ * name rejects with `Invalid input: unknown RDF format …`, which lists these.
+ */
 export type RdfFormatName =
     | 'nt' | 'ntriples'
     | 'nq' | 'nquads'
@@ -55,16 +58,28 @@ export interface BuildOptions {
 
 /**
  * A wasm-side store handle. Every method that fails rejects (or, for the
- * synchronous read family, throws) with an `Error`.
+ * synchronous read family, throws) with an `Error`. An argument the Rust
+ * core refuses (a format, layout or index name) rejects with
+ * `Invalid input: …`.
  *
- * Only the pattern-read family — `match`, `getQuads`, `countQuads`,
- * `matchCodes` — is synchronous; `size` and `has` return promises like the
- * builders and mutations.
+ * The read family — `match`, `getQuads`, `countQuads`, `matchCodes`, `size`
+ * and `has` — is synchronous: no read path performs I/O, so there is nothing
+ * to await. The builders, mutations and serializers return promises.
  *
  * A pattern position is a wildcard when it is `null`/`undefined` or an RDF/JS
  * `Variable` term; a bare string is read as a NamedNode IRI; any other value
  * that is not a valid term of that position's kind throws `Invalid <position>
  * term`.
+ *
+ * A quad given to `has`, `addQuad`, `addQuads`, `deleteQuad` or `fromQuads`
+ * holds RDF/JS term objects only: a bare string is a NamedNode in a pattern,
+ * never in a quad. All five validate a quad's terms by one rule, and a quad is
+ * malformed (`Invalid quad object`) when a term is not of its position's kind
+ * or its IRI, blank-node label, language tag or datatype IRI is invalid. A
+ * literal is language-tagged when its `language` is non-empty, else typed when
+ * its `datatype.value` is, else simple. A literal's `datatype`, when present,
+ * is a NamedNode object: a non-object such as a bare IRI string is malformed,
+ * in a quad and in a pattern alike. An absent graph is the default graph.
  */
 export class VortexRdfStore {
     static empty(): VortexRdfStore;
@@ -86,9 +101,10 @@ export class VortexRdfStore {
     layout(): LayoutStrategy;
     /** The secondary indexes this store was built with (canonical kebab-case names). */
     indexes(): IndexType[];
-    size(): Promise<number>;
-    /** Rejects on a malformed quad object, like addQuad/deleteQuad. */
-    has(quad: Quad): Promise<boolean>;
+    /** Number of quads in the store. */
+    size(): number;
+    /** Whether the quad is in the store. Throws on a malformed quad object (addQuad/deleteQuad reject it). */
+    has(quad: Quad): boolean;
     /** Add one quad in place (a quad already present is ignored, per RDF/JS). */
     addQuad(quad: Quad): Promise<void>;
     /**
@@ -127,7 +143,8 @@ export class VortexRdfStore {
      * a code past `Number.MAX_SAFE_INTEGER` (2^53 - 1) throws rather than
      * rounding. `null` unless the store's rows are code-addressable
      * (Dictionary layout, no pending appends, resident dictionary); decode
-     * codes through `termDict()`.
+     * codes through `termDict()`. An invalid pattern term throws whether or
+     * not the rows are code-addressable.
      */
     matchCodes(subject?: Term | string | null, predicate?: Term | string | null, object?: Term | string | null, graph?: Term | string | null): { s: Float64Array; p: Float64Array; o: Float64Array; g: Float64Array; length: number } | null;
     /**
@@ -160,9 +177,12 @@ export class TermDict {
      */
     decode(code: number): string | undefined;
     /**
-     * Encode an N-Triples term string to its code (inverse of `decode`), or
-     * `undefined` when the term is absent. Throws for a code past
-     * `Number.MAX_SAFE_INTEGER`, which no number holds exactly.
+     * Encode a term to its code (inverse of `decode`), or `undefined` when the
+     * term is absent. Tolerant of spelling: an IRI with or without angle
+     * brackets, a literal with escape variants, an `xsd:string` typing, an
+     * upper-case language tag, or `'default'` / `'[]'` for the default graph
+     * all find the stored form's code. Throws for a malformed term, and for a
+     * code past `Number.MAX_SAFE_INTEGER`, which no number holds exactly.
      */
     encode(term: string): number | undefined;
     /** Release the wasm-side handle (also invoked by `Symbol.dispose`). */

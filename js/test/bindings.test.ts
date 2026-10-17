@@ -28,6 +28,20 @@ const NQUADS = [
     '<http://example.org/s4> <http://example.org/p4> "hola"@es .',
 ].join('\n') + '\n';
 
+/** A quad no term of `NQUADS` appears in: absent from any store built from it. */
+const NEW_QUAD = df.quad(
+    df.namedNode('http://example.org/s9'),
+    df.namedNode('http://example.org/p9'),
+    df.literal('new'),
+);
+
+/** The first quad of `NQUADS`: present in any store built from it. */
+const EXISTING_QUAD = df.quad(
+    df.namedNode('http://example.org/s1'),
+    df.namedNode('http://example.org/p1'),
+    df.namedNode('http://example.org/o1'),
+);
+
 /** Every build variant reachable from JS, in the canonical kebab-case
  *  vocabulary — the only spellings accepted, and what `layout()` reports. */
 const VARIANTS: { name: string; options: BuildOptions }[] = [
@@ -59,6 +73,18 @@ describe('build variants', () => {
                 const store = await VortexRdfStore.fromString(NQUADS, 'nquads', options);
                 expect(await store.size()).toBe(6);
                 expect(store.layout()).toBe(options.layout);
+            });
+
+            test('size and has return values, not promises', async () => {
+                const store = await VortexRdfStore.fromString(NQUADS, 'nquads', options);
+                const ex = (name: string) => df.namedNode(`http://example.org/${name}`);
+
+                expect(store.size()).toBe(6);
+                expect(store.has(df.quad(ex('s1'), ex('p1'), ex('o1')))).toBe(true);
+                expect(store.has(df.quad(ex('s2'), ex('p1'), ex('o2'), ex('g1')))).toBe(true);
+                // An exact four-component lookup: the same triple in the
+                // default graph is a different quad.
+                expect(store.has(df.quad(ex('s2'), ex('p1'), ex('o2')))).toBe(false);
             });
 
             test('matches every quad-position pattern', async () => {
@@ -375,10 +401,12 @@ describe('RDF format support', () => {
         expect(await store.size()).toBe(1);
     });
 
+    // Core's invalid-input error, its kind first, listing the accepted names.
     test('rejects an unsupported format', async () => {
-        await expect(VortexRdfStore.fromString(TURTLE, 'nope' as any)).rejects.toThrow(
-            /unknown RDF format "nope"/,
-        );
+        const refusal = /^Invalid input: unknown RDF format "nope"; expected one of: ntriples, nt,/;
+        await expect(VortexRdfStore.fromString(TURTLE, 'nope' as any)).rejects.toThrow(refusal);
+        const store = await VortexRdfStore.fromString(TURTLE, 'turtle');
+        await expect(store.toRdf('nope' as any)).rejects.toThrow(refusal);
     });
 });
 
@@ -476,12 +504,12 @@ describe('lazy terms outliving a dictionary rebuild', () => {
 describe('option validation', () => {
     test('rejects an unknown layout', async () => {
         await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'Nope' as any })).rejects
-            .toThrow(/unknown layout strategy/);
+            .toThrow(/^Invalid input: unknown layout strategy/);
     });
 
     test('rejects an unknown index', async () => {
         await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { indexes: ['Nope'] as any })).rejects
-            .toThrow(/unknown index type/);
+            .toThrow(/^Invalid input: unknown index type/);
     });
 
     test('rejects retired spellings, naming the canonical vocabulary', async () => {
@@ -648,14 +676,9 @@ describe('adding quads', () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
         // Every term here is absent from the dictionary built at load time;
         // the quad lands in the string tail and must still be found by match.
-        const quad = df.quad(
-            df.namedNode('http://example.org/s9'),
-            df.namedNode('http://example.org/p9'),
-            df.literal('new'),
-        );
-        await store.addQuad(quad);
+        await store.addQuad(NEW_QUAD);
         expect(await store.size()).toBe(7);
-        expect(await store.has(quad)).toBe(true);
+        expect(await store.has(NEW_QUAD)).toBe(true);
         const matched = store.getQuads(null, df.namedNode('http://example.org/p9'), null, null);
         expect(matched.length).toBe(1);
         // Decoded values must be correct: appended terms live in the string tail,
@@ -671,48 +694,28 @@ describe('adding quads', () => {
         // are re-encoded against a fresh dictionary).
         const restored = await VortexRdfStore.fromBytes(await store.toBytes());
         expect(await restored.size()).toBe(7);
-        expect(await restored.has(quad)).toBe(true);
+        expect(await restored.has(NEW_QUAD)).toBe(true);
     });
 
     test('Default layout supports addQuad', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'default' });
-        const quad = df.quad(
-            df.namedNode('http://example.org/s9'),
-            df.namedNode('http://example.org/p9'),
-            df.literal('new'),
-        );
-        await store.addQuad(quad);
+        await store.addQuad(NEW_QUAD);
         expect(await store.size()).toBe(7);
-        expect(await store.has(quad)).toBe(true);
+        expect(await store.has(NEW_QUAD)).toBe(true);
     });
 
     test('addQuad ignores a quad already present (RDF/JS set semantics)', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
-        const quad = df.quad(
-            df.namedNode('http://example.org/s1'),
-            df.namedNode('http://example.org/p1'),
-            df.namedNode('http://example.org/o1'),
-        );
-        expect(await store.has(quad)).toBe(true);
-        await store.addQuad(quad);
+        expect(await store.has(EXISTING_QUAD)).toBe(true);
+        await store.addQuad(EXISTING_QUAD);
         expect(await store.size()).toBe(6);
     });
 
     test('addQuads appends a batch, skipping duplicates', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
-        const fresh = df.quad(
-            df.namedNode('http://example.org/s9'),
-            df.namedNode('http://example.org/p9'),
-            df.literal('new'),
-        );
-        const existing = df.quad(
-            df.namedNode('http://example.org/s1'),
-            df.namedNode('http://example.org/p1'),
-            df.namedNode('http://example.org/o1'),
-        );
-        await store.addQuads([fresh, fresh, existing]);
+        await store.addQuads([NEW_QUAD, NEW_QUAD, EXISTING_QUAD]);
         expect(await store.size()).toBe(7);
-        expect(await store.has(fresh)).toBe(true);
+        expect(await store.has(NEW_QUAD)).toBe(true);
     });
 });
 
@@ -826,16 +829,17 @@ describe('matchCodes / termDict gates', () => {
             expect(store.matchCodes(null, p1, null, null)).toBeNull();
             expect(store.termDict()).toBeUndefined();
         });
+
+        test(`${layout}: matchCodes throws on an invalid pattern instead of returning null`, async () => {
+            const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout });
+            expect(() => store.matchCodes(null, null, null, df.literal('g'))).toThrow(/Invalid graph term/);
+        });
     }
 
     test('a pending append closes the code path', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
         expect(store.matchCodes(null, p1, null, null)).not.toBeNull();
-        await store.addQuad(df.quad(
-            df.namedNode('http://example.org/s9'),
-            df.namedNode('http://example.org/p9'),
-            df.literal('new'),
-        ));
+        await store.addQuad(NEW_QUAD);
         expect(store.matchCodes(null, p1, null, null)).toBeNull();
         expect(store.termDict()).toBeUndefined();
         // The term path still answers.
@@ -851,6 +855,26 @@ describe('matchCodes / termDict gates', () => {
         expect(typeof dict.encode('')).toBe('number');
         const code = dict.encode('<http://example.org/s1>')!;
         expect(dict.decode(code)).toBe('<http://example.org/s1>');
+    });
+
+    test('TermDict.encode takes variant spellings and throws on a malformed one', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
+        const dict = store.termDict()!;
+        // Each variant finds the code of the stored form it spells.
+        const spellings: [string, string][] = [
+            ['http://example.org/s1', '<http://example.org/s1>'],
+            ['"hola"@ES', '"hola"@es'],
+            ['"lit"^^<http://www.w3.org/2001/XMLSchema#string>', '"lit"'],
+            ['default', ''],
+        ];
+        for (const [variant, stored] of spellings) {
+            const code = dict.encode(stored);
+            expect(code, stored).toBeDefined();
+            expect(dict.encode(variant), variant).toBe(code);
+        }
+        // An absent variant is still `undefined`; a malformed term throws.
+        expect(dict.encode('http://example.org/nope')).toBeUndefined();
+        expect(() => dict.encode('"unterminated')).toThrow(/Invalid input/);
     });
 
     // Codes are u64 and cross as JS numbers, exact up to 2^53 - 1. A code
@@ -908,11 +932,6 @@ describe('matchCodes / termDict gates', () => {
 });
 
 describe('deleteQuad tombstones a base row', () => {
-    const target = df.quad(
-        df.namedNode('http://example.org/s1'),
-        df.namedNode('http://example.org/p1'),
-        df.namedNode('http://example.org/o1'),
-    );
     const p1 = df.namedNode('http://example.org/p1');
     const s1 = df.namedNode('http://example.org/s1');
 
@@ -928,19 +947,19 @@ describe('deleteQuad tombstones a base row', () => {
     for (const { name, options } of LAYOUTS) {
         test(name, async () => {
             const store = await VortexRdfStore.fromString(NQUADS, 'nquads', options);
-            await store.deleteQuad(target);
+            await store.deleteQuad(EXISTING_QUAD);
             expect(await store.size()).toBe(5);
-            expect(await store.has(target)).toBe(false);
+            expect(await store.has(EXISTING_QUAD)).toBe(false);
             expect(store.countQuads(null, p1, null, null)).toBe(2);
             expect(store.getQuads(s1, null, null, null).length).toBe(1);
 
             // Deleting an absent quad is a no-op.
-            await store.deleteQuad(target);
+            await store.deleteQuad(EXISTING_QUAD);
             expect(await store.size()).toBe(5);
 
             const restored = await VortexRdfStore.fromBytes(await store.toBytes());
             expect(await restored.size()).toBe(5);
-            expect(await restored.has(target)).toBe(false);
+            expect(await restored.has(EXISTING_QUAD)).toBe(false);
             expect(restored.countQuads(null, p1, null, null)).toBe(2);
         });
     }
@@ -996,11 +1015,7 @@ describe('graph and blank-node terms', () => {
 });
 
 describe('term validation and malformed input', () => {
-    const good = df.quad(
-        df.namedNode('http://example.org/s9'),
-        df.namedNode('http://example.org/p9'),
-        df.literal('new'),
-    );
+    const good = NEW_QUAD;
     const s = { termType: 'NamedNode', value: 'http://example.org/s' };
     const p = { termType: 'NamedNode', value: 'http://example.org/p' };
     const o = { termType: 'Literal', value: 'o' };
@@ -1026,12 +1041,12 @@ describe('term validation and malformed input', () => {
         expect(await store.size()).toBe(6);
     });
 
-    test('addQuad / deleteQuad / has reject a malformed quad object with an Error', async () => {
+    test('addQuad / deleteQuad reject and has throws a malformed quad object as an Error', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
         await expect(store.addQuad({} as any)).rejects.toThrow(/Invalid quad/);
         await expect(store.deleteQuad({} as any)).rejects.toThrow(/Invalid quad/);
-        await expect(store.has({} as any)).rejects.toThrow(/Invalid quad/);
-        await expect(store.has({} as any)).rejects.toBeInstanceOf(Error);
+        expect(() => store.has({} as any)).toThrow(/Invalid quad/);
+        expect(() => store.has({} as any)).toThrow(Error);
         expect(await store.size()).toBe(6);
     });
 
@@ -1040,7 +1055,7 @@ describe('term validation and malformed input', () => {
         await expect(VortexRdfStore.fromQuads(42 as any)).rejects.toThrow();
     });
 
-    test('a term of the wrong kind in a quad position is rejected', async () => {
+    test('every quad entry point rejects a malformed term', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
         const cases = [
             { subject: s, predicate: p, object: { termType: 'Variable', value: 'v' } },
@@ -1049,11 +1064,32 @@ describe('term validation and malformed input', () => {
             { subject: s, predicate: p, object: o, graph: { termType: 'Variable', value: 'g' } },
             { subject: s, predicate: p, object: { termType: 'Literal' } },
             { subject: { termType: 'NamedNode', value: 'not an iri' }, predicate: p, object: o },
-        ];
+            // A bare string is a NamedNode only in a pattern, never in a quad.
+            { subject: s, predicate: p, object: 'http://example.org/o' },
+            // An invalid datatype IRI is an error, never a plain literal.
+            {
+                subject: s,
+                predicate: p,
+                object: { termType: 'Literal', value: 'o', datatype: { termType: 'NamedNode', value: 'not an iri' } },
+            },
+            // So is a language that is not a string.
+            { subject: s, predicate: p, object: { termType: 'Literal', value: 'o', language: 42 } },
+            // A datatype is a NamedNode, never a bare IRI string.
+            {
+                subject: s,
+                predicate: p,
+                object: { termType: 'Literal', value: '5', datatype: 'http://www.w3.org/2001/XMLSchema#integer' },
+            },
+        ] as unknown as Quad[];
         for (const quad of cases) {
-            await expect(store.addQuad(quad as unknown as Quad)).rejects.toThrow(/Invalid quad object/);
-            await expect(VortexRdfStore.fromQuads([quad as unknown as Quad])).rejects
-                .toThrow(/Invalid quad object at index 0/);
+            // Soft, so that one run reports every entry point that accepts a case.
+            expect.soft(() => store.has(quad)).toThrow(/Invalid quad object/);
+            await expect.soft(store.addQuad(quad)).rejects.toThrow(/Invalid quad object/);
+            await expect.soft(store.deleteQuad(quad)).rejects.toThrow(/Invalid quad object/);
+            await expect.soft(store.addQuads([quad])).rejects.toThrow(/Invalid quad object at index 0/);
+            await expect.soft(VortexRdfStore.fromQuads([quad])).rejects.toThrow(/Invalid quad object at index 0/);
+            await expect.soft(VortexRdfStore.fromQuads(Readable.from([quad], { objectMode: true }))).rejects
+                .toThrow(/Invalid quad object in RDF\/JS stream at position 0/);
         }
         expect(await store.size()).toBe(6);
     });
@@ -1072,7 +1108,7 @@ describe('term validation and malformed input', () => {
         const bad = df.quad(df.blankNode('not a label'), df.namedNode('http://example.org/p'), df.literal('o'));
         await expect(store.addQuad(bad)).rejects.toThrow(/Invalid quad object/);
         await expect(VortexRdfStore.fromQuads([bad])).rejects.toThrow(/Invalid quad object at index 0/);
-        await expect(store.has(bad)).rejects.toThrow(/Invalid quad object/);
+        expect(() => store.has(bad)).toThrow(/Invalid quad object/);
     });
 
     test('an invalid pattern term throws instead of matching everything', async () => {
@@ -1084,6 +1120,12 @@ describe('term validation and malformed input', () => {
         expect(() => store.match(null, null, null, df.literal('g'))).toThrow(/Invalid graph term/);
         expect(() => store.matchCodes(null, null, null, df.literal('g'))).toThrow(/Invalid graph term/);
         expect(() => store.countQuads(df.namedNode('not an iri'), null, null, null)).toThrow(Error);
+        // An invalid datatype IRI throws instead of matching the plain literal "lit".
+        expect(() => store.countQuads(null, null, df.literal('lit', df.namedNode('not an iri')), null))
+            .toThrow(/Invalid object term/);
+        // So does a datatype that is a bare IRI string, not a NamedNode.
+        const bareDatatype = { termType: 'Literal', value: '42', datatype: 'http://www.w3.org/2001/XMLSchema#integer' };
+        expect(() => store.countQuads(null, null, bareDatatype as unknown as Term, null)).toThrow(/Invalid object term/);
     });
 
     test('a Variable term is a wildcard', async () => {

@@ -3,12 +3,14 @@
 ## Git hooks and the local CI mirror
 
 Run `./scripts/install-git-hooks.sh` once per clone to enable the git hooks. The
-`pre-push` hook mirrors the `lint`, `rust-tests`, `python-tests` and `js-tests`
-jobs in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — `cargo fmt
---check`, both `cargo clippy` runs (workspace, and core with
-`--no-default-features`), both `cargo test` variants, `uv sync --locked && uv
-run pytest tests -q` in `python/`, and the wasm-pack build + `npm run
-typecheck` + `npm test` in `js/`. You can also run it manually with
+`pre-push` hook mirrors the `lint`, `rust-tests`, `interface-tests`,
+`python-tests` and `js-tests` jobs in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) — `cargo fmt --check`,
+both `cargo clippy` runs (workspace, and core with `--no-default-features`),
+both `cargo test` variants, the `interface-tests/` crate's fmt check, clippy
+and tests (`--locked`), `uv sync --locked && uv run pytest tests -q` in
+`python/`, and the wasm-pack build + `npm run typecheck` + `npm test` in
+`js/`. You can also run it manually with
 `./scripts/ci-check.sh`. Skip it for one push with `git push --no-verify`.
 
 The python and js blocks are soft skips when their tooling is missing (`uv`;
@@ -21,7 +23,10 @@ The local `js-tests` mirror trades exactness for wall clock: it builds with
 build's wall clock and buys no memory headroom) and caps `CARGO_BUILD_JOBS`
 (default 4; export it to override) so a cold wasm build's rustc fan-out doesn't
 exhaust memory. The tests therefore run against an unoptimized wasm binary — CI
-stays the source of truth for the exact artifact that ships.
+stays the source of truth for the exact artifact that ships. The local
+`interface-tests` mirror caps `CARGO_BUILD_JOBS` the same way (default 4;
+export it to override), since a cold build compiles DataFusion's dependency
+tree.
 
 Node's version is pinned once in [`.tool-versions`](.tool-versions); every
 workflow reads it via `node-version-file`, and mise and asdf pick it up natively,

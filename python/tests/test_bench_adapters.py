@@ -21,12 +21,13 @@ BENCH_DIR = Path(__file__).resolve().parents[1] / "bench"
 sys.path.insert(0, str(BENCH_DIR))
 
 from adapters import VORTEX_SLUGS, build_adapter, split_term  # noqa: E402
+from conftest import NAME  # noqa: E402
 from datasets import FULL_SCAN_PATTERN, Pat  # noqa: E402
 
 #: The fixture holds two `foaf:name` triples on IRI subjects plus one on a
 #: blank node; a bound predicate is the pattern that routes through a secondary
 #: index when the variant has one, so it covers the indexed cells too.
-NAME_PATTERN = Pat("P", None, "<http://xmlns.com/foaf/0.1/name>", None, None)
+NAME_PATTERN = Pat("P", None, NAME, None, None)
 
 
 @pytest.mark.parametrize("slug", VORTEX_SLUGS)

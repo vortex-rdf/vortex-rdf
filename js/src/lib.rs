@@ -20,8 +20,11 @@ pub use store::{TermDict, VortexRdfStore};
 #[wasm_bindgen(typescript_custom_section)]
 const TS_APPEND_CONTENT: &'static str = include_str!("api.d.ts");
 
-#[wasm_bindgen]
-pub fn init_panic_hook() {
+/// Installs the panic hook, which reports a Rust panic's message and location
+/// to `console.error`. A private start function: it runs when the wasm module
+/// is instantiated, by `init` and `initSync` alike, and gets no JS binding.
+#[wasm_bindgen(start, private)]
+fn start() {
     console_error_panic_hook::set_once();
 }
 

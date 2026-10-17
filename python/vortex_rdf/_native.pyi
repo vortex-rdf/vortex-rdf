@@ -29,7 +29,9 @@ _KeepSpec = Dict[Union[str, int], Union[_U64s, range, Tuple[int, int]]]
 _Probe = Union[Tuple[Optional[str], Optional[str], Optional[str], Optional[str]], Dict[str, Any]]
 
 class VortexRdfError(Exception):
-    """Raised when a Vortex-RDF store operation fails."""
+    """Raised when a Vortex-RDF store operation fails: a store that does not
+    read, an operation the store refuses. An invalid argument raises
+    ``ValueError`` instead, and an I/O failure ``OSError``."""
 
 class TermDict:
     def decode(self, code: int) -> Optional[str]:
@@ -128,7 +130,8 @@ class TermDict:
     @property
     def file_backed(self) -> bool:
         """Whether terms are read from the store's file on demand rather
-        than held in memory."""
+        than held in memory. A read of the file that fails raises
+        ``VortexRdfError`` (``OSError`` for an I/O failure)."""
         ...
     def decode_many(self, codes: _U64s) -> List[Optional[str]]:
         """Decode a batch of codes in one GIL-released call.
@@ -293,6 +296,9 @@ def serialize_rdf(
 
     The options after the two paths are keyword-only. `format` is detected
     from the input file extension when omitted; `layout` defaults to
-    `"dictionary"`, the default shared by the JS bindings and the CLI.
+    `"dictionary"`, the default shared by the JS bindings and the CLI. An
+    unknown format, layout or index name raises ``ValueError``, a failed read
+    or write ``OSError``, and an input that does not parse
+    ``VortexRdfError``.
     """
     ...

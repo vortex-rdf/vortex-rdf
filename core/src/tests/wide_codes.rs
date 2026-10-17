@@ -4,7 +4,8 @@
 //! hold, and every path that takes or returns a code — the build's code map,
 //! the written code columns, matches through each index, keeps, batched
 //! probes, mutation and compaction rebuilds, the dictionary handles under
-//! both residencies, and the column kernels — has to carry them unchanged.
+//! both residencies, the view statistics' code bounds, the chunk exports, the
+//! data source's scan and the column kernels — has to carry them unchanged.
 //! A code narrowed anywhere on the way lands below the base, where no term
 //! is, so a truncation fails loudly instead of answering with another term.
 
@@ -110,25 +111,19 @@ async fn code(store: &VortexRdfStore, terms: &[String], term: &str) -> TermCode 
 
 /// The rows of `view` as quads decoded from its gathered code columns,
 /// asserting every code is past `u32::MAX`.
-async fn decoded_rows(view: &VortexRdfStore) -> BTreeSet<String> {
-    let reader = view.dict_reader().unwrap();
-    let [s, p, o, g] = view.code_columns_gathered().await.unwrap().unwrap();
-    let mut rows = BTreeSet::new();
-    for i in 0..s.len() {
-        let mut terms = Vec::new();
-        for column in [&s, &p, &o, &g] {
-            let code = column.as_slice()[i];
-            assert!(code > TermCode::from(u32::MAX), "code {code} fits 32 bits");
-            terms.push(reader.decode(code).await.unwrap().unwrap());
-        }
-        let graph = if terms[3].is_empty() {
-            String::new()
-        } else {
-            format!(" {}", terms[3])
-        };
-        rows.insert(format!("{} {} {}{graph}", terms[0], terms[1], terms[2]));
+async fn decoded_row_set(view: &VortexRdfStore) -> BTreeSet<String> {
+    let cols = view.code_columns_gathered().await.unwrap().unwrap();
+    for code in cols.iter().flat_map(|column| column.as_slice()) {
+        assert!(*code > TermCode::from(u32::MAX), "code {code} fits 32 bits");
     }
-    rows
+    decoded_rows(&cols, &view.dict_reader().unwrap())
+        .await
+        .into_iter()
+        .map(|(s, p, o, g)| match g.as_str() {
+            "" => format!("{s} {p} {o}"),
+            _ => format!("{s} {p} {o} {g}"),
+        })
+        .collect()
 }
 
 /// What `as_set` spells for the quads of `quads` passing `keep`.
@@ -226,7 +221,11 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
 
     // A resident dictionary also answers through its snapshot.
     if let Some(snapshot) = reader.snapshot() {
-        assert_eq!(snapshot.encode(&terms[1]), Some(BASE + 1), "{label}");
+        assert_eq!(
+            snapshot.encode(&terms[1]).unwrap(),
+            Some(BASE + 1),
+            "{label}"
+        );
         assert_eq!(snapshot.encode_many(&refs).unwrap(), encoded, "{label}");
         assert_eq!(
             snapshot.decode(BASE + 1).as_deref(),
@@ -234,7 +233,7 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         );
         assert_eq!(snapshot.decode(TermCode::from((BASE + 1) as u32)), None);
         assert_eq!(
-            snapshot.encode_tolerant("http://example.org/bob").unwrap(),
+            snapshot.encode("http://example.org/bob").unwrap(),
             Some(code(store, &terms, "<http://example.org/bob>").await)
         );
         assert_eq!(snapshot.decode_many(&probe), decoded, "{label}");
@@ -259,7 +258,11 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
     assert_eq!(early.size().await.unwrap(), alice_rows.len(), "{label}");
 
     // ── matches, through every access path ──────────────────────────────
-    assert_eq!(decoded_rows(store).await, as_set(quads.to_vec()), "{label}");
+    assert_eq!(
+        decoded_row_set(store).await,
+        as_set(quads.to_vec()),
+        "{label}"
+    );
     assert_eq!(
         as_set(store.quads_vec().await.unwrap()),
         as_set(quads.to_vec())
@@ -270,7 +273,7 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         .await
         .unwrap();
     assert_eq!(
-        decoded_rows(&by_predicate).await,
+        decoded_row_set(&by_predicate).await,
         expected(quads, |q| q.predicate == name),
         "{label}: predicate (index) match"
     );
@@ -280,7 +283,7 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         .await
         .unwrap();
     assert_eq!(
-        decoded_rows(&by_object).await,
+        decoded_row_set(&by_object).await,
         expected(quads, |q| q.object == bob_iri),
         "{label}: object (index) match"
     );
@@ -290,7 +293,7 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         .await
         .unwrap();
     assert_eq!(
-        decoded_rows(&residual).await,
+        decoded_row_set(&residual).await,
         expected(quads, |q| q.subject == alice && q.predicate == age),
         "{label}: subject + residual match"
     );
@@ -300,22 +303,59 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         .await
         .unwrap();
     assert_eq!(
-        decoded_rows(&by_graph).await,
+        decoded_row_set(&by_graph).await,
         expected(quads, |q| q.graph_name == g1),
         "{label}: graph match"
     );
+
+    // ── the code bounds of the view statistics ──────────────────────────
+    let whole = store.view_statistics().unwrap();
+    if whole.file_backed {
+        // On file, a pushed-down equality bounds its column by its code:
+        // the graph match, which no index answers.
+        let g1_code = code(store, &terms, "<http://example.org/g1>").await;
+        let stats = by_graph.view_statistics().unwrap();
+        assert!(stats.pending_filter, "{label}: the graph is filtered");
+        assert_eq!(
+            stats.code_bounds[QuadColumn::G.index()],
+            Some((g1_code, g1_code)),
+            "{label}: a pushed-down equality's bound"
+        );
+    } else {
+        // In memory, a run of the sorted base is bounded by its first and
+        // last subject codes: the whole base, and one subject's run.
+        let last_subject = code(store, &terms, "_:b1").await;
+        assert_eq!(
+            whole.code_bounds[QuadColumn::S.index()],
+            Some((alice_code, last_subject)),
+            "{label}: the whole base's bound"
+        );
+        let run = store
+            .match_pattern(Some(&alice), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            run.view_statistics().unwrap().code_bounds[QuadColumn::S.index()],
+            Some((alice_code, alice_code)),
+            "{label}: a subject run's bound"
+        );
+    }
 
     // ── keeps: sets, ranges, and the narrowed code admitting nothing ────
     let kept = store
         .keep(QuadColumn::S, &Keep::set([alice_code]))
         .await
         .unwrap();
-    assert_eq!(decoded_rows(&kept).await, alice_rows, "{label}: keep set");
+    assert_eq!(
+        decoded_row_set(&kept).await,
+        alice_rows,
+        "{label}: keep set"
+    );
     // A set too sparse for a bitmap is searched instead.
     let sparse = Keep::set([alice_code, alice_code + (1 << 33)]);
     let kept = store.keep(QuadColumn::S, &sparse).await.unwrap();
     assert_eq!(
-        decoded_rows(&kept).await,
+        decoded_row_set(&kept).await,
         alice_rows,
         "{label}: sparse keep set"
     );
@@ -325,7 +365,11 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         .keep(QuadColumn::S, &Keep::range(alice_code..alice_code + 1))
         .await
         .unwrap();
-    assert_eq!(decoded_rows(&kept).await, alice_rows, "{label}: keep range");
+    assert_eq!(
+        decoded_row_set(&kept).await,
+        alice_rows,
+        "{label}: keep range"
+    );
     let narrowed = TermCode::from(alice_code as u32);
     for keep in [Keep::set([narrowed]), Keep::range(narrowed..narrowed + 1)] {
         let kept = store.keep(QuadColumn::S, &keep).await.unwrap();
@@ -337,7 +381,7 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
         .await
         .unwrap();
     assert_eq!(
-        decoded_rows(&kept).await,
+        decoded_row_set(&kept).await,
         expected(quads, |q| q.predicate == name
             && matches!(q.object, Term::Literal(_))),
         "{label}: keep a kind range after an index match"
@@ -352,23 +396,27 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
             .keep(QuadColumn::G, Keep::range(BASE..BASE + 1))
             .window(1, Some(2)),
     ];
-    assert_eq!(
-        store.count_many(&probes).await.unwrap(),
-        vec![1, alice_rows.len(), 0, 2],
-        "{label}"
-    );
+    let counts = vec![1, alice_rows.len(), 0, 2];
+    assert_eq!(store.count_many(&probes).await.unwrap(), counts, "{label}");
+    for (probe, want) in probes.iter().zip(&counts) {
+        assert_eq!(
+            store.count_probe(probe).await.unwrap(),
+            *want,
+            "{label}: count_probe"
+        );
+    }
     let matched = store.run_probe(&probes[0]).await.unwrap();
     let [_, _, o, _] = matched.code_columns_gathered().await.unwrap().unwrap();
     assert_eq!(o.as_slice(), &[bob], "{label}");
     let views = store.match_many(&probes).await.unwrap();
     let bob_name = Term::Literal(Literal::new_language_tagged_literal("Bob", "en").unwrap());
     assert_eq!(
-        decoded_rows(&views[0]).await,
+        decoded_row_set(&views[0]).await,
         expected(quads, |q| q.predicate == name && q.object == bob_name),
         "{label}: match_many"
     );
     assert_eq!(
-        decoded_rows(&views[1]).await,
+        decoded_row_set(&views[1]).await,
         alice_rows,
         "{label}: match_many"
     );
@@ -516,4 +564,85 @@ async fn codes_past_u32_survive_mutation_rebuilds() {
         .unwrap();
     quads.pop();
     check_store(&shrunk, &quads, "deleted and compacted").await;
+}
+
+/// `code_chunks`, `row_chunks` and the data source's scan of `store`, built
+/// or opened under the [`BASE`] guard, over the whole store, an index-served
+/// predicate match and a subject run: each export answers the gathered codes
+/// in base row order, every code it yields is at least the base, and a scan
+/// filtered on a wide code keeps exactly that code's rows.
+async fn check_chunk_exports(store: &VortexRdfStore, label: &str) {
+    use crate::vortex_scan::ScanRequest;
+    use vortex_array::expr::{eq, get_item, lit, root};
+
+    let name = iri("name");
+    let alice = subject("alice");
+    let views = [
+        ("whole", store.clone()),
+        (
+            "predicate",
+            store
+                .match_pattern(None, Some(&name), None, None)
+                .await
+                .unwrap(),
+        ),
+        (
+            "subject",
+            store
+                .match_pattern(Some(&alice), None, None, None)
+                .await
+                .unwrap(),
+        ),
+    ];
+    for (tag, view) in &views {
+        let expected = base_ordered_codes(view).await;
+        assert!(!expected.is_empty(), "{label} {tag}");
+        let (codes, _) = collect_code_chunks(view, &QuadColumn::ALL, 2).await;
+        assert!(
+            codes.iter().flatten().all(|&code| code >= BASE),
+            "{label} {tag}: a code_chunks code fits 32 bits"
+        );
+        assert_eq!(codes, expected, "{label} {tag}: code_chunks");
+        let rows = chunk_code_rows(&collect_row_chunks(view, 2).await);
+        assert!(
+            rows.iter().flatten().all(|&code| code >= BASE),
+            "{label} {tag}: a row_chunks code fits 32 bits"
+        );
+        assert_eq!(rows, expected, "{label} {tag}: row_chunks");
+        let source = view.data_source().unwrap();
+        let scanned = scan_codes(&source, ScanRequest::default()).await;
+        assert!(
+            scanned.iter().flatten().all(|&code| code >= BASE),
+            "{label} {tag}: a scanned code fits 32 bits"
+        );
+        assert_eq!(scanned, expected, "{label} {tag}: the data source's scan");
+        let p = expected[0][1];
+        let filtered = scan_codes(
+            &source,
+            ScanRequest {
+                filter: Some(eq(get_item("p", root()), lit(p))),
+                ..Default::default()
+            },
+        )
+        .await;
+        let want: Vec<[TermCode; 4]> = expected.iter().copied().filter(|r| r[1] == p).collect();
+        assert_eq!(filtered, want, "{label} {tag}: a scan filtered on code {p}");
+    }
+}
+
+/// The chunk exports and the data source's scan carry codes past `u32::MAX`
+/// unchanged: on an in-memory build, and on its file opened mapped, loaded
+/// whole and adopted from its bytes.
+#[tokio::test]
+async fn codes_past_u32_through_the_chunk_exports() {
+    let _base = CodeBase::set(BASE);
+    let built = built_store(dataset(), LayoutStrategy::Dictionary, indexes()).await;
+    check_chunk_exports(&built, "built in memory").await;
+    #[cfg(feature = "file-io")]
+    {
+        let (_dir, path) = write_store_file(dataset(), LayoutStrategy::Dictionary, indexes()).await;
+        for (open, store) in reopened_stores(&path).await {
+            check_chunk_exports(&store, open).await;
+        }
+    }
 }

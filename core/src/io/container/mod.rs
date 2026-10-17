@@ -14,7 +14,7 @@
 //! (component descriptors and their JSON stamp), [`layout`] the root layout
 //! vtable and its read-side inspection, [`sources`] the always-compiled
 //! component producers builders construct on every target, and [`write`] the
-//! write strategy, gated like `io::ser`. `ser` assembles a store's parts and drives
+//! write strategy, gated like `io::write`. `io::write` assembles a store's parts and drives
 //! [`write::write_store`]; `read` reads the bytes back.
 
 pub(crate) mod layout;
@@ -28,7 +28,7 @@ pub(crate) mod layout;
 )]
 pub(crate) mod sources;
 pub(crate) mod wire;
-/// Write strategy; gated like `io::ser`.
+/// Write strategy; gated like `io::write`.
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) mod write;
 
@@ -81,27 +81,29 @@ pub(crate) use layout::store_metadata_of_bytes;
 pub(crate) use layout::subtree_bytes;
 pub(crate) use layout::{
     RdfStoreLayoutVTable, is_legacy_file, is_native_file, legacy_store_message, newer_root_id,
-    quads_sorted, register, store_component, store_components,
+    register, store_component,
 };
 #[cfg(test)]
 pub(crate) use sources::default_child_strategy;
 pub(crate) use sources::{NativeComponentWrite, child_strategy};
 #[cfg(all(test, feature = "file-io"))]
 pub(crate) use sources::{ONE_MEG, child_strategy_with, id_fields};
-// Consumed only by the write side (`ser` and `IndexComponent::to_write`),
+// Consumed only by the write side (`io::write` and `IndexComponent::to_write`),
 // gated the same way.
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) use sources::BufferedComponentSource;
+#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+pub(crate) use sources::dict_child_strategy;
 pub(crate) use wire::{StoreComponentDescriptor, StoreComponentRole};
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-pub(crate) use write::{dict_child_strategy, write_store};
+pub(crate) use write::write_store;
 
 #[cfg(test)]
 mod tests {
     use super::wire::{decode_store_metadata, encode_store_metadata};
     use super::*;
     use crate::session::VORTEX_SESSION;
-    use crate::store::layouts::dictionary::term_dict::COL_DICT_TERM;
+    use crate::store::layouts::dictionary::storage::COL_DICT_TERM;
     use vortex_array::IntoArray;
     use vortex_array::arrays::{StructArray, VarBinViewArray};
     use vortex_array::dtype::{DType, Nullability};
@@ -193,6 +195,74 @@ mod tests {
 
         let dup = encode_store_metadata(false, &[dict.clone(), dict]).unwrap();
         assert!(decode_store_metadata(&dup).is_err());
+    }
+
+    /// The exact root metadata bytes of a store with a dictionary and a copy
+    /// index child, and of a bare store: every reader depends on them. A
+    /// component without `sorted`, under a root without `quads_sorted`,
+    /// decodes both as `false`.
+    #[test]
+    fn metadata_json_is_pinned() {
+        use crate::store::indexes::COL_RID;
+        use crate::store::schema::{CODE_PTYPE, PRIMARY_COLUMNS, ROW_ID_PTYPE};
+        use vortex_array::dtype::StructFields;
+
+        let dict = dict_descriptor(dict_chunk(&["a"]).dtype().clone());
+        let code = DType::Primitive(CODE_PTYPE, Nullability::NonNullable);
+        let row_id = DType::Primitive(ROW_ID_PTYPE, Nullability::NonNullable);
+        let index = StoreComponentDescriptor {
+            name: "index:posg".into(),
+            role: StoreComponentRole::Index,
+            implementation: "secondary-by-copy/posg".into(),
+            version: INDEX_VERSION,
+            required: false,
+            sorted: true,
+            dtype: DType::Struct(
+                StructFields::new(
+                    PRIMARY_COLUMNS
+                        .iter()
+                        .copied()
+                        .chain([COL_RID])
+                        .collect::<Vec<_>>()
+                        .into(),
+                    vec![code.clone(), code.clone(), code.clone(), code, row_id],
+                ),
+                Nullability::NonNullable,
+            ),
+        };
+        let bytes = encode_store_metadata(true, &[dict.clone(), index]).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            concat!(
+                r#"{"version":1,"quads_sorted":true,"components":["#,
+                r#"{"name":"dictionary","role":"dictionary","implementation":"sorted-terms-fsst-v1","#,
+                r#""version":2,"required":true,"sorted":true,"#,
+                r#""fields":[{"name":"_dict_term","kind":"utf8"}]},"#,
+                r#"{"name":"index:posg","role":"index","implementation":"secondary-by-copy/posg","#,
+                r#""version":1,"required":false,"sorted":true,"#,
+                r#""fields":[{"name":"s","kind":"u64"},{"name":"p","kind":"u64"},"#,
+                r#"{"name":"o","kind":"u64"},{"name":"g","kind":"u64"},"#,
+                r#"{"name":"rid","kind":"u64"}]}]}"#,
+            )
+        );
+        assert_eq!(
+            std::str::from_utf8(&encode_store_metadata(false, &[]).unwrap()).unwrap(),
+            r#"{"version":1,"quads_sorted":false,"components":[]}"#
+        );
+
+        let unstamped = concat!(
+            r#"{"version":1,"components":[{"name":"dictionary","role":"dictionary","#,
+            r#""implementation":"sorted-terms-fsst-v1","version":2,"required":true,"#,
+            r#""fields":[{"name":"_dict_term","kind":"utf8"}]}]}"#,
+        );
+        let unsorted_dict = StoreComponentDescriptor {
+            sorted: false,
+            ..dict
+        };
+        assert_eq!(
+            decode_store_metadata(unstamped.as_bytes()).unwrap(),
+            (false, vec![unsorted_dict])
+        );
     }
 
     #[test]

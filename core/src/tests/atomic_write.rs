@@ -46,11 +46,7 @@ const BOTH_INDEXES: [IndexType; 2] = [IndexType::SecondaryByCopy, IndexType::Sec
 /// file and no temp file.
 #[tokio::test]
 async fn test_failed_build_leaves_nothing_at_a_fresh_path() {
-    for layout in [
-        LayoutStrategy::Default,
-        LayoutStrategy::TypedObject,
-        LayoutStrategy::Dictionary,
-    ] {
+    for layout in LAYOUTS {
         for indexes in [vec![], BOTH_INDEXES.to_vec()] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("store.vortex");
@@ -223,7 +219,7 @@ async fn test_a_directory_at_the_path_is_refused_before_the_input_is_read() {
 /// directory untouched and removes the temp file.
 #[tokio::test]
 async fn test_a_rename_failing_after_the_write_removes_the_temp_file() {
-    use crate::io::ser::write_store_atomically;
+    use crate::io::write::write_store_atomically;
     use vortex_io::VortexWrite as _;
 
     let dir = tempfile::tempdir().unwrap();
@@ -251,7 +247,7 @@ async fn test_a_rename_failing_after_the_write_removes_the_temp_file() {
 /// was: absent, or the previous store's exact bytes.
 #[tokio::test]
 async fn test_write_failing_after_the_temp_file_exists_removes_it() {
-    use crate::io::ser::write_store_atomically;
+    use crate::io::write::write_store_atomically;
     use vortex_io::VortexWrite as _;
 
     for existing in [false, true] {
@@ -292,7 +288,7 @@ async fn test_write_failing_after_the_temp_file_exists_removes_it() {
 /// to exist while the write is stalled, so the cleanup is what removed it.
 #[tokio::test]
 async fn test_dropping_the_write_removes_the_temp_file() {
-    use crate::io::ser::write_store_atomically;
+    use crate::io::write::write_store_atomically;
     use vortex_io::VortexWrite as _;
 
     let dir = tempfile::tempdir().unwrap();
@@ -324,7 +320,7 @@ async fn test_dropping_the_write_removes_the_temp_file() {
 /// and leaves the previous store as it was.
 #[tokio::test]
 async fn test_a_panic_in_the_write_removes_the_temp_file() {
-    use crate::io::ser::write_store_atomically;
+    use crate::io::write::write_store_atomically;
     use futures::FutureExt as _;
     use vortex_io::VortexWrite as _;
 
@@ -362,7 +358,7 @@ async fn test_a_panic_in_the_write_removes_the_temp_file() {
 /// be mistaken for a store, and a successful write leaves only `path`.
 #[tokio::test]
 async fn test_temp_file_is_a_sibling_and_gone_after_success() {
-    use crate::io::ser::write_store_atomically;
+    use crate::io::write::write_store_atomically;
     use vortex_io::VortexWrite as _;
 
     let dir = tempfile::tempdir().unwrap();
@@ -391,7 +387,7 @@ async fn test_temp_file_is_a_sibling_and_gone_after_success() {
 /// seen by the future.
 #[tokio::test]
 async fn test_dropping_the_creation_at_any_step_leaves_no_temp_file() {
-    use crate::io::ser::PendingStore;
+    use crate::io::write::PendingStore;
     use std::task::Poll;
     use std::time::Duration;
 
@@ -690,7 +686,7 @@ mod links_and_permissions {
     /// temp file.
     #[tokio::test]
     async fn test_the_temp_file_has_the_old_permissions_while_it_is_written() {
-        use crate::io::ser::write_store_atomically;
+        use crate::io::write::write_store_atomically;
         use vortex_io::VortexWrite as _;
 
         let (dir, path) =
@@ -721,7 +717,7 @@ mod links_and_permissions {
     /// new file gets.
     #[tokio::test]
     async fn test_a_temp_standing_in_for_a_store_is_born_private() {
-        use crate::io::ser::create_temp;
+        use crate::io::write::create_temp;
 
         let dir = tempfile::tempdir().unwrap();
         let plain = dir.path().join("plain");
@@ -998,13 +994,7 @@ mod links_and_permissions {
         let appended_subject =
             NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s00100").unwrap());
         assert_eq!(
-            appended
-                .match_pattern(Some(&appended_subject), None, None, None)
-                .await
-                .unwrap()
-                .size()
-                .await
-                .unwrap(),
+            matched_size(&appended, Some(&appended_subject), None, None, None).await,
             1
         );
         let p0 = NamedNode::new("http://example.org/p0").unwrap();
@@ -1014,13 +1004,7 @@ mod links_and_permissions {
             .filter(|quad| quad.predicate == p0)
             .count();
         assert_eq!(
-            appended
-                .match_pattern(None, Some(&p0), None, None)
-                .await
-                .unwrap()
-                .size()
-                .await
-                .unwrap(),
+            matched_size(&appended, None, Some(&p0), None, None).await,
             expected_p0
         );
         assert_eq!(crate::store::test_hooks::gathers(), gathered);
@@ -1217,7 +1201,7 @@ mod links_and_permissions {
     #[tokio::test]
     async fn test_a_file_replaced_during_the_write_is_not_overwritten() {
         use crate::io::read::FileIdentity;
-        use crate::io::ser::PendingStore;
+        use crate::io::write::PendingStore;
         use vortex_io::VortexWrite as _;
 
         let (dir, path) =
@@ -1251,7 +1235,7 @@ mod links_and_permissions {
     /// any other, and an append does not hide it.
     #[tokio::test]
     async fn test_only_the_refusal_before_the_build_counts_as_unwritable() {
-        use crate::io::ser::write_store_atomically;
+        use crate::io::write::write_store_atomically;
 
         let (dir, path) =
             write_store_file(modular_quads(12, 3, 4), LayoutStrategy::Default, vec![]).await;

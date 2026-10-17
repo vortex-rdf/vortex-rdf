@@ -7,26 +7,12 @@ use super::*;
 
 #[tokio::test]
 async fn test_match_pattern_default_layout() {
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(two_quads()),
-        LayoutStrategy::Default,
-        vec![],
-    )
-    .await
-    .expect("build failed");
-    probe_default(VortexRdfStore::from_built(arr).unwrap()).await;
+    probe_default(built_store(two_quads(), LayoutStrategy::Default, vec![]).await).await;
 }
 
 #[tokio::test]
 async fn test_match_typed_object_layout() {
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(two_quads()),
-        LayoutStrategy::TypedObject,
-        vec![],
-    )
-    .await
-    .expect("build failed");
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(two_quads(), LayoutStrategy::TypedObject, vec![]).await;
     assert_eq!(store.layout(), LayoutStrategy::TypedObject);
     probe_typed_object(store).await;
 }
@@ -53,18 +39,10 @@ async fn test_term_kinds_match_under_every_layout() {
             _ => None,
         })
         .unwrap();
-    for layout in [
-        LayoutStrategy::Default,
-        LayoutStrategy::TypedObject,
-        LayoutStrategy::Dictionary,
-    ] {
+    for layout in LAYOUTS {
         for indexes in [vec![], vec![IndexType::SecondaryByCopy]] {
             let tag = format!("{layout:?} {indexes:?}");
-            let arr =
-                build_array::<SortedInMemoryBuilder>(quad_stream(quads.clone()), layout, indexes)
-                    .await
-                    .unwrap();
-            let store = VortexRdfStore::from_built(arr).unwrap();
+            let store = built_store(quads.clone(), layout, indexes).await;
             assert_eq!(view_strings(&store).await, quad_strings(&quads), "{tag}");
 
             let by_blank_s = store
@@ -173,7 +151,7 @@ pub(super) async fn run_subject_range_then_index_routing_above_gate(
         .await
         .unwrap();
     assert_eq!(above.debug_selection_range(), None);
-    assert!(!above.debug_has_serve_plan());
+    assert_eq!(served_component(&above), None);
     assert_eq!(
         view_strings(&above).await,
         expected_strings(quads, |i| quads[i].subject == s0 && quads[i].object == o5)
@@ -184,7 +162,7 @@ pub(super) async fn run_subject_range_then_index_routing_above_gate(
         .await
         .unwrap();
     assert_eq!(below.debug_selection_range(), None);
-    assert!(!below.debug_has_serve_plan());
+    assert_eq!(served_component(&below), None);
     assert_eq!(
         view_strings(&below).await,
         expected_strings(quads, |i| quads[i].subject == s1 && quads[i].object == o5)
@@ -194,14 +172,12 @@ pub(super) async fn run_subject_range_then_index_routing_above_gate(
 #[tokio::test]
 async fn test_subject_range_then_index_routing_above_gate() {
     let quads = above_gate_quads();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
+    let store = built_store(
+        quads.clone(),
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByCopy],
     )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    .await;
     run_subject_range_then_index_routing_above_gate(&store, &quads).await;
 }
 
@@ -255,14 +231,7 @@ fn prefix_terms() -> (NamedOrBlankNode, NamedNode, Term, GraphName) {
 async fn test_prefix_probe_resolves_bound_prefixes_to_ranges() {
     let (s, p, o, g) = prefix_terms();
     for indexes in [vec![], vec![IndexType::SecondaryByCopy]] {
-        let arr = build_array::<SortedInMemoryBuilder>(
-            quad_stream(prefix_quads()),
-            LayoutStrategy::Dictionary,
-            indexes.clone(),
-        )
-        .await
-        .unwrap();
-        let store = VortexRdfStore::from_built(arr).unwrap();
+        let store = built_store(prefix_quads(), LayoutStrategy::Dictionary, indexes.clone()).await;
 
         let label = format!("{indexes:?}");
         let label = &label;
@@ -326,14 +295,7 @@ async fn test_prefix_probe_resolves_bound_prefixes_to_ranges() {
 #[tokio::test]
 async fn test_prefix_probe_stops_at_the_first_unbound_role() {
     let (s, _, o, g) = prefix_terms();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(prefix_quads()),
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(prefix_quads(), LayoutStrategy::Dictionary, vec![]).await;
 
     let by_so = store
         .match_pattern(Some(&s), None, Some(&o), None)
@@ -357,10 +319,7 @@ async fn test_prefix_probe_string_layout_narrows_by_subject_only() {
     let (s, p, o, _) = prefix_terms();
     let s99 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s99").unwrap());
     for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
-        let arr = build_array::<SortedInMemoryBuilder>(quad_stream(prefix_quads()), layout, vec![])
-            .await
-            .unwrap();
-        let store = VortexRdfStore::from_built(arr).unwrap();
+        let store = built_store(prefix_quads(), layout, vec![]).await;
         let by_s = store
             .match_pattern(Some(&s), None, None, None)
             .await
@@ -392,14 +351,7 @@ async fn test_prefix_probe_string_layout_narrows_by_subject_only() {
 #[tokio::test]
 async fn test_prefix_probe_chains_within_a_range() {
     let (s, p, o, _) = prefix_terms();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(prefix_quads()),
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(prefix_quads(), LayoutStrategy::Dictionary, vec![]).await;
 
     let by_s = store
         .match_pattern(Some(&s), None, None, None)
@@ -434,7 +386,7 @@ async fn test_prefix_probe_declines_an_unstamped_base() {
     let mut quads = prefix_quads();
     quads.reverse();
     let store = unstamped_store(&quads);
-    assert!(!store.debug_base_subject_sorted());
+    assert_eq!(store.view_statistics().unwrap().sort_order, None);
 
     let by_s = store
         .match_pattern(Some(&s), None, None, None)
@@ -465,14 +417,7 @@ async fn test_derived_view_does_not_lose_base_rows() {
         })
         .collect();
 
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
-        LayoutStrategy::Default,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    let store = built_store(quads.clone(), LayoutStrategy::Default, vec![]).await;
 
     let object = Term::Literal(Literal::new_simple_literal("object 0"));
     let matched = store
@@ -546,7 +491,12 @@ async fn test_file_prefix_probe_resolves_bound_prefixes_to_ranges() {
         let label = format!("{indexes:?}");
         let expect = |view: &VortexRdfStore, range: std::ops::Range<u64>| {
             assert_eq!(view.debug_selection_range(), Some(range), "{label}");
-            assert_eq!(view.debug_file_filter_pending(), Some(false), "{label}");
+            let stats = view.view_statistics().unwrap();
+            assert_eq!(
+                (stats.file_backed, stats.pending_filter),
+                (true, false),
+                "{label}"
+            );
         };
 
         let by_sp = store
@@ -592,7 +542,12 @@ async fn test_file_prefix_probe_resolves_bound_prefixes_to_ranges() {
             .await
             .unwrap();
         assert_eq!(by_so.debug_selection_range(), Some(12..24), "{label}");
-        assert_eq!(by_so.debug_file_filter_pending(), Some(true), "{label}");
+        let stats = by_so.view_statistics().unwrap();
+        assert_eq!(
+            (stats.file_backed, stats.pending_filter),
+            (true, true),
+            "{label}"
+        );
         assert_eq!(by_so.size().await.unwrap(), 6, "{label}");
     }
 }

@@ -31,7 +31,6 @@ console_error_panic_hook.workspace = true
 getrandom = { version = "0.3.4", features = ["wasm_js"] }
 getrandom_04 = { package = "getrandom", version = "0.4.3", features = ["wasm_js"] }
 oxrdf.workspace = true
-oxrdfio.workspace = true
 
 # The core dependency is target-conditional so that the crate builds on both
 # targets it is checked against. WebAssembly has no filesystem, so the wasm

@@ -14,7 +14,7 @@ use vortex_array::scalar::Scalar;
 
 use crate::store::probes::StructProbes;
 use crate::store::schema::TermCode;
-use crate::store::selection::RowSelection;
+use crate::store::view::selection::RowSelection;
 
 /// A residual equality constraint's probe value, extracted from its `Scalar`
 /// once per scan — not per chunk, the string extraction allocates. An
@@ -119,7 +119,7 @@ impl<'a> TypedEq<'a> {
         canonicalize: bool,
         cached: Option<&'a vortex_rdf_encoded_search::SortedProbe<'a>>,
     ) -> Option<TypedEq<'a>> {
-        use crate::store::array::{cached_code_primitive, shared_code_primitive};
+        use crate::store::resident::{cached_code_primitive, shared_code_primitive};
         use vortex_array::dtype::DType;
         if col.dtype().is_nullable() {
             return None;
@@ -361,7 +361,7 @@ pub(crate) fn typed_positions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::selection::RowSelection;
+    use crate::store::view::selection::RowSelection;
     use vortex_array::arrays::{Primitive, SharedArray};
     use vortex_array::validity::Validity;
     use vortex_array::{IntoArray, VortexSessionExecute};
@@ -448,13 +448,13 @@ mod tests {
         let n = (TYPED_EQ_MAX_ROWS as TermCode) * 2;
         let sa = wrapped_struct(n);
         let o = sa.unmasked_field_by_name("o").unwrap().clone();
-        assert!(crate::store::array::cached_code_primitive(&o).is_none());
+        assert!(crate::store::resident::cached_code_primitive(&o).is_none());
 
         let eqs = eqs(&[("p", 3), ("o", 10)]);
         let ids = typed_residual_ids(&sa, &RowSelection::All, n as usize, &eqs, None).unwrap();
         let want: Vec<u64> = (0..n).filter(|i| i % 7 == 3 && i % 11 == 10).collect();
         assert_eq!(ids.as_slice(), &want[..]);
-        assert!(crate::store::array::cached_code_primitive(&o).is_some());
+        assert!(crate::store::resident::cached_code_primitive(&o).is_some());
     }
 
     /// A scan reading far fewer values than materializing would decode stays
@@ -470,7 +470,7 @@ mod tests {
         let ids = typed_residual_ids(&sa, &narrow, n as usize, &eqs, None).unwrap();
         let want: Vec<u64> = (10..90u64).filter(|i| i % 7 == 3 && i % 11 == 10).collect();
         assert_eq!(ids.as_slice(), &want[..]);
-        assert!(crate::store::array::cached_code_primitive(&o).is_none());
+        assert!(crate::store::resident::cached_code_primitive(&o).is_none());
     }
 
     /// A canonical narrower unsigned column (TypedObject's kind byte) binds
@@ -498,6 +498,16 @@ mod tests {
             typed_residual_ids(&sa, &RowSelection::Range(0..100), n as usize, &eqs, None).unwrap();
         let want: Vec<u64> = (0..100u64).filter(|i| i % 7 == 3).collect();
         assert_eq!(ids.as_slice(), &want[..]);
+    }
+
+    /// An id selection tests exactly the rows it names.
+    #[test]
+    fn id_selection_tests_named_rows_only() {
+        let sa = mixed_struct(100);
+        let eqs = eqs(&[("p", 3)]);
+        let selection = RowSelection::Ids(Buffer::from_iter([3u64, 4, 10, 17, 99]));
+        let ids = typed_residual_ids(&sa, &selection, 100, &eqs, None).unwrap();
+        assert_eq!(ids.as_slice(), &[3u64, 10, 17]);
     }
 
     const LONG: &str = "a string longer than the twelve inline view bytes";

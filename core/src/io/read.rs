@@ -2,7 +2,7 @@
 //! native root, and materializing whole files or auxiliary children on any
 //! target. The opened-store runtime handle the store's file-backed query
 //! paths drive lives store-side, in
-//! [`store::native_file`](crate::store::native_file), beside the scan
+//! [`store::persist::native_file`](crate::store::persist::native_file), beside the scan
 //! machinery that defines its memo semantics; the wire format itself (layout
 //! VTable, descriptors, write strategy) lives in
 //! [`container`](super::container).
@@ -17,7 +17,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::store::array::chunked_or_single;
 
 /// The host's available parallelism, read once; 1 on targets that cannot
-/// answer (wasm). Read by [`collect_chunks`] for its in-flight split count and
+/// answer (wasm). Read by [`inline_splits`] for its in-flight split count and
 /// exposed through [`available_parallelism`] to the store's scan and serve
 /// split loops.
 static AVAILABLE_PARALLELISM: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
@@ -33,18 +33,29 @@ pub(crate) fn available_parallelism() -> usize {
     *AVAILABLE_PARALLELISM
 }
 
-/// Drive a scan's per-split futures inline and collect the chunks in split
-/// (row) order — the shared tail of [`scan_all`], [`scan_all_reader`] and
-/// [`scan_reader_chunks`].
+/// A scan's per-split futures driven inline: polled on the calling task, their
+/// results in split (row) order.
 ///
-/// The futures are polled through a `buffered` window — several in flight on
-/// this same task, still no runtime handle — so one split's I/O overlaps
-/// another's decode.
+/// The futures are polled through a `buffered` window of the host's
+/// parallelism — several in flight on this same task, still no runtime
+/// handle — so one split's I/O overlaps another's decode.
+pub(crate) fn inline_splits<F>(
+    tasks: Vec<F>,
+) -> impl futures::Stream<Item = VortexResult<Option<ArrayRef>>> + Unpin
+where
+    F: Future<Output = VortexResult<Option<ArrayRef>>>,
+{
+    futures::stream::iter(tasks).buffered(*AVAILABLE_PARALLELISM)
+}
+
+/// Drive a scan's per-split futures inline ([`inline_splits`]) and collect
+/// the chunks in split (row) order — the shared tail of [`scan_all`],
+/// [`scan_all_reader`] and [`scan_reader_chunks`].
 async fn collect_chunks<F>(tasks: Vec<F>) -> Result<Vec<ArrayRef>>
 where
     F: Future<Output = VortexResult<Option<ArrayRef>>>,
 {
-    drain_chunks(futures::stream::iter(tasks).buffered(*AVAILABLE_PARALLELISM)).await
+    drain_chunks(inline_splits(tasks)).await
 }
 
 /// The non-empty chunks of a stream of per-split results, in stream order.
@@ -54,7 +65,7 @@ where
 {
     let mut chunks = Vec::new();
     while let Some(chunk) = results.next().await {
-        if let Some(chunk) = chunk.map_err(VortexRdfError::Vortex)? {
+        if let Some(chunk) = chunk? {
             chunks.push(chunk);
         }
     }
@@ -63,7 +74,7 @@ where
 
 /// [`collect_chunks`] assembled into one array of `dtype`: the tail of
 /// [`scan_all`], of `read_index_row_ids` and of `read_all_rows` for a scan
-/// within its inline limit.
+/// its driver choice runs inline.
 pub(crate) async fn collect_scan<F>(
     dtype: vortex_array::dtype::DType,
     tasks: Vec<F>,
@@ -74,12 +85,38 @@ where
     chunked_or_single(collect_chunks(tasks).await?, dtype)
 }
 
-/// [`collect_scan`] with each split future spawned onto the session's runtime,
-/// `window` of them in flight. The chunks come back in split order, as the
-/// inline driver returns them.
+/// A scan's per-split futures each spawned onto the session's runtime as the
+/// stream is polled, `window` of them in flight, their results in split order
+/// as [`inline_splits`] yields them.
 ///
-/// With no tokio runtime on the calling thread there is nothing to spawn
-/// onto: the futures run inline and nothing is spawned.
+/// Spawning needs a tokio runtime on the polling thread:
+/// [`ScanDriver::for_row_scan`] picks this driver only where there is one.
+///
+/// [`ScanDriver::for_row_scan`]: crate::store::scan::file_reads::ScanDriver::for_row_scan
+#[cfg(feature = "file-io")]
+pub(crate) fn spawned_splits<F>(
+    tasks: Vec<F>,
+    window: usize,
+) -> impl futures::Stream<Item = VortexResult<Option<ArrayRef>>> + Unpin + Send + 'static
+where
+    F: Future<Output = VortexResult<Option<ArrayRef>>> + Send + 'static,
+{
+    use vortex_io::session::RuntimeSessionExt as _;
+
+    let handle = crate::session::VORTEX_SESSION.handle();
+    futures::stream::iter(tasks)
+        .map(move |task| {
+            #[cfg(test)]
+            spawn_probe::note();
+            handle.spawn(task)
+        })
+        .buffered(window)
+}
+
+/// [`collect_scan`] with each split future spawned onto the session's runtime
+/// ([`spawned_splits`]), `window` of them in flight. The chunks come back in
+/// split order, as the inline driver returns them. Needs a tokio runtime on
+/// the polling thread, as [`spawned_splits`] does.
 #[cfg(feature = "file-io")]
 pub(crate) async fn collect_scan_spawned<F>(
     dtype: vortex_array::dtype::DType,
@@ -89,22 +126,11 @@ pub(crate) async fn collect_scan_spawned<F>(
 where
     F: Future<Output = VortexResult<Option<ArrayRef>>> + Send + 'static,
 {
-    use vortex_io::session::RuntimeSessionExt as _;
-
-    if tokio::runtime::Handle::try_current().is_err() {
-        return collect_scan(dtype, tasks).await;
-    }
-    let handle = crate::session::VORTEX_SESSION.handle();
-    let spawned = futures::stream::iter(tasks).map(move |task| {
-        #[cfg(test)]
-        spawn_probe::note();
-        handle.spawn(task)
-    });
-    chunked_or_single(drain_chunks(spawned.buffered(window)).await?, dtype)
+    chunked_or_single(drain_chunks(spawned_splits(tasks, window)).await?, dtype)
 }
 
-/// Test hook: the number of split futures [`collect_scan_spawned`] has spawned
-/// on this thread. Zero means a scan ran inline.
+/// Test hook: the number of split futures [`spawned_splits`] has spawned on
+/// this thread. Zero means a scan ran inline.
 #[cfg(all(test, feature = "file-io"))]
 pub(crate) mod spawn_probe {
     use std::cell::Cell;
@@ -132,8 +158,8 @@ pub(crate) mod spawn_probe {
 /// resolve synchronously) be read on wasm and in no-file-io builds.
 pub(crate) async fn scan_all(file: &vortex_file::VortexFile) -> Result<ArrayRef> {
     let dtype = file.dtype().clone();
-    let scan = file.scan().map_err(VortexRdfError::Vortex)?;
-    let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
+    let scan = file.scan()?;
+    let tasks = scan.build()?;
     collect_scan(dtype, tasks).await
 }
 
@@ -145,6 +171,20 @@ pub(crate) async fn scan_all_reader(reader: vortex_layout::LayoutReaderRef) -> R
     chunked_or_single(scan_reader_chunks(reader).await?, dtype)
 }
 
+/// [`scan_all_reader`] driven to completion on the current thread, for a
+/// reader that MUST sit over a buffer-backed segment source: its segment
+/// reads resolve synchronously (the `from_bytes` invariant every handle-free
+/// open already relies on), so the scan completes on its first poll.
+pub(crate) fn scan_all_reader_sync(reader: vortex_layout::LayoutReaderRef) -> Result<ArrayRef> {
+    use futures::FutureExt as _;
+    scan_all_reader(reader).now_or_never().unwrap_or_else(|| {
+        unreachable!(
+            "a synchronous scan only ever reads a buffer-backed segment source, whose reads \
+             resolve without pending"
+        )
+    })
+}
+
 /// [`scan_all_reader`] before assembly: the reader's scan chunks in split
 /// (row) order, each in its stored encoding.
 pub(crate) async fn scan_reader_chunks(
@@ -154,7 +194,7 @@ pub(crate) async fn scan_reader_chunks(
         crate::session::VORTEX_SESSION.clone(),
         reader,
     );
-    let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
+    let tasks = scan.build()?;
     collect_chunks(tasks).await
 }
 
@@ -301,7 +341,7 @@ pub(crate) mod map_probe {
 
 /// Open a Vortex file lazily — no data is read until the returned
 /// `VortexFile` is scanned. The handle caches no reader: the
-/// [`NativeStoreFile`](crate::store::native_file::NativeStoreFile) around it
+/// [`NativeStoreFile`](crate::store::persist::native_file::NativeStoreFile) around it
 /// owns the reader tree.
 ///
 /// Both modes reach the file through `File::open` first, so a path that

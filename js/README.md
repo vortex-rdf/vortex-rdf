@@ -59,7 +59,7 @@ const store = VortexRdfStore.empty();
 
 ### Querying
 
-`match` implements the RDF/JS [`Source.match`](https://rdf.js.org/stream-spec/#source-interface) contract. It takes a `(subject, predicate, object, graph)` pattern — `null`/`undefined` or an RDF/JS `Variable` for a wildcard position, a bare string for a NamedNode IRI — and returns **synchronously** an RDF/JS `Stream<Quad>`:
+`match` implements the RDF/JS [`Source.match`](https://rdf.js.org/stream-spec/#source-interface) contract. It takes a `(subject, predicate, object, graph)` pattern — `null`/`undefined` or an RDF/JS `Variable` for a wildcard position, a bare string for a NamedNode IRI (in a pattern only, never inside a quad) — and returns **synchronously** an RDF/JS `Stream<Quad>`:
 
 ```javascript
 store.match(null, myPredicate, null, null)
@@ -86,16 +86,16 @@ const n = store.countQuads(null, myPredicate, null, null);
 
 The quads implement the RDF/JS `Quad`/`Term` interface (`.subject.value`, `.equals`, …) and interoperate with foreign RDF/JS terms via `.equals` in both directions. They are lazy views into the producing store, so — unlike a plain data object — don't `structuredClone` them or rely on enumerating own properties.
 
-Test membership of a single quad with `has` (an exact four-component lookup) and read the quad count with `size`; both return promises:
+Test membership of a single quad with `has` (an exact four-component lookup) and read the quad count with `size`; both are synchronous, like `getQuads` and `countQuads`:
 
 ```javascript
-if (await store.has(myQuad)) {
+if (store.has(myQuad)) {
   console.log('present');
 }
-console.log(await store.size());
+console.log(store.size());
 ```
 
-An invalid pattern term or a malformed quad object throws (or rejects) with an `Error`.
+An invalid pattern term, or a malformed quad object given to `has`, throws an `Error`; a malformed quad object given to a mutation or to `fromQuads` rejects with one. Every quad entry point (`has`, `addQuad`, `addQuads`, `deleteQuad`, and `fromQuads` on an array or a stream) validates a quad by one rule: each term must be an RDF/JS term object (a bare string is not one) of its position's kind, and its IRI, blank-node label, language tag or datatype IRI must be valid. An absent graph is the default graph.
 
 ### Mutation
 
@@ -131,7 +131,7 @@ if (dict) {
 }
 ```
 
-`decode`/`encode` speak N-Triples term strings — `<iri>`, `_:blank`, `"lit"@lang`, `"lit"^^<dt>`, and `''` for the default graph. The handle is a snapshot: it keeps decoding correctly after the store is mutated, because it retains the dictionary its codes address. It is a wasm-side handle — call `free()` when done (also wired to `Symbol.dispose`, so `using` disposes it automatically).
+`decode`/`encode` speak N-Triples term strings — `<iri>`, `_:blank`, `"lit"@lang`, `"lit"^^<dt>`, and `''` for the default graph. `encode` also takes the variant spellings of those — an IRI without angle brackets, an `xsd:string`-typed literal, an upper-case language tag, `default` or `[]` for the default graph — and returns the stored form's code; a malformed term throws. The handle is a snapshot: it keeps decoding correctly after the store is mutated, because it retains the dictionary its codes address. It is a wasm-side handle — call `free()` when done (also wired to `Symbol.dispose`, so `using` disposes it automatically).
 
 `matchCodes` is its pattern-matching counterpart: it resolves a pattern to the matched rows' raw term codes — four columnar `Float64Array`s `{ s, p, o, g }` of exact integer codes plus a `length` — without materializing any term strings, and returns `null` under the same conditions `termDict()` returns `undefined`:
 

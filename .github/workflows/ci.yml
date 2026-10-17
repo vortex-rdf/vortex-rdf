@@ -76,6 +76,31 @@ jobs:
       - name: Run Rust tests
         run: ${{ matrix.command }}
 
+  # The DataFusion conformance crate is a workspace of its own
+  # (interface-tests/Cargo.toml), so its dependency tree builds here only,
+  # `--locked` against the crate's own Cargo.lock.
+  interface-tests:
+    name: Interface Tests (DataFusion)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt, clippy
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: interface-tests
+          shared-key: interface-tests
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check formatting (interface-tests)
+        run: cargo fmt --manifest-path interface-tests/Cargo.toml --check
+      - name: Run clippy (interface-tests)
+        run: cargo clippy --manifest-path interface-tests/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Run interface tests
+        run: cargo test --manifest-path interface-tests/Cargo.toml --locked
+
   python-tests:
     name: Python Tests
     runs-on: ubuntu-latest

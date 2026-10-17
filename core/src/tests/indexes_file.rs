@@ -42,13 +42,7 @@ async fn test_file_backed_delete_keeps_indexes() {
     // The index still routes the lookup after the delete, and the
     // tombstoned rows must not come back.
     assert_eq!(
-        after
-            .match_pattern(None, None, Some(&object0), None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
+        matched_size(&after, None, None, Some(&object0), None).await,
         0
     );
     // Predicate p0 (i even: 0,2,4,6,8,10) had rows 0 and 6 tombstoned.
@@ -71,13 +65,7 @@ async fn test_file_backed_delete_keeps_indexes() {
     // s05 is object "object 2" (5 % 3); that lookup now returns one fewer.
     let object2 = Term::Literal(Literal::new_simple_literal("object 2"));
     assert_eq!(
-        after2
-            .match_pattern(None, None, Some(&object2), None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
+        matched_size(&after2, None, None, Some(&object2), None).await,
         3,
     );
 
@@ -96,11 +84,86 @@ async fn test_file_backed_delete_keeps_indexes() {
 /// located run (sorted dictionary-code copies) point-reads its small runs'
 /// ids at match time and proves an empty run there, an unlocated one leaves
 /// the rid scan pending until a consumer needs it.
+///
+/// Graph-bound patterns first: a bound predicate, or predicate and object,
+/// with a graph is still served by the copy family, the graph riding the
+/// plan's filter instead of a located range; unknown graphs and tombstones
+/// inside a served graph run answer exactly.
 async fn run_copy_index_file_test(layout: LayoutStrategy, located: bool) {
     let (quads, graphs) = copy_index_script_dataset();
     let (_dir, path) =
         write_store_file(quads.clone(), layout, vec![IndexType::SecondaryByCopy]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
+
+    // Predicate and graph — the serving script asserts the rest of this
+    // shape: a graph is never a sort key of the copies, so the plan filters
+    // the child instead of reading a located run.
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let by_pg = store
+        .match_pattern(None, Some(&p1), None, Some(&graphs[1]))
+        .await
+        .unwrap();
+    assert_eq!(
+        by_pg.debug_serve_row_range(),
+        None,
+        "a graph term keeps the located run off the plan"
+    );
+
+    // Predicate, object and graph: i ≡ 1 (mod 15) in g0 (even i) → 16.
+    let o1 = Term::Literal(Literal::new_simple_literal("o1"));
+    let by_pog = store
+        .match_pattern(None, Some(&p1), Some(&o1), Some(&graphs[0]))
+        .await
+        .unwrap();
+    assert_eq!(served_component(&by_pog), Some("index:posg"));
+    assert_eq!(by_pog.debug_serve_row_range(), None);
+    assert_eq!(selection_pending(&by_pog), !located);
+    assert_eq!(by_pog.size().await.unwrap(), 1);
+    assert_eq!(
+        view_strings(&by_pog).await,
+        expected_strings(&quads, |i| i % 15 == 1 && i % 2 == 0)
+    );
+
+    // A graph the store never saw matches nothing.
+    let unknown = GraphName::NamedNode(NamedNode::new("http://example.org/nope").unwrap());
+    let none = store
+        .match_pattern(None, Some(&p1), None, Some(&unknown))
+        .await
+        .unwrap();
+    assert_eq!(none.size().await.unwrap(), 0);
+    assert_eq!(view_strings(&none).await, Vec::<String>::new());
+
+    // A tombstone inside the served graph run leaves it.
+    let deleted = store.delete_quad(&quads[7]).await.unwrap();
+    let after = deleted
+        .match_pattern(None, Some(&p1), None, Some(&graphs[1]))
+        .await
+        .unwrap();
+    assert_eq!(served_component(&after), Some("index:posg"));
+    assert_eq!(after.size().await.unwrap(), 4);
+    assert_eq!(
+        view_strings(&after).await,
+        expected_strings(&quads, |i| i % 3 == 1 && i % 2 == 1 && i != 7)
+    );
+
+    // A located run inside the point-read cap is read point by point through
+    // the component's chunk probes, with no row scan; an unlocated one scans
+    // the child under the plan's filter.
+    {
+        use crate::store::scan::file_reads::scan_hooks;
+        let by_p = store
+            .match_pattern(None, Some(&p1), None, None)
+            .await
+            .unwrap();
+        assert_eq!(by_p.debug_serve_row_range().is_some(), located);
+        let scans = scan_hooks::scans();
+        assert_eq!(
+            view_strings(&by_p).await,
+            expected_strings(&quads, |i| i % 3 == 1)
+        );
+        assert_eq!(scan_hooks::scans() > scans, !located, "{layout:?}");
+    }
+
     run_copy_index_serving_script(
         store,
         &quads,
@@ -139,7 +202,7 @@ async fn test_copy_index_file_serving_wide_located_run_stays_pending() {
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
-    assert!(by_p.debug_has_serve_plan());
+    assert_eq!(served_component(&by_p), Some("index:posg"));
     // POSG order puts p1's run right after p0's 10,000 rows.
     assert_eq!(
         by_p.debug_serve_row_range(),
@@ -147,7 +210,7 @@ async fn test_copy_index_file_serving_wide_located_run_stays_pending() {
         "the run must be located for the range scan to serve it"
     );
     assert!(
-        by_p.debug_selection_pending(),
+        selection_pending(&by_p),
         "a 10,000-row run exceeds the point-read cap and must stay deferred"
     );
     assert_eq!(by_p.size().await.unwrap(), 10_000);
@@ -178,7 +241,7 @@ async fn test_copy_index_file_serving_wide_located_run_stays_pending() {
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
-    assert!(by_p_after.debug_has_serve_plan());
+    assert_eq!(served_component(&by_p_after), Some("index:posg"));
     assert_eq!(by_p_after.size().await.unwrap(), 9_999);
     assert_eq!(
         view_strings(&by_p_after).await,
@@ -213,9 +276,9 @@ async fn test_copy_index_file_locates_dictionary_coded_columns() {
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
-    assert!(by_p.debug_has_serve_plan());
+    assert_eq!(served_component(&by_p), Some("index:posg"));
     assert_eq!(by_p.debug_serve_row_range(), Some(3_000..6_000));
-    assert!(by_p.debug_selection_pending());
+    assert!(selection_pending(&by_p));
     assert_eq!(by_p.size().await.unwrap(), 3_000);
     assert_eq!(
         view_strings(&by_p).await,
@@ -241,7 +304,7 @@ async fn test_copy_index_file_locates_dictionary_coded_columns() {
         .match_pattern(None, Some(&p1), Some(&o1), None)
         .await
         .unwrap();
-    assert!(by_po.debug_has_serve_plan());
+    assert_eq!(served_component(&by_po), Some("index:posg"));
     assert_eq!(by_po.debug_serve_row_range(), Some(3_429..3_858));
     assert_eq!(by_po.size().await.unwrap(), 429);
     assert_eq!(
@@ -255,7 +318,7 @@ async fn test_copy_index_file_locates_dictionary_coded_columns() {
         .match_pattern(None, None, Some(&o2), None)
         .await
         .unwrap();
-    assert!(by_o.debug_has_serve_plan());
+    assert_eq!(served_component(&by_o), Some("index:ospg"));
     assert_eq!(by_o.debug_serve_row_range(), Some(2_572..3_858));
     assert_eq!(by_o.size().await.unwrap(), 1_286);
     assert_eq!(
@@ -270,7 +333,7 @@ async fn test_copy_index_file_locates_dictionary_coded_columns() {
         .match_pattern(None, Some(&subject_as_p), None, None)
         .await
         .unwrap();
-    assert!(!zero.debug_selection_pending());
+    assert!(!selection_pending(&zero));
     assert_eq!(zero.size().await.unwrap(), 0);
 
     // A tombstone inside a served run leaves every split through the rid
@@ -289,8 +352,7 @@ async fn test_copy_index_file_locates_dictionary_coded_columns() {
 
 /// The code columns of `view` as sorted `(s, p, o, g)` rows.
 async fn sorted_code_rows(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
-    let [s, p, o, g] = view.code_columns_gathered().await.unwrap().unwrap();
-    let mut rows: Vec<[TermCode; 4]> = (0..s.len()).map(|i| [s[i], p[i], o[i], g[i]]).collect();
+    let mut rows = row_list(view).await;
     rows.sort_unstable();
     rows
 }
@@ -319,13 +381,20 @@ async fn test_copy_index_file_serves_code_columns_from_the_run() {
         let memory = VortexRdfStore::from_file_in_memory(&path).await.unwrap();
         let deleted = file.delete_quad(&quads[1]).await.unwrap();
         let memory_deleted = memory.delete_quad(&quads[1]).await.unwrap();
-        let patterns: [(Option<&NamedNode>, Option<&Term>); 3] =
-            [(Some(&p1), None), (Some(&p1), Some(&o1)), (None, Some(&o2))];
-        for (p, o) in patterns {
+        let patterns: [(Option<&NamedNode>, Option<&Term>, &str); 3] = [
+            (Some(&p1), None, "index:posg"),
+            (Some(&p1), Some(&o1), "index:posg"),
+            (None, Some(&o2), "index:ospg"),
+        ];
+        for (p, o, component) in patterns {
             for (store, in_memory) in [(&file, &memory), (&deleted, &memory_deleted)] {
                 let served = store.match_pattern(None, p, o, None).await.unwrap();
-                assert!(served.debug_has_serve_plan(), "{rows} {p:?} {o:?}");
-                let pending = served.debug_selection_pending();
+                assert_eq!(
+                    served_component(&served),
+                    Some(component),
+                    "{rows} {p:?} {o:?}"
+                );
+                let pending = selection_pending(&served);
                 if rows == 9_000 {
                     assert!(pending, "{p:?} {o:?}: a wide run defers its ids");
                 }
@@ -391,14 +460,7 @@ async fn test_file_with_both_index_kinds() {
     let file = VortexRdfStore::from_file(&path).await.unwrap();
     assert_eq!(file.indexes(), both.as_slice());
 
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
-        LayoutStrategy::Default,
-        both.clone(),
-    )
-    .await
-    .unwrap();
-    let memory = VortexRdfStore::from_built(arr).unwrap();
+    let memory = built_store(quads.clone(), LayoutStrategy::Default, both.clone()).await;
     assert_eq!(memory.indexes(), both.as_slice());
 
     let adopted = VortexRdfStore::from_bytes(&file.to_bytes().await.unwrap())
@@ -408,24 +470,20 @@ async fn test_file_with_both_index_kinds() {
 
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
-    for (tag, p, o) in [
-        ("P", Some(&p1), None),
-        ("O", None, Some(&o1)),
-        ("PO", Some(&p1), Some(&o1)),
-    ] {
-        let want = view_strings(&memory.match_pattern(None, p, o, None).await.unwrap()).await;
-        assert!(!want.is_empty(), "{tag}");
-        assert_eq!(
-            view_strings(&file.match_pattern(None, p, o, None).await.unwrap()).await,
-            want,
-            "{tag}: file"
-        );
-        assert_eq!(
-            view_strings(&adopted.match_pattern(None, p, o, None).await.unwrap()).await,
-            want,
-            "{tag}: adopted"
-        );
+    let patterns: [Pattern<'_>; 3] = [
+        ("P", None, Some(&p1), None, None),
+        ("O", None, None, Some(&o1), None),
+        ("PO", None, Some(&p1), Some(&o1), None),
+    ];
+    for &(tag, s, p, o, g) in &patterns {
+        assert!(matched_size(&memory, s, p, o, g).await > 0, "{tag}");
     }
+    assert_patterns_agree(
+        &memory,
+        &[("file", &file), ("adopted", &adopted)],
+        &patterns,
+    )
+    .await;
 }
 
 // ─── SecondaryByReference on a file ────────────────────────────────────
@@ -469,7 +527,7 @@ async fn run_reference_index_file_test(layout: LayoutStrategy, located: bool) {
         expected_strings(&quads, |i| i % 7 == 2)
     );
     // This index serves no quads: the reads gather the primary columns.
-    assert!(!by_o.debug_has_serve_plan());
+    assert_eq!(served_component(&by_o), None);
 
     // Predicate-bound: 300 rows — a located run past the cap, whose ids come
     // from the range-restricted rid scan.
@@ -569,9 +627,10 @@ async fn test_reference_index_file_typed_object() {
 }
 
 /// A reference-index count over a located run (predicate-only or
-/// object-only, nothing residual) is the run's width: no row id is read.
-/// `limit` caps it; a window reads only the rows it takes, in base order;
-/// a residual or tombstones send the count through the ids.
+/// object-only, nothing residual) is the run's width: no row id is read — on
+/// file the located-rid-read hook stays at 0. `limit` caps it; a window reads
+/// only the rows it takes, in base order; a residual or tombstones send the
+/// count through the ids.
 #[tokio::test]
 async fn test_reference_index_counts_located_runs_from_width() {
     use crate::store::{IdsNeed, Probe};
@@ -582,22 +641,33 @@ async fn test_reference_index_counts_located_runs_from_width() {
         vec![IndexType::SecondaryByReference],
     )
     .await;
-    for store in [
-        VortexRdfStore::from_file(&path).await.unwrap(),
-        VortexRdfStore::from_file_in_memory(&path).await.unwrap(),
+    for (store, on_file) in [
+        (VortexRdfStore::from_file(&path).await.unwrap(), true),
+        (
+            VortexRdfStore::from_file_in_memory(&path).await.unwrap(),
+            false,
+        ),
     ] {
+        // The rid rows read from located runs: none on the freshly opened
+        // file, and no hook in memory, which has no file.
+        let no_rid_reads = on_file.then_some(0);
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
         let o2 = Term::Literal(Literal::new_simple_literal("o2"));
         let counted = store
             .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
             .await
             .unwrap();
-        assert!(counted.debug_selection_pending());
+        assert!(selection_pending(&counted));
         assert_eq!(counted.size().await.unwrap(), 300);
         assert_eq!(
             counted.debug_row_ids_materialized(),
             Some(false),
             "a count reads no row id"
+        );
+        assert_eq!(
+            store.debug_located_rid_reads(),
+            no_rid_reads,
+            "size() reads no row id"
         );
         let by_p = Probe::new(None, Some(p1.clone()), None, None);
         let by_o = Probe::new(None, None, Some(o2.clone()), None);
@@ -618,12 +688,17 @@ async fn test_reference_index_counts_located_runs_from_width() {
                 .unwrap(),
             vec![10, 129]
         );
+        assert_eq!(
+            store.debug_located_rid_reads(),
+            no_rid_reads,
+            "the count of a window(0, 10) probe reads no row id"
+        );
         // The public match still computes its ids: its rows may be streamed.
         let matched = store
             .match_pattern(None, Some(&p1), None, None)
             .await
             .unwrap();
-        assert!(!matched.debug_selection_pending());
+        assert!(!selection_pending(&matched));
         let all = matched.code_columns_gathered().await.unwrap().unwrap();
         for (offset, limit) in [(0usize, 5usize), (7, 20), (295, 10), (300, 3)] {
             let windowed = store
@@ -677,7 +752,12 @@ async fn test_reference_index_file_checks_sparse_residual_by_point_reads() {
             .match_pattern(None, Some(&p1), Some(&o2), None)
             .await
             .unwrap();
-        assert_eq!(matched.debug_file_filter_pending(), Some(!sparse), "{rows}");
+        let stats = matched.view_statistics().unwrap();
+        assert_eq!(
+            (stats.file_backed, stats.pending_filter),
+            (true, !sparse),
+            "{rows}"
+        );
         assert_eq!(matched.size().await.unwrap(), want.len(), "{rows}");
         assert_eq!(view_strings(&matched).await, want, "{rows}");
         let in_memory = memory
@@ -688,11 +768,8 @@ async fn test_reference_index_file_checks_sparse_residual_by_point_reads() {
         let probe = Probe::new(None, Some(p1.clone()), Some(o2.clone()), None);
         for store in [&file, &memory] {
             assert_eq!(
-                store
-                    .count_many(std::slice::from_ref(&probe))
-                    .await
-                    .unwrap(),
-                vec![want.len()],
+                store.count_probe(&probe).await.unwrap(),
+                want.len(),
                 "{rows}"
             );
         }
@@ -931,14 +1008,14 @@ async fn test_reference_index_pending_run_composes() {
             .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
             .await
             .unwrap();
-        assert!(pending.debug_selection_pending());
+        assert!(selection_pending(&pending));
         // A residual term keeps the run's ids from staying pending: the
         // filter over them needs the ids.
         let residual = store
             .match_pattern_for(None, Some(&p1), Some(&o2), None, IdsNeed::CountOrWindow)
             .await
             .unwrap();
-        assert!(!residual.debug_selection_pending());
+        assert!(!selection_pending(&residual));
         let o_code = all[2][0];
         let kept_rows: Vec<usize> = (0..all[2].len()).filter(|&i| all[2][i] == o_code).collect();
         assert!(kept_rows.len() > 1 && kept_rows.len() < all[2].len());
@@ -992,13 +1069,7 @@ async fn test_reference_index_pending_run_composes() {
                 .unwrap(),
             vec![43, 5]
         );
-        assert_eq!(
-            by_po_view
-                .count_many(std::slice::from_ref(&by_p))
-                .await
-                .unwrap(),
-            vec![43]
-        );
+        assert_eq!(by_po_view.count_probe(&by_p).await.unwrap(), 43);
         // i ≡ 16 (mod 21): the 43 rows are in subject order, so the window
         // (2, 3) is the third to fifth of them.
         let window = by_p_view
@@ -1335,22 +1406,11 @@ async fn test_reference_index_counts_with_named_graphs() {
                     .match_pattern_for(None, p, o, graph, IdsNeed::CountOrWindow)
                     .await
                     .unwrap();
-                assert_eq!(
-                    counted.debug_selection_pending(),
-                    graph.is_none(),
-                    "{label}"
-                );
+                assert_eq!(selection_pending(&counted), graph.is_none(), "{label}");
                 assert_eq!(counted.size().await.unwrap(), want, "{label}");
                 let probe = Probe::new(None, p.cloned(), o.cloned(), graph.cloned());
                 let before = store.debug_located_rid_reads();
-                assert_eq!(
-                    store
-                        .count_many(std::slice::from_ref(&probe))
-                        .await
-                        .unwrap(),
-                    vec![want],
-                    "{label}"
-                );
+                assert_eq!(store.count_probe(&probe).await.unwrap(), want, "{label}");
                 if let Some(before) = before {
                     let read = store.debug_located_rid_reads().unwrap() - before;
                     assert_eq!(read, if graph.is_none() { 0 } else { run }, "{label}");
@@ -1393,10 +1453,28 @@ async fn test_reference_index_counts_with_named_graphs() {
 /// 100,000-row file — are gathered by taking them, not by a scan filtering
 /// every split: from the chunk probes' leaves under the Dictionary layout,
 /// split by split under a string layout, whose columns have no chunk probes.
-/// The rows are the in-memory store's, tombstoned rows dropped.
+/// The `quads` stream and the N-Quads export's raw stream take them as
+/// `quads_vec` does, none of them runs a row scan, and the export lifts no
+/// dictionary. The rows are the in-memory store's, tombstoned rows dropped.
 #[tokio::test]
 async fn test_reference_index_file_takes_sparse_ids() {
-    use crate::store::scan::file_scan::take_hooks;
+    use crate::store::scan::file_reads::{scan_hooks, take_hooks};
+
+    /// `view`'s N-Quads export, as sorted lines.
+    async fn export_lines(view: &VortexRdfStore) -> Vec<String> {
+        let mut out = Vec::new();
+        crate::export_rdf(view.clone(), &mut out, oxrdfio::RdfFormat::NQuads)
+            .await
+            .unwrap();
+        let mut lines: Vec<String> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.sort();
+        lines
+    }
+
     let quads = graph_modular_quads(100_000, 6, 3, 333, &[GraphName::DefaultGraph]);
     let o5 = Term::Literal(Literal::new_simple_literal("o5"));
     let doomed = 5 + 333 * 7;
@@ -1411,34 +1489,49 @@ async fn test_reference_index_file_takes_sparse_ids() {
         let deleted = file.delete_quad(&quads[doomed]).await.unwrap();
         let memory_deleted = memory.delete_quad(&quads[doomed]).await.unwrap();
         for (store, in_memory, rows) in [(&file, &memory, 301), (&deleted, &memory_deleted, 300)] {
-            let label = format!("{layout:?} {rows}");
             let matched = store
                 .match_pattern(None, None, Some(&o5), None)
                 .await
                 .unwrap();
-            let (chunks, splits) = take_hooks::takes();
-            let strings = view_strings(&matched).await;
-            let (chunks_after, splits_after) = take_hooks::takes();
-            if through_chunks {
-                assert!(
-                    chunks_after > chunks,
-                    "{label}: taken through the chunk probes"
-                );
-                assert_eq!(splits_after, splits, "{label}");
-            } else {
-                assert!(splits_after > splits, "{label}: taken split by split");
-                assert_eq!(chunks_after, chunks, "{label}");
-            }
-            assert_eq!(
-                strings,
-                expected_strings(&quads, |i| i % 333 == 5 && (rows == 301 || i != doomed)),
-                "{label}"
-            );
+            let want = expected_strings(&quads, |i| i % 333 == 5 && (rows == 301 || i != doomed));
             let in_memory_matched = in_memory
                 .match_pattern(None, None, Some(&o5), None)
                 .await
                 .unwrap();
-            assert_eq!(view_strings(&in_memory_matched).await, strings, "{label}");
+            let want_lines = export_lines(&in_memory_matched).await;
+            assert_eq!(want_lines.len(), rows, "{layout:?} {rows}");
+            for read in ["quads_vec", "quads", "export"] {
+                let label = format!("{layout:?} {rows} {read}");
+                let (chunks, splits) = take_hooks::takes();
+                let scans = scan_hooks::scans();
+                let (got, expected) = match read {
+                    "quads_vec" => (view_strings(&matched).await, &want),
+                    "quads" => {
+                        let decoded: Vec<Quad> =
+                            matched.quads().unwrap().try_collect().await.unwrap();
+                        (quad_strings(&decoded), &want)
+                    }
+                    _ => (export_lines(&matched).await, &want_lines),
+                };
+                let (chunks_after, splits_after) = take_hooks::takes();
+                if through_chunks {
+                    assert!(
+                        chunks_after > chunks,
+                        "{label}: taken through the chunk probes"
+                    );
+                    assert_eq!(splits_after, splits, "{label}");
+                } else {
+                    assert!(splits_after > splits, "{label}: taken split by split");
+                    assert_eq!(chunks_after, chunks, "{label}");
+                }
+                assert_eq!(scan_hooks::scans(), scans, "{label}: no row scan");
+                assert_eq!(&got, expected, "{label}");
+            }
+            let label = format!("{layout:?} {rows}");
+            if through_chunks {
+                assert_eq!(matched.debug_dict_lifts(), Some(0), "{label}: no lift");
+            }
+            assert_eq!(view_strings(&in_memory_matched).await, want, "{label}");
             if through_chunks {
                 let codes = sorted_code_rows(&matched).await;
                 assert_eq!(codes.len(), rows, "{label}");

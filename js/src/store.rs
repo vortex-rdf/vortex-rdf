@@ -6,7 +6,7 @@ use std::io::Cursor;
 
 use futures::StreamExt;
 use js_sys::{Object, Reflect};
-use vortex_rdf_core::common::terms::parse_quads_from_reader;
+use vortex_rdf_core::common::{formats::format_from_name, terms::parse_quads_from_reader};
 use vortex_rdf_core::{
     DictSnapshot, LayoutStrategy, Result as CoreResult, VortexRdfStore as CoreStore, export_rdf,
 };
@@ -16,8 +16,8 @@ use wasm_bindgen_futures::future_to_promise;
 use crate::codes::{code_from_js, code_to_js, codes_to_js};
 use crate::error::{js_err, js_err_ctx};
 use crate::ingest::{js_array_to_dictionary_array, js_array_to_quads, js_to_quad_stream};
-use crate::options::{build_array, parse_build_options, parse_format};
-use crate::terms::{JsPattern, js_to_quad};
+use crate::options::{build_array, parse_build_options};
+use crate::terms::{JsPattern, quad_arg};
 
 #[wasm_bindgen(module = "/js-snippets/lazy-rdf.js")]
 extern "C" {
@@ -56,14 +56,20 @@ impl VortexRdfStore {
         }
     }
 
+    /// The store's dictionary as a snapshot, or `None` when the code path
+    /// does not apply. Core's [`dict_reader`](CoreStore::dict_reader) is the
+    /// one "codes are decodable" gate (Dictionary layout, no append tail — see
+    /// its doc for why anything less decodes to wrong terms), and a snapshot
+    /// needs the dictionary resident, as every dictionary in this build is.
+    fn dict_snapshot(&self) -> Option<DictSnapshot> {
+        self.inner.dict_reader()?.snapshot()
+    }
+
     /// The dictionary for decoding a match's code columns, or `None` when
-    /// the code path does not apply. Core's
-    /// [`code_read_snapshot`](CoreStore::code_read_snapshot) is the one
-    /// "codes are decodable" gate (Dictionary layout, no append tail, resident
-    /// dictionary — see its doc for why anything less decodes to wrong terms);
+    /// the code path does not apply (see [`dict_snapshot`](Self::dict_snapshot));
     /// reads it declines fall back to the always-correct term path.
     fn code_path_dict(&self) -> Option<JsValue> {
-        let snapshot = self.inner.code_read_snapshot()?;
+        let snapshot = self.dict_snapshot()?;
         Some(self.dict_view(snapshot))
     }
 
@@ -122,14 +128,18 @@ impl TermDict {
         Ok(self.snapshot.decode(code))
     }
 
-    /// Encode an N-Triples term string to its code (inverse of
-    /// [`decode`](Self::decode)), or `undefined` when this dictionary does
-    /// not hold the term. Throws for a code past 2^53 − 1, which no JS number
-    /// holds exactly.
+    /// Encode a term to its code (inverse of [`decode`](Self::decode)), or
+    /// `undefined` when this dictionary does not hold the term. Tolerant of
+    /// spelling: an IRI with or without angle brackets, a literal with escape
+    /// variants, an `xsd:string` typing, an upper-case language tag, or
+    /// `default`/`[]` for the default graph all find the stored form's code.
+    /// Throws for a malformed term, and for a code past 2^53 − 1, which no JS
+    /// number holds exactly.
     #[wasm_bindgen(js_name = encode)]
     pub fn encode(&self, term: &str) -> Result<Option<f64>, JsValue> {
         self.snapshot
             .encode(term)
+            .map_err(js_err)?
             .map(code_to_js)
             .transpose()
             .map_err(js_err)
@@ -157,7 +167,7 @@ impl VortexRdfStore {
         format_name: &str,
         options: JsValue,
     ) -> Result<VortexRdfStore, JsValue> {
-        let format = parse_format(format_name)?;
+        let format = format_from_name(format_name).map_err(js_err)?;
         let config = parse_build_options(options)?;
         let quads_stream = parse_quads_from_reader(Cursor::new(input), format);
         let built = build_array(quads_stream, config).await?;
@@ -219,7 +229,7 @@ impl VortexRdfStore {
 
     #[wasm_bindgen(js_name = toRdf, skip_typescript)]
     pub async fn to_rdf(&self, format_name: &str) -> Result<String, JsValue> {
-        let format = parse_format(format_name)?;
+        let format = format_from_name(format_name).map_err(js_err)?;
         let mut buffer = Vec::new();
         export_rdf(self.inner.clone(), &mut buffer, format)
             .await
@@ -227,17 +237,19 @@ impl VortexRdfStore {
         String::from_utf8(buffer).map_err(|e| js_err_ctx("UTF-8 error", e))
     }
 
+    /// Number of quads in the store. Returns synchronously: no wasm read path
+    /// performs I/O, so there is nothing to await (see `resolve_now`).
     #[wasm_bindgen(skip_typescript)]
-    pub async fn size(&self) -> Result<usize, JsValue> {
-        self.inner.size().await.map_err(js_err)
+    pub fn size(&self) -> Result<usize, JsValue> {
+        resolve_now(self.inner.size())?.map_err(js_err)
     }
 
-    /// Whether the quad is in the store. Rejects on a malformed quad object,
-    /// like `addQuad`/`deleteQuad`.
+    /// Whether the quad is in the store. Returns synchronously; throws on a
+    /// malformed quad object (`addQuad`/`deleteQuad` reject it).
     #[wasm_bindgen(skip_typescript)]
-    pub async fn has(&self, quad_js: JsValue) -> Result<bool, JsValue> {
-        let quad = js_to_quad(quad_js).ok_or_else(|| js_err("Invalid quad object"))?;
-        self.inner.contains(&quad).await.map_err(js_err)
+    pub fn has(&self, quad_js: JsValue) -> Result<bool, JsValue> {
+        let quad = quad_arg(&quad_js)?;
+        resolve_now(self.inner.contains(&quad))?.map_err(js_err)
     }
 
     /// The inner store as one owning its rows, ready for in-place mutation;
@@ -265,7 +277,7 @@ impl VortexRdfStore {
 
     #[wasm_bindgen(js_name = addQuad, skip_typescript)]
     pub async fn add_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
-        let quad = js_to_quad(quad_js).ok_or_else(|| js_err("Invalid quad object"))?;
+        let quad = quad_arg(&quad_js)?;
         self.mutate(async |s| s.add_quad(quad).await).await
     }
 
@@ -277,7 +289,7 @@ impl VortexRdfStore {
 
     #[wasm_bindgen(js_name = deleteQuad, skip_typescript)]
     pub async fn delete_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
-        let quad = js_to_quad(quad_js).ok_or_else(|| js_err("Invalid quad object"))?;
+        let quad = quad_arg(&quad_js)?;
         self.mutate(async |s| s.delete_quad(&quad).await).await
     }
 
@@ -351,7 +363,8 @@ impl VortexRdfStore {
     /// `length` — with no term strings materialized; a code past 2^53 − 1
     /// throws. `null` unless the store's rows are code-addressable
     /// (Dictionary layout, no pending appends, resident dictionary); decode
-    /// codes through [`termDict`](Self::term_dict).
+    /// codes through [`termDict`](Self::term_dict). An invalid pattern term
+    /// throws whether or not the rows are code-addressable.
     #[wasm_bindgen(js_name = matchCodes, skip_typescript)]
     pub fn match_codes(
         &self,
@@ -360,12 +373,12 @@ impl VortexRdfStore {
         object: JsValue,
         graph: JsValue,
     ) -> Result<JsValue, JsValue> {
-        // Same gate as `code_path_dict`: without a code-read snapshot the codes
-        // would not resolve via `termDict`.
-        if self.inner.code_read_snapshot().is_none() {
+        let pattern = JsPattern::parse(subject, predicate, object, graph)?;
+        // Same gate as `code_path_dict`: without a dictionary snapshot the
+        // codes would not resolve via `termDict`.
+        if self.dict_snapshot().is_none() {
             return Ok(JsValue::NULL);
         }
-        let pattern = JsPattern::parse(subject, predicate, object, graph)?;
         let matched = resolve_now(pattern.matched(&self.inner))??;
 
         let result = Object::new();
@@ -380,13 +393,13 @@ impl VortexRdfStore {
     /// dictionary — the one door to code↔term translation (`decode`/`encode`
     /// of N-Triples term strings: `<iri>`, `_:blank`, `"lit"@lang`,
     /// `"lit"^^<dt>`, or `""` for the default graph). `undefined` short of
-    /// core's code-read gate ([`code_read_snapshot`](CoreStore::code_read_snapshot):
-    /// Dictionary layout, no append tail, resident dictionary). The handle
-    /// keeps decoding correctly after the store is mutated, because it retains
-    /// the dictionary its codes address.
+    /// core's [`dict_reader`](CoreStore::dict_reader) gate and a resident
+    /// snapshot (Dictionary layout, no append tail, resident dictionary). The
+    /// handle keeps decoding correctly after the store is mutated, because it
+    /// retains the dictionary its codes address.
     #[wasm_bindgen(js_name = termDict, skip_typescript)]
     pub fn term_dict(&self) -> Option<TermDict> {
-        let snapshot = self.inner.code_read_snapshot()?;
+        let snapshot = self.dict_snapshot()?;
         Some(TermDict { snapshot })
     }
 }

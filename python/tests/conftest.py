@@ -19,6 +19,24 @@ FIXTURE_NQ = """\
 LAYOUTS = ["default", "typed-object", "dictionary"]
 INDEXES = ["secondary-by-copy", "secondary-by-reference"]
 
+#: `foaf:name`, the predicate of three fixture triples: two on IRI subjects,
+#: one on a blank node.
+NAME = "<http://xmlns.com/foaf/0.1/name>"
+#: Match patterns over the fixture: every quad, a bound predicate, a bound
+#: subject and a language-tagged object.
+PATTERNS = ({}, {"p": NAME}, {"s": "<http://ex.org/bob>"}, {"o": '"Bob"@en'})
+
+
+def u64s(col):
+    """The values of a `U64Column`, read through its raw byte view, as a
+    list of ints."""
+    return memoryview(col).cast("Q").tolist()
+
+
+def u64_rows(cols):
+    """The rows of `match_codes` columns, as tuples of codes."""
+    return list(zip(*(u64s(col) for col in cols)))
+
 
 @pytest.fixture(params=LAYOUTS)
 def layout(request):
@@ -39,40 +57,46 @@ def fixture_nq_path(tmp_path_factory):
     return path
 
 
+def _serialize_variants(source, out_dir, variants):
+    """`source` serialized once per `(key, layout, indexes)` of `variants`
+    into `out_dir`, as `{key: path}`. A key is a layout name or a tuple of
+    names, which also name the file."""
+    files = {}
+    for key, layout, indexes in variants:
+        stem = "-".join(key) if isinstance(key, tuple) else key
+        out = out_dir / f"{stem}.vortex"
+        serialize_rdf(source, out, layout=layout, indexes=indexes)
+        files[key] = out
+    return files
+
+
 @pytest.fixture(scope="session")
 def vortex_files(fixture_nt_path, tmp_path_factory):
     """One serialized `.vortex` file per layout, keyed by layout name."""
-    out_dir = tmp_path_factory.mktemp("vortex")
-    files = {}
-    for layout in LAYOUTS:
-        out = out_dir / f"fixture-{layout}.vortex"
-        serialize_rdf(fixture_nt_path, out, layout=layout)
-        files[layout] = out
-    return files
+    return _serialize_variants(
+        fixture_nt_path,
+        tmp_path_factory.mktemp("vortex"),
+        [(layout, layout, []) for layout in LAYOUTS],
+    )
 
 
 @pytest.fixture(scope="session")
 def indexed_files(fixture_nt_path, tmp_path_factory):
     """`vortex_files` built with one secondary index, keyed by
     `(layout, index)`."""
-    out_dir = tmp_path_factory.mktemp("vortex-indexed")
-    files = {}
-    for layout in LAYOUTS:
-        for index in INDEXES:
-            out = out_dir / f"fixture-{layout}-{index}.vortex"
-            serialize_rdf(fixture_nt_path, out, layout=layout, indexes=[index])
-            files[(layout, index)] = out
-    return files
+    return _serialize_variants(
+        fixture_nt_path,
+        tmp_path_factory.mktemp("vortex-indexed"),
+        [((layout, index), layout, [index]) for layout in LAYOUTS for index in INDEXES],
+    )
 
 
 @pytest.fixture(scope="session")
 def quad_files(fixture_nq_path, tmp_path_factory):
     """The named-graph fixture serialized per layout, keyed like
     `vortex_files`."""
-    out_dir = tmp_path_factory.mktemp("vortex-quads")
-    files = {}
-    for layout in LAYOUTS:
-        out = out_dir / f"quads-{layout}.vortex"
-        serialize_rdf(fixture_nq_path, out, layout=layout)
-        files[layout] = out
-    return files
+    return _serialize_variants(
+        fixture_nq_path,
+        tmp_path_factory.mktemp("vortex-quads"),
+        [(layout, layout, []) for layout in LAYOUTS],
+    )

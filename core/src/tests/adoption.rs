@@ -35,7 +35,7 @@ async fn test_default_fixture_adopts() {
 
 /// The Dictionary fixture opens with both index families, decodes to its
 /// quads, serves a predicate match through its by-copy index, and hands out
-/// a code-read snapshot holding every distinct term.
+/// a resident dictionary snapshot holding every distinct term.
 #[tokio::test]
 async fn test_dictionary_fixture_adopts() {
     let quads = dictionary_test_quads();
@@ -55,8 +55,9 @@ async fn test_dictionary_fixture_adopts() {
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
-    assert!(
-        served.debug_has_serve_plan(),
+    assert_eq!(
+        served_component(&served),
+        Some("index:posg"),
         "a P match routes through the index"
     );
     assert_eq!(
@@ -65,7 +66,8 @@ async fn test_dictionary_fixture_adopts() {
     );
 
     let snapshot = store
-        .code_read_snapshot()
+        .dict_reader()
+        .and_then(|reader| reader.snapshot())
         .expect("a resident, untailed Dictionary store hands out a snapshot");
     let terms: std::collections::BTreeSet<String> = tuple_rows(&quads)
         .into_iter()
@@ -73,7 +75,11 @@ async fn test_dictionary_fixture_adopts() {
         .collect();
     assert_eq!(snapshot.len(), terms.len());
     for (code, term) in terms.iter().enumerate() {
-        assert_eq!(snapshot.encode(term), Some(code as TermCode), "{term}");
+        assert_eq!(
+            snapshot.encode(term).unwrap(),
+            Some(code as TermCode),
+            "{term}"
+        );
         assert_eq!(
             snapshot.decode(code as TermCode).as_deref(),
             Some(term.as_str())
@@ -101,10 +107,7 @@ async fn test_fixtures_match_regenerated_stores() {
             vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
         ),
     ] {
-        let arr = build_array::<SortedInMemoryBuilder>(quad_stream(quads.clone()), layout, indexes)
-            .await
-            .unwrap();
-        let regenerated = VortexRdfStore::from_built(arr).unwrap();
+        let regenerated = built_store(quads.clone(), layout, indexes).await;
         let bytes = regenerated.to_bytes().await.unwrap();
         if std::env::var_os("VORTEX_RDF_REGEN_FIXTURES").is_some() {
             let path =

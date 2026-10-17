@@ -34,6 +34,7 @@ Vortex-RDF is a columnar RDF serialization and a queryable quad store built on t
 ```rust no_run
 use oxrdf::NamedNode;
 use oxrdfio::RdfFormat;
+use std::io::{BufWriter, Write};
 use vortex_rdf_core::{IndexType, LayoutStrategy, VortexRdfStore, export_rdf};
 use vortex_rdf_core::{common::terms::parse_quads_from_reader, io::quads_stream_to_vortex_file};
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -52,8 +53,10 @@ let knows = NamedNode::new("http://xmlns.com/foaf/0.1/knows")?;
 let matched = store.match_pattern(None, Some(&knows), None, None).await?;
 println!("{} matches", matched.size().await?);
 
-// Export the matches back to textual RDF
-export_rdf(matched, std::fs::File::create("knows.nq")?, RdfFormat::NQuads).await?;
+// Export the matches back to textual RDF; the writer is the caller's to buffer and flush
+let mut out = BufWriter::new(std::fs::File::create("knows.nq")?);
+export_rdf(matched, &mut out, RdfFormat::NQuads).await?;
+out.flush()?;
 # Ok::<(), Box<dyn std::error::Error>>(()) })?; Ok(()) }
 ```
 
@@ -131,6 +134,7 @@ for await (const quad of store.match(null, 'http://ex/p', null, null)) {
 - **Builders** — every build sorts globally by `(s, p, o, g)`: in memory on wasm, out of core (spilling sorted runs to disk) everywhere a filesystem exists. A built store holds each quad once and each term once, in its canonical spelling. See [docs/serialization.md](docs/serialization.md).
 - **The store** — a base (array or memory-mapped file) plus a view: a row selection, tombstone masks and an append tail; `match_pattern` routes each bound position to the cheapest path (subject prefix probe, index, pushed-down filter, mask scan) and matches the tail independently. See [docs/matching.md](docs/matching.md).
 - **Narrowing beyond a pattern** — `keep` restricts a view to a code set or range per column (a `VALUES` block, a term predicate's codes, a namespace) inside the store; `window`/`size_capped`/`exists` stop a filtered file scan at the first block that fills a `LIMIT` or answers an `ASK`; `match_many` batches probes; `DictReader` serves the dictionary — read in place from a memory-mapped file, or held in memory — with `prefix_range`, candidate `filter_codes` (FILTER predicates over the codes a query produced, including `regex`, `contains`, `strstarts`, `strends`) and a spelling-tolerant `encode`. See [docs/matching.md §16](docs/matching.md#16-narrowing-beyond-a-pattern).
+- **Interfaces for a query engine** — any view is a vortex `DataSource` (`UInt64` code columns under the Dictionary layout; projection, filter and limit pushed into the scan; one partition) that vortex's DataFusion integration registers as a table; the index copies and the dictionary are tables too; `row_chunks`/`code_chunks` stream columns without Arrow; `view_statistics`, `partitions`, `generation` and `dictionary_id` tell a planner what a view holds and when its codes stop applying. See [docs/interfaces.md](docs/interfaces.md).
 - **Mutations & compaction** — additions are accumulated in the `Tail`, deletions set tombstone bits, nothing is rewritten until a compaction rebuilds one sorted, indexed base (automatically once the tail outgrows its thresholds). See [docs/mutations.md](docs/mutations.md).
 - **The `.vortex` container** — one self-describing Vortex file: the quad table, the `dictionary` child and the index children under a `vortex-rdf.store.v2` root, also the byte-exchange format of the bindings; files written by vortex-rdf 0.11 or earlier (`vortex-rdf.store.v1`) are refused with an error asking for a rebuild. See [docs/file-format.md](docs/file-format.md).
 
@@ -142,6 +146,7 @@ for await (const quad of store.match(null, 'http://ex/p', null, null)) {
 | [docs/matching.md](docs/matching.md) | how a quad pattern is resolved on each backend, and what each path costs |
 | [docs/serialization.md](docs/serialization.md) | how a store is built and written: both sort pipelines, columns per layout, index builds |
 | [docs/mutations.md](docs/mutations.md) | the merge-on-read model: tail, tombstones, compaction and auto-compaction |
+| [docs/interfaces.md](docs/interfaces.md) | the contract an external query engine reads the store through: data sources, component tables, chunk streams, runtimes, view statistics, identities |
 | [js/README.md](js/README.md) | the JavaScript/WebAssembly bindings |
 | [python/README.md](python/README.md) | the Python bindings |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | git hooks, the local CI mirror, doc-anchor checks, changelog generation |

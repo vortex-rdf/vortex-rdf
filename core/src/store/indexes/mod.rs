@@ -1,52 +1,54 @@
 //! Secondary-index vocabulary and the store's dispatch into it.
 //!
 //! This hub owns what is common to every index: the [`IndexType`] enum and
-//! its exhaustive dispatch into the per-index modules (persisted-child identities,
-//! resolution), the resolution currency (`IndexResolution`,
-//! `ResolvedRoles`, the eager/lazy `ResolvedRowIds` split and its
-//! `LazyRowIds` recipe) both backends answer in, and the planners that try a
-//! store's whole index set in preference order.
+//! its exhaustive dispatch into the per-index modules (persisted-child
+//! identities, the probe a pattern shape chooses), the resolution currency
+//! (`IndexResolution`, `ResolvedRoles`, the eager/lazy `ResolvedRowIds` split
+//! and its `LazyRowIds` recipe) both backends answer in, and the planners
+//! that try a store's whole index set in preference order.
 //!
 //! What belongs in a leaf instead: an index's column-name scheme, its sort
-//! orders, how it builds its children, and how it probes them
-//! (`secondary_by_copy`, `secondary_by_reference`) — the hub hardcodes no
-//! column name but the one every child shares, the primary row id
-//! ([`COL_RID`]). Two further clusters live beside it: `serve` (reading
-//! matched quads out of an index's own columns) and `components` (the
-//! persisted-child model and the slug registry), both re-exported here so
-//! callers see one `indexes::` surface.
+//! orders, how it builds its children, and which probe it runs for a pattern
+//! (`copy`, `reference`) — the hub hardcodes no column name but the one every
+//! child shares, the primary row id ([`COL_RID`]). Every index's probe runs
+//! through one resolver per backend: `resolve` in memory, `file` on file
+//! (beside the file readers). Two further clusters live beside them: `serve`
+//! (reading matched quads out of an index's own columns) and `components`
+//! (the persisted-child model and the slug registry), both re-exported here
+//! so callers see one `indexes::` surface.
 
+#[cfg(feature = "file-io")]
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use vortex_array::ArrayRef;
-use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
+#[cfg(feature = "file-io")]
 use vortex_array::scalar::Scalar;
 use vortex_buffer::Buffer;
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout};
+#[cfg(feature = "file-io")]
+use crate::store::persist::native_file::ChildReader;
 use crate::store::schema::RowId;
+use resolve::IndexProbe;
 
 pub(crate) mod components;
-pub(crate) mod row_ids;
-pub(crate) mod secondary_by_copy;
-pub(crate) mod secondary_by_reference;
+pub(crate) mod copy;
+#[cfg(feature = "file-io")]
+pub(crate) mod file;
+pub(crate) mod reference;
+mod resolve;
 pub(crate) mod serve;
 
+#[cfg(feature = "file-io")]
+pub(crate) use components::check_component_rows;
 pub(crate) use components::{
-    ComponentIdentity, IndexComponent, KnownComponent, adopt_component_reader,
-    indexes_from_components, known_component,
+    ComponentIdentity, DeferredSource, IndexComponent, adopt_component, indexes_from_components,
+    known_component, sorted_row_ids,
 };
 #[cfg(feature = "file-io")]
-pub(crate) use components::{adopt_scanned_component, check_component_rows};
-pub(crate) use row_ids::sorted_row_ids;
-#[cfg(feature = "file-io")]
-pub(crate) use row_ids::{
-    read_located_rids, resolve_eager_from_scan, rid_point_reads, scan_index_row_ids,
-};
-#[cfg(feature = "file-io")]
-pub(crate) use serve::FileServePlan;
+pub(crate) use file::{FileServePlan, read_located_rids, scan_index_row_ids};
 pub(crate) use serve::InMemoryServePlan;
 
 /// The primary-row-id column every persisted index child carries beside its
@@ -209,7 +211,7 @@ pub enum IndexType {
     /// take the matching rows from a *contiguous* run of the copy columns
     /// instead of scattering row-id reads across the primary columns. Routing
     /// engages only on children whose writer recorded them globally sorted,
-    /// which every build here does. The `secondary_by_copy` module owns
+    /// which every build here does. The `copy` module owns
     /// resolution and serving.
     SecondaryByCopy,
 
@@ -243,7 +245,8 @@ impl std::fmt::Display for IndexType {
 
 /// Accepts exactly the canonical kebab-case names
 /// [`Display`](std::fmt::Display) emits — `"secondary-by-copy"`,
-/// `"secondary-by-reference"` — the one vocabulary every frontend shares.
+/// `"secondary-by-reference"` — the one vocabulary every frontend shares. Any
+/// other name is an [`InvalidInput`](VortexRdfError::InvalidInput) error.
 impl std::str::FromStr for IndexType {
     type Err = VortexRdfError;
 
@@ -251,7 +254,7 @@ impl std::str::FromStr for IndexType {
         match s {
             "secondary-by-copy" => Ok(IndexType::SecondaryByCopy),
             "secondary-by-reference" => Ok(IndexType::SecondaryByReference),
-            _ => Err(VortexRdfError::Deserialization(format!(
+            _ => Err(VortexRdfError::InvalidInput(format!(
                 "unknown index type {s:?}; expected \"secondary-by-copy\" or \
                  \"secondary-by-reference\""
             ))),
@@ -260,81 +263,47 @@ impl std::str::FromStr for IndexType {
 }
 
 /// Every [`IndexType`], in declaration = preference order — what the slug
-/// registry scans and what [`IndexType::preference_rank`] indexes into.
-/// Adding a variant fails to compile at that exhaustive match until the
-/// variant is listed here too.
+/// registry scans and what the in-memory index set
+/// ([`indexes_from_components`]) is filtered out of, in this order.
 pub(crate) const ALL_INDEX_TYPES: [IndexType; 2] =
     [IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
 
 impl IndexType {
-    /// This variant's position in [`ALL_INDEX_TYPES`] — the resolution
-    /// preference order, as a sort key.
-    pub(crate) const fn preference_rank(self) -> usize {
-        match self {
-            IndexType::SecondaryByCopy => 0,
-            IndexType::SecondaryByReference => 1,
-        }
-    }
-
-    /// This index's persisted-child identities — the const table every generic
-    /// loop is parameterized by: the slug registry ([`known_component`]) and
-    /// the roster-to-index-set fold ([`indexes_from_components`]). The
+    /// This index's persisted-child identities — the static table every
+    /// generic loop is parameterized by: the slug registry
+    /// ([`known_component`]) and the components each leaf builds. The
     /// exhaustive match is the compile-fail anchor for those loops: a new
     /// variant answers here once and flows into all of them.
     pub(crate) const fn component_identities(self) -> &'static [ComponentIdentity] {
         match self {
-            IndexType::SecondaryByCopy => &secondary_by_copy::IDENTITIES,
-            IndexType::SecondaryByReference => &secondary_by_reference::IDENTITIES,
+            IndexType::SecondaryByCopy => &copy::IDENTITIES,
+            IndexType::SecondaryByReference => &reference::IDENTITIES,
         }
     }
 
-    /// Resolve this index against an in-memory base array, producing the exact
-    /// base row ids for whichever pattern component it covers.
+    /// The probe this index runs for `pattern` — the child it searches, by
+    /// which sort keys, what a hit resolves, and whether the child serves
+    /// the matched quads — or `None` for a shape it does not accelerate (e.g.
+    /// `SecondaryByReference` declines when a subject is bound), leaving the
+    /// store to try the next index or fall back to a scan. A probe without
+    /// keys bounds no run, so it is declined here, for both backends.
     ///
-    /// Each index owns its own execution: it decides which pattern shapes it
-    /// accelerates (e.g. `SecondaryByReference` declines when a subject is
-    /// bound), chooses and probes its columns, and hands back the row ids to
-    /// select — or declines, leaving the store to fall back to a scan. Like
-    /// [`component_identities`](Self::component_identities), the exhaustive match makes
-    /// the compiler demand a query-side answer from every new index variant.
-    pub(crate) fn resolve_in_memory(
+    /// The one step each index owns at query time: one resolver per backend
+    /// executes every index's probe (`resolve::resolve_in_memory`,
+    /// `file::resolve_file`). Like
+    /// [`component_identities`](Self::component_identities), the exhaustive
+    /// match makes the compiler demand a query-side answer from every new
+    /// index variant.
+    fn choose<'a>(
         self,
-        components: &[IndexComponent],
+        pattern: QuadPattern<'a>,
         layout: &ResolvedLayout,
-        pattern: QuadPattern<'_>,
-        codes: &mut PatternCodes,
-    ) -> Result<IndexResolution<InMemoryServePlan>> {
-        match self {
-            IndexType::SecondaryByCopy => {
-                secondary_by_copy::resolve_in_memory(components, layout, pattern, codes)
-            }
-            IndexType::SecondaryByReference => {
-                secondary_by_reference::resolve_in_memory(components, pattern, codes)
-            }
-        }
-    }
-
-    /// Resolve this index against a file-backed store, producing the exact
-    /// primary row ids for whichever pattern component it covers — the
-    /// file-backed counterpart of [`Self::resolve_in_memory`], differing only
-    /// in how the index reaches its columns (a pushed-down scan instead of an
-    /// in-memory binary search).
-    #[cfg(feature = "file-io")]
-    pub(crate) async fn resolve_file(
-        self,
-        file: &Arc<crate::store::native_file::NativeStoreFile>,
-        layout: &ResolvedLayout,
-        pattern: QuadPattern<'_>,
-        codes: &mut PatternCodes,
-    ) -> Result<IndexResolution<FileServePlan>> {
-        match self {
-            IndexType::SecondaryByCopy => {
-                secondary_by_copy::resolve_file(file, layout, pattern, codes).await
-            }
-            IndexType::SecondaryByReference => {
-                secondary_by_reference::resolve_file(file, pattern, codes).await
-            }
-        }
+    ) -> Option<IndexProbe<'a>> {
+        let probe = match self {
+            IndexType::SecondaryByCopy => copy::choose(pattern, layout),
+            IndexType::SecondaryByReference => reference::choose(pattern),
+        };
+        probe.filter(|probe| !probe.keys.is_empty())
     }
 }
 
@@ -380,7 +349,7 @@ impl ResolvedRoles {
 /// resolutions, `FileServePlan` for file ones), so a resolution can only ever
 /// hand the store a plan its own backend can execute.
 ///
-/// [`RowSelection`]: crate::store::selection::RowSelection
+/// [`RowSelection`]: crate::store::view::selection::RowSelection
 // `Resolved` dwarfs the dataless `Declined`, but the enum is a transient
 // per-match return value that is destructured immediately and never stored
 // in bulk.
@@ -416,10 +385,11 @@ pub(crate) enum IndexResolution<Plan> {
 
 /// How a resolution answers its row ids.
 ///
-/// `Eager` is a resolution that had to compute its ids to answer at all (a
-/// back-reference probe, or a copy resolution without a serving plan) and is
-/// non-empty by construction — an empty scan short-circuits to
-/// [`IndexResolution::Empty`] instead. Only the file resolvers answer this
+/// `Eager` is a resolution whose ids were computed at match time — the
+/// pushed-down scan a back-reference probe needs to answer at all when its
+/// run is not located, or a small located run's rid point reads — and is
+/// non-empty by construction: an empty scan short-circuits to
+/// [`IndexResolution::Empty`] instead. Only the file resolver answers this
 /// way: an in-memory resolution is always `Lazy`, so a build without
 /// `file-io` has no `Eager`. `Lazy` rides alongside a serve
 /// plan, or stands alone over a located run whose width is known — only on a
@@ -470,28 +440,22 @@ enum LazyRowIdSource {
     Component { rids: ArrayRef, ascending: bool },
     /// File-backed: the rid-only pushed-down scan of the index child
     /// ([`scan_index_row_ids`]) the eager path would have run at match time.
+    /// The child binds through its file's memo under its own name, so the
+    /// deferred scan binds with the same identity every plan and eager scan
+    /// of this component uses (see `BoundExprMemo`).
     #[cfg(feature = "file-io")]
     IndexChild {
-        reader: vortex_layout::LayoutReaderRef,
+        child: ChildReader,
         constraints: Vec<(&'static str, Scalar)>,
-        rid_column: &'static str,
-        /// The owning file handle's bind memo and this child's scope tag —
-        /// so the deferred scan binds with the same identity every plan and
-        /// eager scan of this component uses (see `BoundExprMemo`).
-        memo: Arc<crate::store::native_file::BoundExprMemo>,
-        scope: &'static str,
     },
     /// File-backed: a located run of an index child's rid column — read on
     /// first need through [`read_located_rids`]; its width is known up front,
     /// so a count needs none of it.
     #[cfg(feature = "file-io")]
     LocatedRun {
-        file: Arc<crate::store::native_file::NativeStoreFile>,
-        component: &'static str,
-        reader: vortex_layout::LayoutReaderRef,
-        rid_column: &'static str,
+        file: Arc<crate::store::persist::native_file::NativeStoreFile>,
+        child: ChildReader,
         range: Range<u64>,
-        scope: &'static str,
     },
 }
 
@@ -504,71 +468,39 @@ impl LazyRowIds {
     }
 
     /// Lazy ids over an in-memory component's matched rid run, in the
-    /// component's own order.
-    pub(crate) fn from_component_run(rids: ArrayRef) -> Self {
+    /// component's own order — `ascending` when those rids are already in
+    /// row id order: a reference component's rows are ordered by
+    /// `(val, rid)`, so the rows of one value are.
+    pub(crate) fn from_component_run(rids: ArrayRef, ascending: bool) -> Self {
         Self {
             cell: Arc::new(OnceLock::new()),
-            source: LazyRowIdSource::Component {
-                rids,
-                ascending: false,
-            },
-        }
-    }
-
-    /// Lazy ids over an in-memory component's matched rid run whose rids
-    /// ascend: a reference component's rows are ordered by `(val, rid)`, so
-    /// the rows of one value are in row id order.
-    pub(crate) fn from_ascending_component_run(rids: ArrayRef) -> Self {
-        Self {
-            cell: Arc::new(OnceLock::new()),
-            source: LazyRowIdSource::Component {
-                rids,
-                ascending: true,
-            },
+            source: LazyRowIdSource::Component { rids, ascending },
         }
     }
 
     /// Lazy ids scanned from a file's index child on first need.
     #[cfg(feature = "file-io")]
     pub(crate) fn from_index_child_scan(
-        reader: vortex_layout::LayoutReaderRef,
+        child: ChildReader,
         constraints: Vec<(&'static str, Scalar)>,
-        rid_column: &'static str,
-        memo: Arc<crate::store::native_file::BoundExprMemo>,
-        scope: &'static str,
     ) -> Self {
         Self {
             cell: Arc::new(OnceLock::new()),
-            source: LazyRowIdSource::IndexChild {
-                reader,
-                constraints,
-                rid_column,
-                memo,
-                scope,
-            },
+            source: LazyRowIdSource::IndexChild { child, constraints },
         }
     }
 
-    /// Lazy ids over a located run of a file index child.
+    /// Lazy ids over a located run of a file index child whose rids ascend
+    /// within the run, as [`window_async`](Self::window_async) requires.
     #[cfg(feature = "file-io")]
     pub(crate) fn from_located_run(
-        file: Arc<crate::store::native_file::NativeStoreFile>,
-        component: &'static str,
-        reader: vortex_layout::LayoutReaderRef,
-        rid_column: &'static str,
+        file: Arc<crate::store::persist::native_file::NativeStoreFile>,
+        child: ChildReader,
         range: Range<u64>,
-        scope: &'static str,
     ) -> Self {
         Self {
             cell: Arc::new(OnceLock::new()),
-            source: LazyRowIdSource::LocatedRun {
-                file,
-                component,
-                reader,
-                rid_column,
-                range,
-                scope,
-            },
+            source: LazyRowIdSource::LocatedRun { file, child, range },
         }
     }
 
@@ -587,15 +519,7 @@ impl LazyRowIds {
         offset: usize,
         limit: usize,
     ) -> Result<Option<Buffer<RowId>>> {
-        let LazyRowIdSource::LocatedRun {
-            file,
-            component,
-            reader,
-            rid_column,
-            range,
-            scope,
-        } = &self.source
-        else {
+        let LazyRowIdSource::LocatedRun { file, child, range } = &self.source else {
             return Ok(None);
         };
         let width = range.end - range.start;
@@ -605,9 +529,7 @@ impl LazyRowIds {
             return Ok(Some(Buffer::empty()));
         }
         let rows = range.start + start..range.start + end;
-        Ok(Some(
-            read_located_rids(file, component, reader, rid_column, rows, scope).await?,
-        ))
+        Ok(Some(read_located_rids(file, child, rows).await?))
     }
 
     /// The ids of rows `offset..offset + limit` of an in-memory run whose rids
@@ -629,7 +551,7 @@ impl LazyRowIds {
         if start >= end {
             return Ok(Some(Buffer::empty()));
         }
-        let window = rids.slice(start..end).map_err(VortexRdfError::Vortex)?;
+        let window = rids.slice(start..end)?;
         Ok(Some(sorted_row_ids(window)?))
     }
 
@@ -656,22 +578,11 @@ impl LazyRowIds {
         }
         let ids = match &self.source {
             LazyRowIdSource::Component { rids, .. } => sorted_row_ids(rids.clone())?,
-            LazyRowIdSource::IndexChild {
-                reader,
-                constraints,
-                rid_column,
-                memo,
-                scope,
-            } => scan_index_row_ids(reader.clone(), constraints, rid_column, memo, scope).await?,
-            LazyRowIdSource::LocatedRun {
-                file,
-                component,
-                reader,
-                rid_column,
-                range,
-                scope,
-            } => {
-                read_located_rids(file, component, reader, rid_column, range.clone(), scope).await?
+            LazyRowIdSource::IndexChild { child, constraints } => {
+                scan_index_row_ids(child, constraints).await?
+            }
+            LazyRowIdSource::LocatedRun { file, child, range } => {
+                read_located_rids(file, child, range.clone()).await?
             }
         };
         Ok(self.cell.get_or_init(|| ids).clone())
@@ -680,7 +591,9 @@ impl LazyRowIds {
     /// The ids, computing (and caching) them on first call — the synchronous
     /// form for in-memory sources (a file child's ids take I/O, and every
     /// consumer of a file view's selection is already async; see
-    /// [`materialized_async`](Self::materialized_async)).
+    /// [`materialized_async`](Self::materialized_async)). A file child's ids
+    /// that `materialized_async` has already read are returned from the
+    /// cache, which is how the file match folds them.
     pub(crate) fn materialized(&self) -> Result<Buffer<RowId>> {
         if let Some(ids) = self.cell.get() {
             return Ok(ids.clone());
@@ -696,59 +609,6 @@ impl LazyRowIds {
     }
 }
 
-/// Binary-search a component's sorted `column` for the `[lo, hi)` run of rows
-/// equal to `native`, searched `within` a row range whose slice of the column
-/// is itself sorted (the whole component, or a lead run for a prefix probe) —
-/// the probe step shared by the in-memory resolvers.
-///
-/// `None` when the column is missing or the probe can't cast to its dtype
-/// (the resolver declines and the store falls back to a mask scan); an empty
-/// range when the probed term is absent from the data.
-fn sorted_probe_run(
-    rows: &StructArray,
-    column: &'static str,
-    native: &Scalar,
-    within: Range<usize>,
-) -> Result<Option<Range<usize>>> {
-    use crate::store::array::search_sorted_bounds;
-
-    let Ok(col) = rows.unmasked_field_by_name(column) else {
-        return Ok(None);
-    };
-    let Ok(scalar) = native.cast(col.dtype()) else {
-        return Ok(None);
-    };
-    let run = col.slice(within.clone()).map_err(VortexRdfError::Vortex)?;
-    let (lo, hi) = search_sorted_bounds(&run, &scalar)?;
-    Ok(Some(within.start + lo..within.start + hi))
-}
-
-/// [`sorted_probe_run`] through a component's cached probe when its column
-/// resolves one (skipping the per-call slice + encoding-tree walk): a full
-/// search on the whole column, or a windowed search inside a lead run —
-/// window-only, exactly like the slice-then-search path. String-valued
-/// components (whose probe scalars are not integers) and probe-declined
-/// encodings fall back to the per-call search.
-fn component_probe_run(
-    component: &IndexComponent,
-    column: &'static str,
-    native: &Scalar,
-    within: Option<Range<usize>>,
-) -> Result<Option<Range<usize>>> {
-    if let Some(owned) = component.probe(column)
-        && let Ok(needle) = u64::try_from(native)
-    {
-        let (lo, hi) = match within {
-            None => owned.bounds(needle),
-            Some(range) => owned.bounds_in(range, needle),
-        };
-        return Ok(Some(lo..hi));
-    }
-    let rows = component.rows()?;
-    let within = within.unwrap_or(0..rows.len());
-    sorted_probe_run(rows, column, native, within)
-}
-
 /// Resolve the pattern against the configured indexes over an in-memory array,
 /// returning the first index whose outcome isn't `Declined` (indexes are tried
 /// in declaration = preference order). `Declined` when none apply, so the store
@@ -761,7 +621,10 @@ pub(crate) fn resolve_indexes_in_memory(
     codes: &mut PatternCodes,
 ) -> Result<IndexResolution<InMemoryServePlan>> {
     for index in indexes {
-        match index.resolve_in_memory(components, layout, pattern, codes)? {
+        let Some(probe) = index.choose(pattern, layout) else {
+            continue;
+        };
+        match resolve::resolve_in_memory(probe, components, codes)? {
             IndexResolution::Declined => continue,
             resolved => return Ok(resolved),
         }
@@ -779,13 +642,16 @@ pub(crate) fn resolve_indexes_in_memory(
 #[cfg(feature = "file-io")]
 pub(crate) async fn resolve_indexes_file(
     indexes: &[IndexType],
-    file: &Arc<crate::store::native_file::NativeStoreFile>,
+    file: &Arc<crate::store::persist::native_file::NativeStoreFile>,
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
 ) -> Result<IndexResolution<FileServePlan>> {
     for index in indexes {
-        match index.resolve_file(file, layout, pattern, codes).await? {
+        let Some(probe) = index.choose(pattern, layout) else {
+            continue;
+        };
+        match file::resolve_file(probe, file, codes).await? {
             IndexResolution::Declined => continue,
             resolved => return Ok(resolved),
         }
@@ -827,7 +693,7 @@ mod tests {
             for identity in index.component_identities() {
                 let known = known_component(identity.slug).expect("declared slug is known");
                 assert_eq!(known.index, index);
-                assert_eq!(known.identity.name, identity.name);
+                assert_eq!(known.name, identity.name);
             }
         }
 

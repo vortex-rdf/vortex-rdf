@@ -2,8 +2,9 @@
 //! built or serialized from.
 //!
 //! This hub owns everything the two pipelines share — the
-//! [`VortexArrayBuilder`] contract and its two products ([`BuiltArray`],
-//! [`BuiltStream`]), primary chunk assembly, the sortedness stamps a build is
+//! [`VortexArrayBuilder`] contract and its products ([`BuiltArray`], and the
+//! crate-private `BuiltStream` the file writer consumes), the primary chunk
+//! build ([`build_struct_array`]), the sortedness stamps a build is
 //! allowed to claim, and the globally-sorted index emission
 //! ([`build_components`]). A leaf (`sorted_in_memory`, `sorted_stream`)
 //! contributes only its memory profile; `spill` backs the out-of-core one.
@@ -41,15 +42,12 @@
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-use crate::store::array::chunked_or_single;
 use crate::store::array::stamp_is_sorted;
 use crate::store::indexes::{
-    IndexComponent, IndexType, Indexes, check_indexed_rows, secondary_by_copy,
-    secondary_by_reference, unique_indexes,
+    IndexComponent, IndexType, Indexes, check_indexed_rows, copy, reference, unique_indexes,
 };
-use crate::store::layouts::LayoutStrategy;
 use crate::store::layouts::dictionary::{QuadCodes, TermDictionary};
+use crate::store::layouts::{LayoutStrategy, dictionary};
 use futures::{Stream, stream};
 use std::future::Future;
 use std::sync::Arc;
@@ -63,16 +61,8 @@ pub(crate) const DEFAULT_CHUNK_ROWS: usize = 100_000;
 
 /// A stream of StructArray chunks ready for consumption by the Vortex file
 /// writer. Items use `VortexResult` because the writer polls the stream
-/// directly; builder errors are converted via `into_vortex_error`.
-pub type ChunkStream = stream::BoxStream<'static, vortex_error::VortexResult<ArrayRef>>;
-
-/// Convert a builder error into a `VortexError` for use inside a [`ChunkStream`].
-fn into_vortex_error(e: VortexRdfError) -> vortex_error::VortexError {
-    match e {
-        VortexRdfError::Vortex(v) => v,
-        other => vortex_error::vortex_err!("{}", other),
-    }
-}
+/// directly; builder errors are converted through the `From<VortexRdfError> for VortexError` impl.
+pub(crate) type ChunkStream = stream::BoxStream<'static, vortex_error::VortexResult<ArrayRef>>;
 
 /// A built dataset: the quad array plus whatever layout state cannot be
 /// derived from the array alone — for the Dictionary layout, its term
@@ -99,7 +89,7 @@ pub struct BuiltArray {
 /// stream of primary-only quad chunks, the index children riding beside it as
 /// writable components, and the dictionary the serializer writes as the
 /// `dictionary` child.
-pub struct BuiltStream {
+pub(crate) struct BuiltStream {
     /// The schema dtype shared by every chunk.
     pub dtype: DType,
     /// The lazy stream of primary-only quad chunks.
@@ -108,7 +98,7 @@ pub struct BuiltStream {
     pub(crate) components: Vec<crate::io::container::NativeComponentWrite>,
     /// Whether the chunks are in global `(s, p, o, g)` order; written as the
     /// root's `quads_sorted` (see `WireMetadata::quads_sorted`).
-    // Read by the serializer (`io::ser`), which is compiled in under
+    // Read by the serializer (`io::write`), which is compiled in under
     // `file-io` and on wasm32.
     #[cfg_attr(
         not(any(feature = "file-io", target_arch = "wasm32")),
@@ -131,6 +121,8 @@ pub(crate) mod sorted_in_memory;
 pub(crate) mod sorted_stream;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod spill;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) mod stream_indexes;
 
 pub use sorted_in_memory::SortedInMemoryBuilder;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -138,10 +130,10 @@ pub use sorted_stream::SortedStreamBuilder;
 
 /// A build pipeline from a quad stream to store parts:
 /// [`build_vortex_array`](Self::build_vortex_array) materializes the dataset
-/// (for [`VortexRdfStore::from_built`](crate::VortexRdfStore::from_built)),
-/// [`build_vortex_stream`](Self::build_vortex_stream) emits it lazily for the
-/// file writer. Both sort globally by (s, p, o, g); which implementation
-/// exists is decided by the target (see the module doc).
+/// (for [`VortexRdfStore::from_built`](crate::VortexRdfStore::from_built)).
+/// Both implementations sort globally by (s, p, o, g); which one exists is
+/// decided by the target (see the module doc). The lazy chunk stream for the
+/// file writer is [`SortedStreamBuilder`]'s alone.
 ///
 /// The input quads must be canonical (from [`RawQuad::from_quad`], the parser
 /// or [`RawQuad::canonical`]): a builder interns and compares the spelling it
@@ -155,16 +147,6 @@ pub trait VortexArrayBuilder {
         layout: LayoutStrategy,
         indexes: Indexes,
     ) -> impl Future<Output = Result<BuiltArray>> + Send;
-
-    /// Produce the schema dtype and a lazily-evaluated stream of StructArray
-    /// chunks, for feeding directly into the Vortex file writer, so that
-    /// writing a file needs only O(chunk) memory for the column arrays
-    /// instead of O(dataset).
-    fn build_vortex_stream(
-        quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
-        layout: LayoutStrategy,
-        indexes: Indexes,
-    ) -> impl Future<Output = Result<BuiltStream>> + Send;
 }
 
 /// Build one StructArray chunk of primary quad columns for the given layout.
@@ -172,7 +154,10 @@ pub trait VortexArrayBuilder {
 /// the quad rows (see [`build_components`]).
 ///
 /// The layout-specific column logic lives in [`crate::store::layouts`]; this
-/// function only orchestrates it.
+/// function only orchestrates it. An empty `quads` builds every layout's
+/// empty chunk, the Dictionary layout's being [`dictionary::empty_struct`]
+/// (unstamped: nothing to sort); a non-empty Dictionary chunk needs the
+/// dictionary's codes ([`dictionary::build_chunk`]).
 ///
 /// `s_sorted` must be `true` only when `quads` is sorted by subject: it stamps
 /// the `IsSorted` statistic on the `s` column, which enables the binary-search
@@ -183,6 +168,9 @@ pub(crate) fn build_struct_array(
     layout: LayoutStrategy,
     s_sorted: bool,
 ) -> Result<ArrayRef> {
+    if layout == LayoutStrategy::Dictionary && quads.is_empty() {
+        return dictionary::empty_struct();
+    }
     let field_names = layout.field_names();
     let field_arrays = layout.build_columns(quads)?;
 
@@ -205,8 +193,8 @@ pub(crate) fn build_struct_array(
 /// dataset, handed on as persisted children by
 /// [`into_components`](Self::into_components).
 struct GlobalIndexes {
-    by_copy: Option<secondary_by_copy::GlobalCopyArrays>,
-    by_reference: Option<secondary_by_reference::GlobalReferenceArrays>,
+    by_copy: Option<copy::GlobalCopyArrays>,
+    by_reference: Option<reference::GlobalReferenceArrays>,
 }
 
 impl GlobalIndexes {
@@ -215,8 +203,8 @@ impl GlobalIndexes {
     /// when that family is requested.
     fn build(
         indexes: &[IndexType],
-        copy: impl FnOnce() -> secondary_by_copy::GlobalCopyArrays,
-        reference: impl FnOnce() -> secondary_by_reference::GlobalReferenceArrays,
+        copy: impl FnOnce() -> copy::GlobalCopyArrays,
+        reference: impl FnOnce() -> reference::GlobalReferenceArrays,
     ) -> Self {
         let unique = unique_indexes(indexes);
         Self {
@@ -254,8 +242,8 @@ pub(crate) fn build_components(
     }
     GlobalIndexes::build(
         indexes,
-        || secondary_by_copy::GlobalCopyArrays::from_quads(quads),
-        || secondary_by_reference::GlobalReferenceArrays::from_quads(quads),
+        || copy::GlobalCopyArrays::from_quads(quads),
+        || reference::GlobalReferenceArrays::from_quads(quads),
     )
     .into_components()
 }
@@ -273,22 +261,22 @@ pub(crate) fn build_components_from_codes(
     }
     GlobalIndexes::build(
         indexes,
-        || secondary_by_copy::GlobalCopyArrays::from_codes(codes),
-        || secondary_by_reference::GlobalReferenceArrays::from_codes(codes),
+        || copy::GlobalCopyArrays::from_codes(codes),
+        || reference::GlobalReferenceArrays::from_codes(codes),
     )
     .into_components()
 }
 
-/// The parts of a store rebuilt from raw quads under `strategy`: the primary
-/// rows, the requested indexes' components over them, and — under the
-/// Dictionary layout — the fresh term dictionary the rows' codes address.
-/// The rebuild every compaction and every mutated store's serialization run.
+/// A store's parts rebuilt from raw quads under `strategy`: the primary rows,
+/// the requested indexes' components over them, and — under the Dictionary
+/// layout — the fresh term dictionary the rows' codes address. The rebuild
+/// every compaction and every mutated store's serialization run.
 ///
 /// The Dictionary layout derives its dictionary from `raws`; an empty set
-/// still yields the components (over empty codes), so the index roster and
-/// its code dtypes survive. `sorted` must be `true` only when `raws` is
-/// SPOG-sorted: it stamps the `s` column. The components are globally
-/// sorted whatever the row order.
+/// yields an empty dictionary and the components over empty codes, so the
+/// index roster and its code dtypes survive. `sorted` must be `true` only
+/// when `raws` is SPOG-sorted: it stamps the `s` column. The components are
+/// globally sorted whatever the row order.
 ///
 /// Like every builder this keeps the rows it is given and numbers the index
 /// children by them, so a caller that sorts them (`sorted`) drops the
@@ -298,54 +286,25 @@ pub(crate) fn build_parts_from_raws(
     strategy: LayoutStrategy,
     indexes: &[IndexType],
     sorted: bool,
-) -> Result<(ArrayRef, Vec<IndexComponent>, Option<Arc<TermDictionary>>)> {
-    use crate::store::layouts::dictionary;
+) -> Result<BuiltArray> {
     debug_assert!(
         !sorted || raws.windows(2).all(|pair| pair[0] < pair[1]),
         "sorted rows must ascend with each quad once"
     );
     match strategy {
-        LayoutStrategy::Dictionary if raws.is_empty() => Ok((
-            dictionary::empty_struct()?,
-            build_components_from_codes(indexes, &QuadCodes::empty())?,
-            Some(Arc::new(TermDictionary::empty())),
-        )),
         LayoutStrategy::Dictionary => {
             let (dict, code_map) = TermDictionary::from_quads_with_map(raws)?;
             let codes = dictionary::encode_quads(raws, &code_map)?;
-            let primary = dictionary::build_code_chunk(&codes, 0..raws.len(), sorted)?;
-            let components = build_components_from_codes(indexes, &codes)?;
-            Ok((primary, components, Some(Arc::new(dict))))
+            Ok(BuiltArray {
+                array: dictionary::build_code_chunk(&codes, 0..raws.len(), sorted)?,
+                components: build_components_from_codes(indexes, &codes)?,
+                dict: Some(Arc::new(dict)),
+            })
         }
-        strategy => {
-            let primary = build_struct_array(raws, strategy, sorted)?;
-            let components = build_components(indexes, raws)?;
-            Ok((primary, components, None))
-        }
+        strategy => Ok(BuiltArray {
+            array: build_struct_array(raws, strategy, sorted)?,
+            components: build_components(indexes, raws)?,
+            dict: None,
+        }),
     }
-}
-
-/// Assemble a builder's per-chunk StructArrays into a single ArrayRef. Every
-/// build emits at least one (possibly empty) chunk, so `chunks` carries the
-/// schema; an empty list is a caller bug.
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) fn assemble_chunks(chunks: Vec<ArrayRef>) -> Result<ArrayRef> {
-    let dtype = chunks
-        .first()
-        .ok_or_else(|| {
-            VortexRdfError::InvalidOperation("assemble_chunks: no chunks to assemble".to_string())
-        })?
-        .dtype()
-        .clone();
-    chunked_or_single(chunks, dtype)
-}
-
-/// An empty StructArray with the given layout's primary schema. Building from
-/// an empty quad slice yields every column empty but with the correct dtype,
-/// so this is just the regular build path with no rows.
-fn make_empty_struct(layout: LayoutStrategy) -> Result<ArrayRef> {
-    if layout == LayoutStrategy::Dictionary {
-        return crate::store::layouts::dictionary::empty_struct();
-    }
-    build_struct_array(&[], layout, false)
 }

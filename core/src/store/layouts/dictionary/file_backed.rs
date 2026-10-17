@@ -11,9 +11,9 @@
 //! of a child written without them (chunks of uneven length have no uniform
 //! zone to record) — and the kind ranges. A child whose shape a window
 //! search cannot address is not file-backed at all:
-//! [`store::open`](crate::store::open) lifts it resident instead. The policy
+//! [`store::persist::open`](crate::store::persist::open) lifts it resident instead. The policy
 //! enum choosing between this and the resident form is
-//! [`DictAccess`](super::access::DictAccess); the module only compiles with
+//! [`DictAccess`](super::handles::DictAccess); the module only compiles with
 //! `file-io`, since without a file there is nothing to leave the terms in.
 
 use std::cmp::Ordering;
@@ -34,20 +34,19 @@ use vortex_layout::layouts::zoned::Zoned;
 use vortex_layout::segments::SegmentSource;
 use vortex_layout::{LayoutChildType, LayoutRef};
 
-use crate::common::terms::canonical_spelling;
 use crate::error::{Result, VortexRdfError};
 use crate::io::container::DICT_COMPONENT_NAME;
 use crate::io::read::available_parallelism;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::StrColReader;
-use crate::store::native_file::NativeStoreFile;
+use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::schema::TermCode;
 
-use super::check_code;
-use super::predicates::{KindRanges, TermPredicate, Verdict};
+use super::predicates::{KindRanges, TermPredicate};
+use super::storage::{COL_DICT_TERM, TermChunk, chunk_of, window_bound_aggregates};
 use super::term_dict::{
-    COL_DICT_TERM, TermChunk, TermDictionary, check_candidates, chunk_of, code_rank,
-    prefix_successor, rank_code, split_verdicts, window_bound_aggregates,
+    CodeSpace, TermDictionary, check_candidates, check_code, find_by, kind_verdicts,
+    lower_bound_by, prefix_range_from, prefix_successor, split_verdicts, tolerant_fallback,
 };
 
 /// A window's first and last term.
@@ -162,14 +161,18 @@ impl WindowCache {
 /// What a [`FileBackedDict`] holds: the child's layout metadata, the
 /// per-window bounds and the bounded cache of rebuilt windows.
 struct Windows {
+    /// The identity of this dictionary (see
+    /// [`DictReader::dictionary_id`](crate::DictReader::dictionary_id)): one
+    /// per open, shared by every clone of the handle.
+    id: u64,
     /// The dictionary child's layout reader, for the transient whole-column
     /// lift (serialization, compaction).
     reader: vortex_layout::LayoutReaderRef,
     windows: Vec<Window>,
     /// `starts[i]` = `windows[i].start`, ascending (for [`chunk_of`]).
     starts: Vec<usize>,
-    /// Number of terms.
-    len: usize,
+    /// The terms' codes.
+    code_space: CodeSpace,
     /// Where the leaves' segments are read from — over a mapped file, the map.
     source: Arc<dyn SegmentSource>,
     /// The kind ranges (three code ranges and the default graph's code),
@@ -186,35 +189,21 @@ struct Windows {
     /// read to pin that a call asks for no window at all.
     #[cfg(test)]
     requested: std::sync::atomic::AtomicUsize,
-    /// The code of the first term (see `term_dict::code_base`).
+    /// Whole-dictionary lifts since open — what the tests read to pin that a
+    /// read lifts no dictionary at all.
     #[cfg(test)]
-    base: TermCode,
+    lifted: std::sync::atomic::AtomicUsize,
 }
 
 impl Windows {
-    /// The code of the first term: 0 outside the tests' code-base hook.
-    #[inline]
-    fn base(&self) -> TermCode {
-        #[cfg(test)]
-        {
-            self.base
-        }
-        #[cfg(not(test))]
-        {
-            0
-        }
-    }
-
-    /// The rank of `code`, or `None` when no term has that code.
-    #[inline]
-    fn rank_of(&self, code: TermCode) -> Option<usize> {
-        code_rank(code, self.base(), self.len)
-    }
-
-    /// The code of the term at `rank`.
-    #[inline]
-    fn code_at(&self, rank: usize) -> TermCode {
-        rank_code(rank, self.base())
+    /// The window holding `needle`'s lower bound: the first whose last term
+    /// is not below `needle`, with its index — `None` when every term is
+    /// below `needle`.
+    fn locate(&self, needle: &[u8]) -> Option<(usize, &Window)> {
+        let w = self
+            .windows
+            .partition_point(|window| &*window.last < needle);
+        self.windows.get(w).map(|window| (w, window))
     }
 
     /// The cache's guard. Every entry is complete when it is inserted, so a
@@ -267,16 +256,10 @@ impl FileBackedDict {
 
     /// [`open`](Self::open) with a window cache of `budget` bytes.
     async fn open_with_budget(native: &NativeStoreFile, budget: usize) -> Result<Option<Self>> {
-        let Some((_, reader)) = native
-            .component_reader(DICT_COMPONENT_NAME)
-            .map_err(VortexRdfError::Vortex)?
-        else {
+        let Some((_, reader)) = native.component_reader(DICT_COMPONENT_NAME)? else {
             return Ok(None);
         };
-        let Some(child) = native
-            .component_layout(DICT_COMPONENT_NAME)
-            .map_err(VortexRdfError::Vortex)?
-        else {
+        let Some(child) = native.component_layout(DICT_COMPONENT_NAME)? else {
             return Ok(None);
         };
         let Some((leaves, zones)) = term_column(&child) else {
@@ -313,10 +296,11 @@ impl FileBackedDict {
             start += rows;
         }
         Ok(Some(Self(Arc::new(Windows {
+            id: super::term_dict::next_dictionary_id(),
             reader,
             windows,
             starts,
-            len: start,
+            code_space: CodeSpace::new(start),
             source,
             kinds: OnceLock::new(),
             cache: Mutex::new(WindowCache::new(budget)),
@@ -325,80 +309,67 @@ impl FileBackedDict {
             #[cfg(test)]
             requested: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
-            base: super::term_dict::code_base(),
+            lifted: std::sync::atomic::AtomicUsize::new(0),
         }))))
+    }
+
+    /// This dictionary's identity.
+    pub(crate) fn id(&self) -> u64 {
+        self.0.id
     }
 
     /// Number of terms.
     pub(crate) fn len(&self) -> usize {
-        self.0.len
+        self.0.code_space.len()
     }
 
-    /// Term → code: the window whose bounds enclose `term`, then a binary
-    /// search of that one window (through the window cache) — none at all
-    /// for a window's first or last term, or a term falling between two
-    /// windows.
-    pub(crate) async fn encode(&self, term: &str) -> Result<Option<TermCode>> {
+    /// Term → code, exactly as spelled: the window whose bounds enclose
+    /// `term`, then a binary search of the inside of that one window (through
+    /// the window cache) — none at all for a window's first or last term, or
+    /// a term falling between two windows.
+    pub(crate) async fn encode_exact(&self, term: &str) -> Result<Option<TermCode>> {
         let inner = &*self.0;
         let needle = term.as_bytes();
-        let w = inner
-            .windows
-            .partition_point(|window| &*window.last < needle);
-        let Some(window) = inner.windows.get(w) else {
+        let Some((w, window)) = inner.locate(needle) else {
             return Ok(None);
         };
+        let code_at = |local: usize| inner.code_space.code_at(window.start + local);
         match needle.cmp(&*window.first) {
             Ordering::Less => return Ok(None),
-            Ordering::Equal => return Ok(Some(inner.code_at(window.start))),
+            Ordering::Equal => return Ok(Some(code_at(0))),
             Ordering::Greater => {}
         }
         if needle == &*window.last {
-            return Ok(Some(inner.code_at(window.start + window.rows - 1)));
+            return Ok(Some(code_at(window.rows - 1)));
         }
+        // first < needle < last: a hit lies strictly inside.
         let chunk = inner.window_chunk(w).await?;
         let mut cursor = chunk.cursor();
-        let (mut lo, mut hi) = (1, window.rows - 1);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            match cursor.bytes_at(mid).cmp(needle) {
-                Ordering::Less => lo = mid + 1,
-                Ordering::Equal => return Ok(Some(inner.code_at(window.start + mid))),
-                Ordering::Greater => hi = mid,
-            }
-        }
-        Ok(None)
+        Ok(find_by(1..window.rows - 1, |local| {
+            cursor.bytes_at(local).cmp(needle)
+        })
+        .map(code_at))
     }
 
     /// The code of the first term not below `needle` in byte order (the
     /// term count when every term is below it).
     pub(crate) async fn lower_bound(&self, needle: &[u8]) -> Result<TermCode> {
         let inner = &*self.0;
-        let w = inner
-            .windows
-            .partition_point(|window| &*window.last < needle);
-        let Some(window) = inner.windows.get(w) else {
-            return Ok(inner.code_at(inner.len));
+        let Some((w, window)) = inner.locate(needle) else {
+            return Ok(inner.code_space.code_end());
         };
         if needle <= &*window.first {
-            return Ok(inner.code_at(window.start));
+            return Ok(inner.code_space.code_at(window.start));
         }
         // first < needle <= last: the bound lies inside, past the first term.
         let chunk = inner.window_chunk(w).await?;
         let mut cursor = chunk.cursor();
-        let (mut lo, mut hi) = (1, window.rows - 1);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if cursor.bytes_at(mid) < needle {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        Ok(inner.code_at(window.start + lo))
+        let local = lower_bound_by(1..window.rows - 1, |local| cursor.bytes_at(local) < needle);
+        Ok(inner.code_space.code_at(window.start + local))
     }
 
     /// Visit the terms of `codes` (strictly ascending and inside the
-    /// dictionary, else an `InvalidOperation` error before any window is
+    /// dictionary, else an `InvalidInput` error before any window is
     /// read) in order: per window holding any of them, one cached chunk and
     /// one cursor, which decompresses only the asked rows. `visit` gets each
     /// code's position in `codes` and its term, trusted to be UTF-8 as the
@@ -406,18 +377,18 @@ impl FileBackedDict {
     async fn visit_terms(
         &self,
         codes: &[TermCode],
-        mut visit: impl FnMut(usize, Result<&str>),
+        mut visit: impl FnMut(usize, &str),
     ) -> Result<()> {
         // Each window's run is found by a partition point, so a list out of
         // order would leave a code before its window's start (wrapping
         // `rank - window.start`) or a run of nothing (a loop that never
         // advances).
         let inner = &*self.0;
-        check_candidates(codes, inner.base(), inner.len)?;
+        check_candidates(codes, inner.code_space)?;
         // Every candidate is inside the dictionary (checked above), so its
         // offset from the first code is a rank below the term count: exact
         // as a `usize`.
-        let base = inner.base();
+        let base = inner.code_space.base();
         let rank = |code: TermCode| (code - base) as usize;
         let mut at = 0;
         while at < codes.len() {
@@ -449,20 +420,11 @@ impl FileBackedDict {
         let Some(&max) = codes.last() else {
             return Ok(Vec::new());
         };
-        check_code(max, self.0.base(), self.len())?;
+        check_code(max, self.0.code_space)?;
         let mut terms = Vec::with_capacity(codes.len());
-        let mut failure = None;
-        self.visit_terms(codes, |_, term| match term {
-            Ok(term) => terms.push(Arc::from(term)),
-            Err(e) => {
-                failure.get_or_insert(e);
-            }
-        })
-        .await?;
-        match failure {
-            Some(e) => Err(e),
-            None => Ok(terms),
-        }
+        self.visit_terms(codes, |_, term| terms.push(Arc::from(term)))
+            .await?;
+        Ok(terms)
     }
 
     /// Code → term for `codes` in any order, repeats allowed, handed to
@@ -480,7 +442,7 @@ impl FileBackedDict {
     ) -> Result<()> {
         let mut sorted: Vec<(TermCode, usize)> = Vec::with_capacity(codes.len());
         for (i, &code) in codes.iter().enumerate() {
-            if self.0.rank_of(code).is_some() {
+            if self.0.code_space.rank_of(code).is_some() {
                 sorted.push((code, i));
             } else {
                 visit(i, None);
@@ -489,45 +451,29 @@ impl FileBackedDict {
         sorted.sort_unstable();
         let groups: Vec<&[(TermCode, usize)]> = sorted.chunk_by(|a, b| a.0 == b.0).collect();
         let distinct: Vec<TermCode> = groups.iter().map(|group| group[0].0).collect();
-        let mut failure = None;
-        self.visit_terms(&distinct, |j, term| match term {
-            Ok(term) => {
-                for &(_, i) in groups[j] {
-                    visit(i, Some(term));
-                }
-            }
-            Err(e) => {
-                failure.get_or_insert(e);
+        self.visit_terms(&distinct, |j, term| {
+            for &(_, i) in groups[j] {
+                visit(i, Some(term));
             }
         })
-        .await?;
-        failure.map_or(Ok(()), Err)
+        .await
     }
 
-    /// [`decode_many_with`](Self::decode_many_with) collected: one owned
-    /// string per decoded position.
-    pub(crate) async fn decode_many_any(&self, codes: &[TermCode]) -> Result<Vec<Option<String>>> {
-        let mut terms = vec![None; codes.len()];
-        self.decode_many_with(codes, |i, term| terms[i] = term.map(str::to_owned))
-            .await?;
-        Ok(terms)
-    }
-
-    /// The async twin of `TermDictionary::encode_tolerant`.
-    pub(crate) async fn encode_tolerant(&self, term: &str) -> Result<Option<TermCode>> {
-        if let Some(code) = self.encode(term).await? {
+    /// The async twin of `TermDictionary::encode`: tolerant of spelling, the
+    /// exact lookup first.
+    pub(crate) async fn encode(&self, term: &str) -> Result<Option<TermCode>> {
+        if let Some(code) = self.encode_exact(term).await? {
             return Ok(Some(code));
         }
-        let canonical = canonical_spelling(term)?;
-        if canonical == term {
-            return Ok(None);
+        match tolerant_fallback(term)? {
+            Some(canonical) => self.encode_exact(&canonical).await,
+            None => Ok(None),
         }
-        self.encode(&canonical).await
     }
 
-    /// [`encode_tolerant`](Self::encode_tolerant) over a batch, in order.
+    /// [`encode`](Self::encode) over a batch, in order.
     pub(crate) async fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<TermCode>>> {
-        futures::stream::iter(terms.iter().map(|term| self.encode_tolerant(term)))
+        futures::stream::iter(terms.iter().map(|term| self.encode(term)))
             .buffered(available_parallelism().max(4))
             .try_collect()
             .await
@@ -537,10 +483,10 @@ impl FileBackedDict {
     pub(crate) async fn prefix_range(&self, prefix: &str) -> Result<Range<TermCode>> {
         let lo = self.lower_bound(prefix.as_bytes()).await?;
         let hi = match prefix_successor(prefix.as_bytes()) {
-            Some(successor) => self.lower_bound(&successor).await?,
-            None => self.0.code_at(self.len()),
+            Some(successor) => Some(self.lower_bound(&successor).await?),
+            None => None,
         };
-        Ok(lo..hi.max(lo))
+        Ok(prefix_range_from(lo, hi, self.0.code_space.code_end()))
     }
 
     /// The kind ranges, computed once per handle (a few window searches;
@@ -549,20 +495,20 @@ impl FileBackedDict {
         if let Some(kinds) = self.0.kinds.get() {
             return Ok(kinds.clone());
         }
-        let default_graph = self
+        let code_space = self.0.code_space;
+        let first_is_empty = self
             .0
             .windows
             .first()
-            .filter(|window| window.first.is_empty())
-            .map(|_| self.0.code_at(0));
-        let kinds = KindRanges {
-            start: self.0.base(),
-            default_graph,
-            literals: self.prefix_range("\"").await?,
-            iris: self.prefix_range("<").await?,
-            blanks: self.prefix_range("_:").await?,
-            len: self.0.code_at(self.len()),
-        };
+            .is_some_and(|window| window.first.is_empty());
+        let kinds = KindRanges::new(
+            code_space.base(),
+            first_is_empty,
+            self.prefix_range("\"").await?,
+            self.prefix_range("<").await?,
+            self.prefix_range("_:").await?,
+            code_space.code_end(),
+        );
         Ok(self.0.kinds.get_or_init(|| kinds).clone())
     }
 
@@ -575,26 +521,12 @@ impl FileBackedDict {
         predicate: &TermPredicate,
         codes: &[TermCode],
     ) -> Result<(Buffer<TermCode>, Buffer<TermCode>)> {
-        check_candidates(codes, self.0.base(), self.len())?;
+        check_candidates(codes, self.0.code_space)?;
         let kinds = self.kind_ranges().await?;
-        // Undecided until a verdict is set: a candidate no branch below reaches
-        // stays undecided rather than silently failing.
-        let mut verdicts = vec![Verdict::Unknown; codes.len()];
-        let (mut read_at, mut read) = (Vec::new(), Vec::new());
-        for (i, &code) in codes.iter().enumerate() {
-            match predicate.kind_verdict(kinds.kind_of_code(code)) {
-                Some(verdict) => verdicts[i] = verdict,
-                None => {
-                    read_at.push(i);
-                    read.push(code);
-                }
-            }
-        }
+        let (mut verdicts, read_at) = kind_verdicts(predicate, &kinds, codes);
+        let read: Vec<TermCode> = read_at.iter().map(|&at| codes[at]).collect();
         self.visit_terms(&read, |j, spelling| {
-            verdicts[read_at[j]] = match spelling {
-                Ok(spelling) => predicate.eval(spelling),
-                Err(_) => Verdict::Unknown,
-            };
+            verdicts[read_at[j]] = predicate.eval(spelling);
         })
         .await?;
         Ok(split_verdicts(codes, &verdicts))
@@ -603,8 +535,12 @@ impl FileBackedDict {
     /// Lift the whole dictionary resident — the transient full-column read
     /// behind [`DictAccess::ensure_resident`].
     ///
-    /// [`DictAccess::ensure_resident`]: super::access::DictAccess::ensure_resident
+    /// [`DictAccess::ensure_resident`]: super::handles::DictAccess::ensure_resident
     pub(crate) async fn lift_resident(&self) -> Result<TermDictionary> {
+        #[cfg(test)]
+        self.0
+            .lifted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TermDictionary::from_child_reader(self.0.reader.clone()).await
     }
 
@@ -620,10 +556,23 @@ impl FileBackedDict {
         self.0.windows.len()
     }
 
+    /// The rank of each window's first term, ascending.
+    #[cfg(test)]
+    pub(crate) fn debug_window_starts(&self) -> Vec<usize> {
+        self.0.starts.clone()
+    }
+
     /// Windows asked for since the handle opened, from the cache or not.
     #[cfg(test)]
     pub(crate) fn debug_windows_requested(&self) -> usize {
         self.0.requested.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whole-dictionary lifts ([`lift_resident`](Self::lift_resident)) since
+    /// the handle opened.
+    #[cfg(test)]
+    pub(crate) fn debug_lifts(&self) -> usize {
+        self.0.lifted.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// What the window cache's windows are charged.
@@ -749,20 +698,15 @@ async fn zone_bounds(
         return Ok(None);
     }
     let windows = leaves.len();
-    let reader = zones
-        .table
-        .new_reader(
-            "dictionary-zones".into(),
-            Arc::clone(source),
-            &VORTEX_SESSION,
-            &Default::default(),
-        )
-        .map_err(VortexRdfError::Vortex)?;
+    let reader = zones.table.new_reader(
+        "dictionary-zones".into(),
+        Arc::clone(source),
+        &VORTEX_SESSION,
+        &Default::default(),
+    )?;
     let table = crate::io::read::scan_all_reader(reader).await?;
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let table = table
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
+    let table = table.execute::<StructArray>(&mut ctx)?;
     let aggregates = window_bound_aggregates();
     let Some(maxes) = bound_column(&table, &aggregates[0].to_string(), &mut ctx)? else {
         return Ok(None);
@@ -787,15 +731,10 @@ fn bound_column(
     let Ok(column) = table.unmasked_field_by_name(name) else {
         return Ok(None);
     };
-    if !column.all_valid(ctx).map_err(VortexRdfError::Vortex)? {
+    if !column.all_valid(ctx)? {
         return Ok(None);
     }
-    Ok(Some(
-        column
-            .clone()
-            .execute::<VarBinViewArray>(ctx)
-            .map_err(VortexRdfError::Vortex)?,
-    ))
+    Ok(Some(column.clone().execute::<VarBinViewArray>(ctx)?))
 }
 
 /// Each window's bounds read from its own leaf — the fallback for a term
@@ -837,15 +776,11 @@ async fn rebuild_leaf(
     let flat = layout
         .as_opt::<Flat>()
         .expect("term leaves are validated flat at open");
-    let segment = source
-        .request(flat.segment_id())
-        .await
-        .map_err(VortexRdfError::Vortex)?;
+    let segment = source.request(flat.segment_id()).await?;
     let parts = match flat.array_tree().cloned() {
         Some(tree) => SerializedArray::from_flatbuffer_and_segment(tree, segment),
         None => SerializedArray::try_from(segment),
-    }
-    .map_err(VortexRdfError::Vortex)?;
+    }?;
     parts
         .decode(flat.dtype(), rows, flat.array_ctx(), &VORTEX_SESSION)
         .map_err(VortexRdfError::Vortex)
@@ -891,6 +826,11 @@ mod tests {
         (fbd, terms)
     }
 
+    /// The public handle on `fbd`, which shares its window cache.
+    fn reader(fbd: &FileBackedDict) -> crate::DictReader {
+        super::super::handles::DictAccess::FileBacked(fbd.clone()).reader()
+    }
+
     /// What one 100-term FSST window costs the cache: its code offsets, one
     /// `u32` per term plus one, and the per-entry overhead.
     const WINDOW_BYTES: usize = 101 * size_of::<u32>() + WINDOW_ENTRY_OVERHEAD;
@@ -899,7 +839,10 @@ mod tests {
     /// windows.
     async fn touch(fbd: &FileBackedDict, terms: &[String], w: usize) {
         let i = w * 100 + 37;
-        assert_eq!(fbd.encode(&terms[i]).await.unwrap(), Some(i as TermCode));
+        assert_eq!(
+            fbd.encode_exact(&terms[i]).await.unwrap(),
+            Some(i as TermCode)
+        );
     }
 
     /// Windows that are each sorted but out of term order across the child
@@ -944,7 +887,7 @@ mod tests {
         assert_eq!(fbd.len(), 600);
         for (i, term) in terms.iter().enumerate() {
             assert_eq!(
-                fbd.encode(term).await.unwrap(),
+                fbd.encode_exact(term).await.unwrap(),
                 Some(i as TermCode),
                 "{term}"
             );
@@ -957,7 +900,7 @@ mod tests {
                 .zip(&terms)
                 .all(|(got, want)| &**got == want.as_str())
         );
-        assert_eq!(fbd.encode("<http://zzz>").await.unwrap(), None);
+        assert_eq!(fbd.encode_exact("<http://zzz>").await.unwrap(), None);
     }
 
     /// A window's first and last term are answered from the bounds alone, an
@@ -969,17 +912,17 @@ mod tests {
         for w in 0..6 {
             let (before, asked) = (fbd.debug_windows_rebuilt(), fbd.debug_windows_requested());
             assert_eq!(
-                fbd.encode(&terms[w * 100]).await.unwrap(),
+                fbd.encode_exact(&terms[w * 100]).await.unwrap(),
                 Some((w * 100) as TermCode)
             );
             assert_eq!(
-                fbd.encode(&terms[w * 100 + 99]).await.unwrap(),
+                fbd.encode_exact(&terms[w * 100 + 99]).await.unwrap(),
                 Some((w * 100 + 99) as TermCode)
             );
             assert_eq!(fbd.debug_windows_rebuilt(), before, "window {w}'s edges");
             assert_eq!(fbd.debug_windows_requested(), asked, "window {w}'s edges");
             assert_eq!(
-                fbd.encode(&terms[w * 100 + 37]).await.unwrap(),
+                fbd.encode_exact(&terms[w * 100 + 37]).await.unwrap(),
                 Some((w * 100 + 37) as TermCode)
             );
             assert_eq!(
@@ -997,11 +940,11 @@ mod tests {
         // moves no rebuild count: the request count is what pins "no leaf".
         let (before, asked) = (fbd.debug_windows_rebuilt(), fbd.debug_windows_requested());
         let between = format!("{}~", terms[99]);
-        assert_eq!(fbd.encode(&between).await.unwrap(), None);
+        assert_eq!(fbd.encode_exact(&between).await.unwrap(), None);
         assert_eq!(fbd.lower_bound(between.as_bytes()).await.unwrap(), 100);
-        assert_eq!(fbd.encode("!").await.unwrap(), None);
+        assert_eq!(fbd.encode_exact("!").await.unwrap(), None);
         assert_eq!(fbd.lower_bound(b"!").await.unwrap(), 0);
-        assert_eq!(fbd.encode("~").await.unwrap(), None);
+        assert_eq!(fbd.encode_exact("~").await.unwrap(), None);
         assert_eq!(fbd.lower_bound(b"~").await.unwrap(), 600);
         assert_eq!(fbd.debug_windows_rebuilt(), before);
         assert_eq!(fbd.debug_windows_requested(), asked);
@@ -1034,16 +977,16 @@ mod tests {
         let (fbd, terms) = windowed_handle(600, 100).await;
         let before = fbd.debug_windows_rebuilt();
         for _ in 0..3 {
-            assert_eq!(fbd.encode(&terms[137]).await.unwrap(), Some(137));
+            assert_eq!(fbd.encode_exact(&terms[137]).await.unwrap(), Some(137));
         }
         assert_eq!(fbd.debug_windows_rebuilt() - before, 1);
-        assert_eq!(fbd.encode(&terms[142]).await.unwrap(), Some(142));
+        assert_eq!(fbd.encode_exact(&terms[142]).await.unwrap(), Some(142));
         let inside = format!("{}~", terms[150]);
         assert_eq!(fbd.lower_bound(inside.as_bytes()).await.unwrap(), 151);
         assert_eq!(fbd.debug_windows_rebuilt() - before, 1);
 
         fbd.debug_clear_cache();
-        assert_eq!(fbd.encode(&terms[137]).await.unwrap(), Some(137));
+        assert_eq!(fbd.encode_exact(&terms[137]).await.unwrap(), Some(137));
         assert_eq!(fbd.debug_windows_rebuilt() - before, 2);
     }
 
@@ -1061,7 +1004,10 @@ mod tests {
             }
         }
         assert_eq!(fbd.debug_windows_rebuilt() - before, 2);
-        let any = fbd.decode_many_any(&[450, 105, 450, 9999]).await.unwrap();
+        let any = reader(&fbd)
+            .decode_many(&[450, 105, 450, 9999])
+            .await
+            .unwrap();
         assert_eq!(any[0].as_deref(), Some(terms[450].as_str()));
         assert_eq!(any[1].as_deref(), Some(terms[105].as_str()));
         assert_eq!(any[3], None);
@@ -1108,14 +1054,14 @@ mod tests {
             let (native, d) = native_over(&terms, window).await;
             let fbd = FileBackedDict::open(&native).await.unwrap().unwrap();
             for (i, term) in terms.iter().enumerate() {
-                assert_eq!(fbd.encode(term).await.unwrap(), Some(i as TermCode));
+                assert_eq!(fbd.encode_exact(term).await.unwrap(), Some(i as TermCode));
                 assert_eq!(
                     fbd.lower_bound(term.as_bytes()).await.unwrap(),
                     i as TermCode
                 );
             }
             let past_the_longest = format!("{}~", terms[9]);
-            assert_eq!(fbd.encode(&past_the_longest).await.unwrap(), None);
+            assert_eq!(fbd.encode_exact(&past_the_longest).await.unwrap(), None);
             assert_eq!(
                 fbd.lower_bound(past_the_longest.as_bytes()).await.unwrap(),
                 d.lower_bound(past_the_longest.as_bytes())
@@ -1127,7 +1073,7 @@ mod tests {
             assert!(decoded.iter().zip(&terms).all(|(got, want)| &**got == want));
             // Any order, repeats included.
             let scattered: Vec<TermCode> = [9, 0, 5, 9, 15, 2, 1, 5, 7, 12, 3, 9].into();
-            let got = fbd.decode_many_any(&scattered).await.unwrap();
+            let got = reader(&fbd).decode_many(&scattered).await.unwrap();
             for (code, term) in scattered.iter().zip(&got) {
                 assert_eq!(term.as_deref(), Some(terms[*code as usize].as_str()));
             }
@@ -1157,7 +1103,7 @@ mod tests {
             .map(|&code| terms.get(code as usize).cloned())
             .collect();
         assert_eq!(got, want);
-        assert_eq!(fbd.decode_many_any(&codes).await.unwrap(), want);
+        assert_eq!(reader(&fbd).decode_many(&codes).await.unwrap(), want);
     }
 
     /// The cache holds at most its budget and evicts the least recently used
@@ -1306,7 +1252,10 @@ mod tests {
         assert!(60 * 5 * size_of::<u32>() < budget / 2);
         for w in 0..60 {
             let i = w * 4 + 1;
-            assert_eq!(fbd.encode(&terms[i]).await.unwrap(), Some(i as TermCode));
+            assert_eq!(
+                fbd.encode_exact(&terms[i]).await.unwrap(),
+                Some(i as TermCode)
+            );
             assert!(fbd.debug_cached_bytes() <= budget, "after window {w}");
         }
         let cached = fbd.debug_cached_windows();
@@ -1355,7 +1304,7 @@ mod tests {
             assert!(
                 matches!(
                     fbd.decode_many(&codes).await,
-                    Err(VortexRdfError::InvalidOperation(_))
+                    Err(VortexRdfError::InvalidInput(_))
                 ),
                 "{codes:?}"
             );
@@ -1479,17 +1428,24 @@ mod tests {
         assert_eq!(fbd.debug_window_count(), 4);
         // Eight edge terms (a window's first and last) read no leaf.
         for i in (0..4).flat_map(|w| [w * 100, w * 100 + 99]) {
-            assert_eq!(fbd.encode(&terms[i]).await.unwrap(), Some(i as TermCode));
+            assert_eq!(
+                fbd.encode_exact(&terms[i]).await.unwrap(),
+                Some(i as TermCode)
+            );
         }
         assert_eq!(fbd.debug_windows_rebuilt(), 0);
         // Every term finds its own code; each window is rebuilt once.
         for (i, term) in terms.iter().enumerate() {
-            assert_eq!(fbd.encode(term).await.unwrap(), Some(i as TermCode), "{i}");
+            assert_eq!(
+                fbd.encode_exact(term).await.unwrap(),
+                Some(i as TermCode),
+                "{i}"
+            );
         }
         assert_eq!(fbd.debug_windows_rebuilt(), 4);
         // A near miss — the last byte changed — is absent, not a neighbour.
         let near = format!("{}?", &terms[150][..terms[150].len() - 1]);
-        assert_eq!(fbd.encode(&near).await.unwrap(), None);
+        assert_eq!(fbd.encode_exact(&near).await.unwrap(), None);
         assert_eq!(fbd.lower_bound(near.as_bytes()).await.unwrap(), 151);
     }
 
@@ -1507,9 +1463,7 @@ mod tests {
         let bytes =
             crate::tests::write_dict_only_store_as(&d, crate::io::container::DICT_VERSION, false)
                 .await;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("unzoned-windows.vortex");
-        std::fs::write(&path, &bytes).unwrap();
+        let (_dir, path) = crate::tests::temp_store_file(&bytes);
         let native = crate::tests::open_mapped(&path).await;
         let descriptor = native
             .components()
@@ -1545,13 +1499,16 @@ mod tests {
         // The edge terms are answered from the bounds read at open.
         for code in (0..6).flat_map(|w| [w * 100, w * 100 + 99]) {
             let term = column.str_at(code).unwrap();
-            assert_eq!(fbd.encode(term).await.unwrap(), Some(code as TermCode));
+            assert_eq!(
+                fbd.encode_exact(term).await.unwrap(),
+                Some(code as TermCode)
+            );
         }
         assert_eq!(fbd.debug_windows_rebuilt(), 0);
         for code in 0..600 {
             let term = column.str_at(code).unwrap();
             assert_eq!(
-                fbd.encode(term).await.unwrap(),
+                fbd.encode_exact(term).await.unwrap(),
                 Some(code as TermCode),
                 "{term}"
             );
@@ -1563,9 +1520,11 @@ mod tests {
         for (code, term) in decoded.iter().enumerate() {
             assert_eq!(&**term, column.str_at(code).unwrap(), "code {code}");
         }
-        assert_eq!(fbd.encode("<http://zzz>").await.unwrap(), None);
+        assert_eq!(fbd.encode_exact("<http://zzz>").await.unwrap(), None);
         assert_eq!(
-            fbd.encode("<http://example.org/term/0100>~").await.unwrap(),
+            fbd.encode_exact("<http://example.org/term/0100>~")
+                .await
+                .unwrap(),
             None
         );
     }
@@ -1709,7 +1668,7 @@ mod tests {
             assert!(
                 matches!(
                     fbd.filter_codes(&predicate, &codes).await,
-                    Err(VortexRdfError::InvalidOperation(_))
+                    Err(VortexRdfError::InvalidInput(_))
                 ),
                 "{codes:?}"
             );

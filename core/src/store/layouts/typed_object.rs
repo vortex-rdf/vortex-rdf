@@ -9,22 +9,15 @@ use vortex_array::arrays::struct_::StructArray;
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 use vortex_array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 
-use crate::common::terms::{parse_graph_name, parse_named_node, parse_subject, parse_term};
+use crate::common::terms::{Trust, graph_name, named_node, subject, term};
 use crate::common::vocab::XSD_STRING;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
-use crate::store::array::{StrColReader, field_as, make_nullable_string_array, make_string_array};
-use crate::store::schema::{COL_G, COL_P, COL_S};
-
-/// The term kind tag — its presence in a schema is what marks the layout.
-pub(crate) const COL_O_KIND: &str = "o_kind";
-/// The object's lexical value: IRI string, blank node id, or literal value.
-pub(crate) const COL_O_VALUE: &str = "o_value";
-/// The literal datatype IRI — null unless the object is a typed literal.
-pub(crate) const COL_O_DATATYPE: &str = "o_datatype";
-/// The literal language tag — null unless the object is a language literal.
-pub(crate) const COL_O_LANG: &str = "o_lang";
+use crate::store::array::{StrColReader, field_as, make_string_array};
+use crate::store::schema::{
+    COL_G, COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE, COL_P, COL_S,
+};
 
 /// The primary columns:
 /// `s`, `p`, `o_kind`, `o_value`, `o_datatype`, `o_lang`, `g`.
@@ -49,10 +42,7 @@ pub(crate) fn build_columns(quads: &[RawQuad]) -> Result<Vec<ArrayRef>> {
     let mut langs: Vec<Option<String>> = Vec::with_capacity(n);
 
     for q in quads {
-        let term = parse_term(&q.o).ok_or_else(|| {
-            VortexRdfError::Deserialization(format!("Cannot parse object string: {}", q.o))
-        })?;
-        let (kind, value, dt, lang) = decompose_object(&term);
+        let (kind, value, dt, lang) = decompose_object(&term(&q.o, Trust::Stored)?);
         kinds.push(kind);
         values.push(value);
         datatypes.push(dt);
@@ -64,8 +54,8 @@ pub(crate) fn build_columns(quads: &[RawQuad]) -> Result<Vec<ArrayRef>> {
         make_string_array(quads.iter().map(|q| q.p.as_str())),
         PrimitiveArray::from_iter(kinds).into_array(),
         make_string_array(values.iter().map(String::as_str)),
-        make_nullable_string_array(datatypes),
-        make_nullable_string_array(langs),
+        VarBinViewArray::from_iter_nullable_str(datatypes).into_array(),
+        VarBinViewArray::from_iter_nullable_str(langs).into_array(),
         make_string_array(quads.iter().map(|q| q.g.as_str())),
     ])
 }
@@ -100,10 +90,10 @@ fn compose_object(
     datatype: Option<&str>,
     lang: Option<&str>,
 ) -> Result<Term> {
-    // Trusted-input decode path — see `parse_named_node`: the sub-columns
+    // Trusted decode, as for `Trust::Stored` spellings: the sub-columns
     // were decomposed from already-validated terms at build time, so the
     // checked constructors' re-validation (a full `oxiri::Iri::parse` per
-    // IRI) is skipped, matching `parse_term`.
+    // IRI) is skipped.
     match kind {
         0 => Ok(Term::NamedNode(NamedNode::new_unchecked(value))),
         1 => Ok(Term::BlankNode(BlankNode::new_unchecked(value))),
@@ -125,16 +115,6 @@ fn compose_object(
     }
 }
 
-/// A nullable string column, or `None` when it cannot be read as one — every
-/// row then reads as null.
-fn nullable_str_col(
-    struct_arr: &StructArray,
-    name: &str,
-    ctx: &mut ExecutionCtx,
-) -> Option<VarBinViewArray> {
-    field_as::<VarBinViewArray>(struct_arr, name, ctx).ok()
-}
-
 /// The four object sub-columns of a chunk, executed to their canonical
 /// arrays.
 struct ObjectColumns {
@@ -146,13 +126,14 @@ struct ObjectColumns {
 
 impl ObjectColumns {
     /// Load the sub-columns of `struct_arr`. `o_kind` and `o_value` are
-    /// required; the nullable `o_datatype`/`o_lang` fall back to all-null.
+    /// required; the nullable `o_datatype`/`o_lang` read as all-null when
+    /// they cannot be read as string columns.
     fn load(struct_arr: &StructArray, ctx: &mut ExecutionCtx) -> Result<Self> {
         Ok(Self {
             kind: field_as::<PrimitiveArray>(struct_arr, COL_O_KIND, ctx)?,
             value: field_as::<VarBinViewArray>(struct_arr, COL_O_VALUE, ctx)?,
-            datatype: nullable_str_col(struct_arr, COL_O_DATATYPE, ctx),
-            lang: nullable_str_col(struct_arr, COL_O_LANG, ctx),
+            datatype: field_as::<VarBinViewArray>(struct_arr, COL_O_DATATYPE, ctx).ok(),
+            lang: field_as::<VarBinViewArray>(struct_arr, COL_O_LANG, ctx).ok(),
         })
     }
 
@@ -245,11 +226,12 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
 
     (0..n)
         .map(|i| {
-            let subject = parse_subject(subjects.str_at(i)?)?;
-            let predicate = parse_named_node(predicates.str_at(i)?)?;
-            let object = objects.term_at(i)?;
-            let graph_name = parse_graph_name(graphs.str_at(i)?)?;
-            Ok(Quad::new(subject, predicate, object, graph_name))
+            Ok(Quad::new(
+                subject(subjects.str_at(i)?, Trust::Stored)?,
+                named_node(predicates.str_at(i)?, Trust::Stored)?,
+                objects.term_at(i)?,
+                graph_name(graphs.str_at(i)?, Trust::Stored)?,
+            ))
         })
         .collect()
 }

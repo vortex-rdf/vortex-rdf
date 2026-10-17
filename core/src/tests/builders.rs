@@ -1,17 +1,14 @@
-//! The builders: chunk-boundary behaviour of both sorted builders, the
+//! The builders: chunk-boundary behaviour of the streaming builder, the
 //! spill-and-merge path of the streaming one, the file writer's ordering,
 //! and the sorted stamp a build leaves on its subject column.
 
 use super::*;
-use crate::store::builders::{sorted_in_memory, sorted_stream};
-use vortex_array::VortexSessionExecute;
-use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
+use crate::store::builders::sorted_stream;
 
-/// The chunk-boundary harness every builder shares: chunk_size 3 over the 10
-/// given quads must split as [3, 3, 3, 1] from both builders, whatever
-/// the `layout`. Hands back each builder's collected chunks — plus the
-/// dictionary the stream carried beside them, for the Dictionary layout —
-/// for the callers' layout-specific follow-up assertions.
+/// The chunk-boundary harness: chunk_size 3 over the 10 given quads must
+/// split as [3, 3, 3, 1], whatever the `layout`. Hands back the collected
+/// chunks — plus the dictionary the stream carried beside them, for the
+/// Dictionary layout — for the callers' layout-specific follow-up assertions.
 async fn run_chunk_boundary_builders(
     layout: LayoutStrategy,
     quads: &[Quad],
@@ -21,29 +18,17 @@ async fn run_chunk_boundary_builders(
     Option<std::sync::Arc<crate::store::layouts::dictionary::TermDictionary>>,
 )> {
     let mut out = Vec::new();
-    for (name, result) in [
-        (
-            "sorted_in_memory",
-            sorted_in_memory::build_chunk_stream(
-                Box::new(quad_stream(quads.to_vec())),
-                layout,
-                vec![],
-                3,
-            )
-            .await,
-        ),
-        (
-            "sorted_stream",
-            sorted_stream::build_chunk_stream(
-                Box::new(quad_stream(quads.to_vec())),
-                layout,
-                vec![],
-                3,
-                None,
-            )
-            .await,
-        ),
-    ] {
+    for (name, result) in [(
+        "sorted_stream",
+        sorted_stream::build_chunk_stream(
+            Box::new(quad_stream(quads.to_vec())),
+            layout,
+            vec![],
+            3,
+            None,
+        )
+        .await,
+    )] {
         let built = result.unwrap_or_else(|e| panic!("{name}: {e}"));
         let dict = built.dict.clone();
         let chunks: Vec<_> = built
@@ -62,7 +47,7 @@ async fn run_chunk_boundary_builders(
 
 #[tokio::test]
 async fn test_default_streaming_chunk_boundaries() {
-    // Quads fed in REVERSE subject order; both sorted builders must emit
+    // Quads fed in REVERSE subject order; the builder must emit
     // globally sorted output across chunk boundaries.
     let quads: Vec<Quad> = (0..10)
         .rev()
@@ -98,8 +83,6 @@ async fn test_default_streaming_chunk_boundaries() {
 
 #[tokio::test]
 async fn test_dictionary_streaming_chunk_boundaries() {
-    use crate::store::builders::assemble_chunks;
-
     let quads = dictionary_test_quads();
 
     for (name, chunks, dict) in
@@ -109,7 +92,8 @@ async fn test_dictionary_streaming_chunk_boundaries() {
         // codes, and the dictionary the stream carried beside them is
         // handed back with the reassembled array — all chunks' codes must
         // reference that same global dictionary.
-        let arr = assemble_chunks(chunks).unwrap();
+        let dtype = chunks[0].dtype().clone();
+        let arr = crate::store::array::chunked_or_single(chunks, dtype).unwrap();
         let store = VortexRdfStore::from_built(crate::store::builders::BuiltArray {
             array: arr,
             components: Vec::new(),
@@ -202,13 +186,7 @@ async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
             ("PO", Some(&p1), Some(&o1), 2),
         ] {
             assert_eq!(
-                store
-                    .match_pattern(None, pp, po, None)
-                    .await
-                    .unwrap()
-                    .size()
-                    .await
-                    .unwrap(),
+                matched_size(&store, None, pp, po, None).await,
                 want,
                 "{layout:?}: {tag}"
             );
@@ -220,11 +198,7 @@ async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
 /// still declares the requested index set, under every layout.
 #[tokio::test]
 async fn test_sorted_stream_empty_dataset() {
-    for layout in [
-        LayoutStrategy::Default,
-        LayoutStrategy::TypedObject,
-        LayoutStrategy::Dictionary,
-    ] {
+    for layout in LAYOUTS {
         for indexes in [
             vec![],
             vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
@@ -249,13 +223,7 @@ async fn test_sorted_stream_empty_dataset() {
             assert_eq!(store.size().await.unwrap(), 0, "{layout:?}/{indexes:?}");
             let p = NamedNode::new("http://example.org/p0").unwrap();
             assert_eq!(
-                store
-                    .match_pattern(None, Some(&p), None, None)
-                    .await
-                    .unwrap()
-                    .size()
-                    .await
-                    .unwrap(),
+                matched_size(&store, None, Some(&p), None, None).await,
                 0,
                 "{layout:?}/{indexes:?}"
             );
@@ -300,22 +268,6 @@ async fn test_writer_sorts_reversed_input() {
     assert_eq!(decoded[24].object.to_string(), "\"object value 24\"");
 }
 
-/// Whether a built array's `s` column carries the IsSorted stamp — the
-/// binary-search fast path's sole license, so the builder tests assert on it
-/// directly.
-fn assert_subject_stamp(arr: vortex_array::ArrayRef, expect_sorted: bool, name: &str) {
-    use vortex_array::expr::stats::{Precision, Stat, StatsProvider};
-
-    let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
-    let struct_arr = arr.execute::<StructArray>(&mut ctx).unwrap();
-    let s_col = struct_arr.unmasked_field_by_name("s").unwrap();
-    let is_sorted = match s_col.statistics().get(Stat::IsSorted) {
-        Precision::Exact(sc) | Precision::Inexact(sc) => bool::try_from(&sc).unwrap_or(false),
-        Precision::Absent => false,
-    };
-    assert_eq!(is_sorted, expect_sorted, "{name}: IsSorted stat mismatch");
-}
-
 /// Reverse-subject-order quads, so only a genuinely sorting builder may end
 /// up with a sorted `s` column.
 fn reverse_order_quads() -> Vec<Quad> {
@@ -324,7 +276,8 @@ fn reverse_order_quads() -> Vec<Quad> {
     quads
 }
 
-/// Both sorted builders stamp the `s` column sorted — the streaming one
+/// Both sorted builders stamp the `s` column sorted, and the stamp is the
+/// binary-search fast path's sole license. The streaming builder stamps it
 /// after materializing several chunks into one array.
 #[tokio::test]
 async fn test_sorted_builders_stamp_is_sorted() {
@@ -337,7 +290,10 @@ async fn test_sorted_builders_stamp_is_sorted() {
     )
     .await
     .unwrap();
-    assert_subject_stamp(sorted.array, true, "sorted_in_memory");
+    assert!(
+        crate::store::array::subject_sorted(&sorted.array),
+        "sorted_in_memory: no IsSorted stamp on s"
+    );
 
     let streamed = sorted_stream::build_array(
         Box::new(quad_stream(quads)),
@@ -347,5 +303,8 @@ async fn test_sorted_builders_stamp_is_sorted() {
     )
     .await
     .unwrap();
-    assert_subject_stamp(streamed.array, true, "sorted_stream");
+    assert!(
+        crate::store::array::subject_sorted(&streamed.array),
+        "sorted_stream: no IsSorted stamp on s"
+    );
 }
