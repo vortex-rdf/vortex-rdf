@@ -250,9 +250,9 @@ impl VortexRdfStore {
                 limit.saturating_sub(base_taken),
             )
         });
-        log::debug!(
-            "[window] offset {offset} limit {limit}: {base_taken} base rows at {:?}",
-            debug::elapsed(t)
+        debug::step!(
+            t,
+            "[window] offset {offset} limit {limit}: {base_taken} base rows"
         );
         Ok(self.derived(quads, tail))
     }
@@ -337,21 +337,21 @@ impl VortexRdfStore {
         let narrowed =
             match Self::keep_sorted_run(&struct_arr, base, probes, &selection, column, keep) {
                 Some(narrowed) => {
-                    log::debug!(
-                        "[keep] {:?} narrowed by binary search inside a sorted run at {:?}",
-                        column,
-                        debug::elapsed(t)
+                    debug::step!(
+                        t,
+                        "[keep] {:?} narrowed by binary search inside a sorted run",
+                        column
                     );
                     narrowed
                 }
                 None => {
                     let narrowed =
                         Self::keep_by_pass(&struct_arr, base, probes, &selection, column, keep)?;
-                    log::debug!(
-                        "[keep] {:?} narrowed by a pass over {} selected rows at {:?}",
+                    debug::step!(
+                        t,
+                        "[keep] {:?} narrowed by a pass over {} selected rows",
                         column,
-                        selection.len(base_len),
-                        debug::elapsed(t)
+                        selection.len(base_len)
                     );
                     narrowed
                 }
@@ -501,10 +501,10 @@ impl VortexRdfStore {
         };
         let (filter, narrowed) = match located {
             Some(narrowed) => {
-                log::debug!(
-                    "[keep] {:?} located as runs of the sorted column at {:?}",
-                    column,
-                    debug::elapsed(t)
+                debug::step!(
+                    t,
+                    "[keep] {:?} located as runs of the sorted column",
+                    column
                 );
                 (filter.clone(), narrowed)
             }
@@ -522,11 +522,11 @@ impl VortexRdfStore {
                     .await?;
                 let selected = selection.len(row_count);
                 let narrowed = selection.refine_positions(positions, selected);
-                log::debug!(
-                    "[keep] {:?} tested in memory over {} file rows at {:?}",
+                debug::step!(
+                    t,
+                    "[keep] {:?} tested in memory over {} file rows",
                     column,
-                    selected,
-                    debug::elapsed(t)
+                    selected
                 );
                 (None, narrowed)
             }
