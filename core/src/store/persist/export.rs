@@ -83,7 +83,7 @@ async fn write_structured<W: Write>(
 ) -> error::Result<()> {
     // The quad stream's read is set up on the first poll, so the loop's
     // timing below includes it.
-    let mut quads_stream = store.quads()?;
+    let mut quads_stream = store.quads();
 
     let write_start = debug::timer();
     let mut rdf_serializer = RdfSerializer::from_format(format).for_writer(writer);

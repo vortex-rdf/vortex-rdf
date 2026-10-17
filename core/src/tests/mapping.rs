@@ -159,14 +159,19 @@ async fn test_mapped_store_survives_rename_over_its_path() {
 }
 
 /// A path that cannot be opened is the same I/O error in both modes, naming
-/// the path and keeping the kind: a missing file, and (off root) one the
-/// process may not read.
+/// the path and keeping the kind: a missing file, a directory, and (off root)
+/// one the process may not read.
 #[tokio::test]
 async fn test_open_errors_are_io_errors_naming_the_path_in_both_modes() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing.vortex");
+    let directory = dir.path().join("directory.vortex");
+    std::fs::create_dir(&directory).unwrap();
     #[allow(unused_mut)]
-    let mut cases = vec![(missing, std::io::ErrorKind::NotFound)];
+    let mut cases = vec![
+        (missing, std::io::ErrorKind::NotFound),
+        (directory, std::io::ErrorKind::IsADirectory),
+    ];
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -194,7 +199,7 @@ async fn test_open_errors_are_io_errors_naming_the_path_in_both_modes() {
                 "{how}: {error:?}"
             );
             assert!(
-                error.to_string().contains(&format!("{path:?}")),
+                error.to_string().contains(&format!("open {path:?}: ")),
                 "{how}: the error must name the path: {error}"
             );
         }

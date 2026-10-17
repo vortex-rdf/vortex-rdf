@@ -594,7 +594,7 @@ async fn test_delete_matching_pattern() {
         .unwrap();
     assert_eq!(after.size().await.unwrap(), 6);
     assert_eq!(matched_size(&after, None, Some(&p0), None, None).await, 0);
-    assert_eq!(after.quads().unwrap().count().await, 6);
+    assert_eq!(after.quads().count().await, 6);
 
     // Deleting the same pattern twice is idempotent, not a double-count.
     let again = after

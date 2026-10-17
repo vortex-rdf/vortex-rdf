@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use pyo3::exceptions::PyFileNotFoundError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use vortex_buffer::Buffer;
@@ -214,14 +213,6 @@ impl VortexRdfStore {
     #[new]
     #[pyo3(signature = (path, *, in_memory=false))]
     fn new(py: Python<'_>, path: PathBuf, in_memory: bool) -> PyResult<Self> {
-        // Core reports a missing path as an I/O error from the open; the
-        // `FileNotFoundError` contract is honoured here with a clear message.
-        if !path.is_file() {
-            return Err(PyFileNotFoundError::new_err(format!(
-                "no such Vortex file: {}",
-                path.display()
-            )));
-        }
         let store = py
             .detach(|| {
                 RUNTIME.block_on(async {

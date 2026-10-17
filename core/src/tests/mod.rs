@@ -418,7 +418,6 @@ fn component_names(built: &BuiltArray) -> Vec<&'static str> {
 async fn subjects_of(store: &VortexRdfStore) -> Vec<String> {
     let mut got: Vec<String> = store
         .quads()
-        .unwrap()
         .map(|q| q.unwrap().subject.to_string())
         .collect()
         .await;
@@ -1057,7 +1056,7 @@ async fn probe_default(store: VortexRdfStore) {
         .await
         .unwrap();
     assert_eq!(filtered.size().await.unwrap(), 1);
-    let results: Vec<Quad> = filtered.quads().unwrap().try_collect().await.unwrap();
+    let results: Vec<Quad> = filtered.quads().try_collect().await.unwrap();
     assert_eq!(results[0].subject.to_string(), "<http://example.org/s1>");
 
     let p3 = NamedNode::new("http://example.org/p3").unwrap();
@@ -1077,7 +1076,7 @@ async fn probe_typed_object(store: VortexRdfStore) {
         .await
         .unwrap();
     assert_eq!(filtered.size().await.unwrap(), 1);
-    let results: Vec<Quad> = filtered.quads().unwrap().try_collect().await.unwrap();
+    let results: Vec<Quad> = filtered.quads().try_collect().await.unwrap();
     assert_eq!(results[0].subject.to_string(), "<http://example.org/s1>");
     assert_eq!(results[0].object.to_string(), "\"o1\"");
 
@@ -1235,7 +1234,6 @@ async fn assert_shared_matches_quads(
     assert_eq!(shared_tuple_rows(&shared), tuple_rows(&quads), "{tag}");
     let chunked: Vec<crate::store::SharedQuad> = view
         .shared_quad_chunks()
-        .unwrap()
         .collect::<Vec<_>>()
         .await
         .into_iter()

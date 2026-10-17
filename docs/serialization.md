@@ -53,11 +53,11 @@ A builder hands these back in one of two shapes
 |---|---|---|---|
 | CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`SerializeArgs`](../cli/src/main.rs#L33)) | out-of-core | file |
 | Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L145) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L60) | out-of-core | file / any `VortexWrite` |
-| Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L78), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L59) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L37) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L129) to name the builder | either | in-memory store |
+| Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L78), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L59) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L37) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L130) to name the builder | either | in-memory store |
 | Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L165) | — (re-serializes a store) | bytes |
-| Rust | [`to_serializable_parts`](../core/src/store/persist/serialize.rs#L110) → [`from_parts`](../core/src/store/construct.rs#L111) | — | in-memory round trip |
+| Rust | [`VortexRdfStore::from_file_in_memory`](../core/src/store/persist/open.rs#L224) | — (reads a `.vortex` file whole, then adopts it in memory) | in-memory store |
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize_rdf`](../python/src/serialize.rs#L33)) | out-of-core | file |
-| Python | `VortexRdfStore(path, in_memory=True)` | — (opens, then lifts through `to_serializable_parts` → `from_parts`) | in-memory store |
+| Python | `VortexRdfStore(path, in_memory=True)` | — (calls `from_file_in_memory`) | in-memory store |
 | Python | `store.to_bytes()` / `VortexRdfStore.from_bytes(data)` | — | bytes |
 | JavaScript | `VortexRdfStore.fromQuads(quads \| Stream<Quad>, {layout, indexes})`, `fromString(text, format, options)` ([`fromString`](../js/src/store.rs#L164)), `serializeRdf(text, format, options)` ([`serializeRdf`](../js/src/lib.rs#L35)) | in memory (the only pipeline compiled to wasm) | in-memory store / bytes |
 | JavaScript | `store.toBytes()` / `VortexRdfStore.fromBytes(bytes)`; `deserializeRdf(bytes, format)` ([`deserializeRdf`](../js/src/lib.rs#L49)) writes RDF text back | — | bytes |
@@ -478,9 +478,9 @@ inode stays alive for the mapping.
 ## 10. Adopting a build in memory
 
 A build that is queried in place, without a file, skips the writer:
-[`from_built`](../core/src/store/construct.rs#L129) turns a `BuiltArray` into the
+[`from_built`](../core/src/store/construct.rs#L130) turns a `BuiltArray` into the
 store's *compressed-resident* form (through
-[`adopt`](../core/src/store/construct.rs#L154), the step it shares with
+[`adopt`](../core/src/store/construct.rs#L155), the step it shares with
 `from_parts`):
 
 - every non-nullable `u64` code child and row-id child of the base and of
@@ -488,7 +488,7 @@ store's *compressed-resident* form (through
   knows —
   `Constant` for a single-valued column, `RunEnd` for a sorted column with few
   runs, bit-packed at the observed width otherwise
-  ([`with_compressed_int_children`](../core/src/store/resident.rs#L87)); the
+  ([`with_compressed_int_children`](../core/src/store/resident.rs#L88)); the
   `IsSorted` stamps carry across;
 - the base's compressed columns are wrapped in a `vortex.shared` node, so the
   match fast paths probe the compressed source while the code-column payload
@@ -497,10 +497,10 @@ store's *compressed-resident* form (through
   ([`StructProbes::warm`](../core/src/store/probes.rs#L53)), so no query pays the
   encoding-tree walk.
 
-The other in-memory constructor, [`from_parts`](../core/src/store/construct.rs#L111),
-adopts a store's split parts (the bindings' round trip): it keeps each integer
-child's existing encoding wherever a probe binds it and decodes only the ones
-that decline. Opening serialized bytes in memory is
+The other in-memory adoption, [`from_parts`](../core/src/store/construct.rs#L112)
+(crate-private; `from_file_in_memory` calls it), takes a store's split parts:
+it keeps each integer child's existing encoding wherever a probe binds it and
+decodes only the ones that decline. Opening serialized bytes in memory is
 [file-format.md §8](file-format.md#8-reading-a-file).
 
 ---
@@ -544,7 +544,7 @@ quad, sort, drop repeated quads, and rebuild:
   the store is then reopened memory-mapped. On Windows that rename is refused
   while the file is mapped, by this store included, so there a file-backed
   store cannot compact over its own path ([mutations.md §5](mutations.md#5-compaction)).
-- **An in-memory store** rebuilds through [`from_raw_quads`](../core/src/store/construct.rs#L141)
+- **An in-memory store** rebuilds through [`from_raw_quads`](../core/src/store/construct.rs#L142)
   (a fresh dictionary under Dictionary, components over the whole set) and
   adopts the result exactly as `from_built` does.
 

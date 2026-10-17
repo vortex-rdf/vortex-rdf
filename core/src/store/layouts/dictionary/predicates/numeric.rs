@@ -10,7 +10,9 @@ use crate::common::vocab::{XSD, XSD_STRING};
 use super::literal::LiteralView;
 use super::{NumOp, Verdict};
 
-/// A numeric constant, as a parsed XSD numeric literal.
+/// A numeric constant, as a parsed XSD numeric literal: the payload of
+/// [`TermPredicate::Num`](super::TermPredicate::Num), built by
+/// [`TermPredicate::parse_with`](super::TermPredicate::parse_with).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Number {
     value: Num,

@@ -221,9 +221,19 @@ def test_bad_term_raises_value_error(vortex_files, layout, matcher):
             match(**pattern)
 
 
-def test_missing_file_raises_oserror(tmp_path):
-    with pytest.raises(OSError):
-        VortexRdfStore(tmp_path / "missing.vortex")
+@pytest.mark.parametrize("in_memory", [False, True], ids=["mapped", "in-memory"])
+@pytest.mark.parametrize(
+    ("kind", "error"),
+    [("missing", FileNotFoundError), ("directory", IsADirectoryError)],
+)
+def test_an_unopenable_path_raises_its_io_kind_naming_the_path(tmp_path, kind, error, in_memory):
+    """Core's `Io` error keeps the kind and the path, whichever way the store opens;
+    the binding raises the `OSError` subclass the kind names."""
+    path = tmp_path / f"{kind}.vortex"
+    if kind == "directory":
+        path.mkdir()
+    with pytest.raises(error, match=re.escape(path.name)):
+        VortexRdfStore(path, in_memory=in_memory)
 
 
 def test_serialize_rejects_unknown_options(fixture_nt_path, tmp_path):

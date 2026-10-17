@@ -144,7 +144,7 @@ async fn test_file_backed_dictionary_serves_from_copy_index() {
     // The located run is small, so its ids resolved eagerly by rid point
     // reads at match time — no deferred rid scan remains.
     assert!(!selection_pending(&matched));
-    let served: Vec<Quad> = matched.quads().unwrap().try_collect().await.unwrap();
+    let served: Vec<Quad> = matched.quads().try_collect().await.unwrap();
     assert_eq!(served.len(), 4);
 }
 
@@ -162,7 +162,7 @@ async fn test_file_backed_dictionary_serializes_and_mutates() {
     let bytes = fb.to_bytes().await.unwrap();
     let reread = VortexRdfStore::from_bytes(&bytes).await.unwrap();
     let expected = quad_strings(&quads);
-    let got: Vec<Quad> = reread.quads().unwrap().try_collect().await.unwrap();
+    let got: Vec<Quad> = reread.quads().try_collect().await.unwrap();
     assert_eq!(quad_strings(&got), expected);
 
     // Mutation: an added quad lands in the string tail; reads merge it with
@@ -688,7 +688,7 @@ async fn test_dictionary_native_file_roundtrip() {
         .await
         .unwrap();
     assert_eq!(matched.size().await.unwrap(), 4);
-    let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
+    let decoded: Vec<Quad> = store.quads().try_collect().await.unwrap();
     assert_eq!(quad_strings(&decoded), quad_strings(&quads));
 }
 

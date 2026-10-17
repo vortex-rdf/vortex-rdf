@@ -452,7 +452,7 @@ async fn match_payload(
     // N-Triples spelling already (the default graph as the empty string, this
     // payload's vocabulary for it), so the bytes go straight into the
     // column — no parse into oxrdf terms, no re-render.
-    let mut chunks = matched.shared_quad_chunks().map_err(js_err)?;
+    let mut chunks = matched.shared_quad_chunks();
     // (offsets seeded with a leading 0, bytes) per s/p/o/g column.
     let mut cols: [(Vec<u32>, Vec<u8>); 4] = [
         (vec![0], Vec::new()),

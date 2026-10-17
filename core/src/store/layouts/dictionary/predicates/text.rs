@@ -34,7 +34,9 @@ pub enum CaseMap {
     Upper,
 }
 
-/// A string kind: its test and how a term's text is read.
+/// A string kind: its test and how a term's text is read. The payload of
+/// [`TermPredicate::Text`](super::TermPredicate::Text), built by
+/// [`TermPredicate::parse_with`](super::TermPredicate::parse_with).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextPredicate {
     pub(super) test: TextTest,

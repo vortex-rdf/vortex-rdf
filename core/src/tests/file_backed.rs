@@ -52,7 +52,7 @@ async fn test_file_backed_non_contiguous_predicate_matches() {
         .unwrap();
     assert_eq!(matched.size().await.unwrap(), 2 * CLUSTER);
 
-    let results: Vec<Quad> = matched.quads().unwrap().try_collect().await.unwrap();
+    let results: Vec<Quad> = matched.quads().try_collect().await.unwrap();
     assert_eq!(results.len(), 2 * CLUSTER);
     // Both the leading and the trailing cluster must be present.
     assert!(
@@ -112,7 +112,7 @@ async fn test_file_backed_chained_subject_then_object_index() {
         .await
         .unwrap();
     assert_eq!(chained.size().await.unwrap(), 1); // 12000 % 5 == 0
-    let results: Vec<Quad> = chained.quads().unwrap().try_collect().await.unwrap();
+    let results: Vec<Quad> = chained.quads().try_collect().await.unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(
         results[0].subject.to_string(),
@@ -140,7 +140,7 @@ async fn test_file_backed_chained_subject_then_object_index() {
         .unwrap();
     let expected = (0..N).filter(|i| i % 5 == 1 && i % 3 == 2).count();
     assert_eq!(step2.size().await.unwrap(), expected);
-    let results: Vec<Quad> = step2.quads().unwrap().try_collect().await.unwrap();
+    let results: Vec<Quad> = step2.quads().try_collect().await.unwrap();
     assert_eq!(results.len(), expected);
     assert!(
         results.iter().all(|q| {
@@ -198,10 +198,7 @@ async fn test_file_backed_filtered_size_skips_tombstones() {
         .unwrap();
     // p0 is on rows 0, 3, 6, 9; row 3 is gone.
     assert_eq!(matched.size().await.unwrap(), 3);
-    assert_eq!(
-        matched.size().await.unwrap(),
-        matched.quads().unwrap().count().await
-    );
+    assert_eq!(matched.size().await.unwrap(), matched.quads().count().await);
     assert_eq!(
         view_strings(&matched).await,
         expected_strings(&quads, |i| i % 3 == 0 && i != 3)
@@ -419,7 +416,7 @@ async fn probe_dictionary(store: VortexRdfStore) {
         .await
         .unwrap();
     assert_eq!(filtered.size().await.unwrap(), 4);
-    let results: Vec<Quad> = filtered.quads().unwrap().try_collect().await.unwrap();
+    let results: Vec<Quad> = filtered.quads().try_collect().await.unwrap();
     assert!(
         results
             .iter()

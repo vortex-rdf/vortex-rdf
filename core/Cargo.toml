@@ -81,6 +81,11 @@ mimalloc = ["dep:mimalloc"]
 # builds have no use for an argument parser.
 clap = ["dep:clap"]
 
+# Every public item has one public path: a `pub` item that is reachable from
+# the API but re-exported nowhere has none, and the gates run with `-D warnings`.
+[lints.rust]
+unnameable_types = "warn"
+
 [dev-dependencies]
 divan = { workspace = true }
 oxigraph = { version = "0.5.9", default-features = false, features = ["rocksdb"] }

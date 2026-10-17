@@ -1,6 +1,6 @@
 //! Serialization: the rows-plus-components-plus-dictionary parts every write
-//! path produces (`to_serializable_parts`, `to_bytes`, the bindings'
-//! in-memory round-trips).
+//! path produces (`to_serializable_parts`, `to_bytes`) and the in-memory open
+//! adopts (`from_file_in_memory`).
 
 use crate::error::Result;
 use crate::store::QuadsSource;
@@ -83,7 +83,7 @@ impl VortexRdfStore {
     /// tail combined, as one array of primary columns, the index components
     /// describing them and, under the Dictionary layout, the term dictionary
     /// those rows' codes address — what every serialization path writes
-    /// (`to_bytes`, the bindings' in-memory round-trips).
+    /// (`to_bytes`) and the in-memory open adopts (`from_file_in_memory`).
     ///
     /// Components are included only when their `rid`s actually address the
     /// returned rows: an unrefined, untombstoned owner passes its components
@@ -107,7 +107,7 @@ impl VortexRdfStore {
     ///
     /// The row read paths use the rows-only `selected_rows`, which never
     /// materializes components.
-    pub async fn to_serializable_parts(&self) -> Result<StoreParts> {
+    pub(crate) async fn to_serializable_parts(&self) -> Result<StoreParts> {
         let base = self.base_selected_rows().await?;
         let owner_shaped = self.quads.is_unrefined();
         let tombstoned = self.quads.deleted().is_some();
@@ -135,7 +135,7 @@ impl VortexRdfStore {
                 QuadsSource::InMemory { components, .. } => components.to_vec(),
                 // An unrefined file view reads its index children
                 // wholesale, so a file-backed store's serialization (and
-                // the bindings' in-memory round-trip) keeps its indexes.
+                // its in-memory open) keeps its indexes.
                 #[cfg(feature = "file-io")]
                 QuadsSource::File { file, .. } => scanned_index_components(file).await?,
             }

@@ -5,8 +5,9 @@
 //!
 //! Items here are about RDF *text*: how terms and quads are spelled, parsed,
 //! named and written. Export consumes a store but produces text only;
-//! anything that touches arrays, layouts, or the container format belongs in
-//! [`store`](crate::store) or [`io`](crate::io).
+//! anything that touches arrays, layouts, or the container format belongs with
+//! the store ([`VortexRdfStore`](crate::VortexRdfStore) and its builders) or in
+//! [`io`](crate::io).
 
 pub mod formats;
 pub(crate) mod quad;

@@ -1,9 +1,11 @@
 //! In-memory construction of a [`VortexRdfStore`]: the constructors from a
-//! quad stream, a builder's output, [`StoreParts`] and compaction's raw
+//! quad stream, a builder's output, `StoreParts` and compaction's raw
 //! quads, the empty store, and the layout, adoption and assembly steps they
 //! share.
 
 use crate::error::{Result, VortexRdfError};
+#[cfg(any(feature = "file-io", test))]
+use crate::store::StoreParts;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::store::builders::SortedInMemoryBuilder;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -15,9 +17,7 @@ use crate::store::indexes::{IndexComponent, Indexes};
 use crate::store::layouts::dictionary::TermDictionary;
 use crate::store::layouts::{DictAccess, LayoutStrategy, ResolvedLayout};
 use crate::store::view::selection::ViewSelection;
-use crate::store::{
-    QuadsSource, RawQuad, StoreParts, VortexRdfStore, next_generation, probes, resident,
-};
+use crate::store::{QuadsSource, RawQuad, VortexRdfStore, next_generation, probes, resident};
 
 use std::sync::Arc;
 
@@ -95,20 +95,21 @@ impl VortexRdfStore {
     /// it: dict-less Dictionary parts are refused (bare code columns carry no
     /// way back to their terms).
     ///
-    /// This is the bindings' explicit resident adoption: the base's integer
-    /// children stay in their compressed form wherever the match fast paths
-    /// can bind them through encoded search probes, and only children outside
-    /// the probe's supported set are decoded to canonical primitives (see
-    /// `with_searchable_int_children`);
-    /// every index component is materialized into the same resident form, so
-    /// its sorted probes bind directly too.
+    /// This is the explicit resident adoption (the in-memory file open's): the
+    /// base's integer children stay in their compressed form wherever the
+    /// match fast paths can bind them through encoded search probes, and only
+    /// children outside the probe's supported set are decoded to canonical
+    /// primitives (see `with_searchable_int_children`); every index component
+    /// is materialized into the same resident form, so its sorted probes bind
+    /// directly too.
     ///
     /// The array's statistics are trusted as provenance: an `IsSorted` stamp
     /// on its `s` column asserts the rows are in global `(s, p, o, g)` order —
     /// the order every builder of this crate produces — and the match fast
     /// paths search every bound role on that basis. Rows sorted by subject
     /// alone must not carry it.
-    pub fn from_parts(parts: StoreParts) -> Result<Self> {
+    #[cfg(any(feature = "file-io", test))]
+    pub(crate) fn from_parts(parts: StoreParts) -> Result<Self> {
         Self::adopt(
             parts.built,
             resident::with_searchable_int_children,
@@ -147,7 +148,7 @@ impl VortexRdfStore {
         Self::from_built(build_parts_from_raws(raws, strategy, &indexes, sorted)?)
     }
 
-    /// The one adoption step of [`from_parts`](Self::from_parts) and
+    /// The one adoption step of `from_parts` and
     /// [`from_built`](Self::from_built): resolve the layout from `built`'s
     /// dictionary and dtype, put the base through `encode_base` and every
     /// component through `encode_component`, and assemble the store.
@@ -171,9 +172,8 @@ impl VortexRdfStore {
     ///
     /// Callers own the resident form of what they pass: [`adopt`](Self::adopt)
     /// compresses a build and keeps an adopted store's wire encodings
-    /// selectively
-    /// ([`with_searchable_int_children`](resident::with_searchable_int_children));
-    /// this assembler transforms nothing.
+    /// selectively (`with_searchable_int_children`); this assembler transforms
+    /// nothing.
     ///
     /// A Dictionary `layout` must hold its dictionary resident: an in-memory
     /// view decodes its rows without suspending, through that dictionary

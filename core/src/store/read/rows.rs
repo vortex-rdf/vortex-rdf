@@ -33,7 +33,7 @@ use crate::store::VortexRdfStore;
 impl VortexRdfStore {
     /// The rows this view selects, base and tail combined, as a single
     /// in-memory array of primary columns only — the rows-only counterpart
-    /// of [`to_serializable_parts`](Self::to_serializable_parts): no index
+    /// of `to_serializable_parts`: no index
     /// components are materialized, rebuilt, or split off, because none ride
     /// in the result (in memory they live beside the base, on disk as index
     /// children; serialize through `to_serializable_parts` to get them
@@ -48,7 +48,7 @@ impl VortexRdfStore {
     ///   *fresh* dictionary (the tail's terms have no codes in the cached one)
     ///   that this method cannot hand out — decode such views through
     ///   [`quads`](Self::quads)/[`quads_vec`](Self::quads_vec), or serialize
-    ///   them via [`to_serializable_parts`](Self::to_serializable_parts),
+    ///   them via `to_serializable_parts`,
     ///   which returns the dictionary beside the rows;
     /// - every other layout stores the tail in the base's own vocabulary, so
     ///   the two chunk together with no decode at all.

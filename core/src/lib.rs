@@ -47,20 +47,22 @@
 
 pub mod columns;
 pub mod common;
-pub mod debug;
-pub mod error;
+pub(crate) mod debug;
+mod error;
 pub mod io;
 mod session;
-/// The quad store: builders, layouts, indexes, matching and mutation.
-pub mod store;
+// The quad store: builders, layouts, indexes, matching and mutation. Its
+// public items are re-exported below, so each is reached at the crate root
+// and nowhere else; `error` is re-exported the same way.
+mod store;
 
 pub use error::{Result, VortexRdfError};
 
 pub use store::{
     BuiltArray, CaseMap, CodeChunkStream, DictReader, DictSnapshot, DictionaryQuadSink,
-    IndexComponentInfo, IndexType, Indexes, Keep, KindRanges, LayoutStrategy, NumOp, Probe,
+    IndexComponentInfo, IndexType, Indexes, Keep, KindRanges, LayoutStrategy, NumOp, Number, Probe,
     QuadColumn, RawQuad, RowChunkStream, RowCountHint, RowId, SelectionKind, SharedQuad, SortOrder,
-    SortedInMemoryBuilder, StoreParts, TermCode, TermPredicate, TextOptions, Verdict,
+    SortedInMemoryBuilder, TermCode, TermPredicate, TextOptions, TextPredicate, Verdict,
     ViewStatistics, VortexArrayBuilder, VortexRdfStore, export_rdf,
 };
 

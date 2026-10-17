@@ -18,7 +18,7 @@ async fn run_dictionary_roundtrip<B: VortexArrayBuilder>(builder: &str) {
     let store = VortexRdfStore::from_built(arr).unwrap();
     assert_eq!(store.layout(), LayoutStrategy::Dictionary, "{builder}");
 
-    let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
+    let decoded: Vec<Quad> = store.quads().try_collect().await.unwrap();
     assert_eq!(quad_strings(&decoded), quad_strings(&quads), "{builder}");
 }
 
@@ -151,7 +151,7 @@ async fn test_dictionary_match_and_mutations() {
         .await
         .unwrap();
     assert_eq!(by_subject.size().await.unwrap(), 1);
-    let results: Vec<Quad> = by_subject.quads().unwrap().try_collect().await.unwrap();
+    let results: Vec<Quad> = by_subject.quads().try_collect().await.unwrap();
     assert_eq!(results[0].subject.to_string(), "<http://example.org/s03>");
 
     // Predicate match: mask scan over the TermCode codes (p0 occurs for i = 0,3,6,9).
@@ -177,7 +177,7 @@ async fn test_dictionary_match_and_mutations() {
     // delete_quad works (mask-based); the cached dictionary is propagated.
     let deleted = store.delete_quad(&quads[0]).await.unwrap();
     assert_eq!(deleted.size().await.unwrap(), 9);
-    let decoded: Vec<Quad> = deleted.quads().unwrap().try_collect().await.unwrap();
+    let decoded: Vec<Quad> = deleted.quads().try_collect().await.unwrap();
     assert_eq!(decoded.len(), 9);
     assert!(!quad_strings(&decoded).contains(&quads[0].to_string()));
 
@@ -186,7 +186,7 @@ async fn test_dictionary_match_and_mutations() {
     // the deleted quad brings the store back to its full size.
     let readded = deleted.add_quad(quads[0].clone()).await.unwrap();
     assert_eq!(readded.size().await.unwrap(), 10);
-    let decoded: Vec<Quad> = readded.quads().unwrap().try_collect().await.unwrap();
+    let decoded: Vec<Quad> = readded.quads().try_collect().await.unwrap();
     assert!(quad_strings(&decoded).contains(&quads[0].to_string()));
 }
 
@@ -212,7 +212,7 @@ async fn test_dictionary_layout_secondary_index_compatibility() {
     let store = VortexRdfStore::from_built(arr).unwrap();
 
     // Full roundtrip decode with the index columns present.
-    let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
+    let decoded: Vec<Quad> = store.quads().try_collect().await.unwrap();
     assert_eq!(quad_strings(&decoded), quad_strings(&quads));
 
     // Predicate-only match: routes through the code-based `index:ref-p` child
@@ -223,7 +223,7 @@ async fn test_dictionary_layout_secondary_index_compatibility() {
         .await
         .unwrap();
     assert_eq!(by_pred.size().await.unwrap(), 4);
-    let results: Vec<Quad> = by_pred.quads().unwrap().try_collect().await.unwrap();
+    let results: Vec<Quad> = by_pred.quads().try_collect().await.unwrap();
     assert!(
         results
             .iter()
@@ -238,7 +238,7 @@ async fn test_dictionary_layout_secondary_index_compatibility() {
         .await
         .unwrap();
     assert_eq!(by_obj.size().await.unwrap(), 3);
-    let results: Vec<Quad> = by_obj.quads().unwrap().try_collect().await.unwrap();
+    let results: Vec<Quad> = by_obj.quads().try_collect().await.unwrap();
     assert!(
         results
             .iter()
@@ -254,7 +254,7 @@ async fn test_dictionary_layout_secondary_index_compatibility() {
         .await
         .unwrap();
     assert_eq!(by_both.size().await.unwrap(), 1);
-    let results: Vec<Quad> = by_both.quads().unwrap().try_collect().await.unwrap();
+    let results: Vec<Quad> = by_both.quads().try_collect().await.unwrap();
     assert_eq!(results[0].subject.to_string(), "<http://example.org/s01>");
 
     // Terms absent from the dictionary match nothing through the index paths.
@@ -284,7 +284,7 @@ async fn test_dictionary_sorted_with_secondary_index() {
     )
     .await;
 
-    let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
+    let decoded: Vec<Quad> = store.quads().try_collect().await.unwrap();
     assert_eq!(quad_strings(&decoded), quad_strings(&quads));
 
     // s + o pattern (i = 5: s05 has "object 1").
@@ -295,7 +295,7 @@ async fn test_dictionary_sorted_with_secondary_index() {
         .await
         .unwrap();
     assert_eq!(matched.size().await.unwrap(), 1);
-    let results: Vec<Quad> = matched.quads().unwrap().try_collect().await.unwrap();
+    let results: Vec<Quad> = matched.quads().try_collect().await.unwrap();
     assert_eq!(results[0].subject.to_string(), "<http://example.org/s05>");
     assert_eq!(results[0].object.to_string(), "\"object 1\"");
 
@@ -321,7 +321,7 @@ async fn test_dictionary_empty_dataset() {
     let store = VortexRdfStore::from_built(arr).unwrap();
     assert_eq!(store.layout(), LayoutStrategy::Dictionary);
     assert_eq!(store.size().await.unwrap(), 0);
-    let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
+    let decoded: Vec<Quad> = store.quads().try_collect().await.unwrap();
     assert!(decoded.is_empty());
 }
 

@@ -32,7 +32,9 @@ pub(crate) use self::file_backed::FileBackedDict;
 pub(crate) use self::handles::DictAccess;
 pub use self::handles::{DictReader, DictSnapshot};
 pub use self::ingest::DictionaryQuadSink;
-pub use self::predicates::{CaseMap, KindRanges, NumOp, TermPredicate, TextOptions, Verdict};
+pub use self::predicates::{
+    CaseMap, KindRanges, NumOp, Number, TermPredicate, TextOptions, TextPredicate, Verdict,
+};
 pub(crate) use self::term_dict::TermDictionary;
 
 // Read only by the out-of-core builder, which is compiled out on

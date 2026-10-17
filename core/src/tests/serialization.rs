@@ -318,7 +318,6 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
         .await
         .unwrap()
         .quads()
-        .unwrap()
         .try_collect()
         .await
         .unwrap();
@@ -529,7 +528,6 @@ async fn test_tailed_serialization_sorts_and_keeps_indexes() {
             );
             let subjects: Vec<String> = reread
                 .quads()
-                .unwrap()
                 .try_collect::<Vec<Quad>>()
                 .await
                 .unwrap()

@@ -23,7 +23,7 @@ async fn run_builder_roundtrip<B: VortexArrayBuilder>() {
     .expect("build failed");
 
     let store = VortexRdfStore::from_built(arr).unwrap();
-    let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
+    let decoded: Vec<Quad> = store.quads().try_collect().await.unwrap();
     assert_eq!(decoded.len(), 1);
     assert_eq!(decoded[0].subject.to_string(), quad.subject.to_string());
     assert_eq!(decoded[0].predicate.to_string(), quad.predicate.to_string());
@@ -367,7 +367,7 @@ async fn assert_export_matches_oxrdf(store: VortexRdfStore) {
         // Both hold as many quads as were written: the edit drops one, adds one.
         let stored = store.quads_vec().await.unwrap();
         assert_eq!(stored.len(), quads.len(), "{layout:?} {cell}");
-        let streamed: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
+        let streamed: Vec<Quad> = store.quads().try_collect().await.unwrap();
         assert_eq!(streamed, stored, "{layout:?} {cell}");
         let mut exported = Vec::new();
         crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NQuads)
@@ -406,7 +406,7 @@ async fn test_export_ntriples_fast_path_and_named_graph_refusal() {
         .cloned()
         .collect();
     let store = built_store(default_graph_only.clone(), LayoutStrategy::Default, vec![]).await;
-    let stored: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
+    let stored: Vec<Quad> = store.quads().try_collect().await.unwrap();
     let mut exported = Vec::new();
     crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NTriples)
         .await

@@ -63,7 +63,7 @@ pub(in crate::store) fn check_id_columns(table: &str, dtype: &DType) -> Result<(
 }
 
 /// What one entry of a store's component roster means to this version.
-pub(in crate::store) enum ComponentKind {
+enum ComponentKind {
     /// The required `dictionary` child (the Dictionary layout's terms).
     Dict,
     /// A known index child: the registry row carrying the identity an
@@ -81,9 +81,7 @@ pub(in crate::store) enum ComponentKind {
 /// [`DICT_VERSION`](container::DICT_VERSION), and of an *uninterpretable
 /// required* component: skipping one — a future change set, say — would
 /// silently change query results.
-pub(in crate::store) fn classify_component(
-    descriptor: &container::StoreComponentDescriptor,
-) -> Result<ComponentKind> {
+fn classify_component(descriptor: &container::StoreComponentDescriptor) -> Result<ComponentKind> {
     if descriptor.name == container::DICT_COMPONENT_NAME {
         if descriptor.implementation != container::DICT_IMPLEMENTATION {
             return Err(VortexRdfError::Deserialization(format!(
@@ -219,8 +217,9 @@ impl VortexRdfStore {
     /// index child — through Vortex's file reader rather than a mapping, so
     /// the loaded store owns its memory and never reads the file again: the
     /// explicit "load everything" opt-in (Python's `in_memory=True`). The
-    /// file is opened, then its [`to_serializable_parts`](Self::to_serializable_parts)
-    /// are adopted through [`from_parts`](Self::from_parts).
+    /// file is opened, then its rows, dictionary and index children are
+    /// adopted in memory, each column keeping its compressed form wherever a
+    /// match can bind it directly.
     #[cfg(feature = "file-io")]
     pub async fn from_file_in_memory<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
         let opened = Self::open_file(path, read::FileAccess::Read).await?;
@@ -352,7 +351,7 @@ impl VortexRdfStore {
         }
         check_id_columns("quad table", file.dtype())?;
         // The root scan is the transparent quad child.
-        let quads = read::scan_all(&file).await?;
+        let quads = read::scan_all_reader(file.layout_reader()?).await?;
         let root = file.footer().layout();
         let typed = root.as_::<container::RdfStoreLayoutVTable>();
         let mut ctx = VORTEX_SESSION.create_execution_ctx();

@@ -52,7 +52,7 @@ async fn test_file_backed_delete_keeps_indexes() {
         .await
         .unwrap();
     assert_eq!(by_p0.size().await.unwrap(), 4);
-    assert_eq!(by_p0.quads().unwrap().count().await, 4);
+    assert_eq!(by_p0.quads().count().await, 4);
 
     // Filter-scan delete: a subject isn't index-resolved, so this exercises
     // the pruning + filter evaluation path that resolves the doomed rows.
@@ -73,7 +73,7 @@ async fn test_file_backed_delete_keeps_indexes() {
     let compacted = after2.compact_with_indexes(vec![]).await.unwrap();
     assert_eq!(compacted.size().await.unwrap(), 7);
     assert!(compacted.indexes().is_empty());
-    assert_eq!(compacted.quads().unwrap().count().await, 7);
+    assert_eq!(compacted.quads().count().await, 7);
 }
 
 // ─── SecondaryByCopy on a file ─────────────────────────────────────────
@@ -223,7 +223,6 @@ async fn test_copy_index_file_serving_wide_located_run_stays_pending() {
     // split would make of it.
     let chunks: Vec<usize> = by_p
         .shared_quad_chunks()
-        .unwrap()
         .map(|chunk| chunk.len())
         .filter(|len| futures::future::ready(*len > 0))
         .collect()
@@ -286,7 +285,6 @@ async fn test_copy_index_file_locates_dictionary_coded_columns() {
     );
     let chunks: Vec<usize> = by_p
         .shared_quad_chunks()
-        .unwrap()
         .map(|chunk| chunk.len())
         .filter(|len| futures::future::ready(*len > 0))
         .collect()
@@ -1507,8 +1505,7 @@ async fn test_reference_index_file_takes_sparse_ids() {
                 let (got, expected) = match read {
                     "quads_vec" => (view_strings(&matched).await, &want),
                     "quads" => {
-                        let decoded: Vec<Quad> =
-                            matched.quads().unwrap().try_collect().await.unwrap();
+                        let decoded: Vec<Quad> = matched.quads().try_collect().await.unwrap();
                         (quad_strings(&decoded), &want)
                     }
                     _ => (export_lines(&matched).await, &want_lines),

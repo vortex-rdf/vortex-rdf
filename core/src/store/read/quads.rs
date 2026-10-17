@@ -44,10 +44,8 @@ impl VortexRdfStore {
     /// the serving index's order for a served view, else in base row order),
     /// then the tail's live rows. Nothing is read until the first poll, and a
     /// failure to set the read up arrives as the stream's first item.
-    pub fn quads(&self) -> Result<Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + '_>> {
-        Ok(Box::new(
-            self.chunk_stream::<Quad>(true).flat_map(stream::iter),
-        ))
+    pub fn quads(&self) -> Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + '_> {
+        Box::new(self.chunk_stream::<Quad>(true).flat_map(stream::iter))
     }
 
     /// Every quad this view covers, materialized into one exactly-sized
@@ -80,8 +78,8 @@ impl VortexRdfStore {
     /// one-element `vec![Err(..)]`.
     pub fn shared_quad_chunks(
         &self,
-    ) -> Result<Box<dyn Stream<Item = Vec<Result<SharedQuad>>> + Unpin + Send + '_>> {
-        Ok(Box::new(self.chunk_stream::<SharedQuad>(true)))
+    ) -> Box<dyn Stream<Item = Vec<Result<SharedQuad>>> + Unpin + Send + '_> {
+        Box::new(self.chunk_stream::<SharedQuad>(true))
     }
 
     /// The raw-text counterpart of

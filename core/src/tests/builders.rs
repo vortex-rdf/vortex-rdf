@@ -101,7 +101,7 @@ async fn test_dictionary_streaming_chunk_boundaries() {
         })
         .unwrap();
         assert_eq!(store.layout(), LayoutStrategy::Dictionary, "{name}");
-        let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
+        let decoded: Vec<Quad> = store.quads().try_collect().await.unwrap();
         assert_eq!(
             quad_strings(&decoded),
             quad_strings(&quads),
@@ -171,7 +171,7 @@ async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
         assert_eq!(store.indexes(), &indexes[..]);
 
         // Every quad survived the spill round-trip, in global subject order.
-        let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
+        let decoded: Vec<Quad> = store.quads().try_collect().await.unwrap();
         let mut expected = quad_strings(&quads);
         expected.sort();
         assert_eq!(quad_strings(&decoded), expected, "{layout:?}");
@@ -261,7 +261,7 @@ async fn test_writer_sorts_reversed_input() {
     let store = VortexRdfStore::from_bytes(&buffer).await.unwrap();
     assert_eq!(store.size().await.unwrap(), 25);
 
-    let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
+    let decoded: Vec<Quad> = store.quads().try_collect().await.unwrap();
     assert_eq!(decoded[0].subject.to_string(), "<http://example.org/s00>");
     assert_eq!(decoded[0].object.to_string(), "\"object value 0\"");
     assert_eq!(decoded[24].subject.to_string(), "<http://example.org/s24>");

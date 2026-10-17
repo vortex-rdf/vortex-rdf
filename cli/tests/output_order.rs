@@ -17,6 +17,8 @@ fn an_unreadable_input_leaves_the_output_file_alone() {
     let scratch = Scratch::new("refused");
     let garbage = scratch.file("garbage.vortex", "this is not a store");
     let missing = scratch.path("missing.vortex");
+    let directory = scratch.path("a-directory.vortex");
+    fs::create_dir(&directory).unwrap();
     let rdf = scratch.file("data.nt", TRIPLE);
     let rdf_missing = scratch.path("missing.nt");
     let output = scratch.file("out.nq", KEPT);
@@ -28,15 +30,25 @@ fn an_unreadable_input_leaves_the_output_file_alone() {
             KEPT,
             "{what} touched the output file"
         );
+        result
     };
     for (action, input) in [
         ("deserialize", &garbage),
         ("deserialize", &missing),
+        ("deserialize", &directory),
         ("match", &garbage),
         ("match", &missing),
+        ("match", &directory),
         ("match", &rdf_missing),
     ] {
-        refused(&format!("{action} {input:?}"), run(action, input, &output));
+        let result = refused(&format!("{action} {input:?}"), run(action, input, &output));
+        if input == &directory {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(
+                stderr.contains("is a directory"),
+                "{action} should say the input is a directory: {stderr}"
+            );
+        }
     }
     // The bytes of a file that is no store, piped in as the input.
     refused(

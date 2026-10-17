@@ -7,7 +7,6 @@ use std::fs::File;
 use std::time::Instant;
 
 use vortex_rdf_core::common::terms::parse_quads_from_reader;
-use vortex_rdf_core::debug as debug_time;
 use vortex_rdf_core::{LayoutStrategy, Probe, VortexRdfError, VortexRdfStore};
 
 use super::{export_to_output, input_format, output_format};
@@ -79,13 +78,10 @@ pub async fn run(args: MatchArgs) -> Result<()> {
 
     let is_vortex = input.extension().map(|e| e == "vortex").unwrap_or(false);
 
-    let load_start = debug_time::timer();
+    let load_start = Instant::now();
     let store = if is_vortex {
         let store = VortexRdfStore::from_file(&input).await?;
-        debug!(
-            "Opened Vortex file in {:?}",
-            debug_time::elapsed(load_start)
-        );
+        debug!("Opened Vortex file in {:?}", load_start.elapsed());
         store
     } else {
         let input_format = input_format(explicit_input, Some(input.as_path()), "--input-format")?;
@@ -95,22 +91,16 @@ pub async fn run(args: MatchArgs) -> Result<()> {
 
         let store =
             VortexRdfStore::from_quads(quads_stream, LayoutStrategy::Dictionary, vec![]).await?;
-        debug!(
-            "Vortex store built in {:?}",
-            debug_time::elapsed(load_start)
-        );
+        debug!("Vortex store built in {:?}", load_start.elapsed());
         store
     };
 
-    let match_start = debug_time::timer();
+    let match_start = Instant::now();
     let filtered = store
         .run_probe(&probe)
         .await
         .context("Failed to match pattern")?;
-    debug!(
-        "Applying match pattern took {:?}",
-        debug_time::elapsed(match_start)
-    );
+    debug!("Applying match pattern took {:?}", match_start.elapsed());
 
     // The output file is created once the input has been read and matched, so
     // a failure before that leaves an existing output file as it was.

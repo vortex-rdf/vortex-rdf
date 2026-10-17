@@ -32,7 +32,7 @@ async fn run_quads_vec_matches_stream(store: VortexRdfStore, kind: &str, streams
         ("tailed", store.add_quad(extra).await.unwrap()),
     ];
     for (tag, view) in views {
-        let streamed: Vec<Quad> = view.quads().unwrap().try_collect().await.unwrap();
+        let streamed: Vec<Quad> = view.quads().try_collect().await.unwrap();
         let built = chunk_stream_hooks::streams();
         let collected = view.quads_vec().await.unwrap();
         assert_eq!(

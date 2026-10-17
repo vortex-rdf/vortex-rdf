@@ -1,5 +1,5 @@
-// The submodules are crate-private: every public item below is re-exported
-// here (or at the crate root), so each has exactly one canonical public path.
+// This module and its submodules are crate-private: the public items below
+// are re-exported at the crate root, which is each one's only public path.
 pub(crate) mod array;
 pub(crate) mod builders;
 mod construct;
@@ -26,7 +26,8 @@ pub use indexes::{IndexType, Indexes};
 pub use layouts::LayoutStrategy;
 pub use layouts::dictionary::DictionaryQuadSink;
 pub use layouts::dictionary::{
-    CaseMap, DictReader, DictSnapshot, KindRanges, NumOp, TermPredicate, TextOptions, Verdict,
+    CaseMap, DictReader, DictSnapshot, KindRanges, NumOp, Number, TermPredicate, TextOptions,
+    TextPredicate, Verdict,
 };
 pub use persist::export::export_rdf;
 pub use query::batch::Probe;
@@ -38,8 +39,7 @@ pub use read::metadata::{
 };
 pub use schema::{QuadColumn, RowId, TermCode};
 // `RawQuad` lives in `common` (it is pure RDF text — see that module's
-// charter); this re-export makes `store::RawQuad` the path builder consumers
-// use.
+// charter); the crate root re-exports it from here with the store's types.
 pub use crate::common::quad::{RawQuad, SharedQuad};
 
 pub(crate) use view::{QuadsSource, Tail};
@@ -106,8 +106,9 @@ pub struct VortexRdfStore {
 /// describing them, and — under the Dictionary layout — the term dictionary
 /// the rows' codes address, plus the rows' sortedness. Produced by
 /// [`VortexRdfStore::to_serializable_parts`] and adopted back by
-/// [`VortexRdfStore::from_parts`] (the bindings' in-memory round-trip).
-pub struct StoreParts {
+/// [`VortexRdfStore::from_parts`] (the in-memory open, `from_file_in_memory`).
+#[cfg(any(feature = "file-io", target_arch = "wasm32", test))]
+pub(crate) struct StoreParts {
     pub(crate) built: BuiltArray,
     /// Whether the rows are in global `(s, p, o, g)` order; written as the
     /// root's `quads_sorted` (see `WireMetadata::quads_sorted`).

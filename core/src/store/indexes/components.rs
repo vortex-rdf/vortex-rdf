@@ -313,13 +313,14 @@ impl IndexComponent {
     /// into memory.
     ///
     /// [`resident::with_searchable_int_children`]: crate::store::resident::with_searchable_int_children
+    #[cfg(any(feature = "file-io", test))]
     pub(crate) fn into_searchable(self) -> Result<Self> {
         self.rebuilt(crate::store::resident::with_searchable_int_children)
     }
 
     /// This component with its integer children compressed into
     /// probe-supported encodings — the construction-side counterpart of
-    /// [`into_searchable`](Self::into_searchable): a builder's canonical
+    /// `into_searchable`: a builder's canonical
     /// emission compresses here (see
     /// [`resident::with_compressed_int_children`]), without the base's payload
     /// wrapper (components never serve code columns). The sorted probes bind

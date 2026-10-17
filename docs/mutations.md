@@ -102,7 +102,7 @@ flowchart TD
   then unions the two. A base short-circuit (a term with no code in the
   dictionary) never skips the tail, since that term may exist in the tail's
   plain strings.
-- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L182) is the number
+- **Watching it.** [`tail_len`](../core/src/store/mod.rs#L183) is the number
   of physical tail rows — the store's only unindexed, unsorted region, and the
   number to watch when tuning compaction.
 
@@ -169,7 +169,7 @@ flowchart TD
 | `size()` | selected rows minus tombstones, counted from the masks | selected tail rows minus the tail's tombstones |
 | `quads()` / `quads_vec()` | selected rows gathered, tombstones filtered out, in view order | live tail rows, in append order, after the base |
 | `match_pattern` | a narrowed selection over the same base; tombstones untouched | a narrowed tail selection; tombstones untouched |
-| `to_bytes()` / `to_serializable_parts()` | a tailed or tombstoned owner re-sorts base + tail into `(s, p, o, g)` order and rebuilds its indexes ([serialization.md §11.1](serialization.md#111-serializing-a-store-to_bytes-to_serializable_parts)) | folded into the same rebuild |
+| `to_bytes()` | a tailed or tombstoned owner re-sorts base + tail into `(s, p, o, g)` order and rebuilds its indexes ([serialization.md §11.1](serialization.md#111-serializing-a-store-to_bytes-to_serializable_parts)) | folded into the same rebuild |
 | `compact()` | every live row, base first | every live tail row, then re-sorted with the base |
 
 The rows a rebuild or compaction starts from come from
@@ -244,7 +244,7 @@ flowchart TD
   known to fit the data (`VORTEX_RDF_SPILL_DIR` outranks that default).
 - **An in-memory store**, and any *derived view* of a file (whose rows are a
   subset of a file other readers share), rebuilds in memory through
-  [`from_raw_quads`](../core/src/store/construct.rs#L141) →
+  [`from_raw_quads`](../core/src/store/construct.rs#L142) →
   [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L284) and adopts
   the result in the same compressed-resident form a freshly built store has
   ([serialization.md §10](serialization.md#10-adopting-a-build-in-memory)).
@@ -289,7 +289,7 @@ open of the file and no rebuild (a debug-level log line says so), and every
 later append over the threshold retries the same way, folding the tail as soon
 as the file can be written again. An explicit `compact()` of such a store still
 fails with `PermissionDenied`: it is the call that reports why the tail is not
-being folded, and [`tail_len`](../core/src/store/mod.rs#L182) shows the tail
+being folded, and [`tail_len`](../core/src/store/mod.rs#L183) shows the tail
 growing. The tail then has no bound but memory, and every query mask-scans it,
 so a read-only store is for reading: append to a copy.
 

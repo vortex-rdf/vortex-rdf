@@ -282,7 +282,7 @@ chunks are not one uniform window (chunks adopted from a foreign file) is
 written without the zone map; readers inspect the layout for it.
 
 **Reading it from a file.** A file store is memory-mapped
-([`from_file`](../core/src/store/persist/open.rs#L214)) and the dictionary stays in
+([`from_file`](../core/src/store/persist/open.rs#L212)) and the dictionary stays in
 its child
 ([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L243)).
 At open the handle reads the zone table — one small segment — and keeps, per

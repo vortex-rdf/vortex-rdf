@@ -49,8 +49,8 @@ where
 }
 
 /// Drive a scan's per-split futures inline ([`inline_splits`]) and collect
-/// the chunks in split (row) order — the shared tail of [`scan_all`],
-/// [`scan_all_reader`] and [`scan_reader_chunks`].
+/// the chunks in split (row) order — the shared tail of `collect_scan` and
+/// [`scan_reader_chunks`].
 async fn collect_chunks<F>(tasks: Vec<F>) -> Result<Vec<ArrayRef>>
 where
     F: Future<Output = VortexResult<Option<ArrayRef>>>,
@@ -73,8 +73,9 @@ where
 }
 
 /// [`collect_chunks`] assembled into one array of `dtype`: the tail of
-/// [`scan_all`], of `read_index_row_ids` and of `read_all_rows` for a scan
-/// its driver choice runs inline.
+/// `read_index_row_ids` and of `read_all_rows` for a scan its driver choice
+/// runs inline.
+#[cfg(feature = "file-io")]
 pub(crate) async fn collect_scan<F>(
     dtype: vortex_array::dtype::DType,
     tasks: Vec<F>,
@@ -150,22 +151,14 @@ pub(crate) mod spawn_probe {
     }
 }
 
-/// Materialize a whole file by driving its scan's per-split futures inline.
+/// Materialize a whole layout reader — a file's root, or one of the native
+/// store root's auxiliary children (dictionary, index copies) — by driving its
+/// scan's per-split futures inline.
 ///
 /// `ScanBuilder::into_array_stream` spawns onto the session's runtime handle;
 /// this drives `ScanBuilder::build`'s futures directly instead, so it needs no
 /// handle at all — which is what lets buffer-backed files (whose segment reads
 /// resolve synchronously) be read on wasm and in no-file-io builds.
-pub(crate) async fn scan_all(file: &vortex_file::VortexFile) -> Result<ArrayRef> {
-    let dtype = file.dtype().clone();
-    let scan = file.scan()?;
-    let tasks = scan.build()?;
-    collect_scan(dtype, tasks).await
-}
-
-/// [`scan_all`] over an arbitrary layout reader — how the native store root's
-/// auxiliary children (dictionary, index copies) are materialized from a
-/// buffer-backed file on every target, runtime handle included or not.
 pub(crate) async fn scan_all_reader(reader: vortex_layout::LayoutReaderRef) -> Result<ArrayRef> {
     let dtype = reader.dtype().clone();
     chunked_or_single(scan_reader_chunks(reader).await?, dtype)
@@ -344,9 +337,11 @@ pub(crate) mod map_probe {
 /// [`NativeStoreFile`](crate::store::persist::native_file::NativeStoreFile) around it
 /// owns the reader tree.
 ///
-/// Both modes reach the file through `File::open` first, so a path that
-/// cannot be opened is the same I/O error in either, with the path in its
-/// message.
+/// Both modes check the path, then reach the file through `File::open`, so a
+/// path that cannot be opened is the same I/O error in either, with the path
+/// in its message: a missing file is `NotFound`, a directory `IsADirectory`
+/// (checked first: Unix opens one read-only and fails only at the map or the
+/// read, Windows reports another kind).
 ///
 /// A mapped file must not be truncated or rewritten in place while open
 /// (its pages would fault); replacing it by rename is fine on Unix.
@@ -359,6 +354,13 @@ pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
     use vortex_file::OpenOptionsSessionExt;
 
     let path = path.as_ref();
+    if path.is_dir() {
+        return Err(path_error(
+            "open",
+            path,
+            std::io::ErrorKind::IsADirectory.into(),
+        ));
+    }
     let options = crate::session::VORTEX_SESSION.open_options();
     let file = std::fs::File::open(path).map_err(|e| path_error("open", path, e))?;
     match access {
