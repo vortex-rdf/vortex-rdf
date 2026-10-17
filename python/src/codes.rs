@@ -15,7 +15,7 @@ use vortex_buffer::Buffer;
 use vortex_rdf_core::VortexRdfError as CoreError;
 use vortex_rdf_core::{CaseMap, DictReader, TermCode, TermPredicate, TextOptions, columns};
 
-use crate::{RUNTIME, parse_err, store_err};
+use crate::{RUNTIME, py_err};
 
 /// Buckets in the decode-sharing cache (see [`TermDict::decode_slice`]).
 /// A power of two, so the bucket index is a mask rather than a division; 256
@@ -86,15 +86,6 @@ pub struct TermDict {
     pub(crate) reader: DictReader,
 }
 
-/// A malformed term or predicate argument is a `ValueError`; anything else
-/// (an I/O failure reading a file-backed dictionary) is a store error.
-fn term_err(e: CoreError) -> PyErr {
-    match e {
-        CoreError::Deserialization(_) | CoreError::InvalidOperation(_) => parse_err(e),
-        other => store_err(other),
-    }
-}
-
 impl TermDict {
     /// Decodes `codes` GIL-released into Python strings, a repeated code
     /// sharing its string while the cache below still holds it. Callers
@@ -162,7 +153,7 @@ impl TermDict {
                 }
                 Ok((slots, decoded))
             })
-            .map_err(store_err)?;
+            .map_err(py_err)?;
 
         let build = |i: usize| decoded.get(i).map(|term| PyString::new(py, term).unbind());
 
@@ -191,7 +182,7 @@ impl TermDict {
             return Ok(snapshot.decode(code));
         }
         py.detach(|| RUNTIME.block_on(self.reader.decode(code)))
-            .map_err(term_err)
+            .map_err(py_err)
     }
 
     /// The code of the term `term`, or `None` when this dictionary does not
@@ -203,10 +194,10 @@ impl TermDict {
     /// `ValueError`.
     fn encode(&self, py: Python<'_>, term: &str) -> PyResult<Option<TermCode>> {
         if let Some(snapshot) = self.reader.snapshot() {
-            return snapshot.encode_tolerant(term).map_err(term_err);
+            return snapshot.encode_tolerant(term).map_err(py_err);
         }
         py.detach(|| RUNTIME.block_on(self.reader.encode(term)))
-            .map_err(term_err)
+            .map_err(py_err)
     }
 
     /// [`encode`](Self::encode) over a sequence of terms, in order, in one
@@ -217,7 +208,7 @@ impl TermDict {
             let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
             RUNTIME.block_on(self.reader.encode_many(&refs))
         })
-        .map_err(term_err)
+        .map_err(py_err)
     }
 
     /// `kind` over the candidate `codes`: `(passed, undecided)`, both
@@ -272,7 +263,7 @@ impl TermDict {
             case,
             as_str,
         };
-        let predicate = TermPredicate::parse_with(kind, arg, &options).map_err(term_err)?;
+        let predicate = TermPredicate::parse_with(kind, arg, &options).map_err(py_err)?;
         // Like a keep's code set: whatever is no u64 code list is a bad value.
         let codes = code_buffer(codes).map_err(|e| {
             PyValueError::new_err(format!(
@@ -285,7 +276,7 @@ impl TermDict {
                 Some(snapshot) => snapshot.filter_codes(&predicate, codes.as_slice()),
                 None => RUNTIME.block_on(self.reader.filter_codes(&predicate, codes.as_slice())),
             })
-            .map_err(term_err)?;
+            .map_err(py_err)?;
         Ok((U64Column { codes: passed }, U64Column { codes: undecided }))
     }
 
@@ -295,7 +286,7 @@ impl TermDict {
     /// and an IRI namespace (`<http://example.org/`) are each one range.
     fn prefix_range(&self, py: Python<'_>, prefix: &str) -> PyResult<(TermCode, TermCode)> {
         py.detach(|| RUNTIME.block_on(self.reader.prefix_range(prefix)))
-            .map_err(term_err)
+            .map_err(py_err)
     }
 
     /// The code of the first term not below `term` in byte order — a
@@ -303,7 +294,7 @@ impl TermDict {
     /// dictionary's size when every term is below it.
     fn lower_bound(&self, py: Python<'_>, term: &str) -> PyResult<TermCode> {
         py.detach(|| RUNTIME.block_on(self.reader.lower_bound(term)))
-            .map_err(term_err)
+            .map_err(py_err)
     }
 
     /// Whether the terms are read from the store's file on demand (`True`)

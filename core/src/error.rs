@@ -23,7 +23,8 @@ pub enum VortexRdfError {
 
     /// Serialized bytes cannot be interpreted as a store: a foreign root
     /// layout, a missing or unknown required component, a code outside its
-    /// dictionary, malformed metadata.
+    /// dictionary, malformed metadata. Also an RDF document that does not
+    /// parse.
     #[error("Deserialization error: {0}")]
     Deserialization(String),
 
@@ -31,6 +32,14 @@ pub enum VortexRdfError {
     /// a view derived from `match_pattern`, which does not own its rows.
     #[error("Invalid operation: {0}")]
     InvalidOperation(String),
+
+    /// An argument a caller supplied is not valid: a term spelling, a layout,
+    /// index or format name, a term predicate's kind or argument, candidate
+    /// codes that are not ascending, unique and inside the dictionary, a
+    /// chunk export's zero batch size or empty column list. What the store or
+    /// a document holds never raises it.
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
 }
 
 /// This crate's error as the vortex error a stream or `DataSource` reports. A

@@ -11,7 +11,7 @@ use vortex_rdf_core::common::terms::parse_pattern_checked;
 use vortex_rdf_core::{Keep, Probe, QuadColumn, TermCode};
 
 use crate::codes::{U64Column, extract_u64s};
-use crate::parse_err;
+use crate::py_err;
 
 /// A `Probe` from a pattern 4-tuple (or list) `(s, p, o, g)`, or a dict with
 /// keys `s`, `p`, `o`, `g`, `keep`, `limit`, `offset` (each optional; any
@@ -86,7 +86,7 @@ pub(crate) fn pattern_probe(
     o: Option<&str>,
     g: Option<&str>,
 ) -> PyResult<Probe> {
-    let (s, p, o, g) = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
+    let (s, p, o, g) = parse_pattern_checked(s, p, o, g).map_err(py_err)?;
     Ok(Probe::new(s, p, o, g))
 }
 

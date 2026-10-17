@@ -207,7 +207,7 @@ def test_blank_node_round_trip(vortex_files):
 @pytest.mark.parametrize("matcher", ["get_quads", "count_quads", "match_columns", "match_codes"])
 def test_bad_term_raises_value_error(vortex_files, layout, matcher):
     """All four pattern slots validate on every matcher: a malformed term
-    raises ValueError."""
+    raises ValueError, carrying core's invalid-input message."""
     match = getattr(VortexRdfStore(vortex_files[layout]), matcher)
     for pattern in (
         {"s": "not a term"},
@@ -216,7 +216,7 @@ def test_bad_term_raises_value_error(vortex_files, layout, matcher):
         {"o": '"Bob"@not a language tag'},
         {"g": "<http://ex.org/not a valid iri>"},
     ):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=r"^Invalid input: "):
             match(**pattern)
 
 
@@ -226,12 +226,16 @@ def test_missing_file_raises_oserror(tmp_path):
 
 
 def test_serialize_rejects_unknown_options(fixture_nt_path, tmp_path):
+    """An unknown name is core's invalid input, raised as ValueError."""
     out = tmp_path / "out.vortex"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r'^Invalid input: unknown layout strategy "nope"'):
         serialize_rdf(fixture_nt_path, out, layout="nope")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r'^Invalid input: unknown index type "nope"'):
         serialize_rdf(fixture_nt_path, out, indexes=["nope"])
-    with pytest.raises(ValueError, match=r"unknown RDF format"):
+    with pytest.raises(
+        ValueError,
+        match=r'^Invalid input: unknown RDF format "nope"; expected one of: ntriples, nt,',
+    ):
         serialize_rdf(fixture_nt_path, out, format="nope")
 
 

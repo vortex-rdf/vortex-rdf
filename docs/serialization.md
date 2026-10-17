@@ -64,7 +64,7 @@ A builder hands these back in one of two shapes
 
 Every surface defaults to the `dictionary` layout (the CLI's `--layout`,
 Python's `layout=`, and the JavaScript `BuildOptions`
-([`options.rs`](../js/src/options.rs#L37 "LayoutStrategy::Dictionary"))) and spells layouts and indexes with
+([`options.rs`](../js/src/options.rs#L25 "LayoutStrategy::Dictionary"))) and spells layouts and indexes with
 the same kebab-case names, which `LayoutStrategy`/`IndexType` parse and print.
 
 ---
@@ -88,11 +88,11 @@ literals go through `oxrdf`'s `Display`, which escapes them.
 
 Where the stream comes from:
 
-- **RDF text** — [`parse_quads_from_reader`](../core/src/common/terms.rs#L372)
+- **RDF text** — [`parse_quads_from_reader`](../core/src/common/terms.rs#L373)
   drives an `oxrdfio` parser and converts each parsed quad on the spot, so no
   second copy of the terms outlives the conversion. Formats: N-Triples,
   N-Quads, Turtle, TriG, N3, RDF/XML, JSON-LD — named through
-  [`format_from_name`](../core/src/common/formats.rs#L42) (`"nt"`, `"ttl"`,
+  [`format_from_name`](../core/src/common/formats.rs#L48) (`"nt"`, `"ttl"`,
   `"xml"`, …) or detected from the file extension.
 - **RDF/JS quads** ([`ingest.rs`](../js/src/ingest.rs)) — an array is packed
   host-side into one length-prefixed buffer per 65,536 quads and decoded inside
@@ -114,7 +114,7 @@ deduplicated dataset (an RDF dataset is a set: a quad is in it or is not).
 The rebuilds of [§11](#11-rebuilds-mutated-stores-compaction-export) do the
 same. Builders do not parse a term again, so a build's input must come from
 one of the canonical sources: `RawQuad::from_quad` (an `oxrdf` quad), the
-parser, or [`RawQuad::canonical`](../core/src/common/quad.rs#L111), which
+parser, or [`RawQuad::canonical`](../core/src/common/quad.rs#L113), which
 turns four strings into a `RawQuad` and rejects what is no quad (a literal
 subject, a malformed IRI). A `RawQuad` written by hand in some other spelling
 of the same terms is a different quad.

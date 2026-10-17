@@ -249,7 +249,7 @@ impl DictSnapshot {
     }
 
     /// `predicate` over the candidate `codes` — ascending, unique and inside
-    /// the dictionary, else an `InvalidOperation` error: `(passed,
+    /// the dictionary, else an `InvalidInput` error: `(passed,
     /// undecided)`, both ascending subsets of `codes`; a candidate in
     /// neither fails the predicate. Only candidates whose kind does not
     /// decide them are read. Nothing is memoized.

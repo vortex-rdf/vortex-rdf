@@ -369,7 +369,7 @@ impl FileBackedDict {
     }
 
     /// Visit the terms of `codes` (strictly ascending and inside the
-    /// dictionary, else an `InvalidOperation` error before any window is
+    /// dictionary, else an `InvalidInput` error before any window is
     /// read) in order: per window holding any of them, one cached chunk and
     /// one cursor, which decompresses only the asked rows. `visit` gets each
     /// code's position in `codes` and its term, trusted to be UTF-8 as the
@@ -1297,7 +1297,7 @@ mod tests {
             assert!(
                 matches!(
                     fbd.decode_many(&codes).await,
-                    Err(VortexRdfError::InvalidOperation(_))
+                    Err(VortexRdfError::InvalidInput(_))
                 ),
                 "{codes:?}"
             );
@@ -1649,7 +1649,7 @@ mod tests {
             assert!(
                 matches!(
                     fbd.filter_codes(&predicate, &codes).await,
-                    Err(VortexRdfError::InvalidOperation(_))
+                    Err(VortexRdfError::InvalidInput(_))
                 ),
                 "{codes:?}"
             );

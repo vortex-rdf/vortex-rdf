@@ -25,7 +25,10 @@ export type LayoutStrategy = 'default' | 'typed-object' | 'dictionary';
  */
 export type IndexType = 'secondary-by-reference' | 'secondary-by-copy';
 
-/** RDF syntaxes accepted for parsing and emitted for serialization. */
+/**
+ * RDF syntaxes accepted for parsing and emitted for serialization. Any other
+ * name rejects with `Invalid input: unknown RDF format …`, which lists these.
+ */
 export type RdfFormatName =
     | 'nt' | 'ntriples'
     | 'nq' | 'nquads'
@@ -55,7 +58,9 @@ export interface BuildOptions {
 
 /**
  * A wasm-side store handle. Every method that fails rejects (or, for the
- * synchronous read family, throws) with an `Error`.
+ * synchronous read family, throws) with an `Error`. An argument the Rust
+ * core refuses (a format, layout or index name) rejects with
+ * `Invalid input: …`.
  *
  * The read family — `match`, `getQuads`, `countQuads`, `matchCodes`, `size`
  * and `has` — is synchronous: no read path performs I/O, so there is nothing

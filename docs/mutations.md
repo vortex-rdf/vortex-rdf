@@ -276,7 +276,7 @@ that crosses a threshold on such a store does not fail and does not lose the
 batch: the batch stays in the in-memory tail, where matches and counts see it
 like any appended row, and the call returns `Ok` with the store. Only the
 writer's own refusal is absorbed
-([`is_unwritable`](../core/src/error.rs#L98)): the
+([`is_unwritable`](../core/src/error.rs#L107)): the
 [`PendingStore::create`](../core/src/io/write.rs#L296) that finds, before a quad
 is gathered, that the file or its directory cannot be written
 (`PermissionDenied`, or a read-only filesystem). Any other failure of the

@@ -46,9 +46,9 @@ impl VortexRdfStore {
     /// the cap). Tombstoned rows are skipped and, under a string layout, the
     /// append tail's live rows come last.
     ///
-    /// Errors: `batch_rows == 0`; a Dictionary-layout view with a non-empty
-    /// tail (its tail holds strings whose terms have no code — `compact` the
-    /// store first).
+    /// Errors: `batch_rows == 0` is invalid input; a Dictionary-layout view
+    /// with a non-empty tail (its tail holds strings whose terms have no code
+    /// — `compact` the store first) an invalid operation.
     pub fn row_chunks(&self, batch_rows: usize) -> Result<RowChunkStream> {
         check_batch(batch_rows)?;
         self.ensure_no_dictionary_tail("row_chunks")?;
@@ -69,9 +69,9 @@ impl VortexRdfStore {
     /// zero-copy for a contiguous selection without tombstones. On file the
     /// scan, and a read by id with no filter pending, read only `columns`; a
     /// read by id under a pending filter reads every primary column. Errors:
-    /// `batch_rows == 0`, no columns, or a view whose rows are not
-    /// code-addressable (a string layout, or a Dictionary view with a
-    /// non-empty tail).
+    /// `batch_rows == 0` or no columns (invalid input), or a view whose rows
+    /// are not code-addressable (an invalid operation: a string layout, or a
+    /// Dictionary view with a non-empty tail).
     pub fn code_chunks(
         &self,
         columns: &[QuadColumn],
@@ -79,7 +79,7 @@ impl VortexRdfStore {
     ) -> Result<CodeChunkStream> {
         check_batch(batch_rows)?;
         if columns.is_empty() {
-            return Err(VortexRdfError::InvalidOperation(
+            return Err(VortexRdfError::InvalidInput(
                 "code_chunks needs at least one column".to_string(),
             ));
         }
@@ -219,10 +219,11 @@ impl VortexRdfStore {
     }
 }
 
-/// `Err` for a zero batch size.
+/// The [`InvalidInput`](VortexRdfError::InvalidInput) error for a zero batch
+/// size.
 fn check_batch(batch_rows: usize) -> Result<()> {
     if batch_rows == 0 {
-        return Err(VortexRdfError::InvalidOperation(
+        return Err(VortexRdfError::InvalidInput(
             "a chunk stream needs batch_rows > 0".to_string(),
         ));
     }

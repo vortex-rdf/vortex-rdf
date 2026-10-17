@@ -144,7 +144,8 @@ impl std::fmt::Display for LayoutStrategy {
 
 /// Accepts exactly the canonical kebab-case names
 /// [`Display`](std::fmt::Display) emits — `"default"`, `"typed-object"`,
-/// `"dictionary"` — the one vocabulary every frontend shares.
+/// `"dictionary"` — the one vocabulary every frontend shares. Any other name
+/// is an [`InvalidInput`](VortexRdfError::InvalidInput) error.
 impl std::str::FromStr for LayoutStrategy {
     type Err = VortexRdfError;
 
@@ -153,7 +154,7 @@ impl std::str::FromStr for LayoutStrategy {
             "default" => Ok(LayoutStrategy::Default),
             "typed-object" => Ok(LayoutStrategy::TypedObject),
             "dictionary" => Ok(LayoutStrategy::Dictionary),
-            _ => Err(VortexRdfError::Deserialization(format!(
+            _ => Err(VortexRdfError::InvalidInput(format!(
                 "unknown layout strategy {s:?}; expected \"default\", \"typed-object\" or \
                  \"dictionary\""
             ))),

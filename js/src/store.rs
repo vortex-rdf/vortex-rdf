@@ -6,7 +6,7 @@ use std::io::Cursor;
 
 use futures::StreamExt;
 use js_sys::{Object, Reflect};
-use vortex_rdf_core::common::terms::parse_quads_from_reader;
+use vortex_rdf_core::common::{formats::format_from_name, terms::parse_quads_from_reader};
 use vortex_rdf_core::{
     DictSnapshot, LayoutStrategy, Result as CoreResult, VortexRdfStore as CoreStore, export_rdf,
 };
@@ -16,7 +16,7 @@ use wasm_bindgen_futures::future_to_promise;
 use crate::codes::{code_from_js, code_to_js, codes_to_js};
 use crate::error::{js_err, js_err_ctx};
 use crate::ingest::{js_array_to_dictionary_array, js_array_to_quads, js_to_quad_stream};
-use crate::options::{build_array, parse_build_options, parse_format};
+use crate::options::{build_array, parse_build_options};
 use crate::terms::{JsPattern, quad_arg};
 
 #[wasm_bindgen(module = "/js-snippets/lazy-rdf.js")]
@@ -157,7 +157,7 @@ impl VortexRdfStore {
         format_name: &str,
         options: JsValue,
     ) -> Result<VortexRdfStore, JsValue> {
-        let format = parse_format(format_name)?;
+        let format = format_from_name(format_name).map_err(js_err)?;
         let config = parse_build_options(options)?;
         let quads_stream = parse_quads_from_reader(Cursor::new(input), format);
         let built = build_array(quads_stream, config).await?;
@@ -219,7 +219,7 @@ impl VortexRdfStore {
 
     #[wasm_bindgen(js_name = toRdf, skip_typescript)]
     pub async fn to_rdf(&self, format_name: &str) -> Result<String, JsValue> {
-        let format = parse_format(format_name)?;
+        let format = format_from_name(format_name).map_err(js_err)?;
         let mut buffer = Vec::new();
         export_rdf(self.inner.clone(), &mut buffer, format)
             .await

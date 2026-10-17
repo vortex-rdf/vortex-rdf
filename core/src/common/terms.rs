@@ -34,14 +34,15 @@ pub(crate) enum Trust {
     /// [`BlankNode::new`], [`Literal::new_language_tagged_literal`]), a bare
     /// IRI (no angle brackets) is a named node, the default graph may also be
     /// spelled `default` (any case) or `[]`, and a malformed literal is an
-    /// error.
+    /// error. Every refusal is an
+    /// [`InvalidInput`](VortexRdfError::InvalidInput) error.
     Input,
 }
 
-/// The error for `spelling`, whose `what` (an IRI, a blank node, a language
-/// tag) a validating constructor refused with `error`.
+/// The error for the user-typed `spelling`, whose `what` (an IRI, a blank
+/// node, a language tag) a validating constructor refused with `error`.
 fn invalid(what: &str, spelling: &str, error: impl std::fmt::Display) -> VortexRdfError {
-    VortexRdfError::Deserialization(format!("invalid {what} {spelling:?}: {error}"))
+    VortexRdfError::InvalidInput(format!("invalid {what} {spelling:?}: {error}"))
 }
 
 /// A named node from `<iri>`, the angle brackets optional.
@@ -223,9 +224,8 @@ fn literal(s: &str, trust: Trust) -> Result<Literal> {
         )),
         None => match trust {
             Trust::Stored => Ok(Literal::new_simple_literal(s.trim_matches('"'))),
-            Trust::Input => Err(VortexRdfError::Deserialization(format!(
-                "malformed literal {:?}",
-                s
+            Trust::Input => Err(VortexRdfError::InvalidInput(format!(
+                "malformed literal {s:?}"
             ))),
         },
     }
@@ -259,7 +259,8 @@ pub(crate) fn graph_name(s: &str, trust: Trust) -> Result<GraphName> {
 /// A term from its N-Triples form: `<iri>`, `_:id`, or a simple,
 /// language-tagged or typed [`literal`]. [`Trust::Input`] also reads a bare
 /// IRI (no angle brackets) as a named node; under [`Trust::Stored`] a
-/// spelling in none of those forms is an error.
+/// spelling in none of those forms is a
+/// [`Deserialization`](VortexRdfError::Deserialization) error.
 #[inline(always)]
 pub(crate) fn term(s: &str, trust: Trust) -> Result<Term> {
     if s.starts_with("_:") {
@@ -349,8 +350,8 @@ pub(crate) fn canonical_raw_quad(s: &str, p: &str, o: &str, g: &str) -> Result<R
     // The term parsers report an invalid term without saying where it was.
     fn at<T>(position: &str, parsed: Result<T>) -> Result<T> {
         parsed.map_err(|error| match error {
-            VortexRdfError::Deserialization(message) => {
-                VortexRdfError::Deserialization(format!("quad {position}: {message}"))
+            VortexRdfError::InvalidInput(message) => {
+                VortexRdfError::InvalidInput(format!("quad {position}: {message}"))
             }
             other => other,
         })
@@ -429,9 +430,17 @@ mod tests {
             term("_:b0", Trust::Stored).unwrap(),
             Term::BlankNode(b) if b.as_str() == "b0"
         ));
-        // Only the stored forms are terms; anything else is an error.
-        assert!(term("http://example.org/x", Trust::Stored).is_err());
-        assert!(term("not a term", Trust::Stored).is_err());
+        // Only the stored forms are terms; anything else is a store that does
+        // not read, never invalid input.
+        for s in ["http://example.org/x", "not a term"] {
+            assert!(
+                matches!(
+                    term(s, Trust::Stored),
+                    Err(VortexRdfError::Deserialization(_))
+                ),
+                "{s:?}"
+            );
+        }
     }
 
     #[test]
@@ -529,7 +538,7 @@ mod tests {
             (3, "_:a b", "invalid blank node \"_:a b\": "),
         ] {
             match in_slot(slot, spelling) {
-                Err(VortexRdfError::Deserialization(got)) => {
+                Err(VortexRdfError::InvalidInput(got)) => {
                     assert!(
                         got.starts_with(message),
                         "slot {slot} {spelling:?}: {got:?}"
