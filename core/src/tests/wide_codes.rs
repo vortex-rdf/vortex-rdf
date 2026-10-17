@@ -392,11 +392,15 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
             .keep(QuadColumn::G, Keep::range(BASE..BASE + 1))
             .window(1, Some(2)),
     ];
-    assert_eq!(
-        store.count_many(&probes).await.unwrap(),
-        vec![1, alice_rows.len(), 0, 2],
-        "{label}"
-    );
+    let counts = vec![1, alice_rows.len(), 0, 2];
+    assert_eq!(store.count_many(&probes).await.unwrap(), counts, "{label}");
+    for (probe, want) in probes.iter().zip(&counts) {
+        assert_eq!(
+            store.count_probe(probe).await.unwrap(),
+            *want,
+            "{label}: count_probe"
+        );
+    }
     let matched = store.run_probe(&probes[0]).await.unwrap();
     let [_, _, o, _] = matched.code_columns_gathered().await.unwrap().unwrap();
     assert_eq!(o.as_slice(), &[bob], "{label}");

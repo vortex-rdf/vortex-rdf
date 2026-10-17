@@ -45,6 +45,18 @@ fn invalid(what: &str, spelling: &str, error: impl std::fmt::Display) -> VortexR
     VortexRdfError::InvalidInput(format!("invalid {what} {spelling:?}: {error}"))
 }
 
+/// `parsed` with its [`InvalidInput`](VortexRdfError::InvalidInput) message
+/// led by `place`: the term parsers report an invalid term without saying
+/// which position of a quad or a pattern held it.
+pub(crate) fn at<T>(place: &str, parsed: Result<T>) -> Result<T> {
+    parsed.map_err(|error| match error {
+        VortexRdfError::InvalidInput(message) => {
+            VortexRdfError::InvalidInput(format!("{place}: {message}"))
+        }
+        other => other,
+    })
+}
+
 /// A named node from `<iri>`, the angle brackets optional.
 #[inline(always)]
 pub(crate) fn named_node(s: &str, trust: Trust) -> Result<NamedNode> {
@@ -287,37 +299,6 @@ pub(crate) fn quad_from_terms(s: &str, p: &str, o: &str, g: &str) -> Result<Quad
     ))
 }
 
-/// A parsed quad pattern: the four term positions, each bound (`Some`) or
-/// free (`None`) — what [`parse_pattern_checked`] returns and
-/// `VortexRdfStore::match_pattern` borrows.
-pub type Pattern = (
-    Option<NamedOrBlankNode>,
-    Option<NamedNode>,
-    Option<Term>,
-    Option<GraphName>,
-);
-
-/// Parses a user-typed quad pattern — the four optional term strings every
-/// frontend's match surface accepts — validating every component: the
-/// subject is a named or blank node, the predicate a named node, the object
-/// any term (a bare IRI, without angle brackets, included), the graph a named
-/// or blank node or a default-graph spelling (`""`, `default`, `[]`). A
-/// `None` slot stays free; the first invalid slot's error is returned as-is
-/// (callers wanting per-slot context wrap the error themselves).
-pub fn parse_pattern_checked(
-    s: Option<&str>,
-    p: Option<&str>,
-    o: Option<&str>,
-    g: Option<&str>,
-) -> Result<Pattern> {
-    Ok((
-        s.map(|s| subject(s, Trust::Input)).transpose()?,
-        p.map(|p| named_node(p, Trust::Input)).transpose()?,
-        o.map(|o| term(o, Trust::Input)).transpose()?,
-        g.map(|g| graph_name(g, Trust::Input)).transpose()?,
-    ))
-}
-
 /// The spelling the dictionary and the columns hold for a user-typed term:
 /// the validated parse of `spelling` (an IRI with or without angle brackets,
 /// a `_:` blank node, or an escape-aware literal) rendered back through the
@@ -347,20 +328,11 @@ pub fn canonical_spelling(spelling: &str) -> Result<String> {
 /// subject, predicate or graph, and a blank node is no predicate. A failure
 /// names the position.
 pub(crate) fn canonical_raw_quad(s: &str, p: &str, o: &str, g: &str) -> Result<RawQuad> {
-    // The term parsers report an invalid term without saying where it was.
-    fn at<T>(position: &str, parsed: Result<T>) -> Result<T> {
-        parsed.map_err(|error| match error {
-            VortexRdfError::InvalidInput(message) => {
-                VortexRdfError::InvalidInput(format!("quad {position}: {message}"))
-            }
-            other => other,
-        })
-    }
     Ok(RawQuad::from_quad(&Quad::new(
-        at("subject", subject(s, Trust::Input))?,
-        at("predicate", named_node(p, Trust::Input))?,
-        at("object", term(o, Trust::Input))?,
-        at("graph", graph_name(g, Trust::Input))?,
+        at("quad subject", subject(s, Trust::Input))?,
+        at("quad predicate", named_node(p, Trust::Input))?,
+        at("quad object", term(o, Trust::Input))?,
+        at("quad graph", graph_name(g, Trust::Input))?,
     )))
 }
 
@@ -443,43 +415,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_pattern_checked_binds_each_slot() {
-        let (s, p, o, g) = parse_pattern_checked(
-            Some("_:b0"),
-            Some("<http://example.org/p>"),
-            Some("\"v\"@en"),
-            Some("http://example.org/g"),
-        )
-        .unwrap();
-        assert!(matches!(s, Some(NamedOrBlankNode::BlankNode(b)) if b.as_str() == "b0"));
-        assert_eq!(p, Some(NamedNode::new("http://example.org/p").unwrap()));
-        assert_eq!(
-            o,
-            Some(Term::Literal(
-                Literal::new_language_tagged_literal("v", "en").unwrap()
-            ))
-        );
-        assert_eq!(
-            g,
-            Some(GraphName::NamedNode(
-                NamedNode::new("http://example.org/g").unwrap()
-            ))
-        );
-
-        // A bare IRI (no angle brackets) in the object slot takes the
-        // named-node arm.
-        assert_eq!(
-            term("http://example.org/x", Trust::Input).unwrap(),
-            Term::NamedNode(NamedNode::new("http://example.org/x").unwrap())
-        );
-
-        // A `None` slot stays free; "default" names the default graph.
-        let (s, p, o, g) = parse_pattern_checked(None, None, None, Some("default")).unwrap();
-        assert!(s.is_none() && p.is_none() && o.is_none());
-        assert_eq!(g, Some(GraphName::DefaultGraph));
-    }
-
     /// The user-typed default-graph spellings belong to the `Input` form
     /// only; the `Stored` form reads the `""` the columns store.
     #[test]
@@ -503,49 +438,6 @@ mod tests {
                 ),
                 "{s:?}"
             );
-        }
-    }
-
-    /// Pattern slots are user-typed, so they take the `Input` parse: an
-    /// invalid term in any slot must error rather than silently match nothing,
-    /// with a message that names the invalid part (oxrdf's own reason follows
-    /// the `: `).
-    #[test]
-    fn parse_pattern_checked_rejects_invalid_slots() {
-        let in_slot = |slot: usize, spelling| {
-            let mut slots: [Option<&str>; 4] = [None; 4];
-            slots[slot] = Some(spelling);
-            parse_pattern_checked(slots[0], slots[1], slots[2], slots[3])
-        };
-        for (slot, spelling, message) in [
-            (
-                0,
-                "no spaces allowed",
-                "invalid IRI \"no spaces allowed\": ",
-            ),
-            (0, "_:a b", "invalid blank node \"_:a b\": "),
-            (1, "not an iri", "invalid IRI \"not an iri\": "),
-            (1, "<not an iri>", "invalid IRI \"not an iri\": "),
-            (
-                2,
-                "\"unterminated",
-                "malformed literal \"\\\"unterminated\"",
-            ),
-            (2, "\"v\"@not a tag", "invalid language tag \"not a tag\": "),
-            (2, "\"x\"^^<not an iri>", "invalid IRI \"not an iri\": "),
-            (2, "_:a b", "invalid blank node \"_:a b\": "),
-            (3, "bad graph iri", "invalid IRI \"bad graph iri\": "),
-            (3, "_:a b", "invalid blank node \"_:a b\": "),
-        ] {
-            match in_slot(slot, spelling) {
-                Err(VortexRdfError::InvalidInput(got)) => {
-                    assert!(
-                        got.starts_with(message),
-                        "slot {slot} {spelling:?}: {got:?}"
-                    )
-                }
-                other => panic!("slot {slot} {spelling:?}: {other:?}"),
-            }
         }
     }
 

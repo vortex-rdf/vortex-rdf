@@ -207,16 +207,17 @@ def test_blank_node_round_trip(vortex_files):
 @pytest.mark.parametrize("matcher", ["get_quads", "count_quads", "match_columns", "match_codes"])
 def test_bad_term_raises_value_error(vortex_files, layout, matcher):
     """All four pattern slots validate on every matcher: a malformed term
-    raises ValueError, carrying core's invalid-input message."""
+    raises ValueError, carrying core's invalid-input message and the slot
+    that held the term."""
     match = getattr(VortexRdfStore(vortex_files[layout]), matcher)
-    for pattern in (
-        {"s": "not a term"},
-        {"p": '"literals-cannot-be-predicates"'},
-        {"o": "<http://ex.org/not a valid iri>"},
-        {"o": '"Bob"@not a language tag'},
-        {"g": "<http://ex.org/not a valid iri>"},
+    for position, pattern in (
+        ("subject", {"s": "not a term"}),
+        ("predicate", {"p": '"literals-cannot-be-predicates"'}),
+        ("object", {"o": "<http://ex.org/not a valid iri>"}),
+        ("object", {"o": '"Bob"@not a language tag'}),
+        ("graph", {"g": "<http://ex.org/not a valid iri>"}),
     ):
-        with pytest.raises(ValueError, match=r"^Invalid input: "):
+        with pytest.raises(ValueError, match=rf"^Invalid input: pattern {position}: "):
             match(**pattern)
 
 

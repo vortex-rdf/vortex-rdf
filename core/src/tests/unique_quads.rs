@@ -11,7 +11,7 @@
 //! answer computed from the distinct set of the parsed quads.
 
 use super::*;
-use crate::common::terms::{canonical_spelling, parse_pattern_checked, parse_quads_from_reader};
+use crate::common::terms::{canonical_spelling, parse_quads_from_reader};
 use crate::store::RawQuad;
 use crate::store::builders::{BuiltArray, sorted_stream};
 use oxrdfio::RdfFormat;
@@ -149,12 +149,8 @@ async fn assert_holds_each_quad_once(store: &VortexRdfStore, expected: &BTreeSet
     );
 
     for pattern in PATTERNS {
-        let (s, p, o, g) =
-            parse_pattern_checked(pattern.0, pattern.1, pattern.2, pattern.3).unwrap();
-        let view = store
-            .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
-            .await
-            .unwrap();
+        let probe = Probe::parse(pattern.0, pattern.1, pattern.2, pattern.3).unwrap();
+        let view = store.run_probe(&probe).await.unwrap();
         let want: BTreeSet<Row> = expected
             .iter()
             .filter(|q| answers(q, pattern))

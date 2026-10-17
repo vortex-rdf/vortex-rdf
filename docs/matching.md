@@ -1154,9 +1154,13 @@ stops at its first matching block.
 `match_many(&[Probe])` (and `count_many`) runs a pattern plus its keeps and
 window per probe and answers in input order, the probes concurrently
 (`try_join_all`): a file-backed store overlaps their reads, an in-memory
-match is CPU work and runs probe by probe. The futures are `Send`, so a
-binding layer can instead spawn one task per probe onto its runtime — the
-Python bindings do, for every batch.
+match is CPU work and runs probe by probe. `run_probe` and `count_probe` are
+the one-probe forms, and `count_many` maps over `count_probe`.
+`Probe::parse` builds a probe from the four term spellings a person types,
+and a spelling it refuses is an `InvalidInput` error naming the slot
+(`pattern subject: …`). The futures are `Send`, so a binding layer can
+instead spawn one task per probe onto its runtime — the Python bindings do,
+for every batch.
 
 ### 16.4 Predicates and the dictionary handle
 
@@ -1206,7 +1210,7 @@ checked against rdflib by `python/tests/test_filter_codes_differential.py`.
 | Typed residual/tail equality loops | [`core/src/store/scan/typed_eq.rs`](../core/src/store/scan/typed_eq.rs) |
 | `Keep`, `keep`, `window`, `empty_view` | [`core/src/store/query/narrowing.rs`](../core/src/store/query/narrowing.rs) |
 | `size`, `size_capped`, `exists`, `live_len_if_known` | [`core/src/store/read/count.rs`](../core/src/store/read/count.rs) |
-| `Probe`, `match_many`, `count_many` | [`core/src/store/query/batch.rs`](../core/src/store/query/batch.rs) |
+| `Probe` (with `Probe::parse`), `match_many`, `count_many`, `run_probe`, `count_probe` | [`core/src/store/query/batch.rs`](../core/src/store/query/batch.rs) |
 | `DictReader`, `DictSnapshot`, `prefix_range`, tolerant `encode` | [`core/src/store/layouts/dictionary/handles.rs`](../core/src/store/layouts/dictionary/handles.rs), [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs) |
 | `TermPredicate`, `Verdict`, `KindRanges`, the verdict rules, the regex subset | [`core/src/store/layouts/dictionary/predicates/mod.rs`](../core/src/store/layouts/dictionary/predicates/mod.rs), [`numeric.rs`](../core/src/store/layouts/dictionary/predicates/numeric.rs), [`literal.rs`](../core/src/store/layouts/dictionary/predicates/literal.rs), [`text.rs`](../core/src/store/layouts/dictionary/predicates/text.rs), [`regex_filter.rs`](../core/src/store/layouts/dictionary/predicates/regex_filter.rs) |
 | The RDF/XSD datatype IRIs the predicates and the TypedObject layout share | [`core/src/common/vocab.rs`](../core/src/common/vocab.rs) |
