@@ -130,6 +130,29 @@ async function runGroup(opts: BenchOptions, add: (b: Bench) => void): Promise<vo
     }
 }
 
+// Under CodSpeed a query task is one call (see READ_OPTS). A one-off warm-up
+// cost of the read path every query task shares (a V8 tier-up of the JS glue
+// or the lazy read model, or any other first-time work) is then charged to
+// whichever task's call happens to cross it, and it moves between tasks
+// whenever the code changes how often that path runs. So every query group
+// first runs each of its queries WARM_UP_ROUNDS times, untimed: a warm group on
+// the store its tasks query, a cold group on a throwaway store adopted from the
+// same bytes, so that a cold task still measures the first query of a store
+// adopted for it alone.
+const WARM_UP_ROUNDS = 100;
+
+async function warmUp(store: VortexRdfStore, patterns: Pat[]): Promise<void> {
+    for (let i = 0; i < WARM_UP_ROUNDS; i++)
+        for (const p of patterns) await store.getQuads(p.s, p.p, p.o, p.g);
+}
+
+/** warmUp for a cold group, on a throwaway store adopted from `bytes`. */
+async function warmUpCold(bytes: Uint8Array, patterns: Pat[]): Promise<void> {
+    const store = await VortexRdfStore.fromBytes(bytes);
+    await warmUp(store, patterns);
+    store.free();
+}
+
 // ─── Groups ──────────────────────────────────────────────────────────────────
 
 /** build::<config> — VortexRdfStore.fromQuads over each star variant, plus a
@@ -179,10 +202,12 @@ async function benchLiterals(literals: Quad[]): Promise<void> {
 }
 
 /** query_<config>::<pattern> — getQuads across every routing class, on each
- * query variant. Store built once per variant (untimed). */
+ * query variant. Store built once per variant; every group warmed up first
+ * (both untimed; see warmUp). */
 async function benchQuery(triples: Quad[], quads: Quad[]): Promise<void> {
     for (const v of QUERY_VARIANTS) {
         const th = await VortexRdfStore.fromQuads(triples, v.options);
+        await warmUp(th, [...TRIPLE_PATTERNS, FULL_SCAN_PATTERN]);
         await runGroup(READ_OPTS, (b) => {
             for (const p of TRIPLE_PATTERNS)
                 b.add(`query_warm_${v.slug}::${p.name}`, async () => { await th.getQuads(p.s, p.p, p.o, p.g); });
@@ -196,8 +221,10 @@ async function benchQuery(triples: Quad[], quads: Quad[]): Promise<void> {
         // tinybench does not time (and which CodSpeed likewise excludes from
         // the measured invocation), so this isolates the query against empty
         // caches; adopting is measured on its own as `open::<config>` below.
-        // Freed in afterEach; see StoreAdapter.dispose in shared.ts.
+        // Freed in afterEach; see StoreAdapter.dispose in shared.ts. The
+        // warm-up's throwaway store shares no cache with the adopted ones.
         const tbytes = await th.toBytes();
+        await warmUpCold(tbytes, TRIPLE_PATTERNS);
         await runGroup(READ_OPTS, (b) => {
             let h: VortexRdfStore | undefined;
             b.add(`open::${v.slug}`, async () => { h = await VortexRdfStore.fromBytes(tbytes); }, {
@@ -214,11 +241,13 @@ async function benchQuery(triples: Quad[], quads: Quad[]): Promise<void> {
         th.free();
 
         const qh = await VortexRdfStore.fromQuads(quads, v.options);
+        await warmUp(qh, QUAD_PATTERNS);
         await runGroup(READ_OPTS, (b) => {
             for (const p of QUAD_PATTERNS)
                 b.add(`query_warm_${v.slug}::${p.name}`, async () => { await qh.getQuads(p.s, p.p, p.o, p.g); });
         });
         const qbytes = await qh.toBytes();
+        await warmUpCold(qbytes, QUAD_PATTERNS);
         await runGroup(READ_OPTS, (b) => {
             for (const p of QUAD_PATTERNS) {
                 let q: VortexRdfStore | undefined;
