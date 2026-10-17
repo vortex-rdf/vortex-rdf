@@ -1,9 +1,12 @@
 //! Resolving an [`RdfFormat`] from what a user supplies: a file path or a
 //! format name. The two entry points below are the only places a format is
 //! named rather than passed, so every binding's format argument funnels
-//! through them and accepts the same spellings.
+//! through them, accepts the same spellings and refuses the rest with the
+//! same error.
 
 use oxrdfio::{JsonLdProfileSet, RdfFormat};
+
+use crate::error::{Result, VortexRdfError};
 
 /// Every accepted format name with the format it denotes, each long spelling
 /// before its aliases.
@@ -37,19 +40,28 @@ pub fn detect_format(path: Option<&std::path::Path>) -> Option<RdfFormat> {
 
 /// Parse a user-facing RDF format name — case-insensitive, accepting the
 /// common aliases (`"ntriples"`, `"ttl"`, `"xml"`, …) — into an
-/// [`RdfFormat`]. `None` for an unrecognized name. The name table behind
-/// every string-typed format parameter (the JS bindings' `RdfFormatName`).
-pub fn format_from_name(name: &str) -> Option<RdfFormat> {
-    let name = name.to_lowercase();
+/// [`RdfFormat`]. An unrecognized name is an
+/// [`InvalidInput`](VortexRdfError::InvalidInput) error that lists every
+/// accepted name. The name table behind every string-typed format parameter:
+/// the JS bindings' `RdfFormatName`, Python's `format=` and the CLI's format
+/// flags.
+pub fn format_from_name(name: &str) -> Result<RdfFormat> {
+    let spelling = name.to_lowercase();
     FORMAT_NAMES
         .iter()
-        .find(|(spelling, _)| *spelling == name)
+        .find(|(accepted, _)| *accepted == spelling)
         .map(|(_, format)| *format)
+        .ok_or_else(|| {
+            VortexRdfError::InvalidInput(format!(
+                "unknown RDF format {name:?}; expected one of: {}",
+                supported_format_names().join(", ")
+            ))
+        })
 }
 
 /// Every name [`format_from_name`] accepts, long spelling before its aliases
-/// — the list "unsupported format" errors quote.
-pub fn supported_format_names() -> &'static [&'static str] {
+/// — the list its error quotes.
+pub(crate) fn supported_format_names() -> &'static [&'static str] {
     const NAMES: [&str; FORMAT_NAMES.len()] = {
         let mut names = [""; FORMAT_NAMES.len()];
         let mut i = 0;
@@ -66,8 +78,9 @@ pub fn supported_format_names() -> &'static [&'static str] {
 mod tests {
     use super::*;
 
-    // tests/names.rs asserts every supported_format_names() entry parses;
-    // this pins the extension mapping, case-insensitivity, and the None arms.
+    // tests/names.rs asserts every supported_format_names() entry parses and
+    // pins the refusal's message; this pins the extension mapping,
+    // case-insensitivity, and the arms that decline.
     #[test]
     fn detect_format_maps_extensions_and_declines_the_rest() {
         let path = |p: &str| detect_format(Some(std::path::Path::new(p)));
@@ -85,16 +98,23 @@ mod tests {
 
     #[test]
     fn format_from_name_accepts_aliases_case_insensitively() {
-        assert_eq!(format_from_name("NTriples"), Some(RdfFormat::NTriples));
-        assert_eq!(format_from_name("nq"), Some(RdfFormat::NQuads));
-        assert_eq!(format_from_name("ttl"), Some(RdfFormat::Turtle));
-        assert_eq!(format_from_name("TRIG"), Some(RdfFormat::TriG));
-        assert_eq!(format_from_name("n3"), Some(RdfFormat::N3));
-        assert_eq!(format_from_name("xml"), Some(RdfFormat::RdfXml));
+        for (name, format) in [
+            ("NTriples", RdfFormat::NTriples),
+            ("nq", RdfFormat::NQuads),
+            ("ttl", RdfFormat::Turtle),
+            ("TRIG", RdfFormat::TriG),
+            ("n3", RdfFormat::N3),
+            ("xml", RdfFormat::RdfXml),
+        ] {
+            assert_eq!(format_from_name(name).unwrap(), format, "{name}");
+        }
         assert!(matches!(
             format_from_name("jsonld"),
-            Some(RdfFormat::JsonLd { .. })
+            Ok(RdfFormat::JsonLd { .. })
         ));
-        assert_eq!(format_from_name("csv"), None);
+        assert!(matches!(
+            format_from_name("csv"),
+            Err(VortexRdfError::InvalidInput(_))
+        ));
     }
 }

@@ -544,13 +544,17 @@ fn string_kind_options_are_validated() {
         ("contains", "\"x\"@", opts(None, false)),
     ] {
         assert!(
-            TermPredicate::parse_with(kind, arg, &options).is_err(),
+            matches!(
+                TermPredicate::parse_with(kind, arg, &options),
+                Err(crate::VortexRdfError::InvalidInput(_))
+            ),
             "{kind} {arg:?}"
         );
     }
 }
 
-/// Malformed predicates are refused at parse time, with the kind named.
+/// Malformed predicates are refused at parse time as invalid input, with
+/// the kind named.
 #[test]
 fn parse_rejects_malformed() {
     for (kind, arg) in [
@@ -562,7 +566,13 @@ fn parse_rejects_malformed() {
         ("num_eq", "1.5.2"),
         ("num_gt", "\"5\"^^<http://ex.org/dt>"),
     ] {
-        assert!(TermPredicate::parse(kind, arg).is_err(), "{kind} {arg:?}");
+        assert!(
+            matches!(
+                TermPredicate::parse(kind, arg),
+                Err(crate::VortexRdfError::InvalidInput(_))
+            ),
+            "{kind} {arg:?}"
+        );
     }
     // A numeric argument is a bare lexical form or a typed literal.
     assert!(TermPredicate::parse("num_lt", "5").is_ok());
@@ -783,7 +793,8 @@ async fn filter_codes_leaves_wide_longs_undecided() {
     }
 }
 
-/// Candidates must be ascending, unique and inside the dictionary.
+/// Candidates must be ascending, unique and inside the dictionary: any other
+/// list is invalid input.
 #[tokio::test]
 async fn filter_codes_rejects_bad_candidates() {
     let store = predicate_store().await;
@@ -794,7 +805,7 @@ async fn filter_codes_rejects_bad_candidates() {
         assert!(
             matches!(
                 dict.filter_codes(&predicate, &codes),
-                Err(crate::VortexRdfError::InvalidOperation(_))
+                Err(crate::VortexRdfError::InvalidInput(_))
             ),
             "{codes:?}"
         );

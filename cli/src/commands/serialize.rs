@@ -1,15 +1,15 @@
 //! The `serialize` arm: RDF text (file or stdin) → a Vortex-RDF file.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use log::info;
 use std::fs::File;
 use std::io::{Read, stdin};
 use std::time::Instant;
 
-use vortex_rdf_core::common::formats::detect_format;
 use vortex_rdf_core::common::terms::parse_quads_from_reader;
 use vortex_rdf_core::io::quads_stream_to_vortex_file;
 
+use super::input_format;
 use crate::SerializeArgs;
 
 pub async fn run(args: SerializeArgs) -> Result<()> {
@@ -22,9 +22,7 @@ pub async fn run(args: SerializeArgs) -> Result<()> {
     } = args;
 
     let start = Instant::now();
-    let format = format
-        .or_else(|| detect_format(input.as_deref()))
-        .ok_or_else(|| anyhow!("Could not detect RDF format. Please specify it with --format"))?;
+    let format = input_format(format, input.as_deref(), "--format")?;
 
     let reader: Box<dyn Read + Send> = match &input {
         Some(p) => Box::new(File::open(p).context("Failed to open input file")?),

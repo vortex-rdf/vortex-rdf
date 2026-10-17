@@ -107,7 +107,9 @@ impl RawQuad {
     /// graph as `""`, `default` or `[]` — and must hold a term its position can
     /// (no literal subject, predicate or graph, no blank predicate). `"x"`,
     /// `"x"^^<…#string>` and `"\u0078"` give the same quad, and `"y"@EN` gives
-    /// `"y"@en`. A malformed spelling is an error naming the position.
+    /// `"y"@en`. A malformed spelling is an
+    /// [`InvalidInput`](crate::VortexRdfError::InvalidInput) error naming the
+    /// position.
     pub fn canonical(s: &str, p: &str, o: &str, g: &str) -> Result<Self> {
         crate::common::terms::canonical_raw_quad(s, p, o, g)
     }
@@ -280,7 +282,7 @@ mod tests {
         ] {
             let [s, p, o, g] = quad;
             match RawQuad::canonical(s, p, o, g).err() {
-                Some(crate::error::VortexRdfError::Deserialization(message)) => {
+                Some(crate::error::VortexRdfError::InvalidInput(message)) => {
                     assert!(message.starts_with(prefix), "{quad:?}: {message:?}")
                 }
                 other => panic!("{quad:?}: {other:?}"),

@@ -1,24 +1,23 @@
 //! The `match` arm (named `matching` because `match` is a keyword): filter a
 //! store by a quad pattern and export the matches as RDF text.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use log::{debug, info};
 use std::fs::File;
 use std::time::Instant;
 
-use vortex_rdf_core::common::formats::detect_format;
 use vortex_rdf_core::common::terms::{parse_pattern_checked, parse_quads_from_reader};
 use vortex_rdf_core::debug as debug_time;
 use vortex_rdf_core::{LayoutStrategy, VortexRdfStore};
 
-use super::{export_to_output, output_format};
+use super::{export_to_output, input_format, output_format};
 use crate::MatchArgs;
 
 pub async fn run(args: MatchArgs) -> Result<()> {
     let MatchArgs {
         input,
         output,
-        input_format,
+        input_format: explicit_input,
         output_format: explicit_format,
         subject,
         predicate,
@@ -56,11 +55,7 @@ pub async fn run(args: MatchArgs) -> Result<()> {
         );
         store
     } else {
-        let input_format = input_format
-            .or_else(|| detect_format(Some(input.as_path())))
-            .ok_or_else(|| {
-                anyhow!("Could not detect RDF format. Please specify it with --input-format")
-            })?;
+        let input_format = input_format(explicit_input, Some(input.as_path()), "--input-format")?;
 
         let reader = Box::new(File::open(&input).context("Failed to open input file")?);
         let quads_stream = parse_quads_from_reader(reader, input_format);

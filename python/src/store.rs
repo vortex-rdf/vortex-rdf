@@ -12,7 +12,7 @@ use vortex_rdf_core::{TermCode, VortexRdfError as CoreError, VortexRdfStore as C
 use crate::codes::{TermDict, U64Column};
 use crate::fan_out::fan_out;
 use crate::probes::{parse_keeps, parse_probe, pattern_probe};
-use crate::{RUNTIME, VortexRdfError, parse_err, store_err};
+use crate::{RUNTIME, VortexRdfError, py_err};
 use vortex_rdf_core::Probe;
 
 /// `(s, p, o, g)` code columns as returned by [`VortexRdfStore::match_codes`].
@@ -139,7 +139,7 @@ impl VortexRdfStore {
         py.detach(|| -> Result<_, CoreError> {
             RUNTIME.block_on(async { self.matched(pattern).await?.code_columns_gathered().await })
         })
-        .map_err(store_err)
+        .map_err(py_err)
     }
 
     /// The matched rows as four columns of N-Triples strings, in
@@ -177,7 +177,7 @@ impl VortexRdfStore {
             .detach(|| -> Result<_, CoreError> {
                 RUNTIME.block_on(async { self.matched(pattern).await?.shared_quads_vec().await })
             })
-            .map_err(store_err)?;
+            .map_err(py_err)?;
         // Intern by `Arc` address: `rows` holds every `Arc` for the whole
         // loop, so an address identifies one term. A strong count of one means
         // no other row shares the term, so it skips the map.
@@ -240,7 +240,7 @@ impl VortexRdfStore {
                     }
                 })
             })
-            .map_err(store_err)?;
+            .map_err(py_err)?;
         Ok(Self {
             store,
             path: Some(path),
@@ -256,7 +256,7 @@ impl VortexRdfStore {
     fn from_bytes(py: Python<'_>, data: Vec<u8>) -> PyResult<Self> {
         let store = py
             .detach(|| RUNTIME.block_on(CoreStore::from_bytes_owned(data)))
-            .map_err(store_err)?;
+            .map_err(py_err)?;
         Ok(Self { store, path: None })
     }
 
@@ -267,7 +267,7 @@ impl VortexRdfStore {
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let bytes = py
             .detach(|| RUNTIME.block_on(self.store.to_bytes()))
-            .map_err(store_err)?;
+            .map_err(py_err)?;
         Ok(PyBytes::new(py, &bytes))
     }
 
@@ -289,7 +289,7 @@ impl VortexRdfStore {
 
     fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
         py.detach(|| RUNTIME.block_on(self.store.size()))
-            .map_err(store_err)
+            .map_err(py_err)
     }
 
     fn __repr__(&self) -> String {
@@ -324,7 +324,7 @@ impl VortexRdfStore {
         o: Option<&str>,
         g: Option<&str>,
     ) -> PyResult<Vec<PyQuad>> {
-        let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
+        let pattern = parse_pattern_checked(s, p, o, g).map_err(py_err)?;
         let [subjects, predicates, objects, graphs] = self.matched_columns(py, &pattern)?;
         let mut rows = Vec::with_capacity(subjects.len());
         for (((s, p), o), g) in subjects
@@ -366,7 +366,7 @@ impl VortexRdfStore {
                 Ok(counts[0])
             })
         })
-        .map_err(store_err)
+        .map_err(py_err)
     }
 
     /// [`Self::count_quads`] for a batch of probes in one GIL-released call,
@@ -384,7 +384,7 @@ impl VortexRdfStore {
                 Ok(counts[0])
             })
         })
-        .map_err(store_err)
+        .map_err(py_err)
     }
 
     /// Match a pattern and return the matching quads as four parallel columns
@@ -405,7 +405,7 @@ impl VortexRdfStore {
         o: Option<&str>,
         g: Option<&str>,
     ) -> PyResult<StringColumns> {
-        let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
+        let pattern = parse_pattern_checked(s, p, o, g).map_err(py_err)?;
         let [subjects, predicates, objects, graphs] = self.matched_columns(py, &pattern)?;
         Ok((subjects, predicates, objects, graphs))
     }
@@ -461,7 +461,7 @@ impl VortexRdfStore {
                         .await
                 })
             })
-            .map_err(store_err)?;
+            .map_err(py_err)?;
         Ok(columns.map(code_columns))
     }
 
@@ -486,7 +486,7 @@ impl VortexRdfStore {
                     store.run_probe(&probe).await?.code_columns_gathered().await
                 })
             })
-            .map_err(store_err)?;
+            .map_err(py_err)?;
         Ok(columns.into_iter().map(|c| c.map(code_columns)).collect())
     }
 }

@@ -401,10 +401,12 @@ describe('RDF format support', () => {
         expect(await store.size()).toBe(1);
     });
 
+    // Core's invalid-input error, its kind first, listing the accepted names.
     test('rejects an unsupported format', async () => {
-        await expect(VortexRdfStore.fromString(TURTLE, 'nope' as any)).rejects.toThrow(
-            /unknown RDF format "nope"/,
-        );
+        const refusal = /^Invalid input: unknown RDF format "nope"; expected one of: ntriples, nt,/;
+        await expect(VortexRdfStore.fromString(TURTLE, 'nope' as any)).rejects.toThrow(refusal);
+        const store = await VortexRdfStore.fromString(TURTLE, 'turtle');
+        await expect(store.toRdf('nope' as any)).rejects.toThrow(refusal);
     });
 });
 
@@ -502,12 +504,12 @@ describe('lazy terms outliving a dictionary rebuild', () => {
 describe('option validation', () => {
     test('rejects an unknown layout', async () => {
         await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'Nope' as any })).rejects
-            .toThrow(/unknown layout strategy/);
+            .toThrow(/^Invalid input: unknown layout strategy/);
     });
 
     test('rejects an unknown index', async () => {
         await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { indexes: ['Nope'] as any })).rejects
-            .toThrow(/unknown index type/);
+            .toThrow(/^Invalid input: unknown index type/);
     });
 
     test('rejects retired spellings, naming the canonical vocabulary', async () => {

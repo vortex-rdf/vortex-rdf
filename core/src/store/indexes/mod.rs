@@ -245,7 +245,8 @@ impl std::fmt::Display for IndexType {
 
 /// Accepts exactly the canonical kebab-case names
 /// [`Display`](std::fmt::Display) emits — `"secondary-by-copy"`,
-/// `"secondary-by-reference"` — the one vocabulary every frontend shares.
+/// `"secondary-by-reference"` — the one vocabulary every frontend shares. Any
+/// other name is an [`InvalidInput`](VortexRdfError::InvalidInput) error.
 impl std::str::FromStr for IndexType {
     type Err = VortexRdfError;
 
@@ -253,7 +254,7 @@ impl std::str::FromStr for IndexType {
         match s {
             "secondary-by-copy" => Ok(IndexType::SecondaryByCopy),
             "secondary-by-reference" => Ok(IndexType::SecondaryByReference),
-            _ => Err(VortexRdfError::Deserialization(format!(
+            _ => Err(VortexRdfError::InvalidInput(format!(
                 "unknown index type {s:?}; expected \"secondary-by-copy\" or \
                  \"secondary-by-reference\""
             ))),

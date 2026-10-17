@@ -63,24 +63,39 @@ fn an_unreadable_input_leaves_the_output_file_alone() {
     }
 }
 
-/// `/dev/full` opens for writing and fails every write with ENOSPC. The export
-/// is one line, which a buffered writer holds until its final flush: the error
-/// of that flush must still end the command in failure.
+/// `/dev/full` opens for writing and fails every write with ENOSPC. A
+/// one-line export is held by the buffered writer until its final flush; a
+/// longer one overflows the writer's 8 KiB buffer, so a write fails first.
+/// Either way the command fails with its own failure text and the write
+/// error.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_output_that_cannot_be_written_is_reported() {
     let scratch = Scratch::new("unwritable");
-    let rdf = scratch.file("data.nt", TRIPLE);
-    let store = scratch.path("data.vortex");
-    assert!(run("serialize", &rdf, &store).status.success());
+    let long: String = (0..400)
+        .map(|i| {
+            format!("<http://example.org/s{i}> <http://example.org/p> <http://example.org/o> .\n")
+        })
+        .collect();
+    for (name, text) in [("one-line", TRIPLE), ("long", long.as_str())] {
+        let rdf = scratch.file(&format!("{name}.nt"), text);
+        let store = scratch.path(&format!("{name}.vortex"));
+        assert!(run("serialize", &rdf, &store).status.success());
 
-    for action in ["deserialize", "match"] {
-        let result = run(action, &store, Path::new("/dev/full"));
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        assert!(!result.status.success(), "{action} succeeded: {result:?}");
-        assert!(
-            stderr.contains("No space left on device"),
-            "{action} did not report the write error: {stderr}"
-        );
+        for (action, failure) in [
+            ("deserialize", "Failed to export RDF from Vortex"),
+            ("match", "Failed to export filtered results"),
+        ] {
+            let result = run(action, &store, Path::new("/dev/full"));
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(
+                !result.status.success(),
+                "{name} {action} succeeded: {result:?}"
+            );
+            assert!(
+                stderr.contains(failure) && stderr.contains("No space left on device"),
+                "{name} {action} did not report {failure:?} and the write error: {stderr}"
+            );
+        }
     }
 }

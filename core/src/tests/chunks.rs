@@ -368,17 +368,20 @@ async fn test_chunks_string_layouts_include_tail() {
     }
 }
 
-/// The gates: a zero batch, no columns, and a Dictionary view whose tail
-/// holds terms without codes, which has no chunks and no data source.
+/// The gates: a zero batch and no columns are invalid input; a Dictionary
+/// view whose tail holds terms without codes has no chunks and no data
+/// source, an invalid operation.
 #[tokio::test]
 async fn test_chunks_gates() {
     let store = built_store(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
+    let invalid =
+        |result: crate::error::Result<_>| matches!(result, Err(VortexRdfError::InvalidInput(_)));
+    assert!(invalid(store.row_chunks(0).map(drop)));
+    assert!(invalid(store.code_chunks(&QuadColumn::ALL, 0).map(drop)));
+    assert!(invalid(store.code_chunks(&[], 10).map(drop)));
     let refused = |result: crate::error::Result<_>| {
         matches!(result, Err(VortexRdfError::InvalidOperation(_)))
     };
-    assert!(refused(store.row_chunks(0).map(drop)));
-    assert!(refused(store.code_chunks(&QuadColumn::ALL, 0).map(drop)));
-    assert!(refused(store.code_chunks(&[], 10).map(drop)));
     let tailed = store.add_quads(appended_quads(3)).await.unwrap();
     assert_eq!(tailed.tail_len(), 3);
     assert!(

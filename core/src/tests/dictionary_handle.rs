@@ -407,21 +407,21 @@ async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapsh
     }
 
     // Candidates must be ascending, unique and inside the dictionary, under
-    // either residency; none at all is two empty answers.
+    // either residency, else invalid input; none at all is two empty answers.
     let is_iri = TermPredicate::parse("is_iri", "").unwrap();
     let len = oracle.len() as TermCode;
     for codes in [vec![3u64, 1], vec![1, 1], vec![0, len], vec![len + 7]] {
         assert!(
             matches!(
                 reader.filter_codes(&is_iri, &codes).await,
-                Err(crate::VortexRdfError::InvalidOperation(_))
+                Err(crate::VortexRdfError::InvalidInput(_))
             ),
             "{tag}: filter_codes over {codes:?}"
         );
         assert!(
             matches!(
                 oracle.filter_codes(&is_iri, &codes),
-                Err(crate::VortexRdfError::InvalidOperation(_))
+                Err(crate::VortexRdfError::InvalidInput(_))
             ),
             "{tag}: snapshot filter_codes over {codes:?}"
         );

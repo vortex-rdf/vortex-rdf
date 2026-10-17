@@ -400,11 +400,12 @@ pub(super) fn find_by(
     None
 }
 
-/// `codes` must be strictly ascending and inside `code_space` — the
-/// contract every candidate evaluation checks before reading.
+/// `codes` must be strictly ascending and inside `code_space`, else an
+/// [`InvalidInput`](VortexRdfError::InvalidInput) error — the contract every
+/// candidate evaluation checks before reading.
 pub(super) fn check_candidates(codes: &[TermCode], code_space: CodeSpace) -> Result<()> {
     if let Some(pair) = codes.windows(2).find(|pair| pair[0] >= pair[1]) {
-        return Err(VortexRdfError::InvalidOperation(format!(
+        return Err(VortexRdfError::InvalidInput(format!(
             "codes must be sorted and unique: {} follows {}",
             pair[1], pair[0]
         )));
@@ -412,7 +413,7 @@ pub(super) fn check_candidates(codes: &[TermCode], code_space: CodeSpace) -> Res
     // Ascending, so the ends bound every candidate.
     for &code in [codes.first(), codes.last()].into_iter().flatten() {
         if code_space.rank_of(code).is_none() {
-            return Err(VortexRdfError::InvalidOperation(format!(
+            return Err(VortexRdfError::InvalidInput(format!(
                 "code {code} is outside the dictionary ({} terms)",
                 code_space.len()
             )));

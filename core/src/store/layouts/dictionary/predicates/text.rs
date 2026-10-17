@@ -77,7 +77,7 @@ impl TextConstant {
     /// is [`NotAString`](TextConstant::NotAString).
     pub(super) fn parse(arg: &str) -> Result<Self> {
         let invalid = || {
-            VortexRdfError::InvalidOperation(format!(
+            VortexRdfError::InvalidInput(format!(
                 "a string constant is a strict N-Triples spelling (\"text\", \"text\"@tag, \
                  \"text\"^^<datatype>, <iri> or _:label), got {arg:?}"
             ))

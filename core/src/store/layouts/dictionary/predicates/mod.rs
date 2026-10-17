@@ -244,9 +244,10 @@ impl TermPredicate {
     /// `"5"^^<http://www.w3.org/2001/XMLSchema#integer>`, or a bare number
     /// typed by its syntax: `5` is an integer, `1.5` a decimal, `1e3` a
     /// double). `case`/`as_str` on a non-string kind and `flags` on any kind
-    /// but `regex` are errors.
+    /// but `regex` are errors. Every refusal is an
+    /// [`InvalidInput`](VortexRdfError::InvalidInput) error.
     pub fn parse_with(kind: &str, arg: &str, options: &TextOptions) -> Result<Self> {
-        let invalid = |msg: String| VortexRdfError::InvalidOperation(msg);
+        let invalid = |msg: String| VortexRdfError::InvalidInput(msg);
         if !options.flags.is_empty() && kind != "regex" {
             return Err(invalid(format!(
                 "flags apply to the regex kind, not {kind:?}"
@@ -811,7 +812,7 @@ mod tests {
             ] {
                 if !matches!(
                     TermPredicate::parse(kind, malformed),
-                    Err(VortexRdfError::InvalidOperation(_))
+                    Err(VortexRdfError::InvalidInput(_))
                 ) {
                     wrong.push(format!("{kind} {malformed:?} was not refused"));
                 }
