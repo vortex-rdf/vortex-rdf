@@ -268,11 +268,14 @@ class VortexRdfStore:
         *,
         keep: Optional[_KeepSpec] = None,
         limit: Optional[int] = None,
+        offset: int = 0,
     ) -> int:
         """Number of quads matching the pattern, counted from the row
         selection; no term is materialized. `keep` narrows as for
-        `match_codes` (Dictionary layout only); `limit` caps the count and
-        stops the read once that many rows are known to exist."""
+        `match_codes` (Dictionary layout only). `offset` and `limit` window
+        the rows in base order as `match_codes` does: `offset` skips that
+        many matched rows, and `limit` caps the count and stops the read
+        once that many rows are known to exist."""
         ...
     def match_columns(
         self,

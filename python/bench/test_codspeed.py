@@ -289,10 +289,10 @@ def test_readpath_full_decoded_literals(benchmark, stores):
 
 # ─── decode::<shape> (Python-only) ──────────────────────────────────────────
 #
-# No JavaScript counterpart: these guard `TermDict::decode_slice`'s sharing of
-# one Python string across repeats of a code. The three shapes are not
-# variations on one workload — each is a different way a column can repeat, and
-# the sharing covers them unequally:
+# No JavaScript counterpart: these guard `decode_slice`'s (python/src/codes.rs)
+# sharing of one Python string across repeats of a code. The three shapes are
+# not variations on one workload — each is a different way a column can repeat,
+# and the sharing covers them unequally:
 #
 #   constant  — a bound position, one code for every row.
 #   distinct  — no repetition at all, where sharing can only cost.

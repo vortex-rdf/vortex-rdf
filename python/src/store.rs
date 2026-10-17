@@ -7,10 +7,10 @@ use pyo3::types::{PyBytes, PyString};
 use vortex_buffer::Buffer;
 use vortex_rdf_core::{TermCode, VortexRdfError as CoreError, VortexRdfStore as CoreStore};
 
-use crate::codes::{TermDict, U64Column};
+use crate::codes::{TermDict, U64Column, decode_slice};
 use crate::fan_out::fan_out;
-use crate::probes::{parse_keeps, parse_probe};
-use crate::{RUNTIME, VortexRdfError, py_err};
+use crate::probes::{narrowed_probe, parse_probes};
+use crate::{RUNTIME, VortexRdfError, detached, py_err};
 use vortex_rdf_core::Probe;
 
 /// `(s, p, o, g)` code columns as returned by [`VortexRdfStore::match_codes`].
@@ -25,31 +25,13 @@ fn code_columns([s, p, o, g]: [Buffer<TermCode>; 4]) -> CodeColumns {
     )
 }
 
-/// A probe from the keyword narrowing of `match_codes`/`count_quads`.
-fn narrowed_probe(
-    s: Option<&str>,
-    p: Option<&str>,
-    o: Option<&str>,
-    g: Option<&str>,
-    keep: Option<&Bound<'_, PyAny>>,
-    limit: Option<usize>,
-    offset: usize,
-) -> PyResult<Probe> {
-    let mut probe = Probe::parse(s, p, o, g).map_err(py_err)?;
-    if let Some(keep) = keep.filter(|k| !k.is_none()) {
-        probe.keeps = parse_keeps(keep)?;
-    }
-    probe.limit = limit;
-    probe.offset = offset;
-    Ok(probe)
-}
-
-/// Every probe of a `*_many` call, parsed before any evaluation.
-fn parse_probes(probes: &Bound<'_, PyAny>) -> PyResult<Vec<Probe>> {
-    probes
-        .try_iter()?
-        .map(|probe| parse_probe(&probe?))
-        .collect()
+/// The rows `probe` matches as `(s, p, o, g)` term-code columns, gathered,
+/// or `None` when the match declines the code path.
+async fn probe_codes(
+    store: &CoreStore,
+    probe: &Probe,
+) -> Result<Option<[Buffer<TermCode>; 4]>, CoreError> {
+    store.run_probe(probe).await?.code_columns_gathered().await
 }
 
 /// One row of [`VortexRdfStore::get_quads`]: subject, predicate, object, graph.
@@ -119,25 +101,6 @@ pub struct VortexRdfStore {
 }
 
 impl VortexRdfStore {
-    /// The matched rows as `(s, p, o, g)` term-code columns, gathered off the
-    /// GIL, or `None` when the match declines the code path.
-    fn matched_code_columns(
-        &self,
-        py: Python<'_>,
-        probe: &Probe,
-    ) -> PyResult<Option<[Buffer<TermCode>; 4]>> {
-        py.detach(|| -> Result<_, CoreError> {
-            RUNTIME.block_on(async {
-                self.store
-                    .run_probe(probe)
-                    .await?
-                    .code_columns_gathered()
-                    .await
-            })
-        })
-        .map_err(py_err)
-    }
-
     /// The matched rows as four columns of N-Triples strings, in
     /// subject-predicate-object-graph order. The default graph is the empty
     /// string, the spelling `Probe::parse` accepts for it.
@@ -150,11 +113,10 @@ impl VortexRdfStore {
             // layout), whether the dictionary is in memory or
             // left in the mapped file; the match itself still decides, so fall
             // through when it declines.
-            if let Some(codes) = self.matched_code_columns(py, probe)? {
-                let dict = TermDict { reader };
+            if let Some(codes) = detached(py, || probe_codes(&self.store, probe))? {
                 let mut decoded = Vec::with_capacity(4);
                 for column in &codes {
-                    decoded.push(dict.decode_slice(py, column.as_slice())?);
+                    decoded.push(decode_slice(py, &reader, column.as_slice())?);
                 }
                 let decoded: [_; 4] = decoded
                     .try_into()
@@ -165,12 +127,9 @@ impl VortexRdfStore {
 
         // The matched quads with shared-string terms: each distinct term of a
         // decoded chunk is one `Arc<str>`, handed to every row repeating it.
-        let rows = py
-            .detach(|| -> Result<_, CoreError> {
-                RUNTIME
-                    .block_on(async { self.store.run_probe(probe).await?.shared_quads_vec().await })
-            })
-            .map_err(py_err)?;
+        let rows = detached(py, || async {
+            self.store.run_probe(probe).await?.shared_quads_vec().await
+        })?;
         // Intern by `Arc` address: `rows` holds every `Arc` for the whole
         // loop, so an address identifies one term. A strong count of one means
         // no other row shares the term, so it skips the map.
@@ -213,19 +172,15 @@ impl VortexRdfStore {
     #[new]
     #[pyo3(signature = (path, *, in_memory=false))]
     fn new(py: Python<'_>, path: PathBuf, in_memory: bool) -> PyResult<Self> {
-        let store = py
-            .detach(|| {
-                RUNTIME.block_on(async {
-                    if in_memory {
-                        // The whole store, read through the file reader and
-                        // adopted in memory — nothing reads the file again.
-                        CoreStore::from_file_in_memory(&path).await
-                    } else {
-                        CoreStore::from_file(&path).await
-                    }
-                })
-            })
-            .map_err(py_err)?;
+        let store = detached(py, || async {
+            if in_memory {
+                // The whole store, read through the file reader and adopted
+                // in memory — nothing reads the file again.
+                CoreStore::from_file_in_memory(&path).await
+            } else {
+                CoreStore::from_file(&path).await
+            }
+        })?;
         Ok(Self {
             store,
             path: Some(path),
@@ -239,9 +194,7 @@ impl VortexRdfStore {
     /// accepted but extracted element by element.
     #[staticmethod]
     fn from_bytes(py: Python<'_>, data: Vec<u8>) -> PyResult<Self> {
-        let store = py
-            .detach(|| RUNTIME.block_on(CoreStore::from_bytes_owned(data)))
-            .map_err(py_err)?;
+        let store = detached(py, || CoreStore::from_bytes_owned(data))?;
         Ok(Self { store, path: None })
     }
 
@@ -250,9 +203,7 @@ impl VortexRdfStore {
     /// `.vortex` file, carrying the quad table plus the dictionary and
     /// index components.
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = py
-            .detach(|| RUNTIME.block_on(self.store.to_bytes()))
-            .map_err(py_err)?;
+        let bytes = detached(py, || self.store.to_bytes())?;
         Ok(PyBytes::new(py, &bytes))
     }
 
@@ -273,8 +224,7 @@ impl VortexRdfStore {
     }
 
     fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
-        py.detach(|| RUNTIME.block_on(self.store.size()))
-            .map_err(py_err)
+        detached(py, || self.store.size())
     }
 
     fn __repr__(&self) -> String {
@@ -327,13 +277,15 @@ impl VortexRdfStore {
     /// selection alone -- no term is materialized into Python.
     ///
     /// `keep` narrows the match to rows whose code in a position is in a
-    /// set or range (see [`Self::match_codes`]; Dictionary layout only), and
-    /// `limit` caps the count, stopping the read as soon as that many rows
-    /// are known to exist (`count_quads(..., limit=1)` is an existence
+    /// set or range (see [`Self::match_codes`]; Dictionary layout only).
+    /// `offset` and `limit` window the rows in base order as
+    /// [`Self::match_codes`] does: `offset` skips that many matched rows,
+    /// and `limit` caps the count, stopping the read as soon as that many
+    /// rows are known to exist (`count_quads(..., limit=1)` is an existence
     /// test).
     // The parameters are the Python signature: a pattern and its narrowing.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (s=None, p=None, o=None, g=None, *, keep=None, limit=None))]
+    #[pyo3(signature = (s=None, p=None, o=None, g=None, *, keep=None, limit=None, offset=0))]
     fn count_quads(
         &self,
         py: Python<'_>,
@@ -343,10 +295,10 @@ impl VortexRdfStore {
         g: Option<&str>,
         keep: Option<&Bound<'_, PyAny>>,
         limit: Option<usize>,
+        offset: usize,
     ) -> PyResult<usize> {
-        let probe = narrowed_probe(s, p, o, g, keep, limit, 0)?;
-        py.detach(|| RUNTIME.block_on(self.store.count_probe(&probe)))
-            .map_err(py_err)
+        let probe = narrowed_probe(s, p, o, g, keep, limit, offset)?;
+        detached(py, || self.store.count_probe(&probe))
     }
 
     /// [`Self::count_quads`] for a batch of probes in one GIL-released call,
@@ -430,17 +382,7 @@ impl VortexRdfStore {
         if self.store.dict_reader().is_none() {
             return Ok(None);
         }
-        let columns = py
-            .detach(|| -> Result<_, CoreError> {
-                RUNTIME.block_on(async {
-                    self.store
-                        .run_probe(&probe)
-                        .await?
-                        .code_columns_gathered()
-                        .await
-                })
-            })
-            .map_err(py_err)?;
+        let columns = detached(py, || probe_codes(&self.store, &probe))?;
         Ok(columns.map(code_columns))
     }
 
@@ -462,7 +404,7 @@ impl VortexRdfStore {
         let columns = py
             .detach(|| {
                 fan_out(&RUNTIME, &self.store, probes, |store, probe| async move {
-                    store.run_probe(&probe).await?.code_columns_gathered().await
+                    probe_codes(&store, &probe).await
                 })
             })
             .map_err(py_err)?;

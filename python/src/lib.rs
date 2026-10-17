@@ -12,6 +12,8 @@ mod probes;
 mod serialize;
 mod store;
 
+use std::future::Future;
+use std::pin::pin;
 use std::sync::LazyLock;
 
 use pyo3::exceptions::PyValueError;
@@ -47,6 +49,19 @@ pub(crate) fn py_err(e: CoreError) -> PyErr {
         CoreError::Io(io) => io.into(),
         other => VortexRdfError::new_err(other.to_string()),
     }
+}
+
+/// Builds the future `task` returns and drives it to completion on
+/// [`RUNTIME`], both with the GIL released, raising its error as [`py_err`]
+/// maps it. The future is pinned where it is built, so the runtime's
+/// `block_on` layers pass a pointer to it rather than moving it.
+pub(crate) fn detached<T, F, Fut>(py: Python<'_>, task: F) -> PyResult<T>
+where
+    T: Send,
+    F: FnOnce() -> Fut + Send,
+    Fut: Future<Output = Result<T, CoreError>>,
+{
+    py.detach(|| RUNTIME.block_on(pin!(task()))).map_err(py_err)
 }
 
 #[pymodule]

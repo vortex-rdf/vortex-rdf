@@ -1,7 +1,7 @@
-//! Probe and keep specifications from Python objects: the `keep` argument
-//! of `match_codes`/`count_quads` and the probe list of the `*_many` calls.
-//! Everything is parsed before any evaluation, so a malformed probe raises
-//! `ValueError` before the store is touched.
+//! Probe and keep specifications from Python objects: the narrowing
+//! keywords of `match_codes`/`count_quads` and the probe list of the
+//! `*_many` calls. Everything is parsed before any evaluation, so a
+//! malformed probe raises `ValueError` before the store is touched.
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -12,10 +12,39 @@ use vortex_rdf_core::{Keep, Probe, QuadColumn, TermCode};
 use crate::codes::{U64Column, extract_u64s};
 use crate::py_err;
 
+/// A probe from a pattern's four term spellings and its narrowing: the
+/// keywords of `match_codes`/`count_quads`, or the keys of a dict probe.
+/// `keep` is read by [`parse_keeps`]; absent or `None`, it keeps every row.
+pub(crate) fn narrowed_probe(
+    s: Option<&str>,
+    p: Option<&str>,
+    o: Option<&str>,
+    g: Option<&str>,
+    keep: Option<&Bound<'_, PyAny>>,
+    limit: Option<usize>,
+    offset: usize,
+) -> PyResult<Probe> {
+    let mut probe = Probe::parse(s, p, o, g).map_err(py_err)?;
+    if let Some(keep) = keep.filter(|k| !k.is_none()) {
+        probe.keeps = parse_keeps(keep)?;
+    }
+    probe.limit = limit;
+    probe.offset = offset;
+    Ok(probe)
+}
+
+/// Every probe of a `*_many` call, parsed before any evaluation.
+pub(crate) fn parse_probes(probes: &Bound<'_, PyAny>) -> PyResult<Vec<Probe>> {
+    probes
+        .try_iter()?
+        .map(|probe| parse_probe(&probe?))
+        .collect()
+}
+
 /// A `Probe` from a pattern 4-tuple (or list) `(s, p, o, g)`, or a dict with
 /// keys `s`, `p`, `o`, `g`, `keep`, `limit`, `offset` (each optional; any
 /// other key is an error).
-pub(crate) fn parse_probe(obj: &Bound<'_, PyAny>) -> PyResult<Probe> {
+fn parse_probe(obj: &Bound<'_, PyAny>) -> PyResult<Probe> {
     if let Ok(dict) = obj.cast::<PyDict>() {
         let mut terms: [Option<String>; 4] = [None, None, None, None];
         let mut keep = None;
@@ -35,7 +64,7 @@ pub(crate) fn parse_probe(obj: &Bound<'_, PyAny>) -> PyResult<Probe> {
                 "p" => terms[1] = Some(value.extract()?),
                 "o" => terms[2] = Some(value.extract()?),
                 "g" => terms[3] = Some(value.extract()?),
-                "keep" => keep = Some(parse_keeps(&value)?),
+                "keep" => keep = Some(value),
                 "limit" => limit = Some(extract_count(&value, "limit")?),
                 "offset" => offset = extract_count(&value, "offset")?,
                 other => {
@@ -46,12 +75,15 @@ pub(crate) fn parse_probe(obj: &Bound<'_, PyAny>) -> PyResult<Probe> {
             }
         }
         let [s, p, o, g] = terms;
-        let mut probe =
-            Probe::parse(s.as_deref(), p.as_deref(), o.as_deref(), g.as_deref()).map_err(py_err)?;
-        probe.keeps = keep.unwrap_or_default();
-        probe.offset = offset;
-        probe.limit = limit;
-        return Ok(probe);
+        return narrowed_probe(
+            s.as_deref(),
+            p.as_deref(),
+            o.as_deref(),
+            g.as_deref(),
+            keep.as_ref(),
+            limit,
+            offset,
+        );
     }
     let items: Vec<Bound<'_, PyAny>> = if let Ok(tuple) = obj.cast::<PyTuple>() {
         tuple.iter().collect()
@@ -89,7 +121,7 @@ fn extract_count(value: &Bound<'_, PyAny>, name: &str) -> PyResult<usize> {
 /// The keeps of a `keep` argument: a dict from position (`"s"`, `"p"`,
 /// `"o"`, `"g"`, or 0–3) to a code set or range, applied in `(s, p, o, g)`
 /// order.
-pub(crate) fn parse_keeps(obj: &Bound<'_, PyAny>) -> PyResult<Vec<(QuadColumn, Keep)>> {
+fn parse_keeps(obj: &Bound<'_, PyAny>) -> PyResult<Vec<(QuadColumn, Keep)>> {
     let Ok(dict) = obj.cast::<PyDict>() else {
         return Err(PyValueError::new_err(
             "keep must be a dict mapping a position (\"s\", \"p\", \"o\", \"g\" or 0-3) to a \

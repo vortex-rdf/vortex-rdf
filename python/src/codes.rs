@@ -5,6 +5,7 @@
 
 use std::ops::Range;
 use std::os::raw::{c_int, c_void};
+use std::pin::pin;
 
 use pyo3::buffer::{ElementType, PyUntypedBuffer};
 use pyo3::exceptions::{PySystemError, PyValueError};
@@ -15,9 +16,9 @@ use vortex_buffer::Buffer;
 use vortex_rdf_core::VortexRdfError as CoreError;
 use vortex_rdf_core::{CaseMap, DictReader, TermCode, TermPredicate, TextOptions, columns};
 
-use crate::{RUNTIME, py_err};
+use crate::{RUNTIME, detached, py_err};
 
-/// Buckets in the decode-sharing cache (see [`TermDict::decode_slice`]).
+/// Buckets in the decode-sharing cache (see [`decode_slice`]).
 /// A power of two, so the bucket index is a mask rather than a division; 256
 /// entries keep the table at 4 KiB, small enough to stay cache-resident and to
 /// zero cheaply for a short column.
@@ -86,90 +87,88 @@ pub struct TermDict {
     pub(crate) reader: DictReader,
 }
 
-impl TermDict {
-    /// Decodes `codes` GIL-released into Python strings, a repeated code
-    /// sharing its string while the cache below still holds it. Callers
-    /// must hand over codes copied out of any Python buffer: a borrowed
-    /// buffer view cannot cross the GIL release.
-    ///
-    /// A direct-mapped cache of `RECENT_BUCKETS` entries, indexed by the
-    /// code's low bits (`code & (RECENT_BUCKETS - 1)`), holds the
-    /// `(code, slot)` most recently decoded into each bucket; an occurrence
-    /// whose bucket holds its own code reuses that slot instead of
-    /// decompressing and allocating again. A hit
-    /// requires the stored code to match, so a collision — or a column holding
-    /// more live terms than there are buckets — costs only a re-decode and
-    /// never yields a wrong term.
-    ///
-    /// Runs in two phases, because Python objects cannot be built while
-    /// detached from the interpreter. The decode loop runs GIL-released and
-    /// produces the distinct terms, packed into one buffer ([`PackedTerms`],
-    /// with no `String` per term), plus a per-occurrence index into them; the
-    /// GIL is then retaken to build one `PyString` per distinct term from a
-    /// slice of that buffer and clone a reference per occurrence. When
-    /// nothing was shared those indices are the identity, and the strings are
-    /// built straight from the decode order.
-    pub(crate) fn decode_slice(
-        &self,
-        py: Python<'_>,
-        codes: &[TermCode],
-    ) -> PyResult<Vec<Option<Py<PyString>>>> {
-        // `slots[i]` indexes `decoded` for the i-th code, so the mapping from
-        // occurrence to decoded term survives the GIL boundary as plain data.
-        let (slots, decoded) = py
-            .detach(|| -> Result<_, CoreError> {
-                let mut slots: Vec<usize> = Vec::with_capacity(codes.len());
-                let mut distinct: Vec<TermCode> = Vec::new();
-                let mut recent = [(0 as TermCode, NO_SLOT); RECENT_BUCKETS];
-                for &code in codes {
-                    // The low bits pick the bucket: masked before the
-                    // narrowing, so they are the code's own.
-                    let bucket = (code & (RECENT_BUCKETS as TermCode - 1)) as usize;
-                    let (cached_code, cached_slot) = recent[bucket];
-                    let slot = if cached_slot != NO_SLOT && cached_code == code {
-                        cached_slot
-                    } else {
-                        let slot = distinct.len();
-                        distinct.push(code);
-                        // Overwrites whatever shared this bucket; a hit is
-                        // gated on the stored code, so a lost entry only
-                        // costs a re-decode.
-                        recent[bucket] = (code, slot);
-                        slot
-                    };
-                    slots.push(slot);
+/// Decodes `codes` through `reader` GIL-released into Python strings, a
+/// repeated code sharing its string while the cache below still holds it.
+/// Callers must hand over codes copied out of any Python buffer: a borrowed
+/// buffer view cannot cross the GIL release.
+///
+/// A direct-mapped cache of `RECENT_BUCKETS` entries, indexed by the
+/// code's low bits (`code & (RECENT_BUCKETS - 1)`), holds the
+/// `(code, slot)` most recently decoded into each bucket; an occurrence
+/// whose bucket holds its own code reuses that slot instead of
+/// decompressing and allocating again. A hit
+/// requires the stored code to match, so a collision — or a column holding
+/// more live terms than there are buckets — costs only a re-decode and
+/// never yields a wrong term.
+///
+/// Runs in two phases, because Python objects cannot be built while
+/// detached from the interpreter. The decode loop runs GIL-released and
+/// produces the distinct terms, packed into one buffer ([`PackedTerms`],
+/// with no `String` per term), plus a per-occurrence index into them; the
+/// GIL is then retaken to build one `PyString` per distinct term from a
+/// slice of that buffer and clone a reference per occurrence. When
+/// nothing was shared those indices are the identity, and the strings are
+/// built straight from the decode order.
+pub(crate) fn decode_slice(
+    py: Python<'_>,
+    reader: &DictReader,
+    codes: &[TermCode],
+) -> PyResult<Vec<Option<Py<PyString>>>> {
+    // `slots[i]` indexes `decoded` for the i-th code, so the mapping from
+    // occurrence to decoded term survives the GIL boundary as plain data.
+    let (slots, decoded) = py
+        .detach(|| -> Result<_, CoreError> {
+            let mut slots: Vec<usize> = Vec::with_capacity(codes.len());
+            let mut distinct: Vec<TermCode> = Vec::new();
+            let mut recent = [(0 as TermCode, NO_SLOT); RECENT_BUCKETS];
+            for &code in codes {
+                // The low bits pick the bucket: masked before the
+                // narrowing, so they are the code's own.
+                let bucket = (code & (RECENT_BUCKETS as TermCode - 1)) as usize;
+                let (cached_code, cached_slot) = recent[bucket];
+                let slot = if cached_slot != NO_SLOT && cached_code == code {
+                    cached_slot
+                } else {
+                    let slot = distinct.len();
+                    distinct.push(code);
+                    // Overwrites whatever shared this bucket; a hit is
+                    // gated on the stored code, so a lost entry only
+                    // costs a re-decode.
+                    recent[bucket] = (code, slot);
+                    slot
+                };
+                slots.push(slot);
+            }
+            // One cursor over the resident terms, or one batched read of
+            // the file-backed child, its future pinned in place (see
+            // `detached`).
+            let mut decoded = PackedTerms::new(distinct.len());
+            match reader.snapshot() {
+                Some(snapshot) => {
+                    snapshot.decode_many_with(&distinct, |i, term| decoded.set(i, term));
                 }
-                // One cursor over the resident terms, or one batched read of
-                // the file-backed child.
-                let mut decoded = PackedTerms::new(distinct.len());
-                match self.reader.snapshot() {
-                    Some(snapshot) => {
-                        snapshot.decode_many_with(&distinct, |i, term| decoded.set(i, term));
-                    }
-                    None => RUNTIME.block_on(
-                        self.reader
-                            .decode_many_with(&distinct, |i, term| decoded.set(i, term)),
-                    )?,
-                }
-                Ok((slots, decoded))
-            })
-            .map_err(py_err)?;
+                None => RUNTIME.block_on(pin!(
+                    reader.decode_many_with(&distinct, |i, term| decoded.set(i, term))
+                ))?,
+            }
+            Ok((slots, decoded))
+        })
+        .map_err(py_err)?;
 
-        let build = |i: usize| decoded.get(i).map(|term| PyString::new(py, term).unbind());
+    let build = |i: usize| decoded.get(i).map(|term| PyString::new(py, term).unbind());
 
-        // Nothing was shared, so `slots` is the identity: every string is used
-        // exactly once and can be moved straight out, skipping the lookup table
-        // and the per-occurrence refcount bump.
-        if decoded.len() == slots.len() {
-            return Ok((0..slots.len()).map(build).collect());
-        }
-
-        let interned: Vec<Option<Py<PyString>>> = (0..decoded.len()).map(build).collect();
-        Ok(slots
-            .into_iter()
-            .map(|slot| interned[slot].as_ref().map(|s| s.clone_ref(py)))
-            .collect())
+    // Nothing was shared, so `slots` is the identity: every string is used
+    // exactly once and can be moved straight out, skipping the lookup table
+    // and the per-occurrence refcount bump.
+    if decoded.len() == slots.len() {
+        return Ok((0..slots.len()).map(build).collect());
     }
+
+    let interned: Vec<Option<Py<PyString>>> = (0..decoded.len()).map(build).collect();
+    Ok(slots
+        .into_iter()
+        .map(|slot| interned[slot].as_ref().map(|s| s.clone_ref(py)))
+        .collect())
 }
 
 #[pymethods]
@@ -181,8 +180,7 @@ impl TermDict {
         if let Some(snapshot) = self.reader.snapshot() {
             return Ok(snapshot.decode(code));
         }
-        py.detach(|| RUNTIME.block_on(self.reader.decode(code)))
-            .map_err(py_err)
+        detached(py, || self.reader.decode(code))
     }
 
     /// The code of the term `term`, or `None` when this dictionary does not
@@ -196,19 +194,17 @@ impl TermDict {
         if let Some(snapshot) = self.reader.snapshot() {
             return snapshot.encode(term).map_err(py_err);
         }
-        py.detach(|| RUNTIME.block_on(self.reader.encode(term)))
-            .map_err(py_err)
+        detached(py, || self.reader.encode(term))
     }
 
     /// [`encode`](Self::encode) over a sequence of terms, in order, in one
     /// GIL-released call. A malformed term raises `ValueError` before any
     /// lookup.
     fn encode_many(&self, py: Python<'_>, terms: Vec<String>) -> PyResult<Vec<Option<TermCode>>> {
-        py.detach(|| {
+        detached(py, || async {
             let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
-            RUNTIME.block_on(self.reader.encode_many(&refs))
+            self.reader.encode_many(&refs).await
         })
-        .map_err(py_err)
     }
 
     /// `kind` over the candidate `codes`: `(passed, undecided)`, both
@@ -285,16 +281,14 @@ impl TermDict {
     /// so a term kind (`"` for literals, `<` for IRIs, `_:` for blank nodes)
     /// and an IRI namespace (`<http://example.org/`) are each one range.
     fn prefix_range(&self, py: Python<'_>, prefix: &str) -> PyResult<(TermCode, TermCode)> {
-        py.detach(|| RUNTIME.block_on(self.reader.prefix_range(prefix)))
-            .map_err(py_err)
+        detached(py, || self.reader.prefix_range(prefix))
     }
 
     /// The code of the first term not below `term` in byte order — a
     /// present term's own code, where an absent one would sort, or the
     /// dictionary's size when every term is below it.
     fn lower_bound(&self, py: Python<'_>, term: &str) -> PyResult<TermCode> {
-        py.detach(|| RUNTIME.block_on(self.reader.lower_bound(term)))
-            .map_err(py_err)
+        detached(py, || self.reader.lower_bound(term))
     }
 
     /// Whether the terms are read from the store's file on demand (`True`)
@@ -318,13 +312,13 @@ impl TermDict {
     /// code.
     ///
     /// A repeated code usually yields the same Python string object, as
-    /// [`decode_slice`](Self::decode_slice) describes.
+    /// [`decode_slice`] describes.
     fn decode_many(
         &self,
         py: Python<'_>,
         codes: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<Option<Py<PyString>>>> {
-        self.decode_slice(py, &extract_u64s(codes)?)
+        decode_slice(py, &self.reader, &extract_u64s(codes)?)
     }
 
     fn __len__(&self) -> usize {

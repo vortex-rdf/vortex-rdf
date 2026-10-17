@@ -339,6 +339,7 @@ def test_window_slices_base_order(code_store):
         got = store.match_codes(limit=limit, offset=offset)
         want = rows[offset:] if limit is None else rows[offset : offset + limit]
         assert u64_rows(got) == want, (offset, limit)
+        assert store.count_quads(limit=limit, offset=offset) == len(want), (offset, limit)
     named = u64_rows(store.match_codes(p=NAME))
     assert u64_rows(store.match_codes(p=NAME, limit=2, offset=1)) == named[1:3]
     assert store.count_quads(p=NAME, limit=2) == 2
@@ -365,11 +366,7 @@ def test_many_matches_singles(code_store, vortex_files):
     for probe, cols, count in zip(probes, many, counts):
         if isinstance(probe, dict):
             single = store.match_codes(**probe)
-            # The offset is consumed before the limit caps the count.
-            plain = {k: v for k, v in probe.items() if k not in ("offset", "limit")}
-            single_count = max(0, store.count_quads(**plain) - probe.get("offset", 0))
-            if "limit" in probe:
-                single_count = min(single_count, probe["limit"])
+            single_count = store.count_quads(**probe)
         else:
             single = store.match_codes(*probe)
             single_count = store.count_quads(*probe)

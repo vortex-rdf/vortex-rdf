@@ -5,9 +5,9 @@ use pyo3::prelude::*;
 use vortex_rdf_core::common::formats::{detect_format, format_from_name};
 use vortex_rdf_core::common::terms::parse_quads_from_reader;
 use vortex_rdf_core::io::quads_stream_to_vortex_file;
-use vortex_rdf_core::{IndexType, LayoutStrategy, VortexRdfError as CoreError};
+use vortex_rdf_core::{IndexType, LayoutStrategy};
 
-use crate::{RUNTIME, py_err};
+use crate::{detached, py_err};
 
 /// Serialize an RDF file into a `.vortex` store file.
 ///
@@ -53,15 +53,9 @@ pub fn serialize_rdf(
         })?,
     };
 
-    py.detach(|| -> Result<(), CoreError> {
+    detached(py, || async {
         let file = std::fs::File::open(&input_path)?;
         let quads = parse_quads_from_reader(file, format);
-        RUNTIME.block_on(quads_stream_to_vortex_file(
-            quads,
-            &output_path,
-            layout,
-            indexes,
-        ))
+        quads_stream_to_vortex_file(quads, &output_path, layout, indexes).await
     })
-    .map_err(py_err)
 }
