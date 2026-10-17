@@ -16,7 +16,7 @@ use wasm_bindgen_futures::future_to_promise;
 use crate::codes::{code_from_js, code_to_js, codes_to_js};
 use crate::error::{js_err, js_err_ctx};
 use crate::ingest::{js_array_to_dictionary_array, js_array_to_quads, js_to_quad_stream};
-use crate::options::{build_array, parse_build_options};
+use crate::options::parse_build_options;
 use crate::terms::{JsPattern, quad_arg};
 
 #[wasm_bindgen(module = "/js-snippets/lazy-rdf.js")]
@@ -170,9 +170,9 @@ impl VortexRdfStore {
         let format = format_from_name(format_name).map_err(js_err)?;
         let config = parse_build_options(options)?;
         let quads_stream = parse_quads_from_reader(Cursor::new(input), format);
-        let built = build_array(quads_stream, config).await?;
-
-        let inner = CoreStore::from_built(built).map_err(js_err)?;
+        let inner = CoreStore::from_quads(quads_stream, config.layout, config.indexes)
+            .await
+            .map_err(|e| js_err_ctx("Vortex build error", e))?;
         Ok(VortexRdfStore::wrap(inner))
     }
 
@@ -191,9 +191,9 @@ impl VortexRdfStore {
         }
 
         let quad_stream = js_to_quad_stream(quads)?;
-        let built = build_array(quad_stream, config).await?;
-
-        let inner = CoreStore::from_built(built).map_err(js_err)?;
+        let inner = CoreStore::from_quads(quad_stream, config.layout, config.indexes)
+            .await
+            .map_err(|e| js_err_ctx("Vortex build error", e))?;
         Ok(VortexRdfStore::wrap(inner))
     }
 

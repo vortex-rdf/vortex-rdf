@@ -1,15 +1,11 @@
 //! Build-time options: resolving the JS `BuildOptions` object into core
-//! strategies, and the single place the builder is monomorphized.
+//! strategies.
 
-use futures::Stream;
 use js_sys::Reflect;
-use vortex_rdf_core::{
-    BuiltArray, IndexType, Indexes, LayoutStrategy, RawQuad, Result as CoreResult,
-    SortedInMemoryBuilder, VortexArrayBuilder,
-};
+use vortex_rdf_core::{IndexType, Indexes, LayoutStrategy};
 use wasm_bindgen::prelude::*;
 
-use crate::error::{js_err, js_err_ctx};
+use crate::error::js_err;
 
 /// Build-time configuration resolved from the JS `BuildOptions` object.
 pub(crate) struct BuildConfig {
@@ -26,21 +22,6 @@ impl Default for BuildConfig {
             indexes: Vec::new(),
         }
     }
-}
-
-/// Run the quad stream through the builder.
-///
-/// Every entry point (`fromString`, `fromQuads`, `serializeRdf`) builds
-/// through here. WebAssembly has no filesystem for the out-of-core strategy's
-/// spill runs, so the in-memory sort is the one builder compiled in.
-pub(crate) async fn build_array(
-    quads: impl Stream<Item = CoreResult<RawQuad>> + Unpin + Send + 'static,
-    config: BuildConfig,
-) -> Result<BuiltArray, JsValue> {
-    let BuildConfig { layout, indexes } = config;
-    SortedInMemoryBuilder::build_vortex_array(Box::new(quads), layout, indexes)
-        .await
-        .map_err(|e| js_err_ctx("Vortex build error", e))
 }
 
 /// Resolve the optional JS build options. Accepts `undefined`/`null` (all

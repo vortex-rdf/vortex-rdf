@@ -156,8 +156,8 @@ fn packed_to_quads_into<T>(
     Ok(())
 }
 
-/// A quad stream boxed for `build_array`, whichever of the two `fromQuads`
-/// input shapes it came from.
+/// A quad stream boxed for core's `VortexRdfStore::from_quads`, whichever of
+/// the two `fromQuads` input shapes it came from.
 pub(crate) type BoxedQuadStream = Box<dyn Stream<Item = CoreResult<RawQuad>> + Unpin + Send>;
 
 /// Accept either shape `fromQuads` allows: a plain array (eagerly validated
