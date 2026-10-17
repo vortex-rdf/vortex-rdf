@@ -246,11 +246,12 @@ Everything in [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern)
 is the engine's pushdown vocabulary: `keep`/`keep_many` (a code set or range
 per column, applied through the store's probes, zone maps or a scan
 conjunct), `window`/`size_capped`/`exists` (`LIMIT`, `OFFSET`, `ASK` without
-reading past the answer), `match_many`/`count_many` (a batch of probes),
-and the dictionary handle's `encode_many`, `prefix_range`, `filter_codes`
-and `kind_ranges`. `filter_codes(predicate, candidates)` answers
-`(passed, undecided)`, both ascending subsets of the candidate codes: a
-candidate is decided only where the native rule is certain
+reading past the answer), `match_many`/`count_many` (a batch of probes;
+`run_probe`/`count_probe` for one), and the dictionary handle's
+`encode_many`, `prefix_range`, `filter_codes` and `kind_ranges`.
+`filter_codes(predicate, candidates)` answers `(passed, undecided)`, both
+ascending subsets of the candidate codes: a candidate is decided only where
+the native rule is certain
 ([matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle)),
 and one in neither set fails. An engine keeps `passed` (as a `keep`),
 evaluates `undecided` itself, and drops the rest.

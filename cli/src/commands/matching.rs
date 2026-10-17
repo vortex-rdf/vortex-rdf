@@ -6,12 +6,50 @@ use log::{debug, info};
 use std::fs::File;
 use std::time::Instant;
 
-use vortex_rdf_core::common::terms::{parse_pattern_checked, parse_quads_from_reader};
+use vortex_rdf_core::common::terms::parse_quads_from_reader;
 use vortex_rdf_core::debug as debug_time;
-use vortex_rdf_core::{LayoutStrategy, VortexRdfStore};
+use vortex_rdf_core::{LayoutStrategy, Probe, VortexRdfError, VortexRdfStore};
 
 use super::{export_to_output, input_format, output_format};
 use crate::MatchArgs;
+
+/// What each pattern flag accepts, keyed by the position core names at the
+/// head of a refusal (`pattern subject: …`): the context a refused flag is
+/// reported under.
+const FLAG_HINTS: [(&str, &str); 4] = [
+    (
+        "pattern subject:",
+        "Invalid --subject pattern (expected <iri>, an IRI, or _:blank)",
+    ),
+    (
+        "pattern predicate:",
+        "Invalid --predicate pattern (expected <iri> or an IRI)",
+    ),
+    (
+        "pattern object:",
+        "Invalid --object pattern (expected <iri>, _:blank, \"literal\", \
+         \"literal\"@lang, or \"literal\"^^<datatype>)",
+    ),
+    (
+        "pattern graph:",
+        "Invalid --graph pattern (expected <iri>, _:blank, or default)",
+    ),
+];
+
+/// `error`, a refused pattern, under the hint of the flag it names.
+fn flag_error(error: VortexRdfError) -> anyhow::Error {
+    let hint = match &error {
+        VortexRdfError::InvalidInput(message) => FLAG_HINTS
+            .iter()
+            .find(|(position, _)| message.starts_with(position))
+            .map(|(_, hint)| *hint),
+        _ => None,
+    };
+    match hint {
+        Some(hint) => anyhow::Error::new(error).context(hint),
+        None => error.into(),
+    }
+}
 
 pub async fn run(args: MatchArgs) -> Result<()> {
     let MatchArgs {
@@ -27,20 +65,15 @@ pub async fn run(args: MatchArgs) -> Result<()> {
 
     let start = Instant::now();
 
-    // Pattern arguments are user-typed, so they take core's validating
-    // `parse_pattern_checked` rather than the store's trusted decode path.
-    // Core reports the first invalid slot without naming it, so each slot
-    // goes through it alone to keep the failing flag in the error.
-    let (subject_node, ..) = parse_pattern_checked(subject.as_deref(), None, None, None)
-        .context("Invalid --subject pattern (expected <iri>, an IRI, or _:blank)")?;
-    let (_, predicate_node, ..) = parse_pattern_checked(None, predicate.as_deref(), None, None)
-        .context("Invalid --predicate pattern (expected <iri> or an IRI)")?;
-    let (.., object_node, _) = parse_pattern_checked(None, None, object.as_deref(), None).context(
-        "Invalid --object pattern (expected <iri>, _:blank, \"literal\", \
-         \"literal\"@lang, or \"literal\"^^<datatype>)",
-    )?;
-    let (.., graph_node) = parse_pattern_checked(None, None, None, graph.as_deref())
-        .context("Invalid --graph pattern (expected <iri>, _:blank, or default)")?;
+    // Pattern arguments are user-typed, so `Probe::parse` validates them
+    // rather than the store's trusted decode path.
+    let probe = Probe::parse(
+        subject.as_deref(),
+        predicate.as_deref(),
+        object.as_deref(),
+        graph.as_deref(),
+    )
+    .map_err(flag_error)?;
 
     let output_format = output_format(explicit_format, output.as_deref());
 
@@ -71,12 +104,7 @@ pub async fn run(args: MatchArgs) -> Result<()> {
 
     let match_start = debug_time::timer();
     let filtered = store
-        .match_pattern(
-            subject_node.as_ref(),
-            predicate_node.as_ref(),
-            object_node.as_ref(),
-            graph_node.as_ref(),
-        )
+        .run_probe(&probe)
         .await
         .context("Failed to match pattern")?;
     debug!(

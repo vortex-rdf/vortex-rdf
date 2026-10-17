@@ -768,11 +768,8 @@ async fn test_reference_index_file_checks_sparse_residual_by_point_reads() {
         let probe = Probe::new(None, Some(p1.clone()), Some(o2.clone()), None);
         for store in [&file, &memory] {
             assert_eq!(
-                store
-                    .count_many(std::slice::from_ref(&probe))
-                    .await
-                    .unwrap(),
-                vec![want.len()],
+                store.count_probe(&probe).await.unwrap(),
+                want.len(),
                 "{rows}"
             );
         }
@@ -1072,13 +1069,7 @@ async fn test_reference_index_pending_run_composes() {
                 .unwrap(),
             vec![43, 5]
         );
-        assert_eq!(
-            by_po_view
-                .count_many(std::slice::from_ref(&by_p))
-                .await
-                .unwrap(),
-            vec![43]
-        );
+        assert_eq!(by_po_view.count_probe(&by_p).await.unwrap(), 43);
         // i ≡ 16 (mod 21): the 43 rows are in subject order, so the window
         // (2, 3) is the third to fifth of them.
         let window = by_p_view
@@ -1419,14 +1410,7 @@ async fn test_reference_index_counts_with_named_graphs() {
                 assert_eq!(counted.size().await.unwrap(), want, "{label}");
                 let probe = Probe::new(None, p.cloned(), o.cloned(), graph.cloned());
                 let before = store.debug_located_rid_reads();
-                assert_eq!(
-                    store
-                        .count_many(std::slice::from_ref(&probe))
-                        .await
-                        .unwrap(),
-                    vec![want],
-                    "{label}"
-                );
+                assert_eq!(store.count_probe(&probe).await.unwrap(), want, "{label}");
                 if let Some(before) = before {
                     let read = store.debug_located_rid_reads().unwrap() - before;
                     assert_eq!(read, if graph.is_none() { 0 } else { run }, "{label}");

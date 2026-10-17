@@ -7,6 +7,7 @@
 use futures::future::try_join_all;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 
+use crate::common::terms::{self, Trust, at};
 use crate::error::Result;
 use crate::store::query::narrowing::Keep;
 use crate::store::schema::QuadColumn;
@@ -50,6 +51,41 @@ impl Probe {
         }
     }
 
+    /// A probe, with no narrowing, of the quad pattern a person typed: the
+    /// four optional term spellings the string-typed frontends (Python and
+    /// the CLI) accept. The subject is a named or blank node, the predicate a
+    /// named node, the object any term (a bare IRI, without angle brackets,
+    /// included), the graph a named or blank node or a default-graph spelling
+    /// (`""`, `default`, `[]`); a `None` slot stays free.
+    ///
+    /// The first invalid slot, in subject-predicate-object-graph order, is an
+    /// [`InvalidInput`](crate::VortexRdfError::InvalidInput) error whose
+    /// message leads with the slot — `pattern subject:`, `pattern predicate:`,
+    /// `pattern object:` or `pattern graph:` — and goes on with the term
+    /// parser's own reason. The CLI picks the hint it reports for a flag by
+    /// that label.
+    pub fn parse(
+        subject: Option<&str>,
+        predicate: Option<&str>,
+        object: Option<&str>,
+        graph: Option<&str>,
+    ) -> Result<Self> {
+        Ok(Self::new(
+            subject
+                .map(|s| at("pattern subject", terms::subject(s, Trust::Input)))
+                .transpose()?,
+            predicate
+                .map(|p| at("pattern predicate", terms::named_node(p, Trust::Input)))
+                .transpose()?,
+            object
+                .map(|o| at("pattern object", terms::term(o, Trust::Input)))
+                .transpose()?,
+            graph
+                .map(|g| at("pattern graph", terms::graph_name(g, Trust::Input)))
+                .transpose()?,
+        ))
+    }
+
     /// This probe with a keep on `column` appended.
     pub fn keep(mut self, column: QuadColumn, keep: Keep) -> Self {
         self.keeps.push((column, keep));
@@ -74,24 +110,27 @@ impl VortexRdfStore {
         try_join_all(probes.iter().map(|probe| self.run_probe(probe))).await
     }
 
-    /// [`size`](Self::size) of each probe's view, in input order — or, for a
-    /// probe with a limit, [`size_capped`](Self::size_capped) at that limit,
-    /// which stops reading at the cap.
+    /// [`count_probe`](Self::count_probe) of each probe, in input order,
+    /// concurrently as for [`match_many`](Self::match_many).
     pub async fn count_many(&self, probes: &[Probe]) -> Result<Vec<usize>> {
-        try_join_all(probes.iter().map(|probe| async move {
-            let view = self
-                .run_pattern_and_keeps(probe, IdsNeed::CountOrWindow)
-                .await?;
-            match probe.limit {
-                // An offset consumes rows before the cap counts them.
-                Some(limit) => Ok(view
-                    .size_capped(probe.offset.saturating_add(limit))
-                    .await?
-                    .saturating_sub(probe.offset)),
-                None => Ok(view.size().await?.saturating_sub(probe.offset)),
-            }
-        }))
-        .await
+        try_join_all(probes.iter().map(|probe| self.count_probe(probe))).await
+    }
+
+    /// [`size`](Self::size) of one probe's view — or, for a probe with a
+    /// limit, [`size_capped`](Self::size_capped) at that limit, which stops
+    /// reading at the cap.
+    pub async fn count_probe(&self, probe: &Probe) -> Result<usize> {
+        let view = self
+            .run_pattern_and_keeps(probe, IdsNeed::CountOrWindow)
+            .await?;
+        match probe.limit {
+            // An offset consumes rows before the cap counts them.
+            Some(limit) => Ok(view
+                .size_capped(probe.offset.saturating_add(limit))
+                .await?
+                .saturating_sub(probe.offset)),
+            None => Ok(view.size().await?.saturating_sub(probe.offset)),
+        }
     }
 
     /// One probe's view: its pattern, keeps and window.
@@ -140,9 +179,12 @@ impl VortexRdfStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::VortexRdfError;
+    use oxrdf::Literal;
 
-    /// The batch future is `Send`, so a binding layer can spawn probes onto
-    /// its runtime's workers.
+    /// The batch futures (`match_many`, `count_many`) and the one-probe
+    /// `count_probe` future are `Send`, so a binding layer can spawn probes
+    /// onto its runtime's workers.
     #[test]
     fn match_many_future_is_send() {
         fn assert_send<T: Send>(_: &T) {}
@@ -151,7 +193,138 @@ mod tests {
             assert_send(&fut);
             let fut = store.count_many(probes);
             assert_send(&fut);
+            let fut = store.count_probe(&probes[0]);
+            assert_send(&fut);
         }
         let _ = check;
+    }
+
+    /// Each slot takes its position's spellings, a bare IRI included; a free
+    /// slot stays free, and the probe is not narrowed.
+    #[test]
+    fn parse_binds_each_slot() {
+        let probe = Probe::parse(
+            Some("_:b0"),
+            Some("<http://example.org/p>"),
+            Some("\"v\"@en"),
+            Some("http://example.org/g"),
+        )
+        .unwrap();
+        assert!(
+            matches!(&probe.subject, Some(NamedOrBlankNode::BlankNode(b)) if b.as_str() == "b0")
+        );
+        assert_eq!(
+            probe.predicate,
+            Some(NamedNode::new("http://example.org/p").unwrap())
+        );
+        assert_eq!(
+            probe.object,
+            Some(Term::Literal(
+                Literal::new_language_tagged_literal("v", "en").unwrap()
+            ))
+        );
+        assert_eq!(
+            probe.graph,
+            Some(GraphName::NamedNode(
+                NamedNode::new("http://example.org/g").unwrap()
+            ))
+        );
+        assert!(probe.keeps.is_empty() && probe.offset == 0 && probe.limit.is_none());
+
+        // A bare IRI (no angle brackets) in the object slot is a named node.
+        let probe = Probe::parse(None, None, Some("http://example.org/x"), None).unwrap();
+        assert_eq!(
+            probe.object,
+            Some(Term::NamedNode(
+                NamedNode::new("http://example.org/x").unwrap()
+            ))
+        );
+
+        // A `None` slot stays free; "default" names the default graph.
+        let probe = Probe::parse(None, None, None, Some("default")).unwrap();
+        assert!(probe.subject.is_none() && probe.predicate.is_none() && probe.object.is_none());
+        assert_eq!(probe.graph, Some(GraphName::DefaultGraph));
+    }
+
+    /// Pattern slots are user-typed, so an invalid term in any slot must
+    /// error rather than silently match nothing, with a message that names
+    /// the slot and then the invalid part (oxrdf's own reason follows the
+    /// `: `).
+    #[test]
+    fn parse_names_the_failing_slot() {
+        let in_slot = |slot: usize, spelling| {
+            let mut slots: [Option<&str>; 4] = [None; 4];
+            slots[slot] = Some(spelling);
+            Probe::parse(slots[0], slots[1], slots[2], slots[3])
+        };
+        for (slot, spelling, message) in [
+            (
+                0,
+                "no spaces allowed",
+                "pattern subject: invalid IRI \"no spaces allowed\": ",
+            ),
+            (
+                0,
+                "_:a b",
+                "pattern subject: invalid blank node \"_:a b\": ",
+            ),
+            (
+                1,
+                "not an iri",
+                "pattern predicate: invalid IRI \"not an iri\": ",
+            ),
+            (
+                1,
+                "<not an iri>",
+                "pattern predicate: invalid IRI \"not an iri\": ",
+            ),
+            (
+                2,
+                "\"unterminated",
+                "pattern object: malformed literal \"\\\"unterminated\"",
+            ),
+            (
+                2,
+                "\"v\"@not a tag",
+                "pattern object: invalid language tag \"not a tag\": ",
+            ),
+            (
+                2,
+                "\"x\"^^<not an iri>",
+                "pattern object: invalid IRI \"not an iri\": ",
+            ),
+            (2, "_:a b", "pattern object: invalid blank node \"_:a b\": "),
+            (
+                3,
+                "bad graph iri",
+                "pattern graph: invalid IRI \"bad graph iri\": ",
+            ),
+            (3, "_:a b", "pattern graph: invalid blank node \"_:a b\": "),
+        ] {
+            match in_slot(slot, spelling) {
+                Err(VortexRdfError::InvalidInput(got)) => {
+                    assert!(
+                        got.starts_with(message),
+                        "slot {slot} {spelling:?}: {got:?}"
+                    )
+                }
+                other => panic!("slot {slot} {spelling:?}: {other:?}"),
+            }
+        }
+
+        // With several invalid slots, the first in s, p, o, g order is the
+        // one reported.
+        let all_invalid = Probe::parse(
+            Some("bad subject"),
+            Some("bad predicate"),
+            Some("\"bad"),
+            Some("bad graph"),
+        );
+        match all_invalid {
+            Err(VortexRdfError::InvalidInput(got)) => {
+                assert!(got.starts_with("pattern subject: "), "{got:?}")
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

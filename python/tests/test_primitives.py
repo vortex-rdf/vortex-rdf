@@ -383,6 +383,12 @@ def test_many_matches_singles(code_store, vortex_files):
             store.match_codes_many(bad)
         with pytest.raises(ValueError):
             store.count_quads_many(bad)
+    # A malformed term names its slot in a tuple probe as in a dict probe.
+    for bad in ([(None, "not a term", None, None)], [{"p": "not a term"}]):
+        with pytest.raises(ValueError, match=r"^Invalid input: pattern predicate: "):
+            store.match_codes_many(bad)
+        with pytest.raises(ValueError, match=r"^Invalid input: pattern predicate: "):
+            store.count_quads_many(bad)
     strings = VortexRdfStore(vortex_files["default"])
     assert strings.match_codes_many(probes[:2]) == [None, None]
     assert strings.count_quads_many(probes[:2]) == [5, 3]
