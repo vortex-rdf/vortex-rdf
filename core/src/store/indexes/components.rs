@@ -194,12 +194,10 @@ impl IndexComponent {
     /// This component as a replayable native child write
     /// ([`index_child_write`]), its descriptor carrying the component's own
     /// sortedness provenance — how a store's serialization hands its
-    /// components to the container writer. Compiled only where a store can
-    /// be written (file-io or wasm32).
+    /// components to the container writer.
     ///
     /// Writing is a genuine use: a deferred adoption materializes here, so
     /// the written child is byte-identical to an eagerly-adopted one's.
-    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
     pub(crate) fn to_write(&self) -> Result<NativeComponentWrite> {
         let array = self.rows()?.clone().into_array();
         index_child_write(
@@ -271,14 +269,14 @@ impl IndexComponent {
     /// into memory.
     ///
     /// [`resident::with_searchable_int_children`]: crate::store::resident::with_searchable_int_children
-    #[cfg(any(feature = "file-io", test))]
+    #[cfg(feature = "file-io")]
     pub(crate) fn into_searchable(self) -> Result<Self> {
         self.rebuilt(crate::store::resident::with_searchable_int_children)
     }
 
     /// This component with its integer children compressed into
     /// probe-supported encodings — the construction-side counterpart of
-    /// `into_searchable`: a builder's canonical
+    /// [`into_searchable`](Self::into_searchable): a builder's canonical
     /// emission compresses here (see
     /// [`resident::with_compressed_int_children`]), without the base's payload
     /// wrapper (components never serve code columns). The sorted probes bind

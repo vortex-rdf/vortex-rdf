@@ -166,7 +166,7 @@ pub(crate) mod spawn_probe {
 /// `ScanBuilder::into_array_stream` spawns onto the session's runtime handle;
 /// this drives `ScanBuilder::build`'s futures directly instead, so it needs no
 /// handle at all — which is what lets buffer-backed files (whose segment reads
-/// resolve synchronously) be read on wasm and in no-file-io builds.
+/// resolve synchronously) be read on wasm.
 pub(crate) async fn scan_all_reader(reader: vortex_layout::LayoutReaderRef) -> Result<ArrayRef> {
     collect_whole_scan(reader_scan(reader)).await
 }

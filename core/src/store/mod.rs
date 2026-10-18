@@ -110,7 +110,6 @@ pub struct VortexRdfStore {
 /// column's stamp. Produced by [`VortexRdfStore::to_serializable_parts`] and
 /// adopted back by [`VortexRdfStore::from_parts`] (the in-memory open,
 /// `from_file_in_memory`).
-#[cfg(any(feature = "file-io", target_arch = "wasm32", test))]
 pub(crate) struct StoreParts {
     pub(crate) built: BuiltArray,
 }

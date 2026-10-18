@@ -54,7 +54,7 @@ A builder hands these back in one of two shapes
 | CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`SerializeArgs`](../cli/src/main.rs#L33)) | out-of-core | file |
 | Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L145) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L60) | out-of-core | file / any `VortexWrite` |
 | Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L75), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L59) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L37) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L127) to name the builder | either | in-memory store |
-| Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L140) | — (re-serializes a store) | bytes |
+| Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L138) | — (re-serializes a store) | bytes |
 | Rust | [`VortexRdfStore::from_file_in_memory`](../core/src/store/persist/open.rs#L249) | — (reads a `.vortex` file whole, then adopts it in memory) | in-memory store |
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize_rdf`](../python/src/serialize.rs#L33)) | out-of-core | file |
 | Python | `VortexRdfStore(path, in_memory=True)` | — (calls `from_file_in_memory`) | in-memory store |
@@ -174,7 +174,7 @@ flowchart TD
 
 **String layouts.** The stream is drained into a `Vec<RawQuad>`, sorted, stripped
 of its adjacent repeats, and built into one struct of primary columns through
-[`build_struct_array`](../core/src/store/builders/mod.rs#L167); the requested
+[`build_struct_array`](../core/src/store/builders/mod.rs#L157); the requested
 index families are sorted over that same vector ([§8](#8-secondary-indexes-at-build-time)).
 
 **Dictionary layout.** Terms are interned as they arrive
@@ -240,7 +240,7 @@ row ids are.
 ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L171)):
 every poll of the chunk stream pulls up to a chunk's worth of quads off the
 heap and builds one struct
-([`build_struct_array`](../core/src/store/builders/mod.rs#L167), or
+([`build_struct_array`](../core/src/store/builders/mod.rs#L157), or
 [`dictionary::build_chunk`](../core/src/store/layouts/dictionary/codec.rs#L127)
 encoding each term through the term→code map). With indexes the merge runs to
 completion first ([`merge_feeding_indexes`](../core/src/store/builders/stream_indexes.rs#L128)):
@@ -272,7 +272,7 @@ followed), then the OS temp dir.
 | Build | Peak memory |
 |---|---|
 | no indexes | heap heads + one chunk (+ the distinct terms under Dictionary) |
-| with indexes | as above, plus each spiller's buffer of up to 100,000 entries, plus the components' compressed segments the writer holds until the quad table finishes ([`write_stream`](../core/src/io/container/write.rs#L98)) |
+| with indexes | as above, plus each spiller's buffer of up to 100,000 entries, plus the components' compressed segments the writer holds until the quad table finishes ([`write_stream`](../core/src/io/container/write.rs#L97)) |
 
 ---
 
@@ -302,9 +302,9 @@ is the sorted set of every distinct term of the dataset — subjects, predicates
 objects and graph names in one namespace, the default graph's `""` included. A
 term's code is its position, so code order equals string order and a bound
 term resolves to its code by binary search. The frozen column is
-FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/storage.rs#L272)):
+FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/storage.rs#L269)):
 one symbol table is trained on the whole column and the terms are compressed in
-independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage.rs#L41)
+independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage.rs#L39)
 (65,536) terms, each window a self-contained FSST array. The term count must
 fit an `i32`.
 
@@ -350,7 +350,7 @@ Opening a file whose index children record row ids of another width is
 refused with a deserialization error that says to rebuild the store
 ([file-format.md §6](file-format.md#6-the-index-children)).
 
-**In memory** ([`build_components`](../core/src/store/builders/mod.rs#L203)) each
+**In memory** ([`build_components`](../core/src/store/builders/mod.rs#L193)) each
 family is a permutation of the complete sorted dataset: sort the row ids by the
 family's comparator ([`CopyFamily::cmp_quads`](../core/src/store/indexes/copy.rs#L147),
 or the code tuple under Dictionary), then gather the columns through that
@@ -369,8 +369,8 @@ the whole dataset; a reader binary-searches a child on that flag alone
 ## 9. Writing the container
 
 Whatever produced the parts, one function writes them:
-[`write_store`](../core/src/io/container/write.rs#L164). It installs the store's
-own write strategy, [`RdfStoreWriteStrategy`](../core/src/io/container/write.rs#L65),
+[`write_store`](../core/src/io/container/write.rs#L163). It installs the store's
+own write strategy, [`RdfStoreWriteStrategy`](../core/src/io/container/write.rs#L64),
 on a stock Vortex file write:
 
 ```mermaid
@@ -386,7 +386,7 @@ flowchart TD
     R --> F["Vortex footer, postscript, end-of-file marker"]
 ```
 
-- **The quad table** goes through [`child_strategy`](../core/src/io/container/sources.rs#L237)
+- **The quad table** goes through [`child_strategy`](../core/src/io/container/sources.rs#L235)
   — Vortex's default `WriteStrategyBuilder` pipeline: split the struct into
   columns, repartition each column into 8,192-row blocks, compute zoned
   statistics per block, dictionary-encode a column where sampling says it pays,
@@ -394,7 +394,7 @@ flowchart TD
   BtrBlocks-style compressor, and write flat leaf layouts. Each id column —
   a `u64` term-code `s`, `p`, `o`, `g` or `val`, or a `u64` row-id `rid` —
   is handed, through the builder's per-field override, to
-  [`id_column_strategy`](../core/src/io/container/sources.rs#L297): the same
+  [`id_column_strategy`](../core/src/io/container/sources.rs#L295): the same
   per-column pipeline rebuilt step for step from Vortex's layout strategies,
   with the coalescing target split in two. A column that does not
   dictionary-encode coalesces toward ~2 MiB, 262,144 rows per leaf for a
@@ -403,12 +403,12 @@ flowchart TD
   copy to Vortex's pipeline: at 1 MiB for both targets it must write the
   stock bytes. A table without id columns — the string layouts' quad
   table — gets the stock pipeline unchanged
-  ([`default_child_strategy`](../core/src/io/container/sources.rs#L218)).
+  ([`default_child_strategy`](../core/src/io/container/sources.rs#L216)).
 - **Index children** take exactly the same strategy, so their encoding is what a
   plain table write produces: plain code columns and `rid` (row ids are
   unique, so never dictionary-encoded) at ~2 MiB, dictionary codes at ~1 MiB,
   term strings under the string layouts at ~1 MiB.
-- **The dictionary** takes [`dict_child_strategy`](../core/src/io/container/sources.rs#L376):
+- **The dictionary** takes [`dict_child_strategy`](../core/src/io/container/sources.rs#L373):
   its chunks are already FSST-compressed windows, so they are written verbatim
   as one flat leaf each under a chunked node — no sampling, no re-encoding —
   zoned one zone per window with the window's exact first and last term when
@@ -420,7 +420,7 @@ flowchart TD
   of every component's, in inventory order; the descriptors and `quads_sorted`
   are encoded into the root layout's metadata ([file-format.md §3](file-format.md#3-the-store-root-vortex-rdfstorev2)).
 - **Provenance.** `quads_sorted` is read off the primary's own `s` stamp when a
-  store re-serializes ([`into_stream`](../core/src/store/persist/serialize.rs#L30)) and is
+  store re-serializes ([`into_stream`](../core/src/store/persist/serialize.rs#L29)) and is
   `true` by construction for a builder's stream; each component's `sorted` flag
   travels on its descriptor.
 
@@ -430,7 +430,7 @@ a builder's chunk stream (files, compaction; a file is written by
 into place, so a failed write leaves no partial file and the previous store
 untouched, and on Unix a store that has the old file mapped keeps reading
 it), or a store's split parts as one chunk
-([`into_stream`](../core/src/store/persist/serialize.rs#L30): `to_bytes`, the
+([`into_stream`](../core/src/store/persist/serialize.rs#L29): `to_bytes`, the
 bindings' exchange bytes). On the wire the two are the same container.
 
 **Replacing a file.** [`PendingStore`](../core/src/io/write.rs#L265) is the one
@@ -515,7 +515,7 @@ where those layers are folded back into the three parts of
 
 ### 11.1 Serializing a store (`to_bytes`, `to_serializable_parts`)
 
-[`to_serializable_parts`](../core/src/store/persist/serialize.rs#L93) decides what a view's
+[`to_serializable_parts`](../core/src/store/persist/serialize.rs#L92) decides what a view's
 parts are:
 
 | The view is… | Rows | Components | Dictionary |
@@ -546,7 +546,7 @@ quad, sort and drop repeated quads exactly as a serialization's rebuild does
   the store is then reopened memory-mapped. On Windows that rename is refused
   while the file is mapped, by this store included, so there a file-backed
   store cannot compact over its own path ([mutations.md §5](mutations.md#5-compaction)).
-- **An in-memory store** rebuilds through [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L230)
+- **An in-memory store** rebuilds through [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L220)
   (a fresh dictionary under Dictionary, components over the whole set) and
   adopts the result through [`from_built`](../core/src/store/construct.rs#L127).
 
@@ -582,8 +582,8 @@ every other format decodes to `oxrdf` terms and drives the `oxrdfio` serializer.
 | `--indexes` / `indexes` | every surface | none | which index families to build ([§8](#8-secondary-indexes-at-build-time)) |
 | `DEFAULT_CHUNK_ROWS` | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L61) | 100,000 rows | run size, emitted chunk size, spiller capacity, auto-compaction cap |
 | `VORTEX_RDF_SPILL_DIR` | environment | unset (caller base, else OS temp) | where spill runs live |
-| `DICT_CHUNK_ROWS` | [`storage.rs`](../core/src/store/layouts/dictionary/storage.rs#L41) | 65,536 terms | FSST window = dictionary child leaf |
-| row block / segment target | Vortex default write strategy; [`child_strategy`](../core/src/io/container/sources.rs#L237) | 8,192 rows / ~1 MiB; ~2 MiB for a plain id column | zone-map granularity, and the segment size of every written column except a plain `u64` term-code or row-id column, which coalesces toward ~2 MiB ([§9](#9-writing-the-container)) |
+| `DICT_CHUNK_ROWS` | [`storage.rs`](../core/src/store/layouts/dictionary/storage.rs#L39) | 65,536 terms | FSST window = dictionary child leaf |
+| row block / segment target | Vortex default write strategy; [`child_strategy`](../core/src/io/container/sources.rs#L235) | 8,192 rows / ~1 MiB; ~2 MiB for a plain id column | zone-map granularity, and the segment size of every written column except a plain `u64` term-code or row-id column, which coalesces toward ~2 MiB ([§9](#9-writing-the-container)) |
 
 ---
 

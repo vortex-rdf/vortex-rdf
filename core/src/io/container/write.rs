@@ -1,8 +1,7 @@
 //! The write side of the container grammar: assembling a native root layout
 //! from its written children, and the write strategy that turns a quad
-//! stream plus component sources into a store file. Gated as a whole at the
-//! module declaration (see `container`'s docs); the always-compiled
-//! component data types live in [`sources`](super::sources).
+//! stream plus component sources into a store file. The component data types
+//! live in [`sources`](super::sources).
 
 use std::sync::Arc;
 

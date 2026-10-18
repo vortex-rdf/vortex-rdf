@@ -22,6 +22,13 @@ join_list() {
   printf '%s' "$out"
 }
 
+# Whether rustup reports the wasm32 target missing. Without rustup there is
+# nothing to ask, so the wasm32 steps run (and fail loudly if it is missing).
+wasm32_target_missing() {
+  command -v rustup >/dev/null 2>&1 &&
+    ! rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknown
+}
+
 # --- docs step ---
 # Cheap and tool-free, so it runs first: a broken `#L` anchor should fail the
 # push before the compilers are even warm.
@@ -36,16 +43,20 @@ cargo fmt --check
 info "cargo clippy --workspace --all-targets -- -D warnings"
 cargo clippy --workspace --all-targets -- -D warnings
 
-info "cargo clippy -p vortex-rdf-core --no-default-features --all-targets -- -D warnings"
-cargo clippy -p vortex-rdf-core --no-default-features --all-targets -- -D warnings
+# Core's other build configuration: wasm32, without `file-io`. Skipped (with a
+# warning) when the wasm32 target is missing, like the js-tests block below.
+if wasm32_target_missing; then
+  warn "lint: skipping the wasm32 clippy — run \`rustup target add wasm32-unknown-unknown\`."
+  skipped+=("wasm32 clippy (no wasm32 target)")
+else
+  info "cargo clippy -p vortex-rdf --target wasm32-unknown-unknown --all-targets -- -D warnings"
+  cargo clippy -p vortex-rdf --target wasm32-unknown-unknown --all-targets -- -D warnings
+fi
 passed+=(lint)
 
 # --- rust-tests job ---
 info "cargo test --workspace"
 cargo test --workspace
-
-info "cargo test -p vortex-rdf-core --no-default-features"
-cargo test -p vortex-rdf-core --no-default-features
 passed+=(rust-tests)
 
 # --- interface-tests job ---
@@ -100,8 +111,7 @@ if ! command -v npm >/dev/null 2>&1; then
 elif [ ! -d js/node_modules ]; then
   warn "js: skipping js-tests — js/node_modules missing (run \`cd js && npm ci\`)."
   skipped+=("js-tests (no node_modules)")
-elif command -v rustup >/dev/null 2>&1 &&
-  ! rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknown; then
+elif wasm32_target_missing; then
   warn "js: skipping js-tests — run \`rustup target add wasm32-unknown-unknown\`."
   skipped+=("js-tests (no wasm32 target)")
 else

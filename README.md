@@ -22,7 +22,7 @@ Vortex-RDF is a columnar RDF serialization and a queryable quad store built on t
 
 | Surface | Install | Notes |
 |---|---|---|
-| Rust | `cargo add vortex-rdf-core` | the default `file-io` feature adds path-based file reading/writing on Tokio; add `--no-default-features` on wasm, where stores are exchanged as bytes |
+| Rust | `cargo add vortex-rdf-core` | native builds need the default `file-io` feature (path-based file reading/writing on Tokio); add `--no-default-features` on wasm32, where stores are exchanged as bytes |
 | CLI | `cargo install vortex-rdf-cli` | |
 | JavaScript | `npm install @vortex-rdf/vortex-rdf-store` | [js/README.md](js/README.md) |
 | Python | `pip install vortex-rdf` | [python/README.md](python/README.md); [`vortex-rdflib`](https://pypi.org/project/vortex-rdflib/) builds an rdflib integration on it |

@@ -33,12 +33,15 @@ jobs:
         uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
           # Shared with `rust-tests`: clippy compiles *dependencies* with plain
           # rustc (only workspace crates go through clippy-driver), so the two
-          # jobs' dev-profile dependency artifacts are the same build.
+          # jobs' native dev-profile dependency artifacts are the same build.
+          # The wasm32 clippy's artifacts are this job's alone: they are in the
+          # shared entry only when this job is the one that saves it.
           shared-key: dev
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check formatting
@@ -47,11 +50,11 @@ jobs:
         run: scripts/check-doc-anchors.sh
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      # The no-default-features build has its own dead-code surface (items only
-      # reachable through the file-io feature), which the default clippy run
-      # cannot see.
-      - name: Run clippy (core, no default features)
-        run: cargo clippy -p vortex-rdf-core --no-default-features --all-targets -- -D warnings
+      # Core's other build configuration: the wasm bindings take it without
+      # `file-io`, a dead-code surface of its own (items only reachable
+      # through that feature), which the native clippy run cannot see.
+      - name: Run clippy (wasm32)
+        run: cargo clippy -p vortex-rdf --target wasm32-unknown-unknown --all-targets -- -D warnings
 
   rust-tests:
     name: Rust Tests (${{ matrix.label }})
@@ -62,8 +65,6 @@ jobs:
         include:
           - label: workspace
             command: cargo test --workspace
-          - label: core-no-default-features
-            command: cargo test -p vortex-rdf-core --no-default-features
     steps:
       - uses: actions/checkout@v7
       - name: Setup Rust toolchain

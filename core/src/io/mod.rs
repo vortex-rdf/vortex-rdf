@@ -8,12 +8,6 @@
 
 pub(crate) mod container;
 pub(crate) mod read;
-/// Write-side native-container machinery. Compiled out of the no-file-io
-/// native build, which has no consumer for the byte writer (reading via
-/// `from_bytes` stays available); present natively behind `file-io` and on
-/// wasm, whose bindings exchange file bytes. `container::write` is gated the
-/// same way.
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) mod write;
 
 #[cfg(feature = "file-io")]

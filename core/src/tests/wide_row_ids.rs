@@ -330,12 +330,9 @@ async fn check_adoptions(store: &VortexRdfStore, quads: &[Quad], label: &str) {
     check_children(&parts, BASE, label);
     let adopted = VortexRdfStore::from_parts(parts).unwrap();
     check_store(&adopted, quads, &format!("{label}: from_parts")).await;
-    #[cfg(feature = "file-io")]
-    {
-        let bytes = store.to_bytes().await.unwrap();
-        let reopened = VortexRdfStore::from_bytes(&bytes).await.unwrap();
-        check_store(&reopened, quads, &format!("{label}: from_bytes")).await;
-    }
+    let bytes = store.to_bytes().await.unwrap();
+    let reopened = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+    check_store(&reopened, quads, &format!("{label}: from_bytes")).await;
 }
 
 /// The in-memory index builds — the sorted in-memory builder under every
@@ -554,12 +551,9 @@ async fn row_ids_past_u32_survive_compaction() {
             &label,
         );
         check_store(&compacted, &all, &format!("{label}: compacted")).await;
-        #[cfg(feature = "file-io")]
-        {
-            let bytes = grown.to_bytes().await.unwrap();
-            let reopened = VortexRdfStore::from_bytes(&bytes).await.unwrap();
-            check_store(&reopened, &all, &format!("{label}: tail serialized")).await;
-        }
+        let bytes = grown.to_bytes().await.unwrap();
+        let reopened = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+        check_store(&reopened, &all, &format!("{label}: tail serialized")).await;
         let shrunk = compacted
             .delete_quad(&extra)
             .await

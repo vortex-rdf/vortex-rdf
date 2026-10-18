@@ -99,19 +99,9 @@ pub(crate) struct BuiltStream {
     pub(crate) components: Vec<crate::io::container::NativeComponentWrite>,
     /// Whether the chunks are in global `(s, p, o, g)` order; written as the
     /// root's `quads_sorted` (see `WireMetadata::quads_sorted`).
-    // Read by the serializer (`io::write`), which is compiled in under
-    // `file-io` and on wasm32.
-    #[cfg_attr(
-        not(any(feature = "file-io", target_arch = "wasm32")),
-        allow(dead_code)
-    )]
     pub(crate) quads_sorted: bool,
     /// The Dictionary layout's terms, placed as the `dictionary` child by the
     /// serializer and carried into the materialized [`BuiltArray`].
-    #[cfg_attr(
-        not(any(feature = "file-io", target_arch = "wasm32")),
-        allow(dead_code)
-    )]
     pub(crate) dict: Option<Arc<TermDictionary>>,
 }
 

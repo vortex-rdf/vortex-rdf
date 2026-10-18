@@ -118,11 +118,10 @@ impl VortexRdfStore {
     /// child by the name [`index_components`](Self::index_components) lists
     /// it under (`index:posg`, `index:ospg`, `index:ref-p`, `index:ref-o`),
     /// its rows in the child's own order with the primary row id in `rid`; or
-    /// the term `dictionary` (`{_dict_term}`, row i the term with code i),
-    /// which needs a `file-io` or a wasm build. `None` for a name this store
-    /// has no child of: an index child is found by the name its
-    /// implementation slug gives it, whatever name a foreign file wrote it
-    /// under.
+    /// the term `dictionary` (`{_dict_term}`, row i the term with code i).
+    /// `None` for a name this store has no child of: an index child is found
+    /// by the name its implementation slug gives it, whatever name a foreign
+    /// file wrote it under.
     ///
     /// An in-memory store's tables read its resident children and need no
     /// runtime. A file-backed store's table is vortex's own
@@ -137,7 +136,6 @@ impl VortexRdfStore {
                     let rows = component.rows()?.clone().into_array();
                     return Ok(Some(chunks_source(vec![rows])));
                 }
-                #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
                 if name == crate::io::container::DICT_COMPONENT_NAME
                     && let crate::store::layouts::ResolvedLayout::Dictionary(access) = &self.layout
                     && let Some(dict) = access.resident()

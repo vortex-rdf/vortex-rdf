@@ -45,6 +45,12 @@
 //! });
 //! ```
 
+#[cfg(all(not(feature = "file-io"), not(target_arch = "wasm32")))]
+compile_error!(
+    "vortex-rdf-core supports two build configurations: native with `file-io` (on by default), \
+     and wasm32-unknown-unknown without default features. Enable `file-io` for a native build."
+);
+
 pub mod columns;
 pub mod common;
 pub(crate) mod debug;

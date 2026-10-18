@@ -7,22 +7,15 @@ use std::sync::LazyLock;
 use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_array::session::ArraySession;
 use vortex_edition::{Edition, EditionDeclaration, EditionFamily, EditionId, EditionMember};
-use vortex_io::session::RuntimeSession;
+use vortex_io::session::{RuntimeSession, RuntimeSessionExt};
 use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
 
-#[cfg(any(
-    all(feature = "file-io", not(target_arch = "wasm32")),
-    all(target_arch = "wasm32", target_os = "unknown")
-))]
-use vortex_io::session::RuntimeSessionExt;
-
 /// The one Vortex session: array, layout, scalar-fn and runtime registries,
 /// with the store's container layout registered and the write editions
-/// enabled. The runtime handle is the only per-target piece: tokio on native
-/// file-io builds; the microtask-queue `WasmRuntime` on
-/// wasm32-unknown-unknown, where the file writer spawns tasks; none on native
-/// no-file-io builds, whose code paths are all handle-free.
+/// enabled. The runtime handle is the only per-target piece: tokio natively;
+/// the microtask-queue `WasmRuntime` on wasm32-unknown-unknown, where the file
+/// writer spawns tasks.
 pub(crate) static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = VortexSession::empty()
         .with::<ArraySession>()

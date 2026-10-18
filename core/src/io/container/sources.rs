@@ -1,8 +1,6 @@
 //! Component sources: replayable producers of one independently typed
-//! component's chunks, plus the descriptor-source-strategy triple a write
-//! consumes. Always compiled — builders construct [`NativeComponentWrite`]s
-//! on every target, even when no serializer is compiled in; only the write
-//! strategy that consumes them (`write`) is gated.
+//! component's chunks, plus the descriptor-source-strategy triple
+//! ([`NativeComponentWrite`]) a write consumes.
 
 use std::sync::Arc;
 
@@ -372,7 +370,6 @@ fn id_column_strategy(
 /// term column is zoned one zone per window, recording each window's exact
 /// first and last term (`vortex.min()`/`vortex.max()`); `None` — chunks of
 /// uneven length — writes no zone map.
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) fn dict_child_strategy(
     zone_rows: Option<std::num::NonZeroUsize>,
 ) -> Arc<dyn vortex_layout::LayoutStrategy> {

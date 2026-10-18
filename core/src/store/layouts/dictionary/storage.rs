@@ -3,7 +3,6 @@
 //! compression) or adopted from a written term column, and the dictionary
 //! child's read and write sides, its zone-map bounds included.
 
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 use std::sync::Arc;
 
 use vortex_array::arrays::primitive::PrimitiveArrayExt as _;
@@ -11,7 +10,6 @@ use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 use vortex_array::dtype::PType;
 use vortex_array::match_each_integer_ptype;
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_fsst::{FSST, FSSTArray, FSSTArraySlotsExt as _, fsst_compress, fsst_train_compressor};
@@ -89,7 +87,6 @@ impl TermChunk {
     }
 
     /// The held column as an array, in its stored encoding.
-    #[cfg(any(feature = "file-io", target_arch = "wasm32", test))]
     fn array(&self) -> ArrayRef {
         match self {
             TermChunk::Canonical(a) => a.clone().into_array(),
@@ -551,7 +548,6 @@ impl TermChunk {
 /// order the zone table holds them: `vortex.max()` (last term), then
 /// `vortex.min()` (first term). Not the bounded string aggregates Vortex
 /// writes by default, which truncate long terms.
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) fn window_bound_aggregates() -> Arc<[vortex_array::aggregate_fn::AggregateFnRef]> {
     use vortex_array::aggregate_fn::fns::{max::Max, min::Min};
     use vortex_array::aggregate_fn::{AggregateFnVTableExt as _, NumericalAggregateOpts};
@@ -561,7 +557,6 @@ pub(crate) fn window_bound_aggregates() -> Arc<[vortex_array::aggregate_fn::Aggr
     ])
 }
 
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 impl TermDictionary {
     /// This dictionary as a native store component: the sorted term column,
     /// one chunk per held FSST window ([`child_chunks`](Self::child_chunks)),

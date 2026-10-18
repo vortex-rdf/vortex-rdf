@@ -26,7 +26,6 @@ impl StoreParts {
     ///
     /// [`BuiltStream`]: crate::store::builders::BuiltStream
     /// [`refuse_experimental_patches`]: crate::io::write::refuse_experimental_patches
-    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
     pub(crate) fn into_stream(self) -> Result<crate::store::builders::BuiltStream> {
         use crate::store::array::subject_sorted;
         use crate::store::indexes::IndexComponent;
@@ -136,7 +135,6 @@ impl VortexRdfStore {
     /// children. The exchange format of the bindings — read back with
     /// [`from_bytes`](Self::from_bytes) or written to disk as a `.vortex`
     /// file.
-    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
     pub async fn to_bytes(&self) -> Result<Vec<u8>> {
         let parts = self.to_serializable_parts().await?;
         let start = crate::debug::timer();

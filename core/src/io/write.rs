@@ -1,7 +1,7 @@
 //! The write side of the native store container.
 //!
 //! Drives [`write_store`](crate::io::container::write_store) over a
-//! [`BuiltStream`](crate::store::builders::BuiltStream) — the primary quad
+//! [`BuiltStream`] — the primary quad
 //! chunks plus each index component's and the dictionary's own
 //! [`NativeComponentWrite`](crate::io::container::NativeComponentWrite),
 //! from a builder or from a store's parts — carrying each part's sortedness
@@ -9,11 +9,11 @@
 //! `quads_stream_to_*` entry points, which run a
 //! builder's chunk stream straight into that writer, and the one way a store
 //! reaches a path on disk: written beside it and renamed into place
-//! ([`write_store_atomically`](crate::io::write::write_store_atomically)).
+//! ([`write_store_atomically`]).
 //!
 //! Reading these bytes back is [`read`](crate::io::read)'s job,
 //! and the container's own on-disk grammar is
-//! [`container`](crate::io::container)'s.
+//! [`container`]'s.
 
 use crate::error::{Result, VortexRdfError};
 

@@ -1,5 +1,5 @@
 //! Reading checked-in vortex-rdf.store.v2 fixtures through `from_bytes` —
-//! the one open path every target has, runtime handle or not. The fixtures
+//! the one open path every target has. The fixtures
 //! hold [`dictionary_test_quads`]: `store-default.vortex` under the Default
 //! layout with no indexes, `store-dictionary-both-indexes.vortex` under the
 //! Dictionary layout with both index families. Setting

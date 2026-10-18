@@ -374,7 +374,6 @@ async fn test_dict_reader_gate_with_a_held_dictionary() {
 /// A store adopted from its own bytes hands out a dictionary reader with a
 /// resident snapshot, and the codes its rows and its matched views gather
 /// decode, through that reader, to exactly the quads it was built from.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_dict_reader_survives_from_bytes() {
     let quads = dictionary_test_quads();

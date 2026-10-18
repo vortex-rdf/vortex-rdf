@@ -16,13 +16,13 @@ is the path such an engine takes.
 | What the engine needs | What it calls |
 |---|---|
 | A table of quads to scan with projection, filter and limit pushdown | [`data_source`](../core/src/store/read/data_source.rs#L105) on any view, registered with vortex's `VortexTable` |
-| The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L132) |
+| The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L131) |
 | Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L50), [`code_chunks`](../core/src/store/read/chunks.rs#L74) |
 | Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L151), [`index_components`](../core/src/store/read/metadata.rs#L224), [`partitions`](../core/src/store/read/metadata.rs#L259) |
-| Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L276) (from [`dict_reader`](../core/src/store/mod.rs#L219)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
+| Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L275) (from [`dict_reader`](../core/src/store/mod.rs#L218)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
-| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L140), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L302) |
-| The session to hand vortex's integrations | [`vortex_session`](../core/src/lib.rs#L81), with [`vortex_scan`](../core/src/lib.rs#L74) re-exported |
+| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L140), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L301) |
+| The session to hand vortex's integrations | [`vortex_session`](../core/src/lib.rs#L87), with [`vortex_scan`](../core/src/lib.rs#L80) re-exported |
 
 ---
 
@@ -112,9 +112,8 @@ or append tail. Use them over a store without tombstones or tail (`compact`
 produces one), or anti-join their `rid` against the view's own rows.
 `None` is returned for a name the store has no child of. An index child goes
 by the name its implementation slug gives it, as `index_components()` lists
-it, so one under a slug this version does not know has none. The `dictionary`
-table needs a `file-io` or wasm build. On a view that a match or a
-narrowing proved empty, the backends differ, as they do for
+it, so one under a slug this version does not know has none. On a view that
+a match or a narrowing proved empty, the backends differ, as they do for
 `index_components` ([§5](#5-what-a-view-promises-before-it-is-read)). In
 memory, such a view holds no index children, so every `index:…` name
 returns `None` (the `dictionary` table stays). On file, every view serves

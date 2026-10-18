@@ -725,13 +725,10 @@ async fn test_compaction_after_appends_holds_each_quad_once() {
             assert_holds_each_quad_once_in(&compacted, &expected, &who).await;
 
             // And its serialization.
-            #[cfg(feature = "file-io")]
-            {
-                let reread = VortexRdfStore::from_bytes(&tailed.to_bytes().await.unwrap())
-                    .await
-                    .unwrap();
-                assert_holds_each_quad_once_in(&reread, &expected, &who).await;
-            }
+            let reread = VortexRdfStore::from_bytes(&tailed.to_bytes().await.unwrap())
+                .await
+                .unwrap();
+            assert_holds_each_quad_once_in(&reread, &expected, &who).await;
         }
     }
 
@@ -820,17 +817,14 @@ async fn test_rebuilds_drop_repeats_a_base_carries() {
         }
 
         // A tail makes the serialization rebuild the rows: it drops them too.
-        #[cfg(feature = "file-io")]
-        {
-            let tailed = store.add_quads([quad_of("s4", "p", "z")]).await.unwrap();
-            let mut expected_tailed = expected.clone();
-            expected_tailed.extend(tuple_rows(&[quad_of("s4", "p", "z")]));
-            let reread = VortexRdfStore::from_bytes(&tailed.to_bytes().await.unwrap())
-                .await
-                .unwrap();
-            let who = format!("{base} tailed serialization");
-            assert_holds_each_quad_once_in(&reread, &expected_tailed, &who).await;
-        }
+        let tailed = store.add_quads([quad_of("s4", "p", "z")]).await.unwrap();
+        let mut expected_tailed = expected.clone();
+        expected_tailed.extend(tuple_rows(&[quad_of("s4", "p", "z")]));
+        let reread = VortexRdfStore::from_bytes(&tailed.to_bytes().await.unwrap())
+            .await
+            .unwrap();
+        let who = format!("{base} tailed serialization");
+        assert_holds_each_quad_once_in(&reread, &expected_tailed, &who).await;
     }
 
     #[cfg(feature = "file-io")]

@@ -1,9 +1,9 @@
 //! In-memory construction of a [`VortexRdfStore`]: the constructors from a
-//! quad stream, a builder's output and `StoreParts`, the empty store, and the
-//! layout, adoption and assembly steps they share.
+//! quad stream, a builder's output and [`StoreParts`], the empty store, and
+//! the layout, adoption and assembly steps they share.
 
 use crate::error::{Result, VortexRdfError};
-#[cfg(any(feature = "file-io", test))]
+#[cfg(feature = "file-io")]
 use crate::store::StoreParts;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::store::builders::SortedInMemoryBuilder;
@@ -105,7 +105,7 @@ impl VortexRdfStore {
     /// the order every builder of this crate produces — and the match fast
     /// paths search every bound role on that basis. Rows sorted by subject
     /// alone must not carry it.
-    #[cfg(any(feature = "file-io", test))]
+    #[cfg(feature = "file-io")]
     pub(crate) fn from_parts(parts: StoreParts) -> Result<Self> {
         Self::adopt(
             parts.built,
@@ -132,7 +132,7 @@ impl VortexRdfStore {
         )
     }
 
-    /// The one adoption step of `from_parts` and
+    /// The one adoption step of [`from_parts`](Self::from_parts) and
     /// [`from_built`](Self::from_built): resolve the layout from `built`'s
     /// dictionary and dtype, put the base through `encode_base` and every
     /// component through `encode_component`, and assemble the store.
@@ -156,8 +156,9 @@ impl VortexRdfStore {
     ///
     /// Callers own the resident form of what they pass: [`adopt`](Self::adopt)
     /// compresses a build and keeps an adopted store's wire encodings
-    /// selectively (`with_searchable_int_children`); this assembler transforms
-    /// nothing.
+    /// selectively
+    /// ([`with_searchable_int_children`](resident::with_searchable_int_children));
+    /// this assembler transforms nothing.
     ///
     /// A Dictionary `layout` must hold its dictionary resident: an in-memory
     /// view decodes its rows without suspending, through that dictionary

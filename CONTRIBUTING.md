@@ -6,17 +6,22 @@ Run `./scripts/install-git-hooks.sh` once per clone to enable the git hooks. The
 `pre-push` hook mirrors the `lint`, `rust-tests`, `interface-tests`,
 `python-tests` and `js-tests` jobs in
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — `cargo fmt --check`,
-both `cargo clippy` runs (workspace, and core with `--no-default-features`),
-both `cargo test` variants, the `interface-tests/` crate's fmt check, clippy
-and tests (`--locked`), `uv sync --locked && uv run pytest tests -q` in
-`python/`, and the wasm-pack build + `npm run typecheck` + `npm test` in
-`js/`. You can also run it manually with
-`./scripts/ci-check.sh`. Skip it for one push with `git push --no-verify`.
+both `cargo clippy` runs (the workspace natively, and the wasm bindings with
+`--target wasm32-unknown-unknown`), `cargo test --workspace`, the
+`interface-tests/` crate's fmt check, clippy and tests (`--locked`),
+`uv sync --locked && uv run pytest tests -q` in `python/`, and the wasm-pack
+build + `npm run typecheck` + `npm test` in `js/`. You can also run it manually
+with `./scripts/ci-check.sh`. Skip it for one push with `git push --no-verify`.
 
-The python and js blocks are soft skips when their tooling is missing (`uv`;
-`npm`, `js/node_modules`, or the `wasm32-unknown-unknown` target): the script
-warns and continues, so CI remains the source of truth for those jobs on a
-clone without the tools.
+Core builds in two configurations: natively with its default `file-io`
+feature, and for wasm32 without it, as the wasm bindings take it. A native
+build without `file-io` stops with a compile error; the wasm32 clippy run is
+what checks the other configuration.
+
+The wasm32 clippy run, the python block and the js block are soft skips when
+their tooling is missing (the `wasm32-unknown-unknown` target; `uv`; `npm`,
+`js/node_modules` or that target): the script warns and continues, so CI
+remains the source of truth for those jobs on a clone without the tools.
 
 The local `js-tests` mirror trades exactness for wall clock: it builds with
 `npm run build:fast` (wasm-pack without wasm-opt, which dominates the full

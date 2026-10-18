@@ -468,13 +468,10 @@ async fn codes_past_u32_round_trip_in_memory() {
     let adopted = VortexRdfStore::from_parts(parts).unwrap();
     check_store(&adopted, &quads, "from_parts").await;
 
-    // Serialization needs a writer: compiled in under `file-io` (and on wasm).
-    #[cfg(feature = "file-io")]
-    {
-        let bytes = store.to_bytes().await.unwrap();
-        let reopened = VortexRdfStore::from_bytes(&bytes).await.unwrap();
-        check_store(&reopened, &quads, "from_bytes").await;
-    }
+    // Serialized and reopened from its bytes.
+    let bytes = store.to_bytes().await.unwrap();
+    let reopened = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+    check_store(&reopened, &quads, "from_bytes").await;
 }
 
 /// A file written and reopened under the guard: its code columns are u64

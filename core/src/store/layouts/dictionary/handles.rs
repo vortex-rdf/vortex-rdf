@@ -38,7 +38,7 @@ use super::term_dict::TermDictionary;
 ///   what confines a file-backed dictionary's I/O to this method.
 /// - [`resident`](Self::resident) hands out the in-memory dictionary itself
 ///   (`None` for `FileBacked`), for the paths that genuinely need the whole
-///   column; `ensure_resident` lifts a file-backed
+///   column; [`ensure_resident`](Self::ensure_resident) lifts a file-backed
 ///   dictionary transiently when serialization must have it.
 #[derive(Clone)]
 pub(crate) enum DictAccess {
@@ -98,7 +98,7 @@ impl DictAccess {
     /// The in-memory dictionary, or `None` when it is file-backed — sync
     /// callers (snapshots, in-memory chunk decode) treat `None` as "not
     /// available here"; paths that genuinely need the whole column go through
-    /// `ensure_resident`.
+    /// [`ensure_resident`](Self::ensure_resident).
     pub(crate) fn resident(&self) -> Option<&Arc<TermDictionary>> {
         match self {
             DictAccess::Resident(dict) => Some(dict),
@@ -118,7 +118,6 @@ impl DictAccess {
     /// (serialization, compaction, tail-merge re-encoding). The lift is
     /// transient: it is not cached back into the access, so a store's steady
     /// state keeps the file-backed footprint.
-    #[cfg(any(feature = "file-io", target_arch = "wasm32", test))]
     pub(crate) async fn ensure_resident(&self) -> Result<Arc<TermDictionary>> {
         match self {
             DictAccess::Resident(dict) => Ok(Arc::clone(dict)),

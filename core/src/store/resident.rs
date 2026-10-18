@@ -3,7 +3,7 @@
 //!
 //! The integer-children helpers are the two ends of the compressed-resident
 //! form: [`with_compressed_int_children`] encodes a built store's code
-//! columns into probe-supported encodings, `with_searchable_int_children`
+//! columns into probe-supported encodings, [`with_searchable_int_children`]
 //! keeps an adopted store's encodings wherever a probe binds them, and
 //! [`shared_code_primitive`] / [`cached_code_primitive`] hand back the
 //! canonical code primitive a slice-bound read path needs — decoding into the
@@ -42,7 +42,7 @@ use vortex_array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 /// business.
 ///
 /// [`search_sorted_bounds`]: crate::store::array::search_sorted_bounds
-#[cfg(any(feature = "file-io", test))]
+#[cfg(feature = "file-io")]
 pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
     use vortex_array::arrays::PrimitiveArray;
 
@@ -66,7 +66,7 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
 /// ([`RowId`](schema::RowId)) — into probe-supported encodings, in place of
 /// the canonical primitives the builders emit — the construction half of the
 /// store's compressed-resident form (the adoption half is
-/// `with_searchable_int_children`).
+/// [`with_searchable_int_children`]).
 ///
 /// Every encoding chosen here is one an encoded search probe resolves, so
 /// the match fast paths keep binding the column; the choice is made from

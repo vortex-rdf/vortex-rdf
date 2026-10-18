@@ -227,7 +227,6 @@ async fn rebuilds_refuse_a_store_grown_past_the_top() {
         "the append itself is a tail"
     );
     assert_refused(grown.compact().await, "compaction");
-    #[cfg(feature = "file-io")]
     assert_refused(grown.to_bytes().await, "serialization of the tail");
     assert_reads_back(&store, LIMIT, "the store grown from").await;
 }
