@@ -1,7 +1,7 @@
 //! The opened native store file: the runtime handle the store's file-backed
-//! query paths drive. It holds what is fixed per file (the component
-//! inventory, the quad table's split ranges, one chunk-probe handle per
-//! column), the reader tree every scan and probe reads through, and two
+//! query paths drive. It holds what is fixed per file (the component roster
+//! classified at open, the quad table's split ranges, one chunk-probe handle
+//! per column), the reader tree every scan and probe reads through, and two
 //! bounded memos: pruning envelopes per filter shape, and bound filter trees.
 //! Vortex keys its reader caches by the identity of the bound trees, so the
 //! reader tree is retired whenever the bound-tree memo clears. The pure
@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -16,15 +17,14 @@ use vortex_array::ArrayRef;
 use vortex_array::expr::{BoundExpression, Expression, root, select};
 use vortex_error::VortexResult;
 use vortex_layout::scan::scan_builder::ScanBuilder;
-use vortex_layout::{LayoutReaderRef, LayoutRef};
+use vortex_layout::{Layout, LayoutReaderRef, LayoutRef};
 
-use crate::io::container::{
-    RdfStoreLayoutVTable, StoreComponentDescriptor, is_native_file, store_component,
-};
-use crate::io::read::{FileIdentity, OpenedFile, unsupported_file_error};
+use crate::io::container::{self, RdfStoreLayoutVTable};
+use crate::io::read::{FileIdentity, OpenedFile};
+use crate::store::persist::open::{ComponentRoster, IndexChild};
 
 /// An opened native store file: the [`vortex_file::VortexFile`] plus its
-/// component inventory and reader tree.
+/// classified component roster and reader tree.
 ///
 /// Derefs to the inner file for its footer, dtype, row count, segment source
 /// and session. The inner file keeps no reader of its own: scans and probes
@@ -36,7 +36,10 @@ use crate::io::read::{FileIdentity, OpenedFile, unsupported_file_error};
 /// zone-map stats decode once per tree.
 pub(crate) struct NativeStoreFile {
     file: vortex_file::VortexFile,
-    components: Vec<StoreComponentDescriptor>,
+    /// The component roster, classified once at open: the dictionary child's
+    /// slot and the known index children, the only children the handle
+    /// reaches.
+    roster: ComponentRoster,
     /// The root metadata's `quads_sorted` provenance (see `WireMetadata`),
     /// captured at open so read paths can restore the subject stamp on
     /// materialized rows without re-walking the layout.
@@ -69,6 +72,10 @@ pub(crate) struct NativeStoreFile {
     mapped: bool,
     /// The identity of the file this handle maps, where the platform has one.
     identity: Option<FileIdentity>,
+    /// The absolute path the file was opened from, which an owner's
+    /// compaction rewrites its rows over; none for a file opened over a
+    /// buffer.
+    path: Option<PathBuf>,
     /// How many times a quad column has been streamed through a scan for a
     /// keep (test hook: pins which keeps were served without reading a column).
     #[cfg(test)]
@@ -81,7 +88,7 @@ pub(crate) struct NativeStoreFile {
 }
 
 /// The readers of one opened file: the quad table's root reader and one
-/// reader per component, each built on first use.
+/// reader per component slot, each built on first use.
 ///
 /// Vortex keeps caches inside a reader (zone-map pruning results,
 /// partitioned expressions, dictionary evaluations) keyed by the identity of
@@ -279,24 +286,24 @@ impl std::ops::Deref for NativeStoreFile {
 }
 
 impl NativeStoreFile {
-    /// Wrap an opened file, requiring the native store root — the one place
-    /// a file's root layout is checked on the open path.
+    /// Wrap an opened file, refusing one this version cannot read and
+    /// classifying its component roster once ([`ComponentRoster::of`]) — the
+    /// one place a file's root layout is checked on the open path. A
+    /// structural refusal comes before a row-count refusal.
     pub(crate) fn try_new(opened: impl Into<OpenedFile>) -> crate::error::Result<Self> {
         let OpenedFile {
             file,
             mapped,
             identity,
+            path,
         } = opened.into();
-        if !is_native_file(&file) {
-            return Err(unsupported_file_error(&file));
-        }
-        let typed = file.footer().layout().as_::<RdfStoreLayoutVTable>();
-        let components = typed.data().components.to_vec();
-        let quads_sorted = typed.data().quads_sorted;
-        let readers = Mutex::new(Arc::new(ReaderTree::new(&file, components.len(), 0)));
+        let roster = ComponentRoster::of(&file)?;
+        let data = file.footer().layout().as_::<RdfStoreLayoutVTable>().data();
+        let quads_sorted = data.quads_sorted;
+        let readers = Mutex::new(Arc::new(ReaderTree::new(&file, data.components.len(), 0)));
         Ok(Self {
             file,
-            components,
+            roster,
             quads_sorted,
             readers,
             splits: OnceLock::new(),
@@ -305,6 +312,7 @@ impl NativeStoreFile {
             bound_exprs: Arc::new(BoundExprMemo::new()),
             mapped,
             identity,
+            path,
             #[cfg(test)]
             column_streams: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -365,6 +373,12 @@ impl NativeStoreFile {
         self.identity
     }
 
+    /// The absolute path the file was opened from; `None` for a file opened
+    /// over a buffer.
+    pub(crate) fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     /// A quad column's chunk-probe handle by name, for point reads and exact
     /// bound-term row ranges through the wire-encoded chunks — built from the
     /// layout on first use and memoized for the handle's lifetime, so the
@@ -373,8 +387,7 @@ impl NativeStoreFile {
     /// too); callers keep the scan.
     pub(crate) fn column_chunks(&self, column: &str) -> ColumnHandle {
         self.memoized_quad_chunks(column, || {
-            let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
-            let quads = typed.slot(0).ok().flatten()?;
+            let quads = container::quad_source(self.root()).ok()?;
             vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&quads, column)
                 .map(Arc::new)
         })
@@ -382,10 +395,12 @@ impl NativeStoreFile {
 
     /// An index component column's chunk-probe handle, the auxiliary-child
     /// counterpart of [`column_chunks`](Self::column_chunks), memoized alike
-    /// per (component, column). `None` on any decline.
+    /// per (component, column): the component by the name the roster
+    /// classified it under (see [`component_layout`](Self::component_layout)).
+    /// `None` on any decline.
     pub(crate) fn component_column_chunks(&self, component: &str, column: &str) -> ColumnHandle {
         self.memoized_component_chunks(component, column, || {
-            let (_, child) = self.component_child(component).ok().flatten()?;
+            let child = self.slot_layout(self.slot_of(component)?).ok()?;
             vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&child, column)
                 .map(Arc::new)
         })
@@ -479,67 +494,94 @@ impl NativeStoreFile {
         self.quads_sorted
     }
 
-    /// The persisted component inventory (auxiliary children only).
-    pub(crate) fn components(&self) -> &[StoreComponentDescriptor] {
-        &self.components
+    /// The known index children of the file's roster, in inventory order.
+    pub(in crate::store) fn index_children(&self) -> &[IndexChild] {
+        &self.roster.index_children
     }
 
-    /// A component's slot in the inventory and its child layout, by name.
-    fn component_child(&self, name: &str) -> VortexResult<Option<(usize, LayoutRef)>> {
-        let Some(index) = self.components.iter().position(|c| c.name == name) else {
-            return Ok(None);
-        };
-        let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
-        let (_, child) = store_component(typed, name)?
-            .ok_or_else(|| vortex_error::vortex_err!("store component {name} has no child"))?;
-        Ok(Some((index, child)))
-    }
-
-    /// A component's child layout, by name.
+    /// A classified component's child layout, by the name the roster knows
+    /// it under: the `dictionary`, or a known index child's registry name.
+    /// `None` for any other name, a component the roster skipped included.
     pub(crate) fn component_layout(&self, name: &str) -> VortexResult<Option<LayoutRef>> {
-        Ok(self.component_child(name)?.map(|(_, child)| child))
+        self.slot_of(name)
+            .map(|slot| self.slot_layout(slot))
+            .transpose()
     }
 
-    /// A component's descriptor and its reader from the current tree, by
-    /// name.
-    pub(crate) fn component_reader(
-        &self,
-        name: &str,
-    ) -> VortexResult<Option<(&StoreComponentDescriptor, LayoutReaderRef)>> {
-        let Some((index, child)) = self.component_child(name)? else {
+    /// A classified component's reader from the current tree, by the name
+    /// the roster knows it under (see
+    /// [`component_layout`](Self::component_layout)).
+    pub(crate) fn component_reader(&self, name: &str) -> VortexResult<Option<LayoutReaderRef>> {
+        self.slot_of(name)
+            .map(|slot| self.slot_reader(slot))
+            .transpose()
+    }
+
+    /// A known index child's reader from the current tree.
+    pub(super) fn index_child_reader(&self, child: &IndexChild) -> VortexResult<LayoutReaderRef> {
+        self.slot_reader(child.slot)
+    }
+
+    /// The known index child under the registry name `name` as a
+    /// [`ChildReader`]: its reader from the current tree, its descriptor's
+    /// `sorted` provenance, and the handle's bind memo. `None` when the
+    /// roster holds no such child — the file has none, or only one under an
+    /// implementation slug this version does not know.
+    pub(crate) fn child_reader(&self, name: &str) -> VortexResult<Option<ChildReader>> {
+        let Some(child) = self.index_child(name) else {
             return Ok(None);
         };
-        let tree = self.readers();
-        let cell = &tree.components[index];
-        if cell.get().is_none() {
-            let reader = child.new_reader(
-                self.components[index].name.as_str().into(),
-                self.file.segment_source(),
-                self.file.session(),
-                &Default::default(),
-            )?;
-            let _ = cell.set(reader);
-        }
-        Ok(Some((
-            &self.components[index],
-            cell.get()
-                .expect("the reader was just initialized above")
-                .clone(),
-        )))
+        Ok(Some(ChildReader {
+            name: child.identity.name,
+            sorted: child.sorted,
+            reader: self.slot_reader(child.slot)?,
+            memo: Arc::clone(&self.bound_exprs),
+        }))
     }
 
-    /// An index child's [`ChildReader`], by name: its reader from the
-    /// current tree ([`component_reader`](Self::component_reader)), its
-    /// descriptor's `sorted` provenance, and the handle's bind memo.
-    pub(crate) fn child_reader(&self, name: &'static str) -> VortexResult<Option<ChildReader>> {
-        Ok(self
-            .component_reader(name)?
-            .map(|(descriptor, reader)| ChildReader {
-                name,
-                sorted: descriptor.sorted,
-                reader,
-                memo: Arc::clone(&self.bound_exprs),
-            }))
+    /// The roster's known index child under the registry name `name`.
+    fn index_child(&self, name: &str) -> Option<&IndexChild> {
+        self.roster
+            .index_children
+            .iter()
+            .find(|child| child.identity.name == name)
+    }
+
+    /// The slot of the classified component `name` names: the dictionary, or
+    /// a known index child under its registry name.
+    fn slot_of(&self, name: &str) -> Option<usize> {
+        if name == container::DICT_COMPONENT_NAME {
+            return self.roster.dict;
+        }
+        self.index_child(name).map(|child| child.slot)
+    }
+
+    /// The root layout: the native store root [`try_new`](Self::try_new)
+    /// required.
+    fn root(&self) -> &Layout<RdfStoreLayoutVTable> {
+        self.file.footer().layout().as_::<RdfStoreLayoutVTable>()
+    }
+
+    /// The child layout of the component in `slot` of the inventory.
+    fn slot_layout(&self, slot: usize) -> VortexResult<LayoutRef> {
+        container::component_child(self.root(), slot)
+    }
+
+    /// The reader of the component in `slot` of the inventory, from the
+    /// current tree: built on its first use there.
+    fn slot_reader(&self, slot: usize) -> VortexResult<LayoutReaderRef> {
+        let tree = self.readers();
+        let cell = &tree.components[slot];
+        if let Some(reader) = cell.get() {
+            return Ok(reader.clone());
+        }
+        let reader = self.slot_layout(slot)?.new_reader(
+            self.root().data().components[slot].name.as_str().into(),
+            self.file.segment_source(),
+            self.file.session(),
+            &Default::default(),
+        )?;
+        Ok(cell.get_or_init(|| reader).clone())
     }
 
     /// The current reader tree: the one made for the bound tree memo's
@@ -555,7 +597,7 @@ impl NativeStoreFile {
         if current.generation != generation {
             *current = Arc::new(ReaderTree::new(
                 &self.file,
-                self.components.len(),
+                self.root().data().components.len(),
                 generation,
             ));
         }
@@ -785,7 +827,7 @@ mod tests {
                 .bind("quads", &eq(get_item("o", root()), lit(i)), &dtype)
                 .unwrap()
         };
-        let component = || native.component_reader("index:ref-p").unwrap().unwrap().1;
+        let component = || native.component_reader("index:ref-p").unwrap().unwrap();
 
         let root_reader = native.layout_reader().unwrap();
         let root_weak = Arc::downgrade(&root_reader);

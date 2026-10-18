@@ -270,8 +270,8 @@ pub(crate) enum FileAccess {
 }
 
 /// A store file opened by [`open_vortex_file`], with how its bytes are
-/// reached. `mapped` and `identity` describe what the open did, not what was
-/// asked for.
+/// reached and where from. `mapped` and `identity` describe what the open
+/// did, not what was asked for.
 #[cfg(feature = "file-io")]
 pub(crate) struct OpenedFile {
     pub(crate) file: vortex_file::VortexFile,
@@ -279,9 +279,12 @@ pub(crate) struct OpenedFile {
     pub(crate) mapped: bool,
     /// The identity of the mapped file; none where the bytes are not a mapping.
     pub(crate) identity: Option<FileIdentity>,
+    /// The absolute path the file was opened from, so that a later change of
+    /// the working directory does not move it; none for a buffer.
+    pub(crate) path: Option<std::path::PathBuf>,
 }
 
-/// A file opened over a buffer: no mapping, no identity.
+/// A file opened over a buffer: no mapping, no identity, no path.
 #[cfg(feature = "file-io")]
 impl From<vortex_file::VortexFile> for OpenedFile {
     fn from(file: vortex_file::VortexFile) -> Self {
@@ -289,6 +292,7 @@ impl From<vortex_file::VortexFile> for OpenedFile {
             file,
             mapped: false,
             identity: None,
+            path: None,
         }
     }
 }
@@ -363,6 +367,7 @@ pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
     }
     let options = crate::session::VORTEX_SESSION.open_options();
     let file = std::fs::File::open(path).map_err(|e| path_error("open", path, e))?;
+    let absolute = std::path::absolute(path).map_err(|e| path_error("resolve", path, e))?;
     match access {
         FileAccess::Mapped => {
             let identity = file.metadata().ok().as_ref().and_then(FileIdentity::of);
@@ -375,12 +380,16 @@ pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
                 file: opened,
                 mapped: true,
                 identity,
+                path: Some(absolute),
             })
         }
         FileAccess::Read => {
             drop(file);
             match options.open_path(path).await {
-                Ok(opened) => Ok(opened.into()),
+                Ok(opened) => Ok(OpenedFile {
+                    path: Some(absolute),
+                    ..opened.into()
+                }),
                 Err(error) => Err(open_failure(
                     error,
                     super::container::newer_root_id_at(path).await,

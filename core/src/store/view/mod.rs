@@ -31,8 +31,6 @@ use crate::store::indexes::FileServePlan;
 #[cfg(feature = "file-io")]
 use crate::store::persist::native_file::NativeStoreFile;
 #[cfg(feature = "file-io")]
-use std::path::PathBuf;
-#[cfg(feature = "file-io")]
 use vortex_array::expr::Expression;
 
 /// A lazily-decoded view onto quad data: the base the store was constructed
@@ -81,12 +79,11 @@ pub(crate) enum QuadsSource {
     #[cfg(feature = "file-io")]
     /// Quad data read lazily from a Vortex file when a query is executed.
     File {
-        /// The absolute path the file was opened from. An owner's compaction
-        /// rewrites its rows over this file atomically and reopens it
-        /// (`compaction.rs`); a derived view's compaction never touches it.
-        path: PathBuf,
         /// The shared file handle, including its cached schema, metadata, and
-        /// layout reader used by scans and pruning. Every root row is a quad
+        /// layout reader used by scans and pruning, and the path it was
+        /// opened from, which an owner's compaction rewrites its rows over
+        /// atomically before it reopens it (`compaction.rs`); a derived
+        /// view's compaction never touches the file. Every root row is a quad
         /// row (the dictionary and index copies ride as auxiliary children
         /// with their own row spaces), so `file.row_count()` is the store's
         /// row space.
@@ -323,7 +320,7 @@ impl QuadsSource {
     }
 
     /// This file source under `filter` and `selection`, its reads served by
-    /// `serve`: the same path, file handle and tombstones.
+    /// `serve`: the same file handle and tombstones.
     #[inline]
     #[cfg(feature = "file-io")]
     pub(crate) fn file_with(
@@ -332,17 +329,10 @@ impl QuadsSource {
         selection: ViewSelection,
         serve: Option<FileServePlan>,
     ) -> Self {
-        let QuadsSource::File {
-            path,
-            file,
-            deleted,
-            ..
-        } = self
-        else {
+        let QuadsSource::File { file, deleted, .. } = self else {
             unreachable!("file_with is only called on a file source");
         };
         QuadsSource::File {
-            path: path.clone(),
             file: Arc::clone(file),
             filter,
             selection,
@@ -370,14 +360,12 @@ impl QuadsSource {
             QuadsSource::InMemory { .. } => self,
             #[cfg(feature = "file-io")]
             QuadsSource::File {
-                path,
                 file,
                 selection,
                 deleted,
                 serve,
                 ..
             } => QuadsSource::File {
-                path,
                 file,
                 filter: None,
                 selection,

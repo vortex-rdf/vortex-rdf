@@ -196,7 +196,7 @@ later stages see an empty selection and skip.
 ## 5. Stage C — backend dispatch
 
 Here it is decided **where the base rows live**. `match_base` reads
-the store's [`QuadsSource`](../core/src/store/view/mod.rs#L47) and hands the prelude's witness to the matching backend. `InMemory` holds the
+the store's [`QuadsSource`](../core/src/store/view/mod.rs#L45) and hands the prelude's witness to the matching backend. `InMemory` holds the
 base array (and any index components) resident (i.e., loaded into RAM), so its stages narrow a
 `RowSelection` directly and run synchronously. `File` leaves the rows on disk,
 so its stages can only *define* a filter and a selection for the next scan
@@ -259,7 +259,7 @@ Each stage in the code, and where the details are below:
 |---|---|---|
 | Prelude | [`matching.rs:205-241`](../core/src/store/query/matching.rs#L205-L241 "InMemory is the only variant") | — |
 | 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching.rs#L362), [`search_sorted_bounds`](../core/src/store/array.rs#L178) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`matching.rs:245-306`](../core/src/store/query/matching.rs#L245-L306 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L647), [`fold_row_ids`](../core/src/store/query/matching.rs#L832) | [§6.2](#62-secondary-index-routing) |
+| 2 · secondary-index routing | [`matching.rs:245-306`](../core/src/store/query/matching.rs#L245-L306 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L645), [`fold_row_ids`](../core/src/store/query/matching.rs#L832) | [§6.2](#62-secondary-index-routing) |
 | 3 · residual column filtering | [`matching.rs:308-328`](../core/src/store/query/matching.rs#L308-L328 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching.rs#L452), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L250), [`mask_for`](../core/src/store/query/matching.rs#L778) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`matching.rs:330-337`](../core/src/store/query/matching.rs#L330-L337 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
@@ -524,7 +524,7 @@ Each stage in the code, and where the details are below:
 |---|---|---|
 | Prelude | [`matching.rs:513-521`](../core/src/store/query/matching.rs#L513-L521 "QuadsSource::File") | — |
 | 1 · subject chunk probe and prefix | [`matching.rs:522-531`](../core/src/store/query/matching.rs#L522-L531 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching.rs#L715), [`locate_subject_run`](../core/src/store/scan/file_reads.rs#L372), [`narrow_subject_run`](../core/src/store/scan/file_reads.rs#L401) | [§7.1](#71-subject-chunk-probe) |
-| 2 · secondary-index routing | [`matching.rs:532-548`](../core/src/store/query/matching.rs#L532-L548 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L674) | [§8](#8-the-index-resolvers) |
+| 2 · secondary-index routing | [`matching.rs:532-548`](../core/src/store/query/matching.rs#L532-L548 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L672) | [§8](#8-the-index-resolvers) |
 | 3 · pushed-down filter | [`matching.rs:561-634`](../core/src/store/query/matching.rs#L561-L634 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_reads.rs#L344) | [§7.3](#73-what-ends-up-on-the-view) |
 | 4 · selection and serve plan | [`matching.rs:554-555`](../core/src/store/query/matching.rs#L554-L555 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L832) and [`matching.rs:643-658`](../core/src/store/query/matching.rs#L643-L658 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L744), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L356) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 | 5 · filter at sparse ids | [`matching.rs:660-675`](../core/src/store/query/matching.rs#L660-L675 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L648) | [§7.3](#73-what-ends-up-on-the-view) |

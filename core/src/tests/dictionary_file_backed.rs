@@ -739,9 +739,11 @@ async fn test_large_dictionary_child_lift_keeps_fsst() {
         .footer()
         .layout()
         .as_::<container::RdfStoreLayoutVTable>();
-    let (_, child) = container::store_component(typed, container::DICT_COMPONENT_NAME)
-        .unwrap()
-        .unwrap();
+    assert_eq!(
+        typed.data().components[0].name,
+        container::DICT_COMPONENT_NAME
+    );
+    let child = container::component_child(typed, 0).unwrap();
     assert_eq!(child.row_count(), len);
     let reader = child
         .new_reader(
@@ -785,8 +787,8 @@ async fn test_unzoned_dictionary_child_opens_mapped() {
     let bytes = write_dict_only_store_as(&dict, container::DICT_VERSION, false).await;
     let (_dir, path) = temp_store_file(&bytes);
     let native = crate::tests::open_mapped(&path).await;
-    let descriptor = native
-        .components()
+    let (_, components) = container::store_metadata_of_bytes(&bytes);
+    let descriptor = components
         .iter()
         .find(|c| c.name == DICT_COMPONENT_NAME)
         .unwrap();

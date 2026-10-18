@@ -256,7 +256,7 @@ impl FileBackedDict {
 
     /// [`open`](Self::open) with a window cache of `budget` bytes.
     async fn open_with_budget(native: &NativeStoreFile, budget: usize) -> Result<Option<Self>> {
-        let Some((_, reader)) = native.component_reader(DICT_COMPONENT_NAME)? else {
+        let Some(reader) = native.component_reader(DICT_COMPONENT_NAME)? else {
             return Ok(None);
         };
         let Some(child) = native.component_layout(DICT_COMPONENT_NAME)? else {
@@ -1330,13 +1330,14 @@ mod tests {
         let terms: Vec<String> = (0..600).map(|i| format!("{prefix}/term/{i:04}>")).collect();
         let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
         let d = TermDictionary::compress_windowed(plain, 100).unwrap();
-        let native = crate::tests::open_native_bytes(crate::tests::write_dict_only_store(&d).await);
-        let descriptor = native
-            .components()
+        let bytes = crate::tests::write_dict_only_store(&d).await;
+        let (_, components) = crate::io::container::store_metadata_of_bytes(&bytes);
+        let descriptor = components
             .iter()
             .find(|c| c.name == DICT_COMPONENT_NAME)
             .unwrap();
         assert_eq!(descriptor.version, 2);
+        let native = crate::tests::open_native_bytes(bytes);
 
         let column = crate::tests::dict_term_column(&native);
         let zoned = column
@@ -1465,8 +1466,8 @@ mod tests {
                 .await;
         let (_dir, path) = crate::tests::temp_store_file(&bytes);
         let native = crate::tests::open_mapped(&path).await;
-        let descriptor = native
-            .components()
+        let (_, components) = crate::io::container::store_metadata_of_bytes(&bytes);
+        let descriptor = components
             .iter()
             .find(|c| c.name == DICT_COMPONENT_NAME)
             .unwrap();

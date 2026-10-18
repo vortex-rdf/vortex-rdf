@@ -92,7 +92,7 @@ per-chunk frame-of-reference (`fastlanes.for.v2`), is never written.
 ## 3. The store root: `vortex-rdf.store.v2`
 
 The root layout is registered in the crate's Vortex session on every target
-([`register`](../core/src/io/container/layout.rs#L200)); its stable
+([`register`](../core/src/io/container/layout.rs#L195)); its stable
 id is [`STORE_LAYOUT_ID`](../core/src/io/container/mod.rs#L43). A file whose
 root has any other id is refused as "not a vortex-rdf store file".
 
@@ -174,8 +174,10 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 On open the layout checks that the child count is `1 + components.len()`,
 that child 0 has the root's row count, and that every component child's dtype
 matches its descriptor ([`deserialize`](../core/src/io/container/layout.rs#L56));
-[`classify_component`](../core/src/store/persist/open.rs#L84) then turns each
-descriptor into the dictionary, a known index, or a skip.
+[`classify_component`](../core/src/store/persist/open.rs#L89) then turns each
+descriptor into the dictionary, a known index, or a skip — an index child by
+its implementation slug alone, whatever its name. The open classifies the
+roster once, and every later read reaches a child only through it.
 
 ---
 
@@ -282,7 +284,7 @@ chunks are not one uniform window (chunks adopted from a foreign file) is
 written without the zone map; readers inspect the layout for it.
 
 **Reading it from a file.** A file store is memory-mapped
-([`from_file`](../core/src/store/persist/open.rs#L212)) and the dictionary stays in
+([`from_file`](../core/src/store/persist/open.rs#L238)) and the dictionary stays in
 its child
 ([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L243)).
 At open the handle reads the zone table — one small segment — and keeps, per
@@ -337,13 +339,13 @@ Shared rules:
   `u64` codes under `Dictionary`. `rid` is always a non-nullable `u64`
   ([`RowId`](../core/src/store/schema.rs#L37)), under every layout; a child
   whose `rid` is an integer of any other width is refused at open
-  ([`check_id_columns`](../core/src/store/persist/open.rs#L39)): rebuild such a store
+  ([`check_id_columns`](../core/src/store/persist/open.rs#L43)): rebuild such a store
   from its RDF source.
 - **Row ids do not limit a store.** A `u64` row id numbers more rows than any
   store holds. The builds still number rows with checked arithmetic — up
   front for the in-memory builds
-  ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L114)), row by row
-  in the out-of-core merge ([`next_row_id`](../core/src/store/indexes/mod.rs#L128))
+  ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L112)), row by row
+  in the out-of-core merge ([`next_row_id`](../core/src/store/indexes/mod.rs#L126))
   — and refuse a store whose ids would run past the last one with a
   serialization error, rather than let an id wrap.
 - **`rid` is the quad's row id in the quad table.** That is what lets a match
@@ -520,7 +522,7 @@ filesystems are unsupported for mapping.
 ## 9. The in-memory twin
 
 A store in memory holds the same three pieces the file does, in the forms the
-read paths are written against ([`QuadsSource`](../core/src/store/view/mod.rs#L47)):
+read paths are written against ([`QuadsSource`](../core/src/store/view/mod.rs#L45)):
 
 | In the file | In memory |
 |---|---|

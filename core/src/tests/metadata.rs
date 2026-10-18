@@ -479,8 +479,10 @@ async fn test_index_components() {
 }
 
 /// A child under a known name but an implementation slug this version does
-/// not know is no index child of it: every open lists only the children whose
-/// slug it knows.
+/// not know is no index child of it: every open lists and serves as a data
+/// source only the children whose slug it knows, and no match reaches the
+/// foreign one — a pattern only it would answer is scanned, while its known
+/// sibling still serves.
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_index_components_classify_children_by_slug() {
@@ -509,8 +511,35 @@ async fn test_index_components_classify_children_by_slug() {
         .into_iter()
         .filter(|child| child.name == "index:ospg")
         .collect::<Vec<_>>();
+    // The copy index answers a bound predicate from `index:posg`, here the
+    // foreign child, and a bound object from `index:ospg`.
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let o3 = Term::Literal(Literal::new_simple_literal("o3"));
     for (open, store) in reopened_stores(&path).await {
         assert_eq!(store.index_components().unwrap(), want, "{open}");
+        // The data source names the children as the roster does.
+        let source = |name: &str| store.component_data_source(name).unwrap();
+        assert!(source("index:posg").is_none(), "{open}: index:posg");
+        assert!(source("index:ospg").is_some(), "{open}: index:ospg");
+        for (pattern, view, served, rows) in [
+            (
+                "predicate",
+                store.match_pattern(None, Some(&p1), None, None).await,
+                None,
+                expected_strings(&quads, |i| i % 5 == 1),
+            ),
+            (
+                "object",
+                store.match_pattern(None, None, Some(&o3), None).await,
+                Some("index:ospg"),
+                expected_strings(&quads, |i| i % 7 == 3),
+            ),
+        ] {
+            let view = view.unwrap();
+            let stats = view.view_statistics().unwrap();
+            assert_eq!(stats.served_component, served, "{open} {pattern}");
+            assert_eq!(view_strings(&view).await, rows, "{open} {pattern}");
+        }
     }
 }
 

@@ -75,13 +75,15 @@ pub(crate) const INDEX_VERSION: u32 = 1;
 pub(crate) use layout::LegacyStoreLayoutVTable;
 #[cfg(feature = "file-io")]
 pub(crate) use layout::newer_root_id_at;
+#[cfg(feature = "file-io")]
+pub(crate) use layout::quad_source;
 #[cfg(all(test, feature = "file-io"))]
 pub(crate) use layout::store_metadata_of_bytes;
 #[cfg(all(test, feature = "file-io"))]
 pub(crate) use layout::subtree_bytes;
 pub(crate) use layout::{
-    RdfStoreLayoutVTable, is_legacy_file, is_native_file, legacy_store_message, newer_root_id,
-    register, store_component,
+    RdfStoreLayoutVTable, component_child, is_legacy_file, is_native_file, legacy_store_message,
+    newer_root_id, register,
 };
 #[cfg(test)]
 pub(crate) use sources::default_child_strategy;
@@ -456,9 +458,9 @@ mod tests {
 
             // …while the dictionary child scans independently.
             let typed = root.as_::<RdfStoreLayoutVTable>();
-            let (descriptor, child) = store_component(typed, DICT_COMPONENT_NAME)
-                .unwrap()
-                .unwrap();
+            let descriptor = &typed.data().components[0];
+            let child = component_child(typed, 0).unwrap();
+            assert_eq!(descriptor.name, DICT_COMPONENT_NAME);
             assert_eq!(descriptor.role, StoreComponentRole::Dictionary);
             assert_eq!(child.row_count(), 3);
             assert_eq!(child.dtype(), &dict_dtype);

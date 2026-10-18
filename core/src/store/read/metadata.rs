@@ -221,8 +221,9 @@ impl VortexRdfStore {
     }
 
     /// The store's index children (see [`IndexComponentInfo`]), in the order
-    /// the store holds them, each classified by its implementation slug: a
-    /// child under a slug this version does not know is not listed.
+    /// the store holds them, each classified by its implementation slug when
+    /// the store was built or opened: a child under a slug this version does
+    /// not know is not listed.
     pub fn index_components(&self) -> Result<Vec<IndexComponentInfo>> {
         let info = |identity: &ComponentIdentity, sorted: bool, rows: usize| IndexComponentInfo {
             name: identity.name,
@@ -240,13 +241,9 @@ impl VortexRdfStore {
                 .collect(),
             #[cfg(feature = "file-io")]
             QuadsSource::File { file, .. } => file
-                .components()
+                .index_children()
                 .iter()
-                .filter_map(|descriptor| {
-                    let identity =
-                        crate::store::indexes::known_component(&descriptor.implementation)?;
-                    Some(info(identity, descriptor.sorted, file.row_count() as usize))
-                })
+                .map(|child| info(child.identity, child.sorted, file.row_count() as usize))
                 .collect(),
         })
     }

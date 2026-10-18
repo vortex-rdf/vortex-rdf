@@ -74,7 +74,8 @@ impl VortexRdfStore {
         // copy, which the in-memory rebuild below provides.
         #[cfg(feature = "file-io")]
         if self.is_owner()
-            && let QuadsSource::File { path, file, .. } = &self.quads
+            && let QuadsSource::File { file, .. } = &self.quads
+            && let Some(path) = file.path()
         {
             return self
                 .stream_compacted_to_file(unique, path, file.identity())

@@ -1246,7 +1246,10 @@ async fn test_open_required_unknown_component_rejected_optional_skipped() {
 }
 
 /// An index child holding one row fewer than the quads is a corrupt or
-/// foreign file; both readers reject it at open with the row counts.
+/// foreign file; both readers reject it at open with the row counts — unless
+/// the roster also carries a required component this version cannot
+/// interpret, which both refuse first: every component is classified before
+/// any row count is checked.
 #[tokio::test]
 async fn test_open_rejects_index_child_with_mismatched_rows() {
     let parts = built_store(
@@ -1258,34 +1261,43 @@ async fn test_open_rejects_index_child_with_mismatched_rows() {
     .to_serializable_parts()
     .await
     .unwrap();
-    let components: Vec<container::NativeComponentWrite> = parts
-        .built
-        .components
-        .iter()
-        .map(|component| {
-            use vortex_array::IntoArray as _;
-            let descriptor = component.to_write().unwrap().descriptor;
-            let rows = component.rows().unwrap().clone().into_array();
-            let short = rows.slice(0..rows.len() - 1).unwrap();
-            container::NativeComponentWrite::new(
-                descriptor,
-                std::sync::Arc::new(
-                    container::BufferedComponentSource::try_new(vec![short]).unwrap(),
-                ),
-                container::default_child_strategy(),
-            )
-            .unwrap()
-        })
-        .collect();
-    let bytes = unstamped_store_bytes(vec![parts.built.array.clone()], components).await;
+    let short_children = || -> Vec<container::NativeComponentWrite> {
+        parts
+            .built
+            .components
+            .iter()
+            .map(|component| {
+                use vortex_array::IntoArray as _;
+                let descriptor = component.to_write().unwrap().descriptor;
+                let rows = component.rows().unwrap().clone().into_array();
+                let short = rows.slice(0..rows.len() - 1).unwrap();
+                container::NativeComponentWrite::new(
+                    descriptor,
+                    std::sync::Arc::new(
+                        container::BufferedComponentSource::try_new(vec![short]).unwrap(),
+                    ),
+                    container::default_child_strategy(),
+                )
+                .unwrap()
+            })
+            .collect()
+    };
+    let mut two_faults = short_children();
+    two_faults.push(unknown_component("index:future", "future-index-v1", true));
 
-    let (from_bytes, from_file, _dir) = open_both(&bytes).await;
-    for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
-        let err = result.err().expect("open should fail");
-        assert!(
-            err.to_string().contains("holds 5 rows against 6 quad rows"),
-            "{path}: unexpected error: {err}"
-        );
+    for (components, want) in [
+        (short_children(), "holds 5 rows against 6 quad rows"),
+        (two_faults, "required component this version cannot"),
+    ] {
+        let bytes = unstamped_store_bytes(vec![parts.built.array.clone()], components).await;
+        let (from_bytes, from_file, _dir) = open_both(&bytes).await;
+        for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
+            let err = result.err().expect("open should fail");
+            assert!(
+                err.to_string().contains(want),
+                "{path}: unexpected error: {err}"
+            );
+        }
     }
 }
 

@@ -16,9 +16,9 @@ is the path such an engine takes.
 | What the engine needs | What it calls |
 |---|---|
 | A table of quads to scan with projection, filter and limit pushdown | [`data_source`](../core/src/store/read/data_source.rs#L100) on any view, registered with vortex's `VortexTable` |
-| The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L125) |
+| The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L127) |
 | Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L50), [`code_chunks`](../core/src/store/read/chunks.rs#L74) |
-| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L149), [`index_components`](../core/src/store/read/metadata.rs#L226), [`partitions`](../core/src/store/read/metadata.rs#L265) |
+| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L149), [`index_components`](../core/src/store/read/metadata.rs#L227), [`partitions`](../core/src/store/read/metadata.rs#L262) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L273) (from [`dict_reader`](../core/src/store/mod.rs#L223)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
 | When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L138), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L299) |
@@ -110,7 +110,9 @@ store holds ([§5](#5-what-a-view-promises-before-it-is-read)).
 The children are **raw**: they do not apply a view's narrowing, tombstones
 or append tail. Use them over a store without tombstones or tail (`compact`
 produces one), or anti-join their `rid` against the view's own rows.
-`None` is returned for a name the store has no child of; the `dictionary`
+`None` is returned for a name the store has no child of. An index child goes
+by the name its implementation slug gives it, as `index_components()` lists
+it, so one under a slug this version does not know has none. The `dictionary`
 table needs a `file-io` or wasm build. On a view that a match or a
 narrowing proved empty, the backends differ, as they do for
 `index_components` ([§5](#5-what-a-view-promises-before-it-is-read)). In
@@ -284,13 +286,13 @@ valid.
   re-takes the dictionary handle after the compaction.
 - The persisted children ([§2](#2-the-persisted-children-as-tables)) are
   the base's, untouched by tombstones and tails.
-- A store opened by [`from_file`](../core/src/store/persist/open.rs#L212)
+- A store opened by [`from_file`](../core/src/store/persist/open.rs#L238)
   reads its memory-mapped file in place, and so does every view, data
   source, partition and stream derived from it: the file must not be
   truncated or rewritten while any of them lives. Replacing it by a rename
   (as `compact` and the file writers do) is fine on Unix, where the mapping
   keeps the old file; Windows refuses to rename over a mapped file.
-  [`from_file_in_memory`](../core/src/store/persist/open.rs#L224) loads the
+  [`from_file_in_memory`](../core/src/store/persist/open.rs#L250) loads the
   file whole instead and never reads it again.
 
 ## 8. Through DataFusion

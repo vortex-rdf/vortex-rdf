@@ -14,7 +14,6 @@ use crate::store::builders::{
     BuiltArray, VortexArrayBuilder, build_parts_from_raws, build_struct_array,
 };
 use crate::store::indexes::{IndexComponent, Indexes};
-use crate::store::layouts::dictionary::TermDictionary;
 use crate::store::layouts::{DictAccess, LayoutStrategy, ResolvedLayout};
 use crate::store::view::selection::ViewSelection;
 use crate::store::{QuadsSource, RawQuad, VortexRdfStore, next_generation, probes, resident};
@@ -25,17 +24,18 @@ use futures::Stream;
 
 use vortex_array::ArrayRef;
 
-/// The layout an in-memory construction (`from_parts`, `from_built`,
-/// `from_bytes`, compaction's `from_raw_quads`) resolves to: a dictionary
-/// held beside the rows makes it Dictionary-resident, otherwise the array's
-/// own dtype decides. A dict-less Dictionary-layout array is rejected: bare
-/// code columns carry no way back to their terms.
+/// The layout a store resolves to, built (`from_parts`, `from_built`,
+/// compaction's `from_raw_quads`) or opened (`from_bytes`, `from_file`): a
+/// dictionary beside the rows — resident, or left in its file child — makes
+/// it Dictionary, otherwise the rows' own dtype decides. A dict-less
+/// Dictionary-layout dtype is rejected: bare code columns carry no way back
+/// to their terms.
 pub(super) fn resolved_layout(
-    dict: Option<Arc<TermDictionary>>,
+    dict: Option<DictAccess>,
     dtype: &vortex_array::dtype::DType,
 ) -> Result<ResolvedLayout> {
     match dict {
-        Some(dict) => Ok(ResolvedLayout::Dictionary(DictAccess::Resident(dict))),
+        Some(dict) => Ok(ResolvedLayout::Dictionary(dict)),
         None => match LayoutStrategy::from_dtype(dtype) {
             LayoutStrategy::TypedObject => Ok(ResolvedLayout::TypedObject),
             LayoutStrategy::Dictionary => Err(VortexRdfError::Deserialization(
@@ -157,7 +157,7 @@ impl VortexRdfStore {
         encode_base: impl FnOnce(ArrayRef) -> Result<ArrayRef>,
         encode_component: impl FnMut(IndexComponent) -> Result<IndexComponent>,
     ) -> Result<Self> {
-        let layout = resolved_layout(built.dict, built.array.dtype())?;
+        let layout = resolved_layout(built.dict.map(DictAccess::Resident), built.array.dtype())?;
         let base = encode_base(built.array)?;
         let components = built
             .components

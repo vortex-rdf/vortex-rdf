@@ -82,18 +82,16 @@ pub(crate) fn check_component_rows(name: &str, component_rows: u64, quad_rows: u
 /// Adopt a persisted child as an in-memory [`IndexComponent`] under the
 /// registry row `identity`, `sorted` the descriptor's provenance: the
 /// child's canonicalization — and, for a [`DeferredSource::Reader`], its
-/// scan too — is *deferred* to the component's first genuine use. The
-/// row-count check runs here, eagerly, on the scan output's length or the
-/// reader's own footer-known count: a corrupt roster fails at adoption, not
-/// at first probe.
+/// scan too — is *deferred* to the component's first genuine use. The child
+/// comes from a roster the open has already checked, its row count among the
+/// rest (`ComponentRoster::of`): a corrupt roster fails at open, not at first
+/// probe.
 pub(crate) fn adopt_component(
     identity: &'static ComponentIdentity,
     source: DeferredSource,
     sorted: bool,
-    quad_rows: u64,
-) -> Result<IndexComponent> {
-    check_component_rows(identity.name, source.row_count(), quad_rows)?;
-    Ok(IndexComponent {
+) -> IndexComponent {
+    IndexComponent {
         identity,
         rows: Arc::new(ComponentRows {
             cell: OnceLock::new(),
@@ -101,7 +99,7 @@ pub(crate) fn adopt_component(
         }),
         sorted,
         probes: StructProbes::new(),
-    })
+    }
 }
 
 /// How much of the read pipeline a deferred component still owes.
@@ -122,15 +120,6 @@ pub(crate) enum DeferredSource {
 }
 
 impl DeferredSource {
-    /// The child's row count, known without running anything further.
-    fn row_count(&self) -> u64 {
-        match self {
-            #[cfg(feature = "file-io")]
-            DeferredSource::Scanned(scanned) => scanned.len() as u64,
-            DeferredSource::Reader(reader) => reader.row_count(),
-        }
-    }
-
     /// The child's un-executed scan output, scanning a reader now.
     fn scanned(&self) -> Result<ArrayRef> {
         match self {

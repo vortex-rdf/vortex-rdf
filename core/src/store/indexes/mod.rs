@@ -41,11 +41,9 @@ pub(crate) mod reference;
 mod resolve;
 pub(crate) mod serve;
 
-#[cfg(feature = "file-io")]
-pub(crate) use components::check_component_rows;
 pub(crate) use components::{
-    ComponentIdentity, DeferredSource, IndexComponent, adopt_component, indexes_from_components,
-    known_component, sorted_row_ids,
+    ComponentIdentity, DeferredSource, IndexComponent, adopt_component, check_component_rows,
+    indexes_from_components, known_component, sorted_row_ids,
 };
 #[cfg(feature = "file-io")]
 pub(crate) use file::{FileServePlan, read_located_rids, scan_index_row_ids};

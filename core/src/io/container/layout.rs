@@ -1,6 +1,6 @@
 //! The store root layout vtable and its read-side inspection: recognizing a
 //! native root, delegating its scan to the transparent quad-source child, and
-//! addressing the auxiliary components by name.
+//! addressing the auxiliary components by their slot in the inventory.
 
 use std::sync::Arc;
 
@@ -116,13 +116,8 @@ impl VTable for RdfStoreLayoutVTable {
         ctx: &LayoutReaderContext,
     ) -> VortexResult<LayoutReaderRef> {
         // The root's scan IS the quad-source scan; auxiliary components stay
-        // independently addressable through `store_component`.
-        layout
-            .slot(QUAD_SOURCE_CHILD)?
-            .ok_or_else(|| {
-                vortex_error::vortex_err!("store root is missing its quad-source child")
-            })?
-            .new_reader(name, segment_source, session, ctx)
+        // independently addressable through `component_child`.
+        quad_source(layout)?.new_reader(name, segment_source, session, ctx)
     }
 }
 
@@ -255,19 +250,18 @@ pub(crate) fn is_legacy_file(file: &vortex_file::VortexFile) -> bool {
     file.footer().layout().encoding_id().as_ref() == LEGACY_STORE_LAYOUT_ID
 }
 
-/// A named auxiliary child of a native root, with its descriptor.
-pub(crate) fn store_component(
-    layout: &RdfStoreLayout,
-    name: &str,
-) -> VortexResult<Option<(StoreComponentDescriptor, LayoutRef)>> {
-    let Some(index) = layout.data().components.iter().position(|c| c.name == name) else {
-        return Ok(None);
-    };
-    let descriptor = layout.data().components[index].clone();
-    let child = layout.slot(index + 1)?.ok_or_else(|| {
-        vortex_error::vortex_err!("store component {name} is missing its child layout")
-    })?;
-    Ok(Some((descriptor, child)))
+/// The quad table of a native root: its transparent quad-source child.
+pub(crate) fn quad_source(root: &RdfStoreLayout) -> VortexResult<LayoutRef> {
+    root.slot(QUAD_SOURCE_CHILD)?
+        .ok_or_else(|| vortex_error::vortex_err!("store root is missing its quad-source child"))
+}
+
+/// The child layout of the component in `slot` of a native root's inventory,
+/// whose descriptor is `components[slot]`: the root's child after the quad
+/// source's and the `slot` components' before it.
+pub(crate) fn component_child(root: &RdfStoreLayout, slot: usize) -> VortexResult<LayoutRef> {
+    root.slot(QUAD_SOURCE_CHILD + 1 + slot)?
+        .ok_or_else(|| vortex_error::vortex_err!("store root has no component child {slot}"))
 }
 
 /// Test-only: the decoded root metadata of serialized store bytes — the

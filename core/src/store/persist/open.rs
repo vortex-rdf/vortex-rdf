@@ -1,18 +1,21 @@
 //! Opening a serialized store: the file constructors (memory-mapped, or
 //! loaded whole), the bytes constructors, and the component-roster
-//! interpretation every open path shares.
+//! interpretation every open path shares ([`ComponentRoster`]).
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::container;
 use crate::io::read;
 use crate::session::VORTEX_SESSION;
-use crate::store::indexes::{ComponentIdentity, DeferredSource, IndexComponent, adopt_component};
+use crate::store::indexes::{
+    ComponentIdentity, DeferredSource, IndexComponent, adopt_component, check_component_rows,
+};
+use crate::store::layouts::DictAccess;
 use crate::store::layouts::dictionary::TermDictionary;
 #[cfg(feature = "file-io")]
 use crate::store::{
     QuadsSource,
     indexes::Indexes,
-    layouts::{DictAccess, LayoutStrategy, ResolvedLayout, dictionary::FileBackedDict},
+    layouts::{LayoutStrategy, dictionary::FileBackedDict},
     persist::native_file::NativeStoreFile,
     view::selection::ViewSelection,
 };
@@ -26,6 +29,7 @@ use vortex_array::dtype::DType;
 use vortex_array::{IntoArray, VortexSessionExecute};
 
 use crate::store::VortexRdfStore;
+use crate::store::construct::resolved_layout;
 use crate::store::indexes::COL_RID;
 use crate::store::schema::{CODE_PTYPE, ROW_ID_PTYPE, is_code_column_name};
 
@@ -75,12 +79,13 @@ enum ComponentKind {
     Skip,
 }
 
-/// Interpret one component descriptor for every open path (`from_file`,
-/// `from_bytes`, `scanned_index_components`), owning the rejection of a
-/// dictionary child of an unknown implementation or of a version newer than
+/// Interpret one component descriptor for every open path (through
+/// [`ComponentRoster::of`]), owning the rejection of a dictionary child of an
+/// unknown implementation or of a version newer than
 /// [`DICT_VERSION`](container::DICT_VERSION), and of an *uninterpretable
 /// required* component: skipping one — a future change set, say — would
-/// silently change query results.
+/// silently change query results. An index child is classified by its
+/// implementation slug alone, never by its name.
 fn classify_component(descriptor: &container::StoreComponentDescriptor) -> Result<ComponentKind> {
     if descriptor.name == container::DICT_COMPONENT_NAME {
         if descriptor.implementation != container::DICT_IMPLEMENTATION {
@@ -126,69 +131,90 @@ fn classify_component(descriptor: &container::StoreComponentDescriptor) -> Resul
     Ok(ComponentKind::Skip)
 }
 
-/// The known index children of a component roster, each with its
-/// descriptor, in roster order. Every entry is classified
-/// ([`classify_component`]), so a dictionary of an unknown implementation or
-/// an uninterpretable required component fails here; the dictionary and
-/// skippable components are left out.
-#[cfg(feature = "file-io")]
-fn index_children(
-    components: &[container::StoreComponentDescriptor],
-) -> Result<
-    Vec<(
-        &'static ComponentIdentity,
-        &container::StoreComponentDescriptor,
-    )>,
-> {
-    let mut children = Vec::new();
-    for descriptor in components {
-        if let ComponentKind::Index(known) = classify_component(descriptor)? {
-            children.push((known, descriptor));
-        }
-    }
-    Ok(children)
+/// One known index child of a store's component roster: the registry row its
+/// implementation slug names, its slot in the inventory (descriptor
+/// `components[slot]`, which only the open paths read), and its descriptor's
+/// `sorted` provenance.
+pub(in crate::store) struct IndexChild {
+    pub(in crate::store) identity: &'static ComponentIdentity,
+    pub(super) slot: usize,
+    pub(in crate::store) sorted: bool,
 }
 
-/// The index set `file`'s roster makes queryable, each index child's row
-/// count checked against the quad table's.
-#[cfg(feature = "file-io")]
-fn index_types(file: &NativeStoreFile) -> Result<Indexes> {
-    let mut indexes: Indexes = Vec::new();
-    for (known, descriptor) in index_children(file.components())? {
-        if let Some(child) = file.component_layout(&descriptor.name)? {
-            crate::store::indexes::check_component_rows(
-                &descriptor.name,
-                child.row_count(),
+/// A store's component roster as this version reads it, classified once at
+/// open: the slot of its dictionary child and its known index children, in
+/// inventory order. Skipped components are left out, so whatever reaches a
+/// child through the roster — the resolvers, the listing, the adoptions —
+/// reaches only the children classified here.
+pub(super) struct ComponentRoster {
+    /// The slot of the `dictionary` child, when the inventory carries one.
+    pub(super) dict: Option<usize>,
+    /// The known index children, in inventory order.
+    pub(super) index_children: Vec<IndexChild>,
+}
+
+impl ComponentRoster {
+    /// The roster of the native store file `file`, refused unless this
+    /// version can read it — the checks every open runs before it reads a
+    /// row: the root must be the native store layout, the quad table's id
+    /// columns this version's width ([`check_id_columns`]) and every
+    /// component interpretable ([`classify_component`]); then each known
+    /// index child must hold one row per quad ([`check_component_rows`]).
+    /// The structural refusals come first: a roster at fault both ways is
+    /// refused for its structure.
+    pub(super) fn of(file: &vortex_file::VortexFile) -> Result<Self> {
+        if !container::is_native_file(file) {
+            return Err(read::unsupported_file_error(file));
+        }
+        check_id_columns("quad table", file.dtype())?;
+        let root = file
+            .footer()
+            .layout()
+            .as_::<container::RdfStoreLayoutVTable>();
+        let descriptors = &root.data().components;
+        let mut roster = Self {
+            dict: None,
+            index_children: Vec::new(),
+        };
+        for (slot, descriptor) in descriptors.iter().enumerate() {
+            match classify_component(descriptor)? {
+                ComponentKind::Dict => roster.dict = Some(slot),
+                ComponentKind::Index(identity) => roster.index_children.push(IndexChild {
+                    identity,
+                    slot,
+                    sorted: descriptor.sorted,
+                }),
+                ComponentKind::Skip => {}
+            }
+        }
+        for child in &roster.index_children {
+            check_component_rows(
+                &descriptors[child.slot].name,
+                container::component_child(root, child.slot)?.row_count(),
                 file.row_count(),
             )?;
         }
-        if !indexes.contains(&known.index) {
-            indexes.push(known.index);
-        }
+        Ok(roster)
     }
-    Ok(indexes)
 }
 
 /// Lift an unrefined file view's index children into in-memory components:
-/// each child is scanned whole and adopted as a deferred component
-/// (canonicalized on its first genuine use, as `from_bytes` adopts its
-/// children), with the descriptor's `sorted` provenance carried across.
+/// each known child of the file's roster is scanned whole and adopted as a
+/// deferred component (canonicalized on its first genuine use, as
+/// `from_bytes` adopts its children), with the descriptor's `sorted`
+/// provenance carried across.
 #[cfg(feature = "file-io")]
 pub(in crate::store) async fn scanned_index_components(
     file: &NativeStoreFile,
 ) -> Result<Vec<IndexComponent>> {
-    let mut components = Vec::new();
-    for (known, descriptor) in index_children(file.components())? {
-        let Some((_, reader)) = file.component_reader(&descriptor.name)? else {
-            continue;
-        };
-        let scanned = read::scan_all_reader(reader).await?;
+    let mut components = Vec::with_capacity(file.index_children().len());
+    for child in file.index_children() {
+        let scanned = read::scan_all_reader(file.index_child_reader(child)?).await?;
         components.push(adopt_component(
-            known,
+            child.identity,
             DeferredSource::Scanned(scanned),
-            descriptor.sorted,
-            file.row_count(),
-        )?);
+            child.sorted,
+        ));
     }
     Ok(components)
 }
@@ -238,60 +264,48 @@ impl VortexRdfStore {
         // Opens the file footer only (schema + layout metadata); no row data
         // is read yet. The handle owns the reader tree, so scans and prunes
         // across this store (and stores derived from it) share decoded
-        // zone-map stats instead of re-reading them each time.
+        // zone-map stats instead of re-reading them each time; it refuses a
+        // file this version cannot read and classifies its component roster
+        // once (`ComponentRoster::of`).
         let file = Arc::new(NativeStoreFile::try_new(
             read::open_vortex_file(path.as_ref(), access).await?,
         )?);
-        // The file's absolute path, which compaction rewrites the compacted
-        // rows back over: a later change of the working directory does not
-        // move it.
-        let source_path = std::path::absolute(path.as_ref())
-            .map_err(|e| crate::error::path_error("resolve", path.as_ref(), e))?;
-        check_id_columns("quad table", file.dtype())?;
         log::debug!(
             "[open] {} {}",
-            source_path.display(),
+            path.as_ref().display(),
             if file.is_mapped() {
                 "memory-mapped"
             } else {
                 "through the file reader"
             }
         );
-        // Interpret the component roster: the dictionary child feeds the
-        // layout below, index children map onto the index set, and unknown
-        // components are skipped when optional, fatal when required (a
-        // skipped required component — a future change set, say — would
-        // silently change query results).
-        let indexes = index_types(&file)?;
-        let layout = match LayoutStrategy::from_dtype(file.dtype()) {
-            LayoutStrategy::Default => ResolvedLayout::Default,
-            LayoutStrategy::TypedObject => ResolvedLayout::TypedObject,
-            LayoutStrategy::Dictionary => {
-                // `index_types` above already classified (and so
-                // implementation-checked) the dictionary descriptor.
-                let (_, reader) = file
-                    .component_reader(container::DICT_COMPONENT_NAME)?
-                    .ok_or_else(|| {
-                        VortexRdfError::Deserialization(
-                            "Dictionary-layout store file carries no dictionary component"
-                                .to_string(),
-                        )
-                    })?;
-                // The dictionary stays in its child, read through the chunk
-                // leaves a probe or decode touches — unless the child's
-                // layout shape declines that handle, and holding it whole is
-                // then the only way to read it at all.
-                let dict_access = match FileBackedDict::open(&file).await? {
-                    Some(dict) => DictAccess::FileBacked(dict),
-                    // One full scan of the dictionary child — chunks keep
-                    // their FSST.
-                    None => DictAccess::Resident(Arc::new(
-                        TermDictionary::from_child_reader(reader).await?,
-                    )),
-                };
-                ResolvedLayout::Dictionary(dict_access)
+        // The roster's known index children map onto the index set, in
+        // roster order.
+        let mut indexes: Indexes = Vec::new();
+        for child in file.index_children() {
+            if !indexes.contains(&child.identity.index) {
+                indexes.push(child.identity.index);
             }
+        }
+        // The dictionary stays in its child, read through the chunk leaves a
+        // probe or decode touches — unless the child's layout shape declines
+        // that handle, and holding it whole is then the only way to read it
+        // at all. Only the Dictionary layout reads one.
+        let dict = match LayoutStrategy::from_dtype(file.dtype()) {
+            LayoutStrategy::Dictionary => match FileBackedDict::open(&file).await? {
+                Some(dict) => Some(DictAccess::FileBacked(dict)),
+                // One full scan of the dictionary child — chunks keep their
+                // FSST.
+                None => match file.component_reader(container::DICT_COMPONENT_NAME)? {
+                    Some(reader) => Some(DictAccess::Resident(Arc::new(
+                        TermDictionary::from_child_reader(reader).await?,
+                    ))),
+                    None => None,
+                },
+            },
+            LayoutStrategy::Default | LayoutStrategy::TypedObject => None,
         };
+        let layout = resolved_layout(dict, file.dtype())?;
         // No filter and no selection yet: this view covers all quad rows.
         // A file-backed store holds no in-memory components (the `File`
         // variant has no place for them): resolution reaches the index
@@ -301,7 +315,6 @@ impl VortexRdfStore {
             indexes,
             generation: crate::store::next_generation(),
             quads: QuadsSource::File {
-                path: source_path,
                 file,
                 filter: None,
                 selection: ViewSelection::all(),
@@ -346,10 +359,8 @@ impl VortexRdfStore {
             .open_options()
             .open_buffer(bytes.clone())
             .map_err(|error| read::open_failure(error, container::newer_root_id(&bytes)))?;
-        if !container::is_native_file(&file) {
-            return Err(read::unsupported_file_error(&file));
-        }
-        check_id_columns("quad table", file.dtype())?;
+        // Refused before a row is read, for a fault of the roster too.
+        let roster = ComponentRoster::of(&file)?;
         // The root scan is the transparent quad child.
         let quads = read::scan_all_reader(file.layout_reader()?).await?;
         let root = file.footer().layout();
@@ -360,42 +371,39 @@ impl VortexRdfStore {
         // through the same helper every materializing read path uses.
         let quads = crate::store::array::with_subject_stamp(quads, typed.data().quads_sorted)?;
 
-        let mut components: Vec<IndexComponent> = Vec::new();
-        let mut dict = None;
-        for descriptor in typed.data().components.iter() {
-            let Some((_, child)) = container::store_component(typed, &descriptor.name)? else {
-                continue;
-            };
-            let kind = classify_component(descriptor)?;
-            let reader = child.new_reader(
-                descriptor.name.as_str().into(),
+        // A reader of the roster's component in `slot`, over the buffer.
+        let reader = |slot: usize| -> vortex_error::VortexResult<vortex_layout::LayoutReaderRef> {
+            container::component_child(typed, slot)?.new_reader(
+                typed.data().components[slot].name.as_str().into(),
                 file.segment_source(),
                 file.session(),
                 &Default::default(),
-            )?;
-            match kind {
-                ComponentKind::Dict => {
-                    dict = Some(Arc::new(TermDictionary::from_child_reader(reader).await?));
-                }
-                ComponentKind::Index(known) => {
-                    // Adopted by reader, nothing read: the roster row comes
-                    // off the wire TOC alone, and the child's scan and
-                    // canonicalization both defer to the component's first
-                    // genuine use — an index probe, serialization — so a
-                    // load pays nothing for index children it never touches.
-                    // Sound here because this reader sits over the buffer
-                    // the file was opened from (see `DeferredSource::Reader`).
-                    components.push(adopt_component(
-                        known,
-                        DeferredSource::Reader(reader),
-                        descriptor.sorted,
-                        quads.len() as u64,
-                    )?);
-                }
-                ComponentKind::Skip => {}
-            }
-        }
-        let layout = crate::store::construct::resolved_layout(dict, quads.dtype())?;
+            )
+        };
+        let dict = match roster.dict {
+            Some(slot) => Some(DictAccess::Resident(Arc::new(
+                TermDictionary::from_child_reader(reader(slot)?).await?,
+            ))),
+            None => None,
+        };
+        // Adopted by reader, nothing read: the roster row comes off the wire
+        // TOC alone, and the child's scan and canonicalization both defer to
+        // the component's first genuine use — an index probe, serialization —
+        // so a load pays nothing for index children it never touches. Sound
+        // here because each reader sits over the buffer the file was opened
+        // from (see `DeferredSource::Reader`).
+        let components = roster
+            .index_children
+            .iter()
+            .map(|child| -> Result<IndexComponent> {
+                Ok(adopt_component(
+                    child.identity,
+                    DeferredSource::Reader(reader(child.slot)?),
+                    child.sorted,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let layout = resolved_layout(dict, quads.dtype())?;
         Self::assemble_resident(quads, components, layout)
     }
 }

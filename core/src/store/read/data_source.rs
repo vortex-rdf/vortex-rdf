@@ -115,7 +115,9 @@ impl VortexRdfStore {
     /// its rows in the child's own order with the primary row id in `rid`; or
     /// the term `dictionary` (`{_dict_term}`, row i the term with code i),
     /// which needs a `file-io` or a wasm build. `None` for a name this store
-    /// has no child of.
+    /// has no child of: an index child is found by the name its
+    /// implementation slug gives it, whatever name a foreign file wrote it
+    /// under.
     ///
     /// An in-memory store's tables read its resident children and need no
     /// runtime. A file-backed store's table is vortex's own
@@ -141,7 +143,7 @@ impl VortexRdfStore {
             #[cfg(feature = "file-io")]
             QuadsSource::File { file, .. } => {
                 use vortex_layout::scan::layout::LayoutReaderDataSource;
-                let Some((_, reader)) = file.component_reader(name)? else {
+                let Some(reader) = file.component_reader(name)? else {
                     return Ok(None);
                 };
                 Ok(Some(Arc::new(LayoutReaderDataSource::new(
