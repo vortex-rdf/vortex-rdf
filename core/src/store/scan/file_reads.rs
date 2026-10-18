@@ -477,9 +477,9 @@ async fn subject_code_bounds(
 /// (`lo <= s < hi`) in a sorted file, by binary search over the subject
 /// column's encoded chunks. The file is sorted by `s`, so those rows are one
 /// run: it starts where the first code `>= lo` does and ends where the first
-/// code `>= hi` does, and each bound is exact for a code the column lacks.
-/// `None` declines — an unsorted file, a column whose chunk shape has no probe
-/// — and the caller keeps the stream.
+/// code `>= hi` does — one lower-bound search each, exact for a code the
+/// column lacks. `None` declines — an unsorted file, a column whose chunk
+/// shape has no probe — and the caller keeps the stream.
 pub(crate) async fn locate_subject_code_range(
     file: &NativeStoreFile,
     range: Range<TermCode>,
@@ -487,13 +487,15 @@ pub(crate) async fn locate_subject_code_range(
     let Some(chunks) = sorted_subject_chunks(file) else {
         return Ok(None);
     };
-    let Some(from) = subject_code_bounds(&chunks, file, range.start).await? else {
+    let source = file.segment_source();
+    let lower_bound = |code| chunks.lower_bound(code, &source, file.session());
+    let Some(from) = lower_bound(range.start).await? else {
         return Ok(None);
     };
-    let Some(to) = subject_code_bounds(&chunks, file, range.end).await? else {
+    let Some(to) = lower_bound(range.end).await? else {
         return Ok(None);
     };
-    Ok(Some(from.start..to.start.max(from.start)))
+    Ok(Some(from..to.max(from)))
 }
 
 /// The rows holding each subject code of `codes` — ascending and unique, as
