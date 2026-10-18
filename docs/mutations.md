@@ -173,7 +173,7 @@ flowchart TD
 | `compact()` | every live row, base first | every live tail row, then re-sorted with the base |
 
 The rows a rebuild or compaction starts from come from
-[`live_raw_quads`](../core/src/store/read/rows.rs#L423): base rows first (in view
+[`live_raw_quads`](../core/src/store/read/rows.rs#L434): base rows first (in view
 order), then tail rows, tombstones already excluded.
 
 ---

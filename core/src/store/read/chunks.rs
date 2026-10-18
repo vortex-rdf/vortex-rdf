@@ -10,24 +10,22 @@
 //! the base, as [`quads`](VortexRdfStore::quads) orders them. A served match
 //! (a view an index answered) materializes its row ids first, so the order is
 //! the base's, never the index's. The streams are lazy: nothing is gathered
-//! or read until the first poll. A file-backed view reads an exact selection
+//! or read until the first poll. The base's rows come through the one
+//! base-row seam (`base_read`): a file-backed view reads an exact selection
 //! by id where `ExactRead` picks a read by id, and otherwise streams its
 //! scan's chunks through the row-scan driver.
-
-use std::future::Future;
 
 use futures::stream::{self, BoxStream, StreamExt};
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::{ArrayRef, VortexSessionExecute as _};
 use vortex_buffer::Buffer;
 
+use super::deferred;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
+use crate::store::VortexRdfStore;
 use crate::store::array::{field_as, into_struct_array, rechunk};
-#[cfg(feature = "file-io")]
-use crate::store::scan::file_reads::stream_rows;
 use crate::store::schema::{QuadColumn, TermCode};
-use crate::store::{QuadsSource, VortexRdfStore};
 
 /// A view's rows as struct chunks in the layout's primary dtype, each of at
 /// most the requested `batch_rows` rows.
@@ -53,8 +51,9 @@ impl VortexRdfStore {
         check_batch(batch_rows)?;
         self.ensure_no_dictionary_tail("row_chunks")?;
         let store = self.clone();
-        Ok(lazy(
+        Ok(deferred(
             async move { store.row_chunk_source(batch_rows).await },
+            Err,
         ))
     }
 
@@ -86,52 +85,23 @@ impl VortexRdfStore {
         self.ensure_code_view("code_chunks")?;
         let columns = columns.to_vec();
         let store = self.clone();
-        Ok(lazy(async move {
-            store.code_chunk_source(&columns, batch_rows).await
-        }))
+        Ok(deferred(
+            async move { store.code_chunk_source(&columns, batch_rows).await },
+            Err,
+        ))
     }
 
     /// The chunk stream behind [`row_chunks`](Self::row_chunks), built when
-    /// the stream is first polled.
+    /// the stream is first polled: the base's rows, then the tail's.
     async fn row_chunk_source(&self, batch_rows: usize) -> Result<RowChunkStream> {
         let tail = self.tail_chunks(batch_rows)?;
-        match &self.quads {
-            QuadsSource::InMemory { .. } => {
-                let mut chunks = rechunk(self.base_selected_rows().await?, batch_rows)?;
-                chunks.extend(tail);
-                Ok(stream::iter(chunks.into_iter().map(Ok)).boxed())
-            }
-            #[cfg(feature = "file-io")]
-            QuadsSource::File {
-                file,
-                filter,
-                selection,
-                deleted,
-                ..
-            } => {
-                // Base row order needs the exact ids, so a pending selection
-                // materializes here.
-                let selection = selection.materialized_async().await?;
-                if let Some(rows) = Self::exact_rows_by_id(
-                    file,
-                    self.layout.strategy().primary_column_names(),
-                    filter.as_ref(),
-                    &selection,
-                    deleted.as_ref(),
-                )
-                .await?
-                {
-                    let mut chunks = rechunk(rows, batch_rows)?;
-                    chunks.extend(tail);
-                    return Ok(stream::iter(chunks.into_iter().map(Ok)).boxed());
-                }
-                let scan =
-                    self.restricted_file_scan(file, filter.as_ref(), &selection, deleted.as_ref())?;
-                Ok(rechunked(stream_rows(scan)?, batch_rows)
-                    .chain(stream::iter(tail.into_iter().map(Ok)))
-                    .boxed())
-            }
-        }
+        let base = self
+            .base_read(self.layout.strategy().primary_column_names())
+            .await?;
+        Ok(base
+            .chunks(batch_rows)?
+            .chain(stream::iter(tail.into_iter().map(Ok)))
+            .boxed())
     }
 
     /// The chunk stream behind [`code_chunks`](Self::code_chunks), built when
@@ -141,73 +111,30 @@ impl VortexRdfStore {
         columns: &[QuadColumn],
         batch_rows: usize,
     ) -> Result<CodeChunkStream> {
-        let names: Vec<&'static str> = columns.iter().map(|c| c.name()).collect();
-        match &self.quads {
-            QuadsSource::InMemory { .. } => {
-                // The requested columns are the base's own code buffers,
-                // sliced per chunk.
-                if let Some(all) = self.base_code_columns() {
-                    let picked: Vec<Buffer<TermCode>> =
-                        columns.iter().map(|c| all[c.index()].clone()).collect();
-                    let rows = picked[0].len();
-                    let chunks: Vec<Result<Vec<Buffer<TermCode>>>> = (0..rows)
-                        .step_by(batch_rows)
-                        .map(|start| {
-                            let end = start.saturating_add(batch_rows).min(rows);
-                            Ok(picked.iter().map(|b| b.slice(start..end)).collect())
-                        })
-                        .collect();
-                    return Ok(stream::iter(chunks).boxed());
-                }
-                // A base whose code columns the shared cache cannot hand out:
-                // the gathered rows, cut to the cap, their codes read per
-                // chunk.
-                let chunks = rechunk(self.base_selected_rows().await?, batch_rows)?;
-                Ok(stream::iter(chunks.into_iter().map(move |c| extract_codes(c, &names))).boxed())
-            }
-            #[cfg(feature = "file-io")]
-            QuadsSource::File {
-                file,
-                filter,
-                selection,
-                deleted,
-                ..
-            } => {
-                let selection = selection.materialized_async().await?;
-                // A read by id checks a pending filter on the columns it
-                // reads, so under one it reads every primary column; the
-                // requested ones are picked out of each chunk by name.
-                let by_id_columns = match filter {
-                    Some(_) => self.layout.strategy().primary_column_names(),
-                    None => &names[..],
-                };
-                if let Some(rows) = Self::exact_rows_by_id(
-                    file,
-                    by_id_columns,
-                    filter.as_ref(),
-                    &selection,
-                    deleted.as_ref(),
-                )
-                .await?
-                {
-                    let chunks = rechunk(rows, batch_rows)?;
-                    return Ok(stream::iter(
-                        chunks.into_iter().map(move |c| extract_codes(c, &names)),
-                    )
-                    .boxed());
-                }
-                let scan = Self::restricted_file_scan_projected(
-                    file,
-                    &names,
-                    filter.as_ref(),
-                    &selection,
-                    deleted.as_ref(),
-                )?;
-                Ok(rechunked(stream_rows(scan)?, batch_rows)
-                    .map(move |chunk| extract_codes(chunk?, &names))
-                    .boxed())
-            }
+        // In memory the requested columns are the base's own code buffers,
+        // sliced per chunk.
+        if let Some(all) = self.base_code_columns() {
+            let picked: Vec<Buffer<TermCode>> =
+                columns.iter().map(|c| all[c.index()].clone()).collect();
+            let rows = picked[0].len();
+            let chunks: Vec<Result<Vec<Buffer<TermCode>>>> = (0..rows)
+                .step_by(batch_rows)
+                .map(|start| {
+                    let end = start.saturating_add(batch_rows).min(rows);
+                    Ok(picked.iter().map(|b| b.slice(start..end)).collect())
+                })
+                .collect();
+            return Ok(stream::iter(chunks).boxed());
         }
+        // A file view, or a base whose code columns the shared cache cannot
+        // hand out: its rows, cut to the cap, their codes read per chunk by
+        // name.
+        let names: Vec<&'static str> = columns.iter().map(|c| c.name()).collect();
+        let base = self.base_read(&names).await?;
+        Ok(base
+            .chunks(batch_rows)?
+            .map(move |chunk| extract_codes(chunk?, &names))
+            .boxed())
     }
 
     /// The tail's live rows cut to `batch_rows`; none without a tail.
@@ -228,36 +155,6 @@ fn check_batch(batch_rows: usize) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-/// A stream that builds its source on first poll — the view's gather or read
-/// runs then, not when the stream is requested — and yields the build's
-/// error as its one item when the build fails.
-fn lazy<T: Send + 'static>(
-    build: impl Future<Output = Result<BoxStream<'static, Result<T>>>> + Send + 'static,
-) -> BoxStream<'static, Result<T>> {
-    stream::once(build)
-        .flat_map(|built| match built {
-            Ok(chunks) => chunks,
-            Err(e) => stream::iter([Err(e)]).boxed(),
-        })
-        .boxed()
-}
-
-/// `chunks` with every chunk cut to `batch_rows`, a chunk's error carried as
-/// one error item.
-#[cfg(feature = "file-io")]
-fn rechunked(chunks: BoxStream<'static, Result<ArrayRef>>, batch_rows: usize) -> RowChunkStream {
-    chunks
-        .flat_map(move |chunk| {
-            let pieces: Vec<Result<ArrayRef>> =
-                match chunk.and_then(|chunk| rechunk(chunk, batch_rows)) {
-                    Ok(pieces) => pieces.into_iter().map(Ok).collect(),
-                    Err(e) => vec![Err(e)],
-                };
-            stream::iter(pieces)
-        })
-        .boxed()
 }
 
 /// The [`TermCode`] buffers of the `names` columns of one struct chunk, in

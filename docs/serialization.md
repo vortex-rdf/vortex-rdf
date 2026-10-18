@@ -241,7 +241,7 @@ row ids are.
 every poll of the chunk stream pulls up to a chunk's worth of quads off the
 heap and builds one struct
 ([`build_struct_array`](../core/src/store/builders/mod.rs#L166), or
-[`dictionary::build_chunk`](../core/src/store/layouts/dictionary/codec.rs#L126)
+[`dictionary::build_chunk`](../core/src/store/layouts/dictionary/codec.rs#L127)
 encoding each term through the term→code map). With indexes the merge runs to
 completion first ([`merge_feeding_indexes`](../core/src/store/builders/stream_indexes.rs#L128)):
 row ids are only known as the merge assigns them, and an index child is a

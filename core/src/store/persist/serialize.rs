@@ -105,7 +105,7 @@ impl VortexRdfStore {
     /// that does not rebuild carries the store's own dictionary, a
     /// file-backed one lifted resident transiently for the write.
     ///
-    /// The row read paths use the rows-only `selected_rows`, which never
+    /// The row read paths read the rows alone (`base_read`), which never
     /// materializes components.
     pub(crate) async fn to_serializable_parts(&self) -> Result<StoreParts> {
         let base = self.base_selected_rows().await?;

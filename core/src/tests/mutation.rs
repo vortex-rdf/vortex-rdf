@@ -331,15 +331,15 @@ async fn test_tail_accretion_flattens_at_row_floor() {
     assert_eq!(view.size().await.unwrap(), TAIL_FLATTEN_FLOOR);
 }
 
-/// A tailed Dictionary view's `selected_rows` re-encodes base and tail
-/// together against a fresh dictionary: the result holds every row as codes
-/// in the base's column shape, those codes address the dictionary
-/// `to_serializable_parts` hands out, and the cached one is withheld.
+/// A tailed Dictionary view's serializable parts re-encode base and tail
+/// together against a fresh dictionary: the rows hold every row as codes in
+/// the base's column shape, those codes address the dictionary the parts
+/// carry, and the cached one is withheld.
 #[tokio::test]
-async fn test_selected_rows_on_tailed_dictionary_store() {
+async fn test_serializable_parts_on_tailed_dictionary_store() {
     let quads = modular_quads(12, 3, 4);
     let store = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
-    let base_rows = store.selected_rows().await.unwrap();
+    let base_rows = store.to_serializable_parts().await.unwrap().built.array;
 
     let novel = make_quad(
         "http://example.org/brand-new-subject",
@@ -353,12 +353,12 @@ async fn test_selected_rows_on_tailed_dictionary_store() {
         "a tailed store's codes address no cached dictionary"
     );
 
-    let rows = tailed.selected_rows().await.unwrap();
+    let parts = tailed.to_serializable_parts().await.unwrap();
+    let rows = parts.built.array;
     assert_eq!(rows.len(), 13);
     assert_eq!(rows.len(), tailed.size().await.unwrap());
     assert_eq!(rows.dtype(), base_rows.dtype());
 
-    let parts = tailed.to_serializable_parts().await.unwrap();
     let dict = parts
         .built
         .dict
@@ -372,28 +372,18 @@ async fn test_selected_rows_on_tailed_dictionary_store() {
     assert_eq!(quad_strings(&decoded), quad_strings(&expected));
 }
 
-/// Under the string layouts a tailed view's `selected_rows` is the base's
-/// rows and the tail's, chunked together in the base's own vocabulary.
+/// Under the string layouts a tailed view's serializable parts hold the
+/// base's rows and the tail's in the layout's own vocabulary, decoding to
+/// every quad.
 #[tokio::test]
-async fn test_selected_rows_on_tailed_default_store() {
-    use vortex_array::arrays::Chunked;
-    use vortex_array::arrays::chunked::ChunkedArrayExt as _;
-
+async fn test_serializable_parts_on_tailed_default_store() {
     let quads = modular_quads(12, 3, 4);
     let store = built_store(quads.clone(), LayoutStrategy::Default, vec![]).await;
     let appended = [tail_quad(0), tail_quad(1)];
     let tailed = store.add_quads(appended.clone()).await.unwrap();
 
-    let rows = tailed.selected_rows().await.unwrap();
+    let rows = tailed.to_serializable_parts().await.unwrap().built.array;
     assert_eq!(rows.len(), 14);
-    let chunked = rows
-        .clone()
-        .try_downcast::<Chunked>()
-        .expect("base and tail chunk together");
-    assert_eq!(
-        chunked.chunks().iter().map(|c| c.len()).collect::<Vec<_>>(),
-        [12, 2]
-    );
     let decoded: Vec<Quad> = crate::store::layouts::ResolvedLayout::Default
         .decode_chunk(&rows)
         .into_iter()

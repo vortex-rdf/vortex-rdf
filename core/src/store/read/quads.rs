@@ -9,9 +9,12 @@ use oxrdf::Quad;
 
 use crate::error::Result;
 use crate::store::layouts::ChunkDecode;
-use crate::store::scan::gather::gather_live;
 use crate::store::{QuadsSource, RawQuad, SharedQuad, Tail, VortexRdfStore};
 
+#[cfg(feature = "file-io")]
+use super::deferred;
+#[cfg(feature = "file-io")]
+use super::rows::BaseRead;
 #[cfg(feature = "file-io")]
 use crate::error::VortexRdfError;
 #[cfg(feature = "file-io")]
@@ -102,19 +105,17 @@ impl VortexRdfStore {
     /// An in-memory view is one chunk ([`in_memory_chunk`](Self::in_memory_chunk)),
     /// taken as it decodes, with no chunk stream around it.
     async fn decoded_vec<T: ChunkDecode>(&self) -> Result<Vec<T>> {
-        let chunks: Vec<Vec<Result<T>>> = match &self.quads {
-            QuadsSource::InMemory { .. } => vec![self.in_memory_chunk::<T>(true)?],
+        match &self.quads {
+            QuadsSource::InMemory { .. } => {
+                let chunk = self.in_memory_chunk::<T>(true)?;
+                flattened(chunk.len(), [chunk])
+            }
             #[cfg(feature = "file-io")]
-            QuadsSource::File { .. } => self.chunk_stream::<T>(true).collect().await,
-        };
-        let total = chunks.iter().map(Vec::len).sum();
-        let mut rows = Vec::with_capacity(total);
-        for chunk in chunks {
-            for row in chunk {
-                rows.push(row?);
+            QuadsSource::File { .. } => {
+                let chunks: Vec<Vec<Result<T>>> = self.chunk_stream::<T>(true).collect().await;
+                flattened(chunks.iter().map(Vec::len).sum(), chunks)
             }
         }
-        Ok(rows)
     }
 
     /// The one chunk stream behind every read above, built on the first poll,
@@ -133,12 +134,7 @@ impl VortexRdfStore {
                     .boxed()
             }
             #[cfg(feature = "file-io")]
-            QuadsSource::File { .. } => stream::once(self.file_chunks::<T>(serve))
-                .flat_map(|built| match built {
-                    Ok(chunks) => chunks,
-                    Err(e) => stream::iter([vec![Err(e)]]).boxed(),
-                })
-                .boxed(),
+            QuadsSource::File { .. } => deferred(self.file_chunks::<T>(serve), |e| vec![Err(e)]),
         }
     }
 
@@ -147,16 +143,13 @@ impl VortexRdfStore {
     /// memory and an in-memory store's dictionary is resident.
     ///
     /// With `serve`, a served view reads its plan's run, a slice or point
-    /// reads of the component's run. Every other read is in base row order,
-    /// the selected rows gathered over exact row ids (a served view's pending
-    /// selection materializes first).
+    /// reads of the component's run. Every other read is the base's rows in
+    /// base row order, gathered over the exact selection
+    /// ([`in_memory_base_rows`](Self::in_memory_base_rows)).
     #[cfg_attr(not(feature = "file-io"), allow(irrefutable_let_patterns))]
     fn in_memory_chunk<T: ChunkDecode>(&self, serve: bool) -> Result<Vec<Result<T>>> {
         let QuadsSource::InMemory {
-            base,
-            selection,
             deleted,
-            probes,
             serve: plan,
             ..
         } = &self.quads
@@ -170,23 +163,7 @@ impl VortexRdfStore {
             // are applied through the rid column. The selection may still be
             // pending — the plan never needs it.
             Some(plan) if serve => plan.decode::<T>(deleted.as_ref()),
-            _ => {
-                let materialized;
-                let selection = match plan {
-                    // Base row order needs exact row ids: a served match's
-                    // pending selection materializes here.
-                    Some(_) => {
-                        materialized = selection.materialized()?;
-                        &materialized
-                    }
-                    // Without a plan the selection is exact (pending ids ride
-                    // alongside one, or on a view that is only counted or
-                    // windowed, never streamed).
-                    None => selection.expect_exact(),
-                };
-                let rows = gather_live(base, selection, deleted.as_ref(), Some(probes))?;
-                T::decode(&self.layout, &rows)
-            }
+            _ => T::decode(&self.layout, &self.in_memory_base_rows()?),
         };
         // Tail rows are in memory and few: they follow the base's.
         quads.extend(self.tail.as_ref().map_or_else(Vec::new, Tail::decode));
@@ -198,17 +175,15 @@ impl VortexRdfStore {
     ///
     /// With `serve`, a served view reads its plan's run: point reads for a
     /// point-sized located run, a row-count-split scan for a wide one, the
-    /// plan's filter scan for an unlocated one. Every other read is in base
-    /// row order, over exact row ids (a served view's pending selection
-    /// materializes first): a selection the reads by id serve
-    /// ([`ExactRead`](file_reads::ExactRead)) is one chunk, and anything else
-    /// streams the restricted scan split by split.
+    /// plan's filter scan for an unlocated one. Every other read is the base's
+    /// rows in base row order, over the exact selection
+    /// ([`base_read`](Self::base_read)): rows read by id
+    /// ([`ExactRead`](file_reads::ExactRead)) are one chunk, and the
+    /// restricted scan streams split by split.
     #[cfg(feature = "file-io")]
     async fn file_chunks<T: ChunkDecode>(&self, serve: bool) -> Result<Chunks<T>> {
         let QuadsSource::File {
             file,
-            filter,
-            selection,
             deleted,
             serve: plan,
             ..
@@ -264,46 +239,17 @@ impl VortexRdfStore {
             };
             return self.scan_chunks(scan, decoder, tail);
         }
-        let materialized;
-        let selection = match plan {
-            // Base row order needs exact row ids: a served match's
-            // pending selection materializes here (running the
-            // deferred index-child read once, cached on the view).
-            Some(_) => {
-                materialized = selection.materialized_async().await?;
-                &materialized
-            }
-            // Without a plan the selection is exact (pending ids ride
-            // alongside one, or on a view that is only counted or
-            // windowed, never streamed).
-            None => selection.expect_exact(),
-        };
-        // An exact selection the reads by id serve (see `ExactRead`) —
-        // point reads through the file's cached chunk probes, or takes
-        // at its ids — decodes as one chunk, with no scan machinery.
-        // Anything else, and a read by id that declines (an
-        // unprobeable chunk), streams the restricted scan: primary
-        // columns only, with the pending filter and the selection
-        // applied, tombstoned rows excluded.
-        let columns = self.layout.strategy().primary_column_names();
-        let chunk = match Self::exact_rows_by_id(
-            file,
-            columns,
-            filter.as_ref(),
-            selection,
-            deleted.as_ref(),
-        )
-        .await
+        match self
+            .base_read(self.layout.strategy().primary_column_names())
+            .await?
         {
-            Ok(Some(rows)) => T::decode_async(&self.layout, &rows).await,
-            Ok(None) => {
-                let scan =
-                    self.restricted_file_scan(file, filter.as_ref(), selection, deleted.as_ref())?;
-                return self.scan_chunks(scan, self.layout.clone(), tail);
-            }
-            Err(e) => vec![Err(e)],
-        };
-        Ok(with_tail(stream::iter([chunk]), tail))
+            // Rows read by id decode as one chunk, with no scan machinery.
+            BaseRead::Rows(rows) => Ok(with_tail(
+                stream::iter([T::decode_async(&self.layout, &rows).await]),
+                tail,
+            )),
+            BaseRead::Scan(scan) => self.scan_chunks(*scan, self.layout.clone(), tail),
+        }
     }
 
     /// `scan`'s chunks decoded through `decoder`, then the tail's chunk. The
@@ -342,6 +288,18 @@ impl VortexRdfStore {
         };
         Ok(with_tail(chunks, tail))
     }
+}
+
+/// The `total` rows of `chunks`, in order, moved into one exactly-sized `Vec`;
+/// a row's error is the result.
+fn flattened<T>(total: usize, chunks: impl IntoIterator<Item = Vec<Result<T>>>) -> Result<Vec<T>> {
+    let mut rows = Vec::with_capacity(total);
+    for chunk in chunks {
+        for row in chunk {
+            rows.push(row?);
+        }
+    }
+    Ok(rows)
 }
 
 /// `chunks` followed by the tail's one chunk.

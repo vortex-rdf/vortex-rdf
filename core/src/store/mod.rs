@@ -210,9 +210,9 @@ impl VortexRdfStore {
     /// - Dictionary layout — no other layout has codes at all;
     /// - an empty append tail — tail rows store terms as *strings* (an
     ///   appended term has no code in the sorted dictionary), so a tailed
-    ///   view's rows are not fully code-addressable, and gathering them
+    ///   view's rows are not fully code-addressable, and serializing them
     ///   re-encodes against a fresh dictionary this handle would not be (see
-    ///   `selected_rows`'s contract).
+    ///   `to_serializable_parts`).
     ///
     /// A view that fails either has codes this dictionary does not address,
     /// and decoding them against it yields silently wrong terms, so bindings

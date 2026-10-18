@@ -1,13 +1,12 @@
-//! The row/code read surface: gathered rows, code columns, and the
-//! selected-rows plumbing the serialization and compaction paths share.
+//! The row/code read surface: the one base-row seam every row reader goes
+//! through ([`BaseRead`]), code columns, and the selected-rows plumbing the
+//! serialization and compaction paths share.
 
 use crate::error::Result;
-use crate::session::VORTEX_SESSION;
 use crate::store::QuadsSource;
 use crate::store::RawQuad;
-use crate::store::array::{chunked_or_single, field_as, subject_sorted, with_subject_stamp};
-use crate::store::layouts::dictionary::TermDictionary;
-use crate::store::layouts::{ResolvedLayout, dictionary};
+use crate::store::array::{rechunk, with_subject_stamp};
+use crate::store::read::chunks::{RowChunkStream, extract_codes};
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_reads;
 use crate::store::scan::gather::gather_live;
@@ -16,9 +15,10 @@ use crate::store::view::selection::RowSelection;
 #[cfg(feature = "file-io")]
 use crate::store::view::selection::ViewSelection;
 
+use futures::stream::{self, StreamExt};
+use vortex_array::ArrayRef;
+use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::arrays::{PrimitiveArray, StructArray};
-use vortex_array::{ArrayRef, VortexSessionExecute};
 use vortex_buffer::Buffer;
 
 #[cfg(feature = "file-io")]
@@ -30,54 +30,50 @@ use vortex_mask::Mask;
 
 use crate::store::VortexRdfStore;
 
-impl VortexRdfStore {
-    /// The rows this view selects, base and tail combined, as a single
-    /// in-memory array of primary columns only — the rows-only counterpart
-    /// of `to_serializable_parts`: no index
-    /// components are materialized, rebuilt, or split off, because none ride
-    /// in the result (in memory they live beside the base, on disk as index
-    /// children; serialize through `to_serializable_parts` to get them
-    /// beside the rows).
-    ///
-    /// Without a tail the base's selected live rows are the whole answer, in
-    /// the store's own vocabulary: under the Dictionary layout a tombstone
-    /// never re-encodes, so the codes stay addressed to the cached dictionary
-    /// ([`dict_reader`](Self::dict_reader) hands it out). With
-    /// a tail the layouts diverge:
-    /// - a Dictionary view must re-encode base and tail together against a
-    ///   *fresh* dictionary (the tail's terms have no codes in the cached one)
-    ///   that this method cannot hand out — decode such views through
-    ///   [`quads`](Self::quads)/[`quads_vec`](Self::quads_vec), or serialize
-    ///   them via `to_serializable_parts`,
-    ///   which returns the dictionary beside the rows;
-    /// - every other layout stores the tail in the base's own vocabulary, so
-    ///   the two chunk together with no decode at all.
-    pub(crate) async fn selected_rows(&self) -> Result<ArrayRef> {
-        let base = self.base_selected_rows().await?;
-        let Some(tail) = &self.tail else {
-            return Ok(base);
-        };
-        match &self.layout {
-            ResolvedLayout::Dictionary(_) => {
-                let (raws, _) = self.merged_raw_quads(&base).await?;
-                if raws.is_empty() {
-                    return dictionary::empty_struct();
-                }
-                let (_, code_map) = TermDictionary::from_quads_with_map(&raws)?;
-                // Appended rows break the base's subject sort, and no index
-                // set rides along: the chunk is the primary columns alone.
-                dictionary::build_chunk(&raws, &code_map, false)
-            }
-            _ => {
-                // The tail is a second chunk in the base's own vocabulary —
-                // no raws decode, no rebuild.
-                let tail_rows = tail.live_rows()?;
-                let dtype = base.dtype().clone();
-                chunked_or_single(vec![base, tail_rows], dtype)
-            }
+/// A view's base rows as [`base_read`](VortexRdfStore::base_read) reads
+/// them: already read, or the scan that reads them.
+pub(in crate::store) enum BaseRead {
+    /// The rows, gathered in memory or read from the file by id.
+    Rows(ArrayRef),
+    /// The restricted scan of the file, to run split by split.
+    #[cfg(feature = "file-io")]
+    Scan(Box<ScanBuilder<ArrayRef>>),
+}
+
+impl BaseRead {
+    /// The rows as one array, the scan run to completion.
+    pub(in crate::store) async fn collect(self) -> Result<ArrayRef> {
+        match self {
+            BaseRead::Rows(rows) => Ok(rows),
+            #[cfg(feature = "file-io")]
+            BaseRead::Scan(scan) => file_reads::read_all_rows(*scan).await,
         }
     }
 
+    /// The rows in chunks of at most `batch_rows` rows, in row order: slices
+    /// of the rows, or the scan's chunks each cut to the cap, a chunk's read
+    /// error carried as one error item.
+    pub(in crate::store) fn chunks(self, batch_rows: usize) -> Result<RowChunkStream> {
+        match self {
+            BaseRead::Rows(rows) => {
+                Ok(stream::iter(rechunk(rows, batch_rows)?.into_iter().map(Ok)).boxed())
+            }
+            #[cfg(feature = "file-io")]
+            BaseRead::Scan(scan) => Ok(file_reads::stream_rows(*scan)?
+                .flat_map(move |chunk| {
+                    let pieces: Vec<Result<ArrayRef>> =
+                        match chunk.and_then(|chunk| rechunk(chunk, batch_rows)) {
+                            Ok(pieces) => pieces.into_iter().map(Ok).collect(),
+                            Err(e) => vec![Err(e)],
+                        };
+                    stream::iter(pieces)
+                })
+                .boxed()),
+        }
+    }
+}
+
+impl VortexRdfStore {
     /// The rows this view selects, as four [`TermCode`] columns (`s`, `p`,
     /// `o`, `g`) — read off the answering index's own columns when the view
     /// carries a serve plan that covers them, else gathered directly from the
@@ -87,7 +83,7 @@ impl VortexRdfStore {
     /// a non-Dictionary layout, a non-empty append tail (its strings are not
     /// in the cached dictionary), a file-backed source, or base columns not
     /// reachable as canonical non-nullable code primitives (e.g. chunked or
-    /// wire-compressed). Callers fall back to `selected_rows`.
+    /// wire-compressed). Callers fall back to reading the rows (`base_read`).
     ///
     /// A builder-compressed column behind a `vortex.shared` wrapper still
     /// qualifies: its canonical primitive is materialized once into the
@@ -205,9 +201,9 @@ impl VortexRdfStore {
     /// them when `code_columns`' zero-copy fast path
     /// does not apply.
     ///
-    /// The fallback is the full read pipeline —
-    /// `selected_rows`, canonicalize, then one
-    /// primitive column per role — so a file-backed store, a narrowed view
+    /// The fallback reads the view's base rows as every row reader does
+    /// (`base_read`: gathered in memory, read by id or scanned on file), then
+    /// takes one code column per role, so a file-backed store, a narrowed view
     /// whose base columns are chunked, or any other non-canonical shape still
     /// answers codes. Only the cases where codes are not the store's
     /// vocabulary at all yield `None`: a non-Dictionary layout, or a non-empty
@@ -233,97 +229,130 @@ impl VortexRdfStore {
         {
             return Ok(Some(columns));
         }
-        let rows = self.selected_rows().await?;
-        let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let struct_arr = rows.execute::<StructArray>(&mut ctx)?;
-        let column =
-            |name: &str, ctx: &mut vortex_array::ExecutionCtx| -> Result<Buffer<TermCode>> {
-                Ok(field_as::<PrimitiveArray>(&struct_arr, name, ctx)?.into_buffer::<TermCode>())
-            };
-        Ok(Some([
-            column(schema::COL_S, &mut ctx)?,
-            column(schema::COL_P, &mut ctx)?,
-            column(schema::COL_O, &mut ctx)?,
-            column(schema::COL_G, &mut ctx)?,
-        ]))
+        let rows = self
+            .base_read(&schema::PRIMARY_COLUMNS)
+            .await?
+            .collect()
+            .await?;
+        let codes = extract_codes(rows, &schema::PRIMARY_COLUMNS)?;
+        Ok(Some(
+            codes
+                .try_into()
+                .expect("one code buffer per primary column"),
+        ))
     }
 
-    /// The base rows this view covers (gathered in memory, or scanned from the
-    /// file with the pending filter and selection applied) — without the tail.
-    pub(in crate::store) async fn base_selected_rows(&self) -> Result<ArrayRef> {
+    /// The base rows this view covers, without the tail, in base row order,
+    /// as [`BaseRead`] carries them: at least the `columns` (primary column
+    /// names), each found by name. Every row reader reads the base through
+    /// here; the served fast paths read the answering index instead.
+    ///
+    /// The read is over the exact selection: a served view's pending
+    /// selection materializes here, since its plan orders the rows by the
+    /// index; any other selection is exact already, a pending one without a
+    /// plan sitting only on a view built to be counted or windowed, which is
+    /// never read (`expect_exact`). In memory the live selected rows are
+    /// gathered, every primary column
+    /// ([`in_memory_base_rows`](Self::in_memory_base_rows)). On file a
+    /// selection the reads by id serve is read by id (`exact_rows_by_id`) —
+    /// through every primary column while a filter is pending, which the read
+    /// checks on the columns it reads — and anything else, or a read by id
+    /// that declines, is the restricted scan of `columns`
+    /// (`restricted_file_scan`).
+    #[cfg_attr(not(feature = "file-io"), allow(unused_variables))]
+    pub(in crate::store) async fn base_read(&self, columns: &[&'static str]) -> Result<BaseRead> {
         match &self.quads {
-            QuadsSource::InMemory {
-                base,
-                selection,
-                deleted,
-                probes,
-                ..
-            } => {
-                // A base-order gather needs exact row ids (a serve plan
-                // reorders rows), so a served match's pending selection
-                // materializes here.
-                let selection = selection.materialized()?;
-                match (&selection, deleted) {
-                    // The whole base, nothing deleted: hand back the array as
-                    // it stands (pure primary columns — index copies live in
-                    // `self.components`, not the base).
-                    (RowSelection::All, None) => Ok(base.clone()),
-                    // Anything narrower: gather the live selected rows. A
-                    // gather preserves row order (selections are ascending,
-                    // tombstones only drop rows), so the base's subject
-                    // sortedness carries to the result — but the filter/take
-                    // kernels do not propagate the stat, so restore it from
-                    // the base's own provenance.
-                    _ => {
-                        let rows = gather_live(base, &selection, deleted.as_ref(), Some(probes))?;
-                        with_subject_stamp(rows, subject_sorted(base))
-                    }
-                }
-            }
+            QuadsSource::InMemory { .. } => Ok(BaseRead::Rows(self.in_memory_base_rows()?)),
             #[cfg(feature = "file-io")]
             QuadsSource::File {
                 file,
                 filter,
                 selection,
                 deleted,
+                serve,
                 ..
             } => {
-                // Same materialization as above — the scan reads in file row
-                // order, which only the exact ids can restrict.
-                let selection = selection.materialized_async().await?;
-                // An exact selection is read point by point through the file's
-                // cached chunk probes, taken at its ids, or scanned, as
-                // `ExactRead` chooses; a read by id that declines runs the scan.
-                let by_id = Self::exact_rows_by_id(
+                let materialized;
+                let selection = match serve {
+                    // Runs the deferred index-child read once, cached on the
+                    // view.
+                    Some(_) => {
+                        materialized = selection.materialized_async().await?;
+                        &materialized
+                    }
+                    None => selection.expect_exact(),
+                };
+                let by_id_columns = match filter {
+                    Some(_) => self.layout.strategy().primary_column_names(),
+                    None => columns,
+                };
+                match Self::exact_rows_by_id(
                     file,
-                    self.layout.strategy().primary_column_names(),
+                    by_id_columns,
                     filter.as_ref(),
-                    &selection,
+                    selection,
                     deleted.as_ref(),
                 )
-                .await?;
-                let arr = match by_id {
-                    Some(rows) => rows,
-                    None => {
-                        file_reads::read_all_rows(self.restricted_file_scan(
-                            file,
-                            filter.as_ref(),
-                            &selection,
-                            deleted.as_ref(),
-                        )?)
-                        .await?
-                    }
-                };
-                // A scan preserves file row order and this view only narrows
-                // it, so the file's recorded quads_sorted provenance carries
-                // to the materialized rows; the multi-chunk read loses any
-                // per-leaf stats, so restore the stamp explicitly — without
-                // it, a re-serialization would demote the file to
-                // quads_sorted:false and every later reader would lose the
-                // subject binary search.
-                with_subject_stamp(arr, file.quads_sorted())
+                .await?
+                {
+                    Some(rows) => Ok(BaseRead::Rows(rows)),
+                    None => Ok(BaseRead::Scan(Box::new(Self::restricted_file_scan(
+                        file,
+                        columns,
+                        filter.as_ref(),
+                        selection,
+                        deleted.as_ref(),
+                    )?))),
+                }
             }
         }
+    }
+
+    /// An in-memory view's live base rows in base row order, every primary
+    /// column: its exact selection (see [`base_read`](Self::base_read))
+    /// gathered with the tombstones dropped, point by point through the
+    /// base's probes when the selection is small.
+    #[cfg_attr(not(feature = "file-io"), allow(irrefutable_let_patterns))]
+    pub(in crate::store) fn in_memory_base_rows(&self) -> Result<ArrayRef> {
+        let QuadsSource::InMemory {
+            base,
+            selection,
+            deleted,
+            probes,
+            serve,
+            ..
+        } = &self.quads
+        else {
+            unreachable!("in_memory_base_rows is only called on an in-memory source");
+        };
+        let materialized;
+        let selection = match serve {
+            Some(_) => {
+                materialized = selection.materialized()?;
+                &materialized
+            }
+            None => selection.expect_exact(),
+        };
+        gather_live(base, selection, deleted.as_ref(), Some(probes))
+    }
+
+    /// The base rows this view covers, without the tail, as one array: the
+    /// [`base_read`](Self::base_read) read to completion, with the subject
+    /// stamp.
+    ///
+    /// A read keeps base row order and this view only narrows it, so the
+    /// base's `(s, p, o, g)` provenance (an in-memory base's stamp, the file's
+    /// recorded `quads_sorted`) carries to the rows. The gather and the
+    /// multi-chunk read lose the stat, so it is restored here — without it, a
+    /// re-serialization would demote the rows to `quads_sorted:false` and
+    /// every later reader would lose the subject binary search.
+    pub(in crate::store) async fn base_selected_rows(&self) -> Result<ArrayRef> {
+        let rows = self
+            .base_read(self.layout.strategy().primary_column_names())
+            .await?
+            .collect()
+            .await?;
+        with_subject_stamp(rows, self.quads.subject_sorted())
     }
 
     /// The rows of `columns` at an exact file `selection` with `filter`
@@ -352,33 +381,15 @@ impl VortexRdfStore {
         }
     }
 
-    /// The scan every unserved file read starts from: the layout's primary
-    /// columns only (index columns are internal and never surfaced), with the
-    /// restrictions the view accumulated via `match_pattern` applied — a
-    /// pushed-down filter for the components no index resolved, and the row
-    /// selection (with tombstoned rows excluded) for those it did.
+    /// The scan every unserved file read starts from: the `columns` only —
+    /// primary column names, in the order the chunks carry them, so the scan
+    /// decodes no column the caller does not read (index columns are internal
+    /// and never surfaced) — with the restrictions the view accumulated via
+    /// `match_pattern` applied: a pushed-down filter for the components no
+    /// index resolved, and the row selection (with tombstoned rows excluded)
+    /// for those it did.
     #[cfg(feature = "file-io")]
-    pub(in crate::store) fn restricted_file_scan(
-        &self,
-        file: &crate::store::persist::native_file::NativeStoreFile,
-        filter: Option<&Expression>,
-        selection: &RowSelection,
-        deleted: Option<&Mask>,
-    ) -> Result<ScanBuilder<ArrayRef>> {
-        Self::restricted_file_scan_projected(
-            file,
-            self.layout.strategy().primary_column_names(),
-            filter,
-            selection,
-            deleted,
-        )
-    }
-
-    /// [`restricted_file_scan`](Self::restricted_file_scan) projecting only
-    /// `columns` — primary column names, in the order the chunks carry them —
-    /// so the scan decodes no column the caller does not read.
-    #[cfg(feature = "file-io")]
-    pub(in crate::store) fn restricted_file_scan_projected(
+    fn restricted_file_scan(
         file: &crate::store::persist::native_file::NativeStoreFile,
         columns: &[&'static str],
         filter: Option<&Expression>,

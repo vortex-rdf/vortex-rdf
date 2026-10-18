@@ -123,6 +123,7 @@ where
 /// separately as components (see
 /// [`build_components_from_codes`](crate::store::builders::build_components_from_codes)),
 /// so nothing else rides here.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) fn build_chunk<K>(
     quads: &[RawQuad],
     code_map: &HashMap<K, TermCode>,

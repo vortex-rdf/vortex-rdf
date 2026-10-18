@@ -601,7 +601,8 @@ pub(super) async fn run_copy_index_serving_script(
     assert_eq!(by_p.indexes(), &[IndexType::SecondaryByCopy]);
     // A base-order gather cannot ride the plan: it materializes the ids and
     // must agree with the served read.
-    assert_eq!(by_p.selected_rows().await.unwrap().len(), 10);
+    let parts = by_p.to_serializable_parts().await.unwrap();
+    assert_eq!(parts.built.array.len(), 10);
 
     // Object-bound: i ≡ 2 (mod 5), served from the OSPG family.
     let o2 = Term::Literal(Literal::new_simple_literal("o2"));

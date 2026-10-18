@@ -8,3 +8,28 @@ pub(crate) mod data_source;
 pub(crate) mod metadata;
 pub(crate) mod quads;
 pub(crate) mod rows;
+
+use std::future::Future;
+
+use futures::stream::{self, BoxStream, Stream, StreamExt};
+
+use crate::error::{Result, VortexRdfError};
+
+/// A stream that builds its source on the first poll — the view's read runs
+/// then, not when the stream is requested — and yields `on_err` of the
+/// build's error as its one item when the build fails.
+fn deferred<'a, S, I>(
+    build: impl Future<Output = Result<S>> + Send + 'a,
+    on_err: fn(VortexRdfError) -> I,
+) -> BoxStream<'a, I>
+where
+    S: Stream<Item = I> + Send + 'a,
+    I: Send + 'a,
+{
+    stream::once(build)
+        .flat_map(move |built| match built {
+            Ok(items) => items.left_stream(),
+            Err(e) => stream::iter([on_err(e)]).right_stream(),
+        })
+        .boxed()
+}

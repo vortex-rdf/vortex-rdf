@@ -316,6 +316,7 @@ async fn test_chunks_string_layouts_include_tail() {
     let appended = appended_quads(40);
     for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
         let store = built_store(quads.clone(), layout, vec![]).await;
+        let base_rows = store.size().await.unwrap();
         let tailed = store.add_quads(appended.clone()).await.unwrap();
         assert_eq!(tailed.tail_len(), 40);
         let expected: Vec<String> = tailed
@@ -331,6 +332,18 @@ async fn test_chunks_string_layouts_include_tail() {
                 chunk_subjects(&chunks),
                 expected,
                 "{layout:?} at batch {batch}"
+            );
+            // The base's rows and the tail's are cut apart, each to the cap.
+            let cut = |rows: usize| {
+                (0..rows)
+                    .step_by(batch)
+                    .map(move |start| (rows - start).min(batch))
+            };
+            let lengths: Vec<usize> = cut(base_rows).chain(cut(tailed.tail_len())).collect();
+            assert_eq!(
+                chunks.iter().map(|c| c.len()).collect::<Vec<_>>(),
+                lengths,
+                "{layout:?} at batch {batch}: the base's chunks, then the tail's"
             );
         }
         assert!(
