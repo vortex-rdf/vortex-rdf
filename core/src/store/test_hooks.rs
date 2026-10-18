@@ -28,7 +28,7 @@ pub(crate) use crate::store::view::{TAIL_FLATTEN_FLOOR, TAIL_MAX_CHUNKS};
 
 thread_local! {
     /// How many times this thread gathered a store's live rows into raw quads
-    /// (`live_raw_quads`, compaction's first step). Thread-local because the
+    /// (`live_raw_quads`, every rebuild's first step). Thread-local because the
     /// tests share a process and run on the current-thread runtime, so a test
     /// reads only its own gathers.
     static GATHERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

@@ -685,7 +685,7 @@ impl ResolvedLayout {
 
     /// [`raw_quads`](Self::raw_quads) with the file-backed Dictionary case
     /// handled: the whole dictionary is lifted resident transiently, then the
-    /// sync decode runs unchanged. Its one caller, `merged_raw_quads`, serves
+    /// sync decode runs unchanged. Its one caller, `live_raw_quads`, serves
     /// whole-base reads only (compaction and serialization), which touch most
     /// of the dictionary anyway; every chunk a read streams decodes through
     /// [`ChunkDecode`] instead.

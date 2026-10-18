@@ -106,19 +106,13 @@ pub struct VortexRdfStore {
 /// A store's serializable state, split the way the store holds it: a
 /// [`BuiltArray`] of the primary quad rows, the in-memory index components
 /// describing them, and — under the Dictionary layout — the term dictionary
-/// the rows' codes address, plus the rows' sortedness. Produced by
-/// [`VortexRdfStore::to_serializable_parts`] and adopted back by
-/// [`VortexRdfStore::from_parts`] (the in-memory open, `from_file_in_memory`).
+/// the rows' codes address. The rows' sortedness travels as their `s`
+/// column's stamp. Produced by [`VortexRdfStore::to_serializable_parts`] and
+/// adopted back by [`VortexRdfStore::from_parts`] (the in-memory open,
+/// `from_file_in_memory`).
 #[cfg(any(feature = "file-io", target_arch = "wasm32", test))]
 pub(crate) struct StoreParts {
     pub(crate) built: BuiltArray,
-    /// Whether the rows are in global `(s, p, o, g)` order; written as the
-    /// root's `quads_sorted` (see `WireMetadata::quads_sorted`).
-    #[cfg_attr(
-        not(any(feature = "file-io", target_arch = "wasm32")),
-        allow(dead_code)
-    )]
-    pub(crate) quads_sorted: bool,
 }
 
 impl VortexRdfStore {

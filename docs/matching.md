@@ -224,7 +224,7 @@ stage only sees what is left.
 
 Only the *struct* is canonical. Its columns stay in the compressed encodings
 every in-memory construction gives them
-([`adopt`](../core/src/store/construct.rs#L156)), and the stages below
+([`adopt`](../core/src/store/construct.rs#L139)), and the stages below
 search them in place through the cached encoded-search probes. No stage
 decompresses a column; a match decodes nothing but the rows a mask scan has to
 compare ([§6.3](#63-residual-column-filtering)).
@@ -272,7 +272,7 @@ Engages when the subject is bound **and** the base's `s` column carries the
 rows are in global `(s, p, o, g)` order — nothing this crate writes lacks it:
 every builder sorts, a tombstoned gather preserves the order it inherits, and a
 rebuild that merges an append tail re-establishes it
-([`order_for_rebuild`](../core/src/store/persist/serialize.rs)). So the stage is skipped
+([`sorted_live_raw_quads`](../core/src/store/write/compaction.rs)). So the stage is skipped
 only for rows that arrived without the provenance — a foreign writer's file,
 whose `quads_sorted: false` keeps
 [`with_subject_stamp`](../core/src/store/array.rs#L108) from inventing a stamp

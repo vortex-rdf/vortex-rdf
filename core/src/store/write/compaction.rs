@@ -7,7 +7,7 @@ use crate::error::VortexRdfError;
 #[cfg(feature = "file-io")]
 use crate::store::FileBase;
 use crate::store::RawQuad;
-use crate::store::builders::DEFAULT_CHUNK_ROWS;
+use crate::store::builders::{DEFAULT_CHUNK_ROWS, build_parts_from_raws};
 use crate::store::indexes::Indexes;
 
 use crate::store::VortexRdfStore;
@@ -81,16 +81,32 @@ impl VortexRdfStore {
                 .await;
         }
         let raws = self.sorted_live_raw_quads().await?;
-        Self::from_raw_quads(&raws, self.layout.strategy(), indexes, true)
+        Self::from_built(build_parts_from_raws(
+            &raws,
+            self.layout.strategy(),
+            &indexes,
+        )?)
     }
 
     /// Every live quad this view covers in (s, p, o, g) order, each once: the
-    /// rows a compaction rebuilds from.
-    async fn sorted_live_raw_quads(&self) -> Result<Vec<RawQuad>> {
-        let mut raws = self.live_raw_quads().await?;
-        raws.sort_unstable();
-        // The compacted store holds each quad once, whatever the rows it was
-        // gathered from carried: equal quads are adjacent after the sort.
+    /// rows every rebuild starts from, a compaction's and a mutated store's
+    /// serialization's (`to_serializable_parts`).
+    ///
+    /// The base rows come first and keep the base's order
+    /// ([`live_raw_quads`](Self::live_raw_quads)). Over a sorted base, the
+    /// tail sorted alone leaves two sorted runs, which the stable `slice::sort`
+    /// (driftsort, which detects existing runs) merges in linear time; only a
+    /// base that never carried the sorted stamp pays a full sort, which heals it.
+    pub(in crate::store) async fn sorted_live_raw_quads(&self) -> Result<Vec<RawQuad>> {
+        let (mut raws, base_rows) = self.live_raw_quads().await?;
+        if !self.quads.subject_sorted() {
+            raws.sort_unstable();
+        } else if base_rows < raws.len() {
+            raws[base_rows..].sort_unstable();
+            raws.sort();
+        }
+        // The rebuilt store holds each quad once, whatever the rows it was
+        // gathered from carried: equal quads are adjacent in (s, p, o, g) order.
         raws.dedup();
         Ok(raws)
     }

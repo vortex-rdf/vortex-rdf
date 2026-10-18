@@ -1,7 +1,6 @@
 //! In-memory construction of a [`VortexRdfStore`]: the constructors from a
-//! quad stream, a builder's output, `StoreParts` and compaction's raw
-//! quads, the empty store, and the layout, adoption and assembly steps they
-//! share.
+//! quad stream, a builder's output and `StoreParts`, the empty store, and the
+//! layout, adoption and assembly steps they share.
 
 use crate::error::{Result, VortexRdfError};
 #[cfg(any(feature = "file-io", test))]
@@ -10,9 +9,7 @@ use crate::store::StoreParts;
 use crate::store::builders::SortedInMemoryBuilder;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use crate::store::builders::SortedStreamBuilder;
-use crate::store::builders::{
-    BuiltArray, VortexArrayBuilder, build_parts_from_raws, build_struct_array,
-};
+use crate::store::builders::{BuiltArray, VortexArrayBuilder, build_struct_array};
 use crate::store::indexes::{IndexComponent, Indexes};
 use crate::store::layouts::{DictAccess, LayoutStrategy, ResolvedLayout};
 use crate::store::{
@@ -25,12 +22,11 @@ use futures::Stream;
 
 use vortex_array::ArrayRef;
 
-/// The layout a store resolves to, built (`from_parts`, `from_built`,
-/// compaction's `from_raw_quads`) or opened (`from_bytes`, `from_file`): a
-/// dictionary beside the rows — resident, or left in its file child — makes
-/// it Dictionary, otherwise the rows' own dtype decides. A dict-less
-/// Dictionary-layout dtype is rejected: bare code columns carry no way back
-/// to their terms.
+/// The layout a store resolves to, built (`from_parts`, `from_built`) or
+/// opened (`from_bytes`, `from_file`): a dictionary beside the rows —
+/// resident, or left in its file child — makes it Dictionary, otherwise the
+/// rows' own dtype decides. A dict-less Dictionary-layout dtype is rejected:
+/// bare code columns carry no way back to their terms.
 pub(super) fn resolved_layout(
     dict: Option<DictAccess>,
     dtype: &vortex_array::dtype::DType,
@@ -134,19 +130,6 @@ impl VortexRdfStore {
             |base| resident::with_compressed_int_children(base, true),
             IndexComponent::into_compressed,
         )
-    }
-
-    /// Build a fresh owning in-memory store from raw quads under `strategy` —
-    /// the shared back half of compaction (see [`build_parts_from_raws`]),
-    /// adopted like any build ([`from_built`](Self::from_built)). `sorted`
-    /// must be `true` only when `raws` is SPOG-sorted.
-    pub(super) fn from_raw_quads(
-        raws: &[RawQuad],
-        strategy: LayoutStrategy,
-        indexes: Indexes,
-        sorted: bool,
-    ) -> Result<Self> {
-        Self::from_built(build_parts_from_raws(raws, strategy, &indexes, sorted)?)
     }
 
     /// The one adoption step of `from_parts` and

@@ -150,7 +150,6 @@ async fn write_unsorted_store_file(
             components: Vec::new(),
             dict: Some(std::sync::Arc::new(dict)),
         },
-        quads_sorted: false,
     };
     let mut bytes: Vec<u8> = Vec::new();
     crate::io::write::built_stream_to_vortex_writer(parts.into_stream().unwrap(), &mut bytes)

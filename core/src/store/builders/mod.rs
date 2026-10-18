@@ -38,7 +38,8 @@
 //! any column, row id or index child is derived from the rows — so the rows
 //! and every child describe the same deduplicated dataset. The rebuilds
 //! (compaction, a mutated store's serialization) sort and drop repeats the
-//! same way before they call [`build_parts_from_raws`].
+//! same way, in one place (`sorted_live_raw_quads`), before they call
+//! [`build_parts_from_raws`].
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
@@ -222,21 +223,17 @@ pub(crate) fn build_components(
 ///
 /// The Dictionary layout derives its dictionary from `raws`; an empty set
 /// yields an empty dictionary and the components over empty codes, so the
-/// index roster and its code dtypes survive. `sorted` must be `true` only
-/// when `raws` is SPOG-sorted: it stamps the `s` column. The components are
-/// globally sorted whatever the row order.
-///
-/// Like every builder this keeps the rows it is given and numbers the index
-/// children by them, so a caller that sorts them (`sorted`) drops the
-/// repeated quads first, and the store it builds holds each quad once.
+/// index roster and its code dtypes survive. `raws` must be SPOG-sorted with
+/// each quad once (the rows `sorted_live_raw_quads` hands both rebuilds): the
+/// `s` column is stamped sorted, and the index children are numbered by these
+/// rows, so the store this builds holds each quad once.
 pub(crate) fn build_parts_from_raws(
     raws: &[RawQuad],
     strategy: LayoutStrategy,
     indexes: &[IndexType],
-    sorted: bool,
 ) -> Result<BuiltArray> {
     debug_assert!(
-        !sorted || raws.windows(2).all(|pair| pair[0] < pair[1]),
+        raws.windows(2).all(|pair| pair[0] < pair[1]),
         "sorted rows must ascend with each quad once"
     );
     match strategy {
@@ -244,13 +241,13 @@ pub(crate) fn build_parts_from_raws(
             let (dict, code_map) = TermDictionary::from_quads_with_map(raws)?;
             let codes = dictionary::encode_quads(raws, &code_map)?;
             Ok(BuiltArray {
-                array: dictionary::build_code_chunk(&codes, 0..raws.len(), sorted)?,
+                array: dictionary::build_code_chunk(&codes, 0..raws.len(), true)?,
                 components: build_components(indexes, IndexInput::Codes(&codes))?,
                 dict: Some(Arc::new(dict)),
             })
         }
         strategy => Ok(BuiltArray {
-            array: build_struct_array(raws, strategy, sorted)?,
+            array: build_struct_array(raws, strategy, true)?,
             components: build_components(indexes, IndexInput::Quads(raws))?,
             dict: None,
         }),

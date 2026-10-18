@@ -36,8 +36,8 @@ flowchart LR
 | Term dictionary | a `TermDictionary` inside the resolved layout | the required `dictionary` child |
 
 A builder hands these back in one of two shapes
-([`BuiltArray`](../core/src/store/builders/mod.rs#L77) and the crate-private
-[`BuiltStream`](../core/src/store/builders/mod.rs#L92)):
+([`BuiltArray`](../core/src/store/builders/mod.rs#L78) and the crate-private
+[`BuiltStream`](../core/src/store/builders/mod.rs#L93)):
 
 - **`BuiltArray`** — everything materialized: the quad array, the components,
   the dictionary. What `VortexRdfStore::from_built` adopts.
@@ -53,8 +53,8 @@ A builder hands these back in one of two shapes
 |---|---|---|---|
 | CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`SerializeArgs`](../cli/src/main.rs#L33)) | out-of-core | file |
 | Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L145) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L60) | out-of-core | file / any `VortexWrite` |
-| Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L79), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L59) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L37) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L131) to name the builder | either | in-memory store |
-| Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L167) | — (re-serializes a store) | bytes |
+| Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L75), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L59) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L37) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L127) to name the builder | either | in-memory store |
+| Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L140) | — (re-serializes a store) | bytes |
 | Rust | [`VortexRdfStore::from_file_in_memory`](../core/src/store/persist/open.rs#L249) | — (reads a `.vortex` file whole, then adopts it in memory) | in-memory store |
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize_rdf`](../python/src/serialize.rs#L33)) | out-of-core | file |
 | Python | `VortexRdfStore(path, in_memory=True)` | — (calls `from_file_in_memory`) | in-memory store |
@@ -174,7 +174,7 @@ flowchart TD
 
 **String layouts.** The stream is drained into a `Vec<RawQuad>`, sorted, stripped
 of its adjacent repeats, and built into one struct of primary columns through
-[`build_struct_array`](../core/src/store/builders/mod.rs#L166); the requested
+[`build_struct_array`](../core/src/store/builders/mod.rs#L167); the requested
 index families are sorted over that same vector ([§8](#8-secondary-indexes-at-build-time)).
 
 **Dictionary layout.** Terms are interned as they arrive
@@ -240,7 +240,7 @@ row ids are.
 ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L171)):
 every poll of the chunk stream pulls up to a chunk's worth of quads off the
 heap and builds one struct
-([`build_struct_array`](../core/src/store/builders/mod.rs#L166), or
+([`build_struct_array`](../core/src/store/builders/mod.rs#L167), or
 [`dictionary::build_chunk`](../core/src/store/layouts/dictionary/codec.rs#L127)
 encoding each term through the term→code map). With indexes the merge runs to
 completion first ([`merge_feeding_indexes`](../core/src/store/builders/stream_indexes.rs#L128)):
@@ -350,7 +350,7 @@ Opening a file whose index children record row ids of another width is
 refused with a deserialization error that says to rebuild the store
 ([file-format.md §6](file-format.md#6-the-index-children)).
 
-**In memory** ([`build_components`](../core/src/store/builders/mod.rs#L202)) each
+**In memory** ([`build_components`](../core/src/store/builders/mod.rs#L203)) each
 family is a permutation of the complete sorted dataset: sort the row ids by the
 family's comparator ([`CopyFamily::cmp_quads`](../core/src/store/indexes/copy.rs#L147),
 or the code tuple under Dictionary), then gather the columns through that
@@ -420,7 +420,7 @@ flowchart TD
   of every component's, in inventory order; the descriptors and `quads_sorted`
   are encoded into the root layout's metadata ([file-format.md §3](file-format.md#3-the-store-root-vortex-rdfstorev2)).
 - **Provenance.** `quads_sorted` is read off the primary's own `s` stamp when a
-  store re-serializes ([`to_serializable_parts`](../core/src/store/persist/serialize.rs#L112)) and is
+  store re-serializes ([`into_stream`](../core/src/store/persist/serialize.rs#L30)) and is
   `true` by construction for a builder's stream; each component's `sorted` flag
   travels on its descriptor.
 
@@ -430,7 +430,7 @@ a builder's chunk stream (files, compaction; a file is written by
 into place, so a failed write leaves no partial file and the previous store
 untouched, and on Unix a store that has the old file mapped keeps reading
 it), or a store's split parts as one chunk
-([`into_stream`](../core/src/store/persist/serialize.rs#L51): `to_bytes`, the
+([`into_stream`](../core/src/store/persist/serialize.rs#L30): `to_bytes`, the
 bindings' exchange bytes). On the wire the two are the same container.
 
 **Replacing a file.** [`PendingStore`](../core/src/io/write.rs#L265) is the one
@@ -478,9 +478,9 @@ inode stays alive for the mapping.
 ## 10. Adopting a build in memory
 
 A build that is queried in place, without a file, skips the writer:
-[`from_built`](../core/src/store/construct.rs#L131) turns a `BuiltArray` into the
+[`from_built`](../core/src/store/construct.rs#L127) turns a `BuiltArray` into the
 store's *compressed-resident* form (through
-[`adopt`](../core/src/store/construct.rs#L156), the step it shares with
+[`adopt`](../core/src/store/construct.rs#L139), the step it shares with
 `from_parts`):
 
 - every non-nullable `u64` code child and row-id child of the base and of
@@ -497,7 +497,7 @@ store's *compressed-resident* form (through
   ([`StructProbes::warm`](../core/src/store/probes.rs#L53)), so no query pays the
   encoding-tree walk.
 
-The other in-memory adoption, [`from_parts`](../core/src/store/construct.rs#L113)
+The other in-memory adoption, [`from_parts`](../core/src/store/construct.rs#L109)
 (crate-private; `from_file_in_memory` calls it), takes a store's split parts:
 it keeps each integer child's existing encoding wherever a probe binds it and
 decodes only the ones that decline. Opening serialized bytes in memory is
@@ -515,7 +515,7 @@ where those layers are folded back into the three parts of
 
 ### 11.1 Serializing a store (`to_bytes`, `to_serializable_parts`)
 
-[`to_serializable_parts`](../core/src/store/persist/serialize.rs#L112) decides what a view's
+[`to_serializable_parts`](../core/src/store/persist/serialize.rs#L93) decides what a view's
 parts are:
 
 | The view is… | Rows | Components | Dictionary |
@@ -524,32 +524,34 @@ parts are:
 | tailed, or tombstoned with indexes | live base rows + live tail rows, **re-sorted** into `(s, p, o, g)` order | **rebuilt** over the merged rows | **fresh** under Dictionary — the tail may hold terms the old dictionary never coded |
 | narrowed (a `match_pattern` result) | its selected rows only | none — its rows are renumbered, and rebuilding indexes for an arbitrary view is compaction's job | the store's own |
 
-The re-sort ([`order_for_rebuild`](../core/src/store/persist/serialize.rs#L28)) sorts
-the small tail alone and merges it into the already-sorted base in a linear
-pass; only a base that never carried the stamp pays a full sort. The written
-artifact therefore always claims `quads_sorted` truthfully. The sorted rows are
-then deduplicated, as every builder's output is, so the artifact holds each
-quad once even when the rows it was gathered from did not.
+The re-sort ([`sorted_live_raw_quads`](../core/src/store/write/compaction.rs#L100),
+the one compaction runs too) sorts the small tail alone and merges it into the
+already-sorted base in a linear pass; only a base that never carried the stamp
+pays a full sort. The written artifact therefore always claims `quads_sorted`
+truthfully. The sorted rows are then deduplicated, as every builder's output
+is, so the artifact holds each quad once even when the rows it was gathered
+from did not.
 
 ### 11.2 Compaction
 
 [`compact`](../core/src/store/write/compaction.rs#L31) /
 [`compact_with_indexes`](../core/src/store/write/compaction.rs#L65) gather every live
-quad, sort, drop repeated quads, and rebuild:
+quad, sort and drop repeated quads exactly as a serialization's rebuild does
+(§11.1), and rebuild:
 
-- **A file-backed owner stays file-backed** ([`stream_compacted_to_file`](../core/src/store/write/compaction.rs#L119)):
+- **A file-backed owner stays file-backed** ([`stream_compacted_to_file`](../core/src/store/write/compaction.rs#L135)):
   the sorted rows are streamed through `SortedStreamBuilder` — spilling beside
   the store file, not in the OS temp dir — into a sibling temp file
   `<store>.write-<uuid>.tmp`, which is atomically renamed over the original;
   the store is then reopened memory-mapped. On Windows that rename is refused
   while the file is mapped, by this store included, so there a file-backed
   store cannot compact over its own path ([mutations.md §5](mutations.md#5-compaction)).
-- **An in-memory store** rebuilds through [`from_raw_quads`](../core/src/store/construct.rs#L143)
+- **An in-memory store** rebuilds through [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L230)
   (a fresh dictionary under Dictionary, components over the whole set) and
-  adopts the result exactly as `from_built` does.
+  adopts the result through [`from_built`](../core/src/store/construct.rs#L127).
 
 `add_quads` compacts automatically when the tail crosses a threshold
-([`tail_needs_compaction`](../core/src/store/write/compaction.rs#L185)):
+([`tail_needs_compaction`](../core/src/store/write/compaction.rs#L201)):
 
 | Trigger | Value |
 |---|---|
@@ -578,7 +580,7 @@ every other format decodes to `oxrdf` terms and drives the `oxrdfio` serializer.
 |---|---|---|---|
 | `--layout` / `layout` | every surface | `dictionary` | column layout ([§7](#7-columns-per-layout)) |
 | `--indexes` / `indexes` | every surface | none | which index families to build ([§8](#8-secondary-indexes-at-build-time)) |
-| `DEFAULT_CHUNK_ROWS` | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L60) | 100,000 rows | run size, emitted chunk size, spiller capacity, auto-compaction cap |
+| `DEFAULT_CHUNK_ROWS` | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L61) | 100,000 rows | run size, emitted chunk size, spiller capacity, auto-compaction cap |
 | `VORTEX_RDF_SPILL_DIR` | environment | unset (caller base, else OS temp) | where spill runs live |
 | `DICT_CHUNK_ROWS` | [`storage.rs`](../core/src/store/layouts/dictionary/storage.rs#L41) | 65,536 terms | FSST window = dictionary child leaf |
 | row block / segment target | Vortex default write strategy; [`child_strategy`](../core/src/io/container/sources.rs#L237) | 8,192 rows / ~1 MiB; ~2 MiB for a plain id column | zone-map granularity, and the segment size of every written column except a plain `u64` term-code or row-id column, which coalesces toward ~2 MiB ([§9](#9-writing-the-container)) |

@@ -53,7 +53,6 @@ fn test_from_parts_rejects_bare_dictionary_array() {
             components: Vec::new(),
             dict: None,
         },
-        quads_sorted: false,
     })
     .err()
     .expect("from_parts should fail");

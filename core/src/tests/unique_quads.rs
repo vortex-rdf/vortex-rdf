@@ -771,9 +771,11 @@ async fn assert_holds_each_quad_once_in(
 }
 
 /// A store whose base was assembled without a builder — rows from a foreign
-/// writer, repeats and all — comes out of compaction (which rebuilds through
+/// writer, repeats and all, in their own order or in `(s, p, o, g)` order
+/// under the sorted stamp — comes out of compaction (which rebuilds through
 /// the sorted builders) and out of a rebuilding serialization (a tail
-/// appended to it) with each quad once.
+/// appended to it) with each quad once: the unstamped rows are sorted whole,
+/// the stamped ones only have a tail merged in.
 #[tokio::test]
 async fn test_rebuilds_drop_repeats_a_base_carries() {
     let with_repeats: Vec<Quad> = vec![
@@ -786,30 +788,49 @@ async fn test_rebuilds_drop_repeats_a_base_carries() {
     ];
     let expected: BTreeSet<Row> = tuple_rows(&with_repeats).into_iter().collect();
     assert_eq!(expected.len(), 3);
-    let store = unstamped_store(&with_repeats);
-    assert_eq!(
-        store.size().await.unwrap(),
-        6,
-        "the base carries its repeats"
-    );
+    let mut sorted: Vec<RawQuad> = with_repeats.iter().map(RawQuad::from_quad).collect();
+    sorted.sort();
+    let stamped = VortexRdfStore::from_built(BuiltArray {
+        array: crate::store::builders::build_struct_array(&sorted, LayoutStrategy::Default, true)
+            .unwrap(),
+        components: vec![],
+        dict: None,
+    })
+    .unwrap();
+    for (base, store) in [
+        ("unstamped", unstamped_store(&with_repeats)),
+        ("stamped", stamped),
+    ] {
+        assert_eq!(
+            store.size().await.unwrap(),
+            6,
+            "{base}: the base carries its repeats"
+        );
+        assert_eq!(
+            store.view_statistics().unwrap().sort_order.is_some(),
+            base == "stamped",
+            "{base}: the base's sorted provenance"
+        );
 
-    for indexes in index_sets() {
-        let who = format!("in memory / {indexes:?}");
-        let compacted = store.compact_with_indexes(indexes.clone()).await.unwrap();
-        assert_holds_each_quad_once_in(&compacted, &expected, &who).await;
-        assert_eq!(compacted.indexes(), indexes.as_slice(), "{who}");
-    }
+        for indexes in index_sets() {
+            let who = format!("{base} in memory / {indexes:?}");
+            let compacted = store.compact_with_indexes(indexes.clone()).await.unwrap();
+            assert_holds_each_quad_once_in(&compacted, &expected, &who).await;
+            assert_eq!(compacted.indexes(), indexes.as_slice(), "{who}");
+        }
 
-    // A tail makes the serialization rebuild the rows: it drops them too.
-    #[cfg(feature = "file-io")]
-    {
-        let tailed = store.add_quads([quad_of("s4", "p", "z")]).await.unwrap();
-        let mut expected_tailed = expected.clone();
-        expected_tailed.extend(tuple_rows(&[quad_of("s4", "p", "z")]));
-        let reread = VortexRdfStore::from_bytes(&tailed.to_bytes().await.unwrap())
-            .await
-            .unwrap();
-        assert_holds_each_quad_once_in(&reread, &expected_tailed, "tailed serialization").await;
+        // A tail makes the serialization rebuild the rows: it drops them too.
+        #[cfg(feature = "file-io")]
+        {
+            let tailed = store.add_quads([quad_of("s4", "p", "z")]).await.unwrap();
+            let mut expected_tailed = expected.clone();
+            expected_tailed.extend(tuple_rows(&[quad_of("s4", "p", "z")]));
+            let reread = VortexRdfStore::from_bytes(&tailed.to_bytes().await.unwrap())
+                .await
+                .unwrap();
+            let who = format!("{base} tailed serialization");
+            assert_holds_each_quad_once_in(&reread, &expected_tailed, &who).await;
+        }
     }
 
     #[cfg(feature = "file-io")]

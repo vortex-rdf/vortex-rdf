@@ -395,27 +395,19 @@ impl VortexRdfStore {
         Ok(selection.restrict_scan(scan, deleted))
     }
 
-    /// The given base rows decoded to raw quads (lifting a file-backed
-    /// dictionary resident for the decode), followed by the tail's live rows,
-    /// and how many of the result came from the base.
-    pub(in crate::store) async fn merged_raw_quads(
-        &self,
-        base: &ArrayRef,
-    ) -> Result<(Vec<RawQuad>, usize)> {
-        let mut raws = self.layout.raw_quads_async(base).await?;
+    /// Every live quad this view covers, decoded to raw N-Triples term strings
+    /// (a file-backed dictionary lifted resident for the decode) — base rows
+    /// first (in view order), then the tail's live rows — and how many of
+    /// them came from the base.
+    pub(in crate::store) async fn live_raw_quads(&self) -> Result<(Vec<RawQuad>, usize)> {
+        #[cfg(test)]
+        crate::store::test_hooks::note_gather();
+        let base = self.base_selected_rows().await?;
+        let mut raws = self.layout.raw_quads_async(&base).await?;
         let base_rows = raws.len();
         if let Some(tail) = &self.tail {
             raws.extend(tail.raw_quads()?);
         }
         Ok((raws, base_rows))
-    }
-
-    /// Every live quad this view covers, decoded to raw N-Triples term strings
-    /// — base rows first (in view order), then tail rows.
-    pub(in crate::store) async fn live_raw_quads(&self) -> Result<Vec<RawQuad>> {
-        #[cfg(test)]
-        crate::store::test_hooks::note_gather();
-        let base = self.base_selected_rows().await?;
-        Ok(self.merged_raw_quads(&base).await?.0)
     }
 }

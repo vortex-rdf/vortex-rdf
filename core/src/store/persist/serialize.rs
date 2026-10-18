@@ -6,40 +6,19 @@ use crate::error::Result;
 use crate::store::Backend;
 #[cfg(feature = "file-io")]
 use crate::store::FileBase;
-use crate::store::array::subject_sorted;
 use crate::store::builders::{BuiltArray, build_parts_from_raws};
 use crate::store::layouts::ResolvedLayout;
-
-use crate::store::RawQuad;
 
 #[cfg(feature = "file-io")]
 use crate::store::persist::open::scanned_index_components;
 use crate::store::{StoreParts, VortexRdfStore};
 
-/// Put a rebuild's rows into the (s, p, o, g) order every builder emits, so
-/// the array they build carries the subject sorted stamp.
-///
-/// The first `base_rows` entries came from the base and `base_sorted` reports
-/// whether they already hold that order; the rest is the appended tail. When
-/// the base was sorted, sorting the tail alone leaves two concatenated sorted
-/// runs — the case `slice::sort` is documented to merge in a linear pass —
-/// and the tail is small, being capped by auto-compaction. Only a base that
-/// never carried the stamp pays a full sort, which is also what heals it.
-fn order_for_rebuild(raws: &mut [RawQuad], base_rows: usize, base_sorted: bool) {
-    if !base_sorted {
-        raws.sort_unstable();
-    } else if base_rows < raws.len() {
-        raws[base_rows..].sort_unstable();
-        raws.sort();
-    }
-}
-
 impl StoreParts {
     /// These parts as a single-chunk [`BuiltStream`] for the writer: the rows
     /// as the one chunk, each component as a write, the dictionary beside
-    /// them, and `quads_sorted` as the root's sortedness. A Dictionary-layout
-    /// primary comes with its dictionary (`to_serializable_parts` always
-    /// pairs them).
+    /// them, and the rows' subject stamp as the root's `quads_sorted`. A
+    /// Dictionary-layout primary comes with its dictionary
+    /// (`to_serializable_parts` always pairs them).
     ///
     /// Refuses while the experimental patched-array switch is on
     /// ([`refuse_experimental_patches`]) before it packs any component, so a
@@ -49,6 +28,7 @@ impl StoreParts {
     /// [`refuse_experimental_patches`]: crate::io::write::refuse_experimental_patches
     #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
     pub(crate) fn into_stream(self) -> Result<crate::store::builders::BuiltStream> {
+        use crate::store::array::subject_sorted;
         use crate::store::indexes::IndexComponent;
         use crate::store::layouts::LayoutStrategy;
         use futures::StreamExt as _;
@@ -70,11 +50,12 @@ impl StoreParts {
             .iter()
             .map(IndexComponent::to_write)
             .collect::<Result<Vec<_>>>()?;
+        let quads_sorted = subject_sorted(&array);
         Ok(crate::store::builders::BuiltStream {
             dtype: array.dtype().clone(),
             chunks: futures::stream::once(async move { Ok(array) }).boxed(),
             components,
-            quads_sorted: self.quads_sorted,
+            quads_sorted,
             dict,
         })
     }
@@ -97,9 +78,9 @@ impl VortexRdfStore {
     /// serialization's.
     ///
     /// A rebuild also **reorders** the rows it re-emits (see
-    /// `order_for_rebuild`), so the merged output is `(s, p, o, g)`-sorted
-    /// and carries the subject stamp — serialization preserves the store's
-    /// quads, not their row numbering.
+    /// `sorted_live_raw_quads`, compaction's rows too), so the merged output
+    /// is `(s, p, o, g)`-sorted and carries the subject stamp — serialization
+    /// preserves the store's quads, not their row numbering.
     ///
     /// Under the Dictionary layout a rebuild re-encodes the rows against a
     /// fresh dictionary, which the parts carry: a tailed view's cached
@@ -110,28 +91,21 @@ impl VortexRdfStore {
     /// The row read paths read the rows alone (`base_read`), which never
     /// materializes components.
     pub(crate) async fn to_serializable_parts(&self) -> Result<StoreParts> {
-        let base = self.base_selected_rows().await?;
         let owner_shaped = self.quads.is_unrefined();
         let tombstoned = self.quads.deleted.is_some();
         let rebuild =
             self.tail.is_some() || (owner_shaped && tombstoned && !self.indexes.is_empty());
         if rebuild {
-            // A rebuild re-emits every surviving row in (s, p, o, g) order, so
-            // the written artifact carries the subject stamp and readers keep
-            // the subject binary search and, on a file, the subject chunk
-            // probe.
-            let base_sorted = subject_sorted(&base);
-            let (mut raws, base_rows) = self.merged_raw_quads(&base).await?;
-            order_for_rebuild(&mut raws, base_rows, base_sorted);
-            // Sorted, so equal quads are adjacent: the written artifact holds
-            // each quad once, as every builder's output does.
-            raws.dedup();
-            let built = build_parts_from_raws(&raws, self.layout.strategy(), &self.indexes, true)?;
+            // A rebuild re-emits every surviving row in (s, p, o, g) order,
+            // each once, as every builder's output is, so the written
+            // artifact carries the subject stamp and readers keep the
+            // subject binary search and, on a file, the subject chunk probe.
+            let raws = self.sorted_live_raw_quads().await?;
             return Ok(StoreParts {
-                built,
-                quads_sorted: true,
+                built: build_parts_from_raws(&raws, self.layout.strategy(), &self.indexes)?,
             });
         }
+        let base = self.base_selected_rows().await?;
         let components = if owner_shaped && !tombstoned {
             match &self.quads.backend {
                 Backend::InMemory(memory) => memory.components.to_vec(),
@@ -149,7 +123,6 @@ impl VortexRdfStore {
             _ => None,
         };
         Ok(StoreParts {
-            quads_sorted: subject_sorted(&base),
             built: BuiltArray {
                 array: base,
                 components,

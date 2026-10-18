@@ -1356,7 +1356,6 @@ fn test_parts_stream_requires_dictionary_beside_code_rows() {
             components: Vec::new(),
             dict: None,
         },
-        quads_sorted: false,
     };
     let _ = parts.into_stream();
 }
