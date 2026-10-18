@@ -155,7 +155,7 @@ flowchart TD
   [`matching_file_row_mask`](../core/src/store/write/mutation.rs#L238) (through
   [`matching_file_rows`](../core/src/store/scan/file_filter.rs#L323)), and on
   every later read the mask is applied **inside the scan**
-  ([`restrict_scan`](../core/src/store/scan/file_reads.rs#L245)) — as an
+  ([`restrict_scan`](../core/src/store/scan/file_reads.rs#L244)) — as an
   `ExcludeByIndex` selection of the deleted ids for an `All` or `Range`
   selection, or subtracted up front from an id list — so it composes with a
   pushed-down filter, whose output carries no row ids to re-align against.

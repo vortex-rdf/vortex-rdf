@@ -12,6 +12,7 @@ use std::future::Future;
 use futures::StreamExt as _;
 use vortex_array::ArrayRef;
 use vortex_error::VortexResult;
+use vortex_layout::scan::scan_builder::ScanBuilder;
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::array::chunked_or_single;
@@ -72,10 +73,9 @@ where
     Ok(chunks)
 }
 
-/// [`collect_chunks`] assembled into one array of `dtype`: the tail of
-/// `read_index_row_ids` and of `read_all_rows` for a scan its driver choice
-/// runs inline.
-#[cfg(feature = "file-io")]
+/// [`collect_chunks`] assembled into one array of `dtype`: the one inline
+/// collector of a whole scan — of [`collect_whole_scan`], and of
+/// `read_all_rows` for a scan its driver choice runs inline.
 pub(crate) async fn collect_scan<F>(
     dtype: vortex_array::dtype::DType,
     tasks: Vec<F>,
@@ -84,6 +84,14 @@ where
     F: Future<Output = VortexResult<Option<ArrayRef>>>,
 {
     chunked_or_single(collect_chunks(tasks).await?, dtype)
+}
+
+/// `scan` planned and run to completion inline ([`collect_scan`]) into one
+/// array: a whole layout reader ([`scan_all_reader`]), or an index child's
+/// row-id scan (`read_index_row_ids`).
+pub(crate) async fn collect_whole_scan(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRef> {
+    let dtype = scan.dtype()?;
+    collect_scan(dtype, scan.build()?).await
 }
 
 /// A scan's per-split futures each spawned onto the session's runtime as the
@@ -160,8 +168,7 @@ pub(crate) mod spawn_probe {
 /// handle at all — which is what lets buffer-backed files (whose segment reads
 /// resolve synchronously) be read on wasm and in no-file-io builds.
 pub(crate) async fn scan_all_reader(reader: vortex_layout::LayoutReaderRef) -> Result<ArrayRef> {
-    let dtype = reader.dtype().clone();
-    chunked_or_single(scan_reader_chunks(reader).await?, dtype)
+    collect_whole_scan(reader_scan(reader)).await
 }
 
 /// [`scan_all_reader`] driven to completion on the current thread, for a
@@ -183,12 +190,12 @@ pub(crate) fn scan_all_reader_sync(reader: vortex_layout::LayoutReaderRef) -> Re
 pub(crate) async fn scan_reader_chunks(
     reader: vortex_layout::LayoutReaderRef,
 ) -> Result<Vec<ArrayRef>> {
-    let scan = vortex_layout::scan::scan_builder::ScanBuilder::new(
-        crate::session::VORTEX_SESSION.clone(),
-        reader,
-    );
-    let tasks = scan.build()?;
-    collect_chunks(tasks).await
+    collect_chunks(reader_scan(reader).build()?).await
+}
+
+/// A scan of every row and column of `reader`, on the crate's session.
+fn reader_scan(reader: vortex_layout::LayoutReaderRef) -> ScanBuilder<ArrayRef> {
+    ScanBuilder::new(crate::session::VORTEX_SESSION.clone(), reader)
 }
 
 /// The actionable error for a file whose root is not the native store layout:

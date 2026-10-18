@@ -23,7 +23,8 @@ use vortex_scan::strict_sorted_buffer::StrictSortedBuffer;
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::read::{
-    available_parallelism, collect_scan, collect_scan_spawned, inline_splits, spawned_splits,
+    available_parallelism, collect_scan, collect_scan_spawned, collect_whole_scan, inline_splits,
+    spawned_splits,
 };
 use crate::store::layouts::{Constraints, PatternCodes, QuadPattern, TermRef};
 use crate::store::persist::native_file::NativeStoreFile;
@@ -207,9 +208,7 @@ pub(crate) fn stream_rows(
 /// caller says so here, not because of its `ordered` flag: any other scan goes
 /// through [`read_all_rows`].
 pub(crate) async fn read_index_row_ids(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRef> {
-    let dtype = scan.dtype()?;
-    let tasks = scan.build()?;
-    collect_scan(dtype, tasks).await
+    collect_whole_scan(scan).await
 }
 
 /// The rows of a point read when it answers, otherwise the rows of `scan` —

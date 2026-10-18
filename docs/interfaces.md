@@ -185,10 +185,10 @@ Every read is lazy, and a stream's first poll decides how it runs:
   the call's error.
 - A file-backed view reads its rows by id or scans the file's splits, as
   it decides at that first poll. A read by id, a scan of at most 42 splits
-  ([`MAX_INLINE_SPLITS`](../core/src/store/scan/file_reads.rs#L64)), and a
+  ([`MAX_INLINE_SPLITS`](../core/src/store/scan/file_reads.rs#L65)), and a
   scan first polled where no tokio runtime is current run inline on the
   polling task. Any other scan spawns its splits
-  ([`ScanDriver`](../core/src/store/scan/file_reads.rs#L40)) onto the tokio
+  ([`ScanDriver`](../core/src/store/scan/file_reads.rs#L41)) onto the tokio
   runtime it is polled in, and vortex looks that runtime up
   (`Handle::current()`) at every spawn, so every later poll of the stream
   must run inside a tokio runtime too.
