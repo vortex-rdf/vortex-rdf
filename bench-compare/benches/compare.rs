@@ -40,7 +40,7 @@ use sophia::inmem::dataset::FastDataset;
 use vortex_rdf_core::common::terms::parse_quads_from_reader;
 use vortex_rdf_core::{IndexType, LayoutStrategy, VortexRdfStore};
 
-#[path = "support/runtime.rs"]
+#[path = "../../core/benches/support/runtime.rs"]
 mod runtime;
 use runtime::rt;
 
@@ -73,7 +73,7 @@ const QUERY_WARMUP: usize = 5;
 //
 // Items the file exposes for the in-process suites (the pattern list, the
 // `#dataset` shape line and its selectivity check) have no use here.
-#[path = "support/dataset.rs"]
+#[path = "../../core/benches/support/dataset.rs"]
 #[allow(dead_code)]
 mod dataset;
 

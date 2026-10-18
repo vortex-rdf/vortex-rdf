@@ -321,7 +321,7 @@ class SuiteError(Exception):
 def load_suite(path, stage):
     """One comparative suite's results, with every key the page reads.
 
-    `core/benches/compare.rs`, `js/bench/compare.bench.ts` and
+    `bench-compare/benches/compare.rs`, `js/bench/compare.bench.ts` and
     `python/bench/run.py` each write one dashboard-shaped JSON object, with the
     keys that suite has:
       - `results`: the rows. A row for an operation a library's API does not
@@ -356,7 +356,7 @@ def main():
     parser = argparse.ArgumentParser(description="Render the benchmark dashboard (see the module docstring).")
     parser.add_argument("rust_log", type=Path, help="the Rust internals' `cargo bench` log, with its `#dataset` line")
     parser.add_argument("out", type=Path, help="the page to write")
-    parser.add_argument("--rust-compare", type=Path, help="core/benches/compare.rs's results")
+    parser.add_argument("--rust-compare", type=Path, help="bench-compare/benches/compare.rs's results")
     parser.add_argument("--js", type=Path, help="js/bench/compare.bench.ts's results")
     parser.add_argument("--python", type=Path, help="python/bench/run.py's results")
     args = parser.parse_args()

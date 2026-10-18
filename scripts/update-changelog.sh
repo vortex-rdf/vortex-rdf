@@ -9,9 +9,10 @@
 # script only rewrites [Unreleased], a preview that changes no version. A cut
 # also sets X.Y.Z everywhere a version is declared: the three version lines of
 # Cargo.toml ([workspace.package] and the two path dependencies), the workspace
-# entries of Cargo.lock and interface-tests/Cargo.lock (`cargo update -w`), and
-# js/package.json with its lock (`npm version`). Python inherits the workspace
-# version through maturin. Released sections (## [x.y.z]) are kept verbatim.
+# entries of Cargo.lock, interface-tests/Cargo.lock and bench-compare/Cargo.lock
+# (`cargo update -w`), and js/package.json with its lock (`npm version`). Python
+# inherits the workspace version through maturin. Released sections (## [x.y.z])
+# are kept verbatim.
 #
 # Cut the changelog last, once nothing else is waiting to land: a cut section
 # is frozen (the script refuses to cut the same version twice), so a commit
@@ -125,6 +126,7 @@ set_lines="$(grep -cE "^version = \"$ver\"\$|^vortex-rdf-(core|encoded-search) =
 [ "$set_lines" = 3 ] || { echo "error: set $set_lines of Cargo.toml's 3 version lines; check it by hand" >&2; exit 1; }
 cargo update -w
 cargo update -w --manifest-path interface-tests/Cargo.toml
+cargo update -w --manifest-path bench-compare/Cargo.toml
 (cd js && npm version "$ver" --no-git-tag-version --allow-same-version)
 
 write_changelog --tag "$version"

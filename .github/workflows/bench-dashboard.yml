@@ -29,10 +29,19 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-rust
+        with:
+          # The cross-library stage formats and lints bench-compare/ before it
+          # benches it.
+          components: rustfmt, clippy
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
+          # bench-compare/ is a workspace of its own, with a target directory
+          # of its own.
+          workspaces: |
+            .
+            bench-compare
           # The bench profile is this job's alone — no sibling to share with.
           shared-key: bench
           save-if: ${{ github.ref == 'refs/heads/main' }}

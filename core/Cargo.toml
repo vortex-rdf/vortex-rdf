@@ -88,9 +88,6 @@ unnameable_types = "warn"
 
 [dev-dependencies]
 divan = { workspace = true }
-oxigraph = { version = "0.5.9", default-features = false, features = ["rocksdb"] }
-sophia = "0.10"
-hdt = { version = "0.7", features = ["nt"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["time", "rt-multi-thread"] }
 
@@ -101,11 +98,6 @@ required-features = ["file-io"]
 
 [[bench]]
 name = "match_lazy"
-harness = false
-required-features = ["file-io"]
-
-[[bench]]
-name = "compare"
 harness = false
 required-features = ["file-io"]
 

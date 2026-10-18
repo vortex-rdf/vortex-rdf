@@ -499,11 +499,12 @@ class VortexVariant:
 
 
 #: Vortex build variants: the same secondary index x residency matrix as the
-#: Rust compare tab (core/benches/compare.rs), so the two tabs' Vortex rows line
-#: up one for one. The JS tab has no file residency. Every variant is a row in
-#: the cross-library panels -- Dictionary is the only layout here, because the
-#: layout axis belongs to the instrumented suite and a variant the dashboard
-#: does not list costs a whole process to measure and then discards the rows.
+#: Rust compare tab (bench-compare/benches/compare.rs), so the two tabs' Vortex
+#: rows line up one for one. The JS tab has no file residency. Every variant is
+#: a row in the cross-library panels -- Dictionary is the only layout here,
+#: because the layout axis belongs to the instrumented suite and a variant the
+#: dashboard does not list costs a whole process to measure and then discards
+#: the rows.
 VORTEX_VARIANTS = [
     VortexVariant("vortex_dict", "Vortex Dict", "dictionary", (), False),
     VortexVariant("vortex_dict_mem", "Vortex Dict (in-memory)", "dictionary", (), True),

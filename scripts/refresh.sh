@@ -8,8 +8,9 @@
 #   scripts/refresh.sh --force-build       # rebuild the bindings even if their stamps match
 #
 # Stages, in the order they run: rust (the internals targets, benchmark +
-# match_lazy), compare (the cross-library suite), js, python, render. Every
-# output lands in target/bench/: the suites' results (rust.txt,
+# match_lazy), compare (the cross-library suite: bench-compare/, a workspace of
+# its own that this script formats, lints and benches), js, python, render.
+# Every output lands in target/bench/: the suites' results (rust.txt,
 # rust-compare.json, js.json, python.json) and the page, public/index.html.
 #
 # Measurement stages run strictly sequentially on purpose: parallel stages
@@ -103,7 +104,12 @@ fi
 
 if has compare; then
   stage "Rust cross-library (compare → $OUT/rust-compare.json)"
-  cargo bench --bench compare
+  # bench-compare/ is a workspace of its own, so oxigraph's RocksDB and the
+  # other libraries under comparison build here only: lint it where it is
+  # built, then bench it.
+  cargo fmt --manifest-path bench-compare/Cargo.toml --check
+  cargo clippy --manifest-path bench-compare/Cargo.toml --all-targets --locked -- -D warnings
+  cargo bench --manifest-path bench-compare/Cargo.toml
 fi
 
 if has js; then

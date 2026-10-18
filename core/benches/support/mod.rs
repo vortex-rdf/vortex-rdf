@@ -19,7 +19,7 @@ use vortex_rdf_core::{
 };
 
 // The dataset shape — moduli, term spellings, probe patterns — lives on its own
-// so `compare.rs` can include just that file (`#[path = "support/dataset.rs"]`)
+// so `bench-compare/benches/compare.rs` can include just that file by `#[path]`
 // without the store-building machinery it has no use for.
 pub mod dataset;
 pub use dataset::{PATTERNS, Pattern, terms_for};

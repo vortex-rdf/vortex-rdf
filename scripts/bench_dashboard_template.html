@@ -1190,7 +1190,7 @@ function renderRust(){
   renderRustCompare();
 }
 
-// ---- Rust tab: cross-library comparison (core/benches/compare.rs) ----
+// ---- Rust tab: cross-library comparison (bench-compare/benches/compare.rs) ----
 // Deliberately the same panel shapes as the Python tab's comparison: the two
 // measure the same file at the same scale, so a reader moving between the tabs
 // should not also have to re-learn the layout.
@@ -1215,7 +1215,7 @@ function renderRustCompare(){
     // The comparative suite is a separate, slower target than the instrumented
     // one; a Rust tab rendered without it should say so rather than show a gap.
     host.innerHTML = '<p class="note">No cross-library results in this run — ' +
-      'produce them with <span class="mono">cargo bench --bench compare</span>.</p>';
+      'produce them with <span class="mono">cargo bench --manifest-path bench-compare/Cargo.toml</span>.</p>';
     return;
   }
   const rcById = new Map(RC_DATA.map(d => [byKey(d), d]));

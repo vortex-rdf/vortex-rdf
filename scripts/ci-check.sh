@@ -95,6 +95,9 @@ job_docs() {
 
 job_lint() {
   run cargo fmt --check
+  # Proves bench-compare's lock still resolves against core's dependencies; builds nothing.
+  info "cargo metadata --locked --manifest-path bench-compare/Cargo.toml --format-version 1"
+  cargo metadata --locked --manifest-path bench-compare/Cargo.toml --format-version 1 > /dev/null
   run cargo clippy --workspace --all-targets -- -D warnings
   # Core's other build configuration: the wasm bindings take it without
   # `file-io`, a dead-code surface of its own (items only reachable through
