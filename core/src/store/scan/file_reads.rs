@@ -815,9 +815,10 @@ impl ExactRead {
         selection: &RowSelection,
         deleted: Option<&Mask>,
     ) -> Result<Self> {
+        let row_count = file.row_count() as usize;
         let pointable = filter.is_none_or(|f| eq_code_pairs(f).is_some())
             && columns.iter().all(|c| file.column_chunks(c).is_some());
-        if pointable && let Some(rows) = selection.point_sized_live_rows(deleted) {
+        if pointable && let Some(rows) = selection.point_sized_live_rows(deleted, row_count) {
             return Ok(ExactRead::Points(rows));
         }
         let RowSelection::Ids(ids) = selection else {
@@ -825,12 +826,8 @@ impl ExactRead {
         };
         let splits = file.splits()?;
         let footprint = Footprint::of(ids, &splits);
-        let live = || -> Vec<RowId> {
-            ids.iter()
-                .copied()
-                .filter(|&id| deleted.is_none_or(|d| !d.value(id as usize)))
-                .collect()
-        };
+        let live =
+            || selection.filter_rows(row_count, move |id| deleted.is_none_or(|d| !d.value(id)));
         if pointable && footprint.few_per_split(POINT_IDS_PER_SPLIT) {
             return Ok(ExactRead::Points(live()));
         }

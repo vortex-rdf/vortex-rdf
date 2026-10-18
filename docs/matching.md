@@ -259,7 +259,7 @@ Each stage in the code, and where the details are below:
 |---|---|---|
 | Prelude | [`matching.rs:205-241`](../core/src/store/query/matching.rs#L205-L241 "InMemory is the only variant") | — |
 | 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching.rs#L362), [`search_sorted_bounds`](../core/src/store/array.rs#L178) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`matching.rs:245-306`](../core/src/store/query/matching.rs#L245-L306 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L616), [`fold_row_ids`](../core/src/store/query/matching.rs#L832) | [§6.2](#62-secondary-index-routing) |
+| 2 · secondary-index routing | [`matching.rs:245-306`](../core/src/store/query/matching.rs#L245-L306 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L647), [`fold_row_ids`](../core/src/store/query/matching.rs#L832) | [§6.2](#62-secondary-index-routing) |
 | 3 · residual column filtering | [`matching.rs:308-328`](../core/src/store/query/matching.rs#L308-L328 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching.rs#L452), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L250), [`mask_for`](../core/src/store/query/matching.rs#L778) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`matching.rs:330-337`](../core/src/store/query/matching.rs#L330-L337 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
@@ -524,7 +524,7 @@ Each stage in the code, and where the details are below:
 |---|---|---|
 | Prelude | [`matching.rs:513-521`](../core/src/store/query/matching.rs#L513-L521 "QuadsSource::File") | — |
 | 1 · subject chunk probe and prefix | [`matching.rs:522-531`](../core/src/store/query/matching.rs#L522-L531 "A bound subject on a sorted file"), [`locate_subject`](../core/src/store/query/matching.rs#L715), [`locate_subject_run`](../core/src/store/scan/file_reads.rs#L372), [`narrow_subject_run`](../core/src/store/scan/file_reads.rs#L401) | [§7.1](#71-subject-chunk-probe) |
-| 2 · secondary-index routing | [`matching.rs:532-548`](../core/src/store/query/matching.rs#L532-L548 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L643) | [§8](#8-the-index-resolvers) |
+| 2 · secondary-index routing | [`matching.rs:532-548`](../core/src/store/query/matching.rs#L532-L548 "With the subject already resolved"), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L674) | [§8](#8-the-index-resolvers) |
 | 3 · pushed-down filter | [`matching.rs:561-634`](../core/src/store/query/matching.rs#L561-L634 "match resolution"), [`build_file_filter`](../core/src/store/scan/file_reads.rs#L344) | [§7.3](#73-what-ends-up-on-the-view) |
 | 4 · selection and serve plan | [`matching.rs:554-555`](../core/src/store/query/matching.rs#L554-L555 "keep_serve"), [`fold_row_ids`](../core/src/store/query/matching.rs#L832) and [`matching.rs:643-658`](../core/src/store/query/matching.rs#L643-L658 "match resolved_selection"), [`prune_by_filter`](../core/src/store/query/matching.rs#L744), [`row_range_from_pruning`](../core/src/store/scan/file_filter.rs#L356) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 | 5 · filter at sparse ids | [`matching.rs:660-675`](../core/src/store/query/matching.rs#L660-L675 "Exact ids sparse in their splits"), [`point_filter_ids`](../core/src/store/scan/file_reads.rs#L648) | [§7.3](#73-what-ends-up-on-the-view) |
@@ -772,7 +772,7 @@ second sorted copy of every quad.
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_reads.rs#L937) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/file.rs#L509)); unlocated: the pushed-down projected+filtered scan of the index child |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_reads.rs#L934) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/file.rs#L515)); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
 | Dropped when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
 | Tombstones | applied through the plan's `rid` column | applied through the plan's `rid` column |
@@ -919,8 +919,8 @@ The match's decisions show up here
 |---|---|---|
 | `quads()` / `quads_vec()` | decode the plan's run (in memory: slice or point reads; file: point reads ≤ 256 rows, else a range scan of the located run (`located_run_scan`); a projected+filtered scan of the child only when the run was not located) — the pending ids are never touched | gather the selection from the primaries; on file, read it by id or scan it as `ExactRead` chooses (below) |
 | `shared_quads_vec()` / `shared_quad_chunks()` | as `quads()`, through the plan's shared-term decode twins — one `Arc<str>` per distinct term of a chunk, handed to every row repeating it | the same gather or restricted scan, decoded to shared terms |
-| `size()` | in memory a lazy component run knows its width without decoding; on file a located plan's run width answers outright when no filter or tombstones apply, otherwise the ids materialize (then filter masks are counted if a filter is pending) | selection length — a located reference run held for a count answers with its width — or `count_matching_rows` over the filter |
-| `code_columns()` / `code_columns_gathered()` | read the four `u64` code columns straight off the index's own columns: in memory a run of at most 256 rows through its probes, on file a run whose ids are still deferred through the plan's scan ([`code_columns`](../core/src/store/indexes/file.rs#L533)) | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views), on file read by id or scanned as `ExactRead` chooses |
+| `size()` | in memory a lazy component run knows its width without decoding; on file a located run's width answers outright when no filter or tombstones apply, otherwise the ids materialize (then filter masks are counted if a filter is pending) | selection length — a located reference run held for a count answers with its width — or `count_matching_rows` over the filter |
+| `code_columns()` / `code_columns_gathered()` | read the four `u64` code columns straight off the index's own columns: in memory a run of at most 256 rows through its probes, on file a run whose ids are still deferred through the plan's scan ([`code_columns`](../core/src/store/indexes/file.rs#L539)) | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views), on file read by id or scanned as `ExactRead` chooses |
 | `raw_quad_chunks()` | plan deliberately ignored (it reorders rows): the pending ids materialize and the rows are read as without one | as `quads()`, in base row order: gathered in memory; on file read by id or scanned as `ExactRead` chooses |
 
 An exact file selection is read the cheapest way
@@ -974,7 +974,7 @@ file run) and a rid-only scan of the index child otherwise.
 | Constant | Value | Defined in | Meaning |
 |---|---|---|---|
 | `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/query/matching.rs#L855) | an already-narrowed view below this skips index routing |
-| `POINT_GATHER_MAX_ROWS` | 256 | [`selection.rs`](../core/src/store/view/selection.rs#L549) | runs/selections at or below this are read point-by-point through cached probes (`gather_by_point_reads`, the located-run reads) |
+| `POINT_GATHER_MAX_ROWS` | 256 | [`selection.rs`](../core/src/store/view/selection.rs#L566) | runs/selections at or below this are read point-by-point through cached probes (`gather_by_point_reads`, the located-run reads) |
 | `POINT_READ_ROWS` | 256 | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L640) | exact file row ids at most one per this many rows of the splits holding them check a pending filter by point reads — a point read costs about what a filtered scan spends on this many rows |
 | `POINT_IDS_PER_SPLIT` | 16 | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L792) | exact file ids at most this many per split they touch are point-read — a take through the chunk probes pays a fixed cost per leaf |
 | `TAKE_ROWS` | 16 | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L676) | exact file ids at most one per this many rows of their splits are taken rather than scanned |

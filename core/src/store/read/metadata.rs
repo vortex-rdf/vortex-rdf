@@ -26,8 +26,9 @@ pub enum SortOrder {
 }
 
 /// How many rows a view holds: exactly, or at most while a pushed-down file
-/// filter has rows still to test or the row ids of a file view's index run
-/// are unread.
+/// filter has rows still to test, or while a file view's index run has row
+/// ids unread that its width cannot count (the run is not located, or
+/// tombstones are to be counted out).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowCountHint {
     /// The row count, when it is known without reading.
@@ -140,21 +141,25 @@ impl VortexRdfStore {
 
     /// What this view promises about its rows before they are read (see
     /// [`ViewStatistics`]), without I/O: a count that would need a scan is a
-    /// bound, a code range that would need a read is `None`. To count an
-    /// in-memory served run's live rows under tombstones, it decodes the
-    /// run's row ids; that decode is the one way it fails.
+    /// bound, a code range that would need a read is `None`. It is not a pure
+    /// read in one case: to count an in-memory pending run's live rows under
+    /// tombstones, it decodes the run's row ids, which stay cached on the run
+    /// for the view and every clone of it; that decode is the one way it
+    /// fails.
     pub fn view_statistics(&self) -> Result<ViewStatistics> {
         let tail_rows = self.tail_size();
         let filtered = self.quads.has_filter();
-        // The base count without reading: an exact selection's live rows, a
-        // run's width (its live rows under tombstones only in memory, where
-        // its ids are read).
+        let (selection, base_len) = (self.quads.view_selection(), self.quads.base_len());
+        // The base's live rows when known without I/O; else at most the
+        // selection's rows before tombstones (a pending run's width), or the
+        // base's.
         let live = self.quads.live_len_if_known()?;
+        let bound = selection.len_if_known(None, base_len)?.unwrap_or(base_len);
         Ok(ViewStatistics {
-            rows: row_count_hint(live, filtered, self.quads.base_len(), tail_rows),
+            rows: row_count_hint(live, filtered, bound, tail_rows),
             sort_order: (self.quads.subject_sorted() && tail_rows == 0).then_some(SortOrder::Spog),
             code_bounds: self.code_bounds(),
-            selection: selection_kind(self.quads.view_selection()),
+            selection: selection_kind(selection),
             served_component: self.quads.served_component(),
             pending_filter: filtered,
             tombstones: self.quads.deleted().map_or(0, Mask::true_count),
@@ -289,18 +294,18 @@ impl VortexRdfStore {
 }
 
 /// The count of a view whose base selection covers `live` rows, when that
-/// is known, out of `base_len`, with a filter still to test them when
+/// is known, and at most `bound`, with a filter still to test them when
 /// `filtered`, and `tail_rows` tail rows after them.
 fn row_count_hint(
     live: Option<usize>,
     filtered: bool,
-    base_len: usize,
+    bound: usize,
     tail_rows: usize,
 ) -> RowCountHint {
     match (live, filtered) {
         (Some(live), false) => RowCountHint::exact(live + tail_rows),
         (Some(live), true) => RowCountHint::at_most(live + tail_rows),
-        (None, _) => RowCountHint::at_most(base_len + tail_rows),
+        (None, _) => RowCountHint::at_most(bound + tail_rows),
     }
 }
 

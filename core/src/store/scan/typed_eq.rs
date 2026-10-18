@@ -275,31 +275,10 @@ pub(crate) fn typed_residual_ids(
     if cols.iter().any(|c| matches!(c, TypedEq::CodeProbe(..))) && wide {
         return None;
     }
-    fn collect_ids(
-        selection: &RowSelection,
-        base_len: usize,
-        matches_row: impl Fn(usize) -> bool,
-    ) -> Vec<u64> {
-        match selection {
-            RowSelection::All => (0..base_len as u64)
-                .filter(|&i| matches_row(i as usize))
-                .collect(),
-            RowSelection::Range(r) => (r.start..r.end)
-                .filter(|&i| matches_row(i as usize))
-                .collect(),
-            RowSelection::Ids(ids) => ids
-                .iter()
-                .copied()
-                .filter(|&i| matches_row(i as usize))
-                .collect(),
-        }
-    }
     let ids: Vec<u64> = if let Some(codes) = TypedEq::code_views(&cols) {
-        collect_ids(selection, base_len, |i| {
-            codes.iter().all(|(s, c)| s[i] == *c)
-        })
+        selection.filter_rows(base_len, |i| codes.iter().all(|(s, c)| s[i] == *c))
     } else {
-        collect_ids(selection, base_len, |i| cols.iter().all(|c| c.matches(i)))
+        selection.filter_rows(base_len, |i| cols.iter().all(|c| c.matches(i)))
     };
     Some(vortex_buffer::Buffer::from_iter(ids))
 }

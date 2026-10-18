@@ -305,9 +305,11 @@ async fn test_view_statistics_in_memory() {
 }
 
 /// On file a count is exact unless a pushed-down filter has rows still to
-/// test, when the selection's live rows bound it; a pushed-down equality
-/// bounds its column by its code, and a served match names the index child
-/// serving it. Every open of a file describes its views as the file's own.
+/// test, when the selection's live rows bound it, or the base has tombstones
+/// and a pending run's ids are unread, when the run's width bounds it; a
+/// pushed-down equality bounds its column by its code, and a served match
+/// names the index child serving it. Every open of a file describes its views
+/// as the file's own.
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_view_statistics_file_backed() {
@@ -389,7 +391,8 @@ async fn test_view_statistics_file_backed() {
     );
 
     // Indexed, the match is served and its count exact.
-    let by_p = open("file/copy/mapped")
+    let copy = open("file/copy/mapped");
+    let by_p = copy
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
@@ -398,6 +401,29 @@ async fn test_view_statistics_file_backed() {
     assert_eq!(stats.served_component, Some("index:posg"));
     assert_eq!(stats.rows, RowCountHint::exact(by_p.size().await.unwrap()));
     assert!(!stats.pending_filter);
+    // A bound graph rides the served run as a filter: the run's 600 rows
+    // bound the count.
+    let g1 = GraphName::NamedNode(NamedNode::new("http://example.org/g1").unwrap());
+    let by_pg = copy
+        .match_pattern(None, Some(&p1), None, Some(&g1))
+        .await
+        .unwrap();
+    let stats = by_pg.view_statistics().unwrap();
+    assert_eq!(stats.served_component, Some("index:posg"));
+    assert!(stats.pending_filter);
+    assert_eq!(stats.rows, RowCountHint::at_most(600));
+    assert_eq!(by_pg.size().await.unwrap(), 200);
+    // A tombstone in the served run: the run's width bounds its live rows
+    // until its ids are read, which counts them.
+    let deleted = copy.delete_quad(&quads[1]).await.unwrap();
+    let by_p = deleted
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    let rows = |view: &VortexRdfStore| view.view_statistics().unwrap().rows;
+    assert_eq!(rows(&by_p), RowCountHint::at_most(600));
+    assert_eq!(by_p.size().await.unwrap(), 599);
+    assert_eq!(rows(&by_p), RowCountHint::exact(599));
 }
 
 /// The children each index set holds, in the order a build emits them.

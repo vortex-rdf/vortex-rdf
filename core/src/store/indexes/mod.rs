@@ -442,11 +442,17 @@ enum LazyRowIdSource {
     /// ([`scan_index_row_ids`]) the eager path would have run at match time.
     /// The child binds through its file's memo under its own name, so the
     /// deferred scan binds with the same identity every plan and eager scan
-    /// of this component uses (see `BoundExprMemo`).
+    /// of this component uses (see `BoundExprMemo`). `located` is the run of
+    /// child rows the constraints select, when the resolver located it:
+    /// exactly the rows the scan keeps, so its width is the ids' count. It
+    /// answers [`len_if_known`](LazyRowIds::len_if_known) and nothing else —
+    /// a serving child's rids follow its own sort order, so no window of the
+    /// run is a window of its ids.
     #[cfg(feature = "file-io")]
     IndexChild {
         child: ChildReader,
         constraints: Vec<(&'static str, Scalar)>,
+        located: Option<Range<u64>>,
     },
     /// File-backed: a located run of an index child's rid column — read on
     /// first need through [`read_located_rids`]; its width is known up front,
@@ -478,15 +484,22 @@ impl LazyRowIds {
         }
     }
 
-    /// Lazy ids scanned from a file's index child on first need.
+    /// Lazy ids scanned from a file's index child on first need, counted by
+    /// `located`, the constraints' run of child rows when the resolver
+    /// located it.
     #[cfg(feature = "file-io")]
     pub(crate) fn from_index_child_scan(
         child: ChildReader,
         constraints: Vec<(&'static str, Scalar)>,
+        located: Option<Range<u64>>,
     ) -> Self {
         Self {
             cell: Arc::new(OnceLock::new()),
-            source: LazyRowIdSource::IndexChild { child, constraints },
+            source: LazyRowIdSource::IndexChild {
+                child,
+                constraints,
+                located,
+            },
         }
     }
 
@@ -557,15 +570,33 @@ impl LazyRowIds {
 
     /// How many rows the ids cover, when knowable without computing them: an
     /// in-memory run knows its width up front (so a count on a served match
-    /// never decodes), and so does a located file run; any other file child
-    /// only after materialization.
+    /// never decodes), and so does a located file run, whether its ids come
+    /// from the run itself or from the child scan it bounds; an unlocated
+    /// child scan only once its ids are read.
     pub(crate) fn len_if_known(&self) -> Option<usize> {
         match &self.source {
             LazyRowIdSource::Component { rids, .. } => Some(rids.len()),
             #[cfg(feature = "file-io")]
-            LazyRowIdSource::IndexChild { .. } => self.cell.get().map(Buffer::len),
+            LazyRowIdSource::IndexChild { located, .. } => self
+                .cell
+                .get()
+                .map(Buffer::len)
+                .or_else(|| located.as_ref().map(|run| (run.end - run.start) as usize)),
             #[cfg(feature = "file-io")]
             LazyRowIdSource::LocatedRun { range, .. } => Some((range.end - range.start) as usize),
+        }
+    }
+
+    /// The ids, when they take no I/O: an in-memory run's, computed (and
+    /// cached) here as [`materialized`](Self::materialized) does, or a file
+    /// child's once read. `None` for a file child's ids not read yet.
+    pub(crate) fn ids_without_io(&self) -> Result<Option<Buffer<RowId>>> {
+        match &self.source {
+            LazyRowIdSource::Component { .. } => self.materialized().map(Some),
+            #[cfg(feature = "file-io")]
+            LazyRowIdSource::IndexChild { .. } | LazyRowIdSource::LocatedRun { .. } => {
+                Ok(self.cell.get().cloned())
+            }
         }
     }
 
@@ -578,9 +609,9 @@ impl LazyRowIds {
         }
         let ids = match &self.source {
             LazyRowIdSource::Component { rids, .. } => sorted_row_ids(rids.clone())?,
-            LazyRowIdSource::IndexChild { child, constraints } => {
-                scan_index_row_ids(child, constraints).await?
-            }
+            LazyRowIdSource::IndexChild {
+                child, constraints, ..
+            } => scan_index_row_ids(child, constraints).await?,
             LazyRowIdSource::LocatedRun { file, child, range } => {
                 read_located_rids(file, child, range.clone()).await?
             }

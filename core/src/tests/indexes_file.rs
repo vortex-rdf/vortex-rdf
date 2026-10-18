@@ -628,10 +628,11 @@ async fn test_reference_index_file_typed_object() {
 /// object-only, nothing residual) is the run's width: no row id is read — on
 /// file the located-rid-read hook stays at 0. `limit` caps it; a window reads
 /// only the rows it takes, in base order; a residual or tombstones send the
-/// count through the ids.
+/// count through the ids, and under a tombstone a file view's statistics
+/// bound it by the run's width until they are read.
 #[tokio::test]
 async fn test_reference_index_counts_located_runs_from_width() {
-    use crate::store::{IdsNeed, Probe};
+    use crate::store::{IdsNeed, Probe, RowCountHint};
     let quads = graph_modular_quads(900, 4, 3, 7, &[GraphName::DefaultGraph]);
     let (_dir, path) = write_store_file(
         quads.clone(),
@@ -718,6 +719,21 @@ async fn test_reference_index_counts_located_runs_from_width() {
         );
         let deleted = store.delete_quad(&quads[1]).await.unwrap();
         assert_eq!(deleted.count_many(&[by_p]).await.unwrap(), vec![299]);
+        // The counted run under the tombstone: on file its width bounds its
+        // rows until its ids are read; in memory they decode to count them.
+        let counted = deleted
+            .match_pattern_for(None, Some(&p1), None, None, IdsNeed::CountOrWindow)
+            .await
+            .unwrap();
+        let rows = |view: &VortexRdfStore| view.view_statistics().unwrap().rows;
+        let unread = if on_file {
+            RowCountHint::at_most(300)
+        } else {
+            RowCountHint::exact(299)
+        };
+        assert_eq!(rows(&counted), unread);
+        assert_eq!(counted.size().await.unwrap(), 299);
+        assert_eq!(rows(&counted), RowCountHint::exact(299));
     }
 }
 

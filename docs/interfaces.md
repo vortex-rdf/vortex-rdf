@@ -18,10 +18,10 @@ is the path such an engine takes.
 | A table of quads to scan with projection, filter and limit pushdown | [`data_source`](../core/src/store/read/data_source.rs#L100) on any view, registered with vortex's `VortexTable` |
 | The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L125) |
 | Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L50), [`code_chunks`](../core/src/store/read/chunks.rs#L74) |
-| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L146), [`index_components`](../core/src/store/read/metadata.rs#L221), [`partitions`](../core/src/store/read/metadata.rs#L260) |
+| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L149), [`index_components`](../core/src/store/read/metadata.rs#L226), [`partitions`](../core/src/store/read/metadata.rs#L265) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L273) (from [`dict_reader`](../core/src/store/mod.rs#L223)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
-| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L137), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L299) |
+| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L138), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L299) |
 | The session to hand vortex's integrations | [`vortex_session`](../core/src/lib.rs#L81), with [`vortex_scan`](../core/src/lib.rs#L74) re-exported |
 
 ---
@@ -209,7 +209,7 @@ is the one way it fails.
 
 | Field | Meaning |
 |---|---|
-| `rows: RowCountHint` | `exact` when the count is known without reading: every in-memory view, and every file view without a pending filter except one whose index run is unread and of unknown width or under tombstones. Otherwise `upper_bound` only: the rows a pending filter has yet to test, or the base's rows. The tail's live rows count in both. |
+| `rows: RowCountHint` | `exact` when the count is known without reading: every in-memory view, and every file view without a pending filter except one whose index run is unread and of unknown width or under tombstones. Otherwise `upper_bound` only: the rows a pending filter has yet to test, or an unread index run's width, or the base's rows when that width is unknown. The tail's live rows count in both. |
 | `sort_order` | `Some(Spog)` when the base is globally sorted (every base this crate writes) and the view reads no tail row — the order `row_chunks`, `code_chunks` and the data source produce, whatever answered the match. A view that reads tail rows has none: they follow the base in append order. |
 | `code_bounds[4]` | Per column, the inclusive `TermCode` range the view's base rows lie in when it is free to know: a subject run's first and last code (in memory, over a tombstone-free contiguous run of a sorted base); the single code of each column a pending file filter binds by equality. |
 | `selection` | `All`, one `Range`, explicit `Ids`, or a `PendingIndexRun` an index resolved but never materialized. |

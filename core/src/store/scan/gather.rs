@@ -56,7 +56,7 @@ pub(crate) fn gather_by_point_reads(
     deleted: Option<&Mask>,
     probes: Option<&StructProbes>,
 ) -> Result<Option<ArrayRef>> {
-    let Some(live) = selection.point_sized_live_rows(deleted) else {
+    let Some(live) = selection.point_sized_live_rows(deleted, base.len()) else {
         return Ok(None);
     };
     let live: Vec<usize> = live.into_iter().map(|i| i as usize).collect();

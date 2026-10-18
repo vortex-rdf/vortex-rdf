@@ -446,12 +446,7 @@ impl VortexRdfStore {
         };
         let ids: Vec<u64> = match reader {
             Some(reader) => {
-                let admit = |row: u64| test.admits(reader.code_at(row as usize));
-                match selection {
-                    RowSelection::All => (0..base.len() as u64).filter(|&r| admit(r)).collect(),
-                    RowSelection::Range(r) => (r.start..r.end).filter(|&r| admit(r)).collect(),
-                    RowSelection::Ids(ids) => ids.iter().copied().filter(|&r| admit(r)).collect(),
-                }
+                selection.filter_rows(base.len(), |row| test.admits(reader.code_at(row)))
             }
             None => {
                 // The selected rows only, decoded once.

@@ -202,10 +202,10 @@ async fn resolve_eager_from_scan(
 /// located empty run proves the pattern matches nothing. What answers the
 /// row ids then depends on the probe:
 /// - A serving probe's ids are deferred to a rid-only scan filtered by its
-///   keys — except a small located run's, which rid point reads resolve now,
-///   a handful of cached-chunk accesses — and a [`FileServePlan`] reads the
-///   matched quads from the child: the located run, or the rows its keys and
-///   residual terms filter.
+///   keys, which a located run's width counts — except a small located run's,
+///   which rid point reads resolve now, a handful of cached-chunk accesses —
+///   and a [`FileServePlan`] reads the matched quads from the child: the
+///   located run, or the rows its keys and residual terms filter.
 /// - A non-serving probe whose rids ascend keeps a located run's ids deferred
 ///   ([`LazyRowIds::from_located_run`]), so that a count takes the run's
 ///   width and a window reads only its own rows.
@@ -264,9 +264,15 @@ pub(super) async fn resolve_file(
         }
         _ => None,
     };
+    // A located run is exactly the keys' rows, so its width counts the
+    // deferred ids whatever residual terms the plan filters on.
     let row_ids = match point_read {
         Some(ids) => ResolvedRowIds::Eager(ids),
-        None => ResolvedRowIds::Lazy(LazyRowIds::from_index_child_scan(child.clone(), keys)),
+        None => ResolvedRowIds::Lazy(LazyRowIds::from_index_child_scan(
+            child.clone(),
+            keys,
+            located.clone(),
+        )),
     };
     // A located range is exactly the constrained rows only when the location
     // covered every constraint: it searched the keys, so a residual term —

@@ -6,7 +6,6 @@
 use crate::error::Result;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_filter;
-use crate::store::view::selection::ViewSelection;
 use crate::store::{QuadsSource, Tail, VortexRdfStore};
 
 impl VortexRdfStore {
@@ -28,10 +27,10 @@ impl VortexRdfStore {
     /// ([`live_len_if_known`](QuadsSource::live_len_if_known)), unless a
     /// file filter is pending, whose selectivity is unknown. Otherwise a
     /// count needs the selection itself, so a deferred resolution's ids (a
-    /// served match's index-child scan, a located run's rids under
-    /// tombstones) are computed here, once, and cached on the view; a pending
-    /// filter is then evaluated over the selected rows (the tombstoned ones
-    /// excluded before counting).
+    /// served match's index-child scan, a file run's ids under tombstones)
+    /// are computed here, once, and cached on the view; a pending filter is
+    /// then evaluated over the selected rows (the tombstoned ones excluded
+    /// before counting).
     pub(crate) async fn base_size(&self) -> Result<usize> {
         if !self.quads.has_filter()
             && let Some(live) = self.quads.live_len_if_known()?
@@ -103,44 +102,17 @@ impl VortexRdfStore {
 
 impl QuadsSource {
     /// The live base rows the selection covers, when that is known without
-    /// I/O ([`ViewSelection::len_if_known`]): an exact selection less its
-    /// tombstones, or a pending run's width while nothing is tombstoned — a
-    /// served match's or a located run held for a count. On file a located
-    /// serve plan also knows the width of the child run it serves (exactly
-    /// the constrained rows) when the selection's own ids are unread. In
-    /// memory a pending run under tombstones reads its ids to count them out
-    /// — the one way this fails. `None` for a file run under tombstones
-    /// (they are defined over primary row ids neither the run nor the plan
-    /// holds), or one that is not located. A pushed-down filter is not
-    /// applied: the count is then a bound on the view's rows.
+    /// I/O ([`ViewSelection::len_if_known`]), whichever backend holds them:
+    /// an exact selection less its tombstones, a pending run's width while
+    /// nothing is tombstoned — a served match's or a located run held for a
+    /// count — and under tombstones a run's ids that take no I/O (an
+    /// in-memory run's, decoded here, the one way this fails; a file run's
+    /// once read). A pushed-down filter is not applied: the count is then a
+    /// bound on the view's rows.
+    ///
+    /// [`ViewSelection::len_if_known`]: crate::store::view::selection::ViewSelection::len_if_known
     pub(crate) fn live_len_if_known(&self) -> Result<Option<usize>> {
-        let base_len = self.base_len();
-        Ok(match self {
-            QuadsSource::InMemory {
-                selection, deleted, ..
-            } => match (selection, deleted) {
-                // A run's live rows under tombstones: its ids, read in memory.
-                (ViewSelection::Pending(_), Some(deleted)) => {
-                    Some(selection.materialized()?.live_len(Some(deleted), base_len))
-                }
-                _ => selection.len_if_known(deleted.as_ref(), base_len),
-            },
-            #[cfg(feature = "file-io")]
-            QuadsSource::File {
-                selection,
-                deleted,
-                serve,
-                ..
-            } => selection
-                .len_if_known(deleted.as_ref(), base_len)
-                .or_else(|| match (selection, deleted, serve) {
-                    (ViewSelection::Pending(_), None, Some(plan)) => {
-                        plan.row_range().map(|range| {
-                            usize::try_from(range.end - range.start).unwrap_or(usize::MAX)
-                        })
-                    }
-                    _ => None,
-                }),
-        })
+        self.view_selection()
+            .len_if_known(self.deleted(), self.base_len())
     }
 }

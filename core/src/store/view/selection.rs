@@ -91,16 +91,24 @@ impl ViewSelection {
     }
 
     /// The live rows this selection covers out of `base_len`, when known
-    /// without reading: an exact selection's rows less the `deleted`
-    /// tombstones, or a pending run's width while nothing is tombstoned
-    /// ([`LazyRowIds::len_if_known`]).
-    pub(crate) fn len_if_known(&self, deleted: Option<&Mask>, base_len: usize) -> Option<usize> {
-        match self {
-            ViewSelection::Exact(selection) => Some(selection.live_len(deleted, base_len)),
-            ViewSelection::Pending(lazy) => {
-                deleted.is_none().then(|| lazy.len_if_known()).flatten()
-            }
-        }
+    /// without I/O: an exact selection's rows less the `deleted` tombstones; a
+    /// pending run's width while nothing is tombstoned
+    /// ([`LazyRowIds::len_if_known`]), and under tombstones its ids less them
+    /// when they take no I/O ([`LazyRowIds::ids_without_io`]) — an in-memory
+    /// run's are decoded and cached here, the one way this fails. Passed no
+    /// tombstones, it counts the selection's rows, which bound its live ones.
+    pub(crate) fn len_if_known(
+        &self,
+        deleted: Option<&Mask>,
+        base_len: usize,
+    ) -> Result<Option<usize>> {
+        Ok(match (self, deleted) {
+            (ViewSelection::Exact(selection), _) => Some(selection.live_len(deleted, base_len)),
+            (ViewSelection::Pending(lazy), None) => lazy.len_if_known(),
+            (ViewSelection::Pending(lazy), Some(deleted)) => lazy
+                .ids_without_io()?
+                .map(|ids| RowSelection::Ids(ids).live_len(Some(deleted), base_len)),
+        })
     }
 
     /// The already-exact selection, for consumers that structurally cannot
@@ -325,19 +333,28 @@ impl RowSelection {
         }
     }
 
-    /// The live base row ids of a point-sized selection, ascending, with the
-    /// `deleted` tombstones dropped; `None` when the selection is not
-    /// point-sized.
-    pub(crate) fn point_sized_live_rows(&self, deleted: Option<&Mask>) -> Option<Vec<u64>> {
-        if !self.is_point_sized() {
-            return None;
+    /// The base row ids this selection covers out of `base_len` that `keep`
+    /// admits, ascending: one loop per variant, each compiled for the
+    /// caller's own `keep`.
+    #[inline]
+    pub(crate) fn filter_rows(&self, base_len: usize, keep: impl Fn(usize) -> bool) -> Vec<u64> {
+        match self {
+            RowSelection::All => (0..base_len as u64).filter(|&i| keep(i as usize)).collect(),
+            RowSelection::Range(range) => range.clone().filter(|&i| keep(i as usize)).collect(),
+            RowSelection::Ids(ids) => ids.iter().copied().filter(|&i| keep(i as usize)).collect(),
         }
-        let live = |id: &u64| deleted.is_none_or(|d| !d.value(*id as usize));
-        Some(match self {
-            RowSelection::All => unreachable!("`All` is never point-sized"),
-            RowSelection::Range(range) => range.clone().filter(live).collect(),
-            RowSelection::Ids(ids) => ids.iter().copied().filter(live).collect(),
-        })
+    }
+
+    /// The live base row ids of a point-sized selection out of `base_len`,
+    /// ascending, with the `deleted` tombstones dropped; `None` when the
+    /// selection is not point-sized.
+    pub(crate) fn point_sized_live_rows(
+        &self,
+        deleted: Option<&Mask>,
+        base_len: usize,
+    ) -> Option<Vec<u64>> {
+        self.is_point_sized()
+            .then(|| self.filter_rows(base_len, move |id| deleted.is_none_or(|d| !d.value(id))))
     }
 
     /// This selection as a mask over the whole base — one bit per base row.
