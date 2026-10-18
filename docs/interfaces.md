@@ -333,9 +333,9 @@ is the starting point: run it with
 `cargo run --manifest-path interface-tests/Cargo.toml --example datafusion_table`.
 
 The crate is a workspace of its own, so the DataFusion dependency tree
-stays out of `cargo test --workspace`. CI runs it in the `interface-tests`
-job, `--locked` against the crate's own `Cargo.lock`, and
-`scripts/ci-check.sh` mirrors that job.
+stays out of `cargo test --workspace`. The `interface-tests` job of
+`scripts/ci-check.sh`, which CI and the pre-push hook run, checks it
+`--locked` against the crate's own `Cargo.lock`.
 
 ## 9. Source map
 

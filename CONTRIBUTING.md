@@ -2,41 +2,30 @@
 
 ## Git hooks and the local CI mirror
 
-Run `./scripts/install-git-hooks.sh` once per clone to enable the git hooks. The
-`pre-push` hook mirrors the `lint`, `rust-tests`, `interface-tests`,
-`python-tests` and `js-tests` jobs in
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) — `cargo fmt --check`,
-both `cargo clippy` runs (the workspace natively, and the wasm bindings with
-`--target wasm32-unknown-unknown`), `cargo test --workspace`, the
-`interface-tests/` crate's fmt check, clippy and tests (`--locked`),
-`uv sync --locked && uv run pytest tests -q` in `python/`, and the wasm-pack
-build + `npm run typecheck` + `npm test` in `js/`. You can also run it manually
-with `./scripts/ci-check.sh`. Skip it for one push with `git push --no-verify`.
+Run `./scripts/install-git-hooks.sh` once per clone to enable the git hooks.
+[`scripts/ci-check.sh`](scripts/ci-check.sh) holds the commands of every CI
+job, one function per job, and the workflows
+([`ci.yml`](.github/workflows/ci.yml), [`docs.yml`](.github/workflows/docs.yml))
+run their jobs through it. The `pre-push` hook runs every job; run
+`./scripts/ci-check.sh` yourself the same way, or name the jobs to run
+(`./scripts/ci-check.sh lint rust-tests`). Skip the hook for one push with
+`git push --no-verify`. The script's header lists the jobs and what a local
+run does differently: it skips a step whose tool is missing, builds the wasm
+package without wasm-opt, and caps the compile jobs of `interface-tests` and
+`js-tests`.
 
 Core builds in two configurations: natively with its default `file-io`
 feature, and for wasm32 without it, as the wasm bindings take it. A native
 build without `file-io` stops with a compile error; the wasm32 clippy run is
 what checks the other configuration.
 
-The wasm32 clippy run, the python block and the js block are soft skips when
-their tooling is missing (the `wasm32-unknown-unknown` target; `uv`; `npm`,
-`js/node_modules` or that target): the script warns and continues, so CI
-remains the source of truth for those jobs on a clone without the tools.
-
-The local `js-tests` mirror trades exactness for wall clock: it builds with
-`npm run build:fast` (wasm-pack without wasm-opt, which dominates the full
-build's wall clock and buys no memory headroom) and caps `CARGO_BUILD_JOBS`
-(default 4; export it to override) so a cold wasm build's rustc fan-out doesn't
-exhaust memory. The tests therefore run against an unoptimized wasm binary — CI
-stays the source of truth for the exact artifact that ships. The local
-`interface-tests` mirror caps `CARGO_BUILD_JOBS` the same way (default 4;
-export it to override), since a cold build compiles DataFusion's dependency
-tree.
-
 Node's version is pinned once in [`.tool-versions`](.tool-versions); every
 workflow reads it via `node-version-file`, and mise and asdf pick it up natively,
 so a local shell matches CI. Keep the version the last token on its line —
-`actions/setup-node` does not accept a trailing comment there.
+`actions/setup-node` does not accept a trailing comment there. Rust's version is
+pinned once too, in [`.github/actions/setup-rust`](.github/actions/setup-rust/action.yml),
+which every workflow's Rust jobs use; `rustup override set` that version in a
+clone to match CI.
 
 ## Documentation anchors
 
@@ -48,9 +37,10 @@ target file exists, an anchored line is within the file, and every line anchor
 names what it points at, which has to appear on the anchored lines: the link's
 label when it is a single backticked identifier, else the link's title, else the
 identifier that opens the table row the link sits in. A line anchor with none
-of these fails. It runs in `scripts/ci-check.sh` and therefore in the
-`pre-push` hook; run it by itself after moving code the docs point at, and
-re-point the anchors it reports.
+of these fails. It is the `docs` job of `scripts/ci-check.sh`, so it runs in the
+`pre-push` hook and, through `docs.yml`, on every pull request and every push to
+`main`, doc-only ones included. Run it by itself after moving code the docs
+point at, and re-point the anchors it reports.
 
 The root `README.md` is a front page: it links only into `docs/`, the binding
 READMEs and this file, never into `core/src`, so it needs no regeneration when

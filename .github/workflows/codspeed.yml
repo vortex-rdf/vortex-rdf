@@ -28,17 +28,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # `cache: false` — this action keeps its own ~/.cargo cache under a
-      # separate key, duplicating what rust-cache already stores repo-wide and
-      # crowding the 10 GB limit. Toolchain and bins only; rust-cache below
-      # covers the caching (including CARGO_HOME/bin, so cargo-codspeed is
-      # still restored rather than reinstalled).
-      - name: Setup rust toolchain and cargo-codspeed binary
-        uses: moonrepo/setup-rust@v1
-        with:
-          channel: "1.99.1"
-          cache: false
-          bins: cargo-codspeed
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-rust
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
@@ -48,6 +39,12 @@ jobs:
           # key, so this entry can never collide with an uninstrumented one.
           shared-key: bench-release
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # After the cache step, so the binary lands in rust-cache's
+      # CARGO_HOME/bin entry: once restored, `cargo install` skips it until a
+      # newer release is out.
+      - name: Install cargo-codspeed
+        run: cargo install cargo-codspeed --locked
 
       # Only the benchmark target is uploaded; match_lazy belongs to the
       # dashboard workflow, so instrumenting it here would be wasted work.
@@ -71,7 +68,7 @@ jobs:
       # wasm-pack (invoked by `npm run build`) needs a Rust toolchain with the
       # wasm target; the bindings are compiled fresh so the bench measures HEAD.
       - name: Setup Rust toolchain (for wasm-pack)
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: ./.github/actions/setup-rust
         with:
           targets: wasm32-unknown-unknown
 
@@ -121,7 +118,7 @@ jobs:
       # The extension is compiled fresh so the benchmark measures HEAD, the
       # same reason the JS job rebuilds the wasm bindings.
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: ./.github/actions/setup-rust
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
@@ -134,7 +131,7 @@ jobs:
 
       - name: Build the bindings
         working-directory: python
-        run: uv sync
+        run: uv sync --locked
 
       # Same CodSpeed project and mode as the other jobs (simulation =
       # instruction counting), so the Python read paths publish alongside them.

@@ -56,12 +56,17 @@ permissions:
   contents: read
 
 jobs:
-  # The full CI suite runs against the exact ref being released; every
-  # publish job is gated on it. Dispatching from a commit whose CI was
-  # skipped (docs-only path filters) or never ran is therefore still safe.
+  # The full CI suite and the doc-anchor check run against the exact ref
+  # being released; every publish job is gated on both. Dispatching from a
+  # commit whose CI was skipped (docs-only path filters) or never ran is
+  # therefore still safe.
   ci:
     name: CI
     uses: ./.github/workflows/ci.yml
+
+  docs:
+    name: Docs
+    uses: ./.github/workflows/docs.yml
 
   # The three registries carry independently declared versions. This job fails
   # before any of them is touched when they disagree with the tag being pushed
@@ -72,7 +77,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: ./.github/actions/setup-rust
       - name: Compare declared versions
         run: |
           set -euo pipefail
@@ -115,7 +120,7 @@ jobs:
   # gate ORs in the event check.
   crates:
     name: crates.io
-    needs: [ci, verify-versions]
+    needs: [ci, docs, verify-versions]
     if: ${{ github.event_name == 'push' || inputs.crates }}
     runs-on: ubuntu-latest
     environment: release
@@ -124,7 +129,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: ./.github/actions/setup-rust
       - name: Authenticate with crates.io
         if: ${{ !inputs.dry_run }}
         id: auth
@@ -136,7 +141,7 @@ jobs:
 
   npm:
     name: npm
-    needs: [ci, verify-versions]
+    needs: [ci, docs, verify-versions]
     if: ${{ github.event_name == 'push' || inputs.npm }}
     runs-on: ubuntu-latest
     environment: release
@@ -150,7 +155,7 @@ jobs:
           node-version-file: .tool-versions
           registry-url: "https://registry.npmjs.org"
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: ./.github/actions/setup-rust
         with:
           targets: wasm32-unknown-unknown
       # wasm-pack is a pinned npm devDependency; `npm ci` installs it and npm
@@ -164,7 +169,7 @@ jobs:
 
   pypi-wheels:
     name: PyPI wheel (${{ matrix.platform.name }})
-    needs: [ci, verify-versions]
+    needs: [ci, docs, verify-versions]
     if: ${{ github.event_name == 'push' || inputs.pypi }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
@@ -187,10 +192,17 @@ jobs:
         uses: actions/setup-python@v7
         with:
           python-version: "3.15"
+      # maturin-action installs the toolchain it builds with itself: inside the
+      # manylinux container on Linux, on the runner on macOS and Windows. Its
+      # rust-toolchain input takes the pinned version from setup-rust's output.
+      - name: Setup Rust toolchain
+        id: rust
+        uses: ./.github/actions/setup-rust
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
+          rust-toolchain: ${{ steps.rust.outputs.toolchain }}
           args: --release --strip --out dist --manifest-path python/Cargo.toml
           # vortex-io's custom-labels build-dep runs bindgen, which needs
           # libclang inside the build container. The manylinux2014 image that
@@ -206,7 +218,7 @@ jobs:
 
   pypi-sdist:
     name: PyPI sdist
-    needs: [ci, verify-versions]
+    needs: [ci, docs, verify-versions]
     if: ${{ github.event_name == 'push' || inputs.pypi }}
     runs-on: ubuntu-latest
     steps:
