@@ -278,7 +278,7 @@ followed), then the OS temp dir.
 
 ## 7. Columns, per layout
 
-The layout decides what a `RawQuad` becomes ([`LayoutStrategy`](../core/src/store/layouts/mod.rs#L57)).
+The layout decides what a `RawQuad` becomes ([`LayoutStrategy`](../core/src/store/layouts/mod.rs#L56)).
 Every layout puts `s` first and stamps it when the rows are sorted.
 
 | Layout | Columns | Term encoding |

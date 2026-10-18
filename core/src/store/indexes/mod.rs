@@ -685,7 +685,7 @@ pub(crate) fn resolve_indexes_in_memory(
     components: &[IndexComponent],
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
-    codes: &mut PatternCodes,
+    codes: &mut PatternCodes<'_>,
 ) -> Result<IndexResolution<InMemoryServePlan>> {
     for index in indexes {
         let Some(probe) = index.choose(pattern, layout) else {
@@ -712,7 +712,7 @@ pub(crate) async fn resolve_indexes_file(
     file: &Arc<crate::store::persist::native_file::NativeStoreFile>,
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
-    codes: &mut PatternCodes,
+    codes: &mut PatternCodes<'_>,
 ) -> Result<IndexResolution<FileServePlan>> {
     for index in indexes {
         let Some(probe) = index.choose(pattern, layout) else {

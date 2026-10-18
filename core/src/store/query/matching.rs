@@ -181,7 +181,7 @@ impl VortexRdfStore {
     pub(in crate::store) async fn prepared_codes(
         &self,
         pattern: QuadPattern<'_>,
-    ) -> Result<Option<PatternCodes>> {
+    ) -> Result<Option<PatternCodes<'_>>> {
         let codes = self.layout.prepare_pattern(pattern).await?;
         Ok((!codes.provably_empty(pattern)).then_some(codes))
     }
@@ -206,7 +206,7 @@ impl VortexRdfStore {
         &self,
         memory: &MemoryBase,
         pattern: QuadPattern<'_>,
-        codes: &mut PatternCodes,
+        codes: &mut PatternCodes<'_>,
         need: IdsNeed,
         t: Option<Instant>,
     ) -> Result<Self> {
@@ -365,7 +365,7 @@ impl VortexRdfStore {
         struct_arr: &StructArray,
         base: &ArrayRef,
         probes: &StructProbes,
-        codes: &mut PatternCodes,
+        codes: &mut PatternCodes<'_>,
         pat: &mut QuadPattern<'_>,
         mut selection: RowSelection,
         t: Option<Instant>,
@@ -457,7 +457,7 @@ impl VortexRdfStore {
         probes: &StructProbes,
         selection: RowSelection,
         pat: QuadPattern<'_>,
-        codes: &mut PatternCodes,
+        codes: &mut PatternCodes<'_>,
         t: Option<Instant>,
     ) -> Result<Option<RowSelection>> {
         // The residual binds a subset of the roles the caller's gate
@@ -510,7 +510,7 @@ impl VortexRdfStore {
         &self,
         base: &FileBase,
         pattern: QuadPattern<'_>,
-        codes: &mut PatternCodes,
+        codes: &mut PatternCodes<'_>,
         need: IdsNeed,
         t: Option<Instant>,
     ) -> Result<Self> {
@@ -715,7 +715,7 @@ impl VortexRdfStore {
     #[cfg(feature = "file-io")]
     async fn locate_subject(
         file: &NativeStoreFile,
-        codes: &mut PatternCodes,
+        codes: &mut PatternCodes<'_>,
         pat: &mut QuadPattern<'_>,
         t: Option<Instant>,
     ) -> Result<Option<Range<u64>>> {

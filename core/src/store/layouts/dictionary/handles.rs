@@ -28,14 +28,14 @@ use super::term_dict::TermDictionary;
 /// which makes term↔code translation asynchronous. The method contract that
 /// keeps both arms behind one seam:
 ///
-/// - [`resolve_pattern`](Self::resolve_pattern) is the **async prelude**: the
-///   one place a dictionary is allowed to perform I/O during a match. It runs
-///   before the synchronous match core, pre-resolves every bound term of the
-///   pattern, and hands back the match's [`PatternCodes`] witness — the only
-///   way one is minted — so the core's synchronous probes can only ever run
-///   over a prelude that ran, and answer from its codes without touching the
-///   dictionary again. That witness is what confines a file-backed
-///   dictionary's I/O to this method.
+/// - [`resolve_pattern`](Self::resolve_pattern) is the dictionary half of the
+///   **async prelude**: the one place a dictionary is allowed to perform I/O
+///   during a match. It runs before the synchronous match core and
+///   pre-resolves every bound term of the pattern into the match's
+///   [`PatternCodes`] witness — which only the prelude mints — so the core's
+///   synchronous probes can only ever run over a prelude that ran, and answer
+///   from its codes without touching the dictionary again. That witness is
+///   what confines a file-backed dictionary's I/O to this method.
 /// - [`resident`](Self::resident) hands out the in-memory dictionary itself
 ///   (`None` for `FileBacked`), for the paths that genuinely need the whole
 ///   column; `ensure_resident` lifts a file-backed
@@ -53,23 +53,27 @@ pub(crate) enum DictAccess {
 }
 
 impl DictAccess {
-    /// Pre-resolve every bound term of `pattern` — the async prelude run
-    /// before the synchronous match core — and mint the [`PatternCodes`]
-    /// witness the core's probes run on.
+    /// Pre-resolve every bound term of `pattern` into `codes`, the
+    /// [`PatternCodes`] witness the async prelude
+    /// ([`prepare_pattern`](crate::store::layouts::ResolvedLayout::prepare_pattern))
+    /// minted for this dictionary's layout — the prelude's dictionary half,
+    /// run before the synchronous match core.
     ///
     /// For `Resident` the lookups are in-memory binary searches, all resolved
     /// here so the invariant the match core is written against holds under
     /// either residency — *after the prelude, every bound role is in the
     /// witness* — which is what lets a file-backed dictionary do its I/O here
     /// and nowhere else.
-    pub(crate) async fn resolve_pattern(&self, pattern: QuadPattern<'_>) -> Result<PatternCodes> {
+    pub(in crate::store::layouts) async fn resolve_pattern(
+        &self,
+        pattern: QuadPattern<'_>,
+        codes: &mut PatternCodes<'_>,
+    ) -> Result<()> {
         match self {
             DictAccess::Resident(dict) => {
-                let mut codes = PatternCodes::resident(Arc::clone(dict));
                 for term in pattern.bound_roles() {
                     codes.resolve(term, |t| dict.encode_exact(t));
                 }
-                Ok(codes)
             }
             // Each bound role costs one window search of the mapped
             // dictionary child; the resolved code is then seeded into the
@@ -82,14 +86,13 @@ impl DictAccess {
                 let rendered: Vec<String> = pattern.bound_roles().map(|t| t.to_string()).collect();
                 let resolved =
                     futures::future::join_all(rendered.iter().map(|t| fb.encode_exact(t))).await;
-                let mut codes = PatternCodes::preresolved();
                 for (term, code) in pattern.bound_roles().zip(resolved) {
                     let code = code?;
                     codes.resolve(term, |_| code);
                 }
-                Ok(codes)
             }
         }
+        Ok(())
     }
 
     /// The in-memory dictionary, or `None` when it is file-backed — sync

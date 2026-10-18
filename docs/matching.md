@@ -128,8 +128,8 @@ perform I/O, and the only reason the prelude is async at all.
 
 | Layout | Residency | What the prelude does | Probe value |
 |---|---|---|---|
-| `Default` | — | nothing but tag the resolver (never suspends) | the N-Triples string |
-| `TypedObject` | — | nothing but tag the resolver (never suspends) | the N-Triples string; the object decomposes into `o_kind`/`o_value`/`o_datatype`/`o_lang` |
+| `Default` | — | nothing: the witness only holds the layout (never suspends) | the N-Triples string |
+| `TypedObject` | — | nothing: the witness only holds the layout (never suspends) | the N-Triples string; the object decomposes into `o_kind`/`o_value`/`o_datatype`/`o_lang` |
 | `Dictionary` | in-memory | seeds the role cache by in-memory binary search | `u64` code |
 | `Dictionary` | file-backed | one window search of the mapped dictionary child per bound role, all **concurrent** (`join_all`), seeding every bound role | `u64` code |
 
