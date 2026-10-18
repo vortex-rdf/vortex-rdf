@@ -19,8 +19,8 @@ use vortex_array::arrays::VarBinViewArray;
 use crate::debug;
 use crate::error::Result;
 use crate::store::RawQuad;
-use crate::store::builders::{BuiltArray, build_components_from_codes};
-use crate::store::indexes::Indexes;
+use crate::store::builders::{BuiltArray, build_components};
+use crate::store::indexes::{IndexInput, Indexes};
 use crate::store::schema::TermCode;
 
 use super::codec::{QuadCodes, build_array};
@@ -146,7 +146,7 @@ pub(crate) fn finish_interned(
 ) -> Result<BuiltArray> {
     let (dict, codes) = interner.finish()?;
     let array = build_array(&codes)?;
-    let components = build_components_from_codes(indexes, &codes)?;
+    let components = build_components(indexes, IndexInput::Codes(&codes))?;
     Ok(BuiltArray {
         array,
         components,

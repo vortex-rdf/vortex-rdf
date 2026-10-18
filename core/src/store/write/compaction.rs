@@ -8,7 +8,7 @@ use crate::error::VortexRdfError;
 use crate::store::FileBase;
 use crate::store::RawQuad;
 use crate::store::builders::DEFAULT_CHUNK_ROWS;
-use crate::store::indexes::{Indexes, unique_indexes};
+use crate::store::indexes::Indexes;
 
 use crate::store::VortexRdfStore;
 
@@ -63,7 +63,6 @@ impl VortexRdfStore {
     ///
     /// [`compact`]: Self::compact
     pub async fn compact_with_indexes(&self, indexes: Indexes) -> Result<Self> {
-        let unique = unique_indexes(&indexes);
         // An OWNING file-backed store stays file-backed: stream the live rows
         // through the sorted builder straight over their own source file (no
         // materialized rebuild — quads, index children, and the dictionary
@@ -78,11 +77,11 @@ impl VortexRdfStore {
             && let Some(path) = file.path()
         {
             return self
-                .stream_compacted_to_file(unique, path, file.identity())
+                .stream_compacted_to_file(indexes, path, file.identity())
                 .await;
         }
         let raws = self.sorted_live_raw_quads().await?;
-        Self::from_raw_quads(&raws, self.layout.strategy(), unique, true)
+        Self::from_raw_quads(&raws, self.layout.strategy(), indexes, true)
     }
 
     /// Every live quad this view covers in (s, p, o, g) order, each once: the

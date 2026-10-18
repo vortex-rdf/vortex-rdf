@@ -75,17 +75,17 @@ pub(crate) fn gather_by_point_reads(
 
 /// The `names` columns of the struct `array`, in that order, each read point
 /// by point at `positions` through its encoded-search probe into a canonical
-/// primitive — the loop behind every in-memory point read: a small
-/// selection's gather ([`gather_by_point_reads`]) and an index serve plan's
-/// small run. `None` declines: a non-struct `array`, a name it lacks, or a
-/// column (e.g. a string column) no probe resolves.
+/// primitive — the loop behind [`gather_by_point_reads`]: a small selection's
+/// gather, and the serve tail's canonicalization of a small chunk
+/// (`ServeDecode::chunk_rows`). `None` declines: a non-struct `array`, a name
+/// it lacks, or a column (e.g. a string column) no probe resolves.
 ///
 /// Each probe comes from `probes` when that cache holds `array`'s resolutions
 /// (resolution walks the encoding tree, the fixed cost this path exists to
 /// avoid) — a column it declined declines the read — and is resolved per
 /// call otherwise (a transient base: a tail, served rows), the only case
 /// that takes the struct apart for its children.
-pub(crate) fn point_read_columns<'n>(
+fn point_read_columns<'n>(
     array: &ArrayRef,
     names: impl IntoIterator<Item = &'n str>,
     positions: &[usize],

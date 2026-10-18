@@ -2,7 +2,8 @@
 //!
 //! This hub owns what is common to every index: the [`IndexType`] enum and
 //! its exhaustive dispatch into the per-index modules (persisted-child
-//! identities, the probe a pattern shape chooses), the resolution currency
+//! identities, the children an in-memory build emits over an
+//! [`IndexInput`], the probe a pattern shape chooses), the resolution currency
 //! (`IndexResolution`, `ResolvedRoles`, the eager/lazy `ResolvedRowIds` split
 //! and its `LazyRowIds` recipe) both backends answer in, and the planners
 //! that try a store's whole index set in preference order.
@@ -27,6 +28,8 @@ use vortex_array::scalar::Scalar;
 use vortex_buffer::Buffer;
 
 use crate::error::{Result, VortexRdfError};
+use crate::store::RawQuad;
+use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout};
 #[cfg(feature = "file-io")]
 use crate::store::persist::native_file::ChildReader;
@@ -42,7 +45,7 @@ mod resolve;
 pub(crate) mod serve;
 
 pub(crate) use components::{
-    ComponentIdentity, DeferredSource, IndexComponent, adopt_component, check_component_rows,
+    ComponentIdentity, IndexComponent, adopt_component, check_component_rows,
     indexes_from_components, known_component, sorted_row_ids,
 };
 #[cfg(feature = "file-io")]
@@ -261,10 +264,33 @@ impl std::str::FromStr for IndexType {
 }
 
 /// Every [`IndexType`], in declaration = preference order — what the slug
-/// registry scans and what the in-memory index set
-/// ([`indexes_from_components`]) is filtered out of, in this order.
+/// registry scans, what the in-memory index set
+/// ([`indexes_from_components`]) is filtered out of, and the order an
+/// in-memory build emits the requested indexes' children in
+/// ([`build_components`](crate::store::builders::build_components)).
 pub(crate) const ALL_INDEX_TYPES: [IndexType; 2] =
     [IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
+
+/// What an in-memory index build reads: the complete dataset in final row
+/// order, as its quads' term strings or, under the Dictionary layout, as
+/// their codes. A row's position in the input is its row id ([`row_id`]).
+#[derive(Copy, Clone)]
+pub(crate) enum IndexInput<'a> {
+    /// The quads of a string layout (Default, TypedObject).
+    Quads(&'a [RawQuad]),
+    /// The Dictionary layout's codes.
+    Codes(&'a QuadCodes),
+}
+
+impl IndexInput<'_> {
+    /// How many rows the input holds.
+    pub(crate) fn rows(self) -> usize {
+        match self {
+            IndexInput::Quads(quads) => quads.len(),
+            IndexInput::Codes(codes) => codes.s.len(),
+        }
+    }
+}
 
 impl IndexType {
     /// This index's persisted-child identities — the static table every
@@ -276,6 +302,18 @@ impl IndexType {
         match self {
             IndexType::SecondaryByCopy => &copy::IDENTITIES,
             IndexType::SecondaryByReference => &reference::IDENTITIES,
+        }
+    }
+
+    /// This index's persisted children over `input`, one per identity, in
+    /// [`component_identities`](Self::component_identities) order: each
+    /// globally sorted over the whole dataset, so each says so. The build
+    /// step each index owns; like `component_identities`, the exhaustive
+    /// match demands a build-side answer from every new variant.
+    pub(crate) fn components(self, input: IndexInput<'_>) -> Result<Vec<IndexComponent>> {
+        match self {
+            IndexType::SecondaryByCopy => copy::components(input),
+            IndexType::SecondaryByReference => reference::components(input),
         }
     }
 
@@ -695,19 +733,6 @@ pub(crate) async fn resolve_indexes_file(
 /// for the compact (value, row-id) predicate/object indexes, or
 /// `vec![IndexType::SecondaryByCopy]` for the full sorted quad copies.
 pub type Indexes = Vec<IndexType>;
-
-/// Deduplicate the requested indexes, preserving first-seen order, so a
-/// repeated index (e.g. the same `--indexes` flag passed twice) cannot
-/// produce duplicate components.
-pub(crate) fn unique_indexes(indexes: &[IndexType]) -> Vec<IndexType> {
-    let mut seen: Vec<IndexType> = Vec::with_capacity(indexes.len());
-    for &idx in indexes {
-        if !seen.contains(&idx) {
-            seen.push(idx);
-        }
-    }
-    seen
-}
 
 #[cfg(test)]
 mod tests {

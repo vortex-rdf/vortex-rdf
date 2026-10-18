@@ -276,11 +276,10 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
                 .enumerate()
                 .map(|(i, q)| {
                     let spog = [q.s.clone(), q.p.clone(), q.o.clone(), q.g.clone()];
-                    let key = match family {
-                        CopyFamily::Posg => CopyKey::posg(&spog),
-                        CopyFamily::Ospg => CopyKey::ospg(spog),
-                    };
-                    (key, (n * 4 + i) as crate::store::RowId)
+                    (
+                        CopyKey::new(family, spog),
+                        (n * 4 + i) as crate::store::RowId,
+                    )
                 })
                 .collect();
             keys.sort_unstable();
@@ -300,7 +299,7 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
                     required: false,
                     // Per-chunk sorts only: the writer may not claim global order.
                     sorted: false,
-                    dtype: crate::store::indexes::copy::out_of_core::copy_child_dtype(false),
+                    dtype: crate::store::indexes::copy::out_of_core::copy_child_dtype::<String>(),
                 },
                 std::sync::Arc::new(container::BufferedComponentSource::try_new(chunks).unwrap()),
                 container::default_child_strategy(),

@@ -21,7 +21,7 @@
 //! `indexes::components`), which is what a store adopts and what a file
 //! writes — nothing intermediate, nothing to split. The two pipelines differ
 //! only in where the components come from: the in-memory sort builds all of
-//! them at once over the dataset (`GlobalIndexes`), the out-of-core one
+//! them at once over the dataset ([`build_components`]), the out-of-core one
 //! streams each family off its own spill-run merger.
 //!
 //! Both sort globally, which is what lets them declare their components
@@ -44,9 +44,9 @@ use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
 use crate::store::array::stamp_is_sorted;
 use crate::store::indexes::{
-    IndexComponent, IndexType, Indexes, check_indexed_rows, copy, reference, unique_indexes,
+    ALL_INDEX_TYPES, IndexComponent, IndexInput, IndexType, Indexes, check_indexed_rows,
 };
-use crate::store::layouts::dictionary::{QuadCodes, TermDictionary};
+use crate::store::layouts::dictionary::TermDictionary;
 use crate::store::layouts::{LayoutStrategy, dictionary};
 use futures::{Stream, stream};
 use std::future::Future;
@@ -189,82 +189,30 @@ pub(crate) fn build_struct_array(
     .map(|a| a.into_array())
 }
 
-/// Every requested index's columns, sorted once over the complete in-memory
-/// dataset, handed on as persisted children by
-/// [`into_components`](Self::into_components).
-struct GlobalIndexes {
-    by_copy: Option<copy::GlobalCopyArrays>,
-    by_reference: Option<reference::GlobalReferenceArrays>,
-}
-
-impl GlobalIndexes {
-    /// Build the requested families, each over the dataset in final row
-    /// order; `copy` and `reference` supply a family's arrays and run only
-    /// when that family is requested.
-    fn build(
-        indexes: &[IndexType],
-        copy: impl FnOnce() -> copy::GlobalCopyArrays,
-        reference: impl FnOnce() -> reference::GlobalReferenceArrays,
-    ) -> Self {
-        let unique = unique_indexes(indexes);
-        Self {
-            by_copy: unique.contains(&IndexType::SecondaryByCopy).then(copy),
-            by_reference: unique
-                .contains(&IndexType::SecondaryByReference)
-                .then(reference),
-        }
-    }
-
-    /// Every built index's persisted children, in index declaration order.
-    /// Each is globally sorted by construction and says so.
-    fn into_components(self) -> Result<Vec<IndexComponent>> {
-        let mut components = Vec::new();
-        if let Some(sbc) = self.by_copy {
-            components.extend(sbc.into_components()?);
-        }
-        if let Some(sbr) = self.by_reference {
-            components.extend(sbr.into_components()?);
-        }
-        Ok(components)
-    }
-}
-
 /// The requested indexes' children over a complete in-memory dataset in final
-/// row order — the one entry point every in-memory index emission goes
-/// through (the builders' construction paths and the mutation/compaction
-/// rebuilds alike).
+/// row order — its term strings, or its codes under the Dictionary layout,
+/// whose sort is order-equivalent to the strings', so the children stay
+/// binary-searchable (queries translate the pattern terms to codes first).
+/// The one entry point every in-memory index emission goes through (the
+/// builders' construction paths and the mutation/compaction rebuilds alike).
+///
+/// Each index in `indexes` builds once, however often it is requested, and
+/// the children come in [`ALL_INDEX_TYPES`] order, whatever the request's
+/// order; each is globally sorted by construction and says so.
 pub(crate) fn build_components(
     indexes: &[IndexType],
-    quads: &[RawQuad],
+    input: IndexInput<'_>,
 ) -> Result<Vec<IndexComponent>> {
-    if !unique_indexes(indexes).is_empty() {
-        check_indexed_rows(quads.len() as u64)?;
+    if !indexes.is_empty() {
+        check_indexed_rows(input.rows() as u64)?;
     }
-    GlobalIndexes::build(
-        indexes,
-        || copy::GlobalCopyArrays::from_quads(quads),
-        || reference::GlobalReferenceArrays::from_quads(quads),
-    )
-    .into_components()
-}
-
-/// Dictionary-layout counterpart of [`build_components`]: the children are
-/// built over the dataset's codes. Sorting codes is order-equivalent to
-/// sorting the term strings, so the children stay binary-searchable —
-/// queries translate the pattern terms to codes first.
-pub(crate) fn build_components_from_codes(
-    indexes: &[IndexType],
-    codes: &QuadCodes,
-) -> Result<Vec<IndexComponent>> {
-    if !unique_indexes(indexes).is_empty() {
-        check_indexed_rows(codes.s.len() as u64)?;
+    let mut components = Vec::new();
+    for index in ALL_INDEX_TYPES {
+        if indexes.contains(&index) {
+            components.extend(index.components(input)?);
+        }
     }
-    GlobalIndexes::build(
-        indexes,
-        || copy::GlobalCopyArrays::from_codes(codes),
-        || reference::GlobalReferenceArrays::from_codes(codes),
-    )
-    .into_components()
+    Ok(components)
 }
 
 /// A store's parts rebuilt from raw quads under `strategy`: the primary rows,
@@ -297,13 +245,13 @@ pub(crate) fn build_parts_from_raws(
             let codes = dictionary::encode_quads(raws, &code_map)?;
             Ok(BuiltArray {
                 array: dictionary::build_code_chunk(&codes, 0..raws.len(), sorted)?,
-                components: build_components_from_codes(indexes, &codes)?,
+                components: build_components(indexes, IndexInput::Codes(&codes))?,
                 dict: Some(Arc::new(dict)),
             })
         }
         strategy => Ok(BuiltArray {
             array: build_struct_array(raws, strategy, sorted)?,
-            components: build_components(indexes, raws)?,
+            components: build_components(indexes, IndexInput::Quads(raws))?,
             dict: None,
         }),
     }

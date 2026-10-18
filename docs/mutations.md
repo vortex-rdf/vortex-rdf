@@ -212,7 +212,7 @@ flowchart TD
 ```
 
 - **A file-backed owner stays file-backed**
-  ([`stream_compacted_to_file`](../core/src/store/write/compaction.rs#L120)): the
+  ([`stream_compacted_to_file`](../core/src/store/write/compaction.rs#L119)): the
   writer is prepared first
   ([`PendingStore::create`](../core/src/io/write.rs#L296), the one writer every
   path-taking build shares), so a source file the process cannot write (a
@@ -245,7 +245,7 @@ flowchart TD
 - **An in-memory store**, and any *derived view* of a file (whose rows are a
   subset of a file other readers share), rebuilds in memory through
   [`from_raw_quads`](../core/src/store/construct.rs#L143) →
-  [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L284) and adopts
+  [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L232) and adopts
   the result in the same compressed-resident form a freshly built store has
   ([serialization.md §10](serialization.md#10-adopting-a-build-in-memory)).
 
@@ -253,8 +253,8 @@ flowchart TD
 
 `add_quads` is append-then-check: the append itself is policy-free, and
 whichever call pushes the tail past a threshold
-([`should_auto_compact`](../core/src/store/write/compaction.rs#L159) →
-[`tail_needs_compaction`](../core/src/store/write/compaction.rs#L186)) pays for
+([`should_auto_compact`](../core/src/store/write/compaction.rs#L158) →
+[`tail_needs_compaction`](../core/src/store/write/compaction.rs#L185)) pays for
 folding it back into the base, which amortizes the O(n log n) rebuild to
 roughly constant cost per appended row. The tail is folded once it reaches
 either of:
@@ -322,9 +322,9 @@ runs the mutation on the store the view came from.
 |---|---|---|---|
 | `TAIL_FLATTEN_FLOOR` | 1,024 | [`view/mod.rs`](../core/src/store/view/mod.rs#L417) | accreted tail chunks are folded into the flat prefix once their rows reach `max(flat_len, TAIL_FLATTEN_FLOOR)` |
 | `TAIL_MAX_CHUNKS` | 64 | [`view/mod.rs`](../core/src/store/view/mod.rs#L421) | the tail is flattened once it holds more chunks than this, whatever their row counts |
-| `AUTO_COMPACT_TAIL_FLOOR` | 4,096 | [`compaction.rs`](../core/src/store/write/compaction.rs#L168) | below this many tail rows `add_quads` never compacts |
-| `AUTO_COMPACT_BASE_RATIO` | 10 | [`compaction.rs`](../core/src/store/write/compaction.rs#L175) | compact once the tail reaches base / 10 |
-| `AUTO_COMPACT_TAIL_CAP` | 100,000 (= `DEFAULT_CHUNK_ROWS`) | [`compaction.rs`](../core/src/store/write/compaction.rs#L182) | compact once the tail could fill a builder chunk, however large the base |
+| `AUTO_COMPACT_TAIL_FLOOR` | 4,096 | [`compaction.rs`](../core/src/store/write/compaction.rs#L167) | below this many tail rows `add_quads` never compacts |
+| `AUTO_COMPACT_BASE_RATIO` | 10 | [`compaction.rs`](../core/src/store/write/compaction.rs#L174) | compact once the tail reaches base / 10 |
+| `AUTO_COMPACT_TAIL_CAP` | 100,000 (= `DEFAULT_CHUNK_ROWS`) | [`compaction.rs`](../core/src/store/write/compaction.rs#L181) | compact once the tail could fill a builder chunk, however large the base |
 
 ---
 

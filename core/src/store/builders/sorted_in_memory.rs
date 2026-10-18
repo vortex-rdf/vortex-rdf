@@ -18,7 +18,7 @@
 use super::{BuiltArray, VortexArrayBuilder, build_components, build_struct_array};
 use crate::error::Result;
 use crate::store::RawQuad;
-use crate::store::indexes::Indexes;
+use crate::store::indexes::{IndexInput, Indexes};
 use crate::store::layouts::LayoutStrategy;
 use crate::store::layouts::dictionary::ingest::{InterningQuadBuilder, finish_interned};
 
@@ -56,7 +56,7 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
             let quads = ingest_and_sort(quad_stream).await?;
             BuiltArray {
                 array: build_struct_array(&quads, layout, true)?,
-                components: build_components(&indexes, &quads)?,
+                components: build_components(&indexes, IndexInput::Quads(&quads))?,
                 dict: None,
             }
         };

@@ -191,7 +191,7 @@ async fn write_chunked_store(
     reference_index: bool,
 ) -> (tempfile::TempDir, std::path::PathBuf) {
     use crate::io::container::BufferedComponentSource;
-    use crate::store::indexes::reference::GlobalReferenceArrays;
+    use crate::store::indexes::IndexInput;
     use crate::store::layouts::dictionary::{self, TermDictionary};
     use vortex_array::IntoArray as _;
     use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
@@ -217,8 +217,8 @@ async fn write_chunked_store(
         // The children's rows are the global `(value, row id)` sort of the
         // codes, cut into `chunk_rows`-row chunks; each chunk is one flat leaf
         // of each of its columns.
-        for component in GlobalReferenceArrays::from_codes(&codes)
-            .into_components()
+        for component in IndexType::SecondaryByReference
+            .components(IndexInput::Codes(&codes))
             .unwrap()
         {
             let rows = component.rows().unwrap().clone().into_array();

@@ -7,13 +7,14 @@ use crate::io::container;
 use crate::io::read;
 use crate::session::VORTEX_SESSION;
 use crate::store::indexes::{
-    ComponentIdentity, DeferredSource, IndexComponent, adopt_component, check_component_rows,
+    ComponentIdentity, IndexComponent, adopt_component, check_component_rows,
 };
 use crate::store::layouts::DictAccess;
 use crate::store::layouts::dictionary::TermDictionary;
 #[cfg(feature = "file-io")]
 use crate::store::{
     Backend, FileBase, QuadsSource,
+    array::into_struct_array,
     indexes::Indexes,
     layouts::{LayoutStrategy, dictionary::FileBackedDict},
     persist::native_file::NativeStoreFile,
@@ -198,10 +199,9 @@ impl ComponentRoster {
 }
 
 /// Lift an unrefined file view's index children into in-memory components:
-/// each known child of the file's roster is scanned whole and adopted as a
-/// deferred component (canonicalized on its first genuine use, as
-/// `from_bytes` adopts its children), with the descriptor's `sorted`
-/// provenance carried across.
+/// each known child of the file's roster is scanned whole and executed to
+/// its rows — its every consumer (a write, an in-memory open) reads them at
+/// once — with the descriptor's `sorted` provenance carried across.
 #[cfg(feature = "file-io")]
 pub(in crate::store) async fn scanned_index_components(
     file: &NativeStoreFile,
@@ -209,9 +209,9 @@ pub(in crate::store) async fn scanned_index_components(
     let mut components = Vec::with_capacity(file.index_children().len());
     for child in file.index_children() {
         let scanned = read::scan_all_reader(file.index_child_reader(child)?).await?;
-        components.push(adopt_component(
+        components.push(IndexComponent::built(
             child.identity,
-            DeferredSource::Scanned(scanned),
+            into_struct_array(scanned)?,
             child.sorted,
         ));
     }
@@ -388,14 +388,14 @@ impl VortexRdfStore {
         // the component's first genuine use — an index probe, serialization —
         // so a load pays nothing for index children it never touches. Sound
         // here because each reader sits over the buffer the file was opened
-        // from (see `DeferredSource::Reader`).
+        // from (see `adopt_component`).
         let components = roster
             .index_children
             .iter()
             .map(|child| -> Result<IndexComponent> {
                 Ok(adopt_component(
                     child.identity,
-                    DeferredSource::Reader(reader(child.slot)?),
+                    reader(child.slot)?,
                     child.sorted,
                 ))
             })

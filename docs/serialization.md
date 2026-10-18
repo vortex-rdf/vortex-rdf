@@ -322,7 +322,7 @@ dictionary alone.
 
 Indexes never ride inside the quad rows: a builder emits primary-only rows plus
 one *component* per requested family, and that is the only form index data ever
-takes — in memory as an [`IndexComponent`](../core/src/store/indexes/components.rs#L143),
+takes — in memory as an [`IndexComponent`](../core/src/store/indexes/components.rs#L125),
 in a file as an auxiliary child.
 
 | Index | Children | Columns | Sorted by |
@@ -343,16 +343,16 @@ than let an id wrap onto row 0:
 
 | Where | Check | Refusal |
 |---|---|---|
-| in-memory builds, compaction's in-memory rebuild, `to_bytes` of a store with a tail | the row count, before any id is assigned ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L112)) | `Serialization`: the store *would exceed* `u64::MAX` quads |
-| the out-of-core merge, a file-backed compaction | each row as the merge numbers it ([`next_row_id`](../core/src/store/indexes/mod.rs#L126)); a refused file build leaves no file | the same |
+| in-memory builds, compaction's in-memory rebuild, `to_bytes` of a store with a tail | the row count, before any id is assigned ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L115)) | `Serialization`: the store *would exceed* `u64::MAX` quads |
+| the out-of-core merge, a file-backed compaction | each row as the merge numbers it ([`next_row_id`](../core/src/store/indexes/mod.rs#L129)); a refused file build leaves no file | the same |
 
 Opening a file whose index children record row ids of another width is
 refused with a deserialization error that says to rebuild the store
 ([file-format.md §6](file-format.md#6-the-index-children)).
 
-**In memory** ([`build_components`](../core/src/store/builders/mod.rs#L236)) each
+**In memory** ([`build_components`](../core/src/store/builders/mod.rs#L202)) each
 family is a permutation of the complete sorted dataset: sort the row ids by the
-family's comparator ([`CopyFamily::cmp_quads`](../core/src/store/indexes/copy.rs#L146),
+family's comparator ([`CopyFamily::cmp_quads`](../core/src/store/indexes/copy.rs#L147),
 or the code tuple under Dictionary), then gather the columns through that
 permutation — the permutation itself is the `rid` column. The lead sort column
 is stamped `IsSorted`.
@@ -537,7 +537,7 @@ quad once even when the rows it was gathered from did not.
 [`compact_with_indexes`](../core/src/store/write/compaction.rs#L65) gather every live
 quad, sort, drop repeated quads, and rebuild:
 
-- **A file-backed owner stays file-backed** ([`stream_compacted_to_file`](../core/src/store/write/compaction.rs#L120)):
+- **A file-backed owner stays file-backed** ([`stream_compacted_to_file`](../core/src/store/write/compaction.rs#L119)):
   the sorted rows are streamed through `SortedStreamBuilder` — spilling beside
   the store file, not in the OS temp dir — into a sibling temp file
   `<store>.write-<uuid>.tmp`, which is atomically renamed over the original;
@@ -549,7 +549,7 @@ quad, sort, drop repeated quads, and rebuild:
   adopts the result exactly as `from_built` does.
 
 `add_quads` compacts automatically when the tail crosses a threshold
-([`tail_needs_compaction`](../core/src/store/write/compaction.rs#L186)):
+([`tail_needs_compaction`](../core/src/store/write/compaction.rs#L185)):
 
 | Trigger | Value |
 |---|---|

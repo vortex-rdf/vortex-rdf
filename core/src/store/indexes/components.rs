@@ -5,9 +5,10 @@
 //! in-memory twin): a set of rows under the child's own plain column names,
 //! carrying the writer's sortedness provenance. Builders emit components
 //! directly, beside primary-only quad rows; this module owns what happens to
-//! them afterwards — assembling a child's rows ([`child_struct`]), adopting a
-//! persisted one back into memory, and reading a persisted child's
-//! implementation slug onto a component identity.
+//! them afterwards — assembling a child's rows ([`child_struct`]), writing
+//! one as a native child ([`index_child_write`]), adopting a persisted one
+//! back into memory, and reading a persisted child's implementation slug onto
+//! a component identity.
 //!
 //! The column *names* belong to the index modules, not here (the row id
 //! every child carries is the one exception, named once in the hub as
@@ -21,13 +22,18 @@ use std::sync::{Arc, OnceLock};
 
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{PrimitiveArray, StructArray};
-use vortex_array::dtype::{DType, FieldName};
+use vortex_array::dtype::{DType, FieldName, Nullability};
 use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_buffer::{Buffer, BufferMut};
 
 use crate::error::{Result, VortexRdfError};
+use crate::io::container::sources::NativeComponentSource;
+use crate::io::container::{
+    INDEX_VERSION, NativeComponentWrite, StoreComponentDescriptor, StoreComponentRole,
+    child_strategy,
+};
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{into_struct_array, make_string_array};
 use crate::store::probes::StructProbes;
@@ -80,53 +86,29 @@ pub(crate) fn check_component_rows(name: &str, component_rows: u64, quad_rows: u
 }
 
 /// Adopt a persisted child as an in-memory [`IndexComponent`] under the
-/// registry row `identity`, `sorted` the descriptor's provenance: the
-/// child's canonicalization — and, for a [`DeferredSource::Reader`], its
-/// scan too — is *deferred* to the component's first genuine use. The child
-/// comes from a roster the open has already checked, its row count among the
-/// rest (`ComponentRoster::of`): a corrupt roster fails at open, not at first
+/// registry row `identity`, `sorted` the descriptor's provenance, reading
+/// nothing of it now: the child's scan and canonicalization both defer to
+/// the component's first genuine use — the form `from_bytes` adopts its
+/// children in, the roster row coming off the wire TOC alone. `reader` MUST
+/// sit over a buffer-backed segment source (a `from_bytes` buffer):
+/// [`IndexComponent::rows`] drives its scan synchronously, and only
+/// buffer-backed segment reads resolve without pending. The child comes from
+/// a roster the open has already checked, its row count among the rest
+/// (`ComponentRoster::of`): a corrupt roster fails at open, not at first
 /// probe.
 pub(crate) fn adopt_component(
     identity: &'static ComponentIdentity,
-    source: DeferredSource,
+    reader: vortex_layout::LayoutReaderRef,
     sorted: bool,
 ) -> IndexComponent {
     IndexComponent {
         identity,
         rows: Arc::new(ComponentRows {
             cell: OnceLock::new(),
-            pending: Some(source),
+            pending: Some(reader),
         }),
         sorted,
         probes: StructProbes::new(),
-    }
-}
-
-/// How much of the read pipeline a deferred component still owes.
-pub(crate) enum DeferredSource {
-    /// The scan already ran (holding its un-executed output — array metadata
-    /// plus refcounts on the source's buffers); only canonicalization is
-    /// deferred. Safe over any segment source — it is how a file view lifts
-    /// its children for serialization.
-    #[cfg(feature = "file-io")]
-    Scanned(ArrayRef),
-    /// Nothing ran: scan and canonicalization both defer — the form
-    /// `from_bytes` uses, reading nothing of the child at open (the roster
-    /// row comes off the wire TOC alone). The reader MUST sit over a
-    /// buffer-backed segment source (a `from_bytes` buffer):
-    /// [`IndexComponent::rows`] drives its scan synchronously, and only
-    /// buffer-backed segment reads resolve without pending.
-    Reader(vortex_layout::LayoutReaderRef),
-}
-
-impl DeferredSource {
-    /// The child's un-executed scan output, scanning a reader now.
-    fn scanned(&self) -> Result<ArrayRef> {
-        match self {
-            #[cfg(feature = "file-io")]
-            DeferredSource::Scanned(scanned) => Ok(scanned.clone()),
-            DeferredSource::Reader(reader) => crate::io::read::scan_all_reader_sync(reader.clone()),
-        }
     }
 }
 
@@ -167,11 +149,11 @@ pub(crate) struct IndexComponent {
 
 /// An [`IndexComponent`]'s rows: `cell` holds them as one struct in child
 /// schema once canonical — from construction for a builder's emission —
-/// and `pending` is what a deferred adoption still runs to fill it (`None`
-/// for rows built in memory).
+/// and `pending` is the reader a deferred adoption still scans to fill it
+/// (`None` for rows built in memory).
 struct ComponentRows {
     cell: OnceLock<StructArray>,
-    pending: Option<DeferredSource>,
+    pending: Option<vortex_layout::LayoutReaderRef>,
 }
 
 impl IndexComponent {
@@ -202,44 +184,31 @@ impl IndexComponent {
         if let Some(array) = self.rows.cell.get() {
             return Ok(array);
         }
-        let Some(source) = &self.rows.pending else {
+        let Some(reader) = &self.rows.pending else {
             unreachable!("a component without a pending adoption holds its built rows")
         };
-        let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let executed = source.scanned()?.execute::<StructArray>(&mut ctx)?;
+        let executed = into_struct_array(crate::io::read::scan_all_reader_sync(reader.clone())?)?;
         Ok(self.rows.cell.get_or_init(|| executed))
     }
 
-    /// This component as a replayable native child write, its descriptor
-    /// carrying the component's own sortedness provenance — the one way a
-    /// component reaches the container writer, from a store's serialization
-    /// and from a builder's chunk stream alike. Compiled only where a store
-    /// can be written (file-io or wasm32).
+    /// This component as a replayable native child write
+    /// ([`index_child_write`]), its descriptor carrying the component's own
+    /// sortedness provenance — how a store's serialization hands its
+    /// components to the container writer. Compiled only where a store can
+    /// be written (file-io or wasm32).
     ///
     /// Writing is a genuine use: a deferred adoption materializes here, so
     /// the written child is byte-identical to an eagerly-adopted one's.
     #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-    pub(crate) fn to_write(&self) -> Result<crate::io::container::NativeComponentWrite> {
-        use crate::io::container::{
-            BufferedComponentSource, INDEX_VERSION, NativeComponentWrite, StoreComponentDescriptor,
-            StoreComponentRole, child_strategy,
-        };
+    pub(crate) fn to_write(&self) -> Result<NativeComponentWrite> {
         let array = self.rows()?.clone().into_array();
-        let strategy = child_strategy(array.dtype());
-        NativeComponentWrite::new(
-            StoreComponentDescriptor {
-                name: self.identity.name.into(),
-                role: StoreComponentRole::Index,
-                implementation: self.identity.slug.into(),
-                version: INDEX_VERSION,
-                required: false,
-                sorted: self.sorted,
-                dtype: array.dtype().clone(),
-            },
-            Arc::new(BufferedComponentSource::try_new(vec![array])?),
-            strategy,
+        index_child_write(
+            self.identity,
+            self.sorted,
+            Arc::new(crate::io::container::BufferedComponentSource::try_new(
+                vec![array],
+            )?),
         )
-        .map_err(VortexRdfError::Vortex)
     }
 
     /// The inverse of [`to_write`](Self::to_write): the write's streamed
@@ -409,6 +378,35 @@ impl IndexComponent {
     }
 }
 
+/// `source` as the native child write of an index component under the
+/// registry row `identity`: its descriptor names the component and its
+/// slug, carries `sorted` — the writer's provenance — and `source`'s dtype,
+/// and the child is written through [`child_strategy`]. The one spelling of
+/// an index child's descriptor, for a component's own rows
+/// ([`IndexComponent::to_write`]) and the out-of-core builder's streamed
+/// children alike.
+pub(crate) fn index_child_write(
+    identity: &'static ComponentIdentity,
+    sorted: bool,
+    source: Arc<dyn NativeComponentSource>,
+) -> Result<NativeComponentWrite> {
+    let dtype = source.dtype().clone();
+    let strategy = child_strategy(&dtype);
+    Ok(NativeComponentWrite::new(
+        StoreComponentDescriptor {
+            name: identity.name.into(),
+            role: StoreComponentRole::Index,
+            implementation: identity.slug.into(),
+            version: INDEX_VERSION,
+            required: false,
+            sorted,
+            dtype,
+        },
+        source,
+        strategy,
+    )?)
+}
+
 /// The index set a component roster implies, in declaration (preference)
 /// order — the in-memory counterpart of reading a file's child roster.
 pub(crate) fn indexes_from_components(components: &[IndexComponent]) -> Indexes {
@@ -441,21 +439,38 @@ pub(crate) fn child_struct(
 }
 
 /// An index column's term encoding — `String` terms, or [`TermCode`]s under
-/// the Dictionary layout — and the array a column of them assembles into:
-/// the one spelling both families' builders emit their term columns through.
-pub(crate) trait TermColumn: Clone + Ord {
+/// the Dictionary layout — with the dtype a column of them has and the array
+/// it assembles into: the one spelling both families' builders emit their
+/// term columns and declare their child dtypes through.
+pub(crate) trait TermColumn: Clone + Default + Ord {
+    /// The dtype of a column of these terms, which the out-of-core builder's
+    /// child dtypes (`copy_child_dtype`, `ref_child_dtype`) declare. Compiled
+    /// where the out-of-core builder is.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn dtype() -> DType;
+
     fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef
     where
         Self: 'a;
 }
 
 impl TermColumn for String {
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn dtype() -> DType {
+        DType::Utf8(Nullability::NonNullable)
+    }
+
     fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef {
         make_string_array(it.map(String::as_str))
     }
 }
 
 impl TermColumn for TermCode {
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn dtype() -> DType {
+        DType::Primitive(crate::store::schema::CODE_PTYPE, Nullability::NonNullable)
+    }
+
     fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef {
         PrimitiveArray::from_iter(it.copied()).into_array()
     }
@@ -487,7 +502,7 @@ pub(crate) fn child_struct_dtype(
     child_columns: &[&'static str],
     field_dtypes: Vec<DType>,
 ) -> DType {
-    use vortex_array::dtype::{Nullability, StructFields};
+    use vortex_array::dtype::StructFields;
     DType::Struct(
         StructFields::new(
             child_columns
@@ -512,7 +527,6 @@ pub(crate) fn child_struct_dtype(
 /// [`base_row`]: super::base_row
 pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<RowId>> {
     use vortex_array::builtins::ArrayBuiltins;
-    use vortex_array::dtype::Nullability;
 
     if row_id_column.is_empty() {
         return Ok(Buffer::empty());

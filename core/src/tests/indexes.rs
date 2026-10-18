@@ -9,7 +9,10 @@ use super::*;
 /// The same index requested twice contributes its children exactly once,
 /// under every layout: the quad rows carry the layout's primary columns and
 /// nothing else, the roster is deduplicated, and where the layout has a
-/// single `o` column each child's `val` column shares its dtype.
+/// single `o` column each child's `val` column shares its dtype. The
+/// out-of-core builder dedups a repeated, non-canonical request the same
+/// way, and reports the index set and its children in `ALL_INDEX_TYPES`
+/// order whatever the request's.
 #[tokio::test]
 async fn test_duplicate_index_requests_are_deduplicated() {
     for layout in LAYOUTS {
@@ -56,6 +59,37 @@ async fn test_duplicate_index_requests_are_deduplicated() {
             .await
             .unwrap();
         assert_eq!(matched.size().await.unwrap(), 1, "{layout:?}");
+
+        // The out-of-core builder, on a repeated request out of order: each
+        // family once, in `ALL_INDEX_TYPES` order.
+        let streamed = build_array::<SortedStreamBuilder>(
+            quad_stream(two_quads()),
+            layout,
+            vec![
+                IndexType::SecondaryByReference,
+                IndexType::SecondaryByCopy,
+                IndexType::SecondaryByReference,
+            ],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{layout:?}: stream build failed: {e}"));
+        let streamed = VortexRdfStore::from_built(streamed).unwrap();
+        assert_eq!(
+            streamed.indexes(),
+            [IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+            "{layout:?}"
+        );
+        let children: Vec<&str> = streamed
+            .index_components()
+            .unwrap()
+            .iter()
+            .map(|child| child.name)
+            .collect();
+        assert_eq!(
+            children,
+            ["index:posg", "index:ospg", "index:ref-o", "index:ref-p"],
+            "{layout:?}"
+        );
     }
 }
 

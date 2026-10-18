@@ -22,7 +22,7 @@
 //! families are spilled and merged as they are, never deduplicated.
 
 use super::spill::{RunSpiller, TempRunsGuard};
-use super::stream_indexes::{merge_feeding_indexes, merger_components};
+use super::stream_indexes::merge_feeding_indexes;
 use super::{
     BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_ROWS, VortexArrayBuilder,
     build_struct_array,
@@ -30,7 +30,7 @@ use super::{
 use crate::error::Result;
 use crate::store::RawQuad;
 use crate::store::array::{chunked_or_single, with_subject_stamp};
-use crate::store::indexes::{IndexComponent, Indexes, unique_indexes};
+use crate::store::indexes::{IndexComponent, Indexes};
 use crate::store::layouts::dictionary::{TermCodeMap, TermDictionary, TermDictionaryBuilder};
 use crate::store::layouts::{LayoutStrategy, dictionary};
 
@@ -215,27 +215,20 @@ pub(crate) async fn build_chunk_stream(
     // Any requested index means a first pass over the merge: the index
     // children are globally sorted, which needs the row ids the merge
     // assigns before their entries can be sorted. Only the families the
-    // requested types need are spilled.
-    let unique = unique_indexes(&indexes);
-    let (merger, components) = if unique.is_empty() {
+    // requested types need are spilled, each once however often requested.
+    let (merger, components) = if indexes.is_empty() {
         (merger, Vec::new())
     } else {
         match &encoding {
             Encoding::Codes { code_map, .. } => {
-                let (merged, mergers) =
-                    merge_feeding_indexes(merger, guard.path(), chunk_size, &unique, |term| {
-                        dictionary::code_of(code_map, term)
-                    })?;
-                let components = merger_components(mergers, chunk_size, &guard, true)?;
-                (merged, components)
+                merge_feeding_indexes(merger, &guard, chunk_size, &indexes, |term| {
+                    dictionary::code_of(code_map, term)
+                })?
             }
             Encoding::Strings(_) => {
-                let (merged, mergers) =
-                    merge_feeding_indexes(merger, guard.path(), chunk_size, &unique, |term| {
-                        Ok(term.to_string())
-                    })?;
-                let components = merger_components(mergers, chunk_size, &guard, false)?;
-                (merged, components)
+                merge_feeding_indexes(merger, &guard, chunk_size, &indexes, |term| {
+                    Ok(term.to_string())
+                })?
             }
         }
     };

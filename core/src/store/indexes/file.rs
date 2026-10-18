@@ -123,10 +123,7 @@ pub(crate) async fn scan_index_row_ids(
 /// constraints select, so re-testing the value columns would only re-read and
 /// re-compare them. A resolver whose location covers only *some* of its
 /// constraints must keep [`scan_index_row_ids`], whose filter tests them all.
-pub(crate) async fn scan_located_row_ids(
-    child: &ChildReader,
-    range: Range<u64>,
-) -> Result<Buffer<RowId>> {
+async fn scan_located_row_ids(child: &ChildReader, range: Range<u64>) -> Result<Buffer<RowId>> {
     read_scanned_row_ids(child.scan(&[COL_RID])?.with_row_range(range)).await
 }
 
@@ -474,11 +471,11 @@ impl FileServePlan {
         self.row_range.clone()
     }
 
-    /// The columns to project from the file to serve these rows: the four
-    /// component sources plus the row-id column (for tombstones).
+    /// The columns to project from the file to serve these rows: the serving
+    /// child's quad columns plus the row-id column (for tombstones) — the
+    /// copy family's child schema ([`CHILD_COLUMNS`](super::copy::CHILD_COLUMNS)).
     pub(crate) fn projection(&self) -> [&'static str; 5] {
-        let [s, p, o, g] = self.decode.primary_columns;
-        [s, p, o, g, self.decode.rid_column]
+        super::copy::CHILD_COLUMNS
     }
 
     /// A scan over the serving index child — where [`Self::projection`] and

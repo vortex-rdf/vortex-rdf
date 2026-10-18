@@ -30,7 +30,7 @@
 //! The copies come in two encodings — term strings (Default and TypedObject
 //! layouts, the object as its full N-Triples term string), or dictionary
 //! codes ([`TermCode`]) under the Dictionary layout — and, like the reference index, are
-//! always sorted over the complete dataset: [`GlobalCopyArrays`] for the
+//! always sorted over the complete dataset: [`components`] for the
 //! in-memory builders, merged `(sort key, row id)` spill runs for the
 //! out-of-core one, lead column stamped either way. The in-memory resolver
 //! requires that global provenance. The file resolver uses it to locate the
@@ -40,6 +40,7 @@
 //!
 //! [`IndexType::SecondaryByCopy`]: super::IndexType::SecondaryByCopy
 //! [`reference`]: super::reference
+//! [`TermCode`]: crate::store::TermCode
 
 use std::cmp::Ordering;
 
@@ -49,13 +50,13 @@ use vortex_array::{ArrayRef, IntoArray};
 use super::components::{ComponentIdentity, IndexComponent, TermColumn, components_from};
 use super::resolve::IndexProbe;
 use super::serve::ServeDecode;
-use super::{COL_RID, IndexType, ResolvedRoles};
+use super::{COL_RID, IndexInput, IndexType, ResolvedRoles};
 use crate::error::Result;
 use crate::store::RawQuad;
 use crate::store::array::stamp_is_sorted;
 use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{QuadPattern, ResolvedLayout, TermRef};
-use crate::store::schema::{COL_G, COL_O, COL_P, COL_S, TermCode};
+use crate::store::schema::{COL_G, COL_O, COL_P, COL_S};
 
 /// One of the two sorted copy families this index maintains, named after its
 /// sort order. Each family owns five columns: the four quad components plus
@@ -70,11 +71,9 @@ pub(crate) enum CopyFamily {
 
 /// The columns of a copy family's persisted child: the primaries under the
 /// schema's names plus the primary row id. Both families use the same names
-/// — the child's identity is what says which sort order the rows are in.
-const CHILD_COLUMNS: [&str; 5] = [COL_S, COL_P, COL_O, COL_G, COL_RID];
-/// The child columns sourcing the primary `(s, p, o, g)` components, in that
-/// order — what both serve plans project.
-const CHILD_PRIMARY: [&str; 4] = [COL_S, COL_P, COL_O, COL_G];
+/// — the child's identity is what says which sort order the rows are in —
+/// and a file serve plan projects exactly these.
+pub(super) const CHILD_COLUMNS: [&str; 5] = [COL_S, COL_P, COL_O, COL_G, COL_RID];
 
 /// This index's persisted-child identity table — one differently-sorted quad
 /// table per family, in [`CopyFamily`] order — feeding every generic loop in
@@ -105,44 +104,46 @@ impl CopyFamily {
         }
     }
 
+    /// This family's sort order: the `(s, p, o, g)` position of each of its
+    /// sort keys, in key order — `(p, o, s, g)` for POSG, `(o, s, p, g)` for
+    /// OSPG. The one spelling of the permutation: the child's sort-key
+    /// columns ([`key_column`](Self::key_column)), the code sort key and the
+    /// out-of-core [`CopyKey`] all derive from it. A position is also the
+    /// component's column in [`CHILD_COLUMNS`].
+    ///
+    /// [`CopyKey`]: out_of_core::CopyKey
+    const fn key_order(self) -> [usize; 4] {
+        match self {
+            CopyFamily::Posg => [1, 2, 0, 3],
+            CopyFamily::Ospg => [2, 0, 1, 3],
+        }
+    }
+
     /// Where each quad component (s, p, o, g) sits inside this family's
-    /// [`CopyKey`] tuple, which stores the components in sort-key order.
+    /// [`CopyKey`] tuple: the inverse of [`key_order`](Self::key_order).
     /// Compiled where the out-of-core builder is.
     ///
     /// [`CopyKey`]: out_of_core::CopyKey
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    fn key_positions(self) -> [usize; 4] {
-        match self {
-            CopyFamily::Posg => [2, 0, 1, 3],
-            CopyFamily::Ospg => [1, 2, 0, 3],
+    const fn key_positions(self) -> [usize; 4] {
+        let order = self.key_order();
+        let mut positions = [0; 4];
+        let mut key = 0;
+        while key < order.len() {
+            positions[order[key]] = key;
+            key += 1;
         }
+        positions
     }
 
-    /// The leading sort-key column inside the persisted child (plain names).
-    fn child_lead_col(self) -> &'static str {
-        match self {
-            CopyFamily::Posg => COL_P,
-            CopyFamily::Ospg => COL_O,
-        }
+    /// The child column holding sort key `key` (0 the lead, 1 the second).
+    fn key_column(self, key: usize) -> &'static str {
+        CHILD_COLUMNS[self.key_order()[key]]
     }
 
-    /// The second sort-key column inside the persisted child.
-    fn child_second_col(self) -> &'static str {
-        match self {
-            CopyFamily::Posg => COL_O,
-            CopyFamily::Ospg => COL_S,
-        }
-    }
-
-    /// Index of the lead value column within [`CHILD_COLUMNS`] order.
-    fn lead_ix(self) -> usize {
-        match self {
-            CopyFamily::Posg => 1,
-            CopyFamily::Ospg => 2,
-        }
-    }
-
-    /// This family's quad comparator over term strings.
+    /// This family's quad comparator over term strings, in
+    /// [`key_order`](Self::key_order) — written out by hand, as the hot
+    /// comparator of the in-memory string sort.
     fn cmp_quads(self, a: &RawQuad, b: &RawQuad) -> Ordering {
         match self {
             CopyFamily::Posg => {
@@ -157,16 +158,6 @@ impl CopyFamily {
                     .then_with(|| a.p.cmp(&b.p))
                     .then_with(|| a.g.cmp(&b.g))
             }
-        }
-    }
-
-    /// Row `i`'s sort key as a code tuple — order-equivalent to
-    /// [`Self::cmp_quads`] because sorted-dictionary codes are lexicographic
-    /// ranks.
-    fn code_key(self, codes: &QuadCodes, i: usize) -> [TermCode; 4] {
-        match self {
-            CopyFamily::Posg => [codes.p[i], codes.o[i], codes.s[i], codes.g[i]],
-            CopyFamily::Ospg => [codes.o[i], codes.s[i], codes.p[i], codes.g[i]],
         }
     }
 }
@@ -214,8 +205,8 @@ pub(super) fn choose<'a>(
     // The lead key, then — for a prefix probe — the second sort key, which
     // the family's comparator sorts within each lead run.
     let mut keys = Vec::with_capacity(2);
-    keys.push((family.child_lead_col(), lead));
-    keys.extend(second.map(|term| (family.child_second_col(), term)));
+    keys.push((family.key_column(0), lead));
+    keys.extend(second.map(|term| (family.key_column(1), term)));
     Some(IndexProbe {
         identity: family.identity(),
         keys,
@@ -225,11 +216,9 @@ pub(super) fn choose<'a>(
             .into_iter()
             .collect(),
         resolves,
-        serve: Some(ServeDecode::new(
-            CHILD_PRIMARY,
-            COL_RID,
-            copy_decode_layout(layout),
-        )),
+        serve: Some(ServeDecode {
+            decode_layout: copy_decode_layout(layout),
+        }),
         rids_ascend: false,
     })
 }
@@ -259,17 +248,14 @@ pub(crate) mod out_of_core {
     use super::{CHILD_COLUMNS, CopyFamily};
     use crate::error::Result;
     use crate::store::array::stamp_is_sorted;
-    use crate::store::schema::{CODE_PTYPE, ROW_ID_PTYPE, RowId};
+    use crate::store::schema::{ROW_ID_PTYPE, RowId};
 
-    /// The persisted child's struct dtype: quad components as strings (or
-    /// codes under the Dictionary layout) plus the u64 primary row id.
-    pub(crate) fn copy_child_dtype(encoded: bool) -> DType {
+    /// The persisted child's struct dtype: quad components as `V` terms
+    /// (strings, or codes under the Dictionary layout) plus the u64 primary
+    /// row id.
+    pub(crate) fn copy_child_dtype<V: TermColumn>() -> DType {
         use vortex_array::dtype::Nullability;
-        let term = if encoded {
-            DType::Primitive(CODE_PTYPE, Nullability::NonNullable)
-        } else {
-            DType::Utf8(Nullability::NonNullable)
-        };
+        let term = V::dtype();
         child_struct_dtype(
             &CHILD_COLUMNS,
             vec![
@@ -301,7 +287,7 @@ pub(crate) mod out_of_core {
             col(g_ix),
             PrimitiveArray::from_iter(keys.iter().map(|(_, rid)| *rid)).into_array(),
         ];
-        stamp_is_sorted(&columns[family.lead_ix()]);
+        stamp_is_sorted(&columns[family.key_order()[0]]);
         child_struct(&CHILD_COLUMNS, columns, keys.len()).map(|a| a.into_array())
     }
 
@@ -310,7 +296,7 @@ pub(crate) mod out_of_core {
     /// family's comparator. `V` is the term encoding: `String`, or
     /// [`TermCode`](crate::store::TermCode)s under the Dictionary layout.
     ///
-    /// Built via [`Self::posg`] / [`Self::ospg`] from an `[s, p, o, g]` tuple;
+    /// Built via [`Self::new`] from an `[s, p, o, g]` tuple;
     /// [`CopyFamily::key_positions`](super::CopyFamily::key_positions) maps the components back out when the sorted
     /// keys are turned into columns.
     #[derive(
@@ -326,23 +312,17 @@ pub(crate) mod out_of_core {
     )]
     pub(crate) struct CopyKey<V>(pub(crate) [V; 4]);
 
-    impl<V: Clone> CopyKey<V> {
-        /// The POSG key of a quad given as `[s, p, o, g]`.
-        pub(crate) fn posg(spog: &[V; 4]) -> Self {
-            Self([
-                spog[1].clone(),
-                spog[2].clone(),
-                spog[0].clone(),
-                spog[3].clone(),
-            ])
-        }
-
-        /// The OSPG key of a quad given as `[s, p, o, g]`, consuming the tuple —
-        /// the merge path constructs it last, so the rearrangement needs no
-        /// clones (which are String allocations on the non-Dictionary layouts).
-        pub(crate) fn ospg(spog: [V; 4]) -> Self {
-            let [s, p, o, g] = spog;
-            Self([o, s, p, g])
+    impl<V: Default> CopyKey<V> {
+        /// The `family` key of a quad given as `[s, p, o, g]`, consuming the
+        /// tuple: each term moves into its place in the family's
+        /// [`key_order`](CopyFamily::key_order), so the rearrangement clones
+        /// nothing (a clone is a String allocation on the non-Dictionary
+        /// layouts).
+        pub(crate) fn new(family: CopyFamily, mut spog: [V; 4]) -> Self {
+            // Four indexed moves into key order.
+            let [a, b, c, d] = family.key_order();
+            let mut take = |component: usize| std::mem::take(&mut spog[component]);
+            Self([take(a), take(b), take(c), take(d)])
         }
     }
 }
@@ -357,10 +337,14 @@ fn string_perm(quads: &[RawQuad], family: CopyFamily) -> Vec<usize> {
 }
 
 /// The permutation of positions putting the encoded dataset in `family`
-/// order.
+/// order: each row's codes in [`key_order`](CopyFamily::key_order) are its
+/// sort key, order-equivalent to [`CopyFamily::cmp_quads`] because
+/// sorted-dictionary codes are lexicographic ranks.
 fn code_perm(codes: &QuadCodes, family: CopyFamily) -> Vec<usize> {
+    let spog = [&codes.s, &codes.p, &codes.o, &codes.g];
+    let [a, b, c, d] = family.key_order().map(|component| spog[component]);
     let mut perm: Vec<usize> = (0..codes.s.len()).collect();
-    perm.sort_unstable_by_key(|&i| family.code_key(codes, i));
+    perm.sort_unstable_by_key(|&i| [a[i], b[i], c[i], d[i]]);
     perm
 }
 
@@ -383,70 +367,47 @@ fn family_columns<'a, V: TermColumn + 'a>(
     ]
 }
 
-/// The complete dataset's copy columns in global family order — the
-/// in-memory builders' emission, handed on as this index's two persisted
-/// children by [`into_components`](Self::into_components).
-pub(crate) struct GlobalCopyArrays {
-    posg: [ArrayRef; 5],
-    ospg: [ArrayRef; 5],
-}
-
-impl GlobalCopyArrays {
-    /// Sort by term strings. Row ids number the quads' positions in `quads`
-    /// (the builder must pass the dataset in final row order), so each family
-    /// is just a permutation of positions — no per-term string copies beyond
-    /// the columns.
-    pub(crate) fn from_quads(quads: &[RawQuad]) -> Self {
-        Self::build(
+/// This index's two persisted children over `input`, one sorted quad copy
+/// per family in [`IDENTITIES`] order, each in its global family order with
+/// its lead column stamped sorted — the in-memory builders' emission. Row
+/// ids number the input's positions (the builder passes the dataset in
+/// final row order), so each family is just a permutation of positions: by
+/// term strings ([`CopyFamily::cmp_quads`]), or by codes under the
+/// Dictionary layout — no per-term string copies beyond the columns.
+pub(super) fn components(input: IndexInput<'_>) -> Result<Vec<IndexComponent>> {
+    match input {
+        IndexInput::Quads(quads) => family_components(
             |family| string_perm(quads, family),
             [&|i| &quads[i].s, &|i| &quads[i].p, &|i| &quads[i].o, &|i| {
                 &quads[i].g
             }],
-        )
-    }
-
-    /// Dictionary-layout variant: sort the codes.
-    pub(crate) fn from_codes(codes: &QuadCodes) -> Self {
-        Self::build(
+        ),
+        IndexInput::Codes(codes) => family_components(
             |family| code_perm(codes, family),
             [&|i| &codes.s[i], &|i| &codes.p[i], &|i| &codes.o[i], &|i| {
                 &codes.g[i]
             }],
-        )
+        ),
     }
+}
 
-    /// Both families' columns: `perm_by` orders the dataset for a family,
-    /// `term_of` reads row `i`'s `(s, p, o, g)` terms; each family's lead
-    /// column is stamped sorted.
-    fn build<'a, V: TermColumn + 'a>(
-        perm_by: impl Fn(CopyFamily) -> Vec<usize>,
-        term_of: [&dyn Fn(usize) -> &'a V; 4],
-    ) -> Self {
-        let build = |family: CopyFamily| {
-            let perm = perm_by(family);
-            let columns = family_columns(&perm, term_of);
-            stamp_is_sorted(&columns[family.lead_ix()]);
-            columns
-        };
-        Self {
-            posg: build(CopyFamily::Posg),
-            ospg: build(CopyFamily::Ospg),
-        }
-    }
-
-    /// This index's two persisted children, one sorted quad copy per family.
-    /// Globally sorted by construction, so both are handed over with that
-    /// provenance.
-    pub(crate) fn into_components(self) -> Result<Vec<IndexComponent>> {
-        let Self { posg, ospg } = self;
-        components_from(
-            &CHILD_COLUMNS,
-            [
-                (CopyFamily::Posg.identity(), Vec::from(posg)),
-                (CopyFamily::Ospg.identity(), Vec::from(ospg)),
-            ],
-        )
-    }
+/// Both families' children: `perm_by` orders the dataset for a family,
+/// `term_of` reads row `i`'s `(s, p, o, g)` terms; each family's lead column
+/// is stamped sorted.
+fn family_components<'a, V: TermColumn + 'a>(
+    perm_by: impl Fn(CopyFamily) -> Vec<usize>,
+    term_of: [&dyn Fn(usize) -> &'a V; 4],
+) -> Result<Vec<IndexComponent>> {
+    let build = |family: CopyFamily| {
+        let perm = perm_by(family);
+        let columns = family_columns(&perm, term_of);
+        stamp_is_sorted(&columns[family.key_order()[0]]);
+        (family.identity(), Vec::from(columns))
+    };
+    components_from(
+        &CHILD_COLUMNS,
+        [build(CopyFamily::Posg), build(CopyFamily::Ospg)],
+    )
 }
 
 #[cfg(test)]
@@ -526,6 +487,21 @@ mod tests {
         // (o, s, p, g): (o0,s0) < (o0,s1) < (o2,s2) → rows 1, 2, 0.
         assert_eq!(string_perm(&quads, CopyFamily::Ospg), vec![1, 2, 0]);
 
+        // The hand-written comparator is the table's order: every pair
+        // compares as its terms do in `key_order`.
+        for family in [CopyFamily::Posg, CopyFamily::Ospg] {
+            let key = |q: &RawQuad| {
+                family
+                    .key_order()
+                    .map(|c| [&q.s, &q.p, &q.o, &q.g][c].clone())
+            };
+            for a in &quads {
+                for b in &quads {
+                    assert_eq!(family.cmp_quads(a, b), key(a).cmp(&key(b)), "{family:?}");
+                }
+            }
+        }
+
         // The code comparator agrees with the string one when codes are
         // lexicographic ranks of the terms.
         let codes = QuadCodes {
@@ -552,14 +528,14 @@ mod tests {
             "g".to_string(),
         ];
 
-        let posg = CopyKey::posg(&spog);
+        let posg = CopyKey::new(CopyFamily::Posg, spog.clone());
         let [s_ix, p_ix, o_ix, g_ix] = CopyFamily::Posg.key_positions();
         assert_eq!(
             [&posg.0[s_ix], &posg.0[p_ix], &posg.0[o_ix], &posg.0[g_ix]],
             [&spog[0], &spog[1], &spog[2], &spog[3]]
         );
 
-        let ospg = CopyKey::ospg(spog.clone());
+        let ospg = CopyKey::new(CopyFamily::Ospg, spog.clone());
         let [s_ix, p_ix, o_ix, g_ix] = CopyFamily::Ospg.key_positions();
         assert_eq!(
             [&ospg.0[s_ix], &ospg.0[p_ix], &ospg.0[o_ix], &ospg.0[g_ix]],
@@ -569,7 +545,10 @@ mod tests {
         // Derived Ord on the key compares by the family's comparator: POSG
         // keys order by predicate first.
         let key = |s: &str, p: &str, o: &str| {
-            CopyKey::posg(&[s.to_string(), p.to_string(), o.to_string(), String::new()])
+            CopyKey::new(
+                CopyFamily::Posg,
+                [s.to_string(), p.to_string(), o.to_string(), String::new()],
+            )
         };
         assert!(key("s9", "p1", "o9") < key("s0", "p2", "o0"));
     }

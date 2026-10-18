@@ -121,7 +121,7 @@ where
 /// Build a Dictionary-layout StructArray chunk from raw quads: four code
 /// columns encoded against the global dictionary. Secondary indexes are built
 /// separately as components (see
-/// [`build_components_from_codes`](crate::store::builders::build_components_from_codes)),
+/// [`build_components`](crate::store::builders::build_components)),
 /// so nothing else rides here.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) fn build_chunk<K>(

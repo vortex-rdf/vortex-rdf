@@ -165,7 +165,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 | `components[i]` | describes child `i + 1` ([`StoreComponentDescriptor`](../core/src/io/container/wire.rs#L128)) |
 | `name` | the child's identity; non-empty, unique, never `quad-source` |
 | `role` | `dictionary`, `index`, `change-set` (reserved for future delta components) or `other` |
-| `implementation` | the slug a reader interprets the columns through — the key of the registry behind [`known_component`](../core/src/store/indexes/components.rs#L60) |
+| `implementation` | the slug a reader interprets the columns through — the key of the registry behind [`known_component`](../core/src/store/indexes/components.rs#L66) |
 | `version` | the implementation's version, positive; a dictionary or index child above the version a reader reads (`DICT_VERSION`, `INDEX_VERSION`) fails the open ([§3](#3-the-store-root-vortex-rdfstorev2)) |
 | `required` | a reader that cannot interpret a required component **must fail the open**; an unknown optional component is skipped |
 | `sorted` | the writer's provenance that the sort-key columns are *globally* sorted — a reader may binary-search the child only when this is set; absent means false |
@@ -174,7 +174,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 On open the layout checks that the child count is `1 + components.len()`,
 that child 0 has the root's row count, and that every component child's dtype
 matches its descriptor ([`deserialize`](../core/src/io/container/layout.rs#L56));
-[`classify_component`](../core/src/store/persist/open.rs#L88) then turns each
+[`classify_component`](../core/src/store/persist/open.rs#L89) then turns each
 descriptor into the dictionary, a known index, or a skip — an index child by
 its implementation slug alone, whatever its name. The open classifies the
 roster once, and every later read reaches a child only through it.
@@ -339,20 +339,20 @@ Shared rules:
   `u64` codes under `Dictionary`. `rid` is always a non-nullable `u64`
   ([`RowId`](../core/src/store/schema.rs#L37)), under every layout; a child
   whose `rid` is an integer of any other width is refused at open
-  ([`check_id_columns`](../core/src/store/persist/open.rs#L42)): rebuild such a store
+  ([`check_id_columns`](../core/src/store/persist/open.rs#L43)): rebuild such a store
   from its RDF source.
 - **Row ids do not limit a store.** A `u64` row id numbers more rows than any
   store holds. The builds still number rows with checked arithmetic — up
   front for the in-memory builds
-  ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L112)), row by row
-  in the out-of-core merge ([`next_row_id`](../core/src/store/indexes/mod.rs#L126))
+  ([`check_indexed_rows`](../core/src/store/indexes/mod.rs#L115)), row by row
+  in the out-of-core merge ([`next_row_id`](../core/src/store/indexes/mod.rs#L129))
   — and refuse a store whose ids would run past the last one with a
   serialization error, rather than let an id wrap.
 - **`rid` is the quad's row id in the quad table.** That is what lets a match
   resolved through an index compose with row selections, tombstones and
   further matches without renumbering anything ([matching.md §1](matching.md#1-what-a-match-produces)).
 - **One row per quad.** A child whose row count differs from the quad table's
-  fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L72)).
+  fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L78)).
 - **A bound graph is never a sort key**, and neither index answers a
   bound-subject pattern — the sorted quad table is the better path there.
 - **A `{val, rid}` child is ordered by `(val, rid)`**: inside one value's run

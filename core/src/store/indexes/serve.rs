@@ -39,25 +39,22 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 
+use super::COL_RID;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::layouts::{ChunkDecode, ResolvedLayout};
-use crate::store::scan::gather::point_read_columns;
-use crate::store::schema::{RowId, TermCode};
+use crate::store::probes::StructProbes;
+use crate::store::schema::{PRIMARY_COLUMNS, RowId, TermCode};
 use crate::store::view::selection::point_sized;
 
-/// The decode tail shared by both backend-typed serve plans: which of the
-/// index's columns source each primary component, which carries the primary
-/// row id, and the layout the projected columns decode through. Acquisition
-/// differs per backend; everything after it lives here, once.
+/// The decode tail shared by both backend-typed serve plans: the layout the
+/// serving child's columns decode through. A serving child holds the whole
+/// quad under the primary column names ([`PRIMARY_COLUMNS`]) beside the
+/// primary row id ([`COL_RID`]), which drops rows tombstoned since
+/// construction. Acquisition differs per backend; everything after it lives
+/// here, once.
 #[derive(Clone)]
 pub(super) struct ServeDecode {
-    /// The source column for each primary `(s, p, o, g)` component, in that
-    /// order — the index's own columns holding the whole quad.
-    pub(super) primary_columns: [&'static str; 4],
-    /// The column giving each served row's primary row id, used to drop rows
-    /// tombstoned since construction.
-    pub(super) rid_column: &'static str,
     /// The layout the projected source columns decode through (an index that
     /// stores whole terms decodes them as strings, or dictionary codes under
     /// the Dictionary layout).
@@ -65,21 +62,6 @@ pub(super) struct ServeDecode {
 }
 
 impl ServeDecode {
-    /// The decode tail of a plan whose index columns `primary_columns` hold
-    /// the quad, `rid_column` its primary row id, decoded through
-    /// `decode_layout`.
-    pub(super) fn new(
-        primary_columns: [&'static str; 4],
-        rid_column: &'static str,
-        decode_layout: ResolvedLayout,
-    ) -> Self {
-        Self {
-            primary_columns,
-            rid_column,
-            decode_layout,
-        }
-    }
-
     /// Decode the `(s, p, o, g)` rows out of a chunk of the plan's projected
     /// index columns, dropping rows tombstoned in `deleted` via the row-id
     /// column.
@@ -110,74 +92,6 @@ impl ServeDecode {
         }
     }
 
-    /// The positions of a small run's live rows, for point reads through the
-    /// component's cached probes. Tombstones are defined over primary row
-    /// ids; the rid column says which primary row each served row mirrors,
-    /// and only a tombstoned view pays for the liveness pass.
-    ///
-    /// The outer `None` declines: a run wider than
-    /// [`POINT_GATHER_MAX_ROWS`], or a rid column whose encoding resolves no
-    /// probe. The inner `None` means no tombstones — every position in
-    /// `range` is live, so the caller iterates the range directly.
-    ///
-    /// [`POINT_GATHER_MAX_ROWS`]: crate::store::view::selection::POINT_GATHER_MAX_ROWS
-    fn live_positions(
-        &self,
-        array: &ArrayRef,
-        range: &Range<usize>,
-        probes: &crate::store::probes::StructProbes,
-        deleted: Option<&Mask>,
-    ) -> Option<Option<Vec<usize>>> {
-        if !point_sized(range.len() as u64) {
-            return None;
-        }
-        let Some(deleted) = deleted else {
-            return Some(None);
-        };
-        let rid = probes.by_name(array, self.rid_column)?;
-        // A row id no `usize` holds declines to the slice path, whose
-        // decode reports it.
-        let mut live = Vec::with_capacity(range.len());
-        for pos in range.clone() {
-            let row = super::row_index(super::base_row(rid.value_at(pos))).ok()?;
-            if !deleted.value(row) {
-                live.push(pos);
-            }
-        }
-        Some(Some(live))
-    }
-
-    /// A small run's live rows as a primary-named `(s, p, o, g)` canonical
-    /// struct, read point-by-point at the run's global positions through the
-    /// component's cached probes ([`point_read_columns`]) — no slice.
-    /// `Ok(None)` declines (a wide run, or a column — e.g. a string copy —
-    /// whose encoding resolves no probe); the caller keeps the slice path.
-    fn point_read_run_rows(
-        &self,
-        array: &ArrayRef,
-        range: Range<usize>,
-        probes: &crate::store::probes::StructProbes,
-        deleted: Option<&Mask>,
-    ) -> Result<Option<ArrayRef>> {
-        let Some(live) = self.live_positions(array, &range, probes, deleted) else {
-            return Ok(None);
-        };
-        let live: Vec<usize> = live.unwrap_or_else(|| range.collect());
-        let Some(children) = point_read_columns(array, self.primary_columns, &live, Some(probes))
-        else {
-            return Ok(None);
-        };
-        Ok(Some(
-            StructArray::try_new(
-                FieldNames::from(crate::store::schema::PRIMARY_COLUMNS),
-                children,
-                live.len(),
-                Validity::NonNullable,
-            )?
-            .into_array(),
-        ))
-    }
-
     /// A chunk's live rows as four code columns, `(s, p, o, g)` — the
     /// code-payload counterpart of [`decode_columns`](Self::decode_columns)
     /// for a Dictionary decode layout, whose columns hold codes.
@@ -191,7 +105,7 @@ impl ServeDecode {
         let rows = self
             .chunk_rows(chunk, deleted)?
             .execute::<StructArray>(&mut ctx)?;
-        let [s, p, o, g] = crate::store::schema::PRIMARY_COLUMNS;
+        let [s, p, o, g] = PRIMARY_COLUMNS;
         let mut column = |name: &str| -> Result<Buffer<TermCode>> {
             Ok(
                 crate::store::array::field_as::<PrimitiveArray>(&rows, name, &mut ctx)?
@@ -201,8 +115,9 @@ impl ServeDecode {
         Ok([column(s)?, column(p)?, column(o)?, column(g)?])
     }
 
-    /// A chunk's live rows as a primary-named `(s, p, o, g)` struct: relabel the
-    /// source columns, then drop any whose primary row id is tombstoned.
+    /// A chunk's live rows as a primary-named `(s, p, o, g)` struct: the
+    /// chunk's quad columns without the row id, then any row whose primary
+    /// row id is tombstoned dropped.
     fn chunk_rows(&self, chunk: &ArrayRef, deleted: Option<&Mask>) -> Result<ArrayRef> {
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let struct_arr = chunk.clone().execute::<StructArray>(&mut ctx)?;
@@ -212,10 +127,10 @@ impl ServeDecode {
                 .cloned()
                 .map_err(VortexRdfError::Vortex)
         };
-        let [s, p, o, g] = self.primary_columns;
+        let [s, p, o, g] = PRIMARY_COLUMNS;
         let len = struct_arr.len();
         let rows = StructArray::try_new(
-            FieldNames::from(crate::store::schema::PRIMARY_COLUMNS),
+            FieldNames::from(PRIMARY_COLUMNS),
             vec![col(s)?, col(p)?, col(o)?, col(g)?],
             len,
             Validity::NonNullable,
@@ -239,7 +154,7 @@ impl ServeDecode {
         };
         // Tombstones are defined over primary row ids; the rid column says which
         // primary row each served row mirrors.
-        let rid_col = col(self.rid_column)?.execute::<PrimitiveArray>(&mut ctx)?;
+        let rid_col = col(COL_RID)?.execute::<PrimitiveArray>(&mut ctx)?;
         let mut positions = Vec::with_capacity(len);
         for (position, &rid) in rid_col.as_slice::<RowId>().iter().enumerate() {
             if !deleted.value(super::row_index(super::base_row(rid))?) {
@@ -274,7 +189,7 @@ pub(crate) struct InMemoryServePlan {
     /// The component's shared probe cache, so a small run reads
     /// point-by-point at its global positions instead of slicing (a slice's
     /// probe would be re-resolved per call).
-    probes: Arc<crate::store::probes::StructProbes>,
+    probes: Arc<StructProbes>,
 }
 
 impl InMemoryServePlan {
@@ -286,7 +201,7 @@ impl InMemoryServePlan {
         component: &'static str,
         array: ArrayRef,
         range: Range<usize>,
-        probes: Arc<crate::store::probes::StructProbes>,
+        probes: Arc<StructProbes>,
     ) -> Self {
         Self {
             decode,
@@ -300,6 +215,77 @@ impl InMemoryServePlan {
     /// The serving component's name.
     pub(crate) fn component(&self) -> &'static str {
         self.component
+    }
+
+    /// The positions of a small run's live rows, for point reads through the
+    /// component's cached probes. Tombstones are defined over primary row
+    /// ids; the rid column says which primary row each served row mirrors,
+    /// and only a tombstoned view pays for the liveness pass.
+    ///
+    /// The outer `None` declines: a run wider than
+    /// [`POINT_GATHER_MAX_ROWS`], or a rid column whose encoding resolves no
+    /// probe. The inner `None` means no tombstones — every position in the
+    /// run is live, so the caller iterates the run directly.
+    ///
+    /// [`POINT_GATHER_MAX_ROWS`]: crate::store::view::selection::POINT_GATHER_MAX_ROWS
+    fn live_positions(&self, deleted: Option<&Mask>) -> Option<Option<Vec<usize>>> {
+        if !point_sized(self.range.len() as u64) {
+            return None;
+        }
+        let Some(deleted) = deleted else {
+            return Some(None);
+        };
+        let rid = self.probes.by_name(&self.array, COL_RID)?;
+        // A row id no `usize` holds declines to the slice path, whose
+        // decode reports it.
+        let mut live = Vec::with_capacity(self.range.len());
+        for pos in self.range.clone() {
+            let row = super::row_index(super::base_row(rid.value_at(pos))).ok()?;
+            if !deleted.value(row) {
+                live.push(pos);
+            }
+        }
+        Some(Some(live))
+    }
+
+    /// A small run's live rows read point by point at the run's global
+    /// positions through the component's cached probes — no slice: the four
+    /// `(s, p, o, g)` columns, each as the `u64`s its probe reads, which are
+    /// the child's codes (a code column is `u64`, and a probe reads every
+    /// width as one). The one point read behind both the decoded and the
+    /// code-payload serve. `None` declines (a wide run, or a column — e.g. a
+    /// string copy — whose encoding resolves no probe); the caller keeps its
+    /// slice or gather path.
+    fn live_point_columns(&self, deleted: Option<&Mask>) -> Option<[Buffer<TermCode>; 4]> {
+        let live = self.live_positions(deleted)?;
+        let read = |name: &str| -> Option<Buffer<TermCode>> {
+            let probe = self.probes.by_name(&self.array, name)?;
+            Some(match &live {
+                None => Buffer::from_iter(self.range.clone().map(|pos| probe.value_at(pos))),
+                Some(live) => Buffer::from_iter(live.iter().map(|&pos| probe.value_at(pos))),
+            })
+        };
+        let [s, p, o, g] = PRIMARY_COLUMNS;
+        Some([read(s)?, read(p)?, read(o)?, read(g)?])
+    }
+
+    /// A small run's live rows ([`live_point_columns`](Self::live_point_columns))
+    /// as a primary-named `(s, p, o, g)` canonical struct. `Ok(None)`
+    /// declines; the caller keeps the slice path.
+    fn point_read_run_rows(&self, deleted: Option<&Mask>) -> Result<Option<ArrayRef>> {
+        let Some(columns) = self.live_point_columns(deleted) else {
+            return Ok(None);
+        };
+        let len = columns[0].len();
+        Ok(Some(
+            StructArray::try_new(
+                FieldNames::from(PRIMARY_COLUMNS),
+                Vec::from(columns.map(IntoArray::into_array)),
+                len,
+                Validity::NonNullable,
+            )?
+            .into_array(),
+        ))
     }
 
     /// The served rows' four [`TermCode`]s, read straight off the index
@@ -322,25 +308,7 @@ impl InMemoryServePlan {
         if !matches!(self.decode.decode_layout, ResolvedLayout::Dictionary(_)) {
             return None;
         }
-        let live = self
-            .decode
-            .live_positions(&self.array, &self.range, &self.probes, deleted)?;
-        let mut columns = Vec::with_capacity(4);
-        for name in self.decode.primary_columns {
-            let probe = self.probes.by_name(&self.array, name)?;
-            // A probe reads every width as a u64 — exactly a code.
-            columns.push(match &live {
-                None => Buffer::from_iter(self.range.clone().map(|pos| probe.value_at(pos))),
-                Some(live) => Buffer::from_iter(live.iter().map(|&pos| probe.value_at(pos))),
-            });
-        }
-        let mut columns = columns.into_iter();
-        Some([
-            columns.next()?,
-            columns.next()?,
-            columns.next()?,
-            columns.next()?,
-        ])
+        self.live_point_columns(deleted)
     }
 
     /// Decode the matched rows straight from the index component's rows:
@@ -349,12 +317,7 @@ impl InMemoryServePlan {
     /// plan's row run — either way decoding those columns as the primary
     /// `(s, p, o, g)`, replacing the row-id gather over the primaries.
     pub(crate) fn decode<T: ChunkDecode>(&self, deleted: Option<&Mask>) -> Vec<Result<T>> {
-        match self.decode.point_read_run_rows(
-            &self.array,
-            self.range.clone(),
-            &self.probes,
-            deleted,
-        ) {
+        match self.point_read_run_rows(deleted) {
             Ok(Some(rows)) => return T::decode(&self.decode.decode_layout, &rows),
             Ok(None) => {}
             Err(e) => return vec![Err(e)],
