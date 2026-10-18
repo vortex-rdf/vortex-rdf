@@ -3,7 +3,9 @@
 //! adopts (`from_file_in_memory`).
 
 use crate::error::Result;
-use crate::store::QuadsSource;
+use crate::store::Backend;
+#[cfg(feature = "file-io")]
+use crate::store::FileBase;
 use crate::store::array::subject_sorted;
 use crate::store::builders::{BuiltArray, build_parts_from_raws};
 use crate::store::layouts::ResolvedLayout;
@@ -110,7 +112,7 @@ impl VortexRdfStore {
     pub(crate) async fn to_serializable_parts(&self) -> Result<StoreParts> {
         let base = self.base_selected_rows().await?;
         let owner_shaped = self.quads.is_unrefined();
-        let tombstoned = self.quads.deleted().is_some();
+        let tombstoned = self.quads.deleted.is_some();
         let rebuild =
             self.tail.is_some() || (owner_shaped && tombstoned && !self.indexes.is_empty());
         if rebuild {
@@ -131,13 +133,13 @@ impl VortexRdfStore {
             });
         }
         let components = if owner_shaped && !tombstoned {
-            match &self.quads {
-                QuadsSource::InMemory { components, .. } => components.to_vec(),
+            match &self.quads.backend {
+                Backend::InMemory(memory) => memory.components.to_vec(),
                 // An unrefined file view reads its index children
                 // wholesale, so a file-backed store's serialization (and
                 // its in-memory open) keeps its indexes.
                 #[cfg(feature = "file-io")]
-                QuadsSource::File { file, .. } => scanned_index_components(file).await?,
+                Backend::File(FileBase { file, .. }) => scanned_index_components(file).await?,
             }
         } else {
             Vec::new()

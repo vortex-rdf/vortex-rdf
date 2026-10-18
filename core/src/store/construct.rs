@@ -15,8 +15,9 @@ use crate::store::builders::{
 };
 use crate::store::indexes::{IndexComponent, Indexes};
 use crate::store::layouts::{DictAccess, LayoutStrategy, ResolvedLayout};
-use crate::store::view::selection::ViewSelection;
-use crate::store::{QuadsSource, RawQuad, VortexRdfStore, next_generation, probes, resident};
+use crate::store::{
+    Backend, MemoryBase, QuadsSource, RawQuad, VortexRdfStore, next_generation, probes, resident,
+};
 
 use std::sync::Arc;
 
@@ -202,14 +203,12 @@ impl VortexRdfStore {
             layout,
             indexes,
             generation: next_generation(),
-            quads: QuadsSource::InMemory {
+            quads: QuadsSource::new(Backend::InMemory(MemoryBase {
                 base,
-                selection: ViewSelection::all(),
                 components,
-                deleted: None,
                 probes: store_probes,
                 serve: None,
-            },
+            })),
             tail: None,
         })
     }

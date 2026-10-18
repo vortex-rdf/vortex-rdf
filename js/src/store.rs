@@ -410,7 +410,7 @@ impl VortexRdfStore {
 /// The read paths are `async` because a file-backed store resolves its rows
 /// (and its dictionary) through I/O — but this crate builds core with
 /// `default-features = false`, so `file-io` is compiled out and no
-/// `QuadsSource::File` exists here. Every await in a wasm read is therefore
+/// `Backend::File` exists here. Every await in a wasm read is therefore
 /// already resolved; a future that did suspend surfaces as an error instead
 /// of a hang.
 fn resolve_now<F: std::future::Future>(future: F) -> Result<F::Output, JsValue> {

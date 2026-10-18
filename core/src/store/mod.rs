@@ -42,7 +42,9 @@ pub use schema::{QuadColumn, RowId, TermCode};
 // charter); the crate root re-exports it from here with the store's types.
 pub use crate::common::quad::{RawQuad, SharedQuad};
 
-pub(crate) use view::{QuadsSource, Tail};
+#[cfg(feature = "file-io")]
+pub(crate) use view::FileBase;
+pub(crate) use view::{Backend, MemoryBase, QuadsSource, Tail};
 
 /// The next store generation (see [`VortexRdfStore::generation`]), from one
 /// process-wide counter: two stores share a generation only when one was

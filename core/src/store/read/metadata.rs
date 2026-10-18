@@ -8,11 +8,13 @@ use std::num::NonZeroUsize;
 use vortex_mask::Mask;
 
 use crate::error::Result;
+#[cfg(feature = "file-io")]
+use crate::store::FileBase;
 use crate::store::indexes::copy::CopyFamily;
 use crate::store::indexes::{ComponentIdentity, IndexType};
 use crate::store::schema::{QuadColumn, TermCode};
 use crate::store::view::selection::{RowSelection, ViewSelection};
-use crate::store::{LayoutStrategy, QuadsSource, VortexRdfStore};
+use crate::store::{Backend, LayoutStrategy, MemoryBase, VortexRdfStore};
 
 /// A sort order of quad rows, by the columns compared first to last.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -149,7 +151,7 @@ impl VortexRdfStore {
     pub fn view_statistics(&self) -> Result<ViewStatistics> {
         let tail_rows = self.tail_size();
         let filtered = self.quads.has_filter();
-        let (selection, base_len) = (self.quads.view_selection(), self.quads.base_len());
+        let (selection, base_len) = (&self.quads.selection, self.quads.base_len());
         // The base's live rows when known without I/O; else at most the
         // selection's rows before tombstones (a pending run's width), or the
         // base's.
@@ -162,7 +164,7 @@ impl VortexRdfStore {
             selection: selection_kind(selection),
             served_component: self.quads.served_component(),
             pending_filter: filtered,
-            tombstones: self.quads.deleted().map_or(0, Mask::true_count),
+            tombstones: self.quads.deleted.as_ref().map_or(0, Mask::true_count),
             tail_rows,
             file_backed: self.quads.is_file_backed(),
             generation: self.generation,
@@ -176,20 +178,14 @@ impl VortexRdfStore {
         if self.layout.strategy() != LayoutStrategy::Dictionary {
             return code_bounds;
         }
-        match &self.quads {
-            QuadsSource::InMemory {
-                base,
-                selection,
-                deleted,
-                probes,
-                ..
-            } => {
+        match &self.quads.backend {
+            Backend::InMemory(MemoryBase { base, probes, .. }) => {
                 let base_len = base.len();
                 // A contiguous, tombstone-free run of a sorted base: the
                 // subject column's first and last codes bound the view.
                 if self.quads.subject_sorted()
-                    && deleted.is_none()
-                    && let ViewSelection::Exact(sel) = selection
+                    && self.quads.deleted.is_none()
+                    && let ViewSelection::Exact(sel) = &self.quads.selection
                     && let Some(run) = match sel {
                         RowSelection::All if base_len > 0 => Some(0..base_len),
                         RowSelection::Range(r) if r.start < r.end && r.end <= base_len as u64 => {
@@ -204,7 +200,7 @@ impl VortexRdfStore {
                 }
             }
             #[cfg(feature = "file-io")]
-            QuadsSource::File { filter, .. } => {
+            Backend::File(FileBase { filter, .. }) => {
                 // The pushed-down equalities bound their columns exactly.
                 if let Some(filter) = filter
                     && let Some(pairs) = crate::store::scan::file_reads::eq_code_pairs(filter)
@@ -232,15 +228,15 @@ impl VortexRdfStore {
             sorted,
             rows,
         };
-        Ok(match &self.quads {
-            QuadsSource::InMemory {
+        Ok(match &self.quads.backend {
+            Backend::InMemory(MemoryBase {
                 base, components, ..
-            } => components
+            }) => components
                 .iter()
                 .map(|c| info(c.identity, c.sorted, base.len()))
                 .collect(),
             #[cfg(feature = "file-io")]
-            QuadsSource::File { file, .. } => file
+            Backend::File(FileBase { file, .. }) => file
                 .index_children()
                 .iter()
                 .map(|child| info(child.identity, child.sorted, file.row_count() as usize))

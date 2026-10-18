@@ -44,8 +44,10 @@ use vortex_scan::{
 
 use crate::error::Result;
 use crate::session::VORTEX_SESSION;
+#[cfg(feature = "file-io")]
+use crate::store::FileBase;
 use crate::store::array::rechunk;
-use crate::store::{QuadsSource, VortexRdfStore};
+use crate::store::{Backend, VortexRdfStore};
 
 /// The most rows a chunk of a partition's stream holds, DataFusion's default
 /// batch size: gathered rows, rows read by id and an in-memory child's rows
@@ -125,9 +127,10 @@ impl VortexRdfStore {
     /// onto the tokio runtime it is polled in: read it inside a tokio
     /// runtime.
     pub fn component_data_source(&self, name: &str) -> Result<Option<DataSourceRef>> {
-        match &self.quads {
-            QuadsSource::InMemory { components, .. } => {
-                if let Some(component) = components.iter().find(|c| c.identity.name == name) {
+        match &self.quads.backend {
+            Backend::InMemory(memory) => {
+                if let Some(component) = memory.components.iter().find(|c| c.identity.name == name)
+                {
                     let rows = component.rows()?.clone().into_array();
                     return Ok(Some(chunks_source(vec![rows])));
                 }
@@ -141,7 +144,7 @@ impl VortexRdfStore {
                 Ok(None)
             }
             #[cfg(feature = "file-io")]
-            QuadsSource::File { file, .. } => {
+            Backend::File(FileBase { file, .. }) => {
                 use vortex_layout::scan::layout::LayoutReaderDataSource;
                 let Some(reader) = file.component_reader(name)? else {
                     return Ok(None);

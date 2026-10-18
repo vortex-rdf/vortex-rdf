@@ -17,7 +17,7 @@ use crate::store::scan::typed_eq::{typed_positions, typed_residual_ids};
 use crate::store::scan::{file_filter, file_reads};
 use crate::store::schema;
 use crate::store::view::selection::{RowSelection, ViewSelection};
-use crate::store::{QuadsSource, Tail};
+use crate::store::{Backend, MemoryBase, Tail};
 
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use web_time::Instant;
@@ -31,6 +31,8 @@ use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_mask::Mask;
 
+#[cfg(feature = "file-io")]
+use crate::store::FileBase;
 #[cfg(feature = "file-io")]
 use crate::store::persist::native_file::NativeStoreFile;
 #[cfg(feature = "file-io")]
@@ -157,10 +159,15 @@ impl VortexRdfStore {
         };
         debug::step!(t, "[match_pattern] Prepared pattern codes");
 
-        match &self.quads {
-            QuadsSource::InMemory { .. } => self.match_base_in_memory(pattern, &mut codes, need, t),
+        match &self.quads.backend {
+            Backend::InMemory(memory) => {
+                self.match_base_in_memory(memory, pattern, &mut codes, need, t)
+            }
             #[cfg(feature = "file-io")]
-            QuadsSource::File { .. } => self.match_base_file(pattern, &mut codes, need, t).await,
+            Backend::File(base) => {
+                self.match_base_file(base, pattern, &mut codes, need, t)
+                    .await
+            }
         }
     }
 
@@ -179,16 +186,16 @@ impl VortexRdfStore {
         Ok((!codes.provably_empty(pattern)).then_some(codes))
     }
 
-    /// The in-memory backend of [`match_base`](Self::match_base): the prefix
-    /// probe ([`prefix_probe`](Self::prefix_probe)), secondary-index routing
-    /// and the residual column filter
-    /// ([`residual_narrow`](Self::residual_narrow)), each narrowing the
-    /// selection in base row ids. Those ids are computed here, except for the
-    /// cases that do not need them — a lazy index resolution that is the
-    /// view's sole restriction leaves them pending (`LazyRowIds`) when it
-    /// serves the view's reads, or when the caller only counts or windows the
-    /// view (`need`), for the first consumer that reads through the selection
-    /// and not the plan.
+    /// The in-memory backend of [`match_base`](Self::match_base), `memory`
+    /// the view's base: the prefix probe
+    /// ([`prefix_probe`](Self::prefix_probe)), secondary-index routing and
+    /// the residual column filter ([`residual_narrow`](Self::residual_narrow)),
+    /// each narrowing the selection in base row ids. Those ids are computed
+    /// here, except for the cases that do not need them — a lazy index
+    /// resolution that is the view's sole restriction leaves them pending
+    /// (`LazyRowIds`) when it serves the view's reads, or when the caller
+    /// only counts or windows the view (`need`), for the first consumer that
+    /// reads through the selection and not the plan.
     ///
     /// Tombstones are deliberately not consulted here: they are applied by
     /// every read path instead, so matching may name deleted rows without the
@@ -197,23 +204,18 @@ impl VortexRdfStore {
     /// back through.
     fn match_base_in_memory(
         &self,
+        memory: &MemoryBase,
         pattern: QuadPattern<'_>,
         codes: &mut PatternCodes,
         need: IdsNeed,
         t: Option<Instant>,
     ) -> Result<Self> {
-        // Without `file-io`, InMemory is the only variant.
-        #[allow(irrefutable_let_patterns)]
-        let QuadsSource::InMemory {
+        let MemoryBase {
             base,
-            selection,
             components,
             probes,
             ..
-        } = &self.quads
-        else {
-            unreachable!("match_base routes only InMemory sources here");
-        };
+        } = memory;
         // Materialize the base struct so its columns can be inspected
         // (statistics, binary search). Every search below runs against
         // the base and yields base row ids, which are then intersected
@@ -229,7 +231,7 @@ impl VortexRdfStore {
         // A chained match folds this pattern's restrictions into the
         // previous ones, so a still-pending selection materializes here —
         // chaining is one of the consumers the deferral exists for.
-        let selection = selection.materialized()?;
+        let selection = self.quads.selection.materialized()?;
         // A serving index's plan reads exactly a contiguous row run, so
         // it is only valid when that run *is* the whole result: the view
         // must start unrestricted and nothing but the serving index's
@@ -343,7 +345,7 @@ impl VortexRdfStore {
             matches!(selection, ViewSelection::Pending(_))
         );
         Ok(self.derived(
-            self.quads.in_memory_with(selection, serve),
+            self.quads.in_memory_with(memory, selection, serve),
             self.tail.clone(),
         ))
     }
@@ -496,29 +498,28 @@ impl VortexRdfStore {
         ))
     }
 
-    /// The file backend of [`match_base`](Self::match_base): restrictions
-    /// compose into the derived view — the subject's located run
-    /// ([`locate_subject`](Self::locate_subject)), index-resolved row ids, a
-    /// pushed-down filter, a pruned row range — and no data is read until the
-    /// next scan, except a lazy resolution's ids when they cannot stay
-    /// deferred and the point reads that check a pending filter at sparse ids.
+    /// The file backend of [`match_base`](Self::match_base), `base` the
+    /// view's file: restrictions compose into the derived view — the
+    /// subject's located run ([`locate_subject`](Self::locate_subject)),
+    /// index-resolved row ids, a pushed-down filter, a pruned row range — and
+    /// no data is read until the next scan, except a lazy resolution's ids
+    /// when they cannot stay deferred and the point reads that check a
+    /// pending filter at sparse ids.
     #[cfg(feature = "file-io")]
     async fn match_base_file(
         &self,
+        base: &FileBase,
         pattern: QuadPattern<'_>,
         codes: &mut PatternCodes,
         need: IdsNeed,
         t: Option<Instant>,
     ) -> Result<Self> {
-        let QuadsSource::File {
+        let FileBase {
             file,
             filter: existing_filter,
-            selection: existing_selection,
             ..
-        } = &self.quads
-        else {
-            unreachable!("match_base routes only File sources here");
-        };
+        } = base;
+        let existing_selection = &self.quads.selection;
         // A bound subject on a sorted file resolves to its exact row range
         // first, by binary-searching the subject column's encoded chunks —
         // the file mirror of the in-memory subject fast path. Each index's
@@ -700,7 +701,7 @@ impl VortexRdfStore {
         // across the match unchanged; the read paths apply them (see
         // `restrict_scan`).
         Ok(self.derived(
-            self.quads.file_with(filter, selection, serve),
+            self.quads.file_with(base, filter, selection, serve),
             self.tail.clone(),
         ))
     }

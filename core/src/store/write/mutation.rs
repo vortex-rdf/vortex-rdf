@@ -2,12 +2,16 @@
 //! — its row ids, indexes, and file handle — is never rewritten in place.
 
 use crate::error::{Result, VortexRdfError};
+#[cfg(feature = "file-io")]
+use crate::store::FileBase;
 use crate::store::RawQuad;
 use crate::store::builders::build_struct_array;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_filter;
 use crate::store::view::selection::RowSelection;
-use crate::store::{QuadsSource, Tail, next_generation};
+#[cfg(feature = "file-io")]
+use crate::store::view::selection::ViewSelection;
+use crate::store::{Backend, Tail, next_generation};
 
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use std::collections::HashSet;
@@ -206,15 +210,19 @@ impl VortexRdfStore {
         // rows already deleted; the union absorbs that. Either way the base
         // (or file) and its secondary indexes are left untouched, and an
         // owner's filter stays absent: deleting only widens the tombstones.
-        let doomed = match &doomed.quads {
+        let doomed = match &doomed.quads.backend {
             // In memory the matched view's selection maps straight to a
             // mask — materializing first if its exact ids are still pending
             // (a delete is one of the consumers that needs them).
-            QuadsSource::InMemory { selection, .. } => {
-                selection.materialized()?.to_mask(self.quads.base_len())
-            }
+            Backend::InMemory(_) => doomed
+                .quads
+                .selection
+                .materialized()?
+                .to_mask(self.quads.base_len()),
             #[cfg(feature = "file-io")]
-            QuadsSource::File { .. } => doomed.matching_file_row_mask().await?,
+            Backend::File(base) => {
+                Self::matching_file_row_mask(base, &doomed.quads.selection).await?
+            }
         };
         // A delete changes the data: a new generation over the same base.
         Ok(Self {
@@ -223,22 +231,13 @@ impl VortexRdfStore {
         })
     }
 
-    /// Evaluate this file view's pending filter and (materialized) selection
-    /// to a base-wide mask of matching file rows, via
-    /// [`file_filter::matching_file_rows`].
+    /// Evaluate a file view's pending filter (on its base `file`) and
+    /// `selection`, materialized, to a base-wide mask of matching file rows,
+    /// via [`file_filter::matching_file_rows`].
     #[cfg(feature = "file-io")]
-    async fn matching_file_row_mask(&self) -> Result<Mask> {
-        let QuadsSource::File {
-            file,
-            filter,
-            selection,
-            ..
-        } = &self.quads
-        else {
-            unreachable!("matching_file_row_mask is only called on a file-backed view")
-        };
+    async fn matching_file_row_mask(base: &FileBase, selection: &ViewSelection) -> Result<Mask> {
         // A served match's pending selection materializes here.
         let selection = selection.materialized_async().await?;
-        file_filter::matching_file_rows(file, filter.as_ref(), &selection).await
+        file_filter::matching_file_rows(&base.file, base.filter.as_ref(), &selection).await
     }
 }

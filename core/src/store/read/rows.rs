@@ -3,7 +3,8 @@
 //! serialization and compaction paths share.
 
 use crate::error::Result;
-use crate::store::QuadsSource;
+#[cfg(feature = "file-io")]
+use crate::store::FileBase;
 use crate::store::RawQuad;
 use crate::store::array::{rechunk, with_subject_stamp};
 use crate::store::read::chunks::{RowChunkStream, extract_codes};
@@ -14,6 +15,7 @@ use crate::store::schema::{self, TermCode};
 use crate::store::view::selection::RowSelection;
 #[cfg(feature = "file-io")]
 use crate::store::view::selection::ViewSelection;
+use crate::store::{Backend, MemoryBase};
 
 use futures::stream::{self, StreamExt};
 use vortex_array::ArrayRef;
@@ -100,17 +102,12 @@ impl VortexRdfStore {
         if !self.is_code_view() {
             return None;
         }
-        // Without `file-io`, InMemory is the only variant.
-        #[allow(irrefutable_let_patterns)]
-        let QuadsSource::InMemory { deleted, serve, .. } = &self.quads else {
-            return None;
-        };
         // Served fast path: the answering index's own columns already hold
         // this view's codes as one contiguous run, so reading them there
         // costs neither the row-id materialization this view deferred at
         // match time nor a scattered gather over the primaries.
-        if let Some(plan) = serve
-            && let Some(columns) = plan.code_columns(deleted.as_ref())
+        if let Some(plan) = &self.quads.in_memory()?.serve
+            && let Some(columns) = plan.code_columns(self.quads.deleted.as_ref())
         {
             return Some(columns);
         }
@@ -129,17 +126,8 @@ impl VortexRdfStore {
         if !self.is_code_view() {
             return None;
         }
-        // Without `file-io`, InMemory is the only variant.
-        #[allow(irrefutable_let_patterns)]
-        let QuadsSource::InMemory {
-            base,
-            selection,
-            deleted,
-            ..
-        } = &self.quads
-        else {
-            return None;
-        };
+        let base = &self.quads.in_memory()?.base;
+        let deleted = &self.quads.deleted;
         let struct_arr = base.clone().try_downcast::<Struct>().ok()?;
         let mut prims: Vec<PrimitiveArray> = Vec::with_capacity(4);
         for name in schema::PRIMARY_COLUMNS {
@@ -149,7 +137,7 @@ impl VortexRdfStore {
         // No plan (or a plan that declined): codes are gathered by row id, so
         // a served match's pending selection materializes here (the in-memory
         // decode+sort it deferred at match time).
-        let selection = selection.materialized().ok()?;
+        let selection = self.quads.selection.materialized().ok()?;
         // Contiguous, tombstone-free selections share the base's buffers
         // zero-copy (a `Buffer` slice is a refcount bump); a tombstone-free id
         // list is a branch-free gather; only tombstoned views pay a
@@ -223,9 +211,11 @@ impl VortexRdfStore {
         // off the answering index's run instead of computing the ids and
         // gathering the primary rows at them.
         #[cfg(feature = "file-io")]
-        if let ViewSelection::Pending(_) = self.quads.view_selection()
-            && let Some(plan) = self.quads.file_serve()
-            && let Some(columns) = plan.code_columns(self.quads.deleted()).await?
+        if let ViewSelection::Pending(_) = &self.quads.selection
+            && let Some(FileBase {
+                serve: Some(plan), ..
+            }) = self.quads.file()
+            && let Some(columns) = plan.code_columns(self.quads.deleted.as_ref()).await?
         {
             return Ok(Some(columns));
         }
@@ -261,17 +251,15 @@ impl VortexRdfStore {
     /// (`restricted_file_scan`).
     #[cfg_attr(not(feature = "file-io"), allow(unused_variables))]
     pub(in crate::store) async fn base_read(&self, columns: &[&'static str]) -> Result<BaseRead> {
-        match &self.quads {
-            QuadsSource::InMemory { .. } => Ok(BaseRead::Rows(self.in_memory_base_rows()?)),
+        match &self.quads.backend {
+            Backend::InMemory(memory) => Ok(BaseRead::Rows(self.in_memory_base_rows(memory)?)),
             #[cfg(feature = "file-io")]
-            QuadsSource::File {
+            Backend::File(FileBase {
                 file,
                 filter,
-                selection,
-                deleted,
                 serve,
-                ..
-            } => {
+            }) => {
+                let (selection, deleted) = (&self.quads.selection, &self.quads.deleted);
                 let materialized;
                 let selection = match serve {
                     // Runs the deferred index-child read once, cached on the
@@ -309,31 +297,24 @@ impl VortexRdfStore {
     }
 
     /// An in-memory view's live base rows in base row order, every primary
-    /// column: its exact selection (see [`base_read`](Self::base_read))
-    /// gathered with the tombstones dropped, point by point through the
-    /// base's probes when the selection is small.
-    #[cfg_attr(not(feature = "file-io"), allow(irrefutable_let_patterns))]
-    pub(in crate::store) fn in_memory_base_rows(&self) -> Result<ArrayRef> {
-        let QuadsSource::InMemory {
-            base,
-            selection,
-            deleted,
-            probes,
-            serve,
-            ..
-        } = &self.quads
-        else {
-            unreachable!("in_memory_base_rows is only called on an in-memory source");
-        };
+    /// column, `memory` its base: its exact selection (see
+    /// [`base_read`](Self::base_read)) gathered with the tombstones dropped,
+    /// point by point through the base's probes when the selection is small.
+    pub(in crate::store) fn in_memory_base_rows(&self, memory: &MemoryBase) -> Result<ArrayRef> {
         let materialized;
-        let selection = match serve {
+        let selection = match &memory.serve {
             Some(_) => {
-                materialized = selection.materialized()?;
+                materialized = self.quads.selection.materialized()?;
                 &materialized
             }
-            None => selection.expect_exact(),
+            None => self.quads.selection.expect_exact(),
         };
-        gather_live(base, selection, deleted.as_ref(), Some(probes))
+        gather_live(
+            &memory.base,
+            selection,
+            self.quads.deleted.as_ref(),
+            Some(&memory.probes),
+        )
     }
 
     /// The base rows this view covers, without the tail, as one array: the

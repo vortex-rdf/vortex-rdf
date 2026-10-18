@@ -9,7 +9,7 @@ use oxrdf::Quad;
 
 use crate::error::Result;
 use crate::store::layouts::ChunkDecode;
-use crate::store::{QuadsSource, RawQuad, SharedQuad, Tail, VortexRdfStore};
+use crate::store::{Backend, MemoryBase, RawQuad, SharedQuad, Tail, VortexRdfStore};
 
 #[cfg(feature = "file-io")]
 use super::deferred;
@@ -17,6 +17,8 @@ use super::deferred;
 use super::rows::BaseRead;
 #[cfg(feature = "file-io")]
 use crate::error::VortexRdfError;
+#[cfg(feature = "file-io")]
+use crate::store::FileBase;
 #[cfg(feature = "file-io")]
 use crate::store::indexes::FileServePlan;
 #[cfg(feature = "file-io")]
@@ -105,13 +107,13 @@ impl VortexRdfStore {
     /// An in-memory view is one chunk ([`in_memory_chunk`](Self::in_memory_chunk)),
     /// taken as it decodes, with no chunk stream around it.
     async fn decoded_vec<T: ChunkDecode>(&self) -> Result<Vec<T>> {
-        match &self.quads {
-            QuadsSource::InMemory { .. } => {
-                let chunk = self.in_memory_chunk::<T>(true)?;
+        match &self.quads.backend {
+            Backend::InMemory(memory) => {
+                let chunk = self.in_memory_chunk::<T>(memory, true)?;
                 flattened(chunk.len(), [chunk])
             }
             #[cfg(feature = "file-io")]
-            QuadsSource::File { .. } => {
+            Backend::File(_) => {
                 let chunks: Vec<Vec<Result<T>>> = self.chunk_stream::<T>(true).collect().await;
                 flattened(chunks.iter().map(Vec::len).sum(), chunks)
             }
@@ -127,43 +129,39 @@ impl VortexRdfStore {
     fn chunk_stream<T: ChunkDecode>(&self, serve: bool) -> BoxStream<'_, Vec<Result<T>>> {
         #[cfg(test)]
         chunk_stream_hooks::note();
-        match &self.quads {
-            QuadsSource::InMemory { .. } => {
-                stream::once(future::lazy(move |_| self.in_memory_chunk::<T>(serve)))
-                    .map(|chunk| chunk.unwrap_or_else(|e| vec![Err(e)]))
-                    .boxed()
-            }
+        match &self.quads.backend {
+            Backend::InMemory(memory) => stream::once(future::lazy(move |_| {
+                self.in_memory_chunk::<T>(memory, serve)
+            }))
+            .map(|chunk| chunk.unwrap_or_else(|e| vec![Err(e)]))
+            .boxed(),
             #[cfg(feature = "file-io")]
-            QuadsSource::File { .. } => deferred(self.file_chunks::<T>(serve), |e| vec![Err(e)]),
+            Backend::File(base) => deferred(self.file_chunks::<T>(base, serve), |e| vec![Err(e)]),
         }
     }
 
-    /// An in-memory view's rows as one decoded chunk, the tail's live rows
-    /// appended, tombstones applied — without suspending: the rows are in
-    /// memory and an in-memory store's dictionary is resident.
+    /// An in-memory view's rows as one decoded chunk, `memory` its base, the
+    /// tail's live rows appended, tombstones applied — without suspending:
+    /// the rows are in memory and an in-memory store's dictionary is
+    /// resident.
     ///
     /// With `serve`, a served view reads its plan's run, a slice or point
     /// reads of the component's run. Every other read is the base's rows in
     /// base row order, gathered over the exact selection
     /// ([`in_memory_base_rows`](Self::in_memory_base_rows)).
-    #[cfg_attr(not(feature = "file-io"), allow(irrefutable_let_patterns))]
-    fn in_memory_chunk<T: ChunkDecode>(&self, serve: bool) -> Result<Vec<Result<T>>> {
-        let QuadsSource::InMemory {
-            deleted,
-            serve: plan,
-            ..
-        } = &self.quads
-        else {
-            unreachable!("in_memory_chunk is only called on an in-memory source");
-        };
-        let mut quads = match plan {
+    fn in_memory_chunk<T: ChunkDecode>(
+        &self,
+        memory: &MemoryBase,
+        serve: bool,
+    ) -> Result<Vec<Result<T>>> {
+        let mut quads = match &memory.serve {
             // A served view reads the matched quads straight from the copy
             // family's contiguous run in `base` (a plain slice), instead of
             // gathering the primary columns at scattered row ids; tombstones
             // are applied through the rid column. The selection may still be
             // pending — the plan never needs it.
-            Some(plan) if serve => plan.decode::<T>(deleted.as_ref()),
-            _ => T::decode(&self.layout, &self.in_memory_base_rows()?),
+            Some(plan) if serve => plan.decode::<T>(self.quads.deleted.as_ref()),
+            _ => T::decode(&self.layout, &self.in_memory_base_rows(memory)?),
         };
         // Tail rows are in memory and few: they follow the base's.
         quads.extend(self.tail.as_ref().map_or_else(Vec::new, Tail::decode));
@@ -181,16 +179,11 @@ impl VortexRdfStore {
     /// ([`ExactRead`](file_reads::ExactRead)) are one chunk, and the
     /// restricted scan streams split by split.
     #[cfg(feature = "file-io")]
-    async fn file_chunks<T: ChunkDecode>(&self, serve: bool) -> Result<Chunks<T>> {
-        let QuadsSource::File {
-            file,
-            deleted,
-            serve: plan,
-            ..
-        } = &self.quads
-        else {
-            unreachable!("file_chunks is only called on a file source");
-        };
+    async fn file_chunks<T: ChunkDecode>(&self, base: &FileBase, serve: bool) -> Result<Chunks<T>> {
+        let FileBase {
+            file, serve: plan, ..
+        } = base;
+        let deleted = &self.quads.deleted;
         // Tail rows are in memory and few: decode them eagerly, to be appended
         // after whatever the base yields.
         let tail: Vec<Result<T>> = self.tail.as_ref().map_or_else(Vec::new, Tail::decode);

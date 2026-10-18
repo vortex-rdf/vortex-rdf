@@ -13,11 +13,10 @@ use crate::store::layouts::DictAccess;
 use crate::store::layouts::dictionary::TermDictionary;
 #[cfg(feature = "file-io")]
 use crate::store::{
-    QuadsSource,
+    Backend, FileBase, QuadsSource,
     indexes::Indexes,
     layouts::{LayoutStrategy, dictionary::FileBackedDict},
     persist::native_file::NativeStoreFile,
-    view::selection::ViewSelection,
 };
 
 use vortex_file::OpenOptionsSessionExt as _;
@@ -307,20 +306,18 @@ impl VortexRdfStore {
         };
         let layout = resolved_layout(dict, file.dtype())?;
         // No filter and no selection yet: this view covers all quad rows.
-        // A file-backed store holds no in-memory components (the `File`
-        // variant has no place for them): resolution reaches the index
-        // children through pushed-down scans.
+        // A file-backed store holds no in-memory components (a `FileBase`
+        // has no place for them): resolution reaches the index children
+        // through pushed-down scans.
         Ok(Self {
             layout,
             indexes,
             generation: crate::store::next_generation(),
-            quads: QuadsSource::File {
+            quads: QuadsSource::new(Backend::File(FileBase {
                 file,
                 filter: None,
-                selection: ViewSelection::all(),
-                deleted: None,
                 serve: None,
-            },
+            })),
             tail: None,
         })
     }

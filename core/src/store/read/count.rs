@@ -5,6 +5,8 @@
 
 use crate::error::Result;
 #[cfg(feature = "file-io")]
+use crate::store::FileBase;
+#[cfg(feature = "file-io")]
 use crate::store::scan::file_filter;
 use crate::store::{QuadsSource, Tail, VortexRdfStore};
 
@@ -39,16 +41,21 @@ impl VortexRdfStore {
         }
         let selection = self.quads.materialized_selection().await?;
         #[cfg(feature = "file-io")]
-        if let (Some(file), Some(filter)) = (self.quads.file(), self.quads.filter()) {
+        if let Some(FileBase {
+            file,
+            filter: Some(filter),
+            ..
+        }) = self.quads.file()
+        {
             return file_filter::count_matching_rows(
                 file,
                 filter,
                 &selection,
-                self.quads.deleted(),
+                self.quads.deleted.as_ref(),
             )
             .await;
         }
-        Ok(selection.live_len(self.quads.deleted(), self.quads.base_len()))
+        Ok(selection.live_len(self.quads.deleted.as_ref(), self.quads.base_len()))
     }
 
     /// The tail's contribution to [`size`](Self::size): its selection is
@@ -77,7 +84,12 @@ impl VortexRdfStore {
     /// `limit` matches.
     async fn base_size_capped(&self, limit: usize) -> Result<usize> {
         #[cfg(feature = "file-io")]
-        if let (Some(file), Some(filter)) = (self.quads.file(), self.quads.filter()) {
+        if let Some(FileBase {
+            file,
+            filter: Some(filter),
+            ..
+        }) = self.quads.file()
+        {
             // The selection resolves first (a served view's ids come from its
             // index child); the filter then counts within it.
             let selection = self.quads.materialized_selection().await?;
@@ -85,7 +97,7 @@ impl VortexRdfStore {
                 file,
                 filter,
                 &selection,
-                self.quads.deleted(),
+                self.quads.deleted.as_ref(),
                 limit,
             )
             .await;
@@ -112,7 +124,7 @@ impl QuadsSource {
     ///
     /// [`ViewSelection::len_if_known`]: crate::store::view::selection::ViewSelection::len_if_known
     pub(crate) fn live_len_if_known(&self) -> Result<Option<usize>> {
-        self.view_selection()
-            .len_if_known(self.deleted(), self.base_len())
+        self.selection
+            .len_if_known(self.deleted.as_ref(), self.base_len())
     }
 }

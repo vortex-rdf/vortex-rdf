@@ -5,7 +5,7 @@ use crate::error::Result;
 #[cfg(feature = "file-io")]
 use crate::error::VortexRdfError;
 #[cfg(feature = "file-io")]
-use crate::store::QuadsSource;
+use crate::store::FileBase;
 use crate::store::RawQuad;
 use crate::store::builders::DEFAULT_CHUNK_ROWS;
 use crate::store::indexes::{Indexes, unique_indexes};
@@ -74,7 +74,7 @@ impl VortexRdfStore {
         // copy, which the in-memory rebuild below provides.
         #[cfg(feature = "file-io")]
         if self.is_owner()
-            && let QuadsSource::File { file, .. } = &self.quads
+            && let Some(FileBase { file, .. }) = self.quads.file()
             && let Some(path) = file.path()
         {
             return self

@@ -14,15 +14,15 @@ use vortex_array::arrays::{Struct, StructArray};
 
 #[cfg(feature = "file-io")]
 use crate::error::Result;
+#[cfg(feature = "file-io")]
+use crate::store::FileBase;
 use crate::store::array;
 use crate::store::indexes::IndexComponent;
 use crate::store::layouts::ResolvedLayout;
 #[cfg(feature = "file-io")]
 use crate::store::layouts::{DictAccess, QuadPattern};
-#[cfg(feature = "file-io")]
-use crate::store::persist::native_file::NativeStoreFile;
 use crate::store::view::selection::{RowSelection, ViewSelection};
-use crate::store::{DictSnapshot, QuadsSource, RowId, TermCode, VortexRdfStore};
+use crate::store::{DictSnapshot, RowId, TermCode, VortexRdfStore};
 
 pub(crate) use crate::store::view::{TAIL_FLATTEN_FLOOR, TAIL_MAX_CHUNKS};
 
@@ -144,27 +144,19 @@ use oxrdf::NamedOrBlankNode;
 impl VortexRdfStore {
     /// The in-memory base; `None` for a file-backed store.
     fn in_memory_base(&self) -> Option<&ArrayRef> {
-        match &self.quads {
-            QuadsSource::InMemory { base, .. } => Some(base),
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { .. } => None,
-        }
+        self.quads.in_memory().map(|memory| &memory.base)
     }
 
     /// The in-memory index components; `None` for a file-backed store.
     fn in_memory_components(&self) -> Option<&[IndexComponent]> {
-        match &self.quads {
-            QuadsSource::InMemory { components, .. } => Some(components),
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { .. } => None,
-        }
+        self.quads.in_memory().map(|memory| &*memory.components)
     }
 
     /// Whether a pending selection's row ids have been computed: `false` for
     /// a still-deferred resolution, `None` when the selection is not pending
     /// at all.
     pub(crate) fn debug_row_ids_materialized(&self) -> Option<bool> {
-        match self.quads.view_selection() {
+        match &self.quads.selection {
             ViewSelection::Exact(_) => None,
             ViewSelection::Pending(lazy) => Some(lazy.debug_materialized()),
         }
@@ -173,7 +165,7 @@ impl VortexRdfStore {
     /// The exact row range this view's base selection is, when it is one
     /// (what the prefix probe leaves behind); `None` for every other shape.
     pub(crate) fn debug_selection_range(&self) -> Option<Range<u64>> {
-        match self.quads.view_selection() {
+        match &self.quads.selection {
             ViewSelection::Exact(RowSelection::Range(range)) => Some(range.clone()),
             _ => None,
         }
@@ -243,25 +235,27 @@ impl VortexRdfStore {
     /// mapped open, `Some(false)` for a file read through Vortex's reader,
     /// `None` for an in-memory store.
     pub(crate) fn debug_file_mapped(&self) -> Option<bool> {
-        self.quads.file().map(NativeStoreFile::is_mapped)
+        self.quads.file().map(|base| base.file.is_mapped())
     }
 
     /// How many (scope, filter shape) trees the file handle has bound;
     /// `None` off-file.
     pub(crate) fn debug_bound_exprs(&self) -> Option<usize> {
-        self.quads.file().map(NativeStoreFile::debug_bound_exprs)
+        self.quads.file().map(|base| base.file.debug_bound_exprs())
     }
 
     /// The file's current quad-table root reader; `None` off-file. A test
     /// holds it weakly to see whether a reader tree outlives its retirement.
     pub(crate) fn debug_root_reader(&self) -> Option<vortex_layout::LayoutReaderRef> {
-        self.quads.file()?.layout_reader().ok()
+        self.quads.file()?.file.layout_reader().ok()
     }
 
     /// How many times a keep has streamed a quad column through a scan on
     /// this file handle (shared by every view of the file); `None` off-file.
     pub(crate) fn debug_column_streams(&self) -> Option<usize> {
-        self.quads.file().map(NativeStoreFile::debug_column_streams)
+        self.quads
+            .file()
+            .map(|base| base.file.debug_column_streams())
     }
 
     /// Whether this view's selection is pending with no serve plan to read
@@ -281,6 +275,7 @@ impl VortexRdfStore {
     ) -> Option<(u64, usize)> {
         self.quads
             .file()?
+            .file
             .component_column_chunks(component, column)
             .map(|chunks| (chunks.row_count(), chunks.chunk_count()))
     }
@@ -290,7 +285,7 @@ impl VortexRdfStore {
     pub(crate) fn debug_located_rid_reads(&self) -> Option<usize> {
         self.quads
             .file()
-            .map(NativeStoreFile::debug_located_rid_reads)
+            .map(|base| base.file.debug_located_rid_reads())
     }
 
     /// The exact row range the located-run kernel computes for the subject
@@ -301,7 +296,7 @@ impl VortexRdfStore {
         range: Range<TermCode>,
     ) -> Result<Option<Range<u64>>> {
         use crate::store::scan::file_reads;
-        let Some(file) = self.quads.file() else {
+        let Some(FileBase { file, .. }) = self.quads.file() else {
             return Ok(None);
         };
         file_reads::locate_subject_code_range(file, range).await
@@ -329,10 +324,7 @@ impl VortexRdfStore {
     /// The index-child row range a file view's serve plan located for its
     /// run. `None` without a plan, or when the plan's run is unlocated.
     pub(crate) fn debug_serve_row_range(&self) -> Option<Range<u64>> {
-        match &self.quads {
-            QuadsSource::InMemory { .. } => None,
-            QuadsSource::File { serve, .. } => serve.as_ref().and_then(|plan| plan.row_range()),
-        }
+        self.quads.file()?.serve.as_ref()?.row_range()
     }
 
     /// The zone-map row range a bound subject prunes to on a file view:
@@ -343,7 +335,7 @@ impl VortexRdfStore {
         subject: &NamedOrBlankNode,
     ) -> Result<Option<Range<u64>>> {
         use crate::store::scan::{file_filter, file_reads};
-        let Some(file) = self.quads.file() else {
+        let Some(FileBase { file, .. }) = self.quads.file() else {
             return Ok(None);
         };
         let pattern = QuadPattern::new(Some(subject), None, None, None);
@@ -364,7 +356,7 @@ impl VortexRdfStore {
         subject: &NamedOrBlankNode,
     ) -> Result<Option<Range<u64>>> {
         use crate::store::scan::file_reads;
-        let Some(file) = self.quads.file() else {
+        let Some(FileBase { file, .. }) = self.quads.file() else {
             return Ok(None);
         };
         let Some(mut codes) = self
@@ -384,7 +376,7 @@ impl VortexRdfStore {
         predicate: Option<&oxrdf::NamedNode>,
         object: Option<&oxrdf::Term>,
     ) -> Result<Option<Range<u64>>> {
-        let Some(file) = self.quads.file() else {
+        let Some(FileBase { file, .. }) = self.quads.file() else {
             return Ok(None);
         };
         let pattern = QuadPattern::new(None, predicate, object, None);

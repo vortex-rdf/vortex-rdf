@@ -372,7 +372,7 @@ pub(crate) async fn debug_located_run(
 /// the primary columns.
 ///
 /// The file-backed half of the serving path (see the `serve` module docs;
-/// [`InMemoryServePlan`] is the in-memory half). `QuadsSource::File` carries
+/// [`InMemoryServePlan`] is the in-memory half). `FileBase` carries
 /// exactly this type, so a file view can never hold an in-memory plan.
 ///
 /// [`InMemoryServePlan`]: super::InMemoryServePlan

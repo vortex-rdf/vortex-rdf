@@ -13,8 +13,8 @@
 //! matched columns differs: [`InMemoryServePlan`] slices the contiguous
 //! matched run of an in-memory component, `FileServePlan` scans the index
 //! child — its located run by row range, else with a pushed-down
-//! term-equality filter. Each `QuadsSource` variant
-//! carries exactly its own backend's plan type, so a view paired with the
+//! term-equality filter. Each backend of a view's source (`MemoryBase`,
+//! `FileBase`) carries exactly its own plan type, so a view paired with the
 //! other backend's plan is unrepresentable — and both decode through the
 //! shared [`ServeDecode`] tail, so tombstone handling cannot drift between
 //! them.
@@ -23,10 +23,10 @@
 //! resolution's row ids name, so any operation that can't honor it (chained
 //! matches, counting, materializing) simply ignores it and reads through the
 //! row ids. The store keeps a plan only while the resolution is a view's sole
-//! restriction — see `QuadsSource::File` / `QuadsSource::InMemory`. A plan is
-//! also what licenses *deferring* those row ids (`LazyRowIds`): with a plan
-//! attached, reads never touch them, so the resolution hands back a recipe
-//! instead of scanning for them at match time.
+//! restriction — see `MemoryBase` / `FileBase`. A plan is also what licenses
+//! *deferring* those row ids (`LazyRowIds`): with a plan attached, reads never
+//! touch them, so the resolution hands back a recipe instead of scanning for
+//! them at match time.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -261,7 +261,7 @@ impl ServeDecode {
 /// of gathering the primary columns at scattered row ids.
 ///
 /// The in-memory half of the serving path (see the module docs;
-/// `FileServePlan` is the file-backed half). `QuadsSource::InMemory` carries
+/// `FileServePlan` is the file-backed half). `MemoryBase` carries
 /// exactly this type, so an in-memory view can never hold a file plan.
 #[derive(Clone)]
 pub(crate) struct InMemoryServePlan {

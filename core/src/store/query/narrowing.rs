@@ -24,7 +24,8 @@ use vortex_buffer::Buffer;
 
 use crate::debug;
 use crate::error::Result;
-use crate::store::QuadsSource;
+#[cfg(feature = "file-io")]
+use crate::store::FileBase;
 use crate::store::array::{column_is_sorted, into_struct_array};
 use crate::store::probes::StructProbes;
 use crate::store::resident::cached_code_primitive;
@@ -32,6 +33,7 @@ use crate::store::resident::cached_code_primitive;
 use crate::store::scan::{file_filter, file_reads};
 use crate::store::schema::{self, QuadColumn, TermCode};
 use crate::store::view::selection::{RowSelection, ViewSelection};
+use crate::store::{Backend, MemoryBase};
 
 use crate::store::VortexRdfStore;
 
@@ -194,10 +196,10 @@ impl VortexRdfStore {
         if keep.is_empty() {
             return Ok(self.empty_view());
         }
-        match &self.quads {
-            QuadsSource::InMemory { .. } => self.keep_in_memory(column, keep),
+        match &self.quads.backend {
+            Backend::InMemory(memory) => self.keep_in_memory(memory, column, keep),
             #[cfg(feature = "file-io")]
-            QuadsSource::File { .. } => self.keep_file(column, keep).await,
+            Backend::File(base) => self.keep_file(base, column, keep).await,
         }
     }
 
@@ -270,9 +272,14 @@ impl VortexRdfStore {
         limit: usize,
     ) -> Result<(RowSelection, usize)> {
         let base_len = self.quads.base_len();
-        let deleted = self.quads.deleted();
+        let deleted = self.quads.deleted.as_ref();
         #[cfg(feature = "file-io")]
-        if let (Some(file), Some(filter)) = (self.quads.file(), self.quads.filter()) {
+        if let Some(FileBase {
+            file,
+            filter: Some(filter),
+            ..
+        }) = self.quads.file()
+        {
             // Only the matches the window can reach are evaluated; fewer than
             // asked means the base is exhausted and their count is its live
             // size.
@@ -312,23 +319,14 @@ impl VortexRdfStore {
         }
     }
 
-    /// The in-memory backend of [`keep`](Self::keep).
-    fn keep_in_memory(&self, column: QuadColumn, keep: &Keep) -> Result<Self> {
+    /// The in-memory backend of [`keep`](Self::keep), `memory` the view's
+    /// base.
+    fn keep_in_memory(&self, memory: &MemoryBase, column: QuadColumn, keep: &Keep) -> Result<Self> {
         let t = debug::timer();
-        // Without `file-io`, InMemory is the only variant.
-        #[allow(irrefutable_let_patterns)]
-        let QuadsSource::InMemory {
-            base,
-            selection,
-            probes,
-            ..
-        } = &self.quads
-        else {
-            unreachable!("keep routes only InMemory sources here");
-        };
+        let MemoryBase { base, probes, .. } = memory;
         // A pending view's deferred ids are needed now: the keep narrows exact
         // row ids, and a serve plan's run no longer describes its result.
-        let selection = selection.materialized()?;
+        let selection = self.quads.selection.materialized()?;
         let base_len = base.len();
         if selection.is_empty(base_len) {
             return Ok(self.empty_view());
@@ -474,19 +472,11 @@ impl VortexRdfStore {
     /// every distinct expression would pin new entries in Vortex's
     /// identity-keyed reader caches.
     #[cfg(feature = "file-io")]
-    async fn keep_file(&self, column: QuadColumn, keep: &Keep) -> Result<Self> {
+    async fn keep_file(&self, base: &FileBase, column: QuadColumn, keep: &Keep) -> Result<Self> {
         let t = debug::timer();
-        let QuadsSource::File {
-            file,
-            filter,
-            selection,
-            ..
-        } = &self.quads
-        else {
-            unreachable!("keep routes only File sources here");
-        };
+        let FileBase { file, filter, .. } = base;
         let row_count = file.row_count() as usize;
-        let selection = selection.materialized_async().await?;
+        let selection = self.quads.selection.materialized_async().await?;
         if selection.is_empty(row_count) {
             return Ok(self.empty_view());
         }
@@ -531,7 +521,7 @@ impl VortexRdfStore {
         }
         Ok(self.derived(
             self.quads
-                .file_with(filter, ViewSelection::Exact(narrowed), None),
+                .file_with(base, filter, ViewSelection::Exact(narrowed), None),
             self.tail.clone(),
         ))
     }

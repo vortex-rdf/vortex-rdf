@@ -1,10 +1,10 @@
 //! The store's backing data: [`QuadsSource`] (the base — in memory or a
-//! Vortex file — together with the [`ViewSelection`], tombstones, index
-//! components and serve plan that determine which base rows a view exposes)
-//! and [`Tail`] (rows appended since construction, held apart from the base).
-//! A derived view is built from its parent's source through the constructors
-//! here ([`QuadsSource::in_memory_with`], [`QuadsSource::with_selection`],
-//! …), never field by field.
+//! Vortex file, its [`Backend`] — together with the [`ViewSelection`] and
+//! tombstones that determine which base rows a view exposes) and [`Tail`]
+//! (rows appended since construction, held apart from the base). A derived
+//! view is built from its parent's source through the constructors here
+//! ([`QuadsSource::in_memory_with`], [`QuadsSource::with_selection`], …),
+//! never field by field.
 
 pub(crate) mod selection;
 
@@ -36,86 +36,116 @@ use vortex_array::expr::Expression;
 /// A lazily-decoded view onto quad data: the base the store was constructed
 /// from, plus which of its rows this view covers.
 ///
-/// Both variants keep their base intact and narrow a [`RowSelection`] over
+/// Both backends keep their base intact and narrow a [`RowSelection`] over
 /// it, so base row ids stay meaningful for as long as the view lives: the
 /// secondary indexes' `rid` columns address base rows across
 /// `match_pattern`, and the unselected data stays reachable for later
 /// mutation.
 #[derive(Clone)]
-pub(crate) enum QuadsSource {
+pub(crate) struct QuadsSource {
+    /// The base row ids visible through this particular store or derived
+    /// view; narrowing a view changes this without rewriting the base,
+    /// typically through the prefix probe, index lookups, a mask scan or, on
+    /// file, pruning. May still be pending — on a served match (see the
+    /// backends' `serve`), or on a view built only to be counted or windowed
+    /// (see [`ViewSelection`]).
+    pub(crate) selection: ViewSelection,
+    /// Rows deleted since construction (on file, since the store was
+    /// opened), one bit per base row (`None` until something is deleted).
+    /// Applied by every read path through [`RowSelection::live_mask`];
+    /// reclaimed only by compaction.
+    pub(crate) deleted: Option<Mask>,
+    /// Where the base rows live, with what the backend keeps beside them.
+    pub(crate) backend: Backend,
+}
+
+/// Where a [`QuadsSource`]'s base rows live.
+#[derive(Clone)]
+pub(crate) enum Backend {
     /// Quad data that is already loaded into a Vortex array.
-    InMemory {
-        /// The complete, shared array against which selections, tombstones,
-        /// and secondary-index row ids are defined.
-        base: ArrayRef,
-        /// The base row ids visible through this particular store or derived
-        /// view; narrowing a view changes this without rewriting `base`. May
-        /// still be pending — on a served match (see `serve`), or on a view
-        /// built only to be counted or windowed (see [`ViewSelection`]).
-        selection: ViewSelection,
-        /// Secondary-index components held beside `base`, in the same child
-        /// schema as a native file's index children; empty for stores built
-        /// without indexes. Shared by views (`Arc`): their `rid` columns
-        /// address base rows, which selections and tombstones never renumber.
-        /// A file-backed store carries none — its index data stays on disk
-        /// as index children and resolves through pushed-down scans.
-        components: Arc<[IndexComponent]>,
-        /// Rows deleted since construction, one bit per base row (`None`
-        /// until something is deleted). Applied by every read path through
-        /// [`RowSelection::live_mask`]; reclaimed only by compaction.
-        deleted: Option<Mask>,
-        /// Lazily-resolved encoded-search probes over `base`'s columns,
-        /// shared by every view over this base (see [`StructProbes`]);
-        /// carried wherever `base` carries, and a fresh base takes a fresh
-        /// cache.
-        probes: Arc<StructProbes>,
-        /// The index's plan for reading this view's rows from its own
-        /// columns, present only while the selection is exactly the run the
-        /// plan covers (any narrowing drops it, materializing a `Pending`
-        /// selection first). See [`InMemoryServePlan`] for the mechanism and
-        /// [`ViewSelection`] for the served/pending invariant.
-        serve: Option<InMemoryServePlan>,
-    },
-    #[cfg(feature = "file-io")]
+    InMemory(MemoryBase),
     /// Quad data read lazily from a Vortex file when a query is executed.
-    File {
-        /// The shared file handle, including its cached schema, metadata, and
-        /// layout reader used by scans and pruning, and the path it was
-        /// opened from, which an owner's compaction rewrites its rows over
-        /// atomically before it reopens it (`compaction.rs`); a derived
-        /// view's compaction never touches the file. Every root row is a quad
-        /// row (the dictionary and index copies ride as auxiliary children
-        /// with their own row spaces), so `file.row_count()` is the store's
-        /// row space.
-        file: Arc<NativeStoreFile>,
-        /// Pattern components not resolved to row ids, pushed down to the scan.
-        filter: Option<Expression>,
-        /// The file row ids visible through this store or derived view,
-        /// typically narrowed by index lookups or pruning. May still be
-        /// pending — on a served match (see `serve`), or on a view built only
-        /// to be counted or windowed (see [`ViewSelection`]).
-        selection: ViewSelection,
-        /// Rows deleted since the store was opened, one bit per file row
-        /// (`None` until something is deleted). Applied by every read path
-        /// through [`RowSelection::live_mask`]; reclaimed only by compaction.
-        deleted: Option<Mask>,
-        /// The index's plan for reading this view's rows from its own
-        /// columns, present only while the selection is exactly the run the
-        /// plan covers (any narrowing drops it, materializing a `Pending`
-        /// selection first). See [`FileServePlan`] for the mechanism and
-        /// [`ViewSelection`] for the served/pending invariant.
-        serve: Option<FileServePlan>,
-    },
+    #[cfg(feature = "file-io")]
+    File(FileBase),
+}
+
+/// An in-memory base: the array, the index components and probes held
+/// beside it, and the serve plan of a served view.
+#[derive(Clone)]
+pub(crate) struct MemoryBase {
+    /// The complete, shared array against which selections, tombstones,
+    /// and secondary-index row ids are defined.
+    pub(crate) base: ArrayRef,
+    /// Secondary-index components held beside `base`, in the same child
+    /// schema as a native file's index children; empty for stores built
+    /// without indexes. Shared by views (`Arc`): their `rid` columns
+    /// address base rows, which selections and tombstones never renumber.
+    /// A file-backed store carries none — its index data stays on disk
+    /// as index children and resolves through pushed-down scans.
+    pub(crate) components: Arc<[IndexComponent]>,
+    /// Lazily-resolved encoded-search probes over `base`'s columns,
+    /// shared by every view over this base (see [`StructProbes`]);
+    /// carried wherever `base` carries, and a fresh base takes a fresh
+    /// cache.
+    pub(crate) probes: Arc<StructProbes>,
+    /// The index's plan for reading this view's rows from its own
+    /// columns, present only while the selection is exactly the run the
+    /// plan covers (any narrowing drops it, materializing a `Pending`
+    /// selection first). See [`InMemoryServePlan`] for the mechanism and
+    /// [`ViewSelection`] for the served/pending invariant.
+    pub(crate) serve: Option<InMemoryServePlan>,
+}
+
+/// A file base: the file handle, the filter a match pushed down to its
+/// scan, and the serve plan of a served view.
+#[cfg(feature = "file-io")]
+#[derive(Clone)]
+pub(crate) struct FileBase {
+    /// The shared file handle, including its cached schema, metadata, and
+    /// layout reader used by scans and pruning, and the path it was
+    /// opened from, which an owner's compaction rewrites its rows over
+    /// atomically before it reopens it (`compaction.rs`); a derived
+    /// view's compaction never touches the file. Every root row is a quad
+    /// row (the dictionary and index copies ride as auxiliary children
+    /// with their own row spaces), so `file.row_count()` is the store's
+    /// row space.
+    pub(crate) file: Arc<NativeStoreFile>,
+    /// Pattern components not resolved to row ids, pushed down to the scan.
+    pub(crate) filter: Option<Expression>,
+    /// The index's plan for reading this view's rows from its own
+    /// columns, present only while the selection is exactly the run the
+    /// plan covers (any narrowing drops it, materializing a `Pending`
+    /// selection first). See [`FileServePlan`] for the mechanism and
+    /// [`ViewSelection`] for the served/pending invariant.
+    pub(crate) serve: Option<FileServePlan>,
 }
 
 impl QuadsSource {
-    /// The base row ids visible through this source, whichever backend holds
-    /// the rows.
-    pub(crate) fn view_selection(&self) -> &ViewSelection {
-        match self {
-            QuadsSource::InMemory { selection, .. } => selection,
+    /// A source covering every row of `backend`, nothing deleted: a store's
+    /// own, as a construction or an open makes it.
+    pub(crate) fn new(backend: Backend) -> Self {
+        QuadsSource {
+            selection: ViewSelection::all(),
+            deleted: None,
+            backend,
+        }
+    }
+
+    /// The in-memory base; `None` on file.
+    pub(crate) fn in_memory(&self) -> Option<&MemoryBase> {
+        match &self.backend {
+            Backend::InMemory(memory) => Some(memory),
             #[cfg(feature = "file-io")]
-            QuadsSource::File { selection, .. } => selection,
+            Backend::File(_) => None,
+        }
+    }
+
+    /// The file base; `None` in memory.
+    #[cfg(feature = "file-io")]
+    pub(crate) fn file(&self) -> Option<&FileBase> {
+        match &self.backend {
+            Backend::InMemory(_) => None,
+            Backend::File(base) => Some(base),
         }
     }
 
@@ -125,51 +155,40 @@ impl QuadsSource {
     /// keeping the view; nothing that reads rows may hold one, so no view a
     /// caller gets back is in it.
     pub(crate) fn is_pending_without_plan(&self) -> bool {
-        matches!(self.view_selection(), ViewSelection::Pending(_))
-            && self.served_component().is_none()
+        matches!(self.selection, ViewSelection::Pending(_)) && self.served_component().is_none()
     }
 
     /// Whether this source still covers every base row: no pushed-down
     /// filter and an all-rows selection.
     pub(crate) fn is_unrefined(&self) -> bool {
-        !self.has_filter() && self.view_selection().is_all()
+        !self.has_filter() && self.selection.is_all()
     }
 
     /// The number of base rows: the in-memory array's length, or the file's
     /// row count.
     pub(crate) fn base_len(&self) -> usize {
-        match self {
-            QuadsSource::InMemory { base, .. } => base.len(),
+        match &self.backend {
+            Backend::InMemory(memory) => memory.base.len(),
             #[cfg(feature = "file-io")]
-            QuadsSource::File { file, .. } => file.row_count() as usize,
-        }
-    }
-
-    /// The tombstones, one bit per base row; `None` until something is
-    /// deleted.
-    pub(crate) fn deleted(&self) -> Option<&Mask> {
-        match self {
-            QuadsSource::InMemory { deleted, .. } => deleted.as_ref(),
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { deleted, .. } => deleted.as_ref(),
+            Backend::File(FileBase { file, .. }) => file.row_count() as usize,
         }
     }
 
     /// The base's struct dtype — the layout's primary columns.
     pub(crate) fn dtype(&self) -> &DType {
-        match self {
-            QuadsSource::InMemory { base, .. } => base.dtype(),
+        match &self.backend {
+            Backend::InMemory(memory) => memory.base.dtype(),
             #[cfg(feature = "file-io")]
-            QuadsSource::File { file, .. } => file.dtype(),
+            Backend::File(FileBase { file, .. }) => file.dtype(),
         }
     }
 
     /// Whether the base is read from a file.
     pub(crate) fn is_file_backed(&self) -> bool {
-        match self {
-            QuadsSource::InMemory { .. } => false,
+        match &self.backend {
+            Backend::InMemory(_) => false,
             #[cfg(feature = "file-io")]
-            QuadsSource::File { .. } => true,
+            Backend::File(_) => true,
         }
     }
 
@@ -177,59 +196,30 @@ impl QuadsSource {
     /// in-memory base's subject stamp, or the file's recorded
     /// `quads_sorted` provenance.
     pub(crate) fn subject_sorted(&self) -> bool {
-        match self {
-            QuadsSource::InMemory { base, .. } => subject_sorted(base),
+        match &self.backend {
+            Backend::InMemory(memory) => subject_sorted(&memory.base),
             #[cfg(feature = "file-io")]
-            QuadsSource::File { file, .. } => file.quads_sorted(),
+            Backend::File(FileBase { file, .. }) => file.quads_sorted(),
         }
     }
 
     /// Whether a pushed-down file filter is still to be evaluated; never for
     /// an in-memory source, whose matches resolve to exact row ids.
     pub(crate) fn has_filter(&self) -> bool {
-        match self {
-            QuadsSource::InMemory { .. } => false,
+        match &self.backend {
+            Backend::InMemory(_) => false,
             #[cfg(feature = "file-io")]
-            QuadsSource::File { filter, .. } => filter.is_some(),
-        }
-    }
-
-    /// The file a file-backed source reads; `None` in memory.
-    #[cfg(feature = "file-io")]
-    pub(crate) fn file(&self) -> Option<&NativeStoreFile> {
-        match self {
-            QuadsSource::InMemory { .. } => None,
-            QuadsSource::File { file, .. } => Some(file),
-        }
-    }
-
-    /// The pushed-down filter of a file-backed source; `None` in memory or
-    /// when nothing is left to filter.
-    #[cfg(feature = "file-io")]
-    pub(crate) fn filter(&self) -> Option<&Expression> {
-        match self {
-            QuadsSource::InMemory { .. } => None,
-            QuadsSource::File { filter, .. } => filter.as_ref(),
+            Backend::File(base) => base.filter.is_some(),
         }
     }
 
     /// The index component whose serve plan answers this view's reads, if
     /// any.
     pub(crate) fn served_component(&self) -> Option<&'static str> {
-        match self {
-            QuadsSource::InMemory { serve, .. } => serve.as_ref().map(|plan| plan.component()),
+        match &self.backend {
+            Backend::InMemory(memory) => memory.serve.as_ref().map(|plan| plan.component()),
             #[cfg(feature = "file-io")]
-            QuadsSource::File { serve, .. } => serve.as_ref().map(|plan| plan.component()),
-        }
-    }
-
-    /// The serve plan answering a file-backed source's reads, if any; `None`
-    /// in memory.
-    #[cfg(feature = "file-io")]
-    pub(crate) fn file_serve(&self) -> Option<&FileServePlan> {
-        match self {
-            QuadsSource::InMemory { .. } => None,
-            QuadsSource::File { serve, .. } => serve.as_ref(),
+            Backend::File(base) => base.serve.as_ref().map(|plan| plan.component()),
         }
     }
 
@@ -238,10 +228,10 @@ impl QuadsSource {
     /// synchronously in memory, where they never take I/O, and through the
     /// index child's deferred read on file.
     pub(crate) async fn materialized_selection(&self) -> Result<RowSelection> {
-        match self {
-            QuadsSource::InMemory { selection, .. } => selection.materialized(),
+        match &self.backend {
+            Backend::InMemory(_) => self.selection.materialized(),
             #[cfg(feature = "file-io")]
-            QuadsSource::File { selection, .. } => selection.materialized_async().await,
+            Backend::File(_) => self.selection.materialized_async().await,
         }
     }
 
@@ -263,81 +253,69 @@ impl QuadsSource {
         offset: usize,
         limit: usize,
     ) -> Result<Option<(RowSelection, usize)>> {
-        let located = match self {
-            QuadsSource::InMemory {
-                selection: ViewSelection::Pending(lazy),
-                deleted: None,
-                ..
-            } => match lazy.len_if_known() {
+        let located = match (&self.selection, &self.deleted, &self.backend) {
+            (ViewSelection::Pending(lazy), None, Backend::InMemory(_)) => match lazy.len_if_known()
+            {
                 Some(live) => lazy.window(offset, limit)?.map(|ids| (ids, live)),
                 None => None,
             },
             #[cfg(feature = "file-io")]
-            QuadsSource::File {
-                selection: ViewSelection::Pending(lazy),
-                filter: None,
-                deleted: None,
-                ..
-            } => match lazy.len_if_known() {
-                Some(live) => lazy
-                    .window_async(offset, limit)
-                    .await?
-                    .map(|ids| (ids, live)),
-                None => None,
-            },
+            (ViewSelection::Pending(lazy), None, Backend::File(FileBase { filter: None, .. })) => {
+                match lazy.len_if_known() {
+                    Some(live) => lazy
+                        .window_async(offset, limit)
+                        .await?
+                        .map(|ids| (ids, live)),
+                    None => None,
+                }
+            }
             _ => None,
         };
         Ok(located.map(|(ids, live)| (RowSelection::from_ids(ids), live)))
     }
 
-    /// This in-memory source under `selection`, its reads served by `serve`:
-    /// the same base, components, tombstones and probes.
+    /// This source over `memory`, its own in-memory base, under `selection`,
+    /// its reads served by `serve`: the same base, components, tombstones
+    /// and probes.
     #[inline]
-    #[cfg_attr(not(feature = "file-io"), allow(irrefutable_let_patterns))]
     pub(crate) fn in_memory_with(
         &self,
+        memory: &MemoryBase,
         selection: ViewSelection,
         serve: Option<InMemoryServePlan>,
     ) -> Self {
-        let QuadsSource::InMemory {
-            base,
-            components,
-            deleted,
-            probes,
-            ..
-        } = self
-        else {
-            unreachable!("in_memory_with is only called on an in-memory source");
-        };
-        QuadsSource::InMemory {
-            base: base.clone(),
+        QuadsSource {
             selection,
-            components: Arc::clone(components),
-            deleted: deleted.clone(),
-            probes: Arc::clone(probes),
-            serve,
+            deleted: self.deleted.clone(),
+            backend: Backend::InMemory(MemoryBase {
+                base: memory.base.clone(),
+                components: Arc::clone(&memory.components),
+                probes: Arc::clone(&memory.probes),
+                serve,
+            }),
         }
     }
 
-    /// This file source under `filter` and `selection`, its reads served by
-    /// `serve`: the same file handle and tombstones.
+    /// This source over `base`, its own file base, under `filter` and
+    /// `selection`, its reads served by `serve`: the same file handle and
+    /// tombstones.
     #[inline]
     #[cfg(feature = "file-io")]
     pub(crate) fn file_with(
         &self,
+        base: &FileBase,
         filter: Option<Expression>,
         selection: ViewSelection,
         serve: Option<FileServePlan>,
     ) -> Self {
-        let QuadsSource::File { file, deleted, .. } = self else {
-            unreachable!("file_with is only called on a file source");
-        };
-        QuadsSource::File {
-            file: Arc::clone(file),
-            filter,
+        QuadsSource {
             selection,
-            deleted: deleted.clone(),
-            serve,
+            deleted: self.deleted.clone(),
+            backend: Backend::File(FileBase {
+                file: Arc::clone(&base.file),
+                filter,
+                serve,
+            }),
         }
     }
 
@@ -347,32 +325,21 @@ impl QuadsSource {
     /// [`is_pending_without_plan`](Self::is_pending_without_plan)).
     #[inline]
     pub(crate) fn with_selection(&self, selection: ViewSelection) -> Self {
-        match self {
-            QuadsSource::InMemory { .. } => self.in_memory_with(selection, None),
+        match &self.backend {
+            Backend::InMemory(memory) => self.in_memory_with(memory, selection, None),
             #[cfg(feature = "file-io")]
-            QuadsSource::File { filter, .. } => self.file_with(filter.clone(), selection, None),
+            Backend::File(base) => self.file_with(base, base.filter.clone(), selection, None),
         }
     }
 
     /// This source with its pushed-down filter dropped (a no-op in memory).
-    pub(crate) fn without_filter(self) -> Self {
-        match self {
-            QuadsSource::InMemory { .. } => self,
+    pub(crate) fn without_filter(mut self) -> Self {
+        match &mut self.backend {
+            Backend::InMemory(_) => {}
             #[cfg(feature = "file-io")]
-            QuadsSource::File {
-                file,
-                selection,
-                deleted,
-                serve,
-                ..
-            } => QuadsSource::File {
-                file,
-                filter: None,
-                selection,
-                deleted,
-                serve,
-            },
+            Backend::File(base) => base.filter = None,
         }
+        self
     }
 
     /// This source with the base rows `doomed` sets folded into its
@@ -391,16 +358,8 @@ impl QuadsSource {
             self.is_unrefined(),
             "only an owner's source (every row selected, no filter) takes tombstones"
         );
-        let mut source = self.with_selection(self.view_selection().clone());
-        match &mut source {
-            QuadsSource::InMemory { deleted, .. } => {
-                *deleted = Some(union_deleted(deleted.as_ref(), doomed));
-            }
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { deleted, .. } => {
-                *deleted = Some(union_deleted(deleted.as_ref(), doomed));
-            }
-        }
+        let mut source = self.with_selection(self.selection.clone());
+        source.deleted = Some(union_deleted(self.deleted.as_ref(), doomed));
         source
     }
 
@@ -408,10 +367,10 @@ impl QuadsSource {
     /// no index components; a file source keeps its filter.
     pub(crate) fn emptied(&self) -> Self {
         let mut source = self.with_selection(ViewSelection::Exact(RowSelection::empty()));
-        match &mut source {
-            QuadsSource::InMemory { components, .. } => *components = Arc::from(Vec::new()),
+        match &mut source.backend {
+            Backend::InMemory(memory) => memory.components = Arc::from(Vec::new()),
             #[cfg(feature = "file-io")]
-            QuadsSource::File { .. } => {}
+            Backend::File(_) => {}
         }
         source
     }

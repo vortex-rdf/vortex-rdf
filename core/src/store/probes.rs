@@ -10,7 +10,7 @@ use vortex_array::dtype::FieldName;
 use vortex_rdf_encoded_search::OwnedSortedProbe;
 
 /// Lazily-resolved probes for one struct array's children, shared across the
-/// views over that base (`Arc` in `QuadsSource::InMemory`) and by the index
+/// views over that base (`Arc` in `MemoryBase`) and by the index
 /// components and serve plans keyed on their own struct arrays.
 ///
 /// The cells are keyed by the address of the array they were resolved for;
@@ -25,7 +25,7 @@ type ProbeCells = Vec<(FieldName, Option<Arc<OwnedSortedProbe>>)>;
 
 impl StructProbes {
     /// A fresh, unresolved cache, shared (`Arc`) because every
-    /// `QuadsSource::InMemory` and index component holds one by `Arc`.
+    /// `MemoryBase` and index component holds one by `Arc`.
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }

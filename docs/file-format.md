@@ -174,7 +174,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 On open the layout checks that the child count is `1 + components.len()`,
 that child 0 has the root's row count, and that every component child's dtype
 matches its descriptor ([`deserialize`](../core/src/io/container/layout.rs#L56));
-[`classify_component`](../core/src/store/persist/open.rs#L89) then turns each
+[`classify_component`](../core/src/store/persist/open.rs#L88) then turns each
 descriptor into the dictionary, a known index, or a skip — an index child by
 its implementation slug alone, whatever its name. The open classifies the
 roster once, and every later read reaches a child only through it.
@@ -284,7 +284,7 @@ chunks are not one uniform window (chunks adopted from a foreign file) is
 written without the zone map; readers inspect the layout for it.
 
 **Reading it from a file.** A file store is memory-mapped
-([`from_file`](../core/src/store/persist/open.rs#L238)) and the dictionary stays in
+([`from_file`](../core/src/store/persist/open.rs#L237)) and the dictionary stays in
 its child
 ([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L243)).
 At open the handle reads the zone table — one small segment — and keeps, per
@@ -339,7 +339,7 @@ Shared rules:
   `u64` codes under `Dictionary`. `rid` is always a non-nullable `u64`
   ([`RowId`](../core/src/store/schema.rs#L37)), under every layout; a child
   whose `rid` is an integer of any other width is refused at open
-  ([`check_id_columns`](../core/src/store/persist/open.rs#L43)): rebuild such a store
+  ([`check_id_columns`](../core/src/store/persist/open.rs#L42)): rebuild such a store
   from its RDF source.
 - **Row ids do not limit a store.** A `u64` row id numbers more rows than any
   store holds. The builds still number rows with checked arithmetic — up
@@ -522,7 +522,9 @@ filesystems are unsupported for mapping.
 ## 9. The in-memory twin
 
 A store in memory holds the same three pieces the file does, in the forms the
-read paths are written against ([`QuadsSource`](../core/src/store/view/mod.rs#L45)):
+read paths are written against: its source (the selection and tombstones, and
+the in-memory backend, [`MemoryBase`](../core/src/store/view/mod.rs#L75)) and
+its layout:
 
 | In the file | In memory |
 |---|---|
@@ -532,13 +534,14 @@ read paths are written against ([`QuadsSource`](../core/src/store/view/mod.rs#L4
 | `dictionary` child | `ResolvedLayout::Dictionary(DictAccess::Resident \| FileBacked)` — in memory, or read in place for a file store |
 | footer segment map | the leaves a read slices out of the mapped file |
 | — | `probes: StructProbes` — encoded-search probes resolved once over the base's columns, shared by every view |
-| — | `selection`, `deleted`, `serve` — a view's restrictions ([matching.md §1](matching.md#1-what-a-match-produces)) |
+| — | the source's `selection` and `deleted`, and the base's `serve` — a view's restrictions ([matching.md §1](matching.md#1-what-a-match-produces)) |
 
-A file-backed store (`QuadsSource::File`) holds none of the rows: the file
-handle, a pushed-down filter, a row selection, tombstones and an optional serve
-plan. Its index data stays in the index children and is reached by chunk
-probes and pushed-down scans; a file-backed store structurally cannot carry
-in-memory components.
+A file-backed store (its source's `Backend::File`, a
+[`FileBase`](../core/src/store/view/mod.rs#L103)) holds none of the rows: the
+file handle, a pushed-down filter and an optional serve plan, beside the
+source's selection and tombstones. Its index data stays in the index children
+and is reached by chunk probes and pushed-down scans; a `FileBase`
+structurally cannot carry in-memory components.
 
 **What is not in the file.** Appended rows live in an in-memory `Tail` (under
 `Dictionary`, as `Default`-layout strings — an appended term has no code) and
