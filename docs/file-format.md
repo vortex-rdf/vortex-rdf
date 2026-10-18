@@ -595,19 +595,19 @@ open rather than being read around.
 | `STORE_LAYOUT_ID` | `vortex-rdf.store.v2` | [`container/mod.rs`](../core/src/io/container/mod.rs#L33) |
 | `LEGACY_STORE_LAYOUT_ID` | `vortex-rdf.store.v1` (refused) | [`container/mod.rs`](../core/src/io/container/mod.rs#L40) |
 | `STORE_METADATA_VERSION` | 1 | [`wire.rs`](../core/src/io/container/wire.rs#L18) |
-| row block / zone size | 8,192 rows | Vortex default write strategy |
-| data block target | ~1 MiB; ~2 MiB for an id column (a term code or a row id) that does not dictionary-encode | Vortex default write strategy; [`child_strategy`](../core/src/io/container/sources.rs#L235) |
+| row block / zone size | 8,192 rows — the block a written column is repartitioned into, and its zone-map granularity (Vortex's default write strategy, kept) | [`ROW_BLOCK`](../core/src/io/container/sources.rs#L188) |
+| data block target | ~1 MiB (Vortex's default); ~2 MiB for an id column (a term code or a row id) that does not dictionary-encode | [`ONE_MEG`](../core/src/io/container/sources.rs#L184), [`child_strategy`](../core/src/io/container/sources.rs#L235) |
 | `DICT_CHUNK_ROWS` | 65,536 terms per FSST window and leaf | [`storage.rs`](../core/src/store/layouts/dictionary/storage.rs#L39) |
 | `WINDOW_CACHE_BYTES` | 4 MiB per opened file: what a file-backed dictionary's window cache may hold, each window charged its code offsets and `WINDOW_ENTRY_OVERHEAD` ([§8](#8-reading-a-file)) | [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs#L74) |
 | `WINDOW_ENTRY_OVERHEAD` | 4 KiB charged per cached window beyond its chunk's bytes | [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs#L80) |
 | `DICT_VERSION` | 2 | [`container/mod.rs`](../core/src/io/container/mod.rs#L58) |
 | `INDEX_VERSION` | 1 | [`container/mod.rs`](../core/src/io/container/mod.rs#L62) |
-| `POINT_GATHER_MAX_ROWS` | 256 rows — a located run at most this wide is point-read through the chunk probes | [`selection.rs`](../core/src/store/view/selection.rs#L566) |
-| `POINT_READ_ROWS` | 256 rows — exact row ids at most one per this many rows of the splits holding them check a pending filter by point reads ([matching.md §7](matching.md#7-the-file-path)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L641) |
-| `POINT_IDS_PER_SPLIT` | 16 ids — exact ids at most this many per split they touch are read point by point ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L793) |
+| `POINT_GATHER_MAX_ROWS` | 256 rows — a selection, or a located run, at most this wide is read point by point through the cached probes (`gather_by_point_reads`, the located-run reads) | [`selection.rs`](../core/src/store/view/selection.rs#L566) |
+| `POINT_READ_ROWS` | 256 rows — exact row ids at most one per this many rows of the splits holding them check a pending filter by point reads, which cost about what a filtered scan spends on that many rows ([matching.md §7](matching.md#7-the-file-path)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L641) |
+| `POINT_IDS_PER_SPLIT` | 16 ids — exact ids at most this many per split they touch are read point by point, where a take through the chunk probes pays a fixed cost per leaf ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L793) |
 | `TAKE_ROWS` | 16 rows — exact ids at most one per this many rows of their splits are taken at their rows rather than scanned | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L677) |
 | `MAX_INLINE_SPLITS` | 42 splits — a row scan of at most this many runs inline, a larger one is spawned ([§8](#8-reading-a-file)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L65) |
-| `DEFAULT_CHUNK_ROWS` | 100,000 rows per builder chunk (a producer batch size; the writer re-blocks at 8,192) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L61) |
+| `DEFAULT_CHUNK_ROWS` | 100,000 rows per builder chunk: a run's size, an emitted chunk's size, a spiller's capacity and the auto-compaction cap (a producer batch size; the writer re-blocks at 8,192) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L61) |
 
 ---
 

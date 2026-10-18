@@ -534,36 +534,11 @@ from did not.
 
 ### 11.2 Compaction
 
-[`compact`](../core/src/store/write/compaction.rs#L31) /
-[`compact_with_indexes`](../core/src/store/write/compaction.rs#L65) gather every live
-quad, sort and drop repeated quads exactly as a serialization's rebuild does
-(§11.1), and rebuild:
-
-- **A file-backed owner stays file-backed** ([`stream_compacted_to_file`](../core/src/store/write/compaction.rs#L135)):
-  the sorted rows are streamed through `SortedStreamBuilder` — spilling beside
-  the store file, not in the OS temp dir — into a sibling temp file
-  `<store>.write-<uuid>.tmp`, which is atomically renamed over the original;
-  the store is then reopened memory-mapped. On Windows that rename is refused
-  while the file is mapped, by this store included, so there a file-backed
-  store cannot compact over its own path ([mutations.md §5](mutations.md#5-compaction)).
-- **An in-memory store** rebuilds through [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L220)
-  (a fresh dictionary under Dictionary, components over the whole set) and
-  adopts the result through [`from_built`](../core/src/store/construct.rs#L127).
-
-`add_quads` compacts automatically when the tail crosses a threshold
-([`tail_needs_compaction`](../core/src/store/write/compaction.rs#L201)):
-
-| Trigger | Value |
-|---|---|
-| never below | 4,096 tail rows (`AUTO_COMPACT_TAIL_FLOOR`) |
-| ratio | tail ≥ base / 10 (`AUTO_COMPACT_BASE_RATIO`) |
-| cap | tail ≥ 100,000 rows, whatever the base (`AUTO_COMPACT_TAIL_CAP` = `DEFAULT_CHUNK_ROWS`) |
-
-Between compactions the tail accretes as chunks and is flattened once the
-accreted rows rival the flat prefix (floor 1,024) or 64 chunks pile up
-([`TAIL_FLATTEN_FLOOR`](../core/src/store/view/mod.rs#L431),
-[`TAIL_MAX_CHUNKS`](../core/src/store/view/mod.rs#L435)). The tail, tombstone
-and compaction model in full is [mutations.md](mutations.md).
+`compact` and `compact_with_indexes` gather every live quad, sort and drop
+repeated quads exactly as a serialization's rebuild does (§11.1), and rebuild the
+base and its indexes from them. How a file-backed owner rewrites its file, how an
+in-memory store rebuilds and when `add_quads` compacts by itself are in
+[mutations.md §5](mutations.md#5-compaction).
 
 ### 11.3 Back to RDF text
 
@@ -580,10 +555,10 @@ every other format decodes to `oxrdf` terms and drives the `oxrdfio` serializer.
 |---|---|---|---|
 | `--layout` / `layout` | every surface | `dictionary` | column layout ([§7](#7-columns-per-layout)) |
 | `--indexes` / `indexes` | every surface | none | which index families to build ([§8](#8-secondary-indexes-at-build-time)) |
-| `DEFAULT_CHUNK_ROWS` | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L61) | 100,000 rows | run size, emitted chunk size, spiller capacity, auto-compaction cap |
 | `VORTEX_RDF_SPILL_DIR` | environment | unset (caller base, else OS temp) | where spill runs live |
-| `DICT_CHUNK_ROWS` | [`storage.rs`](../core/src/store/layouts/dictionary/storage.rs#L39) | 65,536 terms | FSST window = dictionary child leaf |
-| row block / segment target | Vortex default write strategy; [`child_strategy`](../core/src/io/container/sources.rs#L235) | 8,192 rows / ~1 MiB; ~2 MiB for a plain id column | zone-map granularity, and the segment size of every written column except a plain `u64` term-code or row-id column, which coalesces toward ~2 MiB ([§9](#9-writing-the-container)) |
+
+The sizes a build uses (`DEFAULT_CHUNK_ROWS`, `DICT_CHUNK_ROWS`, the row block and
+the segment target) are constants, tabulated in [file-format.md §11](file-format.md#11-constants).
 
 ---
 

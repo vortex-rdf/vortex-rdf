@@ -976,11 +976,10 @@ file run) and a rid-only scan of the index child otherwise.
 | Constant | Value | Defined in | Meaning |
 |---|---|---|---|
 | `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/query/matching.rs#L856) | an already-narrowed view below this skips index routing |
-| `POINT_GATHER_MAX_ROWS` | 256 | [`selection.rs`](../core/src/store/view/selection.rs#L566) | runs/selections at or below this are read point-by-point through cached probes (`gather_by_point_reads`, the located-run reads) |
-| `POINT_READ_ROWS` | 256 | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L641) | exact file row ids at most one per this many rows of the splits holding them check a pending filter by point reads — a point read costs about what a filtered scan spends on this many rows |
-| `POINT_IDS_PER_SPLIT` | 16 | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L793) | exact file ids at most this many per split they touch are point-read — a take through the chunk probes pays a fixed cost per leaf |
-| `TAKE_ROWS` | 16 | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L677) | exact file ids at most one per this many rows of their splits are taken rather than scanned |
 | `TYPED_EQ_MAX_ROWS` | 4096 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L238) | selection size above which the typed row loop declines to the vectorized mask scan: always for a lone residual equality, and for any set that binds a column through an encoded-search probe |
+
+The point-read thresholds (`POINT_GATHER_MAX_ROWS`, `POINT_READ_ROWS`,
+`POINT_IDS_PER_SPLIT`, `TAKE_ROWS`) are in [file-format.md §11](file-format.md#11-constants).
 
 ---
 
