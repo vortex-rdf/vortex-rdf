@@ -527,6 +527,50 @@ async fn test_data_source_request_semantics() {
     {
         let (_dir, mapped) = multi_chunk_file().await;
         assert_multi_chunk_requests(&mapped, "mapped").await;
+
+        // A view whose filter is still pending, and one with tombstones, take
+        // their row range off their scan — through the filter, past the
+        // deleted rows: whole, cut by a limit, from the middle, and a range
+        // under a limit.
+        let p0 = NamedNode::new("http://example.org/p0").unwrap();
+        let filtered = mapped
+            .match_pattern(None, Some(&p0), None, None)
+            .await
+            .unwrap();
+        assert!(filtered.view_statistics().unwrap().pending_filter);
+        let tombstoned = mapped
+            .delete_matching(None, Some(&p0), None, None)
+            .await
+            .unwrap();
+        let stats = tombstoned.view_statistics().unwrap();
+        assert!(stats.tombstones > 0 && stats.file_backed);
+        for (tag, view) in [("pending filter", &filtered), ("tombstoned", &tombstoned)] {
+            let rows = base_ordered_codes(view).await;
+            let n = rows.len();
+            let source = view.data_source().unwrap();
+            for (range, limit) in [
+                (0..n, None),
+                (0..n, Some(10)),
+                (n / 2..n, None),
+                (100..2_000, Some(50)),
+            ] {
+                let want: Vec<[TermCode; 4]> = rows[range.clone()]
+                    .iter()
+                    .take(limit.unwrap_or(n))
+                    .copied()
+                    .collect();
+                let request = ScanRequest {
+                    row_range: Some(range.start as u64..range.end as u64),
+                    limit: limit.map(|l| l as u64),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    scan_codes(&source, request).await,
+                    want,
+                    "{tag}, rows {range:?}, limit {limit:?}"
+                );
+            }
+        }
     }
 }
 

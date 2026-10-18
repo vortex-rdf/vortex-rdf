@@ -9,10 +9,13 @@
 //! strings otherwise). A scan request's projection and filter are bound once
 //! against that dtype and applied to every chunk the view streams
 //! ([`row_chunks`](VortexRdfStore::row_chunks)), filter before projection;
-//! its `row_range` and `selection` address the view's output rows; its
-//! `limit` is enforced exactly, after filtering. The source answers one
-//! partition, so a consumer that fans out over partitions sees the whole view
-//! in one ordered stream.
+//! its `row_range` and `selection` address the view's output rows. A
+//! `row_range` windows a view with no pending file filter and no tombstones
+//! first, so only the range's rows are read; any other view streams its scan
+//! from its first row — through its pending filter, past its tombstones — so
+//! the range's end or the `limit` stops it. The `limit` is enforced exactly,
+//! after filtering. The source answers one partition, so a consumer that fans
+//! out over partitions sees the whole view in one ordered stream.
 //!
 //! [`component_data_source`](VortexRdfStore::component_data_source) exposes a
 //! store's persisted children (the copy children `index:posg` and
@@ -369,8 +372,18 @@ impl Partition for ViewPartition {
         let ViewPartition {
             rows, dtype, plan, ..
         } = *self;
-        let chunks: BoxStream<'static, Result<ArrayRef>> = match rows {
-            Rows::View(store) => store.row_chunks(DATA_SOURCE_BATCH_ROWS)?,
+        // A view under a row range with no pending file filter and no
+        // tombstones is windowed to the range, so only the range's rows are
+        // read; its chunks then start at the range's first row. Any other
+        // view streams its scan from its first row, through its filter and
+        // past its tombstones, so a limit can stop it early.
+        let (chunks, offset): (BoxStream<'static, Result<ArrayRef>>, u64) = match rows {
+            Rows::View(store) => match plan.row_range.clone() {
+                Some(range) if !store.quads.has_filter() && store.quads.deleted.is_none() => {
+                    (window_chunks(store, range.clone()), range.start)
+                }
+                _ => (store.row_chunks(DATA_SOURCE_BATCH_ROWS)?, 0),
+            },
             Rows::Chunks(chunks) => {
                 let pieces: Vec<ArrayRef> = chunks
                     .iter()
@@ -379,12 +392,12 @@ impl Partition for ViewPartition {
                     .into_iter()
                     .flatten()
                     .collect();
-                stream::iter(pieces.into_iter().map(Ok)).boxed()
+                (stream::iter(pieces.into_iter().map(Ok)).boxed(), 0)
             }
         };
         let state = RequestState {
             plan,
-            offset: 0,
+            offset,
             remaining: None,
             done: false,
         };
@@ -408,6 +421,26 @@ impl Partition for ViewPartition {
             dtype, stream,
         )))
     }
+}
+
+/// `store`'s output rows in `range`, as [`row_chunks`](VortexRdfStore::row_chunks)
+/// streams them: the view [`window`](VortexRdfStore::window)ed to the range
+/// when the stream is first polled.
+fn window_chunks(
+    store: Arc<VortexRdfStore>,
+    range: Range<u64>,
+) -> BoxStream<'static, Result<ArrayRef>> {
+    let offset = usize::try_from(range.start).unwrap_or(usize::MAX);
+    let limit = usize::try_from(range.end.saturating_sub(range.start)).unwrap_or(usize::MAX);
+    super::deferred(
+        async move {
+            store
+                .window(offset, limit)
+                .await?
+                .row_chunks(DATA_SOURCE_BATCH_ROWS)
+        },
+        Err,
+    )
 }
 
 /// The per-chunk application of a [`RequestPlan`]: output-row bookkeeping

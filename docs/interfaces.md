@@ -15,8 +15,8 @@ is the path such an engine takes.
 
 | What the engine needs | What it calls |
 |---|---|
-| A table of quads to scan with projection, filter and limit pushdown | [`data_source`](../core/src/store/read/data_source.rs#L102) on any view, registered with vortex's `VortexTable` |
-| The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L129) |
+| A table of quads to scan with projection, filter and limit pushdown | [`data_source`](../core/src/store/read/data_source.rs#L105) on any view, registered with vortex's `VortexTable` |
+| The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L132) |
 | Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L50), [`code_chunks`](../core/src/store/read/chunks.rs#L74) |
 | Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L151), [`index_components`](../core/src/store/read/metadata.rs#L224), [`partitions`](../core/src/store/read/metadata.rs#L259) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L276) (from [`dict_reader`](../core/src/store/mod.rs#L219)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
@@ -62,7 +62,7 @@ non-empty tail, which has no source: its tail holds terms without codes, so
 | `projection` | Bound once against the dtype and applied to every chunk after the filter and the limit: a `select`, a `pack` of `get_item`s (renames, reorders) or any computed expression vortex evaluates. The scan's dtype is the projection's return dtype. |
 | `filter` | Bound once and evaluated on every chunk *exactly* — the engine may drop a filter it pushed; a row the filter evaluates to null is dropped. Any expression over the columns: equality, comparisons, `and`/`or`, `in_list`, `like` on string layouts. |
 | `limit` | Enforced exactly after filtering. |
-| `row_range`, `selection` | Addressed in the view's **output** rows (after narrowing, before the filter), applied before the filter. |
+| `row_range`, `selection` | Addressed in the view's **output** rows (after narrowing, before the filter), applied before the filter. A view with no pending file filter and no tombstones is `window`ed to the `row_range` first, so only the range's rows are read; any other view streams its scan from its first row (through its pending filter, past its tombstones), and the range's end or the `limit` stops it. |
 | `ordered` | Rows always come in base order. |
 | `partition_range`, `partition_selection` | The source has one partition, index 0; a window that leaves it out yields no partitions. |
 
