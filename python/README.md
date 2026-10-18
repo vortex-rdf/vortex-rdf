@@ -133,33 +133,7 @@ Rust source changes are picked up by `uv sync` automatically (see `[tool.uv] cac
 
 Building from source (the sdist or a development build) additionally requires **libclang**: a transitive build dependency of the Vortex file engine (`custom-labels`, via `vortex-io`) generates C bindings with `bindgen` at compile time. It is preinstalled on most dev setups (Xcode, LLVM on Windows); on Linux install e.g. `clang-devel` (dnf) or `libclang-dev` (apt). Installing a published wheel needs none of this.
 
-### Benchmarks
-
-`bench/run.py` measures these bindings against [pyoxigraph](https://pypi.org/project/pyoxigraph/), [pycottas](https://pypi.org/project/pycottas/), [rdflib](https://pypi.org/project/rdflib/) and [lightrdf](https://pypi.org/project/lightrdf/) on a file → store → query workload and writes `bench/results.json` for [the dashboard's Python tab](https://vortex-rdf.github.io/vortex-rdf/#py); `bench/test_codspeed.py` is the instrumented suite CodSpeed runs.
-
-```bash
-python3 python/bench/run.py                 # full run
-BENCH_DIM=32 python3 python/bench/run.py    # quick pilot
-uv run pytest bench/test_codspeed.py --codspeed
-```
-
-Harness design (per-library virtualenvs, dataset parity with `js/bench/datasets.ts`, `unsupported` cells where a library lacks the operation, matched-row counts cross-checked and any disagreement recorded in `config.countWarnings`) is documented in `bench/run.py`, `bench/worker.py` and `bench/adapters.py`. Configuration variables:
-
-| Var | Default | Meaning |
-| --- | --- | --- |
-| `BENCH_SIZE` | 1,048,576 | rows (value shared with the Rust and JS suites) |
-| `BENCH_DIM` | unset | optional cube shorthand, `D³` rows; ignored if `BENCH_SIZE` is set |
-| `BENCH_GRAPHS_QUADS` | 8 | named graphs the comparative bench asks for |
-| `MUT_BATCH` | 10000 | quads per add/delete batch |
-| `BENCH_PYTHON` | 3.13 | Python version the per-library virtualenvs are provisioned with |
-| `BENCH_SUBJ_RATIO` / `BENCH_OBJ_RATIO` | 0.1 / 0.5 | distinct subjects / objects per row |
-| `BENCH_PREDICATES` | 32 | distinct predicates |
-| `BENCH_GRAPHS` | 1 | distinct named graphs in the generator; 1 means default graph only |
-| `BENCH_LITERAL_FRAC` | 0.4 | fraction of objects that are literals |
-| `BENCH_SLOW_PHASE_MS` | 30000 | a phase slower than this runs once, without warmup |
-| `PY_BENCH_QUERY_ITERS` / `PY_BENCH_QUERY_WARMUP` | 10 / 5 | measured / warmup iterations per query |
-| `PY_BENCH_HEAVY_ITERS` / `PY_BENCH_FULL_SCAN_ITERS` | 3 / 3 | iterations for the heavy and full-scan phases |
-| `CODSPEED_BENCH_DIM` / `CODSPEED_BENCH_DIM_QUADS` | 32 / 13 | CodSpeed suite: `D³` triples / `D⁴` quads |
+Benchmarks live in [bench/](https://github.com/vortex-rdf/vortex-rdf/blob/main/python/bench/README.md).
 
 ## License
 

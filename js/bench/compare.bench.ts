@@ -1,7 +1,7 @@
 // Comparative benchmark: VortexRdfStore (JS/WASM) config variants vs. rdf-stores.js,
 // oxigraph and hdt (read-only wasm over a natively pre-built artifact — see the
-// hdt section in shared.ts). Emits dashboard-shaped JSON consumed by
-// scripts/render_bench_dashboard.py (the JavaScript tab of the GitHub Pages dashboard).
+// hdt section in shared.ts). Emits dashboard-shaped JSON, target/bench/js.json, consumed
+// by scripts/render_bench_dashboard.py (the JavaScript tab of the GitHub Pages dashboard).
 //
 // Run (after `npm run build` to produce pkg/web):
 //   npm run bench                         # full run (1,048,576 triples by default)
@@ -30,7 +30,7 @@
 
 import { createRequire } from 'node:module';
 import { cpus } from 'node:os';
-import { writeFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
@@ -49,7 +49,7 @@ const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
 const workerPath = resolve(here, 'compare.worker.ts');
 
-const OUT = resolve(here, process.env.BENCH_OUT ?? 'results.json');
+const OUT = resolve(here, process.env.BENCH_OUT ?? '../../target/bench/js.json');
 
 interface MemoryRow {
     slug: string; label: string; role: string;
@@ -196,6 +196,7 @@ async function main(): Promise<void> {
         fullScanIterations: FULL_SCAN_OPTS.iterations,
     };
 
+    mkdirSync(dirname(OUT), { recursive: true });
     writeFileSync(OUT, JSON.stringify({ provenance: provenance(), results, memory, config, failures }, null, 2));
     console.log(`\nWrote ${results.length} benchmark rows, ${memory.length} memory readings`
         + `${failures.length ? `, ${failures.length} unmeasurable phase(s)` : ''} → ${OUT}`);

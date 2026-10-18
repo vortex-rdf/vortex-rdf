@@ -1736,8 +1736,11 @@ fn main() {
             "countWarnings": warnings,
         },
     });
-    let dest = Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/results.json");
-    std::fs::create_dir_all(dest.parent().unwrap()).expect("create bench dir");
+    let dest = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("target/bench/rust-compare.json");
+    std::fs::create_dir_all(dest.parent().unwrap()).expect("create target/bench");
     std::fs::write(&dest, serde_json::to_string_pretty(&out).unwrap()).expect("write results");
     eprintln!("\nWrote {} rows -> {}", rows.len(), dest.display());
 }

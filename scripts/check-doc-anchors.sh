@@ -19,7 +19,7 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 docs=(README.md CONTRIBUTING.md docs/*.md js/README.md python/README.md
-  js/bench/README.md encoded-search/README.md)
+  js/bench/README.md python/bench/README.md encoded-search/README.md)
 
 existing=()
 for doc in "${docs[@]}"; do

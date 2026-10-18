@@ -4,11 +4,11 @@ Three instruments, kept separate because they answer different questions and are
 
 | Command | Question | Output |
 | --- | --- | --- |
-| `npm run bench` | How does the wasm store compare to other JS RDF stores? | `bench/results.json`, [rendered to the dashboard](https://vortex-rdf.github.io/vortex-rdf/#js) |
+| `npm run bench` | How does the wasm store compare to other JS RDF stores? | `target/bench/js.json` at the repository root, beside the other suites' results, [rendered to the dashboard](https://vortex-rdf.github.io/vortex-rdf/#js) |
 | `npm run bench:codspeed` | Did this change regress anything? | uploaded to CodSpeed |
 | `npm run bench:dict-memory` | Where is wasm memory going? | printed; `bench/dict-memory.json` |
 
-`results.json` and `dict-memory.json` are generated and git-ignored.
+Both JSON files are generated and git-ignored. `scripts/refresh.sh` runs every suite and renders the dashboard (`--only js,render` re-measures this one); it needs GNU coreutils (`sha256sum`, `sort -z`).
 
 ## Files
 
@@ -39,7 +39,7 @@ Comparative suite (`compare.bench.ts`, read in `shared.ts`/`datasets.ts`/`util.t
 | `BENCH_PREDICATES` | 32 | distinct predicates (a closed vocabulary) |
 | `BENCH_GRAPHS` | 1 | distinct named graphs in the generator; 1 means default graph only |
 | `BENCH_LITERAL_FRAC` | 0.4 | fraction of objects that are literals |
-| `BENCH_OUT` | `bench/results.json` | where the run's JSON is written |
+| `BENCH_OUT` | `target/bench/js.json` | where the run's JSON is written; a relative path resolves against `bench/` |
 | `BENCH_SLOW_PHASE_MS` | 30000 | a phase slower than this is measured once, without warmup (`samples: 1` in the row) |
 | `CONSUME_BUDGET_MS` | 120000 | a consume loop past this budget throws and lands in the run's `failures` as a failed cell |
 | `WORKER_TIMEOUT_MS` | 1800000 | hard kill for a worker stalled inside a single wasm call |
