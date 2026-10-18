@@ -136,11 +136,12 @@ class TermDict:
     def decode_many(self, codes: _U64s) -> List[Optional[str]]:
         """Decode a batch of codes in one GIL-released call.
 
-        A `U64Column`, a u64 buffer (``memoryview(col).cast("Q")``,
-        ``array("Q", ...)``, a uint64 NumPy array), a non-negative int64
-        buffer or the raw byte view a `U64Column` exports is read in one
-        copy; a buffer of other items (a ``cast("I")`` view, a u32 array)
-        raises ``ValueError``. Any int sequence works element by element.
+        A `U64Column` is shared, not copied. A u64 buffer
+        (``memoryview(col).cast("Q")``, ``array("Q", ...)``, a uint64 NumPy
+        array), a non-negative int64 buffer or the raw byte view a
+        `U64Column` exports is read in one copy; a buffer of other items (a
+        ``cast("I")`` view, a u32 array) raises ``ValueError``. Any int
+        sequence works element by element.
         A repeated code usually shares one string object: a small cache of
         recently decoded codes serves repeats, and a code it has dropped is
         decoded again as an equal, separate string."""

@@ -89,8 +89,9 @@ pub struct TermDict {
 
 /// Decodes `codes` through `reader` GIL-released into Python strings, a
 /// repeated code sharing its string while the cache below still holds it.
-/// Callers must hand over codes copied out of any Python buffer: a borrowed
-/// buffer view cannot cross the GIL release.
+/// `codes` is Rust-owned memory, never a view borrowed from a Python buffer,
+/// which cannot cross the GIL release: callers pass a column's buffer or the
+/// buffer [`extract_u64s`] returns.
 ///
 /// A direct-mapped cache of `RECENT_BUCKETS` entries, indexed by the
 /// code's low bits (`code & (RECENT_BUCKETS - 1)`), holds the
@@ -261,7 +262,7 @@ impl TermDict {
         };
         let predicate = TermPredicate::parse_with(kind, arg, &options).map_err(py_err)?;
         // Like a keep's code set: whatever is no u64 code list is a bad value.
-        let codes = code_buffer(codes).map_err(|e| {
+        let codes = extract_u64s(codes).map_err(|e| {
             PyValueError::new_err(format!(
                 "codes is a U64Column, a u64 buffer or a sequence of non-negative ints below \
                  2**64: {e}"
@@ -302,14 +303,14 @@ impl TermDict {
     /// batch.
     ///
     /// `codes` is preferably a [`U64Column`] (a column from `match_codes`
-    /// passes directly) or a u64 buffer (`memoryview(col).cast("Q")`,
-    /// `array("Q", ...)`, a `uint64` NumPy array), read in one bulk copy
-    /// with no per-element Python-int conversion; a non-negative `int64`
-    /// buffer is read the same way, and a byte-typed buffer — the raw view a
-    /// `U64Column` exports — is reinterpreted as native-endian u64s. A buffer
-    /// of other items (a `cast("I")` view, a u32 array) raises `ValueError`.
-    /// Any other sequence of ints still works, at one `PyLong` extraction per
-    /// code.
+    /// passes directly, its buffer shared rather than copied) or a u64
+    /// buffer (`memoryview(col).cast("Q")`, `array("Q", ...)`, a `uint64`
+    /// NumPy array), read in one bulk copy with no per-element Python-int
+    /// conversion; a non-negative `int64` buffer is read the same way, and a
+    /// byte-typed buffer — the raw view a `U64Column` exports — is
+    /// reinterpreted as native-endian u64s. A buffer of other items (a
+    /// `cast("I")` view, a u32 array) raises `ValueError`. Any other sequence
+    /// of ints still works, at one `PyLong` extraction per code.
     ///
     /// A repeated code usually yields the same Python string object, as
     /// [`decode_slice`] describes.
@@ -338,9 +339,10 @@ impl TermDict {
     }
 }
 
-/// The u64 values of a Python object holding codes, indices or counts. A
-/// [`U64Column`] is copied whole. Any other object exporting a buffer is read
-/// as one, never element by element, and only when its items are u64 values:
+/// The u64 values of a Python object holding codes, indices or counts, as a
+/// Rust-owned buffer. A [`U64Column`] shares its own buffer, uncopied. Any
+/// other object exporting a buffer is read as one, in one copy, never
+/// element by element, and only when its items are u64 values:
 /// 8-byte unsigned integers (`memoryview(col).cast("Q")`, `array("Q", ...)`,
 /// a `uint64` NumPy array), 8-byte signed integers none of which is negative
 /// (an `int64` NumPy array), or raw bytes in multiples of 8 — the view a
@@ -350,9 +352,9 @@ impl TermDict {
 /// object without a buffer is a sequence of ints, at one `PyLong` extraction
 /// per element; an int that is negative or not below 2**64 raises
 /// `OverflowError`. Nothing is narrowed or wrapped.
-pub(crate) fn extract_u64s(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u64>> {
+pub(crate) fn extract_u64s(obj: &Bound<'_, PyAny>) -> PyResult<Buffer<u64>> {
     if let Ok(column) = obj.cast::<U64Column>() {
-        return Ok(column.get().codes.as_slice().to_vec());
+        return Ok(column.get().codes.clone());
     }
     // SAFETY: `obj` is a live object and the GIL is held.
     if unsafe { ffi::PyObject_CheckBuffer(obj.as_ptr()) } == 1 {
@@ -364,9 +366,9 @@ pub(crate) fn extract_u64s(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u64>> {
                  {U64_FORMS}"
             ))
         })?;
-        return buffer_u64s(&buf);
+        return buffer_u64s(&buf).map(Buffer::from);
     }
-    obj.extract::<Vec<u64>>()
+    obj.extract::<Vec<u64>>().map(Buffer::from)
 }
 
 /// What a code argument may be, as the refusals of a buffer spell it.
@@ -480,15 +482,6 @@ fn copy_items(buf: &PyUntypedBuffer, out: &mut [u8]) {
     }
 }
 
-/// The u64 values of `obj` as a buffer: a `U64Column`'s own, shared
-/// zero-copy, or [`extract_u64s`]'s copy of anything else.
-fn code_buffer(obj: &Bound<'_, PyAny>) -> PyResult<Buffer<u64>> {
-    if let Ok(column) = obj.cast::<U64Column>() {
-        return Ok(column.get().codes.clone());
-    }
-    Ok(Buffer::from(extract_u64s(obj)?))
-}
-
 /// One matched term-code column — or a kernel's row indices or counts —
 /// exposed to Python zero-copy through the buffer protocol:
 /// `memoryview(col).cast("Q")` views the Rust memory directly, one native-
@@ -515,7 +508,7 @@ impl U64Column {
     #[new]
     fn new(values: &Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(U64Column {
-            codes: code_buffer(values)?,
+            codes: extract_u64s(values)?,
         })
     }
 
@@ -568,7 +561,7 @@ impl U64Column {
         py: Python<'_>,
         other: &Bound<'_, PyAny>,
     ) -> PyResult<(U64Column, U64Column)> {
-        let right = U64Column::new(other)?.codes;
+        let right = extract_u64s(other)?;
         let (left_idx, right_idx) =
             py.detach(|| columns::equi_join_indices(self.codes.as_slice(), right.as_slice()));
         Ok((

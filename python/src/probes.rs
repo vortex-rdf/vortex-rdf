@@ -9,7 +9,7 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use vortex_buffer::Buffer;
 use vortex_rdf_core::{Keep, Probe, QuadColumn, TermCode};
 
-use crate::codes::{U64Column, extract_u64s};
+use crate::codes::extract_u64s;
 use crate::py_err;
 
 /// A probe from a pattern's four term spellings and its narrowing: the
@@ -165,8 +165,8 @@ fn parse_position(position: &Bound<'_, PyAny>) -> PyResult<QuadColumn> {
 
 /// One keep: a `range` with step 1 or a 2-tuple `(lo, hi)` of ints is a code
 /// range, the half-open codes `lo <= code < hi`; a `U64Column`, a u64 buffer
-/// or any other sequence of ints is a code set (see [`extract_u64s`]). A
-/// 2-tuple is never a set.
+/// or any other sequence of ints is a code set, read by [`extract_u64s`] and
+/// built by [`keep_set`]. A 2-tuple is never a set.
 fn parse_keep(spec: &Bound<'_, PyAny>) -> PyResult<Keep> {
     let py = spec.py();
     let range_type = py.import("builtins")?.getattr("range")?;
@@ -178,9 +178,6 @@ fn parse_keep(spec: &Bound<'_, PyAny>) -> PyResult<Keep> {
         let lo = code_bound(&spec.getattr("start")?)?;
         let hi = code_bound(&spec.getattr("stop")?)?;
         return Ok(Keep::range(lo..hi.max(lo)));
-    }
-    if let Ok(column) = spec.cast::<U64Column>() {
-        return Ok(keep_set(column.get().codes.clone()));
     }
     if let Ok(tuple) = spec.cast::<PyTuple>()
         && tuple.len() == 2
@@ -196,17 +193,40 @@ fn parse_keep(spec: &Bound<'_, PyAny>) -> PyResult<Keep> {
              codes lo <= code < hi; a 2-tuple is never a set): {e}"
         ))
     })?;
-    Ok(Keep::set(codes))
+    Ok(keep_set(codes))
 }
 
-/// A sorted, unique buffer is a `Keep::Set` as it stands; anything else is
-/// sorted and folded first.
+/// A sorted, unique buffer is a `Keep::Set` as it stands. Anything else is
+/// sorted and its repeats folded first: in place when nothing else holds the
+/// buffer (the codes [`extract_u64s`] copied out of a list or a Python
+/// buffer), in a copy when a `U64Column` shares it.
 fn keep_set(codes: Buffer<TermCode>) -> Keep {
     if codes.as_slice().windows(2).all(|w| w[0] < w[1]) {
-        Keep::Set(codes)
-    } else {
-        Keep::set(codes.iter().copied())
+        return Keep::Set(codes);
     }
+    let mut codes = codes.into_mut();
+    let sorted = codes.as_mut_slice();
+    sorted.sort_unstable();
+    // Equal codes now sit side by side (at least two codes got here). Count
+    // the repeats, then, if there are any, keep the first code of each run.
+    let repeats = sorted
+        .iter()
+        .zip(&sorted[1..])
+        .filter(|(a, b)| a == b)
+        .count();
+    let unique = sorted.len() - repeats;
+    if repeats > 0 {
+        let mut kept = 1;
+        for i in 1..sorted.len() {
+            if sorted[i] != sorted[kept - 1] {
+                sorted[kept] = sorted[i];
+                kept += 1;
+            }
+        }
+        debug_assert_eq!(kept, unique);
+    }
+    codes.truncate(unique);
+    Keep::Set(codes.freeze())
 }
 
 /// A range bound as a code: a non-negative int below 2**64.

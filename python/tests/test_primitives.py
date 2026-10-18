@@ -269,6 +269,7 @@ def test_keep_narrows_like_filtering(code_store):
 
     cases = [
         ({"p": [name, knows]}, 1, lambda c: c in (name, knows)),
+        ({"p": [knows, knows, name]}, 1, lambda c: c in (name, knows)),
         ({"p": range(name, name + 1)}, 1, lambda c: c == name),
         ({1: (knows, name + 1)}, 1, lambda c: knows <= c <= name),
         ({"o": range(lit_lo, lit_hi)}, 2, lambda c: lit_lo <= c < lit_hi),
@@ -403,7 +404,8 @@ def test_column_kernels():
     values, counts = col.value_counts()
     assert u64s(values) == [3, 1, 2]
     assert u64s(counts) == [3, 2, 1]
-    assert u64s(col.take([5, 0, 1])) == [3, 3, 1]
+    for indices in ([5, 0, 1], U64Column([5, 0, 1]), array("Q", [5, 0, 1])):
+        assert u64s(col.take(indices)) == [3, 3, 1]
     assert u64s(col.take(col.distinct())) == [2, 1, 3]
     assert u64s(col.take([])) == []
     with pytest.raises(IndexError):
