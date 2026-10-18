@@ -68,9 +68,10 @@ jobs:
     name: Docs
     uses: ./.github/workflows/docs.yml
 
-  # The three registries carry independently declared versions. This job fails
-  # before any of them is touched when they disagree with the tag being pushed
-  # (or, on workflow_dispatch, with each other).
+  # Two files declare the version: the workspace Cargo.toml (which the PyPI
+  # package inherits through maturin's dynamic version) and js/package.json.
+  # This job fails before any registry is touched when they disagree with the
+  # tag being pushed (or, on workflow_dispatch, with each other).
   verify-versions:
     name: Verify versions
     runs-on: ubuntu-latest
@@ -85,10 +86,6 @@ jobs:
           cargo_version="$(cargo metadata --format-version 1 --no-deps \
             | jq -r '.packages[] | select(.name == "vortex-rdf-core") | .version')"
           npm_version="$(node -p "require('./js/package.json').version")"
-          # [project].version is optional: with maturin's dynamic versioning the
-          # PyPI version is inherited from the workspace Cargo.toml, so the cargo
-          # check below already covers it.
-          pypi_version="$(python3 -c "import tomllib; print(tomllib.load(open('python/pyproject.toml','rb'))['project'].get('version', ''))")"
 
           if [ "${{ github.event_name }}" = "push" ]; then
             expected="${GITHUB_REF_NAME#v}"
@@ -108,11 +105,6 @@ jobs:
           }
           check "Cargo.toml (workspace)" "$cargo_version"
           check "js/package.json" "$npm_version"
-          if [ -n "$pypi_version" ]; then
-            check "python/pyproject.toml" "$pypi_version"
-          else
-            echo "  python/pyproject.toml: inherited from Cargo.toml"
-          fi
           exit "$fail"
 
   # A tag push publishes everywhere: the inputs.* context is empty on push

@@ -56,12 +56,9 @@ and is generated from [Conventional Commits](https://www.conventionalcommits.org
 by [`scripts/update-changelog.sh`](scripts/update-changelog.sh), which uses
 [git-cliff](https://git-cliff.org) — install it once with `cargo binstall git-cliff`
 (or `cargo install git-cliff`). The `commit-msg` hook from `install-git-hooks.sh`
-enforces the commit format the generator relies on.
-
-- **Refresh the `[Unreleased]` section:** `./scripts/update-changelog.sh`
-- **Cut a release:** `./scripts/update-changelog.sh vX.Y.Z` moves `[Unreleased]`
-  into a dated version section. Follow it with `git tag vX.Y.Z` — the tag is what
-  advances the boundary for the next release.
+enforces the commit format the generator relies on. The script's header says how
+to refresh the `[Unreleased]` section and how to cut a release, which also sets
+every declared version.
 
 Each entry links its commit and author. Author names resolve to GitHub `@handles`
 when a token is available (`GITHUB_TOKEN`, or borrowed from `gh auth token`) **and

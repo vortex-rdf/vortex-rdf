@@ -1,19 +1,27 @@
 #!/usr/bin/env bash
-# Maintain CHANGELOG.md (Keep a Changelog format).
+# Maintains CHANGELOG.md (Keep a Changelog format) from Conventional Commits,
+# through git-cliff (configured in cliff.toml), and cuts releases.
 #
-#   scripts/update-changelog.sh            # refresh the [Unreleased] section
-#   scripts/update-changelog.sh v0.3.0     # cut a release
+#   scripts/update-changelog.sh           # regenerate the [Unreleased] section
+#   scripts/update-changelog.sh vX.Y.Z    # cut release X.Y.Z
 #
-# Released sections (## [x.y.z]) are always preserved verbatim; the script only
-# ever touches the [Unreleased] section at the top.
+# Both forms take the commits since the latest tag. Without an argument the
+# script only rewrites [Unreleased], a preview that changes no version. A cut
+# also sets X.Y.Z everywhere a version is declared: the three version lines of
+# Cargo.toml ([workspace.package] and the two path dependencies), the workspace
+# entries of Cargo.lock and interface-tests/Cargo.lock (`cargo update -w`), and
+# js/package.json with its lock (`npm version`). Python inherits the workspace
+# version through maturin. Released sections (## [x.y.z]) are kept verbatim.
 #
-# [Unreleased] has two modes, switched by a sentinel line inside it:
-#   * HAND-WRITTEN  — if [Unreleased] contains `<!-- hand-written`, its entries are
-#     curated by hand. `refresh` leaves them untouched; a release stamps them
-#     verbatim into the new version section and opens a fresh, auto-managed
-#     [Unreleased]. (Used while transitional non-Conventional commits are pending.)
-#   * AUTO          — otherwise, `refresh`/release regenerate [Unreleased] from
-#     Conventional Commits via git-cliff (`cargo binstall git-cliff`, or cargo install).
+# Cut the changelog last, once nothing else is waiting to land: a cut section
+# is frozen (the script refuses to cut the same version twice), so a commit
+# that lands after the cut gets its entry added by hand. Commit the cut as
+# `chore(release): X.Y.Z`, merge it, then tag the merge commit
+# (`git tag vX.Y.Z <merge-sha> && git push origin vX.Y.Z`): the tag publishes
+# the release (.github/workflows/release.yml) and starts the next changelog.
+#
+# Needs git-cliff (`cargo binstall git-cliff`, or `cargo install git-cliff`);
+# a cut also needs cargo and npm.
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
@@ -75,61 +83,51 @@ PY
 }
 
 CHANGELOG='CHANGELOG.md'
-REPO='https://github.com/vortex-rdf/vortex-rdf'
-# Boundary for git-cliff in AUTO mode: commits after this ref populate [Unreleased].
-# Follows the latest git tag, so it advances automatically on every tagged release
-# — tag each release (`git tag vX.Y.Z`) to keep this correct. Falls back to the
-# v0.2.0 boundary commit (PR #43 merge) only if no tags exist yet.
-BASE_REF="$(git describe --tags --abbrev=0 2>/dev/null || echo a13b6a1c7e0916d513277bec4d0b9a4ec2b1ed6e)"
-
 version="${1:-}"
 
-# Is the [Unreleased] section hand-written? (sentinel between it and the next heading)
-unreleased_block="$(awk '/^## \[Unreleased\]/{f=1;next} /^## \[/{f=0} f' "$CHANGELOG")"
-hand_written=false
-grep -q '<!-- hand-written' <<<"$unreleased_block" && hand_written=true
+command -v git-cliff >/dev/null || { echo "error: git-cliff not found; install with: cargo binstall git-cliff  (or: cargo install git-cliff)" >&2; exit 1; }
+# The boundary: the commits after the latest tag make up the generated section.
+BASE_REF="$(git describe --tags --abbrev=0)" || { echo "error: no tag to start from; tag the last release" >&2; exit 1; }
 
-# ---------------------------------------------------------------------------
-if [ -z "$version" ]; then
-  # ---- refresh ----
-  if $hand_written; then
-    echo "[Unreleased] is hand-written (sentinel present); left untouched."
-    exit 0
-  fi
-  command -v git-cliff >/dev/null || { echo "error: git-cliff not found; install with: cargo binstall git-cliff  (or: cargo install git-cliff)" >&2; exit 1; }
+# Regenerates the top of CHANGELOG.md (git-cliff's header and newest section, with
+# the given git-cliff arguments) above the frozen released sections.
+write_changelog() {
+  local frozen_tail managed_top
   frozen_tail="$(awk '/^## \[[0-9]/{f=1} f' "$CHANGELOG")"
-  managed_top="$(git-cliff "${BASE_REF}.." | enrich_handles)"
+  managed_top="$(git-cliff "${BASE_REF}.." "$@" | enrich_handles)"
   printf '%s\n\n%s\n' "$managed_top" "$frozen_tail" \
     | awk 'NR>1 && /^## \[/ && prev != "" { print "" } { print; prev=$0 }' > "$CHANGELOG"
-  echo "Refreshed [Unreleased] from Conventional Commits."
+}
+
+if [ -z "$version" ]; then
+  write_changelog
+  echo "Refreshed [Unreleased] from the Conventional Commits since $BASE_REF."
   exit 0
 fi
 
 # ---- cut a release: vX.Y.Z ----
-date="$(date +%Y-%m-%d)"
-if $hand_written; then
-  # Stamp the hand-written [Unreleased] into [version]; open a fresh AUTO [Unreleased].
-  awk -v ver="${version#v}" -v date="$date" -v repo="$REPO" -v tag="$version" '
-    /^## \[Unreleased\]/ {
-      print "## [Unreleased](" repo "/compare/" tag "...HEAD)"
-      print ""
-      print "## [" ver "] - " date
-      next
-    }
-    /<!-- hand-written/ { skip=1 }          # drop the sentinel (may span lines)
-    skip && /-->/       { skip=0; next }
-    skip                { next }
-    { print }
-  ' "$CHANGELOG" | cat -s > "$CHANGELOG.tmp" && mv "$CHANGELOG.tmp" "$CHANGELOG"
-  echo "Cut release $version from the hand-written [Unreleased]. Next [Unreleased] is auto-managed."
-  echo "Tip: tag it so git-cliff has a clean boundary  ->  git tag $version && git push --tags"
-  exit 0
+tag_pattern='^v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$'
+[[ "$version" =~ $tag_pattern ]] || { echo "error: expected a version tag vX.Y.Z, got '$version'" >&2; exit 2; }
+ver="${BASH_REMATCH[1]}"
+if awk -v h="## [$ver]" 'index($0, h) == 1 { found = 1 } END { exit !found }' "$CHANGELOG"; then
+  echo "error: $CHANGELOG already has a [$ver] section; add later commits to it by hand" >&2
+  exit 1
 fi
+command -v cargo >/dev/null || { echo "error: cargo not found" >&2; exit 1; }
+command -v npm >/dev/null || { echo "error: npm not found" >&2; exit 1; }
 
-# AUTO release: let git-cliff generate the version section.
-command -v git-cliff >/dev/null || { echo "error: git-cliff not found; install with: cargo binstall git-cliff  (or: cargo install git-cliff)" >&2; exit 1; }
-frozen_tail="$(awk '/^## \[[0-9]/{f=1} f' "$CHANGELOG")"
-managed_top="$(git-cliff "${BASE_REF}.." --tag "$version" | enrich_handles)"
-printf '%s\n\n%s\n' "$managed_top" "$frozen_tail" \
-  | awk 'NR>1 && /^## \[/ && prev != "" { print "" } { print; prev=$0 }' > "$CHANGELOG"
-echo "Cut release $version from Conventional Commits."
+sed -i.bak -E \
+  -e "s/^version = \"[^\"]*\"/version = \"$ver\"/" \
+  -e "s/^(vortex-rdf-(core|encoded-search) = \{ path = \"[^\"]*\", version = \")[^\"]*\"/\1$ver\"/" \
+  Cargo.toml
+rm Cargo.toml.bak
+set_lines="$(grep -cE "^version = \"$ver\"\$|^vortex-rdf-(core|encoded-search) = \{ path = \"[^\"]*\", version = \"$ver\" \}\$" Cargo.toml || true)"
+[ "$set_lines" = 3 ] || { echo "error: set $set_lines of Cargo.toml's 3 version lines; check it by hand" >&2; exit 1; }
+cargo update -w
+cargo update -w --manifest-path interface-tests/Cargo.toml
+(cd js && npm version "$ver" --no-git-tag-version --allow-same-version)
+
+write_changelog --tag "$version"
+echo "Cut release $version: versions set to $ver, and its CHANGELOG.md section written."
+echo "Review, commit as \`chore(release): $ver\`, merge, then tag the merge commit:"
+echo "  git tag $version <merge-sha> && git push origin $version"

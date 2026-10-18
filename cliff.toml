@@ -1,15 +1,11 @@
 # git-cliff ~ configuration file
 # https://git-cliff.org/docs/configuration
 #
-# CHANGELOG.md follows the Keep a Changelog format. git-cliff regenerates only the
-# [Unreleased] section; everything from the frozen `## [0.2.1]` heading down is kept
-# verbatim by scripts/update-changelog.sh, because releases 0.1.0-0.2.1 predate the
-# project's adoption of Conventional Commits and are curated by hand. Compare links
-# are written inline in each heading, so there is no bottom link-reference block.
-#
-# Usage:
-#   scripts/update-changelog.sh            # refresh the [Unreleased] section
-#   scripts/update-changelog.sh v0.3.0     # cut a release
+# CHANGELOG.md follows the Keep a Changelog format. git-cliff generates only its
+# newest section ([Unreleased], or the release being cut) from the commits since the
+# latest tag; scripts/update-changelog.sh, which runs it (its header has the usage),
+# keeps every released `## [x.y.z]` section verbatim. Compare links are written
+# inline in each heading, so there is no bottom link-reference block.
 
 [changelog]
 header = """
