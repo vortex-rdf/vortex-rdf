@@ -30,23 +30,6 @@ impl StructProbes {
         Arc::new(Self::default())
     }
 
-    /// The cache's answer for `base`'s `idx`-th struct child, resolving all
-    /// children on first use: `Some(Some(probe))` for a resolved probe,
-    /// `Some(None)` for a child whose encoding declines (or one `base` lacks),
-    /// and `None` for a base other than the one first resolved — whose
-    /// children the cache cannot answer for.
-    pub(crate) fn child(
-        &self,
-        base: &ArrayRef,
-        idx: usize,
-    ) -> Option<Option<&Arc<OwnedSortedProbe>>> {
-        Some(
-            self.cells(base)?
-                .get(idx)
-                .and_then(|(_, probe)| probe.as_ref()),
-        )
-    }
-
     /// Resolve `base`'s children now; later lookups against the same base
     /// are cache hits. Called by every in-memory construction after its
     /// encoding pass.
@@ -54,14 +37,22 @@ impl StructProbes {
         let _ = self.cells(base);
     }
 
-    /// The resolved probe for `base`'s child named `name`; `None` for a child
-    /// whose encoding declines or a name `base` lacks, and for a base other
-    /// than the one first resolved.
-    pub(crate) fn by_name(&self, base: &ArrayRef, name: &str) -> Option<&Arc<OwnedSortedProbe>> {
-        self.cells(base)?
-            .iter()
-            .find(|(n, _)| n.as_ref() == name)
-            .and_then(|(_, probe)| probe.as_ref())
+    /// The cache's answer for `base`'s child named `name`, resolving all
+    /// children on first use: `Some(Some(probe))` for a resolved probe,
+    /// `Some(None)` for a child whose encoding declines (or a name `base`
+    /// lacks), and `None` for a base other than the one first resolved —
+    /// whose children the cache cannot answer for.
+    pub(crate) fn by_name(
+        &self,
+        base: &ArrayRef,
+        name: &str,
+    ) -> Option<Option<&Arc<OwnedSortedProbe>>> {
+        Some(
+            self.cells(base)?
+                .iter()
+                .find(|(n, _)| n.as_ref() == name)
+                .and_then(|(_, probe)| probe.as_ref()),
+        )
     }
 
     fn cells(&self, base: &ArrayRef) -> Option<&ProbeCells> {
@@ -121,12 +112,10 @@ mod tests {
         let probes = StructProbes::new();
         probes.warm(&a);
         assert!(probes.cells(&a).is_some());
-        assert!(probes.child(&a, 0).flatten().is_some());
-        assert!(matches!(probes.child(&a, 1), Some(None)));
-        assert!(probes.by_name(&a, "s").is_some());
-        assert!(probes.by_name(&a, "o").is_none());
+        assert!(probes.by_name(&a, "s").flatten().is_some());
+        assert!(matches!(probes.by_name(&a, "o"), Some(None)));
+        assert!(matches!(probes.by_name(&a, "no-such-child"), Some(None)));
         assert!(probes.cells(&b).is_none());
-        assert!(probes.child(&b, 0).is_none());
         assert!(probes.by_name(&b, "s").is_none());
     }
 }

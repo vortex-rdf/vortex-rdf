@@ -149,6 +149,20 @@ impl QuadsSource {
         }
     }
 
+    /// The file and the filter a match pushed down to its scan, while one is
+    /// pending; `None` in memory or with no filter pending.
+    #[cfg(feature = "file-io")]
+    pub(crate) fn pending_filter(&self) -> Option<(&NativeStoreFile, &Expression)> {
+        match &self.backend {
+            Backend::File(FileBase {
+                file,
+                filter: Some(filter),
+                ..
+            }) => Some((file, filter)),
+            _ => None,
+        }
+    }
+
     /// Whether the selection is still pending with no serve plan to read
     /// through — the state of a view built only to be counted or windowed
     /// (`IdsNeed::CountOrWindow`). It is resolved by counting, windowing or

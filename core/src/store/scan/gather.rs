@@ -91,16 +91,11 @@ fn point_read_columns<'n>(
     positions: &[usize],
     probes: Option<&StructProbes>,
 ) -> Option<Vec<ArrayRef>> {
-    let fields = array.dtype().as_struct_fields_opt()?;
     let names = names.into_iter();
     let mut children = Vec::with_capacity(names.size_hint().0);
     let mut parts = None;
     for name in names {
-        let idx = fields
-            .names()
-            .iter()
-            .position(|field| field.as_ref() == name)?;
-        let column = match probes.and_then(|p| p.child(array, idx)) {
+        let column = match probes.and_then(|p| p.by_name(array, name)) {
             Some(cached) => {
                 let cached = cached?;
                 read_points(cached.probe(), cached.array(), positions)
@@ -109,7 +104,7 @@ fn point_read_columns<'n>(
                 if parts.is_none() {
                     parts = Some(array.clone().try_downcast::<Struct>().ok()?);
                 }
-                let child = parts.as_ref()?.unmasked_field(idx);
+                let child = parts.as_ref()?.unmasked_field_by_name(name).ok()?;
                 read_points(&SortedProbe::resolve(child)?, child, positions)
             }
         };
@@ -199,7 +194,7 @@ mod tests {
 
         let probes = StructProbes::new();
         probes.warm(&base);
-        assert!(matches!(probes.child(&base, 1), Some(None)));
+        assert!(matches!(probes.by_name(&base, "o"), Some(None)));
         assert!(
             gather_by_point_reads(&base, &selection, None, Some(&probes))
                 .unwrap()

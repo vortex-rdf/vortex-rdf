@@ -296,6 +296,7 @@ impl IndexComponent {
     fn probe(&self, column: &str) -> Option<Arc<vortex_rdf_encoded_search::OwnedSortedProbe>> {
         self.probes
             .by_name(self.rows().ok()?.as_ref(), column)
+            .flatten()
             .cloned()
     }
 

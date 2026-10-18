@@ -54,6 +54,23 @@ fn split_start_mask(
     }
 }
 
+/// `filter`'s top-level AND-ed conditions — the struct layout prunes one
+/// single-field expression at a time — each bound against `reader`'s dtype
+/// through the file's memo as the iterator reaches it: one bound identity per
+/// shape, shared by every split task and every later call, is what keeps
+/// vortex's identity-keyed reader caches hitting (see `BoundExprMemo`).
+fn bound_conjuncts<'a>(
+    file: &'a NativeStoreFile,
+    reader: &'a dyn LayoutReader,
+    filter: &'a Expression,
+) -> impl Iterator<Item = Result<BoundExpression>> + 'a {
+    conjuncts(filter).into_iter().map(move |conjunct| {
+        Ok(file
+            .bound_exprs()
+            .bind(QUAD_SCOPE, &conjunct, reader.dtype())?)
+    })
+}
+
 /// Narrow `mask` over `range` by each conjunct's statistics-only pruning —
 /// zone maps and footer stats, no row data read — stopping once nothing
 /// survives (further conjuncts can't un-prune rows). A conjunct is taken
@@ -131,18 +148,8 @@ fn filter_split_tasks(
     // The cached layout reader tree — reused across every split task below,
     // so zone-map stats are looked up once, not once per split.
     let reader = file.layout_reader()?;
-    // Split the filter into its top-level AND-ed conditions (the struct
-    // layout can only prune a single-field expression at a time) and bind
-    // them through the handle's memo: one bound identity per shape, shared
-    // by every split task and every later call, is what keeps vortex's
-    // identity-keyed reader caches hitting (see `BoundExprMemo`).
-    let filter_conjuncts: Vec<BoundExpression> = conjuncts(filter)
-        .iter()
-        .map(|conjunct| {
-            file.bound_exprs()
-                .bind(QUAD_SCOPE, conjunct, reader.dtype())
-        })
-        .collect::<vortex_error::VortexResult<_>>()?;
+    let filter_conjuncts: Vec<BoundExpression> =
+        bound_conjuncts(file, reader.as_ref(), filter).collect::<Result<_>>()?;
     // Translate the view's selection into the two knobs the split loop
     // understands: the bounds it iterates and the per-split starting mask
     // (see `split_start_mask`).
@@ -378,17 +385,11 @@ pub(crate) async fn row_range_from_pruning(
     // statistics (zone maps / footer stats) — no row data is read here. Each
     // conjunct's prunability is evaluated over the *entire* file in one call:
     // the zoned reader vectorizes this over all its zones and the file-stats
-    // wrapper checks footer-level bounds first. A conjunct binds (through
-    // the handle's memo) only when the pruning reaches it, so one that
-    // already proves nothing matches leaves the rest unbound; they are
-    // yielded by index, as in `evaluate_filter_split`.
+    // wrapper checks footer-level bounds first. A conjunct binds only when
+    // the pruning reaches it, so one that already proves nothing matches
+    // leaves the rest unbound.
     let reader = file.layout_reader()?;
-    let parts = conjuncts(filter);
-    let bound = (0..parts.len()).map(|i| -> Result<BoundExpression> {
-        Ok(file
-            .bound_exprs()
-            .bind(QUAD_SCOPE, &parts[i], reader.dtype())?)
-    });
+    let bound = bound_conjuncts(file, reader.as_ref(), filter);
     let mask = prune_mask(&reader, bound, &(0..row_count), Mask::new_true(len)).await?;
 
     // Collapse the surviving mask to its enclosing contiguous range: the

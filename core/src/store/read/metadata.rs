@@ -193,7 +193,7 @@ impl VortexRdfStore {
                         }
                         _ => None,
                     }
-                    && let Some(owned) = probes.by_name(base, QuadColumn::S.name())
+                    && let Some(owned) = probes.by_name(base, QuadColumn::S.name()).flatten()
                 {
                     let probe = owned.probe();
                     code_bounds[QuadColumn::S.index()] =

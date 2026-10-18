@@ -173,7 +173,7 @@ impl<'a> TypedEq<'a> {
         for ((field, _), needle) in eqs.iter().zip(needles) {
             let col = struct_arr.unmasked_field_by_name(field).ok()?;
             let cached = probes
-                .and_then(|(base, probes)| probes.by_name(base, field))
+                .and_then(|(base, probes)| probes.by_name(base, field).flatten())
                 .map(|owned| owned.probe());
             cols.push(TypedEq::bind_col(col, needle, canonicalize, cached)?);
         }

@@ -5,8 +5,6 @@
 
 use crate::error::Result;
 #[cfg(feature = "file-io")]
-use crate::store::FileBase;
-#[cfg(feature = "file-io")]
 use crate::store::scan::file_filter;
 use crate::store::{QuadsSource, Tail, VortexRdfStore};
 
@@ -41,12 +39,7 @@ impl VortexRdfStore {
         }
         let selection = self.quads.materialized_selection().await?;
         #[cfg(feature = "file-io")]
-        if let Some(FileBase {
-            file,
-            filter: Some(filter),
-            ..
-        }) = self.quads.file()
-        {
+        if let Some((file, filter)) = self.quads.pending_filter() {
             return file_filter::count_matching_rows(
                 file,
                 filter,
@@ -84,12 +77,7 @@ impl VortexRdfStore {
     /// `limit` matches.
     async fn base_size_capped(&self, limit: usize) -> Result<usize> {
         #[cfg(feature = "file-io")]
-        if let Some(FileBase {
-            file,
-            filter: Some(filter),
-            ..
-        }) = self.quads.file()
-        {
+        if let Some((file, filter)) = self.quads.pending_filter() {
             // The selection resolves first (a served view's ids come from its
             // index child); the filter then counts within it.
             let selection = self.quads.materialized_selection().await?;

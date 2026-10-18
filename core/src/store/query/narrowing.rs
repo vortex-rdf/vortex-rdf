@@ -274,12 +274,7 @@ impl VortexRdfStore {
         let base_len = self.quads.base_len();
         let deleted = self.quads.deleted.as_ref();
         #[cfg(feature = "file-io")]
-        if let Some(FileBase {
-            file,
-            filter: Some(filter),
-            ..
-        }) = self.quads.file()
-        {
+        if let Some((file, filter)) = self.quads.pending_filter() {
             // Only the matches the window can reach are evaluated; fewer than
             // asked means the base is exhausted and their count is its live
             // size.
@@ -388,12 +383,12 @@ impl VortexRdfStore {
             return None;
         }
         for earlier in &QuadColumn::ALL[..column.index()] {
-            let probe = probes.by_name(base, earlier.name())?.probe();
+            let probe = probes.by_name(base, earlier.name()).flatten()?.probe();
             if probe.value_at(run.start) != probe.value_at(run.end - 1) {
                 return None;
             }
         }
-        let probe = probes.by_name(base, column.name())?.probe();
+        let probe = probes.by_name(base, column.name()).flatten()?.probe();
         let width = run.len();
         match keep {
             Keep::Range(lo, hi) => {
@@ -437,7 +432,7 @@ impl VortexRdfStore {
         let col = struct_arr.unmasked_field_by_name(column.name())?;
         let test = keep.test();
         let cached = cached_code_primitive(col);
-        let reader = match (&cached, probes.by_name(base, column.name())) {
+        let reader = match (&cached, probes.by_name(base, column.name()).flatten()) {
             (Some(prim), _) => Some(CodeReader::Slice(prim.as_slice::<TermCode>())),
             (None, Some(probe)) => Some(CodeReader::Probe(probe.probe())),
             (None, None) => None,

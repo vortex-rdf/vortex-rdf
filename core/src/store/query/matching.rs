@@ -381,7 +381,7 @@ impl VortexRdfStore {
             // column resolves (skipping the per-call encoding-tree walk),
             // else the per-call search, which also serves the string
             // layouts' `VarBinView` subjects.
-            let cached = probes.by_name(base, schema::COL_S);
+            let cached = probes.by_name(base, schema::COL_S).flatten();
             let (lo, hi) = match (cached, u64::try_from(&scalar)) {
                 (Some(owned), Ok(needle)) => owned.probe().bounds(needle),
                 _ => search_sorted_bounds(s_col, &scalar)?,
@@ -408,7 +408,7 @@ impl VortexRdfStore {
                 let mut answered = 0;
                 for (term, column) in roles {
                     let Some(term) = term else { break };
-                    let Some(owned) = probes.by_name(base, column) else {
+                    let Some(owned) = probes.by_name(base, column).flatten() else {
                         break;
                     };
                     let Some(needle) = codes

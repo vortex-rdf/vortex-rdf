@@ -494,7 +494,7 @@ store's *compressed-resident* form (through
   match fast paths probe the compressed source while the code-column payload
   path decodes the canonical primitive once into the wrapper's cache;
 - the encoded-search probes over every column are resolved up front
-  ([`StructProbes::warm`](../core/src/store/probes.rs#L53)), so no query pays the
+  ([`StructProbes::warm`](../core/src/store/probes.rs#L36)), so no query pays the
   encoding-tree walk.
 
 The other in-memory adoption, [`from_parts`](../core/src/store/construct.rs#L109)
@@ -561,8 +561,8 @@ quad, sort and drop repeated quads exactly as a serialization's rebuild does
 
 Between compactions the tail accretes as chunks and is flattened once the
 accreted rows rival the flat prefix (floor 1,024) or 64 chunks pile up
-([`TAIL_FLATTEN_FLOOR`](../core/src/store/view/mod.rs#L417),
-[`TAIL_MAX_CHUNKS`](../core/src/store/view/mod.rs#L421)). The tail, tombstone
+([`TAIL_FLATTEN_FLOOR`](../core/src/store/view/mod.rs#L431),
+[`TAIL_MAX_CHUNKS`](../core/src/store/view/mod.rs#L435)). The tail, tombstone
 and compaction model in full is [mutations.md](mutations.md).
 
 ### 11.3 Back to RDF text

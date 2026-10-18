@@ -235,7 +235,7 @@ impl InMemoryServePlan {
         let Some(deleted) = deleted else {
             return Some(None);
         };
-        let rid = self.probes.by_name(&self.array, COL_RID)?.probe();
+        let rid = self.probes.by_name(&self.array, COL_RID).flatten()?.probe();
         // A row id no `usize` holds declines to the slice path, whose
         // decode reports it.
         let mut live = Vec::with_capacity(self.range.len());
@@ -259,7 +259,7 @@ impl InMemoryServePlan {
     fn live_point_columns(&self, deleted: Option<&Mask>) -> Option<[Buffer<TermCode>; 4]> {
         let live = self.live_positions(deleted)?;
         let read = |name: &str| -> Option<Buffer<TermCode>> {
-            let probe = self.probes.by_name(&self.array, name)?.probe();
+            let probe = self.probes.by_name(&self.array, name).flatten()?.probe();
             Some(match &live {
                 None => Buffer::from_iter(self.range.clone().map(|pos| probe.value_at(pos))),
                 Some(live) => Buffer::from_iter(live.iter().map(|&pos| probe.value_at(pos))),
