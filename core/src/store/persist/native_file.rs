@@ -7,12 +7,15 @@
 //! reader tree is retired whenever the bound-tree memo clears. The pure
 //! open/materialize primitives are in [`io::read`](crate::io::read).
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
+use rustc_hash::FxHashMap;
 use vortex_array::ArrayRef;
 use vortex_array::expr::{BoundExpression, Expression, root, select};
 use vortex_error::VortexResult;
@@ -58,13 +61,15 @@ pub(crate) struct NativeStoreFile {
     /// re-ask the same handful of filters, and each envelope costs a pruning
     /// evaluation over every zone. Bounded by [`PRUNING_MEMO_MAX`].
     pruning_envelopes: BoundedMemo<Expression, Option<Range<u64>>>,
-    /// Per-column chunk-probe handles, keyed by quad column (an index
-    /// component's column as `component/column`); `None` memoizes a decline.
+    /// The quad table's chunk-probe handles, by column (see [`ChunkMemo`]).
     /// Each handle keeps the probes of the leaves it fetched, so a repeated
     /// subject or index-run location skips the layout walk and the leaf
     /// rebuilds. Bounded by the file's layout: one handle per column, and per
     /// fetched leaf a probe over mapped bytes.
-    column_chunks: Mutex<ChunkHandles>,
+    quad_chunks: ChunkMemo<()>,
+    /// The index components' chunk-probe handles, by component name and
+    /// column, held and bounded as the quad table's are.
+    component_chunks: ChunkMemo<String>,
     /// One bound tree per (scope, filter shape) — see [`BoundExprMemo`].
     bound_exprs: Arc<BoundExprMemo>,
     /// Whether the file is read through a memory mapping, as the open found
@@ -119,15 +124,53 @@ impl ReaderTree {
     }
 }
 
-/// The chunk-probe handles of a file, by quad column and by (component,
-/// column); `None` memoizes a decline.
-#[derive(Default)]
-struct ChunkHandles {
-    quads: HashMap<String, ColumnHandle>,
-    components: HashMap<String, HashMap<String, ColumnHandle>>,
-}
-
 type ColumnHandle = Option<Arc<vortex_rdf_encoded_search::ColumnChunks>>;
+
+/// Chunk-probe handles by table and column, each built on first use; `None`
+/// memoizes a decline. `T` names the table: `()` for the quad table, the
+/// component name for an index child.
+///
+/// A lookup borrows its key, hashed with `FxHash` (the keys are the file's
+/// own table and column names, and the quad table's `()` hashes to nothing);
+/// a miss builds with the lock released, so two racing misses may both build
+/// and the first insert wins. Every entry is complete when it is inserted, so
+/// a lock poisoned by a panic elsewhere guards consistent entries and is taken
+/// over.
+#[derive(Default)]
+struct ChunkMemo<T>(Mutex<FxHashMap<T, FxHashMap<String, ColumnHandle>>>);
+
+impl<T: Hash + Eq> ChunkMemo<T> {
+    /// `table`'s `column` handle, from `build` on a miss.
+    fn get_or_build<Q>(
+        &self,
+        table: &Q,
+        column: &str,
+        build: impl FnOnce() -> ColumnHandle,
+    ) -> ColumnHandle
+    where
+        T: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = T> + ?Sized,
+    {
+        if let Some(found) = self
+            .handles()
+            .get(table)
+            .and_then(|columns| columns.get(column))
+        {
+            return found.clone();
+        }
+        let built = build();
+        self.handles()
+            .entry(table.to_owned())
+            .or_default()
+            .entry(column.to_owned())
+            .or_insert(built)
+            .clone()
+    }
+
+    fn handles(&self) -> MutexGuard<'_, FxHashMap<T, FxHashMap<String, ColumnHandle>>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// Structural (scope, expression) → the one [`BoundExpression`] this file
 /// hands out for that shape.
@@ -308,7 +351,8 @@ impl NativeStoreFile {
             readers,
             splits: OnceLock::new(),
             pruning_envelopes: BoundedMemo::new(PRUNING_MEMO_MAX),
-            column_chunks: Mutex::new(ChunkHandles::default()),
+            quad_chunks: ChunkMemo::default(),
+            component_chunks: ChunkMemo::default(),
             bound_exprs: Arc::new(BoundExprMemo::new()),
             mapped,
             identity,
@@ -386,7 +430,7 @@ impl NativeStoreFile {
     /// quad child's layout shape or that column's dtype declines (memoized
     /// too); callers keep the scan.
     pub(crate) fn column_chunks(&self, column: &str) -> ColumnHandle {
-        self.memoized_quad_chunks(column, || {
+        self.quad_chunks.get_or_build(&(), column, || {
             let quads = container::quad_source(self.root()).ok()?;
             vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&quads, column)
                 .map(Arc::new)
@@ -399,65 +443,11 @@ impl NativeStoreFile {
     /// classified it under (see [`component_layout`](Self::component_layout)).
     /// `None` on any decline.
     pub(crate) fn component_column_chunks(&self, component: &str, column: &str) -> ColumnHandle {
-        self.memoized_component_chunks(component, column, || {
+        self.component_chunks.get_or_build(component, column, || {
             let child = self.slot_layout(self.slot_of(component)?).ok()?;
             vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&child, column)
                 .map(Arc::new)
         })
-    }
-
-    /// The memo's guard. Every entry is complete when it is inserted, so a
-    /// lock poisoned by a panic elsewhere guards consistent entries and is
-    /// taken over.
-    fn chunk_handles(&self) -> std::sync::MutexGuard<'_, ChunkHandles> {
-        self.column_chunks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// `column`'s memoized handle, from `build` on a miss. The lookup borrows
-    /// the key; `build` runs with the lock released, so two racing misses may
-    /// both build and the first insert wins.
-    fn memoized_quad_chunks(
-        &self,
-        column: &str,
-        build: impl FnOnce() -> ColumnHandle,
-    ) -> ColumnHandle {
-        if let Some(found) = self.chunk_handles().quads.get(column) {
-            return found.clone();
-        }
-        let built = build();
-        self.chunk_handles()
-            .quads
-            .entry(column.to_owned())
-            .or_insert(built)
-            .clone()
-    }
-
-    /// [`memoized_quad_chunks`](Self::memoized_quad_chunks) for a component's
-    /// column.
-    fn memoized_component_chunks(
-        &self,
-        component: &str,
-        column: &str,
-        build: impl FnOnce() -> ColumnHandle,
-    ) -> ColumnHandle {
-        if let Some(found) = self
-            .chunk_handles()
-            .components
-            .get(component)
-            .and_then(|columns| columns.get(column))
-        {
-            return found.clone();
-        }
-        let built = build();
-        self.chunk_handles()
-            .components
-            .entry(component.to_owned())
-            .or_default()
-            .entry(column.to_owned())
-            .or_insert(built)
-            .clone()
     }
 
     /// The quad table's natural splits, memoized. Shadows the inner file's
@@ -746,10 +736,18 @@ mod tests {
                 .component_column_chunks("no-such-component", "val")
                 .is_none()
         );
-        let memo = native.column_chunks.lock().unwrap();
-        assert!(matches!(memo.quads.get("no-such-column"), Some(None)));
         assert!(matches!(
-            memo.components
+            native
+                .quad_chunks
+                .handles()
+                .get(&())
+                .and_then(|columns| columns.get("no-such-column")),
+            Some(None)
+        ));
+        assert!(matches!(
+            native
+                .component_chunks
+                .handles()
                 .get("no-such-component")
                 .and_then(|columns| columns.get("val")),
             Some(None)
@@ -762,28 +760,32 @@ mod tests {
     async fn chunk_handles_are_built_outside_the_lock() {
         let (_dir, native) = crate::tests::mapped_file(50, vec![]).await;
 
-        let built = native.memoized_quad_chunks("probe", || {
+        let built = native.quad_chunks.get_or_build(&(), "probe", || {
             assert!(
-                native.column_chunks.try_lock().is_ok(),
+                native.quad_chunks.0.try_lock().is_ok(),
                 "the handle was built under the memo's lock"
             );
             None
         });
         assert!(built.is_none());
-        let hit = native.memoized_quad_chunks("probe", || panic!("a hit does not rebuild"));
+        let hit = native
+            .quad_chunks
+            .get_or_build(&(), "probe", || panic!("a hit does not rebuild"));
         assert!(hit.is_none());
 
-        native.memoized_component_chunks("index:x", "val", || {
+        native.component_chunks.get_or_build("index:x", "val", || {
             assert!(
-                native.column_chunks.try_lock().is_ok(),
+                native.component_chunks.0.try_lock().is_ok(),
                 "the component handle was built under the memo's lock"
             );
             None
         });
-        native.memoized_component_chunks("index:x", "val", || panic!("a hit does not rebuild"));
+        native
+            .component_chunks
+            .get_or_build("index:x", "val", || panic!("a hit does not rebuild"));
     }
 
-    /// A panic while the memo's lock is held leaves the memo usable: its
+    /// A panic while a memo's lock is held leaves the memo usable: its
     /// entries are whole, so the next lookup takes the poisoned lock over.
     #[tokio::test]
     async fn a_poisoned_chunk_handle_lock_is_recovered() {
@@ -795,12 +797,13 @@ mod tests {
 
         let poisoner = Arc::clone(&native);
         let result = std::thread::spawn(move || {
-            let _held = poisoner.column_chunks.lock().unwrap();
-            panic!("poison the memo");
+            let _quads = poisoner.quad_chunks.0.lock().unwrap();
+            let _components = poisoner.component_chunks.0.lock().unwrap();
+            panic!("poison the memos");
         })
         .join();
         assert!(result.is_err());
-        assert!(native.column_chunks.is_poisoned());
+        assert!(native.quad_chunks.0.is_poisoned() && native.component_chunks.0.is_poisoned());
 
         let after = native
             .column_chunks("s")
