@@ -3,6 +3,7 @@
 //! narrowed, served, tombstoned and tailed views.
 
 use super::*;
+use crate::store::read::chunks::gather_hooks;
 use crate::store::{QuadColumn, TermCode};
 use crate::vortex_scan::ScanRequest;
 use vortex_array::dtype::{DType, Nullability};
@@ -65,10 +66,76 @@ async fn assert_chunks_match(view: &VortexRdfStore, tag: &str) -> Precision<u64>
     count
 }
 
+/// Every item of `stream`, unwrapped, beside how far `counter` rose over the
+/// stream's first pull and over the whole stream.
+async fn drain_counted<T>(
+    mut stream: futures::stream::BoxStream<'static, crate::error::Result<T>>,
+    counter: impl Fn() -> usize,
+) -> (Vec<T>, usize, usize) {
+    let start = counter();
+    let mut items = Vec::new();
+    if let Some(item) = stream.next().await {
+        items.push(item.unwrap());
+    }
+    let first = counter() - start;
+    while let Some(item) = stream.next().await {
+        items.push(item.unwrap());
+    }
+    (items, first, counter() - start)
+}
+
+/// The `(s, p, o, g)` rows of code chunks over every column, concatenated.
+fn code_rows(chunks: &[Vec<vortex_buffer::Buffer<TermCode>>]) -> Vec<[TermCode; 4]> {
+    chunks
+        .iter()
+        .flat_map(|c| (0..c[0].len()).map(move |i| [c[0][i], c[1][i], c[2][i], c[3][i]]))
+        .collect()
+}
+
+/// Both exports of the in-memory `view` at `batch` rows a chunk answer its
+/// base-ordered codes through `gathers` window gathers, one per pull: the
+/// first pull gathers one window, or none when the view gathers none.
+async fn assert_gathers(view: &VortexRdfStore, batch: usize, gathers: usize, tag: &str) {
+    let expected = base_ordered_codes(view).await;
+    let first_pull = gathers.min(1);
+    let codes = view.code_chunks(&QuadColumn::ALL, batch).unwrap();
+    let (chunks, first, total) = drain_counted(codes, gather_hooks::gathers).await;
+    assert_eq!(
+        first, first_pull,
+        "{tag}: code_chunks' first pull at batch {batch}"
+    );
+    assert_eq!(
+        total, gathers,
+        "{tag}: code_chunks' gathers at batch {batch}"
+    );
+    assert_eq!(
+        code_rows(&chunks),
+        expected,
+        "{tag}: code_chunks at batch {batch}"
+    );
+    let rows = view.row_chunks(batch).unwrap();
+    let (chunks, first, total) = drain_counted(rows, gather_hooks::gathers).await;
+    assert_eq!(
+        first, first_pull,
+        "{tag}: row_chunks' first pull at batch {batch}"
+    );
+    assert_eq!(
+        total, gathers,
+        "{tag}: row_chunks' gathers at batch {batch}"
+    );
+    assert_eq!(
+        chunk_code_rows(&chunks),
+        expected,
+        "{tag}: row_chunks at batch {batch}"
+    );
+}
+
 /// In memory, over every index set, and the multi-chunk store whole: each
 /// view's chunks and data source scan are its base-ordered codes, which the
 /// source counts exactly, and the whole store's code chunks are its code
-/// columns, not copies of them.
+/// columns, not copies of them. An index-served match gathers one window of
+/// its ids per chunk, as the chunk is pulled; the whole store, a contiguous
+/// run, gathers nothing.
 #[tokio::test]
 async fn test_chunks_in_memory_match_gathered() {
     let count = assert_chunks_match(&multi_chunk_store().await, "memory multi-chunk").await;
@@ -100,11 +167,34 @@ async fn test_chunks_in_memory_match_gathered() {
             "{indexes:?}: the chunk is the base's column buffer"
         );
     }
+
+    let store = built_store(
+        fixture_quads(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let served = store
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        served_component(&served),
+        Some("index:posg"),
+        "the P match is served by the copy index"
+    );
+    let rows = served.size().await.unwrap();
+    for batch in [7, 256] {
+        assert_gathers(&served, batch, rows.div_ceil(batch), "served P match").await;
+    }
+    assert_gathers(&store, 7, 0, "the whole store").await;
 }
 
 /// In memory, over every index set, the views of a store with tombstones:
 /// the exports and the data source's scan skip the deleted rows, and the
-/// source counts the live ones exactly.
+/// source counts the live ones exactly. Every view, the whole store's
+/// included, gathers one window of its live ids per chunk.
 #[tokio::test]
 async fn test_chunks_skip_tombstones() {
     let quads = fixture_quads();
@@ -126,6 +216,8 @@ async fn test_chunks_skip_tombstones() {
                 matches!(count, Precision::Exact(_)),
                 "{tag}: exact in memory"
             );
+            let rows = view.size().await.unwrap();
+            assert_gathers(&view, 7, rows.div_ceil(7), &tag).await;
         }
     }
 }
@@ -158,8 +250,10 @@ async fn test_chunks_file_backed_match_gathered() {
 
 /// A file view of exact ids past the point-read cap and sparse in their
 /// split — every 20th subject of 20,000 — is read by taking its ids, as the
-/// whole-view gather is: each export takes through the chunk probes and
-/// answers the codes of the same keep on the store loaded whole.
+/// whole-view gather is, one chunk's ids per take: at 256 rows a chunk each
+/// export's first pull takes one window of its 1,000 ids through the chunk
+/// probes and the whole stream four, and the exports answer the codes of
+/// the same keep on the store loaded whole.
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_chunks_take_sparse_file_ids() {
@@ -177,15 +271,17 @@ async fn test_chunks_take_sparse_file_ids() {
     let expected = base_ordered_codes(&loaded.keep(QuadColumn::S, &keep).await.unwrap()).await;
     assert_eq!(expected.len(), 1_000);
 
-    let (through_chunks, _) = take_hooks::takes();
-    let (rows, _) = collect_code_chunks(&view, &QuadColumn::ALL, 256).await;
-    let (after_codes, _) = take_hooks::takes();
-    let row_rows = chunk_code_rows(&collect_row_chunks(&view, 256).await);
-    let (after_rows, _) = take_hooks::takes();
-    assert_eq!(after_codes, through_chunks + 1, "code_chunks takes its ids");
-    assert_eq!(after_rows, after_codes + 1, "row_chunks takes its ids");
-    assert_eq!(rows, expected, "code_chunks");
-    assert_eq!(row_rows, expected, "row_chunks");
+    let takes = || take_hooks::takes().0;
+    let codes = view.code_chunks(&QuadColumn::ALL, 256).unwrap();
+    let (code_chunks, first, total) = drain_counted(codes, takes).await;
+    assert_eq!(first, 1, "code_chunks' first pull takes one chunk's ids");
+    assert_eq!(total, 4, "code_chunks takes one chunk's ids at a time");
+    let rows = view.row_chunks(256).unwrap();
+    let (row_chunks, first, total) = drain_counted(rows, takes).await;
+    assert_eq!(first, 1, "row_chunks' first pull takes one chunk's ids");
+    assert_eq!(total, 4, "row_chunks takes one chunk's ids at a time");
+    assert_eq!(code_rows(&code_chunks), expected, "code_chunks");
+    assert_eq!(chunk_code_rows(&row_chunks), expected, "row_chunks");
 }
 
 /// A subject run on a sorted file whose bound role past a gap in the
