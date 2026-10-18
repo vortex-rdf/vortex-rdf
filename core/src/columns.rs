@@ -1,13 +1,15 @@
 //! Kernels over [`TermCode`] columns — the column-at-a-time operations a
 //! query layer runs between matches: distinct values and value counts (for
-//! `DISTINCT`, `GROUP BY`, `COUNT DISTINCT`), an index gather, and the
-//! matching row pairs of an equi-join. They work on plain slices so every
-//! binding can hand them its zero-copy columns, and they are deliberately
-//! order-preserving, because the orders are observable: distinct values come
-//! out in first-seen order, and a join's pairs come out in nested-loop order
-//! (left rows in order, each with its right matches in their original order).
-//! Row indices and counts are `u64`, the width of the codes, so one column
-//! type carries all three.
+//! `DISTINCT`, `GROUP BY`, `COUNT DISTINCT`), an index gather, and an
+//! equi-join: its pair count, its matching row pairs (refused past a cap
+//! before either output is allocated), and its build side ([`CodeGroups`]),
+//! which joins a left column slice by slice. They work on plain slices so
+//! every binding can hand them its zero-copy columns, and they are
+//! deliberately order-preserving, because the orders are observable: distinct
+//! values come out in first-seen order, and a join's pairs come out in
+//! nested-loop order (left rows in order, each with its right matches in
+//! their original order). Row indices and counts are `u64`, the width of the
+//! codes, so one column type carries all three.
 //!
 //! Term codes are dictionary ranks, so a column's values are dense in a
 //! known range; when that range is small enough relative to the column, a
@@ -142,26 +144,60 @@ pub fn take(codes: &[TermCode], indices: &[u64]) -> Result<Buffer<TermCode>, usi
 /// the same code, in the right column's order — the order a nested loop
 /// produces, which is what makes the result stable across strategies.
 ///
-/// The right column is indexed once (a CSR layout: every right row grouped
-/// under its code), then the left column is probed in order. When both
+/// The right column is grouped once ([`CodeGroups`]: every right row under
+/// its code, CSR style), then the left column is probed in order. When both
 /// columns are already ascending the pairs come from one merge pass instead.
-/// Either way a counting pass finds the number of pairs first, and each
-/// output is allocated once at that length.
-pub fn equi_join_indices(left: &[TermCode], right: &[TermCode]) -> (Buffer<u64>, Buffer<u64>) {
-    let (out_l, out_r) = join_pairs(left, right);
-    (Buffer::from(out_l), Buffer::from(out_r))
+/// Either way a counting pass finds the number of pairs first
+/// ([`join_count`]), and each output is allocated once at that length. A
+/// count past `max_pairs` is refused before either output is allocated:
+/// `Err(pairs)` carries it, and `None` admits any count.
+pub fn equi_join_indices(
+    left: &[TermCode],
+    right: &[TermCode],
+    max_pairs: Option<usize>,
+) -> Result<(Buffer<u64>, Buffer<u64>), usize> {
+    let (out_l, out_r) = join_pairs(left, right, max_pairs)?;
+    Ok((Buffer::from(out_l), Buffer::from(out_r)))
+}
+
+/// The number of pairs [`equi_join_indices`] produces for the same columns,
+/// saturating at `usize::MAX`, from its counting pass alone: the merge count
+/// of two ascending columns, else the left column probed against the right
+/// one's [`CodeGroups`]. Neither pair column is allocated.
+pub fn join_count(left: &[TermCode], right: &[TermCode]) -> usize {
+    if left.is_empty() || right.is_empty() {
+        return 0;
+    }
+    if is_ascending(left) && is_ascending(right) {
+        merge_join_len(left, right)
+    } else {
+        CodeGroups::build(right).count(left)
+    }
 }
 
 /// The pair columns of [`equi_join_indices`], each allocated once at its
-/// final length.
-fn join_pairs(left: &[TermCode], right: &[TermCode]) -> (Vec<u64>, Vec<u64>) {
+/// final length, or `Err(pairs)` for a count past `max_pairs`.
+fn join_pairs(
+    left: &[TermCode],
+    right: &[TermCode],
+    max_pairs: Option<usize>,
+) -> Result<(Vec<u64>, Vec<u64>), usize> {
     if left.is_empty() || right.is_empty() {
-        return (Vec::new(), Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     if is_ascending(left) && is_ascending(right) {
-        merge_join(left, right)
+        merge_join(left, right, max_pairs)
     } else {
-        hash_join(left, right)
+        hash_join(left, right, max_pairs)
+    }
+}
+
+/// `Err(pairs)` when a join of `pairs` pairs exceeds `max_pairs`; `None`
+/// admits any count.
+fn within_cap(pairs: usize, max_pairs: Option<usize>) -> Result<(), usize> {
+    match max_pairs {
+        Some(max) if pairs > max => Err(pairs),
+        _ => Ok(()),
     }
 }
 
@@ -169,17 +205,15 @@ fn is_ascending(codes: &[TermCode]) -> bool {
     codes.windows(2).all(|w| w[0] <= w[1])
 }
 
-/// The join of a left column against a [`RightIndex`] of the right one: for
-/// each left row in order, its right matches. The index is a table over the
-/// right column's code [`Span`] when [`dense_table_fits`] it, else a
-/// [`Hashed`] map of its codes. The kind is picked once, here, and
-/// [`RightIndex::join`] is compiled for each, so its lookup is inlined into
-/// both of the join's passes.
-fn hash_join(left: &[TermCode], right: &[TermCode]) -> (Vec<u64>, Vec<u64>) {
-    match Span::of(right) {
-        Some(span) => RightIndex::dense(right, span).join(left),
-        None => RightIndex::hashed(right).join(left),
-    }
+/// The join of a left column against the right one's [`CodeGroups`]: for
+/// each left row in order, its right matches, or `Err(pairs)` for a count
+/// past `max_pairs`.
+fn hash_join(
+    left: &[TermCode],
+    right: &[TermCode],
+    max_pairs: Option<usize>,
+) -> Result<(Vec<u64>, Vec<u64>), usize> {
+    CodeGroups::build(right).pairs(left, max_pairs)
 }
 
 /// Calls `visit(left_run, right_run)`, in order, for each pair of equal-code
@@ -207,20 +241,26 @@ fn for_each_run_pair(
 }
 
 /// The number of pairs [`merge_join`] produces: the product of the two run
-/// lengths, summed over the equal runs.
+/// lengths, summed over the equal runs, saturating at `usize::MAX`.
 fn merge_join_len(left: &[TermCode], right: &[TermCode]) -> usize {
-    let mut total = 0;
+    let mut total: usize = 0;
     for_each_run_pair(left, right, |run_l, run_r| {
-        total += run_l.len() * run_r.len()
+        total = total.saturating_add(run_l.len().saturating_mul(run_r.len()));
     });
     total
 }
 
 /// The join of two ascending key columns: walk both, and for each run of
 /// equal codes emit the cross product in nested-loop order. A counting walk
-/// sizes both outputs before they are filled.
-fn merge_join(left: &[TermCode], right: &[TermCode]) -> (Vec<u64>, Vec<u64>) {
+/// sizes both outputs before they are filled, and refuses a count past
+/// `max_pairs` with `Err(pairs)` before either is allocated.
+fn merge_join(
+    left: &[TermCode],
+    right: &[TermCode],
+    max_pairs: Option<usize>,
+) -> Result<(Vec<u64>, Vec<u64>), usize> {
     let total = merge_join_len(left, right);
+    within_cap(total, max_pairs)?;
     let mut out_l = Vec::with_capacity(total);
     let mut out_r = Vec::with_capacity(total);
     for_each_run_pair(left, right, |run_l, run_r| {
@@ -229,7 +269,7 @@ fn merge_join(left: &[TermCode], right: &[TermCode]) -> (Vec<u64>, Vec<u64>) {
             out_r.extend(run_r.clone().map(row));
         }
     });
-    (out_l, out_r)
+    Ok((out_l, out_r))
 }
 
 /// The right column grouped by code: [`Groups`] holds each code's right rows
@@ -367,11 +407,20 @@ impl RightIndex<Hashed> {
 
 impl<S: Slots> RightIndex<S> {
     /// The number of pairs `left` forms with the indexed column: the rows
-    /// holding each left code, summed over the left column.
+    /// holding each left code, summed over the left column, saturating at
+    /// `usize::MAX`.
     fn match_count(&self, left: &[TermCode]) -> usize {
-        left.iter()
-            .map(|&code| self.groups.count(self.slots.slot(code)))
-            .sum()
+        let counts = left
+            .iter()
+            .map(|&code| self.groups.count(self.slots.slot(code)));
+        // A left row matches at most every right row, so the sum fits a
+        // `usize` whenever `left.len()` times the right rows does; only past
+        // that bound does the sum need to saturate.
+        if left.len().checked_mul(self.groups.rows.len()).is_some() {
+            counts.sum()
+        } else {
+            counts.fold(0, usize::saturating_add)
+        }
     }
 
     /// The right rows holding `code`, ascending.
@@ -381,9 +430,15 @@ impl<S: Slots> RightIndex<S> {
     }
 
     /// For each left row in order, its right matches. A counting pass sizes
-    /// both outputs before they are filled.
-    fn join(&self, left: &[TermCode]) -> (Vec<u64>, Vec<u64>) {
+    /// both outputs before they are filled, and refuses a count past
+    /// `max_pairs` with `Err(pairs)` before either is allocated.
+    fn join(
+        &self,
+        left: &[TermCode],
+        max_pairs: Option<usize>,
+    ) -> Result<(Vec<u64>, Vec<u64>), usize> {
         let total = self.match_count(left);
+        within_cap(total, max_pairs)?;
         let mut out_l = Vec::with_capacity(total);
         let mut out_r = Vec::with_capacity(total);
         for (i, &code) in left.iter().enumerate() {
@@ -394,7 +449,98 @@ impl<S: Slots> RightIndex<S> {
             out_l.extend(std::iter::repeat_n(row(i), rows.len()));
             out_r.extend_from_slice(rows);
         }
-        (out_l, out_r)
+        Ok((out_l, out_r))
+    }
+}
+
+/// A right key column's rows grouped by code: the build side of
+/// [`equi_join_indices`], built once and probed by any number of left
+/// columns, so a join too large for one call runs as a loop over slices of
+/// its left column. It holds one `u64` per right row and one slot per code
+/// of the column's span (a table, when the span is narrow enough for one) or
+/// per distinct code (an FxHash map otherwise); its owner frees both by
+/// dropping it.
+pub struct CodeGroups(Grouping);
+
+/// The [`RightIndex`] behind a [`CodeGroups`], of the kind [`Span::of`]
+/// picks. The index's methods are compiled for each kind, so a lookup is
+/// inlined into both of a join's passes, and the kind is matched once per
+/// call.
+enum Grouping {
+    Dense(RightIndex<Span>),
+    Hashed(RightIndex<Hashed>),
+}
+
+impl CodeGroups {
+    /// The rows of `right` grouped by code: under a table over its codes'
+    /// span when one fits, else under a hashed map of its distinct codes.
+    pub fn build(right: &[TermCode]) -> Self {
+        CodeGroups(match Span::of(right) {
+            Some(span) => Grouping::Dense(RightIndex::dense(right, span)),
+            None => Grouping::Hashed(RightIndex::hashed(right)),
+        })
+    }
+
+    /// The number of right rows grouped.
+    pub fn len(&self) -> usize {
+        match &self.0 {
+            Grouping::Dense(index) => index.groups.rows.len(),
+            Grouping::Hashed(index) => index.groups.rows.len(),
+        }
+    }
+
+    /// Whether no right row is grouped.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The number of pairs `left` forms with the grouped rows, saturating at
+    /// `usize::MAX`: what [`join`](Self::join) produces, without allocating
+    /// it.
+    pub fn count(&self, left: &[TermCode]) -> usize {
+        match &self.0 {
+            Grouping::Dense(index) => index.match_count(left),
+            Grouping::Hashed(index) => index.match_count(left),
+        }
+    }
+
+    /// The pairs `left` forms with the grouped rows, as parallel index
+    /// columns `(left_idx, right_idx)` in nested-loop order (left rows in
+    /// order, each with its right rows in their column's order), the left
+    /// indices counted from `left`'s first row. A count past `max_pairs` is
+    /// refused before either output is allocated: `Err(pairs)` carries it,
+    /// and `None` admits any count.
+    ///
+    /// For consecutive slices of a left column, the concatenation of their
+    /// joins, each slice's left indices offset by the slice's start, equals
+    /// [`equi_join_indices`] of the whole column against the grouped one with
+    /// no cap.
+    pub fn join(
+        &self,
+        left: &[TermCode],
+        max_pairs: Option<usize>,
+    ) -> Result<(Buffer<u64>, Buffer<u64>), usize> {
+        let (out_l, out_r) = self.pairs(left, max_pairs)?;
+        Ok((Buffer::from(out_l), Buffer::from(out_r)))
+    }
+
+    /// The pair columns of [`join`](Self::join), each allocated once at its
+    /// final length.
+    fn pairs(
+        &self,
+        left: &[TermCode],
+        max_pairs: Option<usize>,
+    ) -> Result<(Vec<u64>, Vec<u64>), usize> {
+        match &self.0 {
+            Grouping::Dense(index) => index.join(left, max_pairs),
+            Grouping::Hashed(index) => index.join(left, max_pairs),
+        }
+    }
+
+    /// Whether the groups sit under a table over the right column's span.
+    #[cfg(test)]
+    fn is_dense(&self) -> bool {
+        matches!(self.0, Grouping::Dense(_))
     }
 }
 
@@ -429,9 +575,15 @@ mod tests {
     /// a table. [`hash_join`] picks one of them; both must agree with the
     /// nested loop.
     fn index_joins(left: &[TermCode], right: &[TermCode]) -> Vec<(&'static str, Pairs)> {
-        let mut joins = vec![("hashed", RightIndex::hashed(right).join(left))];
+        let mut joins = vec![(
+            "hashed",
+            RightIndex::hashed(right).join(left, None).unwrap(),
+        )];
         if let Some(span) = Span::of(right) {
-            joins.push(("dense", RightIndex::dense(right, span).join(left)));
+            joins.push((
+                "dense",
+                RightIndex::dense(right, span).join(left, None).unwrap(),
+            ));
         }
         joins
     }
@@ -489,9 +641,11 @@ mod tests {
         assert_eq!(take(&[10, 20], &[u64::MAX]), Err(0));
     }
 
-    #[test]
-    fn join_matches_the_nested_loop_in_every_strategy() {
-        let cases: Vec<(Vec<TermCode>, Vec<TermCode>)> = vec![
+    /// Column pairs that exercise every join strategy: the hashed and the
+    /// dense right index, the merge path, sparse and wide codes, a dense span
+    /// probed outside it and in its gaps, and an empty side.
+    fn join_cases() -> Vec<(Vec<TermCode>, Vec<TermCode>)> {
+        vec![
             (vec![1, 2, 2, 3, 7], vec![2, 2, 7, 1, 9]), // hashed, dense
             (vec![1, 2, 2, 3, 7], vec![1, 2, 2, 2, 7, 7]), // merge path (both ascending)
             (
@@ -517,9 +671,13 @@ mod tests {
             (vec![], vec![1]),
             (vec![1, 1, 1], vec![1, 1]),
             (vec![4, 5], vec![6]),
-        ];
-        for (l, r) in cases {
-            let (li, ri) = equi_join_indices(&l, &r);
+        ]
+    }
+
+    #[test]
+    fn join_matches_the_nested_loop_in_every_strategy() {
+        for (l, r) in join_cases() {
+            let (li, ri) = equi_join_indices(&l, &r, None).unwrap();
             let (ol, or) = nested_loop(&l, &r);
             assert_eq!(
                 li.as_slice(),
@@ -559,12 +717,13 @@ mod tests {
         ]
     }
 
-    /// The counting pass of each path equals the number of pairs the join
-    /// produces.
+    /// The counting pass of each path, and [`join_count`], equal the number
+    /// of pairs the join produces.
     #[test]
     fn join_counts_equal_the_produced_lengths() {
         for (l, r) in sizing_cases() {
             let produced = nested_loop(&l, &r).0.len();
+            assert_eq!(join_count(&l, &r), produced, "join_count for {l:?} ⋈ {r:?}");
             assert_eq!(
                 RightIndex::hashed(&r).match_count(&l),
                 produced,
@@ -587,16 +746,124 @@ mod tests {
         }
     }
 
+    /// A cap admits a join of at most its pairs, whole, and refuses one past
+    /// it with the count; an empty join passes a cap of zero. The build side
+    /// applies the same cap.
+    #[test]
+    fn join_cap_refuses_only_past_the_count() {
+        for (l, r) in sizing_cases() {
+            let produced = nested_loop(&l, &r).0.len();
+            let uncapped = equi_join_indices(&l, &r, None).unwrap();
+            let groups = CodeGroups::build(&r);
+            assert_eq!(
+                equi_join_indices(&l, &r, Some(produced)),
+                Ok(uncapped.clone()),
+                "a cap at the count admits {l:?} ⋈ {r:?}"
+            );
+            assert_eq!(
+                equi_join_indices(&l, &r, Some(produced + 1)),
+                Ok(uncapped.clone()),
+                "a cap above the count admits {l:?} ⋈ {r:?}"
+            );
+            assert_eq!(
+                groups.join(&l, Some(produced)),
+                Ok(uncapped),
+                "the build side's cap at the count admits {l:?} ⋈ {r:?}"
+            );
+            if produced > 0 {
+                assert_eq!(
+                    equi_join_indices(&l, &r, Some(produced.saturating_sub(1))),
+                    Err(produced),
+                    "a cap below the count refuses {l:?} ⋈ {r:?}"
+                );
+                assert_eq!(
+                    groups.join(&l, Some(produced.saturating_sub(1))),
+                    Err(produced),
+                    "the build side's cap below the count refuses {l:?} ⋈ {r:?}"
+                );
+            }
+        }
+        let empty = (Buffer::empty(), Buffer::empty());
+        assert_eq!(
+            equi_join_indices(&[], &[1], Some(0)),
+            Ok(empty.clone()),
+            "an empty left side under a cap of zero"
+        );
+        assert_eq!(
+            CodeGroups::build(&[1]).join(&[], Some(0)),
+            Ok(empty),
+            "an empty left side against the build side under a cap of zero"
+        );
+    }
+
+    /// A left column joined against a right column's [`CodeGroups`] slice by
+    /// slice, each slice's left indices offset by its start, is the one-shot
+    /// join, for every strategy that join picks and every slice width; each
+    /// slice's count is its pairs, and the groups hold every right row.
+    #[test]
+    fn groups_join_slices_concatenate_to_the_one_shot_result() {
+        for (l, r) in join_cases() {
+            let groups = CodeGroups::build(&r);
+            assert_eq!(groups.len(), r.len(), "right rows of {r:?}");
+            let (want_l, want_r) = equi_join_indices(&l, &r, None).unwrap();
+            for width in [1, 2, 3, l.len().max(1)] {
+                let (mut got_l, mut got_r) = (Vec::new(), Vec::new());
+                for (k, slice) in l.chunks(width).enumerate() {
+                    let start = row(k * width);
+                    let (slice_l, slice_r) = groups.join(slice, None).unwrap();
+                    assert_eq!(
+                        groups.count(slice),
+                        slice_l.len(),
+                        "count of slice {k} at width {width} for {l:?} ⋈ {r:?}"
+                    );
+                    got_l.extend(slice_l.iter().map(|&i| i + start));
+                    got_r.extend_from_slice(slice_r.as_slice());
+                }
+                assert_eq!(
+                    got_l,
+                    want_l.as_slice(),
+                    "left indices at width {width} for {l:?} ⋈ {r:?}"
+                );
+                assert_eq!(
+                    got_r,
+                    want_r.as_slice(),
+                    "right indices at width {width} for {l:?} ⋈ {r:?}"
+                );
+            }
+        }
+        let empty = CodeGroups::build(&[]);
+        assert!(empty.is_empty(), "an empty right column groups no row");
+        assert_eq!(
+            empty.count(&[1, 2]),
+            0,
+            "an empty right column matches nothing"
+        );
+    }
+
+    /// The build side picks the right index the one-shot join picks: a table
+    /// over a narrow span, a hashed map for codes too far apart for one.
+    #[test]
+    fn groups_pick_the_dense_arm_when_the_span_fits() {
+        assert!(
+            CodeGroups::build(&[12, 10, 15, 10]).is_dense(),
+            "a narrow span is a table"
+        );
+        assert!(
+            !CodeGroups::build(&[7, WIDE]).is_dense(),
+            "codes far apart are hashed"
+        );
+    }
+
     /// Every path fills vectors whose capacity is their length, so none
     /// grows its output by reallocation.
     #[test]
     fn join_outputs_are_allocated_at_their_final_length() {
         for (l, r) in sizing_cases() {
             let (want_l, want_r) = nested_loop(&l, &r);
-            let mut paths = vec![("hash", hash_join(&l, &r))];
+            let mut paths = vec![("hash", hash_join(&l, &r, None).unwrap())];
             paths.extend(index_joins(&l, &r));
             if is_ascending(&l) && is_ascending(&r) {
-                paths.push(("merge", merge_join(&l, &r)));
+                paths.push(("merge", merge_join(&l, &r, None).unwrap()));
             }
             for (path, (out_l, out_r)) in paths {
                 assert_eq!(out_l, want_l, "{path} left for {l:?} ⋈ {r:?}");
@@ -687,7 +954,7 @@ mod tests {
         let left_val = [10, 20, 21, 30];
         let right_key = [2, 3, 2];
         let right_val = [200, 300, 201];
-        let (li, ri) = equi_join_indices(&left_key, &right_key);
+        let (li, ri) = equi_join_indices(&left_key, &right_key, None).unwrap();
         let lv = take(&left_val, li.as_slice()).unwrap();
         let rv = take(&right_val, ri.as_slice()).unwrap();
         assert_eq!(lv.as_slice(), &[20, 20, 21, 21, 30]);

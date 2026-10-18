@@ -430,11 +430,17 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
     let (values, counts) = crate::columns::value_counts(p.as_slice());
     assert_eq!(values.len(), 3, "{label}: name, age, knows");
     assert_eq!(counts.as_slice().iter().sum::<u64>(), p.len() as u64);
-    let (left, right) = crate::columns::equi_join_indices(s.as_slice(), distinct.as_slice());
+    let (left, right) =
+        crate::columns::equi_join_indices(s.as_slice(), distinct.as_slice(), None).unwrap();
     assert_eq!(
         left.len(),
         s.len(),
         "{label}: every row joins its own subject"
+    );
+    assert_eq!(
+        crate::columns::CodeGroups::build(distinct.as_slice()).join(s.as_slice(), None),
+        Ok((left.clone(), right.clone())),
+        "{label}: the build side joins as the one-shot join"
     );
     let joined = crate::columns::take(distinct.as_slice(), right.as_slice()).unwrap();
     let rows = crate::columns::take(s.as_slice(), left.as_slice()).unwrap();

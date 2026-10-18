@@ -562,8 +562,9 @@ impl U64Column {
         other: &Bound<'_, PyAny>,
     ) -> PyResult<(U64Column, U64Column)> {
         let right = extract_u64s(other)?;
-        let (left_idx, right_idx) =
-            py.detach(|| columns::equi_join_indices(self.codes.as_slice(), right.as_slice()));
+        let (left_idx, right_idx) = py
+            .detach(|| columns::equi_join_indices(self.codes.as_slice(), right.as_slice(), None))
+            .expect("a join without a cap is never refused");
         Ok((
             U64Column { codes: left_idx },
             U64Column { codes: right_idx },
