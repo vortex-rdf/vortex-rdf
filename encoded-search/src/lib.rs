@@ -10,7 +10,7 @@ pub use owned::OwnedSortedProbe;
 #[cfg(feature = "layout")]
 mod layout;
 #[cfg(feature = "layout")]
-pub use layout::ColumnChunks;
+pub use layout::{ColumnChunks, FlatLeaf, fetch_flat, flat_leaves};
 
 use vortex_array::ArrayRef;
 
@@ -49,7 +49,8 @@ impl<'a> SortedProbe<'a> {
         self.root.lower_bound(needle)
     }
 
-    /// Index of the first element `> needle`.
+    /// Index of the first element `> needle`: [`Self::lower_bound`] of
+    /// `needle + 1`, and the length when `needle` is `u64::MAX`.
     pub fn upper_bound(&self, needle: u64) -> usize {
         self.root.upper_bound(needle)
     }
@@ -134,7 +135,7 @@ pub enum NodeKind {
     Patches,
     /// A window over a child, offsetting every index into it.
     Slice,
-    /// Chunks concatenated end to end, addressed by chunk extremes.
+    /// Chunks concatenated end to end, searched by each chunk's last value.
     Chunked,
     /// Dictionary encoding: codes indexing a values child. Dictionary values
     /// are not order-preserving, so bounds search probes the composed

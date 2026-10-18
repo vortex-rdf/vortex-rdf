@@ -24,15 +24,14 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use futures::{StreamExt as _, TryStreamExt as _};
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
-use vortex_array::serde::SerializedArray;
-use vortex_array::{ArrayRef, ExecutionCtx, VortexSessionExecute};
+use vortex_array::{ExecutionCtx, VortexSessionExecute};
 use vortex_buffer::Buffer;
-use vortex_layout::layouts::chunked::Chunked as ChunkedLayout;
-use vortex_layout::layouts::flat::Flat;
+use vortex_layout::layouts::flat::FlatLayout;
 use vortex_layout::layouts::struct_::Struct as StructLayout;
 use vortex_layout::layouts::zoned::Zoned;
 use vortex_layout::segments::SegmentSource;
 use vortex_layout::{LayoutChildType, LayoutRef};
+use vortex_rdf_encoded_search::{fetch_flat, flat_leaves};
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::container::DICT_COMPONENT_NAME;
@@ -53,12 +52,12 @@ use super::term_dict::{
 type Bounds = (Box<[u8]>, Box<[u8]>);
 
 /// The term column's flat leaves, each with its row count.
-type Leaves = Vec<(LayoutRef, usize)>;
+type Leaves = Vec<(FlatLayout, usize)>;
 
 /// One flat leaf of the term column — one FSST window as written — with the
 /// rank of its first term, its row count, and its first and last terms.
 struct Window {
-    layout: LayoutRef,
+    layout: FlatLayout,
     start: usize,
     rows: usize,
     first: Box<[u8]>,
@@ -229,8 +228,7 @@ impl Windows {
         #[cfg(test)]
         self.rebuilt
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let window = &self.windows[w];
-        let leaf = rebuild_leaf(&window.layout, window.rows, &self.source).await?;
+        let leaf = fetch_flat(&self.windows[w].layout, &self.source, &VORTEX_SESSION).await?;
         let chunk = TermChunk::from_wire(leaf, &mut VORTEX_SESSION.create_execution_ctx())?;
         Ok(self.cache().insert(w, Arc::new(chunk)))
     }
@@ -626,33 +624,19 @@ fn term_column(dict: &LayoutRef) -> Option<(Leaves, Option<Zones>)> {
         }
         _ => None,
     };
-    let data = unwrap_zoned(column)?;
     // An empty child has nothing to search; a term count past what a `usize`
     // holds cannot be ranked on this target.
-    let rows = usize::try_from(data.row_count())
-        .ok()
-        .filter(|&rows| rows > 0)?;
-    let mut leaves = Vec::new();
-    if data.is::<Flat>() {
-        leaves.push((data, rows));
-    } else if data.is::<ChunkedLayout>() {
-        for i in 0..data.nslots() {
-            let Some(LayoutChildType::Chunk(_)) = data.slot_type(i) else {
-                return None;
-            };
-            let leaf = unwrap_zoned(data.slot(i).ok().flatten()?)?;
-            let rows = usize::try_from(leaf.row_count()).ok()?;
-            if rows == 0 {
-                continue;
-            }
-            if !leaf.is::<Flat>() {
-                return None;
-            }
-            leaves.push((leaf, rows));
-        }
-    } else {
+    if !usize::try_from(column.row_count()).is_ok_and(|rows| rows > 0) {
         return None;
     }
+    // A dictionary layout's codes leaves hold codes, not terms.
+    let leaves = flat_leaves(&column)?
+        .into_iter()
+        .map(|leaf| {
+            let rows = usize::try_from(leaf.layout.row_count()).ok()?;
+            leaf.dict_values.is_none().then_some((leaf.layout, rows))
+        })
+        .collect::<Option<Leaves>>()?;
     Some((leaves, zones))
 }
 
@@ -663,20 +647,12 @@ fn exact_bounds(present: &[String]) -> bool {
         .all(|aggregate| present.contains(&aggregate.to_string()))
 }
 
-/// Descend through zoned wrappers to their data child (child 0).
-fn unwrap_zoned(mut node: LayoutRef) -> Option<LayoutRef> {
-    while node.is::<Zoned>() {
-        node = node.slot(0).ok().flatten()?;
-    }
-    Some(node)
-}
-
 /// Whether zone `i` of `zones` covers exactly leaf `i`: one zone per leaf,
 /// every leaf but the last holding `zone_len` rows and the last at most that.
 /// A column written with its windows as zones is cut so; a foreign writer's
 /// may have as many zones as leaves and still cut them elsewhere, which would
 /// hand a window the bounds of other rows.
-fn zones_cut_at_leaves(zones: &Zones, leaves: &[(LayoutRef, usize)]) -> bool {
+fn zones_cut_at_leaves(zones: &Zones, leaves: &[(FlatLayout, usize)]) -> bool {
     let Some(((_, last), rest)) = leaves.split_last() else {
         return false;
     };
@@ -691,7 +667,7 @@ fn zones_cut_at_leaves(zones: &Zones, leaves: &[(LayoutRef, usize)]) -> bool {
 /// [`zones_cut_at_leaves`]) or holds a null bound.
 async fn zone_bounds(
     zones: &Zones,
-    leaves: &[(LayoutRef, usize)],
+    leaves: &[(FlatLayout, usize)],
     source: &Arc<dyn SegmentSource>,
 ) -> Result<Option<Vec<Bounds>>> {
     if !zones_cut_at_leaves(zones, leaves) {
@@ -742,13 +718,13 @@ fn bound_column(
 /// writer): two single-term reads per window through a chunk cursor, at open.
 /// The windows are not cached.
 async fn leaf_bounds(
-    leaves: &[(LayoutRef, usize)],
+    leaves: &[(FlatLayout, usize)],
     source: &Arc<dyn SegmentSource>,
 ) -> Result<Vec<Bounds>> {
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let mut bounds = Vec::with_capacity(leaves.len());
     for (layout, rows) in leaves {
-        let leaf = rebuild_leaf(layout, *rows, source).await?;
+        let leaf = fetch_flat(layout, source, &VORTEX_SESSION).await?;
         let chunk = TermChunk::from_wire(leaf, &mut ctx)?;
         let mut cursor = chunk.cursor();
         let first = Box::from(cursor.bytes_at(0));
@@ -763,27 +739,6 @@ async fn leaf_bounds(
 fn ordered(bounds: &[Bounds]) -> bool {
     bounds.iter().all(|(first, last)| first <= last)
         && bounds.windows(2).all(|pair| pair[0].1 < pair[1].0)
-}
-
-/// A flat leaf rebuilt over its segment in the encoding it was written in —
-/// over a mapped file, metadata over a slice of the map; nothing is
-/// decompressed.
-async fn rebuild_leaf(
-    layout: &LayoutRef,
-    rows: usize,
-    source: &Arc<dyn SegmentSource>,
-) -> Result<ArrayRef> {
-    let flat = layout
-        .as_opt::<Flat>()
-        .expect("term leaves are validated flat at open");
-    let segment = source.request(flat.segment_id()).await?;
-    let parts = match flat.array_tree().cloned() {
-        Some(tree) => SerializedArray::from_flatbuffer_and_segment(tree, segment),
-        None => SerializedArray::try_from(segment),
-    }?;
-    parts
-        .decode(flat.dtype(), rows, flat.array_ctx(), &VORTEX_SESSION)
-        .map_err(VortexRdfError::Vortex)
 }
 
 #[cfg(test)]
@@ -1025,8 +980,7 @@ mod tests {
         let (fbd, _) = windowed_handle(600, 100).await;
         for w in [0, 2, 5] {
             let chunk = fbd.0.window_chunk(w).await.unwrap();
-            let window = &fbd.0.windows[w];
-            let leaf = rebuild_leaf(&window.layout, window.rows, &fbd.0.source)
+            let leaf = fetch_flat(&fbd.0.windows[w].layout, &fbd.0.source, &VORTEX_SESSION)
                 .await
                 .unwrap();
             let fsst = leaf.try_downcast::<FSST>().expect("an FSST leaf");

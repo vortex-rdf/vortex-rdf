@@ -569,8 +569,8 @@ with no filter, as the in-memory path does. `(ex:alice foaf:knows ? ?)`
 narrows to an empty range at match time. `(ex:alice ? "Alice" ?)` stops at the
 unbound predicate: it carries `[0, 2)` plus `o = 1` as a filter.
 
-**Cost.** A handful of binary searches over the chunk extremes and the leaves
-they reach, and one more search inside the run per answered role. The first probe of a freshly opened file rebuilds the leaves it
+**Cost.** A handful of binary searches over the chunks' last values and the
+leaves they reach, and one more search inside the run per answered role. The first probe of a freshly opened file rebuilds the leaves it
 bisects; the column's handle keeps them for later probes
 ([file-format.md §8](file-format.md#8-reading-a-file)).
 

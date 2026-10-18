@@ -147,7 +147,7 @@ impl KeepTest<'_> {
 /// store's cached encoded-search probe.
 enum CodeReader<'a> {
     Slice(&'a [TermCode]),
-    Probe(&'a vortex_rdf_encoded_search::OwnedSortedProbe),
+    Probe(&'a vortex_rdf_encoded_search::SortedProbe<'a>),
 }
 
 impl CodeReader<'_> {
@@ -388,12 +388,12 @@ impl VortexRdfStore {
             return None;
         }
         for earlier in &QuadColumn::ALL[..column.index()] {
-            let probe = probes.by_name(base, earlier.name())?;
+            let probe = probes.by_name(base, earlier.name())?.probe();
             if probe.value_at(run.start) != probe.value_at(run.end - 1) {
                 return None;
             }
         }
-        let probe = probes.by_name(base, column.name())?;
+        let probe = probes.by_name(base, column.name())?.probe();
         let width = run.len();
         match keep {
             Keep::Range(lo, hi) => {
@@ -439,7 +439,7 @@ impl VortexRdfStore {
         let cached = cached_code_primitive(col);
         let reader = match (&cached, probes.by_name(base, column.name())) {
             (Some(prim), _) => Some(CodeReader::Slice(prim.as_slice::<TermCode>())),
-            (None, Some(probe)) => Some(CodeReader::Probe(probe)),
+            (None, Some(probe)) => Some(CodeReader::Probe(probe.probe())),
             (None, None) => None,
         };
         let ids: Vec<u64> = match reader {

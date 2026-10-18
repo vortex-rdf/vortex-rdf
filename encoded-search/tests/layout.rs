@@ -21,7 +21,7 @@ use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex_layout::layouts::repartition::{RepartitionStrategy, RepartitionWriterOptions};
 use vortex_layout::layouts::struct_::StructStrategy;
 use vortex_layout::{LayoutChildType, LayoutRef, LayoutStrategy};
-use vortex_rdf_encoded_search::ColumnChunks;
+use vortex_rdf_encoded_search::{ColumnChunks, fetch_flat, flat_leaves};
 use vortex_session::VortexSession;
 
 /// A struct chunk over the given arrays, all of one length.
@@ -164,6 +164,11 @@ async fn column_chunks_match_canonical() {
             .unwrap()
             .expect("all chunks are probeable");
         assert_eq!(got, canonical_bounds(&data, needle), "needle {needle}");
+        assert_eq!(
+            column.lower_bound(needle, &source, &session).await.unwrap(),
+            Some(got.start),
+            "lower bound of {needle}"
+        );
     }
 
     // Point reads across chunk interiors and boundaries need no sort order
@@ -197,6 +202,18 @@ async fn column_chunks_match_canonical() {
             );
         }
     }
+    // A reversed window holds no row: at `u64::MAX` too, its bounds are
+    // empty at its start.
+    #[allow(clippy::reversed_empty_ranges)]
+    let reversed = 9..5;
+    assert_eq!(
+        column
+            .bounds_in(reversed, u64::MAX, &source, &session)
+            .await
+            .unwrap(),
+        Some(9..9),
+        "reversed window at u64::MAX"
+    );
 }
 
 /// Only non-nullable unsigned-integer fields of the struct resolve.
@@ -269,6 +286,20 @@ async fn column_chunks_count_their_leaves() {
         debug.contains(&format!("chunks: {leaves}")) && debug.contains("fetched: 2"),
         "{debug}"
     );
+
+    // The same leaves tile the column in row order, and a fetched leaf holds
+    // exactly its own rows.
+    let flat = flat_leaves(&data_node(&root, "s")).expect("the shape resolves");
+    assert_eq!(flat.len(), leaves);
+    let mut next = 0;
+    for leaf in &flat {
+        assert_eq!((leaf.row_offset, leaf.dict_values.is_none()), (next, true));
+        next += leaf.layout.row_count();
+    }
+    assert_eq!(next, data.len() as u64);
+    let last = flat.last().unwrap();
+    let rows = fetch_flat(&last.layout, &source, &session).await.unwrap();
+    assert_eq!(taken_u32(rows, &session), &data[last.row_offset as usize..]);
 }
 
 /// A zero-row column resolves to a column with no leaves and answers empty
@@ -491,6 +522,14 @@ async fn column_chunks_probe_run_of_dictionaries() {
     for i in 0..node.nslots() {
         assert!(node.slot(i).unwrap().unwrap().is::<DictLayout>());
     }
+    // Every leaf holds codes, and each dictionary's leaves are adjacent and
+    // name its one values leaf.
+    let mut values = Vec::new();
+    for leaf in flat_leaves(&node).expect("a run of dictionaries resolves") {
+        values.push(leaf.dict_values.expect("a codes leaf").segment_id());
+    }
+    values.dedup();
+    assert_eq!(values.len(), 3);
 
     let source = file.segment_source();
     let column =

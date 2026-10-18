@@ -383,7 +383,7 @@ impl VortexRdfStore {
             // layouts' `VarBinView` subjects.
             let cached = probes.by_name(base, schema::COL_S);
             let (lo, hi) = match (cached, u64::try_from(&scalar)) {
-                (Some(owned), Ok(needle)) => owned.bounds(needle),
+                (Some(owned), Ok(needle)) => owned.probe().bounds(needle),
                 _ => search_sorted_bounds(s_col, &scalar)?,
             };
             selection = selection.intersect_range(lo as u64..hi as u64);
@@ -419,7 +419,7 @@ impl VortexRdfStore {
                     };
                     // `bounds_in` consults only the window's order: a
                     // sub-run of the sorted base is sorted by its next key.
-                    let (lo, hi) = owned.bounds_in(run.clone(), needle);
+                    let (lo, hi) = owned.probe().bounds_in(run.clone(), needle);
                     run = lo..hi;
                     answered += 1;
                     if run.is_empty() {

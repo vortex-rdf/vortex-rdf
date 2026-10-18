@@ -346,8 +346,8 @@ impl IndexComponent {
             && let Ok(needle) = u64::try_from(native)
         {
             let (lo, hi) = match within {
-                None => owned.bounds(needle),
-                Some(range) => owned.bounds_in(range, needle),
+                None => owned.probe().bounds(needle),
+                Some(range) => owned.probe().bounds_in(range, needle),
             };
             return Ok(Some(lo..hi));
         }

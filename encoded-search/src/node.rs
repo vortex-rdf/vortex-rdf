@@ -51,32 +51,15 @@ impl Words<'_> {
             Words::U64(s) => bound(s, needle),
         }
     }
-
-    /// First index whose value is `> needle`.
-    fn upper_bound(&self, needle: u64) -> usize {
-        fn bound<T: Copy + Ord + TryFrom<u64>>(s: &[T], needle: u64) -> usize {
-            match T::try_from(needle) {
-                Ok(n) => s.partition_point(|&v| v <= n),
-                Err(_) => s.len(),
-            }
-        }
-        match self {
-            Words::U8(s) => bound(s, needle),
-            Words::U16(s) => bound(s, needle),
-            Words::U32(s) => bound(s, needle),
-            Words::U64(s) => bound(s, needle),
-        }
-    }
 }
 
 /// One resolved chunk of a [`Node::Chunked`] tree, with its logical start
-/// row. Chunk extremes are read on demand during bounds searches and then
-/// memoized — resolving stays downcast-only (a borrowed probe is resolved
-/// per call), while a long-lived owned probe pays each extreme once.
+/// row. The chunk's last value is read on demand during bounds searches and
+/// then memoized — resolving stays downcast-only (a borrowed probe is
+/// resolved per call), while a long-lived owned probe pays the read once.
 pub(crate) struct Chunk<'a> {
     pub(crate) start: usize,
     pub(crate) node: Node<'a>,
-    first: std::sync::OnceLock<u64>,
     last: std::sync::OnceLock<u64>,
 }
 
@@ -85,14 +68,8 @@ impl<'a> Chunk<'a> {
         Self {
             start,
             node,
-            first: std::sync::OnceLock::new(),
             last: std::sync::OnceLock::new(),
         }
-    }
-
-    /// The chunk's first value, read once.
-    fn first(&self) -> u64 {
-        *self.first.get_or_init(|| self.node.value_at(0))
     }
 
     /// The chunk's last value, read once.
@@ -482,65 +459,13 @@ impl Node<'_> {
         }
     }
 
-    /// First index whose value is `> needle`; requires ascending order.
+    /// First index whose value is `> needle`: values are integers, so it is
+    /// the lower bound of `needle + 1`, and the length when `needle` is
+    /// `u64::MAX`. Requires ascending order.
     pub(crate) fn upper_bound(&self, needle: u64) -> usize {
-        match self {
-            Node::Primitive(w) => w.upper_bound(needle),
-            Node::Constant { value, len } => {
-                if *value <= needle {
-                    *len
-                } else {
-                    0
-                }
-            }
-            Node::Sequence {
-                base,
-                multiplier,
-                len,
-            } => {
-                if needle < *base {
-                    0
-                } else {
-                    // `q + 1` values are `<= needle`; saturating keeps a
-                    // quotient of `u64::MAX` past every position.
-                    clamp_to_len(((needle - *base) / *multiplier).saturating_add(1), *len)
-                }
-            }
-            Node::RunEnd {
-                ends,
-                values,
-                offset,
-                len,
-            } => {
-                let (first, span) = window_runs(ends, *offset, *len);
-                let k = partition(span, |k| values.value_at(first + k) <= needle);
-                run_start(ends, first + k, *offset, *len)
-            }
-            Node::FoR { reference, child } => {
-                if needle < *reference {
-                    0
-                } else {
-                    child.upper_bound(needle - *reference)
-                }
-            }
-            Node::BitPacked(p) => partition(p.len, |i| p.value_at(i) <= needle),
-            // Window-only search; see `lower_bound`.
-            Node::Slice { child, start, len } => {
-                partition(*len, |i| child.value_at(*start + i) <= needle)
-            }
-            Node::Chunked { chunks, .. } => {
-                let c = partition(chunks.len(), |c| chunks[c].first() <= needle);
-                if c == 0 {
-                    0
-                } else {
-                    chunks[c - 1].start + chunks[c - 1].node.upper_bound(needle)
-                }
-            }
-            Node::Dict { codes, values } => partition(codes.len(), |i| {
-                values.value_at(codes.value_at(i) as usize) <= needle
-            }),
-            Node::Delta(d) => partition(d.len(), |i| d.value_at(i) <= needle),
-        }
+        needle
+            .checked_add(1)
+            .map_or(self.len(), |next| self.lower_bound(next))
     }
 
     pub(crate) fn collect_kinds(&self, out: &mut Vec<crate::NodeKind>) {
@@ -664,11 +589,6 @@ mod tests {
         }
         assert_eq!(clamp_to_len(3, len), 3);
         assert_eq!(clamp_to_len(u64::from(u32::MAX), len), len);
-        // The upper bound's `q + 1` past u32::MAX clamps too.
-        assert_eq!(
-            clamp_to_len(u64::from(u32::MAX).saturating_add(1), len),
-            len
-        );
         // The native width.
         assert_eq!(clamp_to_len(u64::MAX, 7usize), 7);
         assert_eq!(clamp_to_len(4, 7usize), 4);

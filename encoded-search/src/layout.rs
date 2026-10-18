@@ -39,7 +39,7 @@ use crate::OwnedSortedProbe;
 /// A dictionary layout's values leaf, shared by every codes leaf beneath it:
 /// fetched and reconstructed in its wire encoding on first use, then cached.
 struct DictValues {
-    layout: LayoutRef,
+    layout: FlatLayout,
     cell: OnceLock<ArrayRef>,
 }
 
@@ -53,11 +53,7 @@ impl DictValues {
         if let Some(values) = self.cell.get() {
             return Ok(values.clone());
         }
-        let flat = self
-            .layout
-            .as_opt::<Flat>()
-            .vortex_expect("dictionary values leaves are validated flat at construction");
-        let values = fetch_flat(flat, self.layout.row_count(), source, session).await?;
+        let values = fetch_flat(&self.layout, source, session).await?;
         let _ = self.cell.set(values);
         Ok(self
             .cell
@@ -72,7 +68,7 @@ impl DictValues {
 /// than the column's values), and the fetched, resolved probe (filled on
 /// first use; `None` when the chunk's encoding declines resolution).
 struct ChunkLeaf {
-    layout: LayoutRef,
+    layout: FlatLayout,
     row_offset: u64,
     row_count: u64,
     dict: Option<Arc<DictValues>>,
@@ -82,8 +78,8 @@ struct ChunkLeaf {
 /// The flat chunk leaves of one non-nullable unsigned-integer column of a
 /// struct layout, addressable for global bounds queries and point reads.
 ///
-/// [`Self::bounds`] requires the column to be sorted ascending across the
-/// whole file — a caller contract, exactly as for
+/// [`Self::lower_bound`] and [`Self::bounds`] require the column to be sorted
+/// ascending across the whole file — a caller contract, exactly as for
 /// [`SortedProbe`](crate::SortedProbe). [`Self::value_at`] is exact
 /// regardless of sort order.
 pub struct ColumnChunks {
@@ -93,12 +89,11 @@ pub struct ColumnChunks {
 }
 
 impl ColumnChunks {
-    /// Walks `root` (a struct layout) to `field`'s chunk leaves: the field
-    /// child, through any zoned wrappers, then flat leaves — directly, under
-    /// a chunked layout, or as the codes of a dictionary layout (whose flat
-    /// values leaf they decode through), itself possibly one of a chunked run
-    /// of dictionaries. Returns `None` when the shape or the field's dtype
-    /// (non-nullable unsigned integer) is unsupported.
+    /// Walks `root` (a struct layout) to `field`'s child and takes its
+    /// [`flat_leaves`]: the column's values, or the codes of the dictionary
+    /// layouts encoding it, each decoding through its dictionary's values
+    /// leaf. Returns `None` when the shape or the field's dtype (non-nullable
+    /// unsigned integer) is unsupported.
     pub fn from_struct_layout(root: &LayoutRef, field: &str) -> Option<Self> {
         root.as_opt::<StructLayout>()?;
         let column = (0..root.nslots()).find_map(|i| {
@@ -112,8 +107,28 @@ impl ColumnChunks {
         }
 
         let row_count = column.row_count();
-        let mut chunks = Vec::new();
-        collect_leaves(column, 0, None, &mut chunks)?;
+        let mut chunks: Vec<ChunkLeaf> = Vec::new();
+        for leaf in flat_leaves(&column)? {
+            // A dictionary's codes leaves are adjacent and name its one
+            // values leaf (one segment): they share one cache of it.
+            let prev = chunks.last().and_then(|prev| prev.dict.as_ref());
+            let dict = leaf.dict_values.map(|layout| match prev {
+                Some(shared) if shared.layout.segment_id() == layout.segment_id() => {
+                    Arc::clone(shared)
+                }
+                _ => Arc::new(DictValues {
+                    layout,
+                    cell: OnceLock::new(),
+                }),
+            });
+            chunks.push(ChunkLeaf {
+                row_offset: leaf.row_offset,
+                row_count: leaf.layout.row_count(),
+                layout: leaf.layout,
+                dict,
+                cell: OnceLock::new(),
+            });
+        }
         Some(Self {
             chunks,
             row_count,
@@ -146,66 +161,61 @@ impl ColumnChunks {
             .count()
     }
 
-    /// Exact global `[lo, hi)` of `needle` in the column, fetching at most
-    /// the chunks a binary search over chunk extremes touches (cached
-    /// thereafter). Requires the sorted contract. `Ok(None)` when a needed
-    /// chunk's encoding declines the probe — the caller falls back to its
-    /// scan path.
+    /// Exact global `[lo, hi)` of `needle` in the column: the
+    /// [`lower_bound`](Self::lower_bound)s of `needle` and of `needle + 1`
+    /// (the row count when `needle` is `u64::MAX`). Requires the sorted
+    /// contract. `Ok(None)` when a needed chunk's encoding declines the probe
+    /// — the caller falls back to its scan path.
     pub async fn bounds(
         &self,
         needle: u64,
         source: &Arc<dyn SegmentSource>,
         session: &VortexSession,
     ) -> VortexResult<Option<Range<u64>>> {
-        if self.chunks.is_empty() {
-            return Ok(Some(0..0));
-        }
+        let Some(lower) = self.lower_bound(needle, source, session).await? else {
+            return Ok(None);
+        };
+        let upper = match needle.checked_add(1) {
+            Some(next) => self.lower_bound(next, source, session).await?,
+            None => Some(self.row_count),
+        };
+        Ok(upper.map(|upper| lower..upper.max(lower)))
+    }
 
-        // First chunk whose last value is >= needle.
+    /// Exact global row of the first value `>= needle` (the row count when
+    /// every value is below it), fetching at most the chunks a binary search
+    /// over the chunks' last values touches (cached thereafter). Requires the
+    /// sorted contract. `Ok(None)` when a needed chunk's encoding declines
+    /// the probe.
+    pub async fn lower_bound(
+        &self,
+        needle: u64,
+        source: &Arc<dyn SegmentSource>,
+        session: &VortexSession,
+    ) -> VortexResult<Option<u64>> {
+        // The first chunk whose last value reaches the needle holds it.
         let (mut lo, mut hi) = (0usize, self.chunks.len());
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let Some(probe) = self.chunk_probe(mid, source, session).await? else {
                 return Ok(None);
             };
+            let probe = probe.probe();
             if probe.value_at(probe.len() - 1) < needle {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
-        let lower = if lo == self.chunks.len() {
-            self.row_count
-        } else {
-            let Some(probe) = self.chunk_probe(lo, source, session).await? else {
-                return Ok(None);
-            };
-            self.chunks[lo].row_offset + probe.lower_bound(needle) as u64
-        };
-
-        // First chunk whose first value is > needle.
-        let (mut lo2, mut hi2) = (0usize, self.chunks.len());
-        while lo2 < hi2 {
-            let mid = lo2 + (hi2 - lo2) / 2;
-            let Some(probe) = self.chunk_probe(mid, source, session).await? else {
-                return Ok(None);
-            };
-            if probe.value_at(0) <= needle {
-                lo2 = mid + 1;
-            } else {
-                hi2 = mid;
-            }
+        if lo == self.chunks.len() {
+            return Ok(Some(self.row_count));
         }
-        let upper = if lo2 == 0 {
-            0
-        } else {
-            let Some(probe) = self.chunk_probe(lo2 - 1, source, session).await? else {
-                return Ok(None);
-            };
-            self.chunks[lo2 - 1].row_offset + probe.upper_bound(needle) as u64
+        let Some(probe) = self.chunk_probe(lo, source, session).await? else {
+            return Ok(None);
         };
-
-        Ok(Some(lower..upper.max(lower)))
+        Ok(Some(
+            self.chunks[lo].row_offset + probe.probe().lower_bound(needle) as u64,
+        ))
     }
 
     /// [`Self::bounds`] restricted to `range`, in absolute rows, under the
@@ -224,29 +234,30 @@ impl ColumnChunks {
         session: &VortexSession,
     ) -> VortexResult<Option<Range<u64>>> {
         assert!(range.end <= self.row_count, "window out of bounds");
-        // partition_point over the window through async point reads.
-        let partition =
-            async |mut lo: u64, mut hi: u64, upper: bool| -> VortexResult<Option<u64>> {
-                while lo < hi {
-                    let mid = lo + (hi - lo) / 2;
-                    let Some(v) = self.value_at(mid, source, session).await? else {
-                        return Ok(None);
-                    };
-                    if v < needle || (upper && v == needle) {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
+        // The first row of `lo..hi` whose value is `>= bound`, by a
+        // partition_point through async point reads.
+        let partition = async |mut lo: u64, mut hi: u64, bound: u64| -> VortexResult<Option<u64>> {
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let Some(v) = self.value_at(mid, source, session).await? else {
+                    return Ok(None);
+                };
+                if v < bound {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
                 }
-                Ok(Some(lo))
-            };
-        let Some(lo) = partition(range.start, range.end, false).await? else {
+            }
+            Ok(Some(lo))
+        };
+        let Some(lo) = partition(range.start, range.end, needle).await? else {
             return Ok(None);
         };
-        let Some(hi) = partition(lo, range.end, true).await? else {
-            return Ok(None);
+        let hi = match needle.checked_add(1) {
+            Some(next) => partition(lo, range.end, next).await?,
+            None => Some(range.end.max(lo)),
         };
-        Ok(Some(lo..hi))
+        Ok(hi.map(|hi| lo..hi))
     }
 
     /// Exact value at global `row`, fetching (and caching) only the chunk
@@ -270,7 +281,9 @@ impl ColumnChunks {
             return Ok(None);
         };
         Ok(Some(
-            probe.value_at((row - self.chunks[idx].row_offset) as usize),
+            probe
+                .probe()
+                .value_at((row - self.chunks[idx].row_offset) as usize),
         ))
     }
 
@@ -324,11 +337,7 @@ impl ColumnChunks {
     ) -> VortexResult<Option<&OwnedSortedProbe>> {
         let leaf = &self.chunks[idx];
         if leaf.cell.get().is_none() {
-            let flat = leaf
-                .layout
-                .as_opt::<Flat>()
-                .vortex_expect("chunk leaves are validated flat at construction");
-            let array = fetch_flat(flat, leaf.row_count, source, session).await?;
+            let array = fetch_flat(&leaf.layout, source, session).await?;
             let array = match &leaf.dict {
                 None => array,
                 Some(dict) => {
@@ -363,28 +372,49 @@ impl std::fmt::Debug for ColumnChunks {
     }
 }
 
-/// Collect the flat leaves under `node`, whose first row is the column's
-/// absolute row `offset`, into `out` in row order: through zoned wrappers,
-/// the chunks of a chunked layout (each at its own offset within the node),
-/// and a dictionary layout's codes child — whose leaves decode through the
-/// dictionary's flat values leaf, `dict`. `None` for any other shape,
-/// including a dictionary nested inside another's codes.
+/// One flat leaf of a column's layout tree, as [`flat_leaves`] finds it.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct FlatLeaf {
+    /// The leaf: one segment holding the array of its rows.
+    pub layout: FlatLayout,
+    /// The column row of the leaf's first row.
+    pub row_offset: u64,
+    /// When the leaf holds a `vortex.dict` layout's codes rather than the
+    /// column's values: that dictionary's flat values leaf, the one every
+    /// codes leaf beneath the dictionary names.
+    pub dict_values: Option<FlatLayout>,
+}
+
+/// The flat leaves holding `column`'s rows, in row order: through zoned
+/// wrappers, the chunks of a chunked layout (each at its own offset), and a
+/// dictionary layout's codes child, whose leaves name the dictionary's flat
+/// values leaf. A flat leaf of zero rows is left out, so a chunked layout
+/// with an empty chunk yields fewer leaves than it has chunks. `None` for any
+/// other shape, including a dictionary whose values are not one flat leaf and
+/// a dictionary nested inside another's codes.
+pub fn flat_leaves(column: &LayoutRef) -> Option<Vec<FlatLeaf>> {
+    let mut leaves = Vec::new();
+    collect_leaves(column.clone(), 0, None, &mut leaves)?;
+    Some(leaves)
+}
+
+/// [`flat_leaves`]' walk of `node`, whose first row is the column's row
+/// `offset`, into `out`; `dict_values` is the values leaf of the dictionary
+/// whose codes `node` holds.
 fn collect_leaves(
     node: LayoutRef,
     offset: u64,
-    dict: Option<Arc<DictValues>>,
-    out: &mut Vec<ChunkLeaf>,
+    dict_values: Option<&FlatLayout>,
+    out: &mut Vec<FlatLeaf>,
 ) -> Option<()> {
     let node = unwrap_zoned(node)?;
-    if node.is::<Flat>() {
-        let row_count = node.row_count();
-        if row_count > 0 {
-            out.push(ChunkLeaf {
-                layout: node,
+    if let Some(flat) = node.as_opt::<Flat>() {
+        if flat.row_count() > 0 {
+            out.push(FlatLeaf {
+                layout: flat.clone(),
                 row_offset: offset,
-                row_count,
-                dict,
-                cell: OnceLock::new(),
+                dict_values: dict_values.cloned(),
             });
         }
         return Some(());
@@ -395,33 +425,32 @@ fn collect_leaves(
                 return None;
             };
             let child = node.slot(i).ok().flatten()?;
-            collect_leaves(child, offset + chunk_offset, dict.clone(), out)?;
+            collect_leaves(child, offset + chunk_offset, dict_values, out)?;
         }
         return Some(());
     }
     if node.is::<DictLayout>() {
-        if dict.is_some() {
+        if dict_values.is_some() {
             return None;
         }
         let values = unwrap_zoned(node.slot(0).ok().flatten()?)?;
-        if !values.is::<Flat>() {
-            return None;
-        }
+        let values = values.as_opt::<Flat>()?;
         let codes = node.slot(1).ok().flatten()?;
-        let dict = Arc::new(DictValues {
-            layout: values,
-            cell: OnceLock::new(),
-        });
-        return collect_leaves(codes, offset, Some(dict), out);
+        return collect_leaves(codes, offset, Some(values), out);
     }
     None
 }
 
 /// Fetch a flat leaf's segment and rebuild its array in the wire encoding —
-/// metadata over the segment buffers, nothing decompressed.
-async fn fetch_flat(
+/// metadata over the segment buffers, nothing decompressed. `session` must
+/// register the encodings the leaf was written with.
+///
+/// # Errors
+/// The segment request's error; the decode's, for a segment that does not
+/// hold the leaf's array or an encoding `session` does not register; and a
+/// row count past what a `usize` holds.
+pub async fn fetch_flat(
     flat: &FlatLayout,
-    row_count: u64,
     source: &Arc<dyn SegmentSource>,
     session: &VortexSession,
 ) -> VortexResult<ArrayRef> {
@@ -430,7 +459,7 @@ async fn fetch_flat(
         Some(tree) => SerializedArray::from_flatbuffer_and_segment(tree, segment)?,
         None => SerializedArray::try_from(segment)?,
     };
-    let row_count = usize::try_from(row_count).vortex_expect("leaf row count must fit in usize");
+    let row_count = usize::try_from(flat.row_count())?;
     parts.decode(flat.dtype(), row_count, flat.array_ctx(), session)
 }
 

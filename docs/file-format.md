@@ -286,7 +286,7 @@ written without the zone map; readers inspect the layout for it.
 **Reading it from a file.** A file store is memory-mapped
 ([`from_file`](../core/src/store/persist/open.rs#L237)) and the dictionary stays in
 its child
-([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L243)).
+([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L241)).
 At open the handle reads the zone table — one small segment — and keeps, per
 window, its leaf and its first and last term; without the zone map it reads
 the bounds from the leaves.
@@ -474,7 +474,7 @@ kernel's decision; no segment cache sits in between.
 What a file store keeps for its lifetime, and what bounds it. The opened handle
 ([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L37)) and the file-backed
 dictionary handle
-([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L243))
+([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L241))
 keep:
 
 | Kept | Bound |
@@ -484,7 +484,7 @@ keep:
 | pruning envelopes per filter shape | 512 entries, cleared wholesale at the cap |
 | bound filter trees, one per filter shape, so Vortex's identity-keyed reader caches hit | 4,096 entries, cleared wholesale at the cap; a clear retires the reader tree, and the caches go with its readers once no view holds one |
 | the dictionary child's reader, the window leaf layouts, the dictionary's window bounds ([§5](#5-the-dictionary-child)) and its kind ranges | two terms per 65,536-term window and a handful of codes |
-| the rebuilt dictionary windows (FSST, code offsets as 32-bit values), so a repeated probe or decode of a window skips the rebuild | [`WINDOW_CACHE_BYTES`](../core/src/store/layouts/dictionary/file_backed.rs#L75) (4 MiB) per opened file, charging each window its code offsets at 4 bytes each plus [`WINDOW_ENTRY_OVERHEAD`](../core/src/store/layouts/dictionary/file_backed.rs#L81) (4 KiB); least recently used evicted; an FSST window of 65,536 terms is charged about 260 KiB, so about 15 fit. For a memory-mapped file store, which every `from_file` store is, the code bytes are slices of the map, so the charge bounds the heap the cache holds |
+| the rebuilt dictionary windows (FSST, code offsets as 32-bit values), so a repeated probe or decode of a window skips the rebuild | [`WINDOW_CACHE_BYTES`](../core/src/store/layouts/dictionary/file_backed.rs#L74) (4 MiB) per opened file, charging each window its code offsets at 4 bytes each plus [`WINDOW_ENTRY_OVERHEAD`](../core/src/store/layouts/dictionary/file_backed.rs#L80) (4 KiB); least recently used evicted; an FSST window of 65,536 terms is charged about 260 KiB, so about 15 fit. For a memory-mapped file store, which every `from_file` store is, the code bytes are slices of the map, so the charge bounds the heap the cache holds |
 
 Keeps (`VALUES`, FILTER code sets) never become filter expressions, so the
 two memos only see a workload's pattern shapes. No count, decode or predicate
@@ -598,8 +598,8 @@ open rather than being read around.
 | row block / zone size | 8,192 rows | Vortex default write strategy |
 | data block target | ~1 MiB; ~2 MiB for an id column (a term code or a row id) that does not dictionary-encode | Vortex default write strategy; [`child_strategy`](../core/src/io/container/sources.rs#L237) |
 | `DICT_CHUNK_ROWS` | 65,536 terms per FSST window and leaf | [`storage.rs`](../core/src/store/layouts/dictionary/storage.rs#L41) |
-| `WINDOW_CACHE_BYTES` | 4 MiB per opened file: what a file-backed dictionary's window cache may hold, each window charged its code offsets and `WINDOW_ENTRY_OVERHEAD` ([§8](#8-reading-a-file)) | [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs#L75) |
-| `WINDOW_ENTRY_OVERHEAD` | 4 KiB charged per cached window beyond its chunk's bytes | [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs#L81) |
+| `WINDOW_CACHE_BYTES` | 4 MiB per opened file: what a file-backed dictionary's window cache may hold, each window charged its code offsets and `WINDOW_ENTRY_OVERHEAD` ([§8](#8-reading-a-file)) | [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs#L74) |
+| `WINDOW_ENTRY_OVERHEAD` | 4 KiB charged per cached window beyond its chunk's bytes | [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs#L80) |
 | `DICT_VERSION` | 2 | [`container/mod.rs`](../core/src/io/container/mod.rs#L68) |
 | `INDEX_VERSION` | 1 | [`container/mod.rs`](../core/src/io/container/mod.rs#L72) |
 | `POINT_GATHER_MAX_ROWS` | 256 rows — a located run at most this wide is point-read through the chunk probes | [`selection.rs`](../core/src/store/view/selection.rs#L566) |
