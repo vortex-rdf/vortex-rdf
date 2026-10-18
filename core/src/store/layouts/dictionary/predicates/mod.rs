@@ -380,7 +380,7 @@ impl TermPredicate {
     /// and numeric predicates print a pair `parse` accepts back; a string
     /// kind's `arg` also names its options (` [lower]`, ` [upper]`,
     /// ` [str]`) and quotes its constant for reading, not for parsing.
-    pub fn canonical(&self) -> (&'static str, String) {
+    fn canonical(&self) -> (&'static str, String) {
         match self {
             TermPredicate::IsLiteral => ("is_literal", String::new()),
             TermPredicate::IsIri => ("is_iri", String::new()),

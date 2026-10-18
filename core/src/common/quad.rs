@@ -66,7 +66,12 @@ impl From<RawQuad> for SharedQuad {
 /// a different quad, with its own dictionary entry. The fields are public so
 /// that a quad can be read; to write one from strings, use
 /// [`canonical`](Self::canonical).
-#[derive(Clone, Hash, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+///
+/// The derived order compares `s`, `p`, `o` and `g` in turn — the store's
+/// `(s, p, o, g)` sort order — so the fields keep that declaration order.
+#[derive(
+    Clone, Hash, PartialEq, Eq, PartialOrd, Ord, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct RawQuad {
     /// Subject term.
     pub s: String,
@@ -76,22 +81,6 @@ pub struct RawQuad {
     pub o: String,
     /// Graph term; `""` for the default graph.
     pub g: String,
-}
-
-impl Ord for RawQuad {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.s
-            .cmp(&other.s)
-            .then_with(|| self.p.cmp(&other.p))
-            .then_with(|| self.o.cmp(&other.o))
-            .then_with(|| self.g.cmp(&other.g))
-    }
-}
-
-impl PartialOrd for RawQuad {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 impl RawQuad {

@@ -72,7 +72,7 @@ the same kebab-case names, which `LayoutStrategy`/`IndexType` parse and print.
 ## 3. The ingest currency: `RawQuad`
 
 Every builder consumes one thing: a stream of
-[`RawQuad`](../core/src/common/quad.rs#L70)s, four owned strings in the exact
+[`RawQuad`](../core/src/common/quad.rs#L75)s, four owned strings in the exact
 form the columns store.
 
 | Field | Spelling | Example |
@@ -114,7 +114,7 @@ deduplicated dataset (an RDF dataset is a set: a quad is in it or is not).
 The rebuilds of [§11](#11-rebuilds-mutated-stores-compaction-export) do the
 same. Builders do not parse a term again, so a build's input must come from
 one of the canonical sources: `RawQuad::from_quad` (an `oxrdf` quad), the
-parser, or [`RawQuad::canonical`](../core/src/common/quad.rs#L113), which
+parser, or [`RawQuad::canonical`](../core/src/common/quad.rs#L102), which
 turns four strings into a `RawQuad` and rejects what is no quad (a literal
 subject, a malformed IRI). A `RawQuad` written by hand in some other spelling
 of the same terms is a different quad.
