@@ -226,10 +226,7 @@ fn decimal_digits(s: &str) -> impl Iterator<Item = Option<u32>> + '_ {
 
 /// The value of `digits` in `radix`, most significant first, or `None` for
 /// a missing digit (`None` in the sequence) or an overflow.
-pub(super) fn digits_value(
-    mut digits: impl Iterator<Item = Option<u32>>,
-    radix: u32,
-) -> Option<i128> {
+fn digits_value(mut digits: impl Iterator<Item = Option<u32>>, radix: u32) -> Option<i128> {
     digits.try_fold(0i128, |v, digit| {
         v.checked_mul(i128::from(radix))?
             .checked_add(i128::from(digit?))

@@ -1,14 +1,15 @@
 //! A spelling taken apart: its kind from the first byte ([`kind_of`]), a
-//! literal's lexical form, language tag and datatype ([`LiteralView`]), and
-//! the `langMatches` and escape rules they are read with.
+//! literal's lexical form (its escapes decoded [strictly](Escapes::Strict)),
+//! language tag and datatype ([`LiteralView`]), and the `langMatches` rule
+//! they are read with.
 
 use std::borrow::Cow;
 
-use crate::common::terms::{LiteralForm, split_literal};
+use crate::common::terms::{Escapes, LiteralForm, split_literal, unescape};
 use crate::common::vocab::{RDF_LANG_STRING, XSD, XSD_STRING};
 
 use super::Verdict;
-use super::numeric::{Num, digits_value, numeric_kind, parse_number};
+use super::numeric::{Num, numeric_kind, parse_number};
 
 /// A literal spelling split into its parts, borrowed from the spelling.
 pub(super) struct LiteralView<'a> {
@@ -43,9 +44,10 @@ impl<'a> LiteralView<'a> {
         })
     }
 
-    /// The lexical form: escapes decoded, `None` for a malformed escape.
+    /// The lexical form: escapes decoded, `None` for a malformed escape
+    /// ([`Escapes::Strict`]), which no two readers agree on.
     pub(super) fn lexical(&self) -> Option<Cow<'a, str>> {
-        unescape_lexical(self.raw_lexical)
+        unescape(self.raw_lexical, Escapes::Strict)
     }
 
     /// The datatype the SPARQL `datatype()` function reports.
@@ -141,41 +143,4 @@ pub(super) fn lang_matches(tag: &str, range: &str) -> Verdict {
     Verdict::from(
         tag == range || (tag.starts_with(&range) && tag.as_bytes().get(range.len()) == Some(&b'-')),
     )
-}
-
-/// The lexical form of a literal spelled with N-Triples escapes (`\t \b \n
-/// \r \f \" \' \\ \uXXXX \UXXXXXXXX`), borrowed when there is none; `None`
-/// for any other backslash sequence, which no two readers agree on.
-fn unescape_lexical(raw: &str) -> Option<Cow<'_, str>> {
-    if !raw.contains('\\') {
-        return Some(Cow::Borrowed(raw));
-    }
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        out.push(match chars.next()? {
-            't' => '\t',
-            'b' => '\u{8}',
-            'n' => '\n',
-            'r' => '\r',
-            'f' => '\u{c}',
-            '"' => '"',
-            '\'' => '\'',
-            '\\' => '\\',
-            'u' => hex_char(&mut chars, 4)?,
-            'U' => hex_char(&mut chars, 8)?,
-            _ => return None,
-        });
-    }
-    Some(Cow::Owned(out))
-}
-
-/// The character spelled by the next `len` hex digits of `chars`.
-fn hex_char(chars: &mut std::str::Chars<'_>, len: usize) -> Option<char> {
-    let v = digits_value((0..len).map(|_| chars.next()?.to_digit(16)), 16)?;
-    char::from_u32(u32::try_from(v).ok()?)
 }

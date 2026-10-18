@@ -100,8 +100,8 @@ pub(crate) enum LiteralForm<'a> {
 ///
 /// A quote terminates the literal only when the run of backslashes directly
 /// before it has even length; an odd run means the last one escapes it. The
-/// scan jumps quote to quote with the memchr-accelerated `str::find` and
-/// counts the backslash run behind each candidate.
+/// scan jumps quote to quote ([`find_quote`]) and counts the backslash run
+/// behind each candidate.
 fn closing_quote(s: &str) -> Option<usize> {
     let b = s.as_bytes();
     if b.first() != Some(&b'"') {
@@ -110,7 +110,7 @@ fn closing_quote(s: &str) -> Option<usize> {
     // Both delimiters are ASCII, so every index here is a char boundary.
     let mut from = 1;
     loop {
-        let quote = s[from..].find('"')? + from;
+        let quote = from + find_quote(&b[from..])?;
         let mut run = quote;
         while run > 1 && b[run - 1] == b'\\' {
             run -= 1;
@@ -120,6 +120,27 @@ fn closing_quote(s: &str) -> Option<usize> {
         }
         from = quote + 1;
     }
+}
+
+/// Offset of the first `"` in `b`, eight bytes at a time: a word XORed with
+/// eight quotes has a zero byte where `b` holds one, and the lowest byte the
+/// zero-byte test flags is always a real one (a borrow can only flag bytes
+/// above it), so the little-endian load makes it the first.
+#[inline]
+fn find_quote(b: &[u8]) -> Option<usize> {
+    const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
+    const HIGHS: u64 = u64::from_ne_bytes([0x80; 8]);
+    const QUOTES: u64 = u64::from_ne_bytes([b'"'; 8]);
+    let (words, tail) = b.as_chunks::<8>();
+    for (i, word) in words.iter().enumerate() {
+        let x = u64::from_le_bytes(*word) ^ QUOTES;
+        let zeros = x.wrapping_sub(ONES) & !x & HIGHS;
+        if zeros != 0 {
+            return Some(i * 8 + zeros.trailing_zeros() as usize / 8);
+        }
+    }
+    let at = words.len() * 8;
+    tail.iter().position(|&c| c == b'"').map(|i| at + i)
 }
 
 /// Splits a serialized literal into its escaped value and its suffix
@@ -144,17 +165,30 @@ pub(crate) fn split_literal(s: &str) -> Option<LiteralForm<'_>> {
         .map(|lang| LiteralForm::Language { value, lang })
 }
 
+/// What [`unescape`] does with a backslash that starts no recognized escape,
+/// or a truncated or non-scalar `\u`/`\U`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Escapes {
+    /// The value has no decoding: `None`. For the readers that must not
+    /// guess at a spelling no two readers agree on (the term predicates).
+    Strict,
+    /// The backslash is kept as written, so decoding never loses input.
+    Lenient,
+}
+
 /// Decodes the N-Triples escapes of a literal's lexical value: `\\`, `\"`,
-/// `\'`, `\n`, `\r`, `\t`, `\b`, `\f`, `\uXXXX` and `\UXXXXXXXX`.
+/// `\'`, `\n`, `\r`, `\t`, `\b`, `\f`, `\uXXXX` and `\UXXXXXXXX`, any other
+/// backslash as `escapes` says. Always `Some` under [`Escapes::Lenient`].
 ///
 /// Borrows when there is no backslash — the common case on the hot
-/// [`Trust::Stored`] decode path, which must stay allocation-free. A
-/// backslash that starts no recognized escape (or a truncated/invalid `\u`)
-/// is preserved verbatim, so this never loses input.
-fn unescape_literal_value(s: &str) -> Cow<'_, str> {
+/// [`Trust::Stored`] decode path, which must stay allocation-free — and
+/// copies the text between escapes a run at a time. Inlined, so a call
+/// site's constant policy folds its branch away.
+#[inline(always)]
+pub(crate) fn unescape(s: &str, escapes: Escapes) -> Option<Cow<'_, str>> {
     let b = s.as_bytes();
     if !b.contains(&b'\\') {
-        return Cow::Borrowed(s);
+        return Some(Cow::Borrowed(s));
     }
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
@@ -180,18 +214,25 @@ fn unescape_literal_value(s: &str) -> Cow<'_, str> {
             Some(b'U') => hex_escape(b, i + 2, 8).map(|c| (c, 10)),
             _ => None,
         };
-        match decoded {
-            Some((c, width)) => {
+        match (decoded, escapes) {
+            (Some((c, width)), _) => {
                 out.push(c);
                 i += width;
             }
-            None => {
+            (None, Escapes::Lenient) => {
                 out.push('\\');
                 i += 1;
             }
+            (None, Escapes::Strict) => return None,
         }
     }
-    Cow::Owned(out)
+    Some(Cow::Owned(out))
+}
+
+/// A literal value [`unescape`]d under [`Escapes::Lenient`], which always
+/// decodes: the decode path's reading.
+fn unescape_literal_value(s: &str) -> Cow<'_, str> {
+    unescape(s, Escapes::Lenient).unwrap_or(Cow::Borrowed(s))
 }
 
 /// The character `len` hex digits at `at` encode, or `None` if they are
@@ -548,14 +589,24 @@ mod tests {
     fn backslash_run_parity_decides_the_closing_quote() {
         // Serialized form -> the value it denotes, over runs of length 1..=3
         // ending at a quote.
-        let cases = [
+        let mut cases: Vec<(String, String)> = [
             ("\"a\\\\\"", "a\\"),           // "a\\"      -> a\
             ("\"a\\\"b\"", "a\"b"),         // "a\"b"     -> a"b
             ("\"a\\\\\\\"b\"", "a\\\"b"),   // "a\\\"b"   -> a\"b
             ("\"\\\\\\\\\"", "\\\\"),       // "\\\\"     -> \\
             ("\"\\\\\\\\\\\"\"", "\\\\\""), // "\\\\\""   -> \\"
-        ];
+        ]
+        .map(|(serialized, value)| (serialized.to_owned(), value.to_owned()))
+        .into();
+        // The same rule wherever the quotes fall against the scan's
+        // eight-byte steps: an escaped quote, then the closing one, each
+        // after 0..=20 bytes of text.
+        cases.extend((0..=20).map(|pad| {
+            let text = "x".repeat(pad);
+            (format!("\"{text}\\\"{text}\""), format!("{text}\"{text}"))
+        }));
         for (serialized, value) in cases {
+            let (serialized, value) = (serialized.as_str(), value.as_str());
             let expected = Term::Literal(Literal::new_simple_literal(value));
             assert_eq!(
                 term(serialized, Trust::Stored).unwrap(),
