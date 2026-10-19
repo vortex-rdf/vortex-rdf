@@ -326,9 +326,7 @@ class VortexRdfStore:
         ``serialize_rdf`` already writes that way (on Windows it fails until
         the store mapping the file, and every `TermDict` and `U64Column` taken
         from it, is dropped). The mapping lives as long as the store or any
-        `TermDict` or `U64Column` taken from it. A file written by
-        vortex-rdf 0.11 or earlier is refused (``VortexRdfError``): rebuild
-        it from its RDF source with ``serialize_rdf``."""
+        `TermDict` or `U64Column` taken from it."""
         ...
     @staticmethod
     def from_bytes(data: bytes) -> "VortexRdfStore": ...

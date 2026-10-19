@@ -1139,9 +1139,9 @@ async fn test_open_rejects_an_index_version_newer_than_this_version_reads() {
     }
 }
 
-/// A root layout from a `vortex-rdf.store.*` generation this version does not
-/// know was written by a newer vortex-rdf: every open path says so and names
-/// the root layout.
+/// A root layout from a `vortex-rdf.store.*` generation numbered above `v2`
+/// was written by a newer vortex-rdf: every open path says so and names the
+/// root layout.
 #[tokio::test]
 async fn test_open_rejects_a_root_layout_from_a_newer_vortex_rdf() {
     let current: &[u8] = container::STORE_LAYOUT_ID.as_bytes();
@@ -1302,8 +1302,7 @@ async fn test_open_rejects_index_child_with_mismatched_rows() {
 
 /// A generic Vortex writer's output — a valid Vortex file under a plain root
 /// layout — is not a store: every open path says so with the generic error
-/// naming the expected `v2` root layout, rather than a scan-time surprise, and
-/// the legacy-store message (for the `v1` root only) does not apply.
+/// naming the expected `v2` root layout, rather than a scan-time surprise.
 #[tokio::test]
 async fn test_open_rejects_foreign_vortex_bytes() {
     use vortex_file::WriteOptionsSessionExt as _;
@@ -1336,10 +1335,74 @@ async fn test_open_rejects_foreign_vortex_bytes() {
             .to_string();
         assert!(
             message.contains("not a vortex-rdf store file")
-                && message.contains("expected the vortex-rdf.store.v2 root layout")
-                && !message.contains("0.11"),
+                && message.contains("expected the vortex-rdf.store.v2 root layout"),
             "{how}: unexpected error: {message}"
         );
+    }
+}
+
+/// `bytes` with the store root layout renamed to `vortex-rdf.store.v1`. The
+/// two ids are the same length, so no offset in the file moves, and a Vortex
+/// file carries no checksum over its footer: a `v1` file is made here without
+/// a binary fixture.
+fn as_written_before_0_12(mut bytes: Vec<u8>) -> Vec<u8> {
+    let current = container::STORE_LAYOUT_ID.as_bytes();
+    let previous: &[u8] = b"vortex-rdf.store.v1";
+    assert_eq!(current.len(), previous.len());
+    let at: Vec<usize> = bytes
+        .windows(current.len())
+        .enumerate()
+        .filter_map(|(at, window)| (window == current).then_some(at))
+        .collect();
+    assert_eq!(at.len(), 1, "the footer names the root layout once");
+    bytes[at[0]..at[0] + previous.len()].copy_from_slice(previous);
+    bytes
+}
+
+/// A store whose root layout is `vortex-rdf.store.v1` fails to open inside
+/// Vortex, which has no layout by that id, on every open path: `from_bytes`,
+/// `from_bytes_owned`, `from_file` and `from_file_in_memory`. The id is no
+/// newer root, so the error does not say a newer vortex-rdf wrote the store,
+/// and it names no vortex-rdf version.
+#[tokio::test]
+async fn a_v1_root_fails_to_open_inside_vortex() {
+    for layout in [LayoutStrategy::Default, LayoutStrategy::Dictionary] {
+        let bytes = as_written_before_0_12(
+            built_store(
+                modular_quads(12, 3, 4),
+                layout,
+                vec![IndexType::SecondaryByReference],
+            )
+            .await
+            .to_bytes()
+            .await
+            .unwrap(),
+        );
+
+        let (from_bytes, from_file, dir) = open_both(&bytes).await;
+        let in_memory = open_in_memory(&dir).await;
+        let owned = VortexRdfStore::from_bytes_owned(bytes.clone()).await;
+        for (how, result) in [
+            ("from_bytes", from_bytes),
+            ("from_bytes_owned", owned),
+            ("from_file", from_file),
+            ("from_file_in_memory", in_memory),
+        ] {
+            let err = result
+                .err()
+                .unwrap_or_else(|| panic!("{layout:?}/{how}: a v1 root must not open"));
+            let message = err.to_string();
+            for needle in ["0.11", "newer"] {
+                assert!(
+                    !message.contains(needle),
+                    "{layout:?}/{how}: the error mentions {needle:?}: {message}"
+                );
+            }
+            assert!(
+                matches!(err, VortexRdfError::Vortex(_)),
+                "{layout:?}/{how}: expected Vortex's own error, got {err:?}"
+            );
+        }
     }
 }
 

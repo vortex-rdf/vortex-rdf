@@ -66,11 +66,8 @@ static STORE_FAMILY: EditionFamily = EditionFamily {
     doc: "The components vortex-rdf adds to a Vortex file: the store's root layout.",
 };
 
-/// The store edition: the `v2` root layout and nothing else. The `v1` root
-/// (`vortex-rdf.store.v1`) is registered so its files can be refused with a
-/// message (see `io::container`), but it is in no edition, so nothing can
-/// write it. A released edition is frozen: a new member gets a new edition,
-/// not a changed one.
+/// The store edition: the `v2` root layout and nothing else. A released
+/// edition is frozen: a new member gets a new edition, not a changed one.
 const STORE_EDITION: EditionId = EditionId::new("vortexrdf", 2026, 10, 0);
 
 static STORE_DECLARATION: EditionDeclaration = EditionDeclaration {
@@ -118,7 +115,7 @@ mod tests {
     use vortex_array::dtype::{DType, Nullability, PType};
     use vortex_edition::{ComponentKind, EditionSessionExt as _};
 
-    use crate::io::container::{LEGACY_STORE_LAYOUT_ID, STORE_LAYOUT_ID};
+    use crate::io::container::STORE_LAYOUT_ID;
 
     fn ids(kind: ComponentKind) -> Vec<String> {
         VORTEX_SESSION
@@ -159,9 +156,6 @@ mod tests {
             }
         }
         assert!(ids(ComponentKind::Layout).contains(&STORE_LAYOUT_ID.to_string()));
-        // The root of vortex-rdf 0.11 and earlier is refused on read and
-        // never written.
-        assert!(!ids(ComponentKind::Layout).contains(&LEGACY_STORE_LAYOUT_ID.to_string()));
         let arrays = ids(ComponentKind::Array);
         for id in ["fastlanes.for.v2", "vortex.patched"] {
             assert!(!arrays.contains(&id.to_string()), "{id} is admitted");
@@ -169,20 +163,19 @@ mod tests {
         editions.validate().unwrap();
     }
 
-    /// vortex-rdf 0.11 shipped the store edition `vortexrdf2026.08.0` with the
-    /// `v1` root as its member, and a released edition is frozen. The `v2`
-    /// root is a member of a new edition, dated for this change, and no
-    /// edition with the old id is declared here.
+    /// The store edition is a new one, dated after `vortexrdf2026.08.0` (which
+    /// the session does not declare), and its only member is the `v2` root
+    /// layout.
     #[test]
     fn the_store_edition_is_new_for_the_v2_root() {
         let editions = VORTEX_SESSION.editions();
-        let shipped_with_0_11 = EditionId::new("vortexrdf", 2026, 8, 0);
-        assert!(editions.find(&shipped_with_0_11).is_none());
+        let earlier_edition = EditionId::new("vortexrdf", 2026, 8, 0);
+        assert!(editions.find(&earlier_edition).is_none());
         assert!(editions.find(&STORE_EDITION).is_some());
         assert!(STORE_EDITION.is_at_or_before(&STORE_EDITION));
         assert!(
-            shipped_with_0_11.is_at_or_before(&STORE_EDITION) && shipped_with_0_11 != STORE_EDITION,
-            "{STORE_EDITION} must come after {shipped_with_0_11}"
+            earlier_edition.is_at_or_before(&STORE_EDITION) && earlier_edition != STORE_EDITION,
+            "{STORE_EDITION} must come after {earlier_edition}"
         );
         let members: Vec<String> = editions
             .components_in(&STORE_EDITION, ComponentKind::Layout)

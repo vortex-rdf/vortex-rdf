@@ -198,14 +198,9 @@ fn reader_scan(reader: vortex_layout::LayoutReaderRef) -> ScanBuilder<ArrayRef> 
     ScanBuilder::new(crate::session::VORTEX_SESSION.clone(), reader)
 }
 
-/// The actionable error for a file whose root is not the native store layout:
-/// for the root of vortex-rdf 0.11 and earlier, what the file is and how to
-/// rebuild it ([`legacy_store_message`](super::container::legacy_store_message));
-/// for anything else, the layout it expected and the one it found.
+/// The error for a file whose root is not the native store layout: the layout
+/// it expected and the one it found.
 pub(crate) fn unsupported_file_error(file: &vortex_file::VortexFile) -> VortexRdfError {
-    if super::container::is_legacy_file(file) {
-        return VortexRdfError::Deserialization(super::container::legacy_store_message());
-    }
     VortexRdfError::Deserialization(format!(
         "not a vortex-rdf store file: expected the {} root layout, found {}",
         super::container::STORE_LAYOUT_ID,
@@ -214,8 +209,8 @@ pub(crate) fn unsupported_file_error(file: &vortex_file::VortexFile) -> VortexRd
 }
 
 /// The error for a file Vortex could not open: the one that says a newer
-/// vortex-rdf wrote it when `newer_root` names a store root this version does
-/// not know ([`newer_root_id`](super::container::newer_root_id)), Vortex's own
+/// vortex-rdf wrote it when `newer_root` names its root layout
+/// ([`newer_root_id`](super::container::newer_root_id)), Vortex's own
 /// otherwise.
 pub(crate) fn open_failure(
     error: vortex_error::VortexError,
