@@ -238,6 +238,25 @@ class CodeGroups:
         A join of more than `max_pairs` pairs raises `JoinTooLarge` before
         any pair is built."""
         ...
+    def gather(
+        self,
+        column: _U64s,
+        left_columns: Sequence[_U64s],
+        right_columns: Sequence[_U64s],
+        *,
+        max_pairs: Optional[int] = None,
+    ) -> Tuple[U64Column, ...]:
+        """The columns the join of `column` with the grouped rows gathers,
+        filled while the pairs are found instead of through `join`'s
+        indices: for each pair in nested-loop order, each of `left_columns`
+        (parallel to `column`) at the pair's left row, then each of
+        `right_columns` (parallel to the grouped column) at its right row,
+        one `U64Column` per column in that order. Each equals
+        `U64Column.take` of its column at the matching index column of
+        `join`. A column of the wrong length raises ``ValueError``, and a
+        join of more than `max_pairs` pairs raises `JoinTooLarge` before any
+        output is built."""
+        ...
 
 class ProbeAnswers:
     """The answers of `VortexRdfStore.match_codes_many`, one per probe in

@@ -57,6 +57,9 @@ def test_u64_column_carries_codes_past_u32():
     assert col.join_count(U64Column([TOP, WIDE, 5])) == 3
     left, right = U64Column([TOP, WIDE, 5]).groups().join(col)
     assert list(zip(u64s(left), u64s(right))) == [(0, 1), (2, 0), (3, 1)]
+    keys = U64Column([TOP, WIDE, 5])
+    gathered = keys.groups().gather(col, [col], [keys])
+    assert [u64s(c) for c in gathered] == [[WIDE, TOP, WIDE]] * 2
     # A code that narrows to 5 does not join 5.
     left, _ = U64Column([5]).join_indices([WIDE])
     assert len(left) == 0
@@ -83,6 +86,7 @@ def _code_takers(store):
         "join_count": column.join_count,
         "groups.count": groups.count,
         "groups.join": groups.join,
+        "groups.gather": lambda codes: groups.gather(codes, [], []),
     }
 
 

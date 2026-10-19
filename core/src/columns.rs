@@ -3,7 +3,8 @@
 //! `DISTINCT`, `GROUP BY`, `COUNT DISTINCT`), an index gather, and an
 //! equi-join: its pair count, its matching row pairs (refused past a cap
 //! before either output is allocated), and its build side ([`CodeGroups`]),
-//! which joins a left column slice by slice. They work on plain slices so
+//! which joins a left column slice by slice and can gather the joined
+//! columns directly. They work on plain slices so
 //! every binding can hand them its zero-copy columns, and they are
 //! deliberately order-preserving, because the orders are observable: distinct
 //! values come out in first-seen order, and a join's pairs come out in
@@ -451,6 +452,41 @@ impl<S: Slots> RightIndex<S> {
         }
         Ok((out_l, out_r))
     }
+
+    /// For each left row in order, its right matches, written as values
+    /// rather than row indices: one output per column, each of
+    /// `left_columns` at the left row, then each of `right_columns` at the
+    /// right row. A counting pass sizes every output, and refuses a count
+    /// past `max_pairs` with `Err(pairs)` before any is allocated; each
+    /// output is then filled in a pass of its own over the left rows.
+    fn gather(
+        &self,
+        left: &[TermCode],
+        left_columns: &[&[TermCode]],
+        right_columns: &[&[TermCode]],
+        max_pairs: Option<usize>,
+    ) -> Result<Vec<Vec<TermCode>>, usize> {
+        let total = self.match_count(left);
+        within_cap(total, max_pairs)?;
+        let mut outputs = Vec::with_capacity(left_columns.len() + right_columns.len());
+        for column in left_columns {
+            let mut out = Vec::with_capacity(total);
+            for (&code, &value) in left.iter().zip(column.iter()) {
+                let matches = self.groups.count(self.slots.slot(code));
+                out.extend(std::iter::repeat_n(value, matches));
+            }
+            outputs.push(out);
+        }
+        for column in right_columns {
+            let mut out = Vec::with_capacity(total);
+            for &code in left {
+                // A grouped row is a `usize` row of the right column, widened.
+                out.extend(self.rows_for(code).iter().map(|&r| column[r as usize]));
+            }
+            outputs.push(out);
+        }
+        Ok(outputs)
+    }
 }
 
 /// A right key column's rows grouped by code: the build side of
@@ -522,6 +558,44 @@ impl CodeGroups {
     ) -> Result<(Buffer<u64>, Buffer<u64>), usize> {
         let (out_l, out_r) = self.pairs(left, max_pairs)?;
         Ok((Buffer::from(out_l), Buffer::from(out_r)))
+    }
+
+    /// The columns [`join`](Self::join)'s pairs gather, filled while the
+    /// pairs are found instead of through their index columns: for each pair
+    /// in nested-loop order, each of `left_columns` at the pair's left row,
+    /// then each of `right_columns` at its right row, as one output per
+    /// column, left columns first. Each output equals [`take`] of its column
+    /// at the matching index column of [`join`](Self::join); a left column
+    /// runs parallel to `left` and a right column to the grouped column. A
+    /// count past `max_pairs` is refused before any output is allocated:
+    /// `Err(pairs)` carries it, and `None` admits any count.
+    ///
+    /// # Panics
+    ///
+    /// When a left column is not as long as `left`, or a right column not as
+    /// long as the grouped column.
+    pub fn gather(
+        &self,
+        left: &[TermCode],
+        left_columns: &[&[TermCode]],
+        right_columns: &[&[TermCode]],
+        max_pairs: Option<usize>,
+    ) -> Result<Vec<Buffer<TermCode>>, usize> {
+        assert!(
+            left_columns.iter().all(|column| column.len() == left.len()),
+            "a left column runs parallel to the left keys"
+        );
+        assert!(
+            right_columns
+                .iter()
+                .all(|column| column.len() == self.len()),
+            "a right column runs parallel to the grouped column"
+        );
+        let outputs = match &self.0 {
+            Grouping::Dense(index) => index.gather(left, left_columns, right_columns, max_pairs),
+            Grouping::Hashed(index) => index.gather(left, left_columns, right_columns, max_pairs),
+        }?;
+        Ok(outputs.into_iter().map(Buffer::from).collect())
     }
 
     /// The pair columns of [`join`](Self::join), each allocated once at its
@@ -818,6 +892,33 @@ mod tests {
                     );
                     got_l.extend(slice_l.iter().map(|&i| i + start));
                     got_r.extend_from_slice(slice_r.as_slice());
+                    // Gathering the row numbers gives the pair indices back,
+                    // and the keys gathered from either side agree.
+                    let rows_l: Vec<u64> = (0..slice.len()).map(|i| row(i) + start).collect();
+                    let rows_r: Vec<u64> = (0..r.len()).map(row).collect();
+                    let gathered = groups
+                        .gather(slice, &[slice, &rows_l], &[&r, &rows_r], None)
+                        .unwrap();
+                    assert_eq!(
+                        gathered[1].iter().map(|&i| i - start).collect::<Vec<_>>(),
+                        slice_l.as_slice(),
+                        "gathered left rows of slice {k} at width {width} for {l:?} ⋈ {r:?}"
+                    );
+                    assert_eq!(
+                        gathered[3], slice_r,
+                        "gathered right rows of slice {k} at width {width} for {l:?} ⋈ {r:?}"
+                    );
+                    assert_eq!(
+                        gathered[0], gathered[2],
+                        "gathered keys of slice {k} at width {width} for {l:?} ⋈ {r:?}"
+                    );
+                    if !slice_l.is_empty() {
+                        assert_eq!(
+                            groups.gather(slice, &[], &[], Some(slice_l.len() - 1)),
+                            Err(slice_l.len()),
+                            "a gather past its cap at width {width} for {l:?} ⋈ {r:?}"
+                        );
+                    }
                 }
                 assert_eq!(
                     got_l,

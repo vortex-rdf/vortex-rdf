@@ -11,7 +11,7 @@ use pyo3::buffer::{ElementType, PyUntypedBuffer};
 use pyo3::exceptions::{PyIndexError, PySystemError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::PyString;
+use pyo3::types::{PyString, PyTuple};
 use vortex_buffer::{Alignment, Buffer};
 use vortex_rdf_core::VortexRdfError as CoreError;
 use vortex_rdf_core::{CaseMap, DictReader, TermCode, TermPredicate, TextOptions, columns};
@@ -701,5 +701,58 @@ impl CodeGroups {
             U64Column { codes: left_idx },
             U64Column { codes: right_idx },
         ))
+    }
+
+    /// The columns the join of `column` with the grouped rows gathers,
+    /// filled while the pairs are found instead of through
+    /// [`join`](Self::join)'s indices: for each pair in nested-loop order,
+    /// each of `left_columns` (parallel to `column`) at the pair's left row,
+    /// then each of `right_columns` (parallel to the grouped column) at its
+    /// right row, one `U64Column` per column in that order. Each equals
+    /// [`U64Column::take`] of its column at the matching index column of
+    /// `join`. Every column is read as [`extract_u64s`] reads it; a column
+    /// of the wrong length raises `ValueError`, and a join of more than
+    /// `max_pairs` pairs raises `JoinTooLarge` before any output is built.
+    #[pyo3(signature = (column, left_columns, right_columns, *, max_pairs=None))]
+    fn gather<'py>(
+        &self,
+        py: Python<'py>,
+        column: &Bound<'py, PyAny>,
+        left_columns: Vec<Bound<'py, PyAny>>,
+        right_columns: Vec<Bound<'py, PyAny>>,
+        max_pairs: Option<usize>,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let left = extract_u64s(column)?;
+        let lefts = left_columns
+            .iter()
+            .map(extract_u64s)
+            .collect::<PyResult<Vec<_>>>()?;
+        let rights = right_columns
+            .iter()
+            .map(extract_u64s)
+            .collect::<PyResult<Vec<_>>>()?;
+        if let Some(bad) = lefts.iter().position(|c| c.len() != left.len()) {
+            return Err(PyValueError::new_err(format!(
+                "left column {bad} holds {} values, not one per row of the {} joined",
+                lefts[bad].len(),
+                left.len()
+            )));
+        }
+        let grouped = self.groups.len();
+        if let Some(bad) = rights.iter().position(|c| c.len() != grouped) {
+            return Err(PyValueError::new_err(format!(
+                "right column {bad} holds {} values, not one per row of the {grouped} grouped",
+                rights[bad].len()
+            )));
+        }
+        let outputs = py
+            .detach(|| {
+                let lefts: Vec<&[u64]> = lefts.iter().map(Buffer::as_slice).collect();
+                let rights: Vec<&[u64]> = rights.iter().map(Buffer::as_slice).collect();
+                self.groups
+                    .gather(left.as_slice(), &lefts, &rights, max_pairs)
+            })
+            .map_err(|pairs| join_too_large(pairs, max_pairs))?;
+        PyTuple::new(py, outputs.into_iter().map(|codes| U64Column { codes }))
     }
 }

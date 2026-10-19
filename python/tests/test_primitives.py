@@ -475,6 +475,30 @@ def test_join_indices_refuses_more_pairs_than_max_pairs():
     assert [u64s(c) for c in capped] == [u64s(c) for c in col.join_indices(right)]
 
 
+def test_groups_gather_is_the_join_indices_taken():
+    from vortex_rdf import JoinTooLarge
+
+    left = U64Column([3, 1, 3, 2, 1, 3])
+    right = U64Column([1, 9, 3, 3])
+    left_values = U64Column([10, 11, 12, 13, 14, 15])
+    right_values = U64Column([20, 21, 22, 23])
+    groups = right.groups()
+    left_idx, right_idx = left.join_indices(right)
+    gathered = groups.gather(left, [left, left_values], [right_values, right])
+    want = [left.take(left_idx), left_values.take(left_idx)]
+    want += [right_values.take(right_idx), right.take(right_idx)]
+    assert [u64s(c) for c in gathered] == [u64s(c) for c in want]
+    assert groups.gather(left, [], []) == ()
+    pairs = len(left_idx)
+    with pytest.raises(JoinTooLarge) as refused:
+        groups.gather(left, [left], [right], max_pairs=pairs - 1)
+    assert refused.value.args[1] == pairs
+    with pytest.raises(ValueError, match="left column 0"):
+        groups.gather(left, [left_values.slice(0, 5)], [])
+    with pytest.raises(ValueError, match="right column 1"):
+        groups.gather(left, [], [right, right_values.slice(0, 3)])
+
+
 def test_groups_join_slice_by_slice_like_join_indices():
     from vortex_rdf import JoinTooLarge
 
