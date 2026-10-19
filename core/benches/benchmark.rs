@@ -66,10 +66,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use futures::stream;
+use futures::{StreamExt, stream};
 use oxrdf::{NamedNode, NamedOrBlankNode};
 
-use vortex_rdf_core::{LayoutStrategy, VortexRdfError, VortexRdfStore, io};
+use vortex_rdf_core::{LayoutStrategy, QuadColumn, VortexRdfError, VortexRdfStore, io};
 
 // The module is shared with `match_lazy.rs` and compiled per-target; items
 // only the other target uses are dead here by design.
@@ -549,7 +549,7 @@ fn dict_decode_matched(bencher: divan::Bencher, residency: &DictResidency) {
 /// evaluated, so the number is what a consumer waits for.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn narrow_keep_range(bencher: divan::Bencher, residency: &DictResidency) {
-    use vortex_rdf_core::{Keep, QuadColumn};
+    use vortex_rdf_core::Keep;
     let store = open_dict_store(*residency, bench_size());
     let (_, p, ..) = terms_for(Pattern::P);
     let p = p.unwrap();
@@ -679,6 +679,102 @@ fn narrow_match_many(bencher: divan::Bencher, residency: &DictResidency) {
             black_box(rows)
         })
     });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Group 4c — CHUNK READS (code chunks / the data source)
+//
+// The streams a query engine reads an in-memory view through, on the Group 2
+// in-memory Dictionary store (`from_built`, the store `from_quads` and the JS
+// `fromString`/`fromQuads` build): a predicate-bound view's code chunks, each
+// a window of its row ids gathered from the base's code columns, for one
+// column and for all four; and a `LIMIT` scan of the whole store's data
+// source, which needs only the first chunk of the store's rows.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// The columns a code-chunk read asks for.
+#[derive(Copy, Clone)]
+enum ChunkColumns {
+    /// `o` alone.
+    O,
+    /// All four, in `(s, p, o, g)` order.
+    Spog,
+}
+
+impl ChunkColumns {
+    fn columns(self) -> &'static [QuadColumn] {
+        match self {
+            Self::O => &[QuadColumn::O],
+            Self::Spog => &QuadColumn::ALL,
+        }
+    }
+}
+
+impl fmt::Debug for ChunkColumns {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::O => "o",
+            Self::Spog => "spog",
+        })
+    }
+}
+
+const CHUNK_COLUMNS: &[ChunkColumns] = &[ChunkColumns::O, ChunkColumns::Spog];
+
+/// `code_chunks` over a predicate-bound view of the in-memory store (a 32nd
+/// of its rows, an id list), drained at the Python binding's default of
+/// 65,536 rows a chunk: `o` alone, and all four columns. The match, and a
+/// first drain that materializes the base's shared code columns, are
+/// untimed.
+#[divan::bench(args = CHUNK_COLUMNS, sample_count = QUERY_SAMPLES)]
+fn chunks_codes(bencher: divan::Bencher, columns: &ChunkColumns) {
+    let columns = columns.columns();
+    let store = cached_store(Layout::Dictionary, Index::None, bench_size());
+    let (_, p, ..) = terms_for(Pattern::P);
+    let view = rt()
+        .block_on(store.match_pattern(None, p.as_ref(), None, None))
+        .expect("match P");
+    let drain = || {
+        rt().block_on(async {
+            let mut chunks = view.code_chunks(columns, 65_536).expect("code_chunks");
+            let mut rows = 0;
+            while let Some(chunk) = chunks.next().await {
+                rows += chunk.expect("code chunk")[0].len();
+            }
+            rows
+        })
+    };
+    assert!(drain() > 0, "the predicate-bound view has rows");
+    bencher.bench(|| black_box(drain()));
+}
+
+/// `LIMIT 100` over the in-memory store's data source: its one partition's
+/// stream ends with the first of the store's 8,192-row chunks.
+#[divan::bench(sample_count = QUERY_SAMPLES)]
+fn chunks_source_limit(bencher: divan::Bencher) {
+    use vortex_rdf_core::vortex_scan::ScanRequest;
+    let source = cached_store(Layout::Dictionary, Index::None, bench_size())
+        .data_source()
+        .expect("data source");
+    let scan = || {
+        rt().block_on(async {
+            let request = ScanRequest {
+                limit: Some(100),
+                ..ScanRequest::default()
+            };
+            let mut partitions = source.scan(request).await.expect("scan").partitions();
+            let mut rows = 0;
+            while let Some(partition) = partitions.next().await {
+                let mut chunks = partition.expect("partition").execute().expect("execute");
+                while let Some(chunk) = chunks.next().await {
+                    rows += chunk.expect("chunk").len();
+                }
+            }
+            rows
+        })
+    };
+    assert_eq!(scan(), 100, "the limit's rows");
+    bencher.bench(|| black_box(scan()));
 }
 
 // ══════════════════════════════════════════════════════════════════════════
