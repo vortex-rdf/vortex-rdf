@@ -75,8 +75,6 @@ where
         return Pulled::Done(runtime.block_on(fut));
     };
     let token = token.clone();
-    #[cfg(test)]
-    pull_hooks::SPAWNS.set(pull_hooks::SPAWNS.get() + 1);
     let task = runtime.spawn(async move {
         tokio::select! {
             biased;
@@ -118,16 +116,5 @@ where
             Pulled::Done(item)
         }
         Pulled::Cancelled => Pulled::Cancelled,
-    }
-}
-
-/// Counts the pulls each thread has spawned as tasks.
-#[cfg(test)]
-pub(crate) mod pull_hooks {
-    use std::cell::Cell;
-
-    thread_local! {
-        /// The pulls this thread has spawned so far.
-        pub(crate) static SPAWNS: Cell<usize> = const { Cell::new(0) };
     }
 }

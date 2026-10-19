@@ -2,7 +2,9 @@
 //! (the crate's own test target is off: it would need to link libpython).
 //!
 //! A pull waits at an await nobody completes, as a file read waits at a
-//! split boundary, so where a cancel lands never depends on timing.
+//! split boundary, so where a cancel lands never depends on timing. Whether
+//! a pulled future runs as a task is read inside it, through
+//! `tokio::task::try_id`, which is `None` outside every task.
 
 #[path = "../src/cancel.rs"]
 mod cancel;
@@ -16,7 +18,7 @@ use futures::stream::{self, StreamExt};
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::Notify;
 
-use cancel::{Pulled, Token, pull, pull_hooks, pull_next};
+use cancel::{Pulled, Token, pull, pull_next};
 
 fn runtime() -> Arc<Runtime> {
     Arc::new(
@@ -35,34 +37,38 @@ fn after_50_ms(then: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
     })
 }
 
-/// What `work` returns on a thread of its own, with the pulls that thread
-/// spawned; `None` when it has not returned within a second, so a pull
-/// that misses its cancel fails the test rather than hanging it.
-fn within_a_second<T: Send + 'static>(
-    work: impl FnOnce() -> T + Send + 'static,
-) -> Option<(T, usize)> {
+/// What `work` returns on a thread of its own; `None` when it has not
+/// returned within a second, so a pull that misses its cancel fails the
+/// test rather than hanging it.
+fn within_a_second<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        let spawns = pull_hooks::SPAWNS.get();
-        let answer = work();
-        let _ = sender.send((answer, pull_hooks::SPAWNS.get() - spawns));
+        let _ = sender.send(work());
     });
     receiver.recv_timeout(Duration::from_secs(1)).ok()
 }
 
-/// A pull waiting at an await nothing will complete stops there once
-/// another thread cancels its token, within a second, and runs as a task of
-/// its own. A stream pull with the cancelled token drops its stream.
+/// With a token a pull runs its future as a task of its own. Waiting at an
+/// await nothing will complete, it stops there once another thread cancels
+/// its token, within a second; a stream pull with the cancelled token drops
+/// its stream.
 #[test]
 fn cancel_lands_at_the_next_await() {
     let runtime = runtime();
     let token = Token::new();
+    assert!(
+        matches!(
+            pull(&runtime, Some(&token), async { tokio::task::try_id() }),
+            Pulled::Done(Some(_))
+        ),
+        "a pull with a token did not run its future as a task"
+    );
     let never = Arc::new(Notify::new());
     let canceller = after_50_ms({
         let token = token.clone();
         move || token.cancel()
     });
-    let (pulled, spawns) = within_a_second({
+    let pulled = within_a_second({
         let (runtime, token, never) = (Arc::clone(&runtime), token.clone(), Arc::clone(&never));
         move || {
             pull(&runtime, Some(&token), async move {
@@ -76,11 +82,10 @@ fn cancel_lands_at_the_next_await() {
         matches!(pulled, Pulled::Cancelled),
         "the pull did not stop at its await"
     );
-    assert_eq!(spawns, 1, "a pull with a token runs as a spawned task");
     canceller.join().unwrap();
     assert!(token.is_cancelled());
 
-    let (stream_dropped, _) = within_a_second({
+    let stream_dropped = within_a_second({
         let (runtime, token) = (Arc::clone(&runtime), token.clone());
         move || {
             let mut slot = Some(
@@ -98,14 +103,19 @@ fn cancel_lands_at_the_next_await() {
     assert!(stream_dropped, "a cancelled stream pull kept its stream");
 }
 
-/// Without a token a pull is the runtime's `block_on`: it waits as long as
-/// its future does and spawns no task, and a stream pull hands its stream
-/// back.
+/// Without a token a pull is the runtime's `block_on`: its future runs
+/// outside every task and as long as it waits, and a stream pull, polled
+/// the same way, hands its stream back.
 #[test]
 fn without_a_token_pull_is_block_on() {
     let runtime = runtime();
-    let spawns = pull_hooks::SPAWNS.get();
-    assert!(matches!(pull(&runtime, None, async { 7 }), Pulled::Done(7)));
+    assert!(
+        matches!(
+            pull(&runtime, None, async { tokio::task::try_id() }),
+            Pulled::Done(None)
+        ),
+        "a pull without a token ran its future as a task"
+    );
 
     let release = Arc::new(Notify::new());
     let notifier = after_50_ms({
@@ -124,15 +134,13 @@ fn without_a_token_pull_is_block_on() {
     );
     notifier.join().unwrap();
 
-    let mut slot = Some(stream::iter([1, 2]));
-    assert!(matches!(
-        pull_next(&runtime, None, &mut slot),
-        Pulled::Done(Some(1))
-    ));
-    assert!(slot.is_some(), "a finished pull kept the stream");
-    assert_eq!(
-        pull_hooks::SPAWNS.get(),
-        spawns,
-        "a pull without a token spawned a task"
+    let mut slot = Some(stream::iter([1, 2]).map(|item| (item, tokio::task::try_id())));
+    assert!(
+        matches!(
+            pull_next(&runtime, None, &mut slot),
+            Pulled::Done(Some((1, None)))
+        ),
+        "a stream pull without a token polled its stream inside a task"
     );
+    assert!(slot.is_some(), "a finished pull kept the stream");
 }

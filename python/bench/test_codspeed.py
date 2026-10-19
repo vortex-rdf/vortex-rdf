@@ -453,19 +453,26 @@ def test_pushdown_many_scans(benchmark, stores):
 
 
 @pytest.mark.benchmark
-@pytest.mark.parametrize("residency", ["file", "memory"])
-def test_pushdown_chunks(benchmark, stores, store_paths, residency):
-    """A P match streamed whole through `match_code_chunks` at the default
-    chunk size: the chunked twin of `readpath[match_codes]`, over the mapped
-    file and over the same store loaded whole."""
+@pytest.mark.parametrize(
+    "residency, batch_rows",
+    [("file", None), ("memory", None), ("file", 64), ("memory", 64)],
+    ids=["file", "memory", "file-64", "memory-64"],
+)
+def test_pushdown_chunks(benchmark, stores, store_paths, residency, batch_rows):
+    """A P match streamed whole through `match_code_chunks`, over the mapped
+    file and over the same store loaded whole. At the default chunk size the
+    match (DIM**2 rows) is one chunk, the chunked twin of
+    `readpath[match_codes]`; at 64 rows a chunk it is DIM**2 / 64 pulls (16
+    at the default DIM), so the per-chunk path is what is measured."""
     if residency == "file":
         store = stores["triples::dict"]
     else:
         store = VortexRdfStore(store_paths["triples::dict"], in_memory=True)
     p = TRIPLE_PATTERNS[1]  # P
+    options = {} if batch_rows is None else {"batch_rows": batch_rows}
 
     def stream():
-        for _ in store.match_code_chunks(p.s, p.p, p.o, p.g):
+        for _ in store.match_code_chunks(p.s, p.p, p.o, p.g, **options):
             pass
 
     benchmark(stream)

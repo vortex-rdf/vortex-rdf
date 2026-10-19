@@ -61,9 +61,14 @@ fn batch_lookahead(lookahead: Option<usize>) -> PyResult<usize> {
     }
 }
 
-/// The token a `cancel=` argument carries.
-fn token_of(cancel: Option<&Bound<'_, CancelToken>>) -> Option<Token> {
-    cancel.map(|cancel| cancel.get().token.clone())
+/// The token a `cancel=` argument carries, refused with [`cancelled`] when
+/// it is already cancelled, before the call runs or spawns anything.
+fn token_of(cancel: Option<&Bound<'_, CancelToken>>) -> PyResult<Option<Token>> {
+    let token = cancel.map(|cancel| cancel.get().token.clone());
+    if token.as_ref().is_some_and(Token::is_cancelled) {
+        return Err(cancelled());
+    }
+    Ok(token)
 }
 
 /// The answers of [`VortexRdfStore::match_codes_many`], one per probe in
@@ -97,6 +102,12 @@ impl Answers {
     fn next(&mut self, token: Option<&Token>) -> Pulled<Option<Result<ProbeColumns, CoreError>>> {
         match self {
             Answers::Batch(batch) => batch.next(&RUNTIME, token),
+            // No probe runs, so a cancelled token is read here: it ends the
+            // answers still due.
+            Answers::Declined(left) if *left > 0 && token.is_some_and(Token::is_cancelled) => {
+                *left = 0;
+                Pulled::Cancelled
+            }
             Answers::Declined(left) => Pulled::Done(match left.checked_sub(1) {
                 Some(rest) => {
                     *left = rest;
@@ -404,7 +415,7 @@ impl VortexRdfStore {
         cancel: Option<&Bound<'_, CancelToken>>,
     ) -> PyResult<usize> {
         let probe = narrowed_probe(s, p, o, g, keep, limit, offset)?;
-        match token_of(cancel) {
+        match token_of(cancel)? {
             None => detached(py, || self.store.count_probe(&probe)),
             Some(token) => {
                 let store = self.store.clone();
@@ -432,7 +443,7 @@ impl VortexRdfStore {
     ) -> PyResult<Vec<usize>> {
         let lookahead = batch_lookahead(lookahead)?;
         let probes = parse_probes(probes)?;
-        let token = token_of(cancel);
+        let token = token_of(cancel)?;
         settled(py.detach(|| {
             Batch::spawn(
                 &RUNTIME,
@@ -511,10 +522,11 @@ impl VortexRdfStore {
         cancel: Option<&Bound<'_, CancelToken>>,
     ) -> PyResult<Option<CodeColumns>> {
         let probe = narrowed_probe(s, p, o, g, keep, limit, offset)?;
+        let token = token_of(cancel)?;
         if self.store.dict_reader().is_none() {
             return Ok(None);
         }
-        let columns = match token_of(cancel) {
+        let columns = match token {
             None => detached(py, || probe_codes(&self.store, &probe))?,
             Some(token) => {
                 let store = self.store.clone();
@@ -561,10 +573,10 @@ impl VortexRdfStore {
                 "batch_rows must be at least 1: the most rows a chunk holds",
             ));
         }
+        let token = token_of(cancel)?;
         if self.store.dict_reader().is_none() {
             return Ok(None);
         }
-        let token = token_of(cancel);
         let store = self.store.clone();
         let wanted = columns.clone();
         let chunks = async move {
@@ -584,12 +596,12 @@ impl VortexRdfStore {
     /// by an iterator ([`ProbeAnswers`]; see [`Self::count_quads_many`] for
     /// the probe forms). Every probe is parsed before any is evaluated. The
     /// probes run concurrently on the bindings' runtime from the call on,
-    /// whether or not the iterator is pulled: at most `lookahead` of them in
-    /// flight (by default twice the machine's parallelism, at least 64) and
-    /// at most `lookahead` answers waiting to be pulled, plus one being
-    /// handed over. The first failing probe in input order raises at its
-    /// position, and the probes after it are aborted, as are the probes in
-    /// flight when the iterator is dropped. With a `cancel` token every pull races it
+    /// whether or not the iterator is pulled: at most 2 × `lookahead` of
+    /// them running or answered but not yet pulled (`lookahead` is by
+    /// default twice the machine's parallelism, at least 64). The first
+    /// failing probe in input order raises at its position, and the probes
+    /// after it are aborted, as are the probes in flight when the iterator
+    /// is dropped. With a `cancel` token every pull races it
     /// ([`CancelToken`]): a cancelled pull raises at its position and aborts
     /// the probes in flight. On a store whose rows have no codes every
     /// answer is `None` and no probe runs.
@@ -602,6 +614,7 @@ impl VortexRdfStore {
     ) -> PyResult<ProbeAnswers> {
         let lookahead = batch_lookahead(lookahead)?;
         let probes = parse_probes(probes)?;
+        let token = token_of(cancel)?;
         let len = probes.len();
         let answers = if self.store.dict_reader().is_none() {
             Answers::Declined(len)
@@ -616,7 +629,7 @@ impl VortexRdfStore {
         };
         Ok(ProbeAnswers {
             answers: Mutex::new(answers),
-            token: token_of(cancel),
+            token,
             len,
         })
     }

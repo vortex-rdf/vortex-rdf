@@ -19,7 +19,7 @@ use tokio::sync::Notify;
 use vortex_rdf_core::VortexRdfError;
 
 use batch::Batch;
-use cancel::{Pulled, Token, pull_hooks};
+use cancel::{Pulled, Token};
 
 fn runtime() -> Runtime {
     Builder::new_multi_thread()
@@ -61,16 +61,9 @@ fn finishing_in_reverse(
             outcome.map_err(|message| VortexRdfError::InvalidOperation(message.to_string()))
         },
     );
-    let spawns = pull_hooks::SPAWNS.get();
-    let answers = std::iter::from_fn(|| done(batch.next(runtime, None)))
+    std::iter::from_fn(|| done(batch.next(runtime, None)))
         .map(|answer| answer.map_err(message))
-        .collect();
-    assert_eq!(
-        pull_hooks::SPAWNS.get(),
-        spawns,
-        "a pull without a token spawned a task"
-    );
-    answers
+        .collect()
 }
 
 fn message(error: VortexRdfError) -> String {

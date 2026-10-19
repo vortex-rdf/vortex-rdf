@@ -1,8 +1,8 @@
 //! A batch of probes run on the bindings' runtime through a bounded,
-//! ordered window that a driver task keeps full: at most `lookahead` probes
-//! are in flight, at most `lookahead` answers wait to be pulled, and the
-//! answers come back in input order, each pulled as `cancel.rs` pulls, with
-//! or without a cancel token. The calls default `lookahead` to twice the
+//! ordered window that a driver task keeps full: at most 2 × `lookahead`
+//! probes are running or answered but not yet pulled, and the answers come
+//! back in input order, each pulled as `cancel.rs` pulls, with or without a
+//! cancel token. The calls default `lookahead` to twice the
 //! machine's parallelism, and at least 64 (`DEFAULT_LOOKAHEAD`, `store.rs`).
 //!
 //! Free of Python types, so `tests/batch.rs` compiles this file (with
@@ -49,9 +49,10 @@ type Joined<T> = Result<Result<T, CoreError>, JoinError>;
 /// ordered `buffered(lookahead)` window over the spawns and forwards each
 /// answer, in input order, into a channel of `lookahead` answers: the
 /// window refills as soon as a probe answers, whether or not anyone is
-/// pulling, until the channel is full. So at most `lookahead` probes are in
-/// the window, at most `lookahead` answers wait in the channel, and one more
-/// waits in the driver's hand. The driver forwards a failure and stops,
+/// pulling, until the channel is full. So at most 2 × `lookahead` probes are
+/// running or answered but not yet pulled: the channel's, the one in the
+/// driver's hand, and the window's, which lacks that one while the driver
+/// waits to hand it over. The driver forwards a failure and stops,
 /// dropping the window. Dropping the batch, or cancelling a pull's token,
 /// closes the channel and aborts the driver, which drops the window and
 /// aborts the probes in it at once.
@@ -86,7 +87,9 @@ impl<T: Send + 'static> Batch<T> {
         let len = probes.len();
         let handle = runtime.handle().clone();
         let shared = shared.clone();
-        let (sender, mut receiver) = mpsc::channel(lookahead);
+        // A batch never holds more answers than probes, and an empty one
+        // still needs a channel.
+        let (sender, mut receiver) = mpsc::channel(lookahead.min(len).max(1));
         let driver = runtime.spawn(async move {
             let mut window = pin!(
                 stream::iter(probes)
