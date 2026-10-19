@@ -173,6 +173,39 @@ fn drop_graph_column(chunk: &vortex_array::ArrayRef) -> vortex_array::ArrayRef {
     .into_array()
 }
 
+/// `bytes`, a store file, with the first leaf of its quad table's `column`
+/// damaged: the trailing flatbuffer length of the leaf's segment set past
+/// the segment, so the file still opens and a read of that leaf fails to
+/// decode it.
+#[cfg(feature = "file-io")]
+fn with_damaged_leaf(bytes: &[u8], column: &str) -> Vec<u8> {
+    use crate::io::container;
+    use vortex_file::OpenOptionsSessionExt as _;
+    use vortex_layout::LayoutChildType;
+
+    let file = crate::session::VORTEX_SESSION
+        .open_options()
+        .open_buffer(vortex_buffer::ByteBuffer::from(bytes.to_vec()))
+        .unwrap();
+    let root = file
+        .footer()
+        .layout()
+        .as_::<container::RdfStoreLayoutVTable>();
+    let quads = container::quad_source(root).unwrap();
+    let field = (0..quads.nslots())
+        .find(|&i| {
+            matches!(quads.slot_type(i), Some(LayoutChildType::Field(ref name)) if name.as_ref() == column)
+        })
+        .unwrap();
+    let leaves =
+        vortex_rdf_encoded_search::flat_leaves(&quads.slot(field).unwrap().unwrap()).unwrap();
+    let segment = &file.footer().segment_map()[*leaves[0].layout.segment_id() as usize];
+    let end = usize::try_from(segment.offset).unwrap() + segment.length as usize;
+    let mut damaged = bytes.to_vec();
+    damaged[end - 4..end].copy_from_slice(&u32::MAX.to_le_bytes());
+    damaged
+}
+
 /// A chunk that cannot be read as the layout's columns at all decodes to a
 /// single `Err`, whatever its row count.
 #[test]
@@ -194,7 +227,10 @@ fn test_decode_chunk_reports_chunk_failure_as_single_err() {
 /// layouts that store the object spelling, an unknown `o_kind` under the
 /// typed layout. The typed layout stores no object spelling, so it meets
 /// that object string at build instead: `from_quads` refuses it with the
-/// parser's error.
+/// parser's error. A store holding the typed layout's bad row fails its
+/// shared read and its N-Quads export with that row's error, and a store
+/// file with a damaged leaf fails every read of that chunk, under each
+/// layout.
 #[tokio::test]
 async fn test_decode_chunk_reports_bad_row_at_its_position() {
     use vortex_array::IntoArray as _;
@@ -221,6 +257,12 @@ async fn test_decode_chunk_reports_bad_row_at_its_position() {
         let kinds = PrimitiveArray::from_iter([2u8, 9, 2]).into_array();
         (with_column(&chunk, "o_kind", kinds), resolved)
     };
+    let typed_store = VortexRdfStore::from_built(crate::store::BuiltArray {
+        array: typed.0.clone(),
+        components: Vec::new(),
+        dict: None,
+    })
+    .unwrap();
     let cases = [
         (
             LayoutStrategy::Default,
@@ -246,6 +288,55 @@ async fn test_decode_chunk_reports_bad_row_at_its_position() {
             decoded[2].as_ref().unwrap().subject.to_string(),
             "<http://example.org/s02>",
             "{layout:?}"
+        );
+    }
+
+    // The typed layout's bad row in a store: its shared read and its N-Quads
+    // export recompose the object from the typed columns, and fail with the
+    // row's error rather than panic.
+    let unknown_kind = |error: &VortexRdfError| match error {
+        VortexRdfError::Deserialization(message) => message == "Unknown object kind: 9",
+        _ => false,
+    };
+    let error = typed_store
+        .shared_quads_vec()
+        .await
+        .expect_err("the shared read fails");
+    assert!(unknown_kind(&error), "shared read: {error}");
+    let error = crate::export_rdf(typed_store, Vec::new(), oxrdfio::RdfFormat::NQuads)
+        .await
+        .expect_err("the N-Quads export fails");
+    assert!(unknown_kind(&error), "N-Quads export: {error}");
+
+    // A store file whose quad table has a damaged leaf opens, and a read of
+    // that chunk reports the failed decode as an error, never a panic: the
+    // row chunks' scan and the quads at the chunk's position, the shared
+    // quads and the N-Quads export as the call's error, under each layout.
+    #[cfg(feature = "file-io")]
+    for layout in LAYOUTS {
+        let (_dir, path) = write_store_file(modular_quads(12, 3, 4), layout, vec![]).await;
+        std::fs::write(
+            &path,
+            with_damaged_leaf(&std::fs::read(&path).unwrap(), "p"),
+        )
+        .unwrap();
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let chunks: Vec<_> = store.row_chunks(64).unwrap().collect().await;
+        assert!(
+            matches!(chunks.first(), Some(Err(_))),
+            "{layout:?}: row chunks"
+        );
+        let quads: Vec<_> = store.quads().collect().await;
+        assert!(matches!(quads.first(), Some(Err(_))), "{layout:?}: quads");
+        assert!(
+            store.shared_quads_vec().await.is_err(),
+            "{layout:?}: shared quads"
+        );
+        assert!(
+            crate::export_rdf(store, Vec::new(), oxrdfio::RdfFormat::NQuads)
+                .await
+                .is_err(),
+            "{layout:?}: N-Quads export"
         );
     }
 }
@@ -490,4 +581,76 @@ async fn test_export_reparses_to_the_same_quads() {
             "{format:?}: export did not round-trip"
         );
     }
+}
+
+/// A writer that takes `budget` bytes and fails every write after them, as
+/// a full volume does, with the error [`FailingWriter::MESSAGE`].
+struct FailingWriter {
+    budget: usize,
+}
+
+impl FailingWriter {
+    const MESSAGE: &'static str = "no storage space";
+}
+
+impl std::io::Write for FailingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.budget == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                Self::MESSAGE,
+            ));
+        }
+        let taken = buf.len().min(self.budget);
+        self.budget -= taken;
+        Ok(taken)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The structured serializer reports a writer that fails: wherever the
+/// failure falls, from its first byte to the closing of the last graph,
+/// the export is an error carrying the writer's, with no panic and no
+/// partial success.
+#[tokio::test]
+async fn test_structured_export_reports_a_failing_writer() {
+    let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
+    let quads = graph_modular_quads(4, 2, 2, 3, &[GraphName::DefaultGraph, g]);
+    let store = built_store(quads, LayoutStrategy::Default, vec![]).await;
+    let mut whole = Vec::new();
+    crate::export_rdf(store.clone(), &mut whole, oxrdfio::RdfFormat::TriG)
+        .await
+        .unwrap();
+    assert!(
+        whole.ends_with(b"}\n"),
+        "the last graph is closed at the end"
+    );
+
+    for budget in 0..whole.len() {
+        let result = crate::export_rdf(
+            store.clone(),
+            FailingWriter { budget },
+            oxrdfio::RdfFormat::TriG,
+        )
+        .await;
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains(FailingWriter::MESSAGE)),
+            "a writer failing after {budget} of {} bytes: {result:?}",
+            whole.len()
+        );
+    }
+    crate::export_rdf(
+        store,
+        FailingWriter {
+            budget: whole.len(),
+        },
+        oxrdfio::RdfFormat::TriG,
+    )
+    .await
+    .unwrap();
 }

@@ -167,33 +167,50 @@ fn recording_stream(
 }
 
 /// A path that cannot take a store is reported before the input is read: a
-/// missing directory fails at once, not after the whole ingest, sort and
-/// dictionary have run.
+/// missing directory, or a regular file where a directory should be, fails at
+/// once with an error naming the path, not after the whole ingest, sort and
+/// dictionary have run, and creates nothing.
 #[tokio::test]
 async fn test_a_missing_directory_fails_before_the_input_is_read() {
+    use std::io::ErrorKind;
+
     for layout in [LayoutStrategy::Default, LayoutStrategy::Dictionary] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("missing").join("store.vortex");
-        let polled = Arc::new(AtomicBool::new(false));
+        for (parent, name, parent_is_a_file, kind) in [
+            ("missing", "store.vortex", false, ErrorKind::NotFound),
+            ("a_file", "out.vortex", true, ErrorKind::NotADirectory),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            if parent_is_a_file {
+                std::fs::write(dir.path().join(parent), b"not a directory").unwrap();
+            }
+            let before = entries(dir.path());
+            let path = dir.path().join(parent).join(name);
+            let polled = Arc::new(AtomicBool::new(false));
 
-        let error = crate::io::quads_stream_to_vortex_file(
-            recording_stream(polled.clone()),
-            &path,
-            layout,
-            vec![],
-        )
-        .await
-        .expect_err("there is nowhere to put the store");
+            let error = crate::io::quads_stream_to_vortex_file(
+                recording_stream(polled.clone()),
+                &path,
+                layout,
+                vec![],
+            )
+            .await
+            .expect_err("there is nowhere to put the store");
 
-        assert!(
-            matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::NotFound),
-            "{layout:?}: {error}"
-        );
-        assert!(
-            !polled.load(Ordering::SeqCst),
-            "{layout:?}: the input was read before the output path was known to take a store"
-        );
-        assert_eq!(entries(dir.path()), Vec::<PathBuf>::new(), "{layout:?}");
+            let tag = format!("{layout:?} {parent}/{name}");
+            assert!(
+                matches!(&error, VortexRdfError::Io(e) if e.kind() == kind),
+                "{tag}: {error}"
+            );
+            assert!(
+                error.to_string().contains(&format!("{path:?}")),
+                "{tag}: the error names the path: {error}"
+            );
+            assert!(
+                !polled.load(Ordering::SeqCst),
+                "{tag}: the input was read before the output path was known to take a store"
+            );
+            assert_eq!(entries(dir.path()), before, "{tag}");
+        }
     }
 }
 
@@ -1414,6 +1431,14 @@ mod special_targets {
         std::fs::symlink_metadata(path).unwrap().file_type()
     }
 
+    /// Make a pipe at `path` with `mkfifo`; false when the tool is not there.
+    fn make_fifo(path: &Path) -> bool {
+        std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
     async fn write_to(path: &Path) -> crate::error::Result<()> {
         crate::io::quads_stream_to_vortex_file(
             quad_stream(modular_quads(12, 3, 4)),
@@ -1438,11 +1463,7 @@ mod special_targets {
     async fn test_a_pipe_is_written_through_while_a_reader_drains_it() {
         let dir = tempfile::tempdir().unwrap();
         let fifo = dir.path().join("pipe");
-        if !std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .is_ok_and(|status| status.success())
-        {
+        if !make_fifo(&fifo) {
             eprintln!("skipped: mkfifo is not available");
             return;
         }
@@ -1499,5 +1520,48 @@ mod special_targets {
         assert!(!polled.load(Ordering::SeqCst), "the input was read");
         assert!(file_type(&socket).is_socket(), "the socket was replaced");
         assert_eq!(entries(dir.path()), vec![socket]);
+    }
+
+    /// A store opened from a file is never written into a pipe that has
+    /// taken the file's path since: its compaction is refused as replaced
+    /// since the open, and the pipe is left alone. The compaction runs on a
+    /// thread of its own and is waited for at most 10 s, since one that
+    /// opened the pipe, which has no reader, would block there.
+    #[tokio::test]
+    async fn test_compaction_refuses_a_path_turned_into_a_pipe_since_the_store_opened() {
+        let (dir, path) =
+            write_store_file(modular_quads(12, 3, 4), LayoutStrategy::Dictionary, vec![]).await;
+        let tailed = VortexRdfStore::from_file(&path)
+            .await
+            .unwrap()
+            .add_quads(appended_quads(2))
+            .await
+            .unwrap();
+        let fifo = dir.path().join("pipe");
+        if !make_fifo(&fifo) {
+            eprintln!("skipped: mkfifo is not available");
+            return;
+        }
+        std::fs::rename(&fifo, &path).unwrap();
+
+        let (sender, compacted) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _ = sender.send(runtime.block_on(tailed.compact()).err());
+        });
+        let error = compacted
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the compaction returns within 10 s")
+            .expect("a pipe is not the file the store opened");
+        assert!(
+            matches!(&error, VortexRdfError::InvalidOperation(m)
+                if m.contains("was replaced since this store opened it")),
+            "{error}"
+        );
+        assert!(file_type(&path).is_fifo(), "the pipe was replaced");
+        assert_eq!(entries(dir.path()), vec![path]);
     }
 }

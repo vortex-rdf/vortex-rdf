@@ -670,6 +670,27 @@ mod tests {
                 "{message}"
             );
         }
+
+        // A real full volume: a run smaller than the writer's buffer reaches
+        // the device only at the final flush, which `finish` reports (the
+        // buffered writer's drop would swallow its error).
+        #[cfg(target_os = "linux")]
+        {
+            let error = write_run(Path::new("/dev/full"), &string_records()).unwrap_err();
+            assert!(
+                matches!(&error, VortexRdfError::Io(e) if e.kind() == ErrorKind::StorageFull),
+                "{error}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("spill run write failed in /dev: "),
+                "{message}"
+            );
+            assert!(
+                message.ends_with("; set VORTEX_RDF_SPILL_DIR to a directory with more room"),
+                "{message}"
+            );
+        }
     }
 
     fn string_records() -> Vec<(String, u32)> {
