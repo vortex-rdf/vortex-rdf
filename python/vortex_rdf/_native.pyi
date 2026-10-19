@@ -262,11 +262,11 @@ class ProbeAnswers:
     """The answers of `VortexRdfStore.match_codes_many`, one per probe in
     input order: its four code columns ``(s, p, o, g)``, or None where the
     code path does not apply. Each `__next__` waits, with the GIL released,
-    for the next answer; the probes run while the iterator is pulled, at
-    most `lookahead` of them in flight. The first failing probe, or a pull
-    whose `CancelToken` is cancelled (`Cancelled`), raises at its position
-    and ends the iteration; dropping the iterator aborts the probes still in
-    flight."""
+    for the next answer; the probes run from the call on, at most
+    `lookahead` of them in flight and at most `lookahead` answers waiting to
+    be pulled. The first failing probe, or a pull whose `CancelToken` is
+    cancelled (`Cancelled`), raises at its position and ends the iteration;
+    dropping the iterator aborts the probes still in flight."""
 
     def __iter__(self) -> "ProbeAnswers": ...
     def __next__(self) -> Optional[Tuple[U64Column, U64Column, U64Column, U64Column]]: ...
@@ -407,15 +407,17 @@ class VortexRdfStore:
         optional term strings or a dict with keys ``s``, ``p``, ``o``,
         ``g``, ``keep``, ``limit``, ``offset``. Every probe is parsed before
         any is evaluated (``ValueError`` first). The probes run concurrently
-        while the iterator is pulled, at most `lookahead` of them spawned and
-        unanswered at a time: by default twice the machine's parallelism;
-        ``0`` raises ``ValueError``. The first failing probe in input order
-        raises at its position and the probes after it are aborted, as are
-        the probes in flight when the iterator is dropped. With a `cancel`
-        token every pull races it (`CancelToken`): a cancelled pull raises
-        `Cancelled` at its position and aborts the probes in flight. On a
-        store whose rows have no codes every answer is None and no probe
-        runs."""
+        from the call on, whether or not the iterator is pulled: at most
+        `lookahead` of them in flight and at most `lookahead` answers
+        waiting to be pulled (plus one being handed over), by default twice
+        the machine's parallelism and at least 64; ``0`` raises
+        ``ValueError``; an explicit value is used as given. The first
+        failing probe in input order raises at its position and the probes
+        after it are aborted, as are the probes in flight when the iterator
+        is dropped. With a `cancel` token every pull races it
+        (`CancelToken`): a cancelled pull raises `Cancelled` at its position
+        and aborts the probes in flight. On a store whose rows have no codes
+        every answer is None and no probe runs."""
         ...
     def count_quads_many(
         self,

@@ -268,9 +268,9 @@ fn stalled_batch(
 }
 
 /// A batch dropped after its first answer aborts the probes in its window
-/// and spawns none of the rest: a window of two spawns two probes for the
-/// first answer, and every spawned probe but the first is dropped
-/// unfinished.
+/// and spawns none of the rest: the driver, running freely, spawns at most
+/// one probe past a window of two before the drop lands, and every spawned
+/// probe but the first is dropped unfinished.
 #[test]
 fn dropping_the_batch_aborts_what_is_in_flight_and_starts_nothing() {
     let runtime = runtime();
@@ -280,21 +280,51 @@ fn dropping_the_batch_aborts_what_is_in_flight_and_starts_nothing() {
         Some(0)
     );
     drop(batch);
-    let started = spawned.load(Ordering::SeqCst);
-    assert_eq!(started, 2, "{started} probes spawned for a window of two");
+    // Once every spawned probe is dropped the window is gone: a probe still
+    // in it holds the count below the spawns.
     wait_until("every spawned probe to be dropped", || {
-        dropped.load(Ordering::SeqCst) == started
+        dropped.load(Ordering::SeqCst) == spawned.load(Ordering::SeqCst)
     });
+    let started = spawned.load(Ordering::SeqCst);
+    assert!(started <= 3, "{started} probes spawned for a window of two");
     assert_eq!(
         finished.load(Ordering::SeqCst),
         1,
         "an aborted probe finished"
     );
+}
+
+/// Between pulls the driver keeps the window full until the answers
+/// waiting fill their channel: with a window of two over probes that
+/// answer at once, it spawns four (two answers in the channel, one in its
+/// hand, one in the window) and no more until a pull takes an answer.
+#[test]
+fn the_window_refills_between_pulls_up_to_its_bound() {
+    let runtime = runtime();
+    let spawned = Arc::new(AtomicUsize::new(0));
+    let mut batch = Batch::spawn(
+        &runtime,
+        &spawned,
+        (0..8).collect::<Vec<usize>>(),
+        2,
+        |spawned, probe| {
+            spawned.fetch_add(1, Ordering::SeqCst);
+            async move { Ok::<_, VortexRdfError>(probe) }
+        },
+    );
+    wait_until("the driver to fill its bound", || {
+        spawned.load(Ordering::SeqCst) == 4
+    });
+    std::thread::sleep(Duration::from_millis(50));
     assert_eq!(
         spawned.load(Ordering::SeqCst),
-        started,
-        "a probe was spawned after the drop"
+        4,
+        "the driver spawned past its bound"
     );
+    let answers: Vec<usize> = std::iter::from_fn(|| done(batch.next(&runtime, None)))
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(answers, (0..8).collect::<Vec<_>>());
 }
 
 /// A pull whose token is cancelled while it waits ends the batch: the
@@ -342,10 +372,10 @@ fn a_cancelled_pull_aborts_the_window() {
     for token in [Some(&token), None] {
         assert!(matches!(batch.next(&runtime, token), Pulled::Done(None)));
     }
-    assert_eq!(
-        spawned.load(Ordering::SeqCst),
-        3,
-        "a probe was spawned after the cancel"
+    let started = spawned.load(Ordering::SeqCst);
+    assert!(
+        started <= 3,
+        "{started} probes spawned for a window of two: one after the cancel"
     );
 }
 

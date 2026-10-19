@@ -39,12 +39,13 @@ async fn probe_codes(store: &CoreStore, probe: &Probe) -> Result<ProbeColumns, C
     store.run_probe(probe).await?.code_columns_gathered().await
 }
 
-/// The probes a batch keeps spawned and unanswered when the call names no
-/// `lookahead`: twice the machine's parallelism, so at least 2.
+/// A batch's `lookahead` when the call names none: twice the machine's
+/// parallelism, and at least 64.
 static DEFAULT_LOOKAHEAD: LazyLock<usize> = LazyLock::new(|| {
     std::thread::available_parallelism()
         .map_or(1, NonZero::get)
         .saturating_mul(2)
+        .max(64)
 });
 
 /// A batch call's `lookahead`, or [`DEFAULT_LOOKAHEAD`] for `None`; zero
@@ -52,7 +53,8 @@ static DEFAULT_LOOKAHEAD: LazyLock<usize> = LazyLock::new(|| {
 fn batch_lookahead(lookahead: Option<usize>) -> PyResult<usize> {
     match lookahead {
         Some(0) => Err(PyValueError::new_err(
-            "lookahead must be at least 1: the probes a batch keeps in flight",
+            "lookahead must be at least 1: the probes a batch keeps in flight, and the \
+             answers it keeps waiting",
         )),
         Some(lookahead) => Ok(lookahead),
         None => Ok(*DEFAULT_LOOKAHEAD),
@@ -66,11 +68,11 @@ fn token_of(cancel: Option<&Bound<'_, CancelToken>>) -> Option<Token> {
 
 /// The answers of [`VortexRdfStore::match_codes_many`], one per probe in
 /// input order: its `(s, p, o, g)` code columns, or `None` where the code
-/// path does not apply. Each `__next__` waits, GIL-released, for the next
-/// answer of a bounded [`Batch`], raced with the call's cancel token if it
-/// passed one; the first failing probe, or a cancelled pull, raises at its
-/// position and ends the iteration, and dropping the iterator aborts the
-/// probes still in flight.
+/// path does not apply. A bounded [`Batch`] runs the probes from the call
+/// on; each `__next__` waits, GIL-released, for its next answer, raced with
+/// the call's cancel token if it passed one. The first failing probe, or a
+/// cancelled pull, raises at its position and ends the iteration, and
+/// dropping the iterator aborts the probes still in flight.
 #[pyclass(frozen, module = "vortex_rdf._native")]
 pub struct ProbeAnswers {
     answers: Mutex<Answers>,
@@ -416,8 +418,8 @@ impl VortexRdfStore {
     /// optional term strings or a dict with keys `s`, `p`, `o`, `g`,
     /// `keep`, `limit`, `offset`. Every probe is parsed before any is
     /// evaluated, so a malformed one raises `ValueError` first. The probes
-    /// run concurrently, at most `lookahead` of them spawned and unanswered
-    /// at a time (see [`Self::match_codes_many`]). The call raises the error
+    /// run concurrently through the bounded window of
+    /// [`Self::match_codes_many`]. The call raises the error
     /// of the first failing probe in input order and aborts the probes after
     /// it. With a `cancel` token the whole batch is one pull raced with it.
     #[pyo3(signature = (probes, *, lookahead=None, cancel=None))]
@@ -581,12 +583,13 @@ impl VortexRdfStore {
     /// [`Self::match_codes`] for a batch of probes, answered in input order
     /// by an iterator ([`ProbeAnswers`]; see [`Self::count_quads_many`] for
     /// the probe forms). Every probe is parsed before any is evaluated. The
-    /// probes run concurrently on the bindings' runtime while the iterator
-    /// is pulled, at most `lookahead` of them spawned and unanswered at a
-    /// time (by default twice the machine's parallelism). The first failing
-    /// probe in input order raises at its position, and the probes after it
-    /// are aborted, as are the probes in flight when the iterator is
-    /// dropped. With a `cancel` token every pull races it
+    /// probes run concurrently on the bindings' runtime from the call on,
+    /// whether or not the iterator is pulled: at most `lookahead` of them in
+    /// flight (by default twice the machine's parallelism, at least 64) and
+    /// at most `lookahead` answers waiting to be pulled, plus one being
+    /// handed over. The first failing probe in input order raises at its
+    /// position, and the probes after it are aborted, as are the probes in
+    /// flight when the iterator is dropped. With a `cancel` token every pull races it
     /// ([`CancelToken`]): a cancelled pull raises at its position and aborts
     /// the probes in flight. On a store whose rows have no codes every
     /// answer is `None` and no probe runs.
