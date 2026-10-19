@@ -28,7 +28,7 @@ use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 
 use super::deferred;
-use super::rows::gather_codes;
+use super::rows::{gather_codes, gather_column};
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::VortexRdfStore;
@@ -77,11 +77,11 @@ impl VortexRdfStore {
     /// ([`dict_reader`](Self::dict_reader) decodes them).
     ///
     /// In memory a contiguous selection without tombstones is sliced from
-    /// the base's own code columns, zero-copy, and any other selection is
-    /// gathered from them one window of live ids per chunk. On file a
-    /// selection taken by id is taken one chunk's ids per pull; the scan, and
-    /// a read by id with no filter pending, read only `columns`; a read by id
-    /// under a pending filter reads every primary column. Errors:
+    /// the base's own code columns, zero-copy, and any other selection has
+    /// only `columns` gathered from them, one window of live ids per chunk.
+    /// On file a selection taken by id is taken one chunk's ids per pull; the
+    /// scan, and a read by id with no filter pending, read only `columns`; a
+    /// read by id under a pending filter reads every primary column. Errors:
     /// `batch_rows == 0` or no columns (invalid input), or a view whose rows
     /// are not code-addressable (an invalid operation: a string layout, or a
     /// Dictionary view with a non-empty tail).
@@ -146,12 +146,22 @@ impl VortexRdfStore {
                     .boxed()
                 }
                 MemoryRows::Windows(windows) => {
+                    // Every column asked for: the four gathered in one pass;
+                    // a subset: only its columns.
+                    let every = QuadColumn::ALL.iter().all(|c| columns.contains(c));
                     let picked: Vec<usize> = columns.iter().map(|c| c.index()).collect();
                     stream::iter(windows.map(move |ids| {
                         #[cfg(test)]
                         gather_hooks::note();
-                        let codes = gather_codes(&prims, &ids);
-                        Ok(picked.iter().map(|&k| codes[k].clone()).collect())
+                        Ok(if every {
+                            let codes = gather_codes(&prims, &ids);
+                            picked.iter().map(|&k| codes[k].clone()).collect()
+                        } else {
+                            picked
+                                .iter()
+                                .map(|&k| gather_column(&prims[k], &ids))
+                                .collect()
+                        })
                     }))
                     .boxed()
                 }

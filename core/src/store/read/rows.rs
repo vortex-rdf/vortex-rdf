@@ -86,10 +86,21 @@ pub(in crate::store) fn gather_codes(
     prims: &[PrimitiveArray; 4],
     ids: &[RowId],
 ) -> [Buffer<TermCode>; 4] {
+    #[cfg(test)]
+    column_hooks::note(true);
     prims.each_ref().map(|prim| {
         let slice = prim.as_slice::<TermCode>();
         Buffer::from_iter(ids.iter().map(|&i| slice[i as usize]))
     })
+}
+
+/// The codes at `ids` of one code primitive, `prim`, in the order of `ids`:
+/// [`gather_codes`] for a single column.
+pub(in crate::store) fn gather_column(prim: &PrimitiveArray, ids: &[RowId]) -> Buffer<TermCode> {
+    #[cfg(test)]
+    column_hooks::note(false);
+    let slice = prim.as_slice::<TermCode>();
+    Buffer::from_iter(ids.iter().map(|&i| slice[i as usize]))
 }
 
 impl VortexRdfStore {
@@ -454,5 +465,29 @@ impl VortexRdfStore {
             raws.extend(tail.raw_quads()?);
         }
         Ok((raws, base_rows))
+    }
+}
+
+/// Test hook: how many gathers this thread made from code primitives, by
+/// path: all four columns in one pass ([`gather_codes`]), or one column
+/// ([`gather_column`]).
+#[cfg(test)]
+pub(crate) mod column_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FOUR: Cell<usize> = const { Cell::new(0) };
+        static ONE: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Record one gather, of all four columns or of one.
+    pub(super) fn note(four: bool) {
+        let cell = if four { &FOUR } else { &ONE };
+        cell.with(|c| c.set(c.get() + 1));
+    }
+
+    /// The gathers on this thread so far: `(of all four columns, of one)`.
+    pub(crate) fn gathers() -> (usize, usize) {
+        (FOUR.with(Cell::get), ONE.with(Cell::get))
     }
 }

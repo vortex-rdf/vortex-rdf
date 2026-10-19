@@ -140,12 +140,13 @@ splits, cut to the cap. Every arm of `code_chunks` gathers one chunk at a
 time, when the chunk is pulled. In memory a contiguous selection without
 tombstones is sliced from the base, zero-copy over its canonical code
 columns, and any other selection is gathered one window of `batch_rows`
-live ids per chunk. On file a selection taken by id is taken one window of
-ids per chunk, and the scan reads the file split by split, a bounded window
-of splits in flight ([§4](#4-which-runtime-a-read-needs)); the scan, and a
-read by id with no filter pending, read only the requested columns. A
-served match materializes its row ids before the first chunk (only its
-columns are chunked), and point reads read their few rows at once.
+live ids per chunk, both reading only the requested columns. On file a
+selection taken by id is taken one window of ids per chunk, and the scan
+reads the file split by split, a bounded window of splits in flight
+([§4](#4-which-runtime-a-read-needs)); the scan, and a read by id with no
+filter pending, read only the requested columns. A served match
+materializes its row ids before the first chunk (only its columns are
+chunked), and point reads read their few rows at once.
 
 `code_columns_gathered` is the one-shot form, for a match the caller has
 counted and will consume whole: one call answers all four columns,

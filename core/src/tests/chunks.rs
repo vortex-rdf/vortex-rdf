@@ -4,13 +4,15 @@
 
 use super::*;
 use crate::store::read::chunks::{gather_hooks, run_hooks};
+use crate::store::read::rows::column_hooks;
 use crate::store::{QuadColumn, TermCode};
 use crate::vortex_scan::ScanRequest;
 use vortex_array::dtype::{DType, Nullability};
 use vortex_array::expr::stats::Precision;
 
 /// Both exports of `view` agree with its base-ordered codes at several
-/// batch sizes, and a column subset comes in the requested order. Its data
+/// batch sizes, every column subset reads the subset's columns of the
+/// four-column read, and a subset comes in the requested order. Its data
 /// source scans to the same codes under a non-nullable struct dtype, and
 /// advertises its statistics' count (exact, or as the upper bound) and four
 /// `u64` codes a row as its byte size; the source and the statistics are
@@ -34,8 +36,13 @@ async fn assert_chunks_match(view: &VortexRdfStore, tag: &str) -> Precision<u64>
             "{tag}: row_chunks at batch {batch}"
         );
     }
+    let (all, _) = collect_code_chunks(view, &QuadColumn::ALL, 1_000).await;
+    assert_eq!(all, expected, "{tag}: code_chunks at 1,000 rows");
+    assert_subsets::<1>(view, &all, tag).await;
+    assert_subsets::<2>(view, &all, tag).await;
+    assert_subsets::<3>(view, &all, tag).await;
     let (rows, _) = collect_code_chunks(view, &[QuadColumn::O, QuadColumn::S], 1_000).await;
-    let want: Vec<[TermCode; 2]> = expected.iter().map(|r| [r[2], r[0]]).collect();
+    let want: Vec<[TermCode; 2]> = all.iter().map(|r| [r[2], r[0]]).collect();
     assert_eq!(rows, want, "{tag}: a column subset in the requested order");
 
     assert!(
@@ -66,6 +73,23 @@ async fn assert_chunks_match(view: &VortexRdfStore, tag: &str) -> Precision<u64>
     count
 }
 
+/// Every subset of `N` code columns, in `(s, p, o, g)` order, read from
+/// `view` at 1,000 rows a chunk: the subset's columns of `all`, the view's
+/// four-column read at that size.
+async fn assert_subsets<const N: usize>(view: &VortexRdfStore, all: &[[TermCode; 4]], tag: &str) {
+    for mask in (1u8..16).filter(|mask| mask.count_ones() as usize == N) {
+        let columns: [QuadColumn; N] = QuadColumn::ALL
+            .into_iter()
+            .filter(|c| mask & (1 << c.index()) != 0)
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let (rows, _) = collect_code_chunks(view, &columns, 1_000).await;
+        let want: Vec<[TermCode; N]> = all.iter().map(|r| columns.map(|c| r[c.index()])).collect();
+        assert_eq!(rows, want, "{tag}: the columns {columns:?}");
+    }
+}
+
 /// Every item of `stream`, unwrapped, beside how far `counter` rose over the
 /// stream's first pull and over the whole stream.
 async fn drain_counted<T>(
@@ -94,10 +118,18 @@ fn code_rows(chunks: &[Vec<vortex_buffer::Buffer<TermCode>>]) -> Vec<[TermCode; 
 
 /// Both exports of the in-memory `view` at `batch` rows a chunk answer its
 /// base-ordered codes through `gathers` window gathers, one per pull: the
-/// first pull gathers one window, or none when the view gathers none.
+/// first pull gathers one window, or none when the view gathers none. A read
+/// of all four code columns, in any order, gathers each window's four in one
+/// pass (`gather_codes`), and a read of `o` alone only that column.
 async fn assert_gathers(view: &VortexRdfStore, batch: usize, gathers: usize, tag: &str) {
     let expected = base_ordered_codes(view).await;
     let first_pull = gathers.min(1);
+    // The gathers by path since `start`: `(of all four columns, of one)`.
+    let since = |start: (usize, usize)| {
+        let (four, one) = column_hooks::gathers();
+        (four - start.0, one - start.1)
+    };
+    let start = column_hooks::gathers();
     let codes = view.code_chunks(&QuadColumn::ALL, batch).unwrap();
     let (chunks, first, total) = drain_counted(codes, gather_hooks::gathers).await;
     assert_eq!(
@@ -109,9 +141,52 @@ async fn assert_gathers(view: &VortexRdfStore, batch: usize, gathers: usize, tag
         "{tag}: code_chunks' gathers at batch {batch}"
     );
     assert_eq!(
+        since(start),
+        (gathers, 0),
+        "{tag}: one four-column gather a window at batch {batch}"
+    );
+    assert_eq!(
         code_rows(&chunks),
         expected,
         "{tag}: code_chunks at batch {batch}"
+    );
+    let start = column_hooks::gathers();
+    let reordered = [QuadColumn::G, QuadColumn::O, QuadColumn::S, QuadColumn::P];
+    let codes = view.code_chunks(&reordered, batch).unwrap();
+    let (chunks, ..) = drain_counted(codes, gather_hooks::gathers).await;
+    assert_eq!(
+        since(start),
+        (gathers, 0),
+        "{tag}: all four reordered, one four-column gather a window at batch {batch}"
+    );
+    assert_eq!(
+        code_rows(&chunks),
+        expected
+            .iter()
+            .map(|r| [r[3], r[2], r[0], r[1]])
+            .collect::<Vec<_>>(),
+        "{tag}: all four reordered at batch {batch}"
+    );
+    let start = column_hooks::gathers();
+    let codes = view.code_chunks(&[QuadColumn::O], batch).unwrap();
+    let (chunks, first, total) = drain_counted(codes, || column_hooks::gathers().1).await;
+    assert_eq!(
+        (first, total),
+        (first_pull, gathers),
+        "{tag}: one column a window at batch {batch}"
+    );
+    assert_eq!(
+        since(start),
+        (0, gathers),
+        "{tag}: `o` alone, one one-column gather a window at batch {batch}"
+    );
+    assert_eq!(
+        chunks
+            .iter()
+            .flat_map(|c| c[0].iter().copied())
+            .collect::<Vec<_>>(),
+        expected.iter().map(|r| r[2]).collect::<Vec<_>>(),
+        "{tag}: the `o` chunks at batch {batch}"
     );
     let rows = view.row_chunks(batch).unwrap();
     let (chunks, first, total) = drain_counted(rows, gather_hooks::gathers).await;
@@ -134,8 +209,8 @@ async fn assert_gathers(view: &VortexRdfStore, batch: usize, gathers: usize, tag
 /// view's chunks and data source scan are its base-ordered codes, which the
 /// source counts exactly, and the whole store's code chunks are its code
 /// columns, not copies of them. An index-served match gathers one window of
-/// its ids per chunk, as the chunk is pulled; the whole store, a contiguous
-/// run, gathers nothing.
+/// its ids per chunk, as the chunk is pulled, and of only the columns read;
+/// the whole store, a contiguous run, gathers nothing.
 #[tokio::test]
 async fn test_chunks_in_memory_match_gathered() {
     let count = assert_chunks_match(&multi_chunk_store().await, "memory multi-chunk").await;
@@ -208,7 +283,8 @@ async fn test_chunks_cut_a_run_per_pull() {
 /// In memory, over every index set, the views of a store with tombstones:
 /// the exports and the data source's scan skip the deleted rows, and the
 /// source counts the live ones exactly. Every view, the whole store's
-/// included, gathers one window of its live ids per chunk.
+/// included, gathers one window of its live ids per chunk, of only the
+/// columns read.
 #[tokio::test]
 async fn test_chunks_skip_tombstones() {
     let quads = fixture_quads();
