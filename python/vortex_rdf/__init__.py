@@ -6,6 +6,9 @@ rdflib Store on top of these bindings.
 """
 
 from ._native import (
+    CancelToken,
+    Cancelled,
+    CodeChunks,
     CodeGroups,
     JoinTooLarge,
     ProbeAnswers,
@@ -18,6 +21,9 @@ from ._native import (
 )
 
 __all__ = [
+    "CancelToken",
+    "Cancelled",
+    "CodeChunks",
     "CodeGroups",
     "JoinTooLarge",
     "ProbeAnswers",

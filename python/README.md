@@ -73,19 +73,38 @@ cols = store.match_codes(p=NAME, keep={"o": passed, "g": [0]}, limit=100, offset
 n = store.count_quads(p=NAME, keep={"o": passed}, limit=1)   # an existence test
 
 # Many probes, answered in input order through a bounded window of probes in flight.
-views = store.match_codes_many([(None, NAME, None, None), {"s": "<http://ex.org/bob>", "limit": 5}])
+for answer in store.match_codes_many([(None, NAME, None, None), {"s": "<http://ex.org/bob>", "limit": 5}]):
+    ...                                     # one probe's (s, p, o, g), or None
 counts = store.count_quads_many([{"p": NAME, "keep": {"o": literals}}])
+
+# A match of any size in chunks: one chunk of at most batch_rows rows in memory at a time.
+for subjects, objects in store.match_code_chunks(p=NAME, columns=("s", "o"), batch_rows=65536):
+    ...
+
+# One token per query stops its long calls from any thread.
+from vortex_rdf import CancelToken
+token = CancelToken()
+chunks = store.match_code_chunks(p=NAME, cancel=token)
+n = store.count_quads(p=NAME, cancel=token)
+token.cancel()                              # the next pull with it raises Cancelled
 
 # Column kernels, order-preserving: first-seen distinct values, nested-loop joins.
 s, p, o, g = cols
 s.distinct(); o.value_counts()
 left_idx, right_idx = o.join_indices(s)     # rows where o == s, as index pairs
 o.take(left_idx)                            # gather a joined column
+o.join_count(s)                             # the number of pairs, none built
+o.join_indices(s, max_pairs=1_000_000)      # JoinTooLarge rather than more pairs
+groups = s.groups()                         # the join's right side, built once
+for start in range(0, len(o), 65536):       # a large join, one zero-copy left slice at a time
+    left_idx, right_idx = groups.join(o.slice(start, min(start + 65536, len(o))))
 ```
 
 `filter_codes(kind, arg, codes, *, flags="", case=None, as_str=False)` evaluates a FILTER predicate over the candidate `codes` (sorted and unique, else `ValueError`) and answers `(passed, undecided)`, both subsets of `codes`; a candidate in neither fails, and the undecided ones are left to the caller's own evaluator. No verdict is memoized. Kinds: `is_literal`, `is_iri`, `is_blank`; `datatype <iri>`, `lang <tag>`, `lang_matches <range>`; `num_lt`/`num_le`/`num_gt`/`num_ge`/`num_eq`/`num_ne <number>` (value comparison for well-formed numeric literals; `xsd:long`/`xsd:unsignedLong` beyond 64 bits undecided; different XSD datatypes order by their IRIs; a non-literal fails the orderings and `=`, passes `!=`); and the string kinds `str_prefix <p>`, `contains`/`strstarts`/`strends <constant's N-Triples spelling>`, `regex <pattern>` with `flags`. String kinds follow rdflib 7.6: the text is a string literal's lexical form (with `as_str=True`, SPARQL `STR()`: an IRI's string or a literal's lexical form; a blank node, or a literal whose datatype rdflib normalizes, is undecided), `case="lower"|"upper"` wraps that text (Python's `str.lower()`/`str.upper()`, decided on ASCII text only), a language-tagged constant needs the same tag on the text, and `regex` decides only patterns from an allow-listed subset that agrees with Python's `re`; the stub's docstring has the exact rules.
 
 `keep` takes a dict from position (`"s"`, `"p"`, `"o"`, `"g"` or 0–3) to a code set or a code range. A set is a `U64Column`, a u64 buffer or a list of ints. A range is a `range` with step 1 (a stepped `range` raises `ValueError`) or a 2-tuple `(lo, hi)`, the half-open codes `lo <= code < hi`. A 2-tuple is always a range, so a set of codes is passed as a list or a `U64Column`, never as `tuple(codes)`. `limit`/`offset` window the rows in base order (`count_quads` counts the same window), and a filtered file scan stops at the first block that fills the window. A probe of the `*_many` calls is an `(s, p, o, g)` tuple or a dict with keys `s`, `p`, `o`, `g`, `keep`, `limit`, `offset`; every probe is parsed before any is evaluated.
+
+`match_codes_many` returns an iterator whose probes run while it is pulled, at most `lookahead` of them in flight (twice the CPU count by default); dropping it aborts the probes still running. `match_code_chunks` takes the narrowing of `match_codes`, plus `columns` (any of `"s"`, `"p"`, `"o"`, `"g"`, in the order the chunks hold them) and `batch_rows` (65,536 by default): each chunk is read or gathered when it is pulled. A `CancelToken` passed as `cancel=` to `match_codes`, `count_quads`, the `*_many` calls or `match_code_chunks` stops them from any thread: a call or pull waiting when it is cancelled stops at its next wait for data (on file, the next split boundary) and raises `Cancelled`, a `VortexRdfError`, as does every later call or pull given the token, while a result already complete is returned; without a token the calls run unraced on the calling thread. `join_count` counts a join's pairs without building them, and `join_indices(other, max_pairs=n)` raises `JoinTooLarge` (`args[1]` is the pair count) before building more than `n`. `groups()` builds a column's side of a join once; `CodeGroups.join` of consecutive `slice`s of the other column, each offset by its start, concatenates to the one-shot `join_indices`.
 
 ## Build options
 

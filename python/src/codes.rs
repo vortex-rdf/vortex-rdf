@@ -601,7 +601,7 @@ impl U64Column {
             .detach(|| {
                 columns::equi_join_indices(self.codes.as_slice(), right.as_slice(), max_pairs)
             })
-            .map_err(join_too_large)?;
+            .map_err(|pairs| join_too_large(pairs, max_pairs))?;
         Ok((
             U64Column { codes: left_idx },
             U64Column { codes: right_idx },
@@ -642,11 +642,12 @@ impl U64Column {
     }
 }
 
-/// `JoinTooLarge` for a join refused at `pairs` pairs: its `args` are the
-/// message and `pairs`.
-fn join_too_large(pairs: usize) -> PyErr {
+/// `JoinTooLarge` for a join of `pairs` pairs refused by its `max_pairs`
+/// cap: its `args` are the message, which names both, and `pairs`.
+fn join_too_large(pairs: usize, max_pairs: Option<usize>) -> PyErr {
+    let cap = max_pairs.unwrap_or_else(|| unreachable!("only a max_pairs cap refuses a join"));
     JoinTooLarge::new_err((
-        format!("the join makes {pairs} pairs, more than its max_pairs"),
+        format!("the join makes {pairs} pairs, more than its max_pairs of {cap}"),
         pairs,
     ))
 }
@@ -695,7 +696,7 @@ impl CodeGroups {
         let left = extract_u64s(column)?;
         let (left_idx, right_idx) = py
             .detach(|| self.groups.join(left.as_slice(), max_pairs))
-            .map_err(join_too_large)?;
+            .map_err(|pairs| join_too_large(pairs, max_pairs))?;
         Ok((
             U64Column { codes: left_idx },
             U64Column { codes: right_idx },

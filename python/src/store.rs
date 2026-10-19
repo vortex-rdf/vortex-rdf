@@ -10,9 +10,11 @@ use vortex_buffer::Buffer;
 use vortex_rdf_core::{TermCode, VortexRdfError as CoreError, VortexRdfStore as CoreStore};
 
 use crate::batch::Batch;
+use crate::cancel::{Pulled, Token};
+use crate::chunks::{CodeChunks, chunk_columns, every_column};
 use crate::codes::{TermDict, U64Column, decode_slice};
 use crate::probes::{narrowed_probe, parse_probes};
-use crate::{RUNTIME, VortexRdfError, detached, py_err};
+use crate::{CancelToken, RUNTIME, VortexRdfError, cancelled, detached, py_err, raced, settled};
 use vortex_rdf_core::Probe;
 
 /// `(s, p, o, g)` code columns as returned by [`VortexRdfStore::match_codes`].
@@ -27,12 +29,13 @@ fn code_columns([s, p, o, g]: [Buffer<TermCode>; 4]) -> CodeColumns {
     )
 }
 
+/// One probe's gathered `(s, p, o, g)` code columns, or `None` where the
+/// code path does not apply.
+type ProbeColumns = Option<[Buffer<TermCode>; 4]>;
+
 /// The rows `probe` matches as `(s, p, o, g)` term-code columns, gathered,
 /// or `None` when the match declines the code path.
-async fn probe_codes(
-    store: &CoreStore,
-    probe: &Probe,
-) -> Result<Option<[Buffer<TermCode>; 4]>, CoreError> {
+async fn probe_codes(store: &CoreStore, probe: &Probe) -> Result<ProbeColumns, CoreError> {
     store.run_probe(probe).await?.code_columns_gathered().await
 }
 
@@ -56,15 +59,23 @@ fn batch_lookahead(lookahead: Option<usize>) -> PyResult<usize> {
     }
 }
 
+/// The token a `cancel=` argument carries.
+fn token_of(cancel: Option<&Bound<'_, CancelToken>>) -> Option<Token> {
+    cancel.map(|cancel| cancel.get().token.clone())
+}
+
 /// The answers of [`VortexRdfStore::match_codes_many`], one per probe in
 /// input order: its `(s, p, o, g)` code columns, or `None` where the code
 /// path does not apply. Each `__next__` waits, GIL-released, for the next
-/// answer of a bounded [`Batch`]; the first failing probe raises at its
+/// answer of a bounded [`Batch`], raced with the call's cancel token if it
+/// passed one; the first failing probe, or a cancelled pull, raises at its
 /// position and ends the iteration, and dropping the iterator aborts the
 /// probes still in flight.
 #[pyclass(frozen, module = "vortex_rdf._native")]
 pub struct ProbeAnswers {
     answers: Mutex<Answers>,
+    /// The token every pull races, when the call passed one.
+    token: Option<Token>,
     /// The number of probes, answered or not.
     len: usize,
 }
@@ -72,22 +83,25 @@ pub struct ProbeAnswers {
 /// What a [`ProbeAnswers`] has still to answer.
 enum Answers {
     /// The probes' gathered code columns, from a running batch.
-    Batch(Batch<Option<[Buffer<TermCode>; 4]>>),
+    Batch(Batch<ProbeColumns>),
     /// `None` for each of this many probes: the store's rows have no codes,
     /// so no probe runs.
     Declined(usize),
 }
 
 impl Answers {
-    /// The next probe's answer; `None` once the probes have all answered or
-    /// one has failed.
-    fn next(&mut self) -> Option<Result<Option<[Buffer<TermCode>; 4]>, CoreError>> {
+    /// The next probe's answer, pulled with `token`; `None` once the probes
+    /// have all answered, one has failed or a pull was cancelled.
+    fn next(&mut self, token: Option<&Token>) -> Pulled<Option<Result<ProbeColumns, CoreError>>> {
         match self {
-            Answers::Batch(batch) => batch.next(&RUNTIME),
-            Answers::Declined(left) => {
-                *left = left.checked_sub(1)?;
-                Some(Ok(None))
-            }
+            Answers::Batch(batch) => batch.next(&RUNTIME, token),
+            Answers::Declined(left) => Pulled::Done(match left.checked_sub(1) {
+                Some(rest) => {
+                    *left = rest;
+                    Some(Ok(None))
+                }
+                None => None,
+            }),
         }
     }
 }
@@ -105,12 +119,13 @@ impl ProbeAnswers {
             self.answers
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .next()
+                .next(self.token.as_ref())
         });
         match answer {
-            None => Ok(None),
-            Some(Ok(columns)) => Ok(Some(columns.map(code_columns))),
-            Some(Err(error)) => Err(py_err(error)),
+            Pulled::Done(None) => Ok(None),
+            Pulled::Done(Some(Ok(columns))) => Ok(Some(columns.map(code_columns))),
+            Pulled::Done(Some(Err(error))) => Err(py_err(error)),
+            Pulled::Cancelled => Err(cancelled()),
         }
     }
 
@@ -367,10 +382,13 @@ impl VortexRdfStore {
     /// [`Self::match_codes`] does: `offset` skips that many matched rows,
     /// and `limit` caps the count, stopping the read as soon as that many
     /// rows are known to exist (`count_quads(..., limit=1)` is an existence
-    /// test).
+    /// test). With a `cancel` token the count runs as a task raced with
+    /// it ([`CancelToken`]); without one it runs on the calling thread.
     // The parameters are the Python signature: a pattern and its narrowing.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (s=None, p=None, o=None, g=None, *, keep=None, limit=None, offset=0))]
+    #[pyo3(signature = (
+        s=None, p=None, o=None, g=None, *, keep=None, limit=None, offset=0, cancel=None
+    ))]
     fn count_quads(
         &self,
         py: Python<'_>,
@@ -381,9 +399,16 @@ impl VortexRdfStore {
         keep: Option<&Bound<'_, PyAny>>,
         limit: Option<usize>,
         offset: usize,
+        cancel: Option<&Bound<'_, CancelToken>>,
     ) -> PyResult<usize> {
         let probe = narrowed_probe(s, p, o, g, keep, limit, offset)?;
-        detached(py, || self.store.count_probe(&probe))
+        match token_of(cancel) {
+            None => detached(py, || self.store.count_probe(&probe)),
+            Some(token) => {
+                let store = self.store.clone();
+                raced(py, &token, async move { store.count_probe(&probe).await })
+            }
+        }
     }
 
     /// [`Self::count_quads`] for a batch of probes in one GIL-released call,
@@ -394,17 +419,19 @@ impl VortexRdfStore {
     /// run concurrently, at most `lookahead` of them spawned and unanswered
     /// at a time (see [`Self::match_codes_many`]). The call raises the error
     /// of the first failing probe in input order and aborts the probes after
-    /// it.
-    #[pyo3(signature = (probes, *, lookahead=None))]
+    /// it. With a `cancel` token the whole batch is one pull raced with it.
+    #[pyo3(signature = (probes, *, lookahead=None, cancel=None))]
     fn count_quads_many(
         &self,
         py: Python<'_>,
         probes: &Bound<'_, PyAny>,
         lookahead: Option<usize>,
+        cancel: Option<&Bound<'_, CancelToken>>,
     ) -> PyResult<Vec<usize>> {
         let lookahead = batch_lookahead(lookahead)?;
         let probes = parse_probes(probes)?;
-        py.detach(|| {
+        let token = token_of(cancel);
+        settled(py.detach(|| {
             Batch::spawn(
                 &RUNTIME,
                 &self.store,
@@ -412,9 +439,8 @@ impl VortexRdfStore {
                 lookahead,
                 |store, probe| async move { store.count_probe(&probe).await },
             )
-            .collect(&RUNTIME)
-        })
-        .map_err(py_err)
+            .collect(&RUNTIME, token.as_ref())
+        }))
     }
 
     /// Match a pattern and return the matching quads as four parallel columns
@@ -462,10 +488,14 @@ impl VortexRdfStore {
     /// `(lo, hi)`, the half-open codes `lo <= code < hi`; what
     /// `TermDict.prefix_range` yields). A 2-tuple is never a set. `offset`
     /// and `limit` window the rows in base order; a filtered file scan stops
-    /// at the first block that fills the window.
+    /// at the first block that fills the window. With a `cancel` token the
+    /// match runs as a task raced with it ([`CancelToken`]); without one it
+    /// runs on the calling thread.
     // The parameters are the Python signature: a pattern and its narrowing.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (s=None, p=None, o=None, g=None, *, keep=None, limit=None, offset=0))]
+    #[pyo3(signature = (
+        s=None, p=None, o=None, g=None, *, keep=None, limit=None, offset=0, cancel=None
+    ))]
     fn match_codes(
         &self,
         py: Python<'_>,
@@ -476,13 +506,76 @@ impl VortexRdfStore {
         keep: Option<&Bound<'_, PyAny>>,
         limit: Option<usize>,
         offset: usize,
+        cancel: Option<&Bound<'_, CancelToken>>,
     ) -> PyResult<Option<CodeColumns>> {
         let probe = narrowed_probe(s, p, o, g, keep, limit, offset)?;
         if self.store.dict_reader().is_none() {
             return Ok(None);
         }
-        let columns = detached(py, || probe_codes(&self.store, &probe))?;
+        let columns = match token_of(cancel) {
+            None => detached(py, || probe_codes(&self.store, &probe))?,
+            Some(token) => {
+                let store = self.store.clone();
+                raced(py, &token, async move { probe_codes(&store, &probe).await })?
+            }
+        };
         Ok(columns.map(code_columns))
+    }
+
+    /// [`Self::match_codes`] in chunks: an iterator ([`CodeChunks`]) whose
+    /// `__next__` pulls the next chunk of at most `batch_rows` rows in base
+    /// row order, as one zero-copy `U64Column` per name in `columns`
+    /// (`"s"`, `"p"`, `"o"`, `"g"`, in the order given), or `None` when the
+    /// code path does not apply. `keep`, `limit` and `offset` narrow the
+    /// match as for [`Self::match_codes`]; this call resolves the narrowed
+    /// match, and its rows are read or gathered one chunk per pull. With a
+    /// `cancel` token this call and every pull race it ([`CancelToken`]).
+    /// `batch_rows == 0`, no column or an unknown name raises `ValueError`.
+    // The parameters are the Python signature: a pattern, its narrowing and
+    // the chunk shape.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        s=None, p=None, o=None, g=None, *, keep=None, limit=None, offset=0,
+        columns=every_column(), batch_rows=65536, cancel=None
+    ))]
+    fn match_code_chunks(
+        &self,
+        py: Python<'_>,
+        s: Option<&str>,
+        p: Option<&str>,
+        o: Option<&str>,
+        g: Option<&str>,
+        keep: Option<&Bound<'_, PyAny>>,
+        limit: Option<usize>,
+        offset: usize,
+        columns: Vec<String>,
+        batch_rows: usize,
+        cancel: Option<&Bound<'_, CancelToken>>,
+    ) -> PyResult<Option<CodeChunks>> {
+        let probe = narrowed_probe(s, p, o, g, keep, limit, offset)?;
+        let columns = chunk_columns(&columns)?;
+        if batch_rows == 0 {
+            return Err(PyValueError::new_err(
+                "batch_rows must be at least 1: the most rows a chunk holds",
+            ));
+        }
+        if self.store.dict_reader().is_none() {
+            return Ok(None);
+        }
+        let token = token_of(cancel);
+        let store = self.store.clone();
+        let wanted = columns.clone();
+        let chunks = async move {
+            store
+                .run_probe(&probe)
+                .await?
+                .code_chunks(&wanted, batch_rows)
+        };
+        let stream = match &token {
+            None => detached(py, || chunks)?,
+            Some(token) => raced(py, token, chunks)?,
+        };
+        Ok(Some(CodeChunks::new(stream, token, columns, batch_rows)))
     }
 
     /// [`Self::match_codes`] for a batch of probes, answered in input order
@@ -493,13 +586,16 @@ impl VortexRdfStore {
     /// time (by default twice the machine's parallelism). The first failing
     /// probe in input order raises at its position, and the probes after it
     /// are aborted, as are the probes in flight when the iterator is
-    /// dropped. On a store whose rows have no codes every answer is `None`
-    /// and no probe runs.
-    #[pyo3(signature = (probes, *, lookahead=None))]
+    /// dropped. With a `cancel` token every pull races it
+    /// ([`CancelToken`]): a cancelled pull raises at its position and aborts
+    /// the probes in flight. On a store whose rows have no codes every
+    /// answer is `None` and no probe runs.
+    #[pyo3(signature = (probes, *, lookahead=None, cancel=None))]
     fn match_codes_many(
         &self,
         probes: &Bound<'_, PyAny>,
         lookahead: Option<usize>,
+        cancel: Option<&Bound<'_, CancelToken>>,
     ) -> PyResult<ProbeAnswers> {
         let lookahead = batch_lookahead(lookahead)?;
         let probes = parse_probes(probes)?;
@@ -517,6 +613,7 @@ impl VortexRdfStore {
         };
         Ok(ProbeAnswers {
             answers: Mutex::new(answers),
+            token: token_of(cancel),
             len,
         })
     }

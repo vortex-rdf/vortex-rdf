@@ -7,6 +7,8 @@
 //! stores are opened lazily from `.vortex` files and queried in place.
 
 mod batch;
+mod cancel;
+mod chunks;
 mod codes;
 mod probes;
 mod serialize;
@@ -19,6 +21,8 @@ use std::sync::LazyLock;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use vortex_rdf_core::VortexRdfError as CoreError;
+
+use crate::cancel::{Pulled, Token, pull};
 
 pyo3::create_exception!(
     _native,
@@ -34,7 +38,16 @@ pyo3::create_exception!(
     JoinTooLarge,
     VortexRdfError,
     "Raised when a join would make more row pairs than its `max_pairs` allows, before any pair \
-     is built. `args` is `(message, pairs)`: `args[1]` is the join's pair count."
+     is built. `args` is `(message, pairs)`: the message names the count and the cap, and \
+     `args[1]` is the join's pair count."
+);
+
+pyo3::create_exception!(
+    _native,
+    Cancelled,
+    VortexRdfError,
+    "Raised by a call or a pull whose `CancelToken` was cancelled before it completed: the work \
+     it had in flight is dropped, and an iterator that raises it stops."
 );
 
 /// Shared runtime for all blocking native calls. Created lazily so a process
@@ -72,16 +85,78 @@ where
     py.detach(|| RUNTIME.block_on(pin!(task()))).map_err(py_err)
 }
 
+/// The [`Cancelled`] a call or a pull raises once its token is cancelled.
+pub(crate) fn cancelled() -> PyErr {
+    Cancelled::new_err("cancelled through its CancelToken")
+}
+
+/// A pull's outcome as the Python call raises it: [`Cancelled`] for a
+/// cancelled pull, a failed one as [`py_err`] maps it.
+pub(crate) fn settled<T>(pulled: Pulled<Result<T, CoreError>>) -> PyResult<T> {
+    match pulled {
+        Pulled::Done(result) => result.map_err(py_err),
+        Pulled::Cancelled => Err(cancelled()),
+    }
+}
+
+/// [`detached`] for a call given a cancel token: `fut` runs as a task on
+/// [`RUNTIME`] raced with `token` (see [`pull`]) while the calling thread
+/// waits with the GIL released.
+pub(crate) fn raced<T, Fut>(py: Python<'_>, token: &Token, fut: Fut) -> PyResult<T>
+where
+    T: Send + 'static,
+    Fut: Future<Output = Result<T, CoreError>> + Send + 'static,
+{
+    settled(py.detach(|| pull(&RUNTIME, Some(token), fut)))
+}
+
+/// A cancel token for one query's long calls: passed as `cancel=` to the
+/// calls that take it, it stops them from any thread. A call or pull still
+/// in progress when the token is cancelled stops at its next await (on
+/// file, the next split boundary) and raises [`Cancelled`]; one that
+/// completes without awaiting again (an in-memory gather) returns its
+/// result, and the next call or pull given the token raises [`Cancelled`].
+/// Cancelling is final.
+#[pyclass(frozen, module = "vortex_rdf._native")]
+pub struct CancelToken {
+    pub(crate) token: Token,
+}
+
+#[pymethods]
+impl CancelToken {
+    #[new]
+    fn new() -> Self {
+        CancelToken {
+            token: Token::new(),
+        }
+    }
+
+    /// Cancels the token, from any thread; cancelling it again does
+    /// nothing.
+    fn cancel(&self) {
+        self.token.cancel();
+    }
+
+    /// Whether the token has been cancelled.
+    #[getter]
+    fn cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<store::VortexRdfStore>()?;
     m.add_class::<store::ProbeAnswers>()?;
+    m.add_class::<chunks::CodeChunks>()?;
+    m.add_class::<CancelToken>()?;
     m.add_class::<codes::TermDict>()?;
     m.add_class::<codes::U64Column>()?;
     m.add_class::<codes::CodeGroups>()?;
     m.add_function(wrap_pyfunction!(serialize::serialize_rdf, m)?)?;
     m.add("VortexRdfError", m.py().get_type::<VortexRdfError>())?;
     m.add("JoinTooLarge", m.py().get_type::<JoinTooLarge>())?;
+    m.add("Cancelled", m.py().get_type::<Cancelled>())?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from vortex_rdf import VortexRdfError, VortexRdfStore, serialize_rdf
+from vortex_rdf import CancelToken, Cancelled, VortexRdfError, VortexRdfStore, serialize_rdf
 
 from conftest import NAME, u64_rows
 
@@ -95,6 +95,19 @@ def test_a_window_of_one_answers_like_the_default_window(code_store):
     for many in (code_store.match_codes_many, code_store.count_quads_many):
         with pytest.raises(ValueError, match="lookahead"):
             many(FIXTURE_PROBES, lookahead=0)
+
+
+def test_a_cancelled_token_raises_at_the_next_pull_then_stops(code_store):
+    token = CancelToken()
+    answers = code_store.match_codes_many(FIXTURE_PROBES, cancel=token)
+    assert u64_rows(next(answers)) == u64_rows(_one_shot(code_store, FIXTURE_PROBES[0]))
+    token.cancel()
+    with pytest.raises(Cancelled):
+        next(answers)
+    for _ in range(2):
+        with pytest.raises(StopIteration):
+            next(answers)
+    assert len(answers) == len(FIXTURE_PROBES)
 
 
 def test_a_store_without_codes_answers_none_and_runs_no_probe(string_store):

@@ -1,14 +1,17 @@
 //! The bounded batch driver of the Python bindings, compiled without Python
-//! (the crate's own test target is off: it would need to link libpython).
+//! (the crate's own test target is off: it would need to link libpython),
+//! together with the cancellable pull it answers through.
 //!
 //! Each probe is a future whose completion order the test fixes with
 //! notifications, so which result the batch reports never depends on timing.
 
 #[path = "../src/batch.rs"]
 mod batch;
+#[path = "../src/cancel.rs"]
+mod cancel;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use tokio::runtime::{Builder, Runtime};
@@ -16,6 +19,7 @@ use tokio::sync::Notify;
 use vortex_rdf_core::VortexRdfError;
 
 use batch::Batch;
+use cancel::{Pulled, Token, pull_hooks};
 
 fn runtime() -> Runtime {
     Builder::new_multi_thread()
@@ -24,10 +28,18 @@ fn runtime() -> Runtime {
         .unwrap()
 }
 
+/// What a pull without a token answers: it is never cancelled.
+fn done<T>(pulled: Pulled<T>) -> T {
+    match pulled {
+        Pulled::Done(value) => value,
+        Pulled::Cancelled => panic!("a pull without a token was cancelled"),
+    }
+}
+
 /// `count` probes that finish in reverse input order, all of them in the
 /// window: probe `i` waits for probe `i + 1` to finish, then answers
-/// `outcomes[i]`. The batch is pulled one answer at a time until it ends;
-/// an error comes back as its message.
+/// `outcomes[i]`. The batch is pulled one answer at a time, without a token,
+/// until it ends; an error comes back as its message.
 fn finishing_in_reverse(
     runtime: &Runtime,
     outcomes: Vec<Result<usize, &'static str>>,
@@ -49,9 +61,16 @@ fn finishing_in_reverse(
             outcome.map_err(|message| VortexRdfError::InvalidOperation(message.to_string()))
         },
     );
-    std::iter::from_fn(|| batch.next(runtime))
+    let spawns = pull_hooks::SPAWNS.get();
+    let answers = std::iter::from_fn(|| done(batch.next(runtime, None)))
         .map(|answer| answer.map_err(message))
-        .collect()
+        .collect();
+    assert_eq!(
+        pull_hooks::SPAWNS.get(),
+        spawns,
+        "a pull without a token spawned a task"
+    );
+    answers
 }
 
 fn message(error: VortexRdfError) -> String {
@@ -71,14 +90,16 @@ fn answers_come_back_in_input_order_whatever_the_finishing_order() {
 #[test]
 fn no_probes_answer_nothing() {
     let runtime = runtime();
-    let answers = Batch::spawn(
-        &runtime,
-        &(),
-        Vec::<usize>::new(),
-        2,
-        |(), probe| async move { Ok::<_, VortexRdfError>(probe) },
-    )
-    .collect(&runtime);
+    let answers = done(
+        Batch::spawn(
+            &runtime,
+            &(),
+            Vec::<usize>::new(),
+            2,
+            |(), probe| async move { Ok::<_, VortexRdfError>(probe) },
+        )
+        .collect(&runtime, None),
+    );
     assert!(answers.unwrap().is_empty());
 }
 
@@ -140,26 +161,28 @@ fn wait_until(what: &str, condition: impl Fn() -> bool) {
 fn a_failure_aborts_the_probes_still_running() {
     let runtime = runtime();
     let dropped = Arc::new(AtomicUsize::new(0));
-    let error = Batch::spawn(
-        &runtime,
-        &dropped,
-        (0..4).collect::<Vec<usize>>(),
-        4,
-        |dropped, probe| {
-            // The guard rides with the future from its creation, so a probe
-            // aborted before its first poll is counted too.
-            let guard = (probe != 0).then(|| Dropped(dropped));
-            async move {
-                if probe == 0 {
-                    return Err(VortexRdfError::InvalidOperation("probe 0".to_string()));
+    let error = done(
+        Batch::spawn(
+            &runtime,
+            &dropped,
+            (0..4).collect::<Vec<usize>>(),
+            4,
+            |dropped, probe| {
+                // The guard rides with the future from its creation, so a
+                // probe aborted before its first poll is counted too.
+                let guard = (probe != 0).then(|| Dropped(dropped));
+                async move {
+                    if probe == 0 {
+                        return Err(VortexRdfError::InvalidOperation("probe 0".to_string()));
+                    }
+                    let _guard = guard;
+                    std::future::pending::<()>().await;
+                    Ok(probe)
                 }
-                let _guard = guard;
-                std::future::pending::<()>().await;
-                Ok(probe)
-            }
-        },
+            },
+        )
+        .collect(&runtime, None),
     )
-    .collect(&runtime)
     .expect_err("probe 0 fails");
     assert_eq!(message(error), "probe 0");
     wait_until("the three pending probes to be aborted", || {
@@ -191,7 +214,7 @@ fn a_panicking_probe_reraises_and_aborts_the_rest() {
                 }
             },
         )
-        .collect(&runtime)
+        .collect(&runtime, None)
     }));
     let payload = outcome.expect_err("the panic reaches the caller");
     let text = payload
@@ -205,13 +228,16 @@ fn a_panicking_probe_reraises_and_aborts_the_rest() {
     });
 }
 
-/// A batch dropped after its first answer aborts the probes in its window
-/// and spawns none of the rest. With a window of two over eight probes that
-/// never finish past the first, at most three are ever spawned, and every
-/// spawned probe but the first is dropped unfinished.
-#[test]
-fn dropping_the_batch_aborts_what_is_in_flight_and_starts_nothing() {
-    let runtime = runtime();
+/// Eight probes that never finish past the first, through a window of two,
+/// counting the probes spawned, finished and dropped.
+fn stalled_batch(
+    runtime: &Runtime,
+) -> (
+    Batch<usize>,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+) {
     let spawned = Arc::new(AtomicUsize::new(0));
     let finished = Arc::new(AtomicUsize::new(0));
     let dropped = Arc::new(AtomicUsize::new(0));
@@ -220,8 +246,8 @@ fn dropping_the_batch_aborts_what_is_in_flight_and_starts_nothing() {
         Arc::clone(&finished),
         Arc::clone(&dropped),
     );
-    let mut batch = Batch::spawn(
-        &runtime,
+    let batch = Batch::spawn(
+        runtime,
         &counters,
         (0..8).collect::<Vec<usize>>(),
         2,
@@ -238,10 +264,24 @@ fn dropping_the_batch_aborts_what_is_in_flight_and_starts_nothing() {
             }
         },
     );
-    assert_eq!(batch.next(&runtime).map(Result::unwrap), Some(0));
+    (batch, spawned, finished, dropped)
+}
+
+/// A batch dropped after its first answer aborts the probes in its window
+/// and spawns none of the rest: a window of two spawns two probes for the
+/// first answer, and every spawned probe but the first is dropped
+/// unfinished.
+#[test]
+fn dropping_the_batch_aborts_what_is_in_flight_and_starts_nothing() {
+    let runtime = runtime();
+    let (mut batch, spawned, finished, dropped) = stalled_batch(&runtime);
+    assert_eq!(
+        done(batch.next(&runtime, None)).map(Result::unwrap),
+        Some(0)
+    );
     drop(batch);
     let started = spawned.load(Ordering::SeqCst);
-    assert!(started <= 3, "{started} probes spawned for a window of two");
+    assert_eq!(started, 2, "{started} probes spawned for a window of two");
     wait_until("every spawned probe to be dropped", || {
         dropped.load(Ordering::SeqCst) == started
     });
@@ -257,6 +297,58 @@ fn dropping_the_batch_aborts_what_is_in_flight_and_starts_nothing() {
     );
 }
 
+/// A pull whose token is cancelled while it waits ends the batch: the
+/// probes in its window are aborted, none of the rest is spawned, and every
+/// later pull answers nothing.
+#[test]
+fn a_cancelled_pull_aborts_the_window() {
+    let runtime = Arc::new(runtime());
+    let (mut batch, spawned, finished, dropped) = stalled_batch(&runtime);
+    let token = Token::new();
+    assert_eq!(
+        done(batch.next(&runtime, Some(&token))).map(Result::unwrap),
+        Some(0)
+    );
+    let canceller = std::thread::spawn({
+        let token = token.clone();
+        move || {
+            std::thread::sleep(Duration::from_millis(50));
+            token.cancel();
+        }
+    });
+    // Pulled on a thread of its own, so a pull that misses the cancel fails
+    // the test rather than hanging it.
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn({
+        let (runtime, token) = (Arc::clone(&runtime), token.clone());
+        move || {
+            let cancelled = matches!(batch.next(&runtime, Some(&token)), Pulled::Cancelled);
+            let _ = sender.send((cancelled, batch));
+        }
+    });
+    let (cancelled, mut batch) = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("the cancel did not land within a second");
+    assert!(cancelled, "the pull answered instead of stopping");
+    canceller.join().unwrap();
+    wait_until("every spawned probe to be dropped", || {
+        dropped.load(Ordering::SeqCst) == spawned.load(Ordering::SeqCst)
+    });
+    assert_eq!(
+        finished.load(Ordering::SeqCst),
+        1,
+        "an aborted probe finished"
+    );
+    for token in [Some(&token), None] {
+        assert!(matches!(batch.next(&runtime, token), Pulled::Done(None)));
+    }
+    assert_eq!(
+        spawned.load(Ordering::SeqCst),
+        3,
+        "a probe was spawned after the cancel"
+    );
+}
+
 /// The answers of `outcomes` through a window of `lookahead`, collected:
 /// probe `i` yields to the runtime once for each probe after it before it
 /// answers, so with several in the window the later probes finish first.
@@ -268,19 +360,21 @@ fn answered_through(
     let count = outcomes.len();
     let probes: Vec<(usize, Result<usize, &'static str>)> =
         outcomes.iter().copied().enumerate().collect();
-    Batch::spawn(
-        runtime,
-        &(),
-        probes,
-        lookahead,
-        move |(), (index, outcome)| async move {
-            for _ in index..count {
-                tokio::task::yield_now().await;
-            }
-            outcome.map_err(|message| VortexRdfError::InvalidOperation(message.to_string()))
-        },
+    done(
+        Batch::spawn(
+            runtime,
+            &(),
+            probes,
+            lookahead,
+            move |(), (index, outcome)| async move {
+                for _ in index..count {
+                    tokio::task::yield_now().await;
+                }
+                outcome.map_err(|message| VortexRdfError::InvalidOperation(message.to_string()))
+            },
+        )
+        .collect(runtime, None),
     )
-    .collect(runtime)
     .map_err(message)
 }
 

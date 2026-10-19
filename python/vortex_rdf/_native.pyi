@@ -36,7 +36,13 @@ class VortexRdfError(Exception):
 class JoinTooLarge(VortexRdfError):
     """Raised when a join would make more row pairs than its ``max_pairs``
     allows, before any pair is built. ``args`` is ``(message, pairs)``:
-    ``args[1]`` is the join's pair count."""
+    the message names the count and the cap, and ``args[1]`` is the join's
+    pair count."""
+
+class Cancelled(VortexRdfError):
+    """Raised by a call or a pull whose `CancelToken` was cancelled before it
+    completed: the work it had in flight is dropped, and an iterator that
+    raises it stops."""
 
 class TermDict:
     def decode(self, code: int) -> Optional[str]:
@@ -238,14 +244,57 @@ class ProbeAnswers:
     input order: its four code columns ``(s, p, o, g)``, or None where the
     code path does not apply. Each `__next__` waits, with the GIL released,
     for the next answer; the probes run while the iterator is pulled, at
-    most `lookahead` of them in flight. The first failing probe raises at its
-    position and ends the iteration; dropping the iterator aborts the probes
-    still in flight."""
+    most `lookahead` of them in flight. The first failing probe, or a pull
+    whose `CancelToken` is cancelled (`Cancelled`), raises at its position
+    and ends the iteration; dropping the iterator aborts the probes still in
+    flight."""
 
     def __iter__(self) -> "ProbeAnswers": ...
     def __next__(self) -> Optional[Tuple[U64Column, U64Column, U64Column, U64Column]]: ...
     def __len__(self) -> int:
         """The number of probes, answered or not."""
+        ...
+    def __repr__(self) -> str: ...
+
+class CodeChunks:
+    """The chunks of `VortexRdfStore.match_code_chunks`: a match's code
+    columns in chunks of at most `batch_rows` rows, in base row order. Each
+    `__next__` pulls one chunk with the GIL released and returns one
+    zero-copy `U64Column` per name in `columns`, in that order. The end of
+    the match, an error or a cancelled `CancelToken` (`Cancelled`) ends the
+    iteration; every later `__next__` raises ``StopIteration``."""
+
+    def __iter__(self) -> "CodeChunks": ...
+    def __next__(self) -> Tuple[U64Column, ...]: ...
+    @property
+    def columns(self) -> Tuple[str, ...]:
+        """The names of the columns each chunk holds, in order."""
+        ...
+    @property
+    def batch_rows(self) -> int:
+        """The most rows a chunk holds."""
+        ...
+    def __repr__(self) -> str: ...
+
+class CancelToken:
+    """A cancel token for one query's long calls: passed as ``cancel=`` to
+    `VortexRdfStore.match_codes`, `count_quads`, `match_codes_many`,
+    `count_quads_many` and `match_code_chunks`, it stops them from any
+    thread. A call or pull still in progress when the token is cancelled
+    stops at its next wait for data (on file, the next split boundary) and
+    raises `Cancelled`; one that finishes without waiting again (in memory,
+    a chunk's or a probe's gather) returns its result, and the next call or
+    pull given the token raises `Cancelled`. Cancelling is final. Without a
+    token those calls run on the calling thread, unraced."""
+
+    def __init__(self) -> None: ...
+    def cancel(self) -> None:
+        """Cancel the token, from any thread; cancelling it again does
+        nothing."""
+        ...
+    @property
+    def cancelled(self) -> bool:
+        """Whether the token has been cancelled."""
         ...
     def __repr__(self) -> str: ...
 
@@ -287,6 +336,7 @@ class VortexRdfStore:
         keep: Optional[_KeepSpec] = None,
         limit: Optional[int] = None,
         offset: int = 0,
+        cancel: Optional[CancelToken] = None,
     ) -> Optional[Tuple[U64Column, U64Column, U64Column, U64Column]]:
         """The matching rows as four zero-copy u64 code columns ``(s, p, o,
         g)`` decodable through `term_dict`, or None when the code path does
@@ -298,10 +348,40 @@ class VortexRdfStore:
         code range (a ``range`` with step 1, or a 2-tuple ``(lo, hi)``, the
         half-open codes ``lo <= code < hi``; a 2-tuple is never a set).
         `offset` and `limit` window the rows in base order; a filtered file
-        scan stops at the first block that fills the window."""
+        scan stops at the first block that fills the window. With a
+        `cancel` token the match races it (`CancelToken`)."""
+        ...
+    def match_code_chunks(
+        self,
+        s: Optional[str] = None,
+        p: Optional[str] = None,
+        o: Optional[str] = None,
+        g: Optional[str] = None,
+        *,
+        keep: Optional[_KeepSpec] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        columns: Sequence[str] = ("s", "p", "o", "g"),
+        batch_rows: int = 65536,
+        cancel: Optional[CancelToken] = None,
+    ) -> Optional[CodeChunks]:
+        """`match_codes` in chunks: an iterator (`CodeChunks`) of at most
+        `batch_rows` rows a chunk, in base row order, each chunk one
+        zero-copy `U64Column` per name in `columns` (``"s"``, ``"p"``,
+        ``"o"``, ``"g"``, in the order given), or None when the code path
+        does not apply. `keep`, `limit` and `offset` narrow the match as for
+        `match_codes`; this call resolves the narrowed match, and its rows
+        are read or gathered one chunk per pull, so memory holds one chunk
+        at a time. With a `cancel` token this call and every pull race it
+        (`CancelToken`). ``batch_rows=0``, no column or an unknown name
+        raises ``ValueError``."""
         ...
     def match_codes_many(
-        self, probes: Sequence[_Probe], *, lookahead: Optional[int] = None
+        self,
+        probes: Sequence[_Probe],
+        *,
+        lookahead: Optional[int] = None,
+        cancel: Optional[CancelToken] = None,
     ) -> ProbeAnswers:
         """`match_codes` for a batch of probes, answered in input order by an
         iterator (`ProbeAnswers`). A probe is an ``(s, p, o, g)`` tuple of
@@ -312,16 +392,24 @@ class VortexRdfStore:
         unanswered at a time: by default twice the machine's parallelism;
         ``0`` raises ``ValueError``. The first failing probe in input order
         raises at its position and the probes after it are aborted, as are
-        the probes in flight when the iterator is dropped. On a store whose
-        rows have no codes every answer is None and no probe runs."""
+        the probes in flight when the iterator is dropped. With a `cancel`
+        token every pull races it (`CancelToken`): a cancelled pull raises
+        `Cancelled` at its position and aborts the probes in flight. On a
+        store whose rows have no codes every answer is None and no probe
+        runs."""
         ...
     def count_quads_many(
-        self, probes: Sequence[_Probe], *, lookahead: Optional[int] = None
+        self,
+        probes: Sequence[_Probe],
+        *,
+        lookahead: Optional[int] = None,
+        cancel: Optional[CancelToken] = None,
     ) -> List[int]:
         """`count_quads` for a batch of probes (see `match_codes_many`), in
         input order, in one GIL-released call through the same bounded
         window. The call raises the error of the first failing probe in
-        input order and aborts the probes after it."""
+        input order and aborts the probes after it. With a `cancel` token
+        the whole batch races it (`CancelToken`)."""
         ...
     def get_quads(
         self,
@@ -343,13 +431,15 @@ class VortexRdfStore:
         keep: Optional[_KeepSpec] = None,
         limit: Optional[int] = None,
         offset: int = 0,
+        cancel: Optional[CancelToken] = None,
     ) -> int:
         """Number of quads matching the pattern, counted from the row
         selection; no term is materialized. `keep` narrows as for
         `match_codes` (Dictionary layout only). `offset` and `limit` window
         the rows in base order as `match_codes` does: `offset` skips that
         many matched rows, and `limit` caps the count and stops the read
-        once that many rows are known to exist."""
+        once that many rows are known to exist. With a `cancel` token the
+        count races it (`CancelToken`)."""
         ...
     def match_columns(
         self,

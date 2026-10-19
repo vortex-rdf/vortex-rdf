@@ -469,6 +469,7 @@ def test_join_indices_refuses_more_pairs_than_max_pairs():
         col.join_indices(right, max_pairs=pairs - 1)
     message, count = refused.value.args
     assert count == pairs and str(pairs) in message
+    assert f"max_pairs of {pairs - 1}" in message, "the message names the cap"
     assert isinstance(refused.value, VortexRdfError)
     capped = col.join_indices(right, max_pairs=pairs)
     assert [u64s(c) for c in capped] == [u64s(c) for c in col.join_indices(right)]
