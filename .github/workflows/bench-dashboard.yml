@@ -74,7 +74,7 @@ jobs:
       # unchanged reuses the previous artifact instead of rebuilding it.
       - name: Cache wasm bindings
         id: wasm-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: js/pkg/web
           key: wasm-pkg-${{ hashFiles('core/src/**', 'core/Cargo.toml', 'encoded-search/src/**', 'encoded-search/Cargo.toml', 'js/src/**', 'js/Cargo.toml', 'Cargo.lock') }}
@@ -86,7 +86,7 @@ jobs:
 
       - name: Cache hdt wasm wrapper
         id: hdt-wasm-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: js/bench/hdt-pkg
           key: hdt-pkg-${{ hashFiles('js/bench/hdt-wasm/src/**', 'js/bench/hdt-wasm/Cargo.toml', 'js/bench/hdt-wasm/Cargo.lock') }}
@@ -116,13 +116,13 @@ jobs:
       # than the version we want to measure. Wall-clock; not uploaded to
       # CodSpeed, same as the JS comparative bench.
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v10.3.0
 
       # Same idea as the wasm cache: the extension depends only on the Rust
       # sources, and `maturin develop --release` costs ~4 minutes.
       - name: Cache Python native extension
         id: py-native-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: python/vortex_rdf/_native.abi3.so
           key: py-native-${{ hashFiles('core/src/**', 'core/Cargo.toml', 'encoded-search/src/**', 'encoded-search/Cargo.toml', 'python/src/**', 'python/Cargo.toml', 'Cargo.lock') }}
@@ -139,7 +139,7 @@ jobs:
       # part of the key for the same reason — a bumped interpreter must not
       # come back as a stale one under a fresh venv.
       - name: Cache benchmark virtualenvs
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             python/bench/.venvs
