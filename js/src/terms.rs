@@ -10,7 +10,7 @@ use std::thread::LocalKey;
 
 use js_sys::Reflect;
 use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
-use vortex_rdf_core::VortexRdfStore as CoreStore;
+use vortex_rdf_core::{Probe, VortexRdfStore as CoreStore};
 use wasm_bindgen::prelude::*;
 
 use crate::error::js_err;
@@ -238,7 +238,8 @@ pub(crate) fn quad_arg(val: &JsValue) -> Result<Quad, JsValue> {
 }
 
 /// A four-position match pattern parsed from the JS arguments of `match`,
-/// `getQuads`, `countQuads` and `matchCodes`: `None` is a wildcard.
+/// `getQuads`, `countQuads`, `matchCodes` and `matchCodeChunks`, or from a
+/// probe of `matchCodesMany` and `countQuadsMany`: `None` is a wildcard.
 pub(crate) struct JsPattern {
     pub s: Option<NamedOrBlankNode>,
     pub p: Option<NamedNode>,
@@ -258,6 +259,11 @@ impl JsPattern {
             o: pattern_slot(o, "object", object)?,
             g: pattern_slot(g, "graph", graph)?,
         })
+    }
+
+    /// This pattern as a core [`Probe`], with no narrowing.
+    pub(crate) fn into_probe(self) -> Probe {
+        Probe::new(self.s, self.p, self.o, self.g)
     }
 
     /// The view of `store` matching this pattern, with the error shaped for JS.

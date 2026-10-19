@@ -14,6 +14,9 @@
 //     strings; `.equals` falls back to value/termType compare.
 //
 // LazyQuad/LazyTerm satisfy the RDF/JS Quad/Term interface via getters.
+//
+// The code reads that answer in pieces (`matchCodeChunks`, `matchCodesMany`)
+// hand back a wasm iterator handle wrapped by `makeHandleIterable` below.
 
 const DEC = new TextDecoder();
 
@@ -227,4 +230,50 @@ class QuadStream {
             Promise.resolve().then(() => this._emit('end'));
         }
     }
+}
+
+// ── Iterables over a wasm iterator handle ────────────────────────────────────
+// A `CodeChunks` or `ProbeAnswers` handle answers each `next()` with its next
+// item, or `undefined` once there is none. HandleIterator is the synchronous
+// iterator (and its own Iterable) over one handle, and is Disposable: the
+// handle is freed at the end, at the first error, on `return()` (a `for…of`
+// left early) and on `[Symbol.dispose]` (`using`). An aborted `signal` ends
+// the iteration at the next `next()`, before the handle is pulled; with no
+// handle the iteration has already finished. `_store` holds the store the
+// handle reads (the package entries set it), so the store stays reachable
+// until the handle is freed.
+class HandleIterator {
+    constructor(handle, signal) {
+        this._handle = handle;
+        this._signal = signal;
+        this._store = undefined;
+    }
+    [Symbol.iterator]() { return this; }
+    next() {
+        const handle = this._handle;
+        if (handle === undefined || this._signal?.aborted) return this.return();
+        let value;
+        try {
+            value = handle.next();
+        } catch (error) {
+            this._free();
+            throw error;
+        }
+        return value === undefined ? this.return() : { done: false, value };
+    }
+    return(value) {
+        this._free();
+        return { done: true, value };
+    }
+    _free() {
+        const handle = this._handle;
+        this._handle = undefined;
+        this._store = undefined;
+        handle?.free();
+    }
+}
+if (Symbol.dispose) HandleIterator.prototype[Symbol.dispose] = HandleIterator.prototype._free;
+
+export function makeHandleIterable(handle, signal) {
+    return new HandleIterator(handle, signal);
 }

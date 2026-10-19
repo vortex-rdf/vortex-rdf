@@ -264,7 +264,9 @@ async function benchQuery(triples: Quad[], quads: Quad[]): Promise<void> {
 /** readpath::<variant> — the read entry points on the default store for one
  * selective pattern (S), isolating the boundary cost each carries: getQuads
  * (materialized array), match (lazy stream drain), matchCodes (code columns
- * as Float64Arrays, no term strings). Directly supports read-path tuning.
+ * as Float64Arrays, no term strings), matchCodeChunks (the same columns
+ * pulled through the chunk iterable until it ends: one chunk at the default
+ * chunk size). Directly supports read-path tuning.
  *
  * The `_decoded` variants additionally read every term's `.value`. They are the
  * only benchmarks in this file that exercise term decoding at all — the others
@@ -285,6 +287,9 @@ async function benchReadPath(triples: Quad[], realistic: Quad[]): Promise<void> 
         b.add('readpath::getQuads', async () => { await store.getQuads(p.s, p.p, p.o, p.g); });
         b.add('readpath::match_stream', async () => { await drain(store.match(p.s, p.p, p.o, p.g)); });
         b.add('readpath::matchCodes', async () => { await store.matchCodes(p.s, p.p, p.o, p.g); });
+        b.add('readpath::matchCodeChunks', async () => {
+            for (const _ of store.matchCodeChunks(p.s, p.p, p.o, p.g)!) { /* pull every chunk */ }
+        });
         b.add('readpath::getQuads_decoded', async () => {
             decodeAll(await store.getQuads(p.s, p.p, p.o, p.g));
         });

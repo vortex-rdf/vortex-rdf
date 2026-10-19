@@ -13,4 +13,10 @@ export type {
     LayoutStrategy,
     IndexType,
     RdfFormatName,
+    CodeKeep,
+    ReadOptions,
+    ChunkOptions,
+    CodeColumns,
+    CodeChunk,
+    Probe,
 } from '../pkg/web/vortex_rdf.js';

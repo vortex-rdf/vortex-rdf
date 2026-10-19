@@ -144,6 +144,26 @@ if (cols) {
 
 `match`/`getQuads` are the supported way to read quads; `matchCodes` is the low-level path for callers that join, count and de-duplicate in code space and decode each distinct term once.
 
+`matchCodes` and `countQuads` take an optional fifth argument that narrows the match inside the store, before any row is gathered. `keep` keeps, per position, the rows whose code is in a code set — a `Float64Array` (a column `matchCodes` returned, say) or an array of codes of any length but two — or in a code range, a two-element array `[lo, hi]` holding the codes `lo <= code < hi`. `offset` and `limit` then window the kept rows in base row order, and `countQuads(…, { limit: 1 })` is an existence test. A keep needs code-addressable rows: without them `matchCodes` answers `null` as always, and `countQuads` throws for a keep. A window works on every layout:
+
+```javascript
+const people = store.matchCodes(null, rdfType, foafPerson, null);
+if (people) {
+  const named = store.countQuads(null, foafName, null, null, { keep: { s: people.s } });
+  const page = store.matchCodes(null, foafName, null, null, { keep: { s: people.s }, offset: 100, limit: 100 });
+}
+```
+
+`matchCodeChunks` reads the same columns in chunks: a synchronous iterable of `{ s, p, o, g, length }` chunks of at most `batchRows` rows (8,192 by default), in base row order, each holding a `Float64Array` copy of only the `columns` you name. It takes `matchCodes`'s options plus `columns`, `batchRows` and an `AbortSignal` as `signal`, and returns `null` where `matchCodes` does. Each pull reads one chunk, so the work stops when the pulls stop; an aborted signal ends the iteration at the next pull, a convenience over breaking out yourself, and a signal aborted before the call returns a finished iterable without resolving the match. The iterable's wasm-side handle is freed at its end, when a `for…of` leaves it early, and by `using`:
+
+```javascript
+for (const chunk of store.matchCodeChunks(null, foafKnows, null, null, { columns: ['s', 'o'] }) ?? []) {
+  join(chunk.s, chunk.o, chunk.length);
+}
+```
+
+`matchCodesMany` answers a batch of probes, each an array `[s, p, o, g]` or an object `{ s, p, o, g, keep, limit, offset }`, as an iterable of per-probe `{ s, p, o, g, length }` columns in input order (`null` for each where `matchCodes` answers `null`, and then no probe runs); `countQuadsMany` returns the probes' counts as an array, on every layout. Every probe is parsed before any runs and the probes run one after another: the batch saves boundary crossings and parsing. A chunk or batch iterable holds its store, which stays alive until the iterable is done; once the store is freed with `free()`, `next()` throws.
+
 ## Build options
 
 `fromString`, `fromQuads` and `serializeRdf` accept an optional `BuildOptions` object; every field is optional. Quads are always sorted by subject → predicate → object → graph while the columnar array is built — that global order is what gives subject lookups their binary search and what every secondary index routes against. The wasm build sorts in memory (WebAssembly has no filesystem for an out-of-core builder) and takes no builder option.

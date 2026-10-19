@@ -3,27 +3,38 @@
 //! (`Number.MAX_SAFE_INTEGER`) exactly — not BigInts. Both directions are
 //! checked here, so a code is never rounded or wrapped: a JS value that is no
 //! such integer is refused on the way in, and a code past 2^53 − 1 is an
-//! error on the way out. Pure functions over Rust values, so they are tested
-//! natively; the bindings turn their errors into JS exceptions.
+//! error on the way out. The conversions are pure functions over Rust values,
+//! so they are tested natively; the bindings turn their errors into JS
+//! exceptions, and [`code_array`] hands a converted column to JS.
 
 use vortex_rdf_core::TermCode;
+use wasm_bindgen::JsValue;
+
+use crate::error::js_err;
 
 /// The largest code a JS number holds exactly: 2^53 − 1.
 pub(crate) const MAX_JS_CODE: TermCode = (1 << 53) - 1;
 
-/// A code from JS: a number that is an integer from 0 to 2^53 − 1. Anything
-/// else — negative, fractional, NaN, infinite, or past 2^53 − 1, where
-/// neighbouring integers share one number — is no code.
-pub(crate) fn code_from_js(value: f64) -> Result<TermCode, String> {
+/// The integer `value` holds when it is one from 0 to 2^53 − 1, the
+/// non-negative integers a JS number holds exactly; `None` for anything else
+/// — negative, fractional, NaN, infinite, or past 2^53 − 1, where
+/// neighbouring integers share one number.
+pub(crate) fn safe_u64(value: f64) -> Option<u64> {
     // `MAX_JS_CODE` converts to f64 exactly (it is below 2^53).
-    if value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value <= MAX_JS_CODE as f64 {
-        // An integer in range, so the conversion is exact.
-        Ok(value as TermCode)
-    } else {
-        Err(format!(
+    let whole =
+        value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value <= MAX_JS_CODE as f64;
+    // Returned only for an integer in range, where the conversion is exact.
+    whole.then_some(value as u64)
+}
+
+/// A code from JS: a number that is an integer from 0 to 2^53 − 1
+/// ([`safe_u64`]). Anything else is no code.
+pub(crate) fn code_from_js(value: f64) -> Result<TermCode, String> {
+    safe_u64(value).ok_or_else(|| {
+        format!(
             "a term code is an integer from 0 to 2^53 - 1 (Number.MAX_SAFE_INTEGER), got {value}"
-        ))
-    }
+        )
+    })
 }
 
 /// A code for JS: the number holding it exactly, or the error for a code past
@@ -61,6 +72,18 @@ pub(crate) fn codes_to_js(codes: &[TermCode]) -> Result<Vec<f64>, String> {
     }
     // Every code is at most 2^53 − 1, so each cast is exact.
     Ok(codes.iter().map(|&code| code as f64).collect())
+}
+
+/// A code column as a JS-owned `Float64Array` of its codes ([`codes_to_js`]);
+/// a code past 2^53 − 1 is an error, never a rounded number.
+pub(crate) fn code_array(codes: &[TermCode]) -> Result<js_sys::Float64Array, JsValue> {
+    let numbers = codes_to_js(codes).map_err(js_err)?;
+    // Copy into a JS-owned Float64Array (safe against wasm memory growth,
+    // which would detach a zero-copy view). A wasm32 store holds fewer rows
+    // than a u32 counts, so the length fits.
+    let array = js_sys::Float64Array::new_with_length(numbers.len() as u32);
+    array.copy_from(&numbers);
+    Ok(array)
 }
 
 #[cfg(test)]

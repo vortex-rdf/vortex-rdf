@@ -1,18 +1,22 @@
 //! WebAssembly bindings for `vortex_rdf_core`: the RDF/JS-flavored
 //! `VortexRdfStore` API plus the `serializeRdf`/`deserializeRdf` conversion
-//! entry points. The lazy RDF/JS read model (LazyQuad/LazyTerm + stream) lives
-//! in js-snippets/lazy-rdf.js and the bulk-ingest quad packer in
+//! entry points. The lazy RDF/JS read model (LazyQuad/LazyTerm + stream) and
+//! the iterables over the chunk and batch handles live in
+//! js-snippets/lazy-rdf.js and the bulk-ingest quad packer in
 //! js-snippets/pack-quads.js, both copied verbatim into the generated pkg.
 
 use wasm_bindgen::prelude::*;
 
+mod chunks;
 mod codes;
 mod error;
 mod ingest;
 mod options;
+mod probes;
 mod store;
 mod terms;
 
+pub use chunks::{CodeChunks, ProbeAnswers};
 pub use store::{TermDict, VortexRdfStore};
 
 /// The hand-written TypeScript surface of this crate (the Rust items carry
@@ -52,4 +56,21 @@ pub async fn deserialize_rdf(bytes: Vec<u8>, format_name: &str) -> Result<String
         .await?
         .to_rdf(format_name)
         .await
+}
+
+/// Drive a read future to completion without suspending, or `Err` if it would
+/// have suspended.
+///
+/// The read paths are `async` because a file-backed store resolves its rows
+/// (and its dictionary) through I/O — but this crate builds core with
+/// `default-features = false`, so `file-io` is compiled out and no
+/// `Backend::File` exists here. Every await in a wasm read is therefore
+/// already resolved; a future that did suspend surfaces as an error instead
+/// of a hang.
+pub(crate) fn resolve_now<F: std::future::Future>(future: F) -> Result<F::Output, JsValue> {
+    use futures::FutureExt;
+
+    future
+        .now_or_never()
+        .ok_or_else(|| error::js_err("read suspended: no wasm read path performs I/O"))
 }
