@@ -39,6 +39,9 @@ class JoinTooLarge(VortexRdfError):
     the message names the count and the cap, and ``args[1]`` is the join's
     pair count."""
 
+    pairs: int
+    """The join's pair count: ``args[1]``."""
+
 class Cancelled(VortexRdfError):
     """Raised by a call or a pull whose `CancelToken` was cancelled before it
     completed: the work it had in flight is dropped, and an iterator that

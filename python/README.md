@@ -94,7 +94,7 @@ s.distinct(); o.value_counts()
 left_idx, right_idx = o.join_indices(s)     # rows where o == s, as index pairs
 o.take(left_idx)                            # gather a joined column
 o.join_count(s)                             # the number of pairs, none built
-o.join_indices(s, max_pairs=1_000_000)      # JoinTooLarge rather than more pairs
+o.join_indices(s, max_pairs=1_000_000)      # JoinTooLarge (.pairs is the count) rather than more pairs
 groups = s.groups()                         # the join's right side, built once
 x, z = groups.gather(o, [s], [o])           # rows where o == s: the left s, the right o, no index pairs
 for start in range(0, len(o), 65536):       # a large join, one zero-copy left slice at a time

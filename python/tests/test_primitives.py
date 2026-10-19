@@ -475,6 +475,17 @@ def test_join_indices_refuses_more_pairs_than_max_pairs():
     assert [u64s(c) for c in capped] == [u64s(c) for c in col.join_indices(right)]
 
 
+def test_join_too_large_names_its_pair_count():
+    from vortex_rdf import JoinTooLarge
+
+    col = U64Column([3, 1, 3, 2, 1, 3])
+    right = [1, 9, 3, 3]
+    pairs = col.join_count(right)
+    with pytest.raises(JoinTooLarge) as refused:
+        col.join_indices(right, max_pairs=pairs - 1)
+    assert refused.value.pairs == refused.value.args[1] == pairs
+
+
 def test_groups_gather_is_the_join_indices_taken():
     from vortex_rdf import JoinTooLarge
 
