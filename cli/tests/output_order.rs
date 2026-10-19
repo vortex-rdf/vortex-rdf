@@ -1,7 +1,8 @@
 //! How `deserialize` and `match` treat their output file. They open their
 //! input before they create it: an input that cannot be read leaves an
 //! existing output file as it was. And an output that cannot be written is
-//! reported, not swallowed.
+//! reported, not swallowed. `--help` and `--version` print to standard
+//! output.
 
 mod common;
 
@@ -11,6 +12,29 @@ use std::path::Path;
 use std::process::Output;
 
 const KEPT: &str = "the previous output\n";
+
+/// `--version` names the tool and its version, `--help` lists the three
+/// subcommands, and both exit 0.
+#[test]
+fn help_and_version_name_the_tool() {
+    let version = cli(&[Path::new("--version")], &[]);
+    assert!(version.status.success(), "{version:?}");
+    let version = String::from_utf8(version.stdout).unwrap();
+    assert!(
+        version.contains("vortex-rdf-cli") && version.contains(env!("CARGO_PKG_VERSION")),
+        "{version}"
+    );
+    let help = cli(&[Path::new("--help")], &[]);
+    assert!(help.status.success(), "{help:?}");
+    let help = String::from_utf8(help.stdout).unwrap();
+    for subcommand in ["serialize", "deserialize", "match"] {
+        assert!(
+            help.lines()
+                .any(|line| line.split_whitespace().next() == Some(subcommand)),
+            "{subcommand}: {help}"
+        );
+    }
+}
 
 #[test]
 fn an_unreadable_input_leaves_the_output_file_alone() {

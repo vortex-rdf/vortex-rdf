@@ -1,11 +1,13 @@
 //! The `match` command's pattern flags: each filters on its own position, and
-//! a malformed one is refused under the hint for that flag.
+//! a malformed one is refused under the hint for that flag. And the flags of
+//! `serialize` that choose the store's layout and indexes.
 
 mod common;
 
 use common::{Scratch, TRIPLE, cli, flag, run};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Output;
+use vortex_rdf_core::{IndexType, LayoutStrategy, VortexRdfStore};
 
 const IN_G1: &str = "<http://example.org/s1> <http://example.org/p1> <http://example.org/o1> <http://example.org/g1> .\n";
 const IN_DEFAULT: &str = "<http://example.org/s2> <http://example.org/p2> \"o2\"@en .\n";
@@ -25,7 +27,8 @@ fn matching(input: &Path, name: &str, value: &str) -> Output {
 }
 
 /// Each flag binds its own position: a bare IRI or an angle-bracket one, a
-/// language-tagged literal, a named graph and the default graph.
+/// language-tagged literal, a named graph and the default graph. The RDF
+/// source, matched directly, gives the same output as its store.
 #[test]
 fn each_flag_filters_its_own_position() {
     let scratch = Scratch::new("pattern-flags");
@@ -39,13 +42,76 @@ fn each_flag_filters_its_own_position() {
         ("--graph", "http://example.org/g1", IN_G1),
         ("--graph", "default", IN_DEFAULT),
     ] {
-        let result = matching(&store, name, value);
-        assert!(result.status.success(), "{name} {value}: {result:?}");
-        assert_eq!(
-            String::from_utf8(result.stdout).unwrap(),
-            want,
-            "{name} {value}"
-        );
+        for input in [&store, &rdf] {
+            let result = matching(input, name, value);
+            assert!(
+                result.status.success(),
+                "{input:?} {name} {value}: {result:?}"
+            );
+            assert_eq!(
+                String::from_utf8(result.stdout).unwrap(),
+                want,
+                "{input:?} {name} {value}"
+            );
+        }
+    }
+}
+
+/// `serialize --layout` and `--indexes` choose the store's layout and its
+/// secondary indexes: every value of each flag, and `--indexes` given twice,
+/// with the store read back as its input. Every layout under every index set
+/// is core's matrix, through the same writer
+/// (`tests::unique_quads::test_every_pipeline_builds_each_quad_once`).
+#[tokio::test]
+async fn serialize_flags_choose_the_layout_and_the_indexes() {
+    let scratch = Scratch::new("serialize-flags");
+    let input = format!("{IN_G1}{IN_DEFAULT}");
+    let rdf = scratch.file("data.nq", &input);
+    for (layout, layout_flag, indexes, index_flags) in [
+        (LayoutStrategy::Default, "default", vec![], &[][..]),
+        (
+            LayoutStrategy::TypedObject,
+            "typed-object",
+            vec![IndexType::SecondaryByCopy],
+            &["secondary-by-copy"][..],
+        ),
+        (
+            LayoutStrategy::Dictionary,
+            "dictionary",
+            vec![IndexType::SecondaryByReference],
+            &["secondary-by-reference"][..],
+        ),
+        (
+            LayoutStrategy::Dictionary,
+            "dictionary",
+            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+            &["secondary-by-copy", "secondary-by-reference"][..],
+        ),
+    ] {
+        let tag = format!("{layout_flag} {index_flags:?}");
+        let store = scratch.path(&format!("{layout_flag}-{}.vortex", index_flags.join("+")));
+        let mut args = vec![
+            PathBuf::from("serialize"),
+            flag("-i"),
+            rdf.clone(),
+            flag("-o"),
+            store.clone(),
+            flag("--layout"),
+            PathBuf::from(layout_flag),
+        ];
+        for index in index_flags {
+            args.extend([flag("--indexes"), PathBuf::from(index)]);
+        }
+        let refs: Vec<&Path> = args.iter().map(PathBuf::as_path).collect();
+        let result = cli(&refs, &[]);
+        assert!(result.status.success(), "{tag}: {result:?}");
+
+        let opened = VortexRdfStore::from_file(&store).await.unwrap();
+        assert_eq!(opened.layout(), layout, "{tag}");
+        assert_eq!(opened.indexes(), indexes.as_slice(), "{tag}");
+        let printed = cli(&[Path::new("deserialize"), &flag("-i"), &store], &[]);
+        assert!(printed.status.success(), "{tag}: {printed:?}");
+        assert_eq!(String::from_utf8(printed.stdout).unwrap(), input, "{tag}");
     }
 }
 
