@@ -879,6 +879,7 @@ mod tests {
         for (l, r) in join_cases() {
             let groups = CodeGroups::build(&r);
             assert_eq!(groups.len(), r.len(), "right rows of {r:?}");
+            assert_eq!(groups.is_empty(), r.is_empty(), "right rows of {r:?}");
             let (want_l, want_r) = equi_join_indices(&l, &r, None).unwrap();
             for width in [1, 2, 3, l.len().max(1)] {
                 let (mut got_l, mut got_r) = (Vec::new(), Vec::new());

@@ -775,9 +775,18 @@ pub(super) async fn run_copy_index_serving_script(
 /// from a slice of the base with its ids pending, a residual graph
 /// constraint drops the plan for a mask scan that gathers the rows itself,
 /// and a known-but-never-predicate term is proven empty by the in-memory
-/// probe at match time.
+/// probe at match time. The N-Quads export of a served view reads it in base
+/// order, not the plan's.
 #[tokio::test]
 async fn test_in_memory_copy_index_serving() {
+    async fn nquads(view: VortexRdfStore) -> String {
+        let mut out = Vec::new();
+        crate::export_rdf(view, &mut out, oxrdfio::RdfFormat::NQuads)
+            .await
+            .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
     let (quads, graphs) = copy_index_script_dataset();
     let store = built_store(
         quads.clone(),
@@ -786,7 +795,7 @@ async fn test_in_memory_copy_index_serving() {
     )
     .await;
     run_copy_index_serving_script(
-        store,
+        store.clone(),
         &quads,
         &graphs,
         ServeExpectations {
@@ -796,6 +805,36 @@ async fn test_in_memory_copy_index_serving() {
         },
     )
     .await;
+
+    // A served view's N-Quads export lists its quads in base (s, p, o, g)
+    // order, as its window (which drops the plan) does; `quads()` reads them
+    // in the index's (p, o, s, g) order.
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let by_p = store
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    assert_eq!(served_component(&by_p), Some("index:posg"));
+    let windowed = by_p.window(0, by_p.size().await.unwrap()).await.unwrap();
+    assert_eq!(served_component(&windowed), None);
+    let exported = nquads(by_p.clone()).await;
+    assert_eq!(exported, nquads(windowed).await);
+    let lines: Vec<&str> = exported.lines().collect();
+    assert!(lines.is_sorted(), "base (s, p, o, g) order: {lines:#?}");
+    let served: Vec<Quad> = by_p.quads().try_collect().await.unwrap();
+    assert_eq!(
+        quad_strings(&served),
+        expected_strings(&quads, |i| i % 3 == 1)
+    );
+    let index_key = |q: &Quad| (q.object.to_string(), q.subject.to_string());
+    assert!(
+        served
+            .windows(2)
+            .all(|w| index_key(&w[0]) < index_key(&w[1])),
+        "the index's order: {served:#?}"
+    );
+    let served_lines: Vec<String> = served.iter().map(|q| format!("{q} .")).collect();
+    assert_ne!(served_lines, lines, "the two orders differ on this run");
 }
 
 // ─── Resident form and code reads over indexes ─────────────────────────

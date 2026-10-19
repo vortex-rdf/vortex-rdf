@@ -389,6 +389,29 @@ async fn test_view_statistics_file_backed() {
         stats.code_bounds,
         [None, Some((p_code, p_code)), None, None]
     );
+    // Rows appended under the predicate add to the bound: the base
+    // selection's rows, then the tail's.
+    let p1_tail: Vec<Quad> = (0..3)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/tail{i}"),
+                "http://example.org/p1",
+                "late",
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    let by_p = store
+        .add_quads(p1_tail.clone())
+        .await
+        .unwrap()
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    let stats = by_p.view_statistics().unwrap();
+    assert!(stats.pending_filter);
+    assert_eq!(stats.tail_rows, 3);
+    assert_eq!(stats.rows, RowCountHint::at_most(quads.len() + 3));
 
     // Indexed, the match is served and its count exact.
     let copy = open("file/copy/mapped");
@@ -424,6 +447,17 @@ async fn test_view_statistics_file_backed() {
     assert_eq!(rows(&by_p), RowCountHint::at_most(600));
     assert_eq!(by_p.size().await.unwrap(), 599);
     assert_eq!(rows(&by_p), RowCountHint::exact(599));
+    // With rows appended under the predicate, the bound is the run's width
+    // and the tail's rows.
+    let by_p = deleted
+        .add_quads(p1_tail)
+        .await
+        .unwrap()
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    assert_eq!(rows(&by_p), RowCountHint::at_most(600 + 3));
+    assert_eq!(by_p.size().await.unwrap(), 602);
 }
 
 /// The children each index set holds, in the order a build emits them.

@@ -1,9 +1,9 @@
 //! The frontend vocabulary: canonical strategy/index/format names — the only
-//! spellings `FromStr` accepts — and the agreement between the hand-written
-//! `Display` impls and the clap derive.
+//! spellings `FromStr` accepts — the quad column names, and the agreement
+//! between the hand-written `Display` impls and the clap derive.
 
 use crate::common::formats::{format_from_name, supported_format_names};
-use crate::{IndexType, LayoutStrategy, VortexRdfError};
+use crate::{IndexType, LayoutStrategy, QuadColumn, VortexRdfError};
 
 #[test]
 fn canonical_names_round_trip() {
@@ -23,6 +23,20 @@ fn canonical_names_round_trip() {
         assert_eq!(index.to_string(), name);
         assert_eq!(name.parse::<IndexType>().unwrap(), index);
     }
+}
+
+/// A quad column's name and position each give it back; the names are the
+/// schema's `s p o g`, and any other name or a fifth position names none.
+#[test]
+fn quad_column_names_round_trip() {
+    let names: Vec<&str> = QuadColumn::ALL.iter().map(|column| column.name()).collect();
+    assert_eq!(names, ["s", "p", "o", "g"]);
+    for column in QuadColumn::ALL {
+        assert_eq!(QuadColumn::from_name(column.name()), Some(column));
+        assert_eq!(QuadColumn::from_index(column.index()), Some(column));
+    }
+    assert_eq!(QuadColumn::from_index(4), None);
+    assert_eq!(QuadColumn::from_name("x"), None);
 }
 
 /// Parsing is strict: only the canonical kebab-case names are accepted.

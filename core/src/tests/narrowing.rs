@@ -412,8 +412,36 @@ mod file {
 
     #[tokio::test]
     async fn test_window_on_file_matches_slicing() {
+        let strings =
+            |quads: Vec<Quad>| -> Vec<String> { quads.iter().map(ToString::to_string).collect() };
         for (tag, _dir, store) in file_stores().await {
             assert_windows_match_slicing(&store, &tag).await;
+            if !tag.ends_with("/mapped") {
+                continue;
+            }
+            // With quads appended, a match on the unindexed graph keeps its
+            // filter pending: a window starting past the base's matches takes
+            // the tail's rows from the offset minus the base's match count.
+            let graph = GraphName::DefaultGraph;
+            let base_matches = matched_size(&store, None, None, None, Some(&graph)).await;
+            let tailed = store.add_quads(appended_quads(30)).await.unwrap();
+            let matched = tailed
+                .match_pattern(None, None, None, Some(&graph))
+                .await
+                .unwrap();
+            assert!(matched.view_statistics().unwrap().pending_filter, "{tag}");
+            let rows = strings(matched.quads_vec().await.unwrap());
+            assert_eq!(rows.len(), base_matches + 30, "{tag}");
+            for (past, limit) in [(1, 5), (10, 100), (29, 1), (30, 1)] {
+                let offset = base_matches + past;
+                let window = matched.window(offset, limit).await.unwrap();
+                let want: Vec<String> = rows.iter().skip(offset).take(limit).cloned().collect();
+                assert_eq!(
+                    strings(window.quads_vec().await.unwrap()),
+                    want,
+                    "{tag}: window({offset}, {limit})"
+                );
+            }
         }
     }
 

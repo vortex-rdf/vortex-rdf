@@ -682,6 +682,68 @@ mod tests {
         );
         assert_eq!(p("datatype", "<http://x>"), p("datatype", "http://x"));
         assert_eq!(p("is_iri", "").to_string(), "is_iri");
+
+        // An empty decimal body is no number, bare or typed.
+        for constant in [".", "+.", "-."]
+            .map(str::to_owned)
+            .into_iter()
+            .chain([typed(".", DEC), typed("", DEC)])
+        {
+            assert!(
+                matches!(
+                    TermPredicate::parse("num_eq", &constant),
+                    Err(VortexRdfError::InvalidInput(_))
+                ),
+                "{constant:?}"
+            );
+        }
+
+        // Each `num_*` kind parses to its operator over the constant, and a
+        // string kind to a text predicate.
+        for (kind, op) in [
+            ("num_lt", NumOp::Lt),
+            ("num_le", NumOp::Le),
+            ("num_gt", NumOp::Gt),
+            ("num_ge", NumOp::Ge),
+            ("num_eq", NumOp::Eq),
+            ("num_ne", NumOp::Ne),
+        ] {
+            assert!(
+                matches!(p(kind, "5"), TermPredicate::Num(parsed, Number { .. }) if parsed == op),
+                "{kind}"
+            );
+        }
+        assert!(matches!(
+            p("contains", "\"a\""),
+            TermPredicate::Text(TextPredicate { .. })
+        ));
+
+        // Every kind but the string ones prints `kind(arg)`, or `kind` when
+        // it takes no argument, and that pair parses back to the predicate. A
+        // constant prints canonically: a scale-0 decimal with no fraction, a
+        // double in its shortest round-trip form.
+        for (kind, arg, shown) in [
+            ("is_literal", "", "is_literal".to_owned()),
+            ("is_iri", "", "is_iri".to_owned()),
+            ("is_blank", "", "is_blank".to_owned()),
+            ("datatype", "<http://x>", "datatype(http://x)".to_owned()),
+            ("lang", "en", "lang(en)".to_owned()),
+            ("lang_matches", "EN-*", "lang_matches(EN-*)".to_owned()),
+            ("num_lt", "1e3", format!("num_lt(\"1000.0\"^^<{DBL}>)")),
+            ("num_le", "5.", format!("num_le(\"5\"^^<{DEC}>)")),
+            ("num_gt", "-7", format!("num_gt(\"-7\"^^<{INT}>)")),
+            ("num_ge", "1.50", format!("num_ge(\"1.50\"^^<{DEC}>)")),
+            ("num_eq", "-.5", format!("num_eq(\"-0.5\"^^<{DEC}>)")),
+            ("num_ne", "0.25", format!("num_ne(\"0.25\"^^<{DEC}>)")),
+        ] {
+            let predicate = p(kind, arg);
+            assert_eq!(predicate.to_string(), shown, "{kind} {arg:?}");
+            let (shown_kind, shown_arg) = match shown.split_once('(') {
+                Some((kind, rest)) => (kind, rest.strip_suffix(')').unwrap()),
+                None => (shown.as_str(), ""),
+            };
+            assert_eq!(p(shown_kind, shown_arg), predicate, "{shown} parses back");
+        }
     }
 
     #[test]

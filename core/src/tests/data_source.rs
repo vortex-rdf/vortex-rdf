@@ -175,6 +175,8 @@ async fn assert_multi_chunk_requests(store: &VortexRdfStore, tag: &str) {
 /// boundaries, on a store of several chunks.
 #[tokio::test]
 async fn test_data_source_request_semantics() {
+    use crate::store::read::data_source::DATA_SOURCE_BATCH_ROWS as BATCH;
+
     let store = built_store(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let all = base_ordered_codes(&store).await;
     let len = all.len() as u64;
@@ -522,7 +524,35 @@ async fn test_data_source_request_semantics() {
 
     // The same requests across chunk boundaries: on the multi-chunk store,
     // built in memory and mapped from its file.
-    assert_multi_chunk_requests(&multi_chunk_store().await, "memory").await;
+    let memory = multi_chunk_store().await;
+    assert_multi_chunk_requests(&memory, "memory").await;
+    // The 200 rows around the first chunk boundary. The plain store windows
+    // the range: one chunk, cut from the range's first row. With rows
+    // deleted, the store streams its chunks (windows of 8,192 live ids) and
+    // cuts the range out of them: a piece on each side of the boundary.
+    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let deleted = memory
+        .delete_matching(None, Some(&p0), None, None)
+        .await
+        .unwrap();
+    for (tag, view, pieces) in [
+        ("windowed", &memory, vec![200]),
+        ("streamed", &deleted, vec![100, 100]),
+    ] {
+        let rows = base_ordered_codes(view).await;
+        let request = ScanRequest {
+            row_range: Some((BATCH - 100) as u64..(BATCH + 100) as u64),
+            ..Default::default()
+        };
+        let chunks = scan_chunks(&view.data_source().unwrap(), request).await;
+        let lengths: Vec<usize> = chunks.iter().map(|chunk| chunk.len()).collect();
+        assert_eq!(lengths, pieces, "{tag}");
+        assert_eq!(
+            chunk_code_rows(&chunks),
+            rows[BATCH - 100..BATCH + 100].to_vec(),
+            "{tag}"
+        );
+    }
     #[cfg(feature = "file-io")]
     {
         let (_dir, mapped) = multi_chunk_file().await;
@@ -530,9 +560,10 @@ async fn test_data_source_request_semantics() {
 
         // A view whose filter is still pending, and one with tombstones, take
         // their row range off their scan — through the filter, past the
-        // deleted rows: whole, cut by a limit, from the middle, and a range
-        // under a limit.
-        let p0 = NamedNode::new("http://example.org/p0").unwrap();
+        // deleted rows: whole, cut by a limit, from the middle, a range under
+        // a limit, a range ending mid-chunk, one starting past the first
+        // chunk, and one starting mid-chunk under a selection of every 7th
+        // row.
         let filtered = mapped
             .match_pattern(None, Some(&p0), None, None)
             .await
@@ -548,26 +579,47 @@ async fn test_data_source_request_semantics() {
             let rows = base_ordered_codes(view).await;
             let n = rows.len();
             let source = view.data_source().unwrap();
-            for (range, limit) in [
-                (0..n, None),
-                (0..n, Some(10)),
-                (n / 2..n, None),
-                (100..2_000, Some(50)),
+            // The range from past the first chunk skips that chunk on a view
+            // of several, as the tombstoned one is; on a view of one chunk it
+            // is the empty range at the view's end.
+            let chunks = collect_row_chunks(view, BATCH).await;
+            if tag == "tombstoned" {
+                assert!(chunks.len() > 1, "{tag}: several chunks");
+            }
+            let first_chunk = chunks[0].len();
+            let sevenths = || {
+                let ids = Buffer::from_iter((0..n as u64).step_by(7));
+                Selection::IncludeByIndex(StrictSortedBuffer::try_new(ids).unwrap())
+            };
+            for (range, limit, every_seventh) in [
+                (0..n, None, false),
+                (0..n, Some(10), false),
+                (n / 2..n, None, false),
+                (100..2_000, Some(50), false),
+                (0..n / 2, None, false),
+                ((first_chunk + 10).min(n)..n, None, false),
+                (n / 2..n, None, true),
             ] {
-                let want: Vec<[TermCode; 4]> = rows[range.clone()]
-                    .iter()
+                let want: Vec<[TermCode; 4]> = range
+                    .clone()
+                    .filter(|i| !every_seventh || i % 7 == 0)
+                    .map(|i| rows[i])
                     .take(limit.unwrap_or(n))
-                    .copied()
                     .collect();
                 let request = ScanRequest {
                     row_range: Some(range.start as u64..range.end as u64),
                     limit: limit.map(|l| l as u64),
+                    selection: if every_seventh {
+                        sevenths()
+                    } else {
+                        Selection::All
+                    },
                     ..Default::default()
                 };
                 assert_eq!(
                     scan_codes(&source, request).await,
                     want,
-                    "{tag}, rows {range:?}, limit {limit:?}"
+                    "{tag}, rows {range:?}, limit {limit:?}, every 7th {every_seventh}"
                 );
             }
         }

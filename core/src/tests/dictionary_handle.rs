@@ -200,6 +200,16 @@ async fn assert_visitor_matches_decode_many(reader: &DictReader, oracle: &DictSn
 /// same dictionary (`oracle`), over every term and probe.
 async fn assert_reader_matches_snapshot(reader: &DictReader, oracle: &DictSnapshot, tag: &str) {
     assert_eq!(reader.len(), oracle.len(), "{tag}: len");
+    // A handle is empty only when it holds no term: the fixture's dictionary
+    // holds some, so neither handle is (the empty store's are, in
+    // `test_dictionary_empty_store_roundtrip`).
+    assert_ne!(
+        reader.len(),
+        0,
+        "{tag}: the fixture's dictionary holds terms"
+    );
+    assert!(!reader.is_empty(), "{tag}: is_empty");
+    assert!(!oracle.is_empty(), "{tag}: snapshot is_empty");
     let terms = all_terms(reader).await;
     assert_eq!(terms.len(), oracle.len(), "{tag}: term count");
     for (code, term) in (0u64..).zip(&terms) {

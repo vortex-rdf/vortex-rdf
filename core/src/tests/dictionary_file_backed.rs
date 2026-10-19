@@ -694,13 +694,52 @@ async fn test_dictionary_native_file_roundtrip() {
 
 /// An empty Dictionary store still writes (and reopens through) the
 /// dictionary segment — the key's presence is unconditional for the layout.
+/// Its dictionary, opened from the file every way or built in memory,
+/// answers as an empty one.
 #[tokio::test]
 async fn test_dictionary_empty_store_roundtrip() {
-    let (_dir, path) = write_store_file(Vec::new(), LayoutStrategy::Dictionary, vec![]).await;
+    use crate::store::{RowCountHint, TermPredicate};
 
-    let store = VortexRdfStore::from_file(&path).await.unwrap();
-    assert_eq!(store.layout(), LayoutStrategy::Dictionary);
-    assert_eq!(store.size().await.unwrap(), 0);
+    let (_dir, path) = write_store_file(Vec::new(), LayoutStrategy::Dictionary, vec![]).await;
+    let built = built_store(Vec::new(), LayoutStrategy::Dictionary, vec![]).await;
+    assert!(
+        built.dict_reader().unwrap().snapshot().is_some(),
+        "a built store's dictionary is resident"
+    );
+    let mut stores: Vec<(&str, VortexRdfStore)> = reopened_stores(&path).await.into();
+    stores.push(("built", built));
+
+    // Both handles of an empty dictionary are empty, its kind ranges hold no
+    // code, a predicate over no candidate answers nothing, and the empty view
+    // counts exactly 0 rows within no code bounds.
+    for (tag, store) in &stores {
+        assert_eq!(store.layout(), LayoutStrategy::Dictionary, "{tag}");
+        assert_eq!(store.size().await.unwrap(), 0, "{tag}");
+        let reader = store.dict_reader().unwrap();
+        assert_eq!(reader.len(), 0, "{tag}");
+        assert!(reader.is_empty(), "{tag}");
+        if let Some(snapshot) = reader.snapshot() {
+            assert_eq!(snapshot.len(), 0, "{tag}: snapshot");
+            assert!(snapshot.is_empty(), "{tag}: snapshot");
+        }
+        let kinds = reader.kind_ranges().await.unwrap();
+        assert!(
+            kinds.default_graph.is_none()
+                && kinds.literals.is_empty()
+                && kinds.iris.is_empty()
+                && kinds.blanks.is_empty()
+                && kinds.len == 0,
+            "{tag}: {kinds:?}"
+        );
+        let (passed, undecided) = reader
+            .filter_codes(&TermPredicate::IsLiteral, &[])
+            .await
+            .unwrap();
+        assert!(passed.is_empty() && undecided.is_empty(), "{tag}");
+        let stats = store.view_statistics().unwrap();
+        assert_eq!(stats.rows, RowCountHint::exact(0), "{tag}");
+        assert_eq!(stats.code_bounds, [None; 4], "{tag}");
+    }
 }
 
 /// A dictionary big enough that the writer splits its child into several

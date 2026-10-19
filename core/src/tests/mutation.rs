@@ -72,23 +72,21 @@ async fn test_multiple_append() {
 /// terms the base has never seen — then matched, narrowed, tombstoned and
 /// compacted, while `store` itself stays as it was.
 async fn run_append_script(store: &VortexRdfStore, quads: &[Quad]) {
-    let added = store
-        .add_quads([
-            make_quad(
-                "http://example.org/s90",
-                "http://example.org/p0",
-                "object 0",
-                GraphName::DefaultGraph,
-            ),
-            make_quad(
-                "http://example.org/s91",
-                "http://example.org/p9",
-                "object 9",
-                GraphName::DefaultGraph,
-            ),
-        ])
-        .await
-        .unwrap();
+    let appended = [
+        make_quad(
+            "http://example.org/s90",
+            "http://example.org/p0",
+            "object 0",
+            GraphName::DefaultGraph,
+        ),
+        make_quad(
+            "http://example.org/s91",
+            "http://example.org/p9",
+            "object 9",
+            GraphName::DefaultGraph,
+        ),
+    ];
+    let added = store.add_quads(appended.clone()).await.unwrap();
     assert_eq!(added.size().await.unwrap(), 14);
     assert_eq!(
         added.indexes(),
@@ -96,6 +94,14 @@ async fn run_append_script(store: &VortexRdfStore, quads: &[Quad]) {
         "appending must not invalidate the base's indexes"
     );
     assert_eq!(store.size().await.unwrap(), 12, "source untouched");
+
+    // An unconstrained match keeps every row, the base's and the tail's.
+    let everything = added.match_pattern(None, None, None, None).await.unwrap();
+    assert_eq!(everything.size().await.unwrap(), 14);
+    assert_eq!(
+        view_strings(&everything).await,
+        quad_strings(&[quads, &appended[..]].concat())
+    );
 
     // An index-routed base lookup unions with the tail scan: "object 0" is
     // on base rows 0, 3, 6, 9 and on the appended s90.
@@ -1227,6 +1233,36 @@ async fn test_owned_file_view_leaves_source_file_intact() {
             .unwrap(),
         12
     );
+}
+
+/// `owned()` returns an owner as it is: an indexed store with a quad deleted
+/// keeps its generation, its tombstone and its indexes. A narrowed view
+/// compacts into a new store instead, with a new generation and no tombstone.
+#[tokio::test]
+async fn test_owned_of_an_owner_keeps_its_tombstones_and_indexes() {
+    let quads = modular_quads(12, 3, 4);
+    let indexes = [IndexType::SecondaryByReference];
+    let store = built_store(quads.clone(), LayoutStrategy::Default, indexes.to_vec()).await;
+    let deleted = store.delete_quad(&quads[1]).await.unwrap();
+
+    let owned = deleted.owned().await.unwrap();
+    assert_eq!(owned.generation(), deleted.generation());
+    assert_eq!(owned.view_statistics().unwrap().tombstones, 1);
+    assert_eq!(owned.indexes(), &indexes);
+    assert_eq!(owned.size().await.unwrap(), 11);
+
+    // `quads[1]` is a p1 row: the view holds its tombstone until it compacts.
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let view = deleted
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    assert_eq!(view.view_statistics().unwrap().tombstones, 1);
+    let compacted = view.owned().await.unwrap();
+    assert_ne!(compacted.generation(), deleted.generation());
+    assert_eq!(compacted.view_statistics().unwrap().tombstones, 0);
+    assert_eq!(compacted.indexes(), &indexes);
+    assert_eq!(compacted.size().await.unwrap(), 3);
 }
 
 /// Mutations belong to the store that owns its rows. A narrowed view is a

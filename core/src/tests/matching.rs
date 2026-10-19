@@ -21,7 +21,8 @@ async fn test_match_typed_object_layout() {
 /// exactly its rows: a blank-node subject, a blank-node graph, the default
 /// graph bound explicitly, and IRI / blank / plain / language-tagged / typed
 /// objects — with and without the copy index, whose sorted copies carry the
-/// same terms.
+/// same terms. An absent term matches nothing, and that empty result carries
+/// no index set.
 #[tokio::test]
 async fn test_term_kinds_match_under_every_layout() {
     let quads = term_kind_quads();
@@ -91,6 +92,15 @@ async fn test_term_kinds_match_under_every_layout() {
                     quad.object
                 );
             }
+            // An empty result carries no index set, so a match chained on it
+            // looks nothing up.
+            let absent = Term::NamedNode(NamedNode::new("http://example.org/absent").unwrap());
+            let none = store
+                .match_pattern(None, None, Some(&absent), None)
+                .await
+                .unwrap();
+            assert_eq!(none.size().await.unwrap(), 0, "{tag}: absent object");
+            assert!(none.indexes().is_empty(), "{tag}: empty result's indexes");
         }
     }
 }
