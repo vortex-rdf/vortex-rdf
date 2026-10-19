@@ -3,6 +3,7 @@ residencies, spelling-tolerant encoding, byte-order ranges and term
 predicates."""
 
 import re
+import time
 import warnings
 from array import array
 
@@ -424,6 +425,77 @@ def test_column_kernels():
         U64Column([-1])
 
 
+def test_slice_is_a_window_of_the_column():
+    col = U64Column([3, 1, 3, 2, 1, 3])
+    assert u64s(col.slice(2, 5)) == u64s(col)[2:5] == [3, 2, 1]
+    assert u64s(col.slice(0, 6)) == u64s(col)
+    assert len(col.slice(3, 3)) == len(col.slice(6, 6)) == 0
+    with pytest.raises(IndexError):
+        col.slice(2, 7)
+    with pytest.raises(IndexError):
+        col.slice(4, 3)
+
+
+def test_slice_shares_the_column_instead_of_copying_it():
+    """1,000 slices of nearly all of a 10-million-row column: as copies they
+    would move 80 GB."""
+    rows = 10_000_000
+    col = U64Column(bytes(8 * rows))
+    started = time.process_time()
+    for start in range(1_000):
+        window = col.slice(start, rows - start)
+    spent = time.process_time() - started
+    assert len(window) == rows - 2 * 999
+    assert spent < 1.0, f"1,000 slices took {spent:.2f} s of CPU: a slice copies"
+
+
+def test_join_count_counts_the_pairs_join_indices_makes():
+    col = U64Column([3, 1, 3, 2, 1, 3])
+    right = [1, 9, 3, 3]
+    empty = U64Column([])
+    cases = [(col, U64Column(right)), (col, right), (col, array("Q", right)), (empty, right), (col, empty)]
+    for left, other in cases:
+        assert left.join_count(other) == len(left.join_indices(other)[0])
+    assert col.join_count(right) == 8
+
+
+def test_join_indices_refuses_more_pairs_than_max_pairs():
+    from vortex_rdf import JoinTooLarge, VortexRdfError
+
+    col = U64Column([3, 1, 3, 2, 1, 3])
+    right = [1, 9, 3, 3]
+    pairs = col.join_count(right)
+    with pytest.raises(JoinTooLarge) as refused:
+        col.join_indices(right, max_pairs=pairs - 1)
+    message, count = refused.value.args
+    assert count == pairs and str(pairs) in message
+    assert isinstance(refused.value, VortexRdfError)
+    capped = col.join_indices(right, max_pairs=pairs)
+    assert [u64s(c) for c in capped] == [u64s(c) for c in col.join_indices(right)]
+
+
+def test_groups_join_slice_by_slice_like_join_indices():
+    from vortex_rdf import JoinTooLarge
+
+    left = U64Column([3, 1, 3, 2, 1, 3])
+    right = U64Column([1, 9, 3, 3])
+    groups = right.groups()
+    assert len(groups) == len(right)
+    assert groups.count(left) == left.join_count(right) == 8
+    want = [u64s(c) for c in left.join_indices(right)]
+    # Two-row slices make at most three pairs each.
+    for max_pairs in (None, 3):
+        got_left, got_right = [], []
+        for start in range(0, len(left), 2):
+            left_idx, right_idx = groups.join(left.slice(start, start + 2), max_pairs=max_pairs)
+            got_left += [start + i for i in u64s(left_idx)]
+            got_right += u64s(right_idx)
+        assert [got_left, got_right] == want, max_pairs
+    with pytest.raises(JoinTooLarge) as refused:
+        groups.join(left, max_pairs=7)
+    assert refused.value.args[1] == 8
+
+
 def test_kernels_round_trip_store_columns(code_store):
     """Distinct subjects and a self-join over the fixture's codes decode to
     the expected terms."""
@@ -437,6 +509,7 @@ def test_kernels_round_trip_store_columns(code_store):
     # Join objects with subjects: every (object row, subject row) pair naming
     # the same term — alice knows bob, and bob is the subject of two rows.
     left_idx, right_idx = o.join_indices(s)
+    assert o.join_count(s) == len(left_idx)
     joined = sorted(
         (term_dict.decode(c), term_dict.decode(d))
         for c, d in zip(u64s(o.take(left_idx)), u64s(s.take(right_idx)))

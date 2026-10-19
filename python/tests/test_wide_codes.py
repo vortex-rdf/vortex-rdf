@@ -54,9 +54,14 @@ def test_u64_column_carries_codes_past_u32():
     assert u64s(col.take([2, 0, 3])) == [TOP, WIDE, WIDE]
     left, right = col.join_indices(U64Column([TOP, WIDE, 5]))
     assert list(zip(u64s(left), u64s(right))) == [(0, 1), (2, 0), (3, 1)]
+    assert col.join_count(U64Column([TOP, WIDE, 5])) == 3
+    left, right = U64Column([TOP, WIDE, 5]).groups().join(col)
+    assert list(zip(u64s(left), u64s(right))) == [(0, 1), (2, 0), (3, 1)]
     # A code that narrows to 5 does not join 5.
     left, _ = U64Column([5]).join_indices([WIDE])
     assert len(left) == 0
+    assert U64Column([5]).join_count([WIDE]) == 0
+    assert U64Column([WIDE]).groups().count([5]) == 0
 
 
 #: Every refusal of a buffer whose items are no u64s names the view to use.
@@ -67,6 +72,7 @@ def _code_takers(store):
     """Each binding that takes codes or indices, as a call on them."""
     term_dict = store.term_dict()
     column = U64Column([1, 2, 3])
+    groups = column.groups()
     return {
         "U64Column": U64Column,
         "decode_many": term_dict.decode_many,
@@ -74,6 +80,9 @@ def _code_takers(store):
         "keep": lambda codes: store.count_quads(keep={"s": codes}),
         "take": column.take,
         "join_indices": column.join_indices,
+        "join_count": column.join_count,
+        "groups.count": groups.count,
+        "groups.join": groups.join,
     }
 
 

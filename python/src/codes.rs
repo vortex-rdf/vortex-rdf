@@ -8,15 +8,15 @@ use std::os::raw::{c_int, c_void};
 use std::pin::pin;
 
 use pyo3::buffer::{ElementType, PyUntypedBuffer};
-use pyo3::exceptions::{PySystemError, PyValueError};
+use pyo3::exceptions::{PyIndexError, PySystemError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyString;
-use vortex_buffer::Buffer;
+use vortex_buffer::{Alignment, Buffer};
 use vortex_rdf_core::VortexRdfError as CoreError;
 use vortex_rdf_core::{CaseMap, DictReader, TermCode, TermPredicate, TextOptions, columns};
 
-use crate::{RUNTIME, detached, py_err};
+use crate::{JoinTooLarge, RUNTIME, detached, py_err};
 
 /// Buckets in the decode-sharing cache (see [`decode_slice`]).
 /// A power of two, so the bucket index is a mask rather than a division; 256
@@ -491,9 +491,10 @@ fn copy_items(buf: &PyUntypedBuffer, out: &mut [u8]) {
 ///
 /// The column kernels ([`distinct`](Self::distinct),
 /// [`value_counts`](Self::value_counts), [`take`](Self::take),
-/// [`join_indices`](Self::join_indices)) run GIL-released and preserve the
-/// orders a query layer observes: first-seen order for distinct values,
-/// nested-loop order for a join's pairs.
+/// [`join_count`](Self::join_count), [`join_indices`](Self::join_indices),
+/// [`groups`](Self::groups)) run GIL-released and preserve the orders a
+/// query layer observes: first-seen order for distinct values, nested-loop
+/// order for a join's pairs.
 #[pyclass(frozen, module = "vortex_rdf._native")]
 pub struct U64Column {
     pub(crate) codes: Buffer<u64>,
@@ -520,6 +521,29 @@ impl U64Column {
         format!("U64Column(len={})", self.codes.len())
     }
 
+    /// The values from `start` up to, not including, `stop`, sharing this
+    /// column's buffer rather than copying it; `IndexError` when `start` is
+    /// past `stop` or `stop` past the end.
+    fn slice(&self, start: usize, stop: usize) -> PyResult<U64Column> {
+        let len = self.codes.len();
+        if start > stop {
+            return Err(PyIndexError::new_err(format!(
+                "slice start {start} is past its stop {stop}"
+            )));
+        }
+        if stop > len {
+            return Err(PyIndexError::new_err(format!(
+                "slice stop {stop} is out of range for a column of {len} values"
+            )));
+        }
+        // Cut at a u64's alignment, which every value's offset meets
+        // whatever alignment the shared buffer carries.
+        let codes = self
+            .codes
+            .slice_with_alignment(start..stop, Alignment::of::<u64>());
+        Ok(U64Column { codes })
+    }
+
     /// The distinct values, each at its first occurrence, in that order.
     fn distinct(&self, py: Python<'_>) -> U64Column {
         let codes = py.detach(|| columns::distinct_first_seen(self.codes.as_slice()));
@@ -541,7 +565,7 @@ impl U64Column {
         let codes = py
             .detach(|| columns::take(self.codes.as_slice(), &indices))
             .map_err(|position| {
-                pyo3::exceptions::PyIndexError::new_err(format!(
+                PyIndexError::new_err(format!(
                     "take index {} is out of range for a column of {} values",
                     indices[position],
                     self.codes.len()
@@ -550,25 +574,46 @@ impl U64Column {
         Ok(U64Column { codes })
     }
 
+    /// The number of row pairs [`join_indices`](Self::join_indices) makes
+    /// with `other` (a `U64Column`, u64 buffer or int sequence), counted
+    /// without building them.
+    fn join_count(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let right = extract_u64s(other)?;
+        Ok(py.detach(|| columns::join_count(self.codes.as_slice(), right.as_slice())))
+    }
+
     /// The row pairs `(left_indices, right_indices)` where this column's
     /// value equals `other`'s (a `U64Column`, u64 buffer or int sequence) —
     /// an equi-join on the two columns as keys, in
     /// nested-loop order: this column's rows in order, each with its
     /// matches in `other` in their original order. Gather the joined
-    /// columns with [`take`](Self::take).
+    /// columns with [`take`](Self::take). A join of more than `max_pairs`
+    /// pairs raises `JoinTooLarge` before any pair is built.
+    #[pyo3(signature = (other, *, max_pairs=None))]
     fn join_indices(
         &self,
         py: Python<'_>,
         other: &Bound<'_, PyAny>,
+        max_pairs: Option<usize>,
     ) -> PyResult<(U64Column, U64Column)> {
         let right = extract_u64s(other)?;
         let (left_idx, right_idx) = py
-            .detach(|| columns::equi_join_indices(self.codes.as_slice(), right.as_slice(), None))
-            .expect("a join without a cap is never refused");
+            .detach(|| {
+                columns::equi_join_indices(self.codes.as_slice(), right.as_slice(), max_pairs)
+            })
+            .map_err(join_too_large)?;
         Ok((
             U64Column { codes: left_idx },
             U64Column { codes: right_idx },
         ))
+    }
+
+    /// This column's rows grouped by value: the right side of
+    /// [`join_indices`](Self::join_indices), built once and joined with any
+    /// number of left columns (see [`CodeGroups`]).
+    fn groups(&self, py: Python<'_>) -> CodeGroups {
+        let groups = py.detach(|| columns::CodeGroups::build(self.codes.as_slice()));
+        CodeGroups { groups }
     }
 
     /// Fills `view` over the raw u64 data; the exported buffer holds a
@@ -594,5 +639,66 @@ impl U64Column {
                 .unwrap_or_else(|| PySystemError::new_err("PyBuffer_FillInfo failed")));
         }
         Ok(())
+    }
+}
+
+/// `JoinTooLarge` for a join refused at `pairs` pairs: its `args` are the
+/// message and `pairs`.
+fn join_too_large(pairs: usize) -> PyErr {
+    JoinTooLarge::new_err((
+        format!("the join makes {pairs} pairs, more than its max_pairs"),
+        pairs,
+    ))
+}
+
+/// A column's rows grouped by value ([`U64Column::groups`]): the right side
+/// of an equi-join, built once and joined with any number of left columns,
+/// so a join too large for one call runs as a loop over slices of its left
+/// column ([`U64Column::slice`]). It holds one u64 per grouped row, plus a
+/// slot per value of the column's span or per distinct value, until it is
+/// dropped.
+#[pyclass(frozen, module = "vortex_rdf._native")]
+pub struct CodeGroups {
+    groups: columns::CodeGroups,
+}
+
+#[pymethods]
+impl CodeGroups {
+    /// The number of grouped rows.
+    fn __len__(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// The number of row pairs [`join`](Self::join) makes with `column` (a
+    /// `U64Column`, u64 buffer or int sequence), counted without building
+    /// them.
+    fn count(&self, py: Python<'_>, column: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let left = extract_u64s(column)?;
+        Ok(py.detach(|| self.groups.count(left.as_slice())))
+    }
+
+    /// The row pairs `(left_indices, right_indices)` where `column`'s value
+    /// (a `U64Column`, u64 buffer or int sequence) equals a grouped row's,
+    /// in nested-loop order: `column`'s rows in order, each with its grouped
+    /// rows in their column's order. The left indices count from `column`'s
+    /// first row, so the joins of consecutive slices of a left column, each
+    /// offset by its slice's start, concatenate to
+    /// [`U64Column::join_indices`] of the whole column. A join of more than
+    /// `max_pairs` pairs raises `JoinTooLarge` before any pair is built.
+    #[pyo3(signature = (column, *, max_pairs=None))]
+    fn join(
+        &self,
+        py: Python<'_>,
+        column: &Bound<'_, PyAny>,
+        max_pairs: Option<usize>,
+    ) -> PyResult<(U64Column, U64Column)> {
+        let left = extract_u64s(column)?;
+        let (left_idx, right_idx) = py
+            .detach(|| self.groups.join(left.as_slice(), max_pairs))
+            .map_err(join_too_large)?;
+        Ok((
+            U64Column { codes: left_idx },
+            U64Column { codes: right_idx },
+        ))
     }
 }

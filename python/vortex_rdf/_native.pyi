@@ -33,6 +33,11 @@ class VortexRdfError(Exception):
     read, an operation the store refuses. An invalid argument raises
     ``ValueError`` instead, and an I/O failure ``OSError``."""
 
+class JoinTooLarge(VortexRdfError):
+    """Raised when a join would make more row pairs than its ``max_pairs``
+    allows, before any pair is built. ``args`` is ``(message, pairs)``:
+    ``args[1]`` is the join's pair count."""
+
 class TermDict:
     def decode(self, code: int) -> Optional[str]:
         """The N-Triples string for `code`, or None when the code is out of
@@ -161,6 +166,11 @@ class U64Column:
         ...
     def __len__(self) -> int: ...
     def __repr__(self) -> str: ...
+    def slice(self, start: int, stop: int) -> "U64Column":
+        """The values from `start` up to, not including, `stop`, sharing
+        this column's memory rather than copying it; ``IndexError`` when
+        `start` is past `stop` or `stop` past the end."""
+        ...
     def distinct(self) -> "U64Column":
         """The distinct values, each at its first occurrence, in that
         order."""
@@ -173,16 +183,55 @@ class U64Column:
         """The values at `indices`, in that order; an index past the end
         raises ``IndexError``."""
         ...
-    def join_indices(self, other: _U64s) -> Tuple["U64Column", "U64Column"]:
+    def join_count(self, other: _U64s) -> int:
+        """The number of row pairs `join_indices` makes with `other`, counted
+        without building them."""
+        ...
+    def join_indices(
+        self, other: _U64s, *, max_pairs: Optional[int] = None
+    ) -> Tuple["U64Column", "U64Column"]:
         """``(left_indices, right_indices)`` of the rows where this column's
         value equals `other`'s — an equi-join on the two as keys, in
         nested-loop order (this column's rows in order, each with its matches
         in `other` in their original order). Gather joined columns with
-        `take`."""
+        `take`. A join of more than `max_pairs` pairs raises `JoinTooLarge`
+        before any pair is built."""
+        ...
+    def groups(self) -> "CodeGroups":
+        """This column's rows grouped by value: the right side of
+        `join_indices`, built once and joined with any number of left
+        columns."""
         ...
     # The buffer protocol is implemented natively (`__getbuffer__`);
     # `__buffer__` is the Python 3.12+ spelling `memoryview()` reports for it.
     def __buffer__(self, flags: int, /) -> memoryview: ...
+
+class CodeGroups:
+    """A column's rows grouped by value (`U64Column.groups`): the right side
+    of an equi-join, built once and joined with any number of left columns,
+    so a join too large for one call runs as a loop over slices of its left
+    column (`U64Column.slice`). It holds one u64 per grouped row, plus a slot
+    per value of the column's span or per distinct value, until it is
+    dropped."""
+
+    def __len__(self) -> int: ...
+    def __repr__(self) -> str: ...
+    def count(self, column: _U64s) -> int:
+        """The number of row pairs `join` makes with `column`, counted
+        without building them."""
+        ...
+    def join(
+        self, column: _U64s, *, max_pairs: Optional[int] = None
+    ) -> Tuple[U64Column, U64Column]:
+        """``(left_indices, right_indices)`` of the rows where `column`'s
+        value equals a grouped row's, in nested-loop order (`column`'s rows
+        in order, each with its grouped rows in their column's order). The
+        left indices count from `column`'s first row, so the joins of
+        consecutive slices of a left column, each offset by its slice's
+        start, concatenate to `U64Column.join_indices` of the whole column.
+        A join of more than `max_pairs` pairs raises `JoinTooLarge` before
+        any pair is built."""
+        ...
 
 class VortexRdfStore:
     def __init__(self, path: _StrPath, *, in_memory: bool = False) -> None:

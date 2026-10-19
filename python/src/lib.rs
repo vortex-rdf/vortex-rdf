@@ -29,6 +29,14 @@ pyo3::create_exception!(
      OSError."
 );
 
+pyo3::create_exception!(
+    _native,
+    JoinTooLarge,
+    VortexRdfError,
+    "Raised when a join would make more row pairs than its `max_pairs` allows, before any pair \
+     is built. `args` is `(message, pairs)`: `args[1]` is the join's pair count."
+);
+
 /// Shared runtime for all blocking native calls. Created lazily so a process
 /// that forks before touching the bindings never inherits runtime threads.
 pub(crate) static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
@@ -69,8 +77,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<store::VortexRdfStore>()?;
     m.add_class::<codes::TermDict>()?;
     m.add_class::<codes::U64Column>()?;
+    m.add_class::<codes::CodeGroups>()?;
     m.add_function(wrap_pyfunction!(serialize::serialize_rdf, m)?)?;
     m.add("VortexRdfError", m.py().get_type::<VortexRdfError>())?;
+    m.add("JoinTooLarge", m.py().get_type::<JoinTooLarge>())?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

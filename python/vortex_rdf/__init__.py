@@ -6,6 +6,8 @@ rdflib Store on top of these bindings.
 """
 
 from ._native import (
+    CodeGroups,
+    JoinTooLarge,
     TermDict,
     U64Column,
     VortexRdfError,
@@ -15,6 +17,8 @@ from ._native import (
 )
 
 __all__ = [
+    "CodeGroups",
+    "JoinTooLarge",
     "TermDict",
     "U64Column",
     "VortexRdfError",
