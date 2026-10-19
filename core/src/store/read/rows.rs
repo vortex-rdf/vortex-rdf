@@ -58,22 +58,17 @@ impl BaseRead {
     }
 
     /// The rows in chunks of at most `batch_rows` rows, in row order: slices
-    /// of the rows, or the scan's chunks each cut to the cap, a chunk's read
-    /// error carried as one error item.
+    /// of the rows, or the scan's chunks each cut to the cap, every slice cut
+    /// when its chunk is pulled; a chunk's read error, or a slice's, carried
+    /// as its error item.
     pub(in crate::store) fn chunks(self, batch_rows: usize) -> Result<RowChunkStream> {
         match self {
-            BaseRead::Rows(rows) => {
-                Ok(stream::iter(rechunk(rows, batch_rows)?.into_iter().map(Ok)).boxed())
-            }
+            BaseRead::Rows(rows) => Ok(stream::iter(rechunk(rows, batch_rows)).boxed()),
             #[cfg(feature = "file-io")]
             BaseRead::Scan(scan) => Ok(file_reads::stream_rows(*scan)?
-                .flat_map(move |chunk| {
-                    let pieces: Vec<Result<ArrayRef>> =
-                        match chunk.and_then(|chunk| rechunk(chunk, batch_rows)) {
-                            Ok(pieces) => pieces.into_iter().map(Ok).collect(),
-                            Err(e) => vec![Err(e)],
-                        };
-                    stream::iter(pieces)
+                .flat_map(move |chunk| match chunk {
+                    Ok(chunk) => stream::iter(rechunk(chunk, batch_rows)).left_stream(),
+                    Err(e) => stream::iter([Err(e)]).right_stream(),
                 })
                 .boxed()),
         }

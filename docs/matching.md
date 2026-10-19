@@ -260,7 +260,7 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`matching.rs:213-243`](../core/src/store/query/matching.rs#L213-L243 "MemoryBase") | — |
-| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching.rs#L364), [`search_sorted_bounds`](../core/src/store/array.rs#L178) | [§6.1](#61-prefix-probe) |
+| 1 · prefix probe | [`prefix_probe`](../core/src/store/query/matching.rs#L364), [`search_sorted_bounds`](../core/src/store/array.rs#L179) | [§6.1](#61-prefix-probe) |
 | 2 · secondary-index routing | [`matching.rs:247-308`](../core/src/store/query/matching.rs#L247-L308 "Secondary-index routing"), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L683), [`fold_row_ids`](../core/src/store/query/matching.rs#L833) | [§6.2](#62-secondary-index-routing) |
 | 3 · residual column filtering | [`matching.rs:310-330`](../core/src/store/query/matching.rs#L310-L330 "residual column filtering"), [`residual_narrow`](../core/src/store/query/matching.rs#L454), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L250), [`mask_for`](../core/src/store/query/matching.rs#L779) | [§6.3](#63-residual-column-filtering) |
 | 4 · finalize | [`matching.rs:332-339`](../core/src/store/query/matching.rs#L332-L339 "Keep the serving plan") | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
@@ -285,7 +285,7 @@ When it engages, the **subject** resolves to its exact `[lo, hi)` run in
   (`probes.by_name(base, "s")`) when the column resolves one and the probe value
   is an integer — the Dictionary layout's code column;
 - otherwise through the per-call
-  [`search_sorted_bounds`](../core/src/store/array.rs#L178), which also handles the
+  [`search_sorted_bounds`](../core/src/store/array.rs#L179), which also handles the
   string layouts' `VarBinView` subject columns.
 
 Then the **roles behind it narrow the run in sort order** — `p` inside the

@@ -112,7 +112,7 @@ impl VortexRdfStore {
         let base = self
             .base_chunks(self.layout.strategy().primary_column_names(), batch_rows)
             .await?;
-        Ok(base.chain(stream::iter(tail.into_iter().map(Ok))).boxed())
+        Ok(base.chain(stream::iter(tail)).boxed())
     }
 
     /// The chunk stream behind [`code_chunks`](Self::code_chunks), built when
@@ -278,12 +278,20 @@ impl VortexRdfStore {
         ))
     }
 
-    /// The tail's live rows cut to `batch_rows`; none without a tail.
-    fn tail_chunks(&self, batch_rows: usize) -> Result<Vec<ArrayRef>> {
-        match &self.tail {
-            Some(tail) => rechunk(tail.live_rows()?, batch_rows),
-            None => Ok(Vec::new()),
-        }
+    /// The tail's live rows cut to `batch_rows`, each slice cut when it is
+    /// reached; none without a tail.
+    fn tail_chunks(
+        &self,
+        batch_rows: usize,
+    ) -> Result<impl Iterator<Item = Result<ArrayRef>> + Send + 'static> {
+        let rows = self
+            .tail
+            .as_ref()
+            .map(|tail| tail.live_rows())
+            .transpose()?;
+        Ok(rows
+            .into_iter()
+            .flat_map(move |rows| rechunk(rows, batch_rows)))
     }
 }
 

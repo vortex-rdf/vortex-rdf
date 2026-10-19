@@ -3,7 +3,8 @@
 //! narrowed, served, tombstoned and tailed views.
 
 use super::*;
-use crate::store::read::chunks::{gather_hooks, run_hooks};
+use crate::store::array::rechunk_hooks;
+use crate::store::read::chunks::{RowChunkStream, gather_hooks, run_hooks};
 use crate::store::read::rows::column_hooks;
 use crate::store::{QuadColumn, TermCode};
 use crate::vortex_scan::ScanRequest;
@@ -11,29 +12,43 @@ use vortex_array::dtype::{DType, Nullability};
 use vortex_array::expr::stats::Precision;
 
 /// Both exports of `view` agree with its base-ordered codes at several
-/// batch sizes, every column subset reads the subset's columns of the
-/// four-column read, and a subset comes in the requested order. Its data
-/// source scans to the same codes under a non-nullable struct dtype, and
-/// advertises its statistics' count (exact, or as the upper bound) and four
-/// `u64` codes a row as its byte size; the source and the statistics are
-/// taken before anything reads the view. Returns the count the source
-/// advertises.
+/// batch sizes — one row, a size the rows do not divide, the view's length —
+/// in the chunks the view reads at its length (one, or a file scan's split
+/// each), each cut to the batch; every column subset reads the subset's
+/// columns of the four-column read, and a subset comes in the requested
+/// order. Its data source scans to the same codes under a non-nullable
+/// struct dtype, and advertises its statistics' count (exact, or as the
+/// upper bound) and four `u64` codes a row as its byte size; the source and
+/// the statistics are taken before anything reads the view. Returns the
+/// count the source advertises.
 async fn assert_chunks_match(view: &VortexRdfStore, tag: &str) -> Precision<u64> {
     let source = view.data_source().unwrap();
     let hint = view.view_statistics().unwrap().rows;
     let expected = base_ordered_codes(view).await;
-    for batch in [1, 7, 256, 100_000] {
+    let n = expected.len();
+    let uncut: Vec<usize> = collect_row_chunks(view, n.max(1))
+        .await
+        .iter()
+        .map(|c| c.len())
+        .collect();
+    let mut batches = vec![1, short_last(n), 256, n.max(1), 100_000];
+    batches.sort_unstable();
+    batches.dedup();
+    for batch in batches {
+        let cut: Vec<usize> = uncut.iter().flat_map(|&m| cut_lengths(m, batch)).collect();
         let (rows, sizes) = collect_code_chunks(view, &QuadColumn::ALL, batch).await;
         assert_eq!(rows, expected, "{tag}: code_chunks at batch {batch}");
-        assert!(
-            sizes.iter().all(|&n| n > 0 && n <= batch),
-            "{tag}: chunk sizes {sizes:?} under batch {batch}"
-        );
+        assert_eq!(sizes, cut, "{tag}: code_chunks' chunks at batch {batch}");
         let chunks = collect_row_chunks(view, batch).await;
         assert_eq!(
             chunk_code_rows(&chunks),
             expected,
             "{tag}: row_chunks at batch {batch}"
+        );
+        assert_eq!(
+            chunks.iter().map(|c| c.len()).collect::<Vec<_>>(),
+            cut,
+            "{tag}: row_chunks' chunks at batch {batch}"
         );
     }
     let (all, _) = collect_code_chunks(view, &QuadColumn::ALL, 1_000).await;
@@ -88,6 +103,59 @@ async fn assert_subsets<const N: usize>(view: &VortexRdfStore, all: &[[TermCode;
         let want: Vec<[TermCode; N]> = all.iter().map(|r| columns.map(|c| r[c.index()])).collect();
         assert_eq!(rows, want, "{tag}: the columns {columns:?}");
     }
+}
+
+/// The lengths of the chunks `rows` rows cut into at `batch` rows a chunk
+/// make, in order: `batch` each, but the last.
+fn cut_lengths(rows: usize, batch: usize) -> impl Iterator<Item = usize> {
+    (0..rows)
+        .step_by(batch)
+        .map(move |start| (rows - start).min(batch))
+}
+
+/// The smallest batch of 7 rows or more that does not divide `rows`, so the
+/// last chunk is short; 7 for no rows.
+fn short_last(rows: usize) -> usize {
+    (7..=rows + 7)
+        .find(|&b| !rows.is_multiple_of(b))
+        .unwrap_or(7)
+}
+
+/// How many slices `rechunk` cut while `stream` was pulled `pulls` times,
+/// each pull a chunk, before it was dropped.
+async fn cuts_pulling(mut stream: RowChunkStream, pulls: usize) -> usize {
+    let start = rechunk_hooks::cuts();
+    for _ in 0..pulls {
+        stream.next().await.unwrap().unwrap();
+    }
+    drop(stream);
+    rechunk_hooks::cuts() - start
+}
+
+/// How many chunks `stream` yields before its first error item, and the
+/// error's message.
+async fn chunks_before_error<T, E: std::fmt::Display>(
+    mut stream: impl futures::Stream<Item = std::result::Result<T, E>> + Unpin,
+) -> (usize, String) {
+    let mut chunks = 0;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(_) => chunks += 1,
+            Err(e) => return (chunks, e.to_string()),
+        }
+    }
+    panic!("no error item after {chunks} chunks")
+}
+
+/// [`multi_chunk_store`]'s quads with the copy index: an index child of
+/// 20,000 rows, which a data source cuts into three chunks.
+async fn indexed_multi_chunk_store() -> VortexRdfStore {
+    built_store(
+        modular_quads(20_000, 3, 8),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
 }
 
 /// Every item of `stream`, unwrapped, beside how far `counter` rose over the
@@ -266,11 +334,19 @@ async fn test_chunks_in_memory_match_gathered() {
     assert_gathers(&store, 7, 0, "the whole store").await;
 }
 
-/// In memory, the whole store is one contiguous run, and its code chunks are
-/// cut as they are pulled: at one row a chunk the first pull cuts one chunk,
-/// and the stream one per row.
+/// Chunks are cut as they are pulled. In memory the whole store is one
+/// contiguous run: at one row a chunk the first pull of its code chunks, and
+/// of its row chunks, cuts one chunk, and each stream one per row; at the
+/// run's length its one row chunk is the run itself, cut nowhere. A stream
+/// dropped early cuts only the chunks it pulled — the store's, a file scan's
+/// split, a tailed store's before its tail — and a `LIMIT` scan only its
+/// first chunk, of the multi-chunk store and of an index child's table,
+/// whose drained chunks are the child's rows cut to the data source's batch;
+/// a child the batch holds whole is one chunk, cut nowhere.
 #[tokio::test]
 async fn test_chunks_cut_a_run_per_pull() {
+    use crate::store::read::data_source::DATA_SOURCE_BATCH_ROWS;
+
     let store = built_store(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
     let expected = base_ordered_codes(&store).await;
     let codes = store.code_chunks(&QuadColumn::ALL, 1).unwrap();
@@ -278,6 +354,155 @@ async fn test_chunks_cut_a_run_per_pull() {
     assert_eq!(first, 1, "the first pull cuts one chunk");
     assert_eq!(total, expected.len(), "one cut per row at one row a chunk");
     assert_eq!(code_rows(&chunks), expected, "the cut chunks are the rows");
+    let rows = store.row_chunks(1).unwrap();
+    let (chunks, first, total) = drain_counted(rows, rechunk_hooks::cuts).await;
+    assert_eq!(
+        (first, total),
+        (1, expected.len()),
+        "row chunks: one cut a pull"
+    );
+    assert_eq!(chunk_code_rows(&chunks), expected, "the cut row chunks");
+    assert_eq!(
+        cuts_pulling(store.row_chunks(expected.len()).unwrap(), 1).await,
+        0,
+        "at the run's length: the run itself, cut nowhere"
+    );
+
+    assert_eq!(
+        cuts_pulling(store.row_chunks(7).unwrap(), 2).await,
+        2,
+        "the store's row chunks, two pulled"
+    );
+    #[cfg(feature = "file-io")]
+    {
+        let (_dir, mapped) = multi_chunk_file().await;
+        assert_eq!(
+            cuts_pulling(mapped.row_chunks(7).unwrap(), 2).await,
+            2,
+            "a file scan's split, two pulled"
+        );
+    }
+    let tailed = built_store(fixture_quads(), LayoutStrategy::Default, vec![])
+        .await
+        .add_quads(appended_quads(40))
+        .await
+        .unwrap();
+    assert_eq!(
+        cuts_pulling(tailed.row_chunks(7).unwrap(), 1).await,
+        1,
+        "a tailed store's first chunk, the tail uncut"
+    );
+
+    let limited = ScanRequest {
+        limit: Some(100),
+        ..Default::default()
+    };
+    let multi = multi_chunk_store().await;
+    let start = rechunk_hooks::cuts();
+    let rows = scan_codes(&multi.data_source().unwrap(), limited.clone()).await;
+    assert_eq!(rows.len(), 100);
+    assert_eq!(rechunk_hooks::cuts() - start, 1, "the store's LIMIT scan");
+    let indexed = indexed_multi_chunk_store().await;
+    let table = indexed
+        .component_data_source("index:posg")
+        .unwrap()
+        .unwrap();
+    let start = rechunk_hooks::cuts();
+    assert_eq!(scan_chunks(&table, limited).await.len(), 1);
+    assert_eq!(
+        rechunk_hooks::cuts() - start,
+        1,
+        "an index child's LIMIT scan"
+    );
+    let start = rechunk_hooks::cuts();
+    let lengths: Vec<usize> = scan_chunks(&table, ScanRequest::default())
+        .await
+        .iter()
+        .map(|c| c.len())
+        .collect();
+    let want: Vec<usize> = cut_lengths(20_000, DATA_SOURCE_BATCH_ROWS).collect();
+    assert_eq!(lengths, want, "an index child's rows cut to the batch");
+    assert_eq!(rechunk_hooks::cuts() - start, want.len(), "a cut a chunk");
+    let small = built_store(
+        fixture_quads(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let table = small.component_data_source("index:posg").unwrap().unwrap();
+    let start = rechunk_hooks::cuts();
+    let lengths: Vec<usize> = scan_chunks(&table, ScanRequest::default())
+        .await
+        .iter()
+        .map(|c| c.len())
+        .collect();
+    assert_eq!(lengths, [3_000], "a child the batch holds is one chunk");
+    assert_eq!(rechunk_hooks::cuts() - start, 0, "and is cut nowhere");
+}
+
+/// A slice that fails to cut is its chunk's error item, after the chunks
+/// before it, wherever rows are cut into chunks: an in-memory store's row
+/// chunks, a file scan's split through both exports, a tailed store's tail,
+/// and an index child's table, whose partition still executes and whose
+/// stream carries the error.
+#[tokio::test]
+async fn test_chunks_surface_a_failed_cut() {
+    use crate::store::array::rechunk_hooks::FailingCut;
+
+    let hooked = |(chunks, message): (usize, String)| {
+        assert!(message.contains("test hook"), "the hook's error: {message}");
+        chunks
+    };
+    let store = built_store(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
+    {
+        let _fail = FailingCut::after(2);
+        let before = hooked(chunks_before_error(store.row_chunks(7).unwrap()).await);
+        assert_eq!(before, 2, "in memory: the third chunk fails");
+    }
+    #[cfg(feature = "file-io")]
+    {
+        let (_dir, mapped) = multi_chunk_file().await;
+        let fail = FailingCut::after(2);
+        let before = hooked(chunks_before_error(mapped.row_chunks(7).unwrap()).await);
+        assert_eq!(before, 2, "a file scan's row chunks");
+        drop(fail);
+        let _fail = FailingCut::after(2);
+        let codes = mapped.code_chunks(&QuadColumn::ALL, 7).unwrap();
+        assert_eq!(
+            hooked(chunks_before_error(codes).await),
+            2,
+            "a file scan's code chunks"
+        );
+    }
+    let tailed = built_store(fixture_quads(), LayoutStrategy::Default, vec![])
+        .await
+        .add_quads(appended_quads(40))
+        .await
+        .unwrap();
+    {
+        // 3,000 base rows make 150 chunks of 20, the tail's 40 two more.
+        let _fail = FailingCut::after(151);
+        let before = hooked(chunks_before_error(tailed.row_chunks(20).unwrap()).await);
+        assert_eq!(before, 151, "the tail's second chunk fails");
+    }
+    let indexed = indexed_multi_chunk_store().await;
+    let table = indexed
+        .component_data_source("index:posg")
+        .unwrap()
+        .unwrap();
+    let _fail = FailingCut::after(1);
+    let mut partitions = table
+        .scan(ScanRequest::default())
+        .await
+        .unwrap()
+        .partitions();
+    let partition = partitions.next().await.unwrap().unwrap();
+    let stream = partition.execute().expect("the partition executes");
+    assert_eq!(
+        hooked(chunks_before_error(stream).await),
+        1,
+        "an index child's table: its second chunk fails"
+    );
 }
 
 /// In memory, over every index set, the views of a store with tombstones:
@@ -495,7 +720,9 @@ async fn assert_string_source(view: &VortexRdfStore, expected: &[String], tag: &
 }
 
 /// The string layouts stream their native struct rows, the tail last, in the
-/// order `quads()` decodes them, through the chunks and the data source.
+/// order `quads()` decodes them, through the chunks — the base's rows and the
+/// tail's cut apart, each to the batch, from one row a chunk to the view's
+/// length — and the data source.
 #[tokio::test]
 async fn test_chunks_string_layouts_include_tail() {
     let quads = fixture_quads();
@@ -512,7 +739,7 @@ async fn test_chunks_string_layouts_include_tail() {
             .iter()
             .map(|q| q.subject.to_string())
             .collect();
-        for batch in [64, 100_000] {
+        for batch in [1, 7, 64, expected.len(), 100_000] {
             let chunks = collect_row_chunks(&tailed, batch).await;
             assert_eq!(
                 chunk_subjects(&chunks),
@@ -520,12 +747,9 @@ async fn test_chunks_string_layouts_include_tail() {
                 "{layout:?} at batch {batch}"
             );
             // The base's rows and the tail's are cut apart, each to the cap.
-            let cut = |rows: usize| {
-                (0..rows)
-                    .step_by(batch)
-                    .map(move |start| (rows - start).min(batch))
-            };
-            let lengths: Vec<usize> = cut(base_rows).chain(cut(tailed.tail_len())).collect();
+            let lengths: Vec<usize> = cut_lengths(base_rows, batch)
+                .chain(cut_lengths(tailed.tail_len(), batch))
+                .collect();
             assert_eq!(
                 chunks.iter().map(|c| c.len()).collect::<Vec<_>>(),
                 lengths,

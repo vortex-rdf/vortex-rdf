@@ -126,23 +126,24 @@ pub(crate) fn chunked_or_single(mut chunks: Vec<ArrayRef>, dtype: DType) -> Resu
     }
 }
 
-/// `rows` cut into slices of at most `batch_rows` rows, in row order: the
-/// array itself when it fits, no slice for an empty array.
-pub(crate) fn rechunk(rows: ArrayRef, batch_rows: usize) -> Result<Vec<ArrayRef>> {
+/// `rows` cut into slices of at most `batch_rows` (> 0) rows, in row order,
+/// each cut when the iterator reaches it: the array itself when it fits, no
+/// slice for an empty array.
+pub(crate) fn rechunk(
+    rows: ArrayRef,
+    batch_rows: usize,
+) -> impl Iterator<Item = Result<ArrayRef>> + Send + 'static {
     let len = rows.len();
-    if len == 0 {
-        return Ok(Vec::new());
-    }
-    if len <= batch_rows {
-        return Ok(vec![rows]);
-    }
-    (0..len)
-        .step_by(batch_rows)
-        .map(|start| {
-            rows.slice(start..(start + batch_rows).min(len))
-                .map_err(VortexRdfError::Vortex)
-        })
-        .collect()
+    let fits = len <= batch_rows;
+    (0..len).step_by(batch_rows).map(move |start| {
+        if fits {
+            return Ok(rows.clone());
+        }
+        #[cfg(test)]
+        rechunk_hooks::note()?;
+        rows.slice(start..start.saturating_add(batch_rows).min(len))
+            .map_err(VortexRdfError::Vortex)
+    })
 }
 
 /// `arr` as a `StructArray`: a plain downcast when it already is one, else
@@ -238,4 +239,53 @@ pub(crate) fn trusted_str(buf: &[u8]) -> &str {
 #[inline]
 pub(crate) fn buf_as_str(buf: &[u8]) -> Result<&str> {
     Ok(trusted_str(buf))
+}
+
+/// Test hook: how many slices this thread's [`rechunk`] iterators cut, and a
+/// guard that fails one of the next cuts.
+#[cfg(test)]
+pub(crate) mod rechunk_hooks {
+    use std::cell::Cell;
+
+    use crate::error::{Result, VortexRdfError};
+
+    thread_local! {
+        static CUTS: Cell<usize> = const { Cell::new(0) };
+        static FAILING: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Record one cut: an error, the cut's, when a [`FailingCut`] names it.
+    pub(super) fn note() -> Result<()> {
+        let cut = CUTS.with(|c| c.replace(c.get() + 1));
+        if FAILING.with(Cell::get) == Some(cut) {
+            return Err(VortexRdfError::Vortex(vortex_error::vortex_err!(
+                "cut {cut} failed (test hook)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The slices cut on this thread so far.
+    pub(crate) fn cuts() -> usize {
+        CUTS.with(Cell::get)
+    }
+
+    /// While alive, the cut this thread's `rechunk` iterators make `n` cuts
+    /// from now (`0`: the next) fails. Dropping it restores the failure it
+    /// replaced.
+    pub(crate) struct FailingCut(Option<usize>);
+
+    impl FailingCut {
+        /// Fail the cut `n` cuts from now.
+        pub(crate) fn after(n: usize) -> Self {
+            let cut = cuts() + n;
+            FailingCut(FAILING.with(|c| c.replace(Some(cut))))
+        }
+    }
+
+    impl Drop for FailingCut {
+        fn drop(&mut self) {
+            FAILING.with(|c| c.set(self.0));
+        }
+    }
 }

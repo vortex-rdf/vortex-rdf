@@ -136,8 +136,8 @@ most `batch_rows` rows:
 
 In memory, chunks are exactly `batch_rows` long but the last of the base
 (and of the tail); a file-backed view's scan chunks follow the file's
-splits, cut to the cap. Every arm of `code_chunks` gathers one chunk at a
-time, when the chunk is pulled. In memory a contiguous selection without
+splits, cut to the cap. Every arm of both streams cuts or gathers one chunk
+at a time, when the chunk is pulled. In memory a contiguous selection without
 tombstones is sliced from the base, zero-copy over its canonical code
 columns, and any other selection is gathered one window of `batch_rows`
 live ids per chunk, both reading only the requested columns. On file a

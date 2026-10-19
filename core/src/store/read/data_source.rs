@@ -383,14 +383,9 @@ impl Partition for ViewPartition {
                 _ => (store.row_chunks(DATA_SOURCE_BATCH_ROWS)?, 0),
             },
             Rows::Chunks(chunks) => {
-                let pieces: Vec<ArrayRef> = chunks
-                    .iter()
-                    .map(|c| rechunk(c.clone(), DATA_SOURCE_BATCH_ROWS))
-                    .collect::<Result<Vec<_>>>()?
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                (stream::iter(pieces.into_iter().map(Ok)).boxed(), 0)
+                let pieces = (0..chunks.len())
+                    .flat_map(move |k| rechunk(chunks[k].clone(), DATA_SOURCE_BATCH_ROWS));
+                (stream::iter(pieces).boxed(), 0)
             }
         };
         let state = RequestState {
