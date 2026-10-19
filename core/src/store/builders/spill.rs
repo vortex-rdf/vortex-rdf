@@ -4,6 +4,7 @@
 //! emission, so peak memory stays bounded by the chunk size.
 
 use std::collections::BinaryHeap;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::marker::PhantomData;
@@ -48,26 +49,66 @@ fn resolve_spill_parent(env_override: Option<std::ffi::OsString>, base: Option<&
         .unwrap_or_else(std::env::temp_dir)
 }
 
-/// A unique temporary spill directory, deleted when dropped so spill files are
-/// cleaned up even if the chunk stream is abandoned before being fully
-/// consumed.
+/// A spill run's I/O failure: `what` failed in `dir` (shown as `.`, the
+/// working directory, when empty). The error keeps the I/O error's kind, and
+/// its message names the directory and the [`SPILL_DIR_ENV`] way out: a
+/// directory with more room when the volume or a quota is full, a writable
+/// one otherwise.
+pub(crate) fn spill_io_error(dir: &Path, what: &str, e: std::io::Error) -> VortexRdfError {
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let dir = dir.display();
+    let hint = match e.kind() {
+        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => "a directory with more room",
+        _ => "a writable directory",
+    };
+    VortexRdfError::Io(std::io::Error::new(
+        e.kind(),
+        format!("spill run {what} failed in {dir}: {e}; set {SPILL_DIR_ENV} to {hint}"),
+    ))
+}
+
+/// The longest file name, in bytes, the common filesystems take.
+const MAX_NAME_BYTES: usize = 255;
+
+/// A unique spill directory for one build's runs, deleted when dropped so
+/// spill files are cleaned up even if the chunk stream is abandoned before
+/// being fully consumed.
 pub(crate) struct TempRunsGuard {
     dir: PathBuf,
 }
 
 impl TempRunsGuard {
-    /// Create `tmp_vortex_{prefix}_{uuid}` under the spill parent.
+    /// Create the run directory under the spill parent, named after the file
+    /// the build writes: `.<output>.spill-<uuid>`, by default a hidden sibling
+    /// of the output, or `.vortex-rdf.spill-<uuid>` when there is no output
+    /// name (a build into memory or into a caller's writer) or it would make
+    /// the directory's name longer than a file name may be.
     ///
     /// The parent is resolved in precedence order: the `VORTEX_RDF_SPILL_DIR`
-    /// environment variable, then the caller-provided `base` (compaction
-    /// passes the directory its temp file is in, beside the file it replaces,
-    /// so spills share the output's volume), then [`std::env::temp_dir`]. The
-    /// library never writes into the caller's working directory: an embedding
-    /// server or binding can run with an arbitrary — even read-only — cwd.
-    pub(crate) fn create(prefix: &str, base: Option<&Path>) -> Result<Self> {
+    /// environment variable, then the caller-provided `base` (a build that
+    /// writes a file passes the directory its temp file is in, beside the
+    /// file it writes or replaces, so spills share the output's volume), then
+    /// [`std::env::temp_dir`]. The library never falls back to the caller's
+    /// working directory: an embedding server or binding can run with an
+    /// arbitrary — even read-only — cwd.
+    pub(crate) fn create(output: Option<&OsStr>, base: Option<&Path>) -> Result<Self> {
         let parent = resolve_spill_parent(std::env::var_os(SPILL_DIR_ENV), base);
-        let dir = parent.join(format!("tmp_vortex_{}_{}", prefix, uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir)?;
+        let suffix = format!(".spill-{}", uuid::Uuid::new_v4());
+        let output = output
+            .filter(|output| 1 + output.len() + suffix.len() <= MAX_NAME_BYTES)
+            .unwrap_or(OsStr::new("vortex-rdf"));
+        let mut name = OsString::from(".");
+        name.push(output);
+        name.push(suffix);
+        let dir = parent.join(name);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| spill_io_error(&parent, "directory creation", e))?;
+        #[cfg(test)]
+        spill_hooks::note(&dir);
         Ok(Self { dir })
     }
 
@@ -83,9 +124,35 @@ impl Drop for TempRunsGuard {
     }
 }
 
-/// Incremental rkyv writer for spilling items one at a time.
+/// Test hook: the run directory the last [`TempRunsGuard`] this thread
+/// created — what the tests read to pin where a build spilled and what the
+/// directory is called.
+#[cfg(test)]
+pub(crate) mod spill_hooks {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static LAST_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Record the run directory a guard created.
+    pub(super) fn note(dir: &Path) {
+        LAST_DIR.with(|last| *last.borrow_mut() = Some(dir.to_path_buf()));
+    }
+
+    /// The run directory the last guard created on this thread, if any.
+    pub(crate) fn last_dir() -> Option<PathBuf> {
+        LAST_DIR.with(|last| last.borrow().clone())
+    }
+}
+
+/// Incremental rkyv writer for spilling items one at a time. Its I/O
+/// failures name the directory the run file is in ([`spill_io_error`]).
 pub(crate) struct RunWriter<T> {
     writer: BufWriter<File>,
+    /// The directory the run file is in, for error messages.
+    dir: PathBuf,
     /// Serialization buffer reused across pushes; `clear` keeps its capacity.
     buf: AlignedVec,
     _marker: PhantomData<T>,
@@ -93,9 +160,11 @@ pub(crate) struct RunWriter<T> {
 
 impl<T: Spillable> RunWriter<T> {
     pub(crate) fn create(path: &Path) -> Result<Self> {
-        let file = File::create(path)?;
+        let dir = path.parent().unwrap_or(path).to_path_buf();
+        let file = File::create(path).map_err(|e| spill_io_error(&dir, "file creation", e))?;
         Ok(Self {
             writer: BufWriter::new(file),
+            dir,
             buf: AlignedVec::new(),
             _marker: PhantomData,
         })
@@ -114,14 +183,18 @@ impl<T: Spillable> RunWriter<T> {
             ))
         })?;
 
-        self.writer.write_all(&len.to_le_bytes())?;
-        self.writer.write_all(bytes.as_ref())?;
+        self.writer
+            .write_all(&len.to_le_bytes())
+            .and_then(|()| self.writer.write_all(bytes.as_ref()))
+            .map_err(|e| spill_io_error(&self.dir, "write", e))?;
         self.buf = bytes;
         Ok(())
     }
 
     pub(crate) fn finish(mut self) -> Result<()> {
-        Ok(self.writer.flush()?)
+        self.writer
+            .flush()
+            .map_err(|e| spill_io_error(&self.dir, "write", e))
     }
 }
 
@@ -530,13 +603,73 @@ mod tests {
         }
         let base = std::env::temp_dir().join(format!("vortex_spill_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
-        let guard = TempRunsGuard::create("unit", Some(&base)).unwrap();
+        let guard = TempRunsGuard::create(None, Some(&base)).unwrap();
         let dir = guard.path().to_path_buf();
         assert!(dir.starts_with(&base));
         assert!(dir.is_dir());
         drop(guard);
         assert!(!dir.exists());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn temp_runs_guard_names_the_directory_after_its_output() {
+        // As above: a preset override would (correctly) take the directory
+        // away from `base`, so only assert where it is absent.
+        if std::env::var_os(SPILL_DIR_ENV).is_some() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("vortex_spill_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        for (output, prefix) in [
+            (Some(OsStr::new("out.vortex")), ".out.vortex.spill-"),
+            (None, ".vortex-rdf.spill-"),
+        ] {
+            let guard = TempRunsGuard::create(output, Some(&base)).unwrap();
+            let dir = guard.path();
+            assert_eq!(dir.parent(), Some(base.as_path()), "{output:?}");
+            let name = dir.file_name().unwrap().to_str().unwrap();
+            let id = name
+                .strip_prefix(prefix)
+                .unwrap_or_else(|| panic!("{output:?}: {name} does not start with {prefix}"));
+            assert!(uuid::Uuid::parse_str(id).is_ok(), "{output:?}: {name}");
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn temp_runs_guard_falls_back_when_the_output_name_is_too_long() {
+        // `.<output>.spill-<uuid>` would be 294 bytes, past what a file name
+        // may be: the directory takes the name a build without an output has.
+        let long = "x".repeat(250);
+        let guard = TempRunsGuard::create(Some(OsStr::new(&long)), None).unwrap();
+        let dir = guard.path();
+        assert!(dir.is_dir());
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        let id = name
+            .strip_prefix(".vortex-rdf.spill-")
+            .unwrap_or_else(|| panic!("{name} does not start with .vortex-rdf.spill-"));
+        assert!(uuid::Uuid::parse_str(id).is_ok(), "{name}");
+    }
+
+    #[test]
+    fn spill_io_error_suggests_room_for_a_full_volume() {
+        for kind in [ErrorKind::StorageFull, ErrorKind::QuotaExceeded] {
+            let error = spill_io_error(Path::new("/spill/runs"), "write", kind.into());
+            assert!(
+                matches!(&error, VortexRdfError::Io(e) if e.kind() == kind),
+                "{error}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("spill run write failed in /spill/runs: "),
+                "{message}"
+            );
+            assert!(
+                message.ends_with("; set VORTEX_RDF_SPILL_DIR to a directory with more room"),
+                "{message}"
+            );
+        }
     }
 
     fn string_records() -> Vec<(String, u32)> {
@@ -549,7 +682,7 @@ mod tests {
 
     #[test]
     fn run_roundtrip_through_reused_buffers() {
-        let guard = TempRunsGuard::create("unit_roundtrip", None).unwrap();
+        let guard = TempRunsGuard::create(None, None).unwrap();
         let path = guard.path().join("run.bin");
         let records = string_records();
         write_run(&path, &records).unwrap();
@@ -562,7 +695,7 @@ mod tests {
 
     #[test]
     fn truncated_run_is_a_deserialization_error() {
-        let guard = TempRunsGuard::create("unit_truncated", None).unwrap();
+        let guard = TempRunsGuard::create(None, None).unwrap();
         let path = guard.path().join("run.bin");
         let records = string_records();
         write_run(&path, &records).unwrap();
@@ -607,7 +740,7 @@ mod tests {
 
     #[test]
     fn distinct_spiller_collapses_repeats_inside_and_across_runs() {
-        let guard = TempRunsGuard::create("unit_distinct", None).unwrap();
+        let guard = TempRunsGuard::create(None, None).unwrap();
         let items = repeated_items();
         let mut expected = items.clone();
         expected.sort_unstable();
@@ -636,7 +769,7 @@ mod tests {
     /// distinct by their row ids, never by being deduplicated.
     #[test]
     fn plain_spiller_keeps_repeats() {
-        let guard = TempRunsGuard::create("unit_plain", None).unwrap();
+        let guard = TempRunsGuard::create(None, None).unwrap();
         let items = repeated_items();
         let mut expected = items.clone();
         expected.sort_unstable();
@@ -661,7 +794,7 @@ mod tests {
     /// yields each item once.
     #[test]
     fn distinct_merge_of_runs_with_repeats() {
-        let guard = TempRunsGuard::create("unit_distinct_runs", None).unwrap();
+        let guard = TempRunsGuard::create(None, None).unwrap();
         let write = |name: &str, items: &[(u32, u32)]| {
             let path = guard.path().join(name);
             write_run(&path, items).unwrap();
@@ -690,7 +823,7 @@ mod tests {
 
     #[test]
     fn spiller_merges_runs_in_global_order() {
-        let guard = TempRunsGuard::create("unit_merge", None).unwrap();
+        let guard = TempRunsGuard::create(None, None).unwrap();
         let mut spiller: RunSpiller<(u32, u32)> = RunSpiller::new(guard.path(), "pairs", 4);
         let items: Vec<(u32, u32)> = (0..23u32).rev().map(|i| (i % 5, i)).collect();
         for item in &items {

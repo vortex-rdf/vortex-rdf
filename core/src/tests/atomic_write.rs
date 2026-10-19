@@ -39,6 +39,20 @@ fn entries(dir: &Path) -> Vec<PathBuf> {
     entries
 }
 
+/// Write a store file all-or-nothing in one call, the protocol every writer
+/// runs: `PendingStore::create`, then `PendingStore::write` with `write`
+/// filling the temp file.
+async fn write_store_atomically<F, Fut>(path: &Path, write: F) -> crate::error::Result<()>
+where
+    F: FnOnce(tokio::fs::File) -> Fut,
+    Fut: std::future::Future<Output = crate::error::Result<()>>,
+{
+    crate::io::write::PendingStore::create(path)
+        .await?
+        .write(write)
+        .await
+}
+
 const BOTH_INDEXES: [IndexType; 2] = [IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
 
 /// A build whose input fails mid-stream — after valid quads — writes nothing
@@ -219,7 +233,6 @@ async fn test_a_directory_at_the_path_is_refused_before_the_input_is_read() {
 /// directory untouched and removes the temp file.
 #[tokio::test]
 async fn test_a_rename_failing_after_the_write_removes_the_temp_file() {
-    use crate::io::write::write_store_atomically;
     use vortex_io::VortexWrite as _;
 
     let dir = tempfile::tempdir().unwrap();
@@ -247,7 +260,6 @@ async fn test_a_rename_failing_after_the_write_removes_the_temp_file() {
 /// was: absent, or the previous store's exact bytes.
 #[tokio::test]
 async fn test_write_failing_after_the_temp_file_exists_removes_it() {
-    use crate::io::write::write_store_atomically;
     use vortex_io::VortexWrite as _;
 
     for existing in [false, true] {
@@ -288,7 +300,6 @@ async fn test_write_failing_after_the_temp_file_exists_removes_it() {
 /// to exist while the write is stalled, so the cleanup is what removed it.
 #[tokio::test]
 async fn test_dropping_the_write_removes_the_temp_file() {
-    use crate::io::write::write_store_atomically;
     use vortex_io::VortexWrite as _;
 
     let dir = tempfile::tempdir().unwrap();
@@ -320,7 +331,6 @@ async fn test_dropping_the_write_removes_the_temp_file() {
 /// and leaves the previous store as it was.
 #[tokio::test]
 async fn test_a_panic_in_the_write_removes_the_temp_file() {
-    use crate::io::write::write_store_atomically;
     use futures::FutureExt as _;
     use vortex_io::VortexWrite as _;
 
@@ -358,7 +368,6 @@ async fn test_a_panic_in_the_write_removes_the_temp_file() {
 /// be mistaken for a store, and a successful write leaves only `path`.
 #[tokio::test]
 async fn test_temp_file_is_a_sibling_and_gone_after_success() {
-    use crate::io::write::write_store_atomically;
     use vortex_io::VortexWrite as _;
 
     let dir = tempfile::tempdir().unwrap();
@@ -686,7 +695,6 @@ mod links_and_permissions {
     /// temp file.
     #[tokio::test]
     async fn test_the_temp_file_has_the_old_permissions_while_it_is_written() {
-        use crate::io::write::write_store_atomically;
         use vortex_io::VortexWrite as _;
 
         let (dir, path) =
@@ -921,9 +929,11 @@ mod links_and_permissions {
     /// the store replaces, links followed — not beside the link the store was
     /// opened through. Through `current -> versions/v3.vortex` in a directory
     /// that takes no new files, the compaction succeeds because `versions/`
-    /// does, and nothing is left in either directory.
+    /// does, and nothing is left in either directory. The run directory is
+    /// named after the file it sits beside, not after the link.
     #[tokio::test]
     async fn test_compaction_spills_beside_the_file_it_replaces_not_the_link() {
+        use crate::store::builders::spill::spill_hooks;
         // `VORTEX_RDF_SPILL_DIR` outranks any placement by design: only assert
         // the default placement when it is absent.
         if std::env::var_os("VORTEX_RDF_SPILL_DIR").is_some() {
@@ -942,6 +952,8 @@ mod links_and_permissions {
         let Some(_read_only) = read_only_dir(dir.path()) else {
             return;
         };
+        // The setup's own build spilled beside `v3.vortex` as well.
+        let setup_spill = spill_hooks::last_dir();
 
         let compacted = tailed
             .compact()
@@ -960,8 +972,115 @@ mod links_and_permissions {
             13
         );
         let versions = dir.path().join("versions");
+        let spilled = spill_hooks::last_dir().expect("the compaction made a run directory");
+        assert_ne!(
+            Some(&spilled),
+            setup_spill.as_ref(),
+            "the compaction made a run directory of its own"
+        );
+        assert_eq!(spilled.parent(), Some(versions.as_path()));
+        let name = spilled.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(".v3.vortex.spill-"), "{name}");
         assert_eq!(entries(dir.path()), vec![current.clone(), versions.clone()]);
         assert_eq!(entries(&versions), vec![v3]);
+    }
+
+    /// A spill run that cannot be written fails with an error that names the
+    /// directory it was to be written in and the `VORTEX_RDF_SPILL_DIR` way
+    /// out (a writable directory), and keeps the I/O error's kind: here, a
+    /// run file in a directory that takes no new files.
+    #[test]
+    fn test_spill_write_error_names_the_directory_and_the_hint() {
+        use crate::store::RawQuad;
+        use crate::store::builders::spill::RunWriter;
+        let dir = tempfile::tempdir().unwrap();
+        let Some(_read_only) = read_only_dir(dir.path()) else {
+            return;
+        };
+
+        let error = RunWriter::<RawQuad>::create(&dir.path().join("quads_run_0.bin"))
+            .err()
+            .expect("a directory that takes no new files takes no spill run");
+
+        assert!(
+            matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&dir.path().display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("; set VORTEX_RDF_SPILL_DIR to a writable directory"),
+            "{message}"
+        );
+    }
+
+    /// A run directory that cannot be created fails the same way, naming the
+    /// directory it was to be created in: `.` for the working directory, the
+    /// one a bare relative output path is in.
+    #[test]
+    fn test_spill_directory_error_names_the_directory_and_the_hint() {
+        use crate::store::builders::spill::{TempRunsGuard, spill_io_error};
+        // `VORTEX_RDF_SPILL_DIR` outranks the base by design: only assert
+        // where it is absent.
+        if std::env::var_os("VORTEX_RDF_SPILL_DIR").is_some() {
+            eprintln!("skipped: VORTEX_RDF_SPILL_DIR is set");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let Some(_read_only) = read_only_dir(dir.path()) else {
+            return;
+        };
+
+        let error = TempRunsGuard::create(None, Some(dir.path()))
+            .err()
+            .expect("a directory that takes no new files takes no run directory");
+
+        assert!(
+            matches!(&error, VortexRdfError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&dir.path().display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("; set VORTEX_RDF_SPILL_DIR to a writable directory"),
+            "{message}"
+        );
+        let in_cwd = spill_io_error(
+            Path::new(""),
+            "directory creation",
+            std::io::ErrorKind::PermissionDenied.into(),
+        );
+        assert!(in_cwd.to_string().contains(" failed in .: "), "{in_cwd}");
+    }
+
+    /// A serialization to a file spills beside it, on the volume that takes
+    /// the store: the run directory is a hidden sibling named after the
+    /// output, and it is gone once the write is done.
+    #[tokio::test]
+    async fn test_serialize_spills_beside_the_output() {
+        use crate::store::builders::spill::spill_hooks;
+        // `VORTEX_RDF_SPILL_DIR` outranks any placement by design: only assert
+        // the default placement when it is absent.
+        if std::env::var_os("VORTEX_RDF_SPILL_DIR").is_some() {
+            eprintln!("skipped: VORTEX_RDF_SPILL_DIR is set");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.vortex");
+
+        rebuild(&path, modular_quads(12, 3, 4)).await.unwrap();
+
+        let spilled = spill_hooks::last_dir().expect("the build made a run directory");
+        assert_eq!(spilled.parent(), Some(dir.path()));
+        let name = spilled.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with(".out.vortex.spill-"), "{name}");
+        assert_eq!(entries(dir.path()), vec![path]);
     }
 
     /// 4,200 new quads: past the 4,096-row auto-compaction floor.
@@ -1235,8 +1354,6 @@ mod links_and_permissions {
     /// any other, and an append does not hide it.
     #[tokio::test]
     async fn test_only_the_refusal_before_the_build_counts_as_unwritable() {
-        use crate::io::write::write_store_atomically;
-
         let (dir, path) =
             write_store_file(modular_quads(12, 3, 4), LayoutStrategy::Default, vec![]).await;
         if !read_only_is_honoured(&path) {

@@ -36,6 +36,7 @@ use crate::store::layouts::{LayoutStrategy, dictionary};
 
 use crate::debug;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
+use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -68,14 +69,15 @@ impl VortexArrayBuilder for SortedStreamBuilder {
 impl SortedStreamBuilder {
     /// The dataset as a lazy chunk stream for the file writer. After the
     /// (blocking) run-sort phase, merged chunks are built on demand as the
-    /// writer polls.
+    /// writer polls. `spill` places the runs as [`build_chunk_stream`]'s does.
     #[cfg(feature = "file-io")]
     pub(crate) async fn build_vortex_stream(
         quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
+        spill: Option<(&OsStr, &Path)>,
     ) -> Result<BuiltStream> {
-        build_chunk_stream(quad_stream, layout, indexes, DEFAULT_CHUNK_ROWS, None).await
+        build_chunk_stream(quad_stream, layout, indexes, DEFAULT_CHUNK_ROWS, spill).await
     }
 }
 
@@ -164,19 +166,21 @@ impl Encoding {
 /// way the merged quads leave through one emission. Temp run files are
 /// removed when the stream is dropped.
 ///
-/// `spill_dir` pins where the run files land (compaction points it at the
-/// directory of its temp file, beside the file it replaces, so spills share
-/// the output's volume); `None` takes [`TempRunsGuard::create`]'s default
-/// resolution.
+/// `spill` is the output file's name and the directory to spill beside: a
+/// build that writes a file points it at the directory of its temp file,
+/// beside the file it writes or replaces, so spills share the output's
+/// volume, in a run directory named after the output. `None` takes
+/// [`TempRunsGuard::create`]'s default resolution.
 pub(crate) async fn build_chunk_stream(
     mut quads_in: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
     indexes: Indexes,
     chunk_size: usize,
-    spill_dir: Option<&Path>,
+    spill: Option<(&OsStr, &Path)>,
 ) -> Result<BuiltStream> {
     let start = debug::timer();
-    let guard = Arc::new(TempRunsGuard::create("sorted_stream", spill_dir)?);
+    let (output, base) = spill.unzip();
+    let guard = Arc::new(TempRunsGuard::create(output, base)?);
 
     // For the Dictionary layout, the global term dictionary is built
     // incrementally during this same ingestion pass.

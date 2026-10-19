@@ -9,7 +9,7 @@
 //! `quads_stream_to_*` entry points, which run a
 //! builder's chunk stream straight into that writer, and the one way a store
 //! reaches a path on disk: written beside it and renamed into place
-//! ([`write_store_atomically`]).
+//! ([`PendingStore`]).
 //!
 //! Reading these bytes back is [`read`](crate::io::read)'s job,
 //! and the container's own on-disk grammar is
@@ -50,6 +50,10 @@ use futures::Stream;
 /// `RdfStoreWriteStrategy::write_stream` for why). The dictionary is complete
 /// before any chunk flows and becomes the required `dictionary` child.
 ///
+/// A writer has no directory to spill beside: the sort's runs go under
+/// `VORTEX_RDF_SPILL_DIR`, else the OS temp dir, in a hidden
+/// `.vortex-rdf.spill-<uuid>` directory removed when the write ends.
+///
 /// The quads must be canonical: build them with [`RawQuad::from_quad`], the
 /// parser ([`parse_quads_from_reader`]) or [`RawQuad::canonical`]. The
 /// builder interns and compares the spelling it is given, so a hand-built
@@ -70,7 +74,8 @@ where
     refuse_experimental_patches()?;
     let start = debug::timer();
 
-    let built = SortedStreamBuilder::build_vortex_stream(Box::new(quads), layout, indexes).await?;
+    let built =
+        SortedStreamBuilder::build_vortex_stream(Box::new(quads), layout, indexes, None).await?;
     built_stream_to_vortex_writer(built, writer).await?;
 
     log::debug!(
@@ -136,6 +141,13 @@ where
 /// pipe behind it) takes the store in place, with no temp file and so no
 /// all-or-nothing guarantee.
 ///
+/// The sort spills its runs beside the file it writes (where the links at
+/// `path` end), on the volume that takes the store, in a hidden directory
+/// named after that file (`.out.vortex.spill-<uuid>` for `out.vortex`) and
+/// removed when the write ends. `VORTEX_RDF_SPILL_DIR` overrides that place;
+/// a character device or a pipe has no directory to spill beside, and spills
+/// where [`quads_stream_to_vortex_writer`] does.
+///
 /// The quads must be canonical, as for [`quads_stream_to_vortex_writer`]:
 /// from [`RawQuad::from_quad`], the parser ([`parse_quads_from_reader`]) or
 /// [`RawQuad::canonical`].
@@ -153,40 +165,28 @@ where
 {
     let start = debug::timer();
 
-    // The temp file comes first and the build runs inside the write: the
-    // path is checked (and the temp created) before any input is read, and an
-    // input that fails leaves nothing behind, the empty temp file going with
-    // the rest.
-    write_store_atomically(path, |writer| async move {
-        let built =
-            SortedStreamBuilder::build_vortex_stream(Box::new(quads), layout, indexes).await?;
-        built_stream_to_vortex_writer(built, writer).await
-    })
+    // The temp file comes first: the path is checked (and the temp created)
+    // before any input is read. The build then spills beside the temp file,
+    // in a run directory named after the file it writes, and an input that
+    // fails leaves nothing behind, the run directory and the empty temp file
+    // going with the rest.
+    let pending = PendingStore::create(path).await?;
+    let built = SortedStreamBuilder::build_vortex_stream(
+        Box::new(quads),
+        layout,
+        indexes,
+        pending.spill_site(),
+    )
     .await?;
+    pending
+        .write(|writer| built_stream_to_vortex_writer(built, writer))
+        .await?;
 
     log::debug!(
         "[ser::quads_stream_to_vortex_file] Streaming write took {:?}",
         debug::elapsed(start)
     );
     Ok(())
-}
-
-/// Write a store file all-or-nothing: `write` fills a temp file created
-/// beside `path`, which is renamed over `path` only once `write` succeeded.
-/// Every store a path-taking writer produces goes through a [`PendingStore`]:
-/// this is the form for a caller that has its bytes to write straight away
-/// (`quads_stream_to_vortex_file` builds inside `write`), which is
-/// [`PendingStore::create`] followed by [`PendingStore::write`]. A caller that
-/// has work to do before it has bytes (compaction gathers, sorts and builds
-/// first) makes the two calls itself, with the work in between, so that a
-/// path that cannot take a store is refused before that work starts.
-#[cfg(feature = "file-io")]
-pub(crate) async fn write_store_atomically<F, Fut>(path: &std::path::Path, write: F) -> Result<()>
-where
-    F: FnOnce(tokio::fs::File) -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
-{
-    PendingStore::create(path).await?.write(write).await
 }
 
 /// A store file about to be written all-or-nothing: the path has been checked
@@ -437,14 +437,16 @@ impl PendingStore {
         })
     }
 
-    /// The directory the temp file is in: beside the file this store
-    /// replaces, links followed (not beside the link a store was opened
-    /// through). The finished store is renamed within it, which makes it the
-    /// one volume known to take a file as large as the store, and so the
-    /// place for a build's scratch space. A store written in place has none.
-    pub(crate) fn dir(&self) -> Option<&std::path::Path> {
+    /// Where a build that fills this store spills: the name of the file this
+    /// store replaces and the directory the temp file is in, beside that
+    /// file, links followed (not beside the link a store was opened through).
+    /// The finished store is renamed within that directory, which makes it
+    /// the one volume known to take a file as large as the store, and so the
+    /// place for a build's scratch space, named after the file it sits
+    /// beside. A store written in place has none.
+    pub(crate) fn spill_site(&self) -> Option<(&std::ffi::OsStr, &std::path::Path)> {
         match &self.sink {
-            Sink::Replace { target, .. } => target.parent(),
+            Sink::Replace { target, .. } => target.file_name().zip(target.parent()),
             Sink::InPlace => None,
         }
     }
@@ -597,7 +599,7 @@ async fn replacement_target(path: &std::path::Path) -> std::io::Result<std::path
 }
 
 /// A temp file that deletes itself when dropped, unless it was
-/// [persisted](Self::persist) — so each error path of [`write_store_atomically`]
+/// [persisted](Self::persist) — so each error path of a [`PendingStore`]
 /// (and a dropped future) cleans up without a line of its own.
 #[cfg(feature = "file-io")]
 struct TempFile(Option<std::path::PathBuf>);

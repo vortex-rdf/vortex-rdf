@@ -225,9 +225,9 @@ flowchart TD
   `<store>.write-<uuid>.tmp` exists before the work starts (a process killed
   meanwhile leaves it behind, and nothing removes it later). The sorted rows
   are then streamed through the out-of-core builder
-  ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L171))
+  ([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L174))
   into it
-  ([`built_stream_to_vortex_writer`](../core/src/io/write.rs#L92)), which is
+  ([`built_stream_to_vortex_writer`](../core/src/io/write.rs#L97)), which is
   then renamed over the original path, and the store is reopened
   memory-mapped. Only the file the store opened is replaced: the file's
   device and inode are recorded at open and checked against the path before
@@ -241,10 +241,11 @@ flowchart TD
   there a file-backed store cannot compact over its own path: the compaction
   fails with the I/O error and the file stays as it was. The builder's spill
   runs are placed in the temp file's directory
-  ([`dir`](../core/src/io/write.rs#L445), [`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L67)):
+  ([`spill_site`](../core/src/io/write.rs#L447), [`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L98)):
   beside the file being replaced, links followed (a store opened through a
   link spills where the link points, not where the link is), the one volume
-  known to fit the data (`VORTEX_RDF_SPILL_DIR` outranks that default).
+  known to fit the data (`VORTEX_RDF_SPILL_DIR` outranks that default), in a
+  run directory named after that file.
 - **An in-memory store**, and any *derived view* of a file (whose rows are a
   subset of a file other readers share), rebuilds in memory through
   [`build_parts_from_raws`](../core/src/store/builders/mod.rs#L220) and adopts

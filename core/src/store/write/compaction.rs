@@ -153,7 +153,7 @@ impl VortexRdfStore {
             self.layout.strategy(),
             indexes,
             DEFAULT_CHUNK_ROWS,
-            pending.dir(),
+            pending.spill_site(),
         )
         .await?;
         pending

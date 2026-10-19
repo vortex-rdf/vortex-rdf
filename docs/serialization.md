@@ -52,8 +52,8 @@ A builder hands these back in one of two shapes
 | Surface | Call | Pipeline | Produces |
 |---|---|---|---|
 | CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`SerializeArgs`](../cli/src/main.rs#L33)) | out-of-core | file |
-| Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L145) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L60) | out-of-core | file / any `VortexWrite` |
-| Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L75), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L59) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L37) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L127) to name the builder | either | in-memory store |
+| Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/write.rs#L157) / [`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L64) | out-of-core | file / any `VortexWrite` |
+| Rust | [`VortexRdfStore::from_quads`](../core/src/store/construct.rs#L75), or [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L60) / [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L37) then [`VortexRdfStore::from_built`](../core/src/store/construct.rs#L127) to name the builder | either | in-memory store |
 | Rust | [`VortexRdfStore::to_bytes`](../core/src/store/persist/serialize.rs#L138) | — (re-serializes a store) | bytes |
 | Rust | [`VortexRdfStore::from_file_in_memory`](../core/src/store/persist/open.rs#L249) | — (reads a `.vortex` file whole, then adopts it in memory) | in-memory store |
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize_rdf`](../python/src/serialize.rs#L33)) | out-of-core | file |
@@ -195,7 +195,7 @@ time (the wasm array path).
 
 ## 6. Pipeline B — sorted out of core
 
-[`SortedStreamBuilder`](../core/src/store/builders/sorted_stream.rs#L56) is an
+[`SortedStreamBuilder`](../core/src/store/builders/sorted_stream.rs#L57) is an
 external merge sort: peak memory is bounded by the chunk size (plus the
 distinct terms, under the Dictionary layout), not by the dataset.
 
@@ -237,7 +237,7 @@ spilled and merged as they are, never deduplicated — are unique because their
 row ids are.
 
 **Phase 3 — emission.** Without indexes the merge is lazy
-([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L171)):
+([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L174)):
 every poll of the chunk stream pulls up to a chunk's worth of quads off the
 heap and builds one struct
 ([`build_struct_array`](../core/src/store/builders/mod.rs#L157), or
@@ -261,13 +261,26 @@ are re-read from `merged.bin` a chunk at a time — no index is ever materialize
 whole.
 
 **Spill files** are length-prefixed `rkyv` records (a little-endian `u32`
-length, then the archived value) in a per-build temp directory named
-`tmp_vortex_<prefix>_<uuid>` and removed when the stream is dropped.
-The parent directory is resolved in this order
-([`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L67)): the
-`VORTEX_RDF_SPILL_DIR` environment variable, a caller-supplied base (compaction
-passes the directory of its temp file: beside the file it replaces, links
-followed), then the OS temp dir.
+length, then the archived value) in a per-build run directory, removed when
+the stream is dropped. A build that writes a file names the directory after
+that file (where the links at its path end), `.<file name>.spill-<uuid>`
+(`.out.vortex.spill-<uuid>` for `out.vortex`), by default a hidden sibling of
+the store, so a directory a crash left behind says which output it belonged
+to; a build with no output path (an in-memory store, or
+[`quads_stream_to_vortex_writer`](../core/src/io/write.rs#L64) into a caller's
+writer), or one whose file name would make the directory's name longer than
+255 bytes, uses `.vortex-rdf.spill-<uuid>`. The parent directory is resolved in
+this order ([`TempRunsGuard::create`](../core/src/store/builders/spill.rs#L98)):
+the `VORTEX_RDF_SPILL_DIR` environment variable, a caller-supplied base (a
+serialization to a file,
+[`quads_stream_to_vortex_file`](../core/src/io/write.rs#L157) and so the CLI
+and Python's `serialize_rdf`, and a compaction both pass the directory of
+their temp file: beside the file they write or replace, links followed, on the
+volume that takes the store), then the OS temp dir (a build with no output
+path, or one writing into a character device or a pipe). A spill write that
+fails reports the directory it failed in and suggests setting
+`VORTEX_RDF_SPILL_DIR` to a directory with more room (the volume or a quota is
+full) or to a writable directory (any other failure).
 
 | Build | Peak memory |
 |---|---|
@@ -424,9 +437,9 @@ flowchart TD
   `true` by construction for a builder's stream; each component's `sorted` flag
   travels on its descriptor.
 
-One driver feeds this, [`built_stream_to_vortex_writer`](../core/src/io/write.rs#L92):
-a builder's chunk stream (files, compaction; a file is written by
-[`write_store_atomically`](../core/src/io/write.rs#L184) beside its path and renamed
+One driver feeds this, [`built_stream_to_vortex_writer`](../core/src/io/write.rs#L97):
+a builder's chunk stream (files, compaction; a file is written through a
+[`PendingStore`](../core/src/io/write.rs#L265) beside its path and renamed
 into place, so a failed write leaves no partial file and the previous store
 untouched, and on Unix a store that has the old file mapped keeps reading
 it), or a store's split parts as one chunk
@@ -434,13 +447,13 @@ it), or a store's split parts as one chunk
 bindings' exchange bytes). On the wire the two are the same container.
 
 **Replacing a file.** [`PendingStore`](../core/src/io/write.rs#L265) is the one
-way a store reaches a path (`write_store_atomically` is its `create` followed
-by its `write`). `create` makes `<store>.write-<uuid>.tmp` beside the file it
-replaces *before* any input is read or any row gathered, so a path that cannot
-take a store (a missing directory, no permission to write there, a directory
-at the path, a store the process cannot write) is reported at once, by a
-serialization and by a compaction alike; then the build fills the temp file and
-`write` renames it over the old one. What the old file was set up as is kept:
+way a store reaches a path. `create` makes `<store>.write-<uuid>.tmp` beside
+the file it replaces *before* any input is read or any row gathered, so a
+path that cannot take a store (a missing directory, no permission to write
+there, a directory at the path, a store the process cannot write) is
+reported at once, by a serialization and by a compaction alike; then the
+build fills the temp file and `write` renames it over the old one. What the
+old file was set up as is kept:
 a symbolic link at the path (or a chain of them) is followed and the file it
 ends at is replaced, so a `current -> versions/v3.vortex` setup keeps its
 link; the temp file for an existing store is created private (`0600` on Unix,
