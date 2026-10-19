@@ -1,14 +1,16 @@
 use std::collections::HashMap;
+use std::num::NonZero;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use vortex_buffer::Buffer;
 use vortex_rdf_core::{TermCode, VortexRdfError as CoreError, VortexRdfStore as CoreStore};
 
+use crate::batch::Batch;
 use crate::codes::{TermDict, U64Column, decode_slice};
-use crate::fan_out::fan_out;
 use crate::probes::{narrowed_probe, parse_probes};
 use crate::{RUNTIME, VortexRdfError, detached, py_err};
 use vortex_rdf_core::Probe;
@@ -32,6 +34,89 @@ async fn probe_codes(
     probe: &Probe,
 ) -> Result<Option<[Buffer<TermCode>; 4]>, CoreError> {
     store.run_probe(probe).await?.code_columns_gathered().await
+}
+
+/// The probes a batch keeps spawned and unanswered when the call names no
+/// `lookahead`: twice the machine's parallelism, so at least 2.
+static DEFAULT_LOOKAHEAD: LazyLock<usize> = LazyLock::new(|| {
+    std::thread::available_parallelism()
+        .map_or(1, NonZero::get)
+        .saturating_mul(2)
+});
+
+/// A batch call's `lookahead`, or [`DEFAULT_LOOKAHEAD`] for `None`; zero
+/// raises `ValueError`.
+fn batch_lookahead(lookahead: Option<usize>) -> PyResult<usize> {
+    match lookahead {
+        Some(0) => Err(PyValueError::new_err(
+            "lookahead must be at least 1: the probes a batch keeps in flight",
+        )),
+        Some(lookahead) => Ok(lookahead),
+        None => Ok(*DEFAULT_LOOKAHEAD),
+    }
+}
+
+/// The answers of [`VortexRdfStore::match_codes_many`], one per probe in
+/// input order: its `(s, p, o, g)` code columns, or `None` where the code
+/// path does not apply. Each `__next__` waits, GIL-released, for the next
+/// answer of a bounded [`Batch`]; the first failing probe raises at its
+/// position and ends the iteration, and dropping the iterator aborts the
+/// probes still in flight.
+#[pyclass(frozen, module = "vortex_rdf._native")]
+pub struct ProbeAnswers {
+    answers: Mutex<Answers>,
+    /// The number of probes, answered or not.
+    len: usize,
+}
+
+/// What a [`ProbeAnswers`] has still to answer.
+enum Answers {
+    /// The probes' gathered code columns, from a running batch.
+    Batch(Batch<Option<[Buffer<TermCode>; 4]>>),
+    /// `None` for each of this many probes: the store's rows have no codes,
+    /// so no probe runs.
+    Declined(usize),
+}
+
+impl Answers {
+    /// The next probe's answer; `None` once the probes have all answered or
+    /// one has failed.
+    fn next(&mut self) -> Option<Result<Option<[Buffer<TermCode>; 4]>, CoreError>> {
+        match self {
+            Answers::Batch(batch) => batch.next(&RUNTIME),
+            Answers::Declined(left) => {
+                *left = left.checked_sub(1)?;
+                Some(Ok(None))
+            }
+        }
+    }
+}
+
+#[pymethods]
+impl ProbeAnswers {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Option<CodeColumns>>> {
+        // The lock is taken GIL-released, so a thread waiting on it holds
+        // no GIL the answering thread needs back.
+        let answer = py.detach(|| {
+            self.answers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .next()
+        });
+        match answer {
+            None => Ok(None),
+            Some(Ok(columns)) => Ok(Some(columns.map(code_columns))),
+            Some(Err(error)) => Err(py_err(error)),
+        }
+    }
+
+    fn __len__(&self) -> usize {
+        self.len
+    }
 }
 
 /// One row of [`VortexRdfStore::get_quads`]: subject, predicate, object, graph.
@@ -305,15 +390,29 @@ impl VortexRdfStore {
     /// answering in input order. A probe is an `(s, p, o, g)` tuple of
     /// optional term strings or a dict with keys `s`, `p`, `o`, `g`,
     /// `keep`, `limit`, `offset`. Every probe is parsed before any is
-    /// evaluated, so a malformed one raises `ValueError` first. The call
-    /// raises the error of the first failing probe in input order and
-    /// cancels the probes after it.
-    fn count_quads_many(&self, py: Python<'_>, probes: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
+    /// evaluated, so a malformed one raises `ValueError` first. The probes
+    /// run concurrently, at most `lookahead` of them spawned and unanswered
+    /// at a time (see [`Self::match_codes_many`]). The call raises the error
+    /// of the first failing probe in input order and aborts the probes after
+    /// it.
+    #[pyo3(signature = (probes, *, lookahead=None))]
+    fn count_quads_many(
+        &self,
+        py: Python<'_>,
+        probes: &Bound<'_, PyAny>,
+        lookahead: Option<usize>,
+    ) -> PyResult<Vec<usize>> {
+        let lookahead = batch_lookahead(lookahead)?;
         let probes = parse_probes(probes)?;
         py.detach(|| {
-            fan_out(&RUNTIME, &self.store, probes, |store, probe| async move {
-                store.count_probe(&probe).await
-            })
+            Batch::spawn(
+                &RUNTIME,
+                &self.store,
+                probes,
+                lookahead,
+                |store, probe| async move { store.count_probe(&probe).await },
+            )
+            .collect(&RUNTIME)
         })
         .map_err(py_err)
     }
@@ -386,28 +485,39 @@ impl VortexRdfStore {
         Ok(columns.map(code_columns))
     }
 
-    /// [`Self::match_codes`] for a batch of probes in one GIL-released
-    /// call, answering in input order (see [`Self::count_quads_many`] for
-    /// the probe forms). The probes run concurrently on the bindings'
-    /// runtime; every probe is parsed before any is evaluated. The call
-    /// raises the error of the first failing probe in input order and
-    /// cancels the probes after it.
+    /// [`Self::match_codes`] for a batch of probes, answered in input order
+    /// by an iterator ([`ProbeAnswers`]; see [`Self::count_quads_many`] for
+    /// the probe forms). Every probe is parsed before any is evaluated. The
+    /// probes run concurrently on the bindings' runtime while the iterator
+    /// is pulled, at most `lookahead` of them spawned and unanswered at a
+    /// time (by default twice the machine's parallelism). The first failing
+    /// probe in input order raises at its position, and the probes after it
+    /// are aborted, as are the probes in flight when the iterator is
+    /// dropped. On a store whose rows have no codes every answer is `None`
+    /// and no probe runs.
+    #[pyo3(signature = (probes, *, lookahead=None))]
     fn match_codes_many(
         &self,
-        py: Python<'_>,
         probes: &Bound<'_, PyAny>,
-    ) -> PyResult<Vec<Option<CodeColumns>>> {
+        lookahead: Option<usize>,
+    ) -> PyResult<ProbeAnswers> {
+        let lookahead = batch_lookahead(lookahead)?;
         let probes = parse_probes(probes)?;
-        if self.store.dict_reader().is_none() {
-            return Ok(probes.iter().map(|_| None).collect());
-        }
-        let columns = py
-            .detach(|| {
-                fan_out(&RUNTIME, &self.store, probes, |store, probe| async move {
-                    probe_codes(&store, &probe).await
-                })
-            })
-            .map_err(py_err)?;
-        Ok(columns.into_iter().map(|c| c.map(code_columns)).collect())
+        let len = probes.len();
+        let answers = if self.store.dict_reader().is_none() {
+            Answers::Declined(len)
+        } else {
+            Answers::Batch(Batch::spawn(
+                &RUNTIME,
+                &self.store,
+                probes,
+                lookahead,
+                |store, probe| async move { probe_codes(&store, &probe).await },
+            ))
+        };
+        Ok(ProbeAnswers {
+            answers: Mutex::new(answers),
+            len,
+        })
     }
 }

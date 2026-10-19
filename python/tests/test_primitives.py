@@ -374,7 +374,7 @@ def test_many_matches_singles(code_store, vortex_files):
             single_count = store.count_quads(*probe)
         assert u64_rows(cols) == u64_rows(single), probe
         assert count == single_count == len(u64_rows(cols)), probe
-    assert store.match_codes_many([]) == []
+    assert list(store.match_codes_many([])) == []
     assert store.count_quads_many([]) == []
     # Parse-all-first: a malformed probe raises before any evaluation.
     for bad in [[(None, None, None)], [{"bogus": 1}], ["<x>"], [(None, "not a term", None, None)]]:
@@ -389,7 +389,7 @@ def test_many_matches_singles(code_store, vortex_files):
         with pytest.raises(ValueError, match=r"^Invalid input: pattern predicate: "):
             store.count_quads_many(bad)
     strings = VortexRdfStore(vortex_files["default"])
-    assert strings.match_codes_many(probes[:2]) == [None, None]
+    assert list(strings.match_codes_many(probes[:2])) == [None, None]
     assert strings.count_quads_many(probes[:2]) == [5, 3]
 
 

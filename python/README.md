@@ -72,7 +72,7 @@ cols = store.match_codes(p=NAME, keep={"o": range(lo, hi)})
 cols = store.match_codes(p=NAME, keep={"o": passed, "g": [0]}, limit=100, offset=20)
 n = store.count_quads(p=NAME, keep={"o": passed}, limit=1)   # an existence test
 
-# Many probes in one GIL-released call, answered in input order.
+# Many probes, answered in input order through a bounded window of probes in flight.
 views = store.match_codes_many([(None, NAME, None, None), {"s": "<http://ex.org/bob>", "limit": 5}])
 counts = store.count_quads_many([{"p": NAME, "keep": {"o": literals}}])
 

@@ -241,8 +241,8 @@ def test_keeps_take_codes_past_u32(store):
     # A wide code beside a narrow one admits the narrow one's rows only.
     assert store.count_quads(keep={"s": [alice, wide]}) == rows
     assert store.count_quads_many([{"keep": {"s": [wide]}}, {"keep": {"s": [alice]}}]) == [0, rows]
-    many = store.match_codes_many([{"keep": {"s": U64Column([wide])}}])
-    assert all(len(col) == 0 for col in many[0])
+    [cols] = store.match_codes_many([{"keep": {"s": U64Column([wide])}}])
+    assert all(len(col) == 0 for col in cols)
 
 
 @pytest.mark.parametrize("bad", OUT_OF_RANGE)

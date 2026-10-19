@@ -60,13 +60,15 @@ def test_version_matches_distribution():
 
 
 def _runtime_methods(cls):
-    names = _public(dir(cls)) | {"__len__", "__repr__"}
+    names = _public(dir(cls)) | {"__len__", "__repr__", "__iter__", "__next__"}
     if sys.version_info >= (3, 12):
         names |= {n for n in ("__buffer__",) if hasattr(cls, n)}
     return names
 
 
-@pytest.mark.parametrize("name", ["VortexRdfStore", "TermDict", "U64Column", "CodeGroups"])
+@pytest.mark.parametrize(
+    "name", ["VortexRdfStore", "TermDict", "U64Column", "CodeGroups", "ProbeAnswers"]
+)
 def test_stub_class_methods_match_runtime(name):
     stub_methods = _stub_classes(_stub_tree())[name]
     cls = getattr(_native, name)

@@ -13,8 +13,8 @@ publish = false
 # `[tool.maturin] module-name` in pyproject.toml). `test = false` keeps
 # `cargo test --workspace` from producing a test binary that would need to
 # link libpython — the crate's behavior is covered by the pytest suite, apart
-# from the batch fan-out (`src/fan_out.rs`, free of Python types), which
-# `tests/fan_out.rs` compiles on its own.
+# from the bounded batch driver (`src/batch.rs`, free of Python types), which
+# `tests/batch.rs` compiles on its own.
 [lib]
 name = "_native"
 crate-type = ["cdylib"]
@@ -23,6 +23,7 @@ doctest = false
 
 [dependencies]
 vortex-rdf-core = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
+futures = { workspace = true }
 pyo3 = { workspace = true, features = ["extension-module", "abi3-py311"] }
 vortex-buffer.workspace = true

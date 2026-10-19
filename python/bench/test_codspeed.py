@@ -434,11 +434,11 @@ def test_pushdown_exists(benchmark, stores):
 
 @pytest.mark.benchmark
 def test_pushdown_many(benchmark, stores):
-    """64 subject probes in one `match_codes_many` — a nested-loop join's
-    probe batch, one GIL release for the lot."""
+    """64 subject probes through one `match_codes_many`, consumed whole — a
+    nested-loop join's probe batch, answered through the bounded window."""
     store = stores["triples::dict"]
     probes = [(nn(i * 7 % DIM), None, None, None) for i in range(64)]
-    benchmark(lambda: store.match_codes_many(probes))
+    benchmark(lambda: list(store.match_codes_many(probes)))
 
 
 @pytest.mark.benchmark

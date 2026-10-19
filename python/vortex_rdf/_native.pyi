@@ -233,6 +233,22 @@ class CodeGroups:
         any pair is built."""
         ...
 
+class ProbeAnswers:
+    """The answers of `VortexRdfStore.match_codes_many`, one per probe in
+    input order: its four code columns ``(s, p, o, g)``, or None where the
+    code path does not apply. Each `__next__` waits, with the GIL released,
+    for the next answer; the probes run while the iterator is pulled, at
+    most `lookahead` of them in flight. The first failing probe raises at its
+    position and ends the iteration; dropping the iterator aborts the probes
+    still in flight."""
+
+    def __iter__(self) -> "ProbeAnswers": ...
+    def __next__(self) -> Optional[Tuple[U64Column, U64Column, U64Column, U64Column]]: ...
+    def __len__(self) -> int:
+        """The number of probes, answered or not."""
+        ...
+    def __repr__(self) -> str: ...
+
 class VortexRdfStore:
     def __init__(self, path: _StrPath, *, in_memory: bool = False) -> None:
         """Open a `.vortex` file memory-mapped, or load it whole with
@@ -285,19 +301,27 @@ class VortexRdfStore:
         scan stops at the first block that fills the window."""
         ...
     def match_codes_many(
-        self, probes: Sequence[_Probe]
-    ) -> List[Optional[Tuple[U64Column, U64Column, U64Column, U64Column]]]:
-        """`match_codes` for a batch of probes in one GIL-released call,
-        answering in input order. A probe is an ``(s, p, o, g)`` tuple of
+        self, probes: Sequence[_Probe], *, lookahead: Optional[int] = None
+    ) -> ProbeAnswers:
+        """`match_codes` for a batch of probes, answered in input order by an
+        iterator (`ProbeAnswers`). A probe is an ``(s, p, o, g)`` tuple of
         optional term strings or a dict with keys ``s``, ``p``, ``o``,
         ``g``, ``keep``, ``limit``, ``offset``. Every probe is parsed before
-        any is evaluated (``ValueError`` first); the probes run concurrently.
-        The call raises the error of the first failing probe in input order
-        and cancels the probes after it."""
+        any is evaluated (``ValueError`` first). The probes run concurrently
+        while the iterator is pulled, at most `lookahead` of them spawned and
+        unanswered at a time: by default twice the machine's parallelism;
+        ``0`` raises ``ValueError``. The first failing probe in input order
+        raises at its position and the probes after it are aborted, as are
+        the probes in flight when the iterator is dropped. On a store whose
+        rows have no codes every answer is None and no probe runs."""
         ...
-    def count_quads_many(self, probes: Sequence[_Probe]) -> List[int]:
+    def count_quads_many(
+        self, probes: Sequence[_Probe], *, lookahead: Optional[int] = None
+    ) -> List[int]:
         """`count_quads` for a batch of probes (see `match_codes_many`), in
-        input order."""
+        input order, in one GIL-released call through the same bounded
+        window. The call raises the error of the first failing probe in
+        input order and aborts the probes after it."""
         ...
     def get_quads(
         self,

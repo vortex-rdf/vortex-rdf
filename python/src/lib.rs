@@ -6,8 +6,8 @@
 //! Unlike the wasm bindings, this crate keeps core's `file-io` feature on:
 //! stores are opened lazily from `.vortex` files and queried in place.
 
+mod batch;
 mod codes;
-mod fan_out;
 mod probes;
 mod serialize;
 mod store;
@@ -75,6 +75,7 @@ where
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<store::VortexRdfStore>()?;
+    m.add_class::<store::ProbeAnswers>()?;
     m.add_class::<codes::TermDict>()?;
     m.add_class::<codes::U64Column>()?;
     m.add_class::<codes::CodeGroups>()?;
