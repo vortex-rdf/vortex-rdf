@@ -132,14 +132,30 @@ most `batch_rows` rows:
   under a string layout the tail's live rows follow the base.
 - `code_chunks(columns, batch_rows)` — `u64` code columns
   (`Buffer<TermCode>`), one buffer per requested `QuadColumn` in the
-  requested order; Dictionary layout, empty tail. In memory the buffers are
-  slices of the base's canonical code columns, zero-copy for a contiguous
-  selection without tombstones; on file the scan projects only the
-  requested columns.
+  requested order; Dictionary layout, empty tail.
 
 In memory, chunks are exactly `batch_rows` long but the last of the base
 (and of the tail); a file-backed view's scan chunks follow the file's
-splits, cut to the cap. `code_columns_gathered` remains the one-shot form.
+splits, cut to the cap. Every arm of `code_chunks` gathers one chunk at a
+time, when the chunk is pulled. In memory a contiguous selection without
+tombstones is sliced from the base, zero-copy over its canonical code
+columns, and any other selection is gathered one window of `batch_rows`
+live ids per chunk. On file a selection taken by id is taken one window of
+ids per chunk, and the scan reads the file split by split, a bounded window
+of splits in flight ([§4](#4-which-runtime-a-read-needs)); the scan, and a
+read by id with no filter pending, read only the requested columns. A
+served match materializes its row ids before the first chunk (only its
+columns are chunked), and point reads read their few rows at once.
+
+`code_columns_gathered` is the one-shot form, for a match the caller has
+counted and will consume whole: one call answers all four columns,
+zero-copy over the base's canonical code columns for a contiguous selection
+without tombstones. The chunk stream is the form for a match consumed
+incrementally or of unknown size, and the bindings reach it through
+`match_code_chunks` (Python) and `matchCodeChunks` (JS). A Python
+`match_codes` call given a cancel token returns its result when its gather
+completes before the cancel is observed, and raises `Cancelled` when the
+token is cancelled before the call or while the call waits for data.
 
 **To Arrow.** vortex converts a chunk through its own session:
 `vortex_session().arrow().execute_arrow(chunk, None, &mut ctx)` (the

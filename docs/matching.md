@@ -1153,15 +1153,26 @@ stops at its first matching block.
 ### 16.3 Batches
 
 `match_many(&[Probe])` (and `count_many`) runs a pattern plus its keeps and
-window per probe and answers in input order, the probes concurrently
-(`try_join_all`): a file-backed store overlaps their reads, an in-memory
-match is CPU work and runs probe by probe. `run_probe` and `count_probe` are
-the one-probe forms, and `count_many` maps over `count_probe`.
-`Probe::parse` builds a probe from the four term spellings a person types,
-and a spelling it refuses is an `InvalidInput` error naming the slot
-(`pattern subject: …`). The futures are `Send`, so a binding layer can
-instead spawn one task per probe onto its runtime — the Python bindings do,
-for every batch.
+window per probe and answers in input order. It builds every probe's future
+at once and joins them (`try_join_all`): a file-backed store overlaps their
+reads, an in-memory match is CPU work and runs probe by probe. No binding
+calls either. `run_probe` and `count_probe` are the one-probe forms, and
+`count_many` maps over `count_probe`. `Probe::parse` builds a probe from the
+four term spellings a person types, and a spelling it refuses is an
+`InvalidInput` error naming the slot (`pattern subject: …`).
+
+The bindings drive the one-probe forms themselves. Their futures are
+`Send`, so the Python bindings spawn one task per probe onto their runtime,
+through a bounded window: a driver task, spawned with the call, keeps an
+ordered window of `lookahead` probes running and forwards their answers in
+input order into a channel of `lookahead` answers, so at most 2 ×
+`lookahead` probes are running or answered but not yet pulled (`lookahead`
+defaults to twice the machine's parallelism, and at least 64).
+`match_codes_many` answers through an iterator, one probe per pull, and
+`count_quads_many` as a list. The JS bindings run a batch sequentially on
+wasm's single thread: `matchCodesMany` answers one probe per pull of its
+iterable, checking the `AbortSignal` its options may carry before each
+pull, and `countQuadsMany` answers an array.
 
 ### 16.4 Predicates and the dictionary handle
 
@@ -1216,5 +1227,9 @@ checked against rdflib by `python/tests/test_filter_codes_differential.py`.
 | `TermPredicate`, `Verdict`, `KindRanges`, the verdict rules, the regex subset | [`core/src/store/layouts/dictionary/predicates/mod.rs`](../core/src/store/layouts/dictionary/predicates/mod.rs), [`numeric.rs`](../core/src/store/layouts/dictionary/predicates/numeric.rs), [`literal.rs`](../core/src/store/layouts/dictionary/predicates/literal.rs), [`text.rs`](../core/src/store/layouts/dictionary/predicates/text.rs), [`regex_filter.rs`](../core/src/store/layouts/dictionary/predicates/regex_filter.rs) |
 | The RDF/XSD datatype IRIs the predicates and the TypedObject layout share | [`core/src/common/vocab.rs`](../core/src/common/vocab.rs) |
 | Column kernels (`distinct_first_seen`, `value_counts`, `take`, `equi_join_indices`) | [`core/src/columns.rs`](../core/src/columns.rs) |
+| `join_count`: a join's pair count, from the counting pass alone, no pair allocated | [`core/src/columns.rs`](../core/src/columns.rs) |
+| The `max_pairs` cap of `equi_join_indices` and `CodeGroups`: a pair count past it is refused before any output is allocated, as `Err(pairs)` (`JoinTooLarge` in Python) | [`core/src/columns.rs`](../core/src/columns.rs) |
+| `CodeGroups` (`build`, `count`, `join`): the right key column grouped by code once and probed by any number of left slices | [`core/src/columns.rs`](../core/src/columns.rs) |
+| `CodeGroups::gather`: the joined columns filled as the pairs are found, with no pair index columns built | [`core/src/columns.rs`](../core/src/columns.rs) |
 | View state (`QuadsSource`, its accessors, view constructors and `located_window`; `Tail`) | [`core/src/store/view/mod.rs`](../core/src/store/view/mod.rs) |
 | Read paths consuming the view | [`core/src/store/read/quads.rs`](../core/src/store/read/quads.rs), [`core/src/store/read/rows.rs`](../core/src/store/read/rows.rs), [`core/src/store/read/count.rs`](../core/src/store/read/count.rs) |
