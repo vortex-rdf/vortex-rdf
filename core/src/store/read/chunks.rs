@@ -123,7 +123,7 @@ impl VortexRdfStore {
         batch_rows: usize,
     ) -> Result<CodeChunkStream> {
         // In memory over the base's own code columns: a contiguous run is
-        // sliced per chunk, and a window of live ids gathered per pull.
+        // sliced and a window of live ids gathered, one chunk per pull.
         if let Some(prims) = self.base_code_primitives() {
             return Ok(match self.memory_rows(batch_rows)? {
                 MemoryRows::Run(run) => {
@@ -137,14 +137,13 @@ impl VortexRdfStore {
                         })
                         .collect();
                     let rows = run.len();
-                    let chunks: Vec<Result<Vec<Buffer<TermCode>>>> = (0..rows)
-                        .step_by(batch_rows)
-                        .map(|start| {
-                            let end = start.saturating_add(batch_rows).min(rows);
-                            Ok(picked.iter().map(|b| b.slice(start..end)).collect())
-                        })
-                        .collect();
-                    stream::iter(chunks).boxed()
+                    stream::iter((0..rows).step_by(batch_rows).map(move |start| {
+                        #[cfg(test)]
+                        run_hooks::note();
+                        let end = start.saturating_add(batch_rows).min(rows);
+                        Ok(picked.iter().map(|b| b.slice(start..end)).collect())
+                    }))
+                    .boxed()
                 }
                 MemoryRows::Windows(windows) => {
                     let picked: Vec<usize> = columns.iter().map(|c| c.index()).collect();
@@ -385,5 +384,26 @@ pub(crate) mod gather_hooks {
     /// The windows gathered on this thread so far.
     pub(crate) fn gathers() -> usize {
         GATHERS.with(Cell::get)
+    }
+}
+
+/// Test hook: how many chunks this thread's code-chunk streams cut from an
+/// in-memory run's columns, one per cut.
+#[cfg(test)]
+pub(crate) mod run_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CUTS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Record one chunk cut.
+    pub(crate) fn note() {
+        CUTS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// The chunks cut on this thread so far.
+    pub(crate) fn cuts() -> usize {
+        CUTS.with(Cell::get)
     }
 }

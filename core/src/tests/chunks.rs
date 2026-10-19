@@ -3,7 +3,7 @@
 //! narrowed, served, tombstoned and tailed views.
 
 use super::*;
-use crate::store::read::chunks::gather_hooks;
+use crate::store::read::chunks::{gather_hooks, run_hooks};
 use crate::store::{QuadColumn, TermCode};
 use crate::vortex_scan::ScanRequest;
 use vortex_array::dtype::{DType, Nullability};
@@ -189,6 +189,20 @@ async fn test_chunks_in_memory_match_gathered() {
         assert_gathers(&served, batch, rows.div_ceil(batch), "served P match").await;
     }
     assert_gathers(&store, 7, 0, "the whole store").await;
+}
+
+/// In memory, the whole store is one contiguous run, and its code chunks are
+/// cut as they are pulled: at one row a chunk the first pull cuts one chunk,
+/// and the stream one per row.
+#[tokio::test]
+async fn test_chunks_cut_a_run_per_pull() {
+    let store = built_store(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
+    let expected = base_ordered_codes(&store).await;
+    let codes = store.code_chunks(&QuadColumn::ALL, 1).unwrap();
+    let (chunks, first, total) = drain_counted(codes, run_hooks::cuts).await;
+    assert_eq!(first, 1, "the first pull cuts one chunk");
+    assert_eq!(total, expected.len(), "one cut per row at one row a chunk");
+    assert_eq!(code_rows(&chunks), expected, "the cut chunks are the rows");
 }
 
 /// In memory, over every index set, the views of a store with tombstones:
