@@ -119,7 +119,8 @@ if has js; then
     [ -d node_modules ] || npm ci
     build "npm run build" pkg/web/vortex_rdf_bg.wasm "${BINDING_DEPS[@]}"
     build "npm run build:hdt-wasm" bench/hdt-pkg/hdt_wasm_bench_bg.wasm \
-      bench/hdt-wasm/src bench/hdt-wasm/Cargo.toml bench/hdt-wasm/Cargo.lock
+      bench/hdt-wasm/src bench/hdt-wasm/Cargo.toml bench/hdt-wasm/Cargo.lock \
+      ../.cargo/config.toml
     npm run bench
   )
 fi

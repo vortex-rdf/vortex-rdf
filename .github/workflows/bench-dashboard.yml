@@ -73,7 +73,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: js/bench/hdt-pkg
-          key: hdt-pkg-${{ hashFiles('js/bench/hdt-wasm/src/**', 'js/bench/hdt-wasm/Cargo.toml', 'js/bench/hdt-wasm/Cargo.lock', 'scripts/refresh.sh', '.github/actions/setup-rust/action.yml') }}
+          key: hdt-pkg-${{ hashFiles('js/bench/hdt-wasm/src/**', 'js/bench/hdt-wasm/Cargo.toml', 'js/bench/hdt-wasm/Cargo.lock', '.cargo/config.toml', 'scripts/refresh.sh', '.github/actions/setup-rust/action.yml') }}
 
       - name: Cache Python native extension
         uses: actions/cache@v6
