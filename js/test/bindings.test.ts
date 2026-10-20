@@ -1,4 +1,4 @@
-import { describe, test, expect } from 'vitest';
+import { beforeAll, describe, test, expect } from 'vitest';
 import { DataFactory } from 'rdf-data-factory';
 import { Readable } from 'node:stream';
 import type { Quad, Term, Literal, Stream } from '@rdfjs/types';
@@ -15,6 +15,8 @@ import {
     type Probe,
     type ReadOptions,
 } from '@vortex-rdf/vortex-rdf-store';
+// The wasm iterator handles, which the package entries do not re-export.
+import { CodeChunks, ProbeAnswers } from '../pkg/web/vortex_rdf.js';
 
 const df = new DataFactory();
 
@@ -525,6 +527,7 @@ describe('multi-chunk payloads', () => {
     // Builders emit chunks of DEFAULT_CHUNK_SIZE (100,000) quads; a payload one
     // row past the boundary exercises every multi-chunk read path.
     const CHUNK_SIZE = 100_000;
+    const N = CHUNK_SIZE + 1;
 
     const manyNquads = (n: number): string => {
         let out = '';
@@ -534,34 +537,41 @@ describe('multi-chunk payloads', () => {
         return out;
     };
 
+    // Built once for the cases below: the payload's `serializeRdf` bytes, a
+    // store built from its text, and that store's `toBytes`.
+    let serialized: Uint8Array;
+    let built: VortexRdfStore;
+    let builtBytes: Uint8Array;
+    beforeAll(async () => {
+        const text = manyNquads(N);
+        serialized = await serializeRdf(text, 'nquads');
+        built = await VortexRdfStore.fromString(text, 'nquads');
+        builtBytes = await built.toBytes();
+    }, 120_000);
+
     test('serializeRdf/deserializeRdf round-trips nquads across a chunk boundary', async () => {
-        const n = CHUNK_SIZE + 1;
-        const bytes = await serializeRdf(manyNquads(n), 'nquads');
-        const out = await deserializeRdf(bytes, 'nquads');
-        expect(out.trim().split('\n').filter(Boolean).length).toBe(n);
+        const out = await deserializeRdf(serialized, 'nquads');
+        expect(out.trim().split('\n').filter(Boolean).length).toBe(N);
     });
 
     test('fromBytes recovers every chunk', async () => {
-        const n = CHUNK_SIZE + 1;
-        const bytes = await serializeRdf(manyNquads(n), 'nquads');
-        const store = await VortexRdfStore.fromBytes(bytes);
-        expect(await store.size()).toBe(n);
+        const store = await VortexRdfStore.fromBytes(serialized);
+        expect(await store.size()).toBe(N);
     });
 
     test('toBytes/fromBytes round-trips a multi-chunk store', async () => {
-        const n = CHUNK_SIZE + 1;
-        const store = await VortexRdfStore.fromString(manyNquads(n), 'nquads');
-        const restored = await VortexRdfStore.fromBytes(await store.toBytes());
-        expect(await restored.size()).toBe(n);
+        const restored = await VortexRdfStore.fromBytes(builtBytes);
+        expect(await restored.size()).toBe(N);
     });
 
-    test('matchCodeChunks at batchRows 7 and the default concatenate to matchCodes', async () => {
-        const built = await VortexRdfStore.fromString(manyNquads(CHUNK_SIZE + 1), 'nquads');
+    test('matchCodeChunks at batchRows 701 and the default concatenate to matchCodes', async () => {
         // Adopted from bytes, the store reads its rows from the encoded columns.
-        const adopted = await VortexRdfStore.fromBytes(await built.toBytes());
-        // Every tenth row: a predicate match the store gathers by row id.
+        const adopted = await VortexRdfStore.fromBytes(builtBytes);
+        // Every tenth row: a predicate match the store gathers by row id. A
+        // batch of 701 rows divides neither its 10,000 rows nor the default
+        // batch of 8,192.
         const p3 = df.namedNode('http://example.org/p3');
-        const cases: [Term | null, number | undefined][] = [[null, undefined], [p3, undefined], [p3, 7]];
+        const cases: [Term | null, number | undefined][] = [[null, undefined], [p3, undefined], [p3, 701]];
         for (const store of [built, adopted]) {
             for (const [predicate, batchRows] of cases) {
                 const whole = store.matchCodes(null, predicate, null, null)!;
@@ -1391,11 +1401,17 @@ describe('disposal', () => {
         expect(() => dict.decode(0)).toThrow();
     });
 
-    test('Symbol.dispose is free on both handles', () => {
+    test('Symbol.dispose is free on every wasm handle', () => {
         expect(typeof VortexRdfStore.prototype[Symbol.dispose]).toBe('function');
         expect(VortexRdfStore.prototype[Symbol.dispose]).toBe(VortexRdfStore.prototype.free);
         expect(typeof TermDict.prototype[Symbol.dispose]).toBe('function');
         expect(TermDict.prototype[Symbol.dispose]).toBe(TermDict.prototype.free);
+        // The iterator handles under matchCodeChunks and matchCodesMany, which
+        // the package does not export: their iterables free them.
+        expect(typeof CodeChunks.prototype[Symbol.dispose]).toBe('function');
+        expect(CodeChunks.prototype[Symbol.dispose]).toBe(CodeChunks.prototype.free);
+        expect(typeof ProbeAnswers.prototype[Symbol.dispose]).toBe('function');
+        expect(ProbeAnswers.prototype[Symbol.dispose]).toBe(ProbeAnswers.prototype.free);
     });
 
     test('an iterable over a freed store throws on its next pull, then ends', async () => {
