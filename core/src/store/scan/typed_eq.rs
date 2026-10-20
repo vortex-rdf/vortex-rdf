@@ -395,31 +395,38 @@ mod tests {
         pairs.iter().map(|&(f, v)| (f, Scalar::from(v))).collect()
     }
 
-    /// An encoded column binds through the probe and filters exactly like the
-    /// canonical ground truth.
+    /// The selection-size gate, by `(constraints, rows, selection, want)`:
+    /// an encoded column binds through the probe and, below the gate,
+    /// filters exactly like the canonical ground truth. A probe-bound
+    /// constraint keeps the gate even with a second constraint beside it,
+    /// and a lone slice-bound constraint keeps it too: a wide selection
+    /// declines to the mask scan (`None`), a narrow one is served.
     #[test]
-    fn probe_bound_column_filters_rows() {
-        let sa = mixed_struct(1000);
-        let eqs = eqs(&[("p", 3), ("o", 10)]);
-        let ids = typed_residual_ids(&sa, &RowSelection::All, 1000, &eqs, None).unwrap();
-        let want: Vec<u64> = (0..1000u64)
-            .filter(|i| i % 7 == 3 && i % 11 == 10)
-            .collect();
-        assert_eq!(ids.as_slice(), &want[..]);
-    }
-
-    /// A probe-bound constraint keeps the selection-size gate even with a
-    /// second constraint beside it: wide selections decline to the mask scan.
-    #[test]
-    fn probe_bound_column_declines_wide_selection() {
-        let n = (TYPED_EQ_MAX_ROWS as TermCode) * 2;
-        let sa = mixed_struct(n);
-        let eqs = eqs(&[("p", 3), ("o", 10)]);
-        assert!(typed_residual_ids(&sa, &RowSelection::All, n as usize, &eqs, None).is_none());
-        let narrow = RowSelection::Range(10..90);
-        let ids = typed_residual_ids(&sa, &narrow, n as usize, &eqs, None).unwrap();
-        let want: Vec<u64> = (10..90u64).filter(|i| i % 7 == 3 && i % 11 == 10).collect();
-        assert_eq!(ids.as_slice(), &want[..]);
+    fn typed_eq_gates_the_selection_size() {
+        let wide = (TYPED_EQ_MAX_ROWS as TermCode) * 2;
+        let both = |range: std::ops::Range<u64>| -> Option<Vec<u64>> {
+            Some(range.filter(|i| i % 7 == 3 && i % 11 == 10).collect())
+        };
+        let lone = |range: std::ops::Range<u64>| -> Option<Vec<u64>> {
+            Some(range.filter(|i| i % 7 == 3).collect())
+        };
+        let probe_bound: &[(&'static str, TermCode)] = &[("p", 3), ("o", 10)];
+        let slice_bound: &[(&'static str, TermCode)] = &[("p", 3)];
+        for (constraints, rows, selection, want) in [
+            (probe_bound, 1000, RowSelection::All, both(0..1000)),
+            (probe_bound, wide, RowSelection::All, None),
+            (probe_bound, wide, RowSelection::Range(10..90), both(10..90)),
+            (slice_bound, wide, RowSelection::All, None),
+            (slice_bound, wide, RowSelection::Range(0..100), lone(0..100)),
+        ] {
+            let sa = mixed_struct(rows);
+            let ids = typed_residual_ids(&sa, &selection, rows as usize, &eqs(constraints), None);
+            assert_eq!(
+                ids.map(|ids| ids.as_slice().to_vec()),
+                want,
+                "{constraints:?} over {rows} rows, {selection:?}"
+            );
+        }
     }
 
     /// A wide scan over a payload-wrapped column materializes the wrapper's
@@ -465,20 +472,6 @@ mod tests {
         let eqs = vec![("k", Scalar::from(2u8))];
         let ids = typed_residual_ids(&sa, &RowSelection::All, 100, &eqs, None).unwrap();
         let want: Vec<u64> = (0..100u64).filter(|i| i % 3 == 2).collect();
-        assert_eq!(ids.as_slice(), &want[..]);
-    }
-
-    /// A lone slice-bound constraint declines a wide selection to the mask
-    /// scan and serves a narrow one.
-    #[test]
-    fn single_code_eq_declines_wide_selection() {
-        let n = (TYPED_EQ_MAX_ROWS as TermCode) * 2;
-        let sa = mixed_struct(n);
-        let eqs = eqs(&[("p", 3)]);
-        assert!(typed_residual_ids(&sa, &RowSelection::All, n as usize, &eqs, None).is_none());
-        let ids =
-            typed_residual_ids(&sa, &RowSelection::Range(0..100), n as usize, &eqs, None).unwrap();
-        let want: Vec<u64> = (0..100u64).filter(|i| i % 7 == 3).collect();
         assert_eq!(ids.as_slice(), &want[..]);
     }
 

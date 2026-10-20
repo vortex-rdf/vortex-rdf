@@ -483,72 +483,58 @@ mod tests {
         }
     }
 
+    /// Both trust forms parse each `(serialized, value)` case to the simple
+    /// literal `value`.
+    fn assert_parses_in_both_trust_forms(cases: &[(&str, &str)]) {
+        for &(serialized, value) in cases {
+            let expected = Term::Literal(Literal::new_simple_literal(value));
+            assert_eq!(
+                term(serialized, Trust::Stored).unwrap(),
+                expected,
+                "stored parse of {serialized}"
+            );
+            assert_eq!(
+                term(serialized, Trust::Input).unwrap(),
+                expected,
+                "input parse of {serialized}"
+            );
+        }
+    }
+
+    /// A simple literal's value parses alike in both trust forms, over three
+    /// tables: structure lookalikes inside the value, the recognized escape
+    /// sequences, and the escapes kept as written.
     #[test]
-    fn structure_scan_ignores_suffix_lookalikes_inside_the_value() {
+    fn literal_values_parse_alike_in_both_trust_forms() {
         // `"@` and `^^` inside the value must not be read as structure: both
         // parses see a simple literal, and the `Input` one does not error.
-        for (serialized, value) in [
+        const SUFFIX_LOOKALIKES: &[(&str, &str)] = &[
             ("\"say \\\"hi\\\"@home\"", "say \"hi\"@home"),
             ("\"a ^^ b\"", "a ^^ b"),
             (
                 "\"\\\"^^<http://example.org/nope>\"",
                 "\"^^<http://example.org/nope>",
             ),
-        ] {
-            let expected = Term::Literal(Literal::new_simple_literal(value));
-            assert_eq!(term(serialized, Trust::Stored).unwrap(), expected);
-            assert_eq!(term(serialized, Trust::Input).unwrap(), expected);
-        }
-    }
-
-    #[test]
-    fn escape_sequences_decode_in_both_paths() {
-        for (serialized, value) in [
+        ];
+        // Every recognized escape sequence decodes, in both paths.
+        const ESCAPE_SEQUENCES: &[(&str, &str)] = &[
             ("\"a\\u0041b\"", "aAb"),
             ("\"\\U0001F600\"", "\u{1F600}"),
             ("\"\\b\\f\"", "\u{8}\u{c}"),
             ("\"\\'\"", "'"),
             ("\"\\t\\n\\r\"", "\t\n\r"),
             ("\"\\\\\\\"\"", "\\\""),
-        ] {
-            let expected = Term::Literal(Literal::new_simple_literal(value));
-            assert_eq!(
-                term(serialized, Trust::Stored).unwrap(),
-                expected,
-                "{}",
-                serialized
-            );
-            assert_eq!(
-                term(serialized, Trust::Input).unwrap(),
-                expected,
-                "{}",
-                serialized
-            );
-        }
-    }
-
-    /// A backslash that starts no recognized escape, or a truncated or
-    /// non-scalar `\u`, is kept as written — the decoder never loses input.
-    #[test]
-    fn unrecognized_escapes_are_preserved_verbatim() {
-        for (serialized, value) in [
+        ];
+        // A backslash that starts no recognized escape, or a truncated or
+        // non-scalar `\u`, is kept as written — the decoder never loses
+        // input.
+        const UNRECOGNIZED_ESCAPES: &[(&str, &str)] = &[
             ("\"\\q\"", "\\q"),
             ("\"\\u12\"", "\\u12"),
             ("\"\\uD800\"", "\\uD800"),
-        ] {
-            let expected = Term::Literal(Literal::new_simple_literal(value));
-            assert_eq!(
-                term(serialized, Trust::Stored).unwrap(),
-                expected,
-                "{}",
-                serialized
-            );
-            assert_eq!(
-                term(serialized, Trust::Input).unwrap(),
-                expected,
-                "{}",
-                serialized
-            );
+        ];
+        for cases in [SUFFIX_LOOKALIKES, ESCAPE_SEQUENCES, UNRECOGNIZED_ESCAPES] {
+            assert_parses_in_both_trust_forms(cases);
         }
     }
 

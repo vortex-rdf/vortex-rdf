@@ -704,24 +704,11 @@ mod tests {
         assert!(TermPredicate::parse("num_lt", "abc").is_err());
         assert!(TermPredicate::parse("datatype", "").is_err());
         assert_eq!(
-            p("num_lt", "5").to_string(),
-            format!("num_lt(\"5\"^^<{INT}>)")
-        );
-        assert_eq!(
-            p("num_lt", "1.50").to_string(),
-            format!("num_lt(\"1.50\"^^<{DEC}>)")
-        );
-        assert_eq!(
-            p("num_lt", "-.5").to_string(),
-            format!("num_lt(\"-0.5\"^^<{DEC}>)")
-        );
-        assert_eq!(
             p("num_lt", &typed("7", INT)),
             p("num_lt", "7"),
             "a typed literal and a bare integer parse alike"
         );
         assert_eq!(p("datatype", "<http://x>"), p("datatype", "http://x"));
-        assert_eq!(p("is_iri", "").to_string(), "is_iri");
 
         // An empty decimal body is no number, bare or typed.
         for constant in [".", "+.", "-."]

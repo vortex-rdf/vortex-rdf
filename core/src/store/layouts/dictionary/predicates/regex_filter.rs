@@ -472,10 +472,12 @@ mod tests {
     use super::*;
     use Verdict::{False, True, Unknown};
 
-    /// Python 3.13 `re.search` results (rdflib's call).
+    /// Each row is a Python `re.search` result (rdflib's call), and the
+    /// filter's verdict on the text agrees with it.
     #[test]
-    fn decided_texts_agree_with_python_re() {
-        for (pattern, flags, text, want) in [
+    fn regex_rows_agree_with_python_re() {
+        // Decided texts, checked against Python 3.13.
+        let decided = [
             ("ab", "", "xaby", True),
             ("^ab", "", "xab", False),
             ("ab$", "m", "xab\n", True),
@@ -518,20 +520,10 @@ mod tests {
             ("[$]", "", "$", True),
             ("^$", "m", "a\n", True),
             ("a.$", "", "a\r", True),
-        ] {
-            assert_eq!(
-                RegexTest::new(pattern, flags).eval(text),
-                want,
-                "{pattern:?} {flags:?} on {text:?}"
-            );
-        }
-    }
-
-    /// More of the allow-list's boundaries, each row checked against Python
-    /// 3.11, 3.13 and 3.14 `re.search` (rdflib's call).
-    #[test]
-    fn allow_list_boundaries_agree_with_python_re() {
-        for (pattern, flags, text, want) in [
+        ];
+        // More of the allow-list's boundaries, each row checked against
+        // Python 3.11, 3.13 and 3.14.
+        let boundaries = [
             // Counted repetition, empty groups and empty alternatives.
             ("a{0}", "", "b", True),
             ("^a{0}$", "", "b", False),
@@ -613,7 +605,8 @@ mod tests {
             ("a$", "m", "a\n", True),
             (r"\Aa", "", "a\n", True),
             ("[$]", "", "a\n", False),
-        ] {
+        ];
+        for (pattern, flags, text, want) in decided.into_iter().chain(boundaries) {
             assert_eq!(
                 RegexTest::new(pattern, flags).eval(text),
                 want,
