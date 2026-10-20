@@ -46,8 +46,8 @@ impl StructProbes {
     /// The cache's answer for `base`'s child named `name`, resolving all
     /// children on first use: `Some(Some(probe))` for a resolved probe,
     /// `Some(None)` for a child whose encoding declines (or a name `base`
-    /// lacks), and `None` for a base other than the one first resolved —
-    /// whose children the cache cannot answer for.
+    /// lacks), and `None` for a base other than the one first resolved: the
+    /// cache cannot answer for that base's children.
     pub(crate) fn by_name(
         &self,
         base: &ArrayRef,

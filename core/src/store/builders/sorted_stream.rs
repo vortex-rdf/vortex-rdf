@@ -38,8 +38,8 @@ use vortex_array::dtype::DType;
 
 /// The out-of-core, globally sorted builder: an external merge sort, so a
 /// dataset larger than memory builds. Sorted runs are spilled to disk
-/// (`build_vortex_array`'s under `VORTEX_RDF_SPILL_DIR`, else the OS temp
-/// dir), then K-way merged into fixed-size chunks.
+/// (`build_vortex_array` spills under `VORTEX_RDF_SPILL_DIR`, else the OS
+/// temp dir), then K-way merged into fixed-size chunks.
 ///
 /// With any secondary index requested, the quad merge runs eagerly to a spill
 /// (it assigns the row ids) while each index family's `(value, row id)`

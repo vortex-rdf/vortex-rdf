@@ -69,7 +69,7 @@ pub struct VortexRdfStore {
     /// selection and tombstones that define the base rows this view sees.
     quads: QuadsSource,
     /// The layout resolved against the base; a Dictionary layout carries its
-    /// term access, shared by every derived view.
+    /// `DictAccess`, shared by every derived view.
     layout: ResolvedLayout,
     /// The secondary indexes this store routes through, read at construction
     /// off its components (file-backed: its index children). A derived view

@@ -190,12 +190,13 @@ const ROW_BLOCK: usize = 8192;
 
 /// The compressor every store child is written with: the session's schemes,
 /// limited to the wire forms its write editions allow, minus FastLanes delta.
-/// Delta suits exactly the columns the store binary-searches in place (the
-/// sorted subject column, the index children's lead columns), but a delta
-/// value is a running sum, so a point read decodes its whole 1,024-value block
-/// where a bit-packed or frame-of-reference column answers from one word. The
-/// reader still probes delta, for files written elsewhere. The pinned core
-/// edition leaves delta out too; the exclusion holds under one that admits it.
+/// Delta is the smallest encoding for exactly the columns the store
+/// binary-searches in place (the sorted subject column, the index children's
+/// lead columns), but a delta value is a running sum, so a point read decodes
+/// its whole 1,024-value block where a bit-packed or frame-of-reference column
+/// answers from one word. The reader still probes delta, for files written
+/// elsewhere. The pinned core edition already leaves delta out; the exclusion
+/// keeps it out under one that admits it.
 fn store_compressor() -> vortex_btrblocks::BtrBlocksCompressorBuilder {
     use vortex_btrblocks::schemes::integer::DeltaScheme;
     use vortex_btrblocks::{BtrBlocksCompressorBuilder, SchemeExt as _};

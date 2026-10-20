@@ -1,5 +1,6 @@
 //! The tokio runtime the bench targets drive their async calls through.
-//! Included by `support/mod.rs` and, via `#[path]`, by `compare.rs`.
+//! Included by `support/mod.rs` and, via `#[path]`, by
+//! `bench-compare/benches/compare.rs`.
 
 use std::sync::OnceLock;
 

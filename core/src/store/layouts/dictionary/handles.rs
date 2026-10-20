@@ -284,9 +284,9 @@ impl DictReader {
         }
     }
 
-    /// [`decode`](Self::decode) over a batch, in order, whatever the codes'
-    /// order and repeats: [`decode_many_with`](Self::decode_many_with), one
-    /// owned string per position.
+    /// [`decode`](Self::decode) over a batch, in order, for codes in any
+    /// order and with repeats: [`decode_many_with`](Self::decode_many_with)
+    /// collected into one owned string per position.
     pub async fn decode_many(&self, codes: &[TermCode]) -> Result<Vec<Option<String>>> {
         let mut terms = vec![None; codes.len()];
         self.decode_many_with(codes, |i, term| terms[i] = term.map(str::to_owned))

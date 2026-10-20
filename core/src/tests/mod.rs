@@ -64,9 +64,10 @@ fn make_quad(s: &str, p: &str, o_lit: &str, g: GraphName) -> Quad {
 }
 
 /// `n` quads `s{i:02} p{i % p_mod} "object {i % o_mod}"` in the default
-/// graph — the suite's stock modular dataset. Subjects are unique and
-/// zero-padded (lexicographic order is numeric order); predicates and
-/// objects recur on their moduli, so match selectivities are arithmetic.
+/// graph: the suite's stock modular dataset. Subjects are unique and
+/// zero-padded to two digits (lexicographic order is numeric order below
+/// 100); predicates and objects recur on their moduli, so match
+/// selectivities are arithmetic.
 fn modular_quads(n: usize, p_mod: usize, o_mod: usize) -> Vec<Quad> {
     (0..n)
         .map(|i| {

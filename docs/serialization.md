@@ -315,7 +315,7 @@ is the sorted set of every distinct term of the dataset — subjects, predicates
 objects and graph names in one namespace, the default graph's `""` included. A
 term's code is its position, so code order equals string order and a bound
 term resolves to its code by binary search. The frozen column is
-FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/storage.rs#L238)):
+FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/storage.rs#L239)):
 one symbol table is trained on the whole column and the terms are compressed in
 independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage.rs#L36)
 (65,536) terms, each window a self-contained FSST array. The term count must
@@ -399,7 +399,7 @@ flowchart TD
     R --> F["Vortex footer, postscript, end-of-file marker"]
 ```
 
-- **The quad table** goes through [`child_strategy`](../core/src/io/container/sources.rs#L229)
+- **The quad table** goes through [`child_strategy`](../core/src/io/container/sources.rs#L230)
   — Vortex's default `WriteStrategyBuilder` pipeline: split the struct into
   columns, repartition each column into 8,192-row blocks, compute zoned
   statistics per block, dictionary-encode a column where sampling says it pays,
@@ -407,7 +407,7 @@ flowchart TD
   BtrBlocks-style compressor, and write flat leaf layouts. Each id column —
   a `u64` term-code `s`, `p`, `o`, `g` or `val`, or a `u64` row-id `rid` —
   is handed, through the builder's per-field override, to
-  [`id_column_strategy`](../core/src/io/container/sources.rs#L289): the same
+  [`id_column_strategy`](../core/src/io/container/sources.rs#L290): the same
   per-column pipeline rebuilt step for step from Vortex's layout strategies,
   with the coalescing target split in two. A column that does not
   dictionary-encode coalesces toward ~2 MiB, 262,144 rows per leaf for a
@@ -416,12 +416,12 @@ flowchart TD
   copy to Vortex's pipeline: at 1 MiB for both targets it must write the
   stock bytes. A table without id columns — the string layouts' quad
   table — gets the stock pipeline unchanged
-  ([`default_child_strategy`](../core/src/io/container/sources.rs#L211)).
+  ([`default_child_strategy`](../core/src/io/container/sources.rs#L212)).
 - **Index children** take exactly the same strategy, so their encoding is what a
   plain table write produces: plain code columns and `rid` (row ids are
   unique, so never dictionary-encoded) at ~2 MiB, dictionary codes at ~1 MiB,
   term strings under the string layouts at ~1 MiB.
-- **The dictionary** takes [`dict_child_strategy`](../core/src/io/container/sources.rs#L366):
+- **The dictionary** takes [`dict_child_strategy`](../core/src/io/container/sources.rs#L367):
   its chunks are already FSST-compressed windows, so they are written verbatim
   as one flat leaf each under a chunked node — no sampling, no re-encoding —
   zoned one zone per window with the window's exact first and last term when

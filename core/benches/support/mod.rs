@@ -383,8 +383,9 @@ pub fn bench_moduli() -> dataset::Moduli {
     *M.get_or_init(|| dataset::moduli(bench_size(), dataset::WANT_GRAPHS))
 }
 
-/// Generate the bench dataset as a stream of quads — the rows `compare.rs`'s
-/// `ensure_quads_dataset` writes, built in process.
+/// Generate the bench dataset as a stream of quads: the rows
+/// `bench-compare/benches/compare.rs`'s `ensure_quads_dataset` writes, built
+/// in process.
 pub fn generate_rdf_data_stream(size: usize) -> impl Stream<Item = Result<RawQuad>> {
     let m = dataset::moduli(size, dataset::WANT_GRAPHS);
 

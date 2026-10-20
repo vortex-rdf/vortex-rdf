@@ -805,8 +805,9 @@ fn chunks_source_limit(bencher: divan::Bencher) {
 /// floor folds the tail into the base, which is a rebuild rather than an append
 /// — `mutate_compact` times that — and for a file-backed store the fold rewrites
 /// its source file in place, which is the shared artifact every other file
-/// benchmark here opens. The comparative suite's `MUT_BATCH` (`compare.rs`) is
-/// not clamped: its add row deliberately includes the auto-compaction.
+/// benchmark here opens. The comparative suite's `MUT_BATCH`
+/// (`bench-compare/benches/compare.rs`) is not clamped: its add row
+/// deliberately includes the auto-compaction.
 fn mut_batch() -> usize {
     /// One below `AUTO_COMPACT_TAIL_FLOOR`, the smallest tail the store will
     /// fold (the ratio trigger only raises that bar).

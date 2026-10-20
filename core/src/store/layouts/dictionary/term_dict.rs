@@ -22,8 +22,9 @@ use super::storage::{DictCursor, ResidentChunks};
 /// term by a read at the term's rank. A single-term read decodes every probe
 /// into one scratch buffer ([`ResidentChunks::bytes_into`]); a batch reads
 /// through a [`cursor`](Self::cursor). Terms are read as UTF-8 unchecked
-/// ([`trusted_str`]), so the dictionary must come from a store this crate
-/// wrote or the caller trusts. Only the kind ranges are cached across calls.
+/// ([`trusted_str`]), so they must come from a Utf8 column of a store this
+/// crate wrote or the caller trusts. Only the kind ranges are cached across
+/// calls.
 pub(crate) struct TermDictionary {
     /// The identity of this dictionary (see
     /// [`DictReader::dictionary_id`](crate::DictReader::dictionary_id)).

@@ -65,8 +65,8 @@ impl<'a> SortedProbe<'a> {
 
     /// [`Self::bounds`] restricted to `range`, in absolute indices: only the
     /// window must be sorted ascending (as in a column sorted per run of a
-    /// leading key), and rows outside it are never read, every probe
-    /// point-reading through [`Self::value_at`].
+    /// leading key), and rows outside it are never read, because every probe
+    /// point-reads through [`Self::value_at`].
     ///
     /// # Panics
     /// Panics if `range.end > self.len()`.

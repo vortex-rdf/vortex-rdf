@@ -381,7 +381,7 @@ pub fn parse_quads_from_reader<R: std::io::Read + Send + 'static>(
 
 /// Mechanism tests for the parsers above: term parsing from serialized
 /// N-Triples strings, and the escape-aware structure scan the literal
-/// decoders are built on (a documented perf-sensitive area — see
+/// decoders are built on (a documented perf-sensitive area: see
 /// [`closing_quote`]). Store-level escaped-literal round-trips live in the
 /// central suite (`crate::tests::escaping`), whose shared case list the
 /// parser-agreement test below borrows.

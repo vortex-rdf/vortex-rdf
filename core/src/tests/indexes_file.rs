@@ -95,9 +95,10 @@ async fn run_copy_index_file_test(layout: LayoutStrategy, located: bool) {
         write_store_file(quads.clone(), layout, vec![IndexType::SecondaryByCopy]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
 
-    // Predicate and graph — the serving script asserts the rest of this
-    // shape: a graph is never a sort key of the copies, so the plan filters
-    // the child instead of reading a located run.
+    // Predicate and graph (the serving script asserts the rest of this
+    // shape): the graph is never one of the keys a copy is searched by (it is
+    // the last key of both orders), so the plan filters the child instead of
+    // reading a located run.
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     let by_pg = store
         .match_pattern(None, Some(&p1), None, Some(&graphs[1]))

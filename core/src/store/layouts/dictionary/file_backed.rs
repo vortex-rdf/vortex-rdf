@@ -61,9 +61,9 @@ struct Window {
 /// The charge one open file's window cache may hold: its windows' bytes
 /// ([`TermChunk::heap_bytes`]) plus [`WINDOW_ENTRY_OVERHEAD`] each, the least
 /// recently used evicted first. A 65,536-term FSST window is charged about
-/// 256 KiB (4 bytes of code offsets per term), so about 15 fit. Over a mapped
-/// file (every `from_file` store) a window's code bytes are slices of the
-/// map, so the charge bounds the heap the cache holds.
+/// 260 KiB (4 bytes of code offsets per term, plus the overhead), so about 15
+/// fit. Over a mapped file (every `from_file` store) a window's code bytes are
+/// slices of the map, so the charge bounds the heap the cache holds.
 const WINDOW_CACHE_BYTES: usize = 4 << 20;
 
 /// What each cached window is charged beyond its chunk's bytes: its symbol
@@ -222,8 +222,8 @@ impl Windows {
 /// A term dictionary left in its layout child: term → code probes and code →
 /// term decodes read the windows they need from the (mapped) file, through a
 /// bounded cache of rebuilt windows. Terms are read as UTF-8 unchecked, so
-/// the file must be one this crate wrote or the caller trusts. Cloning is an
-/// `Arc` bump.
+/// the child must be a Utf8 column of a file this crate wrote or the caller
+/// trusts. Cloning is an `Arc` bump.
 #[derive(Clone)]
 pub(crate) struct FileBackedDict(Arc<Windows>);
 

@@ -45,9 +45,10 @@ const LITERALS_PER_TEN: usize = 4;
 /// Named graphs the *generated* dataset asks for, before the coprimality nudge.
 ///
 /// The comparative suite's N-Quads file requests the same 8 (`moduli` in
-/// `compare.rs`), so the graph role has the same shape wherever a bench binds
-/// one. It cannot be 1: a single-graph dataset has no graph term to bind, which
-/// would quietly turn `G` into a second full scan and `SPOG` into `SPO`.
+/// `bench-compare/benches/compare.rs`), so the graph role has the same shape
+/// wherever a bench binds one. It cannot be 1: a single-graph dataset has no
+/// graph term to bind, which would quietly turn `G` into a second full scan
+/// and `SPOG` into `SPO`.
 pub const WANT_GRAPHS: usize = 8;
 
 /// Per-role term counts for an `n`-row dataset.
@@ -173,9 +174,9 @@ pub fn graph_iri(i: usize) -> String {
 }
 
 /// Object `i`, in whichever of the two forms the caller needs: the in-process
-/// generators build `oxrdf` terms, the file writers in `compare.rs` write
-/// N-Triples text, and both must agree on the *same* term or the two suites stop
-/// measuring the same data.
+/// generators build `oxrdf` terms, the file writers in
+/// `bench-compare/benches/compare.rs` write N-Triples text, and both must agree
+/// on the *same* term or the two suites stop measuring the same data.
 pub enum ObjectTerm {
     Iri(String),
     /// A literal body carrying no quote, backslash or newline, so N-Triples

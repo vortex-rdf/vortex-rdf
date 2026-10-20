@@ -122,7 +122,7 @@ impl Drop for TempRunsGuard {
 }
 
 /// Test hook: the run directory the last [`TempRunsGuard`] this thread
-/// created — what the tests read to pin where a build spilled and what the
+/// created, which the tests read to pin where a build spilled and what the
 /// directory is called.
 #[cfg(test)]
 pub(crate) mod spill_hooks {

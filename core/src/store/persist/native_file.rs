@@ -54,10 +54,10 @@ pub(crate) struct NativeStoreFile {
     splits: OnceLock<Arc<[Range<u64>]>>,
     /// Statistics-only pruning envelopes keyed by filter shape: the
     /// expression itself, whose `Eq`/`Hash` are structural (fn id and options
-    /// per node), so a hit costs a tree walk but no allocation, where an
-    /// envelope costs a pruning evaluation over every zone and the bindings'
-    /// repeated-pattern workloads (e.g. rdflib joins) re-ask the same few
-    /// filters. Bounded by [`PRUNING_MEMO_MAX`].
+    /// per node). An envelope costs a pruning evaluation over every zone, and
+    /// the bindings' repeated-pattern workloads (e.g. rdflib joins) re-ask the
+    /// same few filters; keyed this way a hit costs a tree walk but no
+    /// allocation. Bounded by [`PRUNING_MEMO_MAX`].
     pruning_envelopes: BoundedMemo<Expression, Option<Range<u64>>>,
     /// The quad table's chunk-probe handles, by column (see [`ChunkMemo`]).
     /// Each handle keeps the probes of the leaves it fetched, so a repeated
@@ -217,7 +217,7 @@ impl BoundExprMemo {
         self.0.clears.load(Ordering::Acquire)
     }
 
-    /// Entries held — what the tests read to pin which shapes get bound.
+    /// Entries held: what the tests read to pin which shapes get bound.
     #[cfg(test)]
     pub(crate) fn debug_len(&self) -> usize {
         self.0.map.lock().expect("memo lock").len()

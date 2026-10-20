@@ -160,7 +160,7 @@ impl ResidentChunks {
     }
 
     /// A cursor over the terms: one chunk cursor per chunk, each with its own
-    /// scratch; a one-chunk column's builds only the first.
+    /// scratch; a one-chunk column's cursor builds only the first.
     pub(super) fn cursor(&self) -> DictCursor<'_> {
         let (first, rest) = self
             .chunks
@@ -197,9 +197,10 @@ impl TermDictionary {
     /// a `Serialization` error past `i32::MAX` terms.
     pub(crate) fn from_sorted_column(plain: VarBinViewArray) -> Result<Self> {
         // A conservative cap, not a format limit: nothing in the format needs
-        // the count to fit an `i32` (codes are `u64`, and each FSST window's
-        // offsets span `DICT_CHUNK_ROWS` terms), but no larger dictionary is
-        // tested, and this build holds every term in memory.
+        // the count to fit an `i32` (the column's length is a `usize`, codes
+        // are `u64`, and each FSST window's offsets span `DICT_CHUNK_ROWS`
+        // terms), but no larger dictionary is tested, and this build holds
+        // every term in memory.
         if plain.len() > i32::MAX as usize {
             return Err(VortexRdfError::Serialization(format!(
                 "Dictionary of {} unique terms exceeds the supported maximum ({})",
