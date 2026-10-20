@@ -445,7 +445,7 @@ impl NativeStoreFile {
     }
 
     /// A component's slot in the inventory and its child layout, by name.
-    fn component_child(&self, name: &str) -> VortexResult<Option<(usize, LayoutRef)>> {
+    pub(crate) fn component_child(&self, name: &str) -> VortexResult<Option<(usize, LayoutRef)>> {
         let Some(index) = self.components.iter().position(|c| c.name == name) else {
             return Ok(None);
         };

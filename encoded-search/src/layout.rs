@@ -121,6 +121,32 @@ impl ColumnChunks {
         })
     }
 
+    /// EXPERIMENT (branch exp/zone-map-runend-point-lookup): each chunk leaf's (row_offset, row_count).
+    pub fn debug_chunk_rows(&self) -> Vec<(u64, u64)> {
+        self.chunks
+            .iter()
+            .map(|c| (c.row_offset, c.row_count))
+            .collect()
+    }
+
+    /// EXPERIMENT (branch exp/zone-map-runend-point-lookup): chunk `idx`'s array in its wire encoding (dictionary codes composed with their values).
+    pub async fn debug_chunk_array(
+        &self,
+        idx: usize,
+        source: &Arc<dyn SegmentSource>,
+        session: &VortexSession,
+    ) -> VortexResult<ArrayRef> {
+        let leaf = &self.chunks[idx];
+        let flat = leaf.layout.as_opt::<Flat>().vortex_expect("flat");
+        let array = fetch_flat(flat, leaf.row_count, source, session).await?;
+        Ok(match &leaf.dict {
+            None => array,
+            Some(dict) => {
+                Array::<Dict>::try_new(array, dict.array(source, session).await?)?.into_array()
+            }
+        })
+    }
+
     /// Number of rows in the column.
     pub fn row_count(&self) -> u64 {
         self.row_count
@@ -204,7 +230,6 @@ impl ColumnChunks {
             };
             self.chunks[lo2 - 1].row_offset + probe.upper_bound(needle) as u64
         };
-
         Ok(Some(lower..upper.max(lower)))
     }
 
@@ -440,4 +465,94 @@ fn unwrap_zoned(mut node: LayoutRef) -> Option<LayoutRef> {
         node = node.slot(0).ok().flatten()?;
     }
     Some(node)
+}
+
+/// EXPERIMENT (branch exp/zone-map-runend-point-lookup): a sorted column's zone map (min/max per `zone_len` rows), as the file stores it.
+pub struct DebugZoneDir {
+    /// Rows per zone.
+    pub zone_len: u64,
+    /// Per-zone minimum.
+    pub mins: Vec<u64>,
+    /// Per-zone maximum.
+    pub maxs: Vec<u64>,
+}
+
+/// EXPERIMENT (branch exp/zone-map-runend-point-lookup): read `field`'s zone map from a struct layout (one flat segment).
+pub async fn debug_zone_dir(
+    root: &LayoutRef,
+    field: &str,
+    source: &Arc<dyn SegmentSource>,
+    session: &VortexSession,
+) -> VortexResult<Option<DebugZoneDir>> {
+    use vortex_array::VortexSessionExecute as _;
+    use vortex_array::arrays::struct_::StructArrayExt as _;
+    use vortex_array::arrays::{PrimitiveArray, StructArray};
+    let Some(column) = (0..root.nslots()).find_map(|i| {
+        matches!(root.slot_type(i), Some(LayoutChildType::Field(ref name)) if name.as_ref() == field)
+            .then(|| root.slot(i).ok().flatten())
+            .flatten()
+    }) else { return Ok(None) };
+    let Some(zoned) = column.as_opt::<Zoned>() else {
+        return Ok(None);
+    };
+    let zone_len = zoned.zone_len() as u64;
+    let Some(zones) = column.slot(1)? else {
+        return Ok(None);
+    };
+    let Some(flat) = zones.as_opt::<Flat>() else {
+        return Ok(None);
+    };
+    let table = fetch_flat(flat, zones.row_count(), source, session).await?;
+    let mut ctx = session.create_execution_ctx();
+    let st = table.execute::<StructArray>(&mut ctx)?;
+    let mut get = |name: &str| -> VortexResult<Vec<u64>> {
+        let f = st
+            .unmasked_field_by_name(name)?
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)?;
+        Ok(f.as_slice::<u64>().to_vec())
+    };
+    let mins = get("vortex.min()")?;
+    let maxs = get("vortex.max()")?;
+    Ok(Some(DebugZoneDir {
+        zone_len,
+        mins,
+        maxs,
+    }))
+}
+
+impl ColumnChunks {
+    /// EXPERIMENT (branch exp/zone-map-runend-point-lookup): [`Self::bounds`] that picks the chunk from the file's zone map (plain `u64` bisection, no
+    /// encoded reads) and finds the run with one RunEnd search. Falls back to [`Self::bounds`] when the run
+    /// reaches the chunk's end (it may continue in the next chunk).
+    pub async fn debug_point_bounds(
+        &self,
+        dir: &DebugZoneDir,
+        needle: u64,
+        source: &Arc<dyn SegmentSource>,
+        session: &VortexSession,
+    ) -> VortexResult<Option<Range<u64>>> {
+        let z = dir.maxs.partition_point(|&m| m < needle);
+        if z == dir.maxs.len() {
+            return Ok(Some(self.row_count..self.row_count));
+        }
+        let row = z as u64 * dir.zone_len;
+        let idx = self
+            .chunks
+            .partition_point(|c| c.row_offset + c.row_count <= row);
+        if dir.mins[z] > needle {
+            return Ok(Some(row..row)); // absent: insertion point at the zone start
+        }
+        let Some(probe) = self.chunk_probe(idx, source, session).await? else {
+            return Ok(None);
+        };
+        let (lo, hi) = probe.probe().debug_run_bounds(needle);
+        let leaf = &self.chunks[idx];
+        if hi as u64 == leaf.row_count {
+            return self.bounds(needle, source, session).await;
+        }
+        Ok(Some(
+            leaf.row_offset + lo as u64..leaf.row_offset + hi as u64,
+        ))
+    }
 }

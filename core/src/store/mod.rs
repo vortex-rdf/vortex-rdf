@@ -4,6 +4,7 @@ pub(crate) mod array;
 pub(crate) mod builders;
 pub mod columns;
 pub(crate) mod indexes;
+pub mod inspect;
 pub(crate) mod layouts;
 #[cfg(feature = "file-io")]
 pub(crate) mod native_file;

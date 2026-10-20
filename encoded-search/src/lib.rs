@@ -11,6 +11,8 @@ pub use owned::OwnedSortedProbe;
 mod layout;
 #[cfg(feature = "layout")]
 pub use layout::ColumnChunks;
+#[cfg(feature = "layout")]
+pub use layout::{DebugZoneDir, debug_zone_dir};
 
 use vortex_array::ArrayRef;
 
@@ -42,6 +44,11 @@ impl<'a> SortedProbe<'a> {
     /// Whether the resolved array is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// EXPERIMENT (branch exp/zone-map-runend-point-lookup): see `Node::debug_run_bounds`.
+    pub fn debug_run_bounds(&self, needle: u64) -> (usize, usize) {
+        self.root.debug_run_bounds(needle)
     }
 
     /// Index of the first element `>= needle`.

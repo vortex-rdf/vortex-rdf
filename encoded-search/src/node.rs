@@ -373,6 +373,31 @@ pub(crate) fn partition(n: usize, mut below: impl FnMut(usize) -> bool) -> usize
 }
 
 impl Node<'_> {
+    /// EXPERIMENT (branch exp/zone-map-runend-point-lookup): `(lower_bound, upper_bound)` of `needle` with one search when this is an unsliced RunEnd
+    /// node (one run per distinct value): the run's index gives both boundaries through `ends`.
+    pub(crate) fn debug_run_bounds(&self, needle: u64) -> (usize, usize) {
+        if let Node::RunEnd {
+            ends,
+            values,
+            offset,
+            len,
+        } = self
+            && *offset == 0
+            && ends.len() > 0
+            && ends.value_at(ends.len() - 1) as usize == *len
+        {
+            let k = partition(values.len(), |k| values.value_at(k) < needle);
+            let lo = run_start(ends, k, 0, *len);
+            if k < values.len() && values.value_at(k) == needle {
+                return (lo, run_start(ends, k + 1, 0, *len));
+            }
+            return (lo, lo);
+        }
+        (self.lower_bound(needle), self.upper_bound(needle))
+    }
+}
+
+impl Node<'_> {
     pub(crate) fn len(&self) -> usize {
         match self {
             Node::Primitive(w) => w.len(),
