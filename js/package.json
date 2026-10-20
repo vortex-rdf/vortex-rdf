@@ -32,6 +32,7 @@
     "files": [
         "entry/node.js",
         "entry/browser.js",
+        "entry/pin.js",
         "entry/types.d.ts",
         "pkg/web/vortex_rdf.js",
         "pkg/web/vortex_rdf.d.ts",
