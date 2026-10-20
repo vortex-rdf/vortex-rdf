@@ -117,57 +117,6 @@ async fn test_dictionary_decode_survives_memo_slot_collisions() {
 }
 
 #[tokio::test]
-async fn test_dictionary_match_and_mutations() {
-    let quads = dictionary_test_quads();
-    let store = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
-
-    // Subject match: hits the IsSorted binary-search fast path on the TermCode column.
-    let s3 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s03").unwrap());
-    let by_subject = store
-        .match_pattern(Some(&s3), None, None, None)
-        .await
-        .unwrap();
-    assert_eq!(by_subject.size().await.unwrap(), 1);
-    let results: Vec<Quad> = by_subject.quads().try_collect().await.unwrap();
-    assert_eq!(results[0].subject.to_string(), "<http://example.org/s03>");
-
-    // Predicate match: mask scan over the TermCode codes (p0 occurs for i = 0,3,6,9).
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let by_pred = store
-        .match_pattern(None, Some(&p0), None, None)
-        .await
-        .unwrap();
-    assert_eq!(by_pred.size().await.unwrap(), 4);
-
-    // Terms absent from the dictionary match nothing (both routing paths).
-    let missing_s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/nope").unwrap());
-    assert_eq!(
-        matched_size(&store, Some(&missing_s), None, None, None).await,
-        0
-    );
-    let missing_p = NamedNode::new("http://example.org/nope").unwrap();
-    assert_eq!(
-        matched_size(&store, None, Some(&missing_p), None, None).await,
-        0
-    );
-
-    // delete_quad works (mask-based); the cached dictionary is propagated.
-    let deleted = store.delete_quad(&quads[0]).await.unwrap();
-    assert_eq!(deleted.size().await.unwrap(), 9);
-    let decoded: Vec<Quad> = deleted.quads().try_collect().await.unwrap();
-    assert_eq!(decoded.len(), 9);
-    assert!(!quad_strings(&decoded).contains(&quads[0].to_string()));
-
-    // add_quad works despite the sorted codes: the appended quad lands in
-    // the string tail (its terms need no dictionary code), so re-adding
-    // the deleted quad brings the store back to its full size.
-    let readded = deleted.add_quad(quads[0].clone()).await.unwrap();
-    assert_eq!(readded.size().await.unwrap(), 10);
-    let decoded: Vec<Quad> = readded.quads().try_collect().await.unwrap();
-    assert!(quad_strings(&decoded).contains(&quads[0].to_string()));
-}
-
-#[tokio::test]
 async fn test_dictionary_empty_dataset() {
     let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(vec![]),
@@ -192,43 +141,6 @@ async fn test_dictionary_empty_dataset() {
 async fn test_built_dictionary_terms_are_fsst() {
     let store = built_store(fsst_dictionary_quads(), LayoutStrategy::Dictionary, vec![]).await;
     assert_dictionary_terms_fsst(&store, "built");
-}
-
-/// `dict_reader` is the one "codes are decodable" gate the frontends share:
-/// Dictionary layout and an empty append tail — both, or `None`. Residency is
-/// no term of it: a file-backed dictionary answers through the handle (see
-/// `dictionary_file_backed`); this exercises the layout and tail terms.
-#[tokio::test]
-async fn test_dict_reader_gate_with_a_held_dictionary() {
-    let quads = dictionary_test_quads();
-    let store = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
-    assert!(store.dict_reader().is_some());
-
-    // An append opens a string tail whose rows have no codes in the cached
-    // dictionary: the gate closes even though the resident dictionary is
-    // still held — exactly the difference that makes the gate the safe
-    // predicate for code-typed reads.
-    let tailed = store
-        .add_quad(make_quad(
-            "http://example.org/appended",
-            "http://example.org/p0",
-            "fresh object",
-            GraphName::DefaultGraph,
-        ))
-        .await
-        .unwrap();
-    assert_ne!(tailed.tail_len(), 0);
-    assert!(tailed.debug_dictionary_snapshot().is_some());
-    assert!(tailed.dict_reader().is_none());
-
-    // Folding the tail back into the base reopens the gate.
-    let compacted = tailed.compact().await.unwrap();
-    assert_eq!(compacted.tail_len(), 0);
-    assert!(compacted.dict_reader().is_some());
-
-    // Non-Dictionary layouts have no codes at all.
-    let string_store = built_store(quads, LayoutStrategy::Default, vec![]).await;
-    assert!(string_store.dict_reader().is_none());
 }
 
 /// A store adopted from its own bytes hands out a dictionary reader with a

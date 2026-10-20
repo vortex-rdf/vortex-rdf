@@ -537,9 +537,11 @@ async fn test_delete_matching_spans_base_and_tail() {
     assert!(none.quads_vec().await.unwrap().is_empty());
 }
 
-/// `add_quads` follows RDF/JS dataset (set) semantics: a quad equal to an
-/// existing one, or repeated within the batch, is skipped — and a deleted
-/// quad counts as absent, so it can be re-added.
+/// `add_quads` follows RDF/JS dataset (set) semantics under every layout: a
+/// quad equal to an existing one, or repeated within the batch, is skipped —
+/// and a deleted quad counts as absent, so it can be re-added, a tail row and
+/// a base row alike. Under a deleted base row the other rows still decode,
+/// and the re-added row comes back once, through the tail.
 #[tokio::test]
 async fn test_add_quads_set_semantics() {
     let q1 = make_quad(
@@ -561,32 +563,49 @@ async fn test_add_quads_set_semantics() {
         GraphName::DefaultGraph,
     );
 
-    let store = built_store(
-        vec![q1.clone(), q2.clone()],
-        LayoutStrategy::Default,
-        vec![],
-    )
-    .await;
+    for layout in LAYOUTS {
+        let store = built_store(vec![q1.clone(), q2.clone()], layout, vec![]).await;
 
-    // Adding an existing quad is a no-op.
-    let same = store.add_quad(q1.clone()).await.unwrap();
-    assert_eq!(same.size().await.unwrap(), 2);
+        // Adding an existing quad is a no-op.
+        let same = store.add_quad(q1.clone()).await.unwrap();
+        assert_eq!(same.size().await.unwrap(), 2, "{layout:?}");
 
-    // In-batch duplicates and existing quads are both skipped.
-    let added = store
-        .add_quads([q3.clone(), q3.clone(), q1.clone()])
-        .await
-        .unwrap();
-    assert_eq!(added.size().await.unwrap(), 3);
-    assert!(added.contains(&q3).await.unwrap());
+        // In-batch duplicates and existing quads are both skipped.
+        let added = store
+            .add_quads([q3.clone(), q3.clone(), q1.clone()])
+            .await
+            .unwrap();
+        assert_eq!(added.size().await.unwrap(), 3, "{layout:?}");
+        assert!(added.contains(&q3).await.unwrap(), "{layout:?}");
 
-    // A tombstoned quad is absent, so re-adding it takes effect.
-    let deleted = added.delete_quad(&q3).await.unwrap();
-    assert_eq!(deleted.size().await.unwrap(), 2);
-    assert!(!deleted.contains(&q3).await.unwrap());
-    let readded = deleted.add_quad(q3.clone()).await.unwrap();
-    assert_eq!(readded.size().await.unwrap(), 3);
-    assert!(readded.contains(&q3).await.unwrap());
+        // A tombstoned quad is absent, so re-adding it takes effect.
+        let deleted = added.delete_quad(&q3).await.unwrap();
+        assert_eq!(deleted.size().await.unwrap(), 2, "{layout:?}");
+        assert!(!deleted.contains(&q3).await.unwrap(), "{layout:?}");
+        let readded = deleted.add_quad(q3.clone()).await.unwrap();
+        assert_eq!(readded.size().await.unwrap(), 3, "{layout:?}");
+        assert!(readded.contains(&q3).await.unwrap(), "{layout:?}");
+
+        // So is a base row: the rest of the base still decodes without it,
+        // and re-adding it appends it to the tail.
+        let deleted_base = store.delete_quad(&q1).await.unwrap();
+        assert_eq!(deleted_base.size().await.unwrap(), 1, "{layout:?}");
+        assert!(!deleted_base.contains(&q1).await.unwrap(), "{layout:?}");
+        assert_eq!(
+            quad_strings(&deleted_base.quads_vec().await.unwrap()),
+            quad_strings(std::slice::from_ref(&q2)),
+            "{layout:?}: the base without q1"
+        );
+        let readded_base = deleted_base.add_quad(q1.clone()).await.unwrap();
+        assert_eq!(readded_base.tail_len(), 1, "{layout:?}: q1 is a tail row");
+        assert_eq!(readded_base.size().await.unwrap(), 2, "{layout:?}");
+        assert!(readded_base.contains(&q1).await.unwrap(), "{layout:?}");
+        assert_eq!(
+            quad_strings(&readded_base.quads_vec().await.unwrap()),
+            quad_strings(&[q1.clone(), q2.clone()]),
+            "{layout:?}: q1 once, beside q2"
+        );
+    }
 }
 
 /// `delete_matching` drops every quad a pattern selects, using the same

@@ -455,8 +455,8 @@ async fn test_dict_reader_resident_matches_snapshot() {
 }
 
 /// The handle is gated on the layout and the tail: never on a string layout,
-/// and not while a tail holds quads outside the dictionary; compaction
-/// restores it.
+/// and not while a tail holds quads outside the dictionary, though the
+/// resident dictionary stays held; compaction restores it.
 #[tokio::test]
 async fn test_dict_reader_gates_on_layout_and_tail() {
     let strings = VortexRdfStore::from_quads(
@@ -482,6 +482,10 @@ async fn test_dict_reader_gates_on_layout_and_tail() {
         .await
         .unwrap();
     assert_ne!(tailed.tail_len(), 0);
+    assert!(
+        tailed.debug_dictionary_snapshot().is_some(),
+        "the resident dictionary stays held behind the closed gate"
+    );
     assert!(tailed.dict_reader().is_none(), "a tail disables the handle");
     let compacted = tailed.compact().await.unwrap();
     let reader = compacted
