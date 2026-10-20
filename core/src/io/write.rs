@@ -61,7 +61,7 @@ where
     built_stream_to_vortex_writer(built, writer).await?;
 
     log::debug!(
-        "[ser::quads_stream_to_vortex_writer] Streaming write took {:?}",
+        "[write::quads_stream_to_vortex_writer] Streaming write took {:?}",
         debug::elapsed(start)
     );
     Ok(())
@@ -160,7 +160,7 @@ where
         .await?;
 
     log::debug!(
-        "[ser::quads_stream_to_vortex_file] Streaming write took {:?}",
+        "[write::quads_stream_to_vortex_file] Streaming write took {:?}",
         debug::elapsed(start)
     );
     Ok(())

@@ -187,6 +187,13 @@ pub(crate) async fn build_chunk_stream(
         ingested += 1;
     }
     let merger = spiller.into_merger()?;
+    log::debug!(
+        "[SortedStreamBuilder] Ingested {} quads into {} runs in {:?} (dictionary={})",
+        ingested,
+        merger.run_count(),
+        debug::elapsed(start),
+        dict_builder.is_some()
+    );
     let encoding = match dict_builder {
         Some(builder) => {
             let (dict, code_map) = builder.finish()?;
@@ -197,13 +204,6 @@ pub(crate) async fn build_chunk_stream(
         }
         None => Encoding::Strings(layout),
     };
-    log::debug!(
-        "[SortedStreamBuilder] Ingested {} quads into {} runs in {:?} (dictionary={})",
-        ingested,
-        merger.run_count(),
-        debug::elapsed(start),
-        matches!(encoding, Encoding::Codes { .. })
-    );
 
     // Any requested index means a first pass over the merge: the index
     // children are globally sorted, which needs the row ids the merge

@@ -11,7 +11,7 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, future, stream};
 use oxrdf::NamedOrBlankNode;
 use vortex_array::expr::forms::conjuncts;
-use vortex_array::expr::{Expression, and_collect, eq, get_item, lit, root};
+use vortex_array::expr::{Expression, and_collect, eq, get_item, lit, root, select};
 use vortex_array::scalar::Scalar;
 use vortex_array::{ArrayRef, MaskFuture};
 use vortex_buffer::Buffer;
@@ -295,7 +295,6 @@ pub(crate) async fn column_positions(
 ) -> Result<Vec<usize>> {
     use vortex_array::VortexSessionExecute as _;
     use vortex_array::arrays::{PrimitiveArray, StructArray};
-    use vortex_array::expr::{root, select};
 
     #[cfg(test)]
     file.note_column_stream();
@@ -681,7 +680,6 @@ pub(crate) async fn take_file_rows(
 ) -> Result<Option<ArrayRef>> {
     use vortex_array::IntoArray;
     use vortex_array::arrays::PrimitiveArray;
-    use vortex_array::expr::{root, select};
     use vortex_array::validity::Validity;
 
     if let Some(rows) = chunk_take(file, columns, ids).await? {

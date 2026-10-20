@@ -103,7 +103,7 @@ impl VortexRdfStore {
     pub fn data_source(&self) -> Result<DataSourceRef> {
         self.ensure_no_dictionary_tail("data_source")?;
         let dtype = self.primary_dtype();
-        let (row_count, byte_size) = self.row_count_hint(&dtype)?;
+        let (row_count, byte_size) = self.row_count_and_byte_size(&dtype)?;
         Ok(Arc::new(VortexRdfDataSource {
             rows: Rows::View(Arc::new(self.clone())),
             dtype,
@@ -166,7 +166,7 @@ impl VortexRdfStore {
     /// [`view_statistics`](Self::view_statistics) count as a vortex precision
     /// (exact when known, otherwise the upper bound), and that count times
     /// the width of a `dtype` row when every field is a primitive.
-    fn row_count_hint(&self, dtype: &DType) -> Result<(Precision<u64>, Precision<u64>)> {
+    fn row_count_and_byte_size(&self, dtype: &DType) -> Result<(Precision<u64>, Precision<u64>)> {
         let hint = self.view_statistics()?.rows;
         let rows: Precision<u64> = match hint.exact {
             Some(n) => Precision::exact(n as u64),
@@ -510,9 +510,6 @@ impl RequestState {
             } else {
                 *remaining -= rows;
             }
-        }
-        if chunk.is_empty() {
-            return Ok(None);
         }
         Ok(Some(chunk.apply_bound(&self.plan.projection)?))
     }

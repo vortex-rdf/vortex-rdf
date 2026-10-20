@@ -649,7 +649,10 @@ impl LazyRowIds {
             LazyRowIdSource::Component { rids, .. } => sorted_row_ids(rids.clone())?,
             #[cfg(feature = "file-io")]
             LazyRowIdSource::IndexChild { .. } | LazyRowIdSource::LocatedRun { .. } => {
-                unreachable!("an in-memory view only ever carries component-sourced pending ids")
+                unreachable!(
+                    "an in-memory view only ever carries component-sourced pending ids, and the \
+                     file match reads a file run's ids before it folds them"
+                )
             }
         };
         Ok(self.cell.get_or_init(|| ids).clone())
