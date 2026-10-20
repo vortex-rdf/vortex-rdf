@@ -159,7 +159,7 @@ describe('build variants', () => {
                 expect(count(df.namedNode('http://example.org/nope'), null, null, null)).toBe(0);
             });
 
-            test('round-trips typed and language literals', async () => {
+            test('round-trips typed, language and escaped literals', async () => {
                 const store = await VortexRdfStore.fromString(NQUADS, 'nquads', options);
 
                 const typed = store.getQuads(
@@ -171,6 +171,22 @@ describe('build variants', () => {
 
                 const lang = store.getQuads(null, null, df.literal('hola', 'es'), null);
                 expect(lang.length).toBe(1);
+
+                // Values whose stored N-Triples spelling escapes a character (a
+                // quote, a backslash, a newline, and a control character
+                // written as a \u escape) read back exactly as they went in.
+                const subject = df.namedNode('http://example.org/escaped');
+                const text = df.namedNode('http://example.org/text');
+                const values = ['say "hi"', 'C:\\temp', 'two\nlines', 'bell\u0007'];
+                const escaped = await VortexRdfStore.fromQuads(
+                    values.map((value) => df.quad(subject, text, df.literal(value))),
+                    options,
+                );
+                const objects = escaped.getQuads(subject, text, null, null).map((quad) => quad.object);
+                expect(objects.map((object) => object.value).sort()).toEqual([...values].sort());
+                for (const value of values) {
+                    expect(objects.some((object) => object.equals(df.literal(value))), value).toBe(true);
+                }
             });
 
             test('toBytes/fromBytes preserves the store', async () => {
