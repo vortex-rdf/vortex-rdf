@@ -575,22 +575,26 @@ impl<T: Ord> PartialOrd for MinHeapItem<T> {
 mod tests {
     use super::*;
 
+    /// The spill parent, by `(env override, base)`: the override wins over
+    /// `base`, `base` over the OS temp dir, and an empty override counts as
+    /// unset.
     #[test]
-    fn spill_parent_env_override_wins() {
-        let parent = resolve_spill_parent(Some("/custom/spill".into()), Some(Path::new("/base")));
-        assert_eq!(parent, PathBuf::from("/custom/spill"));
-    }
-
-    #[test]
-    fn spill_parent_prefers_base_over_os_temp() {
-        let parent = resolve_spill_parent(None, Some(Path::new("/base")));
-        assert_eq!(parent, PathBuf::from("/base"));
-    }
-
-    #[test]
-    fn spill_parent_treats_empty_env_as_unset() {
-        let parent = resolve_spill_parent(Some("".into()), None);
-        assert_eq!(parent, std::env::temp_dir());
+    fn spill_parent_resolves_env_then_base_then_os_temp() {
+        for (env, base, parent) in [
+            (
+                Some("/custom/spill"),
+                Some("/base"),
+                PathBuf::from("/custom/spill"),
+            ),
+            (None, Some("/base"), PathBuf::from("/base")),
+            (Some(""), None, std::env::temp_dir()),
+        ] {
+            assert_eq!(
+                resolve_spill_parent(env.map(std::ffi::OsString::from), base.map(Path::new)),
+                parent,
+                "env {env:?}, base {base:?}"
+            );
+        }
     }
 
     #[test]

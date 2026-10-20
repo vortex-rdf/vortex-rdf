@@ -408,32 +408,6 @@ mod tests {
     use futures::StreamExt;
 
     #[test]
-    fn stored_term_reads_each_literal_shape() {
-        let dt = NamedNode::new("http://www.w3.org/2001/XMLSchema#integer").unwrap();
-        for (serialized, expected) in [
-            (
-                "\"Alice\"",
-                Term::Literal(Literal::new_simple_literal("Alice")),
-            ),
-            (
-                "\"Bob\"@en",
-                Term::Literal(Literal::new_language_tagged_literal("Bob", "en").unwrap()),
-            ),
-            (
-                "\"42\"^^<http://www.w3.org/2001/XMLSchema#integer>",
-                Term::Literal(Literal::new_typed_literal("42", dt)),
-            ),
-        ] {
-            assert_eq!(
-                term(serialized, Trust::Stored).unwrap(),
-                expected,
-                "{}",
-                serialized
-            );
-        }
-    }
-
-    #[test]
     fn stored_term_named_and_blank_nodes() {
         assert_eq!(
             term("<http://example.org/x>", Trust::Stored).unwrap(),
@@ -482,9 +456,17 @@ mod tests {
         }
     }
 
+    /// Both trust forms read each literal shape unescaped (plain,
+    /// language-tagged, typed), and every shared escaped case, to its term.
     #[test]
-    fn stored_and_input_parses_agree_on_escaped_literals() {
-        for expected in escaped_literal_cases() {
+    fn stored_and_input_parses_agree_on_every_literal_shape() {
+        let integer = NamedNode::new("http://www.w3.org/2001/XMLSchema#integer").unwrap();
+        let unescaped = [
+            Term::Literal(Literal::new_simple_literal("Alice")),
+            Term::Literal(Literal::new_language_tagged_literal("Bob", "en").unwrap()),
+            Term::Literal(Literal::new_typed_literal("42", integer)),
+        ];
+        for expected in unescaped.into_iter().chain(escaped_literal_cases()) {
             let s = expected.to_string();
             assert_eq!(
                 term(&s, Trust::Stored).unwrap(),

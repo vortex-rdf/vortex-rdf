@@ -998,10 +998,37 @@ async fn base_ordered_codes(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
     row_list(&view.keep(QuadColumn::S, &all).await.unwrap()).await
 }
 
+/// The rows of one [`code_chunks`](VortexRdfStore::code_chunks) chunk over
+/// `N` columns, in the chunk's column order. Asserts one buffer per column,
+/// all of one length.
+fn code_chunk_rows<const N: usize>(
+    chunk: &[vortex_buffer::Buffer<TermCode>],
+) -> Vec<[TermCode; N]> {
+    assert_eq!(chunk.len(), N, "one buffer per requested column");
+    let n = chunk[0].len();
+    assert!(
+        chunk.iter().all(|b| b.len() == n),
+        "column buffers agree in length"
+    );
+    (0..n)
+        .map(|i| std::array::from_fn(|c| chunk[c][i]))
+        .collect()
+}
+
+/// The rows of every `code_chunks` chunk a drained stream held, in order:
+/// each chunk read by [`code_chunk_rows`], with its checks.
+fn drained_code_rows<const N: usize>(
+    chunks: &[Vec<vortex_buffer::Buffer<TermCode>>],
+) -> Vec<[TermCode; N]> {
+    chunks
+        .iter()
+        .flat_map(|chunk| code_chunk_rows::<N>(chunk))
+        .collect()
+}
+
 /// Every chunk [`code_chunks`](VortexRdfStore::code_chunks) yields for
 /// `view` over `columns` at `batch` rows, as rows in the requested column
-/// order, beside each chunk's row count. Asserts one buffer per requested
-/// column, all of one length.
+/// order ([`code_chunk_rows`]), beside each chunk's row count.
 async fn collect_code_chunks<const N: usize>(
     view: &VortexRdfStore,
     columns: &[QuadColumn; N],
@@ -1011,15 +1038,9 @@ async fn collect_code_chunks<const N: usize>(
     let mut rows = Vec::new();
     let mut sizes = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.unwrap();
-        assert_eq!(chunk.len(), N, "one buffer per requested column");
-        let n = chunk[0].len();
-        assert!(
-            chunk.iter().all(|b| b.len() == n),
-            "column buffers agree in length"
-        );
-        sizes.push(n);
-        rows.extend((0..n).map(|i| std::array::from_fn(|c| chunk[c][i])));
+        let chunk = code_chunk_rows::<N>(&chunk.unwrap());
+        sizes.push(chunk.len());
+        rows.extend(chunk);
     }
     (rows, sizes)
 }
@@ -1067,9 +1088,10 @@ fn chunk_columns(chunks: &[vortex_array::ArrayRef], names: &[&str]) -> Vec<Vec<u
     rows
 }
 
-/// The `(s, p, o, g)` codes of Dictionary-layout struct chunks, concatenated:
-/// one `[s, p, o, g]` row per chunk row.
-fn chunk_code_rows(chunks: &[vortex_array::ArrayRef]) -> Vec<[TermCode; 4]> {
+/// The `(s, p, o, g)` codes of Dictionary-layout struct chunks — what
+/// `row_chunks` and a data source scan yield — concatenated: one
+/// `[s, p, o, g]` row per chunk row.
+fn struct_chunk_codes(chunks: &[vortex_array::ArrayRef]) -> Vec<[TermCode; 4]> {
     chunk_columns(chunks, &crate::store::schema::PRIMARY_COLUMNS)
         .into_iter()
         .map(|r| [r[0], r[1], r[2], r[3]])
@@ -1126,7 +1148,7 @@ async fn scan_codes(
     source: &crate::vortex_scan::DataSourceRef,
     request: crate::vortex_scan::ScanRequest,
 ) -> Vec<[TermCode; 4]> {
-    chunk_code_rows(&scan_chunks(source, request).await)
+    struct_chunk_codes(&scan_chunks(source, request).await)
 }
 
 /// The two-quad dataset the Default and TypedObject probes match over.

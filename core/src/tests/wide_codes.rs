@@ -606,7 +606,7 @@ async fn check_chunk_exports(store: &VortexRdfStore, label: &str) {
             "{label} {tag}: a code_chunks code fits 32 bits"
         );
         assert_eq!(codes, expected, "{label} {tag}: code_chunks");
-        let rows = chunk_code_rows(&collect_row_chunks(view, 2).await);
+        let rows = struct_chunk_codes(&collect_row_chunks(view, 2).await);
         assert!(
             rows.iter().flatten().all(|&code| code >= BASE),
             "{label} {tag}: a row_chunks code fits 32 bits"

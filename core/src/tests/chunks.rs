@@ -41,7 +41,7 @@ async fn assert_chunks_match(view: &VortexRdfStore, tag: &str) -> Precision<u64>
         assert_eq!(sizes, cut, "{tag}: code_chunks' chunks at batch {batch}");
         let chunks = collect_row_chunks(view, batch).await;
         assert_eq!(
-            chunk_code_rows(&chunks),
+            struct_chunk_codes(&chunks),
             expected,
             "{tag}: row_chunks at batch {batch}"
         );
@@ -176,14 +176,6 @@ async fn drain_counted<T>(
     (items, first, counter() - start)
 }
 
-/// The `(s, p, o, g)` rows of code chunks over every column, concatenated.
-fn code_rows(chunks: &[Vec<vortex_buffer::Buffer<TermCode>>]) -> Vec<[TermCode; 4]> {
-    chunks
-        .iter()
-        .flat_map(|c| (0..c[0].len()).map(move |i| [c[0][i], c[1][i], c[2][i], c[3][i]]))
-        .collect()
-}
-
 /// Both exports of the in-memory `view` at `batch` rows a chunk answer its
 /// base-ordered codes through `gathers` window gathers, one per pull: the
 /// first pull gathers one window, or none when the view gathers none. A read
@@ -214,7 +206,7 @@ async fn assert_gathers(view: &VortexRdfStore, batch: usize, gathers: usize, tag
         "{tag}: one four-column gather a window at batch {batch}"
     );
     assert_eq!(
-        code_rows(&chunks),
+        drained_code_rows::<4>(&chunks),
         expected,
         "{tag}: code_chunks at batch {batch}"
     );
@@ -228,7 +220,7 @@ async fn assert_gathers(view: &VortexRdfStore, batch: usize, gathers: usize, tag
         "{tag}: all four reordered, one four-column gather a window at batch {batch}"
     );
     assert_eq!(
-        code_rows(&chunks),
+        drained_code_rows::<4>(&chunks),
         expected
             .iter()
             .map(|r| [r[3], r[2], r[0], r[1]])
@@ -249,11 +241,8 @@ async fn assert_gathers(view: &VortexRdfStore, batch: usize, gathers: usize, tag
         "{tag}: `o` alone, one one-column gather a window at batch {batch}"
     );
     assert_eq!(
-        chunks
-            .iter()
-            .flat_map(|c| c[0].iter().copied())
-            .collect::<Vec<_>>(),
-        expected.iter().map(|r| r[2]).collect::<Vec<_>>(),
+        drained_code_rows::<1>(&chunks),
+        expected.iter().map(|r| [r[2]]).collect::<Vec<_>>(),
         "{tag}: the `o` chunks at batch {batch}"
     );
     let rows = view.row_chunks(batch).unwrap();
@@ -267,7 +256,7 @@ async fn assert_gathers(view: &VortexRdfStore, batch: usize, gathers: usize, tag
         "{tag}: row_chunks' gathers at batch {batch}"
     );
     assert_eq!(
-        chunk_code_rows(&chunks),
+        struct_chunk_codes(&chunks),
         expected,
         "{tag}: row_chunks at batch {batch}"
     );
@@ -353,7 +342,11 @@ async fn test_chunks_cut_a_run_per_pull() {
     let (chunks, first, total) = drain_counted(codes, run_hooks::cuts).await;
     assert_eq!(first, 1, "the first pull cuts one chunk");
     assert_eq!(total, expected.len(), "one cut per row at one row a chunk");
-    assert_eq!(code_rows(&chunks), expected, "the cut chunks are the rows");
+    assert_eq!(
+        drained_code_rows::<4>(&chunks),
+        expected,
+        "the cut chunks are the rows"
+    );
     let rows = store.row_chunks(1).unwrap();
     let (chunks, first, total) = drain_counted(rows, rechunk_hooks::cuts).await;
     assert_eq!(
@@ -361,7 +354,7 @@ async fn test_chunks_cut_a_run_per_pull() {
         (1, expected.len()),
         "row chunks: one cut a pull"
     );
-    assert_eq!(chunk_code_rows(&chunks), expected, "the cut row chunks");
+    assert_eq!(struct_chunk_codes(&chunks), expected, "the cut row chunks");
     assert_eq!(
         cuts_pulling(store.row_chunks(expected.len()).unwrap(), 1).await,
         0,
@@ -595,8 +588,12 @@ async fn test_chunks_take_sparse_file_ids() {
     let (row_chunks, first, total) = drain_counted(rows, takes).await;
     assert_eq!(first, 1, "row_chunks' first pull takes one chunk's ids");
     assert_eq!(total, 4, "row_chunks takes one chunk's ids at a time");
-    assert_eq!(code_rows(&code_chunks), expected, "code_chunks");
-    assert_eq!(chunk_code_rows(&row_chunks), expected, "row_chunks");
+    assert_eq!(
+        drained_code_rows::<4>(&code_chunks),
+        expected,
+        "code_chunks"
+    );
+    assert_eq!(struct_chunk_codes(&row_chunks), expected, "row_chunks");
 }
 
 /// A subject run on a sorted file whose bound role past a gap in the
@@ -682,7 +679,7 @@ async fn test_chunks_read_a_file_outside_a_tokio_runtime() {
         futures::executor::block_on(async {
             driver_hooks::take_spawned();
             let (codes, _) = collect_code_chunks(&view, &QuadColumn::ALL, 256).await;
-            let rows = chunk_code_rows(&collect_row_chunks(&view, 256).await);
+            let rows = struct_chunk_codes(&collect_row_chunks(&view, 256).await);
             let source = view.data_source().unwrap();
             let scanned = scan_codes(&source, ScanRequest::default()).await;
             (codes, rows, scanned, driver_hooks::take_spawned())

@@ -221,7 +221,7 @@ async fn test_data_source_request_semantics() {
     .await;
     let swapped: Vec<[TermCode; 4]> = all.iter().map(|r| [r[0], r[3], r[2], r[1]]).collect();
     assert_eq!(
-        chunk_code_rows(&chunks),
+        struct_chunk_codes(&chunks),
         swapped,
         "a pack renames and reorders"
     );
@@ -548,7 +548,7 @@ async fn test_data_source_request_semantics() {
         let lengths: Vec<usize> = chunks.iter().map(|chunk| chunk.len()).collect();
         assert_eq!(lengths, pieces, "{tag}");
         assert_eq!(
-            chunk_code_rows(&chunks),
+            struct_chunk_codes(&chunks),
             rows[BATCH - 100..BATCH + 100].to_vec(),
             "{tag}"
         );
