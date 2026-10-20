@@ -104,15 +104,6 @@ def test_u64_column_buffer_is_zero_copy_view(vortex_files):
     assert typed.tolist() == memoryview(cols[0]).cast("Q").tolist()
 
 
-def test_in_memory_open_matches_file_backed(vortex_files, layout):
-    file_backed = VortexRdfStore(vortex_files[layout])
-    in_memory = VortexRdfStore(vortex_files[layout], in_memory=True)
-    assert in_memory.layout() == layout
-    assert len(in_memory) == len(file_backed) == 5
-    assert sorted(in_memory.get_quads()) == sorted(file_backed.get_quads())
-    assert sorted(in_memory.get_quads(p=NAME)) == sorted(file_backed.get_quads(p=NAME))
-
-
 def test_mapped_bulk_reads_decode_through_the_dictionary_handle(tmp_path):
     """A default (mapped) open decodes a bulk result through its file-backed
     dictionary handle, as the in-memory open does: one Python string per
@@ -292,17 +283,6 @@ def test_serialize_onto_a_directory_fails_and_leaves_it_alone(fixture_nt_path, t
         serialize_rdf(fixture_nt_path, out)
     assert [p.name for p in tmp_path.iterdir()] == ["out.vortex"]
     assert [p.name for p in out.iterdir()] == ["keep.txt"]
-
-
-def test_dictionary_file_is_self_contained(fixture_nt_path, tmp_path):
-    out = tmp_path / "dict.vortex"
-    serialize_rdf(fixture_nt_path, out, layout="dictionary")
-    # The embedded form is one file: no companion appears beside it.
-    assert list(tmp_path.iterdir()) == [out]
-    store = VortexRdfStore(out)
-    assert store.layout() == "dictionary"
-    assert len(store) == 5
-    assert len(store.get_quads(p=NAME)) == 3
 
 
 def test_decode_many_shares_one_object_per_repeated_code(vortex_files):

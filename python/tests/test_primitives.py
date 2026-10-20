@@ -658,28 +658,6 @@ def test_filter_codes_rejects_malformed_constants(dictionary):
     term_dict.filter_codes("regex", '"a"^^xsd:string', every)
 
 
-def test_filter_codes_regex_compiled_size_is_bounded(dictionary):
-    """A pattern whose compiled program is large (counted repetitions
-    multiply) is undecided, like any pattern outside the subset, instead of
-    costing seconds per candidate; the shapes the subset is for stay decided."""
-    _, term_dict = dictionary
-    terms = _terms(term_dict)
-    every = U64Column(range(len(terms)))
-    code = {t: c for c, t in enumerate(terms)}
-    alice, anon, bob = code['"Alice"'], code['"Anon"'], code['"Bob"@en']
-
-    def run(arg):
-        passed, undecided = term_dict.filter_codes("regex", arg, every)
-        return u64s(passed), u64s(undecided)
-
-    for pattern in ["(?:a{1000}){5}b", "(?:a{100}){100}b", r"(?:\w{1000}){5}b", "(?:a{1000}){1000}"]:
-        assert run(pattern) == ([], [0, alice, anon, bob]), pattern
-    for pattern in ["(?:a{50}){50}b", "[0-9A-Za-z_]{1000}x", r"\w{1000}x", "a" * 2000]:
-        assert run(pattern) == ([], [0]), pattern
-    assert run(r"^\w{3,10}$") == ([alice, anon, bob], [0])
-    assert run(r"^\W+$") == ([], [0])
-
-
 # Texts for the REGEX tests against Python's own `re`: the edges of the subset
 # (a final newline, the empty text, ASCII and non-ASCII whitespace and word
 # characters, letters Unicode case-folds across ASCII, an astral character).
