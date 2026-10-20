@@ -469,6 +469,22 @@ impl Node<'_> {
             .map_or(self.len(), |next| self.lower_bound(next))
     }
 
+    /// `(lower_bound, upper_bound)` of `needle`; requires ascending order. A
+    /// RunEnd node finds the needle's run once and reads both ends of it from
+    /// `ends`, where the two bounds would each search the runs again.
+    #[inline]
+    pub(crate) fn bounds(&self, needle: u64) -> (usize, usize) {
+        match self {
+            Node::RunEnd {
+                ends,
+                values,
+                offset,
+                len,
+            } => runend_bounds(ends, values, *offset, *len, needle),
+            _ => (self.lower_bound(needle), self.upper_bound(needle)),
+        }
+    }
+
     pub(crate) fn collect_kinds(&self, out: &mut Vec<crate::NodeKind>) {
         use crate::NodeKind as K;
         match self {
@@ -520,6 +536,35 @@ fn clamp_to_len<I: TryFrom<u64> + Ord + Copy>(q: u64, len: I) -> I {
     I::try_from(q).map_or(len, |n| n.min(len))
 }
 
+/// [`Node::bounds`] of a RunEnd node: the needle's first run by one search of
+/// the window's run values, both bounds from `ends`.
+fn runend_bounds(
+    ends: &Node<'_>,
+    values: &Node<'_>,
+    offset: usize,
+    len: usize,
+    needle: u64,
+) -> (usize, usize) {
+    let (first, span) = window_runs(ends, offset, len);
+    let k = partition(span, |k| values.value_at(first + k) < needle);
+    // Adjacent runs may repeat a value, so the run past the needle's is
+    // searched for unless the next run already holds a larger value.
+    let past = if k == span || values.value_at(first + k) != needle {
+        k
+    } else if k + 1 == span || values.value_at(first + k + 1) > needle {
+        k + 1
+    } else {
+        k + 1
+            + partition(span - k - 1, |j| {
+                values.value_at(first + k + 1 + j) <= needle
+            })
+    };
+    (
+        run_start(ends, first + k, offset, len),
+        run_start(ends, first + past, offset, len),
+    )
+}
+
 /// The runs overlapping the window `[offset, offset + len)`, as
 /// `(first_run, run_count)`. Sortedness is asserted for the window only, so
 /// run searches must stay inside these runs: a sliced RunEnd keeps its full
@@ -529,6 +574,11 @@ fn window_runs(ends: &Node<'_>, offset: usize, len: usize) -> (usize, usize) {
         return (0, 0);
     }
     let nruns = ends.len();
+    // An unsliced node: its last run ends at its length, so every run lies in
+    // the window (the ends ascend).
+    if offset == 0 && nruns > 0 && ends.value_at(nruns - 1) == len as u64 {
+        return (0, nruns);
+    }
     let first = partition(nruns, |r| ends.value_at(r) <= offset as u64);
     let last = partition(nruns, |r| ends.value_at(r) <= (offset + len - 1) as u64);
     (first, (last + 1).min(nruns) - first)
@@ -658,6 +708,51 @@ mod tests {
         assert_eq!(n.value_at(0), 2);
         assert_eq!(n.value_at(2), 5);
         assert_eq!(n.value_at(5), 5);
+    }
+
+    #[test]
+    fn runend_bounds_search_once_and_cross_repeated_values() {
+        // ends [2, 3, 6, 7, 9, 12] over values [1, 4, 4, 4, 7, 9]: adjacent
+        // runs repeat 4, which a RunEnd may hold although a writer merges
+        // them. Logical rows: [1, 1, 4, 4, 4, 4, 4, 7, 7, 9, 9, 9].
+        let ends = [2u64, 3, 6, 7, 9, 12];
+        let values = [1u64, 4, 4, 4, 7, 9];
+        let rows: Vec<u64> = values
+            .iter()
+            .zip(ends.iter())
+            .scan(0u64, |start, (&v, &end)| {
+                let run = (*start..end).map(move |_| v);
+                *start = end;
+                Some(run)
+            })
+            .flatten()
+            .collect();
+        // Unsliced, then three windows (one a single run, one ending mid-run).
+        for (offset, len) in [(0usize, 12usize), (2, 6), (3, 4), (8, 1), (5, 0)] {
+            let n = Node::RunEnd {
+                ends: Box::new(Node::Primitive(Words::U64(&ends))),
+                values: Box::new(Node::Primitive(Words::U64(&values))),
+                offset,
+                len,
+            };
+            let window = &rows[offset..offset + len];
+            for needle in (0..=10).chain([u64::MAX]) {
+                let want = (
+                    window.partition_point(|&v| v < needle),
+                    window.partition_point(|&v| v <= needle),
+                );
+                assert_eq!(
+                    n.bounds(needle),
+                    want,
+                    "offset {offset} len {len} needle {needle}"
+                );
+                assert_eq!(
+                    (n.lower_bound(needle), n.upper_bound(needle)),
+                    want,
+                    "offset {offset} len {len} needle {needle}"
+                );
+            }
+        }
     }
 
     #[test]

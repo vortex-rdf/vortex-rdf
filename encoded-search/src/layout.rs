@@ -71,6 +71,10 @@ struct ChunkLeaf {
     row_count: u64,
     dict: Option<Arc<DictValues>>,
     cell: OnceLock<Option<OwnedSortedProbe>>,
+    /// The chunk's last value, read once from its probe: the chunk bisection
+    /// compares against it, and a probe's `value_at` can cost a search of its
+    /// own (a RunEnd one searches its run ends).
+    last: OnceLock<u64>,
 }
 
 /// The flat chunk leaves of one non-nullable unsigned-integer column of a
@@ -125,6 +129,7 @@ impl ColumnChunks {
                 layout: leaf.layout,
                 dict,
                 cell: OnceLock::new(),
+                last: OnceLock::new(),
             });
         }
         Some(Self {
@@ -170,9 +175,25 @@ impl ColumnChunks {
         source: &Arc<dyn SegmentSource>,
         session: &VortexSession,
     ) -> VortexResult<Option<Range<u64>>> {
-        let Some(lower) = self.lower_bound(needle, source, session).await? else {
+        // The first chunk whose last value reaches the needle holds its first
+        // row. A run that ends inside that chunk is bounded by one search of
+        // the chunk; one that reaches its end may continue into the next
+        // chunks, whose bound the global search finds.
+        let Some(idx) = self.first_chunk_reaching(needle, source, session).await? else {
             return Ok(None);
         };
+        if idx == self.chunks.len() {
+            return Ok(Some(self.row_count..self.row_count));
+        }
+        let Some(probe) = self.chunk_probe(idx, source, session).await? else {
+            return Ok(None);
+        };
+        let leaf = &self.chunks[idx];
+        let (lo, hi) = probe.probe().bounds(needle);
+        let lower = leaf.row_offset + lo as u64;
+        if (hi as u64) < leaf.row_count {
+            return Ok(Some(lower..leaf.row_offset + hi as u64));
+        }
         let upper = match needle.checked_add(1) {
             Some(next) => self.lower_bound(next, source, session).await?,
             None => Some(self.row_count),
@@ -192,19 +213,9 @@ impl ColumnChunks {
         session: &VortexSession,
     ) -> VortexResult<Option<u64>> {
         // The first chunk whose last value reaches the needle holds it.
-        let (mut lo, mut hi) = (0usize, self.chunks.len());
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let Some(probe) = self.chunk_probe(mid, source, session).await? else {
-                return Ok(None);
-            };
-            let probe = probe.probe();
-            if probe.value_at(probe.len() - 1) < needle {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
+        let Some(lo) = self.first_chunk_reaching(needle, source, session).await? else {
+            return Ok(None);
+        };
         if lo == self.chunks.len() {
             return Ok(Some(self.row_count));
         }
@@ -214,6 +225,49 @@ impl ColumnChunks {
         Ok(Some(
             self.chunks[lo].row_offset + probe.probe().lower_bound(needle) as u64,
         ))
+    }
+
+    /// Index of the first chunk whose last value is `>= needle` (the chunk
+    /// count when none is), by bisection over the chunks' cached last values.
+    /// `Ok(None)` when a needed chunk's encoding declines the probe.
+    async fn first_chunk_reaching(
+        &self,
+        needle: u64,
+        source: &Arc<dyn SegmentSource>,
+        session: &VortexSession,
+    ) -> VortexResult<Option<usize>> {
+        let (mut lo, mut hi) = (0usize, self.chunks.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let Some(last) = self.chunk_last(mid, source, session).await? else {
+                return Ok(None);
+            };
+            if last < needle {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(Some(lo))
+    }
+
+    /// Chunk `idx`'s last value, read from its probe on first use; `None`
+    /// when its encoding declines the probe.
+    async fn chunk_last(
+        &self,
+        idx: usize,
+        source: &Arc<dyn SegmentSource>,
+        session: &VortexSession,
+    ) -> VortexResult<Option<u64>> {
+        if let Some(&last) = self.chunks[idx].last.get() {
+            return Ok(Some(last));
+        }
+        let Some(probe) = self.chunk_probe(idx, source, session).await? else {
+            return Ok(None);
+        };
+        let probe = probe.probe();
+        let last = probe.value_at(probe.len() - 1);
+        Ok(Some(*self.chunks[idx].last.get_or_init(|| last)))
     }
 
     /// [`Self::bounds`] restricted to `range`, in absolute rows, under the

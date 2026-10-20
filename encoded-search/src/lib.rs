@@ -59,8 +59,9 @@ impl<'a> SortedProbe<'a> {
 
     /// `(lower_bound, upper_bound)`: the half-open run of elements equal to
     /// `needle`, empty at its insertion point when there is none.
+    #[inline]
     pub fn bounds(&self, needle: u64) -> (usize, usize) {
-        (self.lower_bound(needle), self.upper_bound(needle))
+        self.root.bounds(needle)
     }
 
     /// [`Self::bounds`] restricted to `range`, in absolute indices: only the
