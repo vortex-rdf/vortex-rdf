@@ -1,25 +1,23 @@
 //! The [`IndexType::SecondaryByReference`] index: sorted object and predicate
-//! value columns, each paired with the primary row IDs they point at. This
-//! module owns both halves of the index's lifecycle — building the columns at
-//! write time, and choosing the probe a pattern runs against them at query
-//! time (`choose`), which one shared resolver per backend executes, producing
+//! value columns, each paired with the primary row ids they point at. This
+//! module builds the columns and chooses the probe a pattern runs against
+//! them (`choose`), which one shared resolver per backend executes, producing
 //! primary row ids directly.
 //!
-//! The value columns come in two encodings — term strings, or dictionary
-//! codes ([`TermCode`]) under the Dictionary layout — and are always built over the complete
-//! dataset in one global sort: [`components`] for the in-memory builders,
-//! merged `(value, row id)` spill runs for the out-of-core one. Both hand
-//! the columns over as this index's two persisted children (`{val, rid}` per
-//! covered family), value column stamped `IsSorted`.
+//! The value columns hold term strings or, under the Dictionary layout,
+//! dictionary codes ([`TermCode`]), always built over the whole dataset in
+//! one global sort: [`components`] for the in-memory builders, merged
+//! `(value, row id)` spill runs for the out-of-core one. Both hand the
+//! columns over as this index's two persisted children (`{val, rid}` per
+//! covered family), the value column stamped `IsSorted`.
 //!
-//! Both backends need global sortedness to binary-search, and neither depends
-//! on it to be correct — they differ only in what they do without it, which
-//! is what a child declaring itself unsorted (this crate never writes one,
-//! but the wire format can carry one) falls back to. The in-memory resolver
-//! declines outright and `match_pattern` mask-scans; the file resolver falls
-//! back to the pushed-down equality, which answers whatever the order —
-//! there, sortedness decides only whether the matched run can be *located*
-//! (and, failing that, how much of the scan prunes).
+//! Both backends need global sortedness to binary-search, and neither needs
+//! it to be correct: they differ in what a child declaring itself unsorted
+//! (this crate never writes one, but the wire format can carry one) falls
+//! back to. The in-memory resolver declines and `match_pattern` mask-scans;
+//! the file resolver falls back to the pushed-down equality, which answers
+//! whatever the order, so there sortedness decides only whether the matched
+//! run can be *located* (and, failing that, how much of the scan prunes).
 //!
 //! [`IndexType::SecondaryByReference`]: super::IndexType::SecondaryByReference
 
@@ -40,10 +38,9 @@ use crate::store::schema::{RowId, TermCode};
 pub(crate) const COL_VAL: &str = "val";
 const CHILD_COLUMNS: [&str; 2] = [COL_VAL, COL_RID];
 
-/// This index's persisted-child identity table — one `{val, rid}` table per
-/// covered family, in [`RefFamily`] order — feeding every generic loop in the
-/// hub (the slug registry and the roster it builds); see
-/// [`IndexType::component_identities`](super::IndexType::component_identities).
+/// This index's persisted-child identity table, one `{val, rid}` table per
+/// covered family in [`RefFamily`] order, for the hub's generic loops
+/// (see [`IndexType::component_identities`](super::IndexType::component_identities)).
 /// Each family reaches its row through [`RefFamily::identity`], so each name
 /// keeps exactly one spelling.
 pub(crate) static IDENTITIES: [ComponentIdentity; 2] = [
@@ -60,13 +57,11 @@ pub(crate) static IDENTITIES: [ComponentIdentity; 2] = [
 ];
 
 /// One of the two quad components this index covers, named after it. Each
-/// family owns one `{val, rid}` component — its [`IDENTITIES`] row — so the
+/// family owns one `{val, rid}` component, its [`IDENTITIES`] row, so the
 /// association is stated once there instead of at every roster site.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RefFamily {
-    /// Object values.
     Object,
-    /// Predicate values.
     Predicate,
 }
 
@@ -81,17 +76,18 @@ impl RefFamily {
     }
 }
 
-/// The probe this index runs for a pattern shape — the covered family's
+/// The probe this index runs for a pattern shape (the covered family's
 /// `{val, rid}` child, the term to search its value column for, and which
-/// pattern component a hit resolves — independent of any backend: the shared
+/// pattern component a hit resolves), independent of any backend: the shared
 /// front half of both resolvers.
 ///
 /// A bound subject declines the index: the primary `s` column (binary-searched
 /// or zone-pruned) is the better access path there. When both object and
-/// predicate are bound, the object side is chosen — object equality is usually
-/// the more selective constraint. The children store no whole quads, so the
-/// probe serves no reads; their rows are ordered by `(val, rid)`, so a run's
-/// rids ascend. `None` when nothing this index covers is bound.
+/// predicate are bound, the object side is chosen, object equality being
+/// usually the more selective; the predicate stays a residual. The children
+/// store no whole quads, so the probe serves no reads; their rows are ordered
+/// by `(val, rid)`, so a run's rids ascend. `None` when nothing this index
+/// covers is bound.
 pub(super) fn choose<'a>(pattern: QuadPattern<'a>) -> Option<IndexProbe<'a>> {
     if pattern.subject.is_some() {
         return None;
@@ -170,11 +166,12 @@ fn rid_column(perm: &[usize]) -> ArrayRef {
 
 /// This index's two persisted children over `input`, each a `{val, rid}`
 /// table over the whole dataset in [`IDENTITIES`] order, sorted by
-/// `(value, row id)` with the value column stamped sorted — the in-memory
+/// `(value, row id)` with the value column stamped sorted: the in-memory
 /// builders' emission. Row ids number the input's positions (the builder
-/// passes the dataset in final row order): term strings sort as a
-/// permutation of positions — no per-term string copies — whose ties break
-/// by position, which is row-id order; codes sort as `(code, row id)` pairs.
+/// passes the dataset in final row order), so term strings sort as a
+/// permutation of positions, with no per-term string copies, whose ties
+/// break by position, which is row-id order; codes sort as `(code, row id)`
+/// pairs.
 pub(super) fn components(input: IndexInput<'_>) -> Result<Vec<IndexComponent>> {
     let [(o_val, o_rid), (p_val, p_rid)] = match input {
         IndexInput::Quads(quads) => {

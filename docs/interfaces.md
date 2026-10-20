@@ -15,13 +15,13 @@ is the path such an engine takes.
 
 | What the engine needs | What it calls |
 |---|---|
-| A table of quads to scan with projection, filter and limit pushdown | [`data_source`](../core/src/store/read/data_source.rs#L105) on any view, registered with vortex's `VortexTable` |
-| The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L131) |
-| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L62), [`code_chunks`](../core/src/store/read/chunks.rs#L88) |
-| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L151), [`index_components`](../core/src/store/read/metadata.rs#L224), [`partitions`](../core/src/store/read/metadata.rs#L259) |
+| A table of quads to scan with projection, filter and limit pushdown | [`data_source`](../core/src/store/read/data_source.rs#L103) on any view, registered with vortex's `VortexTable` |
+| The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L129) |
+| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L60), [`code_chunks`](../core/src/store/read/chunks.rs#L90) |
+| Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L152), [`index_components`](../core/src/store/read/metadata.rs#L226), [`partitions`](../core/src/store/read/metadata.rs#L261) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L275) (from [`dict_reader`](../core/src/store/mod.rs#L218)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
-| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L140), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L301) |
+| When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L141), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L301) |
 | The session to hand vortex's integrations | [`vortex_session`](../core/src/lib.rs#L87), with [`vortex_scan`](../core/src/lib.rs#L80) re-exported |
 
 ---
@@ -201,7 +201,7 @@ Every read is lazy, and a stream's first poll decides how it runs:
   the call's error.
 - A file-backed view reads its rows by id or scans the file's splits, as
   it decides at that first poll. A read by id, a scan of at most 42 splits
-  ([`MAX_INLINE_SPLITS`](../core/src/store/scan/file_reads.rs#L65)), and a
+  ([`MAX_INLINE_SPLITS`](../core/src/store/scan/file_reads.rs#L64)), and a
   scan first polled where no tokio runtime is current run inline on the
   polling task. Any other scan spawns its splits
   ([`ScanDriver`](../core/src/store/scan/file_reads.rs#L41)) onto the tokio

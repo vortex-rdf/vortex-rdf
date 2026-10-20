@@ -86,10 +86,11 @@ pub struct ViewStatistics {
     /// A view that reads any has none, since the tail's rows follow the
     /// base's in append order.
     pub sort_order: Option<SortOrder>,
-    /// Per column (`s`, `p`, `o`, `g`), the inclusive code range the base's
-    /// rows are known to lie in (a pushed-down equality's code, a subject
-    /// run's first and last code), or `None` when nothing is known without
-    /// reading. Only the Dictionary layout has codes, and only in the base.
+    /// Per column (`s`, `p`, `o`, `g`), the inclusive code range the view's
+    /// base rows are known to lie in (a pushed-down equality's code, a
+    /// subject run's first and last code), or `None` when nothing is known
+    /// without reading. Only the Dictionary layout has codes, and only in the
+    /// base.
     pub code_bounds: [Option<(TermCode, TermCode)>; 4],
     /// The shape of the view's selection over its base rows.
     pub selection: SelectionKind,
@@ -145,9 +146,9 @@ impl VortexRdfStore {
     /// [`ViewStatistics`]), without I/O: a count that would need a scan is a
     /// bound, a code range that would need a read is `None`. It is not a pure
     /// read in one case: to count an in-memory pending run's live rows under
-    /// tombstones, it decodes the run's row ids, which stay cached on the run
-    /// for the view and every clone of it; that decode is the one way it
-    /// fails.
+    /// tombstones, it decodes the run's row ids, cached in the run's shared
+    /// `LazyRowIds` for the view and every clone of it; that decode is the
+    /// one way it fails.
     pub fn view_statistics(&self) -> Result<ViewStatistics> {
         let tail_rows = self.tail_size();
         let filtered = self.quads.has_filter();
@@ -181,8 +182,9 @@ impl VortexRdfStore {
         match &self.quads.backend {
             Backend::InMemory(MemoryBase { base, probes, .. }) => {
                 let base_len = base.len();
-                // A contiguous, tombstone-free run of a sorted base: the
-                // subject column's first and last codes bound the view.
+                // A contiguous, tombstone-free run of a sorted base: codes are
+                // sorted ranks, so the subject column's first and last codes
+                // bound the view's.
                 if self.quads.subject_sorted()
                     && self.quads.deleted.is_none()
                     && let ViewSelection::Exact(sel) = &self.quads.selection

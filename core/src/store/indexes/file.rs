@@ -1,9 +1,9 @@
-//! The file-backed side of the index hub: the one file resolver every
-//! index's probe runs through ([`resolve_file`]), the readers it and the
-//! deferred ids use (point reads through cached chunk probes, rid-only
-//! pushed-down scans) to produce a resolution's ascending, unique
-//! `Buffer<RowId>` of base rows from an index child, and [`FileServePlan`],
-//! which reads a resolved view's quads out of the child's own columns.
+//! The file side of the index hub: the one file resolver every index's probe
+//! runs through ([`resolve_file`]); the readers it and the deferred ids use
+//! (point reads through cached chunk probes, rid-only pushed-down scans) to
+//! produce a resolution's ascending, unique `Buffer<RowId>` of base rows
+//! from an index child; and [`FileServePlan`], which reads a resolved view's
+//! quads out of the child's own columns.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -29,7 +29,7 @@ use crate::store::scan::file_reads::eq_conjunction;
 use crate::store::schema::{RowId, TermCode};
 
 /// The `[lo, hi)` run of a sorted component column's rows equal to `native`,
-/// located by binary search over the column's cached chunk probes — reading
+/// located by binary search over the column's cached chunk probes, reading
 /// only the chunk leaves the bisection crosses. Searched over the whole
 /// column, or `within` a row range whose slice of the column is itself sorted
 /// (a lead run for a prefix probe).
@@ -62,11 +62,12 @@ async fn locate_component_run(
     .map_err(VortexRdfError::Vortex)
 }
 
-/// The row ids of a located index-child run, read point-by-point from the
+/// The row ids of a located index-child run, read point by point from the
 /// child's rid column through its cached chunk probes and re-sorted into
-/// base row order — the file counterpart of slicing an in-memory rid run.
+/// base row order: the file counterpart of slicing an in-memory rid run.
 /// `Ok(None)` when the rid column's chunks decline (the caller keeps its
-/// scan); rids are unique by construction, so sorting alone suffices.
+/// scan). Rids are unique by construction, so sorting alone suffices; a row
+/// past what a `usize` holds is refused.
 async fn rid_point_reads(
     file: &NativeStoreFile,
     child: &ChildReader,
@@ -90,16 +91,16 @@ async fn rid_point_reads(
     Ok(Some(Buffer::from(ids)))
 }
 
-/// Scan `child`'s rid column for the rows where every `(value_column,
-/// probe)` equality holds, returning the primary row ids as an ascending,
-/// unique buffer (the shape vortex's `Selection::IncludeByIndex` requires) —
-/// the file-backed probe shared by the secondary indexes.
+/// The primary row ids of `child`'s rows where every `(value_column, probe)`
+/// equality holds, by a rid-only scan, as an ascending, unique buffer (the
+/// shape vortex's `Selection::IncludeByIndex` requires): the file probe the
+/// secondary indexes share.
 ///
-/// Each equality is a plain `eq`, the same encoding the serve-plan filter
-/// uses: a binary `Eq` falsifies against the same zone min/max envelope as a
+/// Each equality is a plain `eq`, as in the serve-plan filter: a binary `Eq`
+/// falsifies against the same zone min/max envelope as a
 /// `>= probe AND <= probe` range pair (see vortex's
-/// `stats/rewrite/builtins.rs`) while evaluating a single conjunct. Output
-/// order is irrelevant: the ids are sorted afterwards.
+/// `stats/rewrite/builtins.rs`) while evaluating a single conjunct. The
+/// scan's output order does not matter, as the ids are sorted afterwards.
 pub(crate) async fn scan_index_row_ids(
     child: &ChildReader,
     value_constraints: &[(&'static str, Scalar)],
@@ -114,24 +115,22 @@ pub(crate) async fn scan_index_row_ids(
     read_scanned_row_ids(child.scan(&[COL_RID])?.with_filter(filter)).await
 }
 
-/// The row ids of a *located* index-child run — the rows a resolver bounded
-/// by binary-searching the child's cached chunk probes — read by a rid-only
-/// scan restricted to that range. The wide-run counterpart of
+/// The row ids of a *located* index-child run (the rows a resolver bounded
+/// by binary-searching the child's cached chunk probes), read by a rid-only
+/// scan restricted to that range: the wide-run counterpart of
 /// [`rid_point_reads`], for runs too large to read point by point.
 ///
 /// The scan carries no filter: the location bounded exactly the rows the
-/// constraints select, so re-testing the value columns would only re-read and
-/// re-compare them. A resolver whose location covers only *some* of its
+/// constraints select. A resolver whose location covers only *some* of its
 /// constraints must keep [`scan_index_row_ids`], whose filter tests them all.
 async fn scan_located_row_ids(child: &ChildReader, range: Range<u64>) -> Result<Buffer<RowId>> {
     read_scanned_row_ids(child.scan(&[COL_RID])?.with_row_range(range)).await
 }
 
-/// The row ids of a located index-child run — or of a window of one — in base
+/// The row ids of a located index-child run, or of a window of one, in base
 /// row order: point reads through the rid column's chunk probes for a range
-/// within the point-read cap, otherwise — or when a chunk declines mid-read —
-/// a rid-only scan restricted to the range (the location bounded exactly the
-/// matched rows, so no filter is re-tested).
+/// within the point-read cap, else (or when a chunk declines mid-read) a
+/// rid-only scan restricted to the range, with no filter re-tested.
 ///
 /// `range` is not empty: an empty run or window reads nothing at all, so its
 /// caller answers it without asking.
@@ -171,9 +170,9 @@ async fn read_scanned_row_ids(scan: ScanBuilder<ArrayRef>) -> Result<Buffer<RowI
     sorted_row_ids(struct_arr.unmasked_field_by_name(COL_RID).cloned()?)
 }
 
-/// An eager file resolution off the rid-only pushed-down scan — the file
+/// An eager file resolution off the rid-only pushed-down scan: the file
 /// resolver's answer for a non-serving probe whose ids no located run of
-/// ascending rids defers: `Empty` when the scan proves it matches nothing.
+/// ascending rids defers. `Empty` when the scan proves it matches nothing.
 async fn resolve_eager_from_scan(
     child: &ChildReader,
     constraints: &[(&'static str, Scalar)],
@@ -190,21 +189,21 @@ async fn resolve_eager_from_scan(
     })
 }
 
-/// Resolve `probe` against a file's index children — the file counterpart of
+/// `probe` resolved against a file's index children: the file counterpart of
 /// `resolve::resolve_in_memory`, reaching the probed child's columns through
 /// their cached chunk probes (the file mirror of the in-memory binary search)
-/// or, failing that, a pushed-down scan, whose filter answers regardless of
-/// sortedness.
+/// or, failing that, a pushed-down scan, whose filter answers whatever the
+/// child's sortedness.
 ///
 /// On a globally sorted child the keys' rows are one contiguous run, located
 /// key by key, each search windowed to the run of the keys before it; a
 /// located empty run proves the pattern matches nothing. What answers the
 /// row ids then depends on the probe:
-/// - A serving probe's ids are deferred to a rid-only scan filtered by its
-///   keys, which a located run's width counts — except a small located run's,
-///   which rid point reads resolve now, a handful of cached-chunk accesses —
-///   and a [`FileServePlan`] reads the matched quads from the child: the
-///   located run, or the rows its keys and residual terms filter.
+/// - A serving probe's ids are a deferred rid-only scan filtered by its keys,
+///   which a located run's width counts (a small located run's are read now
+///   by rid point reads, a handful of cached-chunk accesses), and a
+///   [`FileServePlan`] reads the matched quads from the child: the located
+///   run, or the rows its keys and residual terms filter.
 /// - A non-serving probe whose rids ascend keeps a located run's ids deferred
 ///   ([`LazyRowIds::from_located_run`]), so that a count takes the run's
 ///   width and a window reads only its own rows.
@@ -223,8 +222,8 @@ pub(super) async fn resolve_file(
         Located::Absent => return Ok(IndexResolution::Empty),
         Located::Run { child, keys, range } => (child, keys, range),
     };
-    // A located empty run proves the keys' combination absent from the data
-    // — the short-circuit a scan reaches only after reading it.
+    // A located empty run proves the keys' combination absent from the data:
+    // the short-circuit a scan reaches only after reading it.
     if located.as_ref().is_some_and(Range::is_empty) {
         return Ok(IndexResolution::Empty);
     }
@@ -254,9 +253,9 @@ pub(super) async fn resolve_file(
         };
         constraints.push((column, native));
     }
-    // A small located run resolves its row ids NOW by rid point reads — a
-    // handful of cached-chunk accesses — instead of deferring a whole child
-    // scan (which a count or chained match would then pay).
+    // A small located run's row ids are read now by rid point reads, a
+    // handful of cached-chunk accesses, instead of deferring a whole child
+    // scan that a count or a chained match would then pay for.
     let point_read = match &located {
         Some(range) if crate::store::view::selection::point_sized(range.end - range.start) => {
             rid_point_reads(file, &child, range.clone()).await?
@@ -274,8 +273,8 @@ pub(super) async fn resolve_file(
         )),
     };
     // A located range is exactly the constrained rows only when the location
-    // covered every constraint: it searched the keys, so a residual term —
-    // never a sort key — demotes the range back to the filter scan.
+    // covered every constraint: it searched the keys alone, so a residual
+    // term (never a searched key) demotes the range back to the filter scan.
     let row_range = if probe.residual.is_empty() {
         located
     } else {
@@ -285,7 +284,7 @@ pub(super) async fn resolve_file(
         row_ids,
         resolves: probe.resolves,
         // A serving resolution reads the matched quads straight from the
-        // child's columns — point reads or a range scan over a located run,
+        // child's columns: point reads or a range scan over a located run,
         // or the pushed-down filter scan.
         serve: Some(FileServePlan::new(decode, child, constraints, row_range)),
     })
@@ -312,7 +311,7 @@ enum Located {
 /// Open `probe`'s child, translate its keys and locate their run through the
 /// child's chunk probes: the first key over the whole child, each later one
 /// windowed to the run before it. A declined search abandons the location
-/// wholesale, and an empty run ends it — no later key can widen it. The
+/// wholesale, and an empty run ends it, as no later key can widen it. The
 /// shared front half of [`resolve_file`] and the test hook
 /// `debug_located_run`.
 async fn locate(
@@ -342,9 +341,9 @@ async fn locate(
 }
 
 /// Test-only hook exposing the run [`resolve_file`] locates when `index`
-/// resolves `pattern` — `None` when the index declines the pattern, its
-/// child is absent, a key's term is absent, or the location declines and
-/// the resolution falls back to its pushed-down scan — so tests can assert
+/// resolves `pattern` (`None` when the index declines the pattern, its child
+/// is absent, a key's term is absent, or the location declines and the
+/// resolution falls back to its pushed-down scan), so tests can assert
 /// engagement instead of inferring it from results.
 #[cfg(test)]
 pub(crate) async fn debug_located_run(
@@ -364,15 +363,15 @@ pub(crate) async fn debug_located_run(
 }
 
 /// An index's serving plan for a file-backed view: the matched rows are those
-/// where every `(column, value)` term equality holds — a contiguous run of
-/// the index child, which its sort order clusters — read by a scan of that
-/// run when the resolution located it, else by a scan pushing the equalities
+/// where every `(column, value)` term equality holds, a contiguous run of
+/// the index child that its sort order clusters, read by a scan of that run
+/// when the resolution located it, else by a scan pushing the equalities
 /// down as a zone-prunable filter, instead of scattering row-id reads across
 /// the primary columns.
 ///
 /// The file-backed half of the serving path (see the `serve` module docs;
-/// [`InMemoryServePlan`] is the in-memory half). `FileBase` carries
-/// exactly this type, so a file view can never hold an in-memory plan.
+/// [`InMemoryServePlan`] is the in-memory half). `FileBase` carries only this
+/// type, so a file view can never hold an in-memory plan.
 ///
 /// [`InMemoryServePlan`]: super::InMemoryServePlan
 #[derive(Clone)]
@@ -380,13 +379,13 @@ pub(crate) struct FileServePlan {
     decode: ServeDecode,
     /// The serving index child: its cached layout reader, its name
     /// (addressing its cached chunk probes on the file handle for point-read
-    /// serving), and the file handle's bind memo — the plan binds its
-    /// projection and filter through it on FIRST READ, not at construction:
-    /// a match-only call builds the plan without ever scanning through it,
-    /// and must not pay for binds a count-only consumer will never use. The
-    /// memo keys the bound trees by shape, so every plan for a repeated
-    /// pattern carries the same identity and hits the child reader's
-    /// identity-keyed caches (see `BoundExprMemo`).
+    /// serving), and the file handle's bind memo, through which the plan
+    /// binds its projection and filter on FIRST READ, not at construction: a
+    /// match-only call builds the plan without ever scanning through it, and
+    /// must not pay for binds a count-only consumer never uses. The memo keys
+    /// the bound trees by shape, so every plan for a repeated pattern carries
+    /// the same identity and hits the child reader's identity-keyed caches
+    /// (see `BoundExprMemo`).
     child: ChildReader,
     constraints: Vec<(&'static str, Scalar)>,
     /// The lazily bound (projection, filter) pair, shared across clones so
@@ -398,11 +397,11 @@ pub(crate) struct FileServePlan {
         )>,
     >,
     /// The child rows the constraints select, when the resolution located
-    /// them by chunk probes — exactly the constrained rows, letting a small
+    /// them by chunk probes: exactly the constrained rows, letting a small
     /// run be point-read and a wide one scanned by range
     /// ([`Self::located_run_scan`]) instead of filtered. `None` when
-    /// unlocated (or when a constraint the location didn't cover would make
-    /// the range over-approximate).
+    /// unlocated, or when a constraint the location did not cover would make
+    /// the range over-approximate.
     row_range: Option<Range<u64>>,
 }
 
@@ -423,9 +422,9 @@ fn run_split_rows(range: &Range<u64>, workers: u64) -> usize {
 impl FileServePlan {
     /// A plan serving a file's index columns, decoded through `decode`, by a
     /// pushed-down scan filtered to the rows where every `constraints`
-    /// equality holds — or, over a located `row_range`, by point reads (a
+    /// equality holds, or, over a located `row_range`, by point reads (a
     /// small run) or a range-restricted scan split across the workers (a wide
-    /// one) — see [`Self::located_run_scan`].
+    /// one; see [`Self::located_run_scan`]).
     fn new(
         decode: ServeDecode,
         child: ChildReader,
@@ -465,7 +464,6 @@ impl FileServePlan {
             .clone())
     }
 
-    /// The serving component's name on the file handle.
     pub(crate) fn component(&self) -> &'static str {
         self.child.name
     }
@@ -476,20 +474,20 @@ impl FileServePlan {
     }
 
     /// The columns to project from the file to serve these rows: the serving
-    /// child's quad columns plus the row-id column (for tombstones) — the
+    /// child's quad columns plus the row-id column (for tombstones), the
     /// copy family's child schema ([`CHILD_COLUMNS`](super::copy::CHILD_COLUMNS)).
     pub(crate) fn projection(&self) -> [&'static str; 5] {
         super::copy::CHILD_COLUMNS
     }
 
-    /// A scan over the serving index child — where [`Self::projection`] and
+    /// A scan over the serving index child, to which [`Self::projection`] and
     /// the plan's bound filter apply.
     fn child_scan(&self) -> ScanBuilder<ArrayRef> {
         ScanBuilder::new(VORTEX_SESSION.clone(), self.child.reader.clone())
     }
 
-    /// [`Self::child_scan`] with the plan's projection and filter — bound on
-    /// first use — applied. The form the streaming reads consume for an
+    /// [`Self::child_scan`] with the plan's projection and filter (bound on
+    /// first use) applied: the form the streaming reads consume for an
     /// unlocated run.
     pub(crate) fn projected_filtered_scan(&self) -> Result<ScanBuilder<ArrayRef>> {
         let (projection, filter) = self.bound_exprs()?;
@@ -500,9 +498,9 @@ impl FileServePlan {
     }
 
     /// A scan of the located run: [`Self::child_scan`] with the plan's
-    /// projection, restricted to `row_range` and split by row count. `None`
-    /// when the run is unlocated — [`Self::projected_filtered_scan`] answers
-    /// then. The form the streaming reads consume for a wide located run.
+    /// projection, restricted to `row_range` and split by row count; the form
+    /// the streaming reads consume for a wide located run. `None` when the
+    /// run is unlocated, and [`Self::projected_filtered_scan`] answers.
     ///
     /// The scan spawns one task per split and the consumer decodes each
     /// chunk inside its task, so the split count is the decode's
@@ -511,8 +509,7 @@ impl FileServePlan {
     /// by row count spreads the run's decode over the workers instead
     /// (`run_split_rows`). No filter rides along: the located range is
     /// exactly the constrained rows (the same fact `size` and the point
-    /// reads rely on), so the term equalities would only re-read and
-    /// re-compare the columns that bounded it.
+    /// reads rely on).
     pub(crate) fn located_run_scan(&self) -> Result<Option<ScanBuilder<ArrayRef>>> {
         let Some(range) = self.row_range.clone() else {
             return Ok(None);
@@ -528,9 +525,9 @@ impl FileServePlan {
         ))
     }
 
-    /// The served rows' four [`TermCode`]s, read off the index child's own
-    /// columns by a scan of exactly the located run, or by the filtered child
-    /// scan when the run is unlocated — the file counterpart of
+    /// The served rows' four [`TermCode`] columns, read off the index child's
+    /// own columns by a scan of exactly the located run, or by the filtered
+    /// child scan when the run is unlocated: the file counterpart of
     /// [`InMemoryServePlan::code_columns`], for a view whose row ids are still
     /// deferred. Rows come back in the index's order, as the served stream
     /// reads them, tombstoned rows dropped via the row-id column. `None`
@@ -565,9 +562,8 @@ impl FileServePlan {
     }
 
     /// [`decode_columns`](Self::decode_columns) through the layout's async
-    /// decode — for serving a store whose term dictionary is file-backed,
-    /// where each chunk's codes are resolved by reading the dictionary
-    /// windows that hold them.
+    /// decode, for a file-backed dictionary: each chunk's codes are resolved
+    /// by reading the dictionary windows that hold them.
     pub(crate) async fn decode_columns_async<T: ChunkDecode>(
         &self,
         chunk: &ArrayRef,

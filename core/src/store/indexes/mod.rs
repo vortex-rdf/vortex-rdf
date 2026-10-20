@@ -1,21 +1,17 @@
-//! Secondary-index vocabulary and the store's dispatch into it.
+//! Secondary-index vocabulary and the store's dispatch into it: the
+//! [`IndexType`] enum and its exhaustive dispatch into the per-index modules
+//! (persisted-child identities, the children an in-memory build emits over
+//! an [`IndexInput`], the probe a pattern shape chooses), the resolution
+//! currency both backends answer in (`IndexResolution`, `ResolvedRoles`, the
+//! eager/lazy `ResolvedRowIds` and its `LazyRowIds` recipe), and the
+//! planners that try a store's indexes in preference order.
 //!
-//! This hub owns what is common to every index: the [`IndexType`] enum and
-//! its exhaustive dispatch into the per-index modules (persisted-child
-//! identities, the children an in-memory build emits over an
-//! [`IndexInput`], the probe a pattern shape chooses), the resolution currency
-//! (`IndexResolution`, `ResolvedRoles`, the eager/lazy `ResolvedRowIds` split
-//! and its `LazyRowIds` recipe) both backends answer in, and the planners
-//! that try a store's whole index set in preference order.
-//!
-//! What belongs in a leaf instead: an index's column-name scheme, its sort
-//! orders, how it builds its children, and which probe it runs for a pattern
-//! (`copy`, `reference`) — the hub hardcodes no column name but the one every
-//! child shares, the primary row id ([`COL_RID`]). Every index's probe runs
-//! through one resolver per backend: `resolve` in memory, `file` on file
-//! (beside the file readers). Two further clusters live beside them: `serve`
+//! A leaf (`copy`, `reference`) owns an index's column names, sort orders,
+//! child builds and probe choice; the hub names no column but the primary
+//! row id every child carries ([`COL_RID`]). Every probe runs through one
+//! resolver per backend, `resolve` in memory and `file` on file. `serve`
 //! (reading matched quads out of an index's own columns) and `components`
-//! (the persisted-child model and the slug registry), both re-exported here
+//! (the persisted-child model and the slug registry) are re-exported here,
 //! so callers see one `indexes::` surface.
 
 #[cfg(feature = "file-io")]
@@ -53,15 +49,15 @@ pub(crate) use file::{FileServePlan, read_located_rids, scan_index_row_ids};
 pub(crate) use serve::InMemoryServePlan;
 
 /// The primary-row-id column every persisted index child carries beside its
-/// own columns — the currency every resolution answers in, and the one
-/// column name the families share rather than each spelling their own.
+/// own columns: the currency every resolution answers in, and the one column
+/// name the index families share.
 pub(crate) const COL_RID: &str = "rid";
 
 /// The row id an indexed build gives its first row: 0, unless the tests'
-/// `RowIdBase` hook offsets the ids — past `u32::MAX`, so a handful of
-/// quads carry ids a 32-bit width cannot hold, or close to [`RowId::MAX`],
-/// so the refusal of an id past the last one is reachable. Every reader
-/// takes the base off again ([`base_row`]).
+/// `RowIdBase` hook offsets the ids (past `u32::MAX`, so a handful of quads
+/// carry ids a 32-bit width cannot hold, or close to [`RowId::MAX`], so the
+/// refusal of an id past the last one is reachable). Every reader takes the
+/// base off again ([`base_row`]).
 #[inline]
 fn row_id_base() -> RowId {
     #[cfg(test)]
@@ -74,11 +70,10 @@ fn row_id_base() -> RowId {
     }
 }
 
-/// The most quads an indexed build numbers: one per row id below
-/// [`RowId::MAX`] from the base on, which no store reaches — but the builds
-/// count against it with checked arithmetic all the same, through
-/// [`check_indexed_rows`] or, row by row, [`next_row_id`], so that a row id
-/// is refused rather than wrapped onto row 0.
+/// The most quads an indexed build numbers: one per row id from the base up
+/// to [`RowId::MAX`]. No store reaches it, but the builds count against it
+/// with checked arithmetic ([`check_indexed_rows`], or row by row
+/// [`next_row_id`]), so a row id is refused, never wrapped onto row 0.
 #[inline]
 fn row_limit() -> u64 {
     RowId::MAX - row_id_base()
@@ -109,9 +104,9 @@ fn too_many_rows(rows: Option<u64>) -> VortexRdfError {
     ))
 }
 
-/// Refuse to index `rows` quads past the row limit — the check every
-/// in-memory index build runs before it assigns a row id, which is what
-/// lets [`row_id`] number the rows unchecked.
+/// Refuses to index `rows` quads past the row limit: the check every
+/// in-memory index build runs before it assigns a row id, which lets
+/// [`row_id`] number the rows unchecked.
 pub(crate) fn check_indexed_rows(rows: u64) -> Result<()> {
     if rows > row_limit() {
         return Err(too_many_rows(Some(rows)));
@@ -120,11 +115,11 @@ pub(crate) fn check_indexed_rows(rows: u64) -> Result<()> {
 }
 
 /// The id of the next row of an indexed build that has numbered `assigned`
-/// rows so far, counting it — the checked increment of a build that numbers
-/// rows as they stream past and cannot know the count up front. The refusal
-/// comes at the first row past the row limit, before any id wraps, and
-/// leaves the count as it was. Compiled where its one caller, the
-/// out-of-core builder, is.
+/// rows so far, counting it: the checked increment of a build that numbers
+/// rows as they stream past, without the count up front. The refusal comes
+/// at the first row past the row limit, before any id wraps, and leaves the
+/// count as it was. Compiled where its one caller, the out-of-core
+/// builder, is.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) fn next_row_id(assigned: &mut u64) -> Result<RowId> {
     if *assigned >= row_limit() {
@@ -137,7 +132,7 @@ pub(crate) fn next_row_id(assigned: &mut u64) -> Result<RowId> {
 }
 
 /// Row `i`'s id as an index child records it, for `i` below a row count
-/// [`check_indexed_rows`] admitted — the in-memory index builds' numbering.
+/// [`check_indexed_rows`] admitted: the in-memory index builds' numbering.
 /// The check comes first on every path that reaches here, so a sum past
 /// [`RowId::MAX`] is a broken invariant, never a silent wrap.
 pub(crate) fn row_id(i: usize) -> RowId {
@@ -148,9 +143,9 @@ pub(crate) fn row_id(i: usize) -> RowId {
         .expect("index builds refuse a store whose row ids would run past RowId::MAX")
 }
 
-/// The base row the row id `rid` an index child recorded names: the id
-/// itself — less the tests' `RowIdBase` offset under that hook, which must
-/// be the one the store was built under.
+/// The base row an index child's row id `rid` names: the id itself, less the
+/// tests' `RowIdBase` offset under that hook (which must be the one the store
+/// was built under).
 #[inline]
 pub(crate) fn base_row(rid: RowId) -> RowId {
     #[cfg(test)]
@@ -166,9 +161,9 @@ pub(crate) fn base_row(rid: RowId) -> RowId {
 
 /// The base row `row` as an `I` position, refused when `I` cannot hold it:
 /// a row past what the index type addresses is past every row any base of
-/// that width holds, so it is out of range — never narrowed onto another
-/// row. [`row_index`] is the `usize` form every reader uses; this one is
-/// generic so that the 32-bit case (wasm) is testable on any host.
+/// that width holds, so it is out of range, never narrowed onto another row.
+/// [`row_index`] is the `usize` form every reader uses; this one is generic
+/// so that the 32-bit case (wasm) is testable on any host.
 pub(crate) fn index_of<I: TryFrom<RowId>>(row: RowId) -> Result<I> {
     I::try_from(row).map_err(|_| {
         VortexRdfError::Deserialization(format!(
@@ -195,46 +190,45 @@ pub(crate) fn row_index(row: RowId) -> Result<usize> {
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum IndexType {
     /// Two complete extra copies of the quad columns, each in its own sort
-    /// order and each paired with the primary row IDs it permutes — the
-    /// classic triple-store permutation indexes, giving predicate- and
-    /// object-bound patterns the same sorted-column access path the primary
-    /// (s, p, o, g) order gives subjects.
+    /// order and paired with the primary row ids it permutes: the classic
+    /// triple-store permutation indexes, giving predicate- and object-bound
+    /// patterns the sorted-column access the primary (s, p, o, g) order gives
+    /// subjects.
     ///
     /// Adds two children beside the quad rows, each a `{s, p, o, g, rid}`
     /// table (`VarBin<Utf8>` term strings, or u64 codes under the Dictionary
-    /// layout; `rid` always a u64 [`RowId`](crate::store::RowId)):
+    /// layout; `rid` always a u64 [`RowId`]):
     /// - `index:posg`: the quads sorted by (p, o, s, g)
     /// - `index:ospg`: the quads sorted by (o, s, p, g)
     ///
-    /// Predicate-bound patterns binary-search `index:posg`'s `p` column, a
-    /// bound predicate **and** object prefix-search (p, o) in one probe, and
-    /// object-bound patterns binary-search `index:ospg`'s `o` column. Reads
-    /// take the matching rows from a *contiguous* run of the copy columns
-    /// instead of scattering row-id reads across the primary columns. Routing
-    /// engages only on children whose writer recorded them globally sorted,
-    /// which every build here does. The `copy` module owns
-    /// resolution and serving.
+    /// A bound predicate binary-searches `index:posg`'s `p` column, a bound
+    /// predicate **and** object prefix-search (p, o) in one probe, and a
+    /// bound object binary-searches `index:ospg`'s `o` column. Reads take the
+    /// matching rows from a *contiguous* run of the copy columns instead of
+    /// scattering row-id reads across the primary columns. Routing engages
+    /// only on children their writer recorded as globally sorted, as every
+    /// build here does.
     SecondaryByCopy,
 
-    /// Builds sorted secondary indexes for both predicates **and** objects.
+    /// Sorted back-references for both predicates **and** objects.
     ///
     /// Adds two children beside the quad rows, each a `{val, rid}` table:
     /// - `index:ref-o`: object values sorted (`VarBin<Utf8>`; u64 codes under
-    ///   the Dictionary layout), paired with the primary row id (a u64
-    ///   [`RowId`](crate::store::RowId)) each came from
+    ///   the Dictionary layout), each paired with the primary row id (a u64
+    ///   [`RowId`]) it came from
     /// - `index:ref-p`: the same for predicate values
     ///
-    /// Enables binary-search routing in `match_pattern` for predicate-only and
-    /// object-only patterns, avoiding full scans. Routing engages only on
-    /// children whose writer recorded them globally sorted, which every build
-    /// here does.
+    /// A pattern with a bound predicate or object and no bound subject
+    /// binary-searches them instead of scanning (the object's child when both
+    /// are bound). Routing engages only on children their writer recorded as
+    /// globally sorted, as every build here does.
     SecondaryByReference,
 }
 
 /// The canonical index name: kebab-case (`"secondary-by-copy"`,
-/// `"secondary-by-reference"`), the same spelling the `clap` derive exposes
-/// on the CLI — so every frontend reports one vocabulary and a value printed
-/// by one can be parsed by another.
+/// `"secondary-by-reference"`), the spelling the `clap` derive exposes on the
+/// CLI, so every frontend reports one vocabulary and a value one prints
+/// another parses.
 impl std::fmt::Display for IndexType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -245,8 +239,8 @@ impl std::fmt::Display for IndexType {
 }
 
 /// Accepts exactly the canonical kebab-case names
-/// [`Display`](std::fmt::Display) emits — `"secondary-by-copy"`,
-/// `"secondary-by-reference"` — the one vocabulary every frontend shares. Any
+/// [`Display`](std::fmt::Display) emits (`"secondary-by-copy"`,
+/// `"secondary-by-reference"`), the one vocabulary every frontend shares. Any
 /// other name is an [`InvalidInput`](VortexRdfError::InvalidInput) error.
 impl std::str::FromStr for IndexType {
     type Err = VortexRdfError;
@@ -263,7 +257,7 @@ impl std::str::FromStr for IndexType {
     }
 }
 
-/// Every [`IndexType`], in declaration = preference order — what the slug
+/// Every [`IndexType`], in declaration (preference) order: what the slug
 /// registry scans, what the in-memory index set
 /// ([`indexes_from_components`]) is filtered out of, and the order an
 /// in-memory build emits the requested indexes' children in
@@ -283,7 +277,6 @@ pub(crate) enum IndexInput<'a> {
 }
 
 impl IndexInput<'_> {
-    /// How many rows the input holds.
     pub(crate) fn rows(self) -> usize {
         match self {
             IndexInput::Quads(quads) => quads.len(),
@@ -293,11 +286,10 @@ impl IndexInput<'_> {
 }
 
 impl IndexType {
-    /// This index's persisted-child identities — the static table every
-    /// generic loop is parameterized by: the slug registry
-    /// ([`known_component`]) and the components each leaf builds. The
-    /// exhaustive match is the compile-fail anchor for those loops: a new
-    /// variant answers here once and flows into all of them.
+    /// This index's persisted-child identities: the static table the generic
+    /// loops are parameterized by, the slug registry ([`known_component`])
+    /// and each leaf's component build. The exhaustive match makes a new
+    /// variant answer here once for all of them.
     pub(crate) const fn component_identities(self) -> &'static [ComponentIdentity] {
         match self {
             IndexType::SecondaryByCopy => &copy::IDENTITIES,
@@ -306,10 +298,9 @@ impl IndexType {
     }
 
     /// This index's persisted children over `input`, one per identity, in
-    /// [`component_identities`](Self::component_identities) order: each
-    /// globally sorted over the whole dataset, so each says so. The build
-    /// step each index owns; like `component_identities`, the exhaustive
-    /// match demands a build-side answer from every new variant.
+    /// [`component_identities`](Self::component_identities) order, each
+    /// globally sorted over the whole dataset and stamped so. The exhaustive
+    /// match demands a build from every new variant.
     pub(crate) fn components(self, input: IndexInput<'_>) -> Result<Vec<IndexComponent>> {
         match self {
             IndexType::SecondaryByCopy => copy::components(input),
@@ -317,19 +308,17 @@ impl IndexType {
         }
     }
 
-    /// The probe this index runs for `pattern` — the child it searches, by
-    /// which sort keys, what a hit resolves, and whether the child serves
-    /// the matched quads — or `None` for a shape it does not accelerate (e.g.
-    /// `SecondaryByReference` declines when a subject is bound), leaving the
-    /// store to try the next index or fall back to a scan. A probe without
-    /// keys bounds no run, so it is declined here, for both backends.
+    /// The probe this index runs for `pattern` (the child it searches, by
+    /// which sort keys, what a hit resolves, and whether the child serves the
+    /// matched quads), or `None` for a shape it does not accelerate
+    /// (`SecondaryByReference` declines a bound subject, say), and the store
+    /// tries the next index or falls back to a scan. A probe without keys
+    /// bounds no run, so it is declined here, for both backends.
     ///
     /// The one step each index owns at query time: one resolver per backend
     /// executes every index's probe (`resolve::resolve_in_memory`,
-    /// `file::resolve_file`). Like
-    /// [`component_identities`](Self::component_identities), the exhaustive
-    /// match makes the compiler demand a query-side answer from every new
-    /// index variant.
+    /// `file::resolve_file`). The exhaustive match demands a query-side
+    /// answer from every new variant.
     fn choose<'a>(
         self,
         pattern: QuadPattern<'a>,
@@ -343,14 +332,14 @@ impl IndexType {
     }
 }
 
-/// Which pattern component(s) an index lookup resolves. The resolved
-/// components can be omitted from any residual filtering over the fetched
-/// rows — the index's row ids already are exactly their matches.
+/// Which pattern components an index lookup resolves; residual filtering
+/// over the fetched rows omits them, as the index's row ids are exactly
+/// their matches.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ResolvedRoles {
     Predicate,
     Object,
-    /// Both predicate and object at once — a prefix search of the
+    /// Both predicate and object at once: a prefix search of the
     /// (p, o, …)-sorted copy in [`IndexType::SecondaryByCopy`].
     PredicateObject,
 }
@@ -377,13 +366,12 @@ impl ResolvedRoles {
     }
 }
 
-/// The outcome of asking an index to resolve a quad pattern against a backend.
+/// The outcome of asking an index to resolve a quad pattern on a backend.
 ///
-/// Both backends answer in the same currency — ascending, unique *base* row ids
-/// — so the store folds either one into a [`RowSelection`] the same way. `Plan`
-/// is the backend's serve-plan type ([`InMemoryServePlan`] for in-memory
-/// resolutions, `FileServePlan` for file ones), so a resolution can only ever
-/// hand the store a plan its own backend can execute.
+/// Both backends answer in ascending, unique *base* row ids, which the store
+/// folds into a [`RowSelection`] alike. `Plan` is the backend's serve-plan
+/// type ([`InMemoryServePlan`] in memory, `FileServePlan` on file), so a
+/// resolution can only hand the store a plan its own backend executes.
 ///
 /// [`RowSelection`]: crate::store::view::selection::RowSelection
 // `Resolved` dwarfs the dataless `Declined`, but the enum is a transient
@@ -395,23 +383,21 @@ pub(crate) enum IndexResolution<Plan> {
     /// this index covers, or (in memory) its value column isn't in a usable
     /// sorted form. The caller falls back to its non-indexed path.
     Declined,
-    /// The index applies and proved the pattern matches no row — the probed
+    /// The index applies and proved the pattern matches no row: the probed
     /// term is absent from the indexed column. The caller short-circuits to an
     /// empty result.
     Empty,
-    /// The index resolved `resolves`, yielding exactly `row_ids`: an
-    /// ascending, unique set of base row ids (eager, or lazily computed — see
-    /// [`ResolvedRowIds`]). The caller narrows its selection to those ids and
-    /// drops `resolves` from any residual filtering, since the ids already
-    /// satisfy it.
+    /// The index resolved `resolves`, yielding exactly `row_ids`: ascending,
+    /// unique base row ids, eager or lazy ([`ResolvedRowIds`]). The caller
+    /// narrows its selection to them and drops `resolves` from any residual
+    /// filtering.
     ///
-    /// `serve` is the optional, index-agnostic *serving plan*: when the index
-    /// also holds the matched quads clustered in its own columns, it hands back
-    /// the backend's plan so the store can read them straight from there instead
-    /// of gathering the primary columns by scattered row id — a contiguous file
-    /// scan or, for an in-memory base, a plain array slice. An index that stores
-    /// only back-references (no whole quads) leaves it `None`. It is a pure
-    /// optimization — `row_ids` already resolve the pattern on their own.
+    /// `serve` is the optional *serving plan* of an index that holds the
+    /// matched quads in its own columns, so the store reads them there (a
+    /// contiguous file scan, or an array slice in memory) instead of
+    /// gathering the primary columns by scattered row id; a back-reference
+    /// index leaves it `None`. The plan only optimizes: `row_ids` resolve
+    /// the pattern on their own.
     Resolved {
         row_ids: ResolvedRowIds,
         resolves: ResolvedRoles,
@@ -421,22 +407,21 @@ pub(crate) enum IndexResolution<Plan> {
 
 /// How a resolution answers its row ids.
 ///
-/// `Eager` is a resolution whose ids were computed at match time — the
-/// pushed-down scan a back-reference probe needs to answer at all when its
-/// run is not located, or a small located run's rid point reads — and is
-/// non-empty by construction: an empty scan short-circuits to
-/// [`IndexResolution::Empty`] instead. Only the file resolver answers this
-/// way: an in-memory resolution is always `Lazy`, so a build without
-/// `file-io` has no `Eager`. `Lazy` rides alongside a serve
-/// plan, or stands alone over a located run whose width is known — only on a
-/// view built for a count or a window (`IdsNeed::CountOrWindow`), which never
-/// streams rows through its selection. A serve plan answers reads straight
-/// from the index's own columns, and a run's width answers a count, so the
-/// ids — a second pass over the same data — are deferred until a consumer
-/// actually needs the selection (a count the width cannot answer, a chained
-/// match, a delete, a base-order gather). A lazy resolution may therefore
-/// materialize to an *empty* id set; consumers reach it through the view's
-/// pending selection, which handles that like any other narrow selection.
+/// `Eager`: the ids were computed at match time (the pushed-down scan an
+/// unlocated back-reference probe needs, or a small located run's rid point
+/// reads); non-empty by construction, as an empty scan answers
+/// [`IndexResolution::Empty`]. Only the file resolver answers so: an
+/// in-memory resolution is always `Lazy`, so a build without `file-io` has
+/// no `Eager`.
+///
+/// `Lazy`: the ids are a recipe. The match leaves them pending beside a serve
+/// plan it keeps, which reads from the index's own columns, or alone over a
+/// located run of known width on a view built for a count or a window
+/// (`IdsNeed::CountOrWindow`), whose width answers the count, and computes
+/// them at once otherwise. Pending ids are computed when a consumer needs the
+/// selection (a count the width cannot answer, a chained match, a delete, a
+/// base-order gather), and may materialize to an *empty* set, which the
+/// view's pending selection handles like any other narrow selection.
 pub(crate) enum ResolvedRowIds {
     #[cfg(feature = "file-io")]
     Eager(Buffer<RowId>),
@@ -444,29 +429,24 @@ pub(crate) enum ResolvedRowIds {
 }
 
 /// The exact base row ids of an index resolution whose consumer may not need
-/// them — a serve-attached one, or a located run that is only counted or
-/// windowed — computed on first need and shared across every clone of the view
-/// that carries them.
+/// them (a served one, or a located run that is only counted or windowed):
+/// the *recipe*, run by the first consumer that needs the selection, its
+/// result in a cell shared by every clone of the view that carries it. A
+/// serve plan reads without the ids, which on file cost a whole extra scan
+/// of the index child, and a located run's width counts without them.
 ///
-/// The serving plan makes the ids redundant for the dominant
-/// match-then-iterate flow — for a file-backed store they cost a whole extra
-/// pushed-down scan of the index child — and a located run's width makes them
-/// redundant for a count, so the resolution hands back the *recipe* instead
-/// and whichever consumer first needs the selection runs it.
-/// The result lands in a shared cell: later consumers (and view clones made
-/// before materialization) read it back for free. Two consumers racing on
-/// first need may both run the recipe, but the source is immutable so they
-/// compute identical ids; whichever stores first wins and both return the
-/// stored buffer — no lock is held across the computation.
+/// Two consumers racing on first need may both run the recipe; the source is
+/// immutable, so they compute the same ids, whichever stores first wins and
+/// both return the stored buffer. No lock is held across the computation.
 #[derive(Clone)]
 pub(crate) struct LazyRowIds {
     cell: Arc<OnceLock<Buffer<RowId>>>,
     source: LazyRowIdSource,
 }
 
-/// Where a [`LazyRowIds`]' ids come from — mirroring the serve plans'
-/// per-backend split ([`InMemoryServePlan`] / `FileServePlan`), holding
-/// exactly what the eager path would have consumed at resolution time.
+/// Where a [`LazyRowIds`]' ids come from, split by backend as the serve plans
+/// are ([`InMemoryServePlan`], `FileServePlan`), holding what the eager path
+/// would have consumed at resolution time.
 #[derive(Clone)]
 enum LazyRowIdSource {
     /// In-memory: the rid-column slice of the component's matched run, decoded
@@ -481,7 +461,7 @@ enum LazyRowIdSource {
     /// of this component uses (see `BoundExprMemo`). `located` is the run of
     /// child rows the constraints select, when the resolver located it:
     /// exactly the rows the scan keeps, so its width is the ids' count. It
-    /// answers [`len_if_known`](LazyRowIds::len_if_known) and nothing else —
+    /// answers [`len_if_known`](LazyRowIds::len_if_known) and nothing else:
     /// a serving child's rids follow its own sort order, so no window of the
     /// run is a window of its ids.
     #[cfg(feature = "file-io")]
@@ -490,9 +470,9 @@ enum LazyRowIdSource {
         constraints: Vec<(&'static str, Scalar)>,
         located: Option<Range<u64>>,
     },
-    /// File-backed: a located run of an index child's rid column — read on
+    /// File-backed: a located run of an index child's rid column, read on
     /// first need through [`read_located_rids`]; its width is known up front,
-    /// so a count needs none of it.
+    /// so a count reads none of it.
     #[cfg(feature = "file-io")]
     LocatedRun {
         file: Arc<crate::store::persist::native_file::NativeStoreFile>,
@@ -502,17 +482,17 @@ enum LazyRowIdSource {
 }
 
 impl LazyRowIds {
-    /// Test-only hook: whether the ids have actually been computed — so a
-    /// test can pin that a read was answered without them.
+    /// Test-only hook: whether the ids have been computed, so a test can pin
+    /// a read answered without them.
     #[cfg(test)]
     pub(crate) fn debug_materialized(&self) -> bool {
         self.cell.get().is_some()
     }
 
     /// Lazy ids over an in-memory component's matched rid run, in the
-    /// component's own order — `ascending` when those rids are already in
-    /// row id order: a reference component's rows are ordered by
-    /// `(val, rid)`, so the rows of one value are.
+    /// component's own order; `ascending` when those rids are already in row
+    /// id order, as a reference component's are within one value (its rows
+    /// are ordered by `(val, rid)`).
     pub(crate) fn from_component_run(rids: ArrayRef, ascending: bool) -> Self {
         Self {
             cell: Arc::new(OnceLock::new()),
@@ -554,14 +534,14 @@ impl LazyRowIds {
     }
 
     /// The ids of rows `offset..offset + limit` of a located run, in base row
-    /// order — the window's own rows and no others. A reference child's rows
-    /// are ordered by `(val, rid)` (the order this crate's writers emit,
-    /// docs/file-format.md §6), so within one value the rids ascend: row `k`
-    /// of the run holds the run's `k`-th smallest rid, and a window of the
-    /// run's rows is the same window of its ids in base order. A deep page
-    /// costs its limit, one reaching the run's end no more than its rows, and
-    /// an empty window — no limit, or an offset at or past the run's end —
-    /// reads nothing. `None` for any other source.
+    /// order, read from the window's own rows and no others. A reference
+    /// child's rows are ordered by `(val, rid)` (the order this crate's
+    /// writers emit, docs/file-format.md §6), so within one value the rids
+    /// ascend: row `k` of the run holds the run's `k`-th smallest rid, and a
+    /// window of the run's rows is the same window of its ids in base order.
+    /// A deep page costs its limit, and an empty window (no limit, or an
+    /// offset at or past the run's end) reads nothing. `None` for any other
+    /// source.
     #[cfg(feature = "file-io")]
     pub(crate) async fn window_async(
         &self,
@@ -582,7 +562,7 @@ impl LazyRowIds {
     }
 
     /// The ids of rows `offset..offset + limit` of an in-memory run whose rids
-    /// ascend, in base row order — the window's own rows cut out of the rid
+    /// ascend, in base row order: the window's own rows cut out of the rid
     /// column before they are decoded, so a deep page costs its limit and an
     /// empty window (no limit, or an offset at or past the run's end) decodes
     /// nothing. `None` for any other source.
@@ -636,8 +616,8 @@ impl LazyRowIds {
         }
     }
 
-    /// The ids, computing (and caching) them on first call — the awaiting
-    /// form, which also runs a file child's deferred scan.
+    /// The ids, computed and cached on the first call; the awaiting form,
+    /// which also runs a file child's deferred read.
     #[cfg(feature = "file-io")]
     pub(crate) async fn materialized_async(&self) -> Result<Buffer<RowId>> {
         if let Some(ids) = self.cell.get() {
@@ -655,12 +635,12 @@ impl LazyRowIds {
         Ok(self.cell.get_or_init(|| ids).clone())
     }
 
-    /// The ids, computing (and caching) them on first call — the synchronous
-    /// form for in-memory sources (a file child's ids take I/O, and every
-    /// consumer of a file view's selection is already async; see
+    /// The ids, computed and cached on the first call; the synchronous form,
+    /// for in-memory sources (a file child's ids take I/O, and every consumer
+    /// of a file view's selection is async: see
     /// [`materialized_async`](Self::materialized_async)). A file child's ids
-    /// that `materialized_async` has already read are returned from the
-    /// cache, which is how the file match folds them.
+    /// that `materialized_async` has already read come from the cache, which
+    /// is how the file match folds them; unread ones never reach here.
     pub(crate) fn materialized(&self) -> Result<Buffer<RowId>> {
         if let Some(ids) = self.cell.get() {
             return Ok(ids.clone());
@@ -676,10 +656,10 @@ impl LazyRowIds {
     }
 }
 
-/// Resolve the pattern against the configured indexes over an in-memory array,
-/// returning the first index whose outcome isn't `Declined` (indexes are tried
-/// in declaration = preference order). `Declined` when none apply, so the store
-/// can fall back to a mask scan.
+/// The pattern resolved against the configured indexes over an in-memory
+/// base: the first outcome that isn't `Declined`, the indexes tried in
+/// declaration (preference) order. `Declined` when none applies, and the
+/// store falls back to a mask scan.
 pub(crate) fn resolve_indexes_in_memory(
     indexes: &[IndexType],
     components: &[IndexComponent],
@@ -699,11 +679,9 @@ pub(crate) fn resolve_indexes_in_memory(
     Ok(IndexResolution::Declined)
 }
 
-/// File-backed counterpart of [`resolve_indexes_in_memory`]: the first index
-/// whose file resolution isn't `Declined`, in declaration (preference) order.
-///
-/// Whether the matched rows can additionally be *served* from the answering
-/// index's own columns rides along inside the resolution itself
+/// The file counterpart of [`resolve_indexes_in_memory`]: the first file
+/// resolution that isn't `Declined`, in declaration (preference) order. A
+/// serve plan rides inside the resolution
 /// ([`IndexResolution::Resolved::serve`]), so the store never needs to know
 /// which index answered.
 #[cfg(feature = "file-io")]
@@ -728,10 +706,11 @@ pub(crate) async fn resolve_indexes_file(
 
 /// The set of optional secondary indexes to embed in a store.
 ///
-/// An empty `Indexes` means no secondary index columns are written (fastest
-/// write, full-scan queries only). Use `vec![IndexType::SecondaryByReference]`
-/// for the compact (value, row-id) predicate/object indexes, or
-/// `vec![IndexType::SecondaryByCopy]` for the full sorted quad copies.
+/// An empty `Indexes` writes no index children: the fastest write, and every
+/// pattern without a bound subject scans. Use
+/// `vec![IndexType::SecondaryByReference]` for the compact (value, row id)
+/// predicate and object indexes, or `vec![IndexType::SecondaryByCopy]` for
+/// the full sorted quad copies.
 pub type Indexes = Vec<IndexType>;
 
 #[cfg(test)]

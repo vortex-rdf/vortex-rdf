@@ -1,21 +1,19 @@
-//! The persistence model of a secondary index: the *component*, which is the
-//! one form index data ever takes.
-//!
-//! One [`IndexComponent`] is one child of a native store file (or its
-//! in-memory twin): a set of rows under the child's own plain column names,
+//! The persistence model of a secondary index: the *component*, the one form
+//! index data takes. One [`IndexComponent`] is one child of a native store
+//! file, or its in-memory twin: rows under the child's own column names,
 //! carrying the writer's sortedness provenance. Builders emit components
-//! directly, beside primary-only quad rows; this module owns what happens to
-//! them afterwards — assembling a child's rows ([`child_struct`]), writing
-//! one as a native child ([`index_child_write`]), adopting a persisted one
-//! back into memory, and reading a persisted child's implementation slug onto
-//! a component identity.
+//! beside primary-only quad rows; this module assembles a child's rows
+//! ([`child_struct`]), writes one as a native child ([`index_child_write`]),
+//! adopts a persisted one back into memory ([`adopt_component`]), maps an
+//! implementation slug onto its identity ([`known_component`]), and decodes a
+//! rid column into the sorted base row ids every resolution answers in
+//! ([`sorted_row_ids`]).
 //!
-//! The column *names* belong to the index modules, not here (the row id
-//! every child carries is the one exception, named once in the hub as
-//! [`COL_RID`](super::COL_RID)): each leaf declares its identities once in a
-//! static [`ComponentIdentity`] table (reached through
-//! [`IndexType::component_identities`]), and the loops below are parameterized by
-//! those rows.
+//! The column names belong to the index modules (the row id every child
+//! carries is the one exception, named once in the hub as
+//! [`COL_RID`](super::COL_RID)): each leaf declares its identities in a
+//! static [`ComponentIdentity`] table ([`IndexType::component_identities`]),
+//! and the loops here are parameterized by its rows.
 
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
@@ -41,16 +39,15 @@ use crate::store::schema::{ROW_ID_PTYPE, RowId, TermCode};
 
 use super::{ALL_INDEX_TYPES, IndexType, Indexes};
 
-/// The identity a persisted index child carries on the wire — its component
-/// name and implementation slug — and the index type that child makes
-/// queryable. Each leaf module declares its identities as a static table
-/// ([`IndexType::component_identities`]); an [`IndexComponent`] holds its row
-/// of it, and the generic loops here — the slug registry and the roster it
-/// builds — are parameterized by these rows. The columns behind an identity
-/// are the leaf's business ([`child_struct`] assembles them).
+/// The identity a persisted index child carries on the wire (its component
+/// name and implementation slug) and the index type that child makes
+/// queryable: a row of a leaf's static table
+/// ([`IndexType::component_identities`]), which an [`IndexComponent`] holds
+/// and the slug registry scans. The columns behind an identity are the
+/// leaf's ([`child_struct`] assembles them).
 pub(crate) struct ComponentIdentity {
-    /// The component name (`index:posg`, `index:ref-o`, …) — the same
-    /// identity the persisted child carries.
+    /// The component name (`index:posg`, `index:ref-o`, …) the persisted
+    /// child carries.
     pub(crate) name: &'static str,
     /// The implementation slug (`secondary-by-copy/posg`, …).
     pub(crate) slug: &'static str,
@@ -58,11 +55,11 @@ pub(crate) struct ComponentIdentity {
     pub(crate) index: IndexType,
 }
 
-/// The single slug registry: the identity row a persisted component's
-/// implementation slug names in this version, or `None` for foreign slugs
+/// The slug registry: the identity row a persisted component's
+/// implementation slug names in this version, or `None` for a foreign slug
 /// (skippable when optional). A lookup over the per-leaf identity tables, so
-/// a new index (or a renamed slug) is threaded through exactly one place —
-/// its [`IndexType::component_identities`] row.
+/// a new index or slug is added in one place, its
+/// [`IndexType::component_identities`] row.
 pub(crate) fn known_component(implementation: &str) -> Option<&'static ComponentIdentity> {
     ALL_INDEX_TYPES.into_iter().find_map(|index| {
         index
@@ -72,9 +69,9 @@ pub(crate) fn known_component(implementation: &str) -> Option<&'static Component
     })
 }
 
-/// Every known index child holds exactly one row per quad; a mismatched child
-/// means a corrupt or foreign file, and routing through it would return
-/// silently wrong matches.
+/// Refuses an index child whose row count is not the quad count: a known
+/// child holds exactly one row per quad, so a mismatch means a corrupt or
+/// foreign file, and routing through it would return wrong matches silently.
 pub(crate) fn check_component_rows(name: &str, component_rows: u64, quad_rows: u64) -> Result<()> {
     if component_rows != quad_rows {
         return Err(VortexRdfError::Deserialization(format!(
@@ -85,17 +82,15 @@ pub(crate) fn check_component_rows(name: &str, component_rows: u64, quad_rows: u
     Ok(())
 }
 
-/// Adopt a persisted child as an in-memory [`IndexComponent`] under the
+/// A persisted child adopted as an in-memory [`IndexComponent`] under the
 /// registry row `identity`, `sorted` the descriptor's provenance, reading
-/// nothing of it now: the child's scan and canonicalization both defer to
-/// the component's first genuine use — the form `from_bytes` adopts its
-/// children in, the roster row coming off the wire TOC alone. `reader` MUST
-/// sit over a buffer-backed segment source (a `from_bytes` buffer):
-/// [`IndexComponent::rows`] drives its scan synchronously, and only
-/// buffer-backed segment reads resolve without pending. The child comes from
-/// a roster the open has already checked, its row count among the rest
-/// (`ComponentRoster::of`): a corrupt roster fails at open, not at first
-/// probe.
+/// nothing of it now: its scan and canonicalization wait for the component's
+/// first use (how `from_bytes` adopts its children, off the wire TOC alone).
+/// `reader` MUST sit over a buffer-backed segment source (a `from_bytes`
+/// buffer): [`IndexComponent::rows`] drives its scan synchronously, and only
+/// buffer-backed segment reads resolve without pending. The open has already
+/// checked the roster, row counts included (`ComponentRoster::of`), so a
+/// corrupt roster fails at open, not at first probe.
 pub(crate) fn adopt_component(
     identity: &'static ComponentIdentity,
     reader: vortex_layout::LayoutReaderRef,
@@ -114,7 +109,7 @@ pub(crate) fn adopt_component(
 
 /// One secondary-index component held in memory beside the store's primary
 /// base: the in-memory twin of a native store file's index child, carrying
-/// the same rows under the same child schema (plain column names — `s`, `p`,
+/// the same rows under the same child schema (plain column names: `s`, `p`,
 /// `o`, `g`, `rid` for a copy family; `val`, `rid` for a reference family).
 ///
 /// `rid` values address rows of the base the component was built against;
@@ -123,41 +118,41 @@ pub(crate) fn adopt_component(
 /// any physical gather.
 #[derive(Clone)]
 pub(crate) struct IndexComponent {
-    /// The identity the persisted child carries — component name (`index:posg`,
-    /// `index:ref-o`, …), implementation slug and owning index.
+    /// The identity the persisted child carries: component name
+    /// (`index:posg`, `index:ref-o`, …), implementation slug and owning index.
     pub(crate) identity: &'static ComponentIdentity,
-    /// The component's rows: canonical from construction, or a deferred
-    /// adoption canonicalized on first genuine use — reached through
-    /// [`rows`](Self::rows). `Arc`-shared so every clone of the component —
-    /// and of the `Arc<[IndexComponent]>` roster the store's views share —
-    /// sees one materialization.
+    /// The component's rows ([`rows`](Self::rows)): canonical from
+    /// construction, or a deferred adoption canonicalized on first use.
+    /// `Arc`-shared, so every clone of the component, and of the
+    /// `Arc<[IndexComponent]>` roster the store's views share, sees one
+    /// materialization.
     rows: Arc<ComponentRows>,
-    /// Whether the sort-key columns are GLOBALLY sorted — the writer's
-    /// provenance, not an inspection: binary-search resolution is gated on
-    /// this, and per-chunk-sorted data must never claim it (a false stamp
+    /// Whether the sort-key columns are GLOBALLY sorted: the writer's
+    /// provenance, not an inspection. Binary-search resolution is gated on
+    /// it, and per-chunk-sorted data must never claim it (a false stamp
     /// corrupts query results; see the `sorted` field on the wire
     /// descriptor).
     pub(crate) sorted: bool,
-    /// Lazily-resolved encoded-search probes over the component's columns,
-    /// shared by every clone (probe resolution walks the encoding tree per
-    /// call otherwise — the fixed cost of the resolvers' searches and the
-    /// serve path's point reads). The rows are immutable once materialized,
-    /// so the cache's array-identity guard holds for the component's
-    /// lifetime; [`rebuilt`](Self::rebuilt) takes a fresh cache.
+    /// The encoded-search probes over the component's columns, resolved
+    /// lazily and shared by every clone, so the resolvers' searches and the
+    /// serve path's point reads skip the per-call encoding-tree walk. The
+    /// rows are immutable once materialized, so the cache's array-identity
+    /// guard holds for the component's lifetime; [`rebuilt`](Self::rebuilt)
+    /// takes a fresh cache.
     probes: Arc<StructProbes>,
 }
 
 /// An [`IndexComponent`]'s rows: `cell` holds them as one struct in child
-/// schema once canonical — from construction for a builder's emission —
-/// and `pending` is the reader a deferred adoption still scans to fill it
-/// (`None` for rows built in memory).
+/// schema once canonical (from construction, for a builder's emission), and
+/// `pending` is the reader a deferred adoption scans to fill it (`None` for
+/// rows built in memory).
 struct ComponentRows {
     cell: OnceLock<StructArray>,
     pending: Option<vortex_layout::LayoutReaderRef>,
 }
 
 impl IndexComponent {
-    /// A component whose rows are already canonical in memory — the
+    /// A component whose rows are already canonical in memory: the
     /// construction every builder's emission uses.
     pub(crate) fn built(
         identity: &'static ComponentIdentity,
@@ -175,11 +170,11 @@ impl IndexComponent {
         }
     }
 
-    /// The component's rows, canonicalized to one struct in child schema —
-    /// materializing a deferred adoption on first call. Two consumers racing
-    /// on first touch may both run the pipeline, but the source is immutable
-    /// so they canonicalize identical rows; whichever stores first wins and
-    /// both read the stored struct — no lock is held across the run.
+    /// The component's rows as one canonical struct in child schema, a
+    /// deferred adoption materialized on the first call. Two consumers racing
+    /// on first touch may both run the scan; the source is immutable, so they
+    /// canonicalize the same rows, whichever stores first wins and both read
+    /// the stored struct. No lock is held across the run.
     pub(crate) fn rows(&self) -> Result<&StructArray> {
         if let Some(array) = self.rows.cell.get() {
             return Ok(array);
@@ -193,11 +188,10 @@ impl IndexComponent {
 
     /// This component as a replayable native child write
     /// ([`index_child_write`]), its descriptor carrying the component's own
-    /// sortedness provenance — how a store's serialization hands its
-    /// components to the container writer.
-    ///
-    /// Writing is a genuine use: a deferred adoption materializes here, so
-    /// the written child is byte-identical to an eagerly-adopted one's.
+    /// sortedness provenance: how a store's serialization hands its
+    /// components to the container writer. A deferred adoption materializes
+    /// here, so the written child is byte-identical to an eagerly adopted
+    /// one's.
     pub(crate) fn to_write(&self) -> Result<NativeComponentWrite> {
         let array = self.rows()?.clone().into_array();
         index_child_write(
@@ -268,7 +262,7 @@ impl IndexComponent {
     }
 
     /// This component in searchable form: rows materialized, integer
-    /// children kept compressed wherever the encoded search probes bind them
+    /// children kept compressed wherever the encoded-search probes bind them
     /// and decoded to canonical primitives otherwise (see
     /// [`resident::with_searchable_int_children`]), so the sorted probes bind
     /// the value and `rid` columns directly instead of running the generic
@@ -282,12 +276,12 @@ impl IndexComponent {
     }
 
     /// This component with its integer children compressed into
-    /// probe-supported encodings — the construction-side counterpart of
+    /// probe-supported encodings, the construction-side counterpart of
     /// [`into_searchable`](Self::into_searchable): a builder's canonical
     /// emission compresses here (see
     /// [`resident::with_compressed_int_children`]), without the base's payload
-    /// wrapper (components never serve code columns). The sorted probes bind
-    /// the compressed columns directly.
+    /// wrapper, as no component hands out its columns as code primitives. The
+    /// sorted probes bind the compressed columns directly.
     ///
     /// [`resident::with_compressed_int_children`]: crate::store::resident::with_compressed_int_children
     pub(crate) fn into_compressed(self) -> Result<Self> {
@@ -312,10 +306,10 @@ impl IndexComponent {
     }
 
     /// Resolve this component's probes at construction, ahead of the first
-    /// query — the component half of the eager resolution every in-memory
+    /// query: the component half of the eager resolution every in-memory
     /// construction does (see [`StructProbes::warm`]). A *deferred* component
-    /// is left alone: materializing it here would undo the deferral that
-    /// `from_bytes` adoption exists for.
+    /// is left alone, as materializing it here would undo the deferral of a
+    /// `from_bytes` adoption.
     pub(crate) fn warm_probes(&self) {
         if self.rows.pending.is_some() {
             return;
@@ -325,21 +319,20 @@ impl IndexComponent {
         }
     }
 
-    /// Binary-search the component's sorted `column` for the `[lo, hi)` run
-    /// of rows equal to `native`, searched over the whole column or `within`
-    /// a row range whose slice of the column is itself sorted (a lead run for
-    /// a prefix probe) — the probe step of the in-memory resolver.
+    /// The `[lo, hi)` run of rows of the component's sorted `column` equal to
+    /// `native`, by binary search over the whole column or `within` a row
+    /// range whose slice of the column is itself sorted (a lead run for a
+    /// prefix probe): the probe step of the in-memory resolver.
     ///
-    /// Through the column's cached probe when it resolves one, skipping the
-    /// per-call slice and encoding-tree walk: a full search on the whole
-    /// column, or a windowed search inside the lead run — window-only,
-    /// exactly like the slice-then-search path. String-valued components
-    /// (whose probe scalars are not integers) and probe-declined encodings
-    /// search the column itself.
+    /// Through the column's cached probe when it resolves one, with no
+    /// per-call slice or encoding-tree walk, searching only the window as
+    /// the slice-then-search path does. String-valued components (whose probe
+    /// scalars are not integers) and probe-declined encodings search the
+    /// column itself.
     ///
-    /// `None` when the column is missing or the probe can't cast to its dtype
-    /// (the resolver declines and the store falls back to a mask scan); an
-    /// empty range when the probed term is absent from the data.
+    /// `None` when the column is missing or the probe value cannot cast to
+    /// its dtype (the resolver declines and the store falls back to a mask
+    /// scan); an empty range when the probed term is absent from the data.
     pub(crate) fn probe_run(
         &self,
         column: &'static str,
@@ -374,10 +367,10 @@ impl IndexComponent {
         Ok(Some(within.start + lo..within.start + hi))
     }
 
-    /// Look a component up by name, gated on its sortedness provenance — the
-    /// front gate of the in-memory resolver: absent and
-    /// not-globally-sorted both mean the index declines (per-chunk-sorted
-    /// rows are not binary-searchable).
+    /// The component named `name`, if its provenance says globally sorted:
+    /// the front gate of the in-memory resolver, where an absent or not
+    /// globally sorted component declines (per-chunk-sorted rows are not
+    /// binary-searchable).
     pub(crate) fn find_sorted<'a>(
         components: &'a [IndexComponent],
         name: &str,
@@ -390,7 +383,7 @@ impl IndexComponent {
 
 /// `source` as the native child write of an index component under the
 /// registry row `identity`: its descriptor names the component and its
-/// slug, carries `sorted` — the writer's provenance — and `source`'s dtype,
+/// slug, carries `sorted` (the writer's provenance) and `source`'s dtype,
 /// and the child is written through [`child_strategy`]. The one spelling of
 /// an index child's descriptor, for a component's own rows
 /// ([`IndexComponent::to_write`]) and the out-of-core builder's streamed
@@ -418,7 +411,7 @@ pub(crate) fn index_child_write(
 }
 
 /// The index set a component roster implies, in declaration (preference)
-/// order — the in-memory counterpart of reading a file's child roster.
+/// order: the in-memory counterpart of reading a file's child roster.
 pub(crate) fn indexes_from_components(components: &[IndexComponent]) -> Indexes {
     ALL_INDEX_TYPES
         .into_iter()
@@ -426,10 +419,10 @@ pub(crate) fn indexes_from_components(components: &[IndexComponent]) -> Indexes 
         .collect()
 }
 
-/// Assemble a child's rows from its column arrays: `columns[i]` under the
-/// `child_columns[i]` name, non-nullable throughout — the one construction
-/// every builder's component emission goes through, in-memory and
-/// out-of-core alike.
+/// A child's rows assembled from its column arrays: `columns[i]` under the
+/// `child_columns[i]` name, non-nullable throughout. The one construction
+/// every builder's component emission goes through, in memory and out of
+/// core alike.
 pub(crate) fn child_struct(
     child_columns: &[&'static str],
     columns: Vec<ArrayRef>,
@@ -448,8 +441,8 @@ pub(crate) fn child_struct(
     .map_err(VortexRdfError::Vortex)
 }
 
-/// An index column's term encoding — `String` terms, or [`TermCode`]s under
-/// the Dictionary layout — with the dtype a column of them has and the array
+/// An index column's term encoding (`String` terms, or [`TermCode`]s under
+/// the Dictionary layout), with the dtype a column of them has and the array
 /// it assembles into: the one spelling both families' builders emit their
 /// term columns and declare their child dtypes through.
 pub(crate) trait TermColumn: Clone + Default + Ord {
@@ -487,8 +480,8 @@ impl TermColumn for TermCode {
 }
 
 /// An index's two persisted children from one family's columns each, under
-/// `child_columns` — the in-memory builders' emission. Globally sorted by
-/// construction, so both are handed over with that provenance.
+/// `child_columns`: the in-memory builders' emission, globally sorted by
+/// construction and handed over with that provenance.
 pub(crate) fn components_from(
     child_columns: &[&'static str],
     families: [(&'static ComponentIdentity, Vec<ArrayRef>); 2],
@@ -503,7 +496,7 @@ pub(crate) fn components_from(
         .collect()
 }
 
-/// The child struct dtype under `child_columns` names — the dtype counterpart
+/// The child struct dtype under `child_columns` names: the dtype counterpart
 /// of [`child_struct`], shared with the builders' direct child dtypes
 /// (`copy_child_dtype`/`ref_child_dtype`) so a component's declared and built
 /// shapes cannot drift. Compiled out on wasm with those builders.
@@ -526,13 +519,13 @@ pub(crate) fn child_struct_dtype(
     )
 }
 
-/// Decode a row-id column into the ascending, unique `Buffer<RowId>` every
+/// A row-id column decoded into the ascending, unique `Buffer<RowId>` every
 /// index resolution answers in: the base rows its ids name ([`base_row`]).
 ///
-/// Sorting is required, not incidental: the ids come out in the index's own
-/// order, and both `Selection::IncludeByIndex` and the selection algebra need
-/// them ascending. They are unique by construction (each index row references
-/// one quad row), so sorting alone suffices.
+/// The ids come in the index's own order, and `Selection::IncludeByIndex`
+/// and the selection algebra need them ascending, so they are sorted; each
+/// index row references one quad row, so they are unique. Ids past what a
+/// `usize` holds are refused ([`check_addressable`]).
 ///
 /// [`base_row`]: super::base_row
 pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<RowId>> {
@@ -566,10 +559,10 @@ pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<RowId>> {
     Ok(ids.freeze())
 }
 
-/// Refuse ascending base rows `ids` whose last one a `usize` cannot hold —
-/// on a 32-bit target (wasm) a row id past `u32::MAX`, which no base there
-/// holds — so that every later use of an id as a position is exact rather
-/// than narrowed onto another row.
+/// Refuses ascending base rows `ids` whose last one a `usize` cannot hold
+/// (on a 32-bit target, wasm, a row id past `u32::MAX`, which no base there
+/// holds), so every later use of an id as a position is exact, never
+/// narrowed onto another row.
 pub(super) fn check_addressable(ids: &[RowId]) -> Result<()> {
     match ids.last() {
         Some(&last) => super::row_index(last).map(|_| ()),

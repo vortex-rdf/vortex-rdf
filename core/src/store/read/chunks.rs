@@ -1,20 +1,17 @@
-//! Chunked, Arrow-free exports of a view's rows — the streams a query
-//! planner reads a [`VortexRdfStore`] view through when it wants columns
-//! rather than decoded quads: struct chunks in the layout's own dtype
+//! Chunked exports of a view's rows, for a planner that wants columns rather
+//! than decoded quads: struct chunks in the layout's dtype
 //! ([`row_chunks`](VortexRdfStore::row_chunks)) or [`TermCode`] columns
 //! ([`code_chunks`](VortexRdfStore::code_chunks)).
 //!
-//! Every chunk holds at most `batch_rows` rows. Rows come in base row order
-//! with the view's narrowing applied — the pattern, keeps, windows and
-//! tombstones — and under a string layout the append tail's live rows follow
-//! the base, as [`quads`](VortexRdfStore::quads) orders them. A served match
-//! (a view an index answered) materializes its row ids first, so the order is
-//! the base's, never the index's. The streams are lazy: nothing is gathered
-//! or read until the first poll, and then one chunk at a time. In memory a
-//! contiguous selection without tombstones is sliced from the base, and any
-//! other is cut into windows of live ids, each gathered when its chunk is
-//! pulled. On file a selection `ExactRead` takes by id is taken one window
-//! of ids per pull; any other read goes through the one base-row seam
+//! Chunks hold at most `batch_rows` rows and come in base row order with the
+//! view's narrowing and tombstones applied; under a string layout the tail's
+//! live rows follow the base, as [`quads`](VortexRdfStore::quads) orders
+//! them. A served match materializes its row ids first, so the order is the
+//! base's, never the index's. Nothing is read until the first poll. In memory
+//! a contiguous selection without tombstones is sliced from the base, and
+//! any other is cut into windows of live ids, each gathered when its chunk is
+//! pulled. On file a selection `ExactRead` takes by id is taken one window of
+//! ids per pull; any other read goes through the one base-row seam
 //! (`base_read`): the few rows `ExactRead` reads point by point, read at
 //! once, or the scan's chunks, streamed through the row-scan driver.
 
@@ -43,22 +40,23 @@ use crate::store::view::selection::RowSelection;
 /// most the requested `batch_rows` rows.
 pub type RowChunkStream = BoxStream<'static, Result<ArrayRef>>;
 
-/// A view's rows as [`TermCode`] columns — one buffer per requested column,
-/// in the requested order — each chunk of at most the requested `batch_rows`
+/// A view's rows as [`TermCode`] columns, one buffer per requested column in
+/// the requested order, each chunk of at most the requested `batch_rows`
 /// rows.
 pub type CodeChunkStream = BoxStream<'static, Result<Vec<Buffer<TermCode>>>>;
 
 impl VortexRdfStore {
     /// The rows this view selects as struct chunks in the layout's primary
-    /// dtype — [`TermCode`] columns under the Dictionary layout, strings
-    /// otherwise — in base row order, each chunk holding at most `batch_rows`
-    /// rows (a scanned file view's chunks follow the scan's splits, cut to
-    /// the cap). Tombstoned rows are skipped and, under a string layout, the
-    /// append tail's live rows come last.
+    /// dtype ([`TermCode`] columns under the Dictionary layout, strings
+    /// otherwise), in base row order, each of at most `batch_rows` rows (a
+    /// scanned file view's chunks follow the scan's splits, cut to the cap).
+    /// Tombstoned rows are skipped; under a string layout the tail's live
+    /// rows come last. Nothing is read until the first poll, and a read error
+    /// is a stream item.
     ///
-    /// Errors: `batch_rows == 0` is invalid input; a Dictionary-layout view
-    /// with a non-empty tail (its tail holds strings whose terms have no code
-    /// — `compact` the store first) an invalid operation.
+    /// Errors: `batch_rows == 0` (invalid input); a Dictionary view with a
+    /// non-empty tail, whose strings have no code (an invalid operation:
+    /// `compact` the store first).
     pub fn row_chunks(&self, batch_rows: usize) -> Result<RowChunkStream> {
         check_batch(batch_rows)?;
         self.ensure_no_dictionary_tail("row_chunks")?;
@@ -70,21 +68,25 @@ impl VortexRdfStore {
     }
 
     /// The rows this view selects as [`TermCode`] columns, one buffer per
-    /// column of `columns` in that order, in base row order, each chunk
-    /// holding at most `batch_rows` rows. The chunked twin of
-    /// [`code_columns_gathered`](Self::code_columns_gathered), with the same
-    /// vocabulary: the codes of the store's dictionary
-    /// ([`dict_reader`](Self::dict_reader) decodes them).
+    /// column of `columns` in that order, in base row order, each chunk of at
+    /// most `batch_rows` rows: the chunked twin of
+    /// [`code_columns_gathered`](Self::code_columns_gathered), in the codes of
+    /// the store's dictionary ([`dict_reader`](Self::dict_reader) decodes
+    /// them). Nothing is read until the first poll, and a read error is a
+    /// stream item.
     ///
-    /// In memory a contiguous selection without tombstones is sliced from
-    /// the base's own code columns, zero-copy, and any other selection has
-    /// only `columns` gathered from them, one window of live ids per chunk.
-    /// On file a selection taken by id is taken one chunk's ids per pull; the
-    /// scan, and a read by id with no filter pending, read only `columns`; a
-    /// read by id under a pending filter reads every primary column. Errors:
-    /// `batch_rows == 0` or no columns (invalid input), or a view whose rows
-    /// are not code-addressable (an invalid operation: a string layout, or a
-    /// Dictionary view with a non-empty tail).
+    /// In memory, over code columns the shared cache hands out as primitives,
+    /// a contiguous selection without tombstones is sliced zero-copy, and any
+    /// other has only `columns` gathered, one window of live ids per chunk;
+    /// columns the cache cannot hand out (chunked or wire-encoded) are read
+    /// as row chunks and decoded chunk by chunk. On file a selection taken by
+    /// id is taken one chunk's ids per pull. The scan projects only `columns`
+    /// (a pending filter's columns are read to evaluate it), as does a read
+    /// by id with no filter pending; one under a pending filter reads every
+    /// primary column. Errors: `batch_rows == 0` or no columns (invalid
+    /// input), or a view whose rows are not code-addressable (an invalid
+    /// operation: a string layout, or a Dictionary view with a non-empty
+    /// tail).
     pub fn code_chunks(
         &self,
         columns: &[QuadColumn],

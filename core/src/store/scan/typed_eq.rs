@@ -1,11 +1,9 @@
-//! Typed residual equality filtering: the row-at-a-time fast paths
-//! `match_pattern` uses instead of the vectorized mask pipeline when every
-//! residual constraint binds a typed column view — slice compares for
-//! canonical code columns, encoded point reads for compressed integer
-//! columns, view-level string compares for the Default / TypedObject / tail
-//! string columns. Anything else declines — as do wide selections over
-//! encoded columns, where the vectorized pipeline wins — and the caller
-//! falls back to the general mask-scan pipeline.
+//! Typed residual equality filtering: the row loops `match_pattern` runs
+//! instead of the vectorized mask pipeline when every residual constraint
+//! binds a typed column view (slice compares over canonical code columns,
+//! encoded point reads over compressed integer columns, view-level compares
+//! over the Default, TypedObject and tail string columns). Anything else
+//! declines to the mask pipeline, as do selections too wide for a row loop.
 
 use vortex_array::ArrayRef;
 use vortex_array::arrays::struct_::StructArrayExt;
@@ -17,7 +15,7 @@ use crate::store::schema::TermCode;
 use crate::store::view::selection::RowSelection;
 
 /// A residual equality constraint's probe value, extracted from its `Scalar`
-/// once per scan — not per chunk, the string extraction allocates. An
+/// once per scan rather than per chunk (the string extraction allocates). An
 /// integer needle is a term code, or a narrower unsigned value (TypedObject's
 /// kind byte) widened to one.
 enum Needle {
@@ -43,17 +41,16 @@ impl Needle {
     }
 }
 
-/// One equality constraint bound to a concrete typed column view, for the
-/// typed residual-filter fast paths. Three column shapes qualify: canonical
-/// non-nullable [`TermCode`] primitives (the Dictionary layout's code
-/// columns, reached directly or through a payload wrapper's canonical cache,
-/// compared as slice loads), non-nullable unsigned-integer columns whose
-/// encoding resolves an encoded search probe (wire-encoded adoptions and
-/// narrower widths like TypedObject's kind column, compared through per-row
-/// point reads), and canonical non-nullable Utf8 `VarBinView`s (the Default /
-/// TypedObject / tail string columns, compared at the view level). Anything
-/// else — nullable, unsupported encodings, string-encoded columns — declines,
-/// and the caller falls back to the general mask-scan pipeline.
+/// One equality constraint bound to a typed column view. Three column shapes
+/// qualify: canonical non-nullable [`TermCode`] primitives (the Dictionary
+/// layout's code columns, directly or through a payload wrapper's canonical
+/// cache), compared as slice loads; non-nullable unsigned-integer columns
+/// whose encoding resolves an encoded-search probe (wire-encoded adoptions,
+/// narrower widths such as TypedObject's kind column), compared by per-row
+/// point reads; and canonical non-nullable Utf8 `VarBinView`s (the Default,
+/// TypedObject and tail string columns), compared at the view level.
+/// Anything else (nullable, other encodings, string-encoded columns)
+/// declines, and the caller falls back to the mask pipeline.
 enum TypedEq<'a> {
     Code(PrimitiveArray, TermCode),
     CodeProbe(ColumnProbe<'a>, TermCode),
@@ -77,11 +74,11 @@ impl ColumnProbe<'_> {
     }
 }
 
-/// A string equality probe over a canonical `VarBinView` column, comparing at
-/// the view level: length first (a u32 read from the 16-byte view struct —
-/// which alone rejects almost every row), then the inline bytes or the
-/// referenced buffer range. No per-row `ByteBuffer` is materialized, so a row
-/// costs neither a slice nor a refcount bump.
+/// A string equality over a canonical `VarBinView` column, compared at the
+/// view level: the length first (a `u32` of the 16-byte view, which alone
+/// rejects most rows), then the inline bytes or the referenced buffer range.
+/// No per-row `ByteBuffer` is built, so a row costs neither a slice nor a
+/// refcount bump.
 struct StrEq<'a> {
     arr: VarBinViewArray,
     needle: &'a [u8],
@@ -105,14 +102,13 @@ impl StrEq<'_> {
 }
 
 impl<'a> TypedEq<'a> {
-    /// Bind one constraint to its column, or decline. A canonical code column
+    /// One constraint bound to its column, or `None`. A canonical code column
     /// binds by slice, as does a payload-wrapped one whose canonical form is
-    /// already materialized; `canonicalize` additionally materializes one that
-    /// is not, which costs a pass over the whole column and is the caller's
-    /// call to make. Any other non-nullable unsigned-integer column binds
-    /// through an encoded search probe: `cached`, the store's probe for the
-    /// column, else one resolved here when its encoding resolves. The mask
-    /// scan covers what declines, at selection cost.
+    /// already materialized; with `canonicalize` set, a wrapped one is first
+    /// materialized, a pass over the whole column that is the caller's call.
+    /// Any other non-nullable unsigned-integer column binds through an
+    /// encoded-search probe: `cached`, the store's probe for the column, else
+    /// one resolved here when its encoding resolves.
     fn bind_col(
         col: &'a ArrayRef,
         needle: &'a Needle,
@@ -192,12 +188,12 @@ impl<'a> TypedEq<'a> {
         }
     }
 
-    /// The all-code specialization: when every constraint is a code compare
-    /// (the Dictionary layout), the row loop over plain
-    /// `(&[TermCode], TermCode)` pairs — slices hoisted once, borrowing from
-    /// the bound constraints — is branch-free per constraint and vectorizes,
-    /// which a loop over the mixed enum does not. `None` when any constraint
-    /// is a string compare.
+    /// The all-slice specialization: when every constraint is a slice-bound
+    /// code compare, a row loop over plain `(&[TermCode], TermCode)` pairs
+    /// (slices hoisted once, borrowed from the bound constraints) is
+    /// branch-free per constraint and vectorizes, which a loop over the mixed
+    /// enum does not. `None` when any constraint is a probe read or a string
+    /// compare.
     fn code_views<'b>(cols: &'b [TypedEq<'a>]) -> Option<Vec<(&'b [TermCode], TermCode)>> {
         cols.iter()
             .map(|c| match c {
@@ -240,16 +236,16 @@ pub(crate) mod probe_hooks {
 /// column through an encoded-search probe (see [`typed_residual_ids`]).
 const TYPED_EQ_MAX_ROWS: usize = 4_096;
 
-/// Typed residual filter over a store's base: when every residual equality
-/// constraint targets a typed-comparable canonical column (see [`TypedEq`]),
-/// test just the rows the selection covers with direct loads and return the
-/// surviving base row ids. Returns `None` when any constraint cannot take the
-/// typed path — the caller then falls back to the general mask scan, whose
-/// per-call pipeline (slice through the optimizer, ConstantArray compares,
-/// BoolArray canonicalization) is the fixed cost this path avoids. A
-/// probe-read column reads through the store's probe from `probes` — the base
-/// `struct_arr` was taken from, with its probe cache — when it holds one, so
-/// the scan resolves nothing. The base counterpart of [`typed_positions`].
+/// The typed residual filter over a store's base: when every residual
+/// equality binds a typed column (see [`TypedEq`]), the rows the selection
+/// covers are tested with direct loads and the surviving base row ids
+/// returned. `None` when a constraint cannot bind, or the selection is too
+/// wide for the bound columns ([`TYPED_EQ_MAX_ROWS`]); the caller then runs
+/// the mask scan, whose per-call pipeline (a slice through the optimizer,
+/// constant compares, a boolean canonicalization) is the fixed cost this path
+/// avoids. A probe-read column reads through the store's probe in `probes`
+/// (the base `struct_arr` was taken from, with its probe cache) when it holds
+/// one. The base counterpart of [`typed_positions`].
 pub(crate) fn typed_residual_ids(
     struct_arr: &StructArray,
     selection: &RowSelection,
@@ -287,10 +283,10 @@ pub(crate) fn typed_residual_ids(
 }
 
 /// The positions (in `applied`'s own row order) matching every constraint,
-/// via the typed comparisons of [`TypedEq`] — the tail counterpart of
-/// [`typed_residual_ids`]. Accepts a flat canonical struct or
-/// a chunked accretion of them (the shape `VortexRdfStore::add_quads`
-/// builds); `None` on any other shape, falling back to the mask pipeline.
+/// by the typed comparisons of [`TypedEq`]: the tail counterpart of
+/// [`typed_residual_ids`]. Takes a flat canonical struct or a chunked
+/// accretion of them (the shape `VortexRdfStore::add_quads` builds); `None`
+/// on any other shape, which falls back to the mask pipeline.
 pub(crate) fn typed_positions(
     applied: &ArrayRef,
     eqs: &[(&'static str, Scalar)],

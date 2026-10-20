@@ -1,20 +1,18 @@
-//! Narrowing a view beyond a pattern: keeping only the rows whose code in
-//! one column falls in a set or range ([`Keep`]) and windowing the rows —
-//! the restrictions a query engine pushes below a pattern (`VALUES`,
-//! `FILTER` on a term predicate, `LIMIT`/`OFFSET`); the capped counts behind
-//! `ASK` live with the other counts, in `read/count.rs`. The empty view, which
-//! a keep or a match that provably selects nothing returns, lives here too.
+//! Narrowing a view beyond a pattern: [`Keep`] (the rows whose code in one
+//! column is in a set or range) and windows, the restrictions a query engine
+//! pushes below a pattern (`VALUES`, a `FILTER` on a term predicate,
+//! `LIMIT`/`OFFSET`), and the empty view that a keep or a match selecting
+//! nothing returns. The capped counts behind `ASK` live in `read/count.rs`.
 //!
-//! Every narrowing is an ordinary derived view: it composes with
-//! [`match_pattern`](VortexRdfStore::match_pattern) in either order and is
-//! read through the same paths (`size`, `code_columns_gathered`, `quads`).
-//! Keeps are applied *after* the pattern, never through the pattern
-//! compiler and never as scan expressions: in memory as a binary search
-//! inside a sorted run or a pass over the selected rows of the column, on
-//! file as the located runs of a sorted subject column or else a pass over
-//! the column streamed for the view's rows. A window over a file view with a
-//! pending filter evaluates its splits in file order and stops at the first
-//! split that fills it.
+//! Every narrowing is a derived view that composes with
+//! [`match_pattern`](VortexRdfStore::match_pattern) in either order and reads
+//! through the same paths (`size`, `code_columns_gathered`, `quads`). Keeps
+//! apply after the pattern and never as scan expressions: in memory as a
+//! binary search inside a sorted run or a pass over the column's selected
+//! rows, on file as the located runs of a sorted subject column or else a
+//! pass over the column streamed for the view's rows. A window over a file
+//! view with a pending filter evaluates its splits in file order and stops
+//! at the first split that fills it.
 
 use std::ops::Range;
 
@@ -40,7 +38,7 @@ use crate::store::VortexRdfStore;
 /// Which term codes a [`keep`](VortexRdfStore::keep) admits in a column.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Keep {
-    /// Any of these codes — ascending and unique, as [`Keep::set`] builds
+    /// Any of these codes; ascending and unique, as [`Keep::set`] builds
     /// them.
     Set(Buffer<TermCode>),
     /// Any code in the half-open range `lo..hi`. Codes rank the dictionary's
@@ -88,10 +86,9 @@ impl Keep {
                 let (Some(&lo), Some(&hi)) = (codes.first(), codes.last()) else {
                     return KeepTest::Range(0, 0);
                 };
-                // A bitmap costs a bit per code of the span; worth it while
-                // the span is within 8 bits per member (a byte each). A span
-                // wider than a `usize` (on a 32-bit target) takes the sorted
-                // test rather than a wrapped bitmap.
+                // A bitmap, a bit per code of the span, while the span is
+                // within 8 bits per member. A span wider than a `usize` (on a
+                // 32-bit target) takes the sorted test, not a wrapped bitmap.
                 let span = usize::try_from(hi - lo)
                     .ok()
                     .filter(|&span| span < codes.len().saturating_mul(8));
@@ -155,7 +152,7 @@ impl CodeReader<'_> {
     fn code_at(&self, row: usize) -> TermCode {
         match self {
             CodeReader::Slice(slice) => slice[row],
-            // A probe reads every width as a u64 — exactly a code.
+            // A probe reads every width as a `u64`, which is a code.
             CodeReader::Probe(probe) => probe.value_at(row),
         }
     }
@@ -164,12 +161,11 @@ impl CodeReader<'_> {
 impl VortexRdfStore {
     // ── narrowing beyond a pattern ────────────────────────────────────────────
 
-    /// Narrow this view to the rows whose code in `column` the keep admits —
-    /// the rows a `VALUES` block or a term predicate (see
-    /// `DictReader::filter_codes`) selects, applied inside the store instead
-    /// of over gathered columns. Composes with [`match_pattern`] in either
-    /// order and reads through the same paths; an empty keep is the empty
-    /// view.
+    /// Narrow this view to the rows whose code in `column` the keep admits
+    /// (the rows a `VALUES` block or a term predicate selects; see
+    /// `DictReader::filter_codes`), inside the store rather than over
+    /// gathered columns. Composes with [`match_pattern`] in either order and
+    /// reads through the same paths; an empty keep is the empty view.
     ///
     /// Requires the Dictionary layout with an empty append tail (codes are
     /// the store's vocabulary only then, as for
@@ -179,16 +175,15 @@ impl VortexRdfStore {
     /// In memory the keep is a binary search when the selected rows are a
     /// run of the sorted base that `column` orders (a bound prefix of the
     /// `(s, p, o, g)` order, as a subject-bound match leaves), else one pass
-    /// over the selected rows of the column read in place. On file, a keep on
+    /// over the column's selected rows, read in place. On file, a keep on
     /// the subject column of a store sorted by it is located: the rows it
     /// admits are runs of that column, found in the mapped leaf metadata and
     /// intersected with the view's rows, so nothing is read and a pending
     /// filter stays pending (a set of more than one code per sixteen rows of
-    /// the view is streamed instead). Any other keep resolves the view's
-    /// rows, streams the column for them through the mapping and tests the
-    /// keep in memory — never pushed to the scan as an expression. A pending
-    /// view's deferred row ids (a served match's, or a run held for a count)
-    /// materialize first.
+    /// the view streams instead). Any other keep resolves the view's rows,
+    /// streams the column for them and tests the keep in memory, never as a
+    /// scan expression. A pending view's deferred row ids (a served match's,
+    /// or a run held for a count) materialize first.
     ///
     /// [`match_pattern`]: Self::match_pattern
     pub async fn keep(&self, column: QuadColumn, keep: &Keep) -> Result<Self> {
@@ -214,16 +209,15 @@ impl VortexRdfStore {
     }
 
     /// The view's rows after skipping `offset` and taking at most `limit`, in
-    /// the order the view reads them — base rows in base row order, then the
-    /// tail's. A file view with a pending filter resolves it only as far as
-    /// the window reaches: its splits are evaluated in file order and the
-    /// evaluation stops at the first that fills the window, so `LIMIT` over a
-    /// filtered scan costs the matching prefix of the file, not all of it.
-    /// Available on every layout.
+    /// the order the view reads them: base rows in base row order, then the
+    /// tail's. A pending file filter is resolved only as far as the window
+    /// reaches (its splits evaluated in file order, stopping at the first
+    /// that fills the window), so `LIMIT` over a filtered scan costs the
+    /// matching prefix of the file. Available on every layout.
     ///
-    /// A served view's rows come back in base order, not the index's (the
-    /// plan is dropped: a window is a position range over base order, which
-    /// the index's order does not share).
+    /// The serve plan is dropped, so a served view's rows come back in base
+    /// order: a window is a position range over base order, which the
+    /// index's order does not share.
     pub async fn window(&self, offset: usize, limit: usize) -> Result<Self> {
         let t = debug::timer();
         // A located run held pending for this window reads only the window's
@@ -262,7 +256,7 @@ impl VortexRdfStore {
     /// The base's window over its exact `selection`, and the base's live row
     /// count as far as the window needs it: a position range over the
     /// selection, stepping over tombstones, with the selection's live row
-    /// count — or, under a pending file filter, the window of the first
+    /// count; or, under a pending file filter, the window of the first
     /// matches, evaluated only as far as the window reaches, with their count
     /// (at most `offset + limit`).
     async fn base_window(
@@ -295,14 +289,10 @@ impl VortexRdfStore {
         Ok((selection.window(offset, limit, deleted, base_len), live))
     }
 
-    /// An empty view of this store: same base (and tail), selecting no row of
-    /// either.
-    ///
-    /// Scans over it plan no work and `size()` answers 0 without touching the
-    /// data. Indexes and components are dropped: chained matches on an empty
-    /// view would otherwise run pointless lookups just to intersect with
-    /// nothing. No serve plan carries across — a plan is only valid while its
-    /// row run is exactly the selection.
+    /// An empty view of this store: the same base and tail, selecting no row
+    /// of either, so scans plan no work and `size()` answers 0 without
+    /// touching the data. Indexes and components are dropped, so chained
+    /// matches run no lookups, and no serve plan carries over.
     pub(crate) fn empty_view(&self) -> Self {
         let tail = self
             .tail
@@ -361,10 +351,10 @@ impl VortexRdfStore {
     }
 
     /// The keep by binary search, when the selection is a run of the sorted
-    /// base that `column` orders: every column before it in the `(s, p, o,
-    /// g)` order is constant over the run (so the run is sorted by this
-    /// one). A range keep is two lower bounds; a small set is one bounded
-    /// sub-run per code. `None` declines to the row pass.
+    /// base that `column` orders (every earlier column of the `(s, p, o, g)`
+    /// order is constant over the run). A range keep is two lower bounds; a
+    /// small set is one bounded sub-run per code. `None` declines to the row
+    /// pass.
     fn keep_sorted_run(
         struct_arr: &vortex_array::arrays::StructArray,
         base: &ArrayRef,
@@ -419,10 +409,9 @@ impl VortexRdfStore {
         }
     }
 
-    /// The keep by one pass over the selected rows of `column`, read in
-    /// place (its canonical primitive when materialized, else the cached
-    /// probe) — or, for a column neither serves, decoded for the selected
-    /// rows only.
+    /// The keep by one pass over the selected rows of `column`, read in place
+    /// (its canonical primitive when materialized, else the cached probe); a
+    /// column neither serves is decoded for the selected rows only.
     fn keep_by_pass(
         struct_arr: &vortex_array::arrays::StructArray,
         base: &ArrayRef,
@@ -461,13 +450,13 @@ impl VortexRdfStore {
     /// keep on `s` is first located (see [`keep_located`](Self::keep_located)):
     /// the rows it admits are runs of the sorted column, found in the mapped
     /// leaf metadata, so the selection narrows to them and a pending filter
-    /// stays pending. Every other keep — and any the location declines — is
-    /// tested in memory: the view's rows are resolved to exact ids (a pending
+    /// stays pending. Every other keep, and any the location declines, is
+    /// tested in memory: the view's rows resolve to exact ids (a pending
     /// filter evaluated, deferred row ids materialized), the column is
-    /// streamed for them through the mapping and each code is tested. A keep
-    /// never becomes a filter expression: its code list is per query, and
-    /// every distinct expression would pin new entries in Vortex's
-    /// identity-keyed reader caches.
+    /// streamed for them and each code is tested. A keep never becomes a
+    /// filter expression: its code list is per query, and every distinct
+    /// expression would pin new entries in vortex's identity-keyed reader
+    /// caches.
     #[cfg(feature = "file-io")]
     async fn keep_file(&self, base: &FileBase, column: QuadColumn, keep: &Keep) -> Result<Self> {
         let t = debug::timer();
@@ -523,13 +512,12 @@ impl VortexRdfStore {
         ))
     }
 
-    /// A keep on the subject column served by located runs: in a file sorted
-    /// by `s` the rows with `lo <= s < hi` are one run, and a set's codes one
-    /// run each, found by binary search over the mapped column's leaf
-    /// metadata — no column is read, no expression bound, and a pending
-    /// filter is left pending beside the narrowed selection. The runs
-    /// intersect `selection`, which stays a range wherever the admitted rows
-    /// are one run of it.
+    /// A keep on the subject column by located runs: in a file sorted by `s`
+    /// the rows with `lo <= s < hi` are one run, and each of a set's codes one
+    /// run, found by binary search over the mapped column's leaf metadata, so
+    /// no column is read, no expression bound, and a pending filter stays
+    /// pending beside the narrowed selection. The runs intersect `selection`,
+    /// which stays a range wherever the admitted rows are one run of it.
     ///
     /// `None` declines to the stream: the file is not sorted by `s`, a chunk
     /// has no probe, or the set is too large to look up code by code (see
@@ -563,19 +551,18 @@ fn keep_mask(codes: &[TermCode], test: &KeepTest<'_>) -> vortex_mask::Mask {
     )
 }
 
-/// How many selected rows a code of a set keep on the subject column is worth
-/// when deciding between looking the set up and streaming the column: a
-/// lookup costs two binary searches over the mapped chunk metadata per code,
-/// whatever the selection, while the stream costs a little per selected row
-/// plus a fixed scan, and the two meet near this many rows per code.
+/// The selected rows one code of a subject set keep is worth when choosing
+/// between looking the set up and streaming the column: a lookup costs two
+/// binary searches over the mapped chunk metadata per code, whatever the
+/// selection, the stream a little per selected row plus a fixed scan, and the
+/// two meet near this many rows per code.
 #[cfg(feature = "file-io")]
 const LOCATED_SET_ROWS_PER_CODE: usize = 16;
 
 /// Whether a set of `codes` codes on the subject column is looked up code by
-/// code over a selection of `rows` rows rather than streamed: while it has no
-/// more than one code per [`LOCATED_SET_ROWS_PER_CODE`] rows, so the work
-/// stays a fraction of the stream's and a set that is large relative to its
-/// selection streams as every other keep does. Always at least one code.
+/// code over a selection of `rows` rows rather than streamed: while it has at
+/// most one code per [`LOCATED_SET_ROWS_PER_CODE`] rows, rounded up, so at
+/// least one code over any non-empty selection.
 #[cfg(feature = "file-io")]
 fn set_is_located(codes: usize, rows: usize) -> bool {
     codes <= rows.div_ceil(LOCATED_SET_ROWS_PER_CODE)

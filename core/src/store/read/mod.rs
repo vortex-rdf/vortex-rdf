@@ -15,9 +15,9 @@ use futures::stream::{self, BoxStream, Stream, StreamExt};
 
 use crate::error::{Result, VortexRdfError};
 
-/// A stream that builds its source on the first poll — the view's read runs
-/// then, not when the stream is requested — and yields `on_err` of the
-/// build's error as its one item when the build fails.
+/// A stream that builds its source on the first poll, so the view's read runs
+/// then and not when the stream is requested; a failed build yields `on_err`
+/// of its error as the stream's one item.
 fn deferred<'a, S, I>(
     build: impl Future<Output = Result<S>> + Send + 'a,
     on_err: fn(VortexRdfError) -> I,

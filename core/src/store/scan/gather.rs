@@ -1,6 +1,6 @@
 //! Gathering a view's rows out of an in-memory base: the tombstone-aware
-//! slice/take pipeline and the point-read path small selections take
-//! through encoded search probes.
+//! slice/take pipeline, and the point-read path small selections take
+//! through encoded-search probes.
 
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{PrimitiveArray, Struct, StructArray};
@@ -14,13 +14,10 @@ use crate::error::{Result, VortexRdfError};
 use crate::store::probes::StructProbes;
 use crate::store::view::selection::RowSelection;
 
-/// Gather the rows of `base` that `selection` covers and `deleted` has not
-/// tombstoned.
-///
-/// The single place the in-memory read paths turn a view into rows, so that
-/// applying the tombstones cannot be forgotten by one of them: deletions are
-/// deliberately kept out of the selection (see [`RowSelection::live_mask`]), so
-/// a selection alone always over-reports.
+/// The rows of `base` that `selection` covers and `deleted` has not
+/// tombstoned: the one place the in-memory reads turn a view into rows, so
+/// none of them can forget the tombstones, which the selection never holds
+/// (see [`RowSelection::live_mask`]).
 pub(crate) fn gather_live(
     base: &ArrayRef,
     selection: &RowSelection,
@@ -41,15 +38,13 @@ pub(crate) fn gather_live(
     rows.filter(live).map_err(VortexRdfError::Vortex)
 }
 
-/// Rows of a small selection, read point-by-point through encoded search
-/// probes into canonical output columns — the read-side counterpart of the
-/// match paths' encoded probing, skipping the per-column slice/canonicalize
-/// pipeline whose fixed cost dominates tiny reads on a compressed-resident
-/// base. `None` declines: a wide or `All` selection, a non-struct base, or
-/// any child (e.g. a string column) no probe resolves — the general pipeline
-/// handles those. Also serves the index serving plans, which canonicalize
-/// their small contiguous chunks through it (`Range(0..len)` over the sliced
-/// component rows).
+/// The live rows of a point-sized selection, read point by point through
+/// encoded-search probes into canonical columns, skipping the per-column
+/// slice/canonicalize pipeline whose fixed cost dominates tiny reads of a
+/// compressed base. `None` declines to the general pipeline: a wide or `All`
+/// selection, a non-struct base, or a child no probe resolves (a string
+/// column, say). The serve plans canonicalize their small chunks through it
+/// too (`Range(0..len)` over the sliced component rows).
 pub(crate) fn gather_by_point_reads(
     base: &ArrayRef,
     selection: &RowSelection,
@@ -75,16 +70,14 @@ pub(crate) fn gather_by_point_reads(
 
 /// The `names` columns of the struct `array`, in that order, each read point
 /// by point at `positions` through its encoded-search probe into a canonical
-/// primitive — the loop behind [`gather_by_point_reads`]: a small selection's
-/// gather, and the serve tail's canonicalization of a small chunk
-/// (`ServeDecode::chunk_rows`). `None` declines: a non-struct `array`, a name
-/// it lacks, or a column (e.g. a string column) no probe resolves.
+/// primitive: the loop behind [`gather_by_point_reads`]. `None` declines: a
+/// non-struct `array`, a name it lacks, or a column no probe resolves (a
+/// string column, say).
 ///
-/// Each probe comes from `probes` when that cache holds `array`'s resolutions
-/// (resolution walks the encoding tree, the fixed cost this path exists to
-/// avoid) — a column it declined declines the read — and is resolved per
-/// call otherwise (a transient base: a tail, served rows), the only case
-/// that takes the struct apart for its children.
+/// A probe comes from `probes` when that cache holds `array`'s resolutions
+/// (resolution walks the encoding tree, the fixed cost this path avoids), and
+/// a column the cache declined declines the read; for a transient array (a
+/// tail, served rows) it is resolved per call.
 fn point_read_columns<'n>(
     array: &ArrayRef,
     names: impl IntoIterator<Item = &'n str>,
@@ -121,8 +114,9 @@ fn read_points(probe: &SortedProbe, column: &ArrayRef, positions: &[usize]) -> O
 }
 
 /// A primitive column of `ptype` built from point reads widened to `u64`.
-/// `None` for any type the point-read paths do not produce (the caller
-/// declines to its vectorized path).
+/// The reads must be values of a `ptype` column, so narrowing them back is
+/// lossless. `None` for any type the point-read paths do not produce (the
+/// caller declines to its vectorized path).
 pub(crate) fn primitive_from_u64_reads(
     ptype: PType,
     reads: impl Iterator<Item = u64>,

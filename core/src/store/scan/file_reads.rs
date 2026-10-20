@@ -1,7 +1,7 @@
-//! The file-backed read half of the scan tier: pushed-down filter
-//! construction, row and component point reads through the file's cached
-//! chunk probes, and [`RowSelection::restrict_scan`]. Pure functions of a
-//! [`NativeStoreFile`] and a filter expression — no store state.
+//! File reads: the row-scan drivers, pushed-down filter construction, row and
+//! component point reads through the file's cached chunk probes, and
+//! [`RowSelection::restrict_scan`]. Functions of a [`NativeStoreFile`] and
+//! its expressions, with no store state.
 
 use std::future::Future;
 use std::ops::Range;
@@ -48,9 +48,8 @@ pub(crate) enum ScanDriver {
 impl ScanDriver {
     /// The driver for a row scan of `splits` split futures, the one rule
     /// [`read_all_rows`] and [`stream_rows`] share: inline up to
-    /// [`MAX_INLINE_SPLITS`], spawned above it — and inline whatever the
-    /// count on a thread with no tokio runtime, which has nothing to spawn
-    /// onto.
+    /// [`MAX_INLINE_SPLITS`], spawned above it, and inline whatever the count
+    /// on a thread with no tokio runtime, which has nothing to spawn onto.
     pub(crate) fn for_row_scan(splits: usize) -> Self {
         if splits <= max_inline_splits() || tokio::runtime::Handle::try_current().is_err() {
             ScanDriver::Inline
@@ -130,7 +129,7 @@ pub(crate) mod driver_hooks {
 
 /// Test hook: how many row scans this thread ran, collected whole
 /// ([`read_all_rows`]) or streamed ([`stream_rows`], the quad decode's scan
-/// stream) — what a read by id ([`ExactRead`]) runs none of.
+/// stream); a read by id ([`ExactRead`]) runs none.
 #[cfg(test)]
 pub(crate) mod scan_hooks {
     use std::cell::Cell;
@@ -150,19 +149,15 @@ pub(crate) mod scan_hooks {
     }
 }
 
-/// Run a row scan to completion and materialize every row it yields into one
-/// in-memory array, in the scan's row order.
-///
-/// [`ScanDriver::for_row_scan`] picks the driver from the split count. Inline,
-/// the split futures are polled on the calling task by [`collect_scan`];
-/// spawned, they run on the runtime's workers through
-/// [`collect_scan_spawned`], `scan.concurrency()` splits per core in flight.
-/// Either driver returns the chunks in split order, whatever the scan's
-/// `ordered` flag says.
-///
-/// The splits are planned here because their count picks the driver. Row
-/// splits do filter and decode work, so a large scan needs the workers; an
-/// index child's row-id scan goes through [`read_index_row_ids`] instead.
+/// Every row a row scan yields, in one in-memory array in the scan's row
+/// order. [`ScanDriver::for_row_scan`] picks the driver from the split count,
+/// so the splits are planned here: inline, [`collect_scan`] polls the split
+/// futures on the calling task; spawned, [`collect_scan_spawned`] runs them
+/// on the runtime's workers, `scan.concurrency()` splits per core in flight.
+/// Either returns the chunks in split order, whatever the scan's `ordered`
+/// flag says. Row splits do filter and decode work, so a large scan needs
+/// the workers; an index child's row-id scan goes through
+/// [`read_index_row_ids`] instead.
 pub(crate) async fn read_all_rows(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRef> {
     #[cfg(test)]
     scan_hooks::note();
@@ -180,7 +175,7 @@ pub(crate) async fn read_all_rows(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRe
 /// dropped, and a split's error as one error item.
 ///
 /// The splits are planned here, so a planning error is the `Err`; the
-/// driver is [`ScanDriver::for_row_scan`]'s, as for [`read_all_rows`] —
+/// driver is [`ScanDriver::for_row_scan`]'s, as for [`read_all_rows`]:
 /// [`inline_splits`] polls the split futures as the stream is polled,
 /// [`spawned_splits`] spawns them, `scan.concurrency()` per core in flight.
 pub(crate) fn stream_rows(
@@ -199,19 +194,17 @@ pub(crate) fn stream_rows(
         .boxed())
 }
 
-/// Run an index child's row-id scan to completion and materialize its rows,
-/// always inline, whatever its split count.
-///
-/// Zone maps prune almost every split of such a scan and a located run is
-/// sliced out of the row-id column, so there is no work to spread; the caller
-/// decodes the ids on its own thread. A scan is an index scan because its
-/// caller says so here, not because of its `ordered` flag: any other scan goes
+/// An index child's row-id scan run to completion, its rows in one array,
+/// always inline whatever its split count: zone maps prune almost every
+/// split of such a scan, and a located run is sliced out of the row-id
+/// column, so there is no work to spread. A scan is an index scan because
+/// its caller says so here, not by its `ordered` flag; any other scan goes
 /// through [`read_all_rows`].
 pub(crate) async fn read_index_row_ids(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRef> {
     collect_whole_scan(scan).await
 }
 
-/// The rows of a point read when it answers, otherwise the rows of `scan` —
+/// The rows of a point read when it answers, otherwise the rows of `scan`:
 /// the fallback every point-read fast path keeps for a chunk its probes
 /// decline.
 pub(crate) async fn point_rows_or_scan(
@@ -225,22 +218,19 @@ pub(crate) async fn point_rows_or_scan(
 }
 
 impl RowSelection {
-    /// Apply this selection — and any tombstones — to a file scan.
+    /// This selection and the `deleted` tombstones applied to a file scan.
     ///
-    /// A range and an id list reach the scan through different knobs (a row
-    /// range and a [`Selection`]), and the variants being exclusive is what
-    /// keeps them from being set together — vortex's exact-range planning
-    /// (`attempt_split_ranges`) bails out when a row range accompanies an
-    /// `IncludeByIndex` selection. `All` leaves the scan's full row range in
-    /// place (every file row is a quad row).
+    /// A range sets the scan's row range and an id list its [`Selection`];
+    /// the variants are exclusive, as vortex's exact-range planning
+    /// (`attempt_split_ranges`) bails when a row range accompanies an
+    /// `IncludeByIndex` selection. `All` keeps the full row range (every file
+    /// row is a quad row).
     ///
     /// Tombstoned rows are dropped inside the scan, so this composes with a
-    /// pushed-down filter (whose output carries no row ids to re-align
-    /// against). They ride the same `Selection`
-    /// knob as an id list, so the one case where both would claim it — a sparse
-    /// `Ids` selection with deletes — is resolved by subtracting the tombstones
-    /// from the id list up front; `All`/`Range` leave that knob free for an
-    /// `ExcludeByIndex` of the (sparse) deleted rows.
+    /// pushed-down filter, whose output carries no row ids to realign
+    /// against. Under `All` or a range they are an `ExcludeByIndex`
+    /// selection; an id list, which would claim the same knob, has them
+    /// subtracted up front.
     pub(crate) fn restrict_scan<A: 'static + Send>(
         &self,
         scan: ScanBuilder<A>,
@@ -263,7 +253,7 @@ impl RowSelection {
     }
 }
 
-/// The set positions of a tombstone mask as an ascending id list — the sparse
+/// The set positions of a tombstone mask as an ascending id list, the sparse
 /// form the scan wants for an exclusion.
 fn deleted_ids(deleted: &Mask) -> StrictSortedBuffer<RowId> {
     let ids = match deleted.indices() {
@@ -274,8 +264,8 @@ fn deleted_ids(deleted: &Mask) -> StrictSortedBuffer<RowId> {
     StrictSortedBuffer::try_new(ids).vortex_expect("mask indices are ascending and unique")
 }
 
-/// An ascending id list with the tombstoned rows removed — used when a sparse
-/// id selection and the deletions would both want the scan's selection knob.
+/// An ascending id list with the tombstoned rows removed, for when an id
+/// selection and the tombstones would both claim the scan's selection knob.
 fn subtract_deleted(ids: &Buffer<RowId>, deleted: &Mask) -> StrictSortedBuffer<RowId> {
     let ids = Buffer::from_iter(
         ids.iter()
@@ -285,20 +275,18 @@ fn subtract_deleted(ids: &Buffer<RowId>, deleted: &Mask) -> StrictSortedBuffer<R
     StrictSortedBuffer::try_new(ids).vortex_expect("a RowSelection id list is ascending and unique")
 }
 
-/// A [`RowSelection::Ids`] list as the strictly-sorted buffer the scan wants —
-/// ascending and unique is that variant's construction invariant (index
-/// resolutions answer in ascending unique row ids).
+/// A [`RowSelection::Ids`] list as the strictly sorted buffer the scan wants:
+/// ascending and unique is that variant's invariant.
 pub(super) fn strict_ids(ids: &Buffer<RowId>) -> StrictSortedBuffer<RowId> {
     StrictSortedBuffer::try_new(ids.clone())
         .vortex_expect("a RowSelection id list is ascending and unique")
 }
 
-/// The positions — within the rows `selection` covers, in file order, as
-/// `selection.apply` aligns them — whose code in `column` passes
-/// `admit`. The column is streamed through the projected scan rather than
-/// materialized: the scan reads several splits per worker ahead of this loop,
-/// so that many chunks of codes are in flight at once, never the whole column.
-/// Tombstones are not applied (the read paths apply them).
+/// The positions within the rows `selection` covers (in file order, as
+/// `selection.apply` aligns them) whose code in `column` passes `admit`. The
+/// column is streamed through a projected scan, which reads a few splits per
+/// worker ahead of this loop, so a few chunks of codes are in flight at once,
+/// never the whole column. Tombstones are not applied (the reads apply them).
 pub(crate) async fn column_positions(
     file: &NativeStoreFile,
     column: &'static str,
@@ -350,7 +338,7 @@ pub(crate) fn build_file_filter(
     })
 }
 
-/// The conjunction of `column == value` equalities over root fields — the
+/// The conjunction of `column == value` equalities over root fields, the
 /// filter shape every pushed-down index probe and serve scan uses. `None`
 /// for an empty constraint set.
 pub(crate) fn eq_conjunction(
@@ -364,10 +352,11 @@ pub(crate) fn eq_conjunction(
 }
 
 /// The exact row range of `subject`'s run in a sorted file, by binary search
-/// over the subject column's encoded chunks. `None` declines — an unsorted
-/// file, a subject without a native probe scalar (string-subject layouts, a
-/// term the dictionary lacks), a column whose chunk shape has no probe — and
-/// the caller keeps the scan path.
+/// over the subject column's encoded chunks (the column's codes ascend, as
+/// codes are sorted ranks). `None` declines (an unsorted file, a column whose
+/// chunk shape has no probe, or a subject without a native probe scalar:
+/// under a string layout or for a term the dictionary lacks), and the caller
+/// keeps the scan path.
 pub(crate) async fn locate_subject_run(
     file: &NativeStoreFile,
     codes: &mut PatternCodes<'_>,
@@ -394,7 +383,7 @@ pub(crate) async fn locate_subject_run(
 /// Narrow `run`, a bound subject's rows in a file sorted by `(s, p, o, g)`, by
 /// the roles behind the subject in that order: each bound role whose term has
 /// a code is binary-searched inside the run through its column's chunk probes
-/// and cleared from `pattern` — the file mirror of the in-memory prefix probe.
+/// and cleared from `pattern`: the file mirror of the in-memory prefix probe.
 /// The first role that is unbound, has no code or whose chunks decline ends
 /// the prefix, as does an empty run. Answers how many roles it cleared.
 pub(crate) async fn narrow_subject_run(
@@ -447,7 +436,7 @@ pub(crate) async fn narrow_subject_run(
 }
 
 /// The subject column's chunk-probe handle for a file sorted by subject.
-/// `None` declines — an unsorted file, or a column whose chunk shape has no
+/// `None` declines: an unsorted file, or a column whose chunk shape has no
 /// probe.
 fn sorted_subject_chunks(
     file: &NativeStoreFile,
@@ -458,7 +447,7 @@ fn sorted_subject_chunks(
     file.column_chunks(schema::COL_S)
 }
 
-/// The exact row range of subject `code` in the sorted subject column — empty,
+/// The exact row range of subject `code` in the sorted subject column; empty,
 /// at the insertion point, for a code the column lacks. `None` declines: a
 /// chunk the search needs has no probe.
 async fn subject_code_bounds(
@@ -475,10 +464,10 @@ async fn subject_code_bounds(
 /// The exact row range of the rows whose subject code lies in `range`
 /// (`lo <= s < hi`) in a sorted file, by binary search over the subject
 /// column's encoded chunks. The file is sorted by `s`, so those rows are one
-/// run: it starts where the first code `>= lo` does and ends where the first
-/// code `>= hi` does — one lower-bound search each, exact for a code the
-/// column lacks. `None` declines — an unsorted file, a column whose chunk
-/// shape has no probe — and the caller keeps the stream.
+/// run: from the first row whose code is `>= lo` to the first whose code is
+/// `>= hi`, one lower-bound search each, exact whether or not the column
+/// holds `lo` or `hi`. `None` declines (an unsorted file, a column whose
+/// chunk shape has no probe), and the caller keeps the stream.
 pub(crate) async fn locate_subject_code_range(
     file: &NativeStoreFile,
     range: Range<TermCode>,
@@ -497,8 +486,8 @@ pub(crate) async fn locate_subject_code_range(
     Ok(Some(from..to.max(from)))
 }
 
-/// The rows holding each subject code of `codes` — ascending and unique, as
-/// [`Keep::set`](crate::store::Keep::set) builds them — in a sorted file, as
+/// The rows holding each subject code of `codes` (ascending and unique, as
+/// [`Keep::set`](crate::store::Keep::set) builds them) in a sorted file, as
 /// ascending disjoint runs: a code without rows adds none, and codes whose
 /// rows abut share one run. One binary search per code, over chunks fetched
 /// once for the call. `None` declines as [`locate_subject_code_range`] does.
@@ -531,13 +520,14 @@ pub(crate) async fn locate_subject_code_runs(
 
 /// The rows of `columns` at `rows`, the live rows [`ExactRead`] chose to read
 /// point by point, read through the file's cached wire-encoded chunk probes
-/// instead of a scan — the file analogue of the in-memory
-/// [`gather_by_point_reads`](super::gather::gather_by_point_reads). A pushed filter of
-/// equality conjuncts is applied per row during the read (an eq column's
-/// surviving value is its constant, so only residual columns read twice).
-/// `None` declines — a filter that is not an eq conjunction, a column without
-/// a probeable chunk handle — and the caller keeps its scan path. Chunk
-/// fetches are cached on `file`, so warm repeats touch no segments.
+/// instead of a scan: the file analogue of the in-memory
+/// [`gather_by_point_reads`](super::gather::gather_by_point_reads). A pushed
+/// filter of equality conjuncts is checked per row first, and each of its
+/// columns, which must be among `columns`, is then filled with its constant,
+/// so no column is read twice. `None` declines (a filter that is not an eq
+/// conjunction, a column without a probeable chunk handle), and the caller
+/// keeps its scan path. Chunk fetches are cached on `file`, so warm repeats
+/// touch no segments.
 pub(crate) async fn file_point_rows(
     file: &NativeStoreFile,
     columns: &[&str],
@@ -612,7 +602,7 @@ async fn rows_reading(
 }
 
 /// Test hook: how many reads this thread gathered by taking exact ids
-/// ([`take_file_rows`]) — through the chunk probes' leaves, or split by split.
+/// ([`take_file_rows`]), through the chunk probes' leaves or split by split.
 #[cfg(test)]
 pub(crate) mod take_hooks {
     use std::cell::Cell;
@@ -641,11 +631,11 @@ pub(crate) mod take_hooks {
 const POINT_READ_ROWS: u64 = 256;
 
 /// The ids of `ids` whose rows satisfy `filter`, a conjunction of term
-/// equalities, read point by point through the file's chunk probes — what a
+/// equalities, read point by point through the file's chunk probes: what a
 /// filtered scan of the splits holding them answers, without decoding those
-/// splits. `None` declines — a filter of another shape, a column without
-/// chunk probes, ids more than one per [`POINT_READ_ROWS`] rows of their
-/// splits, where the scan costs less — and the caller keeps the filter.
+/// splits. `None` declines (a filter of another shape, a column without
+/// chunk probes, or ids denser than one per [`POINT_READ_ROWS`] rows of
+/// their splits, where the scan costs less), and the caller keeps the filter.
 pub(crate) async fn point_filter_ids(
     file: &NativeStoreFile,
     filter: &Expression,
@@ -677,13 +667,13 @@ pub(crate) async fn point_filter_ids(
 const TAKE_ROWS: u64 = 16;
 
 /// The rows of `columns` at `ids`, the live ids [`ExactRead`] chose to take:
-/// taken at the ids so only what the take kernels touch is decoded, as in the
-/// in-memory gather, where the scan would apply a row mask to every split —
-/// which filters a run-end column run by run. Each column takes from its
-/// chunk probes' leaves when every column has them ([`chunk_take`]), which the
-/// probes resolved once over the mapped segments; otherwise each split's rows
-/// from its first to its last id are projected unmasked and taken. `None`
-/// for no id on the split path, and the caller scans.
+/// taken at the ids, so only what the take kernels touch is decoded, as in
+/// the in-memory gather, where the scan would run a row mask over every split
+/// (which filters a run-end column run by run). Each column takes from its
+/// chunk probes' leaves when every column has them ([`chunk_take`]);
+/// otherwise each split's rows from its first to its last id are projected
+/// unmasked and taken. `None` for no id on the split path, and the caller
+/// scans.
 pub(crate) async fn take_file_rows(
     file: &NativeStoreFile,
     columns: &[&'static str],
@@ -870,7 +860,7 @@ impl Footprint {
     }
 
     /// Whether the ids number at most one per `rows_per_id` rows of the splits
-    /// holding them — the density below which reading them by id costs less
+    /// holding them: the density below which reading them by id costs less
     /// than scanning those splits ([`POINT_READ_ROWS`], [`TAKE_ROWS`]).
     fn sparse(&self, rows_per_id: u64) -> bool {
         self.ids.saturating_mul(rows_per_id) <= self.rows
@@ -882,10 +872,10 @@ impl Footprint {
     }
 }
 
-/// Read `columns` at `rows` point-by-point through their chunk-probe
-/// `handles` into one canonical struct chunk. A column `constant` answers is
-/// filled with that value instead of being read. `Ok(None)` declines — an
-/// unprobeable chunk or a column type the canonical child cannot hold.
+/// `columns` at `rows`, read point by point through their chunk-probe
+/// `handles` into one canonical struct chunk; a column `constant` answers is
+/// filled with that value instead of being read. `Ok(None)` declines: a
+/// chunk without a probe, or a column type the canonical child cannot hold.
 async fn point_read_struct(
     file: &NativeStoreFile,
     handles: &[Arc<vortex_rdf_encoded_search::ColumnChunks>],
@@ -927,10 +917,10 @@ async fn point_read_struct(
     ))
 }
 
-/// A located serve run's projected component columns, read point-by-point
+/// A located serve run's projected component columns, read point by point
 /// through the component's cached chunk probes into one canonical
-/// child-named chunk — the serve path's counterpart of [`file_point_rows`].
-/// `Ok(None)` declines (an unprobeable column or chunk); the caller keeps
+/// child-named chunk: the serve path's counterpart of [`file_point_rows`].
+/// `Ok(None)` declines (a column or chunk without a probe); the caller keeps
 /// its filter scan.
 pub(crate) async fn component_point_chunk(
     file: &NativeStoreFile,
@@ -949,10 +939,10 @@ pub(crate) async fn component_point_chunk(
     point_read_struct(file, &handles, columns, &rows, |_| None).await
 }
 
-/// The `(column, code)` pairs of a filter built by [`build_file_filter`] —
-/// a conjunction of `column == literal` over root fields. `None` for any
-/// other shape (e.g. the `AlwaysFalse` literal), telling the caller the
-/// filter cannot be applied as per-row equality tests.
+/// The `(column, code)` pairs of a filter [`build_file_filter`] built, a
+/// conjunction of `column == literal` over root fields. `None` for any other
+/// shape (the `AlwaysFalse` literal, say): such a filter cannot be applied as
+/// per-row equality tests.
 pub(crate) fn eq_code_pairs(filter: &Expression) -> Option<Vec<(String, u64)>> {
     use vortex_array::scalar_fn::fns::binary::Binary;
     use vortex_array::scalar_fn::fns::get_item::GetItem;

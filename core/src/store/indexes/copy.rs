@@ -1,42 +1,34 @@
 //! The [`IndexType::SecondaryByCopy`] index: two complete extra copies of the
-//! quad columns, one per sort order, each paired with the primary row IDs it
-//! permutes — the classic triple-store permutation indexes (POS/OSP) adapted
-//! to quads. This module owns both halves of the index's lifecycle — building
-//! the copy columns at write time, and choosing the probe a pattern runs
-//! against them at query time (`choose`), which one shared resolver per
-//! backend executes.
+//! quad columns, one per sort order, each paired with the primary row ids it
+//! permutes (the classic triple-store POS/OSP permutation indexes, for
+//! quads). This module builds the copies and chooses the probe a pattern runs
+//! against them (`choose`), which one shared resolver per backend executes.
 //!
-//! The two families are:
+//! - **`index:posg`**, quads sorted by (p, o, s, g): a bound predicate is a
+//!   binary search of the child's `p` column, and a bound predicate and
+//!   object a two-key *prefix* search, as the object column is itself sorted
+//!   within a predicate's run (`ResolvedRoles::PredicateObject`).
+//! - **`index:ospg`**, quads sorted by (o, s, p, g): a bound object is a
+//!   binary search of the child's `o` column.
 //!
-//! - **`index:posg`** — quads sorted by (p, o, s, g). Serves predicate-bound
-//!   patterns by binary search on the child's `p` column, and
-//!   predicate+object patterns by a two-key *prefix* search: within a
-//!   predicate's run the object column is itself sorted, so a second binary
-//!   search inside the run resolves both components at once
-//!   (`ResolvedRoles::PredicateObject`).
-//! - **`index:ospg`** — quads sorted by (o, s, p, g). Serves object-bound
-//!   patterns by binary search on the child's `o` column.
+//! Like [`reference`], resolutions answer in *base row ids* (each child's
+//! `rid` column), so they compose with row selections, tombstones and
+//! chained matches unchanged. The full copies add locality: the rows matching
+//! a bound predicate or object are a *contiguous* run of the copy columns,
+//! which the serve plan this index hands back (`InMemoryServePlan`,
+//! `FileServePlan`) reads `quads()` from, instead of scattering row-id reads
+//! across the primary columns.
 //!
-//! Like [`reference`], resolutions answer in *base row ids* (via
-//! each child's `rid` column), so they compose with row selections, tombstones
-//! and chained matches unchanged. What the full copies add over the reference
-//! index is locality: the rows matching a bound predicate/object are a
-//! *contiguous* run of the copy columns, which both backends exploit by
-//! reading `quads()` straight from the copy family — this index hands back a
-//! serve plan (`InMemoryServePlan` / `FileServePlan`) during resolution to
-//! describe that read — instead of scattering row-id reads across the primary
-//! columns.
-//!
-//! The copies come in two encodings — term strings (Default and TypedObject
-//! layouts, the object as its full N-Triples term string), or dictionary
-//! codes ([`TermCode`]) under the Dictionary layout — and, like the reference index, are
-//! always sorted over the complete dataset: [`components`] for the
-//! in-memory builders, merged `(sort key, row id)` spill runs for the
-//! out-of-core one, lead column stamped either way. The in-memory resolver
-//! requires that global provenance. The file resolver uses it to locate the
-//! matched run by binary search over the child's cached chunk probes (lead
-//! key, then the windowed second key) and falls back to a pushed-down
-//! equality scan when the probes decline.
+//! The copies hold term strings (Default and TypedObject layouts, the object
+//! as its full N-Triples term) or dictionary codes ([`TermCode`]) under the
+//! Dictionary layout, and, like the reference index, are always sorted over
+//! the whole dataset: [`components`] for the in-memory builders, merged
+//! `(sort key, row id)` spill runs for the out-of-core one, lead column
+//! stamped either way. The in-memory resolver requires that global
+//! provenance. The file resolver uses it to locate the matched run by binary
+//! search over the child's cached chunk probes (lead key, then the windowed
+//! second key), and falls back to a pushed-down equality scan when the
+//! probes decline.
 //!
 //! [`IndexType::SecondaryByCopy`]: super::IndexType::SecondaryByCopy
 //! [`reference`]: super::reference
@@ -71,14 +63,13 @@ pub(crate) enum CopyFamily {
 
 /// The columns of a copy family's persisted child: the primaries under the
 /// schema's names plus the primary row id. Both families use the same names
-/// — the child's identity is what says which sort order the rows are in —
-/// and a file serve plan projects exactly these.
+/// (the child's identity says which sort order the rows are in), and a file
+/// serve plan projects exactly these.
 pub(super) const CHILD_COLUMNS: [&str; 5] = [COL_S, COL_P, COL_O, COL_G, COL_RID];
 
-/// This index's persisted-child identity table — one differently-sorted quad
-/// table per family, in [`CopyFamily`] order — feeding every generic loop in
-/// the hub (the slug registry and the roster it builds); see
-/// [`IndexType::component_identities`](super::IndexType::component_identities).
+/// This index's persisted-child identity table, one differently sorted quad
+/// table per family in [`CopyFamily`] order, for the hub's generic loops
+/// (see [`IndexType::component_identities`](super::IndexType::component_identities)).
 /// Each family reaches its row through [`CopyFamily::identity`], so each name
 /// keeps exactly one spelling.
 pub(crate) static IDENTITIES: [ComponentIdentity; 2] = [
@@ -105,8 +96,8 @@ impl CopyFamily {
     }
 
     /// This family's sort order: the `(s, p, o, g)` position of each of its
-    /// sort keys, in key order — `(p, o, s, g)` for POSG, `(o, s, p, g)` for
-    /// OSPG. The one spelling of the permutation: the child's sort-key
+    /// sort keys, in key order (`(p, o, s, g)` for POSG, `(o, s, p, g)` for
+    /// OSPG). The one spelling of the permutation: the child's sort-key
     /// columns ([`key_column`](Self::key_column)), the code sort key and the
     /// out-of-core [`CopyKey`] all derive from it. A position is also the
     /// component's column in [`CHILD_COLUMNS`].
@@ -142,7 +133,7 @@ impl CopyFamily {
     }
 
     /// This family's quad comparator over term strings, in
-    /// [`key_order`](Self::key_order) — written out by hand, as the hot
+    /// [`key_order`](Self::key_order), written out by hand as the hot
     /// comparator of the in-memory string sort.
     fn cmp_quads(self, a: &RawQuad, b: &RawQuad) -> Ordering {
         match self {
@@ -162,18 +153,18 @@ impl CopyFamily {
     }
 }
 
-/// The probe this index runs for a pattern shape — its family's child, the
-/// sort keys and terms to search, and the component(s) a hit resolves —
+/// The probe this index runs for a pattern shape (its family's child, the
+/// sort keys and terms to search, and the components a hit resolves),
 /// independent of any backend: the shared front half of both resolvers.
 ///
 /// A bound subject declines the index: the primary `s` column (binary-searched
 /// or zone-pruned) is the better access path there. A bound predicate *and*
 /// object take the POSG family's (p, o) prefix, resolving both components in
-/// one probe. A bound graph is never a sort key of the copies, so it rides as
-/// a residual term the file serve plan filters on. The copies hold whole
-/// quads, so the probe serves reads from its family's columns; a run's rids
-/// follow the family's sort order, not row order. `None` when nothing this
-/// index covers is bound.
+/// one probe. A bound graph is never one of the keys a copy is searched by
+/// (it is the last key of both orders), so it rides as a residual term the
+/// file serve plan filters on. The copies hold whole quads, so the probe
+/// serves reads from its family's columns; a run's rids follow the family's
+/// sort order, not row order. `None` when nothing this index covers is bound.
 pub(super) fn choose<'a>(
     pattern: QuadPattern<'a>,
     layout: &ResolvedLayout,
@@ -202,8 +193,8 @@ pub(super) fn choose<'a>(
         ),
         (None, None) => return None,
     };
-    // The lead key, then — for a prefix probe — the second sort key, which
-    // the family's comparator sorts within each lead run.
+    // The lead key, then, for a prefix probe, the second sort key, which the
+    // family's comparator sorts within each lead run.
     let mut keys = Vec::with_capacity(2);
     keys.push((family.key_column(0), lead));
     keys.extend(second.map(|term| (family.key_column(1), term)));
@@ -224,8 +215,8 @@ pub(super) fn choose<'a>(
 }
 
 /// The layout a copy family's columns decode through: the copies always store
-/// each component as one full term — dictionary codes under the Dictionary
-/// layout, N-Triples strings otherwise, so even a TypedObject store's copies
+/// each component as one full term (dictionary codes under the Dictionary
+/// layout, N-Triples strings otherwise), so even a TypedObject store's copies
 /// decode as Default.
 fn copy_decode_layout(layout: &ResolvedLayout) -> ResolvedLayout {
     match layout {
@@ -269,9 +260,9 @@ pub(crate) mod out_of_core {
     }
 
     /// One chunk of a copy family's persisted child from a window of its merged
-    /// `(sort key, row id)` entries — plain child column names, lead stamped.
-    /// `V` is the term encoding: `String`, or [`TermCode`]s under the
-    /// Dictionary layout.
+    /// `(sort key, row id)` entries, under plain child column names with the
+    /// lead stamped. `V` is the term encoding: `String`, or [`TermCode`]s
+    /// under the Dictionary layout.
     ///
     /// [`TermCode`]: crate::store::TermCode
     pub(crate) fn copy_child_chunk<V: TermColumn>(
@@ -297,8 +288,8 @@ pub(crate) mod out_of_core {
     /// [`TermCode`](crate::store::TermCode)s under the Dictionary layout.
     ///
     /// Built via [`Self::new`] from an `[s, p, o, g]` tuple;
-    /// [`CopyFamily::key_positions`](super::CopyFamily::key_positions) maps the components back out when the sorted
-    /// keys are turned into columns.
+    /// [`CopyFamily::key_positions`](super::CopyFamily::key_positions) maps the
+    /// components back out when the sorted keys are turned into columns.
     #[derive(
         Clone,
         Debug,
@@ -319,7 +310,6 @@ pub(crate) mod out_of_core {
         /// nothing (a clone is a String allocation on the non-Dictionary
         /// layouts).
         pub(crate) fn new(family: CopyFamily, mut spog: [V; 4]) -> Self {
-            // Four indexed moves into key order.
             let [a, b, c, d] = family.key_order();
             let mut take = |component: usize| std::mem::take(&mut spog[component]);
             Self([take(a), take(b), take(c), take(d)])
@@ -369,11 +359,11 @@ fn family_columns<'a, V: TermColumn + 'a>(
 
 /// This index's two persisted children over `input`, one sorted quad copy
 /// per family in [`IDENTITIES`] order, each in its global family order with
-/// its lead column stamped sorted — the in-memory builders' emission. Row
-/// ids number the input's positions (the builder passes the dataset in
-/// final row order), so each family is just a permutation of positions: by
-/// term strings ([`CopyFamily::cmp_quads`]), or by codes under the
-/// Dictionary layout — no per-term string copies beyond the columns.
+/// its lead column stamped sorted: the in-memory builders' emission. Row ids
+/// number the input's positions (the builder passes the dataset in final row
+/// order), so each family is a permutation of positions, by term strings
+/// ([`CopyFamily::cmp_quads`]) or by codes under the Dictionary layout, with
+/// no per-term string copies beyond the columns.
 pub(super) fn components(input: IndexInput<'_>) -> Result<Vec<IndexComponent>> {
     match input {
         IndexInput::Quads(quads) => family_components(
@@ -465,7 +455,7 @@ mod tests {
         assert_eq!(probe.resolves, ResolvedRoles::Object);
         assert_eq!(terms(&probe.keys), [(COL_O, o.to_string())]);
 
-        // A bound graph is never a sort key: it rides as a residual term.
+        // A bound graph is never a searched key: it rides as a residual term.
         let probe = choose(QuadPattern::new(None, Some(&p), None, Some(&g)), &layout).unwrap();
         assert_eq!(terms(&probe.keys), [(COL_P, p.to_string())]);
         assert_eq!(terms(&probe.residual), [(COL_G, g.to_string())]);

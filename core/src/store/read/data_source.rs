@@ -1,27 +1,25 @@
 //! A vortex [`DataSource`] over any store view, and over a store's persisted
-//! children: the interface a query engine built on vortex (its DataFusion
-//! integration first of all) reads this crate through.
+//! children, for query engines built on vortex (its DataFusion integration).
 //!
 //! [`data_source`](VortexRdfStore::data_source) wraps a view (matched,
 //! narrowed, windowed or whole) as a source whose rows are the view's rows in
-//! base row order and whose dtype is the layout's primary struct
+//! base row order under the layout's primary struct dtype
 //! ([`TermCode`](crate::TermCode) columns under the Dictionary layout,
 //! strings otherwise). A scan request's projection and filter are bound once
 //! against that dtype and applied to every chunk the view streams
 //! ([`row_chunks`](VortexRdfStore::row_chunks)), filter before projection;
 //! its `row_range` and `selection` address the view's output rows. A
 //! `row_range` windows a view with no pending file filter and no tombstones
-//! first, so only the range's rows are read; any other view streams its scan
-//! from its first row — through its pending filter, past its tombstones — so
-//! the range's end or the `limit` stops it. The `limit` is enforced exactly,
-//! after filtering. The source answers one partition, so a consumer that fans
-//! out over partitions sees the whole view in one ordered stream.
+//! first, so only the range's rows are read; any other view streams from its
+//! first row, through its pending filter and past its tombstones, until the
+//! range's end or the `limit` stops it. The `limit` is exact, after
+//! filtering. The source answers one partition, so a consumer that fans out
+//! over partitions sees the whole view in one ordered stream.
 //!
 //! [`component_data_source`](VortexRdfStore::component_data_source) exposes a
 //! store's persisted children (the copy children `index:posg` and
 //! `index:ospg`, the reference children `index:ref-p` and `index:ref-o`, and
-//! the `dictionary`) as plain tables, so an engine can read a sort order or
-//! the term column directly.
+//! the `dictionary`) as plain tables.
 
 use std::any::Any;
 use std::ops::Range;
@@ -77,14 +75,14 @@ pub(crate) struct VortexRdfDataSource {
 }
 
 impl VortexRdfStore {
-    /// This view as a vortex [`DataSource`]: its rows in base row order,
-    /// under the layout's primary struct dtype, every narrowing applied. Its
-    /// row count is the [`view_statistics`](Self::view_statistics) count:
-    /// exact when that is known without reading, otherwise its upper bound.
-    /// The call does no I/O, but it takes that count through
-    /// `view_statistics`, so it does what that call does: on an in-memory
-    /// view whose selection is a pending index run over a base with
-    /// tombstones, it decodes the run's row ids and caches them on the view.
+    /// This view as a vortex [`DataSource`]: its rows in base row order (a
+    /// string layout's tail rows after the base's), under the layout's
+    /// primary struct dtype, every narrowing applied. Its row count is the
+    /// [`view_statistics`](Self::view_statistics) count: exact when that is
+    /// known without reading, otherwise its upper bound. The call does no
+    /// I/O, but it takes that count through `view_statistics`, so on an
+    /// in-memory view whose selection is a pending index run over a base with
+    /// tombstones it decodes the run's row ids and caches them on the view.
     /// Under the Dictionary layout its byte size is the rows' uncompressed
     /// width, four `u64` codes a row; a string layout's source has none.
     ///
@@ -98,10 +96,10 @@ impl VortexRdfStore {
     /// polled in, so every later poll of that stream must run inside a tokio
     /// runtime too.
     ///
-    /// Errors for a Dictionary-layout view with a non-empty append tail: its
-    /// tail holds strings whose terms have no code, so the view has no single
-    /// dtype (`compact` the store first). Errors, too, where
-    /// `view_statistics` does: when that row-id decode fails.
+    /// Errors for a Dictionary-layout view with a non-empty append tail, whose
+    /// strings have no code, so the view has no single dtype (`compact` the
+    /// store first); and where `view_statistics` does, when that row-id
+    /// decode fails.
     pub fn data_source(&self) -> Result<DataSourceRef> {
         self.ensure_no_dictionary_tail("data_source")?;
         let dtype = self.primary_dtype();

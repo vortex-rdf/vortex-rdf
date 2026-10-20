@@ -89,8 +89,6 @@ pub(in crate::store) fn gather_codes(
     })
 }
 
-/// The codes at `ids` of one code primitive, `prim`, in the order of `ids`:
-/// [`gather_codes`] for a single column.
 pub(in crate::store) fn gather_column(prim: &PrimitiveArray, ids: &[RowId]) -> Buffer<TermCode> {
     #[cfg(test)]
     column_hooks::note(false);
@@ -99,36 +97,27 @@ pub(in crate::store) fn gather_column(prim: &PrimitiveArray, ids: &[RowId]) -> B
 }
 
 impl VortexRdfStore {
-    /// The rows this view selects, as four [`TermCode`] columns (`s`, `p`,
-    /// `o`, `g`) — read off the answering index's own columns when the view
-    /// carries a serve plan that covers them, else gathered directly from the
-    /// base's canonical primitive slices.
+    /// The rows this view selects as four [`TermCode`] columns (`s`, `p`,
+    /// `o`, `g`), with no row read: off the answering index's own columns
+    /// when the view's serve plan covers them, else from the base's canonical
+    /// code primitives ([`base_code_columns`](Self::base_code_columns)). A
+    /// builder-compressed column behind a `vortex.shared` wrapper qualifies:
+    /// its primitive is decoded once into the wrapper's cache
+    /// (`shared_code_primitive`) and shared zero-copy from then on.
     ///
-    /// `None` whenever codes cannot be served both cheaply and correctly:
-    /// a non-Dictionary layout, a non-empty append tail (its strings are not
-    /// in the cached dictionary), a file-backed source, or base columns not
-    /// reachable as canonical non-nullable code primitives (e.g. chunked or
-    /// wire-compressed). Callers fall back to reading the rows (`base_read`).
-    ///
-    /// A builder-compressed column behind a `vortex.shared` wrapper still
-    /// qualifies: its canonical primitive is materialized once into the
-    /// wrapper's one-way cache (`shared_code_primitive`) and shared zero-copy
-    /// by every later call and every view over the base — the payload path
-    /// pays a first-touch decode instead of losing the buffer-sharing fast
-    /// path.
-    ///
-    /// Serving codes off the base's buffers skips the slice-gather-canonicalize
-    /// pipeline that [`code_columns_gathered`](Self::code_columns_gathered) —
-    /// the bindings' entry point — otherwise runs; that method tries this fast
-    /// path first.
+    /// `None` for a non-Dictionary layout, a non-empty tail (its strings are
+    /// not in the dictionary), a file-backed source, or base columns the
+    /// cache cannot hand out as non-nullable code primitives (chunked or
+    /// wire-encoded); callers then read the rows, as
+    /// [`code_columns_gathered`](Self::code_columns_gathered) does after
+    /// trying this.
     pub(crate) fn code_columns(&self) -> Option<[Buffer<TermCode>; 4]> {
         if !self.is_code_view() {
             return None;
         }
-        // Served fast path: the answering index's own columns already hold
-        // this view's codes as one contiguous run, so reading them there
-        // costs neither the row-id materialization this view deferred at
-        // match time nor a scattered gather over the primaries.
+        // The answering index's columns hold this view's codes as one
+        // contiguous run: no deferred row ids to compute, no scattered
+        // gather over the primaries.
         if let Some(plan) = &self.quads.in_memory()?.serve
             && let Some(columns) = plan.code_columns(self.quads.deleted.as_ref())
         {
@@ -137,26 +126,22 @@ impl VortexRdfStore {
         self.base_code_columns()
     }
 
-    /// [`code_columns`](Self::code_columns) without the served fast path: the
-    /// view's codes gathered from the base's own columns in base row order,
-    /// whatever answered the match — the order
-    /// [`code_chunks`](Self::code_chunks) yields. A served match's pending
-    /// selection materializes here. `None` under the same conditions as
-    /// `code_columns`, or when a base column is not a canonical code
-    /// primitive the shared cache can hand out.
+    /// [`code_columns`](Self::code_columns) without the served path: the
+    /// view's codes from the base's own columns in base row order, whatever
+    /// answered the match (the order [`code_chunks`](Self::code_chunks)
+    /// yields). A served match's pending selection materializes here. `None`
+    /// under the same conditions as `code_columns`.
     pub(crate) fn base_code_columns(&self) -> Option<[Buffer<TermCode>; 4]> {
         if !self.is_code_view() {
             return None;
         }
         let prims = self.base_code_primitives()?;
-        // No plan (or a plan that declined): codes are gathered by row id, so
-        // a served match's pending selection materializes here (the in-memory
-        // decode+sort it deferred at match time).
+        // A gather by row id needs the exact selection: a served match's
+        // deferred decode and sort run here.
         let selection = self.quads.selection.materialized().ok()?;
-        // Contiguous, tombstone-free selections share the base's buffers
-        // zero-copy (a `Buffer` slice is a refcount bump); a tombstone-free id
-        // list is a branch-free gather; only tombstoned views pay a
-        // per-element liveness test.
+        // Without tombstones a contiguous selection shares the base's buffers
+        // (a `Buffer` slice is a refcount bump) and an id list is a
+        // branch-free gather; only tombstoned views test liveness per row.
         let Some(deleted) = &self.quads.deleted else {
             return Some(match &selection {
                 RowSelection::All => prims.map(|prim| prim.into_buffer::<TermCode>()),
@@ -164,8 +149,6 @@ impl VortexRdfStore {
                     prim.into_buffer::<TermCode>()
                         .slice(r.start as usize..r.end as usize)
                 }),
-                // An index-resolved match without deletes — the bindings'
-                // common payload shape.
                 RowSelection::Ids(ids) => gather_codes(&prims, ids),
             });
         };
@@ -196,10 +179,10 @@ impl VortexRdfStore {
     /// The base's `s`, `p`, `o` and `g` code columns as canonical
     /// primitives: what [`base_code_columns`](Self::base_code_columns) slices
     /// or gathers. A builder-compressed column behind a `vortex.shared`
-    /// wrapper is materialized once into the wrapper's cache
-    /// (`shared_code_primitive`). `None` on file, or for a base column that
-    /// is not a canonical non-nullable code primitive the cache can hand out
-    /// (e.g. chunked or wire-compressed).
+    /// wrapper is decoded once into the wrapper's cache
+    /// (`shared_code_primitive`). `None` on file, or for a base column the
+    /// cache cannot hand out as a non-nullable code primitive (chunked or
+    /// wire-encoded).
     pub(in crate::store) fn base_code_primitives(&self) -> Option<[PrimitiveArray; 4]> {
         use vortex_array::arrays::Struct;
         let base = &self.quads.in_memory()?.base;
@@ -213,21 +196,14 @@ impl VortexRdfStore {
         Some([primitive(s)?, primitive(p)?, primitive(o)?, primitive(g)?])
     }
 
-    /// The rows this view selects as four [`TermCode`] columns, gathering
-    /// them when `code_columns`' zero-copy fast path
-    /// does not apply.
-    ///
-    /// The fallback reads the view's base rows as every row reader does
-    /// (`base_read`: gathered in memory, read by id or scanned on file), then
-    /// takes one code column per role, so a file-backed store, a narrowed view
-    /// whose base columns are chunked, or any other non-canonical shape still
-    /// answers codes. Only the cases where codes are not the store's
-    /// vocabulary at all yield `None`: a non-Dictionary layout, or a non-empty
-    /// append tail (whose terms are absent from the cached dictionary, so its
-    /// codes would address a different one).
-    ///
-    /// This is the payload path behind the bindings' code-column reads; they
-    /// call it instead of re-implementing the gather.
+    /// The rows this view selects as four [`TermCode`] columns (`s`, `p`,
+    /// `o`, `g`): the `code_columns` fast path when it answers, a served
+    /// file view's codes off the answering index's run while its ids are
+    /// deferred, else the view's base rows read as every row reader reads
+    /// them (`base_read`), one code column taken per role, so a code view of
+    /// any shape answers. `None` only where codes are not the store's
+    /// vocabulary: a non-Dictionary layout, or a non-empty tail, whose terms
+    /// the dictionary lacks. The bindings' code-column reads go through here.
     pub async fn code_columns_gathered(&self) -> Result<Option<[Buffer<TermCode>; 4]>> {
         if let Some(columns) = self.code_columns() {
             return Ok(Some(columns));
@@ -235,9 +211,7 @@ impl VortexRdfStore {
         if !self.is_code_view() {
             return Ok(None);
         }
-        // A served file view whose row ids are still deferred reads its codes
-        // off the answering index's run instead of computing the ids and
-        // gathering the primary rows at them.
+        // Codes off the index's run: no row ids computed, no gather.
         #[cfg(feature = "file-io")]
         if let ViewSelection::Pending(_) = &self.quads.selection
             && let Some(FileBase {
@@ -267,14 +241,13 @@ impl VortexRdfStore {
     ///
     /// The read is over the exact selection: a served view's pending
     /// selection materializes here, since its plan orders the rows by the
-    /// index; any other selection is exact already, a pending one without a
-    /// plan sitting only on a view built to be counted or windowed, which is
-    /// never read (`expect_exact`). In memory the live selected rows are
-    /// gathered, every primary column
+    /// index; a pending one without a plan sits only on a view built to be
+    /// counted or windowed, which is never read (`expect_exact`). In memory
+    /// the live selected rows are gathered, every primary column
     /// ([`in_memory_base_rows`](Self::in_memory_base_rows)). On file a
-    /// selection the reads by id serve is read by id (`exact_rows_by_id`) —
-    /// through every primary column while a filter is pending, which the read
-    /// checks on the columns it reads — and anything else, or a read by id
+    /// selection the reads by id serve is read by id (`exact_rows_by_id`),
+    /// through every primary column while a filter is pending (the read
+    /// checks it on the columns it reads); anything else, or a read by id
     /// that declines, is the restricted scan of `columns`
     /// (`restricted_file_scan`).
     #[cfg_attr(not(feature = "file-io"), allow(unused_variables))]
@@ -344,14 +317,12 @@ impl VortexRdfStore {
 
     /// The base rows this view covers, without the tail, as one array: the
     /// [`base_read`](Self::base_read) read to completion, with the subject
-    /// stamp.
-    ///
-    /// A read keeps base row order and this view only narrows it, so the
-    /// base's `(s, p, o, g)` provenance (an in-memory base's stamp, the file's
-    /// recorded `quads_sorted`) carries to the rows. The gather and the
-    /// multi-chunk read lose the stat, so it is restored here — without it, a
-    /// re-serialization would demote the rows to `quads_sorted:false` and
-    /// every later reader would lose the subject binary search.
+    /// stamp restored. A read keeps base row order, so the base's
+    /// `(s, p, o, g)` provenance (an in-memory base's stamp, the file's
+    /// recorded `quads_sorted`) carries to the rows; the gather and a
+    /// multi-chunk read drop the stamp, and without it a re-serialization
+    /// would write the rows as `quads_sorted:false` and every later reader
+    /// would lose the subject binary search.
     pub(in crate::store) async fn base_selected_rows(&self) -> Result<ArrayRef> {
         let rows = self
             .base_read(self.layout.strategy().primary_column_names())
@@ -413,13 +384,12 @@ impl VortexRdfStore {
         }
     }
 
-    /// The scan every unserved file read starts from: the `columns` only —
-    /// primary column names, in the order the chunks carry them, so the scan
-    /// decodes no column the caller does not read (index columns are internal
-    /// and never surfaced) — with the restrictions the view accumulated via
-    /// `match_pattern` applied: a pushed-down filter for the components no
-    /// index resolved, and the row selection (with tombstoned rows excluded)
-    /// for those it did.
+    /// The scan every unserved file read starts from: a projection of
+    /// `columns` (primary column names, in the order the chunks carry them;
+    /// index columns never surface), the view's pushed-down filter for the
+    /// pattern components no index resolved, and its row selection, with
+    /// tombstoned rows excluded, for those one did. The scan decodes the
+    /// projected columns and the columns the filter references.
     #[cfg(feature = "file-io")]
     fn restricted_file_scan(
         file: &NativeStoreFile,
@@ -429,10 +399,10 @@ impl VortexRdfStore {
         deleted: Option<&Mask>,
     ) -> Result<ScanBuilder<ArrayRef>> {
         let mut scan = file.scan()?;
-        // The scan's scope (the quad-source root dtype) is what filters and
-        // projections bind against — read it before the projection replaces
-        // it. Binding goes through the handle's memo so a repeated shape
-        // keeps one identity (see `BoundExprMemo`).
+        // Filters and projections bind against the scan's scope (the root
+        // dtype), so it is read before the projection replaces it. Binding
+        // through the handle's memo keeps one identity per repeated shape
+        // (see `BoundExprMemo`).
         let scope = scan.dtype()?;
         let memo = file.bound_exprs();
         scan = scan.with_projection(memo.bind(
@@ -447,8 +417,8 @@ impl VortexRdfStore {
     }
 
     /// Every live quad this view covers, decoded to raw N-Triples term strings
-    /// (a file-backed dictionary lifted resident for the decode) — base rows
-    /// first (in view order), then the tail's live rows — and how many of
+    /// (a file-backed dictionary lifted resident for the decode), base rows
+    /// first in base row order, then the tail's live rows, and how many of
     /// them came from the base.
     pub(in crate::store) async fn live_raw_quads(&self) -> Result<(Vec<RawQuad>, usize)> {
         #[cfg(test)]

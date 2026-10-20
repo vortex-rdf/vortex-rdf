@@ -1,8 +1,6 @@
-//! Batched probes: many patterns — each with its own keeps and window —
-//! matched in one call, answering in input order. A query engine's
-//! nested-loop join probes the store once per binding; batching lets a
-//! file-backed store overlap those probes' I/O, and hands a binding layer
-//! one call to release its lock around.
+//! Batched probes: many patterns, each with its own keeps and window, matched
+//! in one call and answered in input order; a file-backed store overlaps the
+//! probes' I/O.
 
 use futures::future::try_join_all;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
@@ -17,7 +15,7 @@ use crate::store::VortexRdfStore;
 
 /// One probe of a batch: a pattern (`None` = free, as for
 /// [`match_pattern`](VortexRdfStore::match_pattern)) with the narrowing to
-/// apply to its match — keeps per column, then a window.
+/// apply to its match: keeps per column, then a window.
 #[derive(Clone, Debug, Default)]
 pub struct Probe {
     pub subject: Option<NamedOrBlankNode>,
@@ -51,19 +49,18 @@ impl Probe {
         }
     }
 
-    /// A probe, with no narrowing, of the quad pattern a person typed: the
-    /// four optional term spellings the string-typed frontends (Python and
-    /// the CLI) accept. The subject is a named or blank node, the predicate a
-    /// named node, the object any term (a bare IRI, without angle brackets,
+    /// A probe, with no narrowing, of a quad pattern spelled as text: the four
+    /// optional term spellings the string-typed frontends (Python and the CLI)
+    /// accept. The subject is a named or blank node, the predicate a named
+    /// node, the object any term (a bare IRI, without angle brackets,
     /// included), the graph a named or blank node or a default-graph spelling
     /// (`""`, `default`, `[]`); a `None` slot stays free.
     ///
     /// The first invalid slot, in subject-predicate-object-graph order, is an
     /// [`InvalidInput`](crate::VortexRdfError::InvalidInput) error whose
-    /// message leads with the slot — `pattern subject:`, `pattern predicate:`,
-    /// `pattern object:` or `pattern graph:` — and goes on with the term
-    /// parser's own reason. The CLI picks the hint it reports for a flag by
-    /// that label.
+    /// message leads with the slot (`pattern subject:`, `pattern predicate:`,
+    /// `pattern object:` or `pattern graph:`), then the term parser's reason.
+    /// The CLI picks the hint it reports for a flag by that label.
     pub fn parse(
         subject: Option<&str>,
         predicate: Option<&str>,
@@ -103,9 +100,9 @@ impl Probe {
 impl VortexRdfStore {
     /// The view each probe narrows this store to, in input order:
     /// [`match_pattern`](Self::match_pattern), then the probe's keeps, then
-    /// its window. The probes run concurrently, so a file-backed store
-    /// overlaps their reads; in memory a match is CPU work and the batch
-    /// runs it probe by probe. The first error ends the batch.
+    /// its window. The probes are joined concurrently on the calling task, so
+    /// a file-backed store overlaps their reads, while in memory each probe's
+    /// match is CPU work that runs in turn. The first error ends the batch.
     pub async fn match_many(&self, probes: &[Probe]) -> Result<Vec<Self>> {
         try_join_all(probes.iter().map(|probe| self.run_probe(probe))).await
     }
@@ -116,9 +113,10 @@ impl VortexRdfStore {
         try_join_all(probes.iter().map(|probe| self.count_probe(probe))).await
     }
 
-    /// [`size`](Self::size) of one probe's view — or, for a probe with a
-    /// limit, [`size_capped`](Self::size_capped) at that limit, which stops
-    /// reading at the cap.
+    /// The row count of one probe's view, its window included: with a limit,
+    /// [`size_capped`](Self::size_capped) at `offset + limit`, which stops
+    /// reading at the cap, less the offset; without one, [`size`](Self::size)
+    /// less the offset.
     pub async fn count_probe(&self, probe: &Probe) -> Result<usize> {
         let view = self
             .run_pattern_and_keeps(probe, IdsNeed::CountOrWindow)
@@ -135,8 +133,8 @@ impl VortexRdfStore {
 
     /// One probe's view: its pattern, keeps and window.
     pub async fn run_probe(&self, probe: &Probe) -> Result<Self> {
-        // A windowed view is only windowed (which resolves what the window
-        // reaches); an unwindowed one is read row by row.
+        // A windowed match is only windowed, which resolves what the window
+        // reaches, so its ids may wait; an unwindowed one is read row by row.
         let windowed = probe.offset != 0 || probe.limit.is_some();
         let need = if windowed {
             IdsNeed::CountOrWindow

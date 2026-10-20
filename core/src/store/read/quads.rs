@@ -1,5 +1,5 @@
 //! Quad streaming: the chunk-granularity decode stream behind `quads`,
-//! `quads_vec`, their shared-term twins and the raw export stream — one
+//! `quads_vec`, their shared-term twins and the raw export stream, one
 //! pipeline for every row representation ([`ChunkDecode`]).
 
 use futures::future;
@@ -53,34 +53,28 @@ impl VortexRdfStore {
         Box::new(self.chunk_stream::<Quad>(true).flat_map(stream::iter))
     }
 
-    /// Every quad this view covers, materialized into one exactly-sized
-    /// `Vec`.
-    ///
-    /// Prefer this over `quads().try_collect()` when the whole result is
-    /// wanted: `try_collect` grows its `Vec` one quad at a time, with the
-    /// doubling reallocation copies that implies. Collecting the decoded
-    /// chunks first makes the total length known before a single quad is
-    /// moved.
+    /// Every quad this view covers, in [`quads`](Self::quads)' order, in one
+    /// exactly-sized `Vec`: the decoded chunks are collected first, so the
+    /// total is known before a quad is moved. Prefer it to
+    /// `quads().try_collect()`, which grows its `Vec` one quad at a time.
     pub async fn quads_vec(&self) -> Result<Vec<Quad>> {
         self.decoded_vec::<Quad>().await
     }
 
-    /// Every quad this view covers as [`SharedQuad`]s, materialized into one
-    /// exactly-sized `Vec` — the same rows in the same order as
-    /// [`quads_vec`](Self::quads_vec), with each term decoded once per
-    /// distinct term of a chunk and shared by reference count across the
-    /// rows repeating it, and no per-row parse into oxrdf terms.
+    /// Every quad this view covers as [`SharedQuad`]s in one exactly-sized
+    /// `Vec`, the rows and order of [`quads_vec`](Self::quads_vec): each
+    /// distinct term of a chunk is decoded once and shared by reference count
+    /// across the rows repeating it, with no per-row parse into oxrdf terms.
     pub async fn shared_quads_vec(&self) -> Result<Vec<SharedQuad>> {
         self.decoded_vec::<SharedQuad>().await
     }
 
-    /// The chunk-granularity stream of [`SharedQuad`]s behind
+    /// The chunk stream of [`SharedQuad`]s behind
     /// [`shared_quads_vec`](Self::shared_quads_vec): each item is one decoded
-    /// chunk (a scan split, a read by id, the in-memory base, or the tail),
-    /// so a consumer converting whole batches — a binding interning each
-    /// distinct term once — takes them without per-quad stream overhead. A
-    /// chunk-level error, or a failure to set the read up, arrives as a
-    /// one-element `vec![Err(..)]`.
+    /// chunk (a scan split, a read by id, a file view's tail, or a whole
+    /// in-memory view), for a consumer that converts whole batches without
+    /// per-quad stream overhead. A chunk's error, or a failure to set the
+    /// read up, arrives as a one-element `vec![Err(..)]`.
     pub fn shared_quad_chunks(
         &self,
     ) -> Box<dyn Stream<Item = Vec<Result<SharedQuad>>> + Unpin + Send + '_> {
@@ -88,17 +82,14 @@ impl VortexRdfStore {
     }
 
     /// The raw-text counterpart of
-    /// [`shared_quad_chunks`](Self::shared_quad_chunks): each item is one
-    /// chunk of this view's quads decoded to [`RawQuad`]s — every term in the
-    /// exact N-Triples string form the columns store. The N-Triples/N-Quads
-    /// export fast path streams these and writes the strings verbatim,
-    /// skipping the oxrdf parse → re-escape round trip [`quads`](Self::quads)
-    /// pays per term.
+    /// [`shared_quad_chunks`](Self::shared_quad_chunks): chunks of this view's
+    /// quads as [`RawQuad`]s, every term in the N-Triples form the columns
+    /// store, which the N-Triples/N-Quads export writes verbatim (no oxrdf
+    /// parse and re-escape per term, as [`quads`](Self::quads) pays).
     ///
-    /// A serve plan is deliberately not consulted here: it reorders rows for
-    /// read locality, and this stream reads every view in base row order — a
-    /// served view's pending selection materializes, and its rows are read as
-    /// an unserved view's are.
+    /// Rows come in base row order: a serve plan, which orders rows by its
+    /// index, is not consulted, so a served view's pending selection
+    /// materializes and its rows are read as an unserved view's are.
     pub(in crate::store) fn raw_quad_chunks(&self) -> BoxStream<'_, Vec<Result<RawQuad>>> {
         self.chunk_stream::<RawQuad>(false)
     }
@@ -141,9 +132,8 @@ impl VortexRdfStore {
     }
 
     /// An in-memory view's rows as one decoded chunk, `memory` its base, the
-    /// tail's live rows appended, tombstones applied — without suspending:
-    /// the rows are in memory and an in-memory store's dictionary is
-    /// resident.
+    /// tail's live rows appended, tombstones applied, without suspending: the
+    /// rows are in memory and an in-memory store's dictionary is resident.
     ///
     /// With `serve`, a served view reads its plan's run, a slice or point
     /// reads of the component's run. Every other read is the base's rows in
@@ -155,11 +145,11 @@ impl VortexRdfStore {
         serve: bool,
     ) -> Result<Vec<Result<T>>> {
         let mut quads = match &memory.serve {
-            // A served view reads the matched quads straight from the copy
-            // family's contiguous run in `base` (a plain slice), instead of
-            // gathering the primary columns at scattered row ids; tombstones
-            // are applied through the rid column. The selection may still be
-            // pending — the plan never needs it.
+            // A served view decodes the matched quads from the index
+            // component's contiguous run instead of gathering the primary
+            // columns at scattered row ids; tombstones apply through the
+            // run's rid column, and the selection may stay pending (the plan
+            // never needs it).
             Some(plan) if serve => plan.decode::<T>(self.quads.deleted.as_ref()),
             _ => T::decode(&self.layout, &self.in_memory_base_rows(memory)?),
         };
@@ -187,21 +177,18 @@ impl VortexRdfStore {
         // Tail rows are in memory and few: decode them eagerly, to be appended
         // after whatever the base yields.
         let tail: Vec<Result<T>> = self.tail.as_ref().map_or_else(Vec::new, Tail::decode);
-        // A served view streams from the answering index's own columns
-        // instead: the index clusters the matching rows into a
-        // contiguous run of zones, so the scan prunes to those rather
-        // than scattering row-id reads across the whole file. The plan's
-        // filter selects exactly the rows this view's selection names
-        // (see `FileServePlan`); tombstones are applied through its rid
-        // column. The store executes the plan without knowing which
-        // index produced it.
+        // A served view streams from the answering index's own columns,
+        // where the matching rows are one contiguous run of zones the scan
+        // prunes to, rather than scattering row-id reads across the file.
+        // The plan's filter selects exactly the rows this view's selection
+        // names (see `FileServePlan`); tombstones apply through its rid
+        // column.
         if let Some(plan) = plan
             && serve
         {
-            // A small located run reads point-by-point through the
-            // component's cached chunk probes — one chunk, no scan
-            // machinery; the filter scan handles the rare mid-fetch
-            // decline.
+            // A small located run reads point by point through the
+            // component's cached chunk probes, as one chunk; the filter scan
+            // takes over on a mid-fetch decline.
             if let Some(range) = plan.row_range()
                 && point_sized(range.end - range.start)
             {
@@ -245,13 +232,12 @@ impl VortexRdfStore {
         }
     }
 
-    /// `scan`'s chunks decoded through `decoder`, then the tail's chunk. The
-    /// decode runs inside the scan's split tasks (via the scan's map
-    /// function), so decoding runs concurrently across the runtime's workers
-    /// instead of serially at the stream consumer — except under a
-    /// file-backed dictionary, whose chunk decode awaits a read of the
-    /// dictionary windows holding the chunk's codes, so it runs after the
-    /// scan's stream. A chunk's read error is one error chunk.
+    /// `scan`'s chunks decoded through `decoder`, then the tail's chunk; a
+    /// chunk's read error is one error chunk. The decode runs inside the
+    /// scan's split tasks (its map function), concurrently across the
+    /// runtime's workers, except under a file-backed dictionary: that decode
+    /// awaits a read of the dictionary windows holding the chunk's codes, so
+    /// it runs on the scan's stream.
     #[cfg(feature = "file-io")]
     fn scan_chunks<T: ChunkDecode>(
         &self,
@@ -355,8 +341,8 @@ impl<T: ChunkDecode> ChunkDecoder<T> for ServedDecoder {
     }
 }
 
-/// Test hook: how many chunk streams this thread's reads built — what the
-/// tests read to pin that materializing an in-memory view builds none.
+/// Test hook: how many chunk streams this thread's reads built (materializing
+/// an in-memory view builds none).
 #[cfg(test)]
 pub(crate) mod chunk_stream_hooks {
     use std::cell::Cell;

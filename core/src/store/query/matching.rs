@@ -42,7 +42,7 @@ use vortex_array::expr::{Expression, and};
 
 use crate::store::VortexRdfStore;
 
-/// What the caller of a match will do with the view's selection — whether a
+/// What the caller of a match does with the view's selection: whether a
 /// located index run may leave its row ids unread without a serve plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IdsNeed {
@@ -58,14 +58,13 @@ pub(crate) enum IdsNeed {
 impl VortexRdfStore {
     // ── pattern matching ──────────────────────────────────────────────────────
 
-    /// Derive a view of this store narrowed to the quads matching the pattern
-    /// (`None` = free). No quads are decoded: the base and the tail are
-    /// matched independently and the resulting restrictions compose with
-    /// this view's own — a prefix binary search over the sorted base, a
-    /// secondary index's row ids (on a file store also a pushed-down filter
-    /// or a pruned row range), then a column-wise scan of whatever remains.
-    /// The derived view shares the base, so matches chain; tombstoned rows
-    /// are excluded by every read of the result.
+    /// A view of this store narrowed to the quads matching the pattern
+    /// (`None` = free), with no quad decoded: the base and the tail are
+    /// matched independently, and the restrictions compose with this view's
+    /// own (a prefix binary search over the sorted base, an index's row ids,
+    /// on file also a pushed-down filter or a pruned row range, then a
+    /// column-wise scan of whatever remains). The view shares the base, so
+    /// matches chain; every read of it excludes tombstoned rows.
     pub async fn match_pattern(
         &self,
         subject: Option<&NamedOrBlankNode>,
@@ -92,10 +91,9 @@ impl VortexRdfStore {
     ) -> Result<Self> {
         let pattern = QuadPattern::new(subject, predicate, object, graph);
         let mut matched = self.match_base(pattern, need).await?;
-        // The tail is matched independently of whatever the base concluded —
-        // deliberately after any base short-circuit: a term the base's
+        // The tail is matched whatever the base concluded: a term the base's
         // dictionary has never seen proves nothing about rows appended since
-        // (the tail stores strings precisely so such a term can still match).
+        // (the tail stores strings so such a term can still match).
         if let Some(tail) = &self.tail {
             matched.tail = Some(Self::match_tail(tail, pattern).await?);
         }
@@ -106,11 +104,10 @@ impl VortexRdfStore {
         Ok(matched)
     }
 
-    /// Narrow a tail to the rows matching the pattern, under the tail's own
-    /// layout — the tail counterpart of the base's mask-scan fallback. A tail
-    /// is small, unsorted, and unindexed, so a scan over its (already few)
-    /// selected rows is the right plan; the surviving positions refine the
-    /// tail-local selection exactly as base matches refine the base's.
+    /// A tail narrowed to the rows matching the pattern, under the tail's own
+    /// layout: a scan over its selected rows (a tail is small, unsorted and
+    /// unindexed), whose surviving positions refine the tail-local selection
+    /// as base matches refine the base's.
     async fn match_tail(tail: &Tail, pattern: QuadPattern<'_>) -> Result<Tail> {
         let t = debug::timer();
         let carry = |selection: RowSelection| tail.with_selection(selection);
@@ -118,8 +115,8 @@ impl VortexRdfStore {
             return Ok(carry(tail.selection.clone()));
         }
         // The tail's layouts store plain strings (see `Tail::layout_for`), so
-        // this prelude resolves nothing and never suspends — but the witness
-        // is still minted by it, like every probe surface.
+        // this prelude resolves nothing and never suspends; it still mints the
+        // witness, as for every probe surface.
         let mut codes = tail.layout.prepare_pattern(pattern).await?;
         let eqs = match codes.constraints(pattern)? {
             // The tail's string layouts never compile to AlwaysFalse (see
@@ -132,9 +129,9 @@ impl VortexRdfStore {
             return Ok(carry(tail.selection.clone()));
         }
         let applied = tail.selection.apply(&tail.rows)?;
-        // Typed fast path first: tail string columns compared as raw bytes,
-        // no per-call compare/canonicalize pipeline — the path every
-        // `contains` (and thus every `add_quad` presence check) rides.
+        // Typed fast path first: the tail's string columns compared as raw
+        // bytes, without the per-call compare/canonicalize pipeline; every
+        // `contains`, so every `add_quad` presence check, rides it.
         if let Some(positions) = typed_positions(&applied, &eqs) {
             let mask = Mask::from_indices(applied.len(), positions);
             debug::step!(t, "[match_pattern] Tail matched by typed positions");
@@ -172,12 +169,11 @@ impl VortexRdfStore {
     }
 
     /// The match prelude: every bound term of `pattern` resolved to its code
-    /// at most once, as the witness every synchronous probe of the match
-    /// runs on — the one point where a dictionary may perform I/O (a
-    /// file-backed one scans here). `None` when the layout proves the
-    /// pattern unmatchable (e.g. a term absent from the dictionary), read off
-    /// the prelude's role cache: such a pattern needs no search, and no scan
-    /// machinery, whichever backend holds the rows.
+    /// at most once, the witness every synchronous probe of the match runs
+    /// on, and the one point where a dictionary may do I/O (a file-backed one
+    /// reads here). `None` when the layout proves the pattern unmatchable (a
+    /// term absent from the dictionary, say), read off the prelude's role
+    /// cache: such a pattern needs no search and no scan on either backend.
     pub(in crate::store) async fn prepared_codes(
         &self,
         pattern: QuadPattern<'_>,
@@ -190,17 +186,15 @@ impl VortexRdfStore {
     /// the view's base: the prefix probe
     /// ([`prefix_probe`](Self::prefix_probe)), secondary-index routing and
     /// the residual column filter ([`residual_narrow`](Self::residual_narrow)),
-    /// each narrowing the selection in base row ids. Those ids are computed
-    /// here, except for the cases that do not need them — a lazy index
-    /// resolution that is the view's sole restriction leaves them pending
-    /// (`LazyRowIds`) when it serves the view's reads, or when the caller
-    /// only counts or windows the view (`need`), for the first consumer that
-    /// reads through the selection and not the plan.
+    /// each narrowing the selection in base row ids. The ids are computed
+    /// here, except that an index resolution that is the view's sole
+    /// restriction leaves them pending (`LazyRowIds`) when its plan serves
+    /// the view's reads, or when the caller only counts or windows the view
+    /// (`need`).
     ///
-    /// Tombstones are deliberately not consulted here: they are applied by
-    /// every read path instead, so matching may name deleted rows without the
-    /// result ever showing them. Keeping them out also keeps the mask scan's
-    /// positions aligned with `selection.apply`, which is what `refine` maps
+    /// Tombstones are not consulted: every read applies them, so a match may
+    /// name deleted rows the result never shows, and the mask scan's
+    /// positions stay aligned with `selection.apply`, which `refine` maps
     /// back through.
     fn match_base_in_memory(
         &self,
@@ -216,26 +210,21 @@ impl VortexRdfStore {
             probes,
             ..
         } = memory;
-        // Materialize the base struct so its columns can be inspected
-        // (statistics, binary search). Every search below runs against
-        // the base and yields base row ids, which are then intersected
-        // into this view's selection — so a chained match narrows the
-        // same coordinate space instead of rebasing onto a new array.
-        // Every in-memory construction (`from_built`, `from_parts`) hands
-        // the base over as a struct array, so the common case is a plain
-        // downcast; the execute arm of `into_struct_array` is a fallback
-        // for a non-struct base.
+        // The base as a struct, for its columns. Every search below yields
+        // base row ids, intersected into this view's selection, so a chained
+        // match narrows the same coordinate space. An in-memory construction
+        // hands the base over as a struct array, so this is a downcast;
+        // `into_struct_array` executes any other base.
         let struct_arr = into_struct_array(base.clone())?;
         let base_len = base.len();
 
-        // A chained match folds this pattern's restrictions into the
-        // previous ones, so a still-pending selection materializes here —
-        // chaining is one of the consumers the deferral exists for.
+        // A chained match folds into the previous restrictions, so a pending
+        // selection materializes here.
         let selection = self.quads.selection.materialized()?;
-        // A serving index's plan reads exactly a contiguous row run, so
-        // it is only valid when that run *is* the whole result: the view
-        // must start unrestricted and nothing but the serving index's
-        // own resolution may narrow it (no subject range, no mask scan).
+        // A serve plan reads exactly a contiguous row run, so it is valid
+        // only when that run is the whole result: the view starts
+        // unrestricted and only the serving index's resolution narrows it
+        // (no subject range, no mask scan).
         let unrefined = matches!(selection, RowSelection::All);
 
         // The components still to be resolved. Each fast path below
@@ -245,24 +234,19 @@ impl VortexRdfStore {
             Self::prefix_probe(&struct_arr, base, probes, codes, &mut pat, selection, t)?;
 
         // ── Secondary-index routing ───────────────────────────────
-        // Ask the configured indexes to resolve the rest of the pattern
-        // to exact base row ids — each index picks its probe, which the
-        // in-memory resolver runs over the component's columns (e.g. a
-        // binary search of the sorted `val`/`rid` pair for a bound object).
-        // The store just folds the ids it hands back into the selection.
-        // …but only while there is enough left to narrow. Resolving a
-        // component costs O(rows matching *that component*), regardless
-        // of how few rows the view still holds, so once a fast path has
-        // cut the view to a handful of rows, filtering those rows
-        // column-wise is cheaper. Nothing is lost by skipping: a view
-        // that something else narrowed already discards any serving plan.
-        // A pattern the prefix probe answered in full leaves the indexes
-        // nothing to resolve at all.
+        // The configured indexes resolve the rest of the pattern to exact
+        // base row ids, each with its own probe over its component's columns
+        // (a binary search of the sorted `val`/`rid` pair for a bound object,
+        // say), and the ids fold into the selection. Only while enough is left
+        // to narrow: a resolution costs the rows matching its component,
+        // however few the view still holds, so once the prefix probe has cut
+        // the view below `INDEX_ROUTING_MIN_ROWS` rows they are filtered
+        // column-wise instead (the view has lost any serve plan already).
         let worth_indexing = !prefix_narrowed || selection.len(base_len) >= INDEX_ROUTING_MIN_ROWS;
         let (mut resolved, mut serve) = (None, None);
         if !selection.is_empty(base_len) && pat.any_bound() && worth_indexing {
             match resolve_indexes_in_memory(&self.indexes, components, &self.layout, pat, codes)? {
-                // The probed term is absent from the data — nothing matches.
+                // The probed term is absent from the data: nothing matches.
                 IndexResolution::Empty => {
                     debug::step!(t, "[match_pattern] In-memory index proved empty");
                     return Ok(self.empty_view());
@@ -287,15 +271,12 @@ impl VortexRdfStore {
             }
         }
 
-        // An in-memory resolution is always lazy. A serve-attached one keeps
-        // its ids deferred when it is this view's sole restriction (the view
-        // started unrestricted, no prefix narrowed it and nothing residual is
-        // left to check) — reads go through the plan, so decoding and sorting
-        // the run's rids can wait for a consumer that needs the selection. So
-        // does a sole run the caller only counts or windows: its width is the
-        // count. Anything narrower, or read row by row without a plan, needs
-        // them now; a deferred resolution *is* then the whole selection,
-        // pending until a consumer needs the ids.
+        // An in-memory resolution is always lazy. Its ids stay deferred when
+        // it is the view's sole restriction (the view started unrestricted, no
+        // prefix narrowed it, nothing residual is left) and either its plan
+        // serves the reads or the caller only counts or windows the view (the
+        // run's width is the count); the pending ids are then the whole
+        // selection. Anything else needs them now.
         let sole = unrefined && !prefix_narrowed && !pat.any_bound();
         let selection = match resolved {
             Some(row_ids) => {
@@ -308,15 +289,12 @@ impl VortexRdfStore {
         };
 
         // ── Fallback: residual column filtering ───────────────────
-        // Whatever no fast path answered is compared column-wise. Only
-        // the rows this view already selects are compared, so a chained
-        // match still pays for its own row count, not the base's.
-        // Skipped entirely when the fast paths resolved every component:
-        // `mask_for` would return `None` without reading a row, but its
-        // arguments — `selection.apply` (a slice pushed through the
-        // array optimizer) and a struct canonicalization — are exactly
-        // the per-call cost this gate saves. (A pending selection never
-        // reaches it: the deferral left nothing bound.)
+        // Whatever no fast path answered is compared column-wise over the
+        // rows the view already selects, so a chained match pays for its own
+        // rows, not the base's. Skipped when nothing is left bound, which
+        // saves the per-call `selection.apply` and struct canonicalization; a
+        // pending selection never gets here, as its deferral left nothing
+        // bound.
         let (selection, residual_narrowed) = match selection {
             ViewSelection::Exact(exact) if !exact.is_empty(base_len) && pat.any_bound() => {
                 let Some(narrowed) =
@@ -330,7 +308,7 @@ impl VortexRdfStore {
         };
 
         // Keep the serving plan only if the serving index's resolution
-        // is the sole thing that narrowed this view — otherwise its
+        // is the sole thing that narrowed this view: otherwise its
         // contiguous run over-covers the actual selection.
         let serve = if unrefined && !prefix_narrowed && !residual_narrowed {
             serve
@@ -376,11 +354,11 @@ impl VortexRdfStore {
             && let Ok(Some(probe)) = codes.probe_scalar(TermRef::Subject(subj))
             && let Ok(scalar) = probe.cast(s_col.dtype())
         {
-            // Left/right binary search bounds the run of rows equal to
-            // the probe value — through the store's cached probe when the
-            // column resolves (skipping the per-call encoding-tree walk),
-            // else the per-call search, which also serves the string
-            // layouts' `VarBinView` subjects.
+            // Left and right binary searches bound the run equal to the
+            // probe value: through the store's cached probe when the column
+            // resolves one (no per-call encoding-tree walk), else the
+            // per-call search, which also serves the string layouts'
+            // `VarBinView` subjects.
             let cached = probes.by_name(base, schema::COL_S).flatten();
             let (lo, hi) = match (cached, u64::try_from(&scalar)) {
                 (Some(owned), Ok(needle)) => {
@@ -402,10 +380,9 @@ impl VortexRdfStore {
             );
 
             // The roles behind the subject, in sort order, while the
-            // selection is still one run (a chained view's id list has
-            // no window to search) and the role has a code and a cached
-            // probe — the string layouts stop here, their columns
-            // resolving none.
+            // selection is still one run (a chained view's id list has no
+            // window to search) and the role has a code and a cached probe;
+            // the string layouts stop here, their columns resolving none.
             if let RowSelection::Range(range) = &selection {
                 let mut run = range.start as usize..range.end as usize;
                 let roles = [
@@ -469,18 +446,17 @@ impl VortexRdfStore {
         t: Option<Instant>,
     ) -> Result<Option<RowSelection>> {
         // The residual binds a subset of the roles the caller's gate
-        // already resolved to codes, so the unmatchable arm cannot fire
-        // here — it stays for totality.
+        // already resolved to codes, so the unmatchable arm cannot fire;
+        // it stays for totality.
         let eqs = match codes.constraints(pat)? {
             Constraints::AlwaysFalse => return Ok(None),
             Constraints::Eq(eqs) => eqs,
         };
         // Typed fast path: residual equalities over canonical code columns
-        // (Dictionary layout) become direct slice loops yielding exact
-        // base ids — no slice/compare/mask pipeline — and a probe-bound
-        // column reads through the store's own probe. Rows outside the
-        // selection are never tested, so the ids are already the
-        // intersection.
+        // (Dictionary layout) become slice loops yielding exact base ids,
+        // with no slice/compare/mask pipeline, and a probe-bound column reads
+        // through the store's own probe. Only the selection's rows are
+        // tested, so the ids are already the intersection.
         Ok(Some(
             match typed_residual_ids(
                 struct_arr,
@@ -507,12 +483,14 @@ impl VortexRdfStore {
     }
 
     /// The file backend of [`match_base`](Self::match_base), `base` the
-    /// view's file: restrictions compose into the derived view — the
-    /// subject's located run ([`locate_subject`](Self::locate_subject)),
-    /// index-resolved row ids, a pushed-down filter, a pruned row range — and
-    /// no data is read until the next scan, except a lazy resolution's ids
-    /// when they cannot stay deferred and the point reads that check a
-    /// pending filter at sparse ids.
+    /// view's file: the restrictions compose into the derived view (the
+    /// subject's located run, [`locate_subject`](Self::locate_subject);
+    /// index-resolved row ids; a pushed-down filter; a pruned row range), and
+    /// the rows are read by the next scan. The match itself reads only the
+    /// chunk probes that locate the subject's run, what an index resolution
+    /// reads (its run's location, and its ids unless they stay deferred), a
+    /// chained view's pending ids, the zone-map statistics that prune, and
+    /// the point reads that check a pending filter at sparse ids.
     #[cfg(feature = "file-io")]
     async fn match_base_file(
         &self,
@@ -529,27 +507,22 @@ impl VortexRdfStore {
         } = base;
         let existing_selection = &self.quads.selection;
         // A bound subject on a sorted file resolves to its exact row range
-        // first, by binary-searching the subject column's encoded chunks —
-        // the file mirror of the in-memory subject fast path. Each index's
-        // `choose` declines bound-subject patterns, so this takes over an
-        // uncontested route; the subject then leaves the pattern, the roles
-        // behind it narrow the run the same way (the in-memory prefix probe),
-        // and whatever is still bound rides the narrowed range. Any decline
-        // leaves the pattern intact for the scan path.
+        // first, by binary-searching the subject column's encoded chunks (the
+        // file mirror of the in-memory prefix probe; every index's `choose`
+        // declines a bound subject). The subject leaves the pattern, the roles
+        // behind it narrow the run the same way, and whatever is still bound
+        // rides the narrowed range; a decline leaves the pattern intact.
         let mut pat = pattern;
         let subject_range = Self::locate_subject(file, codes, &mut pat, t).await?;
         // With the subject already resolved to a tiny range, an index
-        // resolution for the residual terms is a pessimization (its pushed
-        // scan costs O(rows matching that component)) — the same routing
-        // rule the in-memory path applies.
+        // resolution for the residual terms costs more than it saves (its
+        // scan costs the rows matching its component), as in memory.
         let worth_indexing = subject_range
             .as_ref()
             .is_none_or(|r| (r.end - r.start) as usize >= INDEX_ROUTING_MIN_ROWS);
-        // Ask the configured indexes to resolve this pattern to exact
-        // row ids — each index picks its probe, the file resolver runs it.
-        // A resolved component is then left out of the pushed-down filter:
-        // the row ids already are exactly its matches, so re-filtering
-        // them would only re-read and re-compare that column.
+        // The configured indexes resolve the pattern to exact row ids, each
+        // with its own probe. A resolved component stays out of the
+        // pushed-down filter: its ids are exactly its matches.
         let resolution = if worth_indexing {
             resolve_indexes_file(&self.indexes, file, &self.layout, pat, codes).await?
         } else {
@@ -568,9 +541,7 @@ impl VortexRdfStore {
             None => selection,
         };
         let (next_filter, resolved_selection, serve) = match resolution {
-            // The probed term is absent — nothing can match. Short-
-            // circuit to the empty view (an empty id set would just
-            // intersect every other restriction down to nothing anyway).
+            // The probed term is absent: nothing can match.
             IndexResolution::Empty => {
                 debug::step!(t, "[match_pattern] File index proved empty");
                 return Ok(self.empty_view());
@@ -588,15 +559,14 @@ impl VortexRdfStore {
                 let residual = file_reads::build_file_filter(pat, codes)?;
                 let serve = keep_serve.then_some(serve).flatten();
                 // With the plan kept, the resolution is the view's sole id
-                // restriction, so its deferred ids *are* the selection — left
-                // pending until a consumer needs them (a count, a chained
-                // match, a delete, a base-order gather); reads stream through
-                // the plan without them. So are the ids of a located run the
-                // caller only counts or windows: its width is the count, and
-                // a window reads only its own rows — provided nothing else
-                // restricts this view and nothing residual is left to filter.
-                // Any other lazy resolution runs its deferred read now, and
-                // folds exactly as an eager one's ids do.
+                // restriction, so its deferred ids are the selection, pending
+                // until a consumer needs them (a count, a chained match, a
+                // delete, a base-order gather) while reads stream through the
+                // plan. So are a located run's ids when the caller only
+                // counts or windows the view, nothing else restricts it and
+                // nothing residual is left: its width is the count, and a
+                // window reads only its own rows. Any other lazy resolution
+                // is read now and folds as an eager one's ids do.
                 let defer = serve.is_some()
                     || (need == IdsNeed::CountOrWindow
                         && keep_serve
@@ -641,8 +611,7 @@ impl VortexRdfStore {
                 (file_reads::build_file_filter(pat, codes)?, None, None)
             }
         };
-        // Combine with whatever filter this view already carried
-        // from earlier match_pattern calls (AND, since both must hold).
+        // ANDed with the filter earlier matches left on this view.
         let filter = match (existing_filter.clone(), next_filter) {
             (Some(lhs), Some(rhs)) => Some(and(lhs, rhs)),
             (Some(lhs), None) => Some(lhs),
@@ -652,10 +621,9 @@ impl VortexRdfStore {
         let selection = match resolved_selection {
             Some(selection) => selection,
             // No index involved: the subject's exact range narrows directly
-            // (a zone envelope could only be wider), else narrow using
-            // zone-map statistics. (A chained match materializes a
-            // still-pending selection to fold into — exactly one of the
-            // consumers the deferral is for.)
+            // (a zone envelope could only be wider), else zone-map statistics
+            // do. A chained match materializes a pending selection to fold
+            // into.
             None => {
                 let existing = existing_selection.materialized_async().await?;
                 ViewSelection::Exact(match (&subject_range, &filter) {
@@ -683,10 +651,9 @@ impl VortexRdfStore {
             other => other,
         };
 
-        // Nothing can match: normalize to the canonical empty view. A
-        // pending selection's coverage is unknown by design — it may
-        // materialize to empty later, which every consumer handles like any
-        // other narrow selection.
+        // Nothing can match: the canonical empty view. A pending selection's
+        // coverage is unknown until it materializes, possibly to empty, which
+        // every consumer handles like any other narrow selection.
         if let ViewSelection::Exact(exact) = &selection
             && exact.is_empty(file.row_count() as usize)
         {
@@ -701,13 +668,10 @@ impl VortexRdfStore {
             serve.is_some(),
             matches!(selection, ViewSelection::Pending(_))
         );
-        // Build the new, more-restricted file view; no data has been
-        // read yet — restrictions are only applied on the next scan.
-        // The file (and thus its index columns) is shared, so the
-        // indexes stay usable for further chained matches. Tombstones are a
-        // property of the base file, not of the pattern, so they carry
-        // across the match unchanged; the read paths apply them (see
-        // `restrict_scan`).
+        // The more-restricted file view, whose rows the next scan reads. It
+        // shares the file, and so the index children further chained matches
+        // use; the tombstones carry over unchanged, and the reads apply them
+        // (see `restrict_scan`).
         Ok(self.derived(
             self.quads.file_with(base, filter, selection, serve),
             self.tail.clone(),
@@ -717,7 +681,7 @@ impl VortexRdfStore {
     /// A bound subject's exact row run in a sorted file: the subject column's
     /// encoded chunks binary-searched through their cached chunk probes, then
     /// the run narrowed by the roles behind the subject in sort order through
-    /// their columns' chunk probes — the file mirror of the in-memory prefix
+    /// their columns' chunk probes, the file mirror of the in-memory prefix
     /// probe. The subject and every answered role leave `pat`. `None`, with
     /// `pat` intact, when no subject is bound or the location declines.
     #[cfg(feature = "file-io")]
@@ -770,35 +734,26 @@ impl VortexRdfStore {
 
     // ── pattern matching helpers ─────────────────────────────────────────────
 
-    /// Build an in-memory boolean mask (one bit per row of `array`, in its own
-    /// order) marking which of its rows satisfy `eqs` — the per-column
-    /// equalities a pattern compiled to under the layout of `array`'s rows
-    /// (the store's own for the base, the tail's own for the tail, which
-    /// stores strings under a Dictionary-encoded base: see
-    /// [`Tail::layout_for`]).
-    ///
-    /// The mask is positional, so it only means anything against the array it
-    /// was computed over: callers holding a view must translate it back to base
-    /// row ids via [`RowSelection::refine`].
-    ///
-    /// Callers compile the constraints and pass them in, because each has
-    /// already consulted them — to rule out an unmatchable pattern, and to try
-    /// the typed comparison paths this is the fallback for.
+    /// A boolean mask, one bit per row of `array` in its own order, of the
+    /// rows that satisfy `eqs`: the per-column equalities a pattern compiled
+    /// to under the layout of `array`'s rows (the store's for the base, the
+    /// tail's for the tail; see [`Tail::layout_for`]). The mask is
+    /// positional, so a caller holding a view maps it back to base row ids
+    /// with [`RowSelection::refine`]. The fallback of the typed comparison
+    /// paths: callers pass in the constraints they compiled to try those.
     fn mask_for(array: &ArrayRef, eqs: &[(&'static str, Scalar)]) -> Result<ArrayRef> {
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let struct_arr = array.clone().execute::<StructArray>(&mut ctx)?;
 
-        // AND together one equality comparison per constrained column.
+        // One equality comparison per constrained column, ANDed.
         let mut mask: Option<ArrayRef> = None;
         for (field, value) in eqs {
             let col = struct_arr.unmasked_field_by_name(field)?;
-            // Cast the scalar to the column's dtype (so numeric columns like
-            // `o_kind` compare against a scalar of matching type/nullability).
+            // Cast to the column's dtype, so a numeric column such as
+            // `o_kind` compares against a scalar of its type and nullability.
             let scalar = value.cast(col.dtype())?;
-            // Broadcast the scalar to a constant column and compare element-wise.
             let rhs = ConstantArray::new(scalar, col.len()).into_array();
             let m = col.binary(rhs, Operator::Eq)?;
-            // Fold this column's mask into the running AND of all constraints.
             mask = Some(match mask.take() {
                 Some(prev) => prev.binary(m, Operator::And)?,
                 None => m,
@@ -812,11 +767,10 @@ impl VortexRdfStore {
         })
     }
 
-    /// Whether the store holds a quad equal to `quad` (tombstoned rows count
-    /// as absent). One fully-bound `match_pattern`, so it rides whatever fast
-    /// path the store has — subject binary search, secondary indexes, or file
-    /// pruning — and checks the tail too; the match is read only as far as
-    /// its first row ([`exists`](Self::exists)).
+    /// Whether the store holds a quad equal to `quad`, tombstoned rows counting
+    /// as absent: one fully-bound `match_pattern` over the base and the tail,
+    /// through whatever fast path applies, read only as far as its first row
+    /// ([`exists`](Self::exists)).
     pub async fn contains(&self, quad: &Quad) -> Result<bool> {
         let matched = self
             .match_pattern(
@@ -853,12 +807,8 @@ fn fold_row_ids(
     })
 }
 
-/// Selection size below which an *already narrowed* view should skip secondary
-/// index routing and filter its remaining rows column-wise instead (see
-/// `match_base`).
-///
-/// An index lookup's cost tracks how many rows match the component it resolves,
-/// not how many the view still holds, so once a fast path has narrowed the view
-/// far enough the lookup is pure overhead. An unrefined view never skips —
-/// that is the case indexes exist for.
+/// Selection size below which a view the subject search already narrowed
+/// skips index routing and filters its remaining rows column-wise (see
+/// `match_base`): a lookup costs the rows matching the component it resolves,
+/// not the rows the view still holds. An unrefined view never skips.
 const INDEX_ROUTING_MIN_ROWS: usize = 4_096;
