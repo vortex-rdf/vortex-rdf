@@ -395,7 +395,8 @@ fn assert_children_describe_exactly(built: &BuiltArray, rows: usize, who: &str) 
 
 /// Copies of one quad that land in different spilled runs collapse in the
 /// K-way merge, and the index children — spilled and merged on their own —
-/// describe the deduplicated rows: one record per row, each row id once.
+/// describe the deduplicated rows: one record per row, each row id once, and
+/// each reference child's `(val, rid)` pairs strictly ascending.
 #[tokio::test]
 async fn test_spilled_runs_collapse_repeats_across_runs() {
     let (stream, expected) = spread_repeats().await;
@@ -414,6 +415,20 @@ async fn test_spilled_runs_collapse_repeats_across_runs() {
             assert_eq!(built.array.len(), expected.len(), "{who}: primary rows");
             assert_eq!(built.components.len(), 4, "{who}");
             assert_children_describe_exactly(&built, expected.len(), &who);
+            let references: Vec<_> = built
+                .components
+                .iter()
+                .filter(|c| c.identity.name.starts_with("index:ref-"))
+                .collect();
+            assert_eq!(references.len(), 2, "{who}: reference children");
+            for component in references {
+                let pairs = reference_pairs(component);
+                assert!(
+                    pairs.windows(2).all(|pair| pair[0] < pair[1]),
+                    "{who}: {} rows are in strict (val, rid) order: {pairs:?}",
+                    component.identity.name
+                );
+            }
 
             let store = VortexRdfStore::from_built(built).unwrap();
             let rows = tuple_rows(&store.quads_vec().await.unwrap());

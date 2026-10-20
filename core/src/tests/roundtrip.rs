@@ -173,12 +173,12 @@ fn drop_graph_column(chunk: &vortex_array::ArrayRef) -> vortex_array::ArrayRef {
     .into_array()
 }
 
-/// `bytes`, a store file, with the first leaf of its quad table's `column`
-/// damaged: the trailing flatbuffer length of the leaf's segment set past
-/// the segment, so the file still opens and a read of that leaf fails to
-/// decode it.
+/// `bytes`, a store file, with the first leaf of `column` damaged in `table`:
+/// the quad table (`None`), or the component of that name. The trailing
+/// flatbuffer length of the leaf's segment is set past the segment, so the
+/// file still opens and a read of that leaf fails to decode it.
 #[cfg(feature = "file-io")]
-fn with_damaged_leaf(bytes: &[u8], column: &str) -> Vec<u8> {
+fn with_damaged_leaf(bytes: &[u8], table: Option<&str>, column: &str) -> Vec<u8> {
     use crate::io::container;
     use vortex_file::OpenOptionsSessionExt as _;
     use vortex_layout::LayoutChildType;
@@ -191,14 +191,25 @@ fn with_damaged_leaf(bytes: &[u8], column: &str) -> Vec<u8> {
         .footer()
         .layout()
         .as_::<container::RdfStoreLayoutVTable>();
-    let quads = container::quad_source(root).unwrap();
-    let field = (0..quads.nslots())
+    let table = match table {
+        None => container::quad_source(root).unwrap(),
+        Some(name) => {
+            let slot = root
+                .data()
+                .components
+                .iter()
+                .position(|component| component.name == name)
+                .unwrap_or_else(|| panic!("no component {name}"));
+            container::component_child(root, slot).unwrap()
+        }
+    };
+    let field = (0..table.nslots())
         .find(|&i| {
-            matches!(quads.slot_type(i), Some(LayoutChildType::Field(ref name)) if name.as_ref() == column)
+            matches!(table.slot_type(i), Some(LayoutChildType::Field(ref name)) if name.as_ref() == column)
         })
         .unwrap();
     let leaves =
-        vortex_rdf_encoded_search::flat_leaves(&quads.slot(field).unwrap().unwrap()).unwrap();
+        vortex_rdf_encoded_search::flat_leaves(&table.slot(field).unwrap().unwrap()).unwrap();
     let segment = &file.footer().segment_map()[*leaves[0].layout.segment_id() as usize];
     let end = usize::try_from(segment.offset).unwrap() + segment.length as usize;
     let mut damaged = bytes.to_vec();
@@ -230,7 +241,8 @@ fn test_decode_chunk_reports_chunk_failure_as_single_err() {
 /// parser's error. A store holding the typed layout's bad row fails its
 /// shared read and its N-Quads export with that row's error, and a store
 /// file with a damaged leaf fails every read of that chunk, under each
-/// layout.
+/// layout, as a damaged dictionary window or copy-index child does the reads
+/// that decode through it.
 #[tokio::test]
 async fn test_decode_chunk_reports_bad_row_at_its_position() {
     use vortex_array::IntoArray as _;
@@ -317,7 +329,7 @@ async fn test_decode_chunk_reports_bad_row_at_its_position() {
         let (_dir, path) = write_store_file(modular_quads(12, 3, 4), layout, vec![]).await;
         std::fs::write(
             &path,
-            with_damaged_leaf(&std::fs::read(&path).unwrap(), "p"),
+            with_damaged_leaf(&std::fs::read(&path).unwrap(), None, "p"),
         )
         .unwrap();
         let store = VortexRdfStore::from_file(&path).await.unwrap();
@@ -337,6 +349,55 @@ async fn test_decode_chunk_reports_bad_row_at_its_position() {
                 .await
                 .is_err(),
             "{layout:?}: N-Quads export"
+        );
+    }
+
+    // A damaged leaf of the file's other tables. A dictionary window, which
+    // a mapped store reads only to decode a chunk's codes, fails the reads
+    // of the rows it decodes. A copy-index child's `o` leaf fails the served
+    // read of a point-sized run, which the match located through the child's
+    // `p` and `rid` columns.
+    #[cfg(feature = "file-io")]
+    {
+        use crate::io::container::DICT_COMPONENT_NAME;
+        use crate::store::layouts::dictionary::storage::COL_DICT_TERM;
+
+        let damaged = |path: &std::path::Path, table: &str, column: &str| {
+            let bytes = with_damaged_leaf(&std::fs::read(path).unwrap(), Some(table), column);
+            std::fs::write(path, bytes).unwrap();
+        };
+        let (_dir, path) =
+            write_store_file(modular_quads(12, 3, 4), LayoutStrategy::Dictionary, vec![]).await;
+        damaged(&path, DICT_COMPONENT_NAME, COL_DICT_TERM);
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        assert!(store.dict_reader().unwrap().is_file_backed());
+        let quads: Vec<_> = store.quads().collect().await;
+        assert!(matches!(quads.first(), Some(Err(_))), "dictionary: quads");
+        assert!(
+            store.shared_quads_vec().await.is_err(),
+            "dictionary: shared quads"
+        );
+
+        let (_dir, path) = write_store_file(
+            modular_quads(12, 3, 4),
+            LayoutStrategy::Dictionary,
+            vec![IndexType::SecondaryByCopy],
+        )
+        .await;
+        damaged(&path, "index:posg", "o");
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let p1 = NamedNode::new("http://example.org/p1").unwrap();
+        let served = store
+            .match_pattern(None, Some(&p1), None, None)
+            .await
+            .unwrap();
+        assert_eq!(served_component(&served), Some("index:posg"));
+        assert_eq!(served.debug_serve_row_range(), Some(4..8));
+        let quads: Vec<_> = served.quads().collect().await;
+        assert!(matches!(quads.first(), Some(Err(_))), "copy child: quads");
+        assert!(
+            served.shared_quads_vec().await.is_err(),
+            "copy child: shared quads"
         );
     }
 }

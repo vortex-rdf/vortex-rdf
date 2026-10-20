@@ -37,6 +37,12 @@ impl StructProbes {
         let _ = self.cells(base);
     }
 
+    /// Whether the cache has resolved a base's children yet (test hook).
+    #[cfg(test)]
+    pub(crate) fn is_resolved(&self) -> bool {
+        self.cells.get().is_some()
+    }
+
     /// The cache's answer for `base`'s child named `name`, resolving all
     /// children on first use: `Some(Some(probe))` for a resolved probe,
     /// `Some(None)` for a child whose encoding declines (or a name `base`
@@ -117,5 +123,18 @@ mod tests {
         assert!(matches!(probes.by_name(&a, "no-such-child"), Some(None)));
         assert!(probes.cells(&b).is_none());
         assert!(probes.by_name(&b, "s").is_none());
+
+        // A struct without children, and a base that is no struct, resolve
+        // no probe.
+        let childless =
+            StructArray::try_new(Vec::<&str>::new().into(), vec![], 4, Validity::NonNullable)
+                .unwrap()
+                .into_array();
+        let flat = Buffer::from_iter(0..4u32).into_array();
+        for base in [childless, flat] {
+            let probes = StructProbes::new();
+            probes.warm(&base);
+            assert!(matches!(probes.by_name(&base, "s"), Some(None)));
+        }
     }
 }

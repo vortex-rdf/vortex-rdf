@@ -179,8 +179,14 @@ pub(super) async fn run_subject_range_then_index_routing_above_gate(
     );
 }
 
+/// In memory the routing also shows in the row ids the index decodes: above
+/// the gate the copy index resolves the residual object and decodes its run
+/// (`o5` is on four rows), below it the object is filtered column-wise and
+/// no row id is decoded.
 #[tokio::test]
 async fn test_subject_range_then_index_routing_above_gate() {
+    use crate::store::test_hooks::decoded_rids;
+
     let quads = above_gate_quads();
     let store = built_store(
         quads.clone(),
@@ -189,6 +195,24 @@ async fn test_subject_range_then_index_routing_above_gate() {
     )
     .await;
     run_subject_range_then_index_routing_above_gate(&store, &quads).await;
+
+    let o5 = Term::Literal(Literal::new_simple_literal("o5"));
+    for (subject, rids) in [("s0", 4), ("s1", 0)] {
+        let s = NamedOrBlankNode::NamedNode(
+            NamedNode::new(format!("http://example.org/{subject}")).unwrap(),
+        );
+        let before = decoded_rids();
+        let matched = store
+            .match_pattern(Some(&s), None, Some(&o5), None)
+            .await
+            .unwrap();
+        assert_eq!(decoded_rids() - before, rids, "{subject}");
+        assert_eq!(
+            view_strings(&matched).await,
+            expected_strings(&quads, |i| quads[i].subject == s && quads[i].object == o5),
+            "{subject}"
+        );
+    }
 }
 
 // ─── Prefix probe: nested binary search over the (s, p, o, g) order ────
@@ -446,7 +470,8 @@ async fn test_derived_view_does_not_lose_base_rows() {
 
 /// A residual over an in-memory base reads its probe-bound columns through
 /// the probes the store resolved for its base, so a match resolves none: a
-/// reference index answers `o` of `(?, p, o)` and `p` is read at its rows.
+/// reference index answers `o` of `(?, p, o)` by searching its component's
+/// cached probe, and `p` is read at its rows through the base's.
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_in_memory_residual_reads_through_the_store_probes() {
@@ -471,8 +496,8 @@ async fn test_in_memory_residual_reads_through_the_store_probes() {
         assert_eq!(resolved_after, resolved, "no probe is resolved per match");
         assert_eq!(
             cached_after,
-            cached + 1,
-            "`p` reads through the store's probe"
+            cached + 2,
+            "`o`'s run is searched, and `p` read, through the store's probes"
         );
         assert_eq!(
             view_strings(&matched).await,

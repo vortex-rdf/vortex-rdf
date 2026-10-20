@@ -227,9 +227,18 @@ async fn test_copy_index_file_serving_wide_located_run_stays_pending() {
         .filter(|len| futures::future::ready(*len > 0))
         .collect()
         .await;
+    // The splits share one width, the last taking the remainder (`file.rs`'s
+    // own tests pin the width for each worker count).
+    assert!(chunks.len() >= 2, "{chunks:?}");
+    let split = chunks[0];
+    assert_eq!(
+        chunks.len(),
+        10_000usize.div_ceil(split),
+        "a wide located run is served in splits of {split} rows, got {chunks:?}"
+    );
     assert!(
-        chunks.len() >= 2,
-        "a wide located run is served in several splits, got {chunks:?}"
+        chunks[..chunks.len() - 1].iter().all(|len| *len == split),
+        "{chunks:?}"
     );
     assert_eq!(chunks.iter().sum::<usize>(), 10_000);
 
@@ -359,9 +368,13 @@ async fn sorted_code_rows(view: &VortexRdfStore) -> Vec<[TermCode; 4]> {
 /// the point-read cap — answers its code columns from the copy family's run,
 /// by a scan of exactly the run: the ids stay unread and no primary row is
 /// gathered. A smaller run, whose ids the match read, gathers its rows. Both
-/// answer the in-memory store's codes, tombstoned rows dropped.
+/// answer the in-memory store's codes, tombstoned rows dropped. A run within
+/// the cap resolves at the match and serves its quads by point reads,
+/// wherever it sits in the child; a wider one by a scan of the run.
 #[tokio::test]
 async fn test_copy_index_file_serves_code_columns_from_the_run() {
+    use crate::store::scan::file_reads::scan_hooks;
+
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     let o1 = Term::Literal(Literal::new_simple_literal("o1"));
     let o2 = Term::Literal(Literal::new_simple_literal("o2"));
@@ -392,10 +405,26 @@ async fn test_copy_index_file_serves_code_columns_from_the_run() {
                     Some(component),
                     "{rows} {p:?} {o:?}"
                 );
+                // At 900 rows the (p, o) and o runs (43 and 129 rows, from
+                // child rows 343 and 258) are within the cap; p's (300) is not.
                 let pending = selection_pending(&served);
-                if rows == 9_000 {
-                    assert!(pending, "{p:?} {o:?}: a wide run defers its ids");
-                }
+                assert_eq!(
+                    pending,
+                    rows == 9_000 || o.is_none(),
+                    "{rows} {p:?} {o:?}: only a run past the cap defers its ids"
+                );
+                let scans = scan_hooks::scans();
+                let strings = view_strings(&served).await;
+                assert_eq!(
+                    scan_hooks::scans() - scans,
+                    usize::from(pending),
+                    "{rows} {p:?} {o:?}: a run within the cap is served without a scan"
+                );
+                assert_eq!(
+                    strings,
+                    view_strings(&in_memory.match_pattern(None, p, o, None).await.unwrap()).await,
+                    "{rows} {p:?} {o:?}"
+                );
                 let reads = file.debug_located_rid_reads().unwrap();
                 let codes = sorted_code_rows(&served).await;
                 assert_eq!(
@@ -825,6 +854,8 @@ async fn test_reference_index_file_checks_sparse_residual_by_point_reads() {
 /// - the row ids requested from the located run (the read counter) grow by
 ///   exactly the window's size — so by none for an empty window, which is no
 ///   limit, or an offset at or past the run's end;
+/// - a read within the point-read cap takes the run's ids by point reads, a
+///   wider one by one rid-only scan, wherever the run sits in its child;
 /// - the pending view the window is also taken beside keeps its own ids
 ///   unread;
 /// - a count, capped or not, asks for no id.
@@ -835,11 +866,14 @@ pub(super) async fn assert_windows_read_only_their_rows(
     width: usize,
     windows: &[(usize, usize)],
 ) {
+    use crate::store::view::selection::POINT_GATHER_MAX_ROWS;
     use crate::store::{IdsNeed, Probe};
     let reads = || store.debug_located_rid_reads().unwrap();
+    let scans = || store.debug_located_rid_scans().unwrap();
     let probe = Probe::new(None, p.cloned(), o.cloned(), None);
     let span =
         |offset: usize, limit: usize| (offset.min(width), offset.saturating_add(limit).min(width));
+    let scans_before = scans();
     let all = store
         .match_pattern(None, p, o, None)
         .await
@@ -849,6 +883,11 @@ pub(super) async fn assert_windows_read_only_their_rows(
         .unwrap()
         .unwrap();
     assert_eq!(all[0].len(), width);
+    assert_eq!(
+        scans() - scans_before,
+        usize::from(width > POINT_GATHER_MAX_ROWS),
+        "the run's {width} ids"
+    );
 
     // A count asks for no id, capped or not.
     let before = reads();
@@ -871,7 +910,7 @@ pub(super) async fn assert_windows_read_only_their_rows(
     assert_eq!(pending.debug_row_ids_materialized(), Some(false));
     for &(offset, limit) in windows {
         let (from, to) = span(offset, limit);
-        let before = reads();
+        let (before, scans_before) = (reads(), scans());
         let window = store
             .run_probe(&probe.clone().window(offset, Some(limit)))
             .await
@@ -880,6 +919,11 @@ pub(super) async fn assert_windows_read_only_their_rows(
             reads() - before,
             to - from,
             "({offset}, {limit}) reads exactly its own rows"
+        );
+        assert_eq!(
+            scans() - scans_before,
+            usize::from(to - from > POINT_GATHER_MAX_ROWS),
+            "({offset}, {limit}) scans only past the point-read cap"
         );
         // The same window taken beside the pending view leaves its ids unread.
         let beside = pending.window(offset, limit).await.unwrap();

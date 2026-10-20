@@ -1309,6 +1309,33 @@ mod links_and_permissions {
         assert_eq!(entries(dir.path()), vec![path.clone()]);
     }
 
+    /// A file removed since the store opened it is no other file: compaction
+    /// writes the store's rows to the path again, and leaves nothing else
+    /// beside them.
+    #[tokio::test]
+    async fn test_compacting_a_store_whose_file_was_removed_writes_it_again() {
+        let quads = modular_quads(12, 3, 4);
+        let (dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let extra = make_quad(
+            "http://example.org/s99",
+            "http://example.org/p0",
+            "object 9",
+            GraphName::DefaultGraph,
+        );
+        let tailed = store.add_quad(extra.clone()).await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let compacted = tailed.compact().await.unwrap();
+
+        let mut want = quads;
+        want.push(extra);
+        assert_eq!(view_strings(&compacted).await, quad_strings(&want));
+        let reopened = VortexRdfStore::from_file(&path).await.unwrap();
+        assert_eq!(view_strings(&reopened).await, quad_strings(&want));
+        assert_eq!(entries(dir.path()), vec![path.clone()]);
+    }
+
     /// The append that crosses the auto-compaction threshold does not take
     /// the refusal for the writer's "unwritable": it comes back as the error
     /// it is, and the rebuilt file is untouched.

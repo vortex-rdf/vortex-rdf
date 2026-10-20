@@ -383,8 +383,16 @@ impl VortexRdfStore {
             // layouts' `VarBinView` subjects.
             let cached = probes.by_name(base, schema::COL_S).flatten();
             let (lo, hi) = match (cached, u64::try_from(&scalar)) {
-                (Some(owned), Ok(needle)) => owned.probe().bounds(needle),
-                _ => search_sorted_bounds(s_col, &scalar)?,
+                (Some(owned), Ok(needle)) => {
+                    #[cfg(test)]
+                    crate::store::scan::typed_eq::probe_hooks::note(true);
+                    owned.probe().bounds(needle)
+                }
+                _ => {
+                    #[cfg(test)]
+                    crate::store::scan::typed_eq::probe_hooks::note(false);
+                    search_sorted_bounds(s_col, &scalar)?
+                }
             };
             selection = selection.intersect_range(lo as u64..hi as u64);
             pat.subject = None;

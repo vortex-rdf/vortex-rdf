@@ -173,6 +173,34 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(column_u32(&rows, "s"), vec![0, 4]);
         assert_eq!(column_u32(&rows, "p"), vec![0, 0]);
+
+        // Narrower columns come back at their own width: a u8 one (the
+        // TypedObject layout's kind byte) and a u16 one equal their slices.
+        let kind = Buffer::from_iter([2u8, 0, 1, 2, 3]).into_array();
+        let wide = Buffer::from_iter([7u16, 300, 9, 65_535, 0]).into_array();
+        let narrow = StructArray::try_new(
+            ["k", "w"].into(),
+            vec![kind, wide],
+            5,
+            Validity::NonNullable,
+        )
+        .unwrap()
+        .into_array();
+        let rows = gather_by_point_reads(&narrow, &selection, Some(&deleted), None)
+            .unwrap()
+            .expect("u8 and u16 columns are read by point reads");
+        let column = |name: &str| {
+            let sa = rows.clone().try_downcast::<Struct>().unwrap();
+            sa.unmasked_field_by_name(name)
+                .unwrap()
+                .clone()
+                .try_downcast::<Primitive>()
+                .unwrap()
+        };
+        assert_eq!(column("k").as_slice::<u8>(), &[2, 3]);
+        assert_eq!(column("w").as_slice::<u16>(), &[7, 0]);
+        // A type no point read produces (no probe reads a signed column).
+        assert!(primitive_from_u64_reads(PType::I32, [1u64].into_iter()).is_none());
     }
 
     /// A child no probe resolves (a string column) declines the whole read —

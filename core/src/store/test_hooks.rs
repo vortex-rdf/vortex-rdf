@@ -217,6 +217,16 @@ impl VortexRdfStore {
             as_struct(base).is_some_and(|base| debug_sorted_children_probe_resolvable(&base))
         })
     }
+
+    /// Whether the named in-memory component's probe cache has resolved its
+    /// columns: at construction, or at a deferred component's first use.
+    /// `None` when this store holds no such in-memory component.
+    pub(crate) fn debug_index_component_probes_resolved(&self, name: &str) -> Option<bool> {
+        self.in_memory_components()?
+            .iter()
+            .find(|c| c.identity.name == name)
+            .map(IndexComponent::probes_resolved)
+    }
 }
 
 #[cfg(feature = "file-io")]
@@ -286,6 +296,14 @@ impl VortexRdfStore {
         self.quads
             .file()
             .map(|base| base.file.debug_located_rid_reads())
+    }
+
+    /// How many of those reads were rid-only scans of the run instead of
+    /// point reads, on this file handle; `None` off-file.
+    pub(crate) fn debug_located_rid_scans(&self) -> Option<usize> {
+        self.quads
+            .file()
+            .map(|base| base.file.debug_located_rid_scans())
     }
 
     /// The exact row range the located-run kernel computes for the subject

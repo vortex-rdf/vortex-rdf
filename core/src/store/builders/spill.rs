@@ -639,17 +639,29 @@ mod tests {
 
     #[test]
     fn temp_runs_guard_falls_back_when_the_output_name_is_too_long() {
-        // `.<output>.spill-<uuid>` would be 294 bytes, past what a file name
-        // may be: the directory takes the name a build without an output has.
-        let long = "x".repeat(250);
-        let guard = TempRunsGuard::create(Some(OsStr::new(&long)), None).unwrap();
-        let dir = guard.path();
-        assert!(dir.is_dir());
-        let name = dir.file_name().unwrap().to_str().unwrap();
-        let id = name
-            .strip_prefix(".vortex-rdf.spill-")
-            .unwrap_or_else(|| panic!("{name} does not start with .vortex-rdf.spill-"));
-        assert!(uuid::Uuid::parse_str(id).is_ok(), "{name}");
+        // `.<output>.spill-<uuid>` is the output's length plus 44 bytes: a
+        // 211-byte output makes a name of 255 bytes, as long as a file name
+        // may be, and a longer one (212, and 250: 294 bytes) takes the name a
+        // build without an output has.
+        for (len, fits) in [(211, true), (212, false), (250, false)] {
+            let output = "x".repeat(len);
+            let guard = TempRunsGuard::create(Some(OsStr::new(&output)), None).unwrap();
+            let dir = guard.path();
+            assert!(dir.is_dir(), "{len}");
+            let name = dir.file_name().unwrap().to_str().unwrap();
+            let prefix = if fits {
+                format!(".{output}.spill-")
+            } else {
+                ".vortex-rdf.spill-".to_owned()
+            };
+            let id = name
+                .strip_prefix(prefix.as_str())
+                .unwrap_or_else(|| panic!("{len}: {name} does not start with {prefix}"));
+            assert!(uuid::Uuid::parse_str(id).is_ok(), "{len}: {name}");
+            if fits {
+                assert_eq!(name.len(), MAX_NAME_BYTES, "{len}");
+            }
+        }
     }
 
     #[test]

@@ -208,8 +208,10 @@ impl<'a> TypedEq<'a> {
     }
 }
 
-/// Test hook: how this thread's typed scans bound their probe-read columns —
-/// through a probe the store had cached, or one resolved for the scan.
+/// Test hook: how this thread's typed scans bound their probe-read columns,
+/// and how its in-memory sorted searches (the prefix probe's subject search,
+/// an index component's run search) read theirs — through a probe the store
+/// had cached, or searched for the call.
 #[cfg(test)]
 pub(crate) mod probe_hooks {
     use std::cell::Cell;
@@ -219,14 +221,15 @@ pub(crate) mod probe_hooks {
         static RESOLVED: Cell<usize> = const { Cell::new(0) };
     }
 
-    /// Record one probe-read column bound from the cache, or resolved.
-    pub(super) fn note(cached: bool) {
+    /// Record one probe-read column bound or searched through the cache, or
+    /// for the call.
+    pub(crate) fn note(cached: bool) {
         let cell = if cached { &CACHED } else { &RESOLVED };
         cell.with(|c| c.set(c.get() + 1));
     }
 
-    /// The `(cached, resolved)` probe binds on this thread so far.
-    #[cfg(feature = "file-io")]
+    /// The `(cached, resolved)` probe binds and searches on this thread so
+    /// far.
     pub(crate) fn binds() -> (usize, usize) {
         (CACHED.with(Cell::get), RESOLVED.with(Cell::get))
     }

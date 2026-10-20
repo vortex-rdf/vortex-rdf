@@ -265,6 +265,60 @@ async fn assert_windows_match_slicing(store: &VortexRdfStore, tag: &str) {
     }
 }
 
+/// Inside a subject run of width 8, a range keep on `p` and a set of one code
+/// (one bounded search of ⌊log2 8⌋ + 1 = 4 steps, fewer than the run's rows;
+/// a code inside the run, and its last row, which ends the search) are
+/// answered by binary search inside the run; a set of two codes (8 steps)
+/// takes the pass over the run. Every keep equals brute force.
+async fn assert_sorted_run_keeps_engage(indexes: Indexes, tag: &str) {
+    use crate::store::query::narrowing::narrow_hooks::sorted_run_keeps;
+    let quads: Vec<Quad> = (0..64)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/s{}", i / 8),
+                &format!("http://example.org/p{}", i % 8),
+                &format!("o{}", i % 3),
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    let store = VortexRdfStore::from_quads(quad_stream(quads), LayoutStrategy::Dictionary, indexes)
+        .await
+        .unwrap();
+    let s3 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s3").unwrap());
+    let run = store
+        .match_pattern(Some(&s3), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(run.debug_selection_range(), Some(24..32), "{tag}");
+    let rows = row_set(&run).await;
+    let dict = store.dict_reader().unwrap();
+    let mut p = Vec::new();
+    for i in 0..8 {
+        let term = format!("<http://example.org/p{i}>");
+        p.push(dict.encode(&term).await.unwrap().unwrap());
+    }
+    for (keep, searched) in [
+        (Keep::range(p[2]..p[5]), true),
+        (Keep::set([p[4]]), true),
+        (Keep::set([p[7]]), true),
+        (Keep::set([p[1], p[6]]), false),
+    ] {
+        let before = sorted_run_keeps();
+        let narrowed = run.keep(QuadColumn::P, &keep).await.unwrap();
+        assert_eq!(
+            sorted_run_keeps() - before,
+            usize::from(searched),
+            "{tag}: keep {keep:?}"
+        );
+        assert_eq!(
+            row_set(&narrowed).await,
+            brute_keep(&rows, QuadColumn::P, &keep),
+            "{tag}: keep {keep:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_keep_in_memory_matches_brute_force() {
     for (tag, indexes) in [
@@ -272,8 +326,36 @@ async fn test_keep_in_memory_matches_brute_force() {
         ("copy", vec![IndexType::SecondaryByCopy]),
         ("reference", vec![IndexType::SecondaryByReference]),
     ] {
-        let store = memory_store(indexes).await;
+        let store = memory_store(indexes.clone()).await;
         assert_keeps_match_brute_force(&store, tag).await;
+        assert_sorted_run_keeps_engage(indexes, tag).await;
+    }
+}
+
+/// A keep on a column with neither a canonical primitive nor a probe to read
+/// in place (the per-chunk references of [`unprobed_object_store`]'s `o`)
+/// decodes the column at the view's selected rows once and tests those:
+/// every keep on `o`, of the whole store and of a predicate-bound view,
+/// equals brute force.
+#[tokio::test]
+async fn test_keep_on_a_column_no_probe_reads_decodes_the_selection() {
+    let store = unprobed_object_store().await;
+    assert_eq!(store.debug_base_child_int_canonical("o"), Some(false));
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let by_p = store
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    for (tag, view) in [("whole", store.clone()), ("p-bound", by_p)] {
+        let rows = row_set(&view).await;
+        for keep in keeps_for(&store, QuadColumn::O).await {
+            let narrowed = view.keep(QuadColumn::O, &keep).await.unwrap();
+            assert_eq!(
+                row_set(&narrowed).await,
+                brute_keep(&rows, QuadColumn::O, &keep),
+                "{tag}: keep {keep:?}"
+            );
+        }
     }
 }
 

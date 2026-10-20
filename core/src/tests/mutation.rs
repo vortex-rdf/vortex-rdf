@@ -520,6 +520,21 @@ async fn test_delete_matching_spans_base_and_tail() {
         quad_strings(&remaining),
         expected_strings(&quads, |i| i % 3 != 0)
     );
+
+    // A view whose tail selects nothing (p1 is on base rows only) adds no
+    // tail row to a second match, even one the tail row itself would answer.
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let by_p1 = tailed
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    let object9 = Term::Literal(Literal::new_simple_literal("object 9"));
+    let none = by_p1
+        .match_pattern(None, None, Some(&object9), None)
+        .await
+        .unwrap();
+    assert_eq!(none.size().await.unwrap(), 0);
+    assert!(none.quads_vec().await.unwrap().is_empty());
 }
 
 /// `add_quads` follows RDF/JS dataset (set) semantics: a quad equal to an

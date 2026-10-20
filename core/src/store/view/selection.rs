@@ -782,6 +782,13 @@ mod tests {
             as_vec(&RowSelection::Ids(ids(&[2, 5, 6, 7])).window(1, 5, Some(&deleted), 10)),
             vec![7]
         );
+        // A selection of no row splits into no piece: the empty range, and
+        // an empty id list (what narrowing an id list to a disjoint range
+        // leaves).
+        assert!(RowSelection::empty().split(4, 10).is_empty());
+        let disjoint = RowSelection::Ids(ids(&[1, 4])).intersect_range(5..9);
+        assert!(matches!(&disjoint, RowSelection::Ids(ids) if ids.is_empty()));
+        assert!(disjoint.split(4, 10).is_empty());
     }
 
     #[test]

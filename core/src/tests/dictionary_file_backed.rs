@@ -695,11 +695,13 @@ async fn test_dictionary_native_file_roundtrip() {
 /// An empty Dictionary store still writes (and reopens through) the
 /// dictionary segment — the key's presence is unconditional for the layout.
 /// Its dictionary, opened from the file every way or built in memory,
-/// answers as an empty one.
+/// answers as an empty one, and a bound predicate matches nothing, as it
+/// does on an empty file of the other layouts.
 #[tokio::test]
 async fn test_dictionary_empty_store_roundtrip() {
     use crate::store::{RowCountHint, TermPredicate};
 
+    let p0 = NamedNode::new("http://example.org/p0").unwrap();
     let (_dir, path) = write_store_file(Vec::new(), LayoutStrategy::Dictionary, vec![]).await;
     let built = built_store(Vec::new(), LayoutStrategy::Dictionary, vec![]).await;
     assert!(
@@ -739,6 +741,24 @@ async fn test_dictionary_empty_store_roundtrip() {
         let stats = store.view_statistics().unwrap();
         assert_eq!(stats.rows, RowCountHint::exact(0), "{tag}");
         assert_eq!(stats.code_bounds, [None; 4], "{tag}");
+        assert_eq!(
+            matched_size(store, None, Some(&p0), None, None).await,
+            0,
+            "{tag}"
+        );
+    }
+
+    // The same empty file under the string layouts, which compile a bound
+    // term to a filter instead of looking it up: the file's empty row count
+    // prunes it to no row.
+    for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
+        let (_dir, path) = write_store_file(Vec::new(), layout, vec![]).await;
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        assert_eq!(
+            matched_size(&store, None, Some(&p0), None, None).await,
+            0,
+            "{layout:?}"
+        );
     }
 }
 

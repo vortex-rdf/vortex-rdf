@@ -457,6 +457,42 @@ async fn test_from_parts_adopts_searchable_children() {
         1
     );
 
+    // A sorted column in an encoding no probe reads (a reference per chunk):
+    // adoption decodes it and keeps its stamp, so a bound subject is still
+    // one searched row range, answering as the built store does.
+    let decoded = VortexRdfStore::from_parts(crate::store::StoreParts {
+        built: chunk_referenced_build("s").await,
+    })
+    .unwrap();
+    assert!(decoded.debug_base_probe_resolvable());
+    assert_eq!(decoded.debug_base_child_int_canonical("s"), Some(true));
+    assert_eq!(
+        decoded.view_statistics().unwrap().sort_order,
+        Some(SortOrder::Spog)
+    );
+    let reference = built_store(fixture_quads(), LayoutStrategy::Dictionary, vec![]).await;
+    for i in [0, 17, 2_999] {
+        let subject = subject_node(i, 4);
+        let got = decoded
+            .match_pattern(Some(&subject), None, None, None)
+            .await
+            .unwrap();
+        assert!(got.debug_selection_range().is_some(), "s{i}: searched");
+        let want = reference
+            .match_pattern(Some(&subject), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(view_strings(&got).await, view_strings(&want).await, "s{i}");
+    }
+    // An unsorted column in such an encoding is decoded too: `from_parts`
+    // leaves no integer column without a probe or a primitive.
+    let decoded = VortexRdfStore::from_parts(crate::store::StoreParts {
+        built: chunk_referenced_build("o").await,
+    })
+    .unwrap();
+    assert_eq!(decoded.debug_base_child_int_canonical("o"), Some(true));
+    assert_eq!(view_strings(&decoded).await, view_strings(&reference).await);
+
     // Rows with no sorted provenance (reversed, rotated): adoption must not
     // invent a stamp they never earned.
     let quads_unsorted = {

@@ -411,6 +411,46 @@ fn component_names(built: &BuiltArray) -> Vec<&'static str> {
     built.components.iter().map(|c| c.identity.name).collect()
 }
 
+/// One `val` of a reference child: a term code under the Dictionary layout,
+/// the term's N-Triples string under the others.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Val {
+    Code(TermCode),
+    Term(String),
+}
+
+/// A reference child's rows as `(val, rid)` pairs, in the child's row order:
+/// what its order contract, strictly ascending pairs, is checked on.
+fn reference_pairs(
+    component: &crate::store::indexes::IndexComponent,
+) -> Vec<(Val, crate::store::RowId)> {
+    use crate::store::array::{StrColReader, field_as};
+    use vortex_array::VortexSessionExecute as _;
+    use vortex_array::arrays::struct_::StructArrayExt as _;
+    use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
+
+    let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
+    let rows = component.rows().unwrap();
+    let rid: PrimitiveArray = field_as(rows, "rid", &mut ctx).unwrap();
+    let val = rows.unmasked_field_by_name("val").unwrap();
+    let vals: Vec<Val> = if matches!(val.dtype(), vortex_array::dtype::DType::Utf8(_)) {
+        let col: VarBinViewArray = field_as(rows, "val", &mut ctx).unwrap();
+        let reader = StrColReader::new(&col);
+        (0..col.len())
+            .map(|i| Val::Term(reader.str_at(i).unwrap().to_owned()))
+            .collect()
+    } else {
+        let col: PrimitiveArray = field_as(rows, "val", &mut ctx).unwrap();
+        col.as_slice::<TermCode>()
+            .iter()
+            .map(|&c| Val::Code(c))
+            .collect()
+    };
+    vals.into_iter()
+        .zip(rid.as_slice::<crate::store::RowId>().iter().copied())
+        .collect()
+}
+
 /// Sorted subject strings of every quad a store exposes.
 async fn subjects_of(store: &VortexRdfStore) -> Vec<String> {
     let mut got: Vec<String> = store
@@ -874,6 +914,69 @@ async fn multi_chunk_file() -> (tempfile::TempDir, VortexRdfStore) {
     .await;
     let (dir, path) = temp_store_file(bytes);
     (dir, VortexRdfStore::from_file(&path).await.unwrap())
+}
+
+/// [`fixture_quads`] built under the Dictionary layout, with the base's
+/// `column` encoded with a reference per 1,024-value chunk
+/// (`fastlanes.for.v2`), its sorted stamp kept: an encoding no probe reads.
+/// `from_built` leaves such a column as it is, so it has neither a canonical
+/// primitive nor a probe; `from_parts` decodes it.
+async fn chunk_referenced_build(column: &str) -> BuiltArray {
+    use crate::store::array::{column_is_sorted, stamp_is_sorted};
+    use vortex::encodings::fastlanes::FoR;
+    use vortex_array::arrays::struct_::StructArrayExt as _;
+    use vortex_array::arrays::{PrimitiveArray, StructArray};
+    use vortex_array::{IntoArray as _, VortexSessionExecute as _};
+
+    let mut built = build_array::<SortedInMemoryBuilder>(
+        quad_stream(fixture_quads()),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await
+    .unwrap();
+    let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
+    let base = built
+        .array
+        .clone()
+        .execute::<StructArray>(&mut ctx)
+        .unwrap();
+    let names = base.names().clone();
+    let children: Vec<vortex_array::ArrayRef> = names
+        .iter()
+        .map(|name| {
+            let child = base.unmasked_field_by_name(name.as_ref()).unwrap().clone();
+            if name.as_ref() != column {
+                return child;
+            }
+            let sorted = column_is_sorted(&child);
+            let codes = child.execute::<PrimitiveArray>(&mut ctx).unwrap();
+            let encoded = FoR::encode_chunked(codes, &mut ctx).unwrap().into_array();
+            assert!(
+                vortex_rdf_encoded_search::SortedProbe::resolve(&encoded).is_none(),
+                "no probe reads per-chunk references"
+            );
+            if sorted {
+                stamp_is_sorted(&encoded);
+            }
+            encoded
+        })
+        .collect();
+    built.array = StructArray::try_new(
+        names,
+        children,
+        base.len(),
+        vortex_array::validity::Validity::NonNullable,
+    )
+    .unwrap()
+    .into_array();
+    built
+}
+
+/// [`chunk_referenced_build`] of the `o` column adopted by `from_built`: a
+/// store whose `o` has neither a canonical primitive nor a probe.
+async fn unprobed_object_store() -> VortexRdfStore {
+    VortexRdfStore::from_built(chunk_referenced_build("o").await).unwrap()
 }
 
 /// The row tuples of a view's gathered codes, in the order gathered.

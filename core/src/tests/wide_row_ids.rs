@@ -15,13 +15,12 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
 use super::*;
-use crate::store::array::{StrColReader, field_as};
+use crate::store::array::field_as;
 use crate::store::builders::sorted_stream;
 use crate::store::test_hooks::RowIdBase;
 use crate::store::{Probe, RowId, StoreParts};
 use vortex_array::VortexSessionExecute as _;
-use vortex_array::arrays::struct_::StructArrayExt as _;
-use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
+use vortex_array::arrays::PrimitiveArray;
 
 /// The first row id: past `u32::MAX`, and congruent to 5 modulo 2^32, so an
 /// id narrowed to 32 bits becomes a small number — a row of an unhooked store
@@ -234,14 +233,6 @@ async fn check_store(store: &VortexRdfStore, quads: &[Quad], label: &str) {
     );
 }
 
-/// One `val` of a reference child: a term code under the Dictionary layout,
-/// the term's N-Triples string under the others.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Val {
-    Code(TermCode),
-    Term(String),
-}
-
 /// What the index children of `parts` record, checked against a store of
 /// [`N`] rows numbered from `base`: each child's row ids are `base..base + N`,
 /// each once, and a reference child's rows are in `(val, rid)` order. Returns
@@ -268,21 +259,7 @@ fn check_children(parts: &StoreParts, base: RowId, label: &str) -> usize {
         if !component.identity.name.starts_with("index:ref-") {
             continue;
         }
-        let val = rows.unmasked_field_by_name("val").unwrap();
-        let vals: Vec<Val> = if matches!(val.dtype(), vortex_array::dtype::DType::Utf8(_)) {
-            let col: VarBinViewArray = field_as(rows, "val", &mut ctx).unwrap();
-            let reader = StrColReader::new(&col);
-            (0..col.len())
-                .map(|i| Val::Term(reader.str_at(i).unwrap().to_owned()))
-                .collect()
-        } else {
-            let col: PrimitiveArray = field_as(rows, "val", &mut ctx).unwrap();
-            col.as_slice::<TermCode>()
-                .iter()
-                .map(|&c| Val::Code(c))
-                .collect()
-        };
-        let pairs: Vec<(Val, RowId)> = vals.into_iter().zip(rids.iter().copied()).collect();
+        let pairs = reference_pairs(component);
         assert!(
             pairs.windows(2).all(|pair| pair[0] < pair[1]),
             "{who}: rows are in (val, rid) order"

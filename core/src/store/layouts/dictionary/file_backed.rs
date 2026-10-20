@@ -1731,7 +1731,8 @@ mod tests {
     /// leaves are: every leaf but the last holds exactly `zone_len` rows, the
     /// last at most that. The same zone count over leaves cut elsewhere (a
     /// foreign writer's) would hand a window the bounds of other rows, so the
-    /// bounds are read from the leaves instead.
+    /// bounds are read from the leaves instead, as they are for a table cut
+    /// at the leaves that lacks a bound column or holds a null bound.
     #[tokio::test]
     async fn zone_bounds_need_zones_cut_at_the_leaves() {
         let terms: Vec<String> = (0..400)
@@ -1786,5 +1787,65 @@ mod tests {
                 "{rows:?}"
             );
         }
+
+        // Tables cut at the leaves, as a foreign writer could leave them:
+        // without the maximum, without the minimum, or with a null bound. No
+        // bounds come from them, and the leaves give the open the same bounds
+        // the zones did.
+        use vortex_array::IntoArray as _;
+        use vortex_file::WriteOptionsSessionExt as _;
+        let names: Vec<String> = window_bound_aggregates()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let (max, min) = (names[0].as_str(), names[1].as_str());
+        let firsts =
+            || VarBinViewArray::from_iter_str((0..4).map(|w| terms[w * 100].as_str())).into_array();
+        let lasts = |null: Option<usize>| {
+            VarBinViewArray::from_iter_nullable_str(
+                (0..4).map(|w| (Some(w) != null).then(|| terms[w * 100 + 99].as_str())),
+            )
+            .into_array()
+        };
+        for columns in [
+            vec![(min, firsts())],
+            vec![(max, lasts(None))],
+            vec![(max, lasts(Some(2))), (min, firsts())],
+        ] {
+            let (fields, arrays): (Vec<&str>, Vec<_>) = columns.into_iter().unzip();
+            let table = StructArray::try_new(
+                fields.into(),
+                arrays,
+                4,
+                vortex_array::validity::Validity::NonNullable,
+            )
+            .unwrap()
+            .into_array();
+            let stream = vortex_array::stream::ArrayStreamAdapter::new(
+                table.dtype().clone(),
+                futures::stream::iter([Ok(table)]),
+            );
+            let mut bytes = Vec::new();
+            VORTEX_SESSION
+                .write_options()
+                .write(&mut bytes, stream)
+                .await
+                .unwrap();
+            let file = VORTEX_SESSION
+                .open_options()
+                .open_buffer(ByteBuffer::from(bytes))
+                .unwrap();
+            let hand = Zones {
+                table: file.footer().layout().clone(),
+                zone_len: 100,
+            };
+            assert!(
+                zone_bounds(&hand, &leaves, &file.segment_source())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(leaf_bounds(&leaves, &source).await.unwrap(), bounds);
     }
 }

@@ -588,6 +588,46 @@ mod tests {
         assert_eq!(p("num_eq", "5").eval(&typed("5.0", DEC)), Verdict::True);
         assert_eq!(p("num_ne", "5").eval(&typed("5.0", DEC)), Verdict::False);
         assert_eq!(p("num_eq", "1e2").eval(&typed("100", INT)), Verdict::True);
+        // Float lexical forms the grammar rejects, and one past `f64`'s
+        // range, have no value; a negative float has its sign.
+        for lex in ["1e", "1e+", "1ex", "1e1.5", "1e999"] {
+            assert_eq!(lt5.eval(&typed(lex, DBL)), Verdict::Unknown, "{lex:?}");
+        }
+        assert_eq!(lt5.eval(&typed("-6.5e0", DBL)), Verdict::True);
+        assert_eq!(
+            p("num_gt", "-6").eval(&typed("-6.5e0", DBL)),
+            Verdict::False
+        );
+        // A float against a decimal without fractional digits compares as
+        // against an integer; a decimal against a fractional float has no
+        // exact comparison here.
+        assert_eq!(p("num_lt", "5.").eval(&typed("4.5e0", DBL)), Verdict::True);
+        assert_eq!(p("num_gt", "5.").eval(&typed("4.5e0", DBL)), Verdict::False);
+        assert_eq!(
+            p("num_lt", "4.5e0").eval(&typed("4.25", DEC)),
+            Verdict::Unknown
+        );
+    }
+
+    /// A numeric predicate's constant hashes by its value, in every model
+    /// (integer, decimal, float): equal constants are one set entry,
+    /// different ones two.
+    #[test]
+    fn numeric_predicates_hash_by_value() {
+        let number = |arg: &str| match p("num_eq", arg) {
+            TermPredicate::Num(_, number) => number,
+            other => panic!("{other:?}"),
+        };
+        let set: std::collections::HashSet<Number> =
+            ["5", "5", "6", "1.5", "1.5", "2.5", "1e3", "1e3", "2e3"]
+                .map(number)
+                .into_iter()
+                .collect();
+        assert_eq!(set.len(), 6);
+        for arg in ["5", "1.5", "1e3"] {
+            assert!(set.contains(&number(arg)), "{arg}");
+        }
+        assert!(!set.contains(&number("7")));
     }
 
     #[test]
@@ -1097,6 +1137,30 @@ mod tests {
                         "{predicate} passed {spelling:?}"
                     );
                 }
+            }
+        }
+
+        // The kinds that read a literal's parts leave a literal spelling that
+        // does not parse undecided; an IRI or a blank node is no literal.
+        for predicate in [
+            p("datatype", INT),
+            p("lang", "en"),
+            p("lang_matches", "*"),
+            p("num_eq", "5"),
+        ] {
+            for spelling in ["\"abc", "\"abc\"^^", "\"abc\"^^xsd:integer"] {
+                assert_eq!(
+                    predicate.eval(spelling),
+                    Verdict::Unknown,
+                    "{predicate} on {spelling:?}"
+                );
+            }
+            for spelling in ["<http://x>", "_:b"] {
+                assert_eq!(
+                    predicate.eval(spelling),
+                    Verdict::False,
+                    "{predicate} on {spelling:?}"
+                );
             }
         }
     }

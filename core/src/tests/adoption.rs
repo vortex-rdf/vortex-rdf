@@ -35,13 +35,25 @@ async fn test_default_fixture_adopts() {
 
 /// The Dictionary fixture opens with both index families, decodes to its
 /// quads, serves a predicate match through its by-copy index, and hands out
-/// a resident dictionary snapshot holding every distinct term.
+/// a resident dictionary snapshot holding every distinct term. Its
+/// components are adopted deferred, probes unresolved, until a match first
+/// uses one, which then searches through the probes it resolved.
 #[tokio::test]
 async fn test_dictionary_fixture_adopts() {
+    use crate::store::scan::typed_eq::probe_hooks;
+
     let quads = dictionary_test_quads();
     let store = VortexRdfStore::from_bytes(DICTIONARY_FIXTURE)
         .await
         .unwrap();
+    let components = ["index:posg", "index:ospg", "index:ref-o", "index:ref-p"];
+    for name in components {
+        assert_eq!(
+            store.debug_index_component_probes_resolved(name),
+            Some(false),
+            "{name}"
+        );
+    }
     assert_eq!(store.layout(), LayoutStrategy::Dictionary);
     assert_eq!(
         store.indexes(),
@@ -51,10 +63,20 @@ async fn test_dictionary_fixture_adopts() {
     assert_eq!(view_strings(&store).await, quad_strings(&quads));
 
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let (cached, resolved) = probe_hooks::binds();
     let served = store
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
+    let after = probe_hooks::binds();
+    assert!(after.0 > cached && after.1 == resolved, "{after:?}");
+    for name in components {
+        assert_eq!(
+            store.debug_index_component_probes_resolved(name),
+            Some(name == "index:posg"),
+            "{name}: resolved at its first use"
+        );
+    }
     assert_eq!(
         served_component(&served),
         Some("index:posg"),

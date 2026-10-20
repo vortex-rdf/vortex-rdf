@@ -151,6 +151,8 @@ pub(crate) async fn read_located_rids(
     {
         return Ok(ids);
     }
+    #[cfg(test)]
+    file.note_located_rid_scan();
     scan_located_row_ids(child, range).await
 }
 
@@ -409,11 +411,13 @@ pub(crate) struct FileServePlan {
 /// call) outweighs what spreading the decode buys.
 const SERVE_SPLIT_MIN_ROWS: u64 = 1024;
 
-/// Rows per split for a located run of `rows`: enough splits to hand every
-/// worker a couple, never fewer than [`SERVE_SPLIT_MIN_ROWS`] rows each.
-fn run_split_rows(rows: u64) -> usize {
-    let workers = crate::io::read::available_parallelism() as u64;
-    rows.div_ceil(2 * workers).max(SERVE_SPLIT_MIN_ROWS) as usize
+/// Rows per split for the located run of child rows `range`: enough splits to
+/// hand each of `workers` a couple, never fewer than [`SERVE_SPLIT_MIN_ROWS`]
+/// rows each.
+fn run_split_rows(range: &Range<u64>, workers: u64) -> usize {
+    (range.end - range.start)
+        .div_ceil(2 * workers)
+        .max(SERVE_SPLIT_MIN_ROWS) as usize
 }
 
 impl FileServePlan {
@@ -514,7 +518,8 @@ impl FileServePlan {
             return Ok(None);
         };
         let (projection, _) = self.bound_exprs()?;
-        let split_rows = run_split_rows(range.end - range.start);
+        let workers = crate::io::read::available_parallelism() as u64;
+        let split_rows = run_split_rows(&range, workers);
         Ok(Some(
             self.child_scan()
                 .with_projection(projection)
@@ -632,19 +637,29 @@ mod tests {
 
     #[test]
     fn run_split_rows_floor_and_arithmetic() {
-        // Small runs never split below the per-split floor.
-        assert_eq!(run_split_rows(100), SERVE_SPLIT_MIN_ROWS as usize);
-        assert_eq!(run_split_rows(0), SERVE_SPLIT_MIN_ROWS as usize);
+        // Small runs never split below the per-split floor, nor does a wide
+        // one shared by many workers.
+        for (range, workers) in [(0..100, 4), (5..5, 4), (10_000..20_000, 22)] {
+            assert_eq!(
+                run_split_rows(&range, workers),
+                SERVE_SPLIT_MIN_ROWS as usize,
+                "{range:?} over {workers}"
+            );
+        }
 
-        // A wide run hands every worker a couple of splits.
-        let rows = 1u64 << 20;
-        let workers = crate::io::read::available_parallelism() as u64;
-        let split = run_split_rows(rows);
-        assert_eq!(
-            split,
-            rows.div_ceil(2 * workers).max(SERVE_SPLIT_MIN_ROWS) as usize
-        );
-        assert!(split as u64 >= SERVE_SPLIT_MIN_ROWS);
-        assert!((rows as usize).div_ceil(split) as u64 <= 2 * workers + 1);
+        // A wide run hands every worker a couple of splits: its width, not
+        // where it sits, over twice the workers.
+        for (range, workers, split) in [
+            (10_000..20_000, 4, 1_250),
+            (0..1 << 20, 8, 65_536),
+            (1 << 20..1 << 21, 8, 65_536),
+            (0..1 << 20, 22, 23_832),
+        ] {
+            assert_eq!(
+                run_split_rows(&range, workers),
+                split,
+                "{range:?} over {workers}"
+            );
+        }
     }
 }

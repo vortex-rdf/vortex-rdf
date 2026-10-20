@@ -873,6 +873,8 @@ mod tests {
         let single =
             TermDictionary::from_term_chunks(vec![plain.clone().into_array()], &mut ctx).unwrap();
         assert!(matches!(single.terms.chunks[..], [TermChunk::Canonical(_)]));
+        // A canonical chunk has no FSST code offsets to point at.
+        assert_eq!(single.terms.chunks[0].offsets_addr(), None);
 
         let column = plain.into_array();
         let pieces = vec![

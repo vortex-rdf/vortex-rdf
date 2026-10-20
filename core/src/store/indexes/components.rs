@@ -240,6 +240,13 @@ impl IndexComponent {
         self.rows.cell.get().is_some()
     }
 
+    /// Whether the component's probe cache has resolved its columns yet (a
+    /// test-hook probe).
+    #[cfg(test)]
+    pub(crate) fn probes_resolved(&self) -> bool {
+        self.probes.is_resolved()
+    }
+
     /// This component with its rows materialized and passed through
     /// `transform`, held as canonical built rows under a fresh probe cache
     /// (the rebuilt rows are a different array, so the old cache's identity
@@ -344,6 +351,8 @@ impl IndexComponent {
         if let Some(owned) = self.probe(column)
             && let Ok(needle) = u64::try_from(native)
         {
+            #[cfg(test)]
+            crate::store::scan::typed_eq::probe_hooks::note(true);
             let (lo, hi) = match within {
                 None => owned.probe().bounds(needle),
                 Some(range) => owned.probe().bounds_in(range, needle),
@@ -359,6 +368,8 @@ impl IndexComponent {
             return Ok(None);
         };
         let run = col.slice(within.clone())?;
+        #[cfg(test)]
+        crate::store::scan::typed_eq::probe_hooks::note(false);
         let (lo, hi) = search_sorted_bounds(&run, &scalar)?;
         Ok(Some(within.start + lo..within.start + hi))
     }

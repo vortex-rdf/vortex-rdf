@@ -330,6 +330,8 @@ impl VortexRdfStore {
         let narrowed =
             match Self::keep_sorted_run(&struct_arr, base, probes, &selection, column, keep) {
                 Some(narrowed) => {
+                    #[cfg(test)]
+                    narrow_hooks::note_sorted_run_keep();
                     debug::step!(
                         t,
                         "[keep] {:?} narrowed by binary search inside a sorted run",
@@ -577,6 +579,28 @@ const LOCATED_SET_ROWS_PER_CODE: usize = 16;
 #[cfg(feature = "file-io")]
 fn set_is_located(codes: usize, rows: usize) -> bool {
     codes <= rows.div_ceil(LOCATED_SET_ROWS_PER_CODE)
+}
+
+/// Test hook: how many of this thread's in-memory keeps were answered by
+/// binary search inside a sorted run (`keep_sorted_run`), not by a pass
+/// over the selected rows.
+#[cfg(test)]
+pub(crate) mod narrow_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SORTED_RUN_KEEPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Record one keep answered inside a sorted run.
+    pub(super) fn note_sorted_run_keep() {
+        SORTED_RUN_KEEPS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// The keeps answered inside a sorted run on this thread so far.
+    pub(crate) fn sorted_run_keeps() -> usize {
+        SORTED_RUN_KEEPS.with(Cell::get)
+    }
 }
 
 #[cfg(test)]

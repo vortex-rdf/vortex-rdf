@@ -90,6 +90,10 @@ pub(crate) struct NativeStoreFile {
     /// rows).
     #[cfg(test)]
     located_rid_reads: std::sync::atomic::AtomicUsize,
+    /// How many of those reads were rid-only scans rather than point reads
+    /// (test hook: pins that a narrow run is point-read wherever it sits).
+    #[cfg(test)]
+    located_rid_scans: std::sync::atomic::AtomicUsize,
 }
 
 /// The readers of one opened file: the quad table's root reader and one
@@ -361,6 +365,8 @@ impl NativeStoreFile {
             column_streams: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             located_rid_reads: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            located_rid_scans: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -404,6 +410,22 @@ impl NativeStoreFile {
     #[cfg(test)]
     pub(crate) fn debug_located_rid_reads(&self) -> usize {
         self.located_rid_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record one read of a located run's row ids by a rid-only scan (test
+    /// hook).
+    #[cfg(test)]
+    pub(crate) fn note_located_rid_scan(&self) {
+        self.located_rid_scans
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many reads of located runs' row ids were rid-only scans on this
+    /// handle (test hook).
+    #[cfg(test)]
+    pub(crate) fn debug_located_rid_scans(&self) -> usize {
+        self.located_rid_scans
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
