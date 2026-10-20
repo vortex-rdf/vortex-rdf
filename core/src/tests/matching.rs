@@ -485,7 +485,6 @@ async fn test_derived_view_does_not_lose_base_rows() {
 /// the probes the store resolved for its base, so a match resolves none: a
 /// reference index answers `o` of `(?, p, o)` by searching its component's
 /// cached probe, and `p` is read at its rows through the base's.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_in_memory_residual_reads_through_the_store_probes() {
     use crate::store::scan::typed_eq::probe_hooks;
@@ -524,7 +523,6 @@ async fn test_in_memory_residual_reads_through_the_store_probes() {
 /// every bound prefix of the sort order is one exact row range and leaves no
 /// filter, with and without secondary indexes. The prefix ends at the first
 /// unbound role, whose bound successors stay a filter over the run.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_file_prefix_probe_resolves_bound_prefixes_to_ranges() {
     let (s, p, o, g) = prefix_terms();

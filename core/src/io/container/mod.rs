@@ -59,9 +59,9 @@ pub(crate) const INDEX_VERSION: u32 = 1;
 pub(crate) use layout::newer_root_id_at;
 #[cfg(feature = "file-io")]
 pub(crate) use layout::quad_source;
-#[cfg(all(test, feature = "file-io"))]
+#[cfg(test)]
 pub(crate) use layout::store_metadata_of_bytes;
-#[cfg(all(test, feature = "file-io"))]
+#[cfg(test)]
 pub(crate) use layout::subtree_bytes;
 pub(crate) use layout::{
     RdfStoreLayoutVTable, component_child, is_native_file, newer_root_id, register,
@@ -71,7 +71,7 @@ pub(crate) use sources::default_child_strategy;
 pub(crate) use sources::{
     BufferedComponentSource, NativeComponentWrite, child_strategy, dict_child_strategy,
 };
-#[cfg(all(test, feature = "file-io"))]
+#[cfg(test)]
 pub(crate) use sources::{ONE_MEG, child_strategy_with, id_fields};
 pub(crate) use wire::{StoreComponentDescriptor, StoreComponentRole};
 pub(crate) use write::write_store;

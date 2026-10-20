@@ -121,7 +121,6 @@ async fn test_generation_and_dictionary_identity() {
         "a compaction re-encodes against a new dictionary"
     );
 
-    #[cfg(feature = "file-io")]
     {
         use std::collections::BTreeSet;
 
@@ -188,7 +187,6 @@ async fn test_generation_and_dictionary_identity() {
 
 /// `view`'s row count hint against its size: a bound the size stays within,
 /// and the size itself wherever it is exact.
-#[cfg(feature = "file-io")]
 async fn assert_rows_bound(view: &VortexRdfStore, stats: &crate::store::ViewStatistics, tag: &str) {
     let size = view.size().await.unwrap();
     assert!(
@@ -310,7 +308,6 @@ async fn test_view_statistics_in_memory() {
 /// pushed-down equality bounds its column by its code, and a served match
 /// names the index child serving it. Every open of a file describes its views
 /// as the file's own.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_view_statistics_file_backed() {
     let quads = fixture_quads();
@@ -497,7 +494,6 @@ async fn test_index_components() {
             "built {indexes:?}"
         );
     }
-    #[cfg(feature = "file-io")]
     for (tag, _dir, store) in file_stores().await {
         let indexes = match tag.split('/').nth(1) {
             Some("copy") => vec![IndexType::SecondaryByCopy],
@@ -517,7 +513,6 @@ async fn test_index_components() {
 /// source only the children whose slug it knows, and no match reaches the
 /// foreign one — a pattern only it would answer is scanned, while its known
 /// sibling still serves.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_index_components_classify_children_by_slug() {
     let quads = fixture_quads();
@@ -686,7 +681,6 @@ async fn test_partitions_in_memory() {
 
 /// Every open of a file, under each index: partitions tile each planner view,
 /// with and without tombstones — served runs, pushed-down filters and windows.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_partitions_file_backed() {
     let quads = fixture_quads();

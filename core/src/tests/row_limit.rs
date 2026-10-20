@@ -169,7 +169,6 @@ async fn the_out_of_core_merge_refuses_row_ids_past_the_top() {
         assert_reads_back(&VortexRdfStore::from_built(at).unwrap(), LIMIT, &label).await;
     }
 
-    #[cfg(feature = "file-io")]
     {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("over.vortex");

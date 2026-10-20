@@ -140,7 +140,6 @@ fn drop_graph_column(chunk: &vortex_array::ArrayRef) -> vortex_array::ArrayRef {
 /// the quad table (`None`), or the component of that name. The trailing
 /// flatbuffer length of the leaf's segment is set past the segment, so the
 /// file still opens and a read of that leaf fails to decode it.
-#[cfg(feature = "file-io")]
 fn with_damaged_leaf(bytes: &[u8], table: Option<&str>, column: &str) -> Vec<u8> {
     use crate::io::container;
     use vortex_file::OpenOptionsSessionExt as _;
@@ -287,7 +286,6 @@ async fn test_decode_chunk_reports_bad_row_at_its_position() {
     // that chunk reports the failed decode as an error, never a panic: the
     // row chunks' scan and the quads at the chunk's position, the shared
     // quads and the N-Quads export as the call's error, under each layout.
-    #[cfg(feature = "file-io")]
     for layout in LAYOUTS {
         let (_dir, path) = write_store_file(modular_quads(12, 3, 4), layout, vec![]).await;
         std::fs::write(
@@ -320,7 +318,6 @@ async fn test_decode_chunk_reports_bad_row_at_its_position() {
     // of the rows it decodes. A copy-index child's `o` leaf fails the served
     // read of a point-sized run, which the match located through the child's
     // `p` and `rid` columns.
-    #[cfg(feature = "file-io")]
     {
         use crate::io::container::DICT_COMPONENT_NAME;
         use crate::store::layouts::dictionary::storage::COL_DICT_TERM;
@@ -545,7 +542,6 @@ async fn test_export_ntriples_fast_path_and_named_graph_refusal() {
 /// the same bytes as the in-memory arm under every layout — the file-backed
 /// dictionary's codes resolved through the async read path included — with
 /// the tombstone and the tail held in memory beside the file.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_export_nquads_fast_path_file_backed() {
     for layout in LAYOUTS {

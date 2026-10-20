@@ -773,7 +773,7 @@ fn read_code_column(struct_arr: &StructArray, name: &str) -> Result<Vec<TermCode
     Ok(col.as_slice::<TermCode>().to_vec())
 }
 
-#[cfg(all(test, feature = "file-io"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

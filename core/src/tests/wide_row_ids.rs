@@ -276,7 +276,6 @@ fn check_children(parts: &StoreParts, base: RowId, label: &str) -> usize {
 
 /// The bytes of a store file the out-of-core builder writes from `quads`,
 /// its merge spilling runs of [`RUN_ROWS`] quads.
-#[cfg(feature = "file-io")]
 async fn spilled_store_bytes(
     quads: Vec<Quad>,
     layout: LayoutStrategy,
@@ -370,7 +369,6 @@ async fn row_ids_past_u32_round_trip_through_spilled_runs() {
 /// mapped open, the loaded open and `from_bytes` read them — under the
 /// Dictionary layout through located runs, whose windows read exactly their
 /// own rows by point reads inside the cap and by a range scan beyond it.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn row_ids_past_u32_round_trip_through_a_file() {
     use vortex_array::dtype::{DType, Nullability, PType};
@@ -481,7 +479,6 @@ async fn reference_children_keep_val_rid_order_across_u32_max() {
         }
     }
 
-    #[cfg(feature = "file-io")]
     {
         let p1 = iri("p1");
         let bytes = spilled_store_bytes(
@@ -540,7 +537,6 @@ async fn row_ids_past_u32_survive_compaction() {
             .unwrap();
         assert_eq!(view_strings(&shrunk).await, quad_strings(&quads), "{label}");
 
-        #[cfg(feature = "file-io")]
         {
             let (_dir, path) = write_store_file(quads.clone(), layout, indexes).await;
             let file = VortexRdfStore::from_file(&path).await.unwrap();

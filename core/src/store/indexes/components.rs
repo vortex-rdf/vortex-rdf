@@ -235,7 +235,7 @@ impl IndexComponent {
     }
 
     /// Whether the rows have been canonicalized yet (a test-hook probe).
-    #[cfg(all(test, feature = "file-io"))]
+    #[cfg(test)]
     pub(crate) fn is_materialized(&self) -> bool {
         self.rows.cell.get().is_some()
     }

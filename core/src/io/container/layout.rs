@@ -202,7 +202,7 @@ pub(crate) fn component_child(root: &RdfStoreLayout, slot: usize) -> VortexResul
 
 /// Test-only: the decoded root metadata of serialized store bytes — the
 /// `quads_sorted` bit and the component inventory.
-#[cfg(all(test, feature = "file-io"))]
+#[cfg(test)]
 pub(crate) fn store_metadata_of_bytes(bytes: &[u8]) -> (bool, Vec<StoreComponentDescriptor>) {
     use vortex_file::OpenOptionsSessionExt as _;
     let file = crate::session::VORTEX_SESSION
@@ -217,7 +217,7 @@ pub(crate) fn store_metadata_of_bytes(bytes: &[u8]) -> (bool, Vec<StoreComponent
 /// On-disk byte size of a layout subtree: the sum of its segments' lengths
 /// across all descendants, resolved through the footer's segment map. What a
 /// component occupies on disk (a test inspection).
-#[cfg(all(test, feature = "file-io"))]
+#[cfg(test)]
 pub(crate) fn subtree_bytes(
     layout: &LayoutRef,
     segment_map: &[vortex_file::SegmentSpec],

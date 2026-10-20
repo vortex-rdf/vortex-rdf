@@ -553,7 +553,6 @@ async fn test_data_source_request_semantics() {
             "{tag}"
         );
     }
-    #[cfg(feature = "file-io")]
     {
         let (_dir, mapped) = multi_chunk_file().await;
         assert_multi_chunk_requests(&mapped, "mapped").await;
@@ -642,7 +641,6 @@ async fn test_component_data_sources() {
     )
     .await;
     assert_eq!(assert_component_tables(&store, "memory").await, 4);
-    #[cfg(feature = "file-io")]
     {
         for (tag, _dir, store) in file_stores().await {
             let children = if tag.starts_with("file/no-index") {
@@ -732,7 +730,6 @@ async fn assert_component_tables(store: &VortexRdfStore, tag: &str) -> usize {
         distinct.dedup();
         assert_eq!(distinct.len(), base.len(), "{tag}: a row per base row");
     }
-    #[cfg(feature = "file-io")]
     assert_dictionary_component(store, tag).await;
     children.len()
 }
@@ -749,7 +746,6 @@ async fn assert_unsized(table: &DataSourceRef, tag: &str) {
 
 /// The `dictionary` child's table: `{_dict_term}`, one strictly sorted row
 /// per term, row i the term of code i.
-#[cfg(feature = "file-io")]
 async fn assert_dictionary_component(store: &VortexRdfStore, tag: &str) {
     let table = store
         .component_data_source("dictionary")
@@ -783,7 +779,6 @@ async fn assert_dictionary_component(store: &VortexRdfStore, tag: &str) {
 /// The session [`vortex_session`](crate::vortex_session) hands out opens a
 /// store file through vortex's own reader: it holds the store's container
 /// layout, whose root is the quad table.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_vortex_session_opens_store_files() {
     use vortex_file::OpenOptionsSessionExt as _;

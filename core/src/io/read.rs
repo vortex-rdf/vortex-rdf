@@ -140,7 +140,7 @@ where
 
 /// Test hook: the number of split futures [`spawned_splits`] has spawned on
 /// this thread. Zero means a scan ran inline.
-#[cfg(all(test, feature = "file-io"))]
+#[cfg(test)]
 pub(crate) mod spawn_probe {
     use std::cell::Cell;
 
@@ -319,7 +319,7 @@ fn map_file(file: &std::fs::File) -> std::io::Result<memmap2::Mmap> {
 }
 
 /// Test hook: the number of files [`map_file`] has mapped on this thread.
-#[cfg(all(test, feature = "file-io"))]
+#[cfg(test)]
 pub(crate) mod map_probe {
     use std::cell::Cell;
 
@@ -401,7 +401,7 @@ pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
     }
 }
 
-#[cfg(all(test, feature = "file-io"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use vortex_array::arrays::PrimitiveArray;

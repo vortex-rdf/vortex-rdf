@@ -588,7 +588,6 @@ async fn test_encode_variant_spellings_agree_with_the_stored_form() {
 
 /// A file-backed reader answers every method like the resident open of the
 /// same file, and the codes a file-backed view gathers decode through it.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_dict_reader_file_backed_matches_resident() {
     let quads = mixed_kind_quads();

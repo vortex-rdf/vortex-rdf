@@ -54,7 +54,6 @@ async fn test_quads_vec_matches_stream_collection() {
     .await;
 }
 
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_quads_vec_matches_stream_collection_file_backed() {
     let (_dir, path) =
@@ -147,7 +146,6 @@ async fn test_shared_quads_match_quads_vec_on_served_view() {
 /// Every view shape a file-backed store can take — the whole store, an
 /// index-served match, a subject-narrowed match, an append tail, a
 /// tombstone — decodes the same rows shared as owned.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_shared_quads_match_quads_vec_on_views() {
     let quads = modular_quads(64, 3, 4);

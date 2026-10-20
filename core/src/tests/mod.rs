@@ -2,35 +2,27 @@
 //! here; each submodule covers one section of behavior.
 
 use super::*;
-#[cfg(feature = "file-io")]
 use crate::io::quads_stream_to_vortex_writer;
 use crate::store::VortexArrayBuilder;
 use futures::{StreamExt, TryStreamExt, stream};
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
-#[cfg(feature = "file-io")]
 use std::sync::OnceLock;
 
 mod adoption;
-#[cfg(feature = "file-io")]
 mod atomic_write;
 mod builders;
 mod chunks;
 mod data_source;
 mod dictionary;
-#[cfg(feature = "file-io")]
 mod dictionary_file_backed;
 mod dictionary_handle;
 // `pub(crate)`: `common::terms`' inline parser tests borrow this module's
 // shared escaped-literal case list.
 pub(crate) mod escaping;
-#[cfg(feature = "file-io")]
 mod file_backed;
 mod indexes;
-#[cfg(feature = "file-io")]
 mod indexes_file;
-#[cfg(feature = "file-io")]
 mod leaf_geometry;
-#[cfg(feature = "file-io")]
 mod mapping;
 mod matching;
 mod metadata;
@@ -40,7 +32,6 @@ mod narrowing;
 mod predicates;
 mod roundtrip;
 mod row_limit;
-#[cfg(feature = "file-io")]
 mod serialization;
 mod streaming;
 mod unique_quads;
@@ -92,7 +83,6 @@ fn modular_quads(n: usize, p_mod: usize, o_mod: usize) -> Vec<Quad> {
 /// Serialize `quads` with `quads_stream_to_vortex_file` into `store.vortex`
 /// inside a fresh temp dir, handing back the dir guard beside the path. Keep
 /// the `TempDir` alive for the store's lifetime.
-#[cfg(feature = "file-io")]
 async fn write_store_file(
     quads: Vec<Quad>,
     layout: LayoutStrategy,
@@ -109,7 +99,6 @@ async fn write_store_file(
 /// [`modular_quads`] at the stock moduli (three predicates, four objects),
 /// for the unit tests that sit beside the code they cover, outside this
 /// module's tree.
-#[cfg(feature = "file-io")]
 pub(crate) fn modular_quads_for_tests(n: usize) -> Vec<Quad> {
     modular_quads(n, 3, 4)
 }
@@ -117,7 +106,6 @@ pub(crate) fn modular_quads_for_tests(n: usize) -> Vec<Quad> {
 /// [`write_store_file`] in the Dictionary layout, for the unit tests that sit
 /// beside the code they cover, outside this module's tree. Keep the `TempDir`
 /// alive for the store's lifetime.
-#[cfg(feature = "file-io")]
 pub(crate) async fn write_store_file_for_tests(
     quads: Vec<Quad>,
     indexes: Indexes,
@@ -129,7 +117,6 @@ pub(crate) async fn write_store_file_for_tests(
 /// rotated left by `rotate` rows — and written without the sorted stamp: the
 /// shape a foreign writer's file arrives in. Keep the `TempDir` alive for the
 /// store's lifetime.
-#[cfg(feature = "file-io")]
 async fn write_unsorted_store_file(
     quads: &[Quad],
     rotate: usize,
@@ -161,7 +148,6 @@ async fn write_unsorted_store_file(
 /// the multi-leaf columns a large file written by the default strategy has,
 /// at a scale a test can afford (the default strategy writes a 160,000-row
 /// column as one leaf). Keep the `TempDir` alive for the store's lifetime.
-#[cfg(feature = "file-io")]
 async fn write_chunked_store_file(
     quads: &[Quad],
     chunk_rows: usize,
@@ -173,7 +159,6 @@ async fn write_chunked_store_file(
 /// its two children written in `chunk_rows`-row flat leaves too — the
 /// multi-leaf `val` and `rid` columns of a large file, so that a located run
 /// can cross a leaf boundary at a scale a test can afford.
-#[cfg(feature = "file-io")]
 async fn write_chunked_reference_store_file(
     quads: &[Quad],
     chunk_rows: usize,
@@ -181,7 +166,6 @@ async fn write_chunked_reference_store_file(
     write_chunked_store(quads, chunk_rows, true).await
 }
 
-#[cfg(feature = "file-io")]
 async fn write_chunked_store(
     quads: &[Quad],
     chunk_rows: usize,
@@ -259,7 +243,6 @@ async fn write_chunked_store(
 /// guard beside the path: the file of a test that holds a store's serialized
 /// bytes rather than its quads (see [`write_store_file`]). Keep the `TempDir`
 /// alive for the file's lifetime.
-#[cfg(feature = "file-io")]
 pub(crate) fn temp_store_file(bytes: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store.vortex");
@@ -270,7 +253,6 @@ pub(crate) fn temp_store_file(bytes: &[u8]) -> (tempfile::TempDir, std::path::Pa
 /// The serialized bytes in `cell`, built by `build` on first use, so a
 /// heavyweight fixture is serialized once per process. Concurrent first
 /// callers may both build; `get_or_init` keeps one.
-#[cfg(feature = "file-io")]
 async fn cached_store_bytes<F, Fut>(cell: &'static OnceLock<Vec<u8>>, build: F) -> &'static [u8]
 where
     F: FnOnce() -> Fut,
@@ -288,7 +270,6 @@ where
 /// [`cached_store_bytes`]) and `quads` runs only for that write, so a fixture
 /// too heavy to write per test is written once. Keep the `TempDir` alive for
 /// the file's lifetime.
-#[cfg(feature = "file-io")]
 async fn cached_store_file(
     cell: &'static OnceLock<Vec<u8>>,
     quads: impl FnOnce() -> Vec<Quad>,
@@ -311,7 +292,6 @@ async fn cached_store_file(
 /// three 65,536-term windows, and rows past one scan split. Serialized once
 /// per process (see [`cached_store_file`]). Keep the `TempDir` alive for the
 /// file's lifetime.
-#[cfg(feature = "file-io")]
 async fn multi_window_dictionary_file() -> (tempfile::TempDir, std::path::PathBuf) {
     static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
     cached_store_file(
@@ -511,7 +491,6 @@ fn unstamped_store(quads: &[Quad]) -> VortexRdfStore {
 
 /// Native store bytes over `chunks` (all of one dtype) written without the
 /// sorted stamp, carrying `components` beside the rows.
-#[cfg(feature = "file-io")]
 async fn unstamped_store_bytes(
     chunks: Vec<vortex_array::ArrayRef>,
     components: Vec<crate::io::container::NativeComponentWrite>,
@@ -537,7 +516,6 @@ async fn unstamped_store_bytes(
 /// A component of the shape a future change set could write: an optional
 /// (unless `required`) index child named `name` under the implementation slug
 /// `slug`, holding three bare code rows.
-#[cfg(feature = "file-io")]
 fn unknown_component(
     name: &str,
     slug: &str,
@@ -563,7 +541,6 @@ fn unknown_component(
 
 /// A minimal native Dictionary-layout file: a one-row zero-code quad child
 /// beside `dict` written as the dictionary component.
-#[cfg(feature = "file-io")]
 pub(crate) async fn write_dict_only_store(
     dict: &crate::store::layouts::dictionary::TermDictionary,
 ) -> Vec<u8> {
@@ -578,7 +555,6 @@ pub(crate) async fn write_dict_only_store(
 /// `version`, and — when `zoned` is false — no zone maps on the term column,
 /// which is what `TermDictionary::to_write` produces for chunks of uneven
 /// length: a reader finds no window bounds and reads them from each leaf.
-#[cfg(feature = "file-io")]
 pub(crate) async fn write_dict_only_store_as(
     dict: &crate::store::layouts::dictionary::TermDictionary,
     version: u32,
@@ -633,7 +609,6 @@ pub(crate) fn widely_varying_terms() -> Vec<String> {
 }
 
 /// A native store file opened over `bytes` held in memory (no file behind it).
-#[cfg(feature = "file-io")]
 pub(crate) fn open_native_bytes(
     bytes: Vec<u8>,
 ) -> crate::store::persist::native_file::NativeStoreFile {
@@ -648,7 +623,6 @@ pub(crate) fn open_native_bytes(
 /// `path` opened mapped, as a file-backed store opens it: the
 /// [`NativeStoreFile`](crate::store::persist::native_file::NativeStoreFile) around the
 /// opened file.
-#[cfg(feature = "file-io")]
 pub(crate) async fn open_mapped(
     path: &std::path::Path,
 ) -> crate::store::persist::native_file::NativeStoreFile {
@@ -662,7 +636,6 @@ pub(crate) async fn open_mapped(
 /// A mapped Dictionary-layout store file of `n` quads (subject-sorted,
 /// subjects unique) with `indexes`. Keep the `TempDir` alive for the file's
 /// lifetime.
-#[cfg(feature = "file-io")]
 pub(crate) async fn mapped_file(
     n: usize,
     indexes: Indexes,
@@ -677,7 +650,6 @@ pub(crate) async fn mapped_file(
 /// The layout node of a native store file's dictionary-child term column —
 /// the child struct's `_dict_term` field exactly as written: a `Zoned` node
 /// when the column carries zone maps, its chunked (or flat) data otherwise.
-#[cfg(feature = "file-io")]
 pub(crate) fn dict_term_column(
     native: &crate::store::persist::native_file::NativeStoreFile,
 ) -> vortex_layout::LayoutRef {
@@ -794,7 +766,6 @@ fn appended_quads(n: usize) -> Vec<Quad> {
 /// The three opens of the store file at `path`, each beside its tag: mapped
 /// (`from_file`, a Dictionary layout's dictionary file-backed), loaded whole
 /// (`from_file_in_memory`) and adopted from its bytes (`from_bytes_owned`).
-#[cfg(feature = "file-io")]
 async fn reopened_stores(path: &std::path::Path) -> [(&'static str, VortexRdfStore); 3] {
     [
         ("mapped", VortexRdfStore::from_file(path).await.unwrap()),
@@ -818,7 +789,6 @@ async fn reopened_stores(path: &std::path::Path) -> [(&'static str, VortexRdfSto
 /// store's lifetime. Each file is written by [`write_store_file`] once per
 /// process (see [`cached_store_bytes`]), and its bytes into a fresh temp dir
 /// per call.
-#[cfg(feature = "file-io")]
 async fn file_stores() -> Vec<(String, std::sync::Arc<tempfile::TempDir>, VortexRdfStore)> {
     static BYTES: [OnceLock<Vec<u8>>; 3] = [const { OnceLock::new() }; 3];
     let mut stores = Vec::new();
@@ -916,7 +886,6 @@ async fn multi_chunk_store() -> VortexRdfStore {
 /// [`multi_chunk_store`]'s file, serialized once per process (see
 /// [`cached_store_bytes`]), written into a fresh temp dir and opened mapped.
 /// Keep the `TempDir` alive for the store's lifetime.
-#[cfg(feature = "file-io")]
 async fn multi_chunk_file() -> (tempfile::TempDir, VortexRdfStore) {
     static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
     let bytes = cached_store_bytes(&BYTES, || async {
@@ -1381,7 +1350,6 @@ async fn assert_shared_matches_quads(
 
 /// A pattern for [`assert_patterns_agree`]: its name in failure messages, then
 /// the subject, predicate, object and graph it binds.
-#[cfg(feature = "file-io")]
 type Pattern<'a> = (
     &'a str,
     Option<&'a NamedOrBlankNode>,
@@ -1392,7 +1360,6 @@ type Pattern<'a> = (
 
 /// Every store in `got`, beside its name, answers each of `patterns` as `want`
 /// does: the same size and the same quads.
-#[cfg(feature = "file-io")]
 async fn assert_patterns_agree(
     want: &VortexRdfStore,
     got: &[(&str, &VortexRdfStore)],

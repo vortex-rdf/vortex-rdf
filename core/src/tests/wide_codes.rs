@@ -465,7 +465,6 @@ async fn codes_past_u32_round_trip_in_memory() {
     .await
     .unwrap();
     // Compressed and uncached, so the first keep reads through the probe.
-    #[cfg(feature = "file-io")]
     assert_eq!(store.debug_base_child_int_canonical("s"), Some(false));
     check_store(&store, &quads, "built in memory").await;
 
@@ -483,7 +482,6 @@ async fn codes_past_u32_round_trip_in_memory() {
 /// A file written and reopened under the guard: its code columns are u64
 /// and hold the wide codes, and the mapped (file-backed dictionary) and
 /// in-memory opens both carry them.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn codes_past_u32_round_trip_through_a_file() {
     use vortex_array::dtype::{DType, Nullability, PType};
@@ -641,7 +639,6 @@ async fn codes_past_u32_through_the_chunk_exports() {
     let _base = CodeBase::set(BASE);
     let built = built_store(dataset(), LayoutStrategy::Dictionary, indexes()).await;
     check_chunk_exports(&built, "built in memory").await;
-    #[cfg(feature = "file-io")]
     {
         let (_dir, path) = write_store_file(dataset(), LayoutStrategy::Dictionary, indexes()).await;
         for (open, store) in reopened_stores(&path).await {

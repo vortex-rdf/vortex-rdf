@@ -201,7 +201,7 @@ pub(crate) fn empty_struct() -> Result<ArrayRef> {
 /// Returned by value: the slices borrow these arrays, so they must outlive
 /// the decode.
 fn code_columns(chunk: &ArrayRef) -> Result<[PrimitiveArray; 4]> {
-    #[cfg(all(test, feature = "file-io"))]
+    #[cfg(test)]
     tests::CODE_COLUMN_READS.with(|reads| reads.set(reads.get() + 1));
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let struct_arr = chunk.clone().execute::<StructArray>(&mut ctx)?;
@@ -595,7 +595,7 @@ pub(crate) async fn decode_chunk_raw_file_backed(
     decode_resolved(fb, chunk, |cols, terms| decode_rows_shared(cols, terms)).await
 }
 
-#[cfg(all(test, feature = "file-io"))]
+#[cfg(test)]
 mod tests {
     use std::cell::Cell;
 

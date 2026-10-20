@@ -230,7 +230,6 @@ where
         .await;
     }
 
-    #[cfg(feature = "file-io")]
     {
         let mut bytes: Vec<u8> = Vec::new();
         quads_stream_to_vortex_writer(raw_stream(DATASET), &mut bytes, layout, indexes.clone())
@@ -568,9 +567,7 @@ async fn test_probe_dictionary_holds_one_code_per_rdf_term() {
     }
     // The file-backed dictionary answers through its reader too; the
     // directory outlives the assertions below.
-    #[cfg(feature = "file-io")]
     let dir = tempfile::tempdir().unwrap();
-    #[cfg(feature = "file-io")]
     {
         let path = dir.path().join("probe.vortex");
         crate::io::quads_stream_to_vortex_file(raw_stream(PROBE), &path, layout, vec![])
@@ -747,7 +744,6 @@ async fn test_compaction_after_appends_holds_each_quad_once() {
         }
     }
 
-    #[cfg(feature = "file-io")]
     for layout in LAYOUTS {
         let who = format!("{layout:?} / file");
         let (_dir, path) = write_store_file(base.clone(), layout, ALL_INDEXES.to_vec()).await;
@@ -842,7 +838,6 @@ async fn test_rebuilds_drop_repeats_a_base_carries() {
         assert_holds_each_quad_once_in(&reread, &expected_tailed, &who).await;
     }
 
-    #[cfg(feature = "file-io")]
     for indexes in index_sets() {
         let who = format!("file / {indexes:?}");
         let (_dir, path) = write_unsorted_store_file(&with_repeats, 0).await;

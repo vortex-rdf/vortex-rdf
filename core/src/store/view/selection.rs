@@ -614,7 +614,6 @@ mod tests {
         assert!(RowSelection::Range(1..3).intersect_range(7..9).is_empty(10));
     }
 
-    #[cfg(feature = "file-io")]
     #[test]
     #[allow(
         clippy::single_range_in_vec_init,
@@ -658,7 +657,6 @@ mod tests {
         assert!(list.intersect_runs(&[]).is_empty(30));
     }
 
-    #[cfg(feature = "file-io")]
     #[test]
     fn refine_positions_keeps_a_contiguous_stretch_a_range() {
         // A contiguous stretch of every row, or of a range, is a range.

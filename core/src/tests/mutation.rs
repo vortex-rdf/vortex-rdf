@@ -698,7 +698,6 @@ async fn test_add_quads_auto_compacts_past_threshold() {
 /// pushes the tail past the thresholds folds it in — rewriting the source
 /// file in place and staying file-backed — while smaller appends leave the
 /// tail (and the file on disk) untouched.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_file_backed_add_auto_compacts_past_threshold() {
     let quads: Vec<Quad> = (0..4)
@@ -775,7 +774,6 @@ async fn test_file_backed_add_auto_compacts_past_threshold() {
 
 /// `n` quads from subject number `first` on, over a few predicates and
 /// objects.
-#[cfg(feature = "file-io")]
 fn compaction_batch(first: usize, n: usize) -> Vec<Quad> {
     (first..first + n)
         .map(|i| {
@@ -794,7 +792,7 @@ fn compaction_batch(first: usize, n: usize) -> Vec<Quad> {
 /// replaces the file (a new inode) with a larger one, the returned store
 /// stays mapped and can compact again, and a reopen of the path holds exactly
 /// the quads appended so far.
-#[cfg(all(unix, feature = "file-io"))]
+#[cfg(unix)]
 #[tokio::test]
 async fn test_chained_compactions_of_a_mapped_store() {
     use std::os::unix::fs::MetadataExt as _;
@@ -853,7 +851,6 @@ async fn test_chained_compactions_of_a_mapped_store() {
 /// memory: every append past the floor folds the tail in, the store grows,
 /// its serialization reopens to the quads appended so far, and the file it
 /// was loaded from is never touched.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_chained_compactions_of_an_in_memory_store() {
     let indexes = vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
@@ -918,7 +915,6 @@ async fn test_chained_compactions_of_an_in_memory_store() {
 /// sees the folded-in, tombstone-free data, the rebuilt index survives, a
 /// later append is folded into the file too, and no sibling artifact (temp
 /// file, spill run) is left beside the store.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_file_backed_compaction_rewrites_source_file() {
     for index in [IndexType::SecondaryByReference, IndexType::SecondaryByCopy] {
@@ -926,7 +922,6 @@ async fn test_file_backed_compaction_rewrites_source_file() {
     }
 }
 
-#[cfg(feature = "file-io")]
 async fn run_file_backed_compaction(index: IndexType) {
     let quads = modular_quads(12, 2, 3);
     let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Default, vec![index]).await;
@@ -1202,7 +1197,6 @@ async fn test_compaction_folds_tail_and_sorts() {
 /// append (the tail lives in memory beside it) and queries union the
 /// pushed-down scan with the tail scan. The script's compaction folds the
 /// tail into the source file, rewritten in place.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_file_backed_add_quads() {
     let quads = modular_quads(12, 2, 3);
@@ -1230,7 +1224,6 @@ async fn test_file_backed_add_quads() {
 /// in-memory copy and leave the shared source file untouched — a view's
 /// compaction rewriting the file would destroy every row outside the view
 /// for all other readers of that path.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_owned_file_view_leaves_source_file_intact() {
     let quads = modular_quads(12, 3, 4);

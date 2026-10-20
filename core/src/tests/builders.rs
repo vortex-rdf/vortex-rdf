@@ -233,7 +233,6 @@ async fn test_sorted_stream_empty_dataset() {
 
 /// The writer's output read back through `from_bytes`: quads fed in reverse
 /// subject order come out sorted, every row and per-row object intact.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_writer_sorts_reversed_input() {
     let quads: Vec<Quad> = (0..25)

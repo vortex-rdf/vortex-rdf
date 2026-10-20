@@ -118,7 +118,7 @@ impl VortexRdfError {
 /// `std::result::Result` with [`VortexRdfError`] as the error type.
 pub type Result<T> = std::result::Result<T, VortexRdfError>;
 
-#[cfg(all(test, feature = "file-io"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Error, ErrorKind};

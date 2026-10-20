@@ -111,7 +111,6 @@ async fn test_dictionary_fixture_adopts() {
 
 /// The fixtures are what `to_bytes` writes for their quads today: a
 /// regeneration opens to the same layout, index roster and quads.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_fixtures_match_regenerated_stores() {
     let quads = dictionary_test_quads();

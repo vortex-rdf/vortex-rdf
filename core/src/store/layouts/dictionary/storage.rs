@@ -634,7 +634,6 @@ mod tests {
     use vortex_array::arrays::VarBinArray;
     use vortex_array::dtype::{DType, NativePType, Nullability, PType};
     use vortex_array::validity::Validity;
-    #[cfg(feature = "file-io")]
     use vortex_layout::layouts::zoned::Zoned;
 
     /// 32-bit code offsets are the very buffer of the array's offsets child:
@@ -738,7 +737,6 @@ mod tests {
             "{name}: viewed exactly when 32-bit"
         );
         let chunk = TermChunk::Fsst(chunk);
-        #[cfg(feature = "file-io")]
         assert_eq!(chunk.heap_bytes(), 4 * original.offsets.len(), "{name}");
         let mut cursor = chunk.cursor();
         for (i, term) in terms.iter().enumerate() {
@@ -904,7 +902,6 @@ mod tests {
 
     /// Chunks that are not one uniform window (adopted from a foreign file)
     /// are written without zone maps, and read back unchanged.
-    #[cfg(feature = "file-io")]
     #[tokio::test]
     async fn non_uniform_chunks_write_without_zone_maps() {
         let terms: Vec<String> = (0..300)
@@ -942,7 +939,6 @@ mod tests {
 
     /// A dictionary child without zone maps — what chunks of uneven length
     /// write — opens file-backed and point-reads across its chunk leaves.
-    #[cfg(feature = "file-io")]
     #[tokio::test]
     async fn unzoned_dict_child_point_reads_file_backed() {
         use crate::store::layouts::dictionary::file_backed::{self, FileBackedDict};

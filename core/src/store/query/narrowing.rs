@@ -636,7 +636,6 @@ mod tests {
 
     /// A set is looked up while it has at most one code per sixteen rows of
     /// the selection, rounded up.
-    #[cfg(feature = "file-io")]
     #[test]
     fn located_sets_are_bounded_by_the_selection() {
         assert!(set_is_located(1, 1));

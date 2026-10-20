@@ -480,7 +480,6 @@ async fn test_narrowing_gates_and_tails() {
     );
 }
 
-#[cfg(feature = "file-io")]
 mod file {
     use super::*;
     use std::ops::Range;

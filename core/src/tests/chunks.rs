@@ -371,7 +371,6 @@ async fn test_chunks_cut_a_run_per_pull() {
         2,
         "the store's row chunks, two pulled"
     );
-    #[cfg(feature = "file-io")]
     {
         let (_dir, mapped) = multi_chunk_file().await;
         assert_eq!(
@@ -457,7 +456,6 @@ async fn test_chunks_surface_a_failed_cut() {
         let before = hooked(chunks_before_error(store.row_chunks(7).unwrap()).await);
         assert_eq!(before, 2, "in memory: the third chunk fails");
     }
-    #[cfg(feature = "file-io")]
     {
         let (_dir, mapped) = multi_chunk_file().await;
         let fail = FailingCut::after(2);
@@ -540,7 +538,6 @@ async fn test_chunks_skip_tombstones() {
 /// codes; the source counts them exactly where the statistics know the count
 /// and as a bound while a pushed-down filter is pending, and the matrix
 /// reaches both.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_chunks_file_backed_match_gathered() {
     let (_multi_dir, multi_chunk) = multi_chunk_file().await;
@@ -567,7 +564,6 @@ async fn test_chunks_file_backed_match_gathered() {
 /// export's first pull takes one window of its 1,000 ids through the chunk
 /// probes and the whole stream four, and the exports answer the codes of
 /// the same keep on the store loaded whole.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_chunks_take_sparse_file_ids() {
     use crate::store::Keep;
@@ -607,7 +603,6 @@ async fn test_chunks_take_sparse_file_ids() {
 /// by id even when they project only an unbound role. With the split limit
 /// forced to zero a scan would spawn its splits; nothing spawns, and the
 /// chunks are the view's base-ordered codes.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_chunks_read_filtered_file_runs_by_id() {
     use crate::store::scan::file_reads::driver_hooks;
@@ -663,7 +658,6 @@ async fn test_chunks_read_filtered_file_runs_by_id() {
 /// limit forced to zero so the scan would spawn wherever a runtime were there
 /// to spawn onto. Nothing is spawned, and both exports and the scan answer
 /// the view's base-ordered codes.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_chunks_read_a_file_outside_a_tokio_runtime() {
     use crate::store::scan::file_reads::driver_hooks;
@@ -767,7 +761,6 @@ async fn test_chunks_string_layouts_include_tail() {
         );
         assert_string_source(&tailed, &expected, &format!("{layout:?}")).await;
     }
-    #[cfg(feature = "file-io")]
     {
         let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Default, vec![]).await;
         let tailed = VortexRdfStore::from_file(&path)

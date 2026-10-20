@@ -242,7 +242,6 @@ fn only_id_fields_take_the_override() {
 /// 8,928). Subjects are unique and each object is its quad's subject, so
 /// every `s` and `o` column, the reference index's object values and every
 /// row-id column are plain columns.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn every_store_write_path_takes_the_id_column_override() {
     let rows = 140_000usize;
