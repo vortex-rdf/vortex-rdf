@@ -584,22 +584,19 @@ fn probes_default_cascade_random() {
     );
 }
 
+/// A nullable column, a signed dtype and a float dtype each decline.
 #[test]
-fn declines_nullable() {
-    let arr = PrimitiveArray::from_option_iter([Some(1u32), None, Some(3)]).into_array();
-    assert!(SortedProbe::resolve(&arr).is_none());
-}
-
-#[test]
-fn declines_signed_dtype() {
-    let arr = PrimitiveArray::from_iter([1i32, 2, 3]).into_array();
-    assert!(SortedProbe::resolve(&arr).is_none());
-}
-
-#[test]
-fn declines_float_dtype() {
-    let arr = PrimitiveArray::from_iter([1.0f32, 2.0]).into_array();
-    assert!(SortedProbe::resolve(&arr).is_none());
+fn declines_unsupported_dtypes() {
+    for (dtype, arr) in [
+        (
+            "nullable u32",
+            PrimitiveArray::from_option_iter([Some(1u32), None, Some(3)]).into_array(),
+        ),
+        ("i32", PrimitiveArray::from_iter([1i32, 2, 3]).into_array()),
+        ("f32", PrimitiveArray::from_iter([1.0f32, 2.0]).into_array()),
+    ] {
+        assert!(SortedProbe::resolve(&arr).is_none(), "{dtype}");
+    }
 }
 
 #[test]
