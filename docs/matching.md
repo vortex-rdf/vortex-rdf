@@ -14,9 +14,10 @@ in [§15](#15-watching-a-match-happen).
 
 ## 1. What a match produces
 
-`match_pattern` **reads no rows**. It returns another `VortexRdfStore` — a
-*derived view* over the same base data, carrying the restrictions the pattern
-implies:
+`match_pattern` **materializes no rows**. It returns another
+`VortexRdfStore` — a *derived view* over the same base data, carrying the
+restrictions the pattern implies (what a file match reads to compose them is
+in [§7](#7-the-file-path)):
 
 | Backend | Restrictions a match can compose |
 |---|---|
@@ -35,9 +36,11 @@ Three pieces of vocabulary recur below:
 - **`ViewSelection`** — `Exact(RowSelection)` or `Pending(LazyRowIds)`. Pending
   means an index resolved the match but the exact ids were never computed,
   because a serve plan answers reads without them.
-- **Serve plan** ([`indexes/serve.rs`](../core/src/store/indexes/serve.rs)) —
-  the matched quads read straight out of the answering index's own columns
-  (a contiguous run) instead of gathering the primary columns at scattered row
+- **Serve plan** ([`indexes/serve.rs`](../core/src/store/indexes/serve.rs) in
+  memory, `FileServePlan` in
+  [`indexes/file.rs`](../core/src/store/indexes/file.rs) on file) — the
+  matched quads read straight out of the answering index's own columns (a
+  contiguous run) instead of gathering the primary columns at scattered row
   ids. Purely an optimization; the row ids alone are always sufficient.
 
 ### 1.1 The running example
@@ -480,9 +483,13 @@ longer starts `All` ([§11](#11-chained-matches)).
 ## 7. The file path
 
 [`match_base_file`](../core/src/store/query/matching.rs#L495) composes the same
-restrictions as the in-memory path, but **nothing is read**: each stage decides
-what the *next* scan will do, and the result is a filter expression plus a row
-selection.
+restrictions as the in-memory path, but **leaves the rows to the next scan**:
+each stage decides what that scan will do, and the result is a filter
+expression plus a row selection. The match itself reads only what those
+decisions need: the chunk probes that locate a bound subject's run, what an
+index resolution reads (its run's location, and its ids unless they stay
+deferred), a chained view's pending ids, the zone-map statistics that prune,
+and stage 5's point reads.
 
 ```mermaid
 flowchart TD
@@ -534,10 +541,10 @@ Each stage in the code, and where the details are below:
 The two paths differ in what a stage produces, not in what it asks. In memory a
 stage narrows a `RowSelection` directly; here stage 3 can only *describe* the
 residual as a filter, and stage 4 turns whatever remains into row bounds the
-scan can honour without reading data. Stage 5 is the one that reads: exact ids
-sparse in their splits check the filter at their own rows, point by point,
-because the scan's filter evaluation decodes every row of each split they
-touch.
+scan can honour, from statistics alone. Stage 5 is the one that tests the
+filter before the scan: exact ids sparse in their splits check it at their own
+rows, point by point, because the scan's filter evaluation decodes every row of
+each split they touch.
 
 ### 7.1 Subject chunk probe
 
@@ -1026,11 +1033,14 @@ the match plus `quads_vec()` over every matched row, on this dataset
 
 ## 15. Watching a match happen
 
-Every stage logs the decision it took at `debug` level under the
-`vortex_rdf_core` target, stamped with the time since the match began
-(the timers only run when debug logging is enabled). The CLI installs
-`env_logger`, so on the Dictionary + `SecondaryByCopy` file of the running
-example:
+Every stage logs the decision it took at `debug` level under its module's
+target in `vortex_rdf_core`, stamped with the time since the match began. The
+timers ask whether debug logging is on for the `vortex_rdf_core::debug`
+target, and a stage logs only with a timer running, so a filter must enable
+that module as well as the stage's: `vortex_rdf_core=debug` enables the whole
+crate, while `vortex_rdf_core::store::query=debug` alone logs no stage line.
+The CLI installs `env_logger`, so on the Dictionary + `SecondaryByCopy` file
+of the running example:
 
 ```sh
 RUST_LOG=vortex_rdf_core=debug vortex-rdf-cli match --input alice.vortex \
@@ -1065,7 +1075,7 @@ that installs a `log` logger sees the same lines; what each one means:
 | `File filter checked by point reads` | [§7.3](#73-what-ends-up-on-the-view) — stage 5 read the filter at sparse ids |
 | `File selection proved empty` | [§7.3](#73-what-ends-up-on-the-view) |
 | `In-memory view built (serve, pending ids)` / `File view built (filter, serve, pending ids)` | [§6.4](#64-keeping-or-dropping-the-serve-plan) / [§7.3](#73-what-ends-up-on-the-view) — what the view carries |
-| `Tail matched by typed positions` / `… by mask scan` / `Tail proved the pattern unmatchable` | [§9](#9-the-tail) |
+| `Tail matched by typed positions` / `… by mask scan` | [§9](#9-the-tail) |
 
 The same store in memory, timings elided:
 
@@ -1168,8 +1178,8 @@ ordered window of `lookahead` probes running and forwards their answers in
 input order into a channel of `lookahead` answers, so at most 2 ×
 `lookahead` probes are running or answered but not yet pulled (`lookahead`
 defaults to twice the machine's parallelism, and at least 64).
-`match_codes_many` answers through an iterator, one probe per pull, and
-`count_quads_many` as a list. The JS bindings run a batch sequentially on
+`match_codes_many` answers through an iterator, one probe's answer per pull,
+and `count_quads_many` as a list. The JS bindings run a batch sequentially on
 wasm's single thread: `matchCodesMany` answers one probe per pull of its
 iterable, checking the `AbortSignal` its options may carry before each
 pull, and `countQuadsMany` answers an array.

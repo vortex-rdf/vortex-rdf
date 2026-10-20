@@ -300,9 +300,10 @@ the bounds from the leaves.
   window missing from it is rebuilt over its mapped segment (metadata over the
   bytes, nothing decompressed), its FSST code offsets are read once as 32-bit
   values (a 32-bit offsets array is used in place, any other width is
-  converted to 32 bits in a copy), and it is kept; a repeated probe or decode
-  of that window skips the rebuild. Its size is bounded per opened file (see
-  the table in [§8](#8-reading-a-file)).
+  converted to 32 bits in a copy, and an offset no `u32` holds fails the
+  read as a deserialization error), and it is kept; a repeated probe or
+  decode of that window skips the rebuild. Its size is bounded per opened file
+  (see the table in [§8](#8-reading-a-file)).
 - The kind ranges are kept for the handle's lifetime; the operating system's
   page cache holds the pages the reads touched.
 
@@ -348,8 +349,10 @@ Shared rules:
   further matches without renumbering anything ([matching.md §1](matching.md#1-what-a-match-produces)).
 - **One row per quad.** A child whose row count differs from the quad table's
   fails the open ([`check_component_rows`](../core/src/store/indexes/components.rs#L75)).
-- **A bound graph is never a sort key**, and neither index answers a
-  bound-subject pattern — the sorted quad table is the better path there.
+- **A bound graph is never a key an index is searched by** (it is the last
+  key of both copy orders, and a `{val, rid}` child holds none), and neither
+  index answers a bound-subject pattern — the sorted quad table is the better
+  path there.
 - **A `{val, rid}` child is ordered by `(val, rid)`**: inside one value's run
   the row ids ascend, so a window over a located run reads only its own rows
   ([matching.md §16.2](matching.md#162-window-size_capped-exists)).
@@ -576,6 +579,9 @@ checks:
    rows; unknown index slugs must be `required: false`.
 8. The quad table holds each quad once, and a reference index's children are
    in `(val, rid)` order. Readers count and window by them without checking.
+9. Every `utf8` column holds valid UTF-8: readers take stored terms as UTF-8
+   unchecked, so a store file is trusted input, and a corrupt or crafted one
+   is outside this contract.
 
 Anything a reader cannot interpret and that is marked `required` fails the
 open rather than being read around.
