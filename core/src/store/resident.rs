@@ -1,13 +1,10 @@
-//! The encoding of a store's integer children and the canonical accessors
-//! that read them back.
-//!
-//! The integer-children helpers are the two ends of the compressed-resident
-//! form: [`with_compressed_int_children`] encodes a built store's code
-//! columns into probe-supported encodings, [`with_searchable_int_children`]
+//! The compressed-resident form of a store's integer children:
+//! [`with_compressed_int_children`] encodes a build's code and row-id columns
+//! into encodings the probes read in place, [`with_searchable_int_children`]
 //! keeps an adopted store's encodings wherever a probe binds them, and
 //! [`shared_code_primitive`] / [`cached_code_primitive`] hand back the
-//! canonical code primitive a slice-bound read path needs — decoding into the
-//! shared wrapper's cache, or only if some earlier read already did.
+//! canonical code primitive a slice-bound read path needs (decoding into the
+//! shared wrapper's cache, or only when an earlier read already did).
 
 use crate::error::Result;
 use crate::session::VORTEX_SESSION;
@@ -20,26 +17,18 @@ use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 
-/// Keep a base struct's integer children (the Dictionary layout's term
-/// codes, TypedObject's kind column) in their compressed form wherever the
-/// match fast paths can bind them, decoding only the remainder to canonical
-/// primitives — preserving each child's `IsSorted` stamp across any
-/// re-encoding.
+/// Keep a base struct's integer children (the Dictionary layout's term codes,
+/// TypedObject's kind column) in their encoding wherever an encoded-search
+/// probe binds them, and decode the rest to canonical primitives once,
+/// keeping each child's `IsSorted` stamp.
 ///
-/// The per-row match fast paths — [`search_sorted_bounds`]' probes and the
-/// typed residual loops — bind canonical primitives and any encoding an
-/// encoded search probe resolves, so those children stay compressed at
-/// adoption. A child outside the probe's supported set (e.g. dictionary
-/// encoding) would pay a per-call fallback through the generic per-scalar
-/// kernel on every match; decoding it once here keeps every fast path fast
-/// for the store's lifetime. String children keep their encoded form: their
-/// canonical `VarBinView` costs real memory, and the mask scan handles them
-/// at selection cost. Serialization re-compresses every child through the
-/// default write strategy, so the wire format is unaffected.
-///
-/// A nullable struct passes through untouched — the base schema is
-/// non-nullable, and rebuilding a struct with validity is not this helper's
-/// business.
+/// The match fast paths ([`search_sorted_bounds`]' probes, the typed residual
+/// loops) bind canonical primitives and every encoding a probe resolves; any
+/// other encoding (e.g. dictionary encoding) would pay the generic per-scalar
+/// kernel on every match. String children keep their encoding: their
+/// canonical `VarBinView` costs real memory, and the mask scan handles them at
+/// selection cost. Serialization re-compresses every child, so the wire format
+/// is unaffected. A nullable struct (never a base) passes through untouched.
 ///
 /// [`search_sorted_bounds`]: crate::store::array::search_sorted_bounds
 #[cfg(feature = "file-io")]
@@ -61,30 +50,23 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
     })
 }
 
-/// Compress a built struct's integer columns — the `u64` code columns
-/// ([`TermCode`](schema::TermCode)) and row-id columns
-/// ([`RowId`](schema::RowId)) — into probe-supported encodings, in place of
-/// the canonical primitives the builders emit — the construction half of the
-/// store's compressed-resident form (the adoption half is
-/// [`with_searchable_int_children`]).
+/// Compress a built struct's `u64` columns (the codes,
+/// [`TermCode`](schema::TermCode), and the row ids, [`RowId`](schema::RowId))
+/// into encodings an encoded-search probe resolves, in place of the canonical
+/// primitives the builders emit, so the match fast paths keep binding them:
+/// the construction half of the compressed-resident form
+/// ([`with_searchable_int_children`] is the adoption half). The choice comes
+/// from bounds the build already knows (Constant for one value, RunEnd for a
+/// sorted column with few runs, BitPacked at the observed width); sortedness
+/// stamps carry across, and other widths and nullable children pass through
+/// untouched. A chunked column is compressed chunk by chunk
+/// ([`compress_int_child`]).
 ///
-/// Every encoding chosen here is one an encoded search probe resolves, so
-/// the match fast paths keep binding the column; the choice is made from
-/// bounds the construction already knows (Constant for single-valued, RunEnd
-/// for sorted with few runs, BitPacked at the observed width).
-/// Sortedness stamps carry across; other widths and nullable children pass
-/// through untouched. A chunked column is compressed chunk by chunk (see
-/// [`compress_int_child`]) — the builders assemble anything over
-/// `DEFAULT_CHUNK_ROWS` rows into a `ChunkedArray`, so without that every
-/// build past one chunk would keep the canonical form.
-///
-/// `payload_lazy` wraps each compressed column in a `vortex.shared` lazy
-/// wrapper: the match fast paths probe the compressed source through the
-/// wrapper, while the code-column payload path materializes the canonical
-/// primitive once into the wrapper's cache (`shared_code_primitive`) and is
-/// zero-copy on every later call. Pass it for the primary base — the only
-/// array the payload path reads; components never serve payloads and skip
-/// the wrapper.
+/// `payload_lazy` wraps each compressed column in a `vortex.shared` wrapper:
+/// the match fast paths probe the compressed source through it, while the
+/// code-column payload path decodes the canonical primitive once into its
+/// cache (`shared_code_primitive`) and is zero-copy on every later call. Pass
+/// it for the primary base, the only array the payload path reads.
 pub(crate) fn with_compressed_int_children(rows: ArrayRef, payload_lazy: bool) -> Result<ArrayRef> {
     use vortex_array::arrays::{Primitive, SharedArray};
 
@@ -137,14 +119,12 @@ fn map_struct_children(
 
 /// A base child as a canonical non-nullable code primitive
 /// ([`TermCode`](schema::TermCode)), zero-copy where one exists: a canonical
-/// column directly, a `vortex.shared` wrapper via its
-/// one-way cache — the first call decodes the compressed source into the
-/// cache, every later call is a refcount bump shared by all views over the
-/// base. `None` for any other encoding (callers fall back to the gather
-/// pipeline).
-///
-/// Decoding into the cache is one pass over the whole column, so callers that
-/// only read a few rows take [`cached_code_primitive`] instead.
+/// column directly, a `vortex.shared` wrapper through its one-way cache (the
+/// first call decodes the compressed source into it, every later call is a
+/// refcount bump shared by all views over the base). `None` for any other
+/// encoding (callers fall back to the gather pipeline). Filling the cache is
+/// one pass over the whole column, so a caller that reads a few rows takes
+/// [`cached_code_primitive`] instead.
 pub(crate) fn shared_code_primitive(
     child: &ArrayRef,
 ) -> Option<vortex_array::arrays::PrimitiveArray> {
@@ -170,11 +150,10 @@ pub(crate) fn shared_code_primitive(
 }
 
 /// The non-decoding half of [`shared_code_primitive`]: a base child's
-/// canonical non-nullable code primitive when one already exists — the column itself, or
-/// a `vortex.shared` wrapper whose one-way cache some earlier read already
-/// filled. `None` when producing one would mean decoding the compressed
-/// source, so a caller reading a handful of rows can prefer per-row point
-/// reads over a whole-column pass.
+/// canonical code primitive when one already exists (the column itself, or a
+/// `vortex.shared` wrapper whose cache an earlier read filled). `None` when
+/// producing one would decode the compressed source, so a caller reading a
+/// handful of rows can take per-row point reads over a whole-column pass.
 pub(crate) fn cached_code_primitive(
     child: &ArrayRef,
 ) -> Option<vortex_array::arrays::PrimitiveArray> {
@@ -189,7 +168,7 @@ pub(crate) fn cached_code_primitive(
 }
 
 /// A non-nullable canonical code primitive ([`TermCode`](schema::TermCode)),
-/// or `None` for anything else — the shape both `*_code_primitive` accessors
+/// or `None` for anything else: the shape both `*_code_primitive` accessors
 /// hand back.
 fn canonical_code(arr: &ArrayRef) -> Option<vortex_array::arrays::PrimitiveArray> {
     use vortex_array::arrays::Primitive;
@@ -201,17 +180,11 @@ fn canonical_code(arr: &ArrayRef) -> Option<vortex_array::arrays::PrimitiveArray
     (prim.ptype() == CODE_PTYPE).then_some(prim)
 }
 
-/// One child column's compressed form, or `None` for a column this helper
-/// leaves alone (not a `u64` code or row-id column, nullable, or an encoding
-/// that is already not a canonical primitive).
-///
-/// A chunked column is compressed chunk by chunk and reassembled, which is
-/// what makes the compressed-resident form reach builds above
-/// `DEFAULT_CHUNK_ROWS` rows at all: the builders assemble anything larger
-/// into a `ChunkedArray`, and a downcast straight to `Primitive` sees only
-/// the wrapper. Per-chunk is also the natural granularity — the bounds pass
-/// that picks the encoding is per-chunk regardless, and a chunk of a globally
-/// sorted column is itself sorted, so the RunEnd choice stays valid.
+/// One child column's compressed form, or `None` for a column left alone
+/// (not a `u64` code or row-id column, nullable, or already not a canonical
+/// primitive). A chunked column (any build past `DEFAULT_CHUNK_ROWS` rows) is
+/// compressed chunk by chunk and reassembled; a chunk of a globally sorted
+/// column is itself sorted, so the RunEnd choice stays valid per chunk.
 fn compress_int_child(
     child: &ArrayRef,
     sorted: bool,

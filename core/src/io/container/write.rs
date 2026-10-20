@@ -1,7 +1,6 @@
-//! The write side of the container grammar: assembling a native root layout
-//! from its written children, and the write strategy that turns a quad
-//! stream plus component sources into a store file. The component data types
-//! live in [`sources`](super::sources).
+//! The write side of the container grammar: assembling a native root from its
+//! written children, and the write strategy that turns a quad stream plus
+//! component sources into a store file.
 
 use std::sync::Arc;
 
@@ -15,9 +14,9 @@ use super::layout::{RdfStoreLayout, RdfStoreLayoutData, RdfStoreLayoutVTable};
 use super::sources::NativeComponentWrite;
 use super::wire::{StoreComponentDescriptor, validate_components};
 
-/// How many component children compress concurrently alongside the quad
-/// source. Sources are lazy (replayable or merger-backed) and cost nothing
-/// until polled, so the window only bounds writer-buffered memory.
+/// How many component children compress concurrently beside the quad source.
+/// Sources cost nothing until polled, so the window bounds writer-buffered
+/// memory.
 const COMPONENT_WRITE_CONCURRENCY: usize = 2;
 
 /// One descriptor paired with its written child layout.
@@ -63,8 +62,7 @@ fn new_store_layout_with_components(
 #[derive(Clone)]
 struct RdfStoreWriteStrategy {
     quad_source: Arc<dyn LayoutStrategy>,
-    /// Provenance recorded in the root metadata; see
-    /// `WireMetadata::quads_sorted`.
+    /// Recorded in the root metadata as `quads_sorted`.
     quads_sorted: bool,
     components: Arc<[NativeComponentWrite]>,
 }
@@ -78,8 +76,8 @@ impl RdfStoreWriteStrategy {
         }
     }
 
-    /// Adopt the component inventory; runs [`validate_components`] once for
-    /// the write path.
+    /// Adopt the component inventory, validated once
+    /// ([`validate_components`]).
     fn with_components(mut self, components: Vec<NativeComponentWrite>) -> VortexResult<Self> {
         validate_components(components.iter().map(|c| &c.descriptor))?;
         self.components = components.into();
@@ -89,10 +87,9 @@ impl RdfStoreWriteStrategy {
 
 #[async_trait::async_trait]
 impl LayoutStrategy for RdfStoreWriteStrategy {
-    /// All children compress concurrently through one segment sink. The
-    /// sequenced sink assigns the quad subtree's segment ids ahead of every
-    /// auxiliary child's, so a component's compressed segments accumulate in
-    /// the sink until the quad table finishes writing: peak memory includes
+    /// All children compress concurrently through one segment sink. The quad
+    /// subtree's segment ids come first, so a component's compressed segments
+    /// wait in the sink until the quad table finishes: peak memory includes
     /// the in-flight components' compressed size.
     async fn write_stream(
         &self,
@@ -116,9 +113,8 @@ impl LayoutStrategy for RdfStoreWriteStrategy {
             let child_sink = Arc::clone(&segment_sink);
             let child_session = session.clone();
             jobs.push(async move {
-                // A source's retained chunks are writer-buffered memory for
-                // as long as this component drains; the reservation releases
-                // when the job completes.
+                // The source's retained chunks count as writer-buffered memory
+                // until the job completes.
                 let _reserved = child_ctx.reserve_buffered_bytes(component.source.buffered_bytes());
                 let child_stream = component.source.open()?;
                 let layout = component

@@ -1,5 +1,5 @@
 //! Mutations: appends accrete in the tail and deletes tombstone, so the base
-//! — its row ids, indexes, and file handle — is never rewritten in place.
+//! (its row ids, indexes and file handle) is never rewritten in place.
 
 use crate::error::{Result, VortexRdfError};
 #[cfg(feature = "file-io")]
@@ -24,16 +24,11 @@ use crate::store::VortexRdfStore;
 impl VortexRdfStore {
     // ── mutations ─────────────────────────────────────────────────────────────
 
-    /// This store as one that owns its rows and can be mutated — cheaply when it
-    /// already is an owner, otherwise an independent, compacted copy.
-    ///
-    /// A view derived from `match_pattern` shares a base it does not own, so it
-    /// cannot be mutated in place. This turns such a view into an owner by
-    /// compacting, rebuilding its declared indexes
-    /// ([`compact_with_indexes`]) so mutating a match result yields an
-    /// independent store that is still indexed. An owner is returned as a
-    /// cheap clone, preserving its tombstones and indexes, so repeated
-    /// in-place deletes stay cheap and keep their indexes.
+    /// This store as an owner that can be mutated: a cheap clone, tombstones
+    /// and indexes kept, when it already owns its rows; otherwise (a view
+    /// derived from `match_pattern`, which shares a base it does not own) an
+    /// independent compacted copy with its indexes rebuilt
+    /// ([`compact_with_indexes`]).
     ///
     /// [`compact_with_indexes`]: Self::compact_with_indexes
     pub async fn owned(&self) -> Result<Self> {
@@ -44,17 +39,14 @@ impl VortexRdfStore {
         }
     }
 
-    /// Whether this store owns its rows, as opposed to being a window onto
-    /// someone else's.
-    ///
-    /// Only an owner may be mutated: a narrowed view's rows are a subset of a
-    /// base it shares, so mutating it would either silently discard the rows
-    /// outside the view or write through to data it doesn't own. A view that
-    /// happens to select everything (an unconstrained `match_pattern`) covers
-    /// exactly the same rows as the store it came from, so it counts as an
-    /// owner — mutating it is indistinguishable from mutating that store.
+    /// Whether this store owns its rows rather than being a window onto
+    /// another's. Only an owner may be mutated: a narrowed view's rows are a
+    /// subset of a base it shares, so mutating it would either drop the rows
+    /// outside the view or write through to data it does not own. A view that
+    /// selects everything (an unconstrained `match_pattern`) covers the same
+    /// rows as the store it came from, so it counts as an owner.
     pub(in crate::store) fn is_owner(&self) -> bool {
-        // A narrowed tail marks a view just as a narrowed base does — a match
+        // A narrowed tail marks a view just as a narrowed base does: a match
         // may cover all base rows yet only some of the tail's.
         let tail_owned = self
             .tail
@@ -63,8 +55,8 @@ impl VortexRdfStore {
         tail_owned && self.quads.is_unrefined()
     }
 
-    /// Err unless this store owns its rows — the gate every mutation takes;
-    /// see [`is_owner`](Self::is_owner).
+    /// Err unless this store owns its rows ([`is_owner`](Self::is_owner)): the
+    /// gate every mutation takes.
     fn ensure_owner(&self, operation: &str) -> Result<()> {
         if self.is_owner() {
             return Ok(());
@@ -77,8 +69,8 @@ impl VortexRdfStore {
         )))
     }
 
-    /// Append a single quad — [`add_quads`] with a batch of one; prefer the
-    /// batch form when adding several.
+    /// Append a single quad: [`add_quads`] with a batch of one, the form to
+    /// prefer for several.
     ///
     /// [`add_quads`]: Self::add_quads
     pub async fn add_quad(&self, quad: Quad) -> Result<Self> {
@@ -87,21 +79,20 @@ impl VortexRdfStore {
 
     /// Append every quad not already present (RDF/JS dataset semantics: a
     /// quad equal to an existing one, or to an earlier quad of the batch, is
-    /// skipped). Appends land in the `Tail`, never the base; under the
-    /// Dictionary layout the tail holds terms as strings. Each presence check
-    /// is one fully-bound [`match_pattern`](Self::match_pattern).
+    /// skipped; each presence check is one fully bound
+    /// [`match_pattern`](Self::match_pattern)). Appends land in the `Tail`,
+    /// never the base, as one more chunk, flattened at the tail's policy
+    /// (`TAIL_FLATTEN_FLOOR`/`TAIL_MAX_CHUNKS`); under the Dictionary layout
+    /// the tail holds terms as strings.
     ///
-    /// Fresh rows join the tail as one more chunk; the tail is flattened only
-    /// when it crosses the policy at `TAIL_FLATTEN_FLOOR`/`TAIL_MAX_CHUNKS`.
     /// The add that pushes the tail over the auto-compaction thresholds
-    /// finishes by folding it into the base ([`compact`]) — on a file-backed
-    /// store a rewrite of its source file (watch [`tail_len`](Self::tail_len)).
-    /// If the writer refuses that file as one this process cannot write (a
-    /// read-only store: permission denied, or a read-only filesystem; or a
-    /// directory that takes no new file) it is never rewritten: the batch
-    /// stays in the in-memory tail and the store is returned, and an explicit
-    /// [`compact`] fails with the reason. Any other failure of the compaction
-    /// is returned.
+    /// finishes with [`compact`], on a file-backed store a rewrite of its
+    /// source file (watch [`tail_len`](Self::tail_len)). If the writer refuses
+    /// that file as one this process cannot write (permission denied, a
+    /// read-only filesystem, or a directory that takes no new file), it is
+    /// never rewritten: the batch stays in the in-memory tail and the store is
+    /// returned, while an explicit [`compact`] fails with the reason. Any
+    /// other failure of the compaction is returned.
     ///
     /// [`compact`]: Self::compact
     pub async fn add_quads(&self, quads: impl IntoIterator<Item = Quad>) -> Result<Self> {
@@ -138,16 +129,14 @@ impl VortexRdfStore {
         if appended.should_auto_compact() {
             match appended.compact().await {
                 Ok(compacted) => return Ok(compacted),
-                // The writer refused the store file (or its directory) as
-                // unwritable by this process, as it does a read-only store: a
-                // file that is never rewritten, so there is nothing to fold
-                // the tail into. The batch stays in the in-memory tail, where
-                // queries see it, and the store is returned as an append
-                // without a compaction is; an explicit `compact()` still
-                // reports why it cannot happen. That refusal comes before
-                // anything is gathered or built, so every later append can
-                // retry for the price of one failed open. A permission error
-                // from later in the rewrite is not it, and is returned.
+                // The writer refused the store file (or its directory) as one
+                // this process cannot write, so there is nothing to fold the
+                // tail into: the batch stays in the in-memory tail, where
+                // queries see it, and an explicit `compact()` still reports
+                // why. The refusal comes before anything is gathered or built,
+                // so each later append retries for one failed open. A
+                // permission error from later in the rewrite is not it, and is
+                // returned.
                 Err(error) if error.is_unwritable() => {
                     log::debug!("[add_quads] compaction refused, batch kept in the tail: {error}");
                 }
@@ -168,16 +157,12 @@ impl VortexRdfStore {
         .await
     }
 
-    /// Remove every quad matching the pattern — the counterpart to
-    /// [`match_pattern`], for when the rows a pattern selects should be dropped
-    /// instead of read.
-    ///
-    /// The matched rows are tombstoned in place: the base's row ids — and
-    /// with them its secondary indexes — stay valid, and the tombstones are
-    /// only reclaimed by [`compact`].
-    ///
-    /// Only a store that owns its rows can be mutated; call it on the store a
-    /// view came from, or on `view.owned()`.
+    /// Remove every quad matching the pattern: the counterpart of
+    /// [`match_pattern`], dropping the rows it selects. The matched rows are
+    /// tombstoned in place, so the base's row ids, and with them its secondary
+    /// indexes, stay valid; only [`compact`] reclaims them. Only an owner can
+    /// be mutated: call it on the store a view came from, or on
+    /// `view.owned()`.
     ///
     /// [`match_pattern`]: Self::match_pattern
     /// [`compact`]: Self::compact
@@ -190,9 +175,8 @@ impl VortexRdfStore {
     ) -> Result<Self> {
         self.ensure_owner("delete_matching")?;
 
-        // Reuse the matcher: which rows a pattern names is exactly the question
-        // `match_pattern` answers, and the view it returns shares this store's
-        // base (or file), so the doomed rows are already in base row ids.
+        // The matched view shares this store's base (or file), so the doomed
+        // rows are already in base row ids.
         let doomed = self
             .match_pattern(subject, predicate, object, graph)
             .await?;
@@ -205,15 +189,14 @@ impl VortexRdfStore {
             (tail, _) => tail.clone(),
         };
 
-        // Fold the doomed rows into a base-wide tombstone mask. The matcher
-        // doesn't consult the existing tombstones, so the doomed set may name
-        // rows already deleted; the union absorbs that. Either way the base
-        // (or file) and its secondary indexes are left untouched, and an
-        // owner's filter stays absent: deleting only widens the tombstones.
+        // Fold the doomed rows into a base-wide tombstone mask. The doomed set
+        // may name rows already deleted (the matcher does not consult the
+        // tombstones); the union absorbs them. The base (or file) and its
+        // secondary indexes stay untouched, and an owner's filter stays
+        // absent: deleting only widens the tombstones.
         let doomed = match &doomed.quads.backend {
-            // In memory the matched view's selection maps straight to a
-            // mask — materializing first if its exact ids are still pending
-            // (a delete is one of the consumers that needs them).
+            // In memory the matched view's selection maps straight to a mask,
+            // materialized first if its exact ids are still pending.
             Backend::InMemory(_) => doomed
                 .quads
                 .selection

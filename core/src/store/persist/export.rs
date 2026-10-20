@@ -1,8 +1,6 @@
-//! Exporting a store back to textual RDF: the write direction of the textual
-//! boundary whose read direction is
-//! [`parse_quads_from_reader`](crate::common::terms::parse_quads_from_reader) — the
-//! counterpart of parsing, not of the Vortex byte format (writing that is
-//! `io::write`'s job, reading it `io::read`'s).
+//! Exporting a store back to textual RDF: the counterpart of
+//! [`parse_quads_from_reader`](crate::common::terms::parse_quads_from_reader),
+//! not of the Vortex byte format.
 
 use crate::error::{self, VortexRdfError};
 use crate::store::VortexRdfStore;
@@ -16,11 +14,12 @@ use std::io::Write;
 /// sequentially. N-Triples and N-Quads are written straight from the store's
 /// raw columns; every other format goes through oxrdfio's serializer.
 ///
-/// The writer receives each quad as several small writes, and it is neither
-/// buffered nor flushed here. Wrap one whose every write is a system call (a
-/// `File`, `Stdout`) in a [`BufWriter`](std::io::BufWriter), pass it by `&mut`,
-/// and flush it once the export returns: a `BufWriter` dropped unflushed
-/// discards the error of its last write.
+/// The writer receives each quad as several small writes and is neither
+/// buffered nor flushed here. Wrap one that makes a system call per write (a
+/// `File`) or per line (`Stdout`, which is line-buffered) in a
+/// [`BufWriter`](std::io::BufWriter), pass it by `&mut`, and flush it once the
+/// export returns: a `BufWriter` dropped unflushed discards the error of its
+/// last write.
 pub async fn export_rdf<W: Write>(
     store: VortexRdfStore,
     writer: W,
@@ -32,20 +31,18 @@ pub async fn export_rdf<W: Write>(
     }
 }
 
-/// The N-Triples/N-Quads fast path: the store's raw term strings are the
-/// serialization, byte for byte. Both formats are `s p o [g] .` lines of
-/// N-Triples-form terms, and the columns store exactly that form (with the
-/// empty string marking the default graph) — so each line is assembled from
-/// the raw strings with no term ever parsed or re-escaped. Only the graph
-/// needs a check: N-Triples cannot represent a named graph, and a non-default
-/// graph fails exactly as oxrdfio's serializer would.
+/// The N-Triples/N-Quads fast path: both formats are `s p o [g] .` lines of
+/// N-Triples-form terms, the form the columns store (the empty string marking
+/// the default graph), so each line is assembled from the raw strings with no
+/// term parsed or re-escaped. N-Triples cannot represent a named graph: a quad
+/// in one fails as oxrdfio's serializer fails it.
 async fn write_raw<W: Write>(
     store: VortexRdfStore,
     mut writer: W,
     format: RdfFormat,
 ) -> error::Result<()> {
-    // The raw chunk stream (in-memory, or the lazy file-backed scan). Its read
-    // is set up on the first poll, so the loop's timing below includes it.
+    // The view's raw chunks, read from the first poll on, so the loop's
+    // timing below includes the read.
     let mut chunks = store.raw_quad_chunks();
 
     let write_start = debug::timer();

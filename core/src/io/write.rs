@@ -1,19 +1,9 @@
-//! The write side of the native store container.
-//!
-//! Drives [`write_store`](crate::io::container::write_store) over a
-//! [`BuiltStream`] — the primary quad
-//! chunks plus each index component's and the dictionary's own
-//! [`NativeComponentWrite`](crate::io::container::NativeComponentWrite),
-//! from a builder or from a store's parts — carrying each part's sortedness
-//! provenance onto the descriptors a reader will trust. Also owns the
-//! `quads_stream_to_*` entry points, which run a
-//! builder's chunk stream straight into that writer, and the one way a store
-//! reaches a path on disk: written beside it and renamed into place
-//! ([`PendingStore`]).
-//!
-//! Reading these bytes back is [`read`](crate::io::read)'s job,
-//! and the container's own on-disk grammar is
-//! [`container`]'s.
+//! The write side of the native store container: the driver that writes a
+//! [`BuiltStream`] (a builder's, or a store's parts) through
+//! [`write_store`](crate::io::container::write_store), carrying each part's
+//! sortedness provenance onto the descriptors a reader trusts; the
+//! `quads_stream_to_*` entry points; and [`PendingStore`], the one way a store
+//! reaches a path on disk.
 
 use crate::error::{Result, VortexRdfError};
 
@@ -35,20 +25,12 @@ use crate::store::{Indexes, LayoutStrategy, RawQuad};
 #[cfg(feature = "file-io")]
 use futures::Stream;
 
-/// Stream quads directly into a native store file as compressed chunks.
-///
-/// The build pipeline is the target's, not the caller's: writing a file means
-/// a filesystem exists, so the rows go through the out-of-core global sort
-/// ([`SortedStreamBuilder`]) — the one pipeline whose peak memory does not
-/// scale with the dataset. (The in-memory sort is what targets without a
-/// filesystem use; see [`SortedInMemoryBuilder`].)
-///
-/// [`SortedInMemoryBuilder`]: crate::SortedInMemoryBuilder
-///
-/// Without index children peak memory is bounded by the chunk size; with
-/// them it also includes the in-flight components' compressed size (see
-/// `RdfStoreWriteStrategy::write_stream` for why). The dictionary is complete
-/// before any chunk flows and becomes the required `dictionary` child.
+/// Stream quads into `writer` as a native store file, through the out-of-core
+/// global sort ([`SortedStreamBuilder`]), whose peak memory does not scale with
+/// the dataset: it is bounded by the chunk size, plus the in-flight components'
+/// compressed size when index children are written
+/// (`RdfStoreWriteStrategy::write_stream`). The dictionary is complete before
+/// any chunk flows and becomes the required `dictionary` child.
 ///
 /// A writer has no directory to spill beside: the sort's runs go under
 /// `VORTEX_RDF_SPILL_DIR`, else the OS temp dir, in a hidden
@@ -85,15 +67,13 @@ where
     Ok(())
 }
 
-/// Drive an already-built chunk stream into `writer`: the primary chunks as
-/// the transparent root child, each component and the dictionary as
-/// auxiliary children. The one writer tail — `to_bytes` feeds it a store's
-/// parts as one chunk (`StoreParts::into_stream`),
-/// `quads_stream_to_vortex_writer` (the streaming entry point) a builder's
-/// stream, and compaction a stream it built with its own spill-directory
-/// placement — so every write refuses here while the experimental
-/// patched-array switch is on ([`refuse_experimental_patches`]). The memory
-/// bound is `RdfStoreWriteStrategy::write_stream`'s.
+/// Drive a built chunk stream into `writer`: the primary chunks as the
+/// transparent root child, each component and the dictionary as auxiliary
+/// children. Every store write ends here (`to_bytes` with a store's parts as
+/// one chunk, the two file writers and compaction with a builder's stream), so
+/// every write refuses here while the experimental patched-array switch is on
+/// ([`refuse_experimental_patches`]). The memory bound is
+/// `RdfStoreWriteStrategy::write_stream`'s.
 pub(crate) async fn built_stream_to_vortex_writer<W>(
     built: BuiltStream,
     mut writer: W,
@@ -118,35 +98,34 @@ where
     )
     .await?;
 
-    // A shutdown failure is writer I/O, not an encoding problem — surface it
-    // through the `Io` variant.
+    // A shutdown failure is writer I/O, not an encoding problem.
     writer.shutdown().await.map_err(VortexRdfError::Io)
 }
 
-/// Serialize a quad stream to a native store file at `path` — the path-based
-/// convenience over [`quads_stream_to_vortex_writer`], with the store written
-/// beside `path` and renamed into place.
+/// Serialize a quad stream to a native store file at `path`:
+/// [`quads_stream_to_vortex_writer`] into a file written beside `path` and
+/// renamed into place.
 ///
-/// The file is all-or-nothing. An input that fails partway — a parse error
-/// halfway through the stream — leaves no file at a fresh `path` and the
+/// The file is all-or-nothing. An input that fails partway (a parse error
+/// halfway through the stream) leaves no file at a fresh `path` and the
 /// previous store untouched at an existing one, and a store that has `path`
 /// memory-mapped keeps reading the file it mapped (the old file is replaced,
 /// never rewritten in place; on Windows the rename is refused while a store
 /// has the file mapped, so the write fails until that store is closed).
 ///
-/// A path that cannot take a store — a missing directory, no permission to
-/// write there, a directory at `path` — is reported before any input is
-/// read, not after the whole ingest, sort and dictionary have run. A
-/// character device or a pipe at `path` (`/dev/null`, `/dev/stdout` with a
+/// A path that cannot take a store (a missing directory, no permission to
+/// write there, a directory at `path`) is reported before any input is read.
+/// A character device or a pipe at `path` (`/dev/null`, `/dev/stdout` with a
 /// pipe behind it) takes the store in place, with no temp file and so no
 /// all-or-nothing guarantee.
 ///
 /// The sort spills its runs beside the file it writes (where the links at
 /// `path` end), on the volume that takes the store, in a hidden directory
-/// named after that file (`.out.vortex.spill-<uuid>` for `out.vortex`) and
-/// removed when the write ends. `VORTEX_RDF_SPILL_DIR` overrides that place;
-/// a character device or a pipe has no directory to spill beside, and spills
-/// where [`quads_stream_to_vortex_writer`] does.
+/// named after that file (`.out.vortex.spill-<uuid>` for `out.vortex`, or
+/// `.vortex-rdf.spill-<uuid>` when that name would be too long for a file
+/// name) and removed when the write ends. `VORTEX_RDF_SPILL_DIR` overrides
+/// that place; a character device or a pipe has no directory to spill beside,
+/// and spills where [`quads_stream_to_vortex_writer`] does.
 ///
 /// The quads must be canonical, as for [`quads_stream_to_vortex_writer`]:
 /// from [`RawQuad::from_quad`], the parser ([`parse_quads_from_reader`]) or
@@ -165,11 +144,9 @@ where
 {
     let start = debug::timer();
 
-    // The temp file comes first: the path is checked (and the temp created)
-    // before any input is read. The build then spills beside the temp file,
-    // in a run directory named after the file it writes, and an input that
-    // fails leaves nothing behind, the run directory and the empty temp file
-    // going with the rest.
+    // The path is checked and the temp file created before any input is read.
+    // The build spills beside the temp file, and an input that fails leaves
+    // nothing behind: the run directory and the empty temp file go too.
     let pending = PendingStore::create(path).await?;
     let built = SortedStreamBuilder::build_vortex_stream(
         Box::new(quads),
@@ -189,20 +166,17 @@ where
     Ok(())
 }
 
-/// A store file about to be written all-or-nothing: the path has been checked
-/// and the file that takes the bytes is open, and nothing has been built yet.
-/// [`create`](Self::create) is where a path that cannot take a store is
-/// refused; [`write`](Self::write) fills the file and renames it into place.
+/// A store file about to be written all-or-nothing: the path has been checked,
+/// the file that takes the bytes is open, and nothing has been built yet.
+/// [`create`](Self::create) refuses a path that cannot take a store before
+/// anything is built: a directory at `path`, and, since the temp file is
+/// created at once, a missing directory or a refused write permission.
+/// [`write`](Self::write) fills the file and renames it into place.
 ///
-/// A path that cannot take a store fails in `create`, before anything is
-/// built: a directory at `path` is refused, and the temp file is created
-/// first, so a missing directory or a refused write permission is reported at
-/// once.
-///
-/// The temp file is a sibling so the rename stays on one filesystem, which
-/// is what makes it atomic. The uuid in its name avoids colliding with a
-/// temp left behind by an earlier interrupted write, and the `.tmp`
-/// extension keeps it from being mistaken for a store.
+/// The temp file is a sibling, so the rename stays on one filesystem and is
+/// atomic. The uuid in its name avoids a temp left behind by an earlier
+/// interrupted write, and the `.tmp` extension keeps it from being taken for
+/// a store.
 ///
 /// What the old file was set up as survives the replacement. A symbolic link
 /// at `path` is followed (a chain of them, and a link to a file that is not
@@ -212,45 +186,42 @@ where
 /// on Unix) and the old file's permission bits are set on it before a byte is
 /// written, so a private store is never copied into a more readable temp file,
 /// not even for a moment. A filesystem that refuses that `chmod` fails the
-/// write (there is no store to promise the old permissions to), with the temp
-/// file removed and the old store as it was. Owner, ACLs and extended
-/// attributes are not preserved: the new file belongs to the writing process.
-/// The replacement gives the path a new inode, so another hard link to the old
-/// file keeps the old store.
+/// write, with the temp file removed and the old store as it was. Owner, ACLs
+/// and extended attributes are not preserved: the new file belongs to the
+/// writing process. The replacement gives the path a new inode, so another
+/// hard link to the old file keeps the old store.
 ///
 /// A path that resolves to a character device or a pipe (`/dev/null`, or
-/// `/dev/stdout` with a pipe behind it) takes the bytes in place: they are
-/// written straight into it, with no temp file and no rename, and opening a
-/// pipe waits for its reader. Any other file that is not a regular file is
-/// refused.
+/// `/dev/stdout` with a pipe behind it) takes the bytes in place, with no temp
+/// file and no rename; opening a pipe waits for its reader. Any other file
+/// that is not a regular file is refused.
 ///
 /// A store written over the file it was opened from
 /// ([`create_over`](Self::create_over)) replaces only that file: the path must
 /// still name the file with the given identity when the temp file is created
-/// and again just before the rename. Otherwise the write is refused with
+/// and again just before the rename, or the write is refused with
 /// [`InvalidOperation`](VortexRdfError::InvalidOperation) and nothing is
 /// replaced. A file that is gone is not another file: the store is written
 /// there.
 ///
-/// A store the process cannot write is never replaced: the old file is opened
-/// for writing as a probe (not truncated, not created, nothing changes) before
-/// anything is built, and a `PermissionDenied` answer (or a read-only
+/// A store the process cannot write is never replaced: before anything is
+/// built, the old file is opened for writing as a probe (not truncated, not
+/// created, nothing changes), and a `PermissionDenied` answer (or a read-only
 /// filesystem's) fails the write with an error naming the path and keeping
-/// the kind. A read-only store signals that it should not be overwritten. A
-/// directory that takes no new file is refused the same way, when the temp
-/// file cannot be created. These two refusals, and only these, are marked
-/// ([`StoreNotWritable`](crate::error::StoreNotWritable)), so a caller that
-/// can do without the write (an append whose auto-compaction is refused) tells
-/// them from a permission error that comes later, such as a refused rename.
+/// the kind. A directory that takes no new file is refused the same way, when
+/// the temp file cannot be created. These two refusals, and only these, are
+/// marked ([`StoreNotWritable`](crate::error::StoreNotWritable)), so a caller
+/// that can do without the write (an append whose auto-compaction is refused)
+/// tells them from a permission error that comes later, such as a refused
+/// rename.
 ///
-/// The old file is never modified. Overwriting it in place would be
-/// unsafe while a reader still maps it (its pages would be pulled out from
-/// under the mapping: SIGBUS, or another store's bytes read as the old
-/// ones), and a process that dies mid-write would leave a half-written file
-/// at `path`. The rename makes the swap atomic: a reader that mapped the old
-/// file keeps its pages until it drops (Windows refuses the rename over a
-/// mapped file, and the write then fails with the I/O error until that store
-/// is closed), and `path` is untouched on any earlier failure.
+/// The old file is never modified: overwriting it in place would pull its
+/// pages from under a reader that maps it (SIGBUS, or another store's bytes
+/// read as the old ones), and a process that died mid-write would leave a
+/// half-written file at `path`. A reader that mapped the old file keeps its
+/// pages until it drops (Windows refuses the rename over a mapped file, and
+/// the write then fails with the I/O error until that store is closed), and
+/// `path` is untouched on any failure before the rename.
 ///
 /// The swap is safe against a process crash, not durable against power loss:
 /// nothing is `fsync`ed before the rename, so on a filesystem that does not
@@ -339,8 +310,8 @@ impl PendingStore {
         let target = replacement_target(path)
             .await
             .map_err(|e| io_error("resolve", e))?;
-        // A directory can never be replaced by a store: say so now, not at the
-        // rename after the build. Otherwise remember the old file's permissions
+        // A directory can never be replaced by a store: refuse now, not at the
+        // rename after the build. Otherwise keep the old file's permissions
         // (none for a fresh path).
         let permissions = match tokio::fs::metadata(&target).await {
             Ok(meta) if meta.is_dir() => {
@@ -362,11 +333,10 @@ impl PendingStore {
                 if opened.is_some_and(|opened| FileIdentity::of(&meta) != Some(opened)) {
                     return Err(replaced_since_open(path));
                 }
-                // A store this process could not write is never replaced: a
-                // read-only store signals that it should not be overwritten.
-                // The rename itself needs only the directory, so the file is
-                // asked directly: opened for writing, neither truncated nor
-                // created, so nothing changes (root still bypasses).
+                // A read-only store signals that it should not be overwritten,
+                // but the rename needs only the directory, so the file itself
+                // is asked: opened for writing, neither truncated nor created,
+                // so nothing changes (root still bypasses).
                 match tokio::fs::OpenOptions::new()
                     .write(true)
                     .open(&target)
@@ -418,9 +388,7 @@ impl PendingStore {
         let file = tokio::fs::File::from_std(file);
         if let Some(permissions) = permissions {
             // Before the first byte, not before the rename: the temp file was
-            // born private, so nothing of a private store is ever readable
-            // through its mode, and it only becomes as readable as the old
-            // file was.
+            // born private and only becomes as readable as the old file was.
             tokio::fs::set_permissions(tmp.path(), permissions)
                 .await
                 .map_err(|e| io_error("copy the permissions onto the temporary file of", e))?;
@@ -437,13 +405,11 @@ impl PendingStore {
         })
     }
 
-    /// Where a build that fills this store spills: the name of the file this
-    /// store replaces and the directory the temp file is in, beside that
-    /// file, links followed (not beside the link a store was opened through).
-    /// The finished store is renamed within that directory, which makes it
-    /// the one volume known to take a file as large as the store, and so the
-    /// place for a build's scratch space, named after the file it sits
-    /// beside. A store written in place has none.
+    /// Where a build that fills this store spills: the name of the file it
+    /// replaces and that file's directory, where the temp file is (links
+    /// followed: not beside the link a store was opened through). The store is
+    /// renamed within that directory, the one volume known to take a file the
+    /// store's size. A store written in place has none.
     pub(crate) fn spill_site(&self) -> Option<(&std::ffi::OsStr, &std::path::Path)> {
         match &self.sink {
             Sink::Replace { target, .. } => target.file_name().zip(target.parent()),
@@ -538,18 +504,17 @@ pub(crate) fn refuse_experimental_patches() -> Result<()> {
     Ok(())
 }
 
-/// Create the temp file at `path`, open for writing.
-///
-/// `create_new`: a file already at the temp name is never opened, let alone
-/// truncated and then deleted by the [`TempFile`] guard. The creation is
-/// synchronous, so a caller guards the file in the same poll that makes it.
+/// Create the temp file at `path`, open for writing: `create_new`, so a file
+/// already at the temp name is never opened, let alone truncated and then
+/// deleted by the [`TempFile`] guard, and synchronous, so a caller guards the
+/// file in the same poll that makes it.
 ///
 /// A temp file that stands in for an existing store (`replacing`) is born
-/// readable and writable by its owner alone on Unix, whatever the umask would
-/// give a new file; the old file's permissions are set on it right after. So a
-/// private store is never in a file others can read, not even for the moment
-/// between the temp file's creation and that `chmod`. A temp file for a fresh
-/// path gets the permissions any new file gets.
+/// readable and writable by its owner alone on Unix, whatever the umask, and
+/// the old file's permissions are set on it right after: a private store is
+/// never in a file others can read, not even between the creation and that
+/// `chmod`. A temp file for a fresh path gets the permissions any new file
+/// gets.
 #[cfg(feature = "file-io")]
 pub(crate) fn create_temp(
     path: &std::path::Path,
@@ -575,7 +540,7 @@ const MAX_LINK_HOPS: usize = 40;
 /// The file a store written "to `path`" replaces: `path` itself, unless it is
 /// a symbolic link, in which case the file the chain of links ends at. A link
 /// to a file that is not there yet ends at that file, which is then created,
-/// as creating through the link always did.
+/// as creating through a link does.
 #[cfg(feature = "file-io")]
 async fn replacement_target(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
     let mut target = path.to_path_buf();
@@ -599,8 +564,8 @@ async fn replacement_target(path: &std::path::Path) -> std::io::Result<std::path
 }
 
 /// A temp file that deletes itself when dropped, unless it was
-/// [persisted](Self::persist) — so each error path of a [`PendingStore`]
-/// (and a dropped future) cleans up without a line of its own.
+/// [persisted](Self::persist): every error path of a [`PendingStore`], and a
+/// dropped future, cleans up without a line of its own.
 #[cfg(feature = "file-io")]
 struct TempFile(Option<std::path::PathBuf>);
 

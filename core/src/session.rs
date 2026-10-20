@@ -1,6 +1,6 @@
-//! Crate-wide Vortex session infrastructure. Lives at the crate root because
-//! executing *any* Vortex kernel — an in-memory decode as much as a file scan
-//! — needs the session's registries.
+//! The crate's Vortex sessions: the store session, whose registries every
+//! kernel needs (an in-memory decode as much as a file scan), and the
+//! placeholder session that names a refused file's root layout.
 
 use std::sync::LazyLock;
 
@@ -11,9 +11,9 @@ use vortex_io::session::{RuntimeSession, RuntimeSessionExt};
 use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
 
-/// The one Vortex session: array, layout, scalar-fn and runtime registries,
-/// with the store's container layout registered and the write editions
-/// enabled. The runtime handle is the only per-target piece: tokio natively;
+/// The store session: the array, layout, scalar-fn and runtime registries,
+/// the default encodings, the store's container layout, and the write
+/// editions enabled. The runtime is the one per-target piece: tokio natively,
 /// the microtask-queue `WasmRuntime` on wasm32-unknown-unknown, where the file
 /// writer spawns tasks.
 pub(crate) static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
@@ -32,11 +32,10 @@ pub(crate) static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     session
 });
 
-/// A session that reads a layout it has no registration for as a placeholder.
-/// Nothing is read through it but the footer: it names the root layout of a
-/// file the store session refused (see
-/// [`newer_root_id`](crate::io::container::newer_root_id)), from a buffer or
-/// through positioned reads of a path.
+/// A session that reads an unregistered layout as a placeholder. Only footers
+/// are read through it: it names the root layout of a file the store session
+/// refused ([`newer_root_id`](crate::io::container::newer_root_id)), from a
+/// buffer or by positioned reads of a path.
 pub(crate) static FOREIGN_LAYOUT_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = VortexSession::empty()
         .with::<ArraySession>()
@@ -51,12 +50,11 @@ pub(crate) static FOREIGN_LAYOUT_SESSION: LazyLock<VortexSession> = LazyLock::ne
 
 /// The frozen Vortex `core` edition the store writes with: every array
 /// encoding, layout, extension dtype and zone-map aggregate a store file may
-/// hold, apart from the store's own root layout. Pinned, not Vortex's moving
-/// default (`vortex::editions::DEFAULT_CORE_EDITION`): a frozen edition never
-/// changes, so a Vortex upgrade cannot widen what the store writes. A wire
-/// form outside it, such as per-chunk frame-of-reference (`fastlanes.for.v2`)
-/// or the experimental patched array (`vortex.patched`), stays out of store
-/// files until this pin moves, whatever the session registers.
+/// hold, apart from the store's root layout. A frozen edition never changes,
+/// so a Vortex upgrade cannot widen what the store writes: a wire form outside
+/// it, such as per-chunk frame-of-reference (`fastlanes.for.v2`) or the
+/// experimental patched array (`vortex.patched`), stays out of store files
+/// until this pin moves, whatever the session registers.
 const CORE_EDITION: EditionId = vortex_edition::declarations::core::CORE_2026_08_3;
 
 /// The family of the components vortex-rdf adds to a Vortex file.
@@ -81,11 +79,10 @@ static STORE_DECLARATION: EditionDeclaration = EditionDeclaration {
 };
 
 /// Register Vortex's edition declarations and the store's, then enable
-/// [`CORE_EDITION`] and the store edition for writing. The file writer emits
-/// only components of an enabled edition (reading needs registration
-/// alone), and a compressor built from the session produces only the wire
-/// forms they allow, so the two editions are the allow-list of everything a
-/// store file can contain.
+/// [`CORE_EDITION`] and [`STORE_EDITION`] for writing. The file writer emits
+/// only components of an enabled edition (reading needs registration alone)
+/// and a compressor built from the session only the wire forms they allow, so
+/// the two editions are the allow-list of what a store file can contain.
 fn enable_write_editions(session: &VortexSession) {
     use vortex_edition::EditionSessionExt as _;
     use vortex_error::{VortexExpect as _, vortex_err};

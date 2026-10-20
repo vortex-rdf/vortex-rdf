@@ -1,21 +1,13 @@
-//! Kernels over [`TermCode`] columns — the column-at-a-time operations a
-//! query layer runs between matches: distinct values and value counts (for
-//! `DISTINCT`, `GROUP BY`, `COUNT DISTINCT`), an index gather, and an
-//! equi-join: its pair count, its matching row pairs (refused past a cap
-//! before either output is allocated), and its build side ([`CodeGroups`]),
-//! which joins a left column slice by slice and can gather the joined
-//! columns directly. They work on plain slices so
-//! every binding can hand them its zero-copy columns, and they are
-//! deliberately order-preserving, because the orders are observable: distinct
-//! values come out in first-seen order, and a join's pairs come out in
-//! nested-loop order (left rows in order, each with its right matches in
-//! their original order). Row indices and counts are `u64`, the width of the
-//! codes, so one column type carries all three.
-//!
-//! Term codes are dictionary ranks, so a column's values are dense in a
-//! known range; when that range is small enough relative to the column, a
-//! direct-mapped table beats hashing. Each kernel picks between the two by
-//! `dense_table_fits`.
+//! Kernels over [`TermCode`] columns: distinct values and value counts, an
+//! index gather, and an equi-join (its pair count, its row pairs, refused past
+//! a cap before either output is allocated, and its build side
+//! [`CodeGroups`], which joins a left column slice by slice and can gather the
+//! joined columns). All work on plain slices and preserve order: distinct
+//! values come out in first-seen order, join pairs in nested-loop order (left
+//! rows in order, each with its right matches in their order). Row indices
+//! and counts are `u64`, the codes' width, so one column type carries all
+//! three. Each kernel uses a direct-mapped table when the code range is dense
+//! relative to the column (`dense_table_fits`), else a hash map.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -25,12 +17,11 @@ use vortex_buffer::Buffer;
 
 use crate::store::schema::TermCode;
 
-/// Whether a direct-mapped table over the codes `[lo, lo + span]` is the
-/// better strategy for a column of `len` values: the table costs `span + 1`
-/// slots, so it wins while it stays within a small multiple of the column's
-/// length. Compared as codes, so a span past what a `usize` holds (on a
-/// 32-bit target) takes the hashed path rather than a wrapped table index: a
-/// `true` answer guarantees `span` fits a `usize`.
+/// Whether a direct-mapped table over the codes `[lo, lo + span]` (`span + 1`
+/// slots) is used for a column of `len` values: while it stays within a small
+/// multiple of the column's length. Compared as codes, so a `true` answer
+/// guarantees `span` fits a `usize`; a wider span (on a 32-bit target) takes
+/// the hashed path, never a wrapped table index.
 fn dense_table_fits(span: TermCode, len: usize) -> bool {
     let cutoff = len.saturating_mul(4).max(1 << 16);
     span < TermCode::try_from(cutoff).unwrap_or(TermCode::MAX)
@@ -140,18 +131,14 @@ pub fn take(codes: &[TermCode], indices: &[u64]) -> Result<Buffer<TermCode>, usi
     ))
 }
 
-/// The matching row pairs of two key columns, as parallel index columns
+/// The matching row pairs of two key columns as parallel index columns
 /// `(left_idx, right_idx)`: for every left row in order, each right row with
-/// the same code, in the right column's order — the order a nested loop
-/// produces, which is what makes the result stable across strategies.
-///
-/// The right column is grouped once ([`CodeGroups`]: every right row under
-/// its code, CSR style), then the left column is probed in order. When both
-/// columns are already ascending the pairs come from one merge pass instead.
-/// Either way a counting pass finds the number of pairs first
-/// ([`join_count`]), and each output is allocated once at that length. A
-/// count past `max_pairs` is refused before either output is allocated:
-/// `Err(pairs)` carries it, and `None` admits any count.
+/// the same code in the right column's order (nested-loop order, whichever
+/// strategy runs). The right column is grouped once ([`CodeGroups`]) and the
+/// left probed in order; two ascending columns take one merge pass. A
+/// counting pass ([`join_count`]) sizes each output, allocated once; a count
+/// past `max_pairs` is refused before either is allocated, as `Err(pairs)`,
+/// and `None` admits any count.
 pub fn equi_join_indices(
     left: &[TermCode],
     right: &[TermCode],
@@ -162,9 +149,8 @@ pub fn equi_join_indices(
 }
 
 /// The number of pairs [`equi_join_indices`] produces for the same columns,
-/// saturating at `usize::MAX`, from its counting pass alone: the merge count
-/// of two ascending columns, else the left column probed against the right
-/// one's [`CodeGroups`]. Neither pair column is allocated.
+/// saturating at `usize::MAX`, from its counting pass alone: no pair column
+/// is allocated.
 pub fn join_count(left: &[TermCode], right: &[TermCode]) -> usize {
     if left.is_empty() || right.is_empty() {
         return 0;
@@ -251,10 +237,10 @@ fn merge_join_len(left: &[TermCode], right: &[TermCode]) -> usize {
     total
 }
 
-/// The join of two ascending key columns: walk both, and for each run of
-/// equal codes emit the cross product in nested-loop order. A counting walk
-/// sizes both outputs before they are filled, and refuses a count past
-/// `max_pairs` with `Err(pairs)` before either is allocated.
+/// The join of two ascending key columns: the cross product of each pair of
+/// equal-code runs, in nested-loop order. A counting walk sizes both outputs
+/// and refuses a count past `max_pairs` with `Err(pairs)` before either is
+/// allocated.
 fn merge_join(
     left: &[TermCode],
     right: &[TermCode],
@@ -274,8 +260,8 @@ fn merge_join(
 }
 
 /// The right column grouped by code: [`Groups`] holds each code's right rows
-/// in a slot of their own, and `slots` finds a code's slot — a table over
-/// the column's code [`Span`], or a [`Hashed`] map of its codes.
+/// in a slot of their own, and `slots` finds a code's slot, through a table
+/// over the column's code [`Span`] or a [`Hashed`] map of its codes.
 struct RightIndex<S> {
     slots: S,
     groups: Groups,
@@ -453,12 +439,12 @@ impl<S: Slots> RightIndex<S> {
         Ok((out_l, out_r))
     }
 
-    /// For each left row in order, its right matches, written as values
-    /// rather than row indices: one output per column, each of
-    /// `left_columns` at the left row, then each of `right_columns` at the
-    /// right row. A counting pass sizes every output, and refuses a count
-    /// past `max_pairs` with `Err(pairs)` before any is allocated; each
-    /// output is then filled in a pass of its own over the left rows.
+    /// For each left row in order, its right matches as values rather than
+    /// row indices: one output per column, each of `left_columns` at the left
+    /// row, then each of `right_columns` at the right row. A counting pass
+    /// sizes every output and refuses a count past `max_pairs` with
+    /// `Err(pairs)` before any is allocated; each output is then filled in a
+    /// pass of its own over the left rows.
     fn gather(
         &self,
         left: &[TermCode],
@@ -493,15 +479,13 @@ impl<S: Slots> RightIndex<S> {
 /// [`equi_join_indices`], built once and probed by any number of left
 /// columns, so a join too large for one call runs as a loop over slices of
 /// its left column. It holds one `u64` per right row and one slot per code
-/// of the column's span (a table, when the span is narrow enough for one) or
-/// per distinct code (an FxHash map otherwise); its owner frees both by
-/// dropping it.
+/// of the column's span (a table, when the span is narrow enough) or per
+/// distinct code (a hash map otherwise).
 pub struct CodeGroups(Grouping);
 
 /// The [`RightIndex`] behind a [`CodeGroups`], of the kind [`Span::of`]
-/// picks. The index's methods are compiled for each kind, so a lookup is
-/// inlined into both of a join's passes, and the kind is matched once per
-/// call.
+/// picks. Each kind's methods are compiled separately, so a lookup inlines
+/// into both of a join's passes and the kind is matched once per call.
 enum Grouping {
     Dense(RightIndex<Span>),
     Hashed(RightIndex<Hashed>),
@@ -561,13 +545,11 @@ impl CodeGroups {
     }
 
     /// The columns [`join`](Self::join)'s pairs gather, filled while the
-    /// pairs are found instead of through their index columns: for each pair
-    /// in nested-loop order, each of `left_columns` at the pair's left row,
-    /// then each of `right_columns` at its right row, as one output per
-    /// column, left columns first. Each output equals [`take`] of its column
-    /// at the matching index column of [`join`](Self::join); a left column
-    /// runs parallel to `left` and a right column to the grouped column. A
-    /// count past `max_pairs` is refused before any output is allocated:
+    /// pairs are found: one output per column, left columns first, each of
+    /// `left_columns` read at a pair's left row and each of `right_columns` at
+    /// its right row, in nested-loop order. Each output equals [`take`] of its
+    /// column at the matching index column of [`join`](Self::join). A count
+    /// past `max_pairs` is refused before any output is allocated:
     /// `Err(pairs)` carries it, and `None` admits any count.
     ///
     /// # Panics

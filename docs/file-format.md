@@ -80,9 +80,9 @@ of the leaves it touches. The file's dtype is embedded, so the file is
 self-describing.
 
 The writer is limited to two editions: Vortex's frozen `core` edition
-`CORE_2026_08_3` ([`CORE_EDITION`](../core/src/session.rs#L60)) — every
+`CORE_2026_08_3` ([`CORE_EDITION`](../core/src/session.rs#L58)) — every
 encoding, layout, extension dtype and zone-map aggregate a store file may hold
-— and the store edition ([`STORE_EDITION`](../core/src/session.rs#L71)), whose
+— and the store edition ([`STORE_EDITION`](../core/src/session.rs#L69)), whose
 one member is the root layout. A frozen edition never changes, so a Vortex
 upgrade cannot widen what a store file holds; a wire form outside it, such as
 per-chunk frame-of-reference (`fastlanes.for.v2`), is never written.
@@ -92,8 +92,8 @@ per-chunk frame-of-reference (`fastlanes.for.v2`), is never written.
 ## 3. The store root: `vortex-rdf.store.v2`
 
 The root layout is registered in the crate's Vortex session on every target
-([`register`](../core/src/io/container/layout.rs#L123)); its stable
-id is [`STORE_LAYOUT_ID`](../core/src/io/container/mod.rs#L32). A file whose
+([`register`](../core/src/io/container/layout.rs#L124)); its stable
+id is [`STORE_LAYOUT_ID`](../core/src/io/container/mod.rs#L28). A file whose
 root is any other layout the session registers is refused as "not a
 vortex-rdf store file". A file written before 0.12 fails to open inside Vortex
 with its unknown-layout error.
@@ -101,8 +101,8 @@ with its unknown-layout error.
 A root of the `vortex-rdf.store.` family numbered above `v2` is a store from a
 newer vortex-rdf and is refused as such, with an error saying to open it with a
 newer version; a dictionary or index component whose version is above the one
-this version reads ([`DICT_VERSION`](../core/src/io/container/mod.rs#L52),
-[`INDEX_VERSION`](../core/src/io/container/mod.rs#L56)) is refused the same
+this version reads ([`DICT_VERSION`](../core/src/io/container/mod.rs#L47),
+[`INDEX_VERSION`](../core/src/io/container/mod.rs#L51)) is refused the same
 way. Readers rely on two guarantees of the `v2` writers that nothing checks at
 open: each quad is stored once, and a reference index's children are in
 `(val, rid)` order ([§10](#10-what-a-file-must-satisfy)).
@@ -121,7 +121,7 @@ flowchart TD
 
 Two kinds of child:
 
-- **Child 0 is transparent** ([`QUAD_SOURCE_NAME`](../core/src/io/container/mod.rs#L37)):
+- **Child 0 is transparent** ([`QUAD_SOURCE_NAME`](../core/src/io/container/mod.rs#L33)):
   the root delegates its dtype, row count and scan to it. A plain Vortex reader
   with the layout registered scans the file exactly like a quad table and never
   sees the components in its columns.
@@ -131,7 +131,7 @@ Two kinds of child:
 
 ### 3.1 The inventory
 
-The root's metadata is a JSON document ([`WireMetadata`](../core/src/io/container/wire.rs#L189))
+The root's metadata is a JSON document ([`WireMetadata`](../core/src/io/container/wire.rs#L185))
 carried inside the Layout flatbuffer, so it is read with the footer:
 
 ```json
@@ -157,7 +157,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 |---|---|
 | `version` | the metadata grammar; readers reject any value but `1` |
 | `quads_sorted` | the writer's provenance that the quad rows are in **global `(s, p, o, g)` order** — the only thing a reader may restore the subject `IsSorted` stamp from, since Vortex statistics do not record sortedness |
-| `components[i]` | describes child `i + 1` ([`StoreComponentDescriptor`](../core/src/io/container/wire.rs#L128)) |
+| `components[i]` | describes child `i + 1` ([`StoreComponentDescriptor`](../core/src/io/container/wire.rs#L126)) |
 | `name` | the child's identity; non-empty, unique, never `quad-source` |
 | `role` | `dictionary`, `index`, `change-set` (reserved for future delta components) or `other` |
 | `implementation` | the slug a reader interprets the columns through — the key of the registry behind [`known_component`](../core/src/store/indexes/components.rs#L63) |
@@ -168,7 +168,7 @@ carried inside the Layout flatbuffer, so it is read with the footer:
 
 On open the layout checks that the child count is `1 + components.len()`,
 that child 0 has the root's row count, and that every component child's dtype
-matches its descriptor ([`deserialize`](../core/src/io/container/layout.rs#L53));
+matches its descriptor ([`deserialize`](../core/src/io/container/layout.rs#L54));
 [`classify_component`](../core/src/store/persist/open.rs#L89) then turns each
 descriptor into the dictionary, a known index, or a skip — an index child by
 its implementation slug alone, whatever its name. The open classifies the
@@ -216,7 +216,7 @@ column
 
 An id column — a `u64` term-code `s`, `p`, `o`, `g` or `val`, or a `u64`
 row-id `rid` — takes the same pipeline with one change, through the writer's
-per-field override ([`child_strategy`](../core/src/io/container/sources.rs#L235)):
+per-field override ([`child_strategy`](../core/src/io/container/sources.rs#L229)):
 if it does not dictionary-encode (a row-id column never does: its ids are
 unique), it coalesces toward ~2 MiB, 262,144 rows per leaf. A code column that
 dictionary-encodes keeps its codes at ~1 MiB: they are as narrow as its
@@ -259,7 +259,7 @@ are bare codes and cannot be decoded without it.
 | Property | Value |
 |---|---|
 | `name` / `role` | `dictionary` / `dictionary` |
-| `implementation` / `version` | `sorted-terms-fsst-v1` / 2 ([`DICT_VERSION`](../core/src/io/container/mod.rs#L52)); version 1, without zone maps, is read the same way, and a higher version is refused at open |
+| `implementation` / `version` | `sorted-terms-fsst-v1` / 2 ([`DICT_VERSION`](../core/src/io/container/mod.rs#L47)); version 1, without zone maps, is read the same way, and a higher version is refused at open |
 | `required` / `sorted` | `true` / `true` |
 | schema | one column, [`_dict_term`](../core/src/store/layouts/dictionary/storage.rs#L31): non-nullable `Utf8` |
 | contents | every distinct term of the dataset — subjects, predicates, objects, graph names and the default graph's `""` in one namespace — sorted, each once |
@@ -269,7 +269,7 @@ are bare codes and cannot be decoded without it.
 The column is FSST-compressed **at the source**, in independent windows of
 65,536 terms ([`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage.rs#L39))
 that share one symbol table trained on the whole column. The child is written
-through its own strategy ([`dict_child_strategy`](../core/src/io/container/sources.rs#L373)):
+through its own strategy ([`dict_child_strategy`](../core/src/io/container/sources.rs#L366)):
 a Struct over a Zoned layout whose data is a Chunked layout of Flat leaves,
 **one leaf per window, written verbatim** — no sampling, no re-encoding. The
 zone map holds **one zone per window** with the exact aggregates
@@ -279,7 +279,7 @@ chunks are not one uniform window (chunks adopted from a foreign file) is
 written without the zone map; readers inspect the layout for it.
 
 **Reading it from a file.** A file store is memory-mapped
-([`from_file`](../core/src/store/persist/open.rs#L237)) and the dictionary stays in
+([`from_file`](../core/src/store/persist/open.rs#L235)) and the dictionary stays in
 its child
 ([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L241)).
 At open the handle reads the zone table — one small segment — and keeps, per
@@ -332,9 +332,9 @@ Shared rules:
 - **Term encoding follows the layout**: `Utf8` strings under `Default` and
   `TypedObject` (a `TypedObject` object appears as its full N-Triples term),
   `u64` codes under `Dictionary`. `rid` is always a non-nullable `u64`
-  ([`RowId`](../core/src/store/schema.rs#L37)), under every layout; a child
+  ([`RowId`](../core/src/store/schema.rs#L33)), under every layout; a child
   whose `rid` is an integer of any other width is refused at open
-  ([`check_id_columns`](../core/src/store/persist/open.rs#L43)): rebuild such a store
+  ([`check_id_columns`](../core/src/store/persist/open.rs#L42)): rebuild such a store
   from its RDF source.
 - **Row ids do not limit a store.** A `u64` row id numbers more rows than any
   store holds. The builds still number rows with checked arithmetic — up
@@ -467,7 +467,7 @@ a call is working on and the bounded structures below. Residency is the
 kernel's decision; no segment cache sits in between.
 
 What a file store keeps for its lifetime, and what bounds it. The opened handle
-([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L40)) and the file-backed
+([`NativeStoreFile`](../core/src/store/persist/native_file.rs#L39)) and the file-backed
 dictionary handle
 ([`FileBackedDict`](../core/src/store/layouts/dictionary/file_backed.rs#L241))
 keep:
@@ -586,21 +586,21 @@ open rather than being read around.
 
 | Constant | Value | Defined in |
 |---|---|---|
-| `STORE_LAYOUT_ID` | `vortex-rdf.store.v2` | [`container/mod.rs`](../core/src/io/container/mod.rs#L32) |
-| `STORE_METADATA_VERSION` | 1 | [`wire.rs`](../core/src/io/container/wire.rs#L18) |
-| row block / zone size | 8,192 rows — the block a written column is repartitioned into, and its zone-map granularity (Vortex's default write strategy, kept) | [`ROW_BLOCK`](../core/src/io/container/sources.rs#L188) |
-| data block target | ~1 MiB (Vortex's default); ~2 MiB for an id column (a term code or a row id) that does not dictionary-encode | [`ONE_MEG`](../core/src/io/container/sources.rs#L184), [`child_strategy`](../core/src/io/container/sources.rs#L235) |
+| `STORE_LAYOUT_ID` | `vortex-rdf.store.v2` | [`container/mod.rs`](../core/src/io/container/mod.rs#L28) |
+| `STORE_METADATA_VERSION` | 1 | [`wire.rs`](../core/src/io/container/wire.rs#L16) |
+| row block / zone size | 8,192 rows — the block a written column is repartitioned into, and its zone-map granularity (Vortex's default write strategy, kept) | [`ROW_BLOCK`](../core/src/io/container/sources.rs#L189) |
+| data block target | ~1 MiB (Vortex's default); ~2 MiB for an id column (a term code or a row id) that does not dictionary-encode | [`ONE_MEG`](../core/src/io/container/sources.rs#L185), [`child_strategy`](../core/src/io/container/sources.rs#L229) |
 | `DICT_CHUNK_ROWS` | 65,536 terms per FSST window and leaf | [`storage.rs`](../core/src/store/layouts/dictionary/storage.rs#L39) |
 | `WINDOW_CACHE_BYTES` | 4 MiB per opened file: what a file-backed dictionary's window cache may hold, each window charged its code offsets and `WINDOW_ENTRY_OVERHEAD` ([§8](#8-reading-a-file)) | [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs#L74) |
 | `WINDOW_ENTRY_OVERHEAD` | 4 KiB charged per cached window beyond its chunk's bytes | [`file_backed.rs`](../core/src/store/layouts/dictionary/file_backed.rs#L80) |
-| `DICT_VERSION` | 2 | [`container/mod.rs`](../core/src/io/container/mod.rs#L52) |
-| `INDEX_VERSION` | 1 | [`container/mod.rs`](../core/src/io/container/mod.rs#L56) |
+| `DICT_VERSION` | 2 | [`container/mod.rs`](../core/src/io/container/mod.rs#L47) |
+| `INDEX_VERSION` | 1 | [`container/mod.rs`](../core/src/io/container/mod.rs#L51) |
 | `POINT_GATHER_MAX_ROWS` | 256 rows — a selection, or a located run, at most this wide is read point by point through the cached probes (`gather_by_point_reads`, the located-run reads) | [`selection.rs`](../core/src/store/view/selection.rs#L518) |
 | `POINT_READ_ROWS` | 256 rows — exact row ids at most one per this many rows of the splits holding them check a pending filter by point reads, which cost about what a filtered scan spends on that many rows ([matching.md §7](matching.md#7-the-file-path)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L631) |
 | `POINT_IDS_PER_SPLIT` | 16 ids — exact ids at most this many per split they touch are read point by point, where a take through the chunk probes pays a fixed cost per leaf ([matching.md §12](matching.md#12-what-the-derived-view-costs-at-read-time)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L783) |
 | `TAKE_ROWS` | 16 rows — exact ids at most one per this many rows of their splits are taken at their rows rather than scanned | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L667) |
 | `MAX_INLINE_SPLITS` | 42 splits — a row scan of at most this many runs inline, a larger one is spawned ([§8](#8-reading-a-file)) | [`file_reads.rs`](../core/src/store/scan/file_reads.rs#L64) |
-| `DEFAULT_CHUNK_ROWS` | 100,000 rows per builder chunk: a run's size, an emitted chunk's size, a spiller's capacity and the auto-compaction cap (a producer batch size; the writer re-blocks at 8,192) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L61) |
+| `DEFAULT_CHUNK_ROWS` | 100,000 rows per builder chunk: a run's size, an emitted chunk's size, a spiller's capacity and the auto-compaction cap (a producer batch size; the writer re-blocks at 8,192) | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L47) |
 
 ---
 

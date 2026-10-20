@@ -1,6 +1,5 @@
-//! Serialization: the rows-plus-components-plus-dictionary parts every write
-//! path produces (`to_serializable_parts`, `to_bytes`) and the in-memory open
-//! adopts (`from_file_in_memory`).
+//! Serialization: a store's parts (rows, components and dictionary), which
+//! `to_bytes` writes and the in-memory open (`from_file_in_memory`) adopts.
 
 use crate::error::Result;
 use crate::store::Backend;
@@ -18,9 +17,8 @@ impl StoreParts {
     /// as the one chunk, each component as a write, the dictionary beside
     /// them, and the rows' subject stamp as the root's `quads_sorted`. A
     /// Dictionary-layout primary comes with its dictionary
-    /// (`to_serializable_parts` always pairs them).
-    ///
-    /// Refuses while the experimental patched-array switch is on
+    /// (`to_serializable_parts` always pairs them). Refuses while the
+    /// experimental patched-array switch is on
     /// ([`refuse_experimental_patches`]) before it packs any component, so a
     /// write that cannot happen materializes no deferred index child.
     ///
@@ -64,31 +62,26 @@ impl VortexRdfStore {
     /// This store's serializable parts: the rows this view covers, base and
     /// tail combined, as one array of primary columns, the index components
     /// describing them and, under the Dictionary layout, the term dictionary
-    /// those rows' codes address — what every serialization path writes
-    /// (`to_bytes`) and the in-memory open adopts (`from_file_in_memory`).
+    /// their codes address. `to_bytes` writes them and the in-memory open
+    /// (`from_file_in_memory`) adopts them.
     ///
-    /// Components are included only when their `rid`s actually address the
-    /// returned rows: an unrefined, untombstoned owner passes its components
-    /// through (in memory) or lifts its index children (file); an owner that
-    /// is tailed, or tombstoned and indexed, REBUILDS them over the surviving
-    /// rows (the held components' rids predate the mutation); a narrowed
-    /// view returns none — its gathered rows are renumbered, and rebuilding
-    /// indexes for an arbitrary view is compaction's job, not
-    /// serialization's.
+    /// Components come only when their `rid`s address the returned rows: an
+    /// unrefined, untombstoned view without a tail passes its components
+    /// through (in memory) or lifts its index children (file); a view with a
+    /// tail, or an unrefined tombstoned one with indexes, rebuilds them over
+    /// the surviving rows (the held components' rids predate the mutation);
+    /// any other narrowed view returns none, its gathered rows being
+    /// renumbered (re-indexing a view is compaction's job).
     ///
-    /// A rebuild also **reorders** the rows it re-emits (see
-    /// `sorted_live_raw_quads`, compaction's rows too), so the merged output
-    /// is `(s, p, o, g)`-sorted and carries the subject stamp — serialization
-    /// preserves the store's quads, not their row numbering.
-    ///
-    /// Under the Dictionary layout a rebuild re-encodes the rows against a
-    /// fresh dictionary, which the parts carry: a tailed view's cached
-    /// dictionary predates the tail and would mismatch the new codes. A view
-    /// that does not rebuild carries the store's own dictionary, a
-    /// file-backed one lifted resident transiently for the write.
-    ///
-    /// The row read paths read the rows alone (`base_read`), which never
-    /// materializes components.
+    /// A rebuild re-emits the surviving rows in `(s, p, o, g)` order, each
+    /// once (`sorted_live_raw_quads`, as compaction does), so the output
+    /// carries the subject stamp: serialization preserves the store's quads,
+    /// not their row numbering. Under the Dictionary layout it re-encodes them
+    /// against a fresh dictionary, which the parts carry (the cached one
+    /// predates the tail). A view that does not rebuild carries the store's
+    /// own dictionary, a file-backed one lifted resident for the write, and
+    /// its rows are read alone (`base_read`), which never materializes
+    /// components.
     pub(crate) async fn to_serializable_parts(&self) -> Result<StoreParts> {
         let owner_shaped = self.quads.is_unrefined();
         let tombstoned = self.quads.deleted.is_some();
@@ -130,11 +123,10 @@ impl VortexRdfStore {
         })
     }
 
-    /// Serialize this store to native-container bytes: the quad table as the
-    /// transparent root child, the dictionary and index copies as auxiliary
-    /// children. The exchange format of the bindings — read back with
-    /// [`from_bytes`](Self::from_bytes) or written to disk as a `.vortex`
-    /// file.
+    /// This store as native-container bytes, the bindings' exchange format:
+    /// the quad table as the transparent root child, the dictionary and index
+    /// children as auxiliary children. Read back with
+    /// [`from_bytes`](Self::from_bytes), or written as a `.vortex` file.
     pub async fn to_bytes(&self) -> Result<Vec<u8>> {
         let parts = self.to_serializable_parts().await?;
         let start = crate::debug::timer();

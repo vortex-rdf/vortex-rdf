@@ -33,13 +33,12 @@ use crate::store::construct::resolved_layout;
 use crate::store::indexes::COL_RID;
 use crate::store::schema::{CODE_PTYPE, ROW_ID_PTYPE, is_code_column_name};
 
-/// Refuse a table whose id columns are integers of a width other than the
-/// one this version reads: the readers take an integer `s`, `p`, `o`, `g`
-/// (the quad table and the copy index's children) or `val` (the reference
-/// index's) for a `u64` code column ([`TermCode`](crate::store::TermCode)), and an
-/// index child's `rid` for a `u64` row id ([`RowId`](crate::store::RowId)), so a
-/// file with narrower codes or row ids must not open. `table` names the
-/// table in the error.
+/// Refuse a table whose id columns are integers of another width than this
+/// version reads: an integer `s`, `p`, `o`, `g` (the quad table and the copy
+/// index's children) or `val` (the reference index's) is read as a `u64` code
+/// ([`TermCode`](crate::store::TermCode)) and an index child's `rid` as a
+/// `u64` row id ([`RowId`](crate::store::RowId)), so a file with narrower
+/// codes or row ids must not open. `table` names the table in the error.
 pub(in crate::store) fn check_id_columns(table: &str, dtype: &DType) -> Result<()> {
     let DType::Struct(fields, _) = dtype else {
         return Ok(());
@@ -71,21 +70,22 @@ enum ComponentKind {
     /// The required `dictionary` child (the Dictionary layout's terms).
     Dict,
     /// A known index child: the registry row carrying the identity an
-    /// in-memory [`IndexComponent`](crate::store::indexes::IndexComponent)
-    /// adopts and the index type it makes queryable.
+    /// in-memory [`IndexComponent`] adopts and the index type it makes
+    /// queryable.
     Index(&'static ComponentIdentity),
-    /// An optional component this version does not interpret — ignoring it
+    /// An optional component this version does not interpret: ignoring it
     /// cannot change query results.
     Skip,
 }
 
 /// Interpret one component descriptor for every open path (through
-/// [`ComponentRoster::of`]), owning the rejection of a dictionary child of an
-/// unknown implementation or of a version newer than
-/// [`DICT_VERSION`](container::DICT_VERSION), and of an *uninterpretable
-/// required* component: skipping one — a future change set, say — would
-/// silently change query results. An index child is classified by its
-/// implementation slug alone, never by its name.
+/// [`ComponentRoster::of`]). Refused: a dictionary child of an unknown
+/// implementation or of a version newer than
+/// [`DICT_VERSION`](container::DICT_VERSION), an index child newer than
+/// [`INDEX_VERSION`](container::INDEX_VERSION) or with id columns of another
+/// width, and an *uninterpretable required* component, since skipping one (a
+/// future change set, say) would change query results. An index child is
+/// classified by its implementation slug alone, never by its name.
 fn classify_component(descriptor: &container::StoreComponentDescriptor) -> Result<ComponentKind> {
     if descriptor.name == container::DICT_COMPONENT_NAME {
         if descriptor.implementation != container::DICT_IMPLEMENTATION {
@@ -144,7 +144,7 @@ pub(in crate::store) struct IndexChild {
 /// A store's component roster as this version reads it, classified once at
 /// open: the slot of its dictionary child and its known index children, in
 /// inventory order. Skipped components are left out, so whatever reaches a
-/// child through the roster — the resolvers, the listing, the adoptions —
+/// child through the roster (the resolvers, the listing, the adoptions)
 /// reaches only the children classified here.
 pub(super) struct ComponentRoster {
     /// The slot of the `dictionary` child, when the inventory carries one.
@@ -155,7 +155,7 @@ pub(super) struct ComponentRoster {
 
 impl ComponentRoster {
     /// The roster of the native store file `file`, refused unless this
-    /// version can read it — the checks every open runs before it reads a
+    /// version can read it, by the checks every open runs before it reads a
     /// row: the root must be the native store layout, the quad table's id
     /// columns this version's width ([`check_id_columns`]) and every
     /// component interpretable ([`classify_component`]); then each known
@@ -199,9 +199,9 @@ impl ComponentRoster {
 }
 
 /// Lift an unrefined file view's index children into in-memory components:
-/// each known child of the file's roster is scanned whole and executed to
-/// its rows — its every consumer (a write, an in-memory open) reads them at
-/// once — with the descriptor's `sorted` provenance carried across.
+/// each known child of the file's roster is scanned whole and executed to its
+/// rows (every consumer, a write or an in-memory open, reads them at once),
+/// its descriptor's `sorted` provenance carried across.
 #[cfg(feature = "file-io")]
 pub(in crate::store) async fn scanned_index_components(
     file: &NativeStoreFile,
@@ -220,30 +220,26 @@ pub(in crate::store) async fn scanned_index_components(
 
 impl VortexRdfStore {
     /// Open a store file memory-mapped (`memmap2`, through Vortex's
-    /// `open_buffer`): a segment read is a slice of the map, so what stays
-    /// in RAM is the kernel's page cache — file-backed, reclaimable RSS —
-    /// and the dictionary's bounded window cache, never a copy of the file
-    /// on this process's heap. Only the footer is read up front; under the
-    /// Dictionary layout the dictionary child's per-window term bounds are
-    /// read too.
+    /// `open_buffer`): a segment read is a slice of the map, so what stays in
+    /// RAM is the kernel's page cache (file-backed, reclaimable) and the
+    /// dictionary's bounded window cache, never a copy of the file on this
+    /// process's heap. Only the footer is read up front, plus, under the
+    /// Dictionary layout, the dictionary child's per-window term bounds.
     ///
     /// The file is read in place for the store's lifetime: it must not be
     /// truncated or rewritten while open. Replacing it by a rename (as
     /// [`compact`](Self::compact) and the file writers do) is fine on Unix,
     /// where the mapping keeps the old file; Windows refuses to rename over a
-    /// mapped file.
-    /// Network filesystems are not supported for mapping.
+    /// mapped file. Network filesystems are not supported for mapping.
     #[cfg(feature = "file-io")]
     pub async fn from_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
         Self::open_file(path, read::FileAccess::Mapped).await
     }
 
-    /// Load a store file whole into memory — quad rows, dictionary and every
-    /// index child — through Vortex's file reader rather than a mapping, so
-    /// the loaded store owns its memory and never reads the file again: the
-    /// explicit "load everything" opt-in (Python's `in_memory=True`). The
-    /// file is opened, then its rows, dictionary and index children are
-    /// adopted in memory, each column keeping its compressed form wherever a
+    /// Load a store file whole into memory (quad rows, dictionary and every
+    /// index child) through Vortex's file reader rather than a mapping, so the
+    /// loaded store owns its memory and never reads the file again (Python's
+    /// `in_memory=True`). Each column keeps its compressed form wherever a
     /// match can bind it directly.
     #[cfg(feature = "file-io")]
     pub async fn from_file_in_memory<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
@@ -252,20 +248,20 @@ impl VortexRdfStore {
     }
 
     /// The open behind both: footer, component roster and resolved layout,
-    /// the file reached through `access`. The dictionary stays in its child —
-    /// unless the child's shape declines the file-backed handle, and holding
-    /// it whole is then the only way to read it at all.
+    /// the file reached through `access`. The dictionary stays in its child,
+    /// read through the leaves a probe or decode touches, unless the child's
+    /// shape declines that handle: then it is held whole, the only way left
+    /// to read it.
     #[cfg(feature = "file-io")]
     async fn open_file<P: AsRef<std::path::Path>>(
         path: P,
         access: read::FileAccess,
     ) -> Result<Self> {
-        // Opens the file footer only (schema + layout metadata); no row data
-        // is read yet. The handle owns the reader tree, so scans and prunes
-        // across this store (and stores derived from it) share decoded
-        // zone-map stats instead of re-reading them each time; it refuses a
-        // file this version cannot read and classifies its component roster
-        // once (`ComponentRoster::of`).
+        // The footer only (schema and layout metadata); no row is read yet.
+        // The handle owns the reader tree, so this store and the views
+        // derived from it share decoded zone-map stats; it refuses a file this
+        // version cannot read and classifies its roster once
+        // (`ComponentRoster::of`).
         let file = Arc::new(NativeStoreFile::try_new(
             read::open_vortex_file(path.as_ref(), access).await?,
         )?);
@@ -286,14 +282,11 @@ impl VortexRdfStore {
                 indexes.push(child.identity.index);
             }
         }
-        // The dictionary stays in its child, read through the chunk leaves a
-        // probe or decode touches — unless the child's layout shape declines
-        // that handle, and holding it whole is then the only way to read it
-        // at all. Only the Dictionary layout reads one.
+        // Only the Dictionary layout reads a dictionary.
         let dict = match LayoutStrategy::from_dtype(file.dtype()) {
             LayoutStrategy::Dictionary => match FileBackedDict::open(&file).await? {
                 Some(dict) => Some(DictAccess::FileBacked(dict)),
-                // One full scan of the dictionary child — chunks keep their
+                // One full scan of the dictionary child; the chunks keep their
                 // FSST.
                 None => match file.component_reader(container::DICT_COMPONENT_NAME)? {
                     Some(reader) => Some(DictAccess::Resident(Arc::new(
@@ -325,19 +318,16 @@ impl VortexRdfStore {
     /// Load a store from Vortex file bytes ([`to_bytes`](Self::to_bytes)'s
     /// output, or a `.vortex` file read into memory): the quad child is read
     /// into an in-memory base, the dictionary child is lifted resident, and
-    /// index children become in-memory components beside the base — adopted
-    /// *un-executed* (buffer-backed) and canonicalized on their first genuine
-    /// use, so a load pays nothing for an index it never queries.
+    /// the index children become in-memory components adopted *un-executed*
+    /// (buffer-backed) and canonicalized on their first use, so a load pays
+    /// nothing for an index it never queries.
     ///
     /// Sortedness is restored from the file's own provenance, never assumed:
     /// the subject binary-search stamp only when the root metadata records a
-    /// sorted build, and each component's binary-searchability from its
-    /// descriptor's `sorted` flag (children whose chunks carry only local
-    /// sorts stay unsearchable — scanning them is correct, searching them
-    /// would not be).
-    ///
-    /// Runs handle-free end to end (buffer-backed segment reads resolve
-    /// synchronously).
+    /// sorted build, and a component's binary search only when its descriptor
+    /// is `sorted` (a child sorted only per chunk is scanned, never searched).
+    /// Runs without a runtime handle: buffer-backed segment reads resolve
+    /// synchronously.
     pub async fn from_bytes(bytes: &[u8]) -> Result<Self> {
         // The borrowed form's one copy: the caller lends a slice, and the
         // file machinery hands out refcounted slices of a buffer it must keep
@@ -383,12 +373,10 @@ impl VortexRdfStore {
             ))),
             None => None,
         };
-        // Adopted by reader, nothing read: the roster row comes off the wire
-        // TOC alone, and the child's scan and canonicalization both defer to
-        // the component's first genuine use — an index probe, serialization —
-        // so a load pays nothing for index children it never touches. Sound
-        // here because each reader sits over the buffer the file was opened
-        // from (see `adopt_component`).
+        // Adopted by reader, nothing read: the child's scan and
+        // canonicalization wait for the component's first use (an index
+        // probe, serialization). Sound because each reader sits over the
+        // buffer the file was opened from (see `adopt_component`).
         let components = roster
             .index_children
             .iter()

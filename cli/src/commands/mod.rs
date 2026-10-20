@@ -1,9 +1,8 @@
-//! The three subcommand bodies, one file per [`crate::Action`] arm; `main.rs`
-//! keeps only the clap definitions and the dispatch. The `match` arm lives in
-//! [`matching`] because `match` is a keyword. What `serialize` and `match`
-//! share for an RDF input is the format rule [`input_format`]; what
-//! `deserialize` and `match` share for their output is the format rule
-//! [`output_format`] and the writer [`export_to_output`].
+//! The three subcommand bodies, one file per [`crate::Action`] arm (`match`
+//! in [`matching`], as `match` is a keyword), and what they share: the input
+//! format rule of `serialize` and `match` ([`input_format`]), and the output
+//! format rule and writer of `deserialize` and `match` ([`output_format`],
+//! [`export_to_output`]).
 
 use anyhow::{Context, Result, anyhow};
 use oxrdfio::RdfFormat;
@@ -29,7 +28,7 @@ fn input_format(explicit: Option<RdfFormat>, path: Option<&Path>, flag: &str) ->
 }
 
 /// The format an exported document is written in: `explicit` when given, else
-/// the one the extension of the output `path` names, else N-Quads — which is
+/// the one the extension of the output `path` names, else N-Quads, which is
 /// also what a document written to stdout (no `path`) gets.
 fn output_format(explicit: Option<RdfFormat>, path: Option<&Path>) -> RdfFormat {
     explicit

@@ -1,19 +1,14 @@
-//! The [`SortedInMemoryBuilder`] strategy: hold the whole dataset, sort it
-//! once by (s, p, o, g), and emit chunks as windows of that single order.
+//! The [`SortedInMemoryBuilder`] strategy: hold the whole dataset and sort it
+//! once by (s, p, o, g). Holding everything is what earns the global
+//! sortedness the build claims (the `s` column's `IsSorted` stamp, and the
+//! index children [`build_components`] builds over the sorted dataset), at
+//! O(dataset) memory; the out-of-core `sorted_stream` gives the same guarantee
+//! without it.
 //!
-//! Holding everything at once is what earns the global sortedness this
-//! builder claims: the `s` column's `IsSorted` stamp, and the index children
-//! it builds through [`build_components`] over the sorted dataset. The cost
-//! is O(dataset) memory; the out-of-core strategy with the same guarantee is
-//! [`sorted_stream`](super::sorted_stream). Only this file's ordering
-//! discipline lives here — the emission machinery it drives belongs to
-//! [`builders`](super).
-//!
-//! Quads are unique and terms are canonical in what this builder emits. The
-//! sort is followed by dropping adjacent repeats, before any column or index
-//! child is built, so the rows, the row ids and every child describe the
-//! same deduplicated dataset. Terms are interned by the spelling the parser
-//! gave them, which is the one canonical spelling of an RDF term.
+//! Quads are unique and terms canonical in what this builder emits: adjacent
+//! repeats are dropped right after the sort, before any column or index child
+//! is built, so the rows, the row ids and every child describe the same
+//! deduplicated dataset, and terms are interned by their canonical spelling.
 
 use super::{BuiltArray, VortexArrayBuilder, build_components, build_struct_array};
 use crate::error::Result;
@@ -25,11 +20,10 @@ use crate::store::layouts::dictionary::ingest::{InterningQuadBuilder, finish_int
 use crate::debug;
 use futures::{Stream, StreamExt};
 
-/// Fully in-memory, globally sorted Vortex RDF Array Builder.
-///
-/// Sorts all quads in memory by (s, p, o, g), builds the primary columns, and
-/// builds every requested index child (by copy and by reference) over the
-/// same sorted dataset, so each child is globally sorted and
+/// The fully in-memory, globally sorted builder, the only one on
+/// wasm32-unknown-unknown: it sorts every quad by (s, p, o, g) in memory,
+/// builds the primary columns, and builds every requested index child over
+/// the same sorted dataset, so each child is globally sorted and
 /// binary-searchable.
 pub struct SortedInMemoryBuilder;
 
@@ -41,14 +35,11 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
     ) -> Result<BuiltArray> {
         let start = debug::timer();
 
-        // Build a single contiguous StructArray of primary columns, with each
-        // requested index's child built beside it over the same sorted
-        // dataset: both the `s` column and every child are then globally
-        // sorted.
-        //
-        // Dictionary layout interns terms as the stream drains, so the sort
-        // runs over 32-byte coded rows and no `Vec<RawQuad>` (four owned
-        // Strings per quad) ever accumulates.
+        // One StructArray of primary columns, each requested index's child
+        // built beside it over the same sorted dataset. The Dictionary layout
+        // interns terms as the stream drains, so the sort runs over 32-byte
+        // coded rows and no `Vec<RawQuad>` (four owned Strings per quad)
+        // accumulates.
         let built = if layout == LayoutStrategy::Dictionary {
             let interner = InterningQuadBuilder::from_stream(quad_stream).await?;
             finish_interned(interner, &indexes)?

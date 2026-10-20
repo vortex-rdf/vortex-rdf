@@ -1,21 +1,17 @@
-//! The native store container: the `vortex-rdf.store.v2` grammar, as a
-//! custom Vortex layout root.
+//! The native store container: the `vortex-rdf.store.v2` grammar, a custom
+//! Vortex layout root. Child 0 is the *transparent* `quad-source`, the quad
+//! table the root delegates its dtype, row count and scan to; every further
+//! child is an *auxiliary* component (the term dictionary, the secondary
+//! indexes' sorted tables) with its own rows and schema, written through the
+//! same segment sink and addressed by name. A session with this layout
+//! registered scans the file like a plain quad table; the components never
+//! appear in its columns.
 //!
-//! A store file's root layout is `vortex-rdf.store.v2`: child 0 is the
-//! *transparent* `quad-source` — the quad table itself, to which the root
-//! delegates its dtype, row count, and scan — and every further child is an
-//! *auxiliary* component (the term dictionary, the secondary indexes' own
-//! sorted tables, and future additions such as change sets) with its own
-//! rows and schema, written through the same segment sink and addressable by
-//! name. A session that has this layout registered scans the file exactly
-//! like a plain quad table; the components never appear in its columns.
-//!
-//! One concern per module: [`wire`] is the persisted metadata codec
-//! (component descriptors and their JSON stamp), [`layout`] the root layout
-//! vtable and its read-side inspection, [`sources`] the component producers
-//! builders construct, and [`write`](mod@write) the write strategy.
-//! `io::write` assembles a store's parts and drives [`write::write_store`];
-//! `read` reads the bytes back.
+//! [`wire`] is the persisted metadata codec (component descriptors and their
+//! JSON stamp), [`layout`] the root layout vtable and its read-side
+//! inspection, [`sources`] the component producers builders construct, and
+//! [`write`](mod@write) the container's write strategy, which
+//! `crate::io::write` drives.
 
 pub(crate) mod layout;
 pub(crate) mod sources;
@@ -44,11 +40,10 @@ pub(crate) const DICT_IMPLEMENTATION: &str = "sorted-terms-fsst-v1";
 /// it reads. Its term column carries exact per-window
 /// `vortex.min()`/`vortex.max()` zone maps exactly when the windows are
 /// uniform (chunks of uneven length, adopted from a foreign file, have no
-/// uniform zone to record). Readers inspect the layout for them and read a
-/// window's bounds from its leaf when they are absent, as in a version-1
-/// child. A child of a newer version is refused at open
-/// (`classify_component`): a newer writer may lay it out in a way this reader
-/// would misread without noticing.
+/// uniform zone); without them, as in a version-1 child, readers read a
+/// window's bounds from its leaf. A child of a newer version is refused at
+/// open (`classify_component`): a newer writer may lay it out in a way this
+/// reader would misread without noticing.
 pub(crate) const DICT_VERSION: u32 = 2;
 /// Version of an index child: the one this crate writes and the newest it
 /// reads. A child of a newer version is refused at open

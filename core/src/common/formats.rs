@@ -1,8 +1,6 @@
-//! Resolving an [`RdfFormat`] from what a user supplies: a file path or a
-//! format name. The two entry points below are the only places a format is
-//! named rather than passed, so every binding's format argument funnels
-//! through them, accepts the same spellings and refuses the rest with the
-//! same error.
+//! Resolving an [`RdfFormat`] from a file path or a format name. Every
+//! binding's format argument goes through these two functions, so all accept
+//! the same spellings and refuse the rest with the same error.
 
 use oxrdfio::{JsonLdProfileSet, RdfFormat};
 
@@ -30,21 +28,18 @@ const FORMAT_NAMES: [(&str, RdfFormat); 12] = [
     ),
 ];
 
-/// Infer the RDF format from a path's extension. `None` when there is no
-/// path, no extension, or the extension names no format oxrdfio knows — the
-/// caller then needs an explicit format.
+/// The RDF format a path's extension names; `None` when there is no path, no
+/// extension, or no format oxrdfio knows for it.
 pub fn detect_format(path: Option<&std::path::Path>) -> Option<RdfFormat> {
     let ext = path?.extension()?.to_str()?;
     RdfFormat::from_extension(ext)
 }
 
-/// Parse a user-facing RDF format name — case-insensitive, accepting the
-/// common aliases (`"ntriples"`, `"ttl"`, `"xml"`, …) — into an
-/// [`RdfFormat`]. An unrecognized name is an
-/// [`InvalidInput`](VortexRdfError::InvalidInput) error that lists every
-/// accepted name. The name table behind every string-typed format parameter:
-/// the JS bindings' `RdfFormatName`, Python's `format=` and the CLI's format
-/// flags.
+/// The [`RdfFormat`] a format name denotes, case-insensitively and with the
+/// common aliases (`"ntriples"`, `"ttl"`, `"xml"`, …). An unknown name is an
+/// [`InvalidInput`](VortexRdfError::InvalidInput) error listing every accepted
+/// name. Every string-typed format parameter resolves here: the JS bindings'
+/// `RdfFormatName`, Python's `format=` and the CLI's format flags.
 pub fn format_from_name(name: &str) -> Result<RdfFormat> {
     let spelling = name.to_lowercase();
     FORMAT_NAMES
@@ -59,8 +54,8 @@ pub fn format_from_name(name: &str) -> Result<RdfFormat> {
         })
 }
 
-/// Every name [`format_from_name`] accepts, long spelling before its aliases
-/// — the list its error quotes.
+/// Every name [`format_from_name`] accepts, long spelling before its aliases:
+/// the list its error quotes.
 pub(crate) fn supported_format_names() -> &'static [&'static str] {
     const NAMES: [&str; FORMAT_NAMES.len()] = {
         let mut names = [""; FORMAT_NAMES.len()];

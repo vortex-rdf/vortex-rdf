@@ -1,6 +1,6 @@
-//! RDF term parsing and reconstruction: N-Triples term spellings — the
-//! store's own columns or user-typed input — into `oxrdf` terms, and RDF
-//! documents into [`RawQuad`] streams.
+//! RDF term parsing: N-Triples term spellings (the store's own columns, or
+//! user-typed input) into `oxrdf` terms, and RDF documents into [`RawQuad`]
+//! streams.
 
 use crate::common::quad::RawQuad;
 use crate::error::{Result, VortexRdfError};
@@ -12,24 +12,21 @@ use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Te
 use oxrdfio::{RdfFormat, RdfParser};
 
 /// Where a term spelling comes from, which decides how much of it the
-/// parsers below validate.
-///
-/// The parsers that take a `Trust` are `#[inline(always)]`: a call site's
-/// constant trust then folds away every branch on it, so the `Stored` decode
-/// path carries none of the `Input` validation.
+/// parsers validate. The parsers that take a `Trust` are `#[inline(always)]`,
+/// so a call site's constant trust folds every branch on it away: the `Stored`
+/// decode path carries none of the `Input` validation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Trust {
-    /// A spelling from the store's *own* serialized columns (see
-    /// [`crate::store::layouts`]), whose terms oxrdf's constructors validated
-    /// at ingestion; `.vortex` files are likewise trusted to have been
-    /// checked when written. Nodes are built with the `new_unchecked`
-    /// constructors, so no IRI is re-parsed on decode, and a malformed
-    /// literal (which the store's writer cannot produce) reads as the
-    /// quote-trimmed simple literal. Only `""` is the default graph, and a
-    /// term is `<iri>`, `_:id` or a literal.
+    /// A spelling from the store's own columns ([`crate::store::layouts`]):
+    /// terms oxrdf's constructors validated when a build ingested them, in a
+    /// store this crate built or a `.vortex` file the caller trusts. Nodes are
+    /// built with the `new_unchecked` constructors, so no IRI is re-parsed on
+    /// decode, and a malformed literal (which the store's writer cannot
+    /// produce) reads as the quote-trimmed simple literal. Only `""` is the
+    /// default graph, and a term is `<iri>`, `_:id` or a literal.
     Stored,
-    /// A spelling that did not come out of the store's columns: CLI pattern
-    /// arguments, binding call arguments, anything a user typed. Every
+    /// A spelling from outside the store's columns: CLI pattern arguments,
+    /// binding call arguments, anything a user typed. Every
     /// component goes through a validating constructor ([`NamedNode::new`],
     /// [`BlankNode::new`], [`Literal::new_language_tagged_literal`]), a bare
     /// IRI (no angle brackets) is a named node, the default graph may also be
@@ -88,7 +85,7 @@ pub(crate) fn subject(s: &str, trust: Trust) -> Result<NamedOrBlankNode> {
 }
 
 /// The three N-Triples literal shapes, with `value` still in its *escaped*
-/// lexical form — the slice between the opening and closing quote.
+/// lexical form: the slice between the opening and the closing quote.
 pub(crate) enum LiteralForm<'a> {
     Simple { value: &'a str },
     Language { value: &'a str, lang: &'a str },
@@ -143,14 +140,11 @@ fn find_quote(b: &[u8]) -> Option<usize> {
     tail.iter().position(|&c| c == b'"').map(|i| at + i)
 }
 
-/// Splits a serialized literal into its escaped value and its suffix
-/// interpretation: empty suffix => simple, `^^<dt>` => typed, `@lang` =>
-/// language-tagged.
-///
-/// `None` means the form is malformed — unterminated, or trailing text after
-/// the closing quote that is neither suffix. The suffix is read only from
-/// *after* the closing quote, so `^^` or `"@` occurring inside the value
-/// cannot be mistaken for structure.
+/// A serialized literal split into its escaped value and its suffix: none
+/// (simple), `^^<dt>` (typed) or `@lang` (language-tagged). `None` for a
+/// malformed form: unterminated, or trailing text after the closing quote
+/// that is neither suffix. The suffix is read only after the closing quote, so
+/// a `^^` or `"@` inside the value is never taken for structure.
 pub(crate) fn split_literal(s: &str) -> Option<LiteralForm<'_>> {
     let end = closing_quote(s)?;
     let value = &s[1..end];
@@ -180,10 +174,10 @@ pub(crate) enum Escapes {
 /// `\'`, `\n`, `\r`, `\t`, `\b`, `\f`, `\uXXXX` and `\UXXXXXXXX`, any other
 /// backslash as `escapes` says. Always `Some` under [`Escapes::Lenient`].
 ///
-/// Borrows when there is no backslash — the common case on the hot
-/// [`Trust::Stored`] decode path, which must stay allocation-free — and
-/// copies the text between escapes a run at a time. Inlined, so a call
-/// site's constant policy folds its branch away.
+/// Borrows when there is no backslash (the common case on the
+/// [`Trust::Stored`] decode path, which stays allocation-free) and copies the
+/// text between escapes a run at a time. Inlined, so a call site's constant
+/// policy folds its branch away.
 #[inline(always)]
 pub(crate) fn unescape(s: &str, escapes: Escapes) -> Option<Cow<'_, str>> {
     let b = s.as_bytes();
@@ -342,12 +336,11 @@ pub(crate) fn quad_from_terms(s: &str, p: &str, o: &str, g: &str) -> Result<Quad
 
 /// The spelling the dictionary and the columns hold for a user-typed term:
 /// the validated parse of `spelling` (an IRI with or without angle brackets,
-/// a `_:` blank node, or an escape-aware literal) rendered back through the
-/// storage form — `xsd:string` typing dropped, the language tag lowercased,
-/// escapes normalized — and the default graph's spellings (`""`, `default`,
-/// `[]`) as the empty string the `g` column stores. Malformed input is an
-/// error; a dictionary that holds the term under *some* spelling holds it
-/// under this one.
+/// a `_:` blank node, or an escape-aware literal) rendered back in the storage
+/// form (`xsd:string` typing dropped, the language tag lower-cased, escapes
+/// normalized), and the default graph's spellings (`""`, `default`, `[]`) as
+/// the empty string the `g` column stores. Malformed input is an error; a
+/// dictionary that holds the term under any spelling holds it under this one.
 pub(crate) fn canonical_spelling(spelling: &str) -> Result<String> {
     if is_default_graph_spelling(spelling) {
         return Ok(String::new());
@@ -355,19 +348,12 @@ pub(crate) fn canonical_spelling(spelling: &str) -> Result<String> {
     Ok(term(spelling, Trust::Input)?.to_string())
 }
 
-/// A quad from four term spellings in any of the forms a person types or a
-/// foreign system writes, rendered in the one canonical spelling the builders
-/// intern ([`RawQuad::canonical`]).
-///
-/// Each position is parsed as [`Trust::Input`], as a pattern's slots are, and
-/// so takes the same tolerant spellings as [`canonical_spelling`] (an IRI with
-/// or without angle brackets, an `xsd:string`-typed or escaped literal, an
-/// upper-case language tag, `""`, `default` or `[]` for the default graph),
-/// and the quad is rendered by [`RawQuad::from_quad`], so a term comes out
-/// exactly as `canonical_spelling` renders it. Unlike `canonical_spelling` it
-/// also requires each term to be one its position can hold: a literal is no
-/// subject, predicate or graph, and a blank node is no predicate. A failure
-/// names the position.
+/// The quad [`RawQuad::canonical`] returns: each position parsed as
+/// [`Trust::Input`], as a pattern's slots are, and the quad rendered by
+/// [`RawQuad::from_quad`], so a term comes out exactly as
+/// [`canonical_spelling`] renders it. Unlike `canonical_spelling`, each term
+/// must be one its position can hold: a literal is no subject, predicate or
+/// graph, and a blank node is no predicate. A failure names the position.
 pub(crate) fn canonical_raw_quad(s: &str, p: &str, o: &str, g: &str) -> Result<RawQuad> {
     Ok(RawQuad::from_quad(&Quad::new(
         at("quad subject", subject(s, Trust::Input))?,
@@ -377,12 +363,10 @@ pub(crate) fn canonical_raw_quad(s: &str, p: &str, o: &str, g: &str) -> Result<R
     )))
 }
 
-/// Parses a stream of RDF quads from any reader using the specified RDF format.
-///
-/// Yields [`RawQuad`]: every builder converts to
-/// `RawQuad` as its first act, so handing back the parsed `Quad` would keep a
-/// second owned copy of every term alive for no purpose. Converting here lets
-/// the `Quad` die inside the map.
+/// The quads of an RDF document read from `reader` in `format`, as
+/// [`RawQuad`]s: each parsed `Quad` is converted and dropped at once, so no
+/// second copy of its terms stays alive. A parse error is a
+/// [`Deserialization`](VortexRdfError::Deserialization) item.
 pub fn parse_quads_from_reader<R: std::io::Read + Send + 'static>(
     reader: R,
     format: RdfFormat,

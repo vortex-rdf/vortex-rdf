@@ -24,13 +24,14 @@ pub(crate) struct RdfStoreLayoutVTable;
 
 pub(super) type RdfStoreLayout = Layout<RdfStoreLayoutVTable>;
 
-/// The root's persisted state: whether the quad rows are in global
-/// `(s, p, o, g)` order (the meaning is defined on `WireMetadata::quads_sorted`;
-/// a materialized read restores the subject sorted stamp from it), and the
-/// component inventory in child order.
+/// The root's persisted state.
 #[derive(Clone, Debug)]
 pub(crate) struct RdfStoreLayoutData {
+    /// Whether the quad rows are in global `(s, p, o, g)` order, the writer's
+    /// provenance (`WireMetadata::quads_sorted`); a materialized read restores
+    /// the subject sorted stamp from it.
     pub(crate) quads_sorted: bool,
+    /// The component inventory, in child order.
     pub(crate) components: Arc<[StoreComponentDescriptor]>,
 }
 
@@ -112,8 +113,8 @@ impl VTable for RdfStoreLayoutVTable {
         session: &VortexSession,
         ctx: &LayoutReaderContext,
     ) -> VortexResult<LayoutReaderRef> {
-        // The root's scan IS the quad-source scan; auxiliary components stay
-        // independently addressable through `component_child`.
+        // The root's scan is the quad-source scan; the components stay
+        // addressable through `component_child`.
         quad_source(layout)?.new_reader(name, segment_source, session, ctx)
     }
 }
@@ -200,7 +201,7 @@ pub(crate) fn component_child(root: &RdfStoreLayout, slot: usize) -> VortexResul
         .ok_or_else(|| vortex_error::vortex_err!("store root has no component child {slot}"))
 }
 
-/// Test-only: the decoded root metadata of serialized store bytes — the
+/// Test-only: the decoded root metadata of serialized store bytes, the
 /// `quads_sorted` bit and the component inventory.
 #[cfg(test)]
 pub(crate) fn store_metadata_of_bytes(bytes: &[u8]) -> (bool, Vec<StoreComponentDescriptor>) {

@@ -14,13 +14,10 @@ use vortex_array::expr::stats::{Precision, Stat, StatsProvider};
 use vortex_array::{ArrayRef, Executable, ExecutionCtx, IntoArray, VortexSessionExecute};
 use vortex_mask::Mask;
 
-/// Zero-cost row access into a canonical `VarBinView` string column: the
-/// 16-byte views slice and the data buffers are resolved once, and each row's
-/// bytes are then an inline read or a plain slice of the referenced buffer.
-///
-/// Rows are read directly from the views slice and the referenced data
-/// buffers, so a loop over the column allocates and refcounts nothing per
-/// row.
+/// Row access into a canonical `VarBinView` string column: the views slice is
+/// resolved once, and each row's bytes are an inline read or a slice of the
+/// referenced data buffer, so a loop over the column allocates and refcounts
+/// nothing per row.
 pub(crate) struct StrColReader<'a> {
     arr: &'a VarBinViewArray,
     views: &'a [BinaryView],
@@ -45,8 +42,8 @@ impl<'a> StrColReader<'a> {
         }
     }
 
-    /// Row `i` as a `&str` view borrowed straight from the column buffers
-    /// (zero-copy); a decoder's oxrdf constructors make the single owned
+    /// Row `i` as a `&str` borrowed from the column buffers, unchecked
+    /// ([`trusted_str`]); a decoder's oxrdf constructors make the single owned
     /// copy.
     #[inline]
     pub(crate) fn str_at(&self, i: usize) -> Result<&'a str> {
@@ -54,10 +51,8 @@ impl<'a> StrColReader<'a> {
     }
 }
 
-/// Build a Vortex string array (`VarBinView<Utf8>`, non-nullable) from string refs.
-///
-/// Values are copied once, directly into the array's buffer — no intermediate
-/// owned `String` per value.
+/// A non-nullable `VarBinView<Utf8>` array of `values`, each copied once,
+/// straight into the array's buffer.
 pub(crate) fn make_string_array(values: impl IntoIterator<Item = impl AsRef<str>>) -> ArrayRef {
     VarBinViewArray::from_iter_str(values).into_array()
 }
@@ -65,8 +60,8 @@ pub(crate) fn make_string_array(values: impl IntoIterator<Item = impl AsRef<str>
 /// Stamp the exact `IsSorted` statistic on an array.
 ///
 /// On a base's `s` column the stamp asserts more than that column's order: it
-/// is the witness that the whole base is in global `(s, p, o, g)` order — the
-/// order every writer of this crate produces — and `match_pattern` trusts it
+/// is the witness that the whole base is in global `(s, p, o, g)` order (the
+/// order every writer of this crate produces), and `match_pattern` trusts it
 /// to binary-search each bound role inside the run the previous one bounded.
 /// Only call it on rows sorted that way by construction: a false stamp
 /// corrupts query results.
@@ -76,9 +71,9 @@ pub(crate) fn stamp_is_sorted(arr: &ArrayRef) {
 }
 
 /// Read back the `IsSorted` statistic written by [`stamp_is_sorted`]. An
-/// absent stat counts as unsorted — order is never assumed, only trusted
-/// when explicitly recorded. On a base's `s` column, `true` licenses the
-/// prefix probe over the whole `(s, p, o, g)` order.
+/// absent stat counts as unsorted: order is never assumed, only trusted when
+/// recorded. On a base's `s` column, `true` licenses the prefix probe over
+/// the whole `(s, p, o, g)` order.
 pub(crate) fn column_is_sorted(arr: &ArrayRef) -> bool {
     match arr.statistics().get(Stat::IsSorted) {
         Precision::Exact(sc) | Precision::Inexact(sc) => bool::try_from(&sc).unwrap_or(false),
@@ -86,10 +81,10 @@ pub(crate) fn column_is_sorted(arr: &ArrayRef) -> bool {
     }
 }
 
-/// Whether a quad struct's `s` column carries the globally-sorted stamp —
-/// the provenance a write records in the root's metadata and a reader gates
-/// its subject binary search on. Every producer that stamps yields a
-/// canonical `StructArray`, so anything that is not one reads as unsorted.
+/// Whether a quad struct's `s` column carries the globally sorted stamp: the
+/// provenance a write records in the root's metadata and a reader gates its
+/// subject binary search on. Every producer that stamps yields a canonical
+/// `StructArray`, so anything that is not one reads as unsorted.
 pub(crate) fn subject_sorted(rows: &ArrayRef) -> bool {
     rows.clone()
         .try_downcast::<Struct>()
@@ -174,8 +169,8 @@ pub(crate) fn field_as<T: Executable>(
 }
 
 /// Binary-search a sorted column for the `[lo, hi)` run of rows equal to
-/// `probe` (`lo == hi` means the value is absent). Only meaningful on
-/// columns [`column_is_sorted`] reports as sorted.
+/// `probe` (empty, at the insertion point, when the value is absent). Only
+/// meaningful on columns [`column_is_sorted`] reports as sorted.
 pub(crate) fn search_sorted_bounds(
     arr: &ArrayRef,
     probe: &vortex_array::scalar::Scalar,
@@ -201,41 +196,37 @@ pub(crate) fn search_sorted_bounds(
     Ok((index_of(lo), index_of(hi)))
 }
 
-/// Convert a boolean ArrayRef into a `vortex_mask::Mask` for use with `ArrayRef::filter`.
+/// A boolean array as a [`Mask`] for `ArrayRef::filter`: canonicalized, then
+/// its packed bit buffer taken as the mask (no per-bit loop).
 pub(crate) fn bool_array_to_mask(arr: ArrayRef) -> Result<Mask> {
-    // Canonicalize to a concrete boolean array, then reinterpret its packed
-    // bit buffer directly as a Mask (no per-bit conversion loop).
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let bool_arr = arr.execute::<BoolArray>(&mut ctx)?;
     Ok(Mask::from_buffer(bool_arr.into_bit_buffer()))
 }
 
-/// Borrow the bytes of a UTF-8 string column value as `&str` without copying.
+/// The bytes of a string column value as `&str`, borrowed and unchecked.
 ///
-/// **Trusted-input decode path**, the same argument as
-/// [`Trust::Stored`](crate::common::terms::Trust::Stored):
-/// every caller reads a column whose dtype is `Utf8`, and vortex validates that
-/// invariant when the array is constructed — `VarBinViewData::validate` runs a
-/// `from_utf8` over every view on IPC decode, and the file reader validates on
-/// its own construction path. Re-validating here would walk each term's bytes
-/// a second time on every decoded row.
-///
-/// The check is kept as a `debug_assert`, so the test suite (which runs debug)
-/// still fails loudly if a non-UTF-8 column ever reaches this, while release
-/// builds skip the second walk.
+/// **Trusted-input decode path**, as
+/// [`Trust::Stored`](crate::common::terms::Trust::Stored): `buf` must be a
+/// value of a `Utf8` column of a store this crate wrote or the caller trusts.
+/// Vortex does not validate every path to such bytes (an FSST chunk read from
+/// a file is canonicalized unchecked), so a corrupt or crafted file is outside
+/// this contract. Release builds skip the check, which would walk every
+/// decoded term's bytes; debug builds keep it as a `debug_assert`, so the test
+/// suite fails loudly if non-UTF-8 bytes ever reach it.
 #[inline]
 pub(crate) fn trusted_str(buf: &[u8]) -> &str {
     debug_assert!(
         std::str::from_utf8(buf).is_ok(),
         "string column value is not valid UTF-8, but its dtype claims Utf8"
     );
-    // SAFETY: `buf` is the bytes of a value in a `Utf8`-dtyped vortex column,
-    // which vortex validates as UTF-8 when the array is constructed (see above).
+    // SAFETY: the caller's precondition above: `buf` is a value of a `Utf8`
+    // column of a store this crate wrote or the caller trusts.
     unsafe { std::str::from_utf8_unchecked(buf) }
 }
 
-/// [`trusted_str`] as a `Result`, so the decode call sites — which `?` on
-/// genuinely fallible neighbours — stay uniform.
+/// [`trusted_str`] as a `Result`, so decode call sites that `?` their
+/// fallible neighbours stay uniform.
 #[inline]
 pub(crate) fn buf_as_str(buf: &[u8]) -> Result<&str> {
     Ok(trusted_str(buf))

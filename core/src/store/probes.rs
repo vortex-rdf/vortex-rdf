@@ -9,9 +9,9 @@ use vortex_array::ArrayRef;
 use vortex_array::dtype::FieldName;
 use vortex_rdf_encoded_search::OwnedSortedProbe;
 
-/// Lazily-resolved probes for one struct array's children, shared across the
-/// views over that base (`Arc` in `MemoryBase`) and by the index
-/// components and serve plans keyed on their own struct arrays.
+/// Lazily resolved probes for one struct array's children, shared across the
+/// views over that base (`Arc` in `MemoryBase`) and held by the index
+/// components and serve plans for their own struct arrays.
 ///
 /// The cells are keyed by the address of the array they were resolved for;
 /// every lookup against a different base returns `None` (the uncached path).
@@ -24,8 +24,8 @@ pub(crate) struct StructProbes {
 type ProbeCells = Vec<(FieldName, Option<Arc<OwnedSortedProbe>>)>;
 
 impl StructProbes {
-    /// A fresh, unresolved cache, shared (`Arc`) because every
-    /// `MemoryBase` and index component holds one by `Arc`.
+    /// A fresh, unresolved cache, by `Arc` as every `MemoryBase` and index
+    /// component holds one.
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }

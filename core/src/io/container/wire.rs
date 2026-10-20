@@ -1,11 +1,9 @@
-//! The persisted component inventory and its wire codec.
-//!
-//! The inventory rides in the root layout's metadata: name, role,
-//! implementation slug, version, the required flag, and the component's
-//! column shape in a small field-kind vocabulary (no serialized DTypes).
-//! Unknown *optional* components are readable-around by construction;
-//! unknown *required* components must fail the open — a reader that skipped
-//! a required change set would silently resurrect deleted rows.
+//! The persisted component inventory and its wire codec: per component its
+//! name, role, implementation slug, version, required and sorted flags, and
+//! column shape in a small field-kind vocabulary (no serialized DTypes), as
+//! JSON in the root layout's metadata. A reader skips an unknown *optional*
+//! component and must fail the open on an unknown *required* one: a reader
+//! that skipped a required change set would resurrect deleted rows.
 
 use std::sync::Arc;
 
@@ -18,8 +16,8 @@ use super::QUAD_SOURCE_NAME;
 const STORE_METADATA_VERSION: u32 = 1;
 
 /// Persisted role of an auxiliary child. `ChangeSet` is reserved for
-/// immutable delta components (write those `required: true` — see module
-/// doc); `Other` keeps the vocabulary open without a wire break.
+/// immutable delta components (written `required: true`: see the module doc);
+/// `Other` keeps the vocabulary open without a wire break.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum StoreComponentRole {
@@ -128,19 +126,18 @@ mod wire_fields {
 pub(crate) struct StoreComponentDescriptor {
     pub(crate) name: String,
     pub(crate) role: StoreComponentRole,
-    /// Implementation slug (e.g. `sorted-terms-fsst-v1`) — how a reader that
+    /// Implementation slug (e.g. `sorted-terms-fsst-v1`): how a reader that
     /// knows the component interprets its columns.
     pub(crate) implementation: String,
     pub(crate) version: u32,
     /// Readers must reject the file when they cannot interpret a required
     /// component; unknown optional components are skipped.
     pub(crate) required: bool,
-    /// Whether the component's sort-key columns are GLOBALLY sorted (not
-    /// merely per-chunk). Provenance, recorded by the writer that knows how
-    /// the component was built — a reader lifting the component into memory
-    /// may only binary-search it when this is set. Stamping per-chunk-sorted
-    /// data as sorted corrupts query results, so absent/false is the safe
-    /// default.
+    /// Whether the component's sort-key columns are *globally* sorted, not
+    /// merely per chunk: provenance, recorded by the writer that knows how the
+    /// component was built. A reader may binary-search the component only when
+    /// this is set; stamping per-chunk-sorted data as sorted corrupts query
+    /// results, so absent means `false`.
     #[serde(default)]
     pub(crate) sorted: bool,
     /// The column shape, written as `fields` in the kind vocabulary.
@@ -167,10 +164,9 @@ impl StoreComponentDescriptor {
     }
 }
 
-/// Validate a component inventory: every descriptor individually
-/// ([`StoreComponentDescriptor::validate`]) plus name uniqueness across the
-/// set. The single owner of inventory validation, run once per container
-/// entry path — [`decode_store_metadata`] on read,
+/// Validate a component inventory: every descriptor
+/// ([`StoreComponentDescriptor::validate`]) and name uniqueness across the
+/// set. Run once on each side: by [`decode_store_metadata`] on read and
 /// `RdfStoreWriteStrategy::with_components` on write.
 pub(super) fn validate_components<'a>(
     components: impl IntoIterator<Item = &'a StoreComponentDescriptor>,
@@ -188,9 +184,9 @@ pub(super) fn validate_components<'a>(
 #[derive(Serialize, Deserialize)]
 struct WireMetadata {
     version: u32,
-    /// Whether the quad rows are in GLOBAL `(s, p, o, g)` order — the
+    /// Whether the quad rows are in *global* `(s, p, o, g)` order: the
     /// writer's provenance (a sorted builder or rebuild produced them). A
-    /// reader materializing the quads may only restore the sorted stamp when
+    /// reader materializing the quads may restore the sorted stamp only when
     /// this is set, and that stamp licenses binary search on every role of a
     /// bound prefix, not the subject alone; the file's own statistics do not
     /// record sortedness, and a false claim corrupts matches.

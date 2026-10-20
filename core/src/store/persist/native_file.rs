@@ -4,8 +4,7 @@
 //! per column), the reader tree every scan and probe reads through, and two
 //! bounded memos: pruning envelopes per filter shape, and bound filter trees.
 //! Vortex keys its reader caches by the identity of the bound trees, so the
-//! reader tree is retired whenever the bound-tree memo clears. The pure
-//! open/materialize primitives are in [`io::read`](crate::io::read).
+//! reader tree is retired whenever the bound-tree memo clears.
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
@@ -33,10 +32,10 @@ use crate::store::persist::open::{ComponentRoster, IndexChild};
 /// and session. The inner file keeps no reader of its own: scans and probes
 /// take theirs from the reader tree ([`layout_reader`](Self::layout_reader),
 /// [`scan`](Self::scan), [`component_reader`](Self::component_reader)). The
-/// root reader delegates to the transparent quad-source child — so scans,
-/// splits, row counts, and pruning all speak quad coordinates, exactly like a
-/// plain quad table. Readers are built once per tree and cached, so their
-/// zone-map stats decode once per tree.
+/// root reader delegates to the transparent quad-source child, so scans,
+/// splits, row counts and pruning all speak quad coordinates, as over a plain
+/// quad table. Readers are built once per tree and cached, so their zone-map
+/// stats decode once per tree.
 pub(crate) struct NativeStoreFile {
     file: vortex_file::VortexFile,
     /// The component roster, classified once at open: the dictionary child's
@@ -50,16 +49,15 @@ pub(crate) struct NativeStoreFile {
     /// The reader tree scans and probes read through; replaced when the bound
     /// tree memo clears (see [`ReaderTree`]).
     readers: Mutex<Arc<ReaderTree>>,
-    /// The quad table's natural split ranges, computed once — every
-    /// counting/matching call iterates them, and deriving them walks the
-    /// layout tree.
+    /// The quad table's natural split ranges, computed once: every count and
+    /// match iterates them, and deriving them walks the layout tree.
     splits: OnceLock<Arc<[Range<u64>]>>,
-    /// Statistics-only pruning envelopes keyed by filter shape — the
-    /// expression itself, whose `Eq`/`Hash` are structural (fn id + options
-    /// per node), so a hit costs a tree walk but no allocation: the
-    /// repeated-pattern workloads the bindings serve (e.g. rdflib joins)
-    /// re-ask the same handful of filters, and each envelope costs a pruning
-    /// evaluation over every zone. Bounded by [`PRUNING_MEMO_MAX`].
+    /// Statistics-only pruning envelopes keyed by filter shape: the
+    /// expression itself, whose `Eq`/`Hash` are structural (fn id and options
+    /// per node), so a hit costs a tree walk but no allocation, where an
+    /// envelope costs a pruning evaluation over every zone and the bindings'
+    /// repeated-pattern workloads (e.g. rdflib joins) re-ask the same few
+    /// filters. Bounded by [`PRUNING_MEMO_MAX`].
     pruning_envelopes: BoundedMemo<Expression, Option<Range<u64>>>,
     /// The quad table's chunk-probe handles, by column (see [`ChunkMemo`]).
     /// Each handle keeps the probes of the leaves it fetched, so a repeated
@@ -70,7 +68,7 @@ pub(crate) struct NativeStoreFile {
     /// The index components' chunk-probe handles, by component name and
     /// column, held and bounded as the quad table's are.
     component_chunks: ChunkMemo<String>,
-    /// One bound tree per (scope, filter shape) — see [`BoundExprMemo`].
+    /// One bound tree per (scope, filter shape): see [`BoundExprMemo`].
     bound_exprs: Arc<BoundExprMemo>,
     /// Whether the file is read through a memory mapping, as the open found
     /// it.
@@ -181,17 +179,17 @@ impl<T: Hash + Eq> ChunkMemo<T> {
 ///
 /// Vortex keys its reader-side pruning and evaluation caches by bound-tree
 /// *identity* (`ExactBoundExpr` compares the children `Arc` pointer), not
-/// structure, and those caches live as long as their reader. A fresh `bind`
-/// per call would never hit them and grow them per call; this memo pins one
-/// identity per shape so repeats, across splits and across calls, land on the
-/// entries the first use created. A clone of a memoized tree shares its
-/// `Arc`s and therefore its identity. The scope tag separates trees bound
-/// against different schemas (the quad root vs. an index child). Bounded by
+/// structure, and those caches live as long as their reader: a fresh `bind`
+/// per call would miss them and grow them on every call. This memo pins one
+/// identity per shape, so repeats, across splits and across calls, land on
+/// the entries the first use created; a clone of a memoized tree shares its
+/// `Arc`s and so its identity. The scope tag separates trees bound against
+/// different schemas (the quad root vs. an index child). Bounded by
 /// [`BIND_MEMO_MAX`]; each clear retires the file's reader tree
 /// ([`ReaderTree`]).
 pub(crate) struct BoundExprMemo(BoundedMemo<(&'static str, Expression), BoundExpression>);
 
-/// Entry cap on [`BoundExprMemo`] — sized for a query workload's distinct
+/// Entry cap on [`BoundExprMemo`]: sized for a query workload's distinct
 /// filter shapes, not for arbitrary term churn.
 pub(crate) const BIND_MEMO_MAX: usize = 4096;
 
@@ -279,17 +277,16 @@ impl<K: std::hash::Hash + Eq, V: Clone> BoundedMemo<K, V> {
     }
 }
 
-/// Entry cap on [`NativeStoreFile::pruning_envelopes`] — sized for a query
+/// Entry cap on [`NativeStoreFile::pruning_envelopes`]: sized for a query
 /// workload's distinct filter shapes, not for arbitrary term churn.
 const PRUNING_MEMO_MAX: usize = 512;
 
 /// One index child of the file, as the index readers use it: the child's
 /// reader, its `sorted` provenance, and the file's bind memo, through which
-/// every expression over the child binds under the child's name — so the
-/// eager scans, the deferred row-id sources and the serve plans of one child
-/// all hand its reader the same bound-tree identities (see
-/// [`BoundExprMemo`]). Taken by name through
-/// [`NativeStoreFile::child_reader`].
+/// every expression over the child binds under the child's name, so the eager
+/// scans, the deferred row-id sources and the serve plans of one child all
+/// hand its reader the same bound-tree identities (see [`BoundExprMemo`]).
+/// Taken by name through [`NativeStoreFile::child_reader`].
 #[derive(Clone)]
 pub(crate) struct ChildReader {
     /// The component name: the child's bind scope, and the key of its
@@ -310,8 +307,8 @@ impl ChildReader {
         Ok(self.memo.bind(self.name, expr, self.reader.dtype())?)
     }
 
-    /// A scan of the child projecting just `columns`. Restrictions — a
-    /// filter, a row range — are the caller's to add.
+    /// A scan of the child projecting just `columns`. Restrictions (a filter,
+    /// a row range) are the caller's to add.
     pub(crate) fn scan(
         &self,
         columns: &[&'static str],
@@ -334,7 +331,7 @@ impl std::ops::Deref for NativeStoreFile {
 
 impl NativeStoreFile {
     /// Wrap an opened file, refusing one this version cannot read and
-    /// classifying its component roster once ([`ComponentRoster::of`]) — the
+    /// classifying its component roster once ([`ComponentRoster::of`]): the
     /// one place a file's root layout is checked on the open path. A
     /// structural refusal comes before a row-count refusal.
     pub(crate) fn try_new(opened: impl Into<OpenedFile>) -> crate::error::Result<Self> {
@@ -370,9 +367,8 @@ impl NativeStoreFile {
         })
     }
 
-    /// The handle's bound-expression memo — shared (`Arc`) so serve plans
-    /// and deferred row-id sources outliving a borrow can keep binding
-    /// through it.
+    /// The handle's bound-expression memo, shared (`Arc`) so serve plans and
+    /// deferred row-id sources that outlive a borrow keep binding through it.
     pub(crate) fn bound_exprs(&self) -> &Arc<BoundExprMemo> {
         &self.bound_exprs
     }
@@ -446,7 +442,7 @@ impl NativeStoreFile {
     }
 
     /// A quad column's chunk-probe handle by name, for point reads and exact
-    /// bound-term row ranges through the wire-encoded chunks — built from the
+    /// bound-term row ranges through the wire-encoded chunks: built from the
     /// layout on first use and memoized for the handle's lifetime, so the
     /// leaves the handle fetched stay probed between calls. `None` when the
     /// quad child's layout shape or that column's dtype declines (memoized
@@ -501,7 +497,7 @@ impl NativeStoreFile {
         self.pruning_envelopes.insert(filter, envelope);
     }
 
-    /// Whether the file records its quad rows as globally `s`-sorted.
+    /// Whether the file records its quad rows in global `(s, p, o, g)` order.
     pub(crate) fn quads_sorted(&self) -> bool {
         self.quads_sorted
     }
@@ -537,7 +533,7 @@ impl NativeStoreFile {
     /// The known index child under the registry name `name` as a
     /// [`ChildReader`]: its reader from the current tree, its descriptor's
     /// `sorted` provenance, and the handle's bind memo. `None` when the
-    /// roster holds no such child — the file has none, or only one under an
+    /// roster holds no such child: the file has none, or only one under an
     /// implementation slug this version does not know.
     pub(crate) fn child_reader(&self, name: &str) -> VortexResult<Option<ChildReader>> {
         let Some(child) = self.index_child(name) else {

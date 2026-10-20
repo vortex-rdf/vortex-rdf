@@ -23,10 +23,10 @@ use futures::Stream;
 use vortex_array::ArrayRef;
 
 /// The layout a store resolves to, built (`from_parts`, `from_built`) or
-/// opened (`from_bytes`, `from_file`): a dictionary beside the rows —
-/// resident, or left in its file child — makes it Dictionary, otherwise the
-/// rows' own dtype decides. A dict-less Dictionary-layout dtype is rejected:
-/// bare code columns carry no way back to their terms.
+/// opened (`from_bytes`, `from_file`): a dictionary beside the rows (resident,
+/// or left in its file child) makes it Dictionary, otherwise the rows' own
+/// dtype decides. A dict-less Dictionary-layout dtype is refused: bare code
+/// columns carry no way back to their terms.
 pub(super) fn resolved_layout(
     dict: Option<DictAccess>,
     dtype: &vortex_array::dtype::DType,
@@ -50,21 +50,13 @@ impl VortexRdfStore {
     // ── constructors ─────────────────────────────────────────────────────────
 
     /// Build a store from a quad stream: the global `(s, p, o, g)` sort, the
-    /// layout's columns, the requested indexes and the store assembly in one
-    /// call. Callers who need neither a particular builder nor its
-    /// intermediate [`BuiltArray`] should prefer this over pairing
+    /// layout's columns, the requested indexes and the assembly in one call,
+    /// through `SortedStreamBuilder` wherever a filesystem exists (so the sort
+    /// is not bounded by memory) and `SortedInMemoryBuilder` on wasm. Both
+    /// produce the same rows; to name one, pair its
     /// `VortexArrayBuilder::build_vortex_array` with
-    /// [`from_built`](Self::from_built).
-    ///
-    /// The builder is picked by target: the out-of-core `SortedStreamBuilder`
-    /// wherever a filesystem exists, so the sort itself is not bounded by
-    /// memory, and `SortedInMemoryBuilder` on wasm, which has none. Both
-    /// produce the same globally sorted rows; name one directly to override
-    /// the choice.
-    ///
-    /// The finished store is resident either way. Writing a dataset larger
-    /// than memory never has to materialize it — `io::quads_stream_to_vortex_file`
-    /// streams the builder's chunks straight into the file writer instead.
+    /// [`from_built`](Self::from_built). The store is resident;
+    /// `io::quads_stream_to_vortex_file` streams a dataset to a file instead.
     ///
     /// The quads must be canonical: build them with [`RawQuad::from_quad`],
     /// the parser ([`parse_quads_from_reader`]) or [`RawQuad::canonical`]. The
@@ -86,25 +78,17 @@ impl VortexRdfStore {
         Self::from_built(built)
     }
 
-    /// Rebuild a store from [`StoreParts`] — the inverse of
-    /// [`to_serializable_parts`](Self::to_serializable_parts). A
-    /// Dictionary-layout quad array must arrive with its dictionary beside
-    /// it: dict-less Dictionary parts are refused (bare code columns carry no
-    /// way back to their terms).
+    /// Rebuild a store from [`StoreParts`], the inverse of
+    /// [`to_serializable_parts`](Self::to_serializable_parts) and the
+    /// in-memory file open's adoption. Dict-less Dictionary parts are refused:
+    /// bare code columns carry no way back to their terms. The base's and
+    /// every component's integer children keep their encoding wherever an
+    /// encoded-search probe binds them and are decoded otherwise
+    /// (`with_searchable_int_children`).
     ///
-    /// This is the explicit resident adoption (the in-memory file open's): the
-    /// base's integer children stay in their compressed form wherever the
-    /// match fast paths can bind them through encoded search probes, and only
-    /// children outside the probe's supported set are decoded to canonical
-    /// primitives (see `with_searchable_int_children`); every index component
-    /// is materialized into the same resident form, so its sorted probes bind
-    /// directly too.
-    ///
-    /// The array's statistics are trusted as provenance: an `IsSorted` stamp
-    /// on its `s` column asserts the rows are in global `(s, p, o, g)` order —
-    /// the order every builder of this crate produces — and the match fast
-    /// paths search every bound role on that basis. Rows sorted by subject
-    /// alone must not carry it.
+    /// An `IsSorted` stamp on the `s` column is trusted as global
+    /// `(s, p, o, g)` order, and the match fast paths search every bound role
+    /// on it: rows sorted by subject alone must not carry it.
     #[cfg(feature = "file-io")]
     pub(crate) fn from_parts(parts: StoreParts) -> Result<Self> {
         Self::adopt(
@@ -114,16 +98,13 @@ impl VortexRdfStore {
         )
     }
 
-    /// Build from a builder's output: the primary quad array plus whatever the
-    /// builder carries beside it — the Dictionary layout's term dictionary and
-    /// the requested indexes' components, both adopted as they are. Nothing is
-    /// re-derived or split out of the rows.
-    ///
-    /// The store holds them in the compressed-resident form: the base's code
-    /// columns and each component's integer children are re-encoded into
-    /// probe-supported encodings (see `with_compressed_int_children`), with
-    /// the base additionally payload-wrapped so the code-column read path
-    /// keeps its zero-copy fast path.
+    /// Build a store from a builder's output: the primary quad array, the
+    /// Dictionary layout's term dictionary and the requested indexes'
+    /// components, adopted as they are. The store holds them compressed and
+    /// resident: the base's code columns and each component's integer
+    /// children are re-encoded into encodings the probes read in place
+    /// (`with_compressed_int_children`), the base's also wrapped so the
+    /// code-column read path decodes each once and is zero-copy after.
     pub fn from_built(built: BuiltArray) -> Result<Self> {
         Self::adopt(
             built,
@@ -132,7 +113,7 @@ impl VortexRdfStore {
         )
     }
 
-    /// The one adoption step of [`from_parts`](Self::from_parts) and
+    /// The adoption step of [`from_parts`](Self::from_parts) and
     /// [`from_built`](Self::from_built): resolve the layout from `built`'s
     /// dictionary and dtype, put the base through `encode_base` and every
     /// component through `encode_component`, and assemble the store.
@@ -151,14 +132,10 @@ impl VortexRdfStore {
         Self::assemble_resident(base, components, layout)
     }
 
-    /// Assemble a store from an already-split primary base plus its
-    /// components — the shared tail of every in-memory construction path.
-    ///
-    /// Callers own the resident form of what they pass: [`adopt`](Self::adopt)
-    /// compresses a build and keeps an adopted store's wire encodings
-    /// selectively
-    /// ([`with_searchable_int_children`](resident::with_searchable_int_children));
-    /// this assembler transforms nothing.
+    /// Assemble an in-memory store from a primary base and its components,
+    /// transforming neither: callers own the resident form of what they pass
+    /// ([`adopt`](Self::adopt) compresses a build, or keeps an adopted store's
+    /// wire encodings selectively).
     ///
     /// A Dictionary `layout` must hold its dictionary resident: an in-memory
     /// view decodes its rows without suspending, through that dictionary

@@ -1,7 +1,7 @@
-//! Temp-file spill machinery behind the out-of-core builder: quads (and, for
-//! globally sorted secondary indexes, `(value, row ID)` pairs) are serialized
-//! to disk with rkyv during ingestion/merge passes and read back during chunk
-//! emission, so peak memory stays bounded by the chunk size.
+//! Temp-file spill machinery behind the out-of-core builder: rkyv-serialized
+//! runs of quads and of the index families' `(value, row id)` entries, written
+//! during the ingest and merge passes and read back during chunk emission, so
+//! peak memory stays bounded by the chunk size.
 
 use std::collections::BinaryHeap;
 use std::ffi::{OsStr, OsString};
@@ -19,10 +19,9 @@ use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
 
-/// Environment variable overriding where spill directories are created — the
-/// escape hatch for putting out-of-core runs on a specific volume. The OS
-/// temp dir is commonly a size-capped, RAM-backed tmpfs, exactly the wrong
-/// home for runs that exist because the data outgrew memory.
+/// Environment variable overriding where spill directories are created: a
+/// volume with room for runs that exist because the data outgrew memory (the
+/// OS temp dir is often a size-capped, RAM-backed tmpfs).
 const SPILL_DIR_ENV: &str = "VORTEX_RDF_SPILL_DIR";
 
 /// The rkyv bounds a record type needs to be spilled and read back.
@@ -74,9 +73,8 @@ pub(crate) fn spill_io_error(dir: &Path, what: &str, e: std::io::Error) -> Vorte
 /// The longest file name, in bytes, the common filesystems take.
 const MAX_NAME_BYTES: usize = 255;
 
-/// A unique spill directory for one build's runs, deleted when dropped so
-/// spill files are cleaned up even if the chunk stream is abandoned before
-/// being fully consumed.
+/// A unique spill directory for one build's runs, deleted when dropped, so
+/// the runs go even when the chunk stream is abandoned unfinished.
 pub(crate) struct TempRunsGuard {
     dir: PathBuf,
 }
@@ -88,13 +86,12 @@ impl TempRunsGuard {
     /// name (a build into memory or into a caller's writer) or it would make
     /// the directory's name longer than a file name may be.
     ///
-    /// The parent is resolved in precedence order: the `VORTEX_RDF_SPILL_DIR`
-    /// environment variable, then the caller-provided `base` (a build that
-    /// writes a file passes the directory its temp file is in, beside the
-    /// file it writes or replaces, so spills share the output's volume), then
-    /// [`std::env::temp_dir`]. The library never falls back to the caller's
-    /// working directory: an embedding server or binding can run with an
-    /// arbitrary — even read-only — cwd.
+    /// The parent is, in precedence order: the `VORTEX_RDF_SPILL_DIR`
+    /// environment variable, the caller's `base` (a build that writes a file
+    /// passes its temp file's directory, beside the file it writes or
+    /// replaces, so spills share the output's volume), then
+    /// [`std::env::temp_dir`]. Never the working directory: an embedding
+    /// server or binding can run with any cwd, even a read-only one.
     pub(crate) fn create(output: Option<&OsStr>, base: Option<&Path>) -> Result<Self> {
         let parent = resolve_spill_parent(std::env::var_os(SPILL_DIR_ENV), base);
         let suffix = format!(".spill-{}", uuid::Uuid::new_v4());
@@ -147,8 +144,9 @@ pub(crate) mod spill_hooks {
     }
 }
 
-/// Incremental rkyv writer for spilling items one at a time. Its I/O
-/// failures name the directory the run file is in ([`spill_io_error`]).
+/// Incremental writer of one spill run: per record, a `u32` little-endian
+/// length and the rkyv bytes. Its I/O failures name the directory the run
+/// file is in ([`spill_io_error`]).
 pub(crate) struct RunWriter<T> {
     writer: BufWriter<File>,
     /// The directory the run file is in, for error messages.
@@ -171,8 +169,7 @@ impl<T: Spillable> RunWriter<T> {
     }
 
     pub(crate) fn push(&mut self, item: &T) -> Result<()> {
-        // rkyv consumes and returns its writer by value, so the held buffer
-        // is taken and put back around each serialization.
+        // rkyv takes and returns the buffer by value.
         self.buf.clear();
         let bytes = to_bytes_in::<_, RkyvError>(item, std::mem::take(&mut self.buf))
             .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
@@ -207,13 +204,9 @@ fn write_run<T: Spillable>(path: &Path, items: &[T]) -> Result<()> {
     writer.finish()
 }
 
-/// One sorted run of a merge, read sequentially — either still in memory or
-/// spilled to a temp file.
-///
-/// A dataset that fits in a single run never round-trips through rkyv and
-/// the filesystem: the ingest buffer *is* the run, already sorted and in
-/// memory. Only once a second run exists does spilling buy anything, so the
-/// builder spills lazily and keeps a lone run here.
+/// One sorted run of a merge, read sequentially: still in memory, or spilled
+/// to a temp file. A dataset that fits in one run never spills: the sorted
+/// ingest buffer is the run.
 pub(crate) struct Run<T>(RunInner<T>);
 
 enum RunInner<T> {
@@ -276,9 +269,9 @@ impl<T: Spillable> RunReader<T> {
         self.payload.resize(len, 0);
         read_exact_or_corrupt(&mut self.reader, &mut self.payload, "payload")?;
 
-        // SAFETY: spill files are produced by this process using the matching
-        // rkyv serializer and consumed immediately; we don't accept external
-        // untrusted data on this path.
+        // SAFETY: spill files are written by this process with the matching
+        // rkyv serializer and read back only by the build that wrote them; no
+        // external data takes this path.
         let item = unsafe { rkyv::from_bytes_unchecked::<T, RkyvError>(&self.payload) }
             .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
         Ok(Some(item))
@@ -286,9 +279,8 @@ impl<T: Spillable> RunReader<T> {
 }
 
 /// `read_exact` of one spill record's `what` (its length or its payload)
-/// into `buf`. A truncated record is a corrupt spill file — a format-level
-/// `Deserialization` failure — while any other read error is plain
-/// filesystem I/O.
+/// into `buf`. A truncated record is a corrupt spill file, a
+/// `Deserialization` failure; any other read error is filesystem I/O.
 fn read_exact_or_corrupt(reader: &mut impl Read, buf: &mut [u8], what: &str) -> Result<()> {
     reader.read_exact(buf).map_err(|e| {
         if e.kind() == ErrorKind::UnexpectedEof {
@@ -305,10 +297,9 @@ fn read_exact_or_corrupt(reader: &mut impl Read, buf: &mut [u8], what: &str) -> 
 /// buffer as a sorted run, and hands back a [`RunMerger`] that streams the
 /// items in global order.
 ///
-/// A spiller keeps every item pushed, repeats included — the index
-/// `(value, row id)` records are all different because their row ids are —
-/// unless it was made with [`distinct`](Self::distinct), which is what the
-/// quads themselves go through.
+/// A spiller keeps every item pushed, repeats included (the index
+/// `(value, row id)` records all differ, as their row ids do), unless it was
+/// made with [`distinct`](Self::distinct), as the quads' spiller is.
 pub(crate) struct RunSpiller<T> {
     dir: PathBuf,
     name: &'static str,
@@ -345,7 +336,7 @@ impl<T: Ord + Spillable> RunSpiller<T> {
     }
 
     /// Sort the buffer into a run, dropping its repeats when the spiller is
-    /// [`distinct`](Self::distinct) — equal items are adjacent once sorted.
+    /// [`distinct`](Self::distinct): equal items are adjacent once sorted.
     fn sort_buf(&mut self) {
         self.buf.sort_unstable();
         if self.distinct {
@@ -355,7 +346,7 @@ impl<T: Ord + Spillable> RunSpiller<T> {
 
     pub(crate) fn push(&mut self, item: T) -> Result<()> {
         // Spill only when the next item would not fit, so a dataset of exactly
-        // `capacity` items stays a single in-memory run (see [`Run`]).
+        // `capacity` items stays a single in-memory run.
         if self.buf.len() == self.capacity {
             self.flush_run()?;
         }
@@ -380,10 +371,8 @@ impl<T: Ord + Spillable> RunSpiller<T> {
         Ok(())
     }
 
-    /// Flush the tail run and set up the K-way merge over all runs.
-    ///
-    /// Nothing spilled means everything still sits in `buf`: sorting it in
-    /// place is the whole merge, so it becomes a single in-memory run.
+    /// Flush the last run and set up the K-way merge over all runs; when
+    /// nothing spilled, the sorted buffer is the single in-memory run.
     pub(crate) fn into_merger(mut self) -> Result<RunMerger<T>> {
         if self.run_paths.is_empty() {
             // The one run is deduplicated in place, so the merger reads it
@@ -425,8 +414,8 @@ impl<T: Ord + Spillable> RunMerger<T> {
     }
 
     /// Merge `runs`, each already sorted. With `distinct`, an item that
-    /// appears more than once — in several runs, or repeated inside one —
-    /// comes out once.
+    /// appears more than once (in several runs, or repeated inside one) comes
+    /// out once.
     pub(crate) fn merge(mut runs: Vec<Run<T>>, distinct: bool) -> Result<Self> {
         let mut heap = BinaryHeap::new();
         // A lone run reads straight through, unless its repeats must be

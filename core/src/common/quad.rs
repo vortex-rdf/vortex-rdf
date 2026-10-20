@@ -9,15 +9,10 @@ use oxrdf::Quad;
 use crate::common::terms::quad_from_terms;
 use crate::error::Result;
 
-/// A quad whose terms are shared N-Triples strings: a decoder produces one
-/// `Arc<str>` per distinct term of a chunk and hands it to every row that
-/// repeats the term by reference count, so materializing a wide result costs
-/// one refcount bump per term. `g` is `""` for the
-/// default graph, as the columns store it.
-///
-/// Pointer identity between equal terms is an optimization the decoders
-/// make where they can (a memo hit), never a guarantee: equal content is the
-/// contract.
+/// A quad whose terms are shared N-Triples strings: one `Arc<str>` per
+/// distinct term of a decoded chunk, shared by reference count with every row
+/// that repeats it. `g` is `""` for the default graph. Equal content is the
+/// contract; pointer identity between equal terms is not guaranteed.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SharedQuad {
     /// Subject term.
@@ -48,27 +43,23 @@ impl From<RawQuad> for SharedQuad {
     }
 }
 
-/// A raw (un-encoded) quad holding term strings in N-Triples form.
-/// This is the shared in-memory (and on-disk, for external sorting)
-/// representation consumed by layouts, indexes and builders before
-/// writing to Vortex arrays.
+/// A quad holding its terms as owned N-Triples strings: the builders' input
+/// and the spill-file record.
 ///
-/// The strings are the canonical spelling of their RDF terms, which is what
+/// The strings are the canonical spelling of their terms, as
 /// [`from_quad`](Self::from_quad), the parsers
 /// ([`parse_quads_from_reader`](crate::common::terms::parse_quads_from_reader))
-/// and [`canonical`](Self::canonical) render: `xsd:string` typing dropped,
-/// escapes resolved, language tags lower-cased.
+/// and [`canonical`](Self::canonical) render them: `xsd:string` typing
+/// dropped, escapes resolved, language tags lower-cased.
 ///
 /// **Build inputs must come from one of those three.** Builders intern the
-/// spelling they are given and drop repeated quads by comparing it — they do
-/// not parse a term again, which would cost a full parse of every build — so
-/// a quad written by hand in some other spelling of the same terms counts as
-/// a different quad, with its own dictionary entry. The fields are public so
-/// that a quad can be read; to write one from strings, use
-/// [`canonical`](Self::canonical).
+/// spelling they are given and drop repeated quads by comparing it, without
+/// parsing a term again, so another spelling of the same terms is a different
+/// quad with its own dictionary entry. The fields are public for reading; to
+/// write a quad from strings, use [`canonical`](Self::canonical).
 ///
-/// The derived order compares `s`, `p`, `o` and `g` in turn — the store's
-/// `(s, p, o, g)` sort order — so the fields keep that declaration order.
+/// The derived order compares `s`, `p`, `o` and `g` in turn, the store's
+/// `(s, p, o, g)` sort order, so the fields keep that declaration order.
 #[derive(
     Clone, Hash, PartialEq, Eq, PartialOrd, Ord, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
@@ -84,16 +75,14 @@ pub struct RawQuad {
 }
 
 impl RawQuad {
-    /// A quad from four term spellings in any of the forms a person types or
-    /// a foreign system writes, in the canonical spelling a build expects:
-    /// the way to turn strings into a `RawQuad` that interns and compares like
-    /// one a parser produced.
+    /// A quad from four term spellings, in the canonical spelling a build
+    /// expects, so it interns and compares like one a parser produced.
     ///
     /// Each position takes the tolerant spellings of
-    /// [`DictSnapshot::encode`](crate::DictSnapshot::encode) — an IRI with or
+    /// [`DictSnapshot::encode`](crate::DictSnapshot::encode) (an IRI with or
     /// without angle brackets, a blank node, a literal with escapes, an
     /// explicit `xsd:string` type or an upper-case language tag, the default
-    /// graph as `""`, `default` or `[]` — and must hold a term its position can
+    /// graph as `""`, `default` or `[]`) and must hold a term its position can
     /// (no literal subject, predicate or graph, no blank predicate). `"x"`,
     /// `"x"^^<…#string>` and `"\u0078"` give the same quad, and `"y"@EN` gives
     /// `"y"@en`. A malformed spelling is an
@@ -114,8 +103,7 @@ impl RawQuad {
             o: match &q.object {
                 oxrdf::Term::NamedNode(n) => named_node_string(n),
                 oxrdf::Term::BlankNode(b) => blank_node_string(b),
-                // Literals need escaping and datatype/language suffixes —
-                // keep the canonical Display implementation for those.
+                // Literals need escaping and suffixes: the Display form.
                 other => other.to_string(),
             },
             g: match &q.graph_name {
@@ -127,9 +115,7 @@ impl RawQuad {
     }
 }
 
-/// `<iri>` built directly with one exact-capacity allocation. IRIs need no
-/// escaping in N-Triples, so this skips the `Display`/`format!` machinery and
-/// its formatter dispatch plus incremental `String` reallocation.
+/// `<iri>` in one exact-capacity allocation (an IRI needs no escaping).
 fn named_node_string(n: &oxrdf::NamedNode) -> String {
     let iri = n.as_str();
     let mut s = String::with_capacity(iri.len() + 2);
@@ -139,7 +125,7 @@ fn named_node_string(n: &oxrdf::NamedNode) -> String {
     s
 }
 
-/// `_:id`, same rationale as [`named_node_string`].
+/// `_:id` in one exact-capacity allocation.
 fn blank_node_string(b: &oxrdf::BlankNode) -> String {
     let id = b.as_str();
     let mut s = String::with_capacity(id.len() + 2);

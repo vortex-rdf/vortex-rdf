@@ -116,15 +116,14 @@ fn finish_pair<T: Ord + Spillable>(pair: Pair<RunSpiller<T>>) -> Result<Pair<Run
 }
 
 /// The indexed pipeline's first pass and its index children: run the K-way
-/// quad merge to completion — into memory when there is a single input run
-/// (the dataset already fit once), else into `merged.bin` under the guard's
-/// directory — while the spillers of the families `indexes` requests take
-/// each quad's terms, encoded by `term_of` as `V` (strings, or dictionary
-/// codes). The merge yields each distinct quad once, so the row ids it
-/// assigns number the deduplicated rows. Returns the merged quads as a
-/// single-run merger and each family's child streaming off its merger
-/// ([`merger_components`]); `chunk_size` is the spill window and the child
-/// chunk size alike.
+/// quad merge to completion (into memory when there is a single input run,
+/// else into `merged.bin` under the guard's directory) while the spillers of
+/// the families `indexes` requests take each quad's terms, encoded by
+/// `term_of` as `V` (strings, or dictionary codes). The merge yields each
+/// distinct quad once, so its row ids number the deduplicated rows. Returns
+/// the merged quads as a single-run merger and each family's child streaming
+/// off its merger ([`merger_components`]); `chunk_size` is both the spill
+/// window and the child chunk size.
 pub(super) fn merge_feeding_indexes<V>(
     mut merger: RunMerger<RawQuad>,
     guard: &Arc<TempRunsGuard>,
@@ -158,10 +157,10 @@ where
 }
 
 /// Each family's child as a native component write ([`index_child_write`])
-/// streaming its chunks off its merger, in windows of `chunk_size` entries —
-/// no lockstep with the quad stream, no materialization. The child dtypes
-/// follow the entries' term encoding `V`. Every pull holds the run guard, so
-/// the run files outlive their readers.
+/// streaming its chunks off its merger in windows of `chunk_size` entries,
+/// never materialized and not in lockstep with the quad stream. The child
+/// dtypes follow the entries' term encoding `V`. Every pull holds the run
+/// guard, so the run files outlive their readers.
 fn merger_components<V>(
     mergers: IndexMergers<V>,
     chunk_size: usize,

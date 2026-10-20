@@ -1,25 +1,18 @@
 //! The [`SortedStreamBuilder`] strategy: spill sorted runs to temporary
-//! files, then K-way merge them back into one global (s, p, o, g) order.
+//! files, then K-way merge them back into one global (s, p, o, g) order. It
+//! gives the in-memory builder's guarantee (globally sorted `s` and index
+//! children) without holding the dataset, at the cost of temp-file I/O; the
+//! requested indexes merge from their own spilled `(value, row id)` runs and
+//! stream out as components, never materialized whole
+//! ([`stream_indexes`](super::stream_indexes)).
 //!
-//! It offers the same sortedness guarantee as
-//! [`sorted_in_memory`](super::sorted_in_memory) — globally sorted `s` and
-//! index children, both binary-searchable — without holding the dataset,
-//! paying for it in temp-file I/O. Requested indexes are merged from their
-//! own spilled `(value, row id)` runs and stream straight out as components,
-//! never materialized whole. The run file format itself belongs to
-//! [`spill`](super::spill), the index families' runs and components to
-//! [`stream_indexes`](super::stream_indexes), the chunk build to
-//! [`builders`](super); what lives here is the merge and the one chunk
-//! stream it feeds.
-//!
-//! Quads are unique and terms are canonical in what this builder emits. The
-//! quad runs are spilled *distinct*: a quad that arrives more than once, in
-//! one run or in several, is merged out once, and the dictionary collects
-//! the terms of the parsed (so canonical) quads as a set. Row ids are
-//! assigned by that merge, after the repeats are gone, so every index
-//! family's `(value, row id)` records describe the deduplicated rows — and
-//! are themselves unique, since each carries a row id of its own. The
-//! families are spilled and merged as they are, never deduplicated.
+//! Quads are unique and terms canonical in what this builder emits. The quad
+//! runs are spilled *distinct*: a quad that arrives more than once, in one run
+//! or in several, is merged out once, and the dictionary collects the terms of
+//! the canonical quads as a set. Row ids are assigned by that merge, after the
+//! repeats are gone, so every index family's `(value, row id)` records
+//! describe the deduplicated rows and are unique, each carrying a row id of
+//! its own; the families are spilled and merged as they are.
 
 use super::spill::{RunSpiller, TempRunsGuard};
 use super::stream_indexes::merge_feeding_indexes;
@@ -43,17 +36,16 @@ use std::sync::Arc;
 use vortex_array::ArrayRef;
 use vortex_array::dtype::DType;
 
-/// Out-of-core globally sorted Vortex RDF Array Builder.
-///
-/// Processes datasets larger than available memory using external merge sort:
-/// sorted runs are spilled to disk, then K-way merged into fixed-size chunks.
+/// The out-of-core, globally sorted builder: an external merge sort, so a
+/// dataset larger than memory builds. Sorted runs are spilled to disk
+/// (`build_vortex_array`'s under `VORTEX_RDF_SPILL_DIR`, else the OS temp
+/// dir), then K-way merged into fixed-size chunks.
 ///
 /// With any secondary index requested, the quad merge runs eagerly to a spill
-/// (row ids are assigned by the merge) while each index family's
-/// `(value, row id)` entries are spilled as sorted runs; each family then
-/// streams its child straight off its own merger beside the lazily re-read
-/// quad chunks. Without indexes a single lazy merge pass emits chunks as the
-/// consumer polls.
+/// (it assigns the row ids) while each index family's `(value, row id)`
+/// entries are spilled as sorted runs; each family then streams its child off
+/// its own merger beside the lazily re-read quad chunks. Without indexes one
+/// lazy merge pass emits chunks as the consumer polls.
 pub struct SortedStreamBuilder;
 
 impl VortexArrayBuilder for SortedStreamBuilder {
@@ -82,10 +74,10 @@ impl SortedStreamBuilder {
 }
 
 /// The chunk stream materialized into one array, its `s` column stamped
-/// sorted — every chunk is a window of the global merge, and assembling
-/// chunks loses the per-chunk stats `match_pattern` gates its binary searches
-/// on — and each streamed index child materialized as an in-memory component
-/// ([`IndexComponent::from_write`]), which `from_built` adopts as it is.
+/// sorted (every chunk is a window of the global merge, and assembling chunks
+/// loses the per-chunk stats `match_pattern` gates its binary searches on),
+/// and each streamed index child materialized as an in-memory component
+/// ([`IndexComponent::from_write`]).
 pub(crate) async fn build_array(
     quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
@@ -154,23 +146,20 @@ impl Encoding {
     }
 }
 
-/// External merge sort producing a lazily evaluated stream of sorted chunks,
-/// each distinct quad once.
-///
-/// Ingest to sorted runs on disk runs to completion before this returns —
-/// sorted output cannot be emitted until all input has been seen. Without
-/// secondary indexes the K-way merge then produces chunks only when the
-/// consumer polls, keeping peak memory at heap + one chunk; with them the
-/// merge itself runs eagerly (it assigns the row ids the index runs carry,
-/// see [`SortedStreamBuilder`]) and only chunk emission stays lazy. Either
-/// way the merged quads leave through one emission. Temp run files are
-/// removed when the stream is dropped.
+/// External merge sort into a lazily evaluated stream of sorted chunks, each
+/// distinct quad once. Ingest into sorted runs completes before this returns:
+/// no sorted output exists before all input is seen. Without secondary
+/// indexes the K-way merge then builds chunks only as the consumer polls, at a
+/// peak memory of the heap plus one chunk (plus the distinct terms under the
+/// Dictionary layout); with them the merge runs eagerly (it assigns the row
+/// ids the index runs carry) and only chunk emission stays lazy. The run
+/// files are removed when the stream is dropped.
 ///
 /// `spill` is the output file's name and the directory to spill beside: a
-/// build that writes a file points it at the directory of its temp file,
-/// beside the file it writes or replaces, so spills share the output's
-/// volume, in a run directory named after the output. `None` takes
-/// [`TempRunsGuard::create`]'s default resolution.
+/// build that writes a file passes its temp file's directory, beside the file
+/// it writes or replaces, so the runs share the output's volume, in a run
+/// directory named after the output. `None` takes
+/// [`TempRunsGuard::create`]'s default.
 pub(crate) async fn build_chunk_stream(
     mut quads_in: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
