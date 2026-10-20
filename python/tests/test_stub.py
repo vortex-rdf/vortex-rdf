@@ -97,8 +97,10 @@ def test_stub_class_methods_match_runtime(name):
 def test_reprs_name_their_class_and_state(vortex_files):
     """`U64Column`'s repr names the class and shows the column's length, as
     `TermDict`'s does, for a column taken from a store and one built from
-    values."""
-    store = VortexRdfStore(vortex_files["dictionary"])
+    values; a store opened from a path shows the path and its layout."""
+    path = vortex_files["dictionary"]
+    store = VortexRdfStore(path)
+    assert repr(store) == f'VortexRdfStore(path="{path}", layout="dictionary")'
     column = store.match_codes()[0]
     assert repr(column) == "U64Column(len=5)"
     assert repr(U64Column([])) == "U64Column(len=0)"
