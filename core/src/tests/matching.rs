@@ -1,21 +1,9 @@
-//! In-memory pattern matching: the per-layout probes, the prefix probe over
-//! the (s, p, o, g) order, and view derivation.
+//! In-memory pattern matching: every term kind under every layout, the
+//! prefix probe over the (s, p, o, g) order, and view derivation.
 
 use super::*;
 
 // ─── In-memory matching ────────────────────────────────────────────────
-
-#[tokio::test]
-async fn test_match_pattern_default_layout() {
-    probe_default(built_store(two_quads(), LayoutStrategy::Default, vec![]).await).await;
-}
-
-#[tokio::test]
-async fn test_match_typed_object_layout() {
-    let store = built_store(two_quads(), LayoutStrategy::TypedObject, vec![]).await;
-    assert_eq!(store.layout(), LayoutStrategy::TypedObject);
-    probe_typed_object(store).await;
-}
 
 /// Every term kind in every role round-trips through each layout and binds
 /// exactly its rows: a blank-node subject, a blank-node graph, the default
@@ -325,24 +313,49 @@ async fn test_prefix_probe_resolves_bound_prefixes_to_ranges() {
 
 /// The prefix ends at the first unbound role: a bound object or graph behind
 /// an unbound predicate is left to the residual scan, whose ids are exact but
-/// no longer a range.
+/// no longer a range. The subject's range and the residual compose the same
+/// way with a reference index: the residual keeps the subject's rows that
+/// hold the object, and a subject and an object that both exist but never
+/// meet match nothing.
 #[tokio::test]
 async fn test_prefix_probe_stops_at_the_first_unbound_role() {
     let (s, _, o, g) = prefix_terms();
-    let store = built_store(prefix_quads(), LayoutStrategy::Dictionary, vec![]).await;
+    // `prefix_quads()` gives every subject both objects; `s04`'s one object,
+    // `o2`, no other subject holds, so `s04` never meets `o1`.
+    let mut quads = prefix_quads();
+    quads.push(make_quad(
+        "http://example.org/s04",
+        "http://example.org/p0",
+        "o2",
+        GraphName::DefaultGraph,
+    ));
+    let s04 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s04").unwrap());
+    for indexes in [vec![], vec![IndexType::SecondaryByReference]] {
+        let store = built_store(quads.clone(), LayoutStrategy::Dictionary, indexes.clone()).await;
 
-    let by_so = store
-        .match_pattern(Some(&s), None, Some(&o), None)
-        .await
-        .unwrap();
-    assert_eq!(by_so.debug_selection_range(), None);
-    assert_eq!(by_so.size().await.unwrap(), 6); // 3 predicates × 2 graphs
-    let by_sg = store
-        .match_pattern(Some(&s), None, None, Some(&g))
-        .await
-        .unwrap();
-    assert_eq!(by_sg.debug_selection_range(), None);
-    assert_eq!(by_sg.size().await.unwrap(), 6); // 3 predicates × 2 objects
+        let by_so = store
+            .match_pattern(Some(&s), None, Some(&o), None)
+            .await
+            .unwrap();
+        assert_eq!(by_so.debug_selection_range(), None, "{indexes:?}");
+        assert_eq!(by_so.size().await.unwrap(), 6, "{indexes:?}"); // 3 predicates × 2 graphs
+        assert_eq!(
+            view_strings(&by_so).await,
+            expected_strings(&quads, |i| quads[i].subject == s && quads[i].object == o),
+            "{indexes:?}: the S+O hit decodes to exactly its rows"
+        );
+        assert_eq!(
+            matched_size(&store, Some(&s04), None, Some(&o), None).await,
+            0,
+            "{indexes:?}: s04 and o1 never meet"
+        );
+        let by_sg = store
+            .match_pattern(Some(&s), None, None, Some(&g))
+            .await
+            .unwrap();
+        assert_eq!(by_sg.debug_selection_range(), None, "{indexes:?}");
+        assert_eq!(by_sg.size().await.unwrap(), 6, "{indexes:?}"); // 3 predicates × 2 objects
+    }
 }
 
 /// Under a string layout only the subject has a searchable column: the

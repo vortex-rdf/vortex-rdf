@@ -1,47 +1,10 @@
-//! Builder smoke round-trips and the textual export paths (raw
-//! N-Triples/N-Quads fast path, structured serializer) checked against
-//! oxrdfio.
+//! Adoption refusals, decode errors, base rebuilds, and the textual export
+//! paths (raw N-Triples/N-Quads fast path, structured serializer) checked
+//! against oxrdfio.
 
 use super::*;
 
-// ─── Builder round-trips ───────────────────────────────────────────────
-
-async fn run_builder_roundtrip<B: VortexArrayBuilder>() {
-    let quad = make_quad(
-        "http://example.org/s",
-        "http://example.org/p",
-        "hello",
-        GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap()),
-    );
-
-    let arr = build_array::<B>(
-        quad_stream(vec![quad.clone()]),
-        LayoutStrategy::Default,
-        vec![],
-    )
-    .await
-    .expect("build failed");
-
-    let store = VortexRdfStore::from_built(arr).unwrap();
-    let decoded: Vec<Quad> = store.quads().try_collect().await.unwrap();
-    assert_eq!(decoded.len(), 1);
-    assert_eq!(decoded[0].subject.to_string(), quad.subject.to_string());
-    assert_eq!(decoded[0].predicate.to_string(), quad.predicate.to_string());
-    assert_eq!(decoded[0].object.to_string(), quad.object.to_string());
-    assert_eq!(
-        decoded[0].graph_name.to_string(),
-        quad.graph_name.to_string()
-    );
-}
-
-#[tokio::test]
-async fn test_builder_roundtrip_sorted_in_memory() {
-    run_builder_roundtrip::<SortedInMemoryBuilder>().await;
-}
-#[tokio::test]
-async fn test_builder_roundtrip_sorted_stream() {
-    run_builder_roundtrip::<SortedStreamBuilder>().await;
-}
+// ─── Adoption, decode errors and rebuilds ──────────────────────────────
 
 /// A bare Dictionary-layout array cannot self-describe, and `from_parts`
 /// says so.

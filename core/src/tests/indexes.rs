@@ -558,16 +558,30 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
         "combined match mismatch for builder={builder_name} layout={layout_name} indexes={index_name}",
     );
 
+    // A subject, a predicate or an object the store does not hold matches
+    // nothing.
+    let missing_s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/nope").unwrap());
     let missing_p = NamedNode::new("http://example.org/nope").unwrap();
-    let empty = store
-        .match_pattern(None, Some(&missing_p), None, None)
-        .await
-        .unwrap();
-    assert_eq!(
-        empty.size().await.unwrap(),
-        0,
-        "missing-term match mismatch for builder={builder_name} layout={layout_name} indexes={index_name}",
-    );
+    let missing_o = Term::Literal(Literal::new_simple_literal("nope"));
+    for (role, size) in [
+        (
+            "subject",
+            matched_size(&store, Some(&missing_s), None, None, None).await,
+        ),
+        (
+            "predicate",
+            matched_size(&store, None, Some(&missing_p), None, None).await,
+        ),
+        (
+            "object",
+            matched_size(&store, None, None, Some(&missing_o), None).await,
+        ),
+    ] {
+        assert_eq!(
+            size, 0,
+            "missing-{role} match mismatch for builder={builder_name} layout={layout_name} indexes={index_name}",
+        );
+    }
 }
 
 /// The 3-layout × 4-index-config matrix for one builder. The 12 cells are
