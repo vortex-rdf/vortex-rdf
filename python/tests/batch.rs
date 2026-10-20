@@ -221,10 +221,12 @@ fn a_panicking_probe_reraises_and_aborts_the_rest() {
     });
 }
 
-/// Eight probes that never finish past the first, through a window of two,
-/// counting the probes spawned, finished and dropped.
+/// Eight probes through a window of two, counting the probes spawned,
+/// finished and dropped: the first answers `first`, and the rest never
+/// finish.
 fn stalled_batch(
     runtime: &Runtime,
+    first: Result<usize, &'static str>,
 ) -> (
     Batch<usize>,
     Arc<AtomicUsize>,
@@ -244,7 +246,7 @@ fn stalled_batch(
         &counters,
         (0..8).collect::<Vec<usize>>(),
         2,
-        |(spawned, finished, dropped), probe| {
+        move |(spawned, finished, dropped), probe| {
             spawned.fetch_add(1, Ordering::SeqCst);
             let guard = Dropped(dropped);
             async move {
@@ -253,7 +255,7 @@ fn stalled_batch(
                     std::future::pending::<()>().await;
                 }
                 finished.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, VortexRdfError>(probe)
+                first.map_err(|message| VortexRdfError::InvalidOperation(message.to_string()))
             }
         },
     );
@@ -267,7 +269,7 @@ fn stalled_batch(
 #[test]
 fn dropping_the_batch_aborts_what_is_in_flight_and_starts_nothing() {
     let runtime = runtime();
-    let (mut batch, spawned, finished, dropped) = stalled_batch(&runtime);
+    let (mut batch, spawned, finished, dropped) = stalled_batch(&runtime, Ok(0));
     assert_eq!(
         done(batch.next(&runtime, None)).map(Result::unwrap),
         Some(0)
@@ -285,6 +287,35 @@ fn dropping_the_batch_aborts_what_is_in_flight_and_starts_nothing() {
         1,
         "an aborted probe finished"
     );
+}
+
+/// A failing first probe ends the batch at its answer and starts none of
+/// the rest: with nothing pulled yet, the driver stops at the failure it
+/// forwards, so exactly two probes are ever spawned through a window of two
+/// and the second is dropped unfinished; the batch then answers the
+/// failure.
+#[test]
+fn a_failure_starts_none_of_the_rest() {
+    let runtime = runtime();
+    let (batch, spawned, finished, dropped) = stalled_batch(&runtime, Err("probe 0"));
+    // The batch is held and unpulled, so its channel stays open: only the
+    // driver's own stop at the failure drops the window and the stalled
+    // second probe in it.
+    wait_until("both spawned probes to be dropped", || {
+        dropped.load(Ordering::SeqCst) == 2
+    });
+    assert_eq!(
+        spawned.load(Ordering::SeqCst),
+        2,
+        "a probe was spawned past the failure"
+    );
+    assert_eq!(
+        finished.load(Ordering::SeqCst),
+        1,
+        "an aborted probe finished"
+    );
+    let error = done(batch.collect(&runtime, None)).expect_err("probe 0 fails");
+    assert_eq!(message(error), "probe 0");
 }
 
 /// Between pulls the driver keeps the window full until the answers
@@ -326,7 +357,7 @@ fn the_window_refills_between_pulls_up_to_its_bound() {
 #[test]
 fn a_cancelled_pull_aborts_the_window() {
     let runtime = Arc::new(runtime());
-    let (mut batch, spawned, finished, dropped) = stalled_batch(&runtime);
+    let (mut batch, spawned, finished, dropped) = stalled_batch(&runtime, Ok(0));
     let token = Token::new();
     assert_eq!(
         done(batch.next(&runtime, Some(&token))).map(Result::unwrap),
