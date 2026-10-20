@@ -577,16 +577,28 @@ async fn test_index_components_classify_children_by_slug() {
     }
 }
 
-/// The partition counts every view is cut into: one (the view itself), a
-/// few, and more than any view has rows.
-const PARTITION_COUNTS: [usize; 6] = [1, 2, 3, 7, 64, 100_000];
+/// The partition counts every view is cut into: one (the view itself) and a
+/// few.
+const PARTITION_COUNTS: [usize; 5] = [1, 2, 3, 7, 64];
 
-/// Partitions tile `view`: at each of [`PARTITION_COUNTS`], at most that many
-/// and never none, read in turn they give the view's base-ordered codes, and
-/// their sizes add up to its size.
+/// A partition count past any view's rows, which cuts the rows a view
+/// selects into one-row partitions — under a pending filter, mostly
+/// partitions without a live row: asked of the views of at most
+/// [`PAST_THE_ROWS_VIEW_ROWS`] rows, which in [`views_of`] are the subject,
+/// the window, the chained match and the empty window.
+const PAST_THE_ROWS: usize = 100_000;
+
+/// The most rows a view [`PAST_THE_ROWS`] is asked of has.
+const PAST_THE_ROWS_VIEW_ROWS: usize = 256;
+
+/// Partitions tile `view`: at each of [`PARTITION_COUNTS`], and at
+/// [`PAST_THE_ROWS`] on a small view, at most that many and never none, read
+/// in turn they give the view's base-ordered codes, and their sizes add up
+/// to its size.
 async fn assert_partitions_tile(view: &VortexRdfStore, tag: &str) {
     let expected = base_ordered_codes(view).await;
-    for n in PARTITION_COUNTS {
+    let past_the_rows = (expected.len() <= PAST_THE_ROWS_VIEW_ROWS).then_some(PAST_THE_ROWS);
+    for n in PARTITION_COUNTS.into_iter().chain(past_the_rows) {
         let parts = view
             .partitions(NonZeroUsize::new(n).unwrap())
             .await

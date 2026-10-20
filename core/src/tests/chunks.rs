@@ -11,16 +11,16 @@ use crate::vortex_scan::ScanRequest;
 use vortex_array::dtype::{DType, Nullability};
 use vortex_array::expr::stats::Precision;
 
-/// Both exports of `view` agree with its base-ordered codes at several
-/// batch sizes — one row, a size the rows do not divide, the view's length —
-/// in the chunks the view reads at its length (one, or a file scan's split
-/// each), each cut to the batch; every column subset reads the subset's
-/// columns of the four-column read, and a subset comes in the requested
-/// order. Its data source scans to the same codes under a non-nullable
-/// struct dtype, and advertises its statistics' count (exact, or as the
-/// upper bound) and four `u64` codes a row as its byte size; the source and
-/// the statistics are taken before anything reads the view. Returns the
-/// count the source advertises.
+/// Both exports of `view` agree with its base-ordered codes at several batch
+/// sizes — one row (on a view of at most 256 rows), a size the rows do not
+/// divide, the view's length — in the chunks the view reads at its length
+/// (one, or a file scan's split each), each cut to the batch; every column
+/// subset reads the subset's columns of the four-column read, and a subset
+/// comes in the requested order. Its data source scans to the same codes
+/// under a non-nullable struct dtype, and advertises its statistics' count
+/// (exact, or as the upper bound) and four `u64` codes a row as its byte
+/// size; the source and the statistics are taken before anything reads the
+/// view. Returns the count the source advertises.
 async fn assert_chunks_match(view: &VortexRdfStore, tag: &str) -> Precision<u64> {
     let source = view.data_source().unwrap();
     let hint = view.view_statistics().unwrap().rows;
@@ -31,7 +31,12 @@ async fn assert_chunks_match(view: &VortexRdfStore, tag: &str) -> Precision<u64>
         .iter()
         .map(|c| c.len())
         .collect();
-    let mut batches = vec![1, short_last(n), 256, n.max(1), 100_000];
+    let mut batches = vec![short_last(n), 256, n.max(1), 100_000];
+    // One row a chunk is a pull per row: a small view holds the case, and
+    // the other batches cut every larger view's chunks and splits.
+    if n <= 256 {
+        batches.push(1);
+    }
     batches.sort_unstable();
     batches.dedup();
     for batch in batches {

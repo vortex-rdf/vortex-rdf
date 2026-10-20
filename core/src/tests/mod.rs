@@ -815,17 +815,28 @@ async fn reopened_stores(path: &std::path::Path) -> [(&'static str, VortexRdfSto
 /// copy index and the reference index, each file opened every way
 /// [`reopened_stores`] opens it. Each store is tagged `file/<index>/<open>`
 /// and comes beside its file's dir guard; keep the guard alive for the
-/// store's lifetime.
+/// store's lifetime. Each file is written by [`write_store_file`] once per
+/// process (see [`cached_store_bytes`]), and its bytes into a fresh temp dir
+/// per call.
 #[cfg(feature = "file-io")]
 async fn file_stores() -> Vec<(String, std::sync::Arc<tempfile::TempDir>, VortexRdfStore)> {
+    static BYTES: [OnceLock<Vec<u8>>; 3] = [const { OnceLock::new() }; 3];
     let mut stores = Vec::new();
-    for (tag, indexes) in [
+    for ((tag, indexes), cell) in [
         ("file/no-index", vec![]),
         ("file/copy", vec![IndexType::SecondaryByCopy]),
         ("file/reference", vec![IndexType::SecondaryByReference]),
-    ] {
-        let (dir, path) =
-            write_store_file(fixture_quads(), LayoutStrategy::Dictionary, indexes).await;
+    ]
+    .into_iter()
+    .zip(&BYTES)
+    {
+        let bytes = cached_store_bytes(cell, || async move {
+            let (_dir, path) =
+                write_store_file(fixture_quads(), LayoutStrategy::Dictionary, indexes).await;
+            std::fs::read(&path).unwrap()
+        })
+        .await;
+        let (dir, path) = temp_store_file(bytes);
         let dir = std::sync::Arc::new(dir);
         for (open, store) in reopened_stores(&path).await {
             assert_eq!(

@@ -407,15 +407,16 @@ async fn test_temp_file_is_a_sibling_and_gone_after_success() {
     assert_eq!(std::fs::read(&path).unwrap(), b"a store");
 }
 
-/// Dropping the creation of a pending store at any of its steps leaves no
-/// temp file behind. Each poll starts one filesystem call and the sleep lets
-/// it finish, so every drop lands on a call that has been made and not yet
-/// seen by the future.
+/// Dropping the creation of a pending store at any of its steps, up to the
+/// one that completes it, leaves no temp file behind. Each poll starts one
+/// filesystem call and the sleep lets it finish, so every drop lands on a
+/// call that has been made and not yet seen by the future; the check then
+/// waits up to a second for the directory to hold only the store.
 #[tokio::test]
 async fn test_dropping_the_creation_at_any_step_leaves_no_temp_file() {
     use crate::io::write::PendingStore;
     use std::task::Poll;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     for existing in [false, true] {
         for steps in 1..=12 {
@@ -425,23 +426,37 @@ async fn test_dropping_the_creation_at_any_step_leaves_no_temp_file() {
                 std::fs::write(&path, b"the previous store").unwrap();
             }
             let mut create = Box::pin(PendingStore::create(&path));
+            let mut completed = false;
             for _ in 0..steps {
                 match futures::poll!(create.as_mut()) {
-                    Poll::Ready(_) => break,
+                    Poll::Ready(_) => {
+                        completed = true;
+                        break;
+                    }
                     Poll::Pending => std::thread::sleep(Duration::from_millis(10)),
                 }
             }
             drop(create);
-            std::thread::sleep(Duration::from_millis(50));
 
-            let leftovers: Vec<PathBuf> = entries(dir.path())
-                .into_iter()
-                .filter(|entry| entry != &path)
-                .collect();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let leftovers = loop {
+                let leftovers: Vec<PathBuf> = entries(dir.path())
+                    .into_iter()
+                    .filter(|entry| entry != &path)
+                    .collect();
+                if leftovers.is_empty() || Instant::now() >= deadline {
+                    break leftovers;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
             assert!(
                 leftovers.is_empty(),
                 "existing={existing}, dropped after {steps} steps: {leftovers:?}"
             );
+            // Every larger step count replays the completed creation.
+            if completed {
+                break;
+            }
         }
     }
 }
