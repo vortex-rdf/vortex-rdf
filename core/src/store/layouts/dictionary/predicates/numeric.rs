@@ -36,8 +36,9 @@ pub(super) enum Num {
     Float(f64),
 }
 
-// `f64` has no `Eq`/`Hash`: a parsed constant is always finite, so the
-// derived `PartialEq` is reflexive, and a float hashes by its bit pattern.
+// `f64` has no `Eq`/`Hash`: a parsed constant is always finite (never NaN),
+// so the derived `PartialEq` is reflexive, and a float hashes by its bit
+// pattern, `-0.0` as the `0.0` it equals.
 impl Eq for Num {}
 
 impl std::hash::Hash for Num {
@@ -54,6 +55,7 @@ impl std::hash::Hash for Num {
             }
             Num::Float(f) => {
                 2u8.hash(state);
+                let f = if *f == 0.0 { 0.0 } else { *f };
                 f.to_bits().hash(state);
             }
         }

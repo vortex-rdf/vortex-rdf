@@ -599,23 +599,34 @@ mod tests {
 
     /// A numeric predicate's constant hashes by its value, in every model
     /// (integer, decimal, float): equal constants are one set entry,
-    /// different ones two.
+    /// different ones two. `0e0` and `-0e0` compare equal, so they hash
+    /// alike.
     #[test]
     fn numeric_predicates_hash_by_value() {
+        use std::hash::BuildHasher as _;
+
         let number = |arg: &str| match p("num_eq", arg) {
             TermPredicate::Num(_, number) => number,
             other => panic!("{other:?}"),
         };
-        let set: std::collections::HashSet<Number> =
-            ["5", "5", "6", "1.5", "1.5", "2.5", "1e3", "1e3", "2e3"]
-                .map(number)
-                .into_iter()
-                .collect();
-        assert_eq!(set.len(), 6);
-        for arg in ["5", "1.5", "1e3"] {
+        let set: std::collections::HashSet<Number> = [
+            "5", "5", "6", "1.5", "1.5", "2.5", "1e3", "1e3", "2e3", "0e0", "-0e0",
+        ]
+        .map(number)
+        .into_iter()
+        .collect();
+        assert_eq!(set.len(), 7);
+        for arg in ["5", "1.5", "1e3", "0e0", "-0e0"] {
             assert!(set.contains(&number(arg)), "{arg}");
         }
         assert!(!set.contains(&number("7")));
+        let hasher = std::collections::hash_map::RandomState::new();
+        assert_eq!(number("0e0"), number("-0e0"));
+        assert_eq!(
+            hasher.hash_one(number("0e0")),
+            hasher.hash_one(number("-0e0")),
+            "equal constants hash alike"
+        );
     }
 
     #[test]
