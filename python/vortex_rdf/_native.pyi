@@ -35,12 +35,14 @@ class VortexRdfError(Exception):
 
 class JoinTooLarge(VortexRdfError):
     """Raised when a join would make more row pairs than its ``max_pairs``
-    allows, before any pair is built. ``args`` is ``(message, pairs)``:
-    the message names the count and the cap, and ``args[1]`` is the join's
-    pair count."""
+    allows, before any pair is built. ``pairs`` is the join's pair count;
+    ``args`` is ``(message, pairs)``, the message naming the count and the
+    cap."""
 
-    pairs: int
-    """The join's pair count: ``args[1]``."""
+    @property
+    def pairs(self) -> int:
+        """The join's pair count (``args[1]``)."""
+        ...
 
 class Cancelled(VortexRdfError):
     """Raised by a call or a pull whose `CancelToken` was cancelled before it
@@ -386,11 +388,11 @@ class VortexRdfStore:
         zero-copy `U64Column` per name in `columns` (``"s"``, ``"p"``,
         ``"o"``, ``"g"``, in the order given), or None when the code path
         does not apply. `keep`, `limit` and `offset` narrow the match as for
-        `match_codes`; this call resolves the narrowed match, and its rows
-        are read or gathered one chunk per pull, so memory holds one chunk
-        at a time. With a `cancel` token this call and every pull race it
-        (`CancelToken`). ``batch_rows=0``, no column or an unknown name
-        raises ``ValueError``."""
+        `match_codes`; this call resolves the narrowed match. In memory each
+        chunk is sliced or gathered when it is pulled; on file a scan reads a
+        bounded window of splits ahead of the pulls. With a `cancel` token
+        this call and every pull race it (`CancelToken`). ``batch_rows=0``,
+        no column or an unknown name raises ``ValueError``."""
         ...
     def match_codes_many(
         self,

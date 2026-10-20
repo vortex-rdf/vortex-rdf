@@ -40,8 +40,8 @@ pyo3::create_exception!(
     JoinTooLarge,
     VortexRdfError,
     "Raised when a join would make more row pairs than its `max_pairs` allows, before any pair \
-     is built. `args` is `(message, pairs)`: the message names the count and the cap, and \
-     `args[1]` is the join's pair count."
+     is built. `pairs` is the join's pair count; `args` is `(message, pairs)`, the message \
+     naming the count and the cap."
 );
 
 pyo3::create_exception!(

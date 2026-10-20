@@ -540,9 +540,11 @@ impl VortexRdfStore {
     /// (`"s"`, `"p"`, `"o"`, `"g"`, in the order given), or `None` when the
     /// code path does not apply. `keep`, `limit` and `offset` narrow the
     /// match as for [`Self::match_codes`]; this call resolves the narrowed
-    /// match, and its rows are read or gathered one chunk per pull. With a
-    /// `cancel` token this call and every pull race it ([`CancelToken`]).
-    /// `batch_rows == 0`, no column or an unknown name raises `ValueError`.
+    /// match. In memory each chunk is sliced or gathered when it is pulled;
+    /// on file a scan reads a bounded window of splits ahead of the pulls.
+    /// With a `cancel` token this call and every pull race it
+    /// ([`CancelToken`]). `batch_rows == 0`, no column or an unknown name
+    /// raises `ValueError`.
     // The parameters are the Python signature: a pattern, its narrowing and
     // the chunk shape.
     #[allow(clippy::too_many_arguments)]
