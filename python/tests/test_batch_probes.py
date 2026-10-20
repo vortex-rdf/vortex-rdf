@@ -74,7 +74,10 @@ def test_a_window_of_one_answers_like_the_default_window(code_store):
 
 
 def test_a_window_past_the_batch_answers_like_the_default_window(code_store):
-    widest = [u64_rows(cols) for cols in code_store.match_codes_many(FIXTURE_PROBES, lookahead=sys.maxsize)]
+    widest = [
+        u64_rows(cols)
+        for cols in code_store.match_codes_many(FIXTURE_PROBES, lookahead=sys.maxsize)
+    ]
     assert widest == [u64_rows(cols) for cols in code_store.match_codes_many(FIXTURE_PROBES)]
     counts = code_store.count_quads_many(FIXTURE_PROBES, lookahead=sys.maxsize)
     assert counts == code_store.count_quads_many(FIXTURE_PROBES)
@@ -83,8 +86,9 @@ def test_a_window_past_the_batch_answers_like_the_default_window(code_store):
 def test_a_cancelled_token_refuses_the_calls_before_anything_runs(code_store, string_store):
     cancelled = CancelToken()
     cancelled.cancel()
-    # Run, this probe fails (a keep needs the Dictionary layout): a call that
-    # raises `Cancelled` for it ran nothing.
+    # Run, this probe fails (a keep needs the Dictionary layout), so a call
+    # that raises `Cancelled` for it checked the token before the probe's
+    # error could surface.
     failing = {"o": "<http://ex.org/o/7>", "keep": {"s": (0, 5)}}
     for store in (code_store, string_store):
         with pytest.raises(Cancelled):
