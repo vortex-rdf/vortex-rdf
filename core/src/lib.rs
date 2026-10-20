@@ -62,11 +62,12 @@ mod store;
 pub use error::{Result, VortexRdfError};
 
 pub use store::{
-    BuiltArray, CaseMap, CodeChunkStream, DictReader, DictSnapshot, DictionaryQuadSink,
-    IndexComponentInfo, IndexType, Indexes, Keep, KindRanges, LayoutStrategy, NumOp, Number, Probe,
-    QuadColumn, RawQuad, RowChunkStream, RowCountHint, RowId, SelectionKind, SharedQuad, SortOrder,
-    SortedInMemoryBuilder, TermCode, TermPredicate, TextOptions, TextPredicate, Verdict,
-    ViewStatistics, VortexArrayBuilder, VortexRdfStore, export_rdf,
+    BuiltArray, CaseMap, CodeChunkStream, CodePattern, DictReader, DictSnapshot,
+    DictionaryQuadSink, IndexComponentInfo, IndexType, Indexes, Keep, KindRanges, LayoutStrategy,
+    LocatedCodes, NumOp, Number, Probe, QuadColumn, RawQuad, RowChunkStream, RowCountHint, RowId,
+    SelectionKind, SharedQuad, SortOrder, SortedInMemoryBuilder, TermCode, TermPredicate,
+    TextOptions, TextPredicate, Verdict, ViewStatistics, VortexArrayBuilder, VortexRdfStore,
+    export_rdf,
 };
 
 /// The vortex scan interface behind [`VortexRdfStore::data_source`] and

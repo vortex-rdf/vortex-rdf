@@ -31,6 +31,7 @@ pub use layouts::dictionary::{
 };
 pub use persist::export::export_rdf;
 pub use query::batch::Probe;
+pub use query::located::{CodePattern, LocatedCodes};
 pub(crate) use query::matching::IdsNeed;
 pub use query::narrowing::Keep;
 pub use read::chunks::{CodeChunkStream, RowChunkStream};

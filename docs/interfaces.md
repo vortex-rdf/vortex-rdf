@@ -19,10 +19,10 @@ is the path such an engine takes.
 | The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L129) |
 | Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L62), [`code_chunks`](../core/src/store/read/chunks.rs#L92) |
 | Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L152), [`index_components`](../core/src/store/read/metadata.rs#L226), [`partitions`](../core/src/store/read/metadata.rs#L261) |
-| Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L243) (from [`dict_reader`](../core/src/store/mod.rs#L202)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
+| Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L243) (from [`dict_reader`](../core/src/store/mod.rs#L203)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |
 | When codes and plans stop applying | [`generation`](../core/src/store/read/metadata.rs#L141), [`DictReader::dictionary_id`](../core/src/store/layouts/dictionary/handles.rs#L267) |
-| The session to hand vortex's integrations | [`vortex_session`](../core/src/lib.rs#L81), with [`vortex_scan`](../core/src/lib.rs#L75) re-exported |
+| The session to hand vortex's integrations | [`vortex_session`](../core/src/lib.rs#L82), with [`vortex_scan`](../core/src/lib.rs#L76) re-exported |
 
 ---
 
@@ -274,6 +274,16 @@ the native rule is certain
 and one in neither set fails. An engine keeps `passed` (as a `keep`),
 evaluates `undecided` itself, and drops the rest.
 
+An engine that already holds term codes, as a nested-loop join's
+per-binding probe does, can ask `locate_codes(CodePattern, offset, limit)`
+first: when the bound codes are a prefix of a sorted table's key order (the
+quad table's `(s, p, o, g)`, the copy index's `index:posg` `(p, o, s, g)`
+or `index:ospg` `(o, s, p, g)`), it answers the match's size and the
+window's code columns from one located run, with no dictionary search, view
+or gather, in that table's order. It answers only a whole file-backed
+Dictionary store (no tail, tombstones or narrowing) and returns `None`
+otherwise, for the engine to `run_probe` instead.
+
 ## 7. Snapshots and mutation
 
 A `VortexRdfStore` value is a snapshot: views share an immutable base, and
@@ -359,6 +369,7 @@ stays out of `cargo test --workspace`. The `interface-tests` job of
 | Concern | File |
 |---|---|
 | `DataSource` over a view, component tables, the request plan | [`core/src/store/read/data_source.rs`](../core/src/store/read/data_source.rs) |
+| `locate_codes`, `CodePattern`, `LocatedCodes` | [`core/src/store/query/located.rs`](../core/src/store/query/located.rs) |
 | `row_chunks`, `code_chunks` | [`core/src/store/read/chunks.rs`](../core/src/store/read/chunks.rs) |
 | `view_statistics`, `index_components`, `partitions`, `generation` | [`core/src/store/read/metadata.rs`](../core/src/store/read/metadata.rs) |
 | The scan driver of a file view's reads | [`core/src/store/scan/file_reads.rs`](../core/src/store/scan/file_reads.rs) |

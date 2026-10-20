@@ -533,3 +533,195 @@ async fn test_file_code_columns_match_memory() {
     }
     check("file/tombstoned", &file, &mem).await;
 }
+
+/// Quads whose sort-key prefixes repeat at every depth: 40 subjects, each
+/// with three predicates, each predicate with two or three objects, each
+/// triple in one to three graphs. So a bound `(s, p)` has several objects, a
+/// `(p, o)` several subjects and a `(p, o, s)` several graphs: every key of a
+/// located run's prefix narrows it.
+fn multiplicity_quads() -> Vec<Quad> {
+    let graph = |k: usize| match k {
+        0 => GraphName::DefaultGraph,
+        k => GraphName::NamedNode(NamedNode::new(format!("http://example.org/g{k}")).unwrap()),
+    };
+    let mut quads = Vec::new();
+    for s in 0..40 {
+        for p in 0..3 {
+            for o in 0..(2 + (s + p) % 2) {
+                for g in 0..=((s + o) % 3) {
+                    quads.push(make_quad(
+                        &format!("http://example.org/s{s:02}"),
+                        &format!("http://example.org/p{}", (s + p) % 5),
+                        &format!("o{}", (s * 3 + o) % 7),
+                        graph(g),
+                    ));
+                }
+            }
+        }
+    }
+    quads
+}
+
+/// `locate_codes` answers exactly what the term path answers: for every bound
+/// subset of a store's own quads' codes, on every file open and index set
+/// (the suite's fixture, and [`multiplicity_quads`] mapped), the total is
+/// `size()` and the rows are the match's, in pages that cover them once. It
+/// declines (`None`) rather than answer a tombstoned or narrowed view or a
+/// non-prefix shape; a code no quad holds matches nothing.
+#[tokio::test]
+async fn test_locate_codes_matches_the_term_path() {
+    // The temp dirs stay alive until the stores are checked.
+    let mut guards: Vec<Box<dyn std::any::Any>> = Vec::new();
+    let mut stores: Vec<(String, VortexRdfStore, Vec<Quad>, usize)> = Vec::new();
+    for (tag, dir, store) in file_stores().await {
+        guards.push(Box::new(dir));
+        stores.push((tag, store, fixture_quads(), 97));
+    }
+    for (name, indexes) in [
+        ("no-index", vec![]),
+        ("copy", vec![IndexType::SecondaryByCopy]),
+        ("reference", vec![IndexType::SecondaryByReference]),
+    ] {
+        let (dir, path) =
+            write_store_file(multiplicity_quads(), LayoutStrategy::Dictionary, indexes).await;
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        guards.push(Box::new(dir));
+        stores.push((
+            format!("multiplicity/{name}/mapped"),
+            store,
+            multiplicity_quads(),
+            3,
+        ));
+    }
+    for (tag, store, quads, step) in stores {
+        check_locate_codes(&tag, &store, &quads, step).await;
+    }
+}
+
+async fn check_locate_codes(tag: &str, store: &VortexRdfStore, quads: &[Quad], step: usize) {
+    use crate::{CodePattern, Probe};
+    let sorted = |c: &[vortex_buffer::Buffer<TermCode>; 4]| -> Vec<[TermCode; 4]> {
+        let mut rows: Vec<[TermCode; 4]> = (0..c[0].len())
+            .map(|i| [c[0][i], c[1][i], c[2][i], c[3][i]])
+            .collect();
+        rows.sort_unstable();
+        rows
+    };
+    let dict = store.dict_reader().unwrap();
+    let all = store.code_columns_gathered().await.unwrap().unwrap();
+    let mut answered = std::collections::BTreeSet::new();
+    for row in (0..all[0].len()).step_by(step) {
+        let quad = [all[0][row], all[1][row], all[2][row], all[3][row]];
+        for mask in 1..16u8 {
+            let slot = |i: usize| (mask & (1 << i) != 0).then_some(quad[i]);
+            let pattern = CodePattern::new(slot(0), slot(1), slot(2), slot(3));
+            let Some(full) = store.locate_codes(pattern, 0, None).await.unwrap() else {
+                continue;
+            };
+            answered.insert(mask);
+            let mut terms = Vec::new();
+            for i in 0..4 {
+                terms.push(match slot(i) {
+                    Some(code) => Some(dict.decode(code).await.unwrap().unwrap()),
+                    None => None,
+                });
+            }
+            let probe = Probe::parse(
+                terms[0].as_deref(),
+                terms[1].as_deref(),
+                terms[2].as_deref(),
+                terms[3].as_deref(),
+            )
+            .unwrap();
+            let view = store.run_probe(&probe).await.unwrap();
+            let want = view.code_columns_gathered().await.unwrap().unwrap();
+            let tag = format!("{tag} {pattern:?}");
+            assert_eq!(
+                full.total,
+                view.size().await.unwrap() as u64,
+                "{tag}: total"
+            );
+            assert_eq!(
+                full.total,
+                full.columns[0].len() as u64,
+                "{tag}: unwindowed rows"
+            );
+            assert_eq!(sorted(&full.columns), sorted(&want), "{tag}: rows");
+            for page in [1usize, 3, 64] {
+                let mut seen = Vec::new();
+                let mut offset = 0;
+                while offset < full.total as usize {
+                    let got = store
+                        .locate_codes(pattern, offset, Some(page))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(got.total, full.total, "{tag}: page total");
+                    let n = got.columns[0].len();
+                    assert_eq!(
+                        n,
+                        page.min(full.total as usize - offset),
+                        "{tag}: page {page} at {offset}"
+                    );
+                    seen.extend((0..n).map(|i| {
+                        [
+                            got.columns[0][i],
+                            got.columns[1][i],
+                            got.columns[2][i],
+                            got.columns[3][i],
+                        ]
+                    }));
+                    offset += page;
+                }
+                seen.sort_unstable();
+                assert_eq!(seen, sorted(&want), "{tag}: pages of {page}");
+            }
+        }
+    }
+    // Masks over (s, p, o, g) = bits 0..4. A mapped sorted file answers the
+    // subject prefixes; the copy index also the posg and ospg ones (`s?o`
+    // among them); the no-index file none of the index-only shapes, and
+    // nothing answers `s??g`.
+    if tag.ends_with("/mapped") {
+        for mask in [0b0001, 0b0011, 0b0111, 0b1111] {
+            assert!(
+                answered.contains(&mask),
+                "{tag}: mask {mask:04b} not answered"
+            );
+        }
+    }
+    if tag.contains("/copy/") && tag.ends_with("/mapped") {
+        for mask in [0b0010, 0b0110, 0b0100, 0b0101] {
+            assert!(
+                answered.contains(&mask),
+                "{tag}: mask {mask:04b} not answered"
+            );
+        }
+    }
+    if tag.contains("/no-index/") {
+        for mask in [0b0010, 0b0110, 0b0100] {
+            assert!(
+                !answered.contains(&mask),
+                "{tag}: mask {mask:04b} has no index to answer it"
+            );
+        }
+    }
+    assert!(!answered.contains(&0b1001), "{tag}: s??g answered");
+    // A code no quad holds, past the dictionary, as a subject.
+    let absent = CodePattern::new(Some(dict.len() as TermCode + 7), None, None, None);
+    if let Some(got) = store.locate_codes(absent, 0, None).await.unwrap() {
+        assert_eq!(got.total, 0, "{tag}: absent code");
+    }
+    // Narrowed and tombstoned views decline.
+    let s = CodePattern::new(Some(all[0][0]), None, None, None);
+    let window = store.window(1, 10).await.unwrap();
+    assert!(
+        window.locate_codes(s, 0, None).await.unwrap().is_none(),
+        "{tag}: window"
+    );
+    let deleted = store.delete_quad(&quads[0]).await.unwrap();
+    assert!(
+        deleted.locate_codes(s, 0, None).await.unwrap().is_none(),
+        "{tag}: tombstones"
+    );
+}
