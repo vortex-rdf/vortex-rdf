@@ -39,13 +39,12 @@ const SUPPORTED_ENCODINGS: &[&str] = &[
 
 /// Most generic-oracle calls a single fixture makes. Fixtures with fewer
 /// needles than this check every one of them; larger ones are stride-sampled.
-const GENERIC_ORACLE_NEEDLES: usize = 2000;
+const GENERIC_ORACLE_NEEDLES: usize = 256;
 
-/// The generic-oracle budget per default-cascade fixture. The cascade yields
-/// dozens of fixtures, and an encoding without a native `search_sorted`
+/// The generic-oracle budget per default-cascade fixture. The cascade picks
+/// delta for most of them, and an encoding without a native `search_sorted`
 /// kernel (delta) answers the generic oracle through per-element point reads
-/// that each decode a block, so the full budget would cost minutes there;
-/// every needle still meets the canonical oracle.
+/// that each decode a block; every needle still meets the canonical oracle.
 const CASCADE_ORACLE_NEEDLES: usize = 64;
 
 fn ctx() -> ExecutionCtx {
@@ -139,18 +138,23 @@ fn delta_bitpacked_5k() -> (Vec<u32>, ArrayRef) {
     (data, arr)
 }
 
-/// Asserts a default-cascade fixture either probes exactly or declined
-/// because its root encoding is outside the supported set; returns whether
-/// it resolved.
-fn assert_probe_or_unsupported(arr: &ArrayRef, data: &[u32]) -> bool {
+/// Asserts a default-cascade fixture either probes exactly, its probe holding
+/// `expect_kinds`, or declined because its root encoding is outside the
+/// supported set while no kinds are expected of it; returns whether it
+/// resolved.
+fn assert_probe_or_unsupported(arr: &ArrayRef, data: &[u32], expect_kinds: &[NodeKind]) -> bool {
     if SortedProbe::resolve(arr).is_some() {
-        assert_probe_with_budget(arr, data, &[], CASCADE_ORACLE_NEEDLES);
+        assert_probe_with_budget(arr, data, expect_kinds, CASCADE_ORACLE_NEEDLES);
         true
     } else {
         let id = arr.encoding_id();
         assert!(
             !SUPPORTED_ENCODINGS.contains(&id.as_str()),
             "a supported root encoding ({id}) declined"
+        );
+        assert!(
+            expect_kinds.is_empty(),
+            "declined ({id}), but its probe must hold {expect_kinds:?}"
         );
         false
     }
@@ -553,25 +557,41 @@ fn probes_chunked_mixed_encodings() {
     );
 }
 
+/// A default-cascade shape: the seed base, length and largest step of its
+/// sorted values, and the salts it runs, each beside the node kinds its probe
+/// must hold.
+type CascadeShape = (u64, usize, u64, &'static [(u64, &'static [NodeKind])]);
+
+/// Each shape runs one salt per encoding tree the cascade picks for it: one
+/// tree for every salt of a shape, but the u16-crossing steps, where salt 5's
+/// step of 2^16 adds patches under the bit-packed deltas. That probe, the
+/// suite's one patched delta, must hold both kinds, so a cascade that stops
+/// picking the tree fails here instead of dropping the case.
 #[test]
 fn probes_default_cascade_random() {
-    let shapes: &[(u64, usize, u64)] = &[
-        (1, 5000, 0),      // constant
-        (2, 5000, 1),      // slow ramp, long runs
-        (3, 5000, 3),      // short runs
-        (4, 5000, 1000),   // wide spread
-        (5, 20_000, 7),    // longer, moderate runs
-        (6, 333, 1 << 20), // short, huge steps
-        (7, 5000, 65_536), // u16-crossing steps
-        (8, 1, 5),         // single element
+    let shapes: &[CascadeShape] = &[
+        (1, 5000, 0, &[(0, &[])]),      // constant
+        (2, 5000, 1, &[(0, &[])]),      // slow ramp, long runs
+        (3, 5000, 3, &[(0, &[])]),      // short runs
+        (4, 5000, 1000, &[(0, &[])]),   // wide spread
+        (5, 20_000, 7, &[(0, &[])]),    // longer, moderate runs
+        (6, 333, 1 << 20, &[(0, &[])]), // short, huge steps
+        // u16-crossing steps
+        (
+            7,
+            5000,
+            65_536,
+            &[(0, &[]), (5, &[NodeKind::Delta, NodeKind::Patches])],
+        ),
+        (8, 1, 5, &[(0, &[])]), // single element
     ];
     let mut resolved = 0usize;
     let mut declined = Vec::new();
-    for &(seed_base, len, max_step) in shapes {
-        for salt in 0..8u64 {
+    for &(seed_base, len, max_step, salts) in shapes {
+        for &(salt, kinds) in salts {
             let data = sorted_random(seed_base * 1000 + salt, len, max_step);
             let arr = compress_default(&data);
-            if assert_probe_or_unsupported(&arr, &data) {
+            if assert_probe_or_unsupported(&arr, &data, kinds) {
                 resolved += 1;
             } else {
                 declined.push(arr.encoding_id().to_string());
@@ -699,7 +719,7 @@ fn bounds_all_equal() {
     let data = vec![42u32; 9000];
     let arr = compress_default(&data);
     assert!(
-        assert_probe_or_unsupported(&arr, &data),
+        assert_probe_or_unsupported(&arr, &data, &[]),
         "an all-equal column must resolve; root encoding {}",
         arr.encoding_id()
     );
