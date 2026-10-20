@@ -1,4 +1,5 @@
 import pathlib
+import pickle
 import re
 import shutil
 from array import array
@@ -6,7 +7,15 @@ from array import array
 import pytest
 
 import vortex_rdf
-from vortex_rdf import VortexRdfStore, serialize_rdf
+from vortex_rdf import (
+    CancelToken,
+    Cancelled,
+    JoinTooLarge,
+    U64Column,
+    VortexRdfError,
+    VortexRdfStore,
+    serialize_rdf,
+)
 
 from conftest import INDEXES, NAME, PATTERNS, u64s
 
@@ -401,3 +410,32 @@ def test_package_ships_typing_files():
     assert any(
         p.name.startswith("_native.") and p.suffix in (".so", ".pyd") for p in pkg.iterdir()
     )
+
+
+def _cancelled_count(files):
+    token = CancelToken()
+    token.cancel()
+    VortexRdfStore(files["default"]).count_quads(cancel=token)
+
+
+@pytest.mark.parametrize(
+    "error, raise_it",
+    [
+        (VortexRdfError, lambda files: VortexRdfStore.from_bytes(b"not a vortex file")),
+        (JoinTooLarge, lambda files: U64Column([1, 1]).join_indices([1], max_pairs=1)),
+        (Cancelled, _cancelled_count),
+    ],
+    ids=["VortexRdfError", "JoinTooLarge", "Cancelled"],
+)
+def test_errors_name_their_module_and_pickle(vortex_files, error, raise_it):
+    """Each error class names the extension module as its `__module__`, so
+    an error the binding raised pickles: the copy has its class and its
+    args, and a `JoinTooLarge` its pair count."""
+    assert error.__module__ == "vortex_rdf._native"
+    with pytest.raises(error) as raised:
+        raise_it(vortex_files)
+    copy = pickle.loads(pickle.dumps(raised.value))
+    assert type(copy) is type(raised.value) is error
+    assert copy.args == raised.value.args
+    if error is JoinTooLarge:
+        assert copy.pairs == raised.value.pairs == 2

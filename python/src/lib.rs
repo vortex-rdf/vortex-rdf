@@ -24,8 +24,10 @@ use vortex_rdf_core::VortexRdfError as CoreError;
 
 use crate::cancel::{Pulled, Token, pull};
 
+// Each exception's module is the extension's import path, as each class's is:
+// pickle finds the exception there, and a traceback names it as it is imported.
 pyo3::create_exception!(
-    _native,
+    vortex_rdf._native,
     VortexRdfError,
     pyo3::exceptions::PyException,
     "Raised when a Vortex-RDF store operation fails: a store that does not read, an operation \
@@ -34,7 +36,7 @@ pyo3::create_exception!(
 );
 
 pyo3::create_exception!(
-    _native,
+    vortex_rdf._native,
     JoinTooLarge,
     VortexRdfError,
     "Raised when a join would make more row pairs than its `max_pairs` allows, before any pair \
@@ -43,7 +45,7 @@ pyo3::create_exception!(
 );
 
 pyo3::create_exception!(
-    _native,
+    vortex_rdf._native,
     Cancelled,
     VortexRdfError,
     "Raised by a call or a pull whose `CancelToken` was cancelled before it completed: the work \
