@@ -105,7 +105,7 @@ impl VortexRdfStore {
 
 /// An immutable handle on a store's term dictionary, decoding a term code to
 /// its N-Triples string. Codes are `u64` and cross as JS numbers, checked
-/// both ways (see [`crate::codes`]): exact up to 2^53 − 1, never rounded or
+/// both ways (see `crate::codes`): exact up to 2^53 − 1, never rounded or
 /// wrapped.
 ///
 /// Handed to the JS lazy read model so that codes produced by one read stay
