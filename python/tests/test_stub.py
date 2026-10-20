@@ -61,7 +61,11 @@ def test_version_matches_distribution():
 
 
 def _runtime_methods(cls):
-    names = _public(dir(cls)) | {"__len__", "__repr__", "__iter__", "__next__"}
+    names = _public(dir(cls)) | {"__len__", "__iter__", "__next__"}
+    # Every object has a `__repr__`: the stub declares one only where the
+    # class defines its own.
+    if "__repr__" in vars(cls):
+        names.add("__repr__")
     if sys.version_info >= (3, 12):
         names |= {n for n in ("__buffer__",) if hasattr(cls, n)}
     return names

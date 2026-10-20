@@ -224,7 +224,6 @@ class CodeGroups:
     dropped."""
 
     def __len__(self) -> int: ...
-    def __repr__(self) -> str: ...
     def count(self, column: _U64s) -> int:
         """The number of row pairs `join` makes with `column`, counted
         without building them."""
@@ -276,7 +275,6 @@ class ProbeAnswers:
     def __len__(self) -> int:
         """The number of probes, answered or not."""
         ...
-    def __repr__(self) -> str: ...
 
 class CodeChunks:
     """The chunks of `VortexRdfStore.match_code_chunks`: a match's code
@@ -296,7 +294,6 @@ class CodeChunks:
     def batch_rows(self) -> int:
         """The most rows a chunk holds."""
         ...
-    def __repr__(self) -> str: ...
 
 class CancelToken:
     """A cancel token for one query's long calls: passed as ``cancel=`` to
@@ -318,7 +315,6 @@ class CancelToken:
     def cancelled(self) -> bool:
         """Whether the token has been cancelled."""
         ...
-    def __repr__(self) -> str: ...
 
 class VortexRdfStore:
     def __init__(self, path: _StrPath, *, in_memory: bool = False) -> None:
