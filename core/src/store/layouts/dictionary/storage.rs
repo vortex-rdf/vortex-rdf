@@ -303,27 +303,44 @@ pub(super) struct FsstTerms {
     /// Kept whole, so the dictionary serializes without recompressing.
     array: FSSTArray,
     /// Code offsets as `u32`, so a per-row read is a slice index: 32-bit
-    /// offsets (`i32` or `u32`; written offsets are never negative) are viewed
-    /// in place, any other width is converted into a copy.
+    /// offsets (`u32`, or `i32` once none is negative) are viewed in place,
+    /// any other width is converted into a copy.
     offsets: Buffer<u32>,
 }
 
 impl FsstTerms {
+    /// The chunk `array`, its code offsets unpacked; a `Deserialization`
+    /// error, naming it, for an offset a `u32` cannot hold (a negative one,
+    /// or one past 4 GiB of codes).
     fn new(array: FSSTArray) -> Result<Self> {
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let offsets = array
             .codes_offsets()
             .clone()
             .execute::<PrimitiveArray>(&mut ctx)?;
+        let refused = |offset: &dyn std::fmt::Display| {
+            VortexRdfError::Deserialization(format!(
+                "an FSST term chunk's code offset {offset} does not fit a u32"
+            ))
+        };
         // A foreign writer may store the offsets in any integer width. The
-        // macro covers every width, so its `u32` arm (never reached) casts
-        // u32 -> u32.
-        #[allow(clippy::unnecessary_cast)]
+        // macro covers every width, so the conversion cannot fail in its
+        // narrower arms and is the identity in its `u32` arm (never reached).
+        #[allow(clippy::unnecessary_fallible_conversions, clippy::useless_conversion)]
         let offsets: Buffer<u32> = match offsets.ptype() {
             PType::U32 => offsets.to_buffer::<u32>(),
-            PType::I32 => offsets.reinterpret_cast(PType::U32).to_buffer::<u32>(),
+            PType::I32 => {
+                if let Some(o) = offsets.as_slice::<i32>().iter().find(|&&o| o < 0) {
+                    return Err(refused(o));
+                }
+                offsets.reinterpret_cast(PType::U32).to_buffer::<u32>()
+            }
             ptype => match_each_integer_ptype!(ptype, |O| {
-                offsets.as_slice::<O>().iter().map(|&o| o as u32).collect()
+                offsets
+                    .as_slice::<O>()
+                    .iter()
+                    .map(|&o| u32::try_from(o).map_err(|_| refused(&o)))
+                    .collect::<Result<_>>()?
             }),
         };
         Ok(Self { array, offsets })
@@ -713,6 +730,57 @@ mod tests {
         check_offsets_stored_as::<i32>(original, &terms);
         check_offsets_stored_as::<u64>(original, &terms);
         check_offsets_stored_as::<i64>(original, &terms);
+    }
+
+    /// A chunk whose code offsets a `u32` cannot hold is refused, never read
+    /// through wrapped or reinterpreted offsets: a 64-bit offset past
+    /// `u32::MAX` (a foreign writer's chunk of more than 4 GiB of codes), and
+    /// a negative `i32` one (a corrupt chunk), which would otherwise be
+    /// viewed in place as a huge `u32`. The offsets are a constant child,
+    /// which FSST checks against the code bytes only once decoded, so the
+    /// chunk holds no 4 GiB of codes.
+    #[test]
+    fn fsst_code_offsets_outside_u32_are_refused() {
+        use vortex_array::ArrayParts;
+        use vortex_array::arrays::ConstantArray;
+        use vortex_array::scalar::Scalar;
+        use vortex_fsst::FSSTSlots;
+
+        let terms = ["<http://e.org/a>", "<http://e.org/b>"];
+        let dict =
+            TermDictionary::compress_windowed(VarBinViewArray::from_iter_str(terms), usize::MAX)
+                .unwrap();
+        let [TermChunk::Fsst(original)] = &dict.terms.chunks[..] else {
+            panic!("a small dictionary is one FSST chunk");
+        };
+        let array = &original.array;
+        let past = u64::from(u32::MAX) + 1;
+        for (offset, shown) in [
+            (Scalar::from(past), past.to_string()),
+            (Scalar::from(-1i32), "-1".to_owned()),
+        ] {
+            let outside = FSSTArray::try_from_parts(ArrayParts::new(
+                FSST,
+                array.dtype().clone(),
+                array.len(),
+                array.data().clone(),
+                FSSTSlots {
+                    uncompressed_lengths: array.uncompressed_lengths().clone(),
+                    codes_offsets: ConstantArray::new(offset, array.len() + 1).into_array(),
+                    codes_validity: None,
+                }
+                .into_slots(),
+            ))
+            .unwrap();
+            let error = FsstTerms::new(outside)
+                .err()
+                .unwrap_or_else(|| panic!("offset {shown}: refused"));
+            assert!(
+                matches!(&error, VortexRdfError::Deserialization(message)
+                    if message.contains(&format!("offset {shown} "))),
+                "{error}"
+            );
+        }
     }
 
     /// A cursor's scratch buffer grows to each term it decodes: terms far
