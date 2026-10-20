@@ -9,40 +9,29 @@
 //! `||`, which Python warns about); the shorthands `\d \w \s \D \W \S \b
 //! \B`; the anchors `^`, `$` and `\A`; groups `( )` and `(?: )` nested up to
 //! `MAX_GROUP_DEPTH`; alternation; the quantifiers `* + ? {n} {n,} {n,m}`
-//! and their lazy forms. Anything else — backreferences, lookaround,
+//! and their lazy forms. Anything else (backreferences, lookaround,
 //! `\p{...}`, `\Z`, inline flags, named groups, possessive quantifiers, a
-//! brace that is no quantifier, a leading `]` in a class — leaves every text
-//! undecided, as does flag `i` on a pattern holding a non-ASCII character.
+//! brace that is no quantifier, a leading `]` in a class) leaves every text
+//! undecided, as do flag `i` on a pattern holding a non-ASCII character and
+//! a compiled program past `NFA_SIZE_LIMIT`.
 //!
 //! Three rules keep a decided verdict exact: a pattern using `\w \W \s \S \d
 //! \D \b \B` or flag `i` decides ASCII texts only; a pattern with `$` and
 //! without flag `m` leaves a text ending in `\n` undecided (Python's `$` also
 //! matches before a final newline); and a pattern with `\B` leaves the empty
 //! text undecided (Python 3.14 matches `\B` there, 3.11–3.13 do not).
-//! The shorthands are therefore spelled out as ASCII class ranges (see
-//! `SHORTHANDS`): Python's `\s` also covers `\x1c`–`\x1f` on ASCII text, which
-//! Rust's `\s` leaves out, and ranges keep the compiled program small where
-//! Rust's Unicode classes are large.
-//!
-//! The compiled program is bounded too (`NFA_SIZE_LIMIT`, with a lazy-DFA
-//! cache sized to hold the DFA of the largest such program): counted
-//! repetitions multiply (a nested `{n}{m}` has n times m states), and a
-//! pattern over the limit is undecided like any other outside the subset,
-//! instead of costing a candidate time that grows with the program.
 
 use std::fmt::Write as _;
 
 use super::Verdict;
 
-/// The class shorthands, spelled out on ASCII as Rust class items. One table
-/// serves both uses, wrapped in `[ ]` where a shorthand stands alone
-/// (`escape`) and spliced where it sits in a class (`class_escape`), so the
-/// spellings cannot drift apart. A pattern using one decides ASCII texts only,
-/// so ASCII is all they have to say, and ranges say it in the fewest states:
-/// Rust's Unicode `\w` is a large program by itself and a negated class
-/// (`[^0-9]`) carries the whole non-ASCII half, where each of these is a
-/// handful of states. Python's `\s` also covers `\x1c`–`\x1f` on ASCII text,
-/// which Rust's `\s` leaves out.
+/// The class shorthands, spelled out on ASCII as Rust class items: wrapped in
+/// `[ ]` where a shorthand stands alone (`escape`) and spliced into a class
+/// (`class_escape`), from this one table so the two cannot drift apart. A
+/// pattern using one decides ASCII texts only, so ASCII ranges suffice, and
+/// they compile to a handful of states where Rust's Unicode `\w` or a negated
+/// class (`[^0-9]`) is a large program. Python's `\s` also covers
+/// `\x1c`–`\x1f` on ASCII text, which Rust's `\s` leaves out.
 const SHORTHANDS: [(char, &str); 6] = [
     ('d', r"0-9"),
     ('D', r"\x00-\x2F\x3A-\x7F"),
@@ -431,7 +420,8 @@ impl Translator<'_> {
                                 ClassItem::Char(hi) => hi,
                                 ClassItem::Shorthand(_) => return None,
                             },
-                            // A range ending in `-` (`[+--]`) is Python's "possible set difference".
+                            // A range ending in `-` (`[+--]`) is Python's
+                            // "possible set difference".
                             '[' | ']' | '-' => return None,
                             hi => hi,
                         };

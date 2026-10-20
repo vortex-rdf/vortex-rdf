@@ -1,21 +1,19 @@
-//! File-side probing behind the `layout` feature: locate one column's flat
-//! chunk leaves inside a layout tree, then answer global bounds queries and
-//! point reads by fetching and probing only the chunks a search touches.
+//! File-side probing behind the `layout` feature: one column's flat chunk
+//! leaves located inside a layout tree ([`flat_leaves`]), then global bounds
+//! queries and point reads that fetch and probe only the leaves a search
+//! touches. A fetch reads the leaf's whole segment and rebuilds the array in
+//! its wire encoding, metadata over the segment buffers with nothing
+//! decompressed ([`fetch_flat`]); each fetched leaf is resolved into an
+//! [`OwnedSortedProbe`] once and cached.
 //!
-//! A chunk fetch reads the leaf's whole segment and reconstructs the array in
-//! its wire encoding (`SerializedArray::decode` rebuilds metadata over the
-//! segment buffers — it does not decompress); each fetched chunk is resolved
-//! into an [`OwnedSortedProbe`] once and cached, so repeated queries probe
-//! without further reads or resolution.
-//!
-//! A column the writer dictionary-encoded at the layout level (a `vortex.dict`
-//! node: a values leaf beside a codes subtree) is probed through its codes
-//! leaves: each is composed with the dictionary's values into a dictionary
-//! array, which the probe resolves like any other — its dictionary node reads
-//! and bisects the decoded values, so the order the writer assigned codes in
-//! never matters. The values leaf is fetched once and shared by every codes
-//! leaf beneath it; a run of dictionaries (the writer opens a new one when a
-//! dictionary outgrows its constraints) is a chunked layout of such nodes.
+//! A column the writer dictionary-encoded at the layout level (a
+//! `vortex.dict` node: a values leaf beside a codes subtree) is probed
+//! through its codes leaves, each composed with the dictionary's values into
+//! a dictionary array: the probe bisects the decoded values, so the order the
+//! writer gave the codes in never matters. The values leaf is fetched once
+//! and shared by every codes leaf beneath it; a run of dictionaries (the
+//! writer opens a new one when one outgrows its constraints) is a chunked
+//! layout of such nodes.
 
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
@@ -63,9 +61,9 @@ impl DictValues {
     }
 }
 
-/// One flat chunk leaf: its layout, logical position, the dictionary its
-/// values index into (when it holds a `vortex.dict` layout's codes rather
-/// than the column's values), and the fetched, resolved probe (filled on
+/// One flat chunk leaf, never empty: its layout, its first row in the
+/// column, the dictionary its values index into (when it holds a
+/// `vortex.dict` layout's codes), and its fetched, resolved probe (filled on
 /// first use; `None` when the chunk's encoding declines resolution).
 struct ChunkLeaf {
     layout: FlatLayout,
@@ -79,9 +77,9 @@ struct ChunkLeaf {
 /// struct layout, addressable for global bounds queries and point reads.
 ///
 /// [`Self::lower_bound`] and [`Self::bounds`] require the column to be sorted
-/// ascending across the whole file — a caller contract, exactly as for
+/// ascending across the whole file, a caller contract as for
 /// [`SortedProbe`](crate::SortedProbe). [`Self::value_at`] is exact
-/// regardless of sort order.
+/// regardless of sort order. Rows are `u64` column positions.
 pub struct ColumnChunks {
     chunks: Vec<ChunkLeaf>,
     row_count: u64,
@@ -164,8 +162,8 @@ impl ColumnChunks {
     /// Exact global `[lo, hi)` of `needle` in the column: the
     /// [`lower_bound`](Self::lower_bound)s of `needle` and of `needle + 1`
     /// (the row count when `needle` is `u64::MAX`). Requires the sorted
-    /// contract. `Ok(None)` when a needed chunk's encoding declines the probe
-    /// — the caller falls back to its scan path.
+    /// contract. `Ok(None)` when a needed chunk's encoding declines the
+    /// probe, for the caller to scan instead.
     pub async fn bounds(
         &self,
         needle: u64,
@@ -280,6 +278,8 @@ impl ColumnChunks {
         let Some(probe) = self.chunk_probe(idx, source, session).await? else {
             return Ok(None);
         };
+        // The local row is below the leaf's row count, which its fetch
+        // checked fits a `usize`.
         Ok(Some(
             probe
                 .probe()
@@ -289,9 +289,9 @@ impl ColumnChunks {
 
     /// The values at `rows` (ascending), as one array of the column's dtype:
     /// each leaf holding some of them takes them from its array in the wire
-    /// encoding — the take kernels, decoding only what they touch — fetching
-    /// (and caching) only those leaves. `Ok(None)` when a leaf the rows reach
-    /// declines its probe.
+    /// encoding (the take kernels decode only what they touch), and only
+    /// those leaves are fetched and cached. `Ok(None)` when a leaf the rows
+    /// reach declines its probe.
     ///
     /// # Panics
     /// Panics if a row is `>= self.row_count()`.
@@ -441,7 +441,7 @@ fn collect_leaves(
     None
 }
 
-/// Fetch a flat leaf's segment and rebuild its array in the wire encoding —
+/// Fetch a flat leaf's segment and rebuild its array in the wire encoding:
 /// metadata over the segment buffers, nothing decompressed. `session` must
 /// register the encodings the leaf was written with.
 ///

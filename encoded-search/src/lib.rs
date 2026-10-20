@@ -16,17 +16,18 @@ use vortex_array::ArrayRef;
 
 /// A resolved, borrowed probe over one encoded (or canonical) array.
 ///
-/// Bounds queries require the array to be sorted ascending — sortedness is a
-/// caller contract, exactly like `slice::partition_point`; an unsorted array
-/// yields an unspecified (but never panicking) bound. [`Self::value_at`] is
-/// exact regardless of sort order.
+/// Bounds queries require the array to be sorted ascending, a caller
+/// contract as for `slice::partition_point`: an unsorted array yields an
+/// unspecified bound, never a panic. [`Self::value_at`] is exact regardless
+/// of sort order.
 pub struct SortedProbe<'a> {
     root: node::Node<'a>,
 }
 
 impl<'a> SortedProbe<'a> {
-    /// Resolves a non-nullable unsigned-integer array whose encoding tree is
-    /// drawn from the supported set; returns `None` otherwise.
+    /// Resolves a host-resident, non-nullable unsigned-integer array whose
+    /// encoding tree is drawn from the supported set ([`NodeKind`]); `None`
+    /// otherwise. Resolution reads metadata only: nothing is decoded.
     pub fn resolve(array: &'a ArrayRef) -> Option<Self> {
         if !array.is_host() {
             return None;
@@ -44,7 +45,8 @@ impl<'a> SortedProbe<'a> {
         self.len() == 0
     }
 
-    /// Index of the first element `>= needle`.
+    /// Index of the first element `>= needle`; the length when every element
+    /// is below it.
     pub fn lower_bound(&self, needle: u64) -> usize {
         self.root.lower_bound(needle)
     }
@@ -55,17 +57,16 @@ impl<'a> SortedProbe<'a> {
         self.root.upper_bound(needle)
     }
 
-    /// `(lower_bound, upper_bound)` — the half-open run of elements equal to
-    /// `needle`.
+    /// `(lower_bound, upper_bound)`: the half-open run of elements equal to
+    /// `needle`, empty at its insertion point when there is none.
     pub fn bounds(&self, needle: u64) -> (usize, usize) {
         (self.lower_bound(needle), self.upper_bound(needle))
     }
 
-    /// [`Self::bounds`] restricted to `range`, in absolute indices. Only the
-    /// window must be sorted ascending; rows outside it are never read.
-    /// Intended for columns that are sorted piecewise, e.g. per run of a
-    /// leading key. Probes point-read through [`Self::value_at`], so the
-    /// window's order is the only order consulted.
+    /// [`Self::bounds`] restricted to `range`, in absolute indices: only the
+    /// window must be sorted ascending (as in a column sorted per run of a
+    /// leading key), and rows outside it are never read, every probe
+    /// point-reading through [`Self::value_at`].
     ///
     /// # Panics
     /// Panics if `range.end > self.len()`.
@@ -109,13 +110,10 @@ impl std::fmt::Debug for SortedProbe<'_> {
     }
 }
 
-/// The set of probe-node shapes a [`SortedProbe`] resolves.
-///
-/// This is deliberately not a vortex type: vortex identifies encodings by an
-/// open, registry-backed string id, while probing supports a fixed set of
-/// node shapes (including [`NodeKind::Patches`], which is a component of
-/// bit-packed arrays rather than an encoding of its own). Non-exhaustive so
-/// new probe nodes extend the set without breaking downstream matches.
+/// The probe-node shapes a [`SortedProbe`] resolves: a fixed set, not
+/// vortex's open registry of encoding ids, and one that includes
+/// [`NodeKind::Patches`], a component of bit-packed arrays rather than an
+/// encoding. Non-exhaustive, so a new node shape breaks no downstream match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NodeKind {

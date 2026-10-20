@@ -22,10 +22,9 @@ pub struct Number {
 }
 
 /// The exact value model: integers as `i128`, decimals as a scaled `i128`
-/// mantissa, floats as `f64`. Everything the XSD grammars accept but this
-/// model cannot hold exactly (an integer over 38 digits, a decimal with more
-/// digits than that, `INF`/`NaN`) is left out of the model and answers
-/// `Unknown`.
+/// mantissa, floats as finite `f64`s. Anything the XSD grammars accept but
+/// the model cannot hold exactly (an integer or a mantissa past `i128`,
+/// `INF`, `NaN`) is outside it and answers `Unknown`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum Num {
     Int(i128),
@@ -37,9 +36,8 @@ pub(super) enum Num {
     Float(f64),
 }
 
-// `f64` has no `Eq`/`Hash`; the derived traits on `Number` key memo tables,
-// so compare and hash floats by their bit pattern (the parsed constant is
-// always finite).
+// `f64` has no `Eq`/`Hash`: a parsed constant is always finite, so the
+// derived `PartialEq` is reflexive, and a float hashes by its bit pattern.
 impl Eq for Num {}
 
 impl std::hash::Hash for Num {
@@ -197,7 +195,8 @@ fn parse_float(lexical: &str) -> Option<Num> {
     Some(Num::Float(if neg { -v } else { v }))
 }
 
-/// Split an optional leading sign off a lexical form.
+/// The optional leading sign of a lexical form (`true` for `-`) and the
+/// rest.
 fn split_sign(lexical: &str) -> Option<(bool, &str)> {
     if let Some(rest) = lexical.strip_prefix('-') {
         Some((true, rest))
@@ -233,12 +232,14 @@ fn digits_value(mut digits: impl Iterator<Item = Option<u32>>, radix: u32) -> Op
     })
 }
 
-/// Integers whose `f64` conversion is exact.
+/// The magnitude below which an integer converts to `f64` exactly.
 const F64_EXACT_INT: i128 = 1 << 53;
 
-/// Compare two values of the model exactly, or `None` when the model cannot
-/// settle the comparison (mixed float/decimal, an integer too wide to hold
-/// exactly in an `f64`, an overflow while aligning scales).
+/// Compare two values exactly; `None` when the model cannot settle it: an
+/// integer (or a decimal without fractional digits) at or past
+/// [`F64_EXACT_INT`] against a float, a float that is fractional or at or
+/// past it against a decimal with fractional digits, or an overflow aligning
+/// scales.
 fn compare_nums(a: Num, b: Num) -> Option<Ordering> {
     match (a, b) {
         (Num::Int(x), Num::Int(y)) => Some(x.cmp(&y)),
@@ -284,8 +285,8 @@ fn compare_nums(a: Num, b: Num) -> Option<Ordering> {
     }
 }
 
-/// A finite, integral float below the exact-integer bound as the integer it
-/// is; `None` for anything a decimal cannot be compared with exactly.
+/// A finite, integral float below [`F64_EXACT_INT`] as the integer it is;
+/// `None` for anything a decimal cannot be compared with exactly.
 fn integral_float(x: f64) -> Option<i128> {
     if x.is_finite() && x.fract() == 0.0 && (x.abs() as i128) < F64_EXACT_INT {
         Some(x as i128)
@@ -355,14 +356,12 @@ impl Number {
         if lit.wide_64() {
             // `xsd:long` / `xsd:unsignedLong` beyond 64 bits: rdflib holds
             // neither to its bound and compares the value, which this model
-            // refuses — the verdict is the caller's.
+            // refuses, so the verdict is the caller's.
             return Verdict::Unknown;
         }
-        // Not a numeric value: a numeric datatype whose lexical form the
-        // model does not hold, or a non-numeric literal. For ordering, a
-        // language-tagged literal counts as `xsd:string` (its datatype is
-        // implicit, and that is the datatype the engine orders it by), not
-        // the `rdf:langString` that `datatype()` reports.
+        // No numeric value: the literal orders by its datatype, a
+        // language-tagged one as `xsd:string` (the datatype the engine
+        // orders it by), not the `rdf:langString` `datatype()` reports.
         let dt = if lit.lang.is_some() {
             XSD_STRING
         } else {
@@ -378,10 +377,9 @@ impl Number {
             return Verdict::Unknown;
         }
         if lit.lang.is_none() && !dt.starts_with(XSD) {
-            // A non-XSD datatype against an XSD one: an engine orders them
-            // by datatype IRI only when both are XSD; otherwise a type error
-            // — which a FILTER folds to false — or an implementation-defined
-            // order. Leave it to the engine.
+            // An engine orders by datatype IRI only when both datatypes are
+            // XSD; a non-XSD one against an XSD one is a type error (which a
+            // FILTER folds to false) or an implementation-defined order.
             return Verdict::Unknown;
         }
         if numeric_kind(dt).is_some() && !lit.parses_unbounded() {
@@ -390,10 +388,9 @@ impl Number {
             // integer) and compare by value, which this model cannot.
             return Verdict::Unknown;
         }
-        // Different XSD datatypes with no comparable values — a non-numeric
+        // Different XSD datatypes with no comparable values (a non-numeric
         // datatype, or a value outside its datatype's bounds, which the
-        // engine rejects too — order by their datatype IRIs: the rule the
-        // Python fast path applies.
+        // engine rejects too) order by their datatype IRIs.
         op.apply(dt.cmp(self.datatype.as_str()))
     }
 }

@@ -1,20 +1,14 @@
-//! The file-backed arm of the Dictionary layout's residency axis: a term
-//! dictionary read in place from its serialized child. A file store is
-//! memory-mapped, so reading a window is slicing its segment out of the map
-//! and rebuilding the FSST array over those bytes (its code offsets are read
-//! once as 32-bit values); only the terms a call asks for are decompressed.
-//! Rebuilt windows are kept in a byte-bounded, least-recently-used cache
-//! ([`WINDOW_CACHE_BYTES`] per opened file), so probes and decodes landing in
-//! a recently used window do not rebuild it. The handle holds the child's
-//! layout (one flat leaf per FSST window) and each window's first and last
-//! term — read at open from the child's exact zone maps, or from the leaves
-//! of a child written without them (chunks of uneven length have no uniform
-//! zone to record) — and the kind ranges. A child whose shape a window
-//! search cannot address is not file-backed at all:
-//! [`store::persist::open`](crate::store::persist::open) lifts it resident instead. The policy
-//! enum choosing between this and the resident form is
-//! [`DictAccess`](super::handles::DictAccess); the module only compiles with
-//! `file-io`, since without a file there is nothing to leave the terms in.
+//! A term dictionary read in place from its file's `dictionary` child, the
+//! file-backed arm of [`DictAccess`](super::handles::DictAccess). The handle
+//! holds the child's flat leaves (one per FSST window) and each window's
+//! first and last term, from the child's exact zone maps or else from the
+//! leaves. A call reads only the windows its terms are in: over a mapped
+//! file, a window is its segment sliced out of the map with the FSST array
+//! rebuilt over it, and only the terms asked for are decompressed. Rebuilt
+//! windows are kept in a byte-bounded, least-recently-used cache
+//! ([`WINDOW_CACHE_BYTES`] per open file). A child no window search can
+//! address is lifted resident instead
+//! ([`store::persist::open`](crate::store::persist::open)).
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -54,8 +48,8 @@ type Bounds = (Box<[u8]>, Box<[u8]>);
 /// The term column's flat leaves, each with its row count.
 type Leaves = Vec<(FlatLayout, usize)>;
 
-/// One flat leaf of the term column — one FSST window as written — with the
-/// rank of its first term, its row count, and its first and last terms.
+/// One flat leaf of the term column (one FSST window as written): the rank of
+/// its first term, its row count (never 0), and its first and last terms.
 struct Window {
     layout: FlatLayout,
     start: usize,
@@ -64,37 +58,36 @@ struct Window {
     last: Box<[u8]>,
 }
 
-/// What one opened file's window cache may hold: the bytes of its windows
-/// (see [`TermChunk::heap_bytes`]) plus [`WINDOW_ENTRY_OVERHEAD`] for each,
-/// least recently used evicted first. An FSST window of 65,536 terms costs
-/// about 256 KiB (its code offsets, 4 bytes each) plus the overhead, so about
-/// 15 windows fit. For a memory-mapped file store, which every `from_file`
-/// store is, a window's code bytes are slices of the map, so the charge
-/// bounds the heap the cache holds.
+/// The charge one open file's window cache may hold: its windows' bytes
+/// ([`TermChunk::heap_bytes`]) plus [`WINDOW_ENTRY_OVERHEAD`] each, the least
+/// recently used evicted first. A 65,536-term FSST window is charged about
+/// 256 KiB (4 bytes of code offsets per term), so about 15 fit. Over a mapped
+/// file (every `from_file` store) a window's code bytes are slices of the
+/// map, so the charge bounds the heap the cache holds.
 const WINDOW_CACHE_BYTES: usize = 4 << 20;
 
-/// What each cached window is charged beyond its chunk's bytes: the symbol
-/// table, the array, the `Arc` and the map entry it takes. It also bounds the
-/// windows a budget admits when they are tiny, to
-/// `WINDOW_CACHE_BYTES / WINDOW_ENTRY_OVERHEAD` (1,024).
+/// What each cached window is charged beyond its chunk's bytes: its symbol
+/// table, array, `Arc` and map entry. It also caps the windows a budget
+/// admits when they are tiny, at `WINDOW_CACHE_BYTES / WINDOW_ENTRY_OVERHEAD`
+/// (1,024).
 pub(super) const WINDOW_ENTRY_OVERHEAD: usize = 4 << 10;
 
-/// The rebuilt windows of one file, by window index, bounded by what they are
-/// charged: their chunks' bytes plus [`WINDOW_ENTRY_OVERHEAD`] each. A lookup
+/// The rebuilt windows of one file, by window index, bounded by their charge
+/// (their chunks' bytes plus [`WINDOW_ENTRY_OVERHEAD`] each). A lookup
 /// refreshes a window's recency; an insert evicts the least recently used
 /// windows until the new one fits, and a window charged more than the whole
-/// budget is not kept. A window evicted while a read still holds it lives
-/// until that read ends.
+/// budget is not kept. An evicted window a read still holds lives until that
+/// read ends.
 struct WindowCache {
     budget: usize,
-    /// What every cached window is charged.
+    /// The cached windows' total charge.
     bytes: usize,
     /// The last recency stamp handed out.
     clock: u64,
     windows: HashMap<usize, CachedWindow>,
 }
 
-/// A cached window with what it is charged and the stamp of its last use.
+/// A cached window, its charge and the stamp of its last use.
 struct CachedWindow {
     chunk: Arc<TermChunk>,
     bytes: usize,
@@ -157,47 +150,41 @@ impl WindowCache {
     }
 }
 
-/// What a [`FileBackedDict`] holds: the child's layout metadata, the
-/// per-window bounds and the bounded cache of rebuilt windows.
+/// What a [`FileBackedDict`] holds: the child's leaves and window bounds, and
+/// the cache of rebuilt windows.
 struct Windows {
     /// The identity of this dictionary (see
     /// [`DictReader::dictionary_id`](crate::DictReader::dictionary_id)): one
     /// per open, shared by every clone of the handle.
     id: u64,
-    /// The dictionary child's layout reader, for the transient whole-column
-    /// lift (serialization, compaction).
+    /// The child's layout reader, for the transient whole-column lift.
     reader: vortex_layout::LayoutReaderRef,
     windows: Vec<Window>,
     /// `starts[i]` = `windows[i].start`, ascending (for [`chunk_of`]).
     starts: Vec<usize>,
-    /// The terms' codes.
     code_space: CodeSpace,
-    /// Where the leaves' segments are read from — over a mapped file, the map.
+    /// Where the leaves' segments are read from: over a mapped file, the map.
     source: Arc<dyn SegmentSource>,
-    /// The kind ranges (three code ranges and the default graph's code),
-    /// computed on first use.
+    /// The kind ranges, computed on first use.
     kinds: OnceLock<KindRanges>,
-    /// Rebuilt windows, kept for reuse. The lock is held for a lookup or an
-    /// insert, never across an `.await`.
+    /// The rebuilt windows. The lock is held for a lookup or an insert, never
+    /// across an `.await`.
     cache: Mutex<WindowCache>,
-    /// Windows rebuilt since open (the cache's misses) — what the tests read
-    /// to pin that a call rebuilds only the windows holding its codes.
+    /// Test hook: windows rebuilt since open (the cache's misses).
     #[cfg(test)]
     rebuilt: std::sync::atomic::AtomicUsize,
-    /// Windows asked for since open, hits and misses alike — what the tests
-    /// read to pin that a call asks for no window at all.
+    /// Test hook: windows asked for since open, hits and misses alike.
     #[cfg(test)]
     requested: std::sync::atomic::AtomicUsize,
-    /// Whole-dictionary lifts since open — what the tests read to pin that a
-    /// read lifts no dictionary at all.
+    /// Test hook: whole-dictionary lifts since open.
     #[cfg(test)]
     lifted: std::sync::atomic::AtomicUsize,
 }
 
 impl Windows {
-    /// The window holding `needle`'s lower bound: the first whose last term
-    /// is not below `needle`, with its index — `None` when every term is
-    /// below `needle`.
+    /// The window holding `needle`'s lower bound, with its index: the first
+    /// whose last term is not below `needle`; `None` when every term is below
+    /// it.
     fn locate(&self, needle: &[u8]) -> Option<(usize, &Window)> {
         let w = self
             .windows
@@ -212,12 +199,10 @@ impl Windows {
         self.cache.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Window `w` as a term chunk: the cached one, else its leaf rebuilt
-    /// over its segment and adopted through [`TermChunk::from_wire`] (FSST
-    /// stays compressed, its code offsets read once as 32-bit values; any
-    /// other encoding is canonicalized), then cached. The leaf is rebuilt with the lock
-    /// released, so two tasks missing one window both rebuild it and the
-    /// cache keeps the first insert.
+    /// Window `w`'s chunk: the cached one, else its leaf rebuilt over its
+    /// segment, adopted ([`TermChunk::from_wire`]) and cached. The rebuild
+    /// runs with the lock released, so two tasks missing one window both
+    /// rebuild it and the cache keeps the first insert.
     async fn window_chunk(&self, w: usize) -> Result<Arc<TermChunk>> {
         #[cfg(test)]
         self.requested
@@ -236,7 +221,9 @@ impl Windows {
 
 /// A term dictionary left in its layout child: term → code probes and code →
 /// term decodes read the windows they need from the (mapped) file, through a
-/// bounded cache of rebuilt windows. Cloning is an `Arc` bump.
+/// bounded cache of rebuilt windows. Terms are read as UTF-8 unchecked, so
+/// the file must be one this crate wrote or the caller trusts. Cloning is an
+/// `Arc` bump.
 #[derive(Clone)]
 pub(crate) struct FileBackedDict(Arc<Windows>);
 
@@ -311,20 +298,18 @@ impl FileBackedDict {
         }))))
     }
 
-    /// This dictionary's identity.
     pub(crate) fn id(&self) -> u64 {
         self.0.id
     }
 
-    /// Number of terms.
     pub(crate) fn len(&self) -> usize {
         self.0.code_space.len()
     }
 
-    /// Term → code, exactly as spelled: the window whose bounds enclose
-    /// `term`, then a binary search of the inside of that one window (through
-    /// the window cache) — none at all for a window's first or last term, or
-    /// a term falling between two windows.
+    /// The code of `term` exactly as spelled: the window whose bounds enclose
+    /// it, then a binary search of that window's inside, read through the
+    /// cache. A window's first or last term, and a term between two windows,
+    /// read no window.
     pub(crate) async fn encode_exact(&self, term: &str) -> Result<Option<TermCode>> {
         let inner = &*self.0;
         let needle = term.as_bytes();
@@ -349,8 +334,9 @@ impl FileBackedDict {
         .map(code_at))
     }
 
-    /// The code of the first term not below `needle` in byte order (the
-    /// term count when every term is below it).
+    /// The code of the first term not below `needle` in byte order; one past
+    /// the last code when every term is below it. Reads at most the one
+    /// window the bound is inside.
     pub(crate) async fn lower_bound(&self, needle: &[u8]) -> Result<TermCode> {
         let inner = &*self.0;
         let Some((w, window)) = inner.locate(needle) else {
@@ -366,20 +352,20 @@ impl FileBackedDict {
         Ok(inner.code_space.code_at(window.start + local))
     }
 
-    /// Visit the terms of `codes` (strictly ascending and inside the
-    /// dictionary, else an `InvalidInput` error before any window is
-    /// read) in order: per window holding any of them, one cached chunk and
-    /// one cursor, which decompresses only the asked rows. `visit` gets each
-    /// code's position in `codes` and its term, trusted to be UTF-8 as the
-    /// column's dtype declares.
+    /// Visit the terms of `codes`, which must ascend strictly inside the
+    /// dictionary ([`check_candidates`], checked before any window is read),
+    /// in order: `visit` gets each code's position in `codes` and its term,
+    /// read unchecked as UTF-8 (see [`FileBackedDict`]). Each window holding
+    /// any of them is read once, through one cursor that decompresses only
+    /// the asked rows.
     async fn visit_terms(
         &self,
         codes: &[TermCode],
         mut visit: impl FnMut(usize, &str),
     ) -> Result<()> {
-        // Each window's run is found by a partition point, so a list out of
-        // order would leave a code before its window's start (wrapping
-        // `rank - window.start`) or a run of nothing (a loop that never
+        // Each window's run is a partition point, so a list out of order
+        // would put a code before its window's start (wrapping
+        // `rank - window.start`) or make a run of nothing (a loop that never
         // advances).
         let inner = &*self.0;
         check_candidates(codes, inner.code_space)?;
@@ -412,8 +398,9 @@ impl FileBackedDict {
         Ok(())
     }
 
-    /// Code → term for `codes` (ascending, unique; out-of-range codes are an
-    /// error), reading only the windows that hold them.
+    /// The terms of `codes`, which must ascend strictly (else an
+    /// `InvalidInput` error); a code past the dictionary is a
+    /// `Deserialization` error. Reads only the windows that hold them.
     pub(crate) async fn decode_many(&self, codes: &[TermCode]) -> Result<Vec<Arc<str>>> {
         let Some(&max) = codes.last() else {
             return Ok(Vec::new());
@@ -425,14 +412,11 @@ impl FileBackedDict {
         Ok(terms)
     }
 
-    /// Code → term for `codes` in any order, repeats allowed, handed to
+    /// The terms of `codes`, in any order and with repeats, each handed to
     /// `visit(position, term)` once per position (`None` for an out-of-range
-    /// code): the positions of the in-range codes are sorted once by code,
-    /// each distinct code is read once through
-    /// [`visit_terms`](Self::visit_terms), and every position holding it is
-    /// visited with the borrowed term — no string is built per term. Out-of-
-    /// range positions are visited first; the rest in code order. Terms are
-    /// trusted to be UTF-8, as the column's dtype declares.
+    /// code), borrowed: no string is built per term. Out-of-range positions
+    /// are visited first, then the rest in code order, each distinct code
+    /// read once ([`visit_terms`](Self::visit_terms)).
     pub(crate) async fn decode_many_with(
         &self,
         codes: &[TermCode],
@@ -457,8 +441,7 @@ impl FileBackedDict {
         .await
     }
 
-    /// The async twin of `TermDictionary::encode`: tolerant of spelling, the
-    /// exact lookup first.
+    /// The code of `term`, tolerant of spelling as `TermDictionary::encode`.
     pub(crate) async fn encode(&self, term: &str) -> Result<Option<TermCode>> {
         if let Some(code) = self.encode_exact(term).await? {
             return Ok(Some(code));
@@ -469,7 +452,7 @@ impl FileBackedDict {
         }
     }
 
-    /// [`encode`](Self::encode) over a batch, in order.
+    /// [`encode`](Self::encode) over a batch, in order, the lookups overlapped.
     pub(crate) async fn encode_many(&self, terms: &[&str]) -> Result<Vec<Option<TermCode>>> {
         futures::stream::iter(terms.iter().map(|term| self.encode(term)))
             .buffered(available_parallelism().max(4))
@@ -477,7 +460,8 @@ impl FileBackedDict {
             .await
     }
 
-    /// The async twin of `TermDictionary::prefix_range`.
+    /// The code range of the terms spelled with `prefix`, as
+    /// `TermDictionary::prefix_range`: two lower bounds.
     pub(crate) async fn prefix_range(&self, prefix: &str) -> Result<Range<TermCode>> {
         let lo = self.lower_bound(prefix.as_bytes()).await?;
         let hi = match prefix_successor(prefix.as_bytes()) {
@@ -510,8 +494,8 @@ impl FileBackedDict {
         Ok(self.0.kinds.get_or_init(|| kinds).clone())
     }
 
-    /// The file-backed twin of `TermDictionary::filter_codes`: candidates
-    /// whose kind decides them are not read; the rest are read through
+    /// `TermDictionary::filter_codes` over the file, under its precondition:
+    /// the candidates their kind does not decide are read through
     /// [`visit_terms`](Self::visit_terms), so only the windows holding them
     /// are read.
     pub(crate) async fn filter_codes(
@@ -530,8 +514,8 @@ impl FileBackedDict {
         Ok(split_verdicts(codes, &verdicts))
     }
 
-    /// Lift the whole dictionary resident — the transient full-column read
-    /// behind [`DictAccess::ensure_resident`].
+    /// The whole dictionary lifted resident with one scan of the term
+    /// column: the transient read behind [`DictAccess::ensure_resident`].
     ///
     /// [`DictAccess::ensure_resident`]: super::handles::DictAccess::ensure_resident
     pub(crate) async fn lift_resident(&self) -> Result<TermDictionary> {
@@ -604,8 +588,8 @@ struct Zones {
     zone_len: usize,
 }
 
-/// The term column's flat leaves — one per FSST window, in row order, with
-/// their row counts — and, when the column is zone-mapped with exact window
+/// The term column's flat leaves (one per FSST window, in row order, with
+/// their row counts) and, when the column is zone-mapped with exact window
 /// bounds, its zone table. `None` for any shape a window search cannot
 /// address.
 fn term_column(dict: &LayoutRef) -> Option<(Leaves, Option<Zones>)> {
@@ -662,9 +646,9 @@ fn zones_cut_at_leaves(zones: &Zones, leaves: &[(FlatLayout, usize)]) -> bool {
         && *last <= zones.zone_len
 }
 
-/// Each window's bounds from the term column's zone table — one zone per
-/// window — or `None` when the table does not line up with the leaves (see
-/// [`zones_cut_at_leaves`]) or holds a null bound.
+/// Each window's bounds from the term column's zone table, one zone per
+/// window; `None` when the zones are not cut at the leaves
+/// ([`zones_cut_at_leaves`]) or a bound is null.
 async fn zone_bounds(
     zones: &Zones,
     leaves: &[(FlatLayout, usize)],
@@ -713,10 +697,9 @@ fn bound_column(
     Ok(Some(column.clone().execute::<VarBinViewArray>(ctx)?))
 }
 
-/// Each window's bounds read from its own leaf — the fallback for a term
-/// column without exact zone maps (chunks of uneven length, or a foreign
-/// writer): two single-term reads per window through a chunk cursor, at open.
-/// The windows are not cached.
+/// Each window's bounds read from its own leaf, for a term column without
+/// exact zone maps (chunks of uneven length, or a foreign writer's): every
+/// leaf is fetched at open for two single-term reads, and none is cached.
 async fn leaf_bounds(
     leaves: &[(FlatLayout, usize)],
     source: &Arc<dyn SegmentSource>,
@@ -734,8 +717,8 @@ async fn leaf_bounds(
     Ok(bounds)
 }
 
-/// Whether window bounds are sorted and disjoint — `first <= last` within a
-/// window, `last < next first` across — what the window search relies on.
+/// Whether window bounds are sorted and disjoint (`first <= last` within a
+/// window, `last < next first` across), as the window search requires.
 fn ordered(bounds: &[Bounds]) -> bool {
     bounds.iter().all(|(first, last)| first <= last)
         && bounds.windows(2).all(|pair| pair[0].1 < pair[1].0)

@@ -19,10 +19,10 @@ pub struct TextOptions {
     pub flags: String,
     /// A case wrapper applied to the text first (`LCASE`/`UCASE`).
     pub case: Option<CaseMap>,
-    /// Whether the text is SPARQL `STR(term)`: an IRI's string, a literal's
-    /// lexical form as a simple literal (undecided for a datatype rdflib
-    /// normalizes), a blank node undecided — instead of rdflib's `string()`
-    /// (string literals only).
+    /// Whether the text is SPARQL `STR(term)` (an IRI's string, a literal's
+    /// lexical form as a simple literal, undecided for a datatype rdflib
+    /// normalizes, and a blank node undecided) rather than rdflib's
+    /// `string()` (string literals only).
     pub as_str: bool,
 }
 
@@ -64,19 +64,19 @@ pub(super) enum TextConstant {
     /// A string literal: its lexical form and language tag as spelled (rdflib
     /// compares tags exactly).
     Text { text: String, lang: Option<String> },
-    /// Anything rdflib's `string()` rejects — a non-string typed literal, an
-    /// IRI, a blank node: every candidate fails.
+    /// Anything rdflib's `string()` rejects (a non-string typed literal, an
+    /// IRI, a blank node): every candidate fails.
     NotAString,
 }
 
 impl TextConstant {
     /// A string constant from its strict N-Triples spelling: a literal
     /// (`"text"`, `"text"@tag` or `"text"^^<datatype>`), an `<iri>` or a
-    /// `_:blank` node. Anything else — an unclosed bracket, a prefixed
+    /// `_:blank` node. Anything else (an unclosed bracket, a prefixed
     /// datatype, a language tag outside `[A-Za-z]+(-[A-Za-z0-9]+)*`, text
-    /// after the term — is an error, never a constant that fails every
-    /// candidate unnoticed. A well-formed spelling that is no string literal
-    /// is [`NotAString`](TextConstant::NotAString).
+    /// after the term) is an `InvalidInput` error, never a constant that
+    /// fails every candidate unnoticed. A well-formed spelling that is no
+    /// string literal is [`NotAString`](TextConstant::NotAString).
     pub(super) fn parse(arg: &str) -> Result<Self> {
         let invalid = || {
             VortexRdfError::InvalidInput(format!(
@@ -199,8 +199,9 @@ fn rdflib_normalizes(dt: &str) -> bool {
 
 impl TextPredicate {
     /// The term's text and language under `string()` (`as_str` off) or
-    /// `STR()` (on); `Err(verdict)` when there is no text — rdflib raises and
-    /// the FILTER fails — or none this layer reads exactly (`Unknown`).
+    /// `STR()` (on); `Err(verdict)` when there is no text (`False`: rdflib
+    /// raises and the FILTER fails) or none this layer reads exactly
+    /// (`Unknown`).
     fn text_of<'s>(
         &self,
         spelling: &'s str,

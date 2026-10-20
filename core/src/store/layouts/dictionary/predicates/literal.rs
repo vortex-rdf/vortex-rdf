@@ -72,12 +72,11 @@ impl<'a> LiteralView<'a> {
         parse_number(&self.lexical()?, numeric_kind(dt)?)
     }
 
-    /// Whether a numeric literal's lexical form parses disregarding the
-    /// datatype's own bounds — an out-of-range `xsd:byte`, say. An engine
-    /// parses such a form to a value it then rejects, and orders the
-    /// literal by its datatype; a form the grammar rejects (whitespace,
-    /// `NaN`) its own, more lenient parser may still accept, so that one is
-    /// left to it.
+    /// Whether a numeric literal's lexical form parses ignoring its
+    /// datatype's bounds (an out-of-range `xsd:byte` does). An engine gives
+    /// such a form a value it then rejects and orders the literal by its
+    /// datatype; a form the grammar rejects (whitespace, `NaN`) its own, more
+    /// lenient parser may still accept, so that one is left to it.
     pub(super) fn parses_unbounded(&self) -> bool {
         self.datatype.and_then(numeric_kind).is_some_and(|kind| {
             self.lexical()
@@ -86,7 +85,7 @@ impl<'a> LiteralView<'a> {
     }
 
     /// Whether this is an `xsd:long` or `xsd:unsignedLong` whose lexical form
-    /// is an integer outside the type's 64-bit bounds — a value rdflib holds
+    /// is an integer outside the type's 64-bit bounds: a value rdflib holds
     /// to no bound and compares, which this model refuses.
     pub(super) fn wide_64(&self) -> bool {
         let Some(local) = self.datatype.and_then(|dt| dt.strip_prefix(XSD)) else {
@@ -98,8 +97,8 @@ impl<'a> LiteralView<'a> {
     }
 }
 
-/// The kind of a spelling from its first byte, which the sorted dictionary
-/// shares with the kind ranges.
+/// The kind of a spelling, from its first byte: the byte the kind ranges
+/// split the sorted dictionary on.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Kind {
     /// The empty spelling of the default graph.
@@ -107,7 +106,7 @@ pub(super) enum Kind {
     Literal,
     Iri,
     Blank,
-    /// Anything a dictionary of this crate never holds.
+    /// A spelling no dictionary of this crate holds.
     Other,
 }
 
@@ -123,13 +122,13 @@ pub(super) fn kind_of(spelling: &str) -> Kind {
 
 /// BCP 47 basic filtering (RFC 4647 §3.3.1) as SPARQL's `langMatches`,
 /// decided for `*` and for a range of ASCII letters, digits and hyphens,
-/// where it and rdflib's `_lang_range_check` agree. rdflib may read any other
-/// range differently: a `*` in any subtag is a wildcard (`en-*` matches
-/// `en-gb`), whitespace around the range is stripped, and Python lower-cases
-/// it (the Kelvin sign to `k`). A range other than `*` with a character
-/// outside that alphabet is `Unknown` whether or not rdflib happens to agree
-/// (for `en_gb` it does). So is a tag outside it, which only a foreign writer's file can
-/// hold (the N-Triples ingest rejects one), so that check is defensive.
+/// where it and rdflib's `_lang_range_check` agree. rdflib may read any
+/// other range differently (a `*` in any subtag is a wildcard, `en-*`
+/// matching `en-gb`; whitespace around the range is stripped; Python
+/// lower-cases it, the Kelvin sign to `k`), so such a range is `Unknown`
+/// even where rdflib happens to agree (`en_gb`). So is a tag outside the
+/// alphabet, which only a foreign writer's file can hold (the N-Triples
+/// ingest rejects one).
 pub(super) fn lang_matches(tag: &str, range: &str) -> Verdict {
     let plain = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
     if range == "*" {

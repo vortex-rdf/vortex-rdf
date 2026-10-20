@@ -1,10 +1,9 @@
-//! The resolved probe tree and its search/access operations.
-//!
-//! A [`Node`] mirrors one encoded array node, borrowing its buffers; every
-//! operation is a slice read, integer arithmetic, or a single bit-packed word
-//! extraction — no `ExecutionCtx`, no decoding, no allocation. The one
-//! exception is [`DeltaNode`], whose values are running sums: it decodes a
-//! 1024-value block the first time one of its values is read, and keeps it.
+//! The resolved probe tree. A [`Node`] mirrors one encoded array node,
+//! borrowing its buffers; every operation is a slice read, integer
+//! arithmetic or one bit-packed word extraction, with no `ExecutionCtx`, no
+//! decode and no allocation. The exception is [`DeltaNode`], whose values
+//! are running sums: it decodes a 1024-value block the first time one of its
+//! values is read, and keeps it.
 
 use std::sync::OnceLock;
 
@@ -35,8 +34,8 @@ impl Words<'_> {
         }
     }
 
-    /// First index whose value is `>= needle`, via the native monomorphized
-    /// `partition_point`. A needle above the width's maximum finds nothing.
+    /// First index whose value is `>= needle`, by the native monomorphized
+    /// `partition_point`; the length for a needle past the width's maximum.
     fn lower_bound(&self, needle: u64) -> usize {
         fn bound<T: Copy + Ord + TryFrom<u64>>(s: &[T], needle: u64) -> usize {
             match T::try_from(needle) {
@@ -53,10 +52,10 @@ impl Words<'_> {
     }
 }
 
-/// One resolved chunk of a [`Node::Chunked`] tree, with its logical start
-/// row. The chunk's last value is read on demand during bounds searches and
-/// then memoized — resolving stays downcast-only (a borrowed probe is
-/// resolved per call), while a long-lived owned probe pays the read once.
+/// One resolved chunk of a [`Node::Chunked`] tree, never empty, with its
+/// logical start row. Its last value is read when a bounds search first
+/// probes the chunk, then kept, so resolution stays downcast-only and a
+/// long-lived owned probe pays the read once.
 pub(crate) struct Chunk<'a> {
     pub(crate) start: usize,
     pub(crate) node: Node<'a>,
@@ -158,9 +157,10 @@ impl PackedNode<'_> {
     }
 }
 
-/// One node of the resolved probe tree. Variants mirror the supported
-/// encodings; children are resolved recursively at [`crate::SortedProbe::resolve`]
-/// time so every operation below is non-fallible.
+/// One node of the resolved probe tree, a variant per supported encoding.
+/// Children are resolved with their parent
+/// ([`crate::SortedProbe::resolve`]), so every operation below is
+/// infallible.
 pub(crate) enum Node<'a> {
     Primitive(Words<'a>),
     Constant {
@@ -230,13 +230,11 @@ impl DeltaWidth {
 }
 
 /// A FastLanes delta-encoded node: every 1024-value block stores one base
-/// per lane and the transposed, delta-encoded values (typically bit-packed
-/// beneath). A value cannot be read in place — it is a running sum down its
-/// lane — so a block is decoded whole the first time any of its values is
-/// asked for, through the same `undelta` and `untranspose` kernels the
-/// encoding's own decompressor runs, and kept for the node's lifetime. A
-/// bounds search therefore decodes the handful of blocks its bisection
-/// crosses, never the chunk.
+/// per lane and the transposed deltas (typically bit-packed beneath). A
+/// value is a running sum down its lane, so a block is decoded whole the
+/// first time any of its values is read, by the encoding's own `undelta`
+/// and `untranspose` kernels, and kept for the node's lifetime: a bounds
+/// search decodes only the blocks its bisection crosses.
 pub(crate) struct DeltaNode<'a> {
     bases: Box<Node<'a>>,
     deltas: Box<Node<'a>>,
@@ -251,8 +249,9 @@ pub(crate) struct DeltaNode<'a> {
 }
 
 impl<'a> DeltaNode<'a> {
-    /// A node over resolved `bases` and `deltas` children; `None` when the
-    /// children are too short for the blocks `offset + len` spans.
+    /// A node over resolved `bases` and `deltas` children; `None` for an
+    /// `offset` of a whole block or more, or children too short for the
+    /// blocks `offset + len` spans.
     pub(crate) fn new(
         bases: Node<'a>,
         deltas: Node<'a>,
@@ -313,8 +312,7 @@ where
     T: fastlanes::Delta + fastlanes::Transpose + Copy + Default + Into<u64> + TryFrom<u64>,
 {
     // The children hold values of width `T` by construction (the array's
-    // dtype), so the narrowing conversions cannot fail; a child that lied
-    // about its width would already have declined resolution.
+    // dtype), so the narrowing conversions cannot fail.
     let narrow = |v: u64| T::try_from(v).unwrap_or_default();
     let mut chunk = [T::default(); 1024];
     for (j, slot) in chunk.iter_mut().enumerate() {
@@ -390,12 +388,15 @@ impl Node<'_> {
                 let c = partition(chunks.len(), |c| chunks[c].start <= i) - 1;
                 chunks[c].node.value_at(i - chunks[c].start)
             }
+            // A code is below the values' length (a construction invariant),
+            // so it fits a `usize`.
             Node::Dict { codes, values } => values.value_at(codes.value_at(i) as usize),
             Node::Delta(d) => d.value_at(i),
         }
     }
 
-    /// First index whose value is `>= needle`; requires ascending order.
+    /// First index whose value is `>= needle`, the length when every value is
+    /// below it; requires ascending order.
     pub(crate) fn lower_bound(&self, needle: u64) -> usize {
         match self {
             Node::Primitive(w) => w.lower_bound(needle),
@@ -521,7 +522,7 @@ fn clamp_to_len<I: TryFrom<u64> + Ord + Copy>(q: u64, len: I) -> I {
 
 /// The runs overlapping the window `[offset, offset + len)`, as
 /// `(first_run, run_count)`. Sortedness is asserted for the window only, so
-/// run searches must stay inside these runs — a sliced RunEnd keeps its full
+/// run searches must stay inside these runs: a sliced RunEnd keeps its full
 /// children, whose out-of-window values are in unspecified order.
 fn window_runs(ends: &Node<'_>, offset: usize, len: usize) -> (usize, usize) {
     if len == 0 {

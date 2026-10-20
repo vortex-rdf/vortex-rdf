@@ -1,7 +1,7 @@
-//! How a resident [`TermDictionary`] holds its sorted terms
-//! ([`ResidentChunks`]) and reads them (the cursors), how one is built (FSST
-//! compression) or adopted from a written term column, and the dictionary
-//! child's read and write sides, its zone-map bounds included.
+//! A resident [`TermDictionary`]'s terms: how they are held
+//! ([`ResidentChunks`]) and read (single-term reads and cursors), built
+//! (FSST-compressed in windows) or adopted from a written term column, and
+//! written as the `dictionary` child with its windows' zone-map bounds.
 
 use std::sync::Arc;
 
@@ -24,35 +24,23 @@ use crate::store::array::{StrColReader, trusted_str};
 
 use super::term_dict::TermDictionary;
 
-/// The single column of the native container's `dictionary` child: non-nullable
-/// utf8, row i holding the term with code i (sorted, so codes are lexicographic
-/// ranks). Part of the wire contract, owned here — the module that builds and
-/// reads the child — per the ownership rule in [`crate::store::schema`].
+/// The `dictionary` child's single column: non-nullable utf8, row i the term
+/// with code i, globally sorted. Wire contract, owned here per the rule in
+/// [`crate::store::schema`].
 pub(crate) const COL_DICT_TERM: &str = "_dict_term";
 
-/// Terms per FSST window when compressing at the source (see
-/// [`TermDictionary::compress`]): the granularity at which a large
-/// dictionary's serialized child is read back, point-read, and lifted
-/// chunk-by-chunk. Small enough that touching one leaf fetches and adopts a
-/// bounded slice of the column; large enough to amortize the copy of the
-/// shared symbol table every window carries.
+/// Terms per FSST window of a built dictionary ([`TermDictionary::compress`]):
+/// the granularity of the child's leaves, of a file-backed read and of a
+/// chunk-by-chunk lift. Small enough that one leaf is a bounded slice of the
+/// column, large enough to amortize the symbol table every window carries.
 const DICT_CHUNK_ROWS: usize = 64 * 1024;
 
-/// How a dictionary's sorted terms are held in memory: the column as one or
-/// more chunks (compressed in windows, or read back from a serialized
-/// dictionary child), with a cumulative-start table mapping a global term
-/// index to (chunk, local index). Always at least one chunk; an empty column
-/// is one empty chunk.
-///
-/// The dictionary is *built* FSST-compressed (see [`TermDictionary::compress`])
-/// and written out that way, so an FSST chunk is the normal case, and a large
-/// dictionary stays FSST-compressed through the resident lift. A
-/// [`TermChunk::Canonical`] chunk covers every other encoding: Vortex picks a
-/// column's encoding when it writes, by sampling, and the selector is free to
-/// choose something other than FSST — so a dictionary read back from a file
-/// or IPC stream may arrive in any encoding, and the read path has to be
-/// total over that. Anything that is not FSST is canonicalized to plaintext
-/// on open.
+/// A dictionary's sorted terms in memory: one or more chunks (a built
+/// dictionary's FSST windows, or a written child's chunks as read back) and
+/// the start table mapping a global term index to (chunk, local index).
+/// Always at least one chunk; an empty column is one empty chunk. A chunk
+/// that arrives FSST stays FSST; any other encoding a writer chose is
+/// canonicalized to plaintext.
 pub(super) struct ResidentChunks {
     chunks: Vec<TermChunk>,
     /// `starts[i]` = global index of chunk i's first term; ascending.
@@ -62,16 +50,15 @@ pub(super) struct ResidentChunks {
 
 /// One chunk of a term column, in the encoding it is held in.
 pub(super) enum TermChunk {
-    /// Plaintext terms. `bytes_at` is a zero-copy read.
+    /// Plaintext terms; a read borrows the array's bytes.
     Canonical(VarBinViewArray),
-    /// FSST-compressed terms: compact in memory, and every read decodes.
+    /// FSST-compressed terms; every read decodes one term.
     Fsst(FsstTerms),
 }
 
 impl TermChunk {
-    /// Adopt one term chunk: kept FSST when it arrived FSST (reads decode
-    /// single rows), canonicalized otherwise (the write path compresses, but
-    /// nothing in the format obliges a producer to have done so).
+    /// Adopt a wire chunk: FSST stays FSST, any other encoding is
+    /// canonicalized to plaintext.
     pub(super) fn from_wire(chunk: ArrayRef, ctx: &mut vortex_array::ExecutionCtx) -> Result<Self> {
         match chunk.try_downcast::<FSST>() {
             Ok(fsst) => Ok(TermChunk::Fsst(FsstTerms::new(fsst)?)),
@@ -86,7 +73,7 @@ impl TermChunk {
         }
     }
 
-    /// The held column as an array, in its stored encoding.
+    /// The chunk as an array, in its stored encoding.
     fn array(&self) -> ArrayRef {
         match self {
             TermChunk::Canonical(a) => a.clone().into_array(),
@@ -94,12 +81,11 @@ impl TermChunk {
         }
     }
 
-    /// What this chunk costs a cache of chunks: the bytes it holds onto. An
-    /// FSST chunk costs its code offsets (one `u32` per term, plus one),
-    /// whether they view the leaf's own buffer or are a converted copy; its
-    /// code bytes, which it only references, are not counted. A canonical
-    /// chunk costs its array's `nbytes()`, which counts buffers that are
-    /// slices of a map as well.
+    /// What a window cache charges for this chunk. An FSST chunk is charged
+    /// its code offsets (4 bytes per term, plus 4), whether they view the
+    /// leaf's buffer or are a converted copy, but not the code bytes it only
+    /// references. A canonical chunk is charged its array's `nbytes()`,
+    /// which counts buffers sliced from a map too.
     #[cfg(feature = "file-io")]
     pub(super) fn heap_bytes(&self) -> usize {
         match self {
@@ -108,9 +94,9 @@ impl TermChunk {
         }
     }
 
-    /// A fresh cursor over this chunk's terms. An FSST cursor's scratch
-    /// starts empty and `bytes_at` grows it to the term it decodes, so a
-    /// single-term decode allocates only for the chunk it touches.
+    /// A cursor over this chunk's terms. An FSST cursor's scratch starts
+    /// empty and grows to the terms it decodes, so a read allocates only for
+    /// the chunks it touches.
     pub(super) fn cursor(&self) -> ChunkCursor<'_> {
         match self {
             TermChunk::Canonical(a) => ChunkCursor::Canonical(StrColReader::new(a)),
@@ -122,15 +108,15 @@ impl TermChunk {
     }
 }
 
-/// The chunk holding global index `i` of a chunked column whose chunks start
-/// at `starts` (ascending, `starts[0] == 0`), and `i` local to that chunk.
+/// The chunk holding global index `i` of chunks starting at `starts`
+/// (ascending, `starts[0] == 0`), and `i` local to that chunk.
 pub(super) fn chunk_of(starts: &[usize], i: usize) -> (usize, usize) {
     let chunk = starts.partition_point(|&s| s <= i) - 1;
     (chunk, i - starts[chunk])
 }
 
 impl ResidentChunks {
-    /// The column `chunks` concatenate to, in order: at least one chunk.
+    /// The column `chunks` concatenate to; at least one chunk.
     fn new(chunks: Vec<TermChunk>) -> Self {
         debug_assert!(!chunks.is_empty(), "a term column holds at least one chunk");
         let mut starts = Vec::with_capacity(chunks.len());
@@ -146,7 +132,6 @@ impl ResidentChunks {
         }
     }
 
-    /// Number of terms.
     pub(super) fn len(&self) -> usize {
         self.len
     }
@@ -165,9 +150,8 @@ impl ResidentChunks {
     }
 
     /// Term `i`'s bytes: borrowed from a canonical chunk, or decoded into
-    /// `scratch` from an FSST one. A read of one term at a time passes one
-    /// scratch buffer through all its probes, where a cursor holds a buffer
-    /// per chunk.
+    /// `scratch` from an FSST one. A single-term read passes one scratch
+    /// through all its probes, where a cursor holds one per chunk.
     pub(super) fn bytes_into<'a>(&'a self, i: usize, scratch: &'a mut Vec<u8>) -> &'a [u8] {
         match self.locate(i) {
             (TermChunk::Canonical(a), local) => StrColReader::new(a).bytes_at(local),
@@ -175,9 +159,8 @@ impl ResidentChunks {
         }
     }
 
-    /// A fresh cursor over the terms: one chunk cursor per chunk, each with
-    /// its own scratch. A one-chunk column's cursor holds no further chunk
-    /// cursors, so taking one builds nothing beyond the first.
+    /// A cursor over the terms: one chunk cursor per chunk, each with its own
+    /// scratch; a one-chunk column's builds only the first.
     pub(super) fn cursor(&self) -> DictCursor<'_> {
         let (first, rest) = self
             .chunks
@@ -204,25 +187,19 @@ impl TermDictionary {
         )]))
     }
 
-    /// Build from already-sorted unique term strings. The column is
-    /// FSST-compressed here (see [`compress`](Self::compress)), so a built
-    /// dictionary holds FSST chunks (windowed past [`DICT_CHUNK_ROWS`])
-    /// regardless of the encoding the writer later selects; only an empty
-    /// dictionary stays canonical.
+    /// A dictionary of sorted unique `terms`, FSST-compressed in windows
+    /// ([`compress`](Self::compress)).
     pub(super) fn from_sorted<'a>(terms: impl Iterator<Item = &'a str> + Clone) -> Result<Self> {
         Self::from_sorted_column(VarBinViewArray::from_iter_str(terms))
     }
 
-    /// Build from an already-assembled column of sorted unique terms — the
-    /// construction entry for callers that hold the plaintext column (the
-    /// interning builder freezes one directly), and the single owner of the
-    /// term-count guard and of the compression step.
+    /// [`from_sorted`](Self::from_sorted) over an assembled plaintext column;
+    /// a `Serialization` error past `i32::MAX` terms.
     pub(crate) fn from_sorted_column(plain: VarBinViewArray) -> Result<Self> {
-        // A conservative cap, not a format limit: no dictionary past
-        // `i32::MAX` terms has been built or tested, and nothing in the format
-        // needs the count to fit an i32 (the column's length is a usize, each
-        // FSST window's offsets span `DICT_CHUNK_ROWS` terms, and codes are
-        // u64). This build holds every term in memory.
+        // A conservative cap, not a format limit: nothing in the format needs
+        // the count to fit an `i32` (codes are `u64`, and each FSST window's
+        // offsets span `DICT_CHUNK_ROWS` terms), but no larger dictionary is
+        // tested, and this build holds every term in memory.
         if plain.len() > i32::MAX as usize {
             return Err(VortexRdfError::Serialization(format!(
                 "Dictionary of {} unique terms exceeds the supported maximum ({})",
@@ -233,9 +210,8 @@ impl TermDictionary {
         Self::compress(plain)
     }
 
-    /// Adopt a term column's chunks through [`TermChunk::from_wire`]:
-    /// already-FSST chunks are kept compressed, any other encoding is
-    /// canonicalized.
+    /// The dictionary of a term column's `chunks`, each adopted through
+    /// [`TermChunk::from_wire`]; empty chunks are dropped.
     fn from_term_chunks(
         chunks: Vec<ArrayRef>,
         ctx: &mut vortex_array::ExecutionCtx,
@@ -253,25 +229,18 @@ impl TermDictionary {
         Ok(Self::new(ResidentChunks::new(adopted)))
     }
 
-    /// FSST-compress a plaintext term column.
-    ///
-    /// An empty dictionary is left canonical: there is nothing to train a
-    /// symbol table on, and `fsst_train_compressor` has no non-null rows to
-    /// sample.
-    ///
-    /// A dictionary larger than [`DICT_CHUNK_ROWS`] is compressed in
-    /// independent windows (one symbol table trained on the whole column,
-    /// each window compressed with it): every window is a self-contained
-    /// FSST array, so the serializer can write the chunks verbatim — no
-    /// re-encoding, no slicing a parent array whose buffers every written
-    /// chunk would then drag along — and the chunk boundaries become the
-    /// file child's leaves, the granularity `FileBackedDict` point-reads.
+    /// `plain` FSST-compressed in windows of [`DICT_CHUNK_ROWS`] terms: one
+    /// symbol table trained on the whole column, each window compressed with
+    /// it into a self-contained array. The writer writes each window verbatim
+    /// as one flat leaf (no re-encoding, no parent buffers dragged along),
+    /// and those leaves are what a file-backed dictionary reads. An empty
+    /// column stays canonical: there is nothing to train a symbol table on.
     fn compress(plain: VarBinViewArray) -> Result<Self> {
         Self::compress_windowed(plain, DICT_CHUNK_ROWS)
     }
 
-    /// [`compress`](Self::compress) with an explicit window, so tests can
-    /// exercise the multi-window path without building 64 Ki terms.
+    /// [`compress`](Self::compress) in windows of `window` terms, so tests
+    /// reach the multi-window path with few terms.
     pub(super) fn compress_windowed(plain: VarBinViewArray, window: usize) -> Result<Self> {
         if plain.is_empty() {
             return Ok(Self::new(ResidentChunks::new(vec![TermChunk::Canonical(
@@ -292,10 +261,9 @@ impl TermDictionary {
             let mut at = 0usize;
             while at < len {
                 let end = (at + window).min(len);
-                // Canonicalize the window before compressing: `fsst_compress`
-                // requires a VarBinView, not the lazy wrapper `slice` returns.
-                // The view copies share the parent's data buffers, so this is
-                // per-window view headers, not a copy of the terms.
+                // `fsst_compress` takes a VarBinView, not the lazy slice. The
+                // executed view shares the parent's data buffers: only the
+                // window's view headers are copied, not its terms.
                 let piece = array
                     .slice(at..end)?
                     .execute::<VarBinViewArray>(&mut ctx)?
@@ -316,30 +284,27 @@ impl TermDictionary {
     }
 }
 
-/// Bytes an FSST symbol expands to at most — one code never yields more.
+/// Bytes one FSST code expands to at most.
 const FSST_SYMBOL_LEN: usize = 8;
 
-/// Extra output headroom for `decompress_into`.
-///
-/// Its 8-symbols-at-a-time path only runs while the output has
-/// `8 * FSST_SYMBOL_LEN` bytes of room left, so a buffer sized exactly to a
-/// term's expanded codes silently falls back to the byte-at-a-time tail loop.
+/// Output headroom that keeps `decompress_into` on its 8-symbols-at-a-time
+/// path, which runs only while `8 * FSST_SYMBOL_LEN` bytes of room are left:
+/// a buffer sized exactly to a term's expanded codes falls back to the
+/// byte-at-a-time loop.
 const FSST_DECODE_HEADROOM: usize = 8 * FSST_SYMBOL_LEN;
 
-/// The room a scratch buffer is given when a decode first allocates it: a term
-/// of up to 120 FSST codes, past which only unusually long terms go. The
-/// probes of a search over usual terms then decode into it without growing it.
+/// The room a decode first allocates a scratch with: a term of up to 120 FSST
+/// codes, so the probes of a search over usual terms never grow it.
 const SCRATCH_SEED_BYTES: usize = 1024;
 
-/// FSST-compressed sorted terms, with the pieces a hot lookup needs hoisted
-/// out of the Vortex array.
+/// FSST-compressed sorted terms, with the code offsets unpacked for per-row
+/// reads.
 pub(super) struct FsstTerms {
-    /// Kept whole so the dictionary can be serialized without recompressing.
+    /// Kept whole, so the dictionary serializes without recompressing.
     array: FSSTArray,
-    /// Code offsets as `u32`, so a per-row read is a slice index. A leaf's
-    /// 32-bit offsets (`i32` or `u32`) are viewed in place (written offsets
-    /// are never negative); every other width is converted to `u32` in a
-    /// copy.
+    /// Code offsets as `u32`, so a per-row read is a slice index: 32-bit
+    /// offsets (`i32` or `u32`; written offsets are never negative) are viewed
+    /// in place, any other width is converted into a copy.
     offsets: Buffer<u32>,
 }
 
@@ -350,10 +315,9 @@ impl FsstTerms {
             .codes_offsets()
             .clone()
             .execute::<PrimitiveArray>(&mut ctx)?;
-        // 32-bit offsets are viewed as they are. A foreign writer may store
-        // them in any other integer width, which is converted to `u32` in a
-        // copy; the macro covers every width, so its `u32` arm casts
-        // u32 -> u32 without being reached.
+        // A foreign writer may store the offsets in any integer width. The
+        // macro covers every width, so its `u32` arm (never reached) casts
+        // u32 -> u32.
         #[allow(clippy::unnecessary_cast)]
         let offsets: Buffer<u32> = match offsets.ptype() {
             PType::U32 => offsets.to_buffer::<u32>(),
@@ -369,12 +333,9 @@ impl FsstTerms {
         self.array.len()
     }
 
-    /// Decode term `i` into `scratch`, returning the bytes written. The
-    /// scratch is grown to hold the term: an FSST code expands to at most
-    /// one 8-byte symbol, and `decompress_into`'s 8-symbols-at-a-time path
-    /// only runs while the output has `FSST_DECODE_HEADROOM` bytes of room
-    /// left, so a buffer sized exactly to the term would fall back to the
-    /// byte-at-a-time tail loop. A buffer is never given less than
+    /// Term `i` decoded into `scratch`, whose bytes it returns. The scratch is
+    /// first grown to the term's codes expanded at [`FSST_SYMBOL_LEN`] bytes
+    /// each plus [`FSST_DECODE_HEADROOM`], and to at least
     /// [`SCRATCH_SEED_BYTES`].
     fn decode_into<'a>(&self, i: usize, scratch: &'a mut Vec<u8>) -> &'a [u8] {
         let (start, end) = (self.offsets[i] as usize, self.offsets[i + 1] as usize);
@@ -400,8 +361,8 @@ impl FsstTerms {
     }
 }
 
-/// Test hook: how many FSST reads on this thread found their scratch buffer
-/// unallocated, and so allocated a fresh one.
+/// Test hooks: the FSST reads on this thread that allocated a fresh scratch,
+/// and those that grew one.
 #[cfg(test)]
 pub(super) mod scratch_hooks {
     use std::cell::Cell;
@@ -431,19 +392,16 @@ pub(super) mod scratch_hooks {
     }
 }
 
-/// A cursor over a dictionary's terms.
-///
-/// `str_at` borrows from the cursor rather than from the dictionary because an
-/// FSST read decodes into the cursor's own scratch buffer, so the borrow ends
-/// at the next call. Callers needing several terms simultaneously — decoding a
-/// quad's four roles — take one cursor per role.
+/// A cursor over a dictionary's terms. A read borrows from the cursor, not
+/// the dictionary, because an FSST read decodes into the cursor's scratch:
+/// the borrow ends at the next read, so holding several terms at once (a
+/// quad's four roles) takes one cursor each.
 pub(super) struct DictCursor<'a> {
     store: &'a ResidentChunks,
-    /// The first chunk's cursor, held inline: a one-chunk column's cursor
+    /// The first chunk's cursor, held inline, so a one-chunk column's cursor
     /// allocates nothing until a read grows its scratch.
     first: ChunkCursor<'a>,
-    /// One cursor per further chunk, each with its own scratch, so a read
-    /// maps the global index to its chunk and delegates.
+    /// One cursor per further chunk, each with its own scratch.
     rest: Vec<ChunkCursor<'a>>,
 }
 
@@ -457,15 +415,16 @@ pub(super) enum ChunkCursor<'a> {
 }
 
 impl ChunkCursor<'_> {
-    /// Term `local` as a `&str`, borrowed from the cursor like
-    /// [`bytes_at`](Self::bytes_at); trusted to be UTF-8, as the column's
-    /// dtype declares (see [`trusted_str`]).
+    /// Term `local` as a `&str`, borrowed like [`bytes_at`](Self::bytes_at)
+    /// and read unchecked ([`trusted_str`]): the chunk must be a Utf8 column
+    /// of a store this crate wrote or the caller trusts.
     #[cfg(feature = "file-io")]
     #[inline]
     pub(super) fn str_at(&mut self, local: usize) -> &str {
         trusted_str(self.bytes_at(local))
     }
 
+    /// Term `local`'s bytes, borrowed from the cursor until the next read.
     #[inline]
     pub(super) fn bytes_at(&mut self, local: usize) -> &[u8] {
         match self {
@@ -476,8 +435,7 @@ impl ChunkCursor<'_> {
 }
 
 impl DictCursor<'_> {
-    /// Term `i`'s bytes: a one-chunk column reads its one chunk cursor
-    /// directly; otherwise `i` is mapped to its chunk's cursor.
+    /// Term `i`'s bytes, borrowed from the cursor until the next read.
     #[inline]
     pub(super) fn bytes_at(&mut self, i: usize) -> &[u8] {
         if self.rest.is_empty() {
@@ -491,9 +449,9 @@ impl DictCursor<'_> {
         cursor.bytes_at(local)
     }
 
-    /// Term `i` as a `&str`, borrowed from the cursor like
-    /// [`bytes_at`](Self::bytes_at); trusted to be UTF-8, as the column's
-    /// dtype declares (see [`trusted_str`]).
+    /// Term `i` as a `&str`, borrowed like [`bytes_at`](Self::bytes_at) and
+    /// read unchecked ([`trusted_str`]): the terms must come from a store this
+    /// crate wrote or the caller trusts.
     #[inline]
     pub(super) fn str_at(&mut self, i: usize) -> &str {
         trusted_str(self.bytes_at(i))
@@ -501,14 +459,10 @@ impl DictCursor<'_> {
 }
 
 impl TermDictionary {
-    /// Read a dictionary child's whole term column into a resident
-    /// dictionary, keeping each chunk's stored encoding (FSST where the
-    /// writer compressed).
-    ///
-    /// Scans the child through [`scan_reader_chunks`] (inline, no runtime
-    /// handle), so it serves the file-backed open, the buffered `open_buffer`
-    /// open, and the wasm read path alike; each scan chunk's term column is
-    /// adopted as one dictionary chunk.
+    /// The resident dictionary of a `dictionary` child's whole term column,
+    /// each scan chunk adopted as one chunk ([`TermChunk::from_wire`]). The
+    /// scan runs inline ([`scan_reader_chunks`]), with no runtime handle, so
+    /// it serves every open path, wasm's included.
     pub(crate) async fn from_child_reader(reader: vortex_layout::LayoutReaderRef) -> Result<Self> {
         if reader.row_count() == 0 {
             return Ok(Self::empty());
@@ -558,10 +512,10 @@ pub(crate) fn window_bound_aggregates() -> Arc<[vortex_array::aggregate_fn::Aggr
 }
 
 impl TermDictionary {
-    /// This dictionary as a native store component: the sorted term column,
-    /// one chunk per held FSST window ([`child_chunks`](Self::child_chunks)),
-    /// written verbatim through the pass-through strategy as the root's
-    /// required `dictionary` child (see `container::dict_child_strategy`).
+    /// This dictionary as the root's required `dictionary` component: the
+    /// chunks of [`child_chunks`](Self::child_chunks), each written verbatim
+    /// as one flat leaf, with one zone per window when the windows are
+    /// uniform ([`uniform_window`](Self::uniform_window)).
     pub(crate) fn to_write(&self) -> Result<crate::io::container::NativeComponentWrite> {
         use crate::io::container::{
             self, BufferedComponentSource, DICT_COMPONENT_NAME, NativeComponentWrite,
@@ -585,14 +539,11 @@ impl TermDictionary {
         .map_err(VortexRdfError::Vortex)
     }
 
-    /// The dictionary component's body, one `{_dict_term: utf8}` struct per
-    /// held term chunk — row i of the concatenation = the term with code i,
-    /// in the encoding the dictionary is held in (FSST when compressed at the
-    /// source). Chunk-granular because each chunk is a self-contained array
-    /// (independent FSST windows, see [`compress`](Self::compress)) written
-    /// verbatim as one flat leaf, so its boundary survives as a split of the
-    /// serialized child. Always at least one chunk, possibly empty — the
-    /// child strategy needs a chunk to write a schema-complete component.
+    /// The component's body: one `{_dict_term: utf8}` struct per held chunk,
+    /// in its stored encoding, row i of the concatenation the term with code
+    /// i. Each chunk is written as one flat leaf, so the windows survive as
+    /// the child's leaves. At least one chunk, possibly empty: the child
+    /// strategy needs one to write a schema-complete component.
     pub(crate) fn child_chunks(&self) -> Result<Vec<ArrayRef>> {
         let wrap = |terms: ArrayRef| -> Result<ArrayRef> {
             let rows = terms.len();
@@ -612,10 +563,10 @@ impl TermDictionary {
             .collect()
     }
 
-    /// The window every held chunk but the last fills — the zone length the
-    /// dictionary child is written with — or `None` when the chunks are not
-    /// one uniform window (chunks adopted from a foreign file), which then
-    /// go without a zone map. A single chunk is its own window; an empty
+    /// The length every held chunk but the last fills, and the last at most:
+    /// the zone length the child is written with, one zone per leaf. `None`
+    /// for chunks of uneven length (adopted from a foreign file), which are
+    /// written without a zone map. A single chunk is its own window; an empty
     /// dictionary has none.
     pub(crate) fn uniform_window(&self) -> Option<std::num::NonZeroUsize> {
         let (last, rest) = self.terms.chunks.split_last()?;

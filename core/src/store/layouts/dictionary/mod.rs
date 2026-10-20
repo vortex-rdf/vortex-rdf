@@ -1,11 +1,12 @@
-//! The term-dictionary subsystem of [`LayoutStrategy::Dictionary`]. This
-//! folder is the whole of it: [`codec`] owns the chunk encode/decode paths,
-//! [`ingest`] the build-side term collection and interning, [`storage`] how
-//! a resident dictionary holds its terms and the dictionary child's read
-//! and write sides, [`term_dict`] the frozen dictionary itself and its
-//! lookups, [`file_backed`] the on-demand file residency, [`handles`] the
-//! residency seam the resolved layout speaks through and the public
-//! handles, and [`predicates`] the term predicates evaluated on spellings.
+//! The term dictionary of [`LayoutStrategy::Dictionary`]: s/p/o/g stored as
+//! codes into one sorted dictionary of N-Triples spellings, a term's code
+//! being its rank, so code order is byte order. [`codec`] encodes and
+//! decodes chunks, [`ingest`] collects and interns terms at build time,
+//! [`storage`] holds a resident dictionary's terms and reads and writes the
+//! `dictionary` child, [`term_dict`] is the frozen dictionary,
+//! [`file_backed`] reads the terms from the file on demand, [`handles`] is
+//! the residency seam and the public handles, and [`predicates`] evaluates
+//! term predicates on spellings.
 //!
 //! [`LayoutStrategy::Dictionary`]: super::LayoutStrategy::Dictionary
 
@@ -39,8 +40,7 @@ pub use self::predicates::{
 };
 pub(crate) use self::term_dict::TermDictionary;
 
-// Read only by the out-of-core builder, which is compiled out on
-// wasm32-unknown-unknown.
+// Read only by the sorted-stream builder, which wasm lacks.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) use self::codec::code_of;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

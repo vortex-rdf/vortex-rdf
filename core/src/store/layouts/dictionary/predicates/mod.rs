@@ -1,24 +1,13 @@
-//! Term predicates evaluated on a dictionary's N-Triples spellings — the
-//! native half of a query layer's `FILTER` fast path.
-//!
-//! A [`TermPredicate`] answers a single-variable SPARQL test (`isIRI(?x)`,
-//! `datatype(?x) = <dt>`, `lang(?x) = "en"`, `langMatches(lang(?x), "en")`,
-//! `?x < 5`, `strstarts(str(?x), "http://…")`, `contains(lcase(?x), "ab")`,
-//! `regex(str(?x), "^http")`) for one term, read straight off its spelling,
-//! with a three-valued [`Verdict`]. The rules are deliberately
-//! **conservative**: a verdict is `True` or `False` only where the SPARQL
-//! semantics over the stored spelling are total and cheap to decide;
-//! everything else — a lexical form the XSD grammar does not cover, a
-//! comparison the value model cannot settle exactly, a datatype the rules do
-//! not know — is `Unknown`, for the caller to resolve with a full SPARQL
-//! engine. A caller therefore never gets a wrong definite answer, only a
-//! slower one.
-//!
-//! A predicate is evaluated over the *candidate* codes a query produced
-//! (`filter_codes`): a code whose kind range decides it
-//! ([`TermPredicate::kind_verdict`]) is not read; every other one is read and
-//! its spelling parsed — the lexical form unescaped, the language tag and
-//! datatype taken from the spelling — before the predicate looks at it.
+//! Term predicates evaluated on N-Triples spellings: single-variable SPARQL
+//! tests (`isIRI(?x)`, `datatype(?x) = <dt>`, `lang(?x) = "en"`,
+//! `langMatches`, `?x < 5`, `strstarts`, `contains`, `regex`, …) read off one
+//! term's spelling, with a three-valued [`Verdict`]. Verdicts are
+//! conservative: `True` or `False` only where the SPARQL semantics over the
+//! stored spelling are total, `Unknown` otherwise (a lexical form outside
+//! the XSD grammar, a comparison the value model cannot settle exactly, an
+//! unknown datatype), for a full SPARQL engine to decide. A caller never gets
+//! a wrong definite answer. Over candidate codes, a code whose kind range
+//! decides it ([`TermPredicate::kind_verdict`]) is not read.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -38,17 +27,16 @@ use self::regex_filter::RegexTest;
 pub use self::text::{CaseMap, TextOptions, TextPredicate};
 use self::text::{TextConstant, TextTest};
 
-/// The code ranges of a sorted dictionary's term kinds. Codes are
-/// lexicographic ranks of the N-Triples spelling, offset by the dictionary's
-/// first code, so every kind is one contiguous range, in byte order: the
-/// empty spelling of the default graph (the first code, when any quad is in
-/// the default graph), then literals (`"`), IRIs (`<`), blank nodes (`_:`).
-/// Anything a dictionary of this crate never holds falls in the gaps between
-/// those ranges.
+/// The code ranges of a sorted dictionary's term kinds. Codes are the ranks
+/// of the N-Triples spellings from the dictionary's first code, so each kind
+/// is one contiguous range, in byte order: the default graph's empty
+/// spelling (the first code, when any quad is in the default graph), then
+/// literals (`"`), IRIs (`<`) and blank nodes (`_:`). Spellings no dictionary
+/// of this crate holds fall in the gaps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KindRanges {
     /// The dictionary's first code: every code is at or above it. 0 in every
-    /// dictionary this version builds.
+    /// dictionary this crate builds or opens.
     pub start: TermCode,
     /// The code of `""`, the default graph's name, when present.
     pub default_graph: Option<TermCode>,
@@ -85,8 +73,8 @@ impl KindRanges {
         }
     }
 
-    /// The codes in none of the three kind ranges, ascending from `start` —
-    /// a foreign writer's spellings, and the default graph's `""`.
+    /// The codes in none of the three kind ranges, ascending from `start`:
+    /// the default graph's `""` and a foreign writer's spellings.
     pub fn gaps(&self) -> impl Iterator<Item = TermCode> + '_ {
         (self.start..self.literals.start)
             .chain(self.literals.end..self.iris.start)
@@ -194,18 +182,18 @@ pub enum TermPredicate {
     IsIri,
     /// `isBLANK(?x)`.
     IsBlank,
-    /// `datatype(?x) = <iri>` — a plain literal has `xsd:string`, a
+    /// `datatype(?x) = <iri>`: a plain literal has `xsd:string`, a
     /// language-tagged one `rdf:langString`, a typed one its datatype; the
     /// lexical form is never inspected.
     Datatype(String),
-    /// `lang(?x) = "tag"` — exact comparison against the stored tag (which
-    /// the ingest lowercases); an untagged literal has the empty tag.
+    /// `lang(?x) = "tag"`: an exact comparison with the stored tag (which the
+    /// ingest lowercases); an untagged literal has the empty tag.
     Lang(String),
-    /// `langMatches(lang(?x), "range")` — BCP 47 basic filtering: `*`
-    /// matches any non-empty tag, otherwise a case-insensitive match of the
-    /// range to the tag or to a `-`-delimited prefix of it. Any range but
-    /// `*` with a character outside ASCII letters, digits and hyphens is
-    /// undecided on a tagged literal: rdflib may read it differently.
+    /// `langMatches(lang(?x), "range")`: BCP 47 basic filtering, `*` matching
+    /// any non-empty tag and any other range matching the tag, or a
+    /// `-`-delimited prefix of it, case-insensitively. Any range but `*` with
+    /// a character outside ASCII letters, digits and hyphens is undecided on
+    /// a tagged literal: rdflib may read it differently.
     LangMatches(String),
     /// `?x <op> <numeric constant>` under the SPARQL operator mapping.
     Num(NumOp, Number),
@@ -233,7 +221,7 @@ impl TermPredicate {
 
     /// Parse a `(kind, arg)` pair and a string kind's options. String kinds:
     /// `str_prefix` (arg: the raw prefix), `contains`, `strstarts`,
-    /// `strends` (arg: the constant's strict N-Triples spelling — a literal,
+    /// `strends` (arg: the constant's strict N-Triples spelling, a literal,
     /// `<iri>` or `_:blank`; a malformed one is an error), `regex` (arg: the
     /// pattern as written, with the SPARQL `flags` option; a pattern outside
     /// the supported subset, or too large once compiled, parses and leaves
@@ -646,8 +634,8 @@ mod tests {
         // "…#string" < "…#unsignedInt".
         let u = typed("5", "http://www.w3.org/2001/XMLSchema#unsignedInt");
         assert_eq!(p("num_lt", &u).eval("\"abc\""), Verdict::True);
-        // Equality and inequality against a non-numeric literal, plain or
-        // language-tagged, are left to the engine.
+        // Equality against a plain non-numeric literal, and inequality
+        // against a plain or a language-tagged one, are left to the engine.
         assert_eq!(p("num_eq", "5").eval("\"abc\""), Verdict::Unknown);
         assert_eq!(p("num_ne", "5").eval("\"abc\""), Verdict::Unknown);
         assert_eq!(p("num_ne", "5").eval("\"abc\"@en"), Verdict::Unknown);

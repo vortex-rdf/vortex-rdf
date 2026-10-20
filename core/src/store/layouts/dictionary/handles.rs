@@ -1,11 +1,7 @@
-//! The *residency* axis of the Dictionary layout: how a resolved store
-//! reaches its term dictionary — held whole in memory, or left in the file's
-//! dictionary child and probed on demand. The dictionary itself lives in the
-//! sibling modules — storage and FSST in [`storage`](super::storage),
-//! probing in [`term_dict`](super::term_dict), the on-demand form in
-//! [`file_backed`](super::file_backed) — and this seam is what couples them
-//! to the layout's pattern vocabulary. The public handles on a store's
-//! dictionary, [`DictSnapshot`] and [`DictReader`], sit beside the seam.
+//! How a resolved store reaches its term dictionary ([`DictAccess`]): held
+//! whole in memory, or left in the file's `dictionary` child and read on
+//! demand. Beside the seam are the public handles on a store's dictionary,
+//! [`DictSnapshot`] and [`DictReader`].
 
 use std::sync::Arc;
 
@@ -20,50 +16,35 @@ use super::file_backed::FileBackedDict;
 use super::predicates::{KindRanges, TermPredicate};
 use super::term_dict::TermDictionary;
 
-/// How a resolved Dictionary layout reaches its term dictionary: the
-/// *residency* axis, sitting above `ResidentChunks`' encoding axis.
-///
-/// `Resident` holds the whole dictionary in memory; `FileBacked` leaves the
-/// terms in the file's scannable dictionary child and reads them on demand,
-/// which makes term↔code translation asynchronous. The method contract that
-/// keeps both arms behind one seam:
-///
-/// - [`resolve_pattern`](Self::resolve_pattern) is the dictionary half of the
-///   **async prelude**: the one place a dictionary is allowed to perform I/O
-///   during a match. It runs before the synchronous match core and
-///   pre-resolves every bound term of the pattern into the match's
-///   [`PatternCodes`] witness — which only the prelude mints — so the core's
-///   synchronous probes can only ever run over a prelude that ran, and answer
-///   from its codes without touching the dictionary again. That witness is
-///   what confines a file-backed dictionary's I/O to this method.
-/// - [`resident`](Self::resident) hands out the in-memory dictionary itself
-///   (`None` for `FileBacked`), for the paths that genuinely need the whole
-///   column; [`ensure_resident`](Self::ensure_resident) lifts a file-backed
-///   dictionary transiently when serialization must have it.
+/// How a resolved Dictionary layout reaches its term dictionary: whole in
+/// memory (`Resident`), or left in the file's `dictionary` child and read on
+/// demand (`FileBacked`), which makes term ↔ code translation asynchronous.
+/// During a match the dictionary does I/O in
+/// [`resolve_pattern`](Self::resolve_pattern) only: that async prelude
+/// resolves every bound role into the match's [`PatternCodes`] witness,
+/// which only the prelude mints, so the synchronous match core answers from
+/// those codes and never touches the dictionary. Paths that need the whole
+/// column take [`resident`](Self::resident), or lift a file-backed
+/// dictionary transiently with [`ensure_resident`](Self::ensure_resident).
 #[derive(Clone)]
 pub(crate) enum DictAccess {
     /// The whole dictionary in memory (FSST-compressed or canonical).
     Resident(Arc<TermDictionary>),
-    /// The dictionary left in its file, read on demand through the leaves a
-    /// call touches — what every file store opens with, unless the child's
-    /// layout shape declines the handle (see
-    /// [`VortexRdfStore::from_file`](crate::store::VortexRdfStore::from_file)).
+    /// The dictionary left in its file, read through the leaves a call
+    /// touches: what every file store opens with, unless the child's shape
+    /// declines it
+    /// ([`VortexRdfStore::from_file`](crate::store::VortexRdfStore::from_file)).
     #[cfg(feature = "file-io")]
     FileBacked(FileBackedDict),
 }
 
 impl DictAccess {
-    /// Pre-resolve every bound term of `pattern` into `codes`, the
-    /// [`PatternCodes`] witness the async prelude
+    /// Resolve every bound term of `pattern` into `codes`, the witness the
+    /// async prelude
     /// ([`prepare_pattern`](crate::store::layouts::ResolvedLayout::prepare_pattern))
-    /// minted for this dictionary's layout — the prelude's dictionary half,
-    /// run before the synchronous match core.
-    ///
-    /// For `Resident` the lookups are in-memory binary searches, all resolved
-    /// here so the invariant the match core is written against holds under
-    /// either residency — *after the prelude, every bound role is in the
-    /// witness* — which is what lets a file-backed dictionary do its I/O here
-    /// and nowhere else.
+    /// minted. A resident dictionary resolves them here too, so under either
+    /// residency every bound role is in the witness once the prelude has
+    /// run.
     pub(in crate::store::layouts) async fn resolve_pattern(
         &self,
         pattern: QuadPattern<'_>,
@@ -75,12 +56,9 @@ impl DictAccess {
                     codes.resolve(term, |t| dict.encode_exact(t));
                 }
             }
-            // Each bound role costs one window search of the mapped
-            // dictionary child; the resolved code is then seeded into the
-            // witness so the sync match core never reaches back here. The
-            // searches are independent, so they run overlapped rather than
-            // one await after another; concurrency is why each term is
-            // rendered into its own String here.
+            // One window search per bound role. The searches are independent
+            // and run overlapped, so each term is rendered into its own
+            // String.
             #[cfg(feature = "file-io")]
             DictAccess::FileBacked(fb) => {
                 let rendered: Vec<String> = pattern.bound_roles().map(|t| t.to_string()).collect();
@@ -95,10 +73,7 @@ impl DictAccess {
         Ok(())
     }
 
-    /// The in-memory dictionary, or `None` when it is file-backed — sync
-    /// callers (snapshots, in-memory chunk decode) treat `None` as "not
-    /// available here"; paths that genuinely need the whole column go through
-    /// [`ensure_resident`](Self::ensure_resident).
+    /// The in-memory dictionary; `None` when file-backed.
     pub(crate) fn resident(&self) -> Option<&Arc<TermDictionary>> {
         match self {
             DictAccess::Resident(dict) => Some(dict),
@@ -107,17 +82,15 @@ impl DictAccess {
         }
     }
 
-    /// A residency-agnostic handle on the dictionary: a clone of this
+    /// A handle on the dictionary under either residency: a clone of this
     /// access (an `Arc` bump).
     pub(crate) fn reader(&self) -> DictReader {
         DictReader(self.clone())
     }
 
-    /// The whole dictionary in memory, lifting a file-backed one with a single
-    /// term-column scan — for the operations that need the full column
-    /// (serialization, compaction, tail-merge re-encoding). The lift is
-    /// transient: it is not cached back into the access, so a store's steady
-    /// state keeps the file-backed footprint.
+    /// The whole dictionary in memory, lifting a file-backed one with one
+    /// term-column scan. The lift is transient, never cached into the
+    /// access, so the store keeps its file-backed footprint.
     pub(crate) async fn ensure_resident(&self) -> Result<Arc<TermDictionary>> {
         match self {
             DictAccess::Resident(dict) => Ok(Arc::clone(dict)),
@@ -126,9 +99,8 @@ impl DictAccess {
         }
     }
 
-    /// Whether the terms are read from the file on demand, so reconstruction
-    /// must decode through the file (async) rather than the resident
-    /// dictionary.
+    /// Whether the terms are read from the file on demand, so a decode goes
+    /// through the file (async).
     pub(crate) fn is_file_backed(&self) -> bool {
         match self {
             DictAccess::Resident(_) => false,
@@ -146,7 +118,6 @@ impl DictAccess {
         }
     }
 
-    /// Number of terms.
     pub(crate) fn len(&self) -> usize {
         match self {
             DictAccess::Resident(dict) => dict.len(),
@@ -157,35 +128,31 @@ impl DictAccess {
 }
 
 /// An immutable handle on a Dictionary-layout store's resident term
-/// dictionary, taken with [`DictReader::snapshot`].
-///
-/// Cloning is an `Arc` bump, and the snapshot retains only the dictionary — not
-/// the store or its quad columns.
+/// dictionary, taken with [`DictReader::snapshot`]. Cloning is an `Arc`
+/// bump; the snapshot keeps only the dictionary alive, not the store or its
+/// quad columns.
 ///
 /// **Term codes are only meaningful against the dictionary they were produced
-/// with.** Mutating a store re-encodes it against a *fresh* dictionary, so a
-/// consumer holding codes must decode them through the snapshot taken when it
-/// received them, not through the store as it stands later — otherwise codes
-/// silently resolve to the wrong terms. Holding the snapshot keeps exactly the
-/// dictionary those codes address alive, and nothing more.
+/// with.** Mutating a store re-encodes it against a fresh dictionary, so a
+/// consumer holding codes decodes them through the snapshot taken when it
+/// received them, not through the store as it stands later, where they can
+/// silently resolve to other terms.
 #[derive(Clone)]
 pub struct DictSnapshot(pub(crate) Arc<TermDictionary>);
 
 impl DictSnapshot {
-    /// Decode a term code to its N-Triples string, or `None` when the code is
-    /// out of this dictionary's range.
+    /// The N-Triples spelling of `code`; `None` when the code is out of
+    /// range.
     pub fn decode(&self, code: TermCode) -> Option<String> {
         self.0.decode(code)
     }
 
-    /// Encode a term to its code (its position in the sorted dictionary), or
-    /// `None` when this dictionary does not hold the term. The inverse of
-    /// [`decode`](Self::decode); a binary search over the dictionary.
-    ///
-    /// Tolerant of spelling: an IRI with or without angle brackets, a literal
-    /// with escape variants, an `xsd:string` typing, an upper-case language
-    /// tag, or a default-graph spelling (`""`, `default`, `[]`) all resolve
-    /// to the code of the stored form. Malformed input is an
+    /// The code of `term` (its rank in the sorted dictionary); `None` when
+    /// the dictionary does not hold it. Tolerant of spelling: an IRI with or
+    /// without angle brackets, a literal's escape variants, an `xsd:string`
+    /// typing, an upper-case language tag and the default-graph spellings
+    /// (`""`, `default`, `[]`) all resolve to the stored form's code.
+    /// Malformed input is an
     /// [`InvalidInput`](crate::VortexRdfError::InvalidInput) error.
     pub fn encode(&self, term: &str) -> Result<Option<TermCode>> {
         self.0.encode(term)
@@ -226,9 +193,9 @@ impl DictSnapshot {
         self.0.decode_many_with(codes, visit);
     }
 
-    /// The code of the first term not below `term` in byte order (the
-    /// dictionary's size when every term is below it): a present term's own
-    /// code, or where an absent one would sort.
+    /// The code of the first term not below `term` in byte order: a present
+    /// term's own code, or where an absent one would sort; the dictionary's
+    /// size when every term is below it.
     pub fn lower_bound(&self, term: &str) -> TermCode {
         self.0.lower_bound(term.as_bytes())
     }
@@ -247,11 +214,12 @@ impl DictSnapshot {
         self.0.kind_ranges().clone()
     }
 
-    /// `predicate` over the candidate `codes` — ascending, unique and inside
-    /// the dictionary, else an `InvalidInput` error: `(passed,
-    /// undecided)`, both ascending subsets of `codes`; a candidate in
-    /// neither fails the predicate. Only candidates whose kind does not
-    /// decide them are read. Nothing is memoized.
+    /// `predicate` over the candidate `codes`, which must ascend strictly
+    /// inside the dictionary (else an `InvalidInput` error): `(passed,
+    /// undecided)`, both ascending subsets of `codes`. An undecided candidate
+    /// is for a full SPARQL engine to decide; one in neither fails the
+    /// predicate. Only the candidates their kind does not decide are read.
+    /// Nothing is memoized.
     pub fn filter_codes(
         &self,
         predicate: &TermPredicate,
@@ -264,19 +232,18 @@ impl DictSnapshot {
 /// A handle on a Dictionary-layout store's term dictionary under either
 /// residency, taken with
 /// [`VortexRdfStore::dict_reader`](crate::store::VortexRdfStore::dict_reader):
-/// the same term ↔ code surface as [`DictSnapshot`], asynchronous so a
-/// dictionary left in its file can answer by reading it. Every method
-/// completes without suspending on a resident dictionary.
+/// [`DictSnapshot`]'s term ↔ code surface, asynchronous so a dictionary left
+/// in its file can answer by reading it. On a resident dictionary every
+/// method completes without suspending.
 ///
-/// Like a snapshot, codes are only meaningful against the dictionary they
-/// were produced with; a file-backed reader additionally keeps the store's
-/// file handle alive.
+/// As with a snapshot, codes are only meaningful against the dictionary they
+/// were produced with; a file-backed reader also keeps the store's file
+/// handle alive.
 #[derive(Clone)]
 pub struct DictReader(DictAccess);
 
 impl DictReader {
-    /// Whether the terms are read from the file on demand (`true`) or held
-    /// in memory (`false`).
+    /// Whether the terms are read from the file on demand.
     pub fn is_file_backed(&self) -> bool {
         self.0.is_file_backed()
     }
@@ -296,19 +263,18 @@ impl DictReader {
     /// the dictionary a build, an open or a `compact` makes, so a consumer
     /// that caches codes knows when they stop applying. Equal ids promise
     /// equal codes; dictionaries under different ids may still hold the same
-    /// terms. Resident and file-backed dictionaries are numbered by one
-    /// process-wide counter, and an id is never persisted.
+    /// terms. Ids come from one process-wide counter and are never persisted.
     pub fn dictionary_id(&self) -> u64 {
         self.0.id()
     }
 
-    /// The synchronous [`DictSnapshot`] of a resident dictionary, `None`
+    /// The synchronous [`DictSnapshot`] of a resident dictionary; `None`
     /// when the terms are file-backed.
     pub fn snapshot(&self) -> Option<DictSnapshot> {
         self.0.resident().map(|dict| DictSnapshot(Arc::clone(dict)))
     }
 
-    /// The N-Triples string for `code`, or `None` when the code is out of
+    /// The N-Triples spelling of `code`; `None` when the code is out of
     /// range.
     pub async fn decode(&self, code: TermCode) -> Result<Option<String>> {
         match &self.0 {
@@ -318,10 +284,9 @@ impl DictReader {
         }
     }
 
-    /// [`decode`](Self::decode) over a batch, in order: any order and
-    /// repeats are fine (a file-backed dictionary reads each distinct code
-    /// once, in one batch). [`decode_many_with`](Self::decode_many_with)
-    /// collected, one owned string per position.
+    /// [`decode`](Self::decode) over a batch, in order, whatever the codes'
+    /// order and repeats: [`decode_many_with`](Self::decode_many_with), one
+    /// owned string per position.
     pub async fn decode_many(&self, codes: &[TermCode]) -> Result<Vec<Option<String>>> {
         let mut terms = vec![None; codes.len()];
         self.decode_many_with(codes, |i, term| terms[i] = term.map(str::to_owned))
@@ -336,8 +301,8 @@ impl DictReader {
     /// in the order of `codes`; a file-backed one visits the out-of-range
     /// positions first, then reads each distinct code once, in one batch, and
     /// visits every position holding it, in code order. The `Result` reports
-    /// a failed read of the file; terms are trusted to be UTF-8, as the
-    /// column's dtype declares.
+    /// a failed read of the file. Terms are read as UTF-8 unchecked, so the
+    /// store must be one this crate wrote or the caller trusts.
     pub async fn decode_many_with(
         &self,
         codes: &[TermCode],

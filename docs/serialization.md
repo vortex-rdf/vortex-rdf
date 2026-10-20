@@ -178,7 +178,7 @@ of its adjacent repeats, and built into one struct of primary columns through
 index families are sorted over that same vector ([§8](#8-secondary-indexes-at-build-time)).
 
 **Dictionary layout.** Terms are interned as they arrive
-([`InterningQuadBuilder`](../core/src/store/layouts/dictionary/ingest.rs#L212)):
+([`InterningQuadBuilder`](../core/src/store/layouts/dictionary/ingest.rs#L189)):
 each distinct term is held once (a `Box<str>` keyed map), and each quad is kept
 as four provisional `u64` codes. `finish` sorts the distinct terms, freezes them
 into the dictionary, replaces every provisional code by its term's sorted rank —
@@ -187,7 +187,7 @@ lexicographic ranks, sorting `[u64; 4]` rows is the same order as sorting the
 term strings, so the sort moves 32-byte rows instead of four-string structs;
 equal rows are then adjacent and the repeats are dropped, since equal codes are
 equal terms.
-[`DictionaryQuadSink`](../core/src/store/layouts/dictionary/ingest.rs#L166) is
+[`DictionaryQuadSink`](../core/src/store/layouts/dictionary/ingest.rs#L153) is
 the push-based form of the same ingest, for callers that produce quads one at a
 time (the wasm array path).
 
@@ -221,7 +221,7 @@ flowchart TD
 that would overflow is sorted and spilled as one run file. A dataset that fits
 in a single buffer never touches the filesystem — the sorted buffer *is* the
 run. Under the Dictionary layout every term is also inserted into a
-[`TermDictionaryBuilder`](../core/src/store/layouts/dictionary/ingest.rs#L103)
+[`TermDictionaryBuilder`](../core/src/store/layouts/dictionary/ingest.rs#L95)
 during this same pass, so the global dictionary is complete before any chunk
 flows; the whole distinct-term set is the one thing this pipeline holds for the
 dataset's lifetime.
@@ -241,7 +241,7 @@ row ids are.
 every poll of the chunk stream pulls up to a chunk's worth of quads off the
 heap and builds one struct
 ([`build_struct_array`](../core/src/store/builders/mod.rs#L132), or
-[`dictionary::build_chunk`](../core/src/store/layouts/dictionary/codec.rs#L127)
+[`dictionary::build_chunk`](../core/src/store/layouts/dictionary/codec.rs#L106)
 encoding each term through the term→code map). With indexes the merge runs to
 completion first ([`merge_feeding_indexes`](../core/src/store/builders/stream_indexes.rs#L127)):
 row ids are only known as the merge assigns them, and an index child is a
@@ -315,17 +315,17 @@ is the sorted set of every distinct term of the dataset — subjects, predicates
 objects and graph names in one namespace, the default graph's `""` included. A
 term's code is its position, so code order equals string order and a bound
 term resolves to its code by binary search. The frozen column is
-FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/storage.rs#L269)):
+FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/storage.rs#L238)):
 one symbol table is trained on the whole column and the terms are compressed in
-independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage.rs#L39)
+independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/storage.rs#L36)
 (65,536) terms, each window a self-contained FSST array. The term count must
 fit an `i32`.
 
 Which pipeline built the dictionary decides how its term→code map is held during
 encoding: borrowed from the live quads in memory
-([`from_quads_with_map`](../core/src/store/layouts/dictionary/ingest.rs#L85)),
+([`from_quads_with_map`](../core/src/store/layouts/dictionary/ingest.rs#L77)),
 owned when the quads were spilled and cannot be borrowed from
-([`TermDictionaryBuilder::finish`](../core/src/store/layouts/dictionary/ingest.rs#L126)).
+([`TermDictionaryBuilder::finish`](../core/src/store/layouts/dictionary/ingest.rs#L117)).
 Either way the map exists only for the build; stores keep the columnar
 dictionary alone.
 

@@ -1,7 +1,6 @@
 //! An owning probe: the array and its resolved [`SortedProbe`] in one value,
-//! so callers can resolve once and reuse the probe across calls (typically
-//! behind an `Arc` in a per-column cache) instead of re-walking the encoding
-//! tree on every search.
+//! resolved once and reused across calls (typically behind an `Arc` in a
+//! per-column cache).
 
 use vortex_array::ArrayRef;
 

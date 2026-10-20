@@ -1,9 +1,7 @@
-//! Resolution of an encoded array into a probe tree.
-//!
-//! Resolution is downcasts and metadata reads only — no child is decoded and
-//! no `ExecutionCtx` is created. Any node outside the supported set, any
-//! nullable or non-unsigned-integer dtype, and any non-host buffer declines
-//! the whole tree.
+//! Resolution of an encoded array into a probe tree: downcasts and metadata
+//! reads only, with no child decoded and no `ExecutionCtx` created. Any node
+//! outside the supported set, any nullable or non-unsigned-integer dtype,
+//! and any non-host buffer declines the whole tree.
 
 use vortex_array::ArrayRef;
 use vortex_array::arrays::chunked::ChunkedArrayExt as _;
@@ -96,8 +94,9 @@ pub(crate) fn resolve_node<'a>(arr: &'a ArrayRef) -> Option<Node<'a>> {
     }
 
     if let Some(view) = arr.as_opt::<BitPacked>() {
-        // One bit width for every block; per-block widths (no wire form yet)
-        // decline, since a block's words no longer sit at a fixed stride.
+        // One bit width for every block; per-block widths (which have no wire
+        // form) decline, since a block's words no longer sit at a fixed
+        // stride.
         let BitWidthsView::Global(bit_width) = view.bit_widths() else {
             return None;
         };

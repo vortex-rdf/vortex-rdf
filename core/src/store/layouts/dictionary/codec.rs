@@ -1,18 +1,8 @@
-//! Column-building and decoding logic for [`LayoutStrategy::Dictionary`]:
-//! s/p/o/g stored as [`TermCode`]s (`u64`) into a global sorted term dictionary (see
-//! [`term_dict`](super::term_dict)), which travels beside the array in memory
-//! and reaches serialized files as the native container's `dictionary` child
-//! (see `crate::io::container`).
-//!
-//! Unlike the other layouts, chunks are not built through the generic
-//! `build_struct_array` path: encoding requires the global `TermDictionary`
-//! (complete only after the whole dataset has been ingested), so the builders
-//! run a dedicated two-pass pipeline that calls `build_chunk` directly.
-//! Secondary indexes compose normally: like every layout's, their children
-//! are built beside the chunks — over the encoded codes rather than the term
-//! strings, which sort identically.
-//!
-//! [`LayoutStrategy::Dictionary`]: crate::store::layouts::LayoutStrategy::Dictionary
+//! Dictionary-layout chunks: four [`TermCode`] (`u64`) columns encoded through
+//! the store's term dictionary, and decoded back into quads. A chunk needs
+//! the complete dictionary, so these builds bypass the generic
+//! `build_struct_array` path; index children are built over the codes,
+//! which sort as the terms do.
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
@@ -41,10 +31,9 @@ use super::file_backed::FileBackedDict;
 use super::storage::DictCursor;
 use super::term_dict::{CodeSpace, TermDictionary, check_code};
 
-/// Dictionary-encoded quad columns: [`RawQuad`] terms replaced by their
-/// codes in the global sorted term dictionary. Produced by the Dictionary
-/// layout's encoding pass and consumed by index builders, which can work on
-/// codes directly (sorted-dictionary codes preserve lexicographic order).
+/// Dictionary-encoded quad columns: every term replaced by its code. Code
+/// order is the terms' byte order, so index children built over the codes
+/// sort as they would over the terms.
 pub(crate) struct QuadCodes {
     pub(crate) s: Vec<TermCode>,
     pub(crate) p: Vec<TermCode>,
@@ -53,8 +42,8 @@ pub(crate) struct QuadCodes {
 }
 
 impl QuadCodes {
-    /// The encoding of no quads — what an empty build's index children are
-    /// built over, so they carry the code dtypes a non-empty build's would.
+    /// The encoding of no quads: an empty build's index children are built
+    /// over it, so they carry the code dtypes.
     pub(crate) fn empty() -> Self {
         Self {
             s: Vec::new(),
@@ -65,15 +54,8 @@ impl QuadCodes {
     }
 }
 
-/// The dictionary code of `term` in `code_map`, or the encoding error for a
-/// term the dictionary does not hold.
-///
-/// Generic over the map's key so both the owned `TermCodeMap` (streaming
-/// builders) and the borrowed [`BorrowedTermCodeMap`] (builders holding a
-/// live quad slice) work without a second code path — `&str: Borrow<str>`
-/// makes the `get(term)` lookup identical for either.
-///
-/// [`BorrowedTermCodeMap`]: super::ingest::BorrowedTermCodeMap
+/// The code of `term` in `code_map`, keyed by owned or borrowed terms; a
+/// `Serialization` error for a term the map lacks.
 pub(crate) fn code_of<K>(code_map: &HashMap<K, TermCode>, term: &str) -> Result<TermCode>
 where
     K: Borrow<str> + Eq + Hash,
@@ -86,7 +68,7 @@ where
     })
 }
 
-/// Encode every term of every quad to its dictionary code (see [`code_of`]).
+/// Every term of every quad as its code in `code_map` ([`code_of`]).
 pub(crate) fn encode_quads<K>(
     quads: &[RawQuad],
     code_map: &HashMap<K, TermCode>,
@@ -118,11 +100,8 @@ where
     Ok(codes)
 }
 
-/// Build a Dictionary-layout StructArray chunk from raw quads: four code
-/// columns encoded against the global dictionary. Secondary indexes are built
-/// separately as components (see
-/// [`build_components`](crate::store::builders::build_components)),
-/// so nothing else rides here.
+/// A Dictionary-layout chunk of `quads`: four code columns encoded through
+/// `code_map`, `s_sorted` as for [`build_code_chunk`].
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) fn build_chunk<K>(
     quads: &[RawQuad],
@@ -136,14 +115,8 @@ where
     build_code_chunk(&codes, 0..quads.len(), s_sorted)
 }
 
-/// Build the whole dataset as one contiguous Dictionary-layout chunk from its
-/// codes — the in-memory builders' construction path, fed by the interning
-/// ingest ([`InterningQuadBuilder`]) so no owned quad strings are involved.
-///
-/// The codes arrive in global (s, p, o, g) order, so the `s` column is
-/// stamped sorted.
-///
-/// [`InterningQuadBuilder`]: super::ingest::InterningQuadBuilder
+/// The whole dataset as one chunk. `codes` must be in global (s, p, o, g)
+/// order: the `s` column is stamped sorted.
 pub(crate) fn build_array(codes: &QuadCodes) -> Result<ArrayRef> {
     if codes.s.is_empty() {
         return empty_struct();
@@ -152,16 +125,11 @@ pub(crate) fn build_array(codes: &QuadCodes) -> Result<ArrayRef> {
     build_code_chunk(codes, 0..n, true)
 }
 
-/// Build a Dictionary-layout chunk for rows `range` of an already encoded
-/// dataset: the four code columns, and nothing else. The term dictionary
-/// is *not* a column of the chunk: in memory it lives in the layout
-/// ([`DictAccess`]), and serialized files carry it as the native container's
-/// `dictionary` child.
-///
-/// `s_sorted` stamps the `IsSorted` statistic on the `s` column; valid
-/// because sorted-dictionary codes preserve lexicographic order.
-///
-/// [`DictAccess`]: super::handles::DictAccess
+/// The chunk of rows `range` of `codes`: the four code columns and nothing
+/// else (the dictionary travels beside the array). `s_sorted` stamps
+/// `IsSorted` on the `s` column, which queries trust as global (s, p, o, g)
+/// order: it must be `true` only for rows sorted so, and it holds over
+/// codes because code order is term order.
 pub(crate) fn build_code_chunk(
     codes: &QuadCodes,
     range: Range<usize>,
@@ -190,15 +158,13 @@ pub(crate) fn build_code_chunk(
     Ok(chunk)
 }
 
-/// An empty StructArray with the Dictionary-layout code schema (an unstamped
-/// `s` column: nothing to sort).
+/// An empty chunk with the code schema, `s` unstamped.
 pub(crate) fn empty_struct() -> Result<ArrayRef> {
     build_code_chunk(&QuadCodes::empty(), 0..0, false)
 }
 
-/// The four primary code columns of a chunk in `[s, p, o, g]` order, as the
-/// arrays whose [`TermCode`] slices the decoders read (see [`code_slices`]).
-/// Returned by value: the slices borrow these arrays, so they must outlive
+/// The four code columns of `chunk` in `[s, p, o, g]` order. The decoders'
+/// [`TermCode`] slices ([`code_slices`]) borrow them, so they must outlive
 /// the decode.
 fn code_columns(chunk: &ArrayRef) -> Result<[PrimitiveArray; 4]> {
     #[cfg(test)]
@@ -216,10 +182,10 @@ fn code_slices(columns: &[PrimitiveArray; 4]) -> [&[TermCode]; 4] {
         .map(|column| column.as_slice::<TermCode>())
 }
 
-/// Where a decode reads a code's term from: the four roles are asked
-/// separately so a dictionary-backed source can keep one cursor (and, for a
-/// chunked dictionary, one warm chunk cursor) per role — the roles occupy
-/// different regions of the sorted term space.
+/// Where a decode reads a code's term. The four roles are asked separately,
+/// so a dictionary-backed source can keep one cursor per role: the roles
+/// occupy different regions of the sorted terms, and each keeps its own
+/// chunk cursors warm.
 trait TermSource {
     /// A term as [`decode_rows_shared`] holds it from row to row.
     type Shared: SharedTerm;
@@ -339,31 +305,26 @@ impl<'a> TermSource for MappedTerms<'a> {
     }
 }
 
-/// Upper bound on a role memo's slots: the memo is sized from the chunk's row
-/// count and clamped here, so it never grows with the data.
+/// Most slots of a role memo, so a memo never grows with the data.
 const MEMO_MAX_SLOTS: usize = 1024;
 
-/// Below this many rows a chunk decodes without a memo at all: the table's own
-/// allocation costs more than the handful of repeats it could catch.
+/// Chunks below this many rows decode without a memo: the table's own
+/// allocation would cost more than the few repeats it could catch.
 const MEMO_MIN_ROWS: usize = 16;
 
-/// A direct-mapped memo of one role's decoded terms, keyed by term code.
-///
-/// Codes repeat heavily down a column — a predicate or graph name recurs on
-/// nearly every row — and each repeat would otherwise pay the dictionary read
-/// (an FSST decompress) *and* the term parse again. Direct-mapped: a miss
-/// costs one compare and one overwrite, and the memory is fixed whatever the
-/// column's cardinality, so a high-cardinality column like subjects cannot
-/// accumulate entries it never reads again.
+/// A direct-mapped memo of one role's decoded terms, keyed by code: one slot
+/// per masked code, overwritten on collision. Codes repeat down a column (a
+/// predicate or graph on nearly every row), and each repeat would pay the
+/// read (an FSST decompress) and the parse again; the fixed size keeps a
+/// high-cardinality column from piling up entries it never reads again.
 struct TermMemo<T> {
     slots: Vec<Option<(TermCode, T)>>,
     mask: usize,
 }
 
 impl<T: Clone> TermMemo<T> {
-    /// Sized to the chunk (a power of two, capped): a short chunk cannot have
-    /// more distinct codes than rows, so it should not clear a big table, and
-    /// a tiny one gets no table at all (`vec![_; 0]` does not allocate).
+    /// Sized to `rows`, which bound the chunk's distinct codes: a power of
+    /// two, at most [`MEMO_MAX_SLOTS`], and no table below [`MEMO_MIN_ROWS`].
     fn new(rows: usize) -> Self {
         let slots = if rows < MEMO_MIN_ROWS {
             0
@@ -394,10 +355,10 @@ impl<T: Clone> TermMemo<T> {
     }
 }
 
-/// `cols` — a chunk's `[s, p, o, g]` code columns — decoded into quads
-/// through `src`, each distinct code's term read and parsed at most once per
-/// role (see [`TermMemo`]). A row whose terms fail to read or parse is an
-/// `Err` at that row's position, the other rows decoding normally.
+/// A chunk's `[s, p, o, g]` code columns decoded into quads through `src`,
+/// each distinct code's term read and parsed at most once per role
+/// ([`TermMemo`]). A row whose terms fail to read or parse is an `Err` at
+/// that row's position; the other rows decode normally.
 fn decode_rows(cols: [&[TermCode]; 4], src: &mut impl TermSource) -> Vec<Result<Quad>> {
     let [s_codes, p_codes, o_codes, g_codes] = cols;
     let n = s_codes.len();
@@ -427,12 +388,11 @@ fn decode_rows(cols: [&[TermCode]; 4], src: &mut impl TermSource) -> Vec<Result<
         .collect()
 }
 
-/// `cols` decoded into rows of term strings through `src` — [`SharedQuad`]s
-/// or [`RawQuad`]s (see [`StringRow`]). Each distinct code's term is read at
-/// most once per role (see [`TermMemo`]) and held as a
-/// [`Shared`](TermSource::Shared) term, so a code repeating down a column
-/// reaches every row repeating it without another read and nothing is parsed
-/// into oxrdf terms. Any failure is the chunk's one `Err`.
+/// The code columns decoded into rows of term strings ([`StringRow`])
+/// through `src`: each distinct code's term is read at most once per role
+/// and held as a [`Shared`](TermSource::Shared) term for every row repeating
+/// it, and nothing is parsed into oxrdf terms. Any failure is the chunk's
+/// one `Err`.
 fn decode_rows_shared<S: TermSource, R: StringRow>(
     [s, p, o, g]: [&[TermCode]; 4],
     src: &mut S,
@@ -462,8 +422,9 @@ fn decode_rows_shared<S: TermSource, R: StringRow>(
     rows
 }
 
-/// Decode a Dictionary-layout StructArray chunk into Quads using the given
-/// (store-cached) dictionary (see [`decode_rows`]).
+/// `chunk`'s rows as quads, decoded against the resident `dict`
+/// ([`decode_rows`]); a failure to read the code columns is the chunk's one
+/// `Err`.
 pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Result<Quad>> {
     let columns = match code_columns(chunk) {
         Ok(columns) => columns,
@@ -484,13 +445,8 @@ pub(crate) fn decode_chunk_shared(
     decode_rows_shared(code_slices(&columns), &mut DictTerms::new(dict))
 }
 
-/// Decode one role's code column to owned term strings, reading each distinct
-/// code's term at most once (see [`TermMemo`]) — the [`raw_quads`]
-/// reconstruction path, where a predicate or graph column repeats a handful
-/// of codes over every row and each repeat would otherwise pay the dictionary
-/// read (an FSST decompress) again.
-///
-/// [`raw_quads`]: crate::store::layouts::ResolvedLayout::raw_quads
+/// One role's code column as owned terms, each distinct code's term read at
+/// most once ([`TermMemo`]); a code outside the dictionary is an error.
 pub(in crate::store::layouts) fn decode_code_column<T: Clone + for<'a> From<&'a str>>(
     dict: &TermDictionary,
     codes: &[TermCode],
@@ -508,11 +464,10 @@ pub(in crate::store::layouts) fn decode_code_column<T: Clone + for<'a> From<&'a 
         .collect()
 }
 
-/// The distinct codes of a chunk's four code columns, ascending — what a
-/// file-backed dictionary must resolve to decode the chunk. A code equal to
-/// the one before it in its column is skipped ahead of the sort: `s` is
-/// sorted and `p` and `g` come in runs, so those columns contribute about
-/// one code per run.
+/// The distinct codes of a chunk's four code columns, ascending. A code
+/// equal to the one before it in its column is skipped ahead of the sort:
+/// `s` is sorted and `p` and `g` come in runs, so those columns add about one
+/// code per run.
 #[cfg(feature = "file-io")]
 fn distinct_codes(columns: [&[TermCode]; 4]) -> Vec<TermCode> {
     let mut codes = Vec::with_capacity(columns[0].len());
@@ -530,8 +485,8 @@ fn distinct_codes(columns: [&[TermCode]; 4]) -> Vec<TermCode> {
     codes
 }
 
-/// The terms of `columns`' distinct codes, resolved with one read of the
-/// windows of a file-backed dictionary that hold them.
+/// The terms of `columns`' distinct codes, read from the windows of `fb`
+/// that hold them, each window once.
 #[cfg(feature = "file-io")]
 async fn resolve_chunk_terms(fb: &FileBackedDict, columns: [&[TermCode]; 4]) -> Result<ChunkTerms> {
     let codes = distinct_codes(columns);
@@ -539,11 +494,11 @@ async fn resolve_chunk_terms(fb: &FileBackedDict, columns: [&[TermCode]; 4]) -> 
     Ok(codes.into_iter().zip(terms).collect())
 }
 
-/// A chunk decoded against a file-backed dictionary: the chunk's code columns
-/// are read once, their distinct codes are resolved to terms (see
-/// [`resolve_chunk_terms`]), and `rows` decodes the same columns against the
-/// resulting map. A failure to read the columns or to resolve their codes is
-/// the chunk's one `Err`.
+/// A chunk decoded against a file-backed dictionary: the code columns are
+/// read once, their distinct codes resolved to terms
+/// ([`resolve_chunk_terms`]), and `rows` decodes the same columns against
+/// that map. A failure to read the columns or to resolve their codes is the
+/// chunk's one `Err`.
 #[cfg(feature = "file-io")]
 async fn decode_resolved<T>(
     fb: &FileBackedDict,
@@ -561,9 +516,7 @@ async fn decode_resolved<T>(
     }
 }
 
-/// [`decode_chunk`] against a file-backed dictionary instead of a resident
-/// one: the rows decode against the chunk's resolved terms (see
-/// [`decode_resolved`]).
+/// [`decode_chunk`] against a file-backed dictionary ([`decode_resolved`]).
 #[cfg(feature = "file-io")]
 pub(crate) async fn decode_chunk_file_backed(
     fb: &FileBackedDict,
@@ -572,9 +525,8 @@ pub(crate) async fn decode_chunk_file_backed(
     decode_resolved(fb, chunk, |cols, terms| decode_rows(cols, terms)).await
 }
 
-/// [`decode_chunk_file_backed`] with shared-string terms: the resolved map
-/// holds one `Arc<str>` per distinct code, so every row's term is a lookup
-/// and a reference-count bump (see [`decode_rows_shared`]).
+/// [`decode_chunk_file_backed`] with shared-string terms: every row's term
+/// is a lookup in the resolved map and a reference-count bump.
 #[cfg(feature = "file-io")]
 pub(crate) async fn decode_chunk_shared_file_backed(
     fb: &FileBackedDict,
@@ -583,10 +535,8 @@ pub(crate) async fn decode_chunk_shared_file_backed(
     decode_resolved(fb, chunk, |cols, terms| decode_rows_shared(cols, terms)).await
 }
 
-/// [`decode_chunk_file_backed`] into [`RawQuad`]s: the chunk reads only the
-/// dictionary windows holding its distinct codes (see [`decode_resolved`]),
-/// and every row's terms are copied out of the resolved map as owned
-/// N-Triples strings (see [`decode_rows_shared`]).
+/// [`decode_chunk_file_backed`] into [`RawQuad`]s, every row's terms copied
+/// out of the resolved map as owned N-Triples strings.
 #[cfg(feature = "file-io")]
 pub(crate) async fn decode_chunk_raw_file_backed(
     fb: &FileBackedDict,
