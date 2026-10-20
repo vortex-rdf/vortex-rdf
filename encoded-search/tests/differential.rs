@@ -56,9 +56,21 @@ fn ctx() -> ExecutionCtx {
 /// single reference.
 static FOR: integer::FoRScheme = integer::FoRScheme::v1();
 
+/// The delta scheme at a zero ratio, which makes the cascade pick Delta
+/// whenever it applies.
+static DELTA: integer::DeltaScheme = integer::DeltaScheme::new(0.0);
+
 /// Compress through exactly `schemes`, with the wire forms the session's
 /// edition allows.
 fn compress_with(schemes: &[&'static dyn Scheme], data: &[u32]) -> ArrayRef {
+    compress_array_with(
+        schemes,
+        PrimitiveArray::from_iter(data.iter().copied()).into_array(),
+    )
+}
+
+/// [`compress_with`] over a canonical array of any unsigned width.
+fn compress_array_with(schemes: &[&'static dyn Scheme], canonical: ArrayRef) -> ArrayRef {
     let session = session();
     let stock: Vec<_> = session
         .compression()
@@ -70,7 +82,6 @@ fn compress_with(schemes: &[&'static dyn Scheme], data: &[u32]) -> ArrayRef {
     for scheme in schemes {
         builder = builder.with_new_scheme(*scheme);
     }
-    let canonical = PrimitiveArray::from_iter(data.iter().copied()).into_array();
     builder.build().compress(&canonical, &mut ctx()).unwrap()
 }
 
@@ -123,8 +134,6 @@ fn for_bitpacked_4k() -> (Vec<u32>, ArrayRef) {
 /// — the shape the default cascade now gives a sorted code column — at a
 /// length that pads the last 1024-value block.
 fn delta_bitpacked_5k() -> (Vec<u32>, ArrayRef) {
-    // A zero ratio makes the cascade pick Delta whenever it applies.
-    static DELTA: integer::DeltaScheme = integer::DeltaScheme::new(0.0);
     let data = sorted_random(11, 5_000, 40);
     let arr = compress_with(&[&DELTA, &integer::BitPackingScheme], &data);
     (data, arr)
@@ -147,8 +156,10 @@ fn assert_probe_or_unsupported(arr: &ArrayRef, data: &[u32]) -> bool {
     }
 }
 
-fn generic_bounds(arr: &ArrayRef, needle: u32) -> (usize, usize) {
-    let probe = Scalar::from(needle);
+/// The generic kernel's bounds of `needle` in `arr`, the needle cast to the
+/// array's type; `None` for a needle that type cannot hold.
+fn generic_bounds(arr: &ArrayRef, needle: u32) -> Option<(usize, usize)> {
+    let probe = Scalar::from(needle).cast(arr.dtype()).ok()?;
     let lo = arr
         .search_sorted(&probe, SearchSortedSide::Left)
         .unwrap()
@@ -157,7 +168,7 @@ fn generic_bounds(arr: &ArrayRef, needle: u32) -> (usize, usize) {
         .search_sorted(&probe, SearchSortedSide::Right)
         .unwrap()
         .to_index();
-    (lo, hi)
+    Some((lo, hi))
 }
 
 /// Three-way agreement on bounds plus exact point access, with an optional
@@ -201,12 +212,10 @@ fn assert_probe_with_budget(
         if i % generic_stride != 0 && needle != u64::from(u32::MAX) {
             continue;
         }
-        if let Ok(narrow) = u32::try_from(needle) {
-            assert_eq!(
-                got,
-                generic_bounds(arr, narrow),
-                "generic oracle, needle {needle}"
-            );
+        if let Ok(narrow) = u32::try_from(needle)
+            && let Some(generic) = generic_bounds(arr, narrow)
+        {
+            assert_eq!(got, generic, "generic oracle, needle {needle}");
         }
     }
 
@@ -303,6 +312,29 @@ fn probes_bitpacked_with_patches() {
 fn probes_delta_bitpacked() {
     let (data, arr) = delta_bitpacked_5k();
     assert_probe(&arr, &data, &[NodeKind::Delta, NodeKind::BitPacked]);
+
+    // The narrower lane widths, whose blocks carry more bases: u8 (128 lanes)
+    // and u16 (64), each sorted and padding its last block. Every needle meets
+    // the canonical oracle; the generic one, which delta answers by a block
+    // decode per element, takes the cascade's sample.
+    let bytes: Vec<u8> = (0..3_000u32).map(|i| (i * 255 / 2_999) as u8).collect();
+    let words: Vec<u16> = sorted_random(13, 3_000, 20)
+        .into_iter()
+        .map(|v| u16::try_from(v).unwrap())
+        .collect();
+    for (data, canonical) in [
+        (
+            bytes.iter().map(|&v| u32::from(v)).collect::<Vec<_>>(),
+            PrimitiveArray::from_iter(bytes.iter().copied()).into_array(),
+        ),
+        (
+            words.iter().map(|&v| u32::from(v)).collect(),
+            PrimitiveArray::from_iter(words.iter().copied()).into_array(),
+        ),
+    ] {
+        let arr = compress_array_with(&[&DELTA, &integer::BitPackingScheme], canonical);
+        assert_probe_with_budget(&arr, &data, &[NodeKind::Delta], CASCADE_ORACLE_NEEDLES);
+    }
 }
 
 /// A sliced delta array starts inside a block (a physical offset) and ends
@@ -386,6 +418,19 @@ fn probes_sequence() {
             .unwrap()
             .into_array();
     assert_probe(&direct, &data, &[NodeKind::Sequence]);
+
+    // A negative step (the multiplier is stored signed) makes the run
+    // descend, which the sorted contract excludes: it declines.
+    let descending = Sequence::try_new(
+        vortex_array::scalar::PValue::U32(100),
+        vortex_array::scalar::PValue::I64(-1),
+        vortex_array::dtype::PType::U32,
+        vortex_array::dtype::Nullability::NonNullable,
+        10,
+    )
+    .unwrap()
+    .into_array();
+    assert!(SortedProbe::resolve(&descending).is_none());
 }
 
 #[test]

@@ -3,14 +3,17 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
-use common::{canonical_bounds, writer_session};
-use vortex_array::arrays::{PrimitiveArray, StructArray};
-use vortex_array::stream::ArrayStreamAdapter;
-use vortex_array::validity::Validity;
+use common::{
+    canonical_bounds, data_node, struct_chunk, struct_of, taken_u32, write_file, writer_session,
+};
+use vortex_array::arrays::PrimitiveArray;
 use vortex_array::{ArrayRef, IntoArray};
-use vortex_file::{OpenOptionsSessionExt as _, WriteOptionsSessionExt as _};
+use vortex_error::VortexResult;
 use vortex_layout::layouts::chunked::Chunked as ChunkedLayout;
 use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
 use vortex_layout::layouts::dict::Dict as DictLayout;
@@ -20,72 +23,11 @@ use vortex_layout::layouts::dict::writer::{
 use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex_layout::layouts::repartition::{RepartitionStrategy, RepartitionWriterOptions};
 use vortex_layout::layouts::struct_::StructStrategy;
-use vortex_layout::{LayoutChildType, LayoutRef, LayoutStrategy};
+use vortex_layout::segments::{SegmentFuture, SegmentId, SegmentSinkRef, SegmentSource};
+use vortex_layout::sequence::{SendableSequentialStream, SequencePointer};
+use vortex_layout::{LayoutRef, LayoutStrategy, LayoutWriterContext};
 use vortex_rdf_encoded_search::{ColumnChunks, fetch_flat, flat_leaves};
 use vortex_session::VortexSession;
-
-/// A struct chunk over the given arrays, all of one length.
-fn struct_of(columns: Vec<(&str, ArrayRef)>) -> ArrayRef {
-    let len = columns[0].1.len();
-    let (names, arrays): (Vec<&str>, Vec<ArrayRef>) = columns.into_iter().unzip();
-    StructArray::try_new(names.into(), arrays, len, Validity::NonNullable)
-        .unwrap()
-        .into_array()
-}
-
-/// A struct chunk over non-nullable `u32` columns.
-fn struct_chunk(columns: &[(&str, &[u32])]) -> ArrayRef {
-    struct_of(
-        columns
-            .iter()
-            .map(|(name, data)| {
-                (
-                    *name,
-                    PrimitiveArray::from_iter(data.iter().copied()).into_array(),
-                )
-            })
-            .collect(),
-    )
-}
-
-/// Writes `chunks` as one file (through `strategy` when given) and returns
-/// the opened file.
-async fn write_file(
-    session: &VortexSession,
-    chunks: Vec<ArrayRef>,
-    strategy: Option<Arc<dyn LayoutStrategy>>,
-) -> vortex_file::VortexFile {
-    let dtype = chunks[0].dtype().clone();
-    let mut options = session.write_options();
-    if let Some(strategy) = strategy {
-        options = options.with_strategy(strategy);
-    }
-    let mut bytes = Vec::new();
-    options
-        .write(
-            &mut bytes,
-            ArrayStreamAdapter::new(dtype, futures::stream::iter(chunks.into_iter().map(Ok))),
-        )
-        .await
-        .unwrap();
-    session.open_options().open_buffer(bytes).unwrap()
-}
-
-/// A field's data node beneath its zoned wrappers, for shape assertions.
-fn data_node(root: &LayoutRef, field: &str) -> LayoutRef {
-    use vortex_layout::layouts::zoned::Zoned;
-    let mut node = (0..root.nslots())
-        .find_map(|i| {
-            matches!(root.slot_type(i), Some(LayoutChildType::Field(ref name)) if name.as_ref() == field)
-                .then(|| root.slot(i).ok().flatten())
-                .flatten()
-        })
-        .expect("field present");
-    while node.is::<Zoned>() {
-        node = node.slot(0).unwrap().unwrap();
-    }
-    node
-}
 
 /// A dictionary strategy with the given codes and values strategies and a
 /// `max_len`-bounded dictionary.
@@ -117,6 +59,82 @@ fn struct_strategy<S: LayoutStrategy>(field: S) -> Arc<dyn LayoutStrategy> {
         Arc::new(FlatLayoutStrategy::default()),
         Arc::new(field),
     ))
+}
+
+/// A segment source that forwards each request to `inner`, counting the
+/// requests made for every segment.
+struct CountingSource {
+    inner: Arc<dyn SegmentSource>,
+    requests: Mutex<HashMap<SegmentId, usize>>,
+}
+
+impl CountingSource {
+    fn new(inner: Arc<dyn SegmentSource>) -> Self {
+        Self {
+            inner,
+            requests: Mutex::default(),
+        }
+    }
+
+    /// The requests made for `id` so far.
+    fn requests(&self, id: SegmentId) -> usize {
+        self.requests.lock().unwrap().get(&id).copied().unwrap_or(0)
+    }
+}
+
+impl SegmentSource for CountingSource {
+    fn request(&self, id: SegmentId) -> SegmentFuture {
+        *self.requests.lock().unwrap().entry(id).or_default() += 1;
+        self.inner.request(id)
+    }
+}
+
+/// A strategy handing its inner one the column's chunks with a zero-row
+/// chunk after the first. The file writer drops empty input chunks before
+/// any strategy sees them, so only a strategy beneath it can pass one on;
+/// vortex's chunked writer then keeps it as a zero-row child.
+struct EmptyChunkAfterFirst<S>(S);
+
+impl<S: LayoutStrategy> LayoutStrategy for EmptyChunkAfterFirst<S> {
+    fn write_stream<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        ctx: LayoutWriterContext,
+        segment_sink: SegmentSinkRef,
+        stream: SendableSequentialStream,
+        eof: SequencePointer,
+        session: &'life1 VortexSession,
+    ) -> Pin<Box<dyn Future<Output = VortexResult<LayoutRef>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        use futures::StreamExt as _;
+        use vortex_layout::sequence::{
+            SequentialStream as _, SequentialStreamAdapter, SequentialStreamExt as _,
+        };
+
+        let dtype = stream.dtype().clone();
+        let mut first = true;
+        let stream = stream.flat_map(move |item| {
+            let items = match item {
+                Ok((id, chunk)) if std::mem::take(&mut first) => {
+                    let mut ids = id.descend();
+                    let (chunk_id, empty_id) = (ids.advance(), ids.advance());
+                    let empty = chunk.slice(0..0).map(|empty| (empty_id, empty));
+                    vec![Ok((chunk_id, chunk)), empty]
+                }
+                other => vec![other],
+            };
+            futures::stream::iter(items)
+        });
+        let stream = SequentialStreamAdapter::new(dtype, stream).sendable();
+        Box::pin(async move {
+            self.0
+                .write_stream(ctx, segment_sink, stream, eof, session)
+                .await
+        })
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -246,7 +264,8 @@ async fn column_chunks_decline_unsupported_fields() {
 }
 
 /// A column reports the flat leaves it is cut into and how many a probe has
-/// fetched, and its `Debug` prints the same two numbers.
+/// fetched, and its `Debug` prints the same two numbers. A zero-row chunk is
+/// no leaf.
 #[tokio::test(flavor = "multi_thread")]
 async fn column_chunks_count_their_leaves() {
     let session = writer_session();
@@ -255,7 +274,7 @@ async fn column_chunks_count_their_leaves() {
         .chunks(200_000)
         .map(|c| struct_chunk(&[("s", c)]))
         .collect();
-    let file = write_file(&session, chunks, None).await;
+    let file = write_file(&session, chunks.clone(), None).await;
     let root = file.footer().layout().clone();
     let column = ColumnChunks::from_struct_layout(&root, "s").expect("the shape must resolve");
     let leaves = column.chunk_count();
@@ -300,6 +319,49 @@ async fn column_chunks_count_their_leaves() {
     let last = flat.last().unwrap();
     let rows = fetch_flat(&last.layout, &source, &session).await.unwrap();
     assert_eq!(taken_u32(rows, &session), &data[last.row_offset as usize..]);
+
+    // A chunked layout holding a zero-row chunk, which vortex's chunked
+    // writer keeps when a strategy hands it one: the empty chunk has no leaf,
+    // the leaves still tile the column, and its bounds and point reads are
+    // exact.
+    let empty_after_first =
+        EmptyChunkAfterFirst(ChunkedLayoutStrategy::new(FlatLayoutStrategy::default()));
+    let file = write_file(&session, chunks, Some(struct_strategy(empty_after_first))).await;
+    let root = file.footer().layout().clone();
+    let node = data_node(&root, "s");
+    let chunk_rows: Vec<u64> = (0..node.nslots())
+        .map(|i| node.slot(i).unwrap().unwrap().row_count())
+        .collect();
+    assert!(
+        node.is::<ChunkedLayout>() && chunk_rows.contains(&0),
+        "the fixture must keep a zero-row chunk: {}",
+        node.display_tree()
+    );
+    let flat = flat_leaves(&node).expect("the shape resolves");
+    assert_eq!(flat.len(), node.nslots() - 1, "the empty chunk has no leaf");
+    let mut next = 0;
+    for leaf in &flat {
+        assert_eq!(leaf.row_offset, next);
+        next += leaf.layout.row_count();
+    }
+    assert_eq!(next, data.len() as u64);
+    let column = ColumnChunks::from_struct_layout(&root, "s").expect("the shape resolves");
+    assert_eq!(column.chunk_count(), flat.len());
+    let source = file.segment_source();
+    for needle in [0u64, 1, 18_181, 36_363, u64::MAX] {
+        assert_eq!(
+            column.bounds(needle, &source, &session).await.unwrap(),
+            Some(canonical_bounds(&data, needle)),
+            "needle {needle}"
+        );
+    }
+    for row in [0, 199_999, 200_000, data.len() as u64 - 1] {
+        assert_eq!(
+            column.value_at(row, &source, &session).await.unwrap(),
+            Some(u64::from(data[row as usize])),
+            "row {row}"
+        );
+    }
 }
 
 /// A zero-row column resolves to a column with no leaves and answers empty
@@ -494,7 +556,8 @@ async fn column_chunks_probe_dictionary_coded_columns() {
 
 /// A column whose dictionary outgrows its constraints becomes a chunked run
 /// of dictionary layouts, each with its own values leaf and chunked codes;
-/// probes address rows across dictionary boundaries exactly.
+/// probes address rows across dictionary boundaries exactly, fetching each
+/// dictionary's values once for all its codes leaves.
 #[tokio::test(flavor = "multi_thread")]
 async fn column_chunks_probe_run_of_dictionaries() {
     let session = writer_session();
@@ -524,12 +587,44 @@ async fn column_chunks_probe_run_of_dictionaries() {
     }
     // Every leaf holds codes, and each dictionary's leaves are adjacent and
     // name its one values leaf.
+    let leaves = flat_leaves(&node).expect("a run of dictionaries resolves");
     let mut values = Vec::new();
-    for leaf in flat_leaves(&node).expect("a run of dictionaries resolves") {
-        values.push(leaf.dict_values.expect("a codes leaf").segment_id());
+    for leaf in &leaves {
+        values.push(
+            leaf.dict_values
+                .as_ref()
+                .expect("a codes leaf")
+                .segment_id(),
+        );
     }
     values.dedup();
     assert_eq!(values.len(), 3);
+    assert!(
+        leaves.len() > values.len(),
+        "a dictionary spans several codes leaves"
+    );
+
+    // Probing every codes leaf requests each one's segment once, and each
+    // dictionary's values segment once, shared by its codes leaves.
+    let counting = Arc::new(CountingSource::new(file.segment_source()));
+    let counted: Arc<dyn SegmentSource> = counting.clone();
+    let probed =
+        ColumnChunks::from_struct_layout(&root, "s").expect("a run of dictionaries resolves");
+    for leaf in &leaves {
+        assert_eq!(
+            probed
+                .value_at(leaf.row_offset, &counted, &session)
+                .await
+                .unwrap(),
+            Some(u64::from(data[leaf.row_offset as usize]))
+        );
+    }
+    for leaf in &leaves {
+        assert_eq!(counting.requests(leaf.layout.segment_id()), 1);
+    }
+    for id in values {
+        assert_eq!(counting.requests(id), 1, "values segment {id:?}");
+    }
 
     let source = file.segment_source();
     let column =
@@ -576,16 +671,6 @@ async fn column_chunks_probe_run_of_dictionaries() {
             );
         }
     }
-}
-
-/// The `u32` values of a taken column array.
-fn taken_u32(array: ArrayRef, session: &VortexSession) -> Vec<u32> {
-    use vortex_array::VortexSessionExecute as _;
-    array
-        .execute::<PrimitiveArray>(&mut session.create_execution_ctx())
-        .unwrap()
-        .as_slice::<u32>()
-        .to_vec()
 }
 
 /// A take at ascending rows answers exactly the values at those rows, each
