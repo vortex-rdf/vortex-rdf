@@ -145,4 +145,7 @@ pub enum NodeKind {
     Delta,
     /// Sparse: one fill value, with exception values at patched positions.
     Sparse,
+    /// FastLanes run-length: per 1024-value chunk, run values and an index
+    /// per position into them.
+    Rle,
 }

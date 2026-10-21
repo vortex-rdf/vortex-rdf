@@ -3592,6 +3592,7 @@ dependencies = [
  "vortex-file",
  "vortex-io",
  "vortex-layout",
+ "vortex-pco",
  "vortex-runend",
  "vortex-sequence",
  "vortex-session",

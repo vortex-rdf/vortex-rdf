@@ -13,7 +13,7 @@ use vortex_array::dtype::PType;
 use vortex_array::scalar::PValue;
 use vortex_fastlanes::{
     BitPacked, BitPackedArrayExt as _, BitPackedSlots, BitWidthsView, Delta, DeltaArrayExt as _,
-    DeltaSlots, FoR, FoRArrayExt as _, FoRSlots,
+    DeltaSlots, FoR, FoRArrayExt as _, FoRSlots, RLE, RLESlots,
 };
 use vortex_runend::{RunEnd, RunEndArrayExt as _, RunEndSlots};
 use vortex_sequence::Sequence;
@@ -111,6 +111,26 @@ pub(crate) fn resolve_node<'a>(arr: &'a ArrayRef) -> Option<Node<'a>> {
                 values: Box::new(resolve_node(slot(slots, SparseSlots::PATCH_VALUES)?)?),
                 offset: data.offset(),
             },
+            len: arr.len(),
+        });
+    }
+
+    if let Some(view) = arr.as_opt::<RLE>() {
+        // Value offsets are absolute; a slice keeps the ones of its chunks,
+        // so the first is the base its value indices count from.
+        let slots = view.slots();
+        let value_offsets = resolve_node(slot(slots, RLESlots::VALUES_IDX_OFFSETS)?)?;
+        let base = if value_offsets.len() == 0 {
+            0
+        } else {
+            value_offsets.value_at(0)
+        };
+        return Some(Node::Rle {
+            values: Box::new(resolve_node(slot(slots, RLESlots::VALUES)?)?),
+            indices: Box::new(resolve_node(slot(slots, RLESlots::INDICES)?)?),
+            value_offsets: Box::new(value_offsets),
+            base,
+            offset: view.data().offset(),
             len: arr.len(),
         });
     }

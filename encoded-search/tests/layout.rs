@@ -445,28 +445,29 @@ async fn column_chunks_empty_column() {
     );
 }
 
-/// A leaf whose wire encoding the probe does not support (FastLanes RLE)
-/// declines with `Ok(None)` at query time, while the column itself still
-/// resolves.
+/// A leaf whose wire encoding the probe does not support (pcodec) declines
+/// with `Ok(None)` at query time, while the column itself still resolves.
 #[tokio::test(flavor = "multi_thread")]
 async fn column_chunks_decline_unsupported_leaf() {
     use vortex_array::VortexSessionExecute as _;
-    use vortex_fastlanes::RLEData;
+    use vortex_pco::Pco;
 
     let session = writer_session();
     let data: Vec<u32> = (0..4_096).map(|i| i / 5).collect();
     // Non-decreasing data, so only the encoding — not the data — is what
     // the probe declines.
-    let rle = RLEData::encode(
+    let pco = Pco::from_primitive(
         PrimitiveArray::from_iter(data.clone()).as_view(),
+        3,
+        0,
         &mut session.create_execution_ctx(),
     )
     .unwrap()
     .into_array();
-    assert_eq!(rle.encoding_id().as_str(), "fastlanes.rle");
+    assert_eq!(pco.encoding_id().as_str(), "vortex.pco");
     // The flat strategy writes the chunk in the encoding it arrives in.
     let strategy = struct_strategy(FlatLayoutStrategy::default());
-    let file = write_file(&session, vec![struct_of(vec![("s", rle)])], Some(strategy)).await;
+    let file = write_file(&session, vec![struct_of(vec![("s", pco)])], Some(strategy)).await;
     let root = file.footer().layout().clone();
 
     let column = ColumnChunks::from_struct_layout(&root, "s").expect("a flat leaf resolves");
@@ -483,6 +484,51 @@ async fn column_chunks_decline_unsupported_leaf() {
     );
     // A leaf whose encoding declined was fetched all the same.
     assert_eq!((column.chunk_count(), column.fetched_chunks()), (1, 1));
+}
+
+/// A FastLanes run-length leaf, a wire form of the store's writer edition,
+/// read back from a file answers every probe as the canonical data does.
+#[tokio::test(flavor = "multi_thread")]
+async fn column_chunks_probe_run_length_leaf() {
+    use vortex_array::VortexSessionExecute as _;
+    use vortex_fastlanes::RLEData;
+
+    let session = writer_session();
+    let data: Vec<u32> = (0..4_096).map(|i| i / 5).collect();
+    let rle = RLEData::encode(
+        PrimitiveArray::from_iter(data.clone()).as_view(),
+        &mut session.create_execution_ctx(),
+    )
+    .unwrap()
+    .into_array();
+    let strategy = struct_strategy(FlatLayoutStrategy::default());
+    let file = write_file(&session, vec![struct_of(vec![("s", rle)])], Some(strategy)).await;
+    let root = file.footer().layout().clone();
+
+    let column = ColumnChunks::from_struct_layout(&root, "s").expect("a flat leaf resolves");
+    let source = file.segment_source();
+    for needle in [0u64, 7, 400, 818, 819, 820, 5_000] {
+        let want = canonical_bounds(&data[1_000..3_000], needle);
+        assert_eq!(
+            column.bounds(needle, &source, &session).await.unwrap(),
+            Some(canonical_bounds(&data, needle)),
+            "bounds({needle})"
+        );
+        assert_eq!(
+            column
+                .bounds_in(1_000..3_000, needle, &source, &session)
+                .await
+                .unwrap(),
+            Some(1_000 + want.start..1_000 + want.end),
+            "bounds_in({needle})"
+        );
+    }
+    for row in [0u64, 1_023, 1_024, 4_095] {
+        assert_eq!(
+            column.value_at(row, &source, &session).await.unwrap(),
+            Some(u64::from(data[row as usize]))
+        );
+    }
 }
 
 /// Dictionary layouts whose shape the probe does not support decline at

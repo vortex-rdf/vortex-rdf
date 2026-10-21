@@ -77,12 +77,14 @@ every query goes through.
 the whole array, or one per 1,024-value chunk: the `fastlanes.for.v2` wire
 form), `BitPacked` (with one bit width, including its patches), `Delta`
 (FastLanes delta, decoded one 1,024-value block at a time on first touch),
-`Slice`, `Chunked`, `Dict` and `Sparse` (a fill value with patches), composed
-arbitrarily; the transparent `Shared` wrapper resolves to whatever it wraps.
-`NodeKind` reports the resolved tree's shape for tests and diagnostics.
-Bit-packing with a width per block declines. A frame of reference per chunk
-and a sparse array have no order-preserving map from a needle to their
-children, so their bounds searches probe the composed values. When its
+`Slice`, `Chunked`, `Dict`, `Sparse` (a fill value with patches) and FastLanes
+run-length (`fastlanes.rle`: per 1,024-value chunk, run values and an index
+per position into them), composed arbitrarily; the transparent `Shared`
+wrapper resolves to whatever it wraps. `NodeKind` reports the resolved tree's
+shape for tests and diagnostics. Bit-packing with a width per block declines.
+A frame of reference per chunk, a sparse array and a run-length array have no
+order-preserving map from a needle to their children, so their bounds searches
+probe the composed values. When its
 builder allows `fastlanes.for.v2`, BtrBlocks' frame-of-reference scheme
 computes a reference per chunk, and an array whose chunk minima differ keeps
 them (one whose references come out constant is still single-reference
