@@ -100,6 +100,16 @@ panicking, never unsound — answer. `bounds_in` requires only its window to be
 sorted, and never reads a row outside it. `value_at` is exact regardless of
 order.
 
+Searches over ascending codes in a run-end node's values, and a `bounds_in`
+window's lower bound, interpolate: once a probe has landed on each side of the
+needle, a few splits go where an even spread between the two values puts it,
+and the rest of the window is bisected. The answer is the bisection's; codes
+spread about evenly cost a few reads instead of one per halving, while
+plateaus and windows of 16 values or fewer cost what bisection does. A
+`bounds_in` window's upper bound is then bisected for between its lower bound
+and the nearest row the lower search found past the needle: a few rows when
+the needle's rows are few.
+
 ## The `layout` feature
 
 Off by default. With it, `ColumnChunks` extends the same treatment to a column
