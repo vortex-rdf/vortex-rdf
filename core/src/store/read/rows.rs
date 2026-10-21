@@ -221,6 +221,53 @@ impl VortexRdfStore {
         {
             return Ok(Some(columns));
         }
+        // On file the read is the one `base_read` makes, decided once; a
+        // point-sized read by id fills the code buffers straight from the
+        // chunk probes, with the same rows and filter checks.
+        #[cfg(feature = "file-io")]
+        if let Backend::File(base) = &self.quads.backend {
+            let (selection, columns) = self.file_read_scope(base, &schema::PRIMARY_COLUMNS).await?;
+            let (file, filter) = (&base.file, base.filter.as_ref());
+            let deleted = self.quads.deleted.as_ref();
+            let rows = match Self::exact_read(file, columns, filter, &selection, deleted)? {
+                ExactRead::Points(rows) => {
+                    if let Some(codes) =
+                        file_reads::file_point_codes(file, columns, filter, rows).await?
+                        && let Some(codes) = primary_order(columns, codes)
+                    {
+                        return Ok(Some(codes));
+                    }
+                    // Declined as the row read would decline: the scan reads.
+                    BaseRead::Scan(Box::new(Self::restricted_file_scan(
+                        file,
+                        &schema::PRIMARY_COLUMNS,
+                        filter,
+                        &selection,
+                        deleted,
+                    )?))
+                }
+                read => {
+                    Self::file_base_read(
+                        file,
+                        &schema::PRIMARY_COLUMNS,
+                        columns,
+                        filter,
+                        &selection,
+                        deleted,
+                        read,
+                    )
+                    .await?
+                }
+            }
+            .collect()
+            .await?;
+            let codes = extract_codes(rows, &schema::PRIMARY_COLUMNS)?;
+            return Ok(Some(
+                codes
+                    .try_into()
+                    .expect("one code buffer per primary column"),
+            ));
+        }
         let rows = self
             .base_read(&schema::PRIMARY_COLUMNS)
             .await?
@@ -439,6 +486,25 @@ impl VortexRdfStore {
         }
         Ok((raws, base_rows))
     }
+}
+
+/// `codes`, one buffer per column of `columns`, as the `(s, p, o, g)` code
+/// columns; `None` when a primary column is missing.
+#[cfg(feature = "file-io")]
+fn primary_order(
+    columns: &[&str],
+    mut codes: Vec<vortex_buffer::Buffer<TermCode>>,
+) -> Option<[vortex_buffer::Buffer<TermCode>; 4]> {
+    let mut take = |name: &str| {
+        let idx = columns.iter().position(|c| *c == name)?;
+        Some(std::mem::take(&mut codes[idx]))
+    };
+    Some([
+        take(schema::COL_S)?,
+        take(schema::COL_P)?,
+        take(schema::COL_O)?,
+        take(schema::COL_G)?,
+    ])
 }
 
 /// Test hook: how many gathers this thread made from code primitives, by

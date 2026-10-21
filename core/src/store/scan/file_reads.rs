@@ -14,7 +14,7 @@ use vortex_array::expr::forms::conjuncts;
 use vortex_array::expr::{Expression, and_collect, eq, get_item, lit, root, select};
 use vortex_array::scalar::Scalar;
 use vortex_array::{ArrayRef, MaskFuture};
-use vortex_buffer::Buffer;
+use vortex_buffer::{Buffer, BufferMut};
 use vortex_error::VortexExpect as _;
 use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_mask::{AllOr, Mask};
@@ -533,40 +533,106 @@ pub(crate) async fn file_point_rows(
     filter: Option<&Expression>,
     rows: Vec<u64>,
 ) -> Result<Option<ArrayRef>> {
-    let eqs = match filter {
-        None => Vec::new(),
-        Some(f) => match eq_code_pairs(f) {
-            Some(pairs) => pairs,
-            None => return Ok(None),
-        },
-    };
-    let Some(handles) = columns
-        .iter()
-        .map(|c| file.column_chunks(c))
-        .collect::<Option<Vec<_>>>()
-    else {
+    let Some(points) = PointRows::read(file, columns, filter, rows).await? else {
         return Ok(None);
     };
-
-    // Filter first: a row survives when every eq column reads its code.
-    let Some(checks) = eqs
-        .iter()
-        .map(|(col, code)| {
-            let idx = columns.iter().position(|c| c == col)?;
-            Some((Arc::clone(&handles[idx]), *code))
-        })
-        .collect::<Option<Vec<_>>>()
-    else {
-        return Ok(None);
-    };
-    let Some(live) = rows_reading(file, &checks, rows).await? else {
-        return Ok(None);
-    };
-
-    point_read_struct(file, &handles, columns, &live, |col| {
-        eqs.iter().find(|(c, _)| c == col).map(|(_, v)| *v)
+    point_read_struct(file, &points.handles, columns, &points.live, |col| {
+        points.constant(col)
     })
     .await
+}
+
+/// [`file_point_rows`] as one code buffer per column of `columns`, in that
+/// order, for a Dictionary file: the same rows, read point by point through
+/// the chunk probes, without building the struct a row read returns.
+/// `Ok(None)` declines as [`file_point_rows`] does.
+pub(crate) async fn file_point_codes(
+    file: &NativeStoreFile,
+    columns: &[&str],
+    filter: Option<&Expression>,
+    rows: Vec<u64>,
+) -> Result<Option<Vec<Buffer<TermCode>>>> {
+    let Some(points) = PointRows::read(file, columns, filter, rows).await? else {
+        return Ok(None);
+    };
+    let source = file.segment_source();
+    let session = file.session();
+    let mut out = Vec::with_capacity(columns.len());
+    for (handle, col) in points.handles.iter().zip(columns) {
+        let codes = match points.constant(col) {
+            Some(code) => BufferMut::full(code, points.live.len()).freeze(),
+            None => {
+                let mut codes = BufferMut::with_capacity(points.live.len());
+                for &row in &points.live {
+                    match handle.value_at(row, &source, session).await? {
+                        Some(code) => codes.push(code),
+                        None => return Ok(None),
+                    }
+                }
+                codes.freeze()
+            }
+        };
+        out.push(codes);
+    }
+    Ok(Some(out))
+}
+
+/// What a point read by id reads: the chunk-probe handle of each read
+/// column, the code equalities of the pending filter, and the rows that pass
+/// them.
+struct PointRows {
+    handles: Vec<Arc<vortex_rdf_encoded_search::ColumnChunks>>,
+    eqs: Vec<(String, u64)>,
+    live: Vec<u64>,
+}
+
+impl PointRows {
+    /// The point read of `columns` at `rows` with `filter` pending: `None`
+    /// when the filter is not code equalities, a column has no chunk probes,
+    /// or a chunk the filter's reads reach has no probe.
+    async fn read(
+        file: &NativeStoreFile,
+        columns: &[&str],
+        filter: Option<&Expression>,
+        rows: Vec<u64>,
+    ) -> Result<Option<Self>> {
+        let eqs = match filter {
+            None => Vec::new(),
+            Some(f) => match eq_code_pairs(f) {
+                Some(pairs) => pairs,
+                None => return Ok(None),
+            },
+        };
+        let Some(handles) = columns
+            .iter()
+            .map(|c| file.column_chunks(c))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+
+        // Filter first: a row survives when every eq column reads its code.
+        let Some(checks) = eqs
+            .iter()
+            .map(|(col, code)| {
+                let idx = columns.iter().position(|c| c == col)?;
+                Some((Arc::clone(&handles[idx]), *code))
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let Some(live) = rows_reading(file, &checks, rows).await? else {
+            return Ok(None);
+        };
+        Ok(Some(Self { handles, eqs, live }))
+    }
+
+    /// The code every surviving row reads in `column`, when the filter pins
+    /// it.
+    fn constant(&self, column: &str) -> Option<u64> {
+        self.eqs.iter().find(|(c, _)| c == column).map(|(_, v)| *v)
+    }
 }
 
 /// A column's chunk-probe handle beside the code its rows must read.

@@ -448,3 +448,88 @@ async fn test_match_file_dictionary() {
     )
     .await;
 }
+
+/// A file store's code columns are the codes of the same quads read in
+/// memory, on every open and index set: subject-bound patterns (which a
+/// point-sized read by id fills straight from the chunk probes), one leaving
+/// a code filter pending (`s?o`), windows past their first row, and
+/// tombstoned rows. Rows compare as sorted sets: a served view returns them
+/// in its index's order.
+#[tokio::test]
+async fn test_file_code_columns_match_memory() {
+    let quads = fixture_quads();
+    let memory = built_store(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+    let rows = |c: [vortex_buffer::Buffer<TermCode>; 4]| -> Vec<[TermCode; 4]> {
+        let mut rows: Vec<[TermCode; 4]> = (0..c[0].len())
+            .map(|i| [c[0][i], c[1][i], c[2][i], c[3][i]])
+            .collect();
+        rows.sort_unstable();
+        rows
+    };
+    // Patterns from the fixture's own quads, every 97th, in the four
+    // subject-bound shapes, each also windowed past its first row.
+    let patterns: Vec<(Option<NamedOrBlankNode>, Option<NamedNode>, Option<Term>)> = quads
+        .iter()
+        .step_by(97)
+        .flat_map(|q| {
+            let (s, p, o) = (q.subject.clone(), q.predicate.clone(), q.object.clone());
+            [
+                (Some(s.clone()), None, None),
+                (Some(s.clone()), Some(p.clone()), None),
+                (Some(s.clone()), Some(p), Some(o.clone())),
+                (Some(s), None, Some(o)),
+            ]
+        })
+        .collect();
+    let check = async |tag: &str, store: &VortexRdfStore, memory: &VortexRdfStore| {
+        for (s, p, o) in &patterns {
+            for window in [None, Some((1, 2))] {
+                let view = |base: &VortexRdfStore| {
+                    let base = base.clone();
+                    let (s, p, o) = (s.clone(), p.clone(), o.clone());
+                    async move {
+                        let v = base
+                            .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), None)
+                            .await
+                            .unwrap();
+                        match window {
+                            Some((offset, limit)) => v.window(offset, limit).await.unwrap(),
+                            None => v,
+                        }
+                    }
+                };
+                let got = view(store)
+                    .await
+                    .code_columns_gathered()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let want = view(memory)
+                    .await
+                    .code_columns_gathered()
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    rows(got),
+                    rows(want),
+                    "{tag}: {s:?} {p:?} {o:?} window {window:?}"
+                );
+            }
+        }
+    };
+    for (tag, _dir, store) in file_stores().await {
+        check(&tag, &store, &memory).await;
+    }
+    // Tombstones: the same deletions on a file store and in memory.
+    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+    let (mut file, mut mem) = (
+        VortexRdfStore::from_file(&path).await.unwrap(),
+        memory.clone(),
+    );
+    for quad in quads.iter().step_by(7).take(60) {
+        file = file.delete_quad(quad).await.unwrap();
+        mem = mem.delete_quad(quad).await.unwrap();
+    }
+    check("file/tombstoned", &file, &mem).await;
+}
