@@ -17,7 +17,7 @@ is the path such an engine takes.
 |---|---|
 | A table of quads to scan with projection, filter and limit pushdown | [`data_source`](../core/src/store/read/data_source.rs#L103) on any view, registered with vortex's `VortexTable` |
 | The index copies in their own sort orders, and the dictionary, as tables | [`component_data_source`](../core/src/store/read/data_source.rs#L129) |
-| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L60), [`code_chunks`](../core/src/store/read/chunks.rs#L90) |
+| Rows as columns, without Arrow | [`row_chunks`](../core/src/store/read/chunks.rs#L62), [`code_chunks`](../core/src/store/read/chunks.rs#L92) |
 | Row counts, sort order, code bounds, partitions, what answered a match | [`view_statistics`](../core/src/store/read/metadata.rs#L152), [`index_components`](../core/src/store/read/metadata.rs#L226), [`partitions`](../core/src/store/read/metadata.rs#L261) |
 | Term ↔ code, term predicates, kind ranges, the default graph's code | [`DictReader`](../core/src/store/layouts/dictionary/handles.rs#L243) (from [`dict_reader`](../core/src/store/mod.rs#L202)), see [matching.md §16.4](./matching.md#164-predicates-and-the-dictionary-handle) |
 | Term-level constraints pushed below a pattern | `keep`, `window`, `size_capped`, `exists`, `match_many` — [matching.md §16](./matching.md#16-narrowing-beyond-a-pattern) |

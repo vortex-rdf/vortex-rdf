@@ -245,11 +245,10 @@ impl VortexRdfStore {
     /// counted or windowed, which is never read (`expect_exact`). In memory
     /// the live selected rows are gathered, every primary column
     /// ([`in_memory_base_rows`](Self::in_memory_base_rows)). On file a
-    /// selection the reads by id serve is read by id (`exact_rows_by_id`),
-    /// through every primary column while a filter is pending (the read
-    /// checks it on the columns it reads); anything else, or a read by id
-    /// that declines, is the restricted scan of `columns`
-    /// (`restricted_file_scan`).
+    /// selection the reads by id serve is read by id, through every primary
+    /// column while a filter is pending (the read checks it on the columns it
+    /// reads); anything else, or a read by id that declines, is the restricted
+    /// scan of `columns` ([`file_base_read`](Self::file_base_read)).
     #[cfg_attr(not(feature = "file-io"), allow(unused_variables))]
     pub(in crate::store) async fn base_read(&self, columns: &[&'static str]) -> Result<BaseRead> {
         match &self.quads.backend {
@@ -259,16 +258,43 @@ impl VortexRdfStore {
                 let (selection, by_id_columns) = self.file_read_scope(base, columns).await?;
                 let (file, filter) = (&base.file, base.filter.as_ref());
                 let deleted = self.quads.deleted.as_ref();
-                match Self::exact_rows_by_id(file, by_id_columns, filter, &selection, deleted)
-                    .await?
-                {
-                    Some(rows) => Ok(BaseRead::Rows(rows)),
-                    None => Ok(BaseRead::Scan(Box::new(Self::restricted_file_scan(
-                        file, columns, filter, &selection, deleted,
-                    )?))),
-                }
+                let read = Self::exact_read(file, by_id_columns, filter, &selection, deleted)?;
+                Self::file_base_read(
+                    file,
+                    columns,
+                    by_id_columns,
+                    filter,
+                    &selection,
+                    deleted,
+                    read,
+                )
+                .await
             }
         }
+    }
+
+    /// A file view's base read once its [`ExactRead`] is chosen: the rows
+    /// `read` reads by id (`by_id_columns`, with `filter` pending), or the
+    /// restricted scan of `columns` at `selection` when `read` leaves the
+    /// selection to the scan or a read by id declines.
+    #[cfg(feature = "file-io")]
+    pub(in crate::store) async fn file_base_read(
+        file: &NativeStoreFile,
+        columns: &[&'static str],
+        by_id_columns: &[&'static str],
+        filter: Option<&Expression>,
+        selection: &RowSelection,
+        deleted: Option<&Mask>,
+        read: ExactRead,
+    ) -> Result<BaseRead> {
+        Ok(
+            match Self::read_exact(file, by_id_columns, filter, read).await? {
+                Some(rows) => BaseRead::Rows(rows),
+                None => BaseRead::Scan(Box::new(Self::restricted_file_scan(
+                    file, columns, filter, selection, deleted,
+                )?)),
+            },
+        )
     }
 
     /// What a read of this file view's `base` rows covers: its exact
@@ -330,24 +356,6 @@ impl VortexRdfStore {
             .collect()
             .await?;
         with_subject_stamp(rows, self.quads.subject_sorted())
-    }
-
-    /// The rows of `columns` at an exact file `selection` with `filter`
-    /// pending and `deleted` tombstoned, read by id as [`ExactRead`] chooses
-    /// ([`exact_read`](Self::exact_read), then
-    /// [`read_exact`](Self::read_exact)). `None` when `ExactRead` leaves the
-    /// selection to the scan, or a read by id declines; the caller then
-    /// scans.
-    #[cfg(feature = "file-io")]
-    pub(in crate::store) async fn exact_rows_by_id(
-        file: &NativeStoreFile,
-        columns: &[&'static str],
-        filter: Option<&Expression>,
-        selection: &RowSelection,
-        deleted: Option<&Mask>,
-    ) -> Result<Option<ArrayRef>> {
-        let read = Self::exact_read(file, columns, filter, selection, deleted)?;
-        Self::read_exact(file, columns, filter, read).await
     }
 
     /// How the rows of `columns` at an exact file `selection`, with `filter`

@@ -804,6 +804,8 @@ impl ExactRead {
         selection: &RowSelection,
         deleted: Option<&Mask>,
     ) -> Result<Self> {
+        #[cfg(test)]
+        exact_read_hooks::note();
         let row_count = file.row_count() as usize;
         let pointable = filter.is_none_or(|f| eq_code_pairs(f).is_some())
             && columns.iter().all(|c| file.column_chunks(c).is_some());
@@ -824,6 +826,26 @@ impl ExactRead {
             return Ok(ExactRead::Take(live()));
         }
         Ok(ExactRead::Scan)
+    }
+}
+
+/// Test hook: how many times this thread chose an [`ExactRead`].
+#[cfg(test)]
+pub(crate) mod exact_read_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CHOSEN: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Record one [`ExactRead::of`](super::ExactRead::of).
+    pub(super) fn note() {
+        CHOSEN.with(|c| c.set(c.get() + 1));
+    }
+
+    /// The reads chosen on this thread so far.
+    pub(crate) fn chosen() -> usize {
+        CHOSEN.with(Cell::get)
     }
 }
 

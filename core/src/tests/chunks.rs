@@ -597,6 +597,76 @@ async fn test_chunks_take_sparse_file_ids() {
     assert_eq!(struct_chunk_codes(&row_chunks), expected, "row_chunks");
 }
 
+/// A file view's chunk stream chooses its read ([`ExactRead::of`]) once, on
+/// its first pull, whichever read it is: the take of sparse exact ids, the
+/// point read of a point-sized filtered run, and the scan of an unrestricted
+/// view, through both exports. With the split limit forced to zero a scan
+/// spawns its splits, which tells the scan apart from the reads by id.
+///
+/// [`ExactRead::of`]: crate::store::scan::file_reads::ExactRead::of
+#[tokio::test]
+async fn test_chunks_choose_a_file_read_once() {
+    use crate::store::Keep;
+    use crate::store::scan::file_reads::{driver_hooks, exact_read_hooks, take_hooks};
+
+    let (_dir, path) = write_store_file(
+        modular_quads(20_000, 3, 4),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await;
+    let file = VortexRdfStore::from_file(&path).await.unwrap();
+    let dict = file.dict_reader().unwrap();
+    let (lo, hi) = dict.prefix_range("<http://example.org/s").await.unwrap();
+    let sparse = file
+        .keep(QuadColumn::S, &Keep::set((lo..hi).step_by(20)))
+        .await
+        .unwrap();
+    let (_runs_dir, runs_path) =
+        write_store_file(term_kind_quads(), LayoutStrategy::Dictionary, vec![]).await;
+    let runs = VortexRdfStore::from_file(&runs_path).await.unwrap();
+    let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s").unwrap());
+    let plain = Term::Literal(Literal::new_simple_literal("plain"));
+    let point_run = runs
+        .match_pattern(Some(&s), None, Some(&plain), None)
+        .await
+        .unwrap();
+
+    // (view, taken by id, scanned)
+    let reads = [
+        ("sparse ids, taken", &sparse, true, false),
+        (
+            "point-sized run, read point by point",
+            &point_run,
+            false,
+            false,
+        ),
+        ("unrestricted view, scanned", &file, false, true),
+    ];
+    let _limit = driver_hooks::ForcedLimit::set(0);
+    for (tag, view, taken, scanned) in reads {
+        let takes = take_hooks::takes().0;
+        driver_hooks::take_spawned();
+        let codes = view.code_chunks(&QuadColumn::ALL, 256).unwrap();
+        let (chunks, first, total) = drain_counted(codes, exact_read_hooks::chosen).await;
+        assert!(!chunks.is_empty(), "{tag}: code_chunks read rows");
+        assert_eq!(
+            (first, total),
+            (1, 1),
+            "{tag}: code_chunks chooses its read once"
+        );
+        let rows = view.row_chunks(256).unwrap();
+        let (_, first, total) = drain_counted(rows, exact_read_hooks::chosen).await;
+        assert_eq!(
+            (first, total),
+            (1, 1),
+            "{tag}: row_chunks chooses its read once"
+        );
+        assert_eq!(take_hooks::takes().0 > takes, taken, "{tag}: taken by id");
+        assert_eq!(driver_hooks::take_spawned() > 0, scanned, "{tag}: scanned");
+    }
+}
+
 /// A subject run on a sorted file whose bound role past a gap in the
 /// `(s, p, o, g)` order stays a pending filter — `<s> ?p "plain"`, and
 /// `GRAPH <g> { <s> <p2> ?o }` — is point-sized, so its code chunks read it

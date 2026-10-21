@@ -28,6 +28,8 @@ use super::deferred;
 use super::rows::{gather_codes, gather_column};
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
+#[cfg(feature = "file-io")]
+use crate::store::FileBase;
 use crate::store::VortexRdfStore;
 use crate::store::array::{field_as, into_struct_array, rechunk};
 #[cfg(feature = "file-io")]
@@ -179,9 +181,9 @@ impl VortexRdfStore {
     /// The base rows this view covers, without the tail, in chunks of at
     /// most `batch_rows` rows of at least the `columns` (primary column
     /// names). In memory a window of live ids ([`MemoryRows::Windows`]) is
-    /// gathered per pull, and on file a selection `ExactRead` takes by id is
-    /// taken one window per pull ([`take_chunks`](Self::take_chunks)); any
-    /// other read is [`base_read`](Self::base_read)'s, cut to the cap.
+    /// gathered per pull; a file view's read is chosen once
+    /// ([`file_base_chunks`](Self::file_base_chunks)); any other read is
+    /// [`base_read`](Self::base_read)'s, cut to the cap.
     async fn base_chunks(
         &self,
         columns: &[&'static str],
@@ -200,8 +202,8 @@ impl VortexRdfStore {
             .boxed());
         }
         #[cfg(feature = "file-io")]
-        if let Some(chunks) = self.take_chunks(columns, batch_rows).await? {
-            return Ok(chunks);
+        if let Some(base) = self.quads.file() {
+            return self.file_base_chunks(base, columns, batch_rows).await;
         }
         self.base_read(columns).await?.chunks(batch_rows)
     }
@@ -228,34 +230,39 @@ impl VortexRdfStore {
         )
     }
 
-    /// A file view's base rows when `ExactRead` takes its exact selection by
-    /// id: the live ids cut into windows of at most `batch_rows`, each taken
-    /// ([`take_file_rows`]) when its chunk is pulled. `None` in memory, and
-    /// for a selection read point by point or by the scan, which
-    /// [`base_read`](Self::base_read) reads.
+    /// A file view's base chunks, its [`ExactRead`] chosen once: a selection
+    /// taken by id is cut into windows of at most `batch_rows` live ids, each
+    /// taken ([`take_file_rows`]) when its chunk is pulled; a point or scan
+    /// read is [`file_base_read`](Self::file_base_read)'s, cut to the cap.
     #[cfg(feature = "file-io")]
-    async fn take_chunks(
+    async fn file_base_chunks(
         &self,
+        base: &FileBase,
         columns: &[&'static str],
         batch_rows: usize,
-    ) -> Result<Option<RowChunkStream>> {
-        let Some(base) = self.quads.file() else {
-            return Ok(None);
-        };
+    ) -> Result<RowChunkStream> {
         let (selection, by_id_columns) = self.file_read_scope(base, columns).await?;
-        let ExactRead::Take(ids) = Self::exact_read(
-            &base.file,
-            by_id_columns,
-            base.filter.as_ref(),
-            &selection,
-            self.quads.deleted.as_ref(),
-        )?
-        else {
-            return Ok(None);
+        let (file, filter) = (&base.file, base.filter.as_ref());
+        let deleted = self.quads.deleted.as_ref();
+        let ids = match Self::exact_read(file, by_id_columns, filter, &selection, deleted)? {
+            ExactRead::Take(ids) => ids,
+            read => {
+                return Self::file_base_read(
+                    file,
+                    columns,
+                    by_id_columns,
+                    filter,
+                    &selection,
+                    deleted,
+                    read,
+                )
+                .await?
+                .chunks(batch_rows);
+            }
         };
         let file = Arc::clone(&base.file);
         let columns: Arc<[&'static str]> = Arc::from(by_id_columns);
-        Ok(Some(
+        Ok(
             stream::iter(id_windows(Buffer::from(ids), batch_rows).enumerate())
                 .then(move |(k, window)| {
                     let (file, columns) = (Arc::clone(&file), Arc::clone(&columns));
@@ -277,7 +284,7 @@ impl VortexRdfStore {
                     }
                 })
                 .boxed(),
-        ))
+        )
     }
 
     /// The tail's live rows cut to `batch_rows`, each slice cut when it is
