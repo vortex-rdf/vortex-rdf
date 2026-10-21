@@ -60,8 +60,19 @@ impl TermChunk {
     /// Adopt a wire chunk: FSST stays FSST, any other encoding is
     /// canonicalized to plaintext.
     pub(super) fn from_wire(chunk: ArrayRef, ctx: &mut vortex_array::ExecutionCtx) -> Result<Self> {
+        Self::from_wire_checked(chunk, ctx, true)
+    }
+
+    /// [`from_wire`](Self::from_wire), the scan of an FSST chunk's code
+    /// offsets skipped when `check_offsets` is false: for a leaf adopted
+    /// before, whose offsets that adoption checked.
+    pub(super) fn from_wire_checked(
+        chunk: ArrayRef,
+        ctx: &mut vortex_array::ExecutionCtx,
+        check_offsets: bool,
+    ) -> Result<Self> {
         match chunk.try_downcast::<FSST>() {
-            Ok(fsst) => Ok(TermChunk::Fsst(FsstTerms::new(fsst)?)),
+            Ok(fsst) => Ok(TermChunk::Fsst(FsstTerms::with_check(fsst, check_offsets)?)),
             Err(other) => Ok(TermChunk::Canonical(other.execute::<VarBinViewArray>(ctx)?)),
         }
     }
@@ -314,6 +325,14 @@ impl FsstTerms {
     /// error, naming it, for an offset a `u32` cannot hold (a negative one,
     /// or one past 4 GiB of codes).
     fn new(array: FSSTArray) -> Result<Self> {
+        Self::with_check(array, true)
+    }
+
+    /// [`new`](Self::new); `check_offsets` false skips the scan of 32-bit
+    /// signed offsets for a negative one, for a chunk whose offsets were
+    /// checked when it was first adopted. Wider and narrower widths convert
+    /// with their checks either way.
+    fn with_check(array: FSSTArray, check_offsets: bool) -> Result<Self> {
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let offsets = array
             .codes_offsets()
@@ -331,7 +350,12 @@ impl FsstTerms {
         let offsets: Buffer<u32> = match offsets.ptype() {
             PType::U32 => offsets.to_buffer::<u32>(),
             PType::I32 => {
-                if let Some(o) = offsets.as_slice::<i32>().iter().find(|&&o| o < 0) {
+                // The OR of every offset has its sign bit set exactly when one
+                // is negative: one pass the compiler vectorizes, where a find
+                // compares offset by offset on every window rebuild.
+                let slice = offsets.as_slice::<i32>();
+                if check_offsets && slice.iter().fold(0i32, |acc, &o| acc | o) < 0 {
+                    let o = slice.iter().find(|&&o| o < 0).expect("a negative offset");
                     return Err(refused(o));
                 }
                 offsets.reinterpret_cast(PType::U32).to_buffer::<u32>()
@@ -740,6 +764,54 @@ mod tests {
     /// viewed in place as a huge `u32`. The offsets are a constant child,
     /// which FSST checks against the code bytes only once decoded, so the
     /// chunk holds no 4 GiB of codes.
+    #[test]
+    fn fsst_offsets_unchecked_adoption_matches_the_checked_one() {
+        use vortex_array::ArrayParts;
+        use vortex_array::arrays::ConstantArray;
+        use vortex_array::scalar::Scalar;
+        use vortex_fsst::FSSTSlots;
+
+        let terms: Vec<String> = (0..500)
+            .map(|i| format!("<http://e.org/t{i:04}>"))
+            .collect();
+        let dict = TermDictionary::compress_windowed(
+            VarBinViewArray::from_iter_str(terms.iter().map(String::as_str)),
+            usize::MAX,
+        )
+        .unwrap();
+        let [TermChunk::Fsst(original)] = &dict.terms.chunks[..] else {
+            panic!("a small dictionary is one FSST chunk");
+        };
+        let checked = FsstTerms::with_check(original.array.clone(), true).unwrap();
+        let unchecked = FsstTerms::with_check(original.array.clone(), false).unwrap();
+        assert_eq!(checked.offsets.as_slice(), unchecked.offsets.as_slice());
+        let mut scratch = Vec::new();
+        for (i, term) in terms.iter().enumerate() {
+            assert_eq!(
+                unchecked.decode_into(i, &mut scratch),
+                term.as_bytes(),
+                "term {i}"
+            );
+        }
+        // The check itself still refuses a negative 32-bit offset.
+        let array = &original.array;
+        let negative = FSSTArray::try_from_parts(ArrayParts::new(
+            FSST,
+            array.dtype().clone(),
+            array.len(),
+            array.data().clone(),
+            FSSTSlots {
+                uncompressed_lengths: array.uncompressed_lengths().clone(),
+                codes_offsets: ConstantArray::new(Scalar::from(-1i32), array.len() + 1)
+                    .into_array(),
+                codes_validity: None,
+            }
+            .into_slots(),
+        ))
+        .unwrap();
+        assert!(FsstTerms::with_check(negative, true).is_err());
+    }
+
     #[test]
     fn fsst_code_offsets_outside_u32_are_refused() {
         use vortex_array::ArrayParts;
