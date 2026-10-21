@@ -220,6 +220,67 @@ async fn column_chunks_match_canonical() {
             );
         }
     }
+    // Windows crossing the flat leaves' own boundaries, with needles whose
+    // run crosses them: the lower bound lies in one leaf and the run goes on
+    // into the next. A window inside one leaf reads through `leaf_rows`; one
+    // across a boundary has no single leaf.
+    let starts: Vec<u64> = flat_leaves(&node)
+        .expect("the column's leaves")
+        .iter()
+        .map(|leaf| leaf.row_offset)
+        .filter(|&start| start > 0)
+        .collect();
+    assert!(!starts.is_empty(), "fixture must have a leaf boundary");
+    let len = data.len() as u64;
+    for &b in &starts {
+        let around: Vec<u64> = (b - 2..b + 2)
+            .map(|r| u64::from(data[r as usize]))
+            .collect();
+        for window in [b - 30..b + 30, b - 1..b + 1, 0..len, b - 11..len, 0..b + 11] {
+            let wdata = &data[window.start as usize..window.end as usize];
+            for needle in around.iter().copied().chain([0, max, u64::MAX]) {
+                let got = column
+                    .bounds_in(window.clone(), needle, &source, &session)
+                    .await
+                    .unwrap()
+                    .expect("all chunks are probeable");
+                let want = canonical_bounds(wdata, needle);
+                assert_eq!(
+                    got,
+                    window.start + want.start..window.start + want.end,
+                    "boundary {b} window {window:?} needle {needle}"
+                );
+            }
+        }
+        let inside = column
+            .leaf_rows(b - 20..b, &source, &session)
+            .await
+            .unwrap()
+            .expect("a window inside one leaf");
+        assert_eq!(inside.rows(), b - 20..b);
+        for row in b - 20..b {
+            assert_eq!(
+                inside.value_at(row),
+                u64::from(data[row as usize]),
+                "row {row}"
+            );
+        }
+        let needle = u64::from(data[(b - 5) as usize]);
+        let want = canonical_bounds(&data[(b - 20) as usize..b as usize], needle);
+        assert_eq!(
+            inside.bounds(needle),
+            b - 20 + want.start..b - 20 + want.end
+        );
+        assert!(
+            column
+                .leaf_rows(b - 1..b + 1, &source, &session)
+                .await
+                .unwrap()
+                .is_none(),
+            "a window across leaf boundary {b}"
+        );
+    }
+
     // A reversed window holds no row: at `u64::MAX` too, its bounds are
     // empty at its start.
     #[allow(clippy::reversed_empty_ranges)]

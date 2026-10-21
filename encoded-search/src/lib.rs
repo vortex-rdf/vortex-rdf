@@ -10,7 +10,7 @@ pub use owned::OwnedSortedProbe;
 #[cfg(feature = "layout")]
 mod layout;
 #[cfg(feature = "layout")]
-pub use layout::{ColumnChunks, FlatLeaf, fetch_flat, flat_leaves};
+pub use layout::{ColumnChunks, FlatLeaf, LeafRows, fetch_flat, flat_leaves};
 
 use vortex_array::ArrayRef;
 

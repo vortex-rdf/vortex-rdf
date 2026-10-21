@@ -593,6 +593,16 @@ async fn test_locate_codes_matches_the_term_path() {
             3,
         ));
     }
+    // Seven-row flat leaves: most subject runs cross a leaf boundary, so the
+    // narrowing and the reads go across leaves as well as inside one.
+    let (dir, path) = write_chunked_store_file(&multiplicity_quads(), 7).await;
+    guards.push(Box::new(dir));
+    stores.push((
+        "multiplicity/seven-row-leaves/mapped".to_string(),
+        VortexRdfStore::from_file(&path).await.unwrap(),
+        multiplicity_quads(),
+        1,
+    ));
     for (tag, store, quads, step) in stores {
         check_locate_codes(&tag, &store, &quads, step).await;
     }

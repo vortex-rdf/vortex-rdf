@@ -228,6 +228,16 @@ async fn read_codes(
 
     if rows.end - rows.start <= POINT_CODES {
         let mut codes = vortex_buffer::BufferMut::with_capacity((rows.end - rows.start) as usize);
+        // A run inside one leaf reads through that leaf's probe, found once.
+        if !rows.is_empty()
+            && let Some(leaf) = column
+                .leaf_rows(rows.clone(), source, session)
+                .await
+                .map_err(VortexRdfError::Vortex)?
+        {
+            codes.extend(rows.map(|row| leaf.value_at(row)));
+            return Ok(Some(codes.freeze()));
+        }
         for row in rows {
             match column
                 .value_at(row, source, session)

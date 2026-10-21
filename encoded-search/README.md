@@ -107,7 +107,10 @@ inside a written Vortex file: it locates one field's flat chunk leaves in a
 layout tree, then answers global lower bounds, bounds queries, point reads and
 takes at ascending rows by fetching only the chunks a binary search over the
 chunks' last values, or the rows, actually touch; a take has each leaf take its
-rows from its array. Each fetched chunk is reconstructed in its wire encoding
+rows from its array. A `bounds_in` window is searched inside the leaf holding
+its lower bound, which the leaves' last values pick, and `leaf_rows` hands
+back a window inside one leaf as a `LeafRows`, whose bounds searches and point
+reads go through that leaf's probe without finding the leaf again. Each fetched chunk is reconstructed in its wire encoding
 (`SerializedArray::decode` rebuilds metadata over the segment buffers — it does
 not decompress), resolved into a probe once, and cached, so repeated queries
 against a hot file do no further I/O.
